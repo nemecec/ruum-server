@@ -1,0 +1,27 @@
+[package]
+name = "ruum-server"
+description = "The Ruum core service binary. Reads config from the environment and wires the modules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ruum-server"
+path = "src/main.rs"
+
+[dependencies]
+ruum-core.workspace = true
+ruum-api.workspace = true
+ruum-mcp.workspace = true
+ruum-webdav.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "ruum-api"
+description = "Ruum REST API (axum). Implements contracts/openapi.yaml."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruum-core.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tokio.workspace = true
+tower.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "ruum-testkit"
+description = "Test helpers: tenant isolation and permission suites, fixtures, HTTP test client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruum-core.workspace = true
+ruum-api.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true

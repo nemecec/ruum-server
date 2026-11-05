@@ -1,0 +1,92 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "LicenseRef-Proprietary"
+publish = false
+repository = "https://ruum.space"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "allow"
+
+# All dependencies of step 1 are declared here, so feature work does not edit this file.
+# A crate uses them with `name.workspace = true`.
+[workspace.dependencies]
+# Internal crates
+ruum-core = { path = "crates/ruum-core" }
+ruum-api = { path = "crates/ruum-api" }
+ruum-mcp = { path = "crates/ruum-mcp" }
+ruum-webdav = { path = "crates/ruum-webdav" }
+ruum-testkit = { path = "crates/ruum-testkit" }
+
+# Async runtime and HTTP
+tokio = { version = "1.54", features = ["full"] }
+axum = { version = "0.8.9", features = ["macros"] }
+tower = { version = "0.5.3", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.7.1", features = ["trace", "cors", "request-id", "limit", "timeout", "catch-panic", "set-header", "util"] }
+http = "1.5"
+http-body-util = "0.1"
+hyper = "1"
+bytes = "1.12"
+futures = "0.3.34"
+async-trait = "0.1.92"
+axum-extra = { version = "0.12.6", features = ["typed-header", "cookie", "query"] }
+headers = "0.4.2"
+tokio-util = { version = "0.7.20", features = ["io"] }
+tokio-stream = "0.1.19"
+url = { version = "2.5.8", features = ["serde"] }
+mime = "0.3.18"
+mime_guess = "2.0.5"
+parking_lot = "0.13.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "json", "stream", "query", "form"] }
+
+# Data and errors
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29", features = ["v7", "serde"] }
+time = { version = "0.3.55", features = ["serde", "serde-well-known", "macros"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+# Observability
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
+
+# Storage
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid", "time", "json", "migrate", "derive"] }
+object_store = { version = "0.14.2", features = ["aws"] }
+blake3 = "1.8.7"
+fastcdc = "5.0.0"
+zstd = "0.14.3"
+
+# Diff plugins (section 5.4). The Wasm plugin runtime is wasmtime.
+similar = "3.2.1"
+quick-xml = "0.42.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+wasmtime = "50"
+
+# Auth and crypto
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+sha2 = "0.11.1"
+argon2 = "0.6.0"
+rand = "0.10.3"
+base64 = "0.23.1"
+hex = "0.4.3"
+
+# Faces: CLI, MCP, WebDAV
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "transport-io"] }
+dav-server = { version = "0.11.0", default-features = false }
+
+# Tests
+proptest = "1.12.0"
+wiremock = "0.6.5"
+tempfile = "3.27.0"

@@ -1,0 +1,18 @@
+[package]
+name = "ruum-webdav"
+description = "WebDAV face of the Ruum node tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruum-core.workspace = true
+axum.workspace = true
+dav-server.workspace = true
+tokio.workspace = true
+tracing.workspace = true
