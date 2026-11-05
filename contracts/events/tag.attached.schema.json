@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/tag.attached.schema.json",
+  "title": "tag.attached",
+  "description": "A tag was attached to a node. This schema is the `data` of a journal entry with `type` `tag.attached`.",
+  "type": "object",
+  "required": [
+    "tag_id",
+    "tag_name"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "tag_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "tag_name": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,3979 @@
+openapi: 3.1.0
+info:
+  title: Ruum API
+  version: 0.1.0
+  summary: Files, versions, tags, sharing, agents and the change journal of Ruum (step 1, Core).
+  description: |
+    The REST API of Ruum (`ruum.space`). Everything is a node in a tree, and one permission
+    system protects all nodes. This contract covers step 1 (Core) of `docs/DESIGN.md`, section 16.
+
+    ## Authentication
+    - **Web UI**: the server runs the OIDC code flow with Zitadel (`/v1/auth/login`,
+      `/v1/auth/callback`) and sets the HttpOnly cookie `ruum_session`. A cookie-authenticated
+      request that changes state must also send the header `Ruum-Csrf` with the value of the
+      cookie `ruum_csrf` (double submit).
+    - **Native clients and the CLI**: `Authorization: Bearer <token>` with a platform token.
+    - **Agents**: exchange an API key (`ruum_agent_...`) for a short-lived access token at
+      `POST /v1/oauth/token`, then send it as a bearer token. The key itself is never a bearer
+      token.
+
+    ## Tenants
+    Calls on nodes, uploads, tags, agents, changes, trash and search act in one tenant. The client
+    names it in the `Ruum-Tenant` header. Agent tokens are bound to one tenant; for them the header
+    is optional and, if sent, must match. Tenant administration uses `/v1/tenants/{tenant_id}`.
+    Guests send the ID of the owner tenant.
+
+    ## Who did it
+    Every write records `actor` (the user, agent or app that did the write) and `on_behalf_of`
+    (the user, when the actor is an agent or an app). Write responses carry them in `change`.
+
+    ## Writes and retries
+    Every write accepts an `Idempotency-Key` header. A retry with the same key and the same body
+    within 24 hours returns the first response. The same key with another body fails with
+    `409 idempotency_key_reused`.
+
+    ## Paging
+    Lists take `cursor` and `limit` and return `{ "items": [...], "next_cursor": "..." }`.
+    `next_cursor` is `null` on the last page. Cursors are opaque.
+
+    ## Errors
+    Every error has the body `{ "error": { "code": "snake_case_code", "message": "...", "hint": "..." } }`.
+    `code` is stable and machine-readable; `hint` tells the next step.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+  contact:
+    name: Ruum
+    url: https://ruum.space
+servers:
+  - url: https://ruum.localhost
+    description: The laptop stack
+  - url: https://api.ruum.space
+    description: Production
+security:
+  - bearerAuth: []
+  - sessionCookie: []
+tags:
+  - name: system
+    description: Health and public keys.
+  - name: auth
+    description: Sign-in through the platform (Zitadel OIDC), sessions and the signed-in principal.
+  - name: tenants
+    description: Personal and team tenants, members, guests, invitations, plans, limits and usage.
+  - name: agents
+    description: Agent principals, scopes, API keys, token exchange, activity and undo.
+  - name: nodes
+    description: The node tree. Folders, files and links; rename, move, copy, trash and restore.
+  - name: uploads
+    description: Resumable chunked uploads and ranged downloads.
+  - name: versions
+    description: Version history, restore, labels and diffs.
+  - name: tags
+    description: Tenant tags on nodes.
+  - name: sharing
+    description: Grants, share links and Shared with me.
+  - name: changes
+    description: The change journal as a feed for sync clients and agents.
+  - name: search
+    description: Search by name.
+  - name: audit
+    description: The audit log of a tenant.
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Liveness check
+      security: []
+      responses:
+        '200':
+          description: The service is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /.well-known/jwks.json:
+    get:
+      tags: [system]
+      operationId: getJwks
+      summary: Public keys of the Ruum token issuer
+      description: The keys that verify Ruum access tokens (agents and share links), as a JWKS.
+      security: []
+      responses:
+        '200':
+          description: The JWKS document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Jwks'
+
+  # ---------------------------------------------------------------- auth
+  /v1/auth/login:
+    get:
+      tags: [auth]
+      operationId: loginStart
+      summary: Start OIDC sign-in
+      description: |
+        Redirects the browser to Zitadel (authorization code flow with PKCE). The server keeps the
+        state, nonce and PKCE verifier in the short-lived cookie `ruum_login`.
+      security: []
+      parameters:
+        - name: return_to
+          in: query
+          description: A relative path in the web UI to go to after sign-in. Absolute URLs are refused.
+          schema:
+            type: string
+            pattern: '^/[^/\\]'
+            default: /
+        - name: idp
+          in: query
+          description: A hint for the identity provider (decision 6).
+          schema:
+            type: string
+            enum: [google, microsoft, passkey]
+      responses:
+        '302':
+          description: Redirect to the identity provider.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              description: The `ruum_login` state cookie.
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/auth/callback:
+    get:
+      tags: [auth]
+      operationId: loginCallback
+      summary: OIDC callback
+      description: |
+        Exchanges the code, verifies the ID token, finds or makes the user (a new user gets a
+        personal tenant) and starts a session. Identities are linked only by an explicit action or
+        by a verified email from a trusted provider.
+      security: []
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: error
+          in: query
+          description: Set by the identity provider when sign-in failed.
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to `return_to`, with the session cookie set.
+          headers:
+            Location:
+              schema:
+                type: string
+            Set-Cookie:
+              description: '`ruum_session` (HttpOnly, Secure, SameSite=Lax) and `ruum_csrf`.'
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Sign out
+      description: Ends the session, clears the cookies and returns the end-session URL of the identity provider.
+      responses:
+        '200':
+          description: Signed out.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutResult'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /v1/me:
+    get:
+      tags: [auth]
+      operationId: getMe
+      summary: The signed-in principal
+      description: Who the caller is. For an agent token, the agent, its user and its scope.
+      responses:
+        '200':
+          description: The principal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /v1/me/identities:
+    get:
+      tags: [auth]
+      operationId: listMyIdentities
+      summary: Linked identities of the signed-in user
+      responses:
+        '200':
+          description: The identities.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Identity'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /v1/me/sessions:
+    get:
+      tags: [auth]
+      operationId: listMySessions
+      summary: Web sessions of the signed-in user
+      responses:
+        '200':
+          description: The sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /v1/me/sessions/{session_id}:
+    delete:
+      tags: [auth]
+      operationId: endSession
+      summary: End one web session
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The session is ended.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- tenants
+  /v1/tenants:
+    get:
+      tags: [tenants]
+      operationId: listTenants
+      summary: Tenants of the signed-in user
+      description: The personal tenant, the team tenants and the tenants where the user is a guest.
+      responses:
+        '200':
+          description: The tenants with the user's role in each.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TenantMembership'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    post:
+      tags: [tenants]
+      operationId: createTenant
+      summary: Create a team tenant
+      description: The caller becomes the owner. Agents cannot create tenants.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantRequest'
+      responses:
+        '201':
+          description: The new tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/tenants/{tenant_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [tenants]
+      operationId: getTenant
+      summary: Get a tenant
+      responses:
+        '200':
+          description: The tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [tenants]
+      operationId: updateTenant
+      summary: Rename a tenant
+      description: Needs the tenant role `admin` or `owner`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTenantRequest'
+      responses:
+        '200':
+          description: The tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/tenants/{tenant_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [tenants]
+      operationId: listMembers
+      summary: List members and guests
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tenants/{tenant_id}/members/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [tenants]
+      operationId: updateMember
+      summary: Change the role of a member
+      description: Needs `admin`. Only an `owner` can make or remove owners. A tenant keeps at least one owner.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  $ref: '#/components/schemas/MemberRole'
+      responses:
+        '200':
+          description: The member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [tenants]
+      operationId: removeMember
+      summary: Remove a member
+      description: Needs `admin`, or the member removes themselves. The agents of the member in this tenant are disabled.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Removed.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/tenants/{tenant_id}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [tenants]
+      operationId: listInvitations
+      summary: List open invitations
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of invitations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvitationPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+    post:
+      tags: [tenants]
+      operationId: createInvitation
+      summary: Invite a person
+      description: Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvitationRequest'
+      responses:
+        '201':
+          description: The invitation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invitation'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/tenants/{tenant_id}/invitations/{invitation_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/InvitationId'
+    delete:
+      tags: [tenants]
+      operationId: revokeInvitation
+      summary: Revoke an invitation
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Revoked.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/invitations/accept:
+    post:
+      tags: [tenants]
+      operationId: acceptInvitation
+      summary: Accept an invitation
+      description: The signed-in user joins the tenant with the role of the invitation. Agents cannot accept invitations.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  description: The secret token from the invitation email.
+      responses:
+        '200':
+          description: The new membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/tenants/{tenant_id}/limits:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [tenants]
+      operationId: getLimits
+      summary: Plan limits and usage
+      description: The limits of the plan (design section 4.3) and the current usage. Any member can read them.
+      responses:
+        '200':
+          description: The limits and the usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LimitsAndUsage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tenants/{tenant_id}/audit:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [audit]
+      operationId: listAudit
+      summary: The audit log of a tenant
+      description: |
+        Newest first. Needs the tenant role `admin`. With `Accept: application/x-ndjson` the server
+        streams all matching entries as one JSON object per line (export).
+      parameters:
+        - name: since
+          in: query
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: until
+          in: query
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: actor
+          in: query
+          description: Only entries by this user, agent or app.
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: action
+          in: query
+          description: Only entries whose action starts with this prefix, for example `agent.`.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/AuditEntry'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  # ---------------------------------------------------------------- agents
+  /v1/agents:
+    get:
+      tags: [agents]
+      operationId: listAgents
+      summary: List agents
+      description: The caller's agents. Tenant admins see all agents of the tenant.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: owner
+          in: query
+          description: Only agents of this user (admins only).
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of agents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    post:
+      tags: [agents]
+      operationId: registerAgent
+      summary: Register an agent
+      description: |
+        Registers an agent that acts for the signed-in user (no team agents in step 1). Only a user
+        can register an agent; an agent cannot. Fails with `plan_limit_reached` at the agent limit.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterAgentRequest'
+      responses:
+        '201':
+          description: The agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/agents/{agent_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+    get:
+      tags: [agents]
+      operationId: getAgent
+      summary: Get an agent
+      responses:
+        '200':
+          description: The agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [agents]
+      operationId: updateAgent
+      summary: Change an agent's name or scope
+      description: Only the owner of the agent. A new scope applies to new access tokens at once and to old ones within their lifetime.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAgentRequest'
+      responses:
+        '200':
+          description: The agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/agents/{agent_id}/disable:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+    post:
+      tags: [agents]
+      operationId: disableAgent
+      summary: Disable an agent
+      description: The owner or a tenant admin. Key exchange and all requests of the agent fail with `agent_disabled`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{agent_id}/enable:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+    post:
+      tags: [agents]
+      operationId: enableAgent
+      summary: Enable an agent
+      description: Only the owner. An agent that was disabled because its user left the tenant cannot be enabled.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The agent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{agent_id}/keys:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+    get:
+      tags: [agents]
+      operationId: listAgentKeys
+      summary: List the API keys of an agent
+      description: Metadata only. The secret is never shown again after creation.
+      responses:
+        '200':
+          description: The keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentKey'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [agents]
+      operationId: createAgentKey
+      summary: Create an API key
+      description: |
+        Only the owner of the agent. The response has the secret once. The server stores only a
+        hash. Keys always expire (default 90 days, at most 1 year).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentKeyRequest'
+      responses:
+        '201':
+          description: The key and its secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentKeyCreated'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/agents/{agent_id}/keys/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+      - $ref: '#/components/parameters/KeyId'
+    delete:
+      tags: [agents]
+      operationId: revokeAgentKey
+      summary: Revoke an API key
+      description: The owner or a tenant admin. Access tokens from this key stop working within their lifetime (at most 15 minutes).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Revoked.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{agent_id}/activity:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+    get:
+      tags: [agents]
+      operationId: listAgentActivity
+      summary: Changes made by an agent
+      description: The journal entries where the agent is the actor, newest first.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JournalPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{agent_id}/undo:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/AgentId'
+    post:
+      tags: [agents]
+      operationId: undoAgent
+      summary: Undo what an agent did since a time
+      description: |
+        Reverts the changes of the agent since `since`, newest first: restores earlier versions,
+        moves nodes back, restores trashed nodes and trashes created ones. A change that another
+        actor changed later is skipped and reported. The undo itself is a set of new changes by the
+        caller. Only the owner of the agent or a tenant admin. With `dry_run` nothing changes.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UndoRequest'
+      responses:
+        '200':
+          description: What was (or would be) reverted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UndoReport'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/oauth/token:
+    post:
+      tags: [agents]
+      operationId: exchangeToken
+      summary: Exchange an API key for an access token
+      description: |
+        Token exchange (RFC 8693 shape). The `subject_token` is an agent API key
+        (`ruum_agent_...`). The result is a short-lived bearer token (15 minutes) bound to the
+        agent's tenant, user and scope. Errors use the Ruum error body; codes are
+        `unauthenticated` (unknown, revoked or expired key) and `agent_disabled`.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenExchangeRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenExchangeRequest'
+      responses:
+        '200':
+          description: The access token.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenExchangeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------- nodes
+  /v1/nodes/root:
+    get:
+      tags: [nodes]
+      operationId: getRoot
+      summary: The root folder of the tenant
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The root folder.
+          headers:
+            ETag:
+              $ref: '#/components/headers/NodeETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /v1/nodes:
+    post:
+      tags: [nodes]
+      operationId: createNode
+      summary: Create a folder, an empty file or a link
+      description: |
+        Needs `edit` on the parent. A `member` link also needs `share` on the target (design
+        section 2.3). Typed nodes come in step 2; `kind: typed` fails with `validation_failed`.
+        To create a file with content, use `POST /v1/uploads` with a `new_file` target, or create
+        an empty file and `PUT /v1/nodes/{node_id}/content`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNodeRequest'
+      responses:
+        '201':
+          description: The new node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/by-path/{path}:
+    get:
+      tags: [nodes]
+      operationId: getNodeByPath
+      summary: Get a node by its path
+      description: |
+        Resolves a path from the tenant root, for example `/v1/nodes/by-path/Projects/Garden`.
+        The `path` parameter spans the rest of the URL and may contain `/`; each name is
+        percent-encoded. Trashed nodes are not found. A link is returned as the link, not its target.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: path
+          in: path
+          required: true
+          description: Names separated by `/`, each percent-encoded.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The node.
+          headers:
+            ETag:
+              $ref: '#/components/headers/NodeETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      operationId: getNode
+      summary: Get a node
+      description: Needs `view`. A node that the caller cannot see is `404`, not `403`, so IDs do not leak.
+      responses:
+        '200':
+          description: The node.
+          headers:
+            ETag:
+              $ref: '#/components/headers/NodeETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/children:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      operationId: listChildren
+      summary: List the children of a folder
+      description: The live children that the caller can see. Folders come first when sorted by name.
+      parameters:
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [name, updated_at, size]
+            default: name
+        - name: kind
+          in: query
+          schema:
+            $ref: '#/components/schemas/NodeKind'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of children.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/rename:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      operationId: renameNode
+      summary: Rename a node
+      description: Needs `edit` on the node. Writes `node.renamed`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameRequest'
+      responses:
+        '200':
+          description: The renamed node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/move:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      operationId: moveNode
+      summary: Move a node
+      description: |
+        Needs `manage` on the node and `edit` on the new parent. A folder cannot move into itself or
+        its own subtree. Moves inside one tenant only. Writes `node.moved`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveRequest'
+      responses:
+        '200':
+          description: The moved node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/copy:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      operationId: copyNode
+      summary: Copy a node
+      description: |
+        Needs `view` on the node and `edit` on the new parent. A file copy gets one version with the
+        head content (chunks are shared, no bytes are copied). A folder is copied with its live
+        subtree; links are copied as links. Grants are not copied. Writes `node.copied` for the new
+        root and `node.created` for each node in it.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CopyRequest'
+      responses:
+        '201':
+          description: The new copy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/trash:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      operationId: trashNode
+      summary: Move a node to the trash
+      description: |
+        Needs `manage`. The node and its subtree leave the tree; the name becomes free. The trash
+        keeps them for the plan's trash period (30 days), then they are purged. The root cannot be
+        trashed. Writes `node.trashed`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: The trashed node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+
+  /v1/nodes/{node_id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      operationId: restoreNode
+      summary: Restore a node from the trash
+      description: |
+        Needs `manage`. Restores into the old parent, or into `parent_id` when given or when the old
+        parent is gone. Writes `node.restored`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreRequest'
+      responses:
+        '200':
+          description: The restored node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/trash:
+    get:
+      tags: [nodes]
+      operationId: listTrash
+      summary: List the trash
+      description: The trashed roots (not their children) that the caller can manage, newest first.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of trashed nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  # ---------------------------------------------------------------- uploads and content
+  /v1/uploads:
+    post:
+      tags: [uploads]
+      operationId: createUpload
+      summary: Start a resumable upload
+      description: |
+        The client cuts the file into chunks with the published chunking parameters (FastCDC,
+        1 MiB minimum, 2 MiB average, 4 MiB maximum), hashes each chunk and the whole content with
+        BLAKE3, and sends the list. The response says which chunks the server does not have yet;
+        the client uploads only those, then calls `complete`. Needs `edit` on the target file, or on
+        the parent folder for a new file. Fails with `quota_exceeded` or `payload_too_large`
+        (largest file of the plan) before any byte is sent. The session expires after 24 hours.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUploadRequest'
+      responses:
+        '201':
+          description: The upload session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/uploads/{upload_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/UploadId'
+    get:
+      tags: [uploads]
+      operationId: getUpload
+      summary: Get an upload and its missing chunks
+      description: Use it to resume an upload after a break. Only the actor that started the upload can see it.
+      responses:
+        '200':
+          description: The upload session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [uploads]
+      operationId: abortUpload
+      summary: Abort an upload
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Aborted. Uploaded chunks are collected later by garbage collection.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/uploads/{upload_id}/chunks/{hash}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/UploadId'
+      - name: hash
+        in: path
+        required: true
+        description: The BLAKE3 hash of the chunk, 64 lowercase hex characters.
+        schema:
+          $ref: '#/components/schemas/Hash'
+    put:
+      tags: [uploads]
+      operationId: putChunk
+      summary: Upload one chunk
+      description: |
+        The body is the raw chunk. The server checks the hash and fails with `hash_mismatch` if it
+        differs. A chunk that is not in the upload's list fails with `validation_failed`. Sending a
+        chunk twice is safe.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              contentMediaType: application/octet-stream
+      responses:
+        '204':
+          description: Stored.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/uploads/{upload_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/UploadId'
+    post:
+      tags: [uploads]
+      operationId: completeUpload
+      summary: Complete an upload
+      description: |
+        Checks that all chunks are stored and that the content hash matches, then makes the new
+        version (and the file node, for a `new_file` target) in one transaction. Fails with
+        `chunk_missing` (the hint lists how many) or `version_mismatch` if `base_version` is no longer
+        the head. Writes `version.created` (and `node.created`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The node and its new version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContentWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/content:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [uploads]
+      operationId: downloadContent
+      summary: Download file content
+      description: |
+        Needs `view`. Returns the head version, or `version` when given. Supports one byte range
+        (`Range: bytes=start-end`) and `HEAD`. The response always has
+        `Content-Disposition: attachment` and a strict `Content-Security-Policy: sandbox`, so an
+        uploaded HTML file cannot run as the platform.
+      parameters:
+        - name: version
+          in: query
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: Range
+          in: header
+          schema:
+            type: string
+            pattern: '^bytes=\d*-\d*$'
+        - name: If-None-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The whole content.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContentETag'
+            Accept-Ranges:
+              schema:
+                type: string
+                const: bytes
+            Content-Length:
+              schema:
+                type: integer
+            Content-Disposition:
+              schema:
+                type: string
+            Ruum-Version:
+              description: The ID of the version that is sent.
+              schema:
+                $ref: '#/components/schemas/Uuid'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        '206':
+          description: The requested range.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContentETag'
+            Content-Range:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+            Ruum-Version:
+              schema:
+                $ref: '#/components/schemas/Uuid'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        '304':
+          description: Not modified (the `If-None-Match` ETag matches).
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '416':
+          $ref: '#/components/responses/RangeNotSatisfiable'
+    put:
+      tags: [uploads]
+      operationId: putContent
+      summary: Replace file content in one request
+      description: |
+        For small files (at most 32 MiB): the body is the whole new content, and the server chunks
+        it. Needs `edit`. Use `If-Match` with the version ID (`"<version_id>"`) to avoid lost
+        updates. Larger files use `POST /v1/uploads`. Writes `version.created`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: If-Match
+          in: header
+          description: The expected head version, as `"<version_id>"`.
+          schema:
+            type: string
+        - name: Content-Type
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              contentMediaType: application/octet-stream
+      responses:
+        '200':
+          description: The node and its new version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContentWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  # ---------------------------------------------------------------- versions
+  /v1/nodes/{node_id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [versions]
+      operationId: listVersions
+      summary: List versions
+      description: Newest first. Needs `view`.
+      parameters:
+        - name: actor_kind
+          in: query
+          description: Only versions by this kind of actor, for example `agent`.
+          schema:
+            $ref: '#/components/schemas/PrincipalKind'
+        - name: labeled
+          in: query
+          description: Only named versions.
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of versions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/versions/{version_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/VersionId'
+    get:
+      tags: [versions]
+      operationId: getVersion
+      summary: Get a version
+      description: Needs `view`. The content is at `GET /v1/nodes/{node_id}/content?version={version_id}`.
+      responses:
+        '200':
+          description: The version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Version'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/versions/{version_id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/VersionId'
+    post:
+      tags: [versions]
+      operationId: restoreVersion
+      summary: Restore a version
+      description: |
+        Needs `edit`. Makes a new head version with the content of the old one (`restored_from` is
+        set). History is never deleted. Writes `version.restored`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The new head version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/versions/{version_id}/label:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/VersionId'
+    put:
+      tags: [versions]
+      operationId: setVersionLabel
+      summary: Name a version
+      description: Needs `edit`. A named version is kept forever and never merged. A `null` label removes the name. Writes `version.labeled`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LabelRequest'
+      responses:
+        '200':
+          description: The version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/diff:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [versions]
+      operationId: diffVersions
+      summary: Compare two versions
+      description: |
+        Needs `view`. Runs the best matching diff plugin (or `plugin`) and returns the one change
+        model of design section 5.4. The fallback chain ends with the binary plugin, so a diff
+        always has a result. Results are cached by `(plugin, hash of from, hash of to)`.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: to
+          in: query
+          description: Default is the head version.
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: plugin
+          in: query
+          description: A plugin name from `listDiffPlugins`, for example `text`.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiffResult'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/diff/plugins:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [versions]
+      operationId: listDiffPlugins
+      summary: Diff plugins that match a node
+      description: Best first. The first one is the default.
+      responses:
+        '200':
+          description: The plugins.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DiffPluginInfo'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- tags
+  /v1/tags:
+    get:
+      tags: [tags]
+      operationId: listTags
+      summary: List tags
+      description: The tags of the tenant. Any member can list them; guests see only tags on nodes they can see.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of tags.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+    post:
+      tags: [tags]
+      operationId: createTag
+      summary: Create a tag
+      description: Any member (not guests). Names are unique in the tenant, case-insensitive.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTagRequest'
+      responses:
+        '201':
+          description: The tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/tags/{tag_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/TagId'
+    get:
+      tags: [tags]
+      operationId: getTag
+      summary: Get a tag
+      responses:
+        '200':
+          description: The tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tag'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [tags]
+      operationId: updateTag
+      summary: Change a tag
+      description: Any member (not guests).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTagRequest'
+      responses:
+        '200':
+          description: The tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    delete:
+      tags: [tags]
+      operationId: deleteTag
+      summary: Delete a tag
+      description: Tenant admins, or the creator of the tag. Detaches the tag from all nodes (one `tag.detached` per node).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tags/{tag_id}/nodes:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/TagId'
+    get:
+      tags: [tags]
+      operationId: listNodesByTag
+      summary: Nodes with a tag
+      description: The live nodes with the tag that the caller can see.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/tags:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [tags]
+      operationId: listNodeTags
+      summary: Tags of a node
+      description: Needs `view` on the node.
+      responses:
+        '200':
+          description: The tags.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tag'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/tags/{tag_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/TagId'
+    put:
+      tags: [tags]
+      operationId: attachTag
+      summary: Attach a tag
+      description: Needs `edit` on the node. Attaching twice is a no-op (no second journal entry). Writes `tag.attached`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Attached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOnly'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [tags]
+      operationId: detachTag
+      summary: Detach a tag
+      description: Needs `edit` on the node. Writes `tag.detached`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Detached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOnly'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------- sharing
+  /v1/nodes/{node_id}/grants:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [sharing]
+      operationId: listGrants
+      summary: List grants
+      description: The direct grants on the node and the inherited ones (with `inherited_from`). Needs `view`.
+      responses:
+        '200':
+          description: The grants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Grant'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [sharing]
+      operationId: addGrant
+      summary: Add a grant
+      description: |
+        Needs `share` on the node. Grants only add rights (decision 8). A grant to an email of a
+        person without a Ruum account, or from another tenant, makes them a guest of this tenant
+        and sends an invitation. An agent can never grant more than its own scope. Writes
+        `grant.added`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddGrantRequest'
+      responses:
+        '201':
+          description: The grant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/nodes/{node_id}/grants/{grant_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/GrantId'
+    delete:
+      tags: [sharing]
+      operationId: removeGrant
+      summary: Remove a grant
+      description: Needs `share` on the node. Inherited grants are removed on the node that holds them. Writes `grant.removed`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOnly'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/nodes/{node_id}/share-links:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [sharing]
+      operationId: listShareLinks
+      summary: List share links
+      description: Needs `share`. Tokens are not shown again.
+      responses:
+        '200':
+          description: The share links.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ShareLink'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [sharing]
+      operationId: createShareLink
+      summary: Create a share link
+      description: |
+        Needs `share`. Makes a secret link (`anyone_with_link`) with a role, an optional expiry and
+        an optional password. The response has the token and URL once. A tenant can forbid links;
+        then this fails with `permission_denied`. Writes `share_link.created`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShareLinkRequest'
+      responses:
+        '201':
+          description: The share link with its token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/share-links/{link_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/LinkId'
+    delete:
+      tags: [sharing]
+      operationId: revokeShareLink
+      summary: Revoke a share link
+      description: Needs `share` on the node of the link. Writes `share_link.revoked`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOnly'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/share-links/resolve:
+    post:
+      tags: [sharing]
+      operationId: resolveShareLink
+      summary: Open a share link
+      description: |
+        No sign-in needed. The token is in the body, not the URL, so it does not reach logs.
+        Returns the node and a short-lived access token for the link's role on that subtree. An
+        expired, revoked or unknown link is `404`. A wrong password is `401`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveShareLinkRequest'
+      responses:
+        '200':
+          description: The shared node and an access token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolvedShareLink'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/shared-with-me:
+    get:
+      tags: [sharing]
+      operationId: listSharedWithMe
+      summary: Shared with me
+      description: |
+        The roots of grants to the caller's user (directly, or through `tenant#member`), across all
+        tenants where the user is a member or guest. Newest first. No `Ruum-Tenant` header. For an
+        agent, only items inside its scope.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of shared items.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  # ---------------------------------------------------------------- changes
+  /v1/changes:
+    get:
+      tags: [changes]
+      operationId: listChanges
+      summary: The changes feed
+      description: |
+        The journal of the tenant, oldest first, after `cursor`. Only entries on nodes that the caller
+        can see (for agents: inside the scope). Sync clients keep `next_cursor` and call again. With
+        `wait` the call waits up to that many seconds for new entries (long poll). A cursor older than
+        the journal retention fails with `410 cursor_expired`; the client must then do a full listing.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: cursor
+          in: query
+          description: The `next_cursor` of the last call. Without it the feed starts at the oldest kept entry.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - name: wait
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 30
+            default: 0
+        - name: node
+          in: query
+          description: Only changes inside this folder (at any depth).
+          schema:
+            $ref: '#/components/schemas/Uuid'
+      responses:
+        '200':
+          description: One page of changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangesPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '410':
+          $ref: '#/components/responses/CursorExpired'
+
+  /v1/changes/latest:
+    get:
+      tags: [changes]
+      operationId: getLatestCursor
+      summary: The newest cursor
+      description: The cursor of the newest entry, so a client can start following from now.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: The cursor.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cursor, seq]
+                properties:
+                  cursor:
+                    type: string
+                  seq:
+                    type: integer
+                    format: int64
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  # ---------------------------------------------------------------- search
+  /v1/search:
+    get:
+      tags: [search]
+      operationId: searchNodes
+      summary: Search by name
+      description: Live nodes whose name contains `q` (case-insensitive) that the caller can see. Best match first.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+        - name: kind
+          in: query
+          schema:
+            $ref: '#/components/schemas/NodeKind'
+        - name: tag
+          in: query
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: within
+          in: query
+          description: Only nodes inside this folder (at any depth).
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of hits.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: A platform access token, or a Ruum access token from `POST /v1/oauth/token`.
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: ruum_session
+      description: The web UI session. State-changing requests also need the `Ruum-Csrf` header.
+
+  parameters:
+    TenantHeader:
+      name: Ruum-Tenant
+      in: header
+      required: true
+      description: The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+        server keeps the first response for 24 hours per tenant, actor and key.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 255
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: The node ETag (`"<revision>"`). The write fails with `412 precondition_failed` if the node changed.
+      schema:
+        type: string
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` of the previous page.
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    TenantId:
+      name: tenant_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    InvitationId:
+      name: invitation_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    AgentId:
+      name: agent_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    NodeId:
+      name: node_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    UploadId:
+      name: upload_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    VersionId:
+      name: version_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    TagId:
+      name: tag_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    GrantId:
+      name: grant_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    LinkId:
+      name: link_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+  headers:
+    NodeETag:
+      description: The node revision as `"<revision>"`. Send it in `If-Match`.
+      schema:
+        type: string
+    ContentETag:
+      description: The content hash of the version as `"<blake3 hex>"`.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: The request is malformed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthenticated:
+      description: No valid credentials (`unauthenticated`, `token_expired`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PermissionDenied:
+      description: The caller lacks the right (`permission_denied`, `scope_exceeded`, `agent_disabled`, `plan_limit_reached`, `quota_exceeded`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Not found, or not visible to the caller (`not_found`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: A conflict (`conflict`, `name_taken`, `version_mismatch`, `idempotency_key_reused`, `chunk_missing`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    CursorExpired:
+      description: The cursor is older than the journal retention (`cursor_expired`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PreconditionFailed:
+      description: '`If-Match` did not match (`precondition_failed`).'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: The body or file is too large for the plan (`payload_too_large`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RangeNotSatisfiable:
+      description: The range is outside the content (`range_not_satisfiable`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationFailed:
+      description: The body or a parameter is not valid (`validation_failed`, `hash_mismatch`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Too many requests (`rate_limited`).
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    # ------------------------------------------------------------ basics
+    Uuid:
+      type: string
+      format: uuid
+      description: A UUIDv7.
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339, UTC.
+    Hash:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: A BLAKE3 hash as 64 lowercase hex characters.
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          const: ok
+        version:
+          type: string
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    ErrorCode:
+      type: string
+      description: Stable, machine-readable error codes.
+      enum:
+        - bad_request
+        - validation_failed
+        - unauthenticated
+        - token_expired
+        - permission_denied
+        - scope_exceeded
+        - not_found
+        - conflict
+        - name_taken
+        - version_mismatch
+        - idempotency_key_reused
+        - precondition_failed
+        - payload_too_large
+        - range_not_satisfiable
+        - cursor_expired
+        - quota_exceeded
+        - plan_limit_reached
+        - rate_limited
+        - agent_disabled
+        - chunk_missing
+        - hash_mismatch
+        - not_implemented
+        - internal
+        - unavailable
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+              description: A short sentence for people.
+            hint:
+              type: string
+              description: The next step, for people and agents.
+      example:
+        error:
+          code: name_taken
+          message: a node named "plan.txt" already exists in this folder
+          hint: choose another name, or send on_conflict=rename
+
+    # ------------------------------------------------------------ principals and changes
+    PrincipalKind:
+      type: string
+      description: '`share_link` is the bearer of a share link (an edit link can upload versions).'
+      enum: [user, group, app, agent, share_link]
+    PrincipalRef:
+      type: object
+      required: [kind, id]
+      properties:
+        kind:
+          $ref: '#/components/schemas/PrincipalKind'
+        id:
+          $ref: '#/components/schemas/Uuid'
+        display_name:
+          type: string
+          description: Filled in responses when known.
+    ActorPair:
+      type: object
+      description: Who did a change, and for whom (design section 3.4).
+      required: [actor, on_behalf_of]
+      properties:
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          description: The user for whom the actor acts. `null` when the actor is the user.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+    Change:
+      type: object
+      description: The change that a write made.
+      required: [seq, actor, on_behalf_of, at]
+      properties:
+        seq:
+          description: The journal sequence number, or `null` if the write made no journal entry.
+          oneOf:
+            - type: integer
+              format: int64
+            - type: 'null'
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    ChangeOnly:
+      type: object
+      required: [change]
+      properties:
+        change:
+          $ref: '#/components/schemas/Change'
+    Role:
+      type: string
+      description: The roles of design section 3.2, from lowest to highest. A higher role includes the lower ones.
+      enum: [view, comment, edit, manage, share]
+
+    # ------------------------------------------------------------ auth
+    LogoutResult:
+      type: object
+      required: [logout_url]
+      properties:
+        logout_url:
+          type: string
+          format: uri
+          description: The end-session URL at the identity provider. The browser goes there next.
+    User:
+      type: object
+      required: [id, home_tenant_id, email, display_name, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        home_tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        avatar_url:
+          type: [string, 'null']
+          format: uri
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    Me:
+      type: object
+      required: [actor, on_behalf_of, user]
+      properties:
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        user:
+          $ref: '#/components/schemas/User'
+          description: The user whose rights apply (the agent's owner for an agent).
+        agent:
+          description: Set when the caller is an agent.
+          oneOf:
+            - $ref: '#/components/schemas/Agent'
+            - type: 'null'
+        bound_tenant_id:
+          description: The tenant the token is bound to (agent tokens).
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+    Identity:
+      type: object
+      required: [id, issuer, subject, email_verified, linked_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        issuer:
+          type: string
+        subject:
+          type: string
+        provider:
+          type: string
+          description: A display name such as `google`, `microsoft`, `passkey`.
+        email:
+          type: [string, 'null']
+        email_verified:
+          type: boolean
+        linked_at:
+          $ref: '#/components/schemas/Timestamp'
+    Session:
+      type: object
+      required: [id, created_at, expires_at, last_seen_at, current]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_seen_at:
+          $ref: '#/components/schemas/Timestamp'
+        user_agent:
+          type: [string, 'null']
+        current:
+          type: boolean
+          description: True for the session of this request.
+
+    # ------------------------------------------------------------ tenants
+    TenantKind:
+      type: string
+      enum: [personal, team]
+    Plan:
+      type: string
+      enum: [free, personal, team]
+    MemberRole:
+      type: string
+      description: The role in a tenant. A guest sees only what is shared with them.
+      enum: [guest, member, admin, owner]
+    Tenant:
+      type: object
+      required: [id, name, kind, plan, region, root_node_id, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/TenantKind'
+        plan:
+          $ref: '#/components/schemas/Plan'
+        region:
+          type: string
+          examples: [hel1]
+        root_node_id:
+          $ref: '#/components/schemas/Uuid'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    TenantMembership:
+      type: object
+      required: [tenant, role]
+      properties:
+        tenant:
+          $ref: '#/components/schemas/Tenant'
+        role:
+          $ref: '#/components/schemas/MemberRole'
+    CreateTenantRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+    UpdateTenantRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+    Member:
+      type: object
+      required: [tenant_id, user_id, email, display_name, role, joined_at]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        user_id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+        display_name:
+          type: string
+        role:
+          $ref: '#/components/schemas/MemberRole'
+        joined_at:
+          $ref: '#/components/schemas/Timestamp'
+    MemberPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    CreateInvitationRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [guest, member, admin]
+        message:
+          type: string
+          maxLength: 1000
+    Invitation:
+      type: object
+      required: [id, tenant_id, email, role, invited_by, created_at, expires_at, accepted_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+        role:
+          $ref: '#/components/schemas/MemberRole'
+        invited_by:
+          $ref: '#/components/schemas/ActorPair'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        accepted_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    InvitationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Invitation'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    Limits:
+      type: object
+      description: The limits of the plan (design section 4.3). `null` means no limit.
+      required: [storage_bytes, max_file_bytes, version_days, version_count, trash_days, agents, members]
+      properties:
+        storage_bytes:
+          type: integer
+          format: int64
+        max_file_bytes:
+          type: integer
+          format: int64
+        version_days:
+          type: [integer, 'null']
+        version_count:
+          type: [integer, 'null']
+        trash_days:
+          type: integer
+        agents:
+          type: integer
+        members:
+          type: [integer, 'null']
+    Usage:
+      type: object
+      required: [storage_bytes, nodes, agents, members]
+      properties:
+        storage_bytes:
+          type: integer
+          format: int64
+        nodes:
+          type: integer
+          format: int64
+        agents:
+          type: integer
+        members:
+          type: integer
+    LimitsAndUsage:
+      type: object
+      required: [plan, limits, usage]
+      properties:
+        plan:
+          $ref: '#/components/schemas/Plan'
+        limits:
+          $ref: '#/components/schemas/Limits'
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    # ------------------------------------------------------------ agents
+    Budget:
+      type: object
+      description: A budget with a hard stop (design section 11). `null` means the plan default.
+      properties:
+        max_storage_bytes:
+          type: [integer, 'null']
+          format: int64
+        max_writes_per_hour:
+          type: [integer, 'null']
+    AgentScope:
+      type: object
+      description: |
+        What the agent may touch. The agent's right is the user's right intersected with this
+        scope: inside `subtree` only, roles up to `max_role`, until `expires_at`.
+      required: [subtree, max_role]
+      properties:
+        subtree:
+          description: The folder the agent may touch. `null` means everything the user can reach in the tenant.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        max_role:
+          $ref: '#/components/schemas/Role'
+        expires_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        budget:
+          $ref: '#/components/schemas/Budget'
+    Agent:
+      type: object
+      required: [id, tenant_id, owner_id, name, description, scope, disabled_at, created_at, last_used_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+          description: The user the agent acts for.
+        name:
+          type: string
+        description:
+          type: [string, 'null']
+        scope:
+          $ref: '#/components/schemas/AgentScope'
+        disabled_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        disabled_reason:
+          type: [string, 'null']
+          enum: [by_owner, by_admin, owner_left, null]
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_used_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    AgentPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Agent'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    RegisterAgentRequest:
+      type: object
+      required: [name, scope]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        description:
+          type: string
+          maxLength: 1000
+        scope:
+          $ref: '#/components/schemas/AgentScope'
+    UpdateAgentRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        scope:
+          $ref: '#/components/schemas/AgentScope'
+    AgentKey:
+      type: object
+      required: [id, agent_id, name, prefix, created_at, expires_at, last_used_at, revoked_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        agent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: [string, 'null']
+        prefix:
+          type: string
+          description: The first characters of the key, to recognise it.
+          examples: [ruum_agent_3fK9]
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_used_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        revoked_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    CreateAgentKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: Default 90 days from now; at most 1 year.
+    AgentKeyCreated:
+      type: object
+      required: [key, secret]
+      properties:
+        key:
+          $ref: '#/components/schemas/AgentKey'
+        secret:
+          type: string
+          description: The API key. Shown only once.
+          pattern: '^ruum_agent_[A-Za-z0-9_-]{43}$'
+    TokenExchangeRequest:
+      type: object
+      required: [grant_type, subject_token, subject_token_type]
+      properties:
+        grant_type:
+          type: string
+          const: urn:ietf:params:oauth:grant-type:token-exchange
+        subject_token:
+          type: string
+          description: The agent API key.
+        subject_token_type:
+          type: string
+          const: urn:ruum:params:oauth:token-type:api-key
+    TokenExchangeResponse:
+      type: object
+      required: [access_token, token_type, expires_in, issued_token_type]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          const: Bearer
+        expires_in:
+          type: integer
+          description: Seconds. 900 by default.
+        issued_token_type:
+          type: string
+          const: urn:ietf:params:oauth:token-type:access_token
+    UndoRequest:
+      type: object
+      required: [since, dry_run]
+      properties:
+        since:
+          $ref: '#/components/schemas/Timestamp'
+        dry_run:
+          type: boolean
+          description: When true, only report what would be reverted.
+    UndoItem:
+      type: object
+      required: [seq, node_id, type, reason]
+      properties:
+        seq:
+          type: integer
+          format: int64
+        node_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        type:
+          $ref: '#/components/schemas/EventType'
+        reason:
+          type: [string, 'null']
+          description: Why the change was skipped.
+    UndoReport:
+      type: object
+      required: [dry_run, reverted, skipped, change]
+      properties:
+        dry_run:
+          type: boolean
+        reverted:
+          type: array
+          items:
+            $ref: '#/components/schemas/UndoItem'
+        skipped:
+          type: array
+          items:
+            $ref: '#/components/schemas/UndoItem'
+        change:
+          description: The last change of the undo. `null` for a dry run.
+          oneOf:
+            - $ref: '#/components/schemas/Change'
+            - type: 'null'
+
+    # ------------------------------------------------------------ nodes
+    NextCursor:
+      description: The cursor of the next page, or `null` on the last page.
+      type: [string, 'null']
+    NodeKind:
+      type: string
+      enum: [folder, file, link, typed]
+    LinkKind:
+      type: string
+      description: '`shortcut` gives no access; `member` gives `view` to people who can see the folder that holds the link.'
+      enum: [shortcut, member]
+    OnConflict:
+      type: string
+      description: What to do when the name is taken. `rename` adds " (2)", " (3)", ... before the extension.
+      enum: [fail, rename]
+      default: fail
+    NodeName:
+      type: string
+      minLength: 1
+      maxLength: 255
+      description: Unique among the live children of a folder. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.
+    Node:
+      type: object
+      required: [id, tenant_id, parent_id, name, kind, type, link_kind, link_target, head_version, owner_id, size_bytes, revision, trashed_at, created_at, updated_at, created_by, updated_by]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        parent_id:
+          description: '`null` only for the root folder.'
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        name:
+          type: string
+        kind:
+          $ref: '#/components/schemas/NodeKind'
+        type:
+          type: [string, 'null']
+          description: The MIME type of a file; `album`, `project`, ... for a folder; the provider type of a typed node.
+        link_kind:
+          oneOf:
+            - $ref: '#/components/schemas/LinkKind'
+            - type: 'null'
+        link_target:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        head_version:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        owner_id:
+          $ref: '#/components/schemas/Uuid'
+        size_bytes:
+          type: integer
+          format: int64
+        revision:
+          type: integer
+          format: int64
+          description: Grows on each change of the node. The ETag is `"<revision>"`.
+        trashed_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        created_by:
+          $ref: '#/components/schemas/ActorPair'
+        updated_by:
+          $ref: '#/components/schemas/ActorPair'
+    NodePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    NodeWrite:
+      type: object
+      required: [node, change]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        change:
+          $ref: '#/components/schemas/Change'
+    CreateNodeRequest:
+      type: object
+      required: [parent_id, name, kind]
+      properties:
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+        kind:
+          type: string
+          enum: [folder, file, link]
+        type:
+          type: string
+          description: A MIME type for a file, or a folder type such as `album` or `project`.
+        link:
+          description: Required when `kind` is `link`.
+          type: object
+          required: [kind, target]
+          properties:
+            kind:
+              $ref: '#/components/schemas/LinkKind'
+            target:
+              $ref: '#/components/schemas/Uuid'
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    RenameRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          $ref: '#/components/schemas/NodeName'
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    MoveRequest:
+      type: object
+      required: [parent_id]
+      properties:
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+          description: A new name at the same time. Default is the current name.
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    CopyRequest:
+      type: object
+      required: [parent_id]
+      properties:
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    RestoreRequest:
+      type: object
+      properties:
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+          description: Where to restore when the old parent is gone or trashed.
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+
+    # ------------------------------------------------------------ uploads
+    ChunkRef:
+      type: object
+      required: [hash, size]
+      properties:
+        hash:
+          $ref: '#/components/schemas/Hash'
+        size:
+          type: integer
+          minimum: 1
+          maximum: 4194304
+    ChunkingParams:
+      type: object
+      required: [algorithm, min_size, avg_size, max_size]
+      properties:
+        algorithm:
+          type: string
+          const: fastcdc-2020
+        min_size:
+          type: integer
+          examples: [1048576]
+        avg_size:
+          type: integer
+          examples: [2097152]
+        max_size:
+          type: integer
+          examples: [4194304]
+    UploadTarget:
+      description: Where the upload goes.
+      oneOf:
+        - $ref: '#/components/schemas/UploadTargetNewVersion'
+        - $ref: '#/components/schemas/UploadTargetNewFile'
+      discriminator:
+        propertyName: target
+        mapping:
+          new_version: '#/components/schemas/UploadTargetNewVersion'
+          new_file: '#/components/schemas/UploadTargetNewFile'
+    UploadTargetNewVersion:
+      type: object
+      description: A new version of an existing file.
+      required: [target, node_id]
+      properties:
+        target:
+          type: string
+          const: new_version
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        base_version:
+          description: Fail with `version_mismatch` at completion if the head is no longer this version.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+    UploadTargetNewFile:
+      type: object
+      description: A new file in a folder.
+      required: [target, parent_id, name]
+      properties:
+        target:
+          type: string
+          const: new_file
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    CreateUploadRequest:
+      allOf:
+        - $ref: '#/components/schemas/UploadTarget'
+        - type: object
+          required: [size, content_hash, chunks]
+          properties:
+            content_type:
+              type: string
+            size:
+              type: integer
+              format: int64
+              minimum: 0
+            content_hash:
+              $ref: '#/components/schemas/Hash'
+            chunks:
+              type: array
+              description: The chunks in order. Empty for an empty file.
+              items:
+                $ref: '#/components/schemas/ChunkRef'
+    Upload:
+      allOf:
+        - $ref: '#/components/schemas/UploadTarget'
+        - type: object
+          required: [id, tenant_id, size, content_hash, chunks, missing, status, chunking, expires_at, created_by]
+          properties:
+            id:
+              $ref: '#/components/schemas/Uuid'
+            tenant_id:
+              $ref: '#/components/schemas/Uuid'
+            content_type:
+              type: [string, 'null']
+            size:
+              type: integer
+              format: int64
+            content_hash:
+              $ref: '#/components/schemas/Hash'
+            chunks:
+              type: array
+              items:
+                $ref: '#/components/schemas/ChunkRef'
+            missing:
+              type: array
+              description: The chunk hashes that the server does not have yet. Upload only these.
+              items:
+                $ref: '#/components/schemas/Hash'
+            status:
+              type: string
+              enum: [open, completed, aborted, expired]
+            chunking:
+              $ref: '#/components/schemas/ChunkingParams'
+            expires_at:
+              $ref: '#/components/schemas/Timestamp'
+            created_by:
+              $ref: '#/components/schemas/ActorPair'
+    ContentWrite:
+      type: object
+      required: [node, version, change]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        version:
+          $ref: '#/components/schemas/Version'
+        change:
+          $ref: '#/components/schemas/Change'
+
+    # ------------------------------------------------------------ versions
+    Version:
+      type: object
+      required: [id, tenant_id, node_id, size_bytes, content_hash, content_type, restored_from, label, actor, on_behalf_of, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        size_bytes:
+          type: integer
+          format: int64
+        content_hash:
+          $ref: '#/components/schemas/Hash'
+        content_type:
+          type: [string, 'null']
+        restored_from:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        label:
+          type: [string, 'null']
+          description: The name of a named version, for example "Before import". Kept forever.
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    VersionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Version'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    VersionWrite:
+      type: object
+      required: [version, change]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        change:
+          $ref: '#/components/schemas/Change'
+    LabelRequest:
+      type: object
+      required: [label]
+      properties:
+        label:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+    DiffChangeKind:
+      type: string
+      enum: [insert, delete, modify, move, format, replace]
+    DiffChange:
+      type: object
+      description: One change. `path` is stable inside a format, so comments can point at it.
+      required: [kind]
+      properties:
+        kind:
+          $ref: '#/components/schemas/DiffChangeKind'
+        path:
+          type: string
+          examples: ['body/p[14]', 'lines/120-124', '$.dependencies.serde']
+        label:
+          type: string
+          description: A label for people, for example "Section 4.2, paragraph 3".
+        old:
+          type: string
+        new:
+          type: string
+        change:
+          type: string
+          description: A description of a format change, for example "bold on".
+        detail:
+          type: array
+          items:
+            $ref: '#/components/schemas/DiffChange'
+    DiffSummary:
+      type: object
+      required: [inserted, deleted, modified, moved]
+      properties:
+        inserted:
+          type: integer
+        deleted:
+          type: integer
+        modified:
+          type: integer
+        moved:
+          type: integer
+    DiffResult:
+      type: object
+      description: The one change model of all diff plugins (design section 5.4).
+      required: [plugin, summary, changes, truncated]
+      properties:
+        plugin:
+          type: string
+          description: '`name@version` of the plugin.'
+          examples: [text@1.0.0]
+        from:
+          $ref: '#/components/schemas/Uuid'
+        to:
+          $ref: '#/components/schemas/Uuid'
+        summary:
+          $ref: '#/components/schemas/DiffSummary'
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DiffChange'
+        render:
+          type: object
+          properties:
+            html:
+              type: string
+              description: A URL of a rendered HTML view of the diff.
+        truncated:
+          type: boolean
+          description: True when the plugin stopped early because of size or time limits.
+      example:
+        plugin: text@1.0.0
+        summary: { inserted: 1, deleted: 0, modified: 1, moved: 0 }
+        changes:
+          - kind: modify
+            path: lines/14
+            old: Payment within 30 days.
+            new: Payment within 14 days.
+            detail:
+              - { kind: replace, old: '30', new: '14' }
+        truncated: false
+    DiffPluginInfo:
+      type: object
+      required: [name, version, priority]
+      properties:
+        name:
+          type: string
+          examples: [text, json, xml, image, binary]
+        version:
+          type: string
+        priority:
+          type: integer
+
+    # ------------------------------------------------------------ tags
+    TagColor:
+      type: string
+      pattern: '^#[0-9a-fA-F]{6}$'
+    Tag:
+      type: object
+      required: [id, tenant_id, name, color, created_by, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        color:
+          oneOf:
+            - $ref: '#/components/schemas/TagColor'
+            - type: 'null'
+        created_by:
+          $ref: '#/components/schemas/ActorPair'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    TagPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    TagWrite:
+      type: object
+      required: [tag, change]
+      properties:
+        tag:
+          $ref: '#/components/schemas/Tag'
+        change:
+          $ref: '#/components/schemas/Change'
+    CreateTagRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        color:
+          $ref: '#/components/schemas/TagColor'
+    UpdateTagRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        color:
+          oneOf:
+            - $ref: '#/components/schemas/TagColor'
+            - type: 'null'
+
+    # ------------------------------------------------------------ sharing
+    Grantee:
+      description: Who gets the role.
+      oneOf:
+        - $ref: '#/components/schemas/GranteeUser'
+        - $ref: '#/components/schemas/GranteeEmail'
+        - $ref: '#/components/schemas/GranteeTenantMembers'
+      discriminator:
+        propertyName: type
+        mapping:
+          user: '#/components/schemas/GranteeUser'
+          email: '#/components/schemas/GranteeEmail'
+          tenant_members: '#/components/schemas/GranteeTenantMembers'
+    GranteeUser:
+      type: object
+      description: A user by ID (a member or a guest).
+      required: [type, id]
+      properties:
+        type:
+          type: string
+          const: user
+        id:
+          $ref: '#/components/schemas/Uuid'
+        display_name:
+          type: string
+          description: Filled in responses.
+        email:
+          type: string
+          description: Filled in responses.
+    GranteeEmail:
+      type: object
+      description: A person by email. Without a Ruum account, or from another tenant, they become a guest.
+      required: [type, email]
+      properties:
+        type:
+          type: string
+          const: email
+        email:
+          type: string
+          format: email
+    GranteeTenantMembers:
+      type: object
+      description: Everybody in the tenant of the node (`tenant#member`).
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: tenant_members
+    Grant:
+      type: object
+      required: [id, node_id, grantee, role, inherited_from, created_by, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        grantee:
+          $ref: '#/components/schemas/Grantee'
+        role:
+          $ref: '#/components/schemas/Role'
+        inherited_from:
+          description: The ancestor that holds the grant, or `null` for a direct grant.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        created_by:
+          $ref: '#/components/schemas/ActorPair'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    AddGrantRequest:
+      type: object
+      required: [grantee, role]
+      properties:
+        grantee:
+          $ref: '#/components/schemas/Grantee'
+        role:
+          $ref: '#/components/schemas/Role'
+        notify:
+          type: boolean
+          default: true
+          description: Send an email to the grantee.
+        message:
+          type: string
+          maxLength: 1000
+    GrantWrite:
+      type: object
+      required: [grant, change]
+      properties:
+        grant:
+          $ref: '#/components/schemas/Grant'
+        change:
+          $ref: '#/components/schemas/Change'
+    ShareLink:
+      type: object
+      required: [id, node_id, role, expires_at, has_password, created_by, created_at, revoked_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        role:
+          type: string
+          enum: [view, comment, edit]
+        token:
+          type: string
+          description: The secret. Only in the create response; stored as a hash.
+        url:
+          type: string
+          format: uri
+          description: The link to give to people. Only in the create response.
+        expires_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        has_password:
+          type: boolean
+        created_by:
+          $ref: '#/components/schemas/ActorPair'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        revoked_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    CreateShareLinkRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [view, comment, edit]
+          description: '`edit` only when the tenant allows it.'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        password:
+          type: string
+          minLength: 8
+          maxLength: 200
+    ShareLinkWrite:
+      type: object
+      required: [share_link, change]
+      properties:
+        share_link:
+          $ref: '#/components/schemas/ShareLink'
+        change:
+          $ref: '#/components/schemas/Change'
+    ResolveShareLinkRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+        password:
+          type: string
+    ResolvedShareLink:
+      type: object
+      required: [tenant_id, node, role, access_token, expires_in]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        node:
+          $ref: '#/components/schemas/Node'
+        role:
+          $ref: '#/components/schemas/Role'
+        access_token:
+          type: string
+          description: A bearer token for this node and its subtree with `role`.
+        expires_in:
+          type: integer
+    SharedItem:
+      type: object
+      required: [node, role, shared_by, shared_at]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        role:
+          $ref: '#/components/schemas/Role'
+        shared_by:
+          $ref: '#/components/schemas/ActorPair'
+        shared_at:
+          $ref: '#/components/schemas/Timestamp'
+    SharedPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SharedItem'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # ------------------------------------------------------------ journal
+    EventType:
+      type: string
+      description: The journal event types of step 1. Payloads are in `contracts/events/`.
+      enum:
+        - node.created
+        - node.renamed
+        - node.moved
+        - node.copied
+        - node.trashed
+        - node.restored
+        - node.purged
+        - version.created
+        - version.restored
+        - version.labeled
+        - tag.attached
+        - tag.detached
+        - grant.added
+        - grant.removed
+        - share_link.created
+        - share_link.revoked
+    JournalEntry:
+      type: object
+      description: One change. `data` follows `contracts/events/<type>.schema.json`.
+      required: [tenant_id, seq, node_id, type, actor, on_behalf_of, at, data]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        seq:
+          type: integer
+          format: int64
+        node_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        type:
+          $ref: '#/components/schemas/EventType'
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+        data:
+          type: object
+          additionalProperties: true
+    JournalPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/JournalEntry'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    ChangesPage:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/JournalEntry'
+        next_cursor:
+          type: string
+          description: Always set. Keep it and pass it to the next call, also when `items` is empty.
+        has_more:
+          type: boolean
+          description: True when more entries are ready now.
+
+    # ------------------------------------------------------------ audit
+    AuditEntry:
+      type: object
+      required: [id, action, actor, on_behalf_of, target_type, target_id, at, data]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        action:
+          type: string
+          description: A dotted action name.
+          examples: [auth.login, agent.key_created, member.removed, grant.added]
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        target_type:
+          type: [string, 'null']
+        target_id:
+          type: [string, 'null']
+        ip:
+          type: [string, 'null']
+        user_agent:
+          type: [string, 'null']
+        at:
+          $ref: '#/components/schemas/Timestamp'
+        data:
+          type: object
+          additionalProperties: true
+    AuditPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # ------------------------------------------------------------ search
+    SearchHit:
+      type: object
+      required: [node, path]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        path:
+          type: string
+          examples: [/Projects/Garden/plan.txt]
+    SearchPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchHit'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'

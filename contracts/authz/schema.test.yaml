@@ -1,0 +1,43 @@
+# Assertions for schema.zed. Run: zed validate contracts/authz/schema.test.yaml
+# (or: docker run --rm -v "$PWD/contracts/authz:/schema:ro" authzed/zed validate /schema/schema.test.yaml)
+schemaFile: "./schema.zed"
+relationships: |-
+  tenant:mari#owner@user:mari
+  tenant:mari#member@user:mari
+  node:mari_root#tenant@tenant:mari
+  node:mari_root#owner@user:mari
+  node:projects#parent@node:mari_root
+  node:garden#parent@node:projects
+  node:plan#parent@node:garden
+  node:garden#editor@user:jaan
+  node:photo#parent@node:mari_root
+  node:album#parent@node:mari_root
+  node:photo#collection@node:album
+  node:album#viewer@user:kati
+  node:plan#viewer@share_link:link1
+  tenant:acme#owner@user:olga
+  tenant:acme#member@user:olga
+  tenant:acme#member@user:peeter
+  node:acme_root#tenant@tenant:acme
+  node:acme_root#sharer@tenant:acme#administer
+  node:acme_root#editor@tenant:acme#member
+  node:acme_docs#parent@node:acme_root
+assertions:
+  assertTrue:
+    - node:plan#share@user:mari
+    - node:plan#edit@user:jaan
+    - node:plan#view@user:jaan
+    - node:photo#view@user:kati
+    - node:plan#view@share_link:link1
+    - node:acme_docs#edit@user:peeter
+    - tenant:acme#administer@user:olga
+    - node:acme_docs#share@user:olga
+  assertFalse:
+    - node:projects#view@user:jaan
+    - node:plan#manage@user:jaan
+    - node:photo#edit@user:kati
+    - node:plan#edit@share_link:link1
+    - node:plan#view@user:peeter
+    - node:acme_docs#manage@user:peeter
+    - node:acme_docs#view@user:mari
+    - tenant:acme#administer@user:peeter

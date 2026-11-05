@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.restored.schema.json",
+  "title": "node.restored",
+  "description": "A node came back from the trash. This schema is the `data` of a journal entry with `type` `node.restored`.",
+  "type": "object",
+  "required": [
+    "parent_id",
+    "old_parent_id",
+    "name"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "old_parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    }
+  }
+}

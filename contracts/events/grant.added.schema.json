@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/grant.added.schema.json",
+  "title": "grant.added",
+  "description": "A role on the node was granted. This schema is the `data` of a journal entry with `type` `grant.added`.",
+  "type": "object",
+  "required": [
+    "grant_id",
+    "grantee",
+    "role"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "grant_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "grantee": {
+      "$ref": "common.schema.json#/$defs/grantee"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/role"
+    }
+  }
+}

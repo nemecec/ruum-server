@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.renamed.schema.json",
+  "title": "node.renamed",
+  "description": "A node got a new name in the same folder. This schema is the `data` of a journal entry with `type` `node.renamed`.",
+  "type": "object",
+  "required": [
+    "parent_id",
+    "old_name",
+    "new_name"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "old_name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    },
+    "new_name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    }
+  }
+}

@@ -25,6 +25,7 @@ pub enum ErrorCode {
     PreconditionFailed,
     PayloadTooLarge,
     RangeNotSatisfiable,
+    CursorExpired,
     QuotaExceeded,
     PlanLimitReached,
     RateLimited,
@@ -37,6 +38,34 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// All codes, for contract tests.
+    pub const ALL: &'static [ErrorCode] = &[
+        ErrorCode::BadRequest,
+        ErrorCode::ValidationFailed,
+        ErrorCode::Unauthenticated,
+        ErrorCode::TokenExpired,
+        ErrorCode::PermissionDenied,
+        ErrorCode::ScopeExceeded,
+        ErrorCode::NotFound,
+        ErrorCode::Conflict,
+        ErrorCode::NameTaken,
+        ErrorCode::VersionMismatch,
+        ErrorCode::IdempotencyKeyReused,
+        ErrorCode::PreconditionFailed,
+        ErrorCode::PayloadTooLarge,
+        ErrorCode::RangeNotSatisfiable,
+        ErrorCode::CursorExpired,
+        ErrorCode::QuotaExceeded,
+        ErrorCode::PlanLimitReached,
+        ErrorCode::RateLimited,
+        ErrorCode::AgentDisabled,
+        ErrorCode::ChunkMissing,
+        ErrorCode::HashMismatch,
+        ErrorCode::NotImplemented,
+        ErrorCode::Internal,
+        ErrorCode::Unavailable,
+    ];
+
     /// The HTTP status for this code.
     pub fn http_status(self) -> u16 {
         use ErrorCode::*;
@@ -50,6 +79,7 @@ impl ErrorCode {
             PreconditionFailed => 412,
             PayloadTooLarge => 413,
             RangeNotSatisfiable => 416,
+            CursorExpired => 410,
             HashMismatch => 422,
             QuotaExceeded | PlanLimitReached => 403,
             RateLimited => 429,
@@ -77,6 +107,7 @@ impl ErrorCode {
             PreconditionFailed => "precondition_failed",
             PayloadTooLarge => "payload_too_large",
             RangeNotSatisfiable => "range_not_satisfiable",
+            CursorExpired => "cursor_expired",
             QuotaExceeded => "quota_exceeded",
             PlanLimitReached => "plan_limit_reached",
             RateLimited => "rate_limited",
@@ -185,6 +216,21 @@ mod tests {
         let s = serde_json::to_string(&ErrorCode::NameTaken).unwrap();
         assert_eq!(s, "\"name_taken\"");
         assert_eq!(ErrorCode::NameTaken.as_str(), "name_taken");
+    }
+
+    #[test]
+    fn every_code_is_in_the_contract() {
+        let spec = include_str!("../../../contracts/openapi.yaml");
+        for code in ErrorCode::ALL {
+            let line = format!("        - {}\n", code.as_str());
+            assert!(
+                spec.contains(&line),
+                "{} is not in openapi.yaml",
+                code.as_str()
+            );
+            let json = serde_json::to_string(code).unwrap();
+            assert_eq!(json, format!("\"{}\"", code.as_str()));
+        }
     }
 
     #[test]

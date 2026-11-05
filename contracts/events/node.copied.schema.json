@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.copied.schema.json",
+  "title": "node.copied",
+  "description": "A node was copied. `node_id` of the entry is the new copy. This schema is the `data` of a journal entry with `type` `node.copied`.",
+  "type": "object",
+  "required": [
+    "source_id",
+    "parent_id",
+    "name",
+    "node_count"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "source_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    },
+    "node_count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Nodes in the new copy, including the root."
+    }
+  }
+}

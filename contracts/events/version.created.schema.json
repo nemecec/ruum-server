@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/version.created.schema.json",
+  "title": "version.created",
+  "description": "A file got a new head version (upload, one-request content write, or a copy). This schema is the `data` of a journal entry with `type` `version.created`.",
+  "type": "object",
+  "required": [
+    "version_id",
+    "previous_version_id",
+    "size_bytes",
+    "content_hash",
+    "coalesced"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "previous_version_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "content_hash": {
+      "$ref": "common.schema.json#/$defs/hash"
+    },
+    "content_type": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "coalesced": {
+      "type": "boolean",
+      "description": "True when this save merged into the version of the previous save (same actor, inside the window). `version_id` is then the merged version."
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/share_link.created.schema.json",
+  "title": "share_link.created",
+  "description": "A share link to the node was made. The token is never in an event. This schema is the `data` of a journal entry with `type` `share_link.created`.",
+  "type": "object",
+  "required": [
+    "share_link_id",
+    "role",
+    "expires_at",
+    "has_password"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "share_link_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "role": {
+      "enum": [
+        "view",
+        "comment",
+        "edit"
+      ]
+    },
+    "expires_at": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "has_password": {
+      "type": "boolean"
+    }
+  }
+}

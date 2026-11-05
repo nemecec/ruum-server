@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.created.schema.json",
+  "title": "node.created",
+  "description": "A node was made: a folder, an empty file, a link, or a node inside a copy. This schema is the `data` of a journal entry with `type` `node.created`.",
+  "type": "object",
+  "required": [
+    "parent_id",
+    "name",
+    "kind"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    },
+    "kind": {
+      "$ref": "common.schema.json#/$defs/node_kind"
+    },
+    "type": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "link_kind": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/link_kind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "link_target": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "copied_from": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The source node when the node is part of a copy."
+    }
+  }
+}

@@ -7,10 +7,10 @@
 
 pub mod memory;
 
-use crate::actor::{Actor, Context, PrincipalKind};
+use crate::actor::{Actor, Context};
 use crate::authz::Role;
 use crate::error::Result;
-use crate::ids::{GrantId, NodeId, PrincipalId, ShareLinkId, TenantId};
+use crate::ids::{GrantId, NodeId, ShareLinkId, TenantId, UserId};
 use crate::journal::Written;
 use crate::nodes::Node;
 use crate::paging::{Page, PageRequest};
@@ -22,15 +22,13 @@ use time::OffsetDateTime;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Grantee {
-    /// A user, group or app by ID.
-    Principal {
-        kind: PrincipalKind,
-        id: PrincipalId,
-    },
-    /// A person by email. If no user has the email, the platform sends a guest invitation.
+    /// A user by ID (a member or a guest).
+    User { id: UserId },
+    /// A person by email. Without a Ruum account, or from another tenant, they become a guest
+    /// and get an invitation.
     Email { email: String },
-    /// Everybody in the tenant (`tenant#member`).
-    TenantMembers { tenant_id: TenantId },
+    /// Everybody in the tenant of the node (`tenant#member`).
+    TenantMembers,
 }
 
 /// A grant of a role on a node.

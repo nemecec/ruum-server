@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/common.schema.json",
+  "title": "Common definitions of the Ruum event schemas",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339, UTC."
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "BLAKE3, 64 lowercase hex characters."
+    },
+    "node_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "node_kind": {
+      "enum": [
+        "folder",
+        "file",
+        "link",
+        "typed"
+      ]
+    },
+    "link_kind": {
+      "enum": [
+        "shortcut",
+        "member"
+      ]
+    },
+    "role": {
+      "enum": [
+        "view",
+        "comment",
+        "edit",
+        "manage",
+        "share"
+      ]
+    },
+    "principal_kind": {
+      "enum": [
+        "user",
+        "group",
+        "app",
+        "agent",
+        "share_link"
+      ]
+    },
+    "principal_ref": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/principal_kind"
+        },
+        "id": {
+          "$ref": "#/$defs/uuid"
+        }
+      }
+    },
+    "grantee": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "id"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "user"
+            },
+            "id": {
+              "$ref": "#/$defs/uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "email"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "email"
+            },
+            "email": {
+              "type": "string",
+              "format": "email"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "tenant_members"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

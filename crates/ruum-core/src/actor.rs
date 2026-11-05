@@ -15,6 +15,8 @@ pub enum PrincipalKind {
     Group,
     App,
     Agent,
+    /// The bearer of a share link.
+    ShareLink,
 }
 
 /// A reference to a principal: its kind and its ID.

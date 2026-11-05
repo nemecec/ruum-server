@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/version.restored.schema.json",
+  "title": "version.restored",
+  "description": "An old version became the new head, as a new version. This schema is the `data` of a journal entry with `type` `version.restored`.",
+  "type": "object",
+  "required": [
+    "version_id",
+    "restored_from",
+    "previous_version_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version_id": {
+      "$ref": "common.schema.json#/$defs/uuid",
+      "description": "The new head version."
+    },
+    "restored_from": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "previous_version_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

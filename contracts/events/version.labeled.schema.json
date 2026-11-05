@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/version.labeled.schema.json",
+  "title": "version.labeled",
+  "description": "A version got, changed or lost its name. This schema is the `data` of a journal entry with `type` `version.labeled`.",
+  "type": "object",
+  "required": [
+    "version_id",
+    "old_label",
+    "new_label"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "old_label": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "new_label": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

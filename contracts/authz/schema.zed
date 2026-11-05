@@ -1,0 +1,116 @@
+// Ruum SpiceDB schema, step 1 (docs/DESIGN.md, section 3).
+//
+// One small set of roles applies to all nodes: view < comment < edit < manage < share.
+// A higher role includes all lower ones. Roles are inherited from parent folders; in step 1 a
+// grant on a child can only add rights (decision 8). "Restricted" folders come later.
+//
+// The right of an agent or an app that acts for a user is the user's right intersected with the
+// agent's scope (subtree, highest role, expiry). The core service applies that intersection
+// after the check (crates/ruum-core/src/authz); this schema does not model it.
+//
+// Object IDs are the UUIDs of the platform tables. Every relationship that the core writes is
+// also implied by a row in Postgres (nodes.parent_id, grants, share_links, memberships), so the
+// graph can be rebuilt from the database.
+
+// A person.
+definition user {}
+
+// A set of users or groups. Managed in the platform or synced by SCIM (after step 1).
+definition group {
+    relation member: user | group#member
+}
+
+// An organisation that pays, or a private person.
+// Every owner and admin also has the `member` relation, so `tenant#member` means
+// "everybody in the organisation". Guests are not members; they only have grants.
+definition tenant {
+    relation owner: user
+    relation admin: user
+    relation member: user | group#member
+    relation guest: user
+
+    // Change tenant settings, members, invitations; read the audit log.
+    permission administer = owner + admin
+}
+
+// A deployed web app with its own identity (step 3). Kept here so node relations can name it.
+definition app {
+    relation tenant: tenant
+}
+
+// An AI agent principal. It always acts for one user (no team agents in step 1, decision 13).
+definition agent {
+    relation tenant: tenant
+    relation acts_for: user
+}
+
+// A secret share link ("anyone with the link"). Opening the link gives the bearer a token for
+// this principal; the link has the role that its grant on the node gives.
+definition share_link {
+    relation tenant: tenant
+}
+
+// A node of the tree: folder, file, link or typed node.
+definition node {
+    relation tenant: tenant
+
+    // The parent folder. Rights flow down from it.
+    relation parent: node
+
+    // Folders that hold a `member` link to this node (design section 2.3). People who can view
+    // such a folder can view this node; a member link never gives more than `view`.
+    relation collection: node
+
+    // The owner of a personal node tree has every right on it.
+    relation owner: user
+
+    // Grants. One relation per role.
+    relation sharer: user | group#member | tenant#member | tenant#administer
+    relation manager: user | group#member | tenant#member | tenant#administer
+    relation editor: user | group#member | app | tenant#member | share_link
+    relation commenter: user | group#member | tenant#member | share_link
+    // `user:*` is for public files and apps; not used in step 1 (decision 9).
+    relation viewer: user | group#member | app | tenant#member | share_link | user:*
+
+    // Change grants and share links.
+    permission share = owner + sharer + parent->share
+
+    // Move, trash, restore.
+    permission manage = share + manager + parent->manage
+
+    // Change content, upload versions, rename, create children.
+    permission edit = manage + editor + parent->edit
+
+    // Comment (comments come after step 1; the role exists now).
+    permission comment = edit + commenter + parent->comment
+
+    // Read, download, list.
+    permission view = comment + viewer + parent->view + collection->view
+}
+
+// Roles that a web app declares in its manifest (design section 9.3). ID: "<app-node-id>/<role>".
+// Not used in step 1; kept so the schema grows without a rewrite.
+definition app_role {
+    relation app: node
+    relation holder: user | group#member | tenant#member
+    relation granter: app_role
+
+    permission has = holder
+    permission grant = app->share + granter->has
+}
+
+// Tuples that the core writes when a tenant is made:
+//
+//   personal tenant T of user U, root folder R:
+//     tenant:T#owner@user:U   tenant:T#member@user:U
+//     node:R#tenant@tenant:T  node:R#owner@user:U
+//
+//   team tenant T made by user U, root folder R:
+//     tenant:T#owner@user:U   tenant:T#member@user:U
+//     node:R#tenant@tenant:T
+//     node:R#sharer@tenant:T#administer  (owners and admins manage and share the team tree)
+//     node:R#editor@tenant:T#member   (every member can work in the team tree)
+//
+// Tuples per node: node:N#parent@node:P and node:N#tenant@tenant:T.
+// A member link L in folder F to target X: node:X#collection@node:F.
+// A grant of role r to principal p on node N: node:N#<relation of r>@<p>.

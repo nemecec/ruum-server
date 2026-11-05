@@ -1,0 +1,12 @@
+# Lint settings for contracts/openapi.yaml: `npx @redocly/cli lint --config contracts/redocly.yaml contracts/openapi.yaml`
+extends:
+  - recommended
+rules:
+  # `/v1/nodes/by-path/{path}` is the path form of the design (section 2.2). Static segments win
+  # over parameters in the router, so `/v1/nodes/{node_id}/...` and `by-path` do not clash.
+  no-ambiguous-paths: off
+  # The first server is the laptop stack (`ruum.localhost`).
+  no-server-example.com: off
+  # Health and JWKS have no client errors; login and callback answer only with redirects.
+  operation-4xx-response: off
+  operation-2xx-response: off

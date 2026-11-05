@@ -54,10 +54,21 @@ pub struct Agent {
     pub scope: AgentScope,
     #[serde(with = "time::serde::rfc3339::option")]
     pub disabled_at: Option<OffsetDateTime>,
+    pub disabled_reason: Option<DisabledReason>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_used_at: Option<OffsetDateTime>,
+}
+
+/// Why an agent is disabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledReason {
+    ByOwner,
+    ByAdmin,
+    /// The user left the tenant. Such an agent cannot be enabled again.
+    OwnerLeft,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

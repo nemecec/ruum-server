@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/share_link.revoked.schema.json",
+  "title": "share_link.revoked",
+  "description": "A share link to the node was revoked. This schema is the `data` of a journal entry with `type` `share_link.revoked`.",
+  "type": "object",
+  "required": [
+    "share_link_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "share_link_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    }
+  }
+}

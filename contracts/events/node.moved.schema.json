@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.moved.schema.json",
+  "title": "node.moved",
+  "description": "A node moved to another folder (and maybe got a new name). This schema is the `data` of a journal entry with `type` `node.moved`.",
+  "type": "object",
+  "required": [
+    "old_parent_id",
+    "new_parent_id",
+    "old_name",
+    "new_name"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "old_parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "new_parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "old_name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    },
+    "new_name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    }
+  }
+}

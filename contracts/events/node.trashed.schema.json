@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.trashed.schema.json",
+  "title": "node.trashed",
+  "description": "A node and its subtree went to the trash. This schema is the `data` of a journal entry with `type` `node.trashed`.",
+  "type": "object",
+  "required": [
+    "parent_id",
+    "name",
+    "subtree_count",
+    "purge_after"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "parent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "name": {
+      "$ref": "common.schema.json#/$defs/node_name"
+    },
+    "subtree_count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Nodes trashed, including this one."
+    },
+    "purge_after": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    }
+  }
+}
