@@ -10,6 +10,7 @@ use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post};
+use ruum_core::Context;
 use ruum_core::authz::Role;
 use ruum_core::identity::{AccessClaims, TokenType};
 use ruum_core::paging::{Cursor, PageRequest};
@@ -349,9 +350,23 @@ pub async fn resolve_share_link(
 /// Shared with me. `GET /v1/shared-with-me` (operationId `listSharedWithMe`).
 pub async fn list_shared_with_me(
     State(state): State<AppState>,
-    RequestContext(ctx): RequestContext,
+    crate::auth::Principal(who): crate::auth::Principal,
     q: Result<Query<PageParams>, QueryRejection>,
 ) -> ApiResult<Json<Value>> {
+    // No `Ruum-Tenant` header (the list spans every tenant of the user). Bound credentials
+    // (agents) use their tenant; for a user the context tenant is not read (the user's
+    // memberships decide), so the nil tenant stands in.
+    let ctx = match who.bound_tenant {
+        Some(_) => {
+            ruum_core::identity::auth::context_for(&state.services, &who, None, None).await?
+        }
+        None => Context {
+            tenant: ruum_core::TenantId(uuid::Uuid::nil()),
+            actor: who.actor,
+            scope: who.scope.clone(),
+            idempotency_key: None,
+        },
+    };
     let p = state
         .services
         .sharing

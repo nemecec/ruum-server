@@ -2,11 +2,11 @@
 //! the REST API (`/v1`), the MCP server (`/mcp`) and WebDAV (`/dav`).
 
 mod config;
+mod wiring;
 
 use anyhow::Context as _;
 use config::Config;
 use ruum_api::{ApiConfig, AppState};
-use ruum_core::Services;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
 
-    if let Some(url) = &config.database_url {
+    let pool = if let Some(url) = &config.database_url {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.db_max_connections)
             .connect(url)
@@ -32,13 +32,13 @@ async fn main() -> anyhow::Result<()> {
             migrator.run(&pool).await.context("run migrations")?;
             tracing::info!("migrations are up to date");
         }
-        // The Postgres-backed services take the pool here when they exist.
+        Some(pool)
     } else {
         tracing::warn!("DATABASE_URL is not set; using in-memory services");
-    }
+        None
+    };
 
-    // Until the real implementations exist, all modules are the in-memory ones.
-    let services = Services::in_memory();
+    let services = wiring::services(&config.public_url, pool).await?;
     let state = AppState::new(
         services.clone(),
         ApiConfig {

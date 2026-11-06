@@ -1,6 +1,6 @@
 //! Routes of the `audit` area (journal and audit, `docs/STEP1.md` area 5).
 
-use crate::auth::RequestContext;
+use crate::auth::{Principal, tenant_context};
 use crate::error::ApiResult;
 use crate::routes::changes::bad_query;
 use crate::state::AppState;
@@ -94,12 +94,16 @@ fn wants_ndjson(headers: &HeaderMap) -> bool {
 /// streams every matching entry, one JSON object per line, newest first.
 pub async fn list_audit(
     State(state): State<AppState>,
-    RequestContext(ctx): RequestContext,
+    Principal(who): Principal,
     tenant: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
     params: Result<Query<AuditParams>, QueryRejection>,
 ) -> ApiResult<Response> {
-    audit_answer(&state, ctx, tenant, &headers, params).await
+    // The tenant is the one in the path (no `Ruum-Tenant` header needed); a caller that is not
+    // in it gets `not_found`.
+    let Path(id) = tenant.map_err(|_| Error::not_found("tenant"))?;
+    let ctx = tenant_context(&state, &who, TenantId(id), &headers).await?;
+    audit_answer(&state, ctx, Ok(Path(id)), &headers, params).await
 }
 
 /// The answer of `listAudit` for an authenticated caller.

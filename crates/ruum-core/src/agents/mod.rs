@@ -11,12 +11,17 @@
 
 pub mod memory;
 pub mod oauth;
+pub mod postgres;
+pub mod undo;
+
+#[cfg(test)]
+mod tests;
 
 use crate::actor::Context;
 use crate::authz::{Role, Scope};
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{AgentId, AgentKeyId, NodeId, TenantId, UserId};
-use crate::journal::JournalEntry;
+use crate::journal::{ChangeInfo, JournalEntry};
 use crate::paging::{Page, PageRequest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -24,8 +29,20 @@ use time::OffsetDateTime;
 
 /// The visible prefix of agent API keys, so secret scanners find leaked keys.
 pub const API_KEY_PREFIX: &str = "ruum_agent_";
+
+/// `AgentStore::authenticate` writes `agents.last_used_at` at most this often (seconds), so a
+/// request of an agent is a read, not a row lock.
+pub const AGENT_TOUCH_SECONDS: i64 = 300;
 /// The lifetime of an access token from a key exchange.
 pub const ACCESS_TOKEN_SECONDS: i64 = 15 * 60;
+/// The default lifetime of an API key.
+pub const KEY_DEFAULT_DAYS: i64 = 90;
+/// The longest lifetime of an API key.
+pub const KEY_MAX_DAYS: i64 = 366;
+/// The `subject_token_type` of an API key in the token exchange.
+pub const API_KEY_TOKEN_TYPE: &str = "urn:ruum:params:oauth:token-type:api-key";
+/// The `issued_token_type` of an access token.
+pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 /// A monthly budget with a hard stop (section 11). Enforcement grows with later steps.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,8 +106,18 @@ pub enum DisabledReason {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewAgent {
     pub name: String,
+    #[serde(default)]
     pub description: Option<String>,
     pub scope: AgentScope,
+}
+
+/// A change of an agent: fields that are `None` keep their value. `description: Some(None)`
+/// clears the description.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentUpdate {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub scope: Option<AgentScope>,
 }
 
 /// Metadata of an API key. The secret is shown only once, at creation.
@@ -117,7 +144,9 @@ pub struct AccessToken {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: i64,
-    pub issued_token_type: String,
+    /// Only for the token exchange: `urn:ietf:params:oauth:token-type:access_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_token_type: Option<String>,
 }
 
 /// What to undo: the agent's entries between `since` and `until`, or only the entries in `seqs`.
@@ -183,38 +212,118 @@ pub struct UndoReport {
     pub dry_run: bool,
     pub reverted: Vec<UndoItem>,
     pub skipped: Vec<UndoItem>,
+    /// The last change of the undo; `None` for a dry run or when nothing was reverted.
+    pub change: Option<ChangeInfo>,
 }
 
 /// Makes a new API key. Returns the secret (shown once) and its hash (stored).
 pub fn generate_key() -> (String, [u8; 32]) {
-    todo!("agents: generate_key")
+    let secret = crate::identity::secret::random_secret(API_KEY_PREFIX);
+    let hash = hash_key(&secret);
+    (secret, hash)
 }
 
 /// The stored hash of a key (SHA-256; keys have 256 bits of entropy, so a slow hash is not
 /// needed).
-pub fn hash_key(_secret: &str) -> [u8; 32] {
-    todo!("agents: hash_key")
+pub fn hash_key(secret: &str) -> [u8; 32] {
+    crate::identity::secret::sha256(secret)
+}
+
+/// Checks the name, description and scope of a new or changed agent. The scope subtree is
+/// checked by the store (it must be a node of the tenant).
+pub fn check_new_agent(req: &NewAgent) -> Result<NewAgent> {
+    let name = crate::identity::check_name("the agent name", &req.name, 100)?;
+    let description = check_description(req.description.clone())?;
+    check_scope(&req.scope)?;
+    Ok(NewAgent {
+        name,
+        description,
+        scope: req.scope.clone(),
+    })
+}
+
+/// Checks a description: at most 1000 characters; empty means none.
+pub fn check_description(d: Option<String>) -> Result<Option<String>> {
+    match d {
+        Some(d) if d.chars().count() > 1000 => Err(crate::identity::invalid(
+            "the description must have at most 1000 characters",
+        )),
+        Some(d) if d.trim().is_empty() => Ok(None),
+        other => Ok(other),
+    }
+}
+
+/// Checks a scope: an expiry in the future, budgets not negative.
+pub fn check_scope(scope: &AgentScope) -> Result<()> {
+    if scope.expires_at.is_some_and(|e| e <= crate::now()) {
+        return Err(crate::identity::invalid(
+            "the scope expiry must be in the future",
+        ));
+    }
+    if scope.budget.max_storage_bytes.is_some_and(|b| b < 0) {
+        return Err(crate::identity::invalid(
+            "max_storage_bytes must not be negative",
+        ));
+    }
+    Ok(())
+}
+
+/// The expiry of a new key: the requested time (in the future, at most [`KEY_MAX_DAYS`] ahead),
+/// or [`KEY_DEFAULT_DAYS`] from now.
+pub fn key_expiry(requested: Option<OffsetDateTime>) -> Result<OffsetDateTime> {
+    let now = crate::now();
+    match requested {
+        None => Ok(now + time::Duration::days(KEY_DEFAULT_DAYS)),
+        Some(t) if t <= now => Err(crate::identity::invalid("expires_at must be in the future")),
+        Some(t) if t > now + time::Duration::days(KEY_MAX_DAYS) => Err(crate::identity::invalid(
+            "an API key expires at most one year ahead",
+        )),
+        Some(t) => Ok(t),
+    }
+}
+
+/// The error of a disabled agent.
+pub fn agent_disabled() -> Error {
+    Error::Api(
+        crate::error::ApiError::new(ErrorCode::AgentDisabled, "the agent is disabled")
+            .with_hint("the owner of the agent can enable it again in the web UI"),
+    )
+}
+
+/// The error of the agent limit of the plan.
+pub fn agent_limit_reached(limit: u32) -> Error {
+    Error::Api(
+        crate::error::ApiError::new(
+            ErrorCode::PlanLimitReached,
+            format!("the tenant has reached its limit of {limit} agents"),
+        )
+        .with_hint("disable or remove an agent, or move to a larger plan"),
+    )
 }
 
 #[async_trait]
 pub trait AgentStore: Send + Sync {
     // Every write below is for users only: it calls `require_user_actor` first.
 
-    /// Registers an agent for the actor's user. Fails with `plan_limit_reached` at the limit.
+    /// Registers an agent for the actor's user. Fails with `plan_limit_reached` at the limit. A
+    /// scope subtree outside the tenant is `not_found`.
     async fn register(&self, ctx: &Context, req: NewAgent) -> Result<Agent>;
-    /// The user's agents; tenant admins see all agents of the tenant.
-    async fn list(&self, ctx: &Context, page: PageRequest) -> Result<Page<Agent>>;
-    async fn get(&self, ctx: &Context, id: AgentId) -> Result<Agent>;
-    async fn update(
+    /// The caller's agents; tenant admins see all agents of the tenant (`owner` filters, for
+    /// admins). An agent caller sees itself.
+    async fn list(
         &self,
         ctx: &Context,
-        id: AgentId,
-        name: Option<String>,
-        description: Option<String>,
-        scope: Option<AgentScope>,
-    ) -> Result<Agent>;
+        owner: Option<UserId>,
+        page: PageRequest,
+    ) -> Result<Page<Agent>>;
+    /// The owner or a tenant admin; others get `not_found`.
+    async fn get(&self, ctx: &Context, id: AgentId) -> Result<Agent>;
+    /// Only the owner (admins get `permission_denied`).
+    async fn update(&self, ctx: &Context, id: AgentId, change: AgentUpdate) -> Result<Agent>;
+    /// Disable: the owner (`by_owner`) or a tenant admin (`by_admin`); it ends the OAuth grants.
+    /// Enable: only the owner, and never after `owner_left`.
     async fn set_disabled(&self, ctx: &Context, id: AgentId, disabled: bool) -> Result<Agent>;
-    /// Makes a key. Returns the metadata and the secret.
+    /// Makes a key. Only the owner. Returns the metadata and the secret.
     async fn create_key(
         &self,
         ctx: &Context,
@@ -222,18 +331,26 @@ pub trait AgentStore: Send + Sync {
         name: Option<String>,
         expires_at: Option<OffsetDateTime>,
     ) -> Result<(AgentKey, String)>;
+    /// The owner or a tenant admin.
     async fn list_keys(&self, ctx: &Context, id: AgentId) -> Result<Vec<AgentKey>>;
+    /// The owner or a tenant admin.
     async fn revoke_key(&self, ctx: &Context, id: AgentId, key: AgentKeyId) -> Result<()>;
-    /// Exchanges a key for a short-lived access token. No session is needed.
+    /// Exchanges a key for a short-lived access token. No session is needed. A system lookup by
+    /// the hash of the key.
     async fn exchange_key(&self, secret: &str) -> Result<AccessToken>;
-    /// The journal entries where the agent is the actor, newest first.
+    /// A system lookup of an agent for authentication: the live row (scope, disabled). Fails
+    /// with `agent_disabled` for a disabled agent and `unauthenticated` for an unknown one.
+    async fn authenticate(&self, tenant: TenantId, id: AgentId) -> Result<Agent>;
+    /// The journal entries where the agent is the actor, newest first. The owner or a tenant
+    /// admin.
     async fn activity(
         &self,
         ctx: &Context,
         id: AgentId,
+        since: Option<OffsetDateTime>,
         page: PageRequest,
     ) -> Result<Page<JournalEntry>>;
-    /// Reverts the changes of the agent, newest first, with the inverse of each event type
-    /// ([`undo_action`]). Changes that others changed later are skipped and reported. Users only.
-    async fn undo(&self, ctx: &Context, id: AgentId, req: UndoRequest) -> Result<UndoReport>;
 }
+
+// Undo (`undoAgent`) is [`undo::undo`]: it needs the stores of the other areas (nodes, versions,
+// tags, sharing), so it takes the whole `Services`.

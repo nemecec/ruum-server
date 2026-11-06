@@ -34,5 +34,9 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::search::router())
         .merge(routes::audit::router())
         .fallback(error::route_not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::idempotency,
+        ))
         .with_state(state)
 }

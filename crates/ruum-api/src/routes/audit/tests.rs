@@ -28,13 +28,13 @@ impl TenantStore for Roles {
     async fn list_for_user(&self, _: UserId) -> Result<Vec<(Tenant, MemberRole)>> {
         unimplemented!()
     }
-    async fn create_personal(&self, _: UserId, _: String) -> Result<Tenant> {
-        unimplemented!()
-    }
     async fn create_team(&self, _: &Actor, _: String) -> Result<Tenant> {
         unimplemented!()
     }
     async fn get(&self, _: &Context) -> Result<Tenant> {
+        unimplemented!()
+    }
+    async fn find(&self, _: TenantId) -> Result<Tenant> {
         unimplemented!()
     }
     async fn update(
@@ -57,7 +57,13 @@ impl TenantStore for Roles {
     async fn remove_member(&self, _: &Context, _: UserId) -> Result<()> {
         unimplemented!()
     }
-    async fn invite(&self, _: &Context, _: String, _: MemberRole) -> Result<(Invitation, String)> {
+    async fn invite(
+        &self,
+        _: &Context,
+        _: String,
+        _: MemberRole,
+        _: Option<String>,
+    ) -> Result<(Invitation, String)> {
         unimplemented!()
     }
     async fn list_invitations(&self, _: &Context, _: PageRequest) -> Result<Page<Invitation>> {

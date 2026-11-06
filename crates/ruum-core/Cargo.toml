@@ -19,6 +19,7 @@ bytes.workspace = true
 fastcdc.workspace = true
 futures.workspace = true
 hex.workspace = true
+jsonwebtoken.workspace = true
 object_store.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -30,10 +31,11 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# `macros` for #[sqlx::test] (the conformance suites against Postgres).
+# `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.
 sqlx = { workspace = true, features = ["macros"] }
 tokio.workspace = true

@@ -16,7 +16,8 @@ use crate::blobs::{
 };
 use crate::identity::{
     IdentityStore, OidcClient, TokenIssuer,
-    memory::{MemoryIdentityStore, MemoryOidcClient, MemoryTokenIssuer},
+    idempotency::{IdempotencyStore, MemoryIdempotencyStore},
+    memory::{MemoryArea, MemoryDeps, MemoryIdentityStore, MemoryOidcClient, MemoryTokenIssuer},
 };
 use crate::journal::{Journal, memory::MemoryJournal};
 use crate::nodes::{NodeStore, memory::MemoryNodeStore};
@@ -50,30 +51,46 @@ pub struct Services {
     pub journal: Arc<dyn Journal>,
     pub search: Arc<dyn Search>,
     pub audit: Arc<dyn AuditLog>,
+    /// The `Idempotency-Key` store of writes.
+    pub idempotency: Arc<dyn IdempotencyStore>,
 }
 
 impl Services {
     /// All in-memory implementations. For unit tests and for running without Docker.
     pub fn in_memory() -> Self {
-        // The modules that others read and write are built once and shared, so that (for
-        // example) the grants of `sharing` are in the same engine that every area checks.
-        let tenants = Arc::new(MemoryTenantStore::default());
-        let nodes = Arc::new(MemoryNodeStore::default());
+        // The modules that others read and write are built once, as concrete types (other
+        // stores take them so), and shared.
+        let tokens: Arc<dyn TokenIssuer> = Arc::new(MemoryTokenIssuer::default());
         let authz = Arc::new(MemoryAuthz::default());
+        let nodes = Arc::new(MemoryNodeStore::default());
         let journal = Arc::new(MemoryJournal::default());
+        let audit = Arc::new(MemoryAuditLog::with_journal(journal.clone()));
+        // The stores of the identity, tenants and agents area share one state. The sharing
+        // store is the member cleanup (set below). When the nodes area is merged, the node store
+        // must become `root_created` (`MemoryArea::set_root_created`).
+        let area = Arc::new(MemoryArea::new(MemoryDeps {
+            tokens: tokens.clone(),
+            authz: Some(authz.clone() as Arc<dyn Authz>),
+            nodes: Some(nodes.clone() as Arc<dyn NodeStore>),
+            journal: Some(journal.clone() as Arc<dyn Journal>),
+            audit: Some(audit.clone() as Arc<dyn AuditLog>),
+            ..MemoryDeps::default()
+        }));
+        let tenants = Arc::new(MemoryTenantStore::new(area.clone()));
         let sharing = Arc::new(MemorySharingStore::new(
             authz.clone(),
             nodes.clone(),
             tenants.clone(),
             journal.clone(),
         ));
+        area.set_member_cleanup(sharing.clone());
         Self {
             tenants,
-            identity: Arc::new(MemoryIdentityStore::default()),
+            identity: Arc::new(MemoryIdentityStore::new(area.clone())),
             oidc: Arc::new(MemoryOidcClient::default()),
-            tokens: Arc::new(MemoryTokenIssuer::default()),
-            agents: Arc::new(MemoryAgentStore::default()),
-            oauth: Arc::new(MemoryOAuthServer::default()),
+            tokens,
+            agents: Arc::new(MemoryAgentStore::new(area.clone())),
+            oauth: Arc::new(MemoryOAuthServer::new(area)),
             nodes,
             blobs: Arc::new(MemoryBlobStore::default()),
             transfers: Arc::new(MemoryTransfers::default()),
@@ -84,7 +101,8 @@ impl Services {
             sharing,
             journal,
             search: Arc::new(MemorySearch::default()),
-            audit: Arc::new(MemoryAuditLog::default()),
+            audit,
+            idempotency: Arc::new(MemoryIdempotencyStore::default()),
         }
     }
 }

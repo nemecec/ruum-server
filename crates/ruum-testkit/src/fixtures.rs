@@ -472,15 +472,533 @@ pub struct World {
 
 /// Makes the fixture world in the services of `state`. See the module comment.
 ///
-/// It is async because the real version writes through `Services`.
-pub async fn seed(_state: &AppState) -> World {
-    // TODO(identity, tenants, nodes, sharing areas): create both tenants through
-    // `state.services` and replace the placeholder credentials with real ones. Then set
-    // `seeded: true`.
+/// It creates both tenants through `Services`: users (through the sign-in path), the team
+/// tenant, members and guests (through invitations), the tree, versions, the tag, grants, the
+/// share link, uploads, the web session, the app password, the agents with their keys and
+/// tokens, and the OAuth client and consent request. Every step runs on its own task: a step
+/// whose area is not built yet (a `todo!`) keeps the placeholder ID of that resource, so the
+/// suites report the operations of that area and not a broken seed. `seeded` is true when the
+/// principals have real credentials.
+pub async fn seed(state: &AppState) -> World {
+    let mut a = TenantFixture::placeholder("alpha");
+    let mut b = TenantFixture::placeholder("bravo");
+    let ok_a = seed::tenant(state, &mut a).await;
+    let ok_b = seed::tenant(state, &mut b).await;
     World {
-        a: TenantFixture::placeholder("alpha"),
-        b: TenantFixture::placeholder("bravo"),
-        seeded: false,
+        a,
+        b,
+        seeded: ok_a && ok_b,
+    }
+}
+
+mod seed {
+    //! The steps of [`super::seed`].
+
+    use super::{Credentials, TenantFixture, Who};
+    use ruum_api::AppState;
+    use ruum_core::actor::{Actor, Context};
+    use ruum_core::agents::oauth::{AuthorizationRequest, ClientRegistration, REQUEST_SECONDS};
+    use ruum_core::agents::{AgentScope, Budget, NewAgent};
+    use ruum_core::authz::{Role, Scope};
+    use ruum_core::blobs::{ChunkRef, Hash, NewUpload, SMALL_CHUNKING, UploadTarget};
+    use ruum_core::identity::{AccessClaims, TokenType, VerifiedLogin, issue_user_token};
+    use ruum_core::nodes::{NewNode, NodeKind, OnConflict};
+    use ruum_core::sharing::{Grantee, NewShareLink, ShareLinkRole};
+    use ruum_core::{NodeId, Services, TenantId};
+    use std::future::Future;
+
+    /// The issuer of the fixture logins.
+    const ISSUER: &str = "https://idp.ruum.test";
+    /// How long the fixture tokens live.
+    const TOKEN_SECONDS: i64 = 3600;
+
+    /// Runs one step on its own task. `None` when the step fails or its area is not built.
+    async fn step<T, F>(label: &str, fut: F) -> Option<T>
+    where
+        F: Future<Output = ruum_core::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        match tokio::spawn(fut).await {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
+                eprintln!("fixtures::seed: {label}: {e}");
+                None
+            }
+            // A panic: the area of this step is not built yet (`todo!`).
+            Err(_) => None,
+        }
+    }
+
+    fn ctx(tenant: TenantId, actor: Actor) -> Context {
+        Context {
+            tenant,
+            actor,
+            scope: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn hash(data: &[u8]) -> Hash {
+        Hash(*blake3::hash(data).as_bytes())
+    }
+
+    /// Uploads `data` as a new file or a new version and returns the node and version IDs.
+    async fn upload(
+        s: &Services,
+        c: &Context,
+        target: UploadTarget,
+        data: Vec<u8>,
+    ) -> ruum_core::Result<(NodeId, ruum_core::VersionId)> {
+        let h = hash(&data);
+        let up = s
+            .transfers
+            .create_upload(
+                c,
+                NewUpload {
+                    target,
+                    content_type: Some("text/plain".into()),
+                    chunking: SMALL_CHUNKING.id.to_string(),
+                    size: data.len() as u64,
+                    content_hash: h,
+                    chunks: vec![ChunkRef {
+                        hash: h,
+                        size: data.len() as u32,
+                    }],
+                },
+            )
+            .await?;
+        s.transfers
+            .put_chunk(c, up.id, h, axum::body::Bytes::from(data))
+            .await?;
+        let w = s.transfers.complete_upload(c, up.id).await?;
+        Ok((w.value.0.id, w.value.1.id))
+    }
+
+    /// Seeds one tenant. Returns true when the principals got real credentials.
+    pub async fn tenant(state: &AppState, t: &mut TenantFixture) -> bool {
+        let s = state.services.clone();
+
+        // ------------------------------------------------------------ users
+        for who in Who::ALL.iter().copied().filter(|w| w.is_user()) {
+            let email = t.principal(who).email.clone();
+            let login = VerifiedLogin {
+                issuer: ISSUER.into(),
+                subject: format!("{}-{}-{}", t.prefix, who.name(), uuid::Uuid::now_v7()),
+                email: email.clone(),
+                email_verified: true,
+                name: Some(format!("{} {}", t.prefix, who.name())),
+                id_token: None,
+            };
+            let s2 = s.clone();
+            let Some(user) = step("user", async move {
+                s2.identity.upsert_from_login(&login).await
+            })
+            .await
+            else {
+                return false;
+            };
+            let p = t.principals.get_mut(&who).expect("every principal");
+            p.id = user.id.0;
+        }
+        let owner = t.user_id(Who::Owner);
+
+        // ------------------------------------------------------------ the team tenant
+        let (s2, name) = (s.clone(), t.name.clone());
+        let Some(tenant) = step("team tenant", async move {
+            s2.tenants.create_team(&Actor::user(owner), name).await
+        })
+        .await
+        else {
+            return false;
+        };
+        t.id = tenant.id;
+        t.root = tenant.root_node_id;
+        let tid = t.id;
+        let owner_ctx = ctx(tid, Actor::user(owner));
+
+        // Members and guests join through invitations.
+        for who in Who::ALL
+            .iter()
+            .copied()
+            .filter(|w| w.is_user() && *w != Who::Owner)
+        {
+            let role = who.tenant_role().expect("a user");
+            let (s2, c, email) = (
+                s.clone(),
+                owner_ctx.clone(),
+                t.principal(who).email.clone().unwrap_or_default(),
+            );
+            let user = t.user_id(who);
+            let joined = step("member", async move {
+                let (_inv, token) = s2.tenants.invite(&c, email, role, None).await?;
+                s2.tenants
+                    .accept_invitation(&Actor::user(user), &token)
+                    .await
+            })
+            .await;
+            if joined.is_none() {
+                return false;
+            }
+        }
+
+        // The open invitation.
+        let (s2, c, email) = (s.clone(), owner_ctx.clone(), t.invitation_email.clone());
+        if let Some((inv, token)) = step("invitation", async move {
+            s2.tenants
+                .invite(&c, email, ruum_core::tenants::MemberRole::Member, None)
+                .await
+        })
+        .await
+        {
+            t.invitation = inv.id;
+            t.invitation_token = token;
+        }
+
+        // ------------------------------------------------------------ credentials of users
+        for who in Who::ALL.iter().copied().filter(|w| w.is_user()) {
+            let user = t.user_id(who);
+            let token = match issue_user_token(s.tokens.as_ref(), user, TOKEN_SECONDS) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            t.principals.get_mut(&who).expect("a user").credentials = Credentials::Bearer(token);
+        }
+        // The member signs in to the web UI: a session and the CSRF value.
+        let member = t.user_id(Who::Member);
+        let s2 = s.clone();
+        if let Some((session, secret)) = step("session", async move {
+            s2.identity
+                .create_session(member, Some("ruum-testkit".into()))
+                .await
+        })
+        .await
+        {
+            t.session = session.id;
+            t.principals
+                .get_mut(&Who::Member)
+                .expect("member")
+                .credentials = Credentials::Session {
+                session: secret,
+                csrf: ruum_core::identity::secret::random_secret(""),
+            };
+        }
+        let member_ctx = ctx(tid, Actor::user(member));
+
+        // The app password of the member.
+        let (s2, c, name) = (
+            s.clone(),
+            member_ctx.clone(),
+            format!("{}-webdav", t.prefix),
+        );
+        if let Some((pw, secret)) = step("app password", async move {
+            s2.identity.create_app_password(&c, name, None).await
+        })
+        .await
+        {
+            t.app_password = pw.id;
+            t.app_password_secret = secret;
+        }
+
+        // ------------------------------------------------------------ the tree
+        let folder = |parent: NodeId, name: &str| NewNode {
+            parent_id: parent,
+            name: name.to_string(),
+            kind: NodeKind::Folder,
+            node_type: None,
+            link: None,
+            on_conflict: OnConflict::Fail,
+        };
+        let (s2, c, req) = (s.clone(), owner_ctx.clone(), folder(t.root, "Projects"));
+        if let Some(n) = step("Projects", async move { s2.nodes.create(&c, req).await }).await {
+            t.projects = n.value.id;
+        }
+        let (s2, c, req) = (s.clone(), owner_ctx.clone(), folder(t.root, "Private"));
+        if let Some(n) = step("Private", async move { s2.nodes.create(&c, req).await }).await {
+            t.private = n.value.id;
+        }
+        let (s2, c, req) = (s.clone(), owner_ctx.clone(), folder(t.projects, "Archive"));
+        if let Some(n) = step("Archive", async move { s2.nodes.create(&c, req).await }).await {
+            t.archive = n.value.id;
+        }
+        // TODO(sharing area): set `editors_can_share = false` on Archive when the sharing store
+        // has the method of `updateNodeSharing`.
+
+        // The plan with two versions (by two actors, so they do not coalesce).
+        let (s2, c, target, data) = (
+            s.clone(),
+            owner_ctx.clone(),
+            UploadTarget::NewFile {
+                parent_id: t.projects,
+                name: t.plan_name.clone(),
+                on_conflict: OnConflict::Fail,
+            },
+            format!("{} plan, first draft\n", t.prefix).into_bytes(),
+        );
+        if let Some((node, v1)) = step(
+            "plan v1",
+            async move { upload(&s2, &c, target, data).await },
+        )
+        .await
+        {
+            t.plan = node;
+            t.v1 = v1;
+            let (s2, c, target, data) = (
+                s.clone(),
+                member_ctx.clone(),
+                UploadTarget::NewVersion {
+                    node_id: node,
+                    base_version: Some(v1),
+                },
+                format!("{} plan, second draft\n", t.prefix).into_bytes(),
+            );
+            if let Some((_, v2)) = step(
+                "plan v2",
+                async move { upload(&s2, &c, target, data).await },
+            )
+            .await
+            {
+                t.v2 = v2;
+            }
+        }
+        // The old file, in the trash.
+        let (s2, c, req) = (
+            s.clone(),
+            owner_ctx.clone(),
+            NewNode {
+                parent_id: t.projects,
+                name: format!("{}-old.txt", t.prefix),
+                kind: NodeKind::File,
+                node_type: Some("text/plain".into()),
+                link: None,
+                on_conflict: OnConflict::Fail,
+            },
+        );
+        if let Some(old) = step("old", async move {
+            let n = s2.nodes.create(&c, req).await?;
+            s2.nodes.trash(&c, n.value.id, None).await
+        })
+        .await
+        {
+            t.old = old.value.id;
+        }
+
+        // The tag T, made by the member, on the plan.
+        let (s2, c, name, plan) = (s.clone(), member_ctx.clone(), t.tag_name.clone(), t.plan);
+        if let Some(tag) = step("tag", async move {
+            let tag = s2.tags.create(&c, name, None).await?;
+            s2.tags.attach(&c, plan, tag.value.id).await?;
+            Ok(tag)
+        })
+        .await
+        {
+            t.tag = tag.value.id;
+        }
+
+        // The grants of the guests on Projects.
+        for who in [
+            Who::GuestView,
+            Who::GuestComment,
+            Who::GuestEdit,
+            Who::GuestManage,
+        ] {
+            let role = who.grant_on_projects().expect("a guest with a grant");
+            let (s2, c, node, user) = (s.clone(), owner_ctx.clone(), t.projects, t.user_id(who));
+            if let Some(g) = step("grant", async move {
+                s2.sharing
+                    .add_grant(&c, node, Grantee::User { id: user }, role)
+                    .await
+            })
+            .await
+                && who == Who::GuestView
+            {
+                t.grant = g.value.id;
+            }
+        }
+
+        // The view share link on Projects, and the token of its bearer.
+        let (s2, c, node) = (s.clone(), owner_ctx.clone(), t.projects);
+        if let Some(link) = step("share link", async move {
+            s2.sharing
+                .create_share_link(
+                    &c,
+                    node,
+                    NewShareLink {
+                        role: ShareLinkRole::View,
+                        expires_at: None,
+                        password: None,
+                    },
+                )
+                .await
+        })
+        .await
+        {
+            t.share_link = link.value.id;
+            if let Some(token) = link.value.token.clone() {
+                t.share_link_token = token;
+            }
+        }
+        let mut claims = AccessClaims::new(
+            s.tokens.as_ref(),
+            TokenType::ShareLink,
+            t.share_link.0,
+            TOKEN_SECONDS,
+        );
+        claims.tid = Some(tid);
+        claims.share_link = Some(t.share_link);
+        claims.scope = Some(Scope {
+            subtree: Some(t.projects),
+            max_role: Role::View,
+            expires_at: None,
+        });
+        if let Ok(token) = s.tokens.issue(&claims) {
+            let p = t.principals.get_mut(&Who::ShareLink).expect("share link");
+            p.id = t.share_link.0;
+            p.credentials = Credentials::Bearer(token);
+        }
+
+        // The uploads of the member: an empty file ready to complete, and one with a chunk to send.
+        let empty = hash(b"");
+        let (s2, c, parent) = (s.clone(), member_ctx.clone(), t.projects);
+        if let Some(up) = step("empty upload", async move {
+            s2.transfers
+                .create_upload(
+                    &c,
+                    NewUpload {
+                        target: UploadTarget::NewFile {
+                            parent_id: parent,
+                            name: "empty.txt".into(),
+                            on_conflict: OnConflict::Fail,
+                        },
+                        content_type: Some("text/plain".into()),
+                        chunking: SMALL_CHUNKING.id.to_string(),
+                        size: 0,
+                        content_hash: empty,
+                        chunks: vec![],
+                    },
+                )
+                .await
+        })
+        .await
+        {
+            t.upload_empty = up.id;
+        }
+        let chunk = hash(&t.chunk);
+        let size = t.chunk.len() as u32;
+        let (s2, c, parent) = (s.clone(), member_ctx.clone(), t.projects);
+        if let Some(up) = step("chunked upload", async move {
+            s2.transfers
+                .create_upload(
+                    &c,
+                    NewUpload {
+                        target: UploadTarget::NewFile {
+                            parent_id: parent,
+                            name: "chunked.txt".into(),
+                            on_conflict: OnConflict::Fail,
+                        },
+                        content_type: Some("text/plain".into()),
+                        chunking: SMALL_CHUNKING.id.to_string(),
+                        size: u64::from(size),
+                        content_hash: chunk,
+                        chunks: vec![ChunkRef { hash: chunk, size }],
+                    },
+                )
+                .await
+        })
+        .await
+        {
+            t.upload_chunked = up.id;
+        }
+
+        // ------------------------------------------------------------ agents
+        let mut agents_ok = true;
+        for who in [Who::Agent, Who::AgentOut, Who::AgentOfGuestView] {
+            let user = who.acts_for().expect("an agent");
+            let (subtree, max_role) = who.scope().expect("an agent");
+            let scope = AgentScope {
+                subtree: subtree.map(|s| t.node(s)),
+                max_role,
+                expires_at: None,
+                budget: Budget::default(),
+            };
+            let (s2, c) = (s.clone(), ctx(tid, Actor::user(t.user_id(user))));
+            let name = format!("{}-{}", t.prefix, who.name().replace('_', "-"));
+            let made = step("agent", async move {
+                let agent = s2
+                    .agents
+                    .register(
+                        &c,
+                        NewAgent {
+                            name,
+                            description: None,
+                            scope,
+                        },
+                    )
+                    .await?;
+                let (key, secret) = s2
+                    .agents
+                    .create_key(&c, agent.id, Some("fixture key".into()), None)
+                    .await?;
+                let token = s2.agents.exchange_key(&secret).await?;
+                Ok((agent, key, secret, token))
+            })
+            .await;
+            let Some((agent, key, secret, token)) = made else {
+                agents_ok = false;
+                continue;
+            };
+            let p = t.principals.get_mut(&who).expect("an agent");
+            p.id = agent.id.0;
+            p.credentials = Credentials::Bearer(token.access_token);
+            if who == Who::Agent {
+                t.agent_key = key.id;
+                t.agent_key_secret = secret;
+            }
+        }
+
+        // ------------------------------------------------------------ OAuth
+        let (s2, name, redirect) = (
+            s.clone(),
+            format!("{}-mcp-client", t.prefix),
+            t.oauth_redirect_uri.clone(),
+        );
+        if let Some(client) = step("OAuth client", async move {
+            s2.oauth
+                .register_client(ClientRegistration {
+                    client_name: name,
+                    redirect_uris: vec![redirect],
+                    grant_types: vec![],
+                    response_types: vec![],
+                    token_endpoint_auth_method: None,
+                    client_uri: None,
+                    logo_uri: None,
+                    software_id: None,
+                    software_version: None,
+                })
+                .await
+                .map_err(|e| ruum_core::Error::Internal(e.error_description))
+        })
+        .await
+        {
+            t.oauth_client_id = client.client_id.clone();
+            let s2 = s.clone();
+            let req = AuthorizationRequest {
+                client_id: client.client_id,
+                redirect_uri: t.oauth_redirect_uri.clone(),
+                code_challenge: crate::requests::CODE_CHALLENGE.into(),
+                state: Some("test-state".into()),
+                resource: s.tokens.audience().to_string(),
+                expires_at: ruum_core::now()
+                    + std::time::Duration::from_secs(REQUEST_SECONDS as u64),
+            };
+            if let Some(request) = step("OAuth request", async move {
+                s2.oauth.start_authorization(req).await
+            })
+            .await
+            {
+                t.oauth_request = request;
+            }
+        }
+        agents_ok
     }
 }
 

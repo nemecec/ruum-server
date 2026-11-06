@@ -235,7 +235,7 @@ impl SharingStore for MemorySharingStore {
             Some(email) => Grantee::Email { email },
             None => grantee,
         };
-        let policy = self.tenants.get(ctx).await?.policy;
+        let policy = self.tenants.find(ctx.tenant).await?.policy;
         match &grantee {
             Grantee::User { id } => {
                 if !is_inside(self.tenants.role_of(ctx.tenant, *id).await?) && !policy.allow_guests
@@ -419,7 +419,7 @@ impl SharingStore for MemorySharingStore {
     ) -> Result<Written<ShareLink>> {
         rules::check_grant(&*self.authz, &*self.nodes, ctx, node, req.role.as_role()).await?;
         let n = self.nodes.get(ctx, node).await?;
-        let policy = self.tenants.get(ctx).await?.policy;
+        let policy = self.tenants.find(ctx.tenant).await?.policy;
         rules::check_new_link(&policy, &req, crate::now())?;
         let token = rules::new_link_token();
         let password_hash = req
@@ -506,7 +506,7 @@ impl SharingStore for MemorySharingStore {
             .cloned()
             .ok_or_else(|| Error::not_found("share link"))?;
         let ctx = rules::link_context(row.tenant, &row.link);
-        let policy = self.tenants.get(&ctx).await?.policy;
+        let policy = self.tenants.find(ctx.tenant).await?.policy;
         if !rules::link_is_open(&policy, &row.link, crate::now()) {
             return Err(Error::not_found("share link"));
         }
@@ -673,4 +673,81 @@ pub(crate) fn is_inside(role: Option<MemberRole>) -> bool {
         role,
         Some(MemberRole::Member | MemberRole::Admin | MemberRole::Owner)
     )
+}
+
+/// The sharing part of `removeMember` and of email binding for the in-memory tenant store (the
+/// Postgres tenant store runs the same steps in its own transaction).
+#[async_trait]
+impl crate::tenants::MemberCleanup for MemorySharingStore {
+    /// Removes the user's direct grants in the tenant and revokes the share links that the user
+    /// or the user's agents made there. Grants the user made for others stay.
+    async fn member_removed(&self, ctx: &Context, user: UserId) -> Result<()> {
+        let tenant = ctx.tenant;
+        let me = Grantee::User { id: user };
+        let made_by = |a: &Actor| {
+            a.on_behalf_of == Some(user)
+                || (a.actor.kind == crate::actor::PrincipalKind::User && a.actor.id.0 == user.0)
+        };
+        let (grants, links) = {
+            let mut st = self.state();
+            let grants: Vec<Grant> = st
+                .grants
+                .iter()
+                .filter(|g| g.tenant == tenant && g.grant.grantee == me)
+                .map(|g| g.grant.clone())
+                .collect();
+            st.grants
+                .retain(|g| !(g.tenant == tenant && g.grant.grantee == me));
+            st.index.retain(|r| !(r.tenant == tenant && r.user == user));
+            let now = crate::now();
+            let mut links = Vec::new();
+            for l in st.links.iter_mut().filter(|l| {
+                l.tenant == tenant && l.link.revoked_at.is_none() && made_by(&l.link.created_by)
+            }) {
+                l.link.revoked_at = Some(now);
+                links.push(l.link.clone());
+            }
+            (grants, links)
+        };
+        let mut updates = Vec::new();
+        for g in &grants {
+            self.journal.append(
+                ctx,
+                NewEntry {
+                    node_id: Some(g.node_id),
+                    revision: None,
+                    event: EventType::GrantRemoved,
+                    data: json!({ "grant_id": g.id, "grantee": g.grantee, "role": g.role }),
+                },
+            )?;
+            updates.push(RelationshipUpdate::Delete(tuples::grant(
+                g.node_id,
+                g.role,
+                tuples::grant_subject_user(user),
+            )));
+        }
+        for l in &links {
+            self.journal.append(
+                ctx,
+                NewEntry {
+                    node_id: Some(l.node_id),
+                    revision: None,
+                    event: EventType::ShareLinkRevoked,
+                    data: json!({ "share_link_id": l.id }),
+                },
+            )?;
+            updates.push(RelationshipUpdate::Delete(tuples::share_link(
+                l.node_id, l.id, l.role,
+            )));
+        }
+        if !updates.is_empty() {
+            self.authz.write(updates).await?;
+        }
+        Ok(())
+    }
+
+    async fn invitation_accepted(&self, ctx: &Context, email: &str, user: UserId) -> Result<()> {
+        self.bind_email_grants(ctx.tenant, email, user).await?;
+        Ok(())
+    }
 }

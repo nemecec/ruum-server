@@ -152,15 +152,15 @@ impl TenantStore for TestTenants {
     async fn list_for_user(&self, _: UserId) -> Result<Vec<(Tenant, MemberRole)>> {
         unimplemented!()
     }
-    async fn create_personal(&self, _: UserId, _: String) -> Result<Tenant> {
-        unimplemented!()
-    }
     async fn create_team(&self, _: &Actor, _: String) -> Result<Tenant> {
         unimplemented!()
     }
     async fn get(&self, ctx: &Context) -> Result<Tenant> {
+        self.find(ctx.tenant).await
+    }
+    async fn find(&self, tenant: TenantId) -> Result<Tenant> {
         Ok(Tenant {
-            id: ctx.tenant,
+            id: tenant,
             name: "test".into(),
             kind: TenantKind::Team,
             plan: Plan::Team,
@@ -170,7 +170,7 @@ impl TenantStore for TestTenants {
                 .policies
                 .read()
                 .unwrap()
-                .get(&ctx.tenant)
+                .get(&tenant)
                 .cloned()
                 .unwrap_or_default(),
             created_at: crate::now(),
@@ -196,7 +196,13 @@ impl TenantStore for TestTenants {
     async fn remove_member(&self, _: &Context, _: UserId) -> Result<()> {
         unimplemented!()
     }
-    async fn invite(&self, _: &Context, _: String, _: MemberRole) -> Result<(Invitation, String)> {
+    async fn invite(
+        &self,
+        _: &Context,
+        _: String,
+        _: MemberRole,
+        _: Option<String>,
+    ) -> Result<(Invitation, String)> {
         unimplemented!()
     }
     async fn list_invitations(&self, _: &Context, _: PageRequest) -> Result<Page<Invitation>> {

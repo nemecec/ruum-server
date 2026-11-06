@@ -36,9 +36,9 @@ async fn health_is_ok() {
 
 #[tokio::test]
 async fn stub_routes_answer_501_with_error_json() {
+    // Only routes of areas that are not built yet (nodes, tags, search, blobs, versions).
     let id = "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a";
     let cases = [
-        (Method::GET, "/v1/me".to_string()),
         (Method::GET, "/v1/nodes/root".to_string()),
         (Method::GET, format!("/v1/nodes/{id}")),
         (
@@ -50,29 +50,11 @@ async fn stub_routes_answer_501_with_error_json() {
         (Method::GET, format!("/v1/nodes/{id}/content")),
         (Method::GET, format!("/v1/nodes/{id}/diff")),
         (Method::PUT, format!("/v1/nodes/{id}/tags/{id}")),
-        (Method::POST, format!("/v1/nodes/{id}/grants")),
-        (Method::GET, "/v1/shared-with-me".to_string()),
-        (Method::GET, "/v1/changes".to_string()),
-        (Method::POST, format!("/v1/agents/{id}/undo")),
-        (Method::POST, "/v1/oauth/token".to_string()),
-        (Method::POST, "/v1/oauth/register".to_string()),
-        (Method::GET, "/v1/oauth/authorize".to_string()),
-        (Method::POST, "/v1/oauth/consent".to_string()),
-        (
-            Method::GET,
-            "/.well-known/oauth-protected-resource".to_string(),
-        ),
         (Method::DELETE, format!("/v1/nodes/{id}")),
         (Method::POST, "/v1/trash/empty".to_string()),
         (Method::GET, "/v1/uploads/params?size=1".to_string()),
         (Method::GET, format!("/v1/nodes/{id}/content-url")),
-        (Method::PATCH, format!("/v1/nodes/{id}/grants/{id}")),
-        (Method::GET, format!("/v1/tenants/{id}/audit")),
         (Method::GET, "/v1/search?q=garden".to_string()),
-        (Method::PATCH, format!("/v1/nodes/{id}/sharing")),
-        (Method::GET, "/v1/me/app-passwords".to_string()),
-        (Method::POST, "/v1/me/app-passwords".to_string()),
-        (Method::DELETE, format!("/v1/me/app-passwords/{id}")),
     ];
     for (method, uri) in cases {
         let (status, body) = call(method.clone(), &uri).await;
