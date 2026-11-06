@@ -269,46 +269,6 @@ async fn subtree(
         .collect()
 }
 
-/// Copies the head version of `head` to a new version of `target` in the caller's transaction:
-/// the same manifest, so the chunks are shared and no bytes are copied. The new version records
-/// the caller as actor. Returns the new version.
-///
-/// TODO(integrator): this writes the `versions` table of the blobs and versions area. When that
-/// area has a Postgres store, it may own this function (same signature) and add its version
-/// policy; the node store only needs the new version ID in the same transaction.
-pub async fn copy_head_version(
-    conn: &mut PgConnection,
-    ctx: &Context,
-    head: VersionId,
-    target: NodeId,
-) -> Result<VersionId> {
-    let id = VersionId::new();
-    let n = sqlx::query(
-        "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
-             content_hash, content_type, actor_kind, actor, on_behalf_of) \
-         select $3, tenant_id, $4, manifest, encoding, size_bytes, content_hash, content_type, \
-             $5, $6, $7 \
-         from versions where tenant_id = $1 and id = $2",
-    )
-    .bind(ctx.tenant.0)
-    .bind(head.0)
-    .bind(id.0)
-    .bind(target.0)
-    .bind(ctx.actor.actor.kind)
-    .bind(ctx.actor.actor.id.0)
-    .bind(ctx.actor.on_behalf_of.map(|u| u.0))
-    .execute(conn)
-    .await?
-    .rows_affected();
-    if n == 0 {
-        return Err(Error::Internal(format!(
-            "nodes: the head version {} is missing",
-            head.0
-        )));
-    }
-    Ok(id)
-}
-
 fn from_micros(t: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(t) * 1000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
@@ -1073,7 +1033,7 @@ impl NodeStore for PgNodeStore {
                 node_type: src.node_type.clone(),
                 link_kind,
                 link_target: src.link_target,
-                head_version: src.head_version.map(|_| VersionId::new()),
+                head_version: None,
                 owner_id: owner,
                 size_bytes: src.size_bytes,
                 revision: 1,
@@ -1087,19 +1047,10 @@ impl NodeStore for PgNodeStore {
                 editors_can_share: None,
                 editors_can_share_effective: None,
             };
-            // The node first (its head version is checked at the commit), then the version.
+            // The node first without content; the version follows after the node entries.
             let mut ins = node.clone();
             ins.head_version = None;
             Self::insert(&mut t, &ins).await?;
-            if let (Some(head), Some(_)) = (src.head_version, node.head_version) {
-                let v = copy_head_version(&mut t.tx, ctx, head, new_id).await?;
-                sqlx::query("update nodes set head_version = $3 where tenant_id = $1 and id = $2")
-                    .bind(ctx.tenant.0)
-                    .bind(new_id.0)
-                    .bind(v.0)
-                    .execute(&mut *t.tx)
-                    .await?;
-            }
             made.push((node, src.id));
         }
         for (node, src) in made.iter().skip(1) {
@@ -1123,6 +1074,13 @@ impl NodeStore for PgNodeStore {
             rules::copied_data(id, req.parent_id, &root_name, made.len()),
         )
         .await?;
+        // Each copied file gets one version with the head of its source (shared chunks), the
+        // `version.created` entry and the new head, in this transaction (the versions area).
+        for (src, (node, _)) in sources.iter().zip(made.iter()) {
+            if src.head_version.is_some() {
+                crate::blobs::postgres::copy_head(&mut t.tx, ctx, src.id, node.id).await?;
+            }
+        }
         for (node, _) in &made {
             t.updates.extend(rules::created_tuples(node));
         }

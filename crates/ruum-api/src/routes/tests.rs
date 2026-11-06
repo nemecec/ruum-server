@@ -35,8 +35,9 @@ async fn health_is_ok() {
 }
 
 #[tokio::test]
-async fn stub_routes_answer_501_with_error_json() {
-    // Only routes of areas that are not built yet (blobs, versions).
+async fn built_routes_answer_with_error_json_not_501() {
+    // Every area is built: the routes that answered 501 before now answer with their own
+    // error (here 401, no credentials), never 501.
     let id = "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a";
     let cases = [
         (Method::PUT, format!("/v1/uploads/{id}/chunks/abc")),
@@ -44,11 +45,22 @@ async fn stub_routes_answer_501_with_error_json() {
         (Method::GET, format!("/v1/nodes/{id}/diff")),
         (Method::GET, "/v1/uploads/params?size=1".to_string()),
         (Method::GET, format!("/v1/nodes/{id}/content-url")),
+        (Method::GET, "/v1/nodes/root".to_string()),
+        (Method::GET, format!("/v1/nodes/{id}")),
+        (
+            Method::GET,
+            "/v1/nodes/by-path/Projects/Garden/plan.txt".to_string(),
+        ),
+        (Method::POST, format!("/v1/nodes/{id}/move")),
+        (Method::PUT, format!("/v1/nodes/{id}/tags/{id}")),
+        (Method::DELETE, format!("/v1/nodes/{id}")),
+        (Method::POST, "/v1/trash/empty".to_string()),
+        (Method::GET, "/v1/search?q=garden".to_string()),
     ];
     for (method, uri) in cases {
         let (status, body) = call(method.clone(), &uri).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
-        assert_eq!(body["error"]["code"], "not_implemented", "{method} {uri}");
+        assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        assert!(body["error"]["code"].is_string(), "{method} {uri}");
         assert!(body["error"]["message"].is_string(), "{method} {uri}");
     }
 }

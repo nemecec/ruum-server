@@ -363,6 +363,19 @@ fn touch(node: &mut Node, ctx: &Context) {
     node.updated_by = ctx.actor;
 }
 
+#[async_trait]
+impl crate::versions::HeadUpdate for MemoryNodeStore {
+    async fn set_head(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        version: VersionId,
+        size_bytes: i64,
+    ) -> Result<Node> {
+        MemoryNodeStore::set_head(self, ctx, node, Some(version), size_bytes)
+    }
+}
+
 impl RootCreated for MemoryNodeStore {
     fn root_created(&self, tenant: &Tenant, owner: UserId) {
         let actor = Actor::user(owner);
@@ -826,17 +839,6 @@ impl NodeStore for MemoryNodeStore {
                 made.push((node, src.id));
             }
         }
-        if let Some(content) = content {
-            for (src, (node, _)) in sources.iter().zip(made.iter_mut()) {
-                if src.head_version.is_some() {
-                    let head = content.copy_head(ctx, src, node.id).await?;
-                    let mut st = self.st();
-                    let r = st.row_mut(ctx.tenant, node.id)?;
-                    r.node.head_version = head;
-                    node.head_version = head;
-                }
-            }
-        }
         let mut updates = Vec::new();
         for (node, src) in made.iter().skip(1) {
             self.append(
@@ -859,6 +861,19 @@ impl NodeStore for MemoryNodeStore {
             updates.extend(rules::created_tuples(node));
         }
         self.relate(updates).await?;
+        // The content after the node entries: each copied file gets one version with the head
+        // of its source (shared chunks) and its own `version.created` entry.
+        if let Some(content) = content {
+            for (src, (node, _)) in sources.iter().zip(made.iter()) {
+                if src.head_version.is_some() {
+                    let head = content.copy_head(ctx, src, node.id).await?;
+                    let mut st = self.st();
+                    let r = st.row_mut(ctx.tenant, node.id)?;
+                    r.node.head_version = head;
+                }
+            }
+        }
+        let root = self.row(ctx.tenant, root.id)?.node;
         Ok(Written {
             value: self.out(ctx, root).await?,
             change,

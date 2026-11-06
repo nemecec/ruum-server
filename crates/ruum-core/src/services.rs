@@ -11,8 +11,8 @@ use crate::agents::{
 use crate::audit::{AuditLog, memory::MemoryAuditLog};
 use crate::authz::{Authz, memory::MemoryAuthz};
 use crate::blobs::{
-    BlobStore, Transfers,
-    memory::{MemoryBlobStore, MemoryTransfers},
+    BlobStore, ContentSigner, Transfers,
+    memory::{ContentDeps, MemoryBlobStore, MemoryContentStore},
 };
 use crate::identity::{
     IdentityStore, OidcClient, TokenIssuer,
@@ -25,10 +25,7 @@ use crate::search::{Search, memory::MemorySearch};
 use crate::sharing::{SharingStore, memory::MemorySharingStore};
 use crate::tags::{TagStore, memory::MemoryTagStore};
 use crate::tenants::{TenantStore, memory::MemoryTenantStore};
-use crate::versions::{
-    DiffService, VersionStore,
-    memory::{MemoryDiffService, MemoryVersionStore},
-};
+use crate::versions::{DiffService, PluginDiffService, VersionStore};
 use std::sync::Arc;
 
 /// All module implementations, behind their traits.
@@ -96,6 +93,27 @@ impl Services {
             nodes.clone(),
             tags.clone(),
         ));
+        // The content store (uploads, downloads, versions). The node store is `heads`
+        // (`versions::HeadUpdate`), so a new version sets the file's `head_version` and
+        // `size_bytes`; the content store copies the head of a file for `copyNode`.
+        let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let content = Arc::new(MemoryContentStore::new(
+            ContentDeps {
+                nodes: nodes.clone(),
+                authz: authz.clone(),
+                journal: journal.clone(),
+                blobs: blobs.clone(),
+                tenants: Some(tenants.clone()),
+                heads: Some(nodes.clone()),
+            },
+            ContentSigner::random(),
+        ));
+        nodes.set_content_copy(content.clone());
+        let diffs = Arc::new(PluginDiffService::new(
+            nodes.clone(),
+            content.clone(),
+            content.clone(),
+        ));
         Self {
             tenants,
             identity: Arc::new(MemoryIdentityStore::new(area.clone())),
@@ -104,10 +122,10 @@ impl Services {
             agents: Arc::new(MemoryAgentStore::new(area.clone())),
             oauth: Arc::new(MemoryOAuthServer::new(area)),
             nodes,
-            blobs: Arc::new(MemoryBlobStore::default()),
-            transfers: Arc::new(MemoryTransfers::default()),
-            versions: Arc::new(MemoryVersionStore::default()),
-            diffs: Arc::new(MemoryDiffService::default()),
+            blobs,
+            transfers: content.clone(),
+            versions: content,
+            diffs,
             tags,
             authz,
             sharing,

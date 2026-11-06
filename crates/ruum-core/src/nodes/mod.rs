@@ -255,8 +255,7 @@ pub fn split_path(path: &str) -> Result<Vec<String>> {
 /// copied. Returns the new version, or `None` when `source` has no head version.
 ///
 /// The in-memory node store calls it through [`memory::MemoryNodeStore::set_content_copy`]; the
-/// Postgres node store copies the `versions` row in its own transaction
-/// ([`postgres::copy_head_version`]).
+/// Postgres node store calls [`crate::blobs::postgres::copy_head`] in its own transaction.
 #[async_trait]
 pub trait ContentCopy: Send + Sync {
     async fn copy_head(
