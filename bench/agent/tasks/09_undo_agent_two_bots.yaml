@@ -1,0 +1,35 @@
+# Undo one of two agents (decision 0003-5, C-7): Alice has two agents in the same folder. The
+# outside agent must tell them apart by name (actor.display_name in list_changes, or the actor
+# filter) and revert only what "Sorter bot" did, keeping the work of "Tidy bot" and of Alice.
+id: undo_agent_two_bots
+title: Undo what Sorter bot did, keep what Tidy bot did
+kind: normal
+persona: alice
+prompt: |
+  Two of my agents worked in my Notes folder today. "Sorter bot" made a mess; "Tidy bot" did
+  good work. Undo everything that Sorter bot did today, and keep what Tidy bot and I did.
+setup:
+  - { file: Notes/meeting.txt, content: "Meeting with Mari on Monday\n", save: meeting }
+  - { file: Notes/todo.txt, content: "- water the plants\n", save: todo }
+  - { file: Notes/ideas.txt, content: "Rain barrel\n", save: ideas }
+  - { file: Notes/draft.txt, content: "draft\n", save: draft }
+  - { folder: Archive }
+  - { agent: Sorter bot, as: alice }
+  - { agent: Tidy bot, as: alice }
+  - { as: Sorter bot, rename: Notes/todo.txt, name: TODO-final.txt }
+  - { as: Tidy bot, move: Notes/draft.txt, to: Archive }
+  - { as: Sorter bot, move: Notes/ideas.txt, to: Archive }
+  - { as: Tidy bot, file: Notes/summary.txt, content: "Summary of the week\n", save: summary }
+  - { as: Sorter bot, write: Notes/meeting.txt, content: "MEETING\n" }
+  - { file: Notes/call-mari.txt, content: "Call Mari about the garden\n", save: call }
+check:
+  - { what: todo.txt has its old name again, path: todo, equals: Notes/todo.txt }
+  - { what: ideas.txt is back in Notes, path: ideas, equals: Notes/ideas.txt }
+  - { what: meeting.txt has its old content, content: { node: meeting }, equals: "Meeting with Mari on Monday\n" }
+  - { what: Tidy bot's move of draft.txt is kept, path: draft, equals: Archive/draft.txt }
+  - { what: Tidy bot's new file summary.txt is kept, path: summary, equals: Notes/summary.txt }
+  - { what: Alice's own new file call-mari.txt is kept, path: call, equals: Notes/call-mari.txt }
+reference:
+  - { rename: Notes/TODO-final.txt, name: todo.txt }
+  - { move: Archive/ideas.txt, to: Notes }
+  - { restore_version: Notes/meeting.txt, version: 1 }
