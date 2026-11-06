@@ -89,18 +89,16 @@ impl PgArea {
     }
 
     /// Applies an outbox row after the commit, when the store has a relationship engine.
+    ///
+    /// It runs `authz::outbox::apply_after_commit`: a new transaction that sets `ruum.tenant_id`
+    /// for that transaction only and holds the row locks until the engine has the changes, so the
+    /// outbox worker cannot send an older row again after a newer one (a revocation is never
+    /// undone by a late grant). An engine failure is recorded on the row and the worker tries
+    /// again; the write itself is committed, so it is not an error of the request.
     pub(crate) async fn apply(&self, outbox: Option<(TenantId, i64)>) -> Result<()> {
         if let (Some((tenant, id)), Some(authz)) = (outbox, &self.authz) {
-            let mut conn = self.pool.acquire().await?;
-            sqlx::query("select set_config('ruum.tenant_id', $1, false)")
-                .bind(tenant.to_string())
-                .execute(&mut *conn)
-                .await?;
-            let r = crate::authz::outbox::apply(&mut conn, authz.as_ref(), tenant, id).await;
-            sqlx::query("select set_config('ruum.tenant_id', '', false)")
-                .execute(&mut *conn)
-                .await?;
-            r?;
+            crate::authz::outbox::apply_after_commit(&self.pool, authz.as_ref(), tenant, &[id])
+                .await;
         }
         Ok(())
     }
@@ -878,5 +876,129 @@ impl IdempotencyStore for PgIdempotencyStore {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::authz::memory::MemoryAuthz;
+    use crate::authz::{ConsistencyToken, ObjectRef, Relationship, SubjectRef};
+    use tokio::sync::Notify;
+
+    /// An engine whose writes wait until the test lets them go.
+    #[derive(Default)]
+    struct Gate {
+        inner: MemoryAuthz,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl Authz for Gate {
+        async fn check(
+            &self,
+            subject: &SubjectRef,
+            permission: &str,
+            object: &ObjectRef,
+            at_least: Option<&ConsistencyToken>,
+        ) -> Result<bool> {
+            self.inner
+                .check(subject, permission, object, at_least)
+                .await
+        }
+        async fn check_bulk(
+            &self,
+            subject: &SubjectRef,
+            permission: &str,
+            objects: &[ObjectRef],
+        ) -> Result<Vec<bool>> {
+            self.inner.check_bulk(subject, permission, objects).await
+        }
+        async fn write(&self, updates: Vec<RelationshipUpdate>) -> Result<ConsistencyToken> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.write(updates).await
+        }
+        async fn read(&self, object: &ObjectRef) -> Result<Vec<Relationship>> {
+            self.inner.read(object).await
+        }
+    }
+
+    async fn tenant_tx(pool: &PgPool, t: TenantId) -> Transaction<'static, Postgres> {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("select set_config('ruum.tenant_id', $1, true)")
+            .bind(t.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx
+    }
+
+    /// `PgArea::apply` keeps the outbox row locked until the engine has the change (the rule of
+    /// `authz::outbox::apply`), so the outbox worker cannot send the same row again after a newer
+    /// one; and it leaves no tenant setting on a pooled connection.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn apply_holds_the_outbox_row_until_the_engine_has_it(pool: PgPool) {
+        let t = TenantId::new();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into tenants (id, name, kind, created_kind, created_by) \
+             values ($1, 'test', 'personal', 'user', $2)",
+        )
+        .bind(t.0)
+        .bind(Uuid::now_v7())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = tenant_tx(&pool, t).await;
+        let update = RelationshipUpdate::Touch(Relationship {
+            object: ObjectRef::new("node", "n1"),
+            relation: "viewer".into(),
+            subject: SubjectRef::object(ObjectRef::new("user", "u1")),
+        });
+        let id = crate::authz::outbox::enqueue(&mut tx, t, &[update])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let gate = Arc::new(Gate::default());
+        let mut area = PgArea::new(
+            pool.clone(),
+            Arc::new(super::super::memory::MemoryTokenIssuer::default()),
+        );
+        area.authz = Some(gate.clone());
+        let task = tokio::spawn(async move { area.apply(Some((t, id))).await });
+        gate.entered.notified().await;
+        // While the engine write runs, the row is locked: the worker cannot take it.
+        let mut tx = tenant_tx(&pool, t).await;
+        let r = sqlx::query(
+            "select id from authz_outbox where tenant_id = $1 and id = $2 for update nowait",
+        )
+        .bind(t.0)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await;
+        assert!(
+            matches!(&r, Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("55P03")),
+            "the outbox row was not locked during the engine write: {r:?}"
+        );
+        drop(tx);
+        gate.release.notify_one();
+        task.await.unwrap().unwrap();
+        assert_eq!(crate::authz::outbox::pending_count(&pool).await.unwrap(), 0);
+        // No pooled connection keeps a tenant setting.
+        let mut conn = pool.acquire().await.unwrap();
+        let v: Option<String> =
+            sqlx::query_scalar("select current_setting('ruum.tenant_id', true)")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert!(v.unwrap_or_default().is_empty());
     }
 }
