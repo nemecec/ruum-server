@@ -2196,11 +2196,15 @@ name = "ruum-testkit"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
+ "http-body-util",
  "ruum-api",
  "ruum-core",
  "serde_json",
  "sqlx",
  "tokio",
+ "tower",
+ "tower-http 0.7.1",
  "uuid",
 ]
 

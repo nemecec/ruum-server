@@ -1,0 +1,62 @@
+# Nightly checks of docs/DESIGN.md, section 18.5: mutation checks, the full end-to-end suite on
+# staging and a restore test of the backups.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.99"
+
+jobs:
+  mutation-check:
+    name: mutation check of the security suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      # Not strict while handlers answer 501: survived and placeholder mutations are warnings.
+      # Set the repository variable MUTATION_STRICT=1 when step 1 is complete.
+      - name: Break each security rule in a copy; the suites must fail
+        env:
+          MUTATION_STRICT: ${{ vars.MUTATION_STRICT || '0' }}
+          RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
+        run: crates/ruum-testkit/scripts/mutation_check.sh
+
+  progress:
+    name: security suites with RUUM_REQUIRE_IMPLEMENTED=1 (progress report)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: List the operations that are not implemented yet
+        env:
+          RUUM_REQUIRE_IMPLEMENTED: "1"
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions -- --nocapture
+
+  e2e-staging:
+    name: full end-to-end suite on staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "::notice::No staging environment yet (design section 13). Add the full e2e run here."
+
+  restore-test:
+    name: restore test of the backups
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "::notice::No backups yet (design section 5.2). Add the restore test here."

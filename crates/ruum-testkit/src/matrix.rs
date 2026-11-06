@@ -31,6 +31,24 @@ pub const USER_ONLY_OPERATIONS: &[&str] = &[
     "oauthConsent",
 ];
 
+/// The operations that a share-link bearer may call (the `Users only` section of
+/// `contracts/openapi.yaml`): the node, content, version and diff reads, inside the link's
+/// subtree. An `edit` link may also call `putContent` and the upload operations; the fixture link
+/// is a `view` link, so they are not listed. Every other operation that needs sign-in answers
+/// `403 user_required` to a share-link bearer.
+pub const SHARE_LINK_OPERATIONS: &[&str] = &[
+    "getRoot",
+    "getNode",
+    "getNodeByPath",
+    "listChildren",
+    "downloadContent",
+    "getContentUrl",
+    "listVersions",
+    "getVersion",
+    "diffVersions",
+    "listDiffPlugins",
+];
+
 /// One case of the permission suite.
 #[derive(Clone, Copy, Debug)]
 pub struct Case {
