@@ -504,4 +504,210 @@ mod tests {
             .unwrap();
         assert_eq!(late, Some(20_000));
     }
+
+    // ------------------------------------------------------------ inverses of area 1
+
+    use crate::nodes::{CopyRequest, NewNode, NodeKind, OnConflict as Oc};
+
+    /// A user with a personal tenant in fresh in-memory services, and the user's context.
+    async fn personal() -> (Services, Context, NodeId) {
+        let s = Services::in_memory();
+        let login = crate::identity::VerifiedLogin {
+            issuer: "https://idp.ruum.test".into(),
+            subject: format!("undo-{}", Uuid::now_v7()),
+            email: Some(format!("undo-{}@example.test", Uuid::now_v7())),
+            email_verified: true,
+            name: Some("Undo".into()),
+            id_token: None,
+        };
+        let user = s.identity.upsert_from_login(&login).await.unwrap();
+        let (tenant, _) = s.tenants.list_for_user(user.id).await.unwrap().remove(0);
+        let ctx = Context {
+            tenant: tenant.id,
+            actor: Actor::user(user.id),
+            scope: None,
+            idempotency_key: None,
+        };
+        (s, ctx, tenant.root_node_id)
+    }
+
+    fn new_node(parent: NodeId, name: &str, kind: NodeKind) -> NewNode {
+        NewNode {
+            parent_id: parent,
+            name: name.into(),
+            kind,
+            node_type: None,
+            link: None,
+            on_conflict: Oc::Fail,
+        }
+    }
+
+    /// The newest journal entry of the tenant.
+    async fn last(s: &Services, ctx: &Context) -> JournalEntry {
+        let latest = s.journal.latest_seq(ctx).await.unwrap();
+        s.journal
+            .read(ctx, Some(latest - 1), 1)
+            .await
+            .unwrap()
+            .items
+            .remove(0)
+    }
+
+    /// Inverts the newest entry, which must be of type `event`.
+    async fn undo_last(s: &Services, ctx: &Context, event: EventType) -> Option<ChangeInfo> {
+        let e = last(s, ctx).await;
+        assert_eq!(e.event, event);
+        invert(s, ctx, &e).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_events_are_inverted() {
+        let (s, ctx, root) = personal().await;
+        let n = &s.nodes;
+
+        // node.created -> trash.
+        let a = n
+            .create(&ctx, new_node(root, "A", NodeKind::Folder))
+            .await
+            .unwrap()
+            .value;
+        assert!(undo_last(&s, &ctx, EventType::NodeCreated).await.is_some());
+        assert!(n.get(&ctx, a.id).await.unwrap().trashed_at.is_some());
+
+        // node.trashed -> restore.
+        assert!(undo_last(&s, &ctx, EventType::NodeTrashed).await.is_some());
+        assert!(n.get(&ctx, a.id).await.unwrap().trashed_at.is_none());
+
+        // node.restored -> trash; then restore it again for the next steps.
+        assert!(undo_last(&s, &ctx, EventType::NodeRestored).await.is_some());
+        n.restore(&ctx, a.id, Default::default()).await.unwrap();
+
+        // node.renamed -> the old name.
+        let f = n
+            .create(&ctx, new_node(a.id, "f.txt", NodeKind::File))
+            .await
+            .unwrap()
+            .value;
+        n.rename(&ctx, f.id, "g.txt".into(), Oc::Fail, None)
+            .await
+            .unwrap();
+        assert!(undo_last(&s, &ctx, EventType::NodeRenamed).await.is_some());
+        assert_eq!(n.get(&ctx, f.id).await.unwrap().name, "f.txt");
+
+        // node.moved -> the old parent and name.
+        let b = n
+            .create(&ctx, new_node(root, "B", NodeKind::Folder))
+            .await
+            .unwrap()
+            .value;
+        n.move_node(
+            &ctx,
+            f.id,
+            MoveRequest {
+                parent_id: b.id,
+                name: Some("h.txt".into()),
+                on_conflict: Oc::Fail,
+                if_revision: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(undo_last(&s, &ctx, EventType::NodeMoved).await.is_some());
+        let back = n.get(&ctx, f.id).await.unwrap();
+        assert_eq!((back.parent_id, back.name.as_str()), (Some(a.id), "f.txt"));
+
+        // node.copied -> the copy goes to the trash (with its subtree).
+        let copy = n
+            .copy(
+                &ctx,
+                a.id,
+                CopyRequest {
+                    parent_id: b.id,
+                    name: None,
+                    on_conflict: Oc::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        assert!(undo_last(&s, &ctx, EventType::NodeCopied).await.is_some());
+        assert!(n.get(&ctx, copy.id).await.unwrap().trashed_at.is_some());
+        // The node.created entries of the copied children: trashing a node that is already in
+        // the trash is a no-op, so undoing them all (newest first) needs no special case.
+        let child = s
+            .journal
+            .read(&ctx, None, 1000)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.event == EventType::NodeCreated
+                    && e.data.get("copied_from").is_some_and(|v| !v.is_null())
+            })
+            .unwrap();
+        let c = invert(&s, &ctx, &child).await.unwrap().unwrap();
+        assert!(c.seq.is_none());
+
+        // node.purged has no inverse.
+        n.purge(&ctx, copy.id).await.unwrap();
+        assert!(undo_last(&s, &ctx, EventType::NodePurged).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tag_events_are_inverted() {
+        let (s, ctx, root) = personal().await;
+        let f = s
+            .nodes
+            .create(&ctx, new_node(root, "f.txt", NodeKind::File))
+            .await
+            .unwrap()
+            .value;
+        let tag = s
+            .tags
+            .create(&ctx, "Garden".into(), None)
+            .await
+            .unwrap()
+            .value;
+
+        // tag.attached -> detach.
+        s.tags.attach(&ctx, f.id, tag.id).await.unwrap();
+        assert!(undo_last(&s, &ctx, EventType::TagAttached).await.is_some());
+        assert!(s.tags.tags_of(&ctx, f.id).await.unwrap().is_empty());
+
+        // tag.detached -> attach.
+        assert!(undo_last(&s, &ctx, EventType::TagDetached).await.is_some());
+        let ids: Vec<TagId> = s
+            .tags
+            .tags_of(&ctx, f.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec![tag.id]);
+    }
+
+    #[tokio::test]
+    async fn an_inverse_on_a_changed_node_is_refused() {
+        let (s, ctx, root) = personal().await;
+        let n = &s.nodes;
+        let f = n
+            .create(&ctx, new_node(root, "f.txt", NodeKind::File))
+            .await
+            .unwrap()
+            .value;
+        n.rename(&ctx, f.id, "g.txt".into(), Oc::Fail, None)
+            .await
+            .unwrap();
+        let renamed = last(&s, &ctx).await;
+        // The old name is taken meanwhile: the inverse fails with a conflict
+        // (`changed_later` in the undo report).
+        n.create(&ctx, new_node(root, "F.TXT", NodeKind::File))
+            .await
+            .unwrap();
+        let err = invert(&s, &ctx, &renamed).await.unwrap_err();
+        assert_eq!(err.to_api().code, ErrorCode::NameTaken);
+    }
 }

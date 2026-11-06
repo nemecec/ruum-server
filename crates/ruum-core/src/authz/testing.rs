@@ -57,6 +57,9 @@ impl TreeNodes {
                 created_by: Actor::user(owner),
                 updated_by: Actor::user(owner),
                 my_role: None,
+                my_can_share: None,
+                editors_can_share: None,
+                editors_can_share_effective: None,
             },
         );
     }

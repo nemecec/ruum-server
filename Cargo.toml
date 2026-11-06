@@ -55,6 +55,8 @@ uuid = { version = "1.29", features = ["v7", "serde"] }
 time = { version = "0.3.55", features = ["serde", "serde-well-known", "macros"] }
 thiserror = "2.0.21"
 anyhow = "1.0.104"
+# Unicode NFC of node names (the SQL check `name is nfc normalized`).
+unicode-normalization = "0.1.26"
 
 # Observability
 tracing = "0.1.44"

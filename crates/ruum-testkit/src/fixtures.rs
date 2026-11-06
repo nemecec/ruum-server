@@ -759,6 +759,30 @@ mod seed {
             {
                 t.v2 = v2;
             }
+        } else {
+            // The blobs area is not built yet: the plan is an empty file without versions, so
+            // the node, tag and search operations still have their file (v1 and v2 keep their
+            // placeholder IDs).
+            let (s2, c, req) = (
+                s.clone(),
+                owner_ctx.clone(),
+                NewNode {
+                    parent_id: t.projects,
+                    name: t.plan_name.clone(),
+                    kind: NodeKind::File,
+                    node_type: Some("text/plain".into()),
+                    link: None,
+                    on_conflict: OnConflict::Fail,
+                },
+            );
+            if let Some(n) = step(
+                "plan (empty)",
+                async move { s2.nodes.create(&c, req).await },
+            )
+            .await
+            {
+                t.plan = n.value.id;
+            }
         }
         // The old file, in the trash.
         let (s2, c, req) = (

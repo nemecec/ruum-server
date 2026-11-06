@@ -36,25 +36,14 @@ async fn health_is_ok() {
 
 #[tokio::test]
 async fn stub_routes_answer_501_with_error_json() {
-    // Only routes of areas that are not built yet (nodes, tags, search, blobs, versions).
+    // Only routes of areas that are not built yet (blobs, versions).
     let id = "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a";
     let cases = [
-        (Method::GET, "/v1/nodes/root".to_string()),
-        (Method::GET, format!("/v1/nodes/{id}")),
-        (
-            Method::GET,
-            "/v1/nodes/by-path/Projects/Garden/plan.txt".to_string(),
-        ),
-        (Method::POST, format!("/v1/nodes/{id}/move")),
         (Method::PUT, format!("/v1/uploads/{id}/chunks/abc")),
         (Method::GET, format!("/v1/nodes/{id}/content")),
         (Method::GET, format!("/v1/nodes/{id}/diff")),
-        (Method::PUT, format!("/v1/nodes/{id}/tags/{id}")),
-        (Method::DELETE, format!("/v1/nodes/{id}")),
-        (Method::POST, "/v1/trash/empty".to_string()),
         (Method::GET, "/v1/uploads/params?size=1".to_string()),
         (Method::GET, format!("/v1/nodes/{id}/content-url")),
-        (Method::GET, "/v1/search?q=garden".to_string()),
     ];
     for (method, uri) in cases {
         let (status, body) = call(method.clone(), &uri).await;

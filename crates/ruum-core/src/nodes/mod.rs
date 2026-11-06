@@ -10,8 +10,23 @@
 //! - `owner_id` is the creator, for display and accounting; it gives no rights.
 //! - Every write appends a journal entry in the same transaction
 //!   ([`crate::journal::postgres::append`] in the Postgres implementation).
+//! - Writing a `collection` tuple (a member link in a folder) needs `share` on the target: when a
+//!   member link is made, or moved into another folder. A copy of a member link by a caller
+//!   without `share` on the target becomes a shortcut. Trash deletes the tuple; restore brings
+//!   it back; purge of the link or of the target deletes it.
+//! - Trash (section 5.2): members with `manage` see and restore a trashed root for the plan's
+//!   `trash_days`; tenant admins until `admin_restore_days`. Purge needs `manage`, and on plans
+//!   where `admin_restore_days > trash_days` (team plans) also the tenant role `admin`.
+//!   Trashing a node that is already in the trash is a no-op (no journal entry).
+//! - Node responses fill `my_role`, `my_can_share` and `editors_can_share_effective`
+//!   ([`rules::decorate`]).
 
 pub mod memory;
+pub mod postgres;
+pub mod rules;
+
+#[cfg(test)]
+mod conformance;
 
 use crate::actor::{Actor, Context};
 use crate::authz::Role;
@@ -81,6 +96,31 @@ pub struct Node {
     /// The caller's effective role on the node (after the scope), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_role: Option<Role>,
+    /// Whether the caller has the `share` permission on the node (after the scope). Set when
+    /// `my_role` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_can_share: Option<bool>,
+    /// The node setting `editors_can_share` (`nodes.editors_can_share`); `None` inherits.
+    #[serde(default)]
+    pub editors_can_share: Option<bool>,
+    /// `editors_can_share` after inheritance, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editors_can_share_effective: Option<bool>,
+}
+
+impl Node {
+    /// The `ETag` of the node: `"<revision>"`.
+    pub fn etag(&self) -> String {
+        format!("\"{}\"", self.revision)
+    }
+
+    /// Drops the fields that depend on the caller (`my_role` and the like).
+    pub fn without_caller_fields(mut self) -> Self {
+        self.my_role = None;
+        self.my_can_share = None;
+        self.editors_can_share_effective = None;
+        self
+    }
 }
 
 /// What to do when the name is taken.
@@ -155,16 +195,76 @@ pub struct RestoreRequest {
     pub if_revision: Option<i64>,
 }
 
+/// The name of the root folder of every tenant.
+pub const ROOT_NAME: &str = "root";
+
+fn invalid_name(message: impl Into<String>) -> crate::error::Error {
+    crate::error::Error::Api(
+        crate::error::ApiError::new(crate::error::ErrorCode::ValidationFailed, message).with_hint(
+            "a name is 1 to 255 characters, without `/` or NUL, not `.` or `..`, and \
+                 without leading or trailing spaces",
+        ),
+    )
+}
+
 /// Normalizes a node name to NFC and checks it: not empty, at most [`MAX_NAME_CHARS`]
 /// characters after NFC, no `/`, no NUL, not `.` or `..`, no leading or trailing spaces.
 /// Returns the normalized name, which is the one to store and to compare.
-pub fn validate_name(_name: &str) -> Result<String> {
-    todo!("nodes: validate_name")
+pub fn validate_name(name: &str) -> Result<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let nfc: String = name.nfc().collect();
+    if nfc.is_empty() {
+        return Err(invalid_name("the name is empty"));
+    }
+    if nfc.chars().count() > MAX_NAME_CHARS {
+        return Err(invalid_name(format!(
+            "the name is longer than {MAX_NAME_CHARS} characters"
+        )));
+    }
+    if nfc.contains('/') || nfc.contains('\0') {
+        return Err(invalid_name("the name contains `/` or NUL"));
+    }
+    if nfc == "." || nfc == ".." {
+        return Err(invalid_name("the name cannot be `.` or `..`"));
+    }
+    if nfc.starts_with(char::is_whitespace) || nfc.ends_with(char::is_whitespace) {
+        return Err(invalid_name("the name starts or ends with a space"));
+    }
+    if nfc.chars().any(char::is_control) {
+        return Err(invalid_name("the name contains a control character"));
+    }
+    Ok(nfc)
+}
+
+/// The key that makes names unique in a folder: the lower case of the NFC name. The same as
+/// `lower(name)` of the unique index `nodes_live_name_key`.
+pub fn name_key(name: &str) -> String {
+    name.to_lowercase()
 }
 
 /// Splits a display path (`Projects/Garden`) into names. Empty segments are ignored.
-pub fn split_path(_path: &str) -> Result<Vec<String>> {
-    todo!("nodes: split_path")
+pub fn split_path(path: &str) -> Result<Vec<String>> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(validate_name)
+        .collect()
+}
+
+/// What the nodes area asks of the versions area when it copies a file (`copyNode`): one new
+/// version of `target` with the head content of `source`. The chunks are shared; no bytes are
+/// copied. Returns the new version, or `None` when `source` has no head version.
+///
+/// The in-memory node store calls it through [`memory::MemoryNodeStore::set_content_copy`]; the
+/// Postgres node store copies the `versions` row in its own transaction
+/// ([`postgres::copy_head_version`]).
+#[async_trait]
+pub trait ContentCopy: Send + Sync {
+    async fn copy_head(
+        &self,
+        ctx: &Context,
+        source: &Node,
+        target: NodeId,
+    ) -> Result<Option<VersionId>>;
 }
 
 /// The node tree. Every method filters by `ctx.tenant` and checks permissions through

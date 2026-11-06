@@ -62,12 +62,11 @@ impl Services {
         // stores take them so), and shared.
         let tokens: Arc<dyn TokenIssuer> = Arc::new(MemoryTokenIssuer::default());
         let authz = Arc::new(MemoryAuthz::default());
-        let nodes = Arc::new(MemoryNodeStore::default());
         let journal = Arc::new(MemoryJournal::default());
+        let nodes = Arc::new(MemoryNodeStore::new(authz.clone(), journal.clone()));
         let audit = Arc::new(MemoryAuditLog::with_journal(journal.clone()));
         // The stores of the identity, tenants and agents area share one state. The sharing
-        // store is the member cleanup (set below). When the nodes area is merged, the node store
-        // must become `root_created` (`MemoryArea::set_root_created`).
+        // store is the member cleanup and the node store holds the root folders (set below).
         let area = Arc::new(MemoryArea::new(MemoryDeps {
             tokens: tokens.clone(),
             authz: Some(authz.clone() as Arc<dyn Authz>),
@@ -84,6 +83,19 @@ impl Services {
             journal.clone(),
         ));
         area.set_member_cleanup(sharing.clone());
+        area.set_root_created(nodes.clone());
+        nodes.set_tenants(tenants.clone());
+        let tags = Arc::new(MemoryTagStore::new(
+            authz.clone(),
+            nodes.clone(),
+            journal.clone(),
+            tenants.clone(),
+        ));
+        let search = Arc::new(MemorySearch::new(
+            authz.clone(),
+            nodes.clone(),
+            tags.clone(),
+        ));
         Self {
             tenants,
             identity: Arc::new(MemoryIdentityStore::new(area.clone())),
@@ -96,11 +108,11 @@ impl Services {
             transfers: Arc::new(MemoryTransfers::default()),
             versions: Arc::new(MemoryVersionStore::default()),
             diffs: Arc::new(MemoryDiffService::default()),
-            tags: Arc::new(MemoryTagStore::default()),
+            tags,
             authz,
             sharing,
             journal,
-            search: Arc::new(MemorySearch::default()),
+            search,
             audit,
             idempotency: Arc::new(MemoryIdempotencyStore::default()),
         }

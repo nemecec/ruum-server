@@ -2,8 +2,9 @@
 //!
 //! With `DATABASE_URL` the journal, audit log, sharing and the identity, tenants and agents area
 //! use Postgres, and the authz engine is SpiceDB (when a preshared key is set) with the outbox
-//! worker. Without it every module is in memory. The modules of areas that are not merged yet
-//! (nodes, tags, search, blobs, versions) stay in memory in both cases.
+//! worker. Without it every module is in memory. With it the nodes, tags and search use Postgres
+//! too. The modules of areas that are not merged yet (blobs, versions) stay in memory in both
+//! cases.
 
 use anyhow::Context as _;
 use ruum_core::Services;
@@ -13,7 +14,11 @@ use ruum_core::authz::outbox;
 use ruum_core::authz::spicedb::{SpiceDbAuthz, SpiceDbConfig};
 use ruum_core::identity::setup::{IdentitySettings, install};
 use ruum_core::journal::postgres::PgJournal;
+use ruum_core::nodes::NodeStore;
+use ruum_core::nodes::postgres::PgNodeStore;
+use ruum_core::search::postgres::PgSearch;
 use ruum_core::sharing::postgres::PgSharingStore;
+use ruum_core::tags::postgres::PgTagStore;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +43,16 @@ pub async fn services(public_url: &str, pool: Option<sqlx::PgPool>) -> anyhow::R
         let authz: Arc<dyn Authz> = services.authz.clone();
         tokio::spawn(outbox::run_worker(pool.clone(), authz, OUTBOX_EVERY));
         services.journal = Arc::new(PgJournal::new(pool.clone()));
+        // The node store first: sharing, tags and search read nodes through it.
+        let nodes: Arc<dyn NodeStore> =
+            Arc::new(PgNodeStore::new(pool.clone(), services.authz.clone()));
+        services.nodes = nodes.clone();
+        services.tags = Arc::new(PgTagStore::new(
+            pool.clone(),
+            services.authz.clone(),
+            nodes.clone(),
+        ));
+        services.search = Arc::new(PgSearch::new(pool.clone(), services.authz.clone(), nodes));
         services.audit = Arc::new(PgAuditLog::new(pool.clone()));
         services.sharing = Arc::new(PgSharingStore::new(
             pool.clone(),
