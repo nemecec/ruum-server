@@ -256,6 +256,10 @@ For Zitadel sign-in through Vite, start the server with
 
 ## Known gaps
 
+- **Step 1 follow-ups** (decision 0003, `provisional`): item 5 (C-7, names of actors) is built
+  on `f/followups`. Items 1 (content role), 2 (C-12), 3 (C-13), 4 (C-14), 6 (C-8 to C-11), 7
+  (search `type`, batch, hints, `safe_stop`) and 8 (IDs of gone nodes) are decided and not built.
+
 - **Cookie names.** The session and CSRF cookies keep their names (`ruum_session`,
   `ruum_csrf`); the `__Host-` prefix is a later hardening, because the rename breaks the
   contract (decision 0002-3). The CSRF value is bound to the session. The REST download
@@ -273,8 +277,9 @@ For Zitadel sign-in through Vite, start the server with
   make the person a guest (reads answer `404`); an email grant to a user who already has an
   account never binds, and `addGrant` sends no mail. `docs/TESTING.md` still lists the fixed UI
   gaps and has no rows for `visual.e2e.ts` and `a11y.e2e.ts`.
-- **Web UI after `q/uxfix`** (`docs/ux/decisions.md`): names depend on what the person may list
-  (a guest sees "Someone in <Space>", "An agent"; contract need C-7 `display_name`); the space
+- **Web UI after `q/uxfix`** (`docs/ux/decisions.md`): names come from the server since
+  decision 0003-5 (C-7, branch `f/followups`: `display_name` and `on_behalf_of_display_name` in
+  every answer; agents show as "*Agent* (agent of *User*)"); the space
   name of an unlisted space is unknown (C-10); the server still coalesces an explicit upload
   when the person picks "Replace it" (C-8). Not done: the session-ended dialog (UX-09), pausing
   uploads offline, the "Changed by agents" filter (C-2), the "Shared" mark on rows (C-1), the
