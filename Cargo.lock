@@ -2753,11 +2753,28 @@ dependencies = [
 name = "ruum-webdav"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64 0.23.1",
+ "blake3",
+ "bytes",
  "dav-server",
+ "fastcdc",
+ "futures",
+ "http",
+ "http-body-util",
+ "mime_guess",
+ "reqwest",
+ "ruum-api",
  "ruum-core",
+ "ruum-testkit",
+ "serde_json",
+ "tempfile",
+ "time",
  "tokio",
+ "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

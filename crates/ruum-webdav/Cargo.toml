@@ -13,6 +13,25 @@ workspace = true
 [dependencies]
 ruum-core.workspace = true
 axum.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
 dav-server.workspace = true
+fastcdc.workspace = true
+futures.workspace = true
+http.workspace = true
+mime_guess.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+ruum-api.workspace = true
+ruum-testkit.workspace = true
+async-trait.workspace = true
+http-body-util.workspace = true
+reqwest.workspace = true
+tower.workspace = true
+uuid.workspace = true
