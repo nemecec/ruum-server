@@ -26,6 +26,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 http-body-util.workspace = true
+jsonschema.workspace = true
 tokio.workspace = true
 tower.workspace = true
