@@ -32,6 +32,11 @@ pub const USER_ONLY_OPERATIONS: &[&str] = &[
     "undoAgent",
     "getOAuthClient",
     "oauthConsent",
+    // Step 2 (databases, docs/STEP2.md card C-1).
+    "confirmColumnClasses",
+    "restoreDatabase",
+    "createDatabaseAccessGrant",
+    "decideDatabaseApproval",
 ];
 
 /// The operations that a share-link bearer may call (the `Users only` section of

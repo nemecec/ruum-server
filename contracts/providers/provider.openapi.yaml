@@ -209,7 +209,7 @@ paths:
 
         | Hook | Journal entry | Provider work |
         |---|---|---|
-        | `copied` | `node.copied` | Copy the content to the new node (`target_node_id`). Often forgotten; required. A database copies schema and data (masked when the caller is an agent, as for branches). |
+        | `copied` | `node.copied` | Copy the content to the new node (`target_node_id`). Often forgotten; required. The platform decides `source.data` and the provider follows it: a database copies `full` data only when the caller is a person with `manage` on the source, and `masked` data for everyone else (agents, and people with `view` or `edit`). |
         | `moved`, `renamed` | `node.moved`, `node.renamed` | Usually nothing (content is keyed by node ID). Update display names. |
         | `trashed` | `node.trashed` | Stop serving (a database refuses new queries and connections), keep the content. |
         | `restored` | `node.restored` | Serve again. |
@@ -659,7 +659,7 @@ components:
           properties:
             kind:
               const: copy
-              description: '`copyNode` of the tree.'
+              description: '`copyNode` of the tree. `data` is set by the platform: `full` only for a person with `manage` on the source, else `masked`.'
             node_id:
               $ref: '#/components/schemas/Uuid'
             data:
@@ -765,9 +765,10 @@ components:
           type: [string, 'null']
         message:
           type: [string, 'null']
+          description: A short text for people. It never holds row values (for a database, engine messages are sanitized to the SQLSTATE text and object names, without `DETAIL`, `HINT` or `CONTEXT`), because every principal with `view` reads it.
         detail:
           type: object
-          description: Type-specific facts for the UI, for example a database's `size_bytes`.
+          description: Type-specific facts for the UI, for example a database's `size_bytes`. Never row values.
           additionalProperties: true
         export:
           description: Set when an export finished.
@@ -960,8 +961,14 @@ components:
           type: string
           description: |
             A role (`view`, `comment`, `edit`, `manage`), `share`, or a type-specific permission.
-            A database has `query_read`, `query_write`, `change_schema`, `write_live` and
-            `read_personal` (contracts/authz/schema.zed).
+            A database has `query_read`, `query_write`, `change_schema`, `read_secret`,
+            `write_live` and `read_personal`. They map to `contracts/authz/schema.zed`:
+            `query_read`, `query_write`, `change_schema` and `read_secret` are permissions of
+            the same name (checked for the user, then intersected with the agent's scope);
+            `write_live` is `agent_write_live` and `read_personal` is `agent_read_personal`
+            (checked for the agent principal, AND the user's `query_write` or `query_read`, AND
+            the grant row is in force). For a person `write_live` equals `query_write` and
+            `read_personal` equals `query_read`. `read_secret` is never true for an agent.
     CheckResult:
       type: object
       required: [allowed, role]

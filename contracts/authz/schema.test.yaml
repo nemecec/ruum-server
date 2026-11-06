@@ -49,6 +49,7 @@ relationships: |-
   node:garden_db#viewer@user:kati
   node:garden_db_preview#parent@node:garden_db
   node:garden_db_preview#draft_branch@agent:*
+  node:garden_db_full#parent@node:garden_db
   node:garden_db#live_writer@agent:jaan_bot
   node:garden_db#personal_reader@agent:jaan_bot
   node:garden_db#live_writer@agent:writer_only_bot
@@ -91,6 +92,7 @@ assertions:
     - node:garden_db#query_read@user:kati
     - node:garden_db#change_schema@user:mari
     - node:garden_db#change_schema@user:tiit
+    - node:garden_db#read_secret@user:mari
     # A branch is a child node: it inherits the grants of the database.
     - node:garden_db_preview#query_write@user:jaan
     - node:garden_db_preview#query_read@user:kati
@@ -125,6 +127,11 @@ assertions:
     - node:garden_db#query_write@user:kati
     - node:garden_db#change_schema@user:jaan
     - node:garden_db_preview#change_schema@user:jaan
+    # Secrets need manage: an editor and a viewer never read them.
+    - node:garden_db#read_secret@user:jaan
+    - node:garden_db#read_secret@user:kati
+    # A branch with full data has no draft mark: agents need a grant there.
+    - node:garden_db_full#agent_write_live@agent:any_bot
     # No grant, no live writes and no real personal values for an agent.
     - node:garden_db#agent_write_live@agent:any_bot
     - node:garden_db#agent_read_personal@agent:any_bot

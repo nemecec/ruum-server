@@ -123,8 +123,11 @@ create table databases (
     engine_version      text not null check (engine_version ~ '^[0-9]{1,3}$'),
     plan                text not null default 'shared-small' check (plan in ('shared-small')),
     -- Where the data lives. Postgres: the cluster ID (`hel1-shared-1`; on the laptop `dev`) and
-    -- the database name in it (`db_<node id without dashes>`). SQLite: the storage ID and the
-    -- object key prefix of the replica in object storage.
+    -- a NEUTRAL database name in it (`d_` + 16 random hex characters; never the node ID or the
+    -- tenant ID, because every role of the cluster can list `pg_database` and `pg_roles`).
+    -- SQLite: the storage ID and the file path below `RUUM_SQLITE_DIR`
+    -- (`<random tenant dir>/<random file name>.db`, one directory per tenant), which is also
+    -- the object key prefix of the replica in object storage.
     cluster             text not null,
     engine_name         text not null check (engine_name ~ '^[a-z0-9_./-]{1,200}$'),
     -- A branch (section 8.4, decision 18): the source database and what data it took. A branch
@@ -148,20 +151,39 @@ create table databases (
 );
 create index databases_branch_idx on databases (tenant_id, branch_of) where branch_of is not null;
 
--- The engine roles of a Postgres database (section 8.4: no static passwords). The roles have
--- NOLOGIN; the platform connects as its own login role and uses `SET ROLE` per request, or
--- grants a short-lived login for a connection. One role per kind and database:
---   read          view, people          (read-only, sees personal values)
---   write         edit, people          (read-write)
---   owner         manage, migrations    (owns the schema)
---   masked_read   agents, read          (PostgreSQL Anonymizer masks personal and secret)
---   masked_write  agents, branch or write_live grant
---   secret_read   people with manage    (sees secret values)
+-- The engine roles of a Postgres database (section 8.4: no static passwords; decision 0004).
+--
+-- Untrusted SQL (every statement of the query API and every migration) runs ONLY in a session
+-- whose session_user is the role of the kind the request needs. Those roles have LOGIN with a
+-- short-lived random password (`VALID UNTIL` a few minutes ahead) that the platform sets when it
+-- opens connections and never stores; connections are pooled per (database, kind) and closed
+-- before the password ends. Each such role is a member of NO other role, holds no ADMIN option,
+-- has CONNECT on its own database only, and is NOINHERIT. So `RESET ROLE`, `SET ROLE` and
+-- `set_config('role', ...)`, also inside a DO block or a function, can only return to the role
+-- itself. The platform's admin role `ruum_dbhost` (CREATEDB, CREATEROLE) runs only platform
+-- DDL (create, drop, roles, lens views, grants) and never untrusted SQL; it is not a member of
+-- these roles (PostgreSQL 16+ gives it ADMIN on the roles it creates, without SET or INHERIT).
+--
+-- Each kind reads through a "lens" (decision 0004). `base`: the tables. `nosecret`: views in
+-- the schema `ruum_nosecret` with every secret column masked. `masked`: views in the schema
+-- `ruum_masked` with personal columns as pseudonyms (text) and secret columns masked. A role
+-- has USAGE only on its lens schema (and `pg_catalog`), never on `public` or another schema, so
+-- functions and tables outside the lens are out of reach.
+--   read          people with view, agents with read_personal   nosecret, read-only
+--   write         people with edit, agents with read_personal   nosecret, read-write (plain and personal columns)
+--   masked_read   agents without read_personal                  masked, read-only
+--   masked_write  agents without read_personal (branch or write_live grant)  masked, read-write (plain columns)
+--   secret_read   people with manage                            base, read-only
+--   owner         people with manage, migrations                base, owns the schema
+--   mask          NOLOGIN; owns the lens views, the schema `ruum_mask`, the key table and the
+--                 pseudonym function. No session ever runs as it.
+-- The role names are neutral (`r_` + 16 random hex characters), like the database names.
 create table database_roles (
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
-    kind                text not null check (kind in ('read', 'write', 'owner', 'masked_read', 'masked_write', 'secret_read')),
+    kind                text not null check (kind in ('read', 'write', 'owner', 'masked_read', 'masked_write', 'secret_read', 'mask')),
     role_name           text not null check (role_name ~ '^[a-z][a-z0-9_]{1,62}$'),
+    can_login           boolean not null generated always as (kind <> 'mask') stored,
     created_at          timestamptz not null default now(),
     primary key (tenant_id, node_id, kind),
     foreign key (tenant_id, node_id) references databases (tenant_id, node_id)
@@ -172,6 +194,15 @@ create unique index database_roles_name_key on database_roles (role_name);
 -- sync adds rows for new columns and marks dropped ones. The effective class is
 -- `coalesce(confirmed_class, 'personal')`: an unconfirmed column fails safe. The newest
 -- suggestion is kept here; every suggestion and confirmation is also in `audit`.
+--
+-- A class follows the IDENTITY of a column, not its name (decision 0004). Postgres: the
+-- relation OID and `attnum` (`rel_oid`, `attnum`) and the type (`type_oid`). SQLite has no
+-- stable column identity: the platform runs every DDL statement itself (migrations, and schema
+-- changes through the query API), parses it, and resets every column of a table that a DDL
+-- statement renamed, rebuilt or dropped and created again; `ADD COLUMN` adds a new,
+-- unconfirmed column only. A rename (same identity, new name), a retype, a table swap (same
+-- name, new identity) and a drop followed by an add of the same name all clear
+-- `confirmed_class` and set `unconfirmed_reason`. The name columns hold the name of today.
 create table database_columns (
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
@@ -179,6 +210,13 @@ create table database_columns (
     table_name          text not null check (length(table_name) between 1 and 63),
     column_name         text not null check (length(column_name) between 1 and 63),
     data_type           text not null,
+    -- Postgres identity (null for SQLite).
+    rel_oid             oid,
+    attnum              smallint,
+    type_oid            oid,
+    -- Why the column waits for a person: new, or its confirmed class was reset.
+    unconfirmed_reason  text check (unconfirmed_reason is null or unconfirmed_reason in
+                            ('new', 'renamed', 'retyped', 'table_changed', 'recreated')),
     suggested_class     data_class,
     suggested_reason    text check (suggested_reason is null or length(suggested_reason) <= 500),
     suggested_kind      principal_kind,
@@ -196,8 +234,12 @@ create table database_columns (
     foreign key (tenant_id, node_id) references databases (tenant_id, node_id),
     foreign key (tenant_id, confirmed_version) references versions (tenant_id, id),
     check ((suggested_class is null) = (suggested_at is null)),
-    check ((confirmed_class is null) = (confirmed_by is null and confirmed_at is null))
+    check ((confirmed_class is null) = (confirmed_by is null and confirmed_at is null)),
+    check ((confirmed_class is null) = (unconfirmed_reason is not null)),
+    check ((rel_oid is null) = (attnum is null))
 );
+create unique index database_columns_identity_key on database_columns (tenant_id, node_id, rel_oid, attnum)
+    where rel_oid is not null and dropped_at is null;
 create index database_columns_unconfirmed_idx on database_columns (tenant_id, node_id)
     where confirmed_class is null and dropped_at is null;
 
@@ -314,9 +356,10 @@ create index database_access_grants_live_idx on database_access_grants (tenant_i
 create index database_access_grants_expiry_idx on database_access_grants (expires_at)
     where revoked_at is null;
 
--- Destructive statements of agents that wait for a person (section 8.5). `statement_hash` is
--- BLAKE3 of the statement and the canonical JSON of the parameters, so an approval allows
--- exactly one statement with exactly those values, once. `params` holds the parameters as
+-- Destructive statements and migrations of agents that wait for a person (section 8.5;
+-- decision 0004: every agent migration on real data waits). `statement_hash` is BLAKE3 of the
+-- statement and the canonical JSON of the parameters (for a migration: of the name and `up`),
+-- so an approval allows exactly one statement with exactly those values, once. `params` holds the parameters as
 -- markers (hidden values and pseudonyms), never raw personal or secret values; the raw values
 -- are not needed, because the agent sends the statement again.
 create table database_approvals (
@@ -324,7 +367,9 @@ create table database_approvals (
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
     status              approval_status not null default 'pending',
-    statement           text not null,
+    subject             text not null default 'statement' check (subject in ('statement', 'migration')),
+    migration_name      text check (migration_name is null or migration_name ~ '^[0-9]{4}_[a-z0-9_]{1,100}$'),
+    statement           text not null,                -- the statement, or the migration's `up`
     statement_hash      bytea not null check (length(statement_hash) = 32),
     params              jsonb not null default '[]'::jsonb,
     reasons             text[] not null check (cardinality(reasons) > 0),
@@ -341,20 +386,24 @@ create table database_approvals (
     unique (tenant_id, id),
     foreign key (tenant_id, node_id) references databases (tenant_id, node_id),
     check ((status in ('approved', 'denied', 'used')) = (decided_by is not null)),
-    check ((status = 'used') = (used_at is not null))
+    check ((status = 'used') = (used_at is not null)),
+    check ((subject = 'migration') = (migration_name is not null))
 );
 create index database_approvals_pending_idx on database_approvals (tenant_id, node_id, created_at desc)
     where status = 'pending';
 
 -- The query log of the HTTP query API (sections 3.4, 8.5 and 11.2): every query with actor and
--- on_behalf_of, the statement as sent and the parameters as pseudonyms, never raw values.
--- High volume: partition by month and keep by the audit retention (open question in STEP2.md).
+-- on_behalf_of, the NORMALIZED statement (every literal replaced by `$L1`, `$L2`, ... after a
+-- parse; `<unparsed statement>` when it does not parse) and the parameters as pseudonyms,
+-- never raw values. `statement_hash` is BLAKE3 of the statement as sent. Agents read only
+-- their own rows. High volume: one plain table in step 2, kept by the audit retention;
+-- partitioning is open question 8 of docs/STEP2.md.
 create table database_queries (
     id                  uuid primary key,
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
     mode                query_mode not null,
-    statement           text not null,
+    statement           text not null,                -- normalized, no literals
     statement_hash      bytea not null check (length(statement_hash) = 32),
     params              jsonb not null default '[]'::jsonb,
     outcome             query_outcome not null,

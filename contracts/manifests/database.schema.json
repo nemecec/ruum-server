@@ -51,7 +51,7 @@
       "default": { "pitr_days": 7 }
     },
     "data_classes": {
-      "description": "The CONFIRMED data class of each column (section 8.5). The key is `<schema>.<table>.<column>` (SQLite: `main.<table>.<column>`), with each part quoted as in SQL when it contains a dot or a quote. A column that is not listed counts as `personal` (fail safe). Only a person changes this map: `confirmColumnClasses` writes a new manifest version, and `updateDatabaseManifest` from an agent may not change it (agents suggest classes with `suggestColumnClasses` or in a migration).",
+      "description": "The CONFIRMED data class of each column (section 8.5). The key is `<schema>.<table>.<column>` (SQLite: `main.<table>.<column>`), with each part quoted as in SQL when it contains a dot or a quote. A column that is not listed counts as `personal` (fail safe). Only a person changes this map: `confirmColumnClasses` writes a new manifest version, and `updateDatabaseManifest` from an agent may not change it (agents suggest classes with `suggestColumnClasses` or in a migration). The key is the column's name today, but the platform keeps the class with the column's identity: a rename, a retype, a table swap or a drop and add of the same name removes the key, and the column is unconfirmed again.",
       "type": "object",
       "propertyNames": {
         "type": "string",

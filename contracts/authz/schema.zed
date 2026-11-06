@@ -152,14 +152,26 @@ definition node {
     permission query_write = edit
     permission change_schema = manage
 
+    // Real `secret` values (design 8.5; decision 0004). People with `manage` only. The core
+    // never asks this for an agent: an agent never sees a secret, whatever its user's role.
+    permission read_secret = manage
+
+    // How the names map (DatabasePermissions in openapi.yaml, checkAccess in
+    // contracts/providers/provider.openapi.yaml): query_read, query_write, change_schema and
+    // read_secret are the permissions above; `write_live` is agent_write_live and
+    // `read_personal` is agent_read_personal below.
+
     // The agent rules of section 8.5. The subject of these checks is the AGENT principal (not
     // its user). The core allows an agent's write on a live database only when BOTH hold:
     // `query_write` for its user (after the scope) and `agent_write_live` for the agent. The
     // same for real personal values: `query_read` for the user and `agent_read_personal` for
     // the agent. `secret` values are never shown to agents: there is no relation for it.
 
-    // Written ONLY on a database branch node (`databases.branch_of` is set): every agent may
-    // write there, within its user's `edit` and its scope (drafts write freely, section 8.5).
+    // Written ONLY on a database branch node (`databases.branch_of` is set) whose data is
+    // `masked` or `schema_only`: every agent may write there, within its user's `edit` and its
+    // scope (drafts write freely, section 8.5). A branch with `full` data has real values, so
+    // it gets no `draft_branch`: an agent needs a `live_writer` grant there, as on a live
+    // database.
     relation draft_branch: agent:*
 
     // A time-limited grant (createDatabaseAccessGrant, table `database_access_grants`). The
@@ -220,7 +232,7 @@ definition app_role {
 //
 // Step 2 (DRAFT), database nodes:
 //   a branch B of database D (B is a child node of D):  node:B#parent@node:D
-//                                                       node:B#draft_branch@agent:*
+//   ... and only when B holds masked or schema_only data: node:B#draft_branch@agent:*
 //   a write_live grant to agent A on D:                node:D#live_writer@agent:A
 //   a read_personal grant to agent A on D:             node:D#personal_reader@agent:A
 //   The grant's end (expiry or revoke) deletes its tuple; the core also checks the row in

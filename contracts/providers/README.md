@@ -66,7 +66,11 @@ client                platform                                 provider
    `getTypedNodeStatus`). States: `provisioning`, `ready`, `updating`, `degraded`, `suspended`,
    `failed`, `deleted`, with a snake_case `reason`. The newest `generation` wins.
 3. **Change.** A new manifest version (`updateDatabaseManifest`, or `restoreVersion` of an older
-   one) is committed first, then sent with `applyManifest`. The control loop (section 8.1)
+   one) is committed first, then sent with `applyManifest`. Both paths run the same checks:
+   the JSON Schema, `validateManifest`, the right the type needs (`manage` for a database) and
+   the type's own rules (an agent may not change `data_classes`). The content of a typed node
+   changes ONLY through these operations: `putContent` and the upload targets on a typed node
+   fail with `409 conflict`. The control loop (section 8.1)
    compares `desired_version` and `observed_version` and calls `applyManifest` again until they
    match or the provider reports `failed`.
 4. **Lifecycle hooks** (`deliverHook`), from the journal, in `seq` order per node, with retries
@@ -74,7 +78,7 @@ client                platform                                 provider
 
    | Hook | When | Provider must |
    |---|---|---|
-   | `copied` | `copyNode` copied a typed node (alone or inside a folder) | copy the content to the new node. A database copies with `data: masked` when the actor is an agent, `full` when it is a person with `manage` on the source. |
+   | `copied` | `copyNode` copied a typed node (alone or inside a folder) | copy the content to the new node with the `data` that the platform sets. A database copies `full` data ONLY when the actor is a person with `manage` on the source; for every other actor (agents, people with `view` or `edit` on the source) the copy holds `masked` data. A viewer who copies into a folder of their own becomes manager of the copy, so a full copy would give them the secrets they could not read. |
    | `moved`, `renamed` | the node moved or got a new name | usually nothing |
    | `trashed` | the node (or a folder above it) went to the trash | stop serving, keep the content (state `suspended`) |
    | `restored` | the node came back from the trash | serve again |
@@ -122,10 +126,22 @@ rules. For a database these are the permissions of `contracts/authz/schema.zed`:
 | `query_read` | read-only queries | `view` |
 | `query_write` | read-write queries | `edit` |
 | `change_schema` | settings, migrations, restore, branches with full data | `manage` |
-| `write_live` | an agent writes to a live database | a `write_live` grant, or the node is a branch |
-| `read_personal` | an agent sees real `personal` values | a `read_personal` grant |
+| `read_secret` | sees real `secret` values | `manage`; never an agent |
+| `write_live` | an agent writes to a live database (schema.zed `agent_write_live`) | a `write_live` grant, or the node is a branch with `masked` or `schema_only` data |
+| `read_personal` | an agent sees real `personal` values (schema.zed `agent_read_personal`) | a `read_personal` grant |
 
+`query_read`, `query_write`, `change_schema` and `read_secret` are checked for the user and
+intersected with the agent's scope. `write_live` and `read_personal` are checked for the agent
+principal, together with the user's `query_write` or `query_read`, and the grant row must be in
+force. For a person, `write_live` equals `query_write` and `read_personal` equals `query_read`.
 `secret` values are never shown to agents. People see `secret` values only with `manage`.
+
+## Guests and the host plan
+
+Typed nodes count against the plan of the tenant that holds them. A guest, or an agent of a
+guest, may create a typed node (create, branch, restore into a new node, copy) only while the
+tenant policy `guests_create_resources` is true (default false). Otherwise the platform answers
+`403 permission_denied` before it calls the provider (decision 0002-2).
 
 ## Rules for every provider
 
@@ -135,5 +151,7 @@ rules. For a database these are the permissions of `contracts/authz/schema.zed`:
 - A provider never changes the tree, never writes the journal, and never stores grants.
 - Data that the provider returns to agents goes through the privacy filter of the platform
   (section 8.5) and is marked untrusted.
+- Status messages, errors and `detail` never hold content values (row values for a
+  database): every principal with `view` reads them.
 - Every write that the provider does on behalf of a principal records `actor` and
   `on_behalf_of` (for a database: the query log, and `application_name` on the connection).

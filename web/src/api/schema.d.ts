@@ -1133,6 +1133,15 @@ export interface paths {
          *     head content (chunks are shared, no bytes are copied). A folder is copied with its live
          *     subtree; links are copied as links. Grants are not copied. Writes `node.copied` for the new
          *     root and `node.created` for each node in it.
+         *
+         *     Typed nodes (step 2): the copy gets the head manifest, and the provider copies the
+         *     content (hook `copied`). A database copies with real data (`full`) only when the caller
+         *     is a person with `manage` on the source database; for everyone else (agents, and people
+         *     with `view` or `edit` on the source) the copy holds `masked` data, as a masked branch. So
+         *     a copy never gives its maker more than they could read in the source. A guest, or an
+         *     agent of a guest, cannot copy a typed node while the tenant policy
+         *     `guests_create_resources` is false (`403 permission_denied`), because the copy counts
+         *     against the host tenant's plan.
          */
         post: operations["copyNode"];
         delete?: never;
@@ -1264,6 +1273,10 @@ export interface paths {
          *     then calls `complete`. Needs `edit` on the target file, or on the parent folder for a new
          *     file. Fails with `quota_exceeded` or `payload_too_large` (largest file of the plan) before
          *     any byte is sent. The session expires after 24 hours.
+         *
+         *     A `new_version` target that is a typed node (step 2: a database) fails with
+         *     `409 conflict`: the content of a typed node is its manifest, which only the type's own
+         *     operations change (`updateDatabaseManifest`, `confirmColumnClasses`, `restoreVersion`).
          *
          *     Known risk (accepted for step 1, design section 5.1): `missing` tells a caller whether
          *     the tenant already stores a chunk, also one from a file the caller cannot read. A member
@@ -1421,6 +1434,10 @@ export interface paths {
          * @description For small files (at most 32 MiB): the body is the whole new content, and the server chunks
          *     it. Needs `edit`. Use `If-Match` with the version ID (`"<version_id>"`) to avoid lost
          *     updates. Larger files use `POST /v1/uploads`. Writes `version.created`.
+         *
+         *     A typed node (step 2: a database) fails with `409 conflict`, also for an `edit` share
+         *     link: the manifest of a typed node changes only through the type's own operations
+         *     (`updateDatabaseManifest`, `confirmColumnClasses`, `restoreVersion`).
          */
         put: operations["putContent"];
         post?: never;
@@ -1541,6 +1558,14 @@ export interface paths {
          * Restore a version
          * @description Needs `edit`. Makes a new head version with the content of the old one (`restored_from` is
          *     set). History is never deleted. Writes `version.restored`.
+         *
+         *     Typed nodes (step 2): restoring a manifest version follows the rules of the type's
+         *     manifest update. For a database it needs `manage`, the old manifest must pass the
+         *     manifest validation of today (`validation_failed`), and an agent may not restore a
+         *     version whose `data_classes` differs from the current one (`validation_failed`, hint
+         *     `suggestColumnClasses`). When a person restores other `data_classes`, that counts as a
+         *     confirmation by that person (audit entry); keys that name no live column are dropped.
+         *     The restore changes settings only, never data (`restoreDatabase` restores data).
          */
         post: operations["restoreVersion"];
         delete?: never;
@@ -2110,6 +2135,13 @@ export interface paths {
          *     With `source.kind: template` the database starts as a copy of a database node inside a
          *     template folder (design section 2.7: schema, migrations and masked sample data).
          *     Agents may create databases inside their scope with `max_role` `edit` or higher.
+         *
+         *     A database counts against the plan of the tenant that holds the folder. A guest, or an
+         *     agent of a guest, may create one only while the tenant policy `guests_create_resources`
+         *     is true (default false; `403 permission_denied` with the hint
+         *     `guests_create_resources`). The same rule holds for `createDatabaseBranch`,
+         *     `restoreDatabase` with `target: new_node`, and `copyNode` of a typed node (decision
+         *     0002-2).
          */
         post: operations["createDatabase"];
         delete?: never;
@@ -2242,33 +2274,70 @@ export interface paths {
          *     result over the cap is cut (`truncated: true`, `truncated_reason`). One statement per
          *     call; a second statement fails with `validation_failed`.
          *
-         *     **Agents** (section 8.5). For an agent the server applies the privacy filter to every
-         *     value: a `secret` column shows `NULL` and empty values as they are and any other value
-         *     as `{"$ruum": "hidden", "class": "secret"}`; a `personal` column shows consistent
-         *     pseudonyms `{"$ruum": "pseudonym", "id": "p_..."}` (the same value gives the same
-         *     pseudonym in this tenant, so joins, grouping and counts work), unless the agent holds a
-         *     `read_personal` grant. An unclassified or unconfirmed column counts as `personal`. A
-         *     computed column counts as the strictest class of the columns it reads, and as
-         *     `personal` when the server cannot tell; aggregates that return numbers (`count`, `sum`,
-         *     `avg`, ...) are `normal`. On Postgres the masking runs inside the database (PostgreSQL
-         *     Anonymizer, bound to the agent's database role); on SQLite it runs in the query layer.
-         *     `mode: write` by an agent works without a grant on a database branch; on a live
-         *     database it needs a `write_live` grant (`403 write_grant_required` without one).
-         *     Destructive statements (`DROP`, `TRUNCATE`, `DELETE` or `UPDATE` without `WHERE`, and
-         *     schema changes outside a migration) from an agent never run at once: the answer is
-         *     `202` with a pending `DatabaseApproval` that names the statement and the number of rows;
-         *     a person decides it (`decideDatabaseApproval`), and the agent sends the same statement
-         *     again with `approval_id`.
+         *     **Agents** (section 8.5). For an agent without a `read_personal` grant, EVERY read of a
+         *     `personal` or `secret` column sees the masked value, wherever the statement reads it:
+         *     in the select list, `WHERE`, `JOIN`, `ORDER BY`, `GROUP BY`, `HAVING`, aggregates,
+         *     subqueries, `RETURNING` and the source of an `INSERT ... SELECT`. The statement runs
+         *     against masking views, not the tables (Postgres: views in the database that the agent's
+         *     engine role is limited to; SQLite: per-connection views and an authorizer), so a filter
+         *     such as `WHERE email LIKE 'a%'` compares the pseudonym, never the real value. A
+         *     `personal` value reads as its pseudonym, the text `p_` plus 12 hex characters (the
+         *     result shows `{"$ruum": "pseudonym", "id": "p_..."}`; the same value gives the same
+         *     pseudonym in this tenant, so joins, grouping and counts of distinct values work). A
+         *     `secret` value reads as `NULL` when it is `NULL` and as the hidden-value marker
+         *     `{"$ruum": "hidden", "class": "secret"}` otherwise. A `read_personal` grant shows real
+         *     `personal` values; `secret` values are never shown to an agent. An unclassified or
+         *     unconfirmed column counts as `personal`.
+         *
+         *     The class of a result column (`ResultColumn.data_class`) is the strictest class of the
+         *     columns it reads, and `personal` when the server cannot tell; an expression that reads
+         *     no column (a constant, a parameter) is `normal` and is never turned into a pseudonym.
+         *     A masked `personal` column has the type `text` in the result, whatever its type in the
+         *     table.
+         *
+         *     **Agent writes.** `mode: write` by an agent works without a grant on a branch with
+         *     `masked` or `schema_only` data; on a live database and on a branch with `full` data it
+         *     needs a `write_live` grant. Checks run in this order: the right of the agent's user and
+         *     the scope (`403 permission_denied` or `scope_exceeded`), then the `write_live` grant
+         *     (`403 write_grant_required`), then the statement rules, and only then the approval of a
+         *     destructive statement (`202`). An approval never replaces a `write_live` grant. A write
+         *     statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, also inside a `WITH`) of an agent
+         *     without `read_personal` that reads or writes a `personal` or `secret` column anywhere
+         *     (target column, `SET`, `WHERE`, a subquery, `RETURNING`, or the `SELECT` of an
+         *     `INSERT`) fails with `403 class_read_required`, so a write can never copy a value into a
+         *     column that the agent reads as `normal`, and never overwrites real values with
+         *     pseudonyms. With `read_personal` the same holds for `secret` columns, and for people
+         *     without `manage` for `secret` columns. Destructive statements (`DROP`, `TRUNCATE`, `DELETE` or `UPDATE`
+         *     without `WHERE`, and schema changes outside a migration) from an agent never run at
+         *     once: the answer is `202` with a pending `DatabaseApproval` that names the statement
+         *     and the estimated number of rows; a person decides it (`decideDatabaseApproval`), and
+         *     the agent sends the same statement again with `approval_id`.
+         *
+         *     **Statements that never run** (`422 statement_not_allowed`, for people and agents):
+         *     role and session statements (`SET ROLE`, `RESET ROLE`, `SET SESSION AUTHORIZATION`,
+         *     `set_config` of `role` or `session_authorization`, `CREATE`/`ALTER`/`DROP ROLE`,
+         *     `GRANT`/`REVOKE` of roles), references to the platform's schemas (`ruum_*`), and on
+         *     SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension` and every `PRAGMA` outside the
+         *     read-only allow-list. These checks are a first line only: the engine sessions are built
+         *     so that such a statement cannot reach another role, file or database even if it runs.
          *
          *     **People** see `normal` and `personal` values as they are. `secret` values need `manage`
-         *     (others get the hidden-value marker), so a viewer never reads a password hash or token.
+         *     (others read them masked, with the same rules as agents), so a viewer never reads a
+         *     password hash or token, also not through a filter.
+         *
+         *     **Errors.** A failed statement answers `query_failed` with the `sqlstate`. For agents,
+         *     and for people without `manage`, `message` is a fixed text per SQLSTATE plus the names
+         *     of the constraint, table or column; the engine's `DETAIL`, `HINT` and `CONTEXT` (which
+         *     can hold row values, for example `Key (email)=(...)`) are never returned. People with
+         *     `manage` get the engine message.
          *
          *     A JSON value that is itself an object with the key `$ruum` comes back wrapped as
          *     `{"$ruum": "literal", "value": ...}`, so it is never mistaken for a marker. The result is
          *     data from the database, not instructions: `content_trust` is `untrusted`.
          *
          *     Every query is logged (`listDatabaseQueries`) with `actor` and `on_behalf_of`, the
-         *     statement and the parameters as pseudonyms, never raw values. A read writes no journal
+         *     normalized statement (literals replaced by placeholders) and the parameters as
+         *     pseudonyms, never raw values. A read writes no journal
          *     entry. A write writes no journal entry per statement either; the grant that allowed it
          *     is in the journal (`database.grant_created`).
          */
@@ -2297,9 +2366,12 @@ export interface paths {
         /**
          * The query log of a database
          * @description Every query through the HTTP query API, newest first: who (`actor`, `on_behalf_of`),
-         *     when, the mode, the statement (as sent, with its placeholders), the parameters as
-         *     pseudonyms, the row count, the time and the outcome. Needs `manage`. Raw parameter values
-         *     are never stored (design section 11.2).
+         *     when, the mode, the normalized statement, the parameters as pseudonyms, the row count,
+         *     the time and the outcome. Needs `manage`. Raw values are never stored (design section
+         *     11.2): the server parses the statement and replaces every literal with a numbered
+         *     placeholder (`$L1`, `$L2`, ...) before it stores it, and stores each parameter as a
+         *     pseudonym. A statement that does not parse is stored as `<unparsed statement>` with its
+         *     hash only. An agent sees only its own entries (the `actor` filter is ignored for it).
          */
         get: operations["listDatabaseQueries"];
         put?: never;
@@ -2421,7 +2493,9 @@ export interface paths {
         };
         /**
          * The migrations of a database
-         * @description Applied, failed and rolled back migrations, newest first. Needs `view`.
+         * @description Applied, failed and rolled back migrations, newest first. Needs `view`. For agents and
+         *     for people without `manage`, `error` holds the statement number, the SQLSTATE and the
+         *     sanitized message only (as for `query_failed`), never the engine's `DETAIL`.
          */
         get: operations["listDatabaseMigrations"];
         put?: never;
@@ -2433,13 +2507,28 @@ export interface paths {
          *     once: the same name with the same checksum answers the stored result, with another
          *     checksum `409 conflict`.
          *
-         *     Who: on a database branch, `edit`. On a live database, `manage`; an agent also needs a
-         *     `write_live` grant. `data_classes` carries the agent's classification of the columns that
-         *     the migration adds (section 8.5); it is stored as suggestions, and a person confirms
-         *     them with `confirmColumnClasses` (the classes of a migration by a person with `manage`
-         *     count as confirmed). Until then the new columns count as `personal`.
-         *     `dry_run: true` runs the migration and rolls it back, and reports the new columns.
-         *     Writes `database.migration_applied` or `database.migration_failed`.
+         *     Who: on a branch with `masked` or `schema_only` data, `edit`. On a live database and on
+         *     a branch with `full` data, `manage`; an agent also needs a `write_live` grant, and its
+         *     migration always waits for a person: the first call answers `202` with a pending
+         *     approval (reason `migration`), and the agent sends the same migration again with
+         *     `approval_id` (a migration runs with the rights of the schema owner, so a person reads
+         *     it before it touches real data). `data_classes` carries the author's classification of
+         *     the columns that the migration adds (section 8.5); from an agent it is stored as
+         *     suggestions, and a person confirms them with `confirmColumnClasses` (the classes of a
+         *     migration by a person with `manage` count as confirmed). Until then the new columns
+         *     count as `personal`.
+         *
+         *     Classes follow the identity of a column, not its name. A column that the migration
+         *     renames or retypes, every column of a table that it renames, swaps or rebuilds, and a
+         *     column that is dropped and added again under the same name return to unconfirmed
+         *     (`personal`), whatever the old class was. So a rename never moves a confirmed `normal`
+         *     class onto `personal` or `secret` data. The same holds for schema changes outside a
+         *     migration.
+         *
+         *     `dry_run: true` runs the migration and rolls it back, and reports the new columns. For
+         *     agents and for people without `manage`, `error` is sanitized (see
+         *     `listDatabaseMigrations`). Writes `database.migration_applied` or
+         *     `database.migration_failed`.
          */
         post: operations["applyDatabaseMigration"];
         delete?: never;
@@ -2481,9 +2570,16 @@ export interface paths {
          *     `data` is `masked` by default: `personal` columns become pseudonyms and non-empty
          *     `secret` values become `NULL`, so a preview never copies real personal data.
          *     `schema_only` copies no rows. `full` copies real data and needs a person with `manage`
-         *     (an agent gets `403 user_required`). A source larger than the plan's branch limit fails
-         *     with `422 database_too_large`. Needs `edit`. Writes `node.created`, `version.created`
-         *     and `database.branch_created`.
+         *     (an agent gets `403 user_required`). A masked `personal` column that is not text holds
+         *     the pseudonym as `text` in the branch (its type changes; the branch's
+         *     `getDatabaseSchema` shows it), and its check constraints are dropped there. A source
+         *     larger than the plan's branch limit fails with `422 database_too_large`. Needs `edit`.
+         *     Guests and their agents need the tenant policy `guests_create_resources`. Writes
+         *     `node.created`, `version.created` and `database.branch_created`.
+         *
+         *     Agents write without a grant only on a branch with `masked` or `schema_only` data (the
+         *     branch gets the `draft_branch` mark). On a branch with `full` data an agent needs a
+         *     `write_live` grant, as on a live database.
          */
         post: operations["createDatabaseBranch"];
         delete?: never;
@@ -2552,7 +2648,8 @@ export interface paths {
          *     next to this one (named `name`), and leaves this one as it is. `target: in_place`
          *     first records a restore point of the current state (so the restore can be undone),
          *     then replaces the data; the database refuses queries while it runs. Needs `manage`.
-         *     Users only. Writes `database.restore_started`, and `database.restored` or
+         *     Users only. `new_node` by a guest needs the tenant policy `guests_create_resources`.
+         *     Writes `database.restore_started`, and `database.restored` or
          *     `database.restore_failed` when it ends.
          */
         post: operations["restoreDatabase"];
@@ -2712,9 +2809,12 @@ export interface paths {
          * Approve or deny a destructive statement
          * @description The person sees the statement, its parameters (as markers) and the number of rows it
          *     touches, and approves or denies it. An approval lets the agent run exactly that
-         *     statement with those parameters once, within 15 minutes. The person needs the right
-         *     that the statement needs (`edit` for data, `manage` for schema). Users only. Writes
-         *     `database.approval_decided`.
+         *     statement with those parameters once, within 15 minutes. Who may decide: the user the
+         *     agent acts for, or a person with `manage` on the database; in both cases the person
+         *     needs the right that the statement needs (`edit` for data, `manage` for schema and
+         *     migrations), else `403 permission_denied`. Users only. An approval never replaces a
+         *     `write_live` grant: when the agent sends the statement again, every other check runs
+         *     again. Writes `database.approval_decided`.
          */
         post: operations["decideDatabaseApproval"];
         delete?: never;
@@ -2753,7 +2853,7 @@ export interface components {
          * @description Stable, machine-readable error codes.
          * @enum {string}
          */
-        ErrorCode: "bad_request" | "validation_failed" | "unauthenticated" | "token_expired" | "permission_denied" | "scope_exceeded" | "user_required" | "not_found" | "conflict" | "name_taken" | "version_mismatch" | "idempotency_key_reused" | "precondition_failed" | "payload_too_large" | "range_not_satisfiable" | "cursor_expired" | "quota_exceeded" | "plan_limit_reached" | "rate_limited" | "agent_disabled" | "chunk_missing" | "hash_mismatch" | "database_not_ready" | "query_failed" | "read_only_query" | "statement_timeout" | "write_grant_required" | "migration_failed" | "database_too_large" | "not_implemented" | "internal" | "unavailable";
+        ErrorCode: "bad_request" | "validation_failed" | "unauthenticated" | "token_expired" | "permission_denied" | "scope_exceeded" | "user_required" | "not_found" | "conflict" | "name_taken" | "version_mismatch" | "idempotency_key_reused" | "precondition_failed" | "payload_too_large" | "range_not_satisfiable" | "cursor_expired" | "quota_exceeded" | "plan_limit_reached" | "rate_limited" | "agent_disabled" | "chunk_missing" | "hash_mismatch" | "database_not_ready" | "query_failed" | "read_only_query" | "statement_timeout" | "write_grant_required" | "migration_failed" | "database_too_large" | "statement_not_allowed" | "class_read_required" | "not_implemented" | "internal" | "unavailable";
         /**
          * @example {
          *       "error": {
@@ -2944,6 +3044,14 @@ export interface components {
              * @default true
              */
             members_can_share: boolean;
+            /**
+             * @description Missing means false (no `default` keyword, so step 1 clients and servers stay as
+             *     they are until step 2 sets it). Step 2 (decision 0002-2). Guests and the agents of guests may create resources that
+             *     count against this tenant's plan: `createDatabase`, `createDatabaseBranch`,
+             *     `restoreDatabase` with `target: new_node`, and `copyNode` of a typed node. When
+             *     false, those calls answer `403 permission_denied` (hint `guests_create_resources`).
+             */
+            guests_create_resources?: boolean;
         };
         Tenant: {
             id: components["schemas"]["Uuid"];
@@ -3836,16 +3944,18 @@ export interface components {
         DataClass: "normal" | "personal" | "secret";
         /**
          * @description What data a branch or copy takes. `masked` (the default): `personal` columns as
-         *     pseudonyms, non-empty `secret` values as `NULL`. `schema_only`: no rows. `full`: real
-         *     data; only a person with `manage`.
+         *     pseudonyms (a column that is not text becomes `text` in the copy), non-empty `secret`
+         *     values as `NULL`. `schema_only`: no rows. `full`: real data; only a person with
+         *     `manage` on the source.
          * @default masked
          * @enum {string}
          */
         DataCopy: "masked" | "schema_only" | "full";
         /**
          * @description The manifest of a database node. The normative schema is
-         *     `contracts/manifests/database.schema.json`; this is the same shape for the generated
-         *     clients (a contract test keeps the two equal).
+         *     `contracts/manifests/database.schema.json`; this is the same schema for the generated
+         *     clients (the same keywords, enums and limits). A contract test (card D-1) keeps the two
+         *     equal; only `readOnly` on `template` and the descriptions may differ.
          */
         DatabaseManifest: {
             /** @constant */
@@ -3859,17 +3969,22 @@ export interface components {
             /** @enum {string} */
             plan: "shared-small";
             /**
+             * @default []
              * @example [
              *       "postgis",
              *       "vector"
              *     ]
              */
-            extensions?: string[];
+            extensions: ("postgis" | "vector" | "pg_trgm" | "citext" | "hstore" | "uuid-ossp" | "pgcrypto" | "btree_gist" | "unaccent")[];
             backups?: {
                 /** @constant */
                 pitr_days: 7;
             };
-            /** @description The confirmed class per `<schema>.<table>.<column>`. Only a person changes it. */
+            /**
+             * @description The confirmed class per `<schema>.<table>.<column>`. Only a person changes it. The
+             *     key is the column's name today; the platform keeps the class with the column's
+             *     identity, and a rename or retype removes the key (the column is unconfirmed again).
+             */
             data_classes?: {
                 [key: string]: components["schemas"]["DataClass"];
             };
@@ -3879,7 +3994,7 @@ export interface components {
                 node_id: components["schemas"]["Uuid"];
                 version_id?: components["schemas"]["Uuid"];
             };
-        };
+        } & (unknown & unknown);
         /**
          * @description The status of section 8.1, from the provider contract (`ProviderState` in
          *     `contracts/providers/provider.openapi.yaml`). `provisioning`: being made. `ready`:
@@ -3893,6 +4008,10 @@ export interface components {
             state: components["schemas"]["DatabaseState"];
             /** @description A snake_case reason, for example `disk_quota_exceeded`, `migration_failed`, `extension_not_available`. */
             reason: string | null;
+            /**
+             * @description A short text for people. It never holds row values: engine messages are sanitized
+             *     as for `query_failed` before they are stored, for every caller.
+             */
             message: string | null;
             /** @description The manifest version that the engine matches now. */
             observed_version_id: components["schemas"]["Uuid"] | null;
@@ -3919,7 +4038,11 @@ export interface components {
         };
         /**
          * @description What the caller may do on this database now (after the agent scope and the grants of
-         *     section 8.5), so clients and agents need not guess.
+         *     section 8.5), so clients and agents need not guess. The names map to
+         *     `contracts/authz/schema.zed` and to `checkAccess` of the provider contract:
+         *     `query_read`, `query_write`, `change_schema` and `read_secret` are permissions of the
+         *     same name; `write_live` is `agent_write_live` and `read_personal` is
+         *     `agent_read_personal` for an agent (for a person both follow from the role).
          */
         DatabasePermissions: {
             /** @description `view`: read-only queries. */
@@ -3928,7 +4051,7 @@ export interface components {
             query_write: boolean;
             /** @description `manage`: settings, migrations, restore. */
             change_schema: boolean;
-            /** @description An agent with a `write_live` grant. Always true for a person with `edit`. */
+            /** @description An agent with a `write_live` grant, or on a branch with `masked` or `schema_only` data. Always true for a person with `edit`. */
             write_live: boolean;
             /** @description Sees real `personal` values (people with `view`; agents only with a grant). */
             read_personal: boolean;
@@ -4047,7 +4170,7 @@ export interface components {
         };
         ResultColumn: {
             name: string;
-            /** @description The SQL type name (`text`, `int8`, `timestamptz`, ...; SQLite the declared type or the storage class). */
+            /** @description The SQL type name (`text`, `int8`, `timestamptz`, ...; SQLite the declared type or the storage class) of the value as the caller gets it. A masked `personal` column is `text` (it holds the pseudonym), whatever its type in the table. */
             type: string;
             /** @description The effective class for this result (the strictest of the columns it reads). */
             data_class: components["schemas"]["DataClass"];
@@ -4058,7 +4181,7 @@ export interface components {
                 column: string;
             } | null;
             /**
-             * @description What the server did to the values of this column for this caller.
+             * @description What the server did to the values of this column for this caller. Constants and parameters are never masked.
              * @enum {string}
              */
             masking: "none" | "pseudonym" | "hidden";
@@ -4096,7 +4219,7 @@ export interface components {
             id: components["schemas"]["Uuid"];
             node_id: components["schemas"]["Uuid"];
             mode: components["schemas"]["QueryMode"];
-            /** @description The statement as sent (with placeholders). Literals that look like personal data are not removed; send values as parameters. */
+            /** @description The normalized statement. Every literal of the statement as sent is replaced with a numbered placeholder (`$L1`, `$L2`, ...); a statement that does not parse is `<unparsed statement>`. Raw values are never stored. */
             statement: string;
             /** @description Each parameter as a pseudonym (or `null`), never the raw value. */
             params: (components["schemas"]["Pseudonym"] | null)[];
@@ -4189,7 +4312,7 @@ export interface components {
             /** @description BLAKE3 of `up`. */
             checksum: components["schemas"]["Hash"];
             status: components["schemas"]["MigrationStatus"];
-            /** @description Why it failed (the statement number and the engine message). */
+            /** @description Why it failed (the statement number, the SQLSTATE and the message). Sanitized for agents and people without `manage` (as for `query_failed`). */
             error: string | null;
             /** @description The columns the migration added, with their effective class. */
             new_columns: components["schemas"]["DatabaseColumn"][];
@@ -4210,6 +4333,8 @@ export interface components {
             name: string;
             /** @description The SQL of the migration (several statements). */
             up: string;
+            /** @description An agent's migration on real data (live, or a branch with `full` data) runs only with an approved `DatabaseApproval` for exactly this name and `up`. */
+            approval_id?: components["schemas"]["Uuid"];
             /** @description The author's classes for the columns this migration adds, by `<schema>.<table>.<column>`. */
             data_classes?: {
                 [key: string]: components["schemas"]["DataClass"];
@@ -4303,10 +4428,10 @@ export interface components {
             /** @description The parameters as the requester may see them (markers for `personal` and `secret` values). */
             params: components["schemas"]["QueryCell"][];
             /** @description Why the statement needs a person. */
-            reasons: ("drop" | "truncate" | "delete_without_where" | "update_without_where" | "schema_change" | "alter_role")[];
+            reasons: ("drop" | "truncate" | "delete_without_where" | "update_without_where" | "schema_change" | "migration")[];
             /**
              * Format: int64
-             * @description The rows the statement touches (from the plan or a count in a rolled-back run); `null` for schema changes.
+             * @description The rows the statement touches, from `EXPLAIN` or a `count(*)` in a read-only transaction (never a test run of the statement, which would take locks on live); `null` for schema changes and migrations.
              */
             estimated_rows: number | null;
             requested_by: components["schemas"]["ActorPair"];
@@ -4431,7 +4556,9 @@ export interface components {
         /**
          * @description The engine refused the statement (`query_failed`, with the SQLSTATE in `sqlstate`), a
          *     write in a read-only query (`read_only_query`), or the database is not ready
-         *     (`database_not_ready`).
+         *     (`database_not_ready`). For agents and for people without `manage` on the database,
+         *     `message` is sanitized: a fixed text per SQLSTATE and object names, never the engine's
+         *     `DETAIL`, `HINT` or `CONTEXT`, which can hold row values.
          */
         QueryFailed: {
             headers: {
@@ -8112,6 +8239,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DatabaseMigrationWrite"];
+                };
+            };
+            /** @description A migration of an agent on real data; nothing ran. A person must approve it first. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalRequired"];
                 };
             };
             401: components["responses"]["Unauthenticated"];
