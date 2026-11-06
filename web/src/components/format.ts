@@ -81,8 +81,8 @@ export const memberRoleLabels: Record<Schemas['MemberRole'], string> = {
 export const memberRoleMeanings: Record<Schemas['MemberRole'], string> = {
   owner: 'everything, including billing and deleting the space',
   admin: 'manage members, sharing rules and all agents',
-  member: 'work with everything in the team space',
-  guest: 'only what is shared with them',
+  member: 'can see, change, delete and share everything in the team space',
+  guest: 'sees only what is shared with them; the role for limiting someone to some folders',
 }
 
 const typeNames: [RegExp, string][] = [

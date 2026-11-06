@@ -281,8 +281,22 @@ export function FolderIcon() {
   )
 }
 
-/** The glyph of a file (a page with a folded corner and lines). Decorative. */
-export function FileIcon() {
+const imageName = /\.(png|jpe?g|gif|webp|avif|heic|bmp|tiff?|svg)$/i
+
+/**
+ * The glyph of a file (a page with a folded corner and lines), or of a picture (a frame with a
+ * hill and a sun) for images, so photos and notes differ at a glance. Decorative.
+ */
+export function FileIcon({ type, name }: { type?: string | null; name?: string } = {}) {
+  if (type?.startsWith('image/') || (name && imageName.test(name))) {
+    return (
+      <svg className="glyph" viewBox="0 0 20 20" width="20" height="20" aria-hidden="true" focusable="false">
+        <rect x="2.5" y="4" width="15" height="12" rx="1.2" fill="none" stroke="currentColor" strokeWidth="1.4" />
+        <path d="M4.5 14l3.6-4.2 2.6 2.8 1.8-1.9 3 3.3" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+        <circle cx="13.3" cy="7.6" r="1.3" fill="currentColor" />
+      </svg>
+    )
+  }
   return (
     <svg className="glyph" viewBox="0 0 20 20" width="20" height="20" aria-hidden="true" focusable="false">
       <path d="M5 2.5h6.5L15.5 6.5v11H5z" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />

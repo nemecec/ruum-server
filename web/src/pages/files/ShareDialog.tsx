@@ -3,10 +3,10 @@ import { Link } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
-import { useNames, type Names } from '../../app/useNames'
+import { useActorText, useNames, type Names } from '../../app/useNames'
 import { useSession } from '../../app/useSession'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { roleLabels, roleMeanings } from '../../components/format'
+import { count, memberRoleLabels, roleLabels, roleMeanings } from '../../components/format'
 import { ConfirmButton, Dialog, ErrorNote, Loaded, LoadMore, Notice, SecretBox } from '../../components/ui'
 import type { Node } from './api'
 
@@ -65,26 +65,40 @@ function granteeDetail(g: Schemas['Grantee'], names: Names, grantId: string): st
   return null
 }
 
-/** The people of a space (members and guests), by user ID and by email; `null` when the caller may not list them. */
-type SpacePeople = { ids: Set<string>; emails: Set<string> }
+/** The people of a space (members and guests), by user ID and by email. */
+type SpacePeople = { byId: Map<string, Schemas['Member']>; byEmail: Map<string, Schemas['Member']> }
 
 async function loadSpacePeople(tenantId: string): Promise<SpacePeople> {
-  const ids = new Set<string>()
-  const emails = new Set<string>()
+  const byId = new Map<string, Schemas['Member']>()
+  const byEmail = new Map<string, Schemas['Member']>()
   let cursor: string | undefined
   for (let i = 0; i < 20; i++) {
     const page = await unwrap(
       client.GET('/v1/tenants/{tenant_id}/members', { params: { path: { tenant_id: tenantId }, query: cursor ? { cursor } : {} } }),
     )
     for (const m of page.items) {
-      ids.add(m.user_id)
-      if (m.email) emails.add(m.email.toLowerCase())
+      byId.set(m.user_id, m)
+      if (m.email) byEmail.set(m.email.toLowerCase(), m)
     }
     if (!page.next_cursor) break
     cursor = page.next_cursor
   }
-  return { ids, emails }
+  return { byId, byEmail }
 }
+
+/**
+ * Who an email is, for the add form: the caller, a person of the space (a share to them goes to
+ * their account by user ID, so it reaches them at once), a person outside it, or `unknown` when
+ * the caller may not list the space's people.
+ */
+export type EmailMatch =
+  | { kind: 'me' }
+  | { kind: 'person'; member: Schemas['Member'] }
+  | { kind: 'outside' }
+  | { kind: 'unknown' }
+
+/** True for the space roles that manage everything in a team space (decision 0001-4, team root). */
+const managesEverything = (role: Schemas['MemberRole']) => role !== 'guest'
 
 /** The share dialog: people with access, the link, and who may share further (copy.md 3.3). */
 export function ShareDialog(props: { node: Node; open: boolean; onClose: () => void; onChanged: () => void }) {
@@ -92,6 +106,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   const { tenant, role: myTenantRole, isAdmin } = useTenant()
   const { me } = useSession()
   const names = useNames()
+  const actorText = useActorText()
   const policy = tenant.policy
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<unknown>()
@@ -112,13 +127,19 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
     [tenant.id, myTenantRole],
   )
   const canInviteGuests = isAdmin && policy.allow_guests
-  /** True when the email is not a member or guest of the space; `null` when the UI cannot tell. */
-  const outside = (email: string): boolean | null => {
-    const known = people.data
-    if (!known) return null
+  const team = tenant.kind === 'team'
+  const match = (email: string): EmailMatch => {
     const e = email.trim().toLowerCase()
-    return e !== me.user.email.toLowerCase() && !known.emails.has(e)
+    if (e === me.user.email.toLowerCase()) return { kind: 'me' }
+    const known = people.data
+    if (!known) return { kind: 'unknown' }
+    const member = known.byEmail.get(e)
+    return member ? { kind: 'person', member } : { kind: 'outside' }
   }
+  // Members, admins and owners of a team space manage everything in it through the team root,
+  // and share there while the policy `members_can_share` is on. A share or a sharing rule can't
+  // give them less, so the dialog shows that access too.
+  const roleCount = people.data ? [...people.data.byId.values()].filter((m) => managesEverything(m.role)).length : null
 
   // The folders that inherited grants come from, by name (ia.md: "from folder Name").
   const fromIds = [...new Set((grants.data?.items ?? []).map((g) => g.inherited_from).filter((x): x is string => Boolean(x)))]
@@ -147,6 +168,19 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
     }
   }, [grants.data, names])
 
+  // The value "Same as the folder above" stands for: the parent's effective rule, or yes at the top.
+  const parentRule = useApi(async () => {
+    if (node.kind !== 'folder') return null
+    if (!node.parent_id) return { top: true, value: true }
+    try {
+      const parent = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: node.parent_id } } }))
+      return { top: !parent.parent_id, value: parent.editors_can_share_effective ?? true }
+    } catch {
+      return null
+    }
+  }, [node.id, node.parent_id, node.kind])
+  const [ruleSaved, setRuleSaved] = useState(false)
+
   const canShare = node.my_can_share ?? node.my_role === 'manage'
   const canManage = node.my_role === 'manage'
   const grantable = grantableRoles(node.my_role)
@@ -155,14 +189,16 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   const owner = names.person(node.owner_id)
   const nameOf = (g: Schemas['Grant']) => granteeName(g.grantee, names, tenant.name, g.id)
 
-  async function run(action: () => Promise<unknown>, done: string, reload: () => void) {
+  async function run(action: () => Promise<unknown>, done: string, reload: () => void): Promise<boolean> {
     setError(undefined)
     try {
       await action()
       setNotice(done)
       reload()
+      return true
     } catch (e) {
       setError(e)
+      return false
     }
   }
 
@@ -175,34 +211,67 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
           <AddPersonForm
             roles={grantable}
             spaceName={tenant.name}
-            outside={outside}
+            team={team}
+            membersCanShare={policy.members_can_share}
+            itemName={node.name}
+            match={match}
             canInvite={canInviteGuests}
-            onAdd={async (body, inviteGuest) => {
+            isAdmin={isAdmin}
+            tenantId={tenant.id}
+            onUseLink={
+              !policy.allow_share_links || linkGrantable.length === 0
+                ? undefined
+                : () => {
+              const select = document.getElementById('link-role')
+              select?.scrollIntoView?.({ block: 'center' })
+              select?.focus()
+            }
+            }
+            onAdd={async (target, role, inviteGuest) => {
               setError(undefined)
-              const email = body.grantee.type === 'email' ? body.grantee.email : 'them'
+              // A person of the space gets the share by user ID: it reaches their account at once
+              // (decision 0002-1). An email grant would wait for an invitation that never comes.
+              const body: Schemas['AddGrantRequest'] =
+                target.kind === 'person'
+                  ? { grantee: { type: 'user', id: target.member.user_id }, role, notify: false }
+                  : { grantee: { type: 'email', email: target.email }, role, notify: false }
+              const who = target.kind === 'person' ? target.member.display_name || target.member.email : target.email
               try {
                 const res = await unwrap(client.POST('/v1/nodes/{node_id}/grants', { params: { path: { node_id: node.id } }, body }))
-                if (body.grantee.type === 'email') rememberGrantEmail(res.grant.id, body.grantee.email)
+                if (target.kind === 'person') names.learn(target.member.user_id, { name: who, email: target.member.email })
+                else rememberGrantEmail(res.grant.id, target.email)
               } catch (e) {
                 setError(e)
                 return
               }
               grants.reload()
-              if (!inviteGuest || body.grantee.type !== 'email') {
-                setNotice(`Shared with ${email}.`)
+              if (target.kind === 'person') {
+                setNotice(
+                  team && managesEverything(target.member.role)
+                    ? `Shared ${node.name} with ${who}. As ${memberRoleLabels[target.member.role].toLowerCase()} of ${tenant.name}, they could already manage it.`
+                    : `Shared ${node.name} with ${who}. They find it under Shared with me.`,
+                )
                 return
               }
-              // The person must join the space before they can open the item: invite them as a guest.
+              if (!inviteGuest) {
+                setNotice(`Shared ${node.name} with ${who}. They can open it only after they join; nobody emailed them.`)
+                return
+              }
+              // The person must join before they can open the item: Ruum emails them an invitation.
               try {
                 await unwrap(
                   client.POST('/v1/tenants/{tenant_id}/invitations', {
                     params: { path: { tenant_id: tenant.id } },
-                    body: { email: body.grantee.email, role: 'guest', message: `I shared ${node.name} with you.` },
+                    body: {
+                      email: target.email,
+                      role: 'guest',
+                      message: `I shared "${node.name}" with you. Accept this invitation and make a free Ruum account to open it.`,
+                    },
                   }),
                 )
-                setNotice(`Shared with ${email}. Ruum sent them an invitation to join ${tenant.name} as a guest; they can open it after they accept.`)
+                setNotice(`Shared ${node.name} with ${who}. Ruum emailed them an invitation: they make a free account, then they can open it.`)
               } catch (e) {
-                setNotice(`Shared with ${email}.`)
+                setNotice(`Shared ${node.name} with ${who}, but the invitation email was not sent.`)
                 setError(e)
               }
             }}
@@ -223,21 +292,46 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                   </span>
                   <span className="muted">Owner</span>
                 </li>
-                {page.items.length === 0 && <li className="muted">Only you can see this.</li>}
+                {team && (
+                  <li className="row">
+                    <span className="grow">
+                      Everyone in {tenant.name} except guests
+                      <span className="muted small block">
+                        {roleCount !== null ? `${count(roleCount, 'person', 'people')}. ` : ''}Owners, admins and members manage everything in{' '}
+                        {tenant.name}
+                        {policy.members_can_share ? ', and share it' : ''}. This comes from their role in the space; a share here can't
+                        give them less.
+                      </span>
+                    </span>
+                    <span className="muted">{roleLabels.manage}</span>
+                  </li>
+                )}
+                {!team && page.items.length === 0 && <li className="muted">Only you can see this.</li>}
                 {page.items.map((g) => {
                   const name = nameOf(g)
                   const detail = granteeDetail(g.grantee, names, g.id)
-                  // A person outside the space can't open the item until they join it as a guest.
-                  const notInSpace =
-                    g.grantee.type === 'user' && people.data && g.grantee.id !== me.user.id && !people.data.ids.has(g.grantee.id)
+                  const mine = g.grantee.type === 'user' && g.grantee.id === me.user.id
+                  const member = g.grantee.type === 'user' ? people.data?.byId.get(g.grantee.id) : undefined
+                  // A person outside the space can't open the item until they join it.
+                  const notInSpace = g.grantee.type === 'user' && people.data && !mine && !member
+                  // A share weaker than the space role changes nothing for that person.
+                  const roleWins = team && member && managesEverything(member.role) && !mine
+                  const addedBy = !g.inherited_from && g.created_by.actor.id !== node.owner_id ? actorText(g.created_by) : null
                   return (
                     <li key={g.id} className="row">
                       <span className="grow">
                         {name}
+                        {mine && ' (you)'}
                         {detail && <span className="muted small block">{detail}</span>}
+                        {addedBy && <span className="muted small block">added by {g.created_by.actor.id === me.user.id ? 'you' : addedBy}</span>}
+                        {roleWins && (
+                          <span className="small block">
+                            {memberRoleLabels[member.role]} of {tenant.name}: can manage everything here, whatever this share says.
+                          </span>
+                        )}
                         {notInSpace && (
                           <span className="small block">
-                            Not in this space: can't open it until they join as a guest
+                            Can't open it yet: they haven't joined
                             {canInviteGuests ? '. Invite them under Space settings, Invitations.' : '. Ask an admin to invite them.'}
                           </span>
                         )}
@@ -256,7 +350,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                           </span>
                         )}
                       </span>
-                      {canShare && !g.inherited_from && grantable.includes(g.role) ? (
+                      {canShare && !mine && !g.inherited_from && grantable.includes(g.role) ? (
                         <>
                           <label className="sr-only" htmlFor={`role-${g.id}`}>
                             Access of {name}
@@ -382,9 +476,15 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
         {canManage && node.kind === 'folder' && (
           <section aria-labelledby="share-settings">
             <h3 id="share-settings">Sharing rule</h3>
+            <p className="muted small" id="share-rule-help">
+              Can people who got <strong>Can edit</strong> on this folder share it with others too? This applies to shares and links, not
+              to {team ? `the owners, admins and members of ${tenant.name}: they manage everything, whatever this rule says` : 'you'}.
+            </p>
             <label>
               People who can edit can also share
               <select
+                aria-describedby="share-rule-help"
+                onFocus={() => setRuleSaved(false)}
                 value={node.editors_can_share === null || node.editors_can_share === undefined ? 'inherit' : String(node.editors_can_share)}
                 onChange={(e) =>
                   run(
@@ -397,14 +497,21 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                       ),
                     'Saved the sharing rule.',
                     props.onChanged,
-                  )
+                  ).then(setRuleSaved)
                 }
               >
-                <option value="inherit">Same as the folder above (now: {(node.editors_can_share_effective ?? true) ? 'yes' : 'no'})</option>
+                <option value="inherit">
+                  {parentRule.data?.top ? 'Standard' : 'Same as the folder above'} (now: {(parentRule.data?.value ?? true) ? 'yes' : 'no'})
+                </option>
                 <option value="true">Yes</option>
                 <option value="false">No</option>
               </select>
             </label>
+            {ruleSaved && (
+              <p className="muted small" role="status">
+                Saved.
+              </p>
+            )}
           </section>
         )}
       </div>
@@ -412,12 +519,21 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   )
 }
 
+/** Whom the add form shares with: a person of the space (by user ID) or an email. */
+type AddTarget = { kind: 'person'; member: Schemas['Member'] } | { kind: 'email'; email: string }
+
 function AddPersonForm(props: {
-  onAdd: (body: Schemas['AddGrantRequest'], inviteGuest: boolean) => Promise<void>
+  onAdd: (target: AddTarget, role: Schemas['Role'], inviteGuest: boolean) => Promise<void>
+  onUseLink?: () => void
   roles: Schemas['Role'][]
   spaceName: string
-  outside: (email: string) => boolean | null
+  team: boolean
+  membersCanShare: boolean
+  itemName: string
+  match: (email: string) => EmailMatch
   canInvite: boolean
+  isAdmin: boolean
+  tenantId: string
 }) {
   const { roles, spaceName } = props
   const [email, setEmail] = useState('')
@@ -425,15 +541,19 @@ function AddPersonForm(props: {
   const [invite, setInvite] = useState(true)
   const [busy, setBusy] = useState(false)
   const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-  const isOutside = valid ? props.outside(email) : null
+  const found: EmailMatch | null = valid ? props.match(email) : null
+  const person = found?.kind === 'person' ? found.member : null
+  const outside = found?.kind === 'outside'
+  const roleWins = props.team && person !== null && managesEverything(person.role)
 
   async function submit(e: FormEvent) {
     e.preventDefault()
     setBusy(true)
     try {
-      // The server sends no email for a share yet (crates/ruum-api/src/routes/sharing.rs), so the UI
-      // does not offer it: the person must not think the other one was told.
-      await props.onAdd({ grantee: { type: 'email', email: email.trim() }, role, notify: false }, isOutside === true && props.canInvite && invite)
+      // `notify: false`: the server sends no share email yet (crates/ruum-api/src/routes/sharing.rs).
+      // A person outside the space gets the invitation email instead (the box below).
+      const target: AddTarget = person ? { kind: 'person', member: person } : { kind: 'email', email: email.trim() }
+      await props.onAdd(target, role, outside && props.canInvite && invite)
       setEmail('')
     } finally {
       setBusy(false)
@@ -457,39 +577,63 @@ function AddPersonForm(props: {
             ))}
           </select>
         </label>
-        <button type="submit" className="primary" disabled={busy}>
+        <button type="submit" className="primary" disabled={busy || found?.kind === 'me'}>
           Share
         </button>
       </div>
       <p id="add-role-meaning" className="muted small">
         {roleLabels[role]}: {roleMeanings[role]}
       </p>
-      {isOutside === true &&
+      {found?.kind === 'me' && <p className="muted small">That's your own email: you have access already.</p>}
+      {person &&
+        (roleWins ? (
+          <p className="warning" role="note">
+            {person.display_name || person.email} is {person.role === 'admin' ? 'an' : 'a'} {memberRoleLabels[person.role].toLowerCase()} of{' '}
+            {spaceName}, so they can already manage everything here
+            {props.membersCanShare || person.role !== 'member' ? ' and share it' : ''}. A share can't give them less. To let them see only
+            some folders, make them a guest
+            {props.isAdmin ? (
+              <>
+                {' '}
+                under <Link to={tenantPath(props.tenantId, 'admin', 'members')}>Members</Link>
+              </>
+            ) : (
+              ' (ask an admin)'
+            )}
+            .
+          </p>
+        ) : (
+          <p className="muted small">
+            {person.display_name || person.email} is in {spaceName}. They find {props.itemName} under Shared with me; Ruum sends no email
+            for this.
+          </p>
+        ))}
+      {outside &&
         (props.canInvite ? (
           <div className="stack">
             <label className="check">
               <input type="checkbox" checked={invite} onChange={(e) => setInvite(e.target.checked)} aria-describedby="add-outside" />
-              Also invite them to {spaceName} as a guest
+              Email them an invitation
             </label>
             <p id="add-outside" className="muted small">
-              {email.trim()} is not in {spaceName}. They can open the item only after they join it as a guest. Ruum emails them the
-              invitation.
+              {email.trim()} is new here. With the invitation they make a free Ruum account, then they can open {props.itemName}.
+              {invite ? '' : ' Without it they cannot open it.'}
             </p>
           </div>
         ) : (
           <p className="warning" role="note">
-            {email.trim()} is not in {spaceName}. They can open the item only after they join it as a guest. Ask an admin of {spaceName} to
-            invite them.
+            {email.trim()} is new here. They can open {props.itemName} only after an admin of {spaceName} invites them.
           </p>
         ))}
-      <label className="check muted">
-        <input type="checkbox" checked={false} disabled aria-describedby="no-share-mail" onChange={() => {}} />
-        Send an email
-      </label>
-      <p id="no-share-mail" className="muted small">
-        Ruum can't send emails for shares yet. Tell the person yourself. People in this space see the item under Shared with me; a
-        person outside it must join the space as a guest first.
-      </p>
+      {outside && props.onUseLink && (
+        <p className="muted small">
+          No account wanted?{' '}
+          <button type="button" className="link" onClick={props.onUseLink}>
+            Use a link instead
+          </button>{' '}
+          and send it to them yourself: anyone with the link can open {props.itemName} without signing in.
+        </p>
+      )}
     </form>
   )
 }
@@ -528,7 +672,7 @@ function CreateLinkForm(props: {
       <div className="inline-form">
         <label>
           Access
-          <select value={role} onChange={(e) => setRole(e.target.value as Schemas['ShareLinkRole'])}>
+          <select id="link-role" value={role} onChange={(e) => setRole(e.target.value as Schemas['ShareLinkRole'])}>
             {props.roles
               .filter((r) => r !== 'edit' || props.allowEdit)
               .map((r) => (

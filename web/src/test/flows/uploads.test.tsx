@@ -11,7 +11,8 @@ describe('uploads, conflicts and the file list', () => {
     await screen.findByRole('link', { name: 'Documents' })
     await user.upload(screen.getByLabelText('Upload files'), new File(['# Notes v3'], 'notes.md', { type: 'text/markdown' }))
     const d = await dialog('notes.md is already here')
-    expect(within(d).getByRole('radio', { name: 'Upload as a new version' })).toBeChecked()
+    expect(within(d).getByRole('radio', { name: 'Save as a new version' })).toBeChecked()
+    expect(within(d).getByText('The file keeps its name. The earlier version stays in Versions.')).toBeInTheDocument()
     await user.click(within(d).getByRole('button', { name: 'Continue' }))
     expect(await screen.findByText(/^Uploaded notes\.md\./)).toBeInTheDocument()
     const create = seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')!
@@ -20,7 +21,7 @@ describe('uploads, conflicts and the file list', () => {
     expect(db.nodes.filter((n) => n.parent_id === ids.personalRoot && n.name.startsWith('notes'))).toHaveLength(1)
   })
 
-  it('says before a conflict upload replaces the person\'s own version of the last minutes, and offers to name it', async () => {
+  it('by default keeps the person\'s own version of the last minutes as a named version, then uploads', async () => {
     const notes = db.nodes.find((n) => n.id === ids.notes)!
     const head = db.versions.find((v) => v.id === notes.head_version)!
     head.actor = { kind: 'user', id: ids.ada, display_name: 'Ada Lovelace' }
@@ -32,23 +33,21 @@ describe('uploads, conflicts and the file list', () => {
     await screen.findByRole('link', { name: 'Documents' })
     await user.upload(screen.getByLabelText('Upload files'), new File(['# v4'], 'notes.md', { type: 'text/markdown' }))
     const d = await dialog('notes.md is already here')
-    expect(within(d).getByRole('note')).toHaveTextContent(/You changed notes\.md 1 minute ago\..*a new version replaces that version/)
-    // The replacing choice says what it does and is not the default.
-    const replace = within(d).getByRole('radio', { name: 'Replace your version from 1 minute ago' })
-    expect(replace).not.toBeChecked()
-    expect(within(d).getByRole('radio', { name: 'Keep both' })).toBeChecked()
-    expect(within(d).queryByRole('radio', { name: 'Upload as a new version' })).not.toBeInTheDocument()
-    await user.click(replace)
-    await user.type(within(d).getByRole('textbox', { name: 'Name the current version to keep it (optional)' }), 'Before v4')
-    await user.click(within(d).getByRole('button', { name: 'Keep it and upload' }))
+    // "Save as a new version" is the default, and the earlier version gets a name, so nothing is lost.
+    expect(within(d).getByRole('radio', { name: 'Save as a new version' })).toBeChecked()
+    const name = within(d).getByRole('textbox', { name: 'Name of the earlier version' })
+    expect((name as HTMLInputElement).value).toMatch(/^Before the upload of \d\d:\d\d$/)
+    expect(within(d).getByText(/You changed notes\.md 1 minute ago\. Ruum keeps that version under this name, so nothing is lost\./)).toBeInTheDocument()
+    await user.keyboard('{Enter}')
     expect(await screen.findByText(/^Uploaded notes\.md\.$/)).toBeInTheDocument()
-    // The old version got a name first, so it stays a version of its own.
-    expect(seen.find((r) => r.method === 'PUT' && r.path.endsWith('/label'))?.body).toEqual({ label: 'Before v4' })
-    expect(db.versions.find((v) => v.id === head.id)?.label).toBe('Before v4')
+    // The old version got its name first, so it stays a version of its own.
+    const labelled = seen.find((r) => r.method === 'PUT' && r.path.endsWith('/label'))?.body as { label: string } | undefined
+    expect(labelled?.label).toMatch(/^Before the upload of /)
+    expect(db.versions.find((v) => v.id === head.id)?.label).toMatch(/^Before the upload of /)
     expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_version', node_id: ids.notes })
   })
 
-  it('a conflict upload by default does not replace the person\'s own version of the last minutes', async () => {
+  it('says in plain words that a conflict upload without a name replaces the version of the last minutes', async () => {
     const notes = db.nodes.find((n) => n.id === ids.notes)!
     const head = db.versions.find((v) => v.id === notes.head_version)!
     head.actor = { kind: 'user', id: ids.ada, display_name: 'Ada Lovelace' }
@@ -59,10 +58,14 @@ describe('uploads, conflicts and the file list', () => {
     await screen.findByRole('link', { name: 'Documents' })
     await user.upload(screen.getByLabelText('Upload files'), new File(['# v4'], 'notes.md', { type: 'text/markdown' }))
     const d = await dialog('notes.md is already here')
-    await user.keyboard('{Enter}')
-    await waitFor(() => expect(d).not.toBeInTheDocument())
+    await user.clear(within(d).getByRole('textbox', { name: 'Name of the earlier version' }))
+    expect(within(d).getByRole('note')).toHaveTextContent(
+      'Without a name, the new upload replaces your version from 1 minute ago: Ruum joins the changes you make within 10 minutes into one version.',
+    )
+    await user.click(within(d).getByRole('button', { name: 'Continue' }))
     await waitFor(() => expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')).toBeTruthy())
-    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_file' })
+    expect(seen.some((r) => r.method === 'PUT' && r.path.endsWith('/label'))).toBe(false)
+    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_version' })
   })
 
   it('keeps both, and shows the name the file was saved under', async () => {
@@ -70,7 +73,7 @@ describe('uploads, conflicts and the file list', () => {
     await screen.findByRole('link', { name: 'Documents' })
     await user.upload(screen.getByLabelText('Upload files'), new File(['other'], 'notes.md', { type: 'text/markdown' }))
     const d = await dialog('notes.md is already here')
-    await user.click(within(d).getByRole('radio', { name: 'Keep both' }))
+    await user.click(within(d).getByRole('radio', { name: 'Keep both, as two separate files' }))
     await user.click(within(d).getByRole('button', { name: 'Continue' }))
     const panel = await screen.findByRole('region', { name: 'Uploads' })
     expect(await within(panel).findByText('Done, saved as notes (2).md')).toBeInTheDocument()

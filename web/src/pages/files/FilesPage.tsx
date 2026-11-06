@@ -425,7 +425,7 @@ function WelcomeCard(props: { empty: boolean | undefined; onUpload: () => void; 
     <section className="welcome card" aria-labelledby="welcome-title">
       <h2 id="welcome-title">Welcome to Ruum, {first}</h2>
       <ul>
-        <li>Upload files and folders, from any device.</li>
+        <li>Upload files from any device; drop them on a folder to put them there.</li>
         <li>Every change is kept as a version, so you can go back.</li>
         <li>Connect an AI agent that works for you, only in the folders you choose.</li>
       </ul>
@@ -589,7 +589,7 @@ function FileTable(props: {
               </td>
               <th scope="row">
                 <span className="name-cell">
-                  <span className={`kind kind-${n.kind}`}>{n.kind === 'folder' ? <FolderIcon /> : <FileIcon />}</span>
+                  <span className={`kind kind-${n.kind}`}>{n.kind === 'folder' ? <FolderIcon /> : <FileIcon type={n.type} name={n.name} />}</span>
                   {n.kind === 'folder' ? (
                     <Link to={tenantPath(props.tenantId, 'files', n.id)}>{n.name}</Link>
                   ) : (

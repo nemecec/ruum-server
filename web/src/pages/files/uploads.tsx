@@ -256,12 +256,18 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
 
 export type ConflictChoice = 'version' | 'keep' | 'skip'
 
+/** "Before the upload of 15:13": the default name that keeps a recent version (24-hour clock, local time). */
+function keepLabel(now = new Date()): string {
+  return `Before the upload of ${now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}`
+}
+
 /**
  * Asks once per batch what to do with files whose names are already in the folder (copy.md 3.2):
- * a new version (the default), keep both, or skip. `recent` are the items whose head version is
- * the person's own unnamed save of the last 10 minutes: a new version replaces it (design 5.3).
- * Then the dialog says so, names the choice "Replace", makes "Keep both" the default, and offers
- * to name the current version to keep it.
+ * save as a new version (the default), keep both, or skip. `recent` are the items whose head
+ * version is the person's own unnamed save of the last 10 minutes: the server joins a new version
+ * into such a version (design 5.3). So that "every change is kept as a version" holds, the
+ * default names that version first (named versions never join) and says so; clearing the name
+ * says in plain words that the upload then replaces it (decisions.md, synthetic-user round).
  */
 export function ConflictDialog(props: {
   names: string[]
@@ -271,18 +277,13 @@ export function ConflictDialog(props: {
 }) {
   const { names } = props
   const recent = props.recent ?? []
-  const [choice, setChoice] = useState<ConflictChoice>(recent.length ? 'keep' : 'version')
-  const [label, setLabel] = useState('')
+  const [choice, setChoice] = useState<ConflictChoice>('version')
+  const [label, setLabel] = useState(() => (recent.length ? keepLabel() : ''))
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
   const title = names.length === 1 ? `${names[0]} is already here` : `${names.length} items are already here`
-  const allRecent = recent.length > 0 && recent.length === names.length
-  const versionLabel =
-    names.length === 1 && allRecent
-      ? `Replace your version from ${formatWhen(recent[0].updated_at).toLowerCase()}`
-      : allRecent
-        ? 'Replace your versions from the last 10 minutes'
-        : 'Upload as a new version'
+  const one = names.length === 1
+  const when = recent.length === 1 ? formatWhen(recent[0].updated_at).toLowerCase() : null
   return (
     <Dialog title={title} open onClose={props.onClose}>
       <form
@@ -307,30 +308,35 @@ export function ConflictDialog(props: {
             {names.length > 8 && <li>and {names.length - 8} more</li>}
           </ul>
         )}
-        {recent.length > 0 && (
-          <p className="warning" role="note">
-            {recent.length === 1
-              ? `You changed ${recent[0].name} ${formatWhen(recent[0].updated_at).toLowerCase()}.`
-              : `You changed ${recent.length} of these files in the last 10 minutes.`}{' '}
-            Ruum keeps one version for the changes you make within 10 minutes, so a new version replaces{' '}
-            {recent.length === 1 ? 'that version' : 'those versions'}.
-          </p>
-        )}
         <fieldset className="stack">
-          <legend>{names.length === 1 ? 'What should Ruum do?' : `What should Ruum do with all ${names.length}?`}</legend>
+          <legend>{one ? 'What should Ruum do?' : `What should Ruum do with all ${names.length}?`}</legend>
           <label className="check">
-            <input type="radio" name="conflict" checked={choice === 'version'} onChange={() => setChoice('version')} />
-            {versionLabel}
+            <input type="radio" name="conflict" checked={choice === 'version'} onChange={() => setChoice('version')} aria-describedby="conflict-version" />
+            Save as a new version
           </label>
-          {choice === 'version' && recent.length > 0 && (
-            <label className="indent">
-              Name the current version to keep it (optional)
-              <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Before the new upload" />
-            </label>
+          {choice === 'version' && (
+            <div className="indent stack">
+              <p id="conflict-version" className="muted small">
+                {one ? 'The file keeps its name. The earlier version stays in Versions.' : 'The files keep their names. The earlier versions stay in Versions.'}
+              </p>
+              {recent.length > 0 && (
+                <>
+                  <label>
+                    {recent.length === 1 ? 'Name of the earlier version' : 'Name of the earlier versions'}
+                    <input value={label} onChange={(e) => setLabel(e.target.value)} aria-describedby="conflict-keep" />
+                  </label>
+                  <p id="conflict-keep" className={label.trim() ? 'muted small' : 'warning'} role={label.trim() ? undefined : 'note'}>
+                    {label.trim()
+                      ? `${recent.length === 1 ? `You changed ${recent[0].name} ${when}` : `You changed ${recent.length} of these files in the last 10 minutes`}. Ruum keeps that version under this name, so nothing is lost.`
+                      : `Without a name, the new upload replaces ${recent.length === 1 ? `your version from ${when}` : 'your versions from the last 10 minutes'}: Ruum joins the changes you make within 10 minutes into one version.`}
+                  </p>
+                </>
+              )}
+            </div>
           )}
           <label className="check">
             <input type="radio" name="conflict" checked={choice === 'keep'} onChange={() => setChoice('keep')} />
-            Keep both
+            {one ? 'Keep both, as two separate files' : 'Keep both, as separate files'}
           </label>
           <label className="check">
             <input type="radio" name="conflict" checked={choice === 'skip'} onChange={() => setChoice('skip')} />
@@ -343,7 +349,7 @@ export function ConflictDialog(props: {
             Cancel
           </button>
           <button type="submit" className="primary" disabled={busy}>
-            {choice === 'version' && recent.length > 0 && label.trim() ? 'Keep it and upload' : 'Continue'}
+            Continue
           </button>
         </div>
       </form>

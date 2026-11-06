@@ -53,8 +53,9 @@ export function AcceptInvitationPage() {
     <main className="page narrow" id="main">
       <h1>You're invited to a space in Ruum</h1>
       <p>
-        You join as <strong>{me.user.display_name}</strong> ({me.user.email}), with the role the person who invited you chose. The
-        space then shows up in your space switcher.
+        You join as <strong>{me.user.display_name}</strong> ({me.user.email}). The invitation email names the space, the person who
+        invited you and your role; Ruum can't show them here yet. After you join, the space and what was shared with you show up in
+        your space switcher.
       </p>
       <ErrorNote error={error} />
       <div className="actions left">

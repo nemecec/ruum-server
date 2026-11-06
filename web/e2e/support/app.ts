@@ -16,7 +16,7 @@ export async function signIn(page: Page, user: TestUser, returnTo = '/', opts: {
   await expect(page.getByRole('heading', { name: 'Sign in to Ruum' })).toBeVisible()
   // The buttons pass an `idp` hint that the server does not send to Zitadel yet (docs/STATUS.md),
   // so every button ends on the Zitadel login UI. The passkey button keeps that true later too.
-  await page.getByRole('link', { name: 'Sign in with a passkey' }).click()
+  await page.getByRole('link', { name: 'Sign in with email' }).click()
   await page.waitForURL(/\/ui\/login\//)
   await page.getByLabel('Login Name').fill(user.loginName)
   await page.getByRole('button', { name: 'Next' }).click()

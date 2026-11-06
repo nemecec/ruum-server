@@ -402,9 +402,13 @@ function seed() {
       accepted_at: null,
     },
   ]
-  const audit: Schemas['AuditEntry'][] = [
+  const audit: (Schemas['AuditEntry'] & { tenant_id?: string })[] = [
     { id: '0190a000-0000-7000-8000-000000000b01', action: 'invitation.created', actor: userRef(), on_behalf_of: null, target_type: 'invitation', target_id: 'alan@example.com', ip: '127.0.0.1', at: '2026-11-01T10:00:00Z', data: { email: 'alan@example.com' } },
     { id: '0190a000-0000-7000-8000-000000000b02', action: 'agent.registered', actor: userRef(), on_behalf_of: null, target_type: 'agent', target_id: ids.agentClaude, ip: '127.0.0.1', at: t0, data: { name: 'Claude Desktop' } },
+    // Access, role and rule entries carry what the server writes in `data` (sharing/postgres.rs, tenants/postgres.rs).
+    { id: '0190a000-0000-7000-8000-000000000b04', tenant_id: ids.team, action: 'grant.added', actor: userRef(), on_behalf_of: null, target_type: 'node', target_id: ids.teamSpecs, ip: null, at: '2026-11-03T10:00:00Z', data: { grantee: { type: 'user', id: ids.grace }, role: 'edit' } },
+    { id: '0190a000-0000-7000-8000-000000000b05', tenant_id: ids.team, action: 'member.role_changed', actor: userRef(), on_behalf_of: null, target_type: 'member', target_id: ids.grace, ip: '127.0.0.1', at: '2026-11-02T10:00:00Z', data: { old_role: 'guest', new_role: 'member' } },
+    { id: '0190a000-0000-7000-8000-000000000b06', tenant_id: ids.team, action: 'node.sharing_updated', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'node', target_id: ids.teamSpecs, ip: null, at: '2026-11-02T09:00:00Z', data: { old_editors_can_share: null, new_editors_can_share: false } },
     { id: '0190a000-0000-7000-8000-000000000b03', action: 'tenant.updated', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'tenant', target_id: ids.team, ip: '127.0.0.1', at: '2026-10-05T09:00:00Z', data: { allow_edit_links: true } },
   ]
   const limits: Record<string, Schemas['LimitsAndUsage']> = {

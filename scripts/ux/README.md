@@ -17,7 +17,7 @@ cd web && npm ci && npx playwright install chromium
 node scripts/ux/drive.mjs start --port 9333 --viewport 1280x800 --scheme light
 node scripts/ux/drive.mjs goto http://localhost:5182/
 node scripts/ux/drive.mjs snapshot
-node scripts/ux/drive.mjs click "link:Sign in with a passkey"
+node scripts/ux/drive.mjs click "link:Sign in with email"
 node scripts/ux/drive.mjs fill "Login Name" ann@example.test
 node scripts/ux/drive.mjs press Enter
 node scripts/ux/drive.mjs screenshot /tmp/files.png
@@ -74,7 +74,7 @@ with a password (the e2e specs do it with `web/e2e/support/zitadel.ts`), then:
 
 ```sh
 node scripts/ux/drive.mjs goto http://localhost:5182/
-node scripts/ux/drive.mjs click "link:Sign in with a passkey"   # every button opens the Zitadel login for now
+node scripts/ux/drive.mjs click "link:Sign in with email"   # every button opens the Zitadel login for now
 node scripts/ux/drive.mjs fill "Login Name" <email>
 node scripts/ux/drive.mjs click button:Next
 node scripts/ux/drive.mjs fill Password <password>

@@ -87,7 +87,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                   return (
                     <li key={v.id} className={current ? 'version current' : 'version'}>
                       <div>
-                        <strong title={when}>{formatWhen(v.created_at)}</strong>
+                        <strong>{formatWhen(v.created_at)}</strong> <span className="muted small">{formatShortDate(v.created_at)}</span>
                         {current && <span className="badge">Current</span>}
                         {v.label && <span className="badge label">{v.label}</span>}
                       </div>
@@ -109,8 +109,12 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                           </button>
                         )}
                         {canEdit && (
-                          <button type="button" aria-label={`${v.label ? 'Rename' : 'Name'} version of ${when}`} onClick={() => setNaming(v)}>
-                            {v.label ? 'Rename' : 'Name'}
+                          <button
+                            type="button"
+                            aria-label={v.label ? `Rename version of ${when}` : `Keep forever: name the version of ${when}`}
+                            onClick={() => setNaming(v)}
+                          >
+                            {v.label ? 'Rename' : 'Keep forever…'}
                           </button>
                         )}
                         {canEdit && !current && (
@@ -151,6 +155,12 @@ const kindLabels: Record<Schemas['DiffChangeKind'], string> = {
   replace: 'Replaced',
 }
 
+/** "1 change", "3 changes": the plain summary of a comparison (the counts by kind confused people). */
+function changeCount(s: { inserted: number; deleted: number; modified: number; moved?: number | null }): string {
+  const n = s.inserted + s.deleted + s.modified + (s.moved ?? 0)
+  return n === 1 ? '1 change' : `${n} changes`
+}
+
 /** Plain names of the diff plugins (ia.md: "Compare as" text, data, image, file). */
 function pluginLabel(id: string): string {
   const name = id.split('@')[0]
@@ -176,6 +186,8 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
   const others = props.versions.filter((v) => v.id !== from.id)
   const [to, setTo] = useState(from.id === node.head_version ? (others[0]?.id ?? '') : '')
   const [plugin, setPlugin] = useState('')
+  // "Compare as" is for people who know the plugins; it waits behind "More options".
+  const [advanced, setAdvanced] = useState(false)
   const plugins = useApi(
     () => unwrap(client.GET('/v1/nodes/{node_id}/diff/plugins', { params: { path: { node_id: node.id } } })),
     [node.id],
@@ -214,7 +226,12 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
                 ))}
             </select>
           </label>
-          {pluginItems.length > 1 && (
+          {pluginItems.length > 1 && !advanced && (
+            <button type="button" className="link small" onClick={() => setAdvanced(true)}>
+              More options
+            </button>
+          )}
+          {pluginItems.length > 1 && advanced && (
             <label>
               Compare as
               <select value={plugin} onChange={(e) => setPlugin(e.target.value)}>
@@ -240,8 +257,7 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
                   ) : (
                     <>
                       <p>
-                        {d.summary.inserted} added, {d.summary.deleted} removed, {d.summary.modified} changed
-                        {d.summary.moved ? `, ${d.summary.moved} moved` : ''}
+                        {changeCount(d.summary)}
                       </p>
                       <ChangeList changes={d.changes} />
                     </>

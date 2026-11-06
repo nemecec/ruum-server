@@ -30,7 +30,8 @@ describe('versions panel', () => {
     await user.click(compare[2])
     const d = await dialog('Compare versions')
     const diff = await within(d).findByRole('group', { name: 'Changes' })
-    expect(within(diff).getByText(/2 added, 0 removed, 2 changed/)).toBeInTheDocument()
+    // One plain count, not the counts by kind.
+    expect(within(diff).getByText('4 changes')).toBeInTheDocument()
     expect(within(diff).getByText('First idea, refined.')).toBeInTheDocument()
   })
 
@@ -51,7 +52,7 @@ describe('versions panel', () => {
 
     // The first draft compared with the second version (not the current one).
     await user.selectOptions(within(d).getByRole('combobox', { name: 'To' }), '0190a000-0000-7000-8000-000000000602')
-    expect(await within(d).findByText(/1 added, 0 removed, 1 changed/)).toBeInTheDocument()
+    expect(await within(d).findByText('2 changes')).toBeInTheDocument()
     const last = seen.filter((r) => r.path.includes('/diff?')).at(-1)!
     expect(new URL(last.path, 'http://x').searchParams.get('from')).toBe('0190a000-0000-7000-8000-000000000601')
     expect(new URL(last.path, 'http://x').searchParams.get('to')).toBe('0190a000-0000-7000-8000-000000000602')
@@ -63,6 +64,9 @@ describe('versions panel', () => {
     await user.click(compare[1])
     const d = await dialog('Compare versions')
     await within(d).findByRole('group', { name: 'Changes' })
+    // "Compare as" waits behind "More options".
+    expect(within(d).queryByRole('combobox', { name: 'Compare as' })).not.toBeInTheDocument()
+    await user.click(within(d).getByRole('button', { name: 'More options' }))
     await user.selectOptions(await within(d).findByRole('combobox', { name: 'Compare as' }), 'binary')
     expect(await within(d).findByText('Compared as file.')).toBeInTheDocument()
     expect(within(d).getByText('Content')).toBeInTheDocument()
@@ -83,7 +87,9 @@ describe('versions panel', () => {
 
   it('names a version, and says that named versions are kept forever', async () => {
     const { user, panel } = await openVersions()
-    const label = await within(panel).findAllByRole('button', { name: /^Name version/ })
+    // The button says what naming is for.
+    const label = await within(panel).findAllByRole('button', { name: /^Keep forever: name the version of / })
+    expect(label[0]).toHaveTextContent('Keep forever…')
     await user.click(label[0])
     const d = await dialog('Name this version')
     expect(within(d).getByText(/Named versions are kept forever/)).toBeInTheDocument()

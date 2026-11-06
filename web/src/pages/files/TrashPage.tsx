@@ -80,7 +80,7 @@ export function TrashPage() {
                   <tr key={node.id}>
                     <th scope="row">
                       <span className="name-cell">
-                        <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon />}</span>
+                        <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon type={node.type} name={node.name} />}</span>
                         {node.name}
                       </span>
                     </th>

@@ -19,7 +19,7 @@ describe('sign-in', () => {
     // Each provider starts loginStart with the same return_to and its idp hint.
     const google = screen.getByRole('link', { name: 'Continue with Google' })
     expect(google).toHaveAttribute('href', `/v1/auth/login?return_to=${encodeURIComponent(`${personal}/agents`)}&idp=google`)
-    expect(screen.getByRole('link', { name: 'Sign in with a passkey' }).getAttribute('href')).toContain('idp=passkey')
+    expect(screen.getByRole('link', { name: 'Sign in with email' }).getAttribute('href')).toContain('idp=passkey')
     expect(screen.getByRole('link', { name: 'Continue with Microsoft' }).getAttribute('href')).toContain('idp=microsoft')
   })
 

@@ -67,7 +67,7 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
               <tr key={node.id}>
                 <th scope="row">
                   <span className="name-cell">
-                    <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon />}</span>
+                    <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon type={node.type} name={node.name} />}</span>
                     <Link to={sharedItemPath(node)}>{node.name}</Link>
                   </span>
                 </th>

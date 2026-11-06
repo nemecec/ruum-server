@@ -241,7 +241,7 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
                   <tr key={n.id}>
                     <th scope="row">
                       <span className="name-cell">
-                        <span className={`kind kind-${n.kind}`}>{n.kind === 'folder' ? <FolderIcon /> : <FileIcon />}</span>
+                        <span className={`kind kind-${n.kind}`}>{n.kind === 'folder' ? <FolderIcon /> : <FileIcon type={n.type} name={n.name} />}</span>
                         <button type="button" className="link" onClick={() => setTrail([...trail, n])}>
                           {n.name}
                         </button>

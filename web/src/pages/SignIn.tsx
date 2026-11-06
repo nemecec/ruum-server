@@ -2,7 +2,7 @@ import { useSearchParams } from 'react-router'
 import { loginUrl, safeReturnTo, type Idp } from '../app/auth'
 
 const providers: { idp: Idp; label: string }[] = [
-  { idp: 'passkey', label: 'Sign in with a passkey' },
+  { idp: 'passkey', label: 'Sign in with email' },
   { idp: 'google', label: 'Continue with Google' },
   { idp: 'microsoft', label: 'Continue with Microsoft' },
 ]
@@ -19,11 +19,16 @@ export function SignInPage() {
   const returnTo = safeReturnTo(params.get('return_to'))
   const error = params.get('error')
   const signedOut = params.has('signed_out')
+  const invited = returnTo.startsWith('/invitations/accept')
 
   return (
     <main className="page narrow" id="main">
       <h1>Sign in to Ruum</h1>
-      <p className="muted">Files, databases and apps in one tree, for you and your agents.</p>
+      {invited ? (
+        <p>Sign in, or make a free account, to join the space you were invited to. Ruum brings you back to the invitation.</p>
+      ) : (
+        <p className="muted">Files, databases and apps in one tree, for you and your agents.</p>
+      )}
       {signedOut && (
         <p className="notice" role="status">
           You are signed out.

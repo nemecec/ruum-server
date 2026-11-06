@@ -17,6 +17,18 @@ describe('tenant admin', () => {
     expect(db.members.find((m) => m.user_id === ids.grace && m.tenant_id === ids.team)?.role).toBe('admin')
   })
 
+  it('asks before a member becomes a guest, and says what they lose', async () => {
+    const { user } = renderApp(`${team}/admin/members`)
+    await user.selectOptions(await screen.findByRole('combobox', { name: 'Role of Grace Hopper' }), 'guest')
+    const d = await dialog('Make Grace Hopper a guest?')
+    expect(d).toHaveTextContent('Grace Hopper then sees only the items that are shared with them directly, and loses access to everything else in Analytical Engines at once.')
+    // Nothing changed before the confirmation.
+    expect(db.members.find((m) => m.user_id === ids.grace && m.tenant_id === ids.team)?.role).toBe('member')
+    await user.click(within(d).getByRole('button', { name: 'Make guest' }))
+    expect(await screen.findByText('Grace Hopper is now guest.')).toBeInTheDocument()
+    expect(db.members.find((m) => m.user_id === ids.grace && m.tenant_id === ids.team)?.role).toBe('guest')
+  })
+
   it('removes a member after a confirmation', async () => {
     const { user } = renderApp(`${team}/admin/members`)
     await user.click(await screen.findByRole('button', { name: 'Remove Grace Hopper' }))
@@ -32,7 +44,7 @@ describe('tenant admin', () => {
     expect(await screen.findByText('alan@example.com')).toBeInTheDocument()
     const form = screen.getByRole('form', { name: 'Invite people' })
     // A team space offers members; the role's meaning is under the menu.
-    expect(within(form).getByText('Member: work with everything in the team space')).toBeInTheDocument()
+    expect(within(form).getByText('Member: can see, change, delete and share everything in the team space')).toBeInTheDocument()
     await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'kathleen@example.com, alan.t@example.com')
     await user.selectOptions(within(form).getByRole('combobox', { name: 'Role' }), 'guest')
     await user.click(within(form).getByRole('button', { name: 'Send invitations' }))
@@ -84,6 +96,19 @@ describe('tenant admin', () => {
     await user.click(screen.getByRole('button', { name: 'Show' }))
     await waitFor(() => expect(screen.queryByText(/invited someone/)).not.toBeInTheDocument())
     expect(screen.getByText(/created an agent: Claude Desktop/)).toBeInTheDocument()
+  })
+
+  it('says who gave whom access to what, and the old and new values', async () => {
+    renderApp(`${team}/admin/audit`)
+    const access = (await screen.findByText(/gave Grace Hopper edit access to/)).closest('li')!
+    // The item is a link to it.
+    expect(await within(access).findByRole('link', { name: 'engine-specs.txt' })).toHaveAttribute('href', `${team}/item/${ids.teamSpecs}`)
+    expect(access).toHaveTextContent('Ada Lovelace gave Grace Hopper edit access to engine-specs.txt')
+    expect(screen.getByText(/changed Grace Hopper from Guest to Member/)).toBeInTheDocument()
+    expect(
+      await screen.findByText(/changed the sharing rule of/, { selector: 'span' }),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/: people who can edit can also share, from same as the folder above to no/)).toBeInTheDocument()
   })
 
   it('keeps non-admins out', async () => {

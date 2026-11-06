@@ -66,3 +66,85 @@ export function auditText(a: Schemas['AuditEntry']): string {
   if (a.target_type === 'node') return joins ? `${verb} an item` : `${verb}: an item`
   return verb
 }
+
+/** What the activity log knows about the items and people an entry names. */
+export type AuditContext = {
+  /** The name of a user, or `undefined` when unknown. */
+  person: (id: string) => string | undefined
+  /** The name of the space (for a grant to everyone in it). */
+  spaceName: string
+}
+
+/** One part of a detailed entry: plain text, or an item the row links to. */
+export type AuditPart = string | { item: string }
+
+const roleWords: Record<string, string> = { view: 'view', comment: 'comment', edit: 'edit', manage: 'manage' }
+const memberRoleWords: Record<string, string> = { owner: 'Owner', admin: 'Admin', member: 'Member', guest: 'Guest' }
+const ruleWords = (v: unknown) => (v === true ? 'yes' : v === false ? 'no' : 'same as the folder above')
+
+function granteeText(g: unknown, ctx: AuditContext): string | null {
+  if (!g || typeof g !== 'object') return null
+  const x = g as Record<string, unknown>
+  switch (x.type) {
+    case 'user':
+      return (typeof x.id === 'string' ? ctx.person(x.id) : undefined) ?? str(x.display_name) ?? str(x.email) ?? 'a person'
+    case 'email':
+      return str(x.email)
+    case 'tenant_members':
+      return `everyone in ${ctx.spaceName}`
+    default:
+      return null
+  }
+}
+
+/**
+ * The detailed form of the entries an admin needs to answer "who gave whom access to what":
+ * access, role and sharing rule changes name the item, the person and the old and new values.
+ * `null` for other entries (they use `auditText`). The item is a separate part so the row can
+ * link to it.
+ */
+export function auditDetail(a: Schemas['AuditEntry'], ctx: AuditContext): AuditPart[] | null {
+  const d = (a.data ?? {}) as Record<string, unknown>
+  const item: AuditPart = { item: a.target_id ?? '' }
+  const role = (v: unknown) => (typeof v === 'string' ? (roleWords[v] ?? v) : 'some')
+  switch (a.action) {
+    case 'grant.added': {
+      const who = granteeText(d.grantee, ctx)
+      if (!who || a.target_type !== 'node') return null
+      return [`gave ${who} ${role(d.role)} access to `, item]
+    }
+    case 'grant.updated': {
+      const who = granteeText(d.grantee, ctx)
+      if (!who || a.target_type !== 'node') return null
+      return [`changed the access of ${who} to `, item, ` from ${role(d.old_role)} to ${role(d.new_role)}`]
+    }
+    case 'grant.removed': {
+      const who = granteeText(d.grantee, ctx)
+      if (!who || a.target_type !== 'node') return null
+      return [`removed the ${role(d.role)} access of ${who} to `, item]
+    }
+    case 'node.sharing_updated':
+      if (a.target_type !== 'node') return null
+      return [
+        'changed the sharing rule of ',
+        item,
+        `: people who can edit can also share, from ${ruleWords(d.old_editors_can_share)} to ${ruleWords(d.new_editors_can_share)}`,
+      ]
+    case 'member.role_changed': {
+      const who = (a.target_id && ctx.person(a.target_id)) ?? 'a member'
+      const from = typeof d.old_role === 'string' ? (memberRoleWords[d.old_role] ?? d.old_role) : null
+      const to = typeof d.new_role === 'string' ? (memberRoleWords[d.new_role] ?? d.new_role) : null
+      return from && to ? [`changed ${who} from ${from} to ${to}`] : [`changed the role of ${who}`]
+    }
+    case 'member.removed': {
+      const who = a.target_id ? ctx.person(a.target_id) : undefined
+      return who ? [`removed ${who} from the space`] : null
+    }
+    case 'share_link.created':
+    case 'share_link.revoked':
+      if (a.target_type !== 'node') return null
+      return [a.action === 'share_link.created' ? 'made a link to ' : 'turned off a link to ', item]
+    default:
+      return null
+  }
+}

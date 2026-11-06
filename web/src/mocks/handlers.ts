@@ -536,7 +536,15 @@ export const handlers: HttpHandler[] = [
   route('get', '/v1/tenants/{tenant_id}/audit', ({ params, query }) => {
     requireAdmin(params.tenant_id)
     const action = query.get('action')
-    return page(db.audit.filter((a) => !action || a.action.startsWith(action)), query)
+    const entries = db.audit
+      .filter((a) => (!a.tenant_id || a.tenant_id === params.tenant_id) && (!action || a.action.startsWith(action)))
+      .sort((x, y) => y.at.localeCompare(x.at))
+      .map((a) => {
+        const copy: Partial<typeof a> = { ...a }
+        delete copy.tenant_id
+        return copy as Schemas['AuditEntry']
+      })
+    return page(entries, query)
   }),
 
   // ------------------------------------------------------------------ agents
@@ -1020,21 +1028,28 @@ export const handlers: HttpHandler[] = [
       if (body.grantee.type === 'email' && !/^[^@\s]+@[^@\s]+$/.test(body.grantee.email)) {
         throw new Fail(422, 'validation_failed', 'Enter a valid email address.')
       }
-      const known = body.grantee.type === 'email' ? db.members.find((m) => m.email === (body.grantee as Schemas['GranteeEmail']).email) : undefined
-      const grantee: Schemas['Grantee'] = known
-        ? { type: 'user', id: known.user_id, display_name: known.display_name, email: known.email }
-        : body.grantee
+      // Like the server (contract, addGrant): a grant to an email stays an email grant until an
+      // invitation is accepted, also for the email of a member; a grant by user ID reaches only
+      // members and guests of the tenant (decision 0002-1).
+      let grantee: Schemas['Grantee'] = body.grantee
+      if (body.grantee.type === 'user') {
+        const id = body.grantee.id
+        const m = db.members.find((x) => x.tenant_id === tenant && x.user_id === id)
+        if (!m) throw notFound('User')
+        grantee = { type: 'user', id: m.user_id }
+      }
       const grant: Schemas['Grant'] = { id: newId(), node_id: n.id, grantee, role: body.role, inherited_from: null, created_by: byUser(), created_at: now() }
       db.grants.push(grant)
-      return { grant, change: record('grant.added', n.id, tenant) }
+      return { grant, change: record('grant.added', n.id, tenant, { grant_id: grant.id, grantee, role: body.role }) }
     },
     { status: 201 },
   ),
   route('patch', '/v1/nodes/{node_id}/grants/{grant_id}', ({ params, body, tenant }) => {
     const grant = db.grants.find((g) => g.id === params.grant_id && g.node_id === params.node_id)
     if (!grant) throw notFound('Grant')
+    const old = grant.role
     grant.role = body.role
-    return { grant, change: record('grant.updated', params.node_id, tenant) }
+    return { grant, change: record('grant.updated', params.node_id, tenant, { grant_id: grant.id, grantee: grant.grantee, old_role: old, new_role: body.role }) }
   }),
   route('delete', '/v1/nodes/{node_id}/grants/{grant_id}', ({ params, tenant }) => {
     const before = db.grants.length
@@ -1044,10 +1059,12 @@ export const handlers: HttpHandler[] = [
   }),
   route('patch', '/v1/nodes/{node_id}/sharing', ({ params, body, tenant }) => {
     const n = findNode(params.node_id, tenant)
+    const old = n.editors_can_share ?? null
     n.editors_can_share = body.editors_can_share
-    n.editors_can_share_effective = body.editors_can_share ?? true
+    const parent = db.nodes.find((x) => x.id === n.parent_id)
+    n.editors_can_share_effective = body.editors_can_share ?? parent?.editors_can_share_effective ?? true
     touch(n)
-    return { node: n, change: record('node.sharing_updated', n.id, tenant) }
+    return { node: n, change: record('node.sharing_updated', n.id, tenant, { old_editors_can_share: old, new_editors_can_share: body.editors_can_share }) }
   }),
   route('get', '/v1/nodes/{node_id}/share-links', ({ params, tenant, query }) => {
     findNode(params.node_id, tenant)

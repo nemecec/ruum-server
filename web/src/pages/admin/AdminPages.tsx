@@ -1,16 +1,17 @@
 import { useState, type FormEvent } from 'react'
-import { NavLink, Outlet } from 'react-router'
+import { Link, NavLink, Outlet } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useSession } from '../../app/useSession'
-import { useTenant } from '../../app/tenant'
+import { tenantPath, useTenant } from '../../app/tenant'
 import { Actor } from '../../app/names'
+import { useNames } from '../../app/useNames'
 import { StartTeamDialog } from '../../app/Shell'
 import { formatBytes, formatDate, formatWhen, memberRoleLabels, memberRoleMeanings } from '../../components/format'
 import { useToast } from '../../components/useToast'
-import { ConfirmButton, EmptyState, ErrorNote, Loaded, LoadMore } from '../../components/ui'
-import { auditText } from './audit'
+import { ConfirmButton, ConfirmDialog, EmptyState, ErrorNote, Loaded, LoadMore } from '../../components/ui'
+import { auditDetail, auditText } from './audit'
 
 /** The tenant admin layout: a sub-navigation and one admin page. */
 export function AdminLayout() {
@@ -59,6 +60,10 @@ export function MembersPage() {
     [tenant.id],
   )
 
+  // A change to Guest takes away everything that is not shared with the person directly, so it
+  // asks first and says so (the role select alone gave no hint).
+  const [toGuest, setToGuest] = useState<Schemas['Member'] | null>(null)
+
   async function changeRole(m: Schemas['Member'], role: Schemas['MemberRole']) {
     setError(undefined)
     try {
@@ -79,6 +84,20 @@ export function MembersPage() {
     <section aria-labelledby="members-title">
       <h2 id="members-title">Members</h2>
       <ErrorNote error={error} />
+      {toGuest && (
+        <ConfirmDialog
+          title={`Make ${toGuest.display_name} a guest?`}
+          message={
+            <p>
+              {toGuest.display_name} then sees only the items that are shared with them directly, and loses access to everything else in{' '}
+              {tenant.name} at once. You can make them a {memberRoleLabels[toGuest.role].toLowerCase()} again later.
+            </p>
+          }
+          confirmLabel="Make guest"
+          onConfirm={() => changeRole(toGuest, 'guest')}
+          onClose={() => setToGuest(null)}
+        />
+      )}
       <Loaded state={members}>
         {({ items }) => (
           <table className="table">
@@ -114,7 +133,11 @@ export function MembersPage() {
                         id={`member-role-${m.user_id}`}
                         value={m.role}
                         disabled={locked}
-                        onChange={(e) => changeRole(m, e.target.value as Schemas['MemberRole'])}
+                        onChange={(e) => {
+                          const role = e.target.value as Schemas['MemberRole']
+                          if (role === 'guest' && m.role !== 'guest') setToGuest(m)
+                          else void changeRole(m, role)
+                        }}
                       >
                         {assignable
                           .filter((r) => r !== 'owner' || myRole === 'owner' || m.role === 'owner')
@@ -437,6 +460,25 @@ export function AuditPage() {
       )) as Schemas['AuditPage'],
     [tenant.id, filter],
   )
+  // The items that entries name, by ID: their name and whether they are a folder. An item the
+  // admin can't open any more (trashed for good) stays "an item".
+  const nodeIds = [
+    ...new Set((audit.data?.items ?? []).filter((a) => a.target_type === 'node' && a.target_id).map((a) => a.target_id as string)),
+  ]
+  const items_ = useApi(async () => {
+    const out: Record<string, AuditItem> = {}
+    await Promise.all(
+      nodeIds.map(async (id) => {
+        try {
+          const n = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: id } } }))
+          out[id] = { name: n.parent_id ? n.name : 'Files', folder: n.kind === 'folder' }
+        } catch {
+          // Not readable: the row says "an item".
+        }
+      }),
+    )
+    return out
+  }, [nodeIds.join(',')])
   return (
     <section aria-labelledby="audit-title">
       <h2 id="audit-title">Activity log</h2>
@@ -473,7 +515,7 @@ export function AuditPage() {
                 {items.map((a) => (
                   <li key={a.id} className="row">
                     <span className="grow">
-                      <Actor pair={a} /> {auditText(a)}
+                      <Actor pair={a} /> <AuditWhat entry={a} items={items_.data ?? {}} />
                     </span>
                     <span className="muted small" title={formatDate(a.at)}>
                       {formatWhen(a.at)}
@@ -487,5 +529,29 @@ export function AuditPage() {
       </Loaded>
       <LoadMore state={audit} />
     </section>
+  )
+}
+
+type AuditItem = { name: string; folder: boolean }
+
+/** What an activity log entry did, with the item, the person and the old and new values where the entry has them. */
+function AuditWhat({ entry, items }: { entry: Schemas['AuditEntry']; items: Record<string, AuditItem> }) {
+  const { tenant } = useTenant()
+  const names = useNames()
+  const parts = auditDetail(entry, { person: (id) => names.person(id)?.name, spaceName: tenant.name })
+  if (!parts) return <>{auditText(entry)}</>
+  return (
+    <>
+      {parts.map((p, i) => {
+        if (typeof p === 'string') return <span key={i}>{p}</span>
+        const it = items[p.item]
+        if (!it) return <span key={i}>an item</span>
+        return (
+          <Link key={i} to={it.folder ? tenantPath(tenant.id, 'files', p.item) : tenantPath(tenant.id, 'item', p.item)}>
+            {it.name}
+          </Link>
+        )
+      })}
+    </>
   )
 }
