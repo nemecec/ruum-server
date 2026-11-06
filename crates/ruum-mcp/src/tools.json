@@ -1,0 +1,2254 @@
+{
+ "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
+ "openapi_sha256": "9e8729e0b2e2bbc7ab3a49c6e51170c58759065196128988923f19ed471e077a",
+ "tools_sha256": "b8240adbb2dccfb5ec503805abad7d34e37714b3aa0406ccec1d01453800c91f",
+ "tools": [
+  {
+   "name": "get_me",
+   "operation": "getMe",
+   "description": "Show who you are: your agent identity, the user you act for, and your scope (subtree, max_role, expiry).",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/me",
+   "params": [],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "list_tenants",
+   "operation": "listTenants",
+   "description": "List the tenants you can work in. Your token is bound to one of them.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tenants",
+   "params": [],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "get_tenant",
+   "operation": "getTenant",
+   "description": "Read a tenant: name, plan, root folder ID and sharing policy.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tenants/{tenant_id}",
+   "params": [
+    {
+     "name": "tenant_id",
+     "in": "path",
+     "prop": "tenant_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tenant_id"
+    ]
+   }
+  },
+  {
+   "name": "list_members",
+   "operation": "listMembers",
+   "description": "List the members and guests of the tenant, to find user IDs for grants.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tenants/{tenant_id}/members",
+   "params": [
+    {
+     "name": "tenant_id",
+     "in": "path",
+     "prop": "tenant_id"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tenant_id"
+    ]
+   }
+  },
+  {
+   "name": "get_limits",
+   "operation": "getLimits",
+   "description": "Read the plan limits and current usage of the tenant (storage, largest file, agents).",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tenants/{tenant_id}/limits",
+   "params": [
+    {
+     "name": "tenant_id",
+     "in": "path",
+     "prop": "tenant_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tenant_id"
+    ]
+   }
+  },
+  {
+   "name": "get_root",
+   "operation": "getRoot",
+   "description": "Get the root folder of the tenant. Start here to browse the tree.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/root",
+   "params": [],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "create_node",
+   "operation": "createNode",
+   "description": "Create a folder, an empty file or a link inside a folder. Use write_file afterwards to give a file content.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes",
+   "params": [],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "body": {
+      "type": "object",
+      "required": [
+       "parent_id",
+       "name",
+       "kind"
+      ],
+      "properties": {
+       "parent_id": {
+        "type": "string",
+        "format": "uuid",
+        "description": "A UUIDv7."
+       },
+       "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "description": "The server stores names in Unicode NFC, and `maxLength` counts characters (code points)\nafter NFC, in every layer. Names are case-preserving but unique case-insensitively among\nthe live children of a folder (`Plan.txt` and `plan.txt` clash), as WebDAV, macOS and\nWindows clients expect. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.\n"
+       },
+       "kind": {
+        "type": "string",
+        "enum": [
+         "folder",
+         "file",
+         "link"
+        ]
+       },
+       "type": {
+        "type": "string",
+        "description": "A MIME type for a file, or a folder type such as `album` or `project`."
+       },
+       "link": {
+        "description": "Required when `kind` is `link`. The target must be in the same tenant.",
+        "type": "object",
+        "required": [
+         "kind",
+         "target"
+        ],
+        "properties": {
+         "kind": {
+          "type": "string",
+          "description": "`shortcut` gives no access; `member` gives `view` to people who can see the folder that holds the link.",
+          "enum": [
+           "shortcut",
+           "member"
+          ]
+         },
+         "target": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A UUIDv7."
+         }
+        }
+       },
+       "on_conflict": {
+        "type": "string",
+        "description": "What to do when the name is taken. `rename` adds \" (2)\", \" (3)\", ... before the extension.",
+        "enum": [
+         "fail",
+         "rename"
+        ],
+        "default": "fail"
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "get_node_by_path",
+   "operation": "getNodeByPath",
+   "description": "Find a file or folder by its path from the root, for example Projects/Garden/plan.md.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/by-path/{path}",
+   "params": [
+    {
+     "name": "path",
+     "in": "path",
+     "prop": "path"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Names separated by `/`, each percent-encoded."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "get_node",
+   "operation": "getNode",
+   "description": "Read the metadata of a file or folder by ID, including your role (my_role) and whether you may share it (my_can_share).",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "purge_node",
+   "operation": "purgeNode",
+   "description": "Delete a trashed item for ever. This cannot be undone; prefer trash_node.",
+   "notes": null,
+   "method": "DELETE",
+   "path": "/v1/nodes/{node_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "list_children",
+   "operation": "listChildren",
+   "description": "List the files and folders inside a folder, one page at a time.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/children",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "sort",
+     "in": "query",
+     "prop": "sort"
+    },
+    {
+     "name": "kind",
+     "in": "query",
+     "prop": "kind"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "sort": {
+      "type": "string",
+      "enum": [
+       "name",
+       "updated_at",
+       "size"
+      ],
+      "default": "name"
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "folder",
+       "file",
+       "link",
+       "typed"
+      ]
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "rename_node",
+   "operation": "renameNode",
+   "description": "Rename a file or folder in place.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/rename",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "If-Match",
+     "in": "header",
+     "prop": "if_match"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "if_match": {
+      "type": "string",
+      "description": "The node ETag (`\"<revision>\"`). The write fails with `412 precondition_failed` if the node changed."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "name"
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "description": "The server stores names in Unicode NFC, and `maxLength` counts characters (code points)\nafter NFC, in every layer. Names are case-preserving but unique case-insensitively among\nthe live children of a folder (`Plan.txt` and `plan.txt` clash), as WebDAV, macOS and\nWindows clients expect. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.\n"
+       },
+       "on_conflict": {
+        "type": "string",
+        "description": "What to do when the name is taken. `rename` adds \" (2)\", \" (3)\", ... before the extension.",
+        "enum": [
+         "fail",
+         "rename"
+        ],
+        "default": "fail"
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "move_node",
+   "operation": "moveNode",
+   "description": "Move a file or folder to another folder (needs manage on it and edit on the target).",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/move",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "If-Match",
+     "in": "header",
+     "prop": "if_match"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "if_match": {
+      "type": "string",
+      "description": "The node ETag (`\"<revision>\"`). The write fails with `412 precondition_failed` if the node changed."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "parent_id"
+      ],
+      "properties": {
+       "parent_id": {
+        "type": "string",
+        "format": "uuid",
+        "description": "A UUIDv7."
+       },
+       "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "description": "A new name at the same time. Default is the current name."
+       },
+       "on_conflict": {
+        "type": "string",
+        "description": "What to do when the name is taken. `rename` adds \" (2)\", \" (3)\", ... before the extension.",
+        "enum": [
+         "fail",
+         "rename"
+        ],
+        "default": "fail"
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "copy_node",
+   "operation": "copyNode",
+   "description": "Copy a file or folder into a folder. The copy shares content, so it is cheap.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/copy",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "parent_id"
+      ],
+      "properties": {
+       "parent_id": {
+        "type": "string",
+        "format": "uuid",
+        "description": "A UUIDv7."
+       },
+       "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "description": "The server stores names in Unicode NFC, and `maxLength` counts characters (code points)\nafter NFC, in every layer. Names are case-preserving but unique case-insensitively among\nthe live children of a folder (`Plan.txt` and `plan.txt` clash), as WebDAV, macOS and\nWindows clients expect. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.\n"
+       },
+       "on_conflict": {
+        "type": "string",
+        "description": "What to do when the name is taken. `rename` adds \" (2)\", \" (3)\", ... before the extension.",
+        "enum": [
+         "fail",
+         "rename"
+        ],
+        "default": "fail"
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "trash_node",
+   "operation": "trashNode",
+   "description": "Move a file or folder to the trash. It can be restored for the trash period.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/trash",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "If-Match",
+     "in": "header",
+     "prop": "if_match"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "if_match": {
+      "type": "string",
+      "description": "The node ETag (`\"<revision>\"`). The write fails with `412 precondition_failed` if the node changed."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "restore_node",
+   "operation": "restoreNode",
+   "description": "Bring a trashed file or folder back from the trash.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/restore",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "If-Match",
+     "in": "header",
+     "prop": "if_match"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "if_match": {
+      "type": "string",
+      "description": "The node ETag (`\"<revision>\"`). The write fails with `412 precondition_failed` if the node changed."
+     },
+     "body": {
+      "type": "object",
+      "properties": {
+       "parent_id": {
+        "type": "string",
+        "format": "uuid",
+        "description": "Where to restore when the old parent is gone or trashed."
+       },
+       "on_conflict": {
+        "type": "string",
+        "description": "What to do when the name is taken. `rename` adds \" (2)\", \" (3)\", ... before the extension.",
+        "enum": [
+         "fail",
+         "rename"
+        ],
+        "default": "fail"
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "list_trash",
+   "operation": "listTrash",
+   "description": "List the trashed items you can restore.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/trash",
+   "params": [
+    {
+     "name": "all",
+     "in": "query",
+     "prop": "all"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "all": {
+      "type": "boolean",
+      "default": false,
+      "description": "Tenant admins only."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "empty_trash",
+   "operation": "emptyTrash",
+   "description": "Delete for ever every trashed item you may purge. This cannot be undone.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/trash/empty",
+   "params": [],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "read_file",
+   "operation": "downloadContent",
+   "description": "Read the content of a file (the head version, or an older version by ID).",
+   "notes": "Returns text for text files and base64 for binary files. Large files: use get_content_url instead.",
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/content",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "version",
+     "in": "query",
+     "prop": "version"
+    },
+    {
+     "name": "Range",
+     "in": "header",
+     "prop": "range"
+    },
+    {
+     "name": "If-None-Match",
+     "in": "header",
+     "prop": "if_none_match"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "version": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "range": {
+      "type": "string",
+      "pattern": "^bytes=\\d*-\\d*$"
+     },
+     "if_none_match": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "write_file",
+   "operation": "putContent",
+   "description": "Replace the content of a file with new content. Makes a new version; older versions stay in the history.",
+   "notes": "Input `body` is replaced by `content` (string) and `encoding` (`utf8` or `base64`). For large files use the REST upload operations or the ruum CLI.",
+   "method": "PUT",
+   "path": "/v1/nodes/{node_id}/content",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "If-Match",
+     "in": "header",
+     "prop": "if_match"
+    },
+    {
+     "name": "Content-Type",
+     "in": "header",
+     "prop": "content_type"
+    }
+   ],
+   "body": "content",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "if_match": {
+      "type": "string",
+      "description": "The expected head version, as `\"<version_id>\"`."
+     },
+     "content_type": {
+      "type": "string"
+     },
+     "content": {
+      "type": "string",
+      "description": "The new content of the file."
+     },
+     "encoding": {
+      "type": "string",
+      "enum": [
+       "utf8",
+       "base64"
+      ],
+      "default": "utf8",
+      "description": "`utf8` for text, `base64` for binary content."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "get_content_url",
+   "operation": "getContentUrl",
+   "description": "Get a short-lived signed URL to download a file, for large or binary files.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/content-url",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "version",
+     "in": "query",
+     "prop": "version"
+    },
+    {
+     "name": "disposition",
+     "in": "query",
+     "prop": "disposition"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "version": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "disposition": {
+      "type": "string",
+      "enum": [
+       "attachment",
+       "inline"
+      ],
+      "default": "attachment"
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "list_versions",
+   "operation": "listVersions",
+   "description": "List the version history of a file, newest first, with who made each version.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/versions",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "actor_kind",
+     "in": "query",
+     "prop": "actor_kind"
+    },
+    {
+     "name": "labeled",
+     "in": "query",
+     "prop": "labeled"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "actor_kind": {
+      "type": "string",
+      "description": "`share_link` is the bearer of a share link (an edit link can upload versions).",
+      "enum": [
+       "user",
+       "group",
+       "app",
+       "agent",
+       "share_link"
+      ]
+     },
+     "labeled": {
+      "type": "boolean",
+      "description": "Only named versions."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "get_version",
+   "operation": "getVersion",
+   "description": "Read the metadata of one version of a file.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/versions/{version_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "version_id",
+     "in": "path",
+     "prop": "version_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "version_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "version_id"
+    ]
+   }
+  },
+  {
+   "name": "restore_version",
+   "operation": "restoreVersion",
+   "description": "Make an older version the current content again (as a new version).",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/versions/{version_id}/restore",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "version_id",
+     "in": "path",
+     "prop": "version_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "version_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "version_id"
+    ]
+   }
+  },
+  {
+   "name": "label_version",
+   "operation": "setVersionLabel",
+   "description": "Give a version a name, such as 'before refactor', so it is kept and easy to find.",
+   "notes": null,
+   "method": "PUT",
+   "path": "/v1/nodes/{node_id}/versions/{version_id}/label",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "version_id",
+     "in": "path",
+     "prop": "version_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "version_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "label"
+      ],
+      "properties": {
+       "label": {
+        "type": [
+         "string",
+         "null"
+        ],
+        "minLength": 1,
+        "maxLength": 200
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "version_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "diff_versions",
+   "operation": "diffVersions",
+   "description": "Show what changed between two versions of a file (text, JSON, XML or image diff).",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/diff",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "from",
+     "in": "query",
+     "prop": "from"
+    },
+    {
+     "name": "to",
+     "in": "query",
+     "prop": "to"
+    },
+    {
+     "name": "plugin",
+     "in": "query",
+     "prop": "plugin"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "from": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "to": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "plugin": {
+      "type": "string",
+      "description": "A plugin name from `listDiffPlugins`, for example `text`."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "from"
+    ]
+   }
+  },
+  {
+   "name": "list_diff_plugins",
+   "operation": "listDiffPlugins",
+   "description": "List the diff methods available for a file.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/diff/plugins",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "list_tags",
+   "operation": "listTags",
+   "description": "List the tags of the tenant.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tags",
+   "params": [
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "create_tag",
+   "operation": "createTag",
+   "description": "Create a new tag in the tenant.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/tags",
+   "params": [],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "body": {
+      "type": "object",
+      "required": [
+       "name"
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+       },
+       "color": {
+        "type": "string",
+        "pattern": "^#[0-9a-fA-F]{6}$"
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "get_tag",
+   "operation": "getTag",
+   "description": "Read one tag.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tags/{tag_id}",
+   "params": [
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tag_id"
+    ]
+   }
+  },
+  {
+   "name": "delete_tag",
+   "operation": "deleteTag",
+   "description": "Delete a tag and remove it from every node.",
+   "notes": null,
+   "method": "DELETE",
+   "path": "/v1/tags/{tag_id}",
+   "params": [
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tag_id"
+    ]
+   }
+  },
+  {
+   "name": "update_tag",
+   "operation": "updateTag",
+   "description": "Change the name or color of a tag.",
+   "notes": null,
+   "method": "PATCH",
+   "path": "/v1/tags/{tag_id}",
+   "params": [
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+       "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+       },
+       "color": {
+        "oneOf": [
+         {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tag_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "list_nodes_by_tag",
+   "operation": "listNodesByTag",
+   "description": "List the files and folders that carry a tag.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/tags/{tag_id}/nodes",
+   "params": [
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tag_id"
+    ]
+   }
+  },
+  {
+   "name": "list_node_tags",
+   "operation": "listNodeTags",
+   "description": "List the tags on a file or folder.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/tags",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "attach_tag",
+   "operation": "attachTag",
+   "description": "Put a tag on a file or folder.",
+   "notes": null,
+   "method": "PUT",
+   "path": "/v1/nodes/{node_id}/tags/{tag_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "tag_id"
+    ]
+   }
+  },
+  {
+   "name": "detach_tag",
+   "operation": "detachTag",
+   "description": "Remove a tag from a file or folder.",
+   "notes": null,
+   "method": "DELETE",
+   "path": "/v1/nodes/{node_id}/tags/{tag_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "tag_id"
+    ]
+   }
+  },
+  {
+   "name": "list_grants",
+   "operation": "listGrants",
+   "description": "List who has access to a file or folder, direct and inherited.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/grants",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "add_grant",
+   "operation": "addGrant",
+   "description": "Give a person access to a file or folder with a role (view, comment, edit or manage). Needs the share permission; you can give at most your own role.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/grants",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "grantee",
+       "role"
+      ],
+      "properties": {
+       "grantee": {
+        "description": "Who gets the role.",
+        "oneOf": [
+         {
+          "type": "object",
+          "description": "A user by ID (a member or a guest).",
+          "required": [
+           "type",
+           "id"
+          ],
+          "properties": {
+           "type": {
+            "type": "string",
+            "const": "user"
+           },
+           "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "A UUIDv7."
+           },
+           "display_name": {
+            "type": "string",
+            "description": "Filled in responses."
+           },
+           "email": {
+            "type": "string",
+            "description": "Filled in responses."
+           }
+          }
+         },
+         {
+          "type": "object",
+          "description": "A person by email. Without a Ruum account, or from another tenant, they become a guest.",
+          "required": [
+           "type",
+           "email"
+          ],
+          "properties": {
+           "type": {
+            "type": "string",
+            "const": "email"
+           },
+           "email": {
+            "type": "string",
+            "format": "email"
+           }
+          }
+         },
+         {
+          "type": "object",
+          "description": "Everybody in the tenant of the node (`tenant#member`).",
+          "required": [
+           "type"
+          ],
+          "properties": {
+           "type": {
+            "type": "string",
+            "const": "tenant_members"
+           }
+          }
+         }
+        ],
+        "discriminator": {
+         "propertyName": "type",
+         "mapping": {
+          "user": "#/components/schemas/GranteeUser",
+          "email": "#/components/schemas/GranteeEmail",
+          "tenant_members": "#/components/schemas/GranteeTenantMembers"
+         }
+        }
+       },
+       "role": {
+        "type": "string",
+        "description": "The roles of design section 3.2 (the Google Drive model), from lowest to highest. A higher\nrole includes the lower ones. `share` is a permission, not a role: `manage` always has it,\n`edit` has it while the node's effective `editors_can_share` is true.\n",
+        "enum": [
+         "view",
+         "comment",
+         "edit",
+         "manage"
+        ]
+       },
+       "notify": {
+        "type": "boolean",
+        "default": true,
+        "description": "Send an email to the grantee."
+       },
+       "message": {
+        "type": "string",
+        "maxLength": 1000
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "remove_grant",
+   "operation": "removeGrant",
+   "description": "Take away a grant. Needs the share permission.",
+   "notes": null,
+   "method": "DELETE",
+   "path": "/v1/nodes/{node_id}/grants/{grant_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "grant_id",
+     "in": "path",
+     "prop": "grant_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "grant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "grant_id"
+    ]
+   }
+  },
+  {
+   "name": "update_grant",
+   "operation": "updateGrant",
+   "description": "Change the role of an existing grant. Needs the share permission.",
+   "notes": null,
+   "method": "PATCH",
+   "path": "/v1/nodes/{node_id}/grants/{grant_id}",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "grant_id",
+     "in": "path",
+     "prop": "grant_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "grant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "role"
+      ],
+      "properties": {
+       "role": {
+        "type": "string",
+        "description": "The roles of design section 3.2 (the Google Drive model), from lowest to highest. A higher\nrole includes the lower ones. `share` is a permission, not a role: `manage` always has it,\n`edit` has it while the node's effective `editors_can_share` is true.\n",
+        "enum": [
+         "view",
+         "comment",
+         "edit",
+         "manage"
+        ]
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "grant_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "update_node_sharing",
+   "operation": "updateNodeSharing",
+   "description": "Set whether editors may share a file or folder (editors_can_share: true, false, or null to inherit). Needs manage.",
+   "notes": null,
+   "method": "PATCH",
+   "path": "/v1/nodes/{node_id}/sharing",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "If-Match",
+     "in": "header",
+     "prop": "if_match"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "if_match": {
+      "type": "string",
+      "description": "The node ETag (`\"<revision>\"`). The write fails with `412 precondition_failed` if the node changed."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "editors_can_share"
+      ],
+      "properties": {
+       "editors_can_share": {
+        "type": [
+         "boolean",
+         "null"
+        ],
+        "description": "`true`, `false`, or `null` to inherit from the parent."
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "list_share_links",
+   "operation": "listShareLinks",
+   "description": "List the share links of a file or folder. Needs the share permission.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/share-links",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id"
+    ]
+   }
+  },
+  {
+   "name": "create_share_link",
+   "operation": "createShareLink",
+   "description": "Make a secret link that gives anyone with it view, comment or edit access. Needs the share permission and the tenant policy.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/share-links",
+   "params": [
+    {
+     "name": "node_id",
+     "in": "path",
+     "prop": "node_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "role"
+      ],
+      "properties": {
+       "role": {
+        "type": "string",
+        "description": "`edit` only when the tenant policy has `allow_edit_links`.",
+        "enum": [
+         "view",
+         "comment",
+         "edit"
+        ]
+       },
+       "expires_at": {
+        "type": "string",
+        "format": "date-time",
+        "description": "RFC 3339, UTC."
+       },
+       "password": {
+        "type": "string",
+        "minLength": 8,
+        "maxLength": 200
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "node_id",
+     "body"
+    ]
+   }
+  },
+  {
+   "name": "revoke_share_link",
+   "operation": "revokeShareLink",
+   "description": "Turn off a share link at once.",
+   "notes": null,
+   "method": "DELETE",
+   "path": "/v1/share-links/{link_id}",
+   "params": [
+    {
+     "name": "link_id",
+     "in": "path",
+     "prop": "link_id"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "link_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "link_id"
+    ]
+   }
+  },
+  {
+   "name": "list_shared_with_me",
+   "operation": "listSharedWithMe",
+   "description": "List the files and folders other people shared with the user you act for.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/shared-with-me",
+   "params": [
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "list_changes",
+   "operation": "listChanges",
+   "description": "Read the change journal after a cursor, to see what changed (can long-poll with wait).",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/changes",
+   "params": [
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    },
+    {
+     "name": "wait",
+     "in": "query",
+     "prop": "wait"
+    },
+    {
+     "name": "node",
+     "in": "query",
+     "prop": "node"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the last call. Without it the feed starts at the oldest kept entry."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     },
+     "wait": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 30,
+      "default": 0
+     },
+     "node": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "get_latest_cursor",
+   "operation": "getLatestCursor",
+   "description": "Get the newest journal cursor, to start following changes from now.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/changes/latest",
+   "params": [],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "search_nodes",
+   "operation": "searchNodes",
+   "description": "Search files and folders by name, optionally by kind, tag or inside a folder.",
+   "notes": null,
+   "method": "GET",
+   "path": "/v1/search",
+   "params": [
+    {
+     "name": "q",
+     "in": "query",
+     "prop": "q"
+    },
+    {
+     "name": "kind",
+     "in": "query",
+     "prop": "kind"
+    },
+    {
+     "name": "tag",
+     "in": "query",
+     "prop": "tag"
+    },
+    {
+     "name": "within",
+     "in": "query",
+     "prop": "within"
+    },
+    {
+     "name": "cursor",
+     "in": "query",
+     "prop": "cursor"
+    },
+    {
+     "name": "limit",
+     "in": "query",
+     "prop": "limit"
+    }
+   ],
+   "body": null,
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "q": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "folder",
+       "file",
+       "link",
+       "typed"
+      ]
+     },
+     "tag": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "within": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "cursor": {
+      "type": "string",
+      "description": "The `next_cursor` of the previous page."
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "default": 100
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "q"
+    ]
+   }
+  }
+ ]
+}

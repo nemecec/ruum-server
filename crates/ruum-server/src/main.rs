@@ -61,8 +61,8 @@ async fn main() -> anyhow::Result<()> {
     // A request that has no answer after the timeout gets `408`. The longest long poll
     // (`listChanges` with `wait`) is 30 seconds; streamed bodies are not cut (the timeout ends
     // when the answer starts).
-    let app = ruum_api::router(state)
-        .merge(ruum_mcp::router(services.clone()))
+    let app = ruum_api::router(state.clone())
+        .merge(ruum_mcp::router(state))
         .merge(ruum_webdav::router(services))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,

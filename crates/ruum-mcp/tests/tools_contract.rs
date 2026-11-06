@@ -246,3 +246,43 @@ fn user_only_operations_are_not_exposed() {
         );
     }
 }
+
+/// `src/tools.json` (what the server serves) is generated from the current contract.
+#[test]
+fn tools_json_is_up_to_date() {
+    use sha2::{Digest, Sha256};
+    let catalog = ruum_mcp::Catalog::load();
+    let regen = "run `node crates/ruum-mcp/scripts/gen-tools.mjs` from the repository root";
+    assert_eq!(
+        catalog.openapi_sha256,
+        hex::encode(Sha256::digest(OPENAPI.as_bytes())),
+        "contracts/openapi.yaml changed: {regen}"
+    );
+    assert_eq!(
+        catalog.tools_sha256,
+        hex::encode(Sha256::digest(TOOLS.as_bytes())),
+        "contracts/mcp/tools.yaml changed: {regen}"
+    );
+    let ops = operations();
+    let (tools, _) = tool_lists();
+    assert_eq!(catalog.tools.len(), tools.len());
+    for (spec, entry) in catalog.tools.iter().zip(&tools) {
+        assert_eq!(Some(&spec.name), entry.name.as_ref());
+        assert_eq!(spec.operation, entry.operation);
+        let op = &ops[&spec.operation];
+        assert_eq!(spec.path, op.path, "{}", spec.name);
+        assert_eq!(spec.method, op.method.to_uppercase(), "{}", spec.name);
+        // Every `{param}` of the path is a required input property.
+        let required: Vec<&str> = spec
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for seg in spec.path.split('/') {
+            if let Some(p) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                assert!(required.contains(&p), "{}: {p} is not required", spec.name);
+            }
+        }
+    }
+}

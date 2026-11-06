@@ -12,9 +12,22 @@ workspace = true
 
 [dependencies]
 ruum-core.workspace = true
+ruum-api.workspace = true
 axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
