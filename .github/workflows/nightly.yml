@@ -17,7 +17,7 @@ env:
 jobs:
   mutation-check:
     name: mutation check of the security suites
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The Postgres mutations (ENV="RUUM_SUITE_BACKEND=postgres ...", the Postgres conformance
     # suites) need a database.
     services:
@@ -48,7 +48,7 @@ jobs:
 
   progress:
     name: security suites with RUUM_REQUIRE_IMPLEMENTED=1 (progress report)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
@@ -63,14 +63,14 @@ jobs:
 
   e2e-staging:
     name: full end-to-end suite on staging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Placeholder
         run: echo "::notice::No staging environment yet (design section 13). Add the full e2e run here."
 
   restore-test:
     name: restore test of the backups
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Placeholder
         run: echo "::notice::No backups yet (design section 5.2). Add the restore test here."

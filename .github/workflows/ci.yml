@@ -22,7 +22,7 @@ env:
 jobs:
   rust-lint:
     name: rust fmt and clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -35,7 +35,7 @@ jobs:
 
   rust-test:
     name: unit tests and migrations
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:17
@@ -63,15 +63,22 @@ jobs:
           sqlx migrate run --source migrations
           sqlx migrate run --source migrations
           sqlx migrate info --source migrations
+      # The superuser of the service container bypasses row-level security, so tests that check
+      # RLS would fail. The tests connect as a role without superuser (CREATEDB for the per-test
+      # databases), as on the laptop stack.
+      - name: Role for the tests
+        run: psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
       # Unit and conformance tests. `#[sqlx::test]` tests use DATABASE_URL (one database per test).
       - name: Unit and conformance tests
+        env:
+          DATABASE_URL: postgres://ruum_test:ruum_test@localhost:5432/ruum
         run: |
           cargo test --workspace --exclude ruum-testkit --locked
           cargo test -p ruum-testkit --lib --test contract --locked
 
   security-suites:
     name: tenant isolation and permission suites
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:17
@@ -83,9 +90,9 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U ruum" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
-      # A handler that answers 501 counts as pending. Set the repository variable
-      # RUUM_REQUIRE_IMPLEMENTED=1 when step 1 is complete, so pending becomes a failure.
-      RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
+      # Step 1 is complete, so a handler that answers 501 (pending) is a failure. A later step can
+      # set the repository variable RUUM_REQUIRE_IMPLEMENTED=0 while it adds new operations.
+      RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '1' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -106,7 +113,7 @@ jobs:
 
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -116,7 +123,7 @@ jobs:
 
   contracts:
     name: contract lint and breaking-change diff
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
@@ -146,7 +153,7 @@ jobs:
 
   web:
     name: web build and generated client
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web
@@ -171,7 +178,7 @@ jobs:
 
   e2e:
     name: end-to-end against the Compose stack
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       # Placeholder until the e2e suite exists (design 12.2). The laptop stack
@@ -186,7 +193,7 @@ jobs:
 
   e2e-browser:
     name: browser end-to-end (Playwright, Chromium)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
