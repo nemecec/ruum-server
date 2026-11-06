@@ -110,7 +110,6 @@ enum Agents {
     Allow,
     Forbidden,
     Denied,
-    Either,
 }
 
 fn agents(policy: Agents, who: Who, user_rule: &dyn Fn(Who) -> Access) -> Access {
@@ -129,7 +128,6 @@ fn agents(policy: Agents, who: Who, user_rule: &dyn Fn(Who) -> Access) -> Access
         Agents::Allow => Access::Allow,
         Agents::Forbidden => Access::Forbidden,
         Agents::Denied => Access::Denied,
-        Agents::Either => Access::Either,
     }
 }
 
@@ -336,14 +334,15 @@ fn operation_rule(op: &str) -> Option<Rule> {
             |_| Access::Allow,
         ),
         "oauthConsent" => user_rule(
-            "users only; creates an agent of the caller in the tenant; assumption: guests may, \
-             as for registerAgent",
+            "users only; creates an agent of the caller in the tenant; guests may, not while \
+             allow_guests is false (decided 0002-2)",
             Agents::Forbidden,
             |_| Access::Allow,
         ),
         "logout" => signed_in(
-            "sessions; open question: an agent bearer token",
-            Agents::Either,
+            "ends the caller's web session; a bearer token (agents too) has none: 200, ends \
+             nothing (decided 0002-5)",
+            Agents::Allow,
         ),
         "getMe" => signed_in("every signed-in principal, agents too", Agents::Allow),
         "listMyIdentities" | "listMySessions" => signed_in(
@@ -392,7 +391,7 @@ fn operation_rule(op: &str) -> Option<Rule> {
             Agents::Forbidden,
         ),
         "listMembers" => tenant_role(
-            "assumption: members and up; guests get 403",
+            "members and up; guests get 403, the list holds emails (decided 0002-5)",
             MemberRole::Member,
             Agents::FollowUser,
         ),
@@ -427,18 +426,22 @@ fn operation_rule(op: &str) -> Option<Rule> {
 
         // ------------------------------------------------------------ agents
         "listAgents" => signed_in(
-            "the caller's agents (admins: all); open question: an agent caller",
-            Agents::Either,
+            "the caller's agents (admins: all); an agent sees only itself (decided 0002-5)",
+            Agents::Allow,
         ),
         "registerAgent" => user_rule(
-            "users only; assumption: guests may register agents",
+            "users only; guests may, not while allow_guests is false (decided 0002-2)",
             Agents::Forbidden,
             |_| Access::Allow,
         ),
         "getAgent" => agent_owner("the owner or a tenant admin; others get 404", true, true),
-        "listAgentActivity" => agent_owner("assumption: the owner or a tenant admin", true, false),
+        "listAgentActivity" => agent_owner(
+            "the owner or a tenant admin; agents get 403/404 (decided 0002-5)",
+            true,
+            false,
+        ),
         "listAgentKeys" => agent_owner(
-            "users only; assumption: the owner or a tenant admin",
+            "users only; the owner or a tenant admin (decided 0002-5)",
             true,
             false,
         ),
@@ -457,7 +460,7 @@ fn operation_rule(op: &str) -> Option<Rule> {
         ),
         "createNode" => node("Needs edit on the parent", Projects, Role::Edit),
         "getNodeByPath" => node(
-            "assumption: view on the target is enough, as for getNode",
+            "view on the target is enough, as for getNode (decided 0002-5)",
             Plan,
             Role::View,
         ),
@@ -539,22 +542,22 @@ fn operation_rule(op: &str) -> Option<Rule> {
             Agents::Allow,
         ),
         "createTag" => tenant_role(
-            "any member, not guests; assumption: agents need max_role edit",
+            "any member, not guests; agents need max_role edit (decided 0002-5)",
             MemberRole::Member,
             Agents::FollowUserWrite,
         ),
         "getTag" | "listNodesByTag" => tag_rule(
-            "assumption: members, and principals who can see a node with the tag",
+            "members, and principals who can see a node with the tag (decided 0002-5)",
             |_| true,
             false,
         ),
         "updateTag" => tag_rule(
-            "any member, not guests; assumption: agents need max_role edit",
+            "any member, not guests; agents need max_role edit (decided 0002-5)",
             |w| w.tenant_role().is_some_and(|r| r >= MemberRole::Member),
             true,
         ),
         "deleteTag" => tag_rule(
-            "tenant admins or the creator (member); assumption: agents need max_role edit",
+            "tenant admins or the creator (member); agents need max_role edit (decided 0002-5)",
             |w| matches!(w, Who::Owner | Who::Admin | Who::Member),
             true,
         ),

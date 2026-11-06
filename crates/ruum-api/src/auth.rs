@@ -23,9 +23,7 @@ use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
-use ruum_core::identity::{
-    Authenticated, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE, auth, unauthenticated,
-};
+use ruum_core::identity::{Authenticated, CSRF_HEADER, SESSION_COOKIE, auth, unauthenticated};
 use ruum_core::{ApiError, Context, Error, ErrorCode, TenantId};
 
 /// The context of an authenticated request in one tenant.
@@ -156,15 +154,18 @@ pub async fn authenticate(
     };
     let who = auth::authenticate_session(&state.services, &secret).await?;
     if !is_safe(method) {
+        // The header must carry the CSRF value of this session (decision 0002-3). Comparing it
+        // only with the `ruum_csrf` cookie is not enough: a sibling host can set that cookie
+        // (cookie tossing), and then a forged header and cookie would match each other.
         let header_value = headers
             .get(CSRF_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        let cookie_value = cookie(headers, CSRF_COOKIE).unwrap_or_default();
+        let expected = ruum_core::identity::csrf_token(&secret);
         if header_value.is_empty()
             || !ruum_core::identity::secret::constant_time_eq(
                 header_value.as_bytes(),
-                cookie_value.as_bytes(),
+                expected.as_bytes(),
             )
         {
             return Err(Error::Api(

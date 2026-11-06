@@ -4,11 +4,13 @@
 //! `127.0.0.1:50051`; both take the preshared key (`SPICEDB_PRESHARED_KEY` of
 //! `scripts/dev.sh env`). The HTTP API needs no gRPC or protobuf crates.
 //!
-//! Consistency: every write returns a ZedToken. The engine keeps the newest token that it wrote
-//! or saw, and a check without an explicit token asks for at least that freshness
-//! (`at_least_as_fresh`), so a request reads its own writes on this server. Across servers the
-//! token of the tenant comes from the outbox ([`super::outbox::latest_token`]) and is passed to
-//! [`Authz::check`].
+//! Consistency (decision 0002-4): every write returns a ZedToken. A check, bulk check or read
+//! asks for at least the freshness of, in this order: the explicit token of the call; the floor
+//! of the request ([`super::request_floor`]), which starts at the tenant's newest applied token
+//! from the outbox ([`super::outbox::PgFreshness`], read once per request by
+//! `identity::auth::context_for`) and rises with every write of the request; else the newest
+//! token that this process wrote (workers and `seed-dev` run outside a request). So a write or
+//! revocation applied by any server is seen by the next request on every server.
 
 use super::schema::CONTRACT_SCHEMA;
 use super::*;
@@ -171,11 +173,14 @@ impl SpiceDbAuthz {
     fn saw(&self, token: &str) {
         // ZedTokens are opaque; the newest write is the one that was made last here.
         *self.latest.lock().expect("token lock") = Some(token.to_string());
+        // The request that wrote reads its own write.
+        raise_request_floor(&ConsistencyToken(token.to_string()));
     }
 
     fn consistency(&self, at_least: Option<&ConsistencyToken>) -> Value {
         let token = at_least
             .map(|t| t.0.clone())
+            .or_else(|| request_floor().map(|t| t.0))
             .or_else(|| self.latest.lock().expect("token lock").clone());
         match token {
             Some(t) => json!({ "atLeastAsFresh": { "token": t } }),

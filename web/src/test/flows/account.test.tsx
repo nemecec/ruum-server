@@ -31,6 +31,9 @@ describe('account page', () => {
     await user.type(within(d).getByRole('textbox', { name: 'Name' }), 'Explorer{Enter}')
     const secret = await within(d).findByRole('textbox', { name: 'App password' })
     expect((secret as HTMLInputElement).value).toMatch(/^ruum_app_[A-Za-z0-9_-]{43}$/)
+    // The WebDAV host to mount (decision 0002-3), not the platform origin.
+    const address = within(d).getByRole('textbox', { name: 'Server address' })
+    expect((address as HTMLInputElement).value).toBe('https://dav.ruum.localhost/')
     await user.click(within(d).getByRole('button', { name: 'Done' }))
     expect(await within(section).findByText('Explorer')).toBeInTheDocument()
   })

@@ -1,10 +1,13 @@
 //! WebDAV face of the node tree (decision 12), built on `dav-server`. It maps WebDAV paths to
 //! nodes of one tenant and uses the same core services as the REST API, so permissions, versions
-//! and the journal work the same way. Mounted at `/dav`.
+//! and the journal work the same way. It runs on its own host (`https://dav.<domain>/`, its
+//! own listener `RUUM_DAV_BIND`) at the root path `/`, never on the platform origin (decision
+//! 0002-3): this router has only WebDAV routes, and the platform router has none.
 //!
 //! - Sign-in ([`auth`]): HTTP Basic with the user's email and an app password (actor = the
 //!   user), or a Bearer agent access token (actor = the agent, on behalf of its owner, within
-//!   its scope). Both are bound to one tenant; `/dav/` is the root folder of that tenant.
+//!   its scope). Both are bound to one tenant; `/` is the root folder of that tenant. Cookies
+//!   are never read and never set, so the session of the web UI never reaches this host.
 //! - Every operation checks the permission with `authz::require` before it acts: `view` to read
 //!   and list, `edit` on the parent to create (PUT, MKCOL, the destination of COPY and MOVE),
 //!   `edit` on a file to write a new version, `edit` to rename, `manage` to move to another
@@ -21,14 +24,15 @@
 //! - PUT bodies are spooled to a temporary file (in `RUUM_DAV_SPOOL_DIR`, else the system
 //!   temporary folder) and limited to the plan's `max_file_bytes` while they are written; a
 //!   known size over that limit or over the free storage is refused before the body is read.
-//! - The root `/dav/` is the tenant root folder. Guests and agents scoped to a subtree cannot
+//! - The root `/` is the tenant root folder. Guests and agents scoped to a subtree cannot
 //!   see it (`403`); they mount the folder they can see by its URL, for example
-//!   `/dav/Projects/Garden/`.
-//! - User content never runs as a page of the platform (design section 15): `/dav` shares the
-//!   origin of the web UI and the API, so every answer carries the content CSP (`sandbox`) and
-//!   `X-Content-Type-Options: nosniff`, and `GET` and `HEAD` of a file also carry
+//!   `/Projects/Garden/`.
+//! - User content never runs as a page (design section 15). The WebDAV host is apart from the
+//!   platform origin, and as defence in depth every answer carries the content CSP (`sandbox`)
+//!   and `X-Content-Type-Options: nosniff`, and `GET` and `HEAD` of a file also carry
 //!   `Content-Disposition: attachment` and send active types (HTML, SVG, XML, scripts) as
-//!   `application/octet-stream` ([`content_safety`]).
+//!   `application/octet-stream` ([`content_safety`]). So no script runs on the sibling host
+//!   (it could otherwise set cookies for the parent domain).
 //! - Not supported in step 1: partial PUT (`Content-Range`) and PATCH, PROPPATCH of dead
 //!   properties, links and typed nodes (they are not listed).
 
@@ -54,9 +58,6 @@ use std::sync::Arc;
 
 pub use auth::REALM;
 pub use fs::{Creds, RuumFs};
-
-/// The path prefix of the WebDAV endpoint.
-pub const DAV_PATH: &str = "/dav";
 
 /// The environment variable of the spool folder of PUT bodies.
 pub const SPOOL_DIR_ENV: &str = "RUUM_DAV_SPOOL_DIR";
@@ -85,7 +86,8 @@ struct DavState {
     spool_dir: Option<PathBuf>,
 }
 
-/// The WebDAV router, to merge into the server, with the options from the environment.
+/// The WebDAV router, for the listener of the WebDAV host, with the options from the
+/// environment. It serves every path from `/`; do not merge it into the platform router.
 pub fn router(services: Services) -> Router {
     router_with(services, Options::from_env())
 }
@@ -102,7 +104,6 @@ pub fn router_with(services: Services, options: Options) -> Router {
             spool_dir: options.spool_dir.clone(),
         }))
         .locksystem(FakeLs::new())
-        .strip_prefix(DAV_PATH)
         .methods(methods)
         .autoindex(false)
         .build_handler();
@@ -112,21 +113,25 @@ pub fn router_with(services: Services, options: Options) -> Router {
         spool_dir: options.spool_dir,
     });
     Router::new()
-        .route(DAV_PATH, any(handle))
-        .route("/dav/", any(handle))
-        .route("/dav/{*path}", any(handle))
+        .route("/", any(handle))
+        .route("/{*path}", any(handle))
         .with_state(state)
 }
 
 async fn handle(State(st): State<Arc<DavState>>, req: Request) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let mut res = dispatch(&st, req).await;
+    // Each request reads at least as fresh as its tenant's newest relationship write
+    // (decision 0002-4).
+    let mut res = ruum_core::authz::with_request_freshness(dispatch(&st, req)).await;
     content_safety(&method, &path, &mut res);
+    // This host never sets cookies (decision 0002-3).
+    res.headers_mut().remove(header::SET_COOKIE);
     res
 }
 
-/// Makes an answer safe to open in a browser on the platform origin (design section 15): the
+/// Makes an answer safe to open in a browser (design section 15), as defence in depth next to
+/// the separate host: the
 /// content CSP (`sandbox`) and `nosniff` on every answer; on a successful `GET` or `HEAD` also
 /// `Content-Disposition: attachment` with the file name, and a passive content type
 /// (`blobs::signed::passive_content_type`).

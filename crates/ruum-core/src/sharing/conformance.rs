@@ -100,6 +100,19 @@ impl World {
                 roles.insert((self.a, g), MemberRole::Guest);
             }
             roles.insert((self.b, self.owner_b), MemberRole::Owner);
+            // The same verified emails as the Postgres rows (`seed_pg`).
+            let mut emails = self.tenants.verified_emails.write().unwrap();
+            for u in [
+                self.owner,
+                self.member,
+                self.guest_view,
+                self.guest_edit,
+                self.guest_manage,
+                self.outsider,
+                self.owner_b,
+            ] {
+                emails.insert(u, email_of(u));
+            }
         }
         let mut rels = vec![
             tuples::tenant_role(self.a, "owner", self.owner),
@@ -182,6 +195,11 @@ fn code<T>(r: Result<T>) -> &'static str {
         },
         Err(e) => panic!("unexpected error: {e}"),
     }
+}
+
+/// The verified email of a user of the world.
+fn email_of(u: UserId) -> String {
+    format!("{}@example.test", u.0)
 }
 
 fn user_grantee(u: UserId) -> Grantee {
@@ -552,6 +570,38 @@ async fn run(w: &World, b: &dyn Backend) {
         ),
         "ok"
     );
+    // An email grant to the verified email of a member is not a guest (decision 0002-1); the
+    // email of a guest, or of a person outside the tenant, is refused.
+    assert_eq!(
+        code(
+            s.add_grant(
+                &o,
+                w.plan,
+                Grantee::Email {
+                    email: email_of(w.member).to_uppercase()
+                },
+                Role::View
+            )
+            .await
+        ),
+        "ok"
+    );
+    for refused in [w.outsider, w.guest_edit] {
+        assert_eq!(
+            code(
+                s.add_grant(
+                    &o,
+                    w.plan,
+                    Grantee::Email {
+                        email: email_of(refused)
+                    },
+                    Role::View
+                )
+                .await
+            ),
+            "403"
+        );
+    }
     b.set_policy(w, TenantPolicy::default()).await;
 
     // ---- email grants stay email grants (no tuple)
@@ -839,7 +889,7 @@ async fn seed_pg(pool: &PgPool, w: &World) {
         )
         .bind(u.0)
         .bind(home.0)
-        .bind(format!("{}@example.test", u.0))
+        .bind(email_of(u))
         .execute(&mut *tx)
         .await
         .unwrap();

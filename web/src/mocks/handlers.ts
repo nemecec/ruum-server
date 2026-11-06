@@ -381,7 +381,11 @@ export const handlers: HttpHandler[] = [
         revoked_at: null,
       }
       db.appPasswords.push(app_password)
-      return { app_password, secret: `${app_password.prefix}${secretChars(39)}` }
+      return {
+        app_password,
+        secret: `${app_password.prefix}${secretChars(39)}`,
+        dav_url: 'https://dav.ruum.localhost/',
+      }
     },
     { status: 201 },
   ),

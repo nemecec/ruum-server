@@ -226,6 +226,13 @@ pub trait TenantStore: Send + Sync {
     ) -> Result<Tenant>;
     /// The role of a user in the tenant, or `None`. A system lookup.
     async fn role_of(&self, tenant: TenantId, user: UserId) -> Result<Option<MemberRole>>;
+    /// Whether `email` is the verified email of a member, admin or owner (not a guest) of the
+    /// tenant, case-insensitive. A system lookup for the `allow_guests` policy of email grants
+    /// (decision 0002-1). The default answers `false`, which refuses the grant.
+    async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
+        let _ = (tenant, email);
+        Ok(false)
+    }
     /// Members and guests, in the order they joined. Needs the tenant role `member`.
     async fn list_members(&self, ctx: &Context, page: PageRequest) -> Result<Page<Member>>;
     /// Changes the role of a member. Users only; needs `admin`; only an owner makes or removes

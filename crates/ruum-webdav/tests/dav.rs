@@ -1,5 +1,5 @@
 //! WebDAV tests: sign-in, the operations, versions, permissions, scopes and tenant isolation.
-//! They run the `/dav` router in memory on the fixture world of `ruum-testkit` (two team
+//! They run the WebDAV router (the router of the WebDAV host, at `/`) in memory on the fixture world of `ruum-testkit` (two team
 //! tenants with every principal), on the real in-memory stores (`Services::in_memory`).
 
 mod support;
@@ -152,7 +152,7 @@ async fn mkcol(app: &axum::Router, path: &str, auth: &Auth) -> Res {
 }
 
 async fn mv(app: &axum::Router, method: &str, from: &str, to: &str, auth: &Auth) -> Res {
-    let dest = format!("https://ruum.localhost{to}");
+    let dest = format!("https://dav.ruum.localhost{to}");
     send(
         app,
         method,
@@ -169,7 +169,7 @@ async fn mv(app: &axum::Router, method: &str, from: &str, to: &str, auth: &Auth)
 #[tokio::test]
 async fn unauthenticated_requests_get_both_challenges() {
     let t = setup().await;
-    let r = propfind(&t.app, "/dav/", &Auth::None, "1").await;
+    let r = propfind(&t.app, "/", &Auth::None, "1").await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     let challenge = r.header("www-authenticate");
     assert!(challenge.contains("Basic realm=\"Ruum\""), "{challenge}");
@@ -201,7 +201,7 @@ async fn other_credentials_are_refused() {
         Auth::Bearer("garbage".into()),
     ];
     for auth in cases {
-        let r = propfind(&t.app, "/dav/", &auth, "0").await;
+        let r = propfind(&t.app, "/", &auth, "0").await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
         assert!(r.header("www-authenticate").contains("Basic"));
     }
@@ -211,7 +211,7 @@ async fn other_credentials_are_refused() {
 async fn options_advertise_class_2_for_finder_and_windows() {
     let t = setup().await;
     let auth = member_basic(&t.w.a);
-    let r = send(&t.app, "OPTIONS", "/dav/", &auth, &[], Body::empty()).await;
+    let r = send(&t.app, "OPTIONS", "/", &auth, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::OK);
     let dav = r.header("dav");
     assert!(dav.split(',').any(|c| c.trim() == "2"), "DAV: {dav}");
@@ -221,7 +221,7 @@ async fn options_advertise_class_2_for_finder_and_windows() {
         assert!(allow.contains(m), "Allow: {allow}");
     }
     // On a file; PATCH (partial update) is not offered.
-    let path = format!("/dav/Projects/{}", t.w.a.plan_name);
+    let path = format!("/Projects/{}", t.w.a.plan_name);
     let r = send(&t.app, "OPTIONS", &path, &auth, &[], Body::empty()).await;
     let allow = r.header("allow");
     for m in ["GET", "PUT", "MOVE", "DELETE", "LOCK"] {
@@ -229,10 +229,10 @@ async fn options_advertise_class_2_for_finder_and_windows() {
     }
     assert!(!allow.contains("PATCH"), "Allow: {allow}");
     // On a free name.
-    let r = send(&t.app, "OPTIONS", "/dav/new", &auth, &[], Body::empty()).await;
+    let r = send(&t.app, "OPTIONS", "/new", &auth, &[], Body::empty()).await;
     assert!(r.header("allow").contains("MKCOL"));
-    // `/dav` without the slash works too.
-    let r = send(&t.app, "OPTIONS", "/dav", &auth, &[], Body::empty()).await;
+    // The root of the host works too.
+    let r = send(&t.app, "OPTIONS", "/", &auth, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::OK);
 }
 
@@ -240,7 +240,7 @@ async fn options_advertise_class_2_for_finder_and_windows() {
 async fn lock_and_unlock_answer_for_finder() {
     let t = setup().await;
     let auth = member_basic(&t.w.a);
-    let path = format!("/dav/Projects/{}", t.w.a.plan_name);
+    let path = format!("/Projects/{}", t.w.a.plan_name);
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>
 <D:locktype><D:write/></D:locktype><D:owner><D:href>finder</D:href></D:owner></D:lockinfo>"#;
@@ -279,30 +279,30 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let before = t.h.journal.entries(a.id).len();
 
     // PROPFIND of the tenant root.
-    let r = propfind(&t.app, "/dav/", &auth, "1").await;
+    let r = propfind(&t.app, "/", &auth, "1").await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     let xml = r.text();
-    assert!(xml.contains("/dav/Projects/"), "{xml}");
-    assert!(xml.contains("/dav/Private/"), "{xml}");
+    assert!(xml.contains("/Projects/"), "{xml}");
+    assert!(xml.contains("/Private/"), "{xml}");
     assert!(xml.contains("collection"), "{xml}");
 
     // MKCOL, and again (the name is taken).
     assert_eq!(
-        mkcol(&t.app, "/dav/Docs", &auth).await.status,
+        mkcol(&t.app, "/Docs", &auth).await.status,
         StatusCode::CREATED
     );
     assert_eq!(
-        mkcol(&t.app, "/dav/Docs", &auth).await.status,
+        mkcol(&t.app, "/Docs", &auth).await.status,
         StatusCode::METHOD_NOT_ALLOWED
     );
     // MKCOL without a parent.
     assert_eq!(
-        mkcol(&t.app, "/dav/Nope/Inner", &auth).await.status,
+        mkcol(&t.app, "/Nope/Inner", &auth).await.status,
         StatusCode::CONFLICT
     );
 
     // PUT a new file: a new node with one version.
-    let r = put(&t.app, "/dav/Docs/hello.txt", &auth, b"hello world").await;
+    let r = put(&t.app, "/Docs/hello.txt", &auth, b"hello world").await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let docs = t.h.tree.child(a.root, "Docs").unwrap();
     let file = t.h.tree.child(docs.id, "hello.txt").unwrap();
@@ -312,7 +312,7 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     assert_eq!(file.node_type.as_deref(), Some("text/plain"));
 
     // GET, HEAD and ranges.
-    let r = get(&t.app, "/dav/Docs/hello.txt", &auth).await;
+    let r = get(&t.app, "/Docs/hello.txt", &auth).await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.body, b"hello world");
     assert_eq!(r.header("etag"), tag1);
@@ -320,7 +320,7 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let r = send(
         &t.app,
         "GET",
-        "/dav/Docs/hello.txt",
+        "/Docs/hello.txt",
         &auth,
         &[("range", "bytes=6-10")],
         Body::empty(),
@@ -332,28 +332,20 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let r = send(
         &t.app,
         "GET",
-        "/dav/Docs/hello.txt",
+        "/Docs/hello.txt",
         &auth,
         &[("range", "bytes=-5")],
         Body::empty(),
     )
     .await;
     assert_eq!(r.body, b"world");
-    let r = send(
-        &t.app,
-        "HEAD",
-        "/dav/Docs/hello.txt",
-        &auth,
-        &[],
-        Body::empty(),
-    )
-    .await;
+    let r = send(&t.app, "HEAD", "/Docs/hello.txt", &auth, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.header("content-length"), "11");
     let r = send(
         &t.app,
         "GET",
-        "/dav/Docs/hello.txt",
+        "/Docs/hello.txt",
         &auth,
         &[("if-none-match", &tag1)],
         Body::empty(),
@@ -363,25 +355,23 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
 
     // PUT again: new content of the same node. Saves by the same user within the coalescing
     // window merge into the head version (design 5.3); the ETag still changes.
-    let r = put(&t.app, "/dav/Docs/hello.txt", &auth, b"hello again!").await;
+    let r = put(&t.app, "/Docs/hello.txt", &auth, b"hello again!").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     let versions = t.h.tree.versions_of(file.id);
     assert_eq!(versions.len(), 1);
     assert_ne!(
-        get(&t.app, "/dav/Docs/hello.txt", &auth)
-            .await
-            .header("etag"),
+        get(&t.app, "/Docs/hello.txt", &auth).await.header("etag"),
         tag1
     );
     assert_eq!(
-        get(&t.app, "/dav/Docs/hello.txt", &auth).await.body,
+        get(&t.app, "/Docs/hello.txt", &auth).await.body,
         b"hello again!"
     );
     // A PUT with a stale If-Match is refused.
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Docs/hello.txt",
+        "/Docs/hello.txt",
         &auth,
         &[("if-match", &tag1), ("content-length", "1")],
         Body::from("x"),
@@ -391,7 +381,7 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
 
     // PROPFIND of the file.
-    let r = propfind(&t.app, "/dav/Docs/hello.txt", &auth, "0").await;
+    let r = propfind(&t.app, "/Docs/hello.txt", &auth, "0").await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert!(
         r.text()
@@ -404,21 +394,21 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let r = mv(
         &t.app,
         "MOVE",
-        "/dav/Docs/hello.txt",
-        "/dav/Docs/renamed.txt",
+        "/Docs/hello.txt",
+        "/Docs/renamed.txt",
         &auth,
     )
     .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
-        get(&t.app, "/dav/Docs/hello.txt", &auth).await.status,
+        get(&t.app, "/Docs/hello.txt", &auth).await.status,
         StatusCode::NOT_FOUND
     );
     let r = mv(
         &t.app,
         "MOVE",
-        "/dav/Docs/renamed.txt",
-        "/dav/Projects/renamed.txt",
+        "/Docs/renamed.txt",
+        "/Projects/renamed.txt",
         &auth,
     )
     .await;
@@ -430,8 +420,8 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let r = mv(
         &t.app,
         "MOVE",
-        "/dav/Projects/renamed.txt",
-        "/dav/Projects/Renamed.txt",
+        "/Projects/renamed.txt",
+        "/Projects/Renamed.txt",
         &auth,
     )
     .await;
@@ -442,32 +432,29 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let r = mv(
         &t.app,
         "COPY",
-        "/dav/Projects/Renamed.txt",
-        "/dav/Docs/copy.txt",
+        "/Projects/Renamed.txt",
+        "/Docs/copy.txt",
         &auth,
     )
     .await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
-        get(&t.app, "/dav/Docs/copy.txt", &auth).await.body,
+        get(&t.app, "/Docs/copy.txt", &auth).await.body,
         b"hello again!"
     );
-    let r = mv(&t.app, "COPY", "/dav/Docs", "/dav/Docs2", &auth).await;
+    let r = mv(&t.app, "COPY", "/Docs", "/Docs2", &auth).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
-        get(&t.app, "/dav/Docs2/copy.txt", &auth).await.body,
+        get(&t.app, "/Docs2/copy.txt", &auth).await.body,
         b"hello again!"
     );
     // Overwrite: F onto an existing node.
     let r = send(
         &t.app,
         "COPY",
-        "/dav/Docs/copy.txt",
+        "/Docs/copy.txt",
         &auth,
-        &[
-            ("destination", "/dav/Projects/Renamed.txt"),
-            ("overwrite", "F"),
-        ],
+        &[("destination", "/Projects/Renamed.txt"), ("overwrite", "F")],
         Body::empty(),
     )
     .await;
@@ -477,8 +464,8 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let r = mv(
         &t.app,
         "COPY",
-        "/dav/Docs/copy.txt",
-        "/dav/Projects/Renamed.txt",
+        "/Docs/copy.txt",
+        "/Projects/Renamed.txt",
         &auth,
     )
     .await;
@@ -486,20 +473,20 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     assert!(t.h.tree.node(file.id).unwrap().trashed_at.is_none());
     assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
     assert_eq!(
-        get(&t.app, "/dav/Projects/Renamed.txt", &auth).await.body,
+        get(&t.app, "/Projects/Renamed.txt", &auth).await.body,
         b"hello again!"
     );
     // Overwrite of a folder: the old folder goes to the trash.
     let docs2 = t.h.tree.child(a.root, "Docs2").unwrap();
-    let r = mv(&t.app, "COPY", "/dav/Docs", "/dav/Docs2", &auth).await;
+    let r = mv(&t.app, "COPY", "/Docs", "/Docs2", &auth).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     assert!(t.h.tree.node(docs2.id).unwrap().trashed_at.is_some());
 
     // DELETE a folder: one node to the trash.
-    let r = send(&t.app, "DELETE", "/dav/Docs2", &auth, &[], Body::empty()).await;
+    let r = send(&t.app, "DELETE", "/Docs2", &auth, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     assert_eq!(
-        propfind(&t.app, "/dav/Docs2", &auth, "0").await.status,
+        propfind(&t.app, "/Docs2", &auth, "0").await.status,
         StatusCode::NOT_FOUND
     );
     let entries = t.h.journal.entries(a.id);
@@ -513,7 +500,7 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
         "one for the overwrite, one for the folder"
     );
     // The root cannot be deleted or moved.
-    let r = send(&t.app, "DELETE", "/dav/", &auth, &[], Body::empty()).await;
+    let r = send(&t.app, "DELETE", "/", &auth, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
 
     // Every write through the app password is the member (decision 0001-7).
@@ -534,16 +521,16 @@ async fn large_files_are_chunked_and_read_in_ranges() {
     let data: Vec<u8> = (0..6 * 1024 * 1024u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect();
-    let r = put(&t.app, "/dav/Projects/big.bin", &auth, &data).await;
+    let r = put(&t.app, "/Projects/big.bin", &auth, &data).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    let r = get(&t.app, "/dav/Projects/big.bin", &auth).await;
+    let r = get(&t.app, "/Projects/big.bin", &auth).await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.body.len(), data.len());
     assert!(r.body == data);
     let r = send(
         &t.app,
         "GET",
-        "/dav/Projects/big.bin",
+        "/Projects/big.bin",
         &auth,
         &[("range", "bytes=3000000-3000099")],
         Body::empty(),
@@ -552,7 +539,7 @@ async fn large_files_are_chunked_and_read_in_ranges() {
     assert_eq!(r.status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(r.body, &data[3_000_000..3_000_100]);
     // The same content again shares every chunk: the second version uploads nothing new.
-    let r = put(&t.app, "/dav/Projects/big.bin", &auth, &data).await;
+    let r = put(&t.app, "/Projects/big.bin", &auth, &data).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
 
@@ -561,9 +548,9 @@ async fn finder_style_puts_work() {
     let t = setup().await;
     let auth = member_basic(&t.w.a);
     // Finder first makes an empty file, then sends the content chunked, without a length.
-    let r = put(&t.app, "/dav/Projects/f.txt", &auth, b"").await;
+    let r = put(&t.app, "/Projects/f.txt", &auth, b"").await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    assert_eq!(get(&t.app, "/dav/Projects/f.txt", &auth).await.body, b"");
+    assert_eq!(get(&t.app, "/Projects/f.txt", &auth).await.body, b"");
     let parts: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
         Ok(bytes::Bytes::from_static(b"from ")),
         Ok(bytes::Bytes::from_static(b"finder")),
@@ -571,7 +558,7 @@ async fn finder_style_puts_work() {
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/f.txt",
+        "/Projects/f.txt",
         &auth,
         &[("x-expected-entity-length", "11")],
         Body::from_stream(futures::stream::iter(parts)),
@@ -579,14 +566,14 @@ async fn finder_style_puts_work() {
     .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     assert_eq!(
-        get(&t.app, "/dav/Projects/f.txt", &auth).await.body,
+        get(&t.app, "/Projects/f.txt", &auth).await.body,
         b"from finder"
     );
     // A body shorter than its length stores nothing.
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/f.txt",
+        "/Projects/f.txt",
         &auth,
         &[("x-expected-entity-length", "100")],
         Body::from("short"),
@@ -594,15 +581,15 @@ async fn finder_style_puts_work() {
     .await;
     assert!(r.status.is_client_error() || r.status.is_server_error());
     assert_eq!(
-        get(&t.app, "/dav/Projects/f.txt", &auth).await.body,
+        get(&t.app, "/Projects/f.txt", &auth).await.body,
         b"from finder"
     );
     // Names with spaces and non-ASCII letters.
-    let r = put(&t.app, "/dav/Projects/%C3%A4%20b.txt", &auth, b"x").await;
+    let r = put(&t.app, "/Projects/%C3%A4%20b.txt", &auth, b"x").await;
     assert_eq!(r.status, StatusCode::CREATED);
-    let r = propfind(&t.app, "/dav/Projects/", &auth, "1").await;
+    let r = propfind(&t.app, "/Projects/", &auth, "1").await;
     assert!(
-        r.text().contains("/dav/Projects/%C3%A4%20b.txt"),
+        r.text().contains("/Projects/%C3%A4%20b.txt"),
         "{}",
         r.text()
     );
@@ -610,7 +597,7 @@ async fn finder_style_puts_work() {
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/f.txt",
+        "/Projects/f.txt",
         &auth,
         &[("if-none-match", "*"), ("content-length", "1")],
         Body::from("y"),
@@ -621,7 +608,7 @@ async fn finder_style_puts_work() {
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/f.txt",
+        "/Projects/f.txt",
         &auth,
         &[("content-range", "bytes 0-0/11"), ("content-length", "1")],
         Body::from("y"),
@@ -629,7 +616,7 @@ async fn finder_style_puts_work() {
     .await;
     assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
-        get(&t.app, "/dav/Projects/f.txt", &auth).await.body,
+        get(&t.app, "/Projects/f.txt", &auth).await.body,
         b"from finder"
     );
 }
@@ -639,18 +626,18 @@ async fn safe_save_by_move_keeps_the_node_and_its_versions() {
     let t = setup().await;
     let a = &t.w.a;
     let auth = member_basic(a);
-    let r = put(&t.app, "/dav/Projects/a.txt", &auth, b"first").await;
+    let r = put(&t.app, "/Projects/a.txt", &auth, b"first").await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let file = t.h.tree.child(a.projects, "a.txt").unwrap();
     // The editor writes a temporary file and moves it over the original.
-    let r = put(&t.app, "/dav/Projects/.a.txt.tmp", &auth, b"second").await;
+    let r = put(&t.app, "/Projects/.a.txt.tmp", &auth, b"second").await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let tmp = t.h.tree.child(a.projects, ".a.txt.tmp").unwrap();
     let r = mv(
         &t.app,
         "MOVE",
-        "/dav/Projects/.a.txt.tmp",
-        "/dav/Projects/a.txt",
+        "/Projects/.a.txt.tmp",
+        "/Projects/a.txt",
         &auth,
     )
     .await;
@@ -659,33 +646,20 @@ async fn safe_save_by_move_keeps_the_node_and_its_versions() {
     assert_eq!(now.id, file.id, "a.txt keeps its node ID");
     // One version: the same user's saves within the coalescing window merge (design 5.3).
     assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
-    assert_eq!(
-        get(&t.app, "/dav/Projects/a.txt", &auth).await.body,
-        b"second"
-    );
+    assert_eq!(get(&t.app, "/Projects/a.txt", &auth).await.body, b"second");
     assert!(t.h.tree.node(tmp.id).unwrap().trashed_at.is_some());
     assert_eq!(
-        get(&t.app, "/dav/Projects/.a.txt.tmp", &auth).await.status,
+        get(&t.app, "/Projects/.a.txt.tmp", &auth).await.status,
         StatusCode::NOT_FOUND
     );
     // A guest with edit may write a version but not trash the source: nothing changes.
     let guest = app_password(&t.h, a, Who::GuestEdit).await;
-    let r = put(&t.app, "/dav/Projects/g.tmp", &guest, b"guest").await;
+    let r = put(&t.app, "/Projects/g.tmp", &guest, b"guest").await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
-    let r = mv(
-        &t.app,
-        "MOVE",
-        "/dav/Projects/g.tmp",
-        "/dav/Projects/a.txt",
-        &guest,
-    )
-    .await;
+    let r = mv(&t.app, "MOVE", "/Projects/g.tmp", "/Projects/a.txt", &guest).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
-    assert_eq!(
-        get(&t.app, "/dav/Projects/a.txt", &auth).await.body,
-        b"second"
-    );
+    assert_eq!(get(&t.app, "/Projects/a.txt", &auth).await.body, b"second");
 }
 
 #[tokio::test]
@@ -696,45 +670,29 @@ async fn a_failed_overwrite_restores_the_old_destination() {
     // The seed trashes a node too: count only the trashes of this test.
     let trashed_before = trashed_count(&t, a.id);
     assert_eq!(
-        mkcol(&t.app, "/dav/Projects/D", &auth).await.status,
+        mkcol(&t.app, "/Projects/D", &auth).await.status,
         StatusCode::CREATED
     );
     assert_eq!(
-        mkcol(&t.app, "/dav/Projects/D/In", &auth).await.status,
+        mkcol(&t.app, "/Projects/D/In", &auth).await.status,
         StatusCode::CREATED
     );
     // MOVE a folder over a node that holds it: refused before anything changes.
-    let r = mv(
-        &t.app,
-        "MOVE",
-        "/dav/Projects/D/In",
-        "/dav/Projects/D",
-        &auth,
-    )
-    .await;
+    let r = mv(&t.app, "MOVE", "/Projects/D/In", "/Projects/D", &auth).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(
-        propfind(&t.app, "/dav/Projects/D/In", &auth, "0")
-            .await
-            .status,
+        propfind(&t.app, "/Projects/D/In", &auth, "0").await.status,
         StatusCode::MULTI_STATUS
     );
     // MOVE a folder into its own subtree, over an existing node there.
     assert_eq!(
-        mkcol(&t.app, "/dav/Projects/D/In/X", &auth).await.status,
+        mkcol(&t.app, "/Projects/D/In/X", &auth).await.status,
         StatusCode::CREATED
     );
-    let r = mv(
-        &t.app,
-        "MOVE",
-        "/dav/Projects/D",
-        "/dav/Projects/D/In/X",
-        &auth,
-    )
-    .await;
+    let r = mv(&t.app, "MOVE", "/Projects/D", "/Projects/D/In/X", &auth).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert_eq!(
-        propfind(&t.app, "/dav/Projects/D/In/X", &auth, "0")
+        propfind(&t.app, "/Projects/D/In/X", &auth, "0")
             .await
             .status,
         StatusCode::MULTI_STATUS
@@ -761,7 +719,7 @@ async fn lock_on_a_new_name_makes_the_file() {
     let r = send(
         &t.app,
         "LOCK",
-        "/dav/Projects/new.docx",
+        "/Projects/new.docx",
         &auth,
         &[("timeout", "Second-600"), ("content-type", "text/xml")],
         Body::from(body),
@@ -774,7 +732,7 @@ async fn lock_on_a_new_name_makes_the_file() {
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/new.docx",
+        "/Projects/new.docx",
         &auth,
         &[("if", &format!("({token})")), ("content-length", "7")],
         Body::from("content"),
@@ -789,7 +747,7 @@ async fn lock_on_a_new_name_makes_the_file() {
     let now = t.h.tree.child(a.projects, "new.docx").unwrap();
     assert_eq!(now.id, file.id, "one file");
     assert_eq!(
-        get(&t.app, "/dav/Projects/new.docx", &auth).await.body,
+        get(&t.app, "/Projects/new.docx", &auth).await.body,
         b"content"
     );
     // A guest with view cannot lock a new name into existence.
@@ -797,7 +755,7 @@ async fn lock_on_a_new_name_makes_the_file() {
     let r = send(
         &t.app,
         "LOCK",
-        "/dav/Projects/g.docx",
+        "/Projects/g.docx",
         &guest,
         &[("timeout", "Second-600"), ("content-type", "text/xml")],
         Body::from(body),
@@ -815,7 +773,7 @@ async fn bodies_over_the_plan_limit_are_refused() {
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/huge.bin",
+        "/Projects/huge.bin",
         &auth,
         &[("content-length", "1099511627776")],
         Body::from("x"),
@@ -826,7 +784,7 @@ async fn bodies_over_the_plan_limit_are_refused() {
     let r = send(
         &t.app,
         "PUT",
-        "/dav/Projects/huge.bin",
+        "/Projects/huge.bin",
         &auth,
         &[("x-expected-entity-length", "1099511627776")],
         Body::from("x"),
@@ -847,15 +805,15 @@ async fn guest_with_view_reads_but_does_not_write() {
     let t = setup().await;
     let a = &t.w.a;
     let auth = app_password(&t.h, a, Who::GuestView).await;
-    let plan = format!("/dav/Projects/{}", a.plan_name);
+    let plan = format!("/Projects/{}", a.plan_name);
     assert_eq!(
-        propfind(&t.app, "/dav/Projects", &auth, "1").await.status,
+        propfind(&t.app, "/Projects", &auth, "1").await.status,
         StatusCode::MULTI_STATUS
     );
     let r = get(&t.app, &plan, &auth).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(
-        put(&t.app, "/dav/Projects/x.txt", &auth, b"x").await.status,
+        put(&t.app, "/Projects/x.txt", &auth, b"x").await.status,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
@@ -863,25 +821,25 @@ async fn guest_with_view_reads_but_does_not_write() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        mkcol(&t.app, "/dav/Projects/D", &auth).await.status,
+        mkcol(&t.app, "/Projects/D", &auth).await.status,
         StatusCode::FORBIDDEN
     );
     let r = send(&t.app, "DELETE", &plan, &auth, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
-    let r = mv(&t.app, "MOVE", &plan, "/dav/Projects/other.txt", &auth).await;
+    let r = mv(&t.app, "MOVE", &plan, "/Projects/other.txt", &auth).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     // What the guest cannot see does not exist.
     assert_eq!(
-        propfind(&t.app, "/dav/Private", &auth, "0").await.status,
+        propfind(&t.app, "/Private", &auth, "0").await.status,
         StatusCode::NOT_FOUND
     );
     // The root is not secret but not readable: a guest mounts the shared folder's URL.
     assert_eq!(
-        propfind(&t.app, "/dav/", &auth, "0").await.status,
+        propfind(&t.app, "/", &auth, "0").await.status,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        mv(&t.app, "COPY", &plan, "/dav/Private/x.txt", &auth)
+        mv(&t.app, "COPY", &plan, "/Private/x.txt", &auth)
             .await
             .status,
         StatusCode::CONFLICT
@@ -894,34 +852,25 @@ async fn guest_with_edit_writes_but_does_not_delete_or_move_out() {
     let a = &t.w.a;
     let auth = app_password(&t.h, a, Who::GuestEdit).await;
     assert_eq!(
-        put(&t.app, "/dav/Projects/e.txt", &auth, b"e").await.status,
+        put(&t.app, "/Projects/e.txt", &auth, b"e").await.status,
         StatusCode::CREATED
     );
     assert_eq!(
-        put(&t.app, "/dav/Projects/e.txt", &auth, b"e2")
-            .await
-            .status,
+        put(&t.app, "/Projects/e.txt", &auth, b"e2").await.status,
         StatusCode::NO_CONTENT
     );
     assert_eq!(
-        mkcol(&t.app, "/dav/Projects/E", &auth).await.status,
+        mkcol(&t.app, "/Projects/E", &auth).await.status,
         StatusCode::CREATED
     );
     // Rename needs edit; a move to another folder and delete need manage.
-    let r = mv(
-        &t.app,
-        "MOVE",
-        "/dav/Projects/e.txt",
-        "/dav/Projects/f.txt",
-        &auth,
-    )
-    .await;
+    let r = mv(&t.app, "MOVE", "/Projects/e.txt", "/Projects/f.txt", &auth).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let r = mv(
         &t.app,
         "MOVE",
-        "/dav/Projects/f.txt",
-        "/dav/Projects/E/f.txt",
+        "/Projects/f.txt",
+        "/Projects/E/f.txt",
         &auth,
     )
     .await;
@@ -929,7 +878,7 @@ async fn guest_with_edit_writes_but_does_not_delete_or_move_out() {
     let r = send(
         &t.app,
         "DELETE",
-        "/dav/Projects/f.txt",
+        "/Projects/f.txt",
         &auth,
         &[],
         Body::empty(),
@@ -940,23 +889,15 @@ async fn guest_with_edit_writes_but_does_not_delete_or_move_out() {
     let r = mv(
         &t.app,
         "COPY",
-        "/dav/Projects/f.txt",
-        "/dav/Projects/E/f.txt",
+        "/Projects/f.txt",
+        "/Projects/E/f.txt",
         &auth,
     )
     .await;
     assert_eq!(r.status, StatusCode::CREATED);
     // A guest with manage deletes.
     let m = app_password(&t.h, a, Who::GuestManage).await;
-    let r = send(
-        &t.app,
-        "DELETE",
-        "/dav/Projects/f.txt",
-        &m,
-        &[],
-        Body::empty(),
-    )
-    .await;
+    let r = send(&t.app, "DELETE", "/Projects/f.txt", &m, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
 
@@ -964,13 +905,13 @@ async fn guest_with_edit_writes_but_does_not_delete_or_move_out() {
 async fn agents_act_within_their_scope() {
     let t = setup().await;
     let a = &t.w.a;
-    let plan = format!("/dav/Projects/{}", a.plan_name);
+    let plan = format!("/Projects/{}", a.plan_name);
 
     // The narrow agent: scope Projects, max role view.
     let narrow = bearer(a, Who::Agent);
     let before = t.h.journal.entries(a.id).len();
     assert_eq!(
-        propfind(&t.app, "/dav/Projects", &narrow, "1").await.status,
+        propfind(&t.app, "/Projects", &narrow, "1").await.status,
         StatusCode::MULTI_STATUS
     );
     assert_eq!(get(&t.app, &plan, &narrow).await.status, StatusCode::OK);
@@ -979,38 +920,29 @@ async fn agents_act_within_their_scope() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        put(&t.app, "/dav/Projects/n.txt", &narrow, b"x")
-            .await
-            .status,
+        put(&t.app, "/Projects/n.txt", &narrow, b"x").await.status,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        propfind(&t.app, "/dav/Private", &narrow, "0").await.status,
+        propfind(&t.app, "/Private", &narrow, "0").await.status,
         StatusCode::NOT_FOUND
     );
     // A scoped agent mounts its scope by URL; the root answers 403, as `NodeStore::root`.
     assert_eq!(
-        propfind(&t.app, "/dav/", &narrow, "0").await.status,
+        propfind(&t.app, "/", &narrow, "0").await.status,
         StatusCode::FORBIDDEN
     );
     assert_eq!(t.h.journal.entries(a.id).len(), before);
 
     // The agent with scope Private and max role manage writes there, for the member.
     let out = bearer(a, Who::AgentOut);
-    let r = put(&t.app, "/dav/Private/a.txt", &out, b"agent").await;
+    let r = put(&t.app, "/Private/a.txt", &out, b"agent").await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
-        propfind(&t.app, "/dav/Projects", &out, "0").await.status,
+        propfind(&t.app, "/Projects", &out, "0").await.status,
         StatusCode::NOT_FOUND
     );
-    let r = mv(
-        &t.app,
-        "COPY",
-        "/dav/Private/a.txt",
-        "/dav/Projects/a.txt",
-        &out,
-    )
-    .await;
+    let r = mv(&t.app, "COPY", "/Private/a.txt", "/Projects/a.txt", &out).await;
     assert_eq!(
         r.status,
         StatusCode::CONFLICT,
@@ -1026,7 +958,7 @@ async fn agents_act_within_their_scope() {
     let g = bearer(a, Who::AgentOfGuestView);
     assert_eq!(get(&t.app, &plan, &g).await.status, StatusCode::OK);
     assert_eq!(
-        put(&t.app, "/dav/Projects/g.txt", &g, b"x").await.status,
+        put(&t.app, "/Projects/g.txt", &g, b"x").await.status,
         StatusCode::FORBIDDEN
     );
 }
@@ -1040,14 +972,14 @@ async fn each_credential_sees_only_its_tenant() {
     let auth_b = member_basic(b);
     // B's member sees B's tree, with nothing of A in it.
     // Depth infinity is refused (propfind-finite-depth); clients walk the tree.
-    let r = propfind(&t.app, "/dav/Projects", &auth_b, "infinity").await;
+    let r = propfind(&t.app, "/Projects", &auth_b, "infinity").await;
     assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
-    let r = propfind(&t.app, "/dav/Projects", &auth_b, "1").await;
+    let r = propfind(&t.app, "/Projects", &auth_b, "1").await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     let xml = r.text();
     assert!(xml.contains(&b.plan_name), "{xml}");
     assert!(!xml.contains(a.prefix), "{xml}");
-    let a_plan = format!("/dav/Projects/{}", a.plan_name);
+    let a_plan = format!("/Projects/{}", a.plan_name);
     assert_eq!(
         get(&t.app, &a_plan, &auth_b).await.status,
         StatusCode::NOT_FOUND
@@ -1056,7 +988,7 @@ async fn each_credential_sees_only_its_tenant() {
     let r = send(
         &t.app,
         "PROPFIND",
-        "/dav/Projects",
+        "/Projects",
         &auth_b,
         &[("depth", "1"), ("ruum-tenant", &a.id.to_string())],
         Body::empty(),
@@ -1064,7 +996,7 @@ async fn each_credential_sees_only_its_tenant() {
     .await;
     assert!(!r.text().contains(a.prefix));
     // B's agent token sees nothing of A.
-    let r = propfind(&t.app, "/dav/Private", &bearer(b, Who::AgentOut), "1").await;
+    let r = propfind(&t.app, "/Private", &bearer(b, Who::AgentOut), "1").await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert!(!r.text().contains(a.prefix));
     // A PUT to the same path makes a file in B, not a version in A.
@@ -1081,7 +1013,7 @@ async fn a_removed_member_loses_dav_and_the_rest_api_refuses_app_passwords() {
     let a = &t.w.a;
     let auth = member_basic(a);
     assert_eq!(
-        propfind(&t.app, "/dav/", &auth, "0").await.status,
+        propfind(&t.app, "/", &auth, "0").await.status,
         StatusCode::MULTI_STATUS
     );
 
@@ -1112,7 +1044,7 @@ async fn a_removed_member_loses_dav_and_the_rest_api_refuses_app_passwords() {
         .remove_member(&admin, a.user_id(Who::Member))
         .await
         .unwrap();
-    let r = propfind(&t.app, "/dav/", &auth, "0").await;
+    let r = propfind(&t.app, "/", &auth, "0").await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
 
@@ -1127,7 +1059,7 @@ async fn propfind_gives_the_properties_finder_asks_for() {
     let r = send(
         &t.app,
         "PROPFIND",
-        "/dav/",
+        "/",
         &member_basic(a),
         &[("depth", "1"), ("content-type", "text/xml")],
         Body::from(body),
@@ -1150,7 +1082,7 @@ async fn propfind_gives_the_properties_finder_asks_for() {
     let r = send(
         &t.app,
         "PROPFIND",
-        "/dav/Projects/",
+        "/Projects/",
         &g,
         &[("depth", "1"), ("content-type", "text/xml")],
         Body::from(body),
@@ -1160,24 +1092,71 @@ async fn propfind_gives_the_properties_finder_asks_for() {
     assert!(r.text().contains(&a.plan_name));
 }
 
+/// The WebDAV host serves only WebDAV (decision 0002-3): the REST API and MCP are not there.
+/// A path such as `/v1/me` is a path in the tenant's tree, and nothing is there (`404`).
 #[tokio::test]
-async fn the_router_merges_with_the_rest_api_as_in_the_server() {
+async fn the_dav_host_serves_only_webdav() {
     let t = setup().await;
-    // `ruum-server` merges the routers; overlapping routes would panic here.
-    let app = ruum_api::router(support::app_state(&t.h.services))
-        .merge(ruum_webdav::router(t.h.services.clone()));
-    let r = propfind(&app, "/dav/", &member_basic(&t.w.a), "0").await;
+    let a = &t.w.a;
+    let auth = member_basic(a);
+    let r = send(&t.app, "GET", "/v1/me", &auth, &[], Body::empty()).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert!(!r.text().contains("\"actor\""), "{}", r.text());
+    let r = send(
+        &t.app,
+        "POST",
+        "/mcp",
+        &bearer(a, Who::AgentOut),
+        &[
+            ("content-type", "application/json"),
+            ("accept", "application/json, text/event-stream"),
+        ],
+        Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+    )
+    .await;
+    // POST is not a WebDAV method: `dav-server` answers `501`, never an MCP answer.
+    assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{}", r.text());
+    assert!(!r.text().contains("jsonrpc"), "{}", r.text());
+    let r = propfind(&t.app, "/", &auth, "0").await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
-    let r = send(&app, "GET", "/v1/me", &Auth::None, &[], Body::empty()).await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+/// The WebDAV host never reads or sets cookies (decision 0002-3): the session cookie of the web
+/// UI is not a credential there, and no answer sets a cookie.
+#[tokio::test]
+async fn the_dav_host_ignores_and_never_sets_cookies() {
+    let t = setup().await;
+    let a = &t.w.a;
+    let Credentials::Session { session, csrf } = &a.principal(Who::Member).credentials else {
+        panic!("the member has a web session in the fixture");
+    };
+    let cookie = format!("ruum_session={session}; ruum_csrf={csrf}");
+    for method in ["PROPFIND", "GET", "PUT"] {
+        let r = send(
+            &t.app,
+            method,
+            "/Projects/",
+            &Auth::None,
+            &[("cookie", &cookie), ("ruum-csrf", csrf), ("depth", "0")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method}: {}", r.text());
+        assert!(r.headers.get("set-cookie").is_none(), "{method}");
+        assert!(r.header("content-security-policy").starts_with("sandbox"));
+    }
+    let r = propfind(&t.app, "/Projects/", &member_basic(a), "1").await;
+    assert_eq!(r.status, StatusCode::MULTI_STATUS);
+    assert!(r.headers.get("set-cookie").is_none());
 }
 
 // ------------------------------------------------------------------------- content safety
 
-/// `/dav` shares the origin of the web UI and the API (`deploy/dev/caddy/Caddyfile`), so a file
-/// opened there in a browser must never run as the platform (design section 15; security
-/// finding of 2026-11-06: an uploaded `.html` or `.svg` with a script was served as active
-/// content without CSP, `nosniff` or `attachment`).
+/// A file opened on the WebDAV host in a browser must never run as a page (design section 15;
+/// security finding of 2026-11-06: an uploaded `.html` or `.svg` with a script was served as
+/// active content without CSP, `nosniff` or `attachment`). The host is apart from the platform
+/// origin since decision 0002-3; the headers stay as defence in depth, because a script on a
+/// sibling host could still set cookies for the parent domain.
 #[tokio::test]
 async fn files_are_served_as_sandboxed_attachments() {
     let t = setup().await;
@@ -1192,7 +1171,7 @@ async fn files_are_served_as_sandboxed_attachments() {
         ("evil.xml", &svg[..]),
         ("evil.js", &b"alert(1)"[..]),
     ] {
-        let path = format!("/dav/Projects/{name}");
+        let path = format!("/Projects/{name}");
         assert_eq!(
             put(&t.app, &path, &auth, body).await.status,
             StatusCode::CREATED,
@@ -1231,7 +1210,7 @@ async fn files_are_served_as_sandboxed_attachments() {
         assert_eq!(r.header("content-type"), "application/octet-stream");
     }
     // Passive types keep their type, still as sandboxed attachments; the name is encoded.
-    let path = "/dav/Projects/n%C3%A4me%20one.txt";
+    let path = "/Projects/n%C3%A4me%20one.txt";
     assert_eq!(
         put(&t.app, path, &auth, b"plain").await.status,
         StatusCode::CREATED
@@ -1252,7 +1231,7 @@ async fn files_are_served_as_sandboxed_attachments() {
         r.header("content-disposition")
     );
     // PROPFIND answers carry the CSP and nosniff too (they are XML).
-    let r = propfind(&t.app, "/dav/Projects/", &auth, "1").await;
+    let r = propfind(&t.app, "/Projects/", &auth, "1").await;
     assert_eq!(r.status, StatusCode::MULTI_STATUS);
     assert!(r.header("content-security-policy").starts_with("sandbox"));
     assert_eq!(r.header("x-content-type-options"), "nosniff");

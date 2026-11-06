@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 /// The default listen address. Ports 5433, 8080, 8787 and 8788 are taken by another local project.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8490";
+/// The default listen address of the WebDAV host (decision 0002-3).
+pub const DEFAULT_DAV_BIND: &str = "127.0.0.1:8492";
 
 // The OIDC, S3 and SpiceDB settings are read when the real implementations are wired in.
 #[allow(dead_code)]
@@ -16,6 +18,12 @@ pub struct Config {
     pub public_url: String,
     /// `RUUM_CONTENT_URL`: the user content domain (downloads, share links).
     pub content_url: String,
+    /// `RUUM_DAV_BIND`: the listener of the WebDAV host (decision 0002-3).
+    pub dav_bind: String,
+    /// `RUUM_DAV_URL`: the public URL of the WebDAV host, for example
+    /// `https://dav.ruum.space/`. Default: `https://dav.<host>/` for an https public URL, else
+    /// `http://<RUUM_DAV_BIND>/`.
+    pub dav_url: String,
     /// `DATABASE_URL`. Without it the server uses in-memory services.
     pub database_url: Option<String>,
     /// `RUUM_DB_MAX_CONNECTIONS`
@@ -47,11 +55,18 @@ fn var(name: &str) -> Option<String> {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let public_url = var("RUUM_PUBLIC_URL").unwrap_or_else(|| "https://ruum.localhost".into());
+        let dav_bind = var("RUUM_DAV_BIND").unwrap_or_else(|| DEFAULT_DAV_BIND.into());
+        let dav_url = var("RUUM_DAV_URL")
+            .map(|u| format!("{}/", u.trim_end_matches('/')))
+            .unwrap_or_else(|| default_dav_url(&public_url, &dav_bind));
         Ok(Self {
             bind: var("RUUM_BIND").unwrap_or_else(|| DEFAULT_BIND.into()),
-            public_url: var("RUUM_PUBLIC_URL").unwrap_or_else(|| "https://ruum.localhost".into()),
+            public_url,
             content_url: var("RUUM_CONTENT_URL")
                 .unwrap_or_else(|| "https://content.ruumapps.localhost".into()),
+            dav_bind,
+            dav_url,
             database_url: var("DATABASE_URL"),
             db_max_connections: var("RUUM_DB_MAX_CONNECTIONS")
                 .map(|v| v.parse())
@@ -81,5 +96,35 @@ impl Config {
                     .max(31),
             ),
         })
+    }
+}
+
+/// The URL of the WebDAV host when `RUUM_DAV_URL` is not set: `https://dav.<host>/` next to an
+/// https public URL (Caddy on the laptop, the load balancer in production), else the listener.
+fn default_dav_url(public_url: &str, dav_bind: &str) -> String {
+    match public_url.strip_prefix("https://") {
+        Some(host) => format!("https://dav.{}/", host.trim_end_matches('/')),
+        None => format!("http://{dav_bind}/"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dav_url_follows_the_public_url() {
+        assert_eq!(
+            default_dav_url("https://ruum.localhost", DEFAULT_DAV_BIND),
+            "https://dav.ruum.localhost/"
+        );
+        assert_eq!(
+            default_dav_url("https://ruum.space/", DEFAULT_DAV_BIND),
+            "https://dav.ruum.space/"
+        );
+        assert_eq!(
+            default_dav_url("http://127.0.0.1:8490", "127.0.0.1:8492"),
+            "http://127.0.0.1:8492/"
+        );
     }
 }

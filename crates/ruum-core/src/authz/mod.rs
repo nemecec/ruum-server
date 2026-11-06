@@ -156,6 +156,75 @@ pub enum RelationshipUpdate {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsistencyToken(pub String);
 
+// ------------------------------------------------------------------ freshness per request
+
+/// Where a request finds the newest applied ZedToken of its tenant (decision 0002-4). The
+/// Postgres implementation reads the outbox ([`outbox::PgFreshness`]); in memory there is
+/// nothing to read ([`NoFreshness`]).
+#[async_trait]
+pub trait Freshness: Send + Sync {
+    /// The newest applied ZedToken of the tenant, written by any process. An error must fail
+    /// the request: a check must never fall back to a stale read silently.
+    async fn tenant_token(&self, tenant: TenantId) -> Result<Option<ConsistencyToken>>;
+}
+
+/// No outbox (the in-memory engine is always fresh).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoFreshness;
+
+#[async_trait]
+impl Freshness for NoFreshness {
+    async fn tenant_token(&self, _: TenantId) -> Result<Option<ConsistencyToken>> {
+        Ok(None)
+    }
+}
+
+tokio::task_local! {
+    /// The freshness floor of the request that runs in this task ([`with_request_freshness`]).
+    static REQUEST_FLOOR: std::sync::Arc<std::sync::Mutex<Option<ConsistencyToken>>>;
+}
+
+/// Runs one request with its own freshness floor. Every face (REST, MCP, WebDAV) wraps each
+/// request in it. Inside, [`load_request_floor`] sets the floor to the tenant's newest token,
+/// and the SpiceDB engine reads every check, bulk check and read at least as fresh as the
+/// floor ([`request_floor`]). Outside a request (workers, `seed-dev`) there is no floor.
+pub async fn with_request_freshness<F: std::future::Future>(f: F) -> F::Output {
+    REQUEST_FLOOR.scope(Default::default(), f).await
+}
+
+/// Whether the current task runs a request ([`with_request_freshness`]).
+pub fn in_request() -> bool {
+    REQUEST_FLOOR.try_with(|_| ()).is_ok()
+}
+
+/// The freshness floor of the current request, if any.
+pub fn request_floor() -> Option<ConsistencyToken> {
+    REQUEST_FLOOR
+        .try_with(|f| f.lock().expect("floor lock").clone())
+        .ok()
+        .flatten()
+}
+
+/// Raises the floor of the current request to `token` (a write of this request, or the tenant
+/// token). Does nothing outside a request.
+pub fn raise_request_floor(token: &ConsistencyToken) {
+    let _ = REQUEST_FLOOR.try_with(|f| *f.lock().expect("floor lock") = Some(token.clone()));
+}
+
+/// Sets the floor of the current request to the newest applied token of `tenant`, so a check
+/// sees every relationship write that any process applied before the request (decision 0002-4:
+/// a revocation on one server holds at once on all servers). An error of the lookup fails the
+/// request. Does nothing outside a request.
+pub async fn load_request_floor(freshness: &dyn Freshness, tenant: TenantId) -> Result<()> {
+    if !in_request() {
+        return Ok(());
+    }
+    if let Some(token) = freshness.tenant_token(tenant).await? {
+        raise_request_floor(&token);
+    }
+    Ok(())
+}
+
 /// The relationship engine.
 #[async_trait]
 pub trait Authz: Send + Sync {

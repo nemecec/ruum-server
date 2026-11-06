@@ -45,10 +45,22 @@ pub use tokens::{JwtTokenIssuer, issue_user_token};
 
 /// The name of the session cookie of the web UI.
 pub const SESSION_COOKIE: &str = "ruum_session";
-/// The name of the CSRF cookie of the web UI (double submit with the `Ruum-Csrf` header).
+/// The name of the CSRF cookie of the web UI (double submit with the `Ruum-Csrf` header). Its
+/// value is [`csrf_token`] of the session, so a cookie set by another host (cookie tossing)
+/// does not pass the check (decision 0002-3).
 pub const CSRF_COOKIE: &str = "ruum_csrf";
 /// The name of the CSRF header.
 pub const CSRF_HEADER: &str = "ruum-csrf";
+/// The CSRF value of a web session: base64url of SHA-256 over a fixed label and the session
+/// secret. Only the server and the browser that holds the session cookie know it, so the check
+/// compares the `Ruum-Csrf` header with this value, not only with the cookie (decision 0002-3).
+/// The label keeps it apart from the stored session hash (`secret::sha256`).
+pub fn csrf_token(session_secret: &str) -> String {
+    use base64::Engine as _;
+    let digest = secret::sha256(&format!("ruum-csrf\0{session_secret}"));
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
 /// The name of the short-lived cookie that holds the state of a sign-in.
 pub const LOGIN_COOKIE: &str = "ruum_login";
 /// How long a web session lives without use.

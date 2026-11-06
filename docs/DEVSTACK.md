@@ -77,10 +77,15 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 - **OpenBao**: dev mode. It is unsealed, keeps its data in memory and loses it on a restart.
   The root token is `BAO_DEV_ROOT_TOKEN` in `.env`.
 - **Mailpit**: catches all mail. Open `http://localhost:8025`.
-- **Caddy**: the HTTPS front. It uses its own local CA for `ruum.localhost` and
-  `*.ruumapps.localhost`. `https://ruum.localhost/caddy-health` answers `ok` from Caddy. The
-  paths `/v1`, `/healthz`, `/.well-known`, `/mcp` and `/dav` go to the Ruum server on the host
-  port 8490 (`RUUM_UPSTREAM` in `.env`). All other paths go to the web UI, Vite on the host port
+- **Caddy**: the HTTPS front. It uses its own local CA for `ruum.localhost`,
+  `dav.ruum.localhost` and `*.ruumapps.localhost`. `https://ruum.localhost/caddy-health`
+  answers `ok` from Caddy. The paths `/v1`, `/healthz`, `/.well-known` and `/mcp` go to the
+  Ruum server on the host port 8490 (`RUUM_UPSTREAM` in `.env`). The WebDAV host
+  `https://dav.ruum.localhost/` goes to the server's WebDAV listener on the host port 8492
+  (`RUUM_DAV_UPSTREAM` in `.env`, `RUUM_DAV_BIND` of the server; decision 0002-3). It has no
+  API and no web UI, and the platform origin has no `/dav`. An existing `.env` without
+  `RUUM_DAV_UPSTREAM` uses the default port; recreate the Caddy container to load the new
+  Caddyfile (`docker compose ... up -d caddy`). All other paths go to the web UI, Vite on the host port
   5173 (`RUUM_WEB_UPSTREAM` in `.env`; see `web/README.md`). The content domain
   `*.content.ruumapps.localhost` (download and preview links) also goes to the Ruum server, with
   the Host header kept. If an upstream does not run, Caddy answers 502 with a short message. The

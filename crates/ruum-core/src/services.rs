@@ -9,7 +9,7 @@ use crate::agents::{
     oauth::{MemoryOAuthServer, OAuthServer},
 };
 use crate::audit::{AuditLog, memory::MemoryAuditLog};
-use crate::authz::{Authz, memory::MemoryAuthz};
+use crate::authz::{Authz, Freshness, NoFreshness, memory::MemoryAuthz};
 use crate::blobs::{
     BlobStore, ContentSigner, Transfers,
     memory::{ContentDeps, MemoryBlobStore, MemoryContentStore},
@@ -44,6 +44,9 @@ pub struct Services {
     pub diffs: Arc<dyn DiffService>,
     pub tags: Arc<dyn TagStore>,
     pub authz: Arc<dyn Authz>,
+    /// The tenant's newest relationship token for each request (decision 0002-4): the outbox
+    /// with Postgres (`authz::outbox::PgFreshness`), nothing in memory.
+    pub freshness: Arc<dyn Freshness>,
     pub sharing: Arc<dyn SharingStore>,
     pub journal: Arc<dyn Journal>,
     pub search: Arc<dyn Search>,
@@ -149,6 +152,7 @@ impl Services {
             diffs,
             tags,
             authz,
+            freshness: Arc::new(NoFreshness),
             sharing,
             journal,
             search,

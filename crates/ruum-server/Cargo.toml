@@ -26,3 +26,9 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.
+sqlx = { workspace = true, features = ["macros"] }
+serde_json.workspace = true
+tower.workspace = true

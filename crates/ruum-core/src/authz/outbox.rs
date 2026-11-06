@@ -14,8 +14,9 @@
 //! [`apply`] applies the pending rows of the tenant in `id` order up to the given row, under a
 //! row lock, so two requests of one tenant never apply their updates out of order.
 //!
-//! Read-after-write: the request that wrote passes the ZedToken of step 2 to its later checks;
-//! other requests use [`latest_token`] of the tenant (`at_least_as_fresh`).
+//! Read-after-write: the request that wrote reads at least as fresh as the ZedToken of step 2
+//! (the engine raises the request's floor); every other request, on any server, starts with
+//! the floor [`latest_token`] of its tenant ([`PgFreshness`], decision 0002-4).
 //!
 //! Failures and the revocation window: a write commits and returns success even when step 2
 //! fails (it retries a few times first, [`AFTER_COMMIT_RETRIES`]). Until the worker applies the
@@ -236,7 +237,9 @@ async fn set_tenant(conn: &mut PgConnection, tenant: TenantId) -> Result<()> {
     Ok(())
 }
 
-/// The newest applied ZedToken of the tenant, for read-after-write consistency.
+/// The newest applied ZedToken of the tenant, for read-after-write consistency. `conn` must be
+/// in a transaction that has set `ruum.tenant_id` to `tenant` (or `ruum.system`): under
+/// row-level security it sees no row otherwise and answers `None`. Use [`PgFreshness`].
 pub async fn latest_token(
     conn: &mut PgConnection,
     tenant: TenantId,
@@ -250,6 +253,31 @@ pub async fn latest_token(
     .await?
     .flatten();
     Ok(t.map(ConsistencyToken))
+}
+
+/// The [`super::Freshness`] of the Postgres stores: the newest applied ZedToken of the tenant
+/// from `authz_outbox`, read in a transaction that sets `ruum.tenant_id` (row-level security),
+/// with the index `authz_outbox_token_idx`. An error fails the request.
+#[derive(Clone, Debug)]
+pub struct PgFreshness {
+    pool: PgPool,
+}
+
+impl PgFreshness {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl super::Freshness for PgFreshness {
+    async fn tenant_token(&self, tenant: TenantId) -> Result<Option<ConsistencyToken>> {
+        let mut tx = self.pool.begin().await?;
+        set_tenant(&mut tx, tenant).await?;
+        let t = latest_token(&mut tx, tenant).await?;
+        tx.commit().await?;
+        Ok(t)
+    }
 }
 
 /// The pending rows of all tenants, for health checks, metrics and alerts.
@@ -433,6 +461,33 @@ mod tests {
         // Applying again returns the stored token and writes nothing.
         let again = apply(&mut conn, &authz, t, id).await.unwrap();
         assert_eq!(again, token);
+    }
+
+    /// The freshness of a request (decision 0002-4): `PgFreshness` reads the tenant's newest
+    /// applied token under row-level security, and only that tenant's. A connection that has
+    /// not set the tenant sees no row, which is why `latest_token` alone is not enough.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn freshness_reads_the_tenant_token_under_rls(pool: PgPool) {
+        use super::super::Freshness;
+        let (t, other) = (tenant(&pool).await, tenant(&pool).await);
+        let authz = MemoryAuthz::default();
+        let fresh = PgFreshness::new(pool.clone());
+        assert_eq!(fresh.tenant_token(t).await.unwrap(), None);
+        let mut tx = ttx(&pool, t).await;
+        let id = enqueue(&mut tx, t, &[viewer("n1", "u1")]).await.unwrap();
+        tx.commit().await.unwrap();
+        // Not applied yet: no token.
+        assert_eq!(fresh.tenant_token(t).await.unwrap(), None);
+        let token = apply_after_commit(&pool, &authz, t, &[id]).await.unwrap();
+        assert_eq!(fresh.tenant_token(t).await.unwrap(), Some(token));
+        assert_eq!(fresh.tenant_token(other).await.unwrap(), None);
+        // Without `ruum.tenant_id` row-level security hides the row.
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(latest_token(&mut conn, t).await.unwrap(), None);
+        drop(conn);
+        // A lookup that fails is an error, never "no token".
+        pool.close().await;
+        assert!(fresh.tenant_token(t).await.is_err());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

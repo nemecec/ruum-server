@@ -28,6 +28,14 @@ use std::time::Duration;
 const OUTBOX_EVERY: Duration = Duration::from_secs(5);
 
 pub async fn services(public_url: &str, pool: Option<sqlx::PgPool>) -> anyhow::Result<Services> {
+    services_with(pool, &IdentitySettings::from_env(public_url)).await
+}
+
+/// [`services`] with explicit identity settings (tests run two servers with one token key).
+pub async fn services_with(
+    pool: Option<sqlx::PgPool>,
+    identity: &IdentitySettings,
+) -> anyhow::Result<Services> {
     let mut services = Services::in_memory();
     if let Some(pool) = &pool {
         match SpiceDbConfig::from_env() {
@@ -42,6 +50,9 @@ pub async fn services(public_url: &str, pool: Option<sqlx::PgPool>) -> anyhow::R
                 "no SpiceDB preshared key (RUUM_SPICEDB_PRESHARED_KEY); the authz engine stays in memory and loses its relationships at a restart"
             ),
         }
+        // Every request reads at least as fresh as its tenant's newest outbox token, so writes
+        // of other servers and of `seed-dev` are seen at once (decision 0002-4).
+        services.freshness = Arc::new(outbox::PgFreshness::new(pool.clone()));
         let authz: Arc<dyn Authz> = services.authz.clone();
         tokio::spawn(outbox::run_worker(pool.clone(), authz, OUTBOX_EVERY));
         services.journal = Arc::new(PgJournal::new(pool.clone()));
@@ -70,7 +81,187 @@ pub async fn services(public_url: &str, pool: Option<sqlx::PgPool>) -> anyhow::R
     }
     // The identity, tenants and agents area: token key, OIDC, mail, plans, Postgres stores. It
     // takes `services.authz`, so it runs after the engine is chosen.
-    install(&mut services, &IdentitySettings::from_env(public_url), pool)
-        .context("set up the identity area")?;
+    install(&mut services, identity, pool).context("set up the identity area")?;
     Ok(services)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use ruum_api::{ApiConfig, AppState};
+    use ruum_core::actor::{Actor, Context};
+    use ruum_core::identity::{VerifiedLogin, issue_user_token};
+    use ruum_core::tenants::MemberRole;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    const URL: &str = "http://127.0.0.1:8490";
+
+    /// One server process: its own services (its own SpiceDB client and ZedTokens) on the shared
+    /// database, and the platform router.
+    async fn server(pool: &sqlx::PgPool, key: &str) -> (Services, axum::Router) {
+        let settings = IdentitySettings {
+            public_url: URL.into(),
+            token_signing_key: Some(key.into()),
+            oidc: None,
+            smtp_url: None,
+            mail_from: None,
+            plan_limits: None,
+        };
+        let s = services_with(Some(pool.clone()), &settings).await.unwrap();
+        let config = ApiConfig {
+            public_url: URL.into(),
+            content_url: "http://content.ruumapps.localhost".into(),
+            dav_url: "http://127.0.0.1:8492/".into(),
+        };
+        let router = crate::app::platform(
+            AppState::new(s.clone(), config),
+            std::time::Duration::from_secs(60),
+        );
+        (s, router)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: Method,
+        uri: &str,
+        token: &str,
+        tenant: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header("ruum-tenant", tenant);
+        let body = match body {
+            Some(v) => {
+                b = b.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Decision 0002-4: a grant and a revocation applied by one server (B) hold at once on
+    /// another server (A), through A's real request path (the router, the extractor
+    /// `RequestContext`, `context_for` with `PgFreshness`, the SpiceDB engine). Without the
+    /// tenant token A reads at SpiceDB's quantization window (5 s): it misses the grant and
+    /// keeps the revoked access. Needs the laptop stack (`DATABASE_URL`, SpiceDB).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn writes_of_another_server_hold_at_once(pool: sqlx::PgPool) {
+        if ruum_core::authz::spicedb::SpiceDbConfig::from_env().is_none() {
+            eprintln!("skipped: SPICEDB_PRESHARED_KEY is not set");
+            return;
+        }
+        let key = ruum_core::identity::secret::random_secret("");
+        let (sb, router_b) = server(&pool, &key).await;
+        let (_sa, router_a) = server(&pool, &key).await;
+        let run = ruum_core::ids::NodeId::new().0.simple().to_string();
+        let login = |name: &str| VerifiedLogin {
+            issuer: "https://dev-seed.ruum.localhost".into(),
+            subject: format!("{name}-{run}"),
+            email: Some(format!("{name}-{run}@example.test")),
+            email_verified: true,
+            name: Some(name.into()),
+            id_token: None,
+        };
+        // Server B: Alice's team tenant, Bob a guest, a folder.
+        let alice = sb
+            .identity
+            .upsert_from_login(&login("alice"))
+            .await
+            .unwrap();
+        let bob = sb.identity.upsert_from_login(&login("bob")).await.unwrap();
+        let team = sb
+            .tenants
+            .create_team(&Actor::user(alice.id), "Fresh".into())
+            .await
+            .unwrap();
+        let alice_ctx = Context {
+            tenant: team.id,
+            actor: Actor::user(alice.id),
+            scope: None,
+            idempotency_key: None,
+        };
+        let (_, invitation) = sb
+            .tenants
+            .invite(&alice_ctx, bob.email.clone(), MemberRole::Guest, None)
+            .await
+            .unwrap();
+        sb.tenants
+            .accept_invitation(&Actor::user(bob.id), &invitation)
+            .await
+            .unwrap();
+        let alice_token = issue_user_token(sb.tokens.as_ref(), alice.id, 600).unwrap();
+        let bob_token = issue_user_token(sb.tokens.as_ref(), bob.id, 600).unwrap();
+        let tenant = team.id.0.to_string();
+        let (st, created) = call(
+            &router_b,
+            Method::POST,
+            "/v1/nodes",
+            &alice_token,
+            &tenant,
+            Some(json!({ "parent_id": team.root_node_id.0, "name": "Shared", "kind": "folder" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{created}");
+        let folder = created["node"]["id"]
+            .as_str()
+            .or_else(|| created["id"].as_str())
+            .expect("the folder id")
+            .to_string();
+        let node = format!("/v1/nodes/{folder}");
+        let bob_on_a = || call(&router_a, Method::GET, &node, &bob_token, &tenant, None);
+        // Server A sees Alice's folder at once (she created it on B).
+        let (st, _) = call(&router_a, Method::GET, &node, &alice_token, &tenant, None).await;
+        assert_eq!(st, StatusCode::OK, "A does not see B's new folder");
+        assert_eq!(bob_on_a().await.0, StatusCode::NOT_FOUND);
+        for round in 0..3 {
+            // B grants Bob view; A lets Bob in at once.
+            let (st, g) = call(
+                &router_b,
+                Method::POST,
+                &format!("{node}/grants"),
+                &alice_token,
+                &tenant,
+                Some(json!({ "grantee": { "type": "user", "id": bob.id.0 }, "role": "view" })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED, "{g}");
+            let grant = g["grant"]["id"]
+                .as_str()
+                .or_else(|| g["id"].as_str())
+                .expect("the grant id")
+                .to_string();
+            assert_eq!(bob_on_a().await.0, StatusCode::OK, "round {round}: grant");
+            // B revokes it; A refuses Bob at once.
+            let (st, r) = call(
+                &router_b,
+                Method::DELETE,
+                &format!("{node}/grants/{grant}"),
+                &alice_token,
+                &tenant,
+                None,
+            )
+            .await;
+            assert!(st.is_success(), "{st} {r}");
+            assert_eq!(
+                bob_on_a().await.0,
+                StatusCode::NOT_FOUND,
+                "round {round}: revocation"
+            );
+        }
+    }
 }

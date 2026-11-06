@@ -36,12 +36,12 @@ pub struct RuumFs {
     pub(crate) spool_dir: Option<PathBuf>,
 }
 
-/// The decoded path below `/dav` as a string. `/` is the tenant root.
+/// The decoded path on the WebDAV host as a string. `/` is the tenant root.
 pub(crate) fn path_str(path: &DavPath) -> FsResult<String> {
     String::from_utf8(path.as_bytes().to_vec()).map_err(|_| FsError::NotFound)
 }
 
-/// The names of a path below `/dav`, without empty segments.
+/// The names of a path on the WebDAV host, without empty segments.
 pub(crate) fn names(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
@@ -51,11 +51,11 @@ pub(crate) fn shown(node: &Node) -> bool {
     matches!(node.kind, NodeKind::Folder | NodeKind::File) && node.trashed_at.is_none()
 }
 
-/// Resolves a path below `/dav` to a live node that the actor can see.
+/// Resolves a path on the WebDAV host to a live node that the actor can see.
 ///
-/// The root (`/dav/`) is not secret: a caller who cannot see it (a guest, an agent scoped to a
+/// The root (`/`) is not secret: a caller who cannot see it (a guest, an agent scoped to a
 /// subtree) gets `403`, as from `NodeStore::root`. Such callers mount the folder they can see
-/// by its deep URL, for example `/dav/Projects/Garden/`; there is no virtual root in step 1.
+/// by its deep URL, for example `/Projects/Garden/`; there is no virtual root in step 1.
 pub(crate) async fn resolve(s: &Services, ctx: &Context, path: &str) -> ruum_core::Result<Node> {
     let parts = names(path);
     let node = if parts.is_empty() {

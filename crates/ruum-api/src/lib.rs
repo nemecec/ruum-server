@@ -44,5 +44,15 @@ pub fn router(state: AppState) -> Router {
             limits::RateLimiter::new(),
             limits::rate_limit,
         ))
+        // Outermost: each request gets its own freshness floor (decision 0002-4).
+        .layer(axum::middleware::from_fn(request_freshness))
         .with_state(state)
+}
+
+/// Runs each request with its own authz freshness floor (`ruum_core::authz::with_request_freshness`).
+async fn request_freshness(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    ruum_core::authz::with_request_freshness(next.run(req)).await
 }

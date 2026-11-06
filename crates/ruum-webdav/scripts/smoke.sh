@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# A curl smoke test of /dav, with the requests that macOS Finder sends (OPTIONS, PROPFIND with
+# A curl smoke test of the WebDAV host, with the requests that macOS Finder sends (OPTIONS, PROPFIND with
 # Depth 0 and 1, the AppleDouble probes, LOCK, an empty PUT and then a chunked PUT with
 # X-Expected-Entity-Length, UNLOCK, MOVE, COPY, DELETE).
 #
-# Usage: DAV_URL=http://127.0.0.1:8597/dav DAV_USER=... DAV_PASS=... scripts/smoke.sh
+# Usage: DAV_URL=http://127.0.0.1:8492 DAV_USER=... DAV_PASS=... scripts/smoke.sh
+# DAV_URL is the WebDAV host (RUUM_DAV_BIND of the server, or https://dav.ruum.localhost),
+# without a trailing slash.
 # DAV_USER is the email of the user and DAV_PASS an app password (ruum_app_...).
 set -euo pipefail
 
-: "${DAV_URL:?the /dav URL}" "${DAV_USER:?the email}" "${DAV_PASS:?an app password}"
+: "${DAV_URL:?the URL of the WebDAV host}" "${DAV_USER:?the email}" "${DAV_PASS:?an app password}"
 U=(-sS -u "$DAV_USER:$DAV_PASS" -A "WebDAVFS/3.0.0 (03008000) Darwin/24.0.0 (arm64)")
 fail() { echo "FAIL: $*" >&2; exit 1; }
 code() { curl "${U[@]}" -o /dev/null -w '%{http_code}' "$@"; }

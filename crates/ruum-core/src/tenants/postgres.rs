@@ -517,6 +517,22 @@ impl TenantStore for PgTenantStore {
         Ok(r)
     }
 
+    async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
+        let mut tx = self.area.system().await?;
+        // The same query as the email grant of `sharing::postgres::add_grant`.
+        let inside: bool = sqlx::query_scalar(
+            "select exists (select 1 from memberships m join users u on u.id = m.user_id \
+             where m.tenant_id = $1 and m.role <> 'guest' and u.email_verified \
+             and lower(u.email) = lower($2))",
+        )
+        .bind(tenant.0)
+        .bind(email)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(inside)
+    }
+
     async fn list_members(&self, ctx: &Context, page_req: PageRequest) -> Result<Page<Member>> {
         let user = caller_user(ctx)?;
         let off = offset(&page_req)?;

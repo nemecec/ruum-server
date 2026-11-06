@@ -1,9 +1,11 @@
 //! The Ruum core service. It reads its config from the environment, wires the modules and serves
-//! the REST API (`/v1`), the MCP server (`/mcp`) and WebDAV (`/dav`).
+//! the REST API (`/v1`) and the MCP server (`/mcp`) on `RUUM_BIND`, and WebDAV on its own
+//! listener `RUUM_DAV_BIND` for the WebDAV host (decision 0002-3, see `app.rs`).
 //!
 //! `ruum-server seed-dev <file>` instead makes test users, a tenant and credentials on a laptop
 //! stack and exits (see `seed.rs`).
 
+mod app;
 mod config;
 mod seed;
 mod wiring;
@@ -62,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         ApiConfig {
             public_url: config.public_url.clone(),
             content_url: config.content_url.clone(),
+            dav_url: config.dav_url.clone(),
         },
     );
 
@@ -71,28 +74,25 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(ruum_core::identity::sweep::run(pool.clone(), SWEEP_EVERY));
     }
 
-    // A request that has no answer after the timeout gets `408`. The longest long poll
-    // (`listChanges` with `wait`) is 30 seconds; streamed bodies are not cut (the timeout ends
-    // when the answer starts).
-    let app = ruum_api::router(state.clone())
-        .merge(ruum_mcp::router(state))
-        .merge(ruum_webdav::router(services))
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            config.request_timeout,
-        ));
+    let platform = app::platform(state.clone(), config.request_timeout);
+    let dav = app::dav(&state, config.request_timeout);
 
     let listener = tokio::net::TcpListener::bind(&config.bind)
         .await
         .with_context(|| format!("bind {}", config.bind))?;
+    let dav_listener = tokio::net::TcpListener::bind(&config.dav_bind)
+        .await
+        .with_context(|| format!("bind {} (RUUM_DAV_BIND)", config.dav_bind))?;
     tracing::info!(addr = %config.bind, "ruum-server listening");
+    tracing::info!(addr = %config.dav_bind, url = %config.dav_url, "WebDAV host listening");
     // The peer address is the key of the rate limits (`ruum_api::limits`).
-    axum::serve(
+    let platform = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        platform.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
-    .await?;
+    .with_graceful_shutdown(shutdown());
+    let dav = axum::serve(dav_listener, dav.into_make_service()).with_graceful_shutdown(shutdown());
+    tokio::try_join!(platform, dav)?;
     Ok(())
 }
 

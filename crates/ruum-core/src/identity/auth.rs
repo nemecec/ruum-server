@@ -222,6 +222,9 @@ pub async fn context_for(
             return Err(Error::not_found("tenant"));
         }
     }
+    // The checks of this request read at least as fresh as the tenant's newest relationship
+    // write from any process (decision 0002-4). A lookup error fails the request.
+    crate::authz::load_request_floor(&*s.freshness, tenant).await?;
     Ok(Context {
         tenant,
         actor: who.actor,

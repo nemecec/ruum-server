@@ -678,8 +678,8 @@ mod seed {
                 .get_mut(&Who::Member)
                 .expect("member")
                 .credentials = Credentials::Session {
+                csrf: ruum_core::identity::csrf_token(&secret),
                 session: secret,
-                csrf: ruum_core::identity::secret::random_secret(""),
             };
         }
         let member_ctx = ctx(tid, Actor::user(member));

@@ -148,6 +148,8 @@ use crate::tenants::*;
 pub(crate) struct TestTenants {
     pub roles: RwLock<HashMap<(TenantId, UserId), MemberRole>>,
     pub policies: RwLock<HashMap<TenantId, TenantPolicy>>,
+    /// Verified emails of users, for `is_verified_member_email`.
+    pub verified_emails: RwLock<HashMap<UserId, String>>,
 }
 
 #[async_trait]
@@ -189,6 +191,15 @@ impl TenantStore for TestTenants {
     }
     async fn role_of(&self, tenant: TenantId, user: UserId) -> Result<Option<MemberRole>> {
         Ok(self.roles.read().unwrap().get(&(tenant, user)).copied())
+    }
+    async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
+        let roles = self.roles.read().unwrap();
+        Ok(self.verified_emails.read().unwrap().iter().any(|(u, e)| {
+            e.eq_ignore_ascii_case(email)
+                && roles
+                    .get(&(tenant, *u))
+                    .is_some_and(|r| *r != MemberRole::Guest)
+        }))
     }
     async fn list_members(&self, _: &Context, _: PageRequest) -> Result<Page<Member>> {
         unimplemented!()

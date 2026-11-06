@@ -155,6 +155,17 @@ impl TenantStore for MemoryTenantStore {
         Ok(self.area.lock().role_of(tenant, user))
     }
 
+    async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
+        let st = self.area.lock();
+        Ok(st.memberships.iter().any(|((t, u), m)| {
+            *t == tenant
+                && m.role != MemberRole::Guest
+                && st.users.get(u).is_some_and(|r| {
+                    r.user.email_verified && r.user.email.eq_ignore_ascii_case(email)
+                })
+        }))
+    }
+
     async fn list_members(&self, ctx: &Context, page: PageRequest) -> Result<Page<Member>> {
         let user = caller_user(ctx)?;
         let items = {

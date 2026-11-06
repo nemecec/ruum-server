@@ -9,8 +9,9 @@ ruum.localhost {
 	handle /caddy-health {
 		respond "ok" 200
 	}
-	# The API, MCP and WebDAV: the Ruum server runs on the host (cargo run), not in Docker.
-	@server path /v1/* /healthz /.well-known/* /mcp /mcp/* /dav /dav/*
+	# The API and MCP: the Ruum server runs on the host (cargo run), not in Docker. WebDAV is not
+	# here: it has its own host, dav.ruum.localhost (decision 0002-3), and /dav is the web UI's.
+	@server path /v1/* /healthz /.well-known/* /mcp /mcp/*
 	handle @server {
 		reverse_proxy {$RUUM_UPSTREAM}
 	}
@@ -20,13 +21,24 @@ ruum.localhost {
 	}
 
 	handle_errors 502 503 504 {
-		@server_down path /v1/* /healthz /.well-known/* /mcp /mcp/* /dav /dav/*
+		@server_down path /v1/* /healthz /.well-known/* /mcp /mcp/*
 		handle @server_down {
 			respond "Ruum server is not running on {$RUUM_UPSTREAM}. Start it with cargo run." 502
 		}
 		handle {
 			respond "The Ruum web UI is not running on {$RUUM_WEB_UPSTREAM:host.docker.internal:5173}. Start it with: cd web && npm run dev:server" 502
 		}
+	}
+}
+
+# The WebDAV host (decision 0002-3): the server's WebDAV listener (RUUM_DAV_BIND, default port
+# 8492), at the root path. It has no API, no MCP and no web UI, and the server never sets or
+# reads cookies there. Mount https://dav.ruum.localhost/ with your email and an app password.
+dav.ruum.localhost {
+	reverse_proxy {$RUUM_DAV_UPSTREAM:host.docker.internal:8492}
+
+	handle_errors 502 503 504 {
+		respond "The Ruum WebDAV listener is not running on {$RUUM_DAV_UPSTREAM:host.docker.internal:8492}. Start the server with cargo run." 502
 	}
 }
 

@@ -98,6 +98,7 @@ function AppPasswords() {
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
   const [secret, setSecret] = useState<string | null>(null)
+  const [davUrl, setDavUrl] = useState<string | null>(null)
   const [error, setError] = useState<unknown>()
 
   async function create(e: FormEvent) {
@@ -106,6 +107,7 @@ function AppPasswords() {
     try {
       const res = await unwrap(client.POST('/v1/me/app-passwords', { body: { name: name.trim() } }))
       setSecret(res.secret)
+      setDavUrl(res.dav_url ?? null)
       setName('')
       passwords.reload()
     } catch (err) {
@@ -121,7 +123,9 @@ function AppPasswords() {
           New app password
         </button>
       </div>
-      <p className="muted small">For WebDAV clients (Finder, Explorer) in {tenant.name}.</p>
+      <p className="muted small">
+        For WebDAV clients (Finder, Explorer) in {tenant.name}. Sign in with your email and the app password.
+      </p>
       <Loaded state={passwords}>
         {({ items }) => (
           <ul className="rows">
@@ -154,6 +158,11 @@ function AppPasswords() {
           {secret ? (
             <div className="stack">
               <SecretBox label="App password" secret={secret} />
+              {davUrl && <SecretBox label="Server address" secret={davUrl} />}
+              <p className="muted small">
+                Connect your WebDAV client to the server address, with your email as the user name. The password is shown only
+                once.
+              </p>
               <div className="actions">
                 <button type="button" className="primary" onClick={() => setCreating(false)}>
                   Done

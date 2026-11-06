@@ -1,4 +1,4 @@
-//! Serves `/dav` on the fixture world of `ruum-testkit` with the in-memory stores, for manual
+//! Serves the WebDAV host (at `/`) on the fixture world of `ruum-testkit` with the in-memory stores, for manual
 //! checks with curl, `mount_webdav` or Finder without the laptop stack.
 //!
 //! ```sh
@@ -38,7 +38,7 @@ async fn main() {
     )
     .expect("write the credentials");
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
-    eprintln!("dav_fake_server: http://{bind}/dav/ (credentials in {creds})");
+    eprintln!("dav_fake_server: http://{bind}/ (credentials in {creds})");
     axum::serve(listener, ruum_webdav::router(h.services))
         .await
         .expect("serve");

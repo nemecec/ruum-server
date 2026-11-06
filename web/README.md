@@ -38,8 +38,8 @@ Vite serves plain http on localhost. Without `RUUM_OIDC_REDIRECT_URI`, the serve
 `https://ruum.localhost/v1/auth/callback`, and the session cookie lands on `ruum.localhost`, not on
 `localhost:5173`.
 
-To serve the UI at `https://ruum.localhost` itself, Caddy sends `/v1`, `/healthz`, `/.well-known`,
-`/mcp` and `/dav` to the server and every other path to Vite (`RUUM_WEB_UPSTREAM` in
+To serve the UI at `https://ruum.localhost` itself, Caddy sends `/v1`, `/healthz`, `/.well-known`
+and `/mcp` to the server (WebDAV has its own host, `https://dav.ruum.localhost/`) and every other path to Vite (`RUUM_WEB_UPSTREAM` in
 `deploy/dev/.env`, default `host.docker.internal:5173`; `deploy/dev/caddy/Caddyfile`). Set it to
 the same port as `RUUM_WEB_PORT` and recreate the Caddy container. Caddy also sends the content
 domain (`https://<tenant>.content.ruumapps.localhost/c/<token>`, the links of Download and Preview)

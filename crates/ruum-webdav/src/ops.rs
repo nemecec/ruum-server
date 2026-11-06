@@ -2,7 +2,6 @@
 //! or copied as one node: one journal entry, one item in the trash, shared chunks for a copy.
 //! (`dav-server` would walk the tree and change each node on its own.)
 
-use crate::DAV_PATH;
 use crate::error::{response, status};
 use crate::file::{WriteOpts, copy_content, upload_limits};
 use crate::fs::{resolve, resolve_parent};
@@ -39,17 +38,16 @@ pub(crate) async fn handle(
     result.unwrap_or_else(|e| response(&e))
 }
 
-/// The decoded path below `/dav` of a URL path, for example `/Projects/a b.txt`.
+/// The decoded path of a URL path on the WebDAV host, for example `/Projects/a b.txt`.
 pub(crate) fn dav_path(url_path: &str) -> Option<String> {
-    if url_path != DAV_PATH && !url_path.starts_with("/dav/") {
+    if !url_path.starts_with('/') {
         return None;
     }
-    let mut p = DavPath::new(url_path).ok()?;
-    p.set_prefix(DAV_PATH).ok()?;
+    let p = DavPath::new(url_path).ok()?;
     String::from_utf8(p.as_bytes().to_vec()).ok()
 }
 
-/// The decoded path below `/dav` of a `Destination` header (an absolute URL or a path).
+/// The decoded path of a `Destination` header (an absolute URL or a path).
 fn destination(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get("destination")?.to_str().ok()?;
     let uri: Uri = raw.parse().ok()?;
@@ -346,22 +344,20 @@ mod tests {
 
     #[test]
     fn decodes_paths_and_destinations() {
-        assert_eq!(dav_path("/dav").as_deref(), Some("/"));
-        assert_eq!(dav_path("/dav/").as_deref(), Some("/"));
-        assert_eq!(dav_path("/dav/a%20b/c.txt").as_deref(), Some("/a b/c.txt"));
-        assert_eq!(dav_path("/other/x"), None);
-        assert_eq!(dav_path("/davx/y"), None);
+        assert_eq!(dav_path("/").as_deref(), Some("/"));
+        assert_eq!(dav_path("/a%20b/c.txt").as_deref(), Some("/a b/c.txt"));
+        // The old platform prefix is an ordinary folder name on the WebDAV host.
+        assert_eq!(dav_path("/dav/y").as_deref(), Some("/dav/y"));
+        assert_eq!(dav_path("x"), None);
         let mut h = HeaderMap::new();
         h.insert(
             "destination",
-            "https://ruum.localhost/dav/New%20Folder/x.txt"
+            "https://dav.ruum.localhost/New%20Folder/x.txt"
                 .parse()
                 .unwrap(),
         );
         assert_eq!(destination(&h).as_deref(), Some("/New Folder/x.txt"));
-        h.insert("destination", "/dav/y".parse().unwrap());
+        h.insert("destination", "/y".parse().unwrap());
         assert_eq!(destination(&h).as_deref(), Some("/y"));
-        h.insert("destination", "/elsewhere/y".parse().unwrap());
-        assert_eq!(destination(&h), None);
     }
 }

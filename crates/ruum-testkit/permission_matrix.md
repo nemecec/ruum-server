@@ -21,7 +21,7 @@ policy (`members_can_share`).
 | `getAuthorizationServerMetadata` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public (security: []) |
 | `loginStart` | any | any | any | any | any | any | any | any | any | any | any | any | any | public (security: []) |
 | `loginCallback` | any | any | any | any | any | any | any | any | any | any | any | any | any | public (security: []) |
-| `logout` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | any | any | any | 403 | sessions; open question: an agent bearer token |
+| `logout` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | ends the caller's web session; a bearer token (agents too) has none: 200, ends nothing (decided 0002-5) |
 | `getMe` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | every signed-in principal, agents too |
 | `listMyIdentities` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only (agents and share links: 403 user_required) |
 | `listMySessions` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only (agents and share links: 403 user_required) |
@@ -33,7 +33,7 @@ policy (`members_can_share`).
 | `createTenant` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only |
 | `getTenant` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | members and guests (listTenants shows guest tenants) |
 | `updateTenant` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin or owner |
-| `listMembers` | 401 | ok | ok | ok | 403 | 403 | 403 | 403 | 403 | ok | ok | 403 | 403 | assumption: members and up; guests get 403 |
+| `listMembers` | 401 | ok | ok | ok | 403 | 403 | 403 | 403 | 403 | ok | ok | 403 | 403 | members and up; guests get 403, the list holds emails (decided 0002-5) |
 | `updateMember` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin |
 | `removeMember` | 401 | ok | ok | 403 | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin, or the member removes themselves (the target is guest) |
 | `listInvitations` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin |
@@ -42,25 +42,25 @@ policy (`members_can_share`).
 | `acceptInvitation` | 401 | any | any | any | any | any | any | any | any | 403 | 403 | 403 | 403 | users only, with the token (the answer depends on membership) |
 | `getLimits` | 401 | ok | ok | ok | 403 | 403 | 403 | 403 | 403 | ok | ok | 403 | 403 | any member can read them; guests get 403 |
 | `listAudit` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin |
-| `listAgents` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | any | any | any | 403 | the caller's agents (admins: all); open question: an agent caller |
-| `registerAgent` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only; assumption: guests may register agents |
+| `listAgents` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | the caller's agents (admins: all); an agent sees only itself (decided 0002-5) |
+| `registerAgent` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only; guests may, not while allow_guests is false (decided 0002-2) |
 | `getAgent` | 401 | ok | ok | ok | 404 | 404 | 404 | 404 | 404 | 403/404 | 403/404 | 403/404 | 403 | the owner or a tenant admin; others get 404 |
 | `updateAgent` | 401 | 403 | 403 | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; only the owner of the agent |
 | `disableAgent` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; the owner or a tenant admin |
 | `enableAgent` | 401 | 403 | 403 | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; only the owner of the agent |
-| `listAgentKeys` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; assumption: the owner or a tenant admin |
+| `listAgentKeys` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; the owner or a tenant admin (decided 0002-5) |
 | `createAgentKey` | 401 | 403 | 403 | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; only the owner of the agent |
 | `revokeAgentKey` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; the owner or a tenant admin |
-| `listAgentActivity` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | assumption: the owner or a tenant admin |
+| `listAgentActivity` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | the owner or a tenant admin; agents get 403/404 (decided 0002-5) |
 | `undoAgent` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403 | 403 | 403 | 403 | users only; the owner or a tenant admin |
 | `registerOAuthClient` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public; a registration gives no access (consent does) |
 | `getOAuthClient` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only; the public metadata of a client, for the consent screen |
 | `oauthAuthorize` | any | any | any | any | any | any | any | any | any | any | any | any | any | public; a redirect to the consent screen, or a 400 page for an unknown client |
-| `oauthConsent` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only; creates an agent of the caller in the tenant; assumption: guests may, as for registerAgent |
+| `oauthConsent` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only; creates an agent of the caller in the tenant; guests may, not while allow_guests is false (decided 0002-2) |
 | `exchangeToken` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public; the agent key in the body is the credential |
 | `getRoot` | 401 | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | view on the root; the root is not secret (403) |
 | `createNode` | 401 | ok | ok | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the parent |
-| `getNodeByPath` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | assumption: view on the target is enough, as for getNode |
+| `getNodeByPath` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | view on the target is enough, as for getNode (decided 0002-5) |
 | `getNode` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | Needs view; 404 when the caller cannot see it |
 | `purgeNode` | 401 | ok | ok | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | Needs manage, and admin on a team plan (admin_restore_days > trash_days) |
 | `listChildren` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | view on the folder |
@@ -87,11 +87,11 @@ policy (`members_can_share`).
 | `diffVersions` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | Needs view |
 | `listDiffPlugins` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | Needs view |
 | `listTags` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | members see all tags; guests only tags on nodes they can see |
-| `createTag` | 401 | ok | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | ok | 403 | 403 | any member, not guests; assumption: agents need max_role edit |
-| `getTag` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 404 | ok | 403 | assumption: members, and principals who can see a node with the tag |
-| `updateTag` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 404 | 403 | 403 | any member, not guests; assumption: agents need max_role edit |
-| `deleteTag` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 404 | 403 | 403 | tenant admins or the creator (member); assumption: agents need max_role edit |
-| `listNodesByTag` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 404 | ok | 403 | assumption: members, and principals who can see a node with the tag |
+| `createTag` | 401 | ok | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | ok | 403 | 403 | any member, not guests; agents need max_role edit (decided 0002-5) |
+| `getTag` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 404 | ok | 403 | members, and principals who can see a node with the tag (decided 0002-5) |
+| `updateTag` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 404 | 403 | 403 | any member, not guests; agents need max_role edit (decided 0002-5) |
+| `deleteTag` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 404 | 403 | 403 | tenant admins or the creator (member); agents need max_role edit (decided 0002-5) |
+| `listNodesByTag` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 404 | ok | 403 | members, and principals who can see a node with the tag (decided 0002-5) |
 | `listNodeTags` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the node |
 | `attachTag` | 401 | ok | ok | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the node |
 | `detachTag` | 401 | ok | ok | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the node |

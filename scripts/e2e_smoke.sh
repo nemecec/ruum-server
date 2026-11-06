@@ -2,12 +2,16 @@
 # End-to-end smoke test of the Ruum server against the laptop stack.
 #
 # It builds ruum-server and the ruum CLI, starts the server on RUUM_E2E_PORT (default 8491)
-# with the stack's Postgres, Garage and SpiceDB, seeds a tenant, users and an agent key
-# (`ruum-server seed-dev`), and then checks with the CLI and curl: folders, chunked upload and
-# download, versions, a copy, sharing, the changes feed, MCP, WebDAV and tenant isolation.
+# and its WebDAV host on RUUM_E2E_DAV_PORT (default 8493) with the stack's Postgres, Garage and
+# SpiceDB, seeds a tenant, users and an agent key (`ruum-server seed-dev`), and then checks with
+# the CLI and curl: folders, chunked upload and download, versions, a copy, sharing, the changes
+# feed, MCP, WebDAV on its own host and tenant isolation.
 #
 #   scripts/dev.sh up            # the stack must be healthy
 #   scripts/e2e_smoke.sh
+#
+# RUUM_DEV_SH names the dev.sh whose `env` to use (default scripts/dev.sh of this checkout), so a
+# git worktree can run against the stack of the main checkout.
 #
 # Every run makes new users and a new tenant; nothing is deleted. The server log is kept in the
 # work folder that the script prints.
@@ -19,6 +23,8 @@ cd "$ROOT"
 
 PORT="${RUUM_E2E_PORT:-8491}"
 BASE="http://127.0.0.1:$PORT"
+DAV_PORT="${RUUM_E2E_DAV_PORT:-8493}"
+DAV_BASE="http://127.0.0.1:$DAV_PORT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ruum-e2e.XXXXXX")"
 PASSED=0
 
@@ -55,17 +61,22 @@ trap cleanup EXIT
 
 # ------------------------------------------------------------------ settings
 say "settings (work folder: $WORK)"
-eval "$(scripts/dev.sh env)"
+eval "$("${RUUM_DEV_SH:-scripts/dev.sh}" env)"
 # The seed and the server must sign and check tokens with the same key; content URLs too.
 export RUUM_TOKEN_SIGNING_KEY="${RUUM_TOKEN_SIGNING_KEY:-$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')}"
 export RUUM_CONTENT_SIGNING_KEY="${RUUM_CONTENT_SIGNING_KEY:-$(openssl rand -base64 32)}"
 export RUUM_BIND="127.0.0.1:$PORT"
 export RUUM_PUBLIC_URL="$BASE"
+export RUUM_DAV_BIND="127.0.0.1:$DAV_PORT"
+export RUUM_DAV_URL="$DAV_BASE/"
 export RUST_LOG="${RUST_LOG:-info}"
 if curl -fsS "$BASE/healthz" >/dev/null 2>&1; then
   fail "port $PORT is in use; set RUUM_E2E_PORT"
 fi
-ok "stack env loaded, port $PORT free"
+if curl -s -o /dev/null "$DAV_BASE/" 2>/dev/null; then
+  fail "port $DAV_PORT is in use; set RUUM_E2E_DAV_PORT"
+fi
+ok "stack env loaded, ports $PORT and $DAV_PORT free"
 
 # ------------------------------------------------------------------ build and start
 say "build"
@@ -96,10 +107,8 @@ say "seed (ruum-server seed-dev)"
 }
 # shellcheck disable=SC1091
 source "$WORK/seed.env"
-# The seed wrote its relationships to SpiceDB from another process. This server has no ZedToken
-# of those writes yet, so its first checks read at SpiceDB's quantization window (5 s by
-# default). Wait until the seed's tuples are visible to it.
-sleep 6
+# The seed wrote its relationships to SpiceDB from another process. No wait: every request
+# reads at least as fresh as its tenant's newest outbox token (decision 0002-4).
 ok "tenant A $TENANT_A, Alice $ALICE_EMAIL, Bob (guest), Carol (tenant B), agent $AGENT_ID"
 
 # curl helpers: api <token> <tenant> <method> <path> [json body] -> body in $WORK/body, status echoed
@@ -222,18 +231,25 @@ jq -e '.result.structuredContent.items[] | select(.name == "data.bin")' "$WORK/m
 ok "list_children over MCP shows data.bin"
 
 # ------------------------------------------------------------------ WebDAV
-say "WebDAV with Alice's app password"
+say "WebDAV on its own host ($DAV_BASE) with Alice's app password"
 DAV=(-s -u "$ALICE_EMAIL:$APP_PASSWORD")
-expect 401 "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 1' "$BASE/dav/E2E/")" "PROPFIND without credentials is 401"
-expect 207 "$(curl "${DAV[@]}" -o "$WORK/propfind.xml" -w '%{http_code}' -X PROPFIND -H 'Depth: 1' "$BASE/dav/E2E/")" "PROPFIND /dav/E2E/"
+expect 404 "$(curl "${DAV[@]}" -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 1' "$BASE/dav/E2E/")" "the platform origin has no /dav (404)"
+expect 201 "$(api "$ALICE_TOKEN" "$TENANT_A" POST "/v1/me/app-passwords" '{"name":"e2e mount"}')" "Alice makes another app password"
+expect "$DAV_BASE/" "$(body '.dav_url')" "the answer names the WebDAV host (dav_url)"
+expect 401 "$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 1' "$DAV_BASE/E2E/")" "PROPFIND without credentials is 401"
+expect 207 "$(curl "${DAV[@]}" -D "$WORK/dav-headers" -o "$WORK/propfind.xml" -w '%{http_code}' -X PROPFIND -H 'Depth: 1' "$DAV_BASE/E2E/")" "PROPFIND /E2E/ on the WebDAV host"
 grep -q "Shared" "$WORK/propfind.xml" || fail "PROPFIND does not list Shared: $(head -c 800 "$WORK/propfind.xml")"
 ok "PROPFIND lists Shared"
+grep -qi '^set-cookie' "$WORK/dav-headers" && fail "the WebDAV host sets a cookie: $(cat "$WORK/dav-headers")"
+grep -qi '^content-security-policy: sandbox' "$WORK/dav-headers" || fail "no sandbox CSP on the WebDAV host: $(cat "$WORK/dav-headers")"
+ok "the WebDAV host sets no cookie and sends the sandbox CSP"
 printf 'hello from webdav\n' >"$WORK/dav.txt"
-expect 201 "$(curl "${DAV[@]}" -o /dev/null -w '%{http_code}' -T "$WORK/dav.txt" "$BASE/dav/E2E/Shared/dav.txt")" "PUT /dav/E2E/Shared/dav.txt"
-expect "hello from webdav" "$(curl "${DAV[@]}" "$BASE/dav/E2E/Shared/dav.txt")" "GET the file back over WebDAV"
+expect 201 "$(curl "${DAV[@]}" -o /dev/null -w '%{http_code}' -T "$WORK/dav.txt" "$DAV_BASE/E2E/Shared/dav.txt")" "PUT /E2E/Shared/dav.txt"
+expect "hello from webdav" "$(curl "${DAV[@]}" "$DAV_BASE/E2E/Shared/dav.txt")" "GET the file back over WebDAV"
 ruum ls /E2E/Shared >"$WORK/out"
 grep -q "dav.txt" "$WORK/out" || fail "the CLI does not see dav.txt: $(cat "$WORK/out")"
 ok "the CLI sees the file written over WebDAV"
+expect 404 "$(curl "${DAV[@]}" -o /dev/null -w '%{http_code}' "$DAV_BASE/v1/me")" "the WebDAV host has no REST API (/v1/me is 404)"
 expect 401 "$(api "$APP_PASSWORD" "$TENANT_A" GET "/v1/me")" "the REST API refuses the app password"
 
 # ------------------------------------------------------------------ isolation
@@ -243,7 +259,7 @@ expect 404 "$(api "$CAROL_TOKEN" "$TENANT_B" GET "/v1/nodes/$FILE/content")" "Ca
 STATUS="$(api "$CAROL_TOKEN" "$TENANT_A" GET "/v1/nodes/$FOLDER")"
 [[ "$STATUS" == 403 || "$STATUS" == 404 ]] || fail "Carol with Ruum-Tenant A: $STATUS $(cat "$WORK/body")"
 ok "Carol with Ruum-Tenant A is refused ($STATUS $(body '.error.code'))"
-mcp_b="$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -u "$ALICE_EMAIL:wrong" "$BASE/dav/")"
+mcp_b="$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -u "$ALICE_EMAIL:wrong" "$DAV_BASE/")"
 expect 401 "$mcp_b" "WebDAV with a wrong app password is 401"
 
 say "PASSED: $PASSED checks"

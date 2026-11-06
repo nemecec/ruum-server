@@ -247,7 +247,17 @@ impl SharingStore for MemorySharingStore {
                     return Err(rules::guests_refused());
                 }
             }
-            Grantee::Email { .. } if !policy.allow_guests => return Err(rules::guests_refused()),
+            // While guests are off, an email grant reaches only the verified email of a person
+            // who is already inside the tenant (the same rule as the Postgres store).
+            Grantee::Email { email }
+                if !policy.allow_guests
+                    && !self
+                        .tenants
+                        .is_verified_member_email(ctx.tenant, email)
+                        .await? =>
+            {
+                return Err(rules::guests_refused());
+            }
             _ => {}
         }
         let grant = Grant {

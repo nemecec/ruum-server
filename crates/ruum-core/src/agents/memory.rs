@@ -110,6 +110,9 @@ impl MemoryAgentStore {
             // A guest's agents have their own limit, so guests cannot use up the tenant's
             // (`agent_pool`, security review of 2026-11-06).
             let guest = role == MemberRole::Guest;
+            if guest && !t.policy.allow_guests {
+                return Err(guest_agents_refused());
+            }
             let limit = if guest {
                 guest_agent_limit(t.plan)
             } else {

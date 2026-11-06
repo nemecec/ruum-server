@@ -352,6 +352,88 @@ async fn guests_cannot_use_up_the_tenant_agent_limit(a: Area) {
     );
 }
 
+/// While the tenant policy has `allow_guests: false`, a guest registers no new agent, neither
+/// with `registerAgent` nor with the OAuth consent (`new_agent`); members still do (decision
+/// 0002-2).
+async fn guests_register_no_agents_while_guests_are_off(a: Area) {
+    let t = team(&a).await;
+    let (tid, oc) = (t.tenant.id, ctx(t.tenant.id, t.owner.id));
+    let guest = user(&a, "guest").await;
+    let (_i, token) = a
+        .tenants
+        .invite(&oc, guest.email.clone(), MemberRole::Guest, None)
+        .await
+        .unwrap();
+    a.tenants
+        .accept_invitation(&Actor::user(guest.id), &token)
+        .await
+        .unwrap();
+    let gc = ctx(tid, guest.id);
+    let kept = a
+        .agents
+        .register(&gc, new_agent("before", None))
+        .await
+        .unwrap();
+    a.tenants
+        .update(
+            &oc,
+            None,
+            Some(crate::tenants::TenantPolicyChange {
+                allow_guests: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code(a.agents.register(&gc, new_agent("after", None)).await),
+        ErrorCode::PermissionDenied
+    );
+    let client = register_client(&a).await;
+    let sealed = a
+        .oauth
+        .start_authorization(request(&client, &a))
+        .await
+        .unwrap();
+    let consent = |new_agent: NewAgent| Consent {
+        request: sealed.clone(),
+        approve: true,
+        tenant_id: Some(tid),
+        agent_id: None,
+        new_agent: Some(new_agent),
+    };
+    assert_eq!(
+        code(
+            a.oauth
+                .consent(&Actor::user(guest.id), consent(new_agent("oauth", None)))
+                .await
+        ),
+        ErrorCode::PermissionDenied
+    );
+    // Members are not guests: they still register agents, also through the consent.
+    let mc = ctx(tid, t.member.id);
+    a.agents
+        .register(&mc, new_agent("member", None))
+        .await
+        .unwrap();
+    a.oauth
+        .consent(
+            &Actor::user(t.member.id),
+            consent(new_agent("member oauth", None)),
+        )
+        .await
+        .unwrap();
+    // The guest's agent from before stays (the policy refuses only new agents).
+    assert!(
+        a.agents
+            .get(&gc, kept.id)
+            .await
+            .unwrap()
+            .disabled_at
+            .is_none()
+    );
+}
+
 async fn keys_exchange_for_short_tokens(a: Area) {
     let t = team(&a).await;
     let (tid, oc, mc) = (
@@ -787,6 +869,7 @@ crate::conformance!(
     a_scope_subtree_stays_in_the_tenant,
     the_agent_limit_holds,
     guests_cannot_use_up_the_tenant_agent_limit,
+    guests_register_no_agents_while_guests_are_off,
     keys_exchange_for_short_tokens,
     oauth_code_flow_with_pkce_and_rotation,
     an_expired_scope_ends_the_agent,

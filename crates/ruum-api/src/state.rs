@@ -9,6 +9,9 @@ pub struct ApiConfig {
     pub public_url: String,
     /// The base URL for share links and downloads on the user content domain.
     pub content_url: String,
+    /// The URL of the WebDAV host (decision 0002-3), for example `https://dav.ruum.localhost/`.
+    /// `createAppPassword` returns it as `dav_url`.
+    pub dav_url: String,
 }
 
 impl Default for ApiConfig {
@@ -16,6 +19,7 @@ impl Default for ApiConfig {
         Self {
             public_url: "https://ruum.localhost".into(),
             content_url: "https://content.ruumapps.localhost".into(),
+            dav_url: "https://dav.ruum.localhost/".into(),
         }
     }
 }

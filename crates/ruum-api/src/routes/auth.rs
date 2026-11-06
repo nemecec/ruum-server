@@ -200,7 +200,8 @@ pub async fn login_callback(
         .identity
         .create_session(user.id, user_agent)
         .await?;
-    let csrf = secret::random_secret("");
+    // Bound to the session (decision 0002-3): the check recomputes it from the session cookie.
+    let csrf = ruum_core::identity::csrf_token(&session_secret);
     let max_age = SESSION_DAYS * 24 * 3600;
     let return_to = if valid_return_to(&start.return_to) {
         start.return_to
@@ -348,7 +349,11 @@ pub async fn create_app_password(
         .await?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "app_password": pw, "secret": secret })),
+        Json(json!({
+            "app_password": pw,
+            "secret": secret,
+            "dav_url": state.config.dav_url,
+        })),
     ))
 }
 
@@ -570,6 +575,132 @@ pub(crate) mod tests {
         assert!(out.body["logout_url"].is_string());
         let after = call(&app, Method::GET, "/v1/me", &[("cookie", &cookie)], None).await;
         assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The CSRF value is bound to the session (decision 0002-3): a header and cookie pair that
+    /// match each other but were not issued for this session fail, as after cookie tossing from
+    /// a sibling host.
+    #[tokio::test]
+    async fn the_csrf_value_is_bound_to_the_session() {
+        let (app, oidc, _) = app();
+        let (session_a, csrf_a) = sign_in(&app, &oidc, "anna@example.test").await;
+        let (_session_b, csrf_b) = sign_in(&app, &oidc, "berit@example.test").await;
+        assert_ne!(csrf_a, csrf_b);
+        let tossed = "attacker-chosen-value".to_string();
+        for forged in [&csrf_b, &tossed] {
+            let cookie = format!("ruum_session={session_a}; ruum_csrf={forged}");
+            let r = call(
+                &app,
+                Method::POST,
+                "/v1/auth/logout",
+                &[("cookie", &cookie), ("ruum-csrf", forged)],
+                None,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{forged}");
+            assert_eq!(r.body["error"]["code"], "permission_denied");
+        }
+        // The session still works, and its own value passes, also next to a tossed cookie.
+        let cookie = format!("ruum_session={session_a}; ruum_csrf={tossed}");
+        let ok = call(
+            &app,
+            Method::POST,
+            "/v1/auth/logout",
+            &[("cookie", &cookie), ("ruum-csrf", &csrf_a)],
+            None,
+        )
+        .await;
+        assert_eq!(ok.status, StatusCode::OK);
+    }
+
+    /// The tenant's freshness token cannot be read (the database is down): the request fails,
+    /// it never goes on with a stale authz read (decision 0002-4).
+    #[tokio::test]
+    async fn a_failed_freshness_lookup_fails_the_request() {
+        struct Broken;
+        #[async_trait::async_trait]
+        impl ruum_core::authz::Freshness for Broken {
+            async fn tenant_token(
+                &self,
+                _: ruum_core::TenantId,
+            ) -> ruum_core::Result<Option<ruum_core::authz::ConsistencyToken>> {
+                Err(ruum_core::Error::Internal(
+                    "the outbox cannot be read".into(),
+                ))
+            }
+        }
+        let (_, oidc, state) = app();
+        let mut services = state.services.clone();
+        services.freshness = Arc::new(Broken);
+        let app = router(AppState::new(services, state.config.clone()));
+        let (session, _csrf) = sign_in(&app, &oidc, "erik@example.test").await;
+        let cookie = format!("ruum_session={session}");
+        // Without a tenant there is nothing to read.
+        let tenants = call(
+            &app,
+            Method::GET,
+            "/v1/tenants",
+            &[("cookie", &cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(tenants.status, StatusCode::OK);
+        let tenant = tenants.body["items"][0]["tenant"]["id"]
+            .as_str()
+            .or_else(|| tenants.body["items"][0]["id"].as_str())
+            .expect("a tenant id")
+            .to_string();
+        for path in ["/v1/agents", "/v1/nodes/root", "/v1/trash"] {
+            let r = call(
+                &app,
+                Method::GET,
+                path,
+                &[("cookie", &cookie), ("ruum-tenant", &tenant)],
+                None,
+            )
+            .await;
+            assert_eq!(
+                r.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{path}: {}",
+                r.body
+            );
+        }
+    }
+
+    /// A new app password comes with the URL of the WebDAV host to mount (decision 0002-3).
+    #[tokio::test]
+    async fn a_new_app_password_names_the_dav_host() {
+        let (app, oidc, _) = app();
+        let (session, csrf) = sign_in(&app, &oidc, "dora@example.test").await;
+        let cookie = format!("ruum_session={session}; ruum_csrf={csrf}");
+        let tenants = call(
+            &app,
+            Method::GET,
+            "/v1/tenants",
+            &[("cookie", &cookie)],
+            None,
+        )
+        .await;
+        let tenant = tenants.body["items"][0]["tenant"]["id"]
+            .as_str()
+            .or_else(|| tenants.body["items"][0]["id"].as_str())
+            .expect("a tenant id")
+            .to_string();
+        let r = call(
+            &app,
+            Method::POST,
+            "/v1/me/app-passwords",
+            &[
+                ("cookie", &cookie),
+                ("ruum-csrf", &csrf),
+                ("ruum-tenant", &tenant),
+            ],
+            Some(serde_json::json!({ "name": "Finder" })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        assert_eq!(r.body["dav_url"], "https://dav.ruum.localhost/");
     }
 
     #[tokio::test]

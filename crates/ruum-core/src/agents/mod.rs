@@ -320,10 +320,23 @@ pub fn check_live(agent: &Agent) -> crate::error::Result<()> {
 /// The tenant's agent limit grows only with its members (not guests, `tenant_limits`), so the
 /// agents of guests are counted apart: each guest has this limit of their own, and the tenant's
 /// limit counts only the agents of owners, admins and members. So a guest cannot use up the
-/// host tenant's agents (security review of 2026-11-06). Whether guests may own agents at all
-/// in step 1 is open for the architect (the contract of `registerAgent` says nothing about it).
+/// host tenant's agents (security review of 2026-11-06). Guests may own agents in step 1
+/// (decision 0002-2), but not while the tenant policy has `allow_guests: false`
+/// ([`guest_agents_refused`]).
 pub fn guest_agent_limit(plan: crate::tenants::Plan) -> u32 {
     crate::tenants::limits::plan_limits(plan).agents
+}
+
+/// The error for a guest who registers an agent (`registerAgent`, `oauthConsent` with
+/// `new_agent`) while the tenant policy has `allow_guests: false` (decision 0002-2).
+pub fn guest_agents_refused() -> Error {
+    Error::Api(
+        crate::error::ApiError::new(
+            ErrorCode::PermissionDenied,
+            "the tenant policy does not allow guests, so a guest cannot register an agent",
+        )
+        .with_hint("ask a tenant admin to allow guests, or to make you a member"),
+    )
 }
 
 /// The error of the agent limit of the plan.

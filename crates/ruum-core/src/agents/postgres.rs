@@ -124,11 +124,13 @@ pub(crate) async fn insert_agent(
     req: NewAgent,
 ) -> Result<(Agent, Option<(TenantId, i64)>)> {
     let t = ctx.tenant;
-    let plan: Plan = sqlx::query_scalar("select plan from tenants where id = $1")
-        .bind(t)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| Error::not_found("tenant"))?;
+    let (plan, settings): (Plan, serde_json::Value) =
+        sqlx::query_as("select plan, settings from tenants where id = $1")
+            .bind(t)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| Error::not_found("tenant"))?;
+    let policy: crate::tenants::TenantPolicy = serde_json::from_value(settings).unwrap_or_default();
     let members: i64 = sqlx::query_scalar(
         "select count(*) from memberships where tenant_id = $1 and role <> 'guest'",
     )
@@ -143,6 +145,11 @@ pub(crate) async fn insert_agent(
     .bind(owner)
     .fetch_one(&mut *conn)
     .await?;
+    // While the tenant policy has `allow_guests: false`, a guest registers no new agent
+    // (decision 0002-2).
+    if guest && !policy.allow_guests {
+        return Err(guest_agents_refused());
+    }
     // A guest's agents have their own limit, so guests cannot use up the tenant's
     // (`guest_agent_limit`).
     let limit = if guest {
