@@ -2,6 +2,7 @@
 // `resetDb()` makes a new copy, so each test starts from the same data.
 
 import type { Schemas } from '../api/client'
+import type { Upload } from '../api/uploads'
 
 type Node = Schemas['Node']
 type Version = Schemas['Version']
@@ -436,6 +437,9 @@ function seed() {
     hidden,
     versions,
     contents,
+    // Chunked uploads: the sessions, and the chunks by `<tenant>:<hash>` (dedup is per tenant).
+    uploads: new Map<string, Upload>(),
+    chunks: new Map<string, Uint8Array>(),
     tags,
     nodeTags,
     grants,

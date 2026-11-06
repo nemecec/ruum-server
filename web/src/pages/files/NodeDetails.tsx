@@ -3,7 +3,7 @@ import { client, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { actorText, formatBytes, formatDate, roleLabels } from '../../components/format'
 import { ConfirmButton, ErrorNote, Loaded } from '../../components/ui'
-import { downloadNode, type Node } from './api'
+import { downloadNode, previewNode, type Node } from './api'
 import { MoveDialog, NameDialog } from './dialogs'
 import { ShareDialog } from './ShareDialog'
 
@@ -13,6 +13,7 @@ export function NodeDetails(props: {
   onChanged: () => void
   onGone: (message: string) => void
   onShowVersions: () => void
+  onUploadVersion: (file: File) => void
   onClose: () => void
 }) {
   const { node } = props
@@ -20,6 +21,7 @@ export function NodeDetails(props: {
   const [error, setError] = useState<unknown>()
   const canEdit = node.my_role === 'edit' || node.my_role === 'manage'
   const heading = useRef<HTMLHeadingElement>(null)
+  const versionInput = useRef<HTMLInputElement>(null)
 
   // Move the focus to the panel when it opens, so keyboard and phone users land on it.
   useEffect(() => {
@@ -69,9 +71,32 @@ export function NodeDetails(props: {
           </button>
         )}
         {node.kind === 'file' && (
+          <button type="button" onClick={() => previewNode(node).catch(setError)}>
+            Preview
+          </button>
+        )}
+        {node.kind === 'file' && (
           <button type="button" onClick={props.onShowVersions}>
             Version history
           </button>
+        )}
+        {node.kind === 'file' && canEdit && (
+          <>
+            <button type="button" onClick={() => versionInput.current?.click()}>
+              Upload new version
+            </button>
+            <input
+              ref={versionInput}
+              type="file"
+              hidden
+              aria-label={`New version of ${node.name}`}
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                e.target.value = ''
+                if (file) props.onUploadVersion(file)
+              }}
+            />
+          </>
         )}
         <button type="button" onClick={() => setDialog('share')}>
           Share

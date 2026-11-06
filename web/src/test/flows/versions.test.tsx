@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { db } from '../../mocks/db'
 import { dialog, ids, personal, renderApp } from '../render'
+import { recordRequests } from '../requests'
 
 describe('versions panel', () => {
   async function openVersions() {
@@ -27,6 +28,37 @@ describe('versions panel', () => {
     const diff = await within(panel).findByLabelText('Changes from this version to the current one')
     expect(within(diff).getByText(/2 added, 0 removed, 2 changed/)).toBeInTheDocument()
     expect(within(diff).getByText('First idea, refined.')).toBeInTheDocument()
+  })
+
+  it('shows the words that changed inside a line, and compares two old versions', async () => {
+    const seen = recordRequests()
+    const { user, panel } = await openVersions()
+    const compare = await within(panel).findAllByRole('button', { name: /^Compare version/ })
+    await user.click(compare[1])
+    let diff = await within(panel).findByLabelText('Changes from this version to the current one')
+    // The detail of the changed line 3: "idea." became "idea, refined."
+    const line3 = within(diff).getByText('Line 3:').closest('li')!
+    expect(within(line3).getByText('idea.', { selector: 'ul del' })).toBeInTheDocument()
+    expect(within(line3).getByText('idea, refined.', { selector: 'ul ins' })).toBeInTheDocument()
+    expect(within(diff).getByText(/compared as text@1.0.0/)).toBeInTheDocument()
+
+    // The first draft compared with the second version (not the current one).
+    await user.selectOptions(within(panel).getByRole('combobox', { name: 'Compare with' }), '0190a000-0000-7000-8000-000000000602')
+    diff = await within(panel).findByLabelText(/^Changes from this version to the version of /)
+    expect(await within(diff).findByText(/1 added, 0 removed, 1 changed/)).toBeInTheDocument()
+    const last = seen.filter((r) => r.path.includes('/diff?')).at(-1)!
+    expect(new URL(last.path, 'http://x').searchParams.get('from')).toBe('0190a000-0000-7000-8000-000000000601')
+    expect(new URL(last.path, 'http://x').searchParams.get('to')).toBe('0190a000-0000-7000-8000-000000000602')
+  })
+
+  it('compares with another diff plugin', async () => {
+    const { user, panel } = await openVersions()
+    const compare = await within(panel).findAllByRole('button', { name: /^Compare version/ })
+    await user.click(compare[0])
+    await within(panel).findByLabelText('Changes from this version to the current one')
+    await user.selectOptions(await within(panel).findByRole('combobox', { name: 'Compare as' }), 'binary')
+    expect(await within(panel).findByText(/compared as binary@1.0.0/)).toBeInTheDocument()
+    expect(within(panel).getByText('Content:')).toBeInTheDocument()
   })
 
   it('restores an old version as a new current version', async () => {

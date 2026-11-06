@@ -586,6 +586,27 @@ legend {
   margin: 0;
   padding-left: 1rem;
 }
+.diff-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.5rem;
+}
+.diff-controls select {
+  display: block;
+  max-width: 100%;
+}
+.diff-changes del,
+.diff-changes ins {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diff-changes .diff-changes {
+  font-size: 0.8125rem;
+}
+.diff-format {
+  font-style: italic;
+}
 .diff ins {
   color: var(--ok);
   text-decoration: none;
@@ -595,6 +616,48 @@ legend {
 }
 .diff-kind {
   font-weight: 600;
+}
+
+/* Uploads */
+
+.uploads {
+  margin: 0 0 1rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+}
+.uploads ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.upload + .upload {
+  border-top: 1px solid var(--border);
+}
+.upload {
+  padding: 0.4rem 0;
+}
+.upload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.upload-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload progress {
+  width: 100%;
+  height: 0.5rem;
+  accent-color: var(--accent);
+}
+.upload button {
+  min-height: 2rem;
+  padding: 0.1rem 0.6rem;
 }
 
 /* Dialogs */

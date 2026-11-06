@@ -9,7 +9,31 @@ ruum.localhost {
 	handle /caddy-health {
 		respond "ok" 200
 	}
-	# The Ruum server runs on the host (cargo run), not in Docker.
+	# The API, MCP and WebDAV: the Ruum server runs on the host (cargo run), not in Docker.
+	@server path /v1/* /healthz /.well-known/* /mcp /mcp/* /dav /dav/*
+	handle @server {
+		reverse_proxy {$RUUM_UPSTREAM}
+	}
+	# Everything else is the web UI: Vite on the host (cd web && npm run dev:server).
+	handle {
+		reverse_proxy {$RUUM_WEB_UPSTREAM:host.docker.internal:5173}
+	}
+
+	handle_errors 502 503 504 {
+		@server_down path /v1/* /healthz /.well-known/* /mcp /mcp/* /dav /dav/*
+		handle @server_down {
+			respond "Ruum server is not running on {$RUUM_UPSTREAM}. Start it with cargo run." 502
+		}
+		handle {
+			respond "The Ruum web UI is not running on {$RUUM_WEB_UPSTREAM:host.docker.internal:5173}. Start it with: cd web && npm run dev:server" 502
+		}
+	}
+}
+
+# The content domain (design 9.5): signed download and preview links from getContentUrl look like
+# https://<tenant>.content.ruumapps.localhost/c/<token>. The Ruum server serves them and reads the
+# tenant from the host, so Caddy keeps the Host header (reverse_proxy does that by default).
+*.content.ruumapps.localhost {
 	reverse_proxy {$RUUM_UPSTREAM}
 
 	handle_errors 502 503 504 {

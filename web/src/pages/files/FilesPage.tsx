@@ -1,4 +1,4 @@
-import { useRef, useState, type ChangeEvent } from 'react'
+import { useCallback, useRef, useState, type ChangeEvent } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router'
 import { client, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
@@ -6,10 +6,12 @@ import { usePagedApi } from '../../api/usePagedApi'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { actorText, formatBytes, formatDate } from '../../components/format'
 import { ErrorNote, Loaded, LoadMore, Notice } from '../../components/ui'
-import { listChildren, listSharedWithMe, loadFolder, uploadFile, type Node } from './api'
+import { listChildren, listSharedWithMe, loadFolder, newFileTarget, newVersionTarget, type Node } from './api'
 import { NameDialog } from './dialogs'
 import { NodeDetails } from './NodeDetails'
 import { SharedTable } from './SharedPage'
+import { UploadList } from './UploadList'
+import { useUploads } from './useUploads'
 import { VersionsPanel } from './VersionsPanel'
 
 /** The file browser: one folder, its breadcrumbs, its children and the details of one child. */
@@ -22,7 +24,6 @@ export function FilesPage() {
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<unknown>()
   const [newFolder, setNewFolder] = useState(false)
-  const [uploading, setUploading] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
 
   const state = useApi(() => loadFolder(folderId), [folderId])
@@ -47,22 +48,33 @@ export function FilesPage() {
     setParams(next, { replace: true })
   }
 
-  async function onUpload(e: ChangeEvent<HTMLInputElement>) {
+  const reloadFolder = state.reload
+  const reloadChildren = children.reload
+  const uploads = useUploads(
+    useCallback((nodes: Node[], failed: number) => {
+      if (nodes.length) {
+        const what = nodes.length === 1 ? nodes[0].name : `${nodes.length} files`
+        setNotice(failed ? `Uploaded ${what}; ${failed} failed.` : `Uploaded ${what}.`)
+      }
+      reloadFolder()
+      reloadChildren()
+    }, [reloadFolder, reloadChildren]),
+  )
+
+  function onUpload(e: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    if (!files.length || !state.data?.folder) return
-    setUploading(true)
+    const folder = state.data?.folder
+    if (!files.length || !folder) return
     setError(undefined)
-    try {
-      const folder = state.data.folder
-      for (const f of files) await uploadFile(folder.id, f)
-      setNotice(files.length === 1 ? `Uploaded ${files[0].name}.` : `Uploaded ${files.length} files.`)
-    } catch (err) {
-      setError(err)
-    } finally {
-      setUploading(false)
-      reload()
-    }
+    setNotice(null)
+    uploads.add(files, (f) => newFileTarget(folder, f), folder.tenant_id)
+  }
+
+  function onUploadVersion(node: Node, file: File) {
+    setError(undefined)
+    setNotice(null)
+    uploads.add([file], () => newVersionTarget(node), node.tenant_id)
   }
 
   return (
@@ -98,8 +110,8 @@ export function FilesPage() {
                       <button type="button" onClick={() => setNewFolder(true)}>
                         New folder
                       </button>
-                      <button type="button" className="primary" disabled={uploading} onClick={() => fileInput.current?.click()}>
-                        {uploading ? 'Uploading...' : 'Upload'}
+                      <button type="button" className="primary" onClick={() => fileInput.current?.click()}>
+                        Upload
                       </button>
                       <input ref={fileInput} type="file" multiple hidden aria-label="Upload files" onChange={onUpload} />
                     </div>
@@ -107,6 +119,7 @@ export function FilesPage() {
                 </div>
                 <ErrorNote error={error} />
                 <Notice text={notice} />
+                <UploadList items={uploads.items} onCancel={uploads.cancel} onClear={uploads.clear} />
                 <Loaded state={children}>
                   {({ items }) => (
                     <FileTable nodes={items} tenantId={tenant.id} selectedId={selectedId} onSelect={(n) => select(n)} />
@@ -148,6 +161,7 @@ export function FilesPage() {
                 reload()
               }}
               onShowVersions={() => select(selected, 'versions')}
+              onUploadVersion={(file) => onUploadVersion(selected, file)}
               onClose={() => select(null)}
             />
           )}

@@ -1,10 +1,8 @@
 import { client, RuumApiError, unwrap, type Schemas } from '../../api/client'
 import { browser } from '../../app/browser'
+import type { UploadTarget } from '../../upload/upload'
 
 export type Node = Schemas['Node']
-
-/** The largest file `putContent` takes in one request (32 MiB). Larger files need chunked uploads. */
-export const MAX_SIMPLE_UPLOAD = 32 * 1024 * 1024
 
 /** True for the answers that mean "you cannot see this" (`403`, or `404` for a node you cannot view). */
 export function isNoAccess(e: unknown): boolean {
@@ -64,30 +62,14 @@ export function listSharedWithMe(cursor: string | undefined) {
   return unwrap(client.GET('/v1/shared-with-me', { params: { query: cursor ? { cursor } : {} } }))
 }
 
-/**
- * Uploads a small file: `createNode` makes the file node and `putContent` writes the first
- * version. Files over 32 MiB need the chunked upload (`createUpload`), which comes with wave B.
- */
-export async function uploadFile(parentId: string, file: File): Promise<Node> {
-  if (file.size > MAX_SIMPLE_UPLOAD) {
-    throw new RuumApiError(413, {
-      code: 'payload_too_large',
-      message: `${file.name} is larger than 32 MiB.`,
-      hint: 'Large uploads are not in the web UI yet; use the CLI or WebDAV.',
-    })
-  }
-  const created = await unwrap(
-    client.POST('/v1/nodes', { body: { parent_id: parentId, name: file.name, kind: 'file', on_conflict: 'rename' } }),
-  )
-  const written = await unwrap(
-    client.PUT('/v1/nodes/{node_id}/content', {
-      params: { path: { node_id: created.node.id } },
-      body: file as unknown as string,
-      bodySerializer: (b: unknown) => b as BodyInit,
-      headers: { 'Content-Type': file.type || 'application/octet-stream' },
-    }),
-  )
-  return written.node
+/** Where a new file goes: the folder, with a new name when the name is taken. */
+export function newFileTarget(folder: Node, file: File): UploadTarget {
+  return { target: 'new_file', parent_id: folder.id, name: file.name, on_conflict: 'rename' }
+}
+
+/** A new version of a file. It fails with `version_mismatch` if someone else wrote one first. */
+export function newVersionTarget(node: Node): UploadTarget {
+  return { target: 'new_version', node_id: node.id, base_version: node.head_version }
 }
 
 /** Downloads from the content domain (`getContentUrl`), never from the API origin. */
@@ -103,4 +85,29 @@ export async function downloadNode(node: Node, version?: string): Promise<void> 
     }),
   )
   browser.download(res.url, node.name)
+}
+
+/**
+ * Opens a preview in a new tab: a content-domain URL with `disposition=inline`. The content domain
+ * serves it in a strict sandbox, so the file never runs as the platform.
+ */
+export async function previewNode(node: Node): Promise<void> {
+  // Open the tab now, while the click still counts as a user action (pop-up blockers), and point
+  // it at the URL when it comes.
+  const tab = browser.openBlank()
+  try {
+    const res = await unwrap(
+      client.GET('/v1/nodes/{node_id}/content-url', {
+        params: {
+          path: { node_id: node.id },
+          query: { disposition: 'inline' },
+          header: { 'Ruum-Tenant': node.tenant_id },
+        },
+      }),
+    )
+    browser.navigateTab(tab, res.url)
+  } catch (e) {
+    tab?.close()
+    throw e
+  }
 }

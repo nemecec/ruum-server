@@ -2,7 +2,9 @@
 // by the contract (src/api/schema.d.ts), so a contract change breaks the build here first.
 
 import { http, HttpResponse, type HttpHandler } from 'msw'
+import { blake3Hex } from '../upload/chunker'
 import type { paths, Schemas } from '../api/client'
+import { type CreateUploadRequest, type Upload } from '../api/uploads'
 import { byUser, db, ids, userRef } from './db'
 
 type Method = 'get' | 'post' | 'put' | 'patch' | 'delete'
@@ -231,7 +233,22 @@ function base64(text: string): string {
   return btoa(bin)
 }
 
-/** A naive line diff, enough for the versions panel of the mock. */
+/** The words that changed inside one line, as the `detail` of a `modify` change. */
+function wordDetail(a: string, b: string): Schemas['DiffChange'][] {
+  const x = a.split(/(\s+)/)
+  const y = b.split(/(\s+)/)
+  let head = 0
+  while (head < x.length && head < y.length && x[head] === y[head]) head++
+  let tail = 0
+  while (tail < x.length - head && tail < y.length - head && x[x.length - 1 - tail] === y[y.length - 1 - tail]) tail++
+  const old = x.slice(head, x.length - tail).join('')
+  const neu = y.slice(head, y.length - tail).join('')
+  if (!old) return [{ kind: 'insert', new: neu }]
+  if (!neu) return [{ kind: 'delete', old }]
+  return [{ kind: 'replace', old, new: neu }]
+}
+
+/** A naive line diff (the `text` plugin of the mock), enough for the versions panel. */
 function lineDiff(a: string, b: string): Schemas['DiffResult'] {
   const left = a.split('\n')
   const right = b.split('\n')
@@ -242,19 +259,93 @@ function lineDiff(a: string, b: string): Schemas['DiffResult'] {
     const o = left[i]
     const n = right[i]
     if (o === n) continue
+    const where = { path: `lines/${i + 1}`, label: `Line ${i + 1}` }
     if (o === undefined) {
-      changes.push({ kind: 'insert', path: `line ${i + 1}`, new: n })
+      changes.push({ kind: 'insert', ...where, new: n })
       summary.inserted++
     } else if (n === undefined) {
-      changes.push({ kind: 'delete', path: `line ${i + 1}`, old: o })
+      changes.push({ kind: 'delete', ...where, old: o })
       summary.deleted++
     } else {
-      changes.push({ kind: 'modify', path: `line ${i + 1}`, old: o, new: n })
+      changes.push({ kind: 'modify', ...where, old: o, new: n, detail: wordDetail(o, n) })
       summary.modified++
     }
   }
-  return { plugin: 'text-lines', summary, changes, truncated: false }
+  return { plugin: 'text@1.0.0', summary, changes, truncated: false }
 }
+
+/** The `binary` plugin of the mock: one change when the bytes differ. */
+function binaryDiff(from: Schemas['Version'], to: Schemas['Version']): Schemas['DiffResult'] {
+  const same = from.content_hash === to.content_hash
+  return {
+    plugin: 'binary@1.0.0',
+    summary: { inserted: 0, deleted: 0, modified: same ? 0 : 1, moved: 0 },
+    changes: same ? [] : [{ kind: 'replace', path: '', label: 'Content', old: `${from.size_bytes} bytes`, new: `${to.size_bytes} bytes` }],
+    truncated: false,
+  }
+}
+
+const diffPlugins: Schemas['DiffPluginInfo'][] = [
+  { name: 'text', version: '1.0.0', priority: 100 },
+  { name: 'binary', version: '1.0.0', priority: 0 },
+]
+
+/** The chunking parameter sets of the mock: small chunks for small and text files, as the server. */
+const SMALL_CHUNKING: Schemas['ChunkingParams'] = {
+  id: 'fastcdc-2020-16k-32k-64k',
+  algorithm: 'fastcdc-2020',
+  min_size: 16384,
+  avg_size: 32768,
+  max_size: 65536,
+}
+const DEFAULT_CHUNKING: Schemas['ChunkingParams'] = {
+  id: 'fastcdc-2020-1m-2m-4m',
+  algorithm: 'fastcdc-2020',
+  min_size: 1048576,
+  avg_size: 2097152,
+  max_size: 4194304,
+}
+const chunkingSets = [SMALL_CHUNKING, DEFAULT_CHUNKING]
+
+function chunkingFor(size: number, contentType: string | null): Schemas['ChunkingParams'] {
+  return size <= 4 * 1024 * 1024 || contentType?.startsWith('text/') ? SMALL_CHUNKING : DEFAULT_CHUNKING
+}
+
+/** Makes a new head version of a file with this content. */
+function writeVersion(n: Schemas['Node'], tenant: string, bytes: Uint8Array, contentType: string | null) {
+  const version: Schemas['Version'] = {
+    id: newId(),
+    tenant_id: tenant,
+    node_id: n.id,
+    size_bytes: bytes.length,
+    content_hash: blake3Hex(bytes),
+    content_type: contentType,
+    restored_from: null,
+    label: null,
+    actor: userRef(),
+    on_behalf_of: null,
+    created_at: now(),
+  }
+  db.versions.push(version)
+  db.contents.set(version.id, new TextDecoder().decode(bytes))
+  n.head_version = version.id
+  n.size_bytes = version.size_bytes
+  touch(n)
+  return version
+}
+
+function canEditNode(n: Schemas['Node']) {
+  return n.my_role === 'edit' || n.my_role === 'manage'
+}
+
+function findUpload(id: string, tenant: string): Upload {
+  const u = db.uploads.get(id)
+  if (!u || u.tenant_id !== tenant || u.status !== 'open') throw notFound('Upload')
+  return u
+}
+
+const missingChunks = (u: Upload) =>
+  [...new Set(u.chunks.map((c) => c.hash))].filter((h) => !db.chunks.has(`${u.tenant_id}:${h}`))
 
 export const handlers: HttpHandler[] = [
   // ------------------------------------------------------------------ auth and account
@@ -643,29 +734,113 @@ export const handlers: HttpHandler[] = [
     async ({ params, request, tenant }) => {
       const n = findNode(params.node_id, tenant)
       if (n.kind !== 'file') throw new Fail(422, 'validation_failed', 'Only files have content.')
-      const text = await request.text()
-      const version: Schemas['Version'] = {
-        id: newId(),
-        tenant_id: tenant,
-        node_id: n.id,
-        size_bytes: new TextEncoder().encode(text).length,
-        content_hash: `sha256:${newId().replace(/-/g, '')}`,
-        content_type: request.headers.get('Content-Type'),
-        restored_from: null,
-        label: null,
-        actor: userRef(),
-        on_behalf_of: null,
-        created_at: now(),
-      }
-      db.versions.push(version)
-      db.contents.set(version.id, text)
-      n.head_version = version.id
-      n.size_bytes = version.size_bytes
-      touch(n)
+      const bytes = new Uint8Array(await request.arrayBuffer())
+      const version = writeVersion(n, tenant, bytes, request.headers.get('Content-Type'))
       return { node: n, version, change: record('version.created', n.id, tenant) }
     },
     { rawBody: true },
   ),
+  // ------------------------------------------------------------------ chunked uploads
+  route('get', '/v1/uploads/params', ({ query, tenant }) => {
+    requireTenantHeader(tenant)
+    const size = Number(query.get('size'))
+    if (!Number.isInteger(size) || size < 0) throw new Fail(422, 'validation_failed', 'size must be a whole number of bytes.')
+    return chunkingFor(size, query.get('content_type'))
+  }),
+  route(
+    'post',
+    '/v1/uploads',
+    ({ body: generated, tenant }) => {
+      requireTenantHeader(tenant)
+      const body = generated as unknown as CreateUploadRequest
+      const chunking = chunkingSets.find((c) => c.id === body.chunking)
+      if (!chunking) throw new Fail(422, 'validation_failed', `Unknown chunking ${body.chunking}.`)
+      if (body.chunks.reduce((n, c) => n + c.size, 0) !== body.size) {
+        throw new Fail(422, 'validation_failed', 'The chunk sizes do not add up to the size.')
+      }
+      const target = body.target === 'new_file' ? findNode(body.parent_id, tenant) : findNode(body.node_id, tenant)
+      if (body.target === 'new_file' && target.kind !== 'folder') throw new Fail(422, 'validation_failed', 'The parent is not a folder.')
+      if (body.target === 'new_version' && target.kind !== 'file') throw new Fail(422, 'validation_failed', 'Only files have versions.')
+      if (!canEditNode(target)) throw new Fail(403, 'permission_denied', 'You need edit access.')
+      const upload: Upload = {
+        ...body,
+        id: newId(),
+        tenant_id: tenant,
+        content_type: body.content_type ?? null,
+        missing: [] as string[],
+        status: 'open' as const,
+        chunking,
+        expires_at: new Date(Date.now() + 24 * 3600_000).toISOString(),
+        created_by: byUser(),
+      }
+      upload.missing = missingChunks(upload)
+      db.uploads.set(upload.id, upload)
+      return upload as unknown as Schemas['Upload']
+    },
+    { status: 201 },
+  ),
+  route('get', '/v1/uploads/{upload_id}', ({ params, tenant }) => {
+    const u = findUpload(params.upload_id, tenant)
+    return { ...u, missing: missingChunks(u) } as unknown as Schemas['Upload']
+  }),
+  route('delete', '/v1/uploads/{upload_id}', ({ params, tenant }) => {
+    findUpload(params.upload_id, tenant).status = 'aborted'
+  }),
+  route(
+    'put',
+    '/v1/uploads/{upload_id}/chunks/{hash}',
+    async ({ params, request, tenant }) => {
+      const u = findUpload(params.upload_id, tenant)
+      if (!u.chunks.some((c) => c.hash === params.hash)) throw new Fail(422, 'validation_failed', 'This chunk is not in the upload.')
+      const bytes = new Uint8Array(await request.arrayBuffer())
+      if (blake3Hex(bytes) !== params.hash) throw new Fail(422, 'hash_mismatch', 'The chunk does not match its hash.')
+      db.chunks.set(`${tenant}:${params.hash}`, bytes)
+    },
+    { rawBody: true },
+  ),
+  route('post', '/v1/uploads/{upload_id}/complete', ({ params, tenant }) => {
+    const u = findUpload(params.upload_id, tenant)
+    const missing = missingChunks(u)
+    if (missing.length) throw new Fail(409, 'chunk_missing', `${missing.length} chunks are missing.`)
+    const bytes = new Uint8Array(u.size)
+    let at = 0
+    for (const c of u.chunks) {
+      bytes.set(db.chunks.get(`${tenant}:${c.hash}`)!, at)
+      at += c.size
+    }
+    if (blake3Hex(bytes) !== u.content_hash) throw new Fail(422, 'hash_mismatch', 'The content does not match content_hash.')
+    let n: Schemas['Node']
+    if (u.target === 'new_file') {
+      const parent = findNode(u.parent_id, tenant)
+      const name = placeName(parent.id, u.name, tenant, u.on_conflict)
+      n = {
+        ...parent,
+        id: newId(),
+        parent_id: parent.id,
+        name,
+        kind: 'file',
+        type: null,
+        head_version: null,
+        size_bytes: 0,
+        revision: 0,
+        created_at: now(),
+        created_by: byUser(),
+        my_role: 'manage',
+        my_can_share: true,
+        editors_can_share: null,
+      }
+      db.nodes.push(n)
+      record('node.created', n.id, tenant, { name })
+    } else {
+      n = findNode(u.node_id, tenant)
+      if (u.base_version && u.base_version !== n.head_version) {
+        throw new Fail(409, 'version_mismatch', 'The file has a newer version than the one this upload started from.')
+      }
+    }
+    const version = writeVersion(n, tenant, bytes, u.content_type ?? null)
+    u.status = 'completed'
+    return { node: n, version, change: record('version.created', n.id, tenant) }
+  }),
   route('get', '/v1/nodes/{node_id}/content-url', ({ params, query, tenant }) => {
     const n = findNode(params.node_id, tenant)
     const versionId = query.get('version') ?? n.head_version
@@ -707,8 +882,17 @@ export const handlers: HttpHandler[] = [
     const n = findNode(params.node_id, tenant)
     const from = query.get('from')
     const to = query.get('to') ?? n.head_version
-    if (!from || !to || !db.contents.has(from) || !db.contents.has(to)) throw notFound('Version')
-    return { ...lineDiff(db.contents.get(from)!, db.contents.get(to)!), from, to }
+    const vFrom = db.versions.find((v) => v.id === from && v.node_id === n.id)
+    const vTo = db.versions.find((v) => v.id === to && v.node_id === n.id)
+    if (!from || !to || !vFrom || !vTo) throw notFound('Version')
+    const plugin = query.get('plugin') ?? 'text'
+    if (!diffPlugins.some((p) => p.name === plugin)) throw new Fail(422, 'validation_failed', `Unknown diff plugin ${plugin}.`)
+    const result = plugin === 'binary' ? binaryDiff(vFrom, vTo) : lineDiff(db.contents.get(from) ?? '', db.contents.get(to) ?? '')
+    return { ...result, from, to }
+  }),
+  route('get', '/v1/nodes/{node_id}/diff/plugins', ({ params, tenant }) => {
+    findNode(params.node_id, tenant)
+    return { items: diffPlugins }
   }),
 
   // ------------------------------------------------------------------ tags

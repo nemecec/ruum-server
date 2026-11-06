@@ -19,4 +19,20 @@ export const browser = {
   open(url: string): void {
     window.open(url, '_blank', 'noopener')
   },
+  /**
+   * Opens an empty tab, to point it at a URL that is not known yet (`navigateTab`). Without
+   * `noopener` here, so the page can set its address; `navigateTab` cuts the link back to the page.
+   */
+  openBlank(): Window | null {
+    return window.open('about:blank', '_blank')
+  },
+  /** Points a tab from `openBlank` at `url`, or opens a new tab when the browser blocked it. */
+  navigateTab(tab: Window | null, url: string): void {
+    if (!tab || tab.closed) {
+      window.open(url, '_blank', 'noopener')
+      return
+    }
+    tab.opener = null
+    tab.location.href = url
+  },
 }

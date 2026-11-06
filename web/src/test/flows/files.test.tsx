@@ -1,5 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { browser } from '../../app/browser'
 import { db } from '../../mocks/db'
 import { dialog, ids, personal, renderApp } from '../render'
 import { recordRequests } from '../requests'
@@ -57,17 +58,78 @@ describe('file browser', () => {
     expect(await within(d).findByRole('alert')).toHaveTextContent('A node named "Photos" already exists here.')
   })
 
-  it('uploads a small file with createNode and putContent', async () => {
+  it('uploads a file in chunks: chunking parameters, createUpload, the missing chunks, complete', async () => {
     const seen = recordRequests()
     const { user } = renderApp(`${personal}/files`)
     await screen.findByRole('link', { name: 'Documents' })
     const file = new File(['hello ruum'], 'hello.txt', { type: 'text/plain' })
     await user.upload(screen.getByLabelText('Upload files'), file)
     expect(await screen.findByRole('button', { name: 'hello.txt' })).toBeInTheDocument()
-    const put = seen.find((r) => r.method === 'PUT' && r.path.endsWith('/content'))
-    expect(put?.body).toBe('hello ruum')
-    expect(put?.headers.get('Content-Type')).toBe('text/plain')
-    expect(put?.headers.get('Idempotency-Key')).toBeTruthy()
+    expect(screen.getByRole('status', { name: '' })).toHaveTextContent('Uploaded hello.txt.')
+    expect(within(screen.getByRole('region', { name: 'Uploads' })).getByText('Uploaded')).toBeInTheDocument()
+
+    const calls = seen.filter((r) => r.path.startsWith('/v1/uploads')).map((r) => `${r.method} ${r.path.replace(/[0-9a-f]{64}/g, ':hash').replace(/[0-9a-f-]{36}/g, ':id')}`)
+    expect(calls).toEqual([
+      'GET /v1/uploads/params?size=10&content_type=text%2Fplain',
+      'POST /v1/uploads',
+      'PUT /v1/uploads/:id/chunks/:hash',
+      'POST /v1/uploads/:id/complete',
+    ])
+    const create = seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')!
+    expect(create.body).toMatchObject({
+      target: 'new_file',
+      parent_id: ids.personalRoot,
+      name: 'hello.txt',
+      on_conflict: 'rename',
+      size: 10,
+      chunking: 'fastcdc-2020-16k-32k-64k',
+      content_type: 'text/plain',
+      // BLAKE3 of "hello ruum"
+      content_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    })
+    const put = seen.find((r) => r.method === 'PUT')!
+    expect(put.body).toBe('hello ruum')
+    expect(put.headers.get('Content-Type')).toBe('application/octet-stream')
+    expect(put.headers.get('Ruum-Tenant')).toBe(ids.personal)
+    expect(put.headers.get('Idempotency-Key')).toBeTruthy()
+    // No upload of whole files through the API: no createNode and no putContent.
+    expect(seen.some((r) => r.path.endsWith('/content') || (r.method === 'POST' && r.path === '/v1/nodes'))).toBe(false)
+  })
+
+  it('sends no chunk that the tenant already stores (dedup)', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${personal}/files`)
+    await screen.findByRole('link', { name: 'Documents' })
+    await user.upload(screen.getByLabelText('Upload files'), new File(['same bytes'], 'a.txt', { type: 'text/plain' }))
+    expect(await screen.findByRole('button', { name: 'a.txt' })).toBeInTheDocument()
+    await user.upload(screen.getByLabelText('Upload files'), new File(['same bytes'], 'b.txt', { type: 'text/plain' }))
+    expect(await screen.findByRole('button', { name: 'b.txt' })).toBeInTheDocument()
+    expect(seen.filter((r) => r.method === 'PUT' && r.path.includes('/chunks/'))).toHaveLength(1)
+    expect(seen.filter((r) => r.path.endsWith('/complete'))).toHaveLength(2)
+  })
+
+  it('uploads a new version of a file, based on the current head', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${personal}/files`)
+    const details = await openDetails(user, 'notes.md')
+    const head = db.nodes.find((n) => n.id === ids.notes)!.head_version
+    await user.upload(within(details).getByLabelText('New version of notes.md'), new File(['# Notes v2'], 'notes.md', { type: 'text/markdown' }))
+    expect(await screen.findByText('Uploaded notes.md.')).toBeInTheDocument()
+    const create = seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')!
+    expect(create.body).toMatchObject({ target: 'new_version', node_id: ids.notes, base_version: head })
+    const notes = db.nodes.find((n) => n.id === ids.notes)!
+    expect(notes.head_version).not.toBe(head)
+    expect(db.contents.get(notes.head_version!)).toBe('# Notes v2')
+  })
+
+  it('shows a failed upload in the list', async () => {
+    const { user } = renderApp(`${personal}/files`)
+    const details = await openDetails(user, 'notes.md')
+    // Someone else writes a new version first.
+    db.nodes.find((n) => n.id === ids.notes)!.head_version = db.versions[0].id
+    await user.upload(within(details).getByLabelText('New version of notes.md'), new File(['late'], 'notes.md'))
+    const uploads = screen.getByRole('region', { name: 'Uploads' })
+    expect(await within(uploads).findByRole('alert')).toHaveTextContent('newer version')
   })
 
   it('downloads through the content domain URL, not the API', async () => {
@@ -79,6 +141,20 @@ describe('file browser', () => {
     expect(download.mock.calls[0][1]).toBe('notes.md')
     expect(seen.some((r) => r.path.includes('/content-url'))).toBe(true)
     expect(seen.some((r) => r.method === 'GET' && r.path.endsWith('/content'))).toBe(false)
+  })
+
+  it('previews through an inline content domain URL in a new tab', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${personal}/files`)
+    const tab = { closed: false, opener: {}, location: { href: 'about:blank' }, close: vi.fn() }
+    const openBlank = vi.spyOn(browser, 'openBlank').mockReturnValue(tab as unknown as Window)
+    const details = await openDetails(user, 'notes.md')
+    await user.click(within(details).getByRole('button', { name: 'Preview' }))
+    await waitFor(() => expect(tab.location.href).toMatch(/^data:/))
+    expect(openBlank).toHaveBeenCalledTimes(1)
+    expect(tab.opener).toBeNull()
+    const call = seen.find((r) => r.path.includes('/content-url'))!
+    expect(new URL(call.path, 'http://x').searchParams.get('disposition')).toBe('inline')
   })
 
   it('renames a file', async () => {

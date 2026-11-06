@@ -109,7 +109,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                       />
                     )}
                   </div>
-                  {compare === v.id && <DiffView nodeId={node.id} from={v.id} />}
+                  {compare === v.id && <DiffView node={node} from={v} versions={page.items} />}
                 </li>
               )
             })}
@@ -130,33 +130,107 @@ const kindLabels: Record<Schemas['DiffChangeKind'], string> = {
   replace: 'Replaced',
 }
 
-function DiffView({ nodeId, from }: { nodeId: string; from: string }) {
-  const diff = useApi(
-    () => unwrap(client.GET('/v1/nodes/{node_id}/diff', { params: { path: { node_id: nodeId }, query: { from } } })),
-    [nodeId, from],
+/**
+ * The changes between two versions (`diffVersions`), in the one change model of all diff plugins
+ * (design section 5.4): a summary, a list of changes with a stable `path`, nested `detail`, and
+ * an optional rendered view. The user can pick the other version and the plugin
+ * (`listDiffPlugins`, best first).
+ */
+function DiffView(props: { node: Node; from: Schemas['Version']; versions: Schemas['Version'][] }) {
+  const { node, from } = props
+  const [to, setTo] = useState('')
+  const [plugin, setPlugin] = useState('')
+  const plugins = useApi(
+    () => unwrap(client.GET('/v1/nodes/{node_id}/diff/plugins', { params: { path: { node_id: node.id } } })),
+    [node.id],
   )
-  if (diff.loading && !diff.data) return <Loading label="Comparing" />
+  const diff = useApi(
+    () =>
+      unwrap(
+        client.GET('/v1/nodes/{node_id}/diff', {
+          params: { path: { node_id: node.id }, query: { from: from.id, ...(to ? { to } : {}), ...(plugin ? { plugin } : {}) } },
+        }),
+      ),
+    [node.id, from.id, to, plugin],
+  )
+  const others = props.versions.filter((v) => v.id !== from.id && v.id !== node.head_version)
+  const toVersion = props.versions.find((v) => v.id === to)
+  const target = toVersion ? `the version of ${formatDate(toVersion.created_at)}` : 'the current one'
+  const pluginItems = plugins.data?.items ?? []
+
   return (
-    <Loaded state={diff}>
-      {(d) => (
-        <div className="diff" aria-label="Changes from this version to the current one">
-          <p className="small">
-            {d.summary.inserted} added, {d.summary.deleted} removed, {d.summary.modified} changed
-            {d.summary.moved ? `, ${d.summary.moved} moved` : ''}
-          </p>
-          {d.changes.length === 0 && <p className="muted">No changes.</p>}
-          <ul>
-            {d.changes.map((c, i) => (
-              <li key={i} className={`diff-${c.kind}`}>
-                <span className="diff-kind">{kindLabels[c.kind]}</span> {c.path && <span className="muted">{c.path}: </span>}
-                {c.old !== undefined && <del>{c.old}</del>} {c.new !== undefined && <ins>{c.new}</ins>}
-                {c.change && <span>{c.change}</span>}
-              </li>
+    <div className="diff">
+      <div className="diff-controls">
+        <label>
+          Compare with
+          <select value={to} onChange={(e) => setTo(e.target.value)}>
+            <option value="">Current version</option>
+            {others.map((v) => (
+              <option key={v.id} value={v.id}>
+                {formatDate(v.created_at)}
+                {v.label ? ` (${v.label})` : ''}
+              </option>
             ))}
-          </ul>
-          {d.truncated && <p className="muted">The diff is long; only the start is shown.</p>}
-        </div>
+          </select>
+        </label>
+        {pluginItems.length > 1 && (
+          <label>
+            Compare as
+            <select value={plugin} onChange={(e) => setPlugin(e.target.value)}>
+              <option value="">Best match ({pluginItems[0].name})</option>
+              {pluginItems.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+      {diff.loading && !diff.data ? (
+        <Loading label="Comparing" />
+      ) : (
+        <Loaded state={diff}>
+          {(d) => (
+            <div aria-label={`Changes from this version to ${target}`} role="group" aria-busy={diff.loading}>
+              <p className="small">
+                {d.summary.inserted} added, {d.summary.deleted} removed, {d.summary.modified} changed
+                {d.summary.moved ? `, ${d.summary.moved} moved` : ''}
+                <span className="muted"> - compared as {d.plugin}</span>
+              </p>
+              {d.changes.length === 0 ? <p className="muted">No changes.</p> : <ChangeList changes={d.changes} />}
+              {d.render?.html && (
+                <p className="small">
+                  <a href={d.render.html} target="_blank" rel="noopener noreferrer">
+                    Open the full view of the changes
+                  </a>
+                </p>
+              )}
+              {d.truncated && <p className="muted">The changes are long; only the first ones are shown.</p>}
+            </div>
+          )}
+        </Loaded>
       )}
-    </Loaded>
+    </div>
+  )
+}
+
+function ChangeList({ changes }: { changes: Schemas['DiffChange'][] }) {
+  return (
+    <ul className="diff-changes">
+      {changes.map((c, i) => (
+        <li key={`${c.path ?? ''}-${i}`} className={`diff-${c.kind}`}>
+          <span className="diff-kind">{kindLabels[c.kind]}</span>{' '}
+          {(c.label || c.path) && (
+            <span className="muted" title={c.path}>
+              {c.label || c.path}:{' '}
+            </span>
+          )}
+          {c.old !== undefined && <del>{c.old}</del>} {c.new !== undefined && <ins>{c.new}</ins>}
+          {c.change && <span className="diff-format">{c.change}</span>}
+          {c.detail && c.detail.length > 0 && <ChangeList changes={c.detail} />}
+        </li>
+      ))}
+    </ul>
   )
 }

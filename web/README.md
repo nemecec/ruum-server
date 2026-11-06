@@ -5,12 +5,72 @@ React + TypeScript + Vite. The first UI is small (design section 12.3), because 
 ```sh
 npm ci
 npm run dev         # http://localhost:5173 with the mock API (src/mocks); no server needed
-npm run dev:server  # http://localhost:5173, proxies /v1 to the core service on 127.0.0.1:8490
+npm run dev:server  # http://localhost:5173, proxies the API to the Ruum server (see below)
 npm run gen:api     # regenerate src/api/schema.d.ts from ../contracts/openapi.yaml
 npm run build       # type check and build to dist/
 npm run lint
 npm test            # component tests (Vitest, Testing Library, jsdom) against the mock API
 ```
+
+## Against the real server
+
+`npm run dev:server` forwards `/v1`, `/healthz`, `/.well-known` and `/auth/callback` to the server
+named by `RUUM_API_URL`:
+
+```sh
+npm run dev:server                                     # http://127.0.0.1:8490, the server on the host
+RUUM_API_URL=https://ruum.localhost npm run dev:server # the same server through Caddy (TLS)
+RUUM_WEB_PORT=5199 npm run dev:server                  # another port for Vite
+```
+
+Sign-in goes through Zitadel, which sends the browser back to a registered redirect URI. The stack
+registers `http://localhost:5173/auth/callback` for the `ruum-web` client, so start the server with
+that callback:
+
+```sh
+eval "$(../scripts/dev.sh env)"
+RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback cargo run -p ruum-server
+```
+
+Vite forwards `/auth/callback` to `loginCallback` (`/v1/auth/callback`). It rewrites the path of
+the sign-in state cookie (`Path=/v1/auth` to `/`) and drops the `Secure` flag of cookies, because
+Vite serves plain http on localhost. Without `RUUM_OIDC_REDIRECT_URI`, the server sends Zitadel to
+`https://ruum.localhost/v1/auth/callback`, and the session cookie lands on `ruum.localhost`, not on
+`localhost:5173`.
+
+To serve the UI at `https://ruum.localhost` itself, Caddy sends `/v1`, `/healthz`, `/.well-known`,
+`/mcp` and `/dav` to the server and every other path to Vite (`RUUM_WEB_UPSTREAM` in
+`deploy/dev/.env`, default `host.docker.internal:5173`; `deploy/dev/caddy/Caddyfile`). Set it to
+the same port as `RUUM_WEB_PORT` and recreate the Caddy container. Caddy also sends the content
+domain (`https://<tenant>.content.ruumapps.localhost/c/<token>`, the links of Download and Preview)
+to the server. Then the default callback
+`https://ruum.localhost/v1/auth/callback` works and no `RUUM_OIDC_REDIRECT_URI` is needed. Vite
+listens on 127.0.0.1 so that Caddy in Docker can reach it, and accepts the host `ruum.localhost`.
+Caddy reads the Caddyfile at start; reload it after a change.
+
+Operations that the server does not have yet answer `501 not_implemented`; the page shows the
+server's message. On `main` after wave A these are all node, tag, search, upload, content and
+version operations, so the file pages work only in mock mode until those areas are merged. Sign-in,
+account, tenants, members, invitations, agents, OAuth consent, sharing and the audit log use the
+real server.
+
+## Uploads and downloads
+
+Every upload is chunked (`src/upload/`): `getChunkingParams`, then the browser cuts the file with
+FastCDC 2020 and hashes each chunk and the whole file with BLAKE3, `createUpload` with the chunk
+list, `putChunk` for only the chunks in `missing` (three at a time, retries on `429` and `5xx`),
+`completeUpload` (it asks `getUpload` again on `chunk_missing`), and `abortUpload` on cancel. The
+chunker is a port of the Rust crate `fastcdc` 5.0.0 (`v2020`, normalization level 1), so the browser
+and the server cut a file at the same places and dedup works; `src/test/upload/vectors.ts` holds
+test vectors from the Rust crates. The file is read in 8 MiB slices, never as a whole.
+"Upload new version" sends `target: new_version` with the current head as `base_version`, so a
+concurrent write fails with `version_mismatch` instead of being lost.
+
+`src/api/uploads.ts` corrects two generated types: openapi-typescript renders the `allOf` with the
+discriminated `UploadTarget` of `CreateUploadRequest` and `Upload` as `target: "<schema name>"`.
+
+Downloads and previews use `getContentUrl` (the content domain), never the API-origin download:
+"Download" with `disposition=attachment`, "Preview" with `disposition=inline` in a new tab.
 
 ## Layout
 
@@ -20,6 +80,7 @@ npm test            # component tests (Vitest, Testing Library, jsdom) against t
 | `src/api/client.ts` | The `openapi-fetch` client typed by the schema. It adds the `Ruum-Tenant`, `Ruum-Csrf` and `Idempotency-Key` headers. `unwrap()` returns the data or throws `RuumApiError`. |
 | `src/app/` | Routes, the session (`getMe`, `listTenants`), the tenant layout with the tenant switcher, sign-in URLs. |
 | `src/pages/` | The pages: files, shared with me, trash, search, agents, OAuth consent, account, tenant admin. |
+| `src/upload/` | Chunked uploads: FastCDC (`fastcdc.ts`, `gear.ts`), chunking and hashing (`chunker.ts`), the upload flow (`upload.ts`). |
 | `src/components/` | Dialog (native `<dialog>`), confirm button, status and error messages, formatting. |
 | `src/mocks/` | The mock API: seed data (`db.ts`) and MSW handlers (`handlers.ts`), both typed by the schema. |
 | `mock-auth.ts` | Vite plugin for `npm run dev`: plays `loginStart` and `loginCallback` (full page redirects). |
@@ -54,8 +115,7 @@ The seed has a third tenant where the user is a guest: the root and "Projects" a
 (`getRoot` answers 403, `getNode` 404), and only "Engine drawings" is shared. Lists are paged
 (the mock cursor is an offset; the default limit is 100), and the UI shows "Load more".
 
-## Not built yet (wave B)
+## Not built yet
 
-- Large uploads: files over 32 MiB need the chunked upload (`createUpload`, `putChunk`,
-  `completeUpload`). The UI uploads small files with `createNode` and `putContent`.
 - Database and web app pages (steps 2 and 3).
+- Drag and drop of files and folder uploads.

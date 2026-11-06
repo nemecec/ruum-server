@@ -78,10 +78,13 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
   The root token is `BAO_DEV_ROOT_TOKEN` in `.env`.
 - **Mailpit**: catches all mail. Open `http://localhost:8025`.
 - **Caddy**: the HTTPS front. It uses its own local CA for `ruum.localhost` and
-  `*.ruumapps.localhost`. `https://ruum.localhost/caddy-health` answers `ok` from Caddy. All other
-  paths go to the Ruum server on the host port 8490 (`RUUM_UPSTREAM` in `.env`). If the server
-  does not run, Caddy answers 502 with a short message. `*.ruumapps.localhost` answers 503 until
-  the app gateway exists (step 3).
+  `*.ruumapps.localhost`. `https://ruum.localhost/caddy-health` answers `ok` from Caddy. The
+  paths `/v1`, `/healthz`, `/.well-known`, `/mcp` and `/dav` go to the Ruum server on the host
+  port 8490 (`RUUM_UPSTREAM` in `.env`). All other paths go to the web UI, Vite on the host port
+  5173 (`RUUM_WEB_UPSTREAM` in `.env`; see `web/README.md`). The content domain
+  `*.content.ruumapps.localhost` (download and preview links) also goes to the Ruum server, with
+  the Host header kept. If an upstream does not run, Caddy answers 502 with a short message. The
+  other `*.ruumapps.localhost` hosts answer 503 until the app gateway exists (step 3).
 - **Forgejo**: only with `--step4`. It uses SQLite for now; step 4 decides the database.
 
 Memory limits: Postgres 1 GB, Zitadel 768 MB, SpiceDB, Garage, NATS and OpenBao 256 MB each,
