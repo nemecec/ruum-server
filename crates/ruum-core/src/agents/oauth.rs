@@ -242,6 +242,42 @@ pub fn check_registration(
             ErrorCode::ValidationFailed,
         ));
     }
+    // Registration needs no sign-in, so every stored field has a size limit.
+    if req
+        .redirect_uris
+        .iter()
+        .any(|u| u.len() > MAX_CLIENT_URI_LEN)
+    {
+        return Err(OAuthError::new(
+            "invalid_redirect_uri",
+            format!("a redirect URI may have at most {MAX_CLIENT_URI_LEN} bytes"),
+            ErrorCode::ValidationFailed,
+        ));
+    }
+    for (what, v) in [
+        ("software_id", &req.software_id),
+        ("software_version", &req.software_version),
+    ] {
+        if v.as_deref().is_some_and(|x| {
+            x.chars().count() > MAX_SOFTWARE_FIELD_CHARS || x.chars().any(char::is_control)
+        }) {
+            return Err(meta(&format!(
+                "{what} may have at most {MAX_SOFTWARE_FIELD_CHARS} characters"
+            )));
+        }
+    }
+    for (what, v) in [("client_uri", &req.client_uri), ("logo_uri", &req.logo_uri)] {
+        if v.as_deref().is_some_and(|u| u.len() > MAX_CLIENT_URI_LEN) {
+            return Err(meta(&format!(
+                "{what} may have at most {MAX_CLIENT_URI_LEN} bytes"
+            )));
+        }
+    }
+    if req.grant_types.len() > 2 || req.response_types.len() > 1 {
+        return Err(meta(
+            "grant_types: at most authorization_code and refresh_token; response_types: code",
+        ));
+    }
     if let Some(bad) = req.redirect_uris.iter().find(|u| !redirect_uri_allowed(u)) {
         return Err(OAuthError::new(
             "invalid_redirect_uri",
@@ -293,6 +329,11 @@ pub fn check_registration(
         ..req
     })
 }
+
+/// The longest redirect, client or logo URI of a registration (bytes).
+pub const MAX_CLIENT_URI_LEN: usize = 2000;
+/// The longest `software_id` or `software_version` of a registration (characters).
+pub const MAX_SOFTWARE_FIELD_CHARS: usize = 100;
 
 /// A new client ID.
 pub fn new_client_id() -> String {
@@ -368,5 +409,67 @@ pub(crate) fn consent_context(who: &Actor, tenant: TenantId) -> Context {
         actor: *who,
         scope: None,
         idempotency_key: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registration() -> ClientRegistration {
+        ClientRegistration {
+            client_name: "Claude".into(),
+            redirect_uris: vec!["http://127.0.0.1:33418/callback".into()],
+            grant_types: vec![],
+            response_types: vec![],
+            token_endpoint_auth_method: None,
+            client_uri: None,
+            logo_uri: None,
+            software_id: Some("claude-code".into()),
+            software_version: Some("2.1.0".into()),
+        }
+    }
+
+    /// Registration needs no sign-in, so every stored field is bounded.
+    #[test]
+    fn registration_fields_have_size_limits() {
+        assert!(check_registration(registration()).is_ok());
+        let long = "x".repeat(MAX_SOFTWARE_FIELD_CHARS + 1);
+        let mut r = registration();
+        r.software_id = Some(long.clone());
+        assert_eq!(
+            check_registration(r).unwrap_err().error,
+            "invalid_client_metadata"
+        );
+        let mut r = registration();
+        r.software_version = Some(long);
+        assert_eq!(
+            check_registration(r).unwrap_err().error,
+            "invalid_client_metadata"
+        );
+        let mut r = registration();
+        r.redirect_uris = vec![format!(
+            "http://127.0.0.1:1/{}",
+            "a".repeat(MAX_CLIENT_URI_LEN)
+        )];
+        assert_eq!(
+            check_registration(r).unwrap_err().error,
+            "invalid_redirect_uri"
+        );
+        let mut r = registration();
+        r.client_uri = Some(format!(
+            "https://x.example/{}",
+            "a".repeat(MAX_CLIENT_URI_LEN)
+        ));
+        assert_eq!(
+            check_registration(r).unwrap_err().error,
+            "invalid_client_metadata"
+        );
+        let mut r = registration();
+        r.grant_types = vec!["authorization_code".into(); 1000];
+        assert_eq!(
+            check_registration(r).unwrap_err().error,
+            "invalid_client_metadata"
+        );
     }
 }
