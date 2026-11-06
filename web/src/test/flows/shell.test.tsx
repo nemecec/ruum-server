@@ -49,7 +49,8 @@ describe('app shell', () => {
     await user.type(within(d).getByRole('textbox', { name: 'Team name' }), 'Pärn Studio{Enter}')
     expect(await screen.findByText('Pärn Studio is ready. Invite the people you work with.')).toBeInTheDocument()
     expect(router.state.location.pathname).toMatch(/\/admin\/invitations$/)
-    expect(screen.getByRole('combobox', { name: 'Space' })).toHaveDisplayValue('Pärn Studio (owner)')
+    // React Router commits the new location in a transition, after the toast: wait for it.
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Space' })).toHaveDisplayValue('Pärn Studio (owner)'))
   })
 
   it('says so when the browser is offline', async () => {

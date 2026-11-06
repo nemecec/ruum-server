@@ -14,7 +14,8 @@ describe('accept an invitation (/invitations/accept)', () => {
     await user.click(screen.getByRole('button', { name: 'Join the space' }))
     expect(await screen.findByText("You've joined Lovelace Lab.")).toBeInTheDocument()
     await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/t\/[0-9a-f-]{36}\/files$/))
-    expect(screen.getByRole('combobox', { name: 'Space' })).toHaveDisplayValue('Lovelace Lab (member)')
+    // React Router commits the new location in a transition: router.state changes first.
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Space' })).toHaveDisplayValue('Lovelace Lab (member)'))
   })
 
   it('says so when the invitation was used or ended', async () => {
