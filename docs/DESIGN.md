@@ -1397,6 +1397,27 @@ The UI is localisable from the start of the work on it (decided 2026-11-07, prov
 - **Translations** are made by a translator agent and checked by a second agent; until a person
   checks them they are marked "machine translated" in the catalogue metadata.
 
+### 12.5 The design system in code
+
+The look of Ruum is defined in one place, so it can be changed later without touching screens
+(decided 2026-11-07, provisional). `docs/ux/design-system.md` describes it; the code enforces it:
+
+- **Design tokens are the single source**: colours, type, spacing, radius, shadows and motion, in
+  one token file in the W3C Design Tokens format (`web/src/design/tokens/`). Style Dictionary
+  generates the CSS custom properties (and TypeScript constants where code needs a value). Light and
+  dark are two token sets; a new brand or theme is another set, with no change to components.
+- **One component library** in `web/src/ui/` (button, dialog, table and file list, form fields,
+  toast, breadcrumbs, menus, chips, empty and error states, ...), each with all its states and
+  accessibility built in. Screens compose these components and contain no styling of their own.
+- **Lint enforces it**: no colour, length or font value outside the token files, no inline styles,
+  no styling in screen folders, no literal UI text (section 12.4).
+- **A component catalogue** (Ladle, a light Storybook) shows every component in every state, in
+  light, dark and the pseudo-locale. Visual and accessibility tests run per component, and the UX
+  review panel (section 18.9) reviews the catalogue.
+
+Order of work: the design system first, then localisation (12.4) on top of it, so each component is
+reworked once.
+
 ## 13. Hetzner
 
 Hetzner is a good fit for the start: low prices, traffic included in dedicated servers, cheap large
