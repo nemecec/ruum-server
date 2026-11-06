@@ -1,8 +1,8 @@
 # Status of step 1
 
 This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06,
-the panel decisions of `docs/decisions/0002-step1-panel-decisions.md` and the quality wave (wave
-C), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, the quality wave (wave
+C) and the UX fixes of the web UI (`q/uxfix`), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -20,6 +20,32 @@ Wave C (2026-11-06, rebased onto `main` and fast-forwarded, in this order): `q/d
 | `q/browser` | Playwright tests in `web/e2e` against the real server, Zitadel and Mailpit (`scripts/e2e_browser.sh`), the browser driver for agents (`scripts/ux/drive.mjs`), the CI job `e2e-browser`. |
 | `q/bench` | The first agent benchmark over MCP (`bench/agent/`, 8 step 1 tasks; first run 7 of 8 passed; `docs/BENCHMARK.md`). |
 | `q/uxdesign` | The UX package (`docs/ux/`: personas, journeys, IA, design system, copy, agent experience, gap analysis), provisional. |
+
+UX fixes (2026-11-06, `git merge --no-ff q/uxfix`, no conflicts; only `web/` and `docs/ux/`
+changed): the blockers and most majors of the UX panel. Details and contract needs C-7 to C-11
+are in `docs/ux/decisions.md`.
+
+| Area | What changed in the web UI |
+|---|---|
+| Shared with me | Every row opens the item (`/t/<space>/files/<id>`, `/t/<space>/item/<id>`); the space and the sharer by name, never an ID; a space that is not in the person's list opens in a guest shell. |
+| Share links | `/s#token` visitor page (password, ended link, subfolders, Download and Preview with the link's bearer token; the token never goes into a URL). |
+| Spaces, invitations | "Start a team space..." in the switcher and on Account; `/invitations/accept` (sign-in keeps `return_to`, one click joins); a personal space offers only Guest. "Send an email" is off (`notify: false`) until the server sends share emails. |
+| Agents | `/t/<space>/agents/connect` (MCP address, steps for Claude Desktop, ChatGPT, Claude Code); consent defaults to one folder and 90 days; Pause/Resume, access summary, activity with item names. |
+| Files | Names instead of IDs (from `listMembers`, `listAgents`), agent marks in Changed, a coalescing warning before "Upload new version", one upload panel with a conflict question per batch, selection with bulk Move and Trash (Undo), sorting, error copy for every `ErrorCode` (`api/errors.ts`), welcome card and empty states. |
+| Tests | Flow tests for share links, invitations, uploads, selection, errors; `web/e2e/visual.e2e.ts` (88 snapshots on the mock UI, darwin only) and `web/e2e/a11y.e2e.ts` (axe, WCAG 2.2 A/AA); the 4 UI `test.fixme` of the browser tests now run. |
+
+Fixes made during the `q/uxfix` integration:
+
+- Two flow tests (`shell.test.tsx` "starts a team space from the space switcher",
+  `invitation.test.tsx` "joins the space with one click") read the space switcher before React
+  Router committed the new location (a transition) and failed about one full run in three. The
+  same assertions now run in `waitFor`.
+- Sign out raced a sign-in redirect: the server ends the session first, a call still under way
+  answered `401`, and the `401` listener sent the browser to `/signin?return_to=...` while
+  `browser.assign(logout_url)` started. The e2e test "sign out ends the session" failed with
+  `net::ERR_ABORTED` (3 of 8 repeats). `api/client.ts` now skips the sign-in listeners while the
+  person signs out (`setSigningOut`); a `401` from logout lands on `/signin`. Two flow tests;
+  the e2e test waits for the end of the chain (`/signin`).
 
 Fixes made during the integration:
 
@@ -185,7 +211,7 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-06, `main` after the wave C integration, `DATABASE_URL` and SpiceDB from `dev.sh env`)
+## Checks (2026-11-06, `main` after the `q/uxfix` integration, `DATABASE_URL` and SpiceDB from `dev.sh env`)
 
 - `cargo fmt --all --check`, `cargo build --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`: pass.
@@ -200,10 +226,15 @@ For Zitadel sign-in through Vite, start the server with
 - `MUTATION_STRICT=1 MUTATION_TARGET_DIR=$PWD/target crates/ruum-testkit/scripts/mutation_check.sh`:
   22 of 22 mutations killed, none survived or skipped.
 - `scripts/e2e_smoke.sh`: `PASSED: 52 checks`.
-- `scripts/e2e_browser.sh`: 10 passed, 6 skipped (the `test.fixme` product gaps of
-  `docs/TESTING.md`), twice in a row.
-- `web/`: `npm ci`, `npm run lint`, `npm run build`, `npx vitest run` (12 files, 88 tests),
-  `npx tsc -p e2e/tsconfig.json`: pass.
+- `scripts/e2e_browser.sh` (projects setup, chromium, visual; the mock UI on 5187 for the
+  visual project): 114 passed, 2 skipped (the server-gap `test.fixme` of `sharing.e2e.ts`),
+  twice in a row after the fixes.
+- `web/`: `npm ci`, `npm run lint`, `npm run build`, `npx vitest run` (16 files, 145 tests, 4
+  runs in a row), `npx tsc -p e2e/tsconfig.json`: pass.
+- Flaky once: the SpiceDB run of `trashed_file_reads` failed one check
+  (`getContentUrl [agent_of_guest_view]: 401, expected 404`) while it ran 595 s next to the
+  permission matrix and a vitest run. Alone it passed (30 s), and the full SpiceDB run again
+  passed. The cause of a `401` under load is not known.
 - Not repeated at the integration: `oasdiff`/`redocly` (no contract change after
   `q/decisions`), `crates/ruum-webdav/scripts/smoke.sh`, `cargo deny check`.
 
@@ -220,10 +251,20 @@ For Zitadel sign-in through Vite, start the server with
   works until it expires (at most `CONTENT_URL_SECONDS`, 5 minutes).
 - **Mutation check.** By default the script builds into `target/mutation`; pass
   `MUTATION_TARGET_DIR=$PWD/target` to share the cache.
-- **Product gaps found by the browser tests** (`test.fixme`, see `docs/TESTING.md`): a cold
-  load of a protected page loses `return_to`; no `/invitations/accept` page in the web UI; an
-  email grant to a user who already has an account never binds and sends no mail; and the
-  others listed there. The UX gap analysis (`docs/ux/gap-analysis.md`) has the same P0 items.
+- **Product gaps found by the browser tests** (`test.fixme`, see `docs/TESTING.md`): the 4 web
+  UI gaps (dialog focus, upload race, cold-load `return_to`, no `/invitations/accept` page) are
+  fixed by `q/uxfix`. Server gaps remain: an email grant that binds at first sign-in does not
+  make the person a guest (reads answer `404`); an email grant to a user who already has an
+  account never binds, and `addGrant` sends no mail. `docs/TESTING.md` still lists the fixed UI
+  gaps and has no rows for `visual.e2e.ts` and `a11y.e2e.ts`.
+- **Web UI after `q/uxfix`** (`docs/ux/decisions.md`): names depend on what the person may list
+  (a guest sees "Someone in <Space>", "An agent"; contract need C-7 `display_name`); the space
+  name of an unlisted space is unknown (C-10); the server still coalesces an explicit upload
+  when the person picks "Replace it" (C-8). Not done: the session-ended dialog (UX-09), pausing
+  uploads offline, the "Changed by agents" filter (C-2), the "Shared" mark on rows (C-1), the
+  share dialog people picker, grouping agent activity by runs, version day groups, Shift-range
+  selection, the grid view, the app shell rail (UX-17), UX-20. The visual snapshots exist only
+  for darwin; a Linux CI job needs its own reviewed set.
 - **SpiceDB freshness inside a request.** A request reads at least as fresh as its tenant's
   newest token at its start and its own writes (decision 0002-4). Work that a handler spawns on
   another task (unless it uses `authz::in_current_request`), the outbox worker and `seed-dev`
