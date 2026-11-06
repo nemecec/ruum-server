@@ -568,4 +568,70 @@ mod idempotency_tests {
         assert_eq!(r.status, 409);
         assert!(!String::from_utf8_lossy(&r.body).contains(&secret));
     }
+
+    /// The row of a `createShareLink` answer holds no `ruum_link_` token, and neither does the
+    /// row of a `no-store` answer (`resolveShareLink`, whose access token has no prefix).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_store_keeps_no_share_link_token(pool: sqlx::PgPool) {
+        let a = super::postgres(pool.clone());
+        let u = super::user(&a, "idem-link").await;
+        let store = super::super::postgres::PgIdempotencyStore::new(pool.clone());
+        let token = crate::sharing::rules::new_link_token();
+        let answers = [
+            (
+                "create-link-0001",
+                format!(r#"{{"share_link":{{"token":"{token}","url":"https://x/s#{token}"}}}}"#),
+                vec![("content-type".to_string(), "application/json".to_string())],
+            ),
+            (
+                "resolve-link-001",
+                r#"{"access_token":"eyJhbGciOiJFZERTQSJ9.e30.c2ln"}"#.to_string(),
+                vec![("cache-control".to_string(), "no-store".to_string())],
+            ),
+        ];
+        for (key, body, headers) in answers {
+            let k = KeyRef {
+                tenant: u.home_tenant_id,
+                actor: u.id.0,
+                key: key.into(),
+            };
+            let h = request_hash("POST", "/v1/x", None, key.as_bytes());
+            assert_eq!(
+                store.begin(&k, "POST", "/v1/x", h).await.unwrap(),
+                Begin::Fresh
+            );
+            store
+                .finish(
+                    &k,
+                    &StoredResponse {
+                        status: 201,
+                        headers,
+                        body: body.into_bytes(),
+                    },
+                )
+                .await
+                .unwrap();
+            let Begin::Replay(r) = store.begin(&k, "POST", "/v1/x", h).await.unwrap() else {
+                panic!("expected a replay");
+            };
+            assert_eq!(r.status, 409);
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("select set_config('ruum.system', 'on', false)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let bodies: Vec<Vec<u8>> = sqlx::query_scalar("select response_body from idempotency_keys")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(bodies.len(), 2);
+        for b in bodies {
+            let b = String::from_utf8_lossy(&b);
+            assert!(
+                !b.contains("ruum_link_") && !b.contains("access_token"),
+                "{b}"
+            );
+        }
+    }
 }

@@ -30,5 +30,7 @@ uuid.workspace = true
 async-trait.workspace = true
 http-body-util.workspace = true
 jsonschema.workspace = true
+# `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.
+sqlx = { workspace = true, features = ["macros"] }
 tokio.workspace = true
 tower.workspace = true

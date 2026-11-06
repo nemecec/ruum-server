@@ -8,6 +8,7 @@ use crate::state::AppState;
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Json, Path, Query, State};
+use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post};
 use ruum_core::Context;
@@ -259,13 +260,22 @@ pub fn share_link_url(public_url: &str, token: &str) -> String {
     format!("{}/s#{token}", public_url.trim_end_matches('/'))
 }
 
+/// The header of answers that carry a secret (the link token, a share-link access token): no
+/// cache keeps them, and the idempotency layer never stores them (decision 0001-7).
+const NO_STORE: [(axum::http::HeaderName, &str); 1] = [(CACHE_CONTROL, "no-store")];
+
 /// Create a share link. `POST /v1/nodes/{node_id}/share-links` (operationId `createShareLink`).
+/// The answer holds the token once, so it says `Cache-Control: no-store`.
 pub async fn create_share_link(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
     node: Result<Path<Uuid>, PathRejection>,
     b: Result<Json<NewShareLink>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<(
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    Json<Value>,
+)> {
     let node = NodeId(path(node)?);
     let req = body(b)?;
     let w = state
@@ -280,6 +290,7 @@ pub async fn create_share_link(
         .map(|t| share_link_url(&state.config.public_url, t));
     Ok((
         StatusCode::CREATED,
+        NO_STORE,
         Json(json!({ "share_link": to_json(&link)?, "change": to_json(&w.change)? })),
     ))
 }
@@ -305,11 +316,12 @@ pub struct ResolveBody {
 
 /// Open a share link. `POST /v1/share-links/resolve` (operationId `resolveShareLink`). No
 /// sign-in. Returns the node and a short-lived access token (`typ` `share_link`) whose scope is
-/// the link's node, role and expiry.
+/// the link's node, role and expiry. The access token is a bearer secret, so the answer says
+/// `Cache-Control: no-store`.
 pub async fn resolve_share_link(
     State(state): State<AppState>,
     b: Result<Json<ResolveBody>, JsonRejection>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], Json<Value>)> {
     let b = body(b)?;
     let (tenant, node, link) = state
         .services
@@ -338,13 +350,16 @@ pub async fn resolve_share_link(
     };
     let access_token = state.services.tokens.issue(&claims)?;
     let role: ShareLinkRole = link.role;
-    Ok(Json(json!({
-        "tenant_id": tenant,
-        "node": to_json(&node)?,
-        "role": role,
-        "access_token": access_token,
-        "expires_in": expires_in,
-    })))
+    Ok((
+        NO_STORE,
+        Json(json!({
+            "tenant_id": tenant,
+            "node": to_json(&node)?,
+            "role": role,
+            "access_token": access_token,
+            "expires_in": expires_in,
+        })),
+    ))
 }
 
 /// Shared with me. `GET /v1/shared-with-me` (operationId `listSharedWithMe`).
@@ -397,6 +412,85 @@ mod tests {
             share_link_url("https://ruum.localhost/", "ruum_link_abc"),
             "https://ruum.localhost/s#ruum_link_abc"
         );
+    }
+
+    /// `createShareLink` with an `Idempotency-Key`: the answer holds the link token, so it says
+    /// `Cache-Control: no-store`, the `idempotency_keys` row keeps no `ruum_link_` token, and the
+    /// retry gets `409 conflict` (decision 0001-7). Postgres stores; the nodes area is not
+    /// needed, because the personal tenant's root row exists.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_share_link_token_is_never_kept_for_a_retry(pool: sqlx::PgPool) {
+        use crate::routes::auth::tests::{call, sign_in};
+        use axum::http::Method;
+        use ruum_core::identity::memory::MemoryOidcClient;
+        use ruum_core::identity::setup::{IdentitySettings, install};
+        use std::sync::Arc;
+
+        let mut s = ruum_core::Services::in_memory();
+        let settings = IdentitySettings {
+            public_url: "https://ruum.localhost".into(),
+            ..IdentitySettings::default()
+        };
+        install(&mut s, &settings, Some(pool.clone())).unwrap();
+        let oidc = Arc::new(MemoryOidcClient::default());
+        s.oidc = oidc.clone();
+        s.journal = Arc::new(ruum_core::journal::postgres::PgJournal::new(pool.clone()));
+        s.sharing = Arc::new(ruum_core::sharing::postgres::PgSharingStore::new(
+            pool.clone(),
+            s.authz.clone(),
+            s.nodes.clone(),
+        ));
+        let app = crate::router(AppState::new(s, crate::ApiConfig::default()));
+        let (session, csrf) = sign_in(&app, &oidc, "links@example.test").await;
+        let cookie = format!("ruum_session={session}; ruum_csrf={csrf}");
+        let tenants = call(
+            &app,
+            Method::GET,
+            "/v1/tenants",
+            &[("cookie", &cookie)],
+            None,
+        )
+        .await;
+        let tenant = &tenants.body["items"][0]["tenant"];
+        let tid = tenant["id"].as_str().unwrap().to_string();
+        let root = tenant["root_node_id"].as_str().unwrap().to_string();
+        let headers = [
+            ("cookie", cookie.as_str()),
+            ("ruum-csrf", csrf.as_str()),
+            ("ruum-tenant", tid.as_str()),
+            ("idempotency-key", "create-link-0001"),
+        ];
+        let uri = format!("/v1/nodes/{root}/share-links");
+        let body = json!({ "role": "view" });
+        let first = call(&app, Method::POST, &uri, &headers, Some(body.clone())).await;
+        assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+        assert_eq!(first.headers["cache-control"], "no-store");
+        let token = first.body["share_link"]["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(token.starts_with(ruum_core::sharing::rules::LINK_TOKEN_PREFIX));
+        // The retry does not see the token again.
+        let retry = call(&app, Method::POST, &uri, &headers, Some(body)).await;
+        assert_eq!(retry.status, StatusCode::CONFLICT, "{}", retry.body);
+        assert_eq!(retry.body["error"]["code"], "conflict");
+        assert!(!retry.body.to_string().contains("ruum_link_"));
+        // No row of the table holds the token.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let rows: Vec<(Option<i16>, Option<Vec<u8>>)> =
+            sqlx::query_as("select status_code, response_body from idempotency_keys")
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Some(409));
+        let stored = String::from_utf8_lossy(rows[0].1.as_deref().unwrap_or_default());
+        assert!(!stored.contains("ruum_link_"), "{stored}");
+        assert!(!stored.contains(&token));
     }
 
     #[test]

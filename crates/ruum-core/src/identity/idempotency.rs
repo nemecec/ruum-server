@@ -12,7 +12,8 @@
 //! (`ruum_api::auth::idempotency`) calls this store.
 //!
 //! A response that holds a secret shown once (an agent API key, an app password, a refresh
-//! token, an OAuth client secret, an invitation token), or that says `Cache-Control: no-store`,
+//! token, an OAuth client secret, an invitation token, a share link token), or that says
+//! `Cache-Control: no-store` (for example the share-link access token of `resolveShareLink`),
 //! is never kept: the stores keep [`secret_withheld`] in its place, so a retry gets
 //! `409 conflict` and the secret is never in the database (decision 0001-7: only SHA-256).
 
@@ -44,6 +45,7 @@ pub const SECRET_PREFIXES: &[&str] = &[
     crate::agents::oauth::REFRESH_PREFIX,
     crate::agents::oauth::CLIENT_PREFIX,
     crate::tenants::INVITATION_PREFIX,
+    crate::sharing::rules::LINK_TOKEN_PREFIX,
 ];
 
 /// The length of the random part of a secret (`secret::random_secret`: 43 base64url characters).
@@ -294,6 +296,28 @@ mod tests {
         assert_eq!(kept.status, 409);
         let plain = resp(r#"{"id":"x"}"#, vec![("content-type", "application/json")]);
         assert_eq!(storable(&plain), plain);
+    }
+
+    /// The answer of `createShareLink` holds the link token (`ruum_link_...`) in `token` and in
+    /// the URL fragment; it is a secret like the others (decision 0001-7, `share_links` keeps only
+    /// the hash).
+    #[test]
+    fn share_link_tokens_are_secrets() {
+        let token = crate::sharing::rules::new_link_token();
+        assert!(body_holds_secret(
+            format!(r#"{{"token":"{token}"}}"#).as_bytes()
+        ));
+        assert!(body_holds_secret(
+            format!(r#"{{"url":"https://ruum.localhost/s#{token}"}}"#).as_bytes()
+        ));
+        let kept = storable(&resp(
+            &format!(r#"{{"share_link":{{"token":"{token}"}}}}"#),
+            vec![],
+        ));
+        assert_eq!(kept.status, 409);
+        assert!(!String::from_utf8_lossy(&kept.body).contains("ruum_link_"));
+        // A link listed later carries no token.
+        assert!(!body_holds_secret(br#"{"token":null,"role":"view"}"#));
     }
 
     #[tokio::test]
