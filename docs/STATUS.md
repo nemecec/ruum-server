@@ -1,14 +1,42 @@
 # Status of step 1
 
-This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06 and
-the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, how to run it, the test
-counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06,
+the panel decisions of `docs/decisions/0002-step1-panel-decisions.md` and the quality wave (wave
+C), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
 
 Wave A: `swarm/authz`, `swarm/journal`, `swarm/identity`, `swarm/webui`.
 Wave B: `swarm/nodes`, `swarm/blobs`, `swarm/webdav`, `swarm/mcp`, `swarm/webui2`.
+Wave C (2026-11-06, rebased onto `main` and fast-forwarded, in this order): `q/decisions`,
+`q/pgsuites`, `q/props`, `q/browser`, `q/bench`, `q/uxdesign`.
+
+| Branch | What it adds |
+|---|---|
+| `q/decisions` | Decision record 0002 and its implementation (see "Panel decisions" below). |
+| `q/pgsuites` | The isolation, permission and trashed file suites also run on the Postgres stores (`RUUM_SUITE_BACKEND=postgres`, optional `RUUM_SUITE_AUTHZ=spicedb`, `RUUM_SUITE_RLS=off`); Postgres tenant-filter mutations; the mutation check runs strict. |
+| `q/props` | Property tests (`crates/ruum-core/tests/properties`: authz, changes feed, chunking, diff) and two fixes they found: a member link can no longer form a loop of `view` (`rules::member_link_loop`, `422`), and the changes feed keeps an agent's grant entries inside its scope. |
+| `q/browser` | Playwright tests in `web/e2e` against the real server, Zitadel and Mailpit (`scripts/e2e_browser.sh`), the browser driver for agents (`scripts/ux/drive.mjs`), the CI job `e2e-browser`. |
+| `q/bench` | The first agent benchmark over MCP (`bench/agent/`, 8 step 1 tasks; first run 7 of 8 passed; `docs/BENCHMARK.md`). |
+| `q/uxdesign` | The UX package (`docs/ux/`: personas, journeys, IA, design system, copy, agent experience, gap analysis), provisional. |
+
+Fixes made during the integration:
+
+- `scripts/dev.sh env` printed `RUUM_DAV_BIND=127.0.0.1:` (no port): the heredoc used a
+  variable that was set inside the heredoc. It now prints `127.0.0.1:8492` (from
+  `RUUM_DAV_UPSTREAM`).
+- `scripts/e2e_browser.sh` gives the WebDAV listener its own port (`RUUM_E2E_BROWSER_DAV_PORT`,
+  default 8496). It inherited `RUUM_DAV_BIND` from `dev.sh env`, the same port as the server.
+- The Postgres suite backend (`crates/ruum-testkit/src/backend.rs`) wires `PgFreshness`, as
+  `ruum-server` does since decision 0002-4. The seed (`fixtures::seed`, `seed_bridge`) and the
+  trash step of the trashed file suite run with a request freshness floor;
+  `authz::in_current_request` carries the floor into the tasks that the seed spawns. Without
+  this, worlds that run at the same time on one SpiceDB engine overwrote the process token, and
+  the SpiceDB run failed 11 to 19 trashed checks and 45 matrix checks (setup steps answered
+  `404`).
+- `web/e2e`: two timing races. `files.e2e.ts` matched any `status` element while the folder
+  showed `Loading...`; `auth.setup.e2e.ts` navigated while the sign-out redirect chain still ran.
 
 All 93 operations of `contracts/openapi.yaml` are built. No route answers `501`.
 
@@ -157,29 +185,27 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-06, branch `q/decisions`, after the panel decisions, `DATABASE_URL` and SpiceDB from `dev.sh env`)
+## Checks (2026-11-06, `main` after the wave C integration, `DATABASE_URL` and SpiceDB from `dev.sh env`)
 
-- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: all pass. ruum-core 194 (1 ignored: `tenants/mail.rs`, needs SMTP),
-  ruum-api 37, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-mcp 4 + 15 (server) + 5
-  (tools contract), ruum-server 5 (one needs SpiceDB: two servers on one database),
-  ruum-testkit 7 + 2 (contract) + 1 (isolation) + 3 (permissions), ruum-webdav 5 + 20.
-- `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit`: pass. Tenant isolation suite: 188
-  checks, 188 passed. Permission matrix: 1209 checks, 1209 passed. Trashed file suite: 78
-  checks, 78 passed. 0 pending, 0 failed.
-- Contracts: `redocly lint`: valid. `oasdiff breaking` against `main`: no breaking change
-  (changelog: one optional response property, `dav_url`).
-- `crates/ruum-testkit/scripts/mutation_check.sh` (with `MUTATION_TARGET_DIR=$PWD/target`) for
-  the new and related mutations: all 8 killed (`sharing-email-grant-policy-memory`,
-  `agents-guest-register-policy`, `agents-guest-register-policy-postgres`,
-  `csrf-not-session-bound`, `authz-ignores-tenant-token`, `authz-spicedb-ignores-request-floor`,
-  `sharing-grant-by-id-makes-guest`, `webdav-content-safety`). The full run was not repeated on
-  this branch; before it, `nodes-tenant-filter` (SKIP) and `sharing-tenant-filter` (SURVIVED)
-  were the known exceptions.
-- `scripts/e2e_smoke.sh`: 52 checks passed (no wait after the seed).
-- `crates/ruum-webdav/scripts/smoke.sh` against `dav_fake_server` at the root path: all passed.
-- `web/`: `npm ci`, `npm run gen:api`, `npm run lint`, `npm run build`, `npm test` (12 files,
-  88 tests): pass.
+- `cargo fmt --all --check`, `cargo build --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace`: 331 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
+  ruum-core 195 + 13 (properties), ruum-api 37, ruum-cli 4 + 12 (mock server) + 3 (real
+  server), ruum-mcp 4 + 15 (server) + 5 (tools contract), ruum-server 5, ruum-testkit 7 + 2
+  (contract) + 1 (isolation) + 3 (permissions), ruum-webdav 5 + 20.
+- `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` on every backend: tenant isolation
+  251/251, permission matrix 1209/1209, trashed file suite 78/78, 0 pending, 0 failed, with
+  `RUUM_SUITE_BACKEND=memory`, `postgres` (memory authz) and `postgres` with
+  `RUUM_SUITE_AUTHZ=spicedb`.
+- `MUTATION_STRICT=1 MUTATION_TARGET_DIR=$PWD/target crates/ruum-testkit/scripts/mutation_check.sh`:
+  22 of 22 mutations killed, none survived or skipped.
+- `scripts/e2e_smoke.sh`: `PASSED: 52 checks`.
+- `scripts/e2e_browser.sh`: 10 passed, 6 skipped (the `test.fixme` product gaps of
+  `docs/TESTING.md`), twice in a row.
+- `web/`: `npm ci`, `npm run lint`, `npm run build`, `npx vitest run` (12 files, 88 tests),
+  `npx tsc -p e2e/tsconfig.json`: pass.
+- Not repeated at the integration: `oasdiff`/`redocly` (no contract change after
+  `q/decisions`), `crates/ruum-webdav/scripts/smoke.sh`, `cargo deny check`.
 
 ## Known gaps
 
@@ -192,18 +218,17 @@ For Zitadel sign-in through Vite, start the server with
   be recreated (it reads the Caddyfile at start; `RUUM_DAV_UPSTREAM` is new in compose).
 - **Signed content URLs and the trash.** A content URL made before the file went to the trash
   works until it expires (at most `CONTENT_URL_SECONDS`, 5 minutes).
-- **Mutation check.** `nodes-tenant-filter` does not match the Postgres node queries (SKIP) and
-  `sharing-tenant-filter` survives, because the isolation suite runs in memory only. By
-  default the script builds into `target/mutation`; pass `MUTATION_TARGET_DIR=$PWD/target` to
-  share the cache.
-- **The security suites run in memory only.** `ruum_testkit::fixtures::app_state` uses
-  `AppState::in_memory()`. The Postgres stores are covered by their conformance suites
-  (`#[sqlx::test]`) and by `scripts/e2e_smoke.sh`, not by the isolation and permission suites.
-  Next step: a Postgres backend for `app_state` when `DATABASE_URL` is set.
+- **Mutation check.** By default the script builds into `target/mutation`; pass
+  `MUTATION_TARGET_DIR=$PWD/target` to share the cache.
+- **Product gaps found by the browser tests** (`test.fixme`, see `docs/TESTING.md`): a cold
+  load of a protected page loses `return_to`; no `/invitations/accept` page in the web UI; an
+  email grant to a user who already has an account never binds and sends no mail; and the
+  others listed there. The UX gap analysis (`docs/ux/gap-analysis.md`) has the same P0 items.
 - **SpiceDB freshness inside a request.** A request reads at least as fresh as its tenant's
   newest token at its start and its own writes (decision 0002-4). Work that a handler spawns on
-  another task, the outbox worker and `seed-dev` have no request floor and read at the process
-  token, as before.
+  another task (unless it uses `authz::in_current_request`), the outbox worker and `seed-dev`
+  have no request floor and read at the process token. Concurrent writers outside a request can
+  overwrite the process token with an older one; the suites hit this before the integration fix.
 - **Coalescing.** Saves by the same actor within 10 minutes merge into the head version (design
   5.3), also through the CLI, WebDAV and MCP. Name a version (`setVersionLabel`) to keep it. The
   WebDAV ETag of a file is `"<head version>-<revision>"`, because a merged save keeps the version
@@ -211,7 +236,7 @@ For Zitadel sign-in through Vite, start the server with
 - **Request timeout.** `RUUM_REQUEST_TIMEOUT_SECONDS` (default 120) also covers the body of a
   large WebDAV `PUT` or `putContent` on a slow link. Chunked uploads are not affected.
 - In-memory `TenantStore::usage` reports 0 bytes and 0 nodes (Postgres reports real usage).
-- No browser sign-in through Zitadel was run end to end; the e2e test uses `seed-dev` tokens.
+- Passkeys, Google and Microsoft sign-in are only in the manual checklist of `docs/TESTING.md`.
 - The WebDAV example `dav_fake_server` keeps its name but now runs on `Services::in_memory`.
 - CI (`.github/workflows/`) has not run on GitHub; nothing is pushed.
 - Older gaps of `docs/FOUNDATION.md` still apply (`node.sharing_updated` is not undone, the
