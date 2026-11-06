@@ -242,6 +242,36 @@ pub fn check_new_agent(req: &NewAgent) -> Result<NewAgent> {
     })
 }
 
+/// The longest agent name (`agents.name` checks the same).
+pub const AGENT_NAME_MAX: usize = 100;
+
+/// The name to store for a new or renamed agent (decision 0003-5): `name` itself, or
+/// `name (2)`, `name (3)`, ... when another agent of the same owner in the tenant already has
+/// that name, ignoring case. Agent names come from the client (OAuth dynamic registration), so
+/// two agents of one owner must not look the same in the activity log. The base name is cut so
+/// that the result has at most [`AGENT_NAME_MAX`] characters. `taken` holds the names of the
+/// owner's other agents in the tenant.
+pub fn unique_agent_name<'a>(name: &str, taken: impl IntoIterator<Item = &'a str>) -> String {
+    let taken: std::collections::HashSet<String> =
+        taken.into_iter().map(|t| t.to_lowercase()).collect();
+    if !taken.contains(&name.to_lowercase()) {
+        return name.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let suffix = format!(" ({n})");
+        let base: String = name
+            .chars()
+            .take(AGENT_NAME_MAX - suffix.chars().count())
+            .collect();
+        let candidate = format!("{}{suffix}", base.trim_end());
+        if !taken.contains(&candidate.to_lowercase()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Checks a description: at most 1000 characters; empty means none.
 pub fn check_description(d: Option<String>) -> Result<Option<String>> {
     match d {

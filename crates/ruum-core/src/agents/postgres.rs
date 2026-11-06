@@ -5,7 +5,9 @@ use super::memory::{Relation, check_access, relation};
 use super::oauth::*;
 use super::*;
 use crate::actor::{Actor, PrincipalKind, require_user_actor};
-use crate::identity::postgres::{PgArea, actor_cols, audit, db_code, enqueue, offset, page};
+use crate::identity::postgres::{
+    PgArea, actor_cols, audit, db_code, enqueue, offset, page, unique_to_conflict,
+};
 use crate::identity::{AccessClaims, TokenType, secret, unauthenticated};
 use crate::tenants::rules::caller_user;
 use crate::tenants::{MemberRole, Plan, tenant_limits};
@@ -183,6 +185,14 @@ pub(crate) async fn insert_agent(
     if live as u32 >= limit {
         return Err(agent_limit_reached(limit));
     }
+    // The tenant row is locked above, so two registrations cannot pick the same name.
+    let name = unique_agent_name(
+        &req.name,
+        owner_agent_names(conn, t, owner, None)
+            .await?
+            .iter()
+            .map(String::as_str),
+    );
     let (kind, by, obo) = actor_cols(&ctx.actor);
     let r = sqlx::query(crate::sql!(
         "insert into agents (id, tenant_id, owner_id, name, description, scope_subtree, \
@@ -193,7 +203,7 @@ pub(crate) async fn insert_agent(
     .bind(AgentId::new())
     .bind(t)
     .bind(owner)
-    .bind(&req.name)
+    .bind(&name)
     .bind(&req.description)
     .bind(req.scope.subtree)
     .bind(role_text(req.scope.max_role))
@@ -204,7 +214,8 @@ pub(crate) async fn insert_agent(
     .bind(obo)
     .fetch_one(&mut *conn)
     .await
-    .map_err(subtree_error)?;
+    .map_err(subtree_error)
+    .map_err(|e| unique_to_conflict(e, "another agent of this user has this name"))?;
     let agent = agent_from(&r)?;
     let outbox = enqueue(
         conn,
@@ -223,6 +234,24 @@ pub(crate) async fn insert_agent(
     )
     .await?;
     Ok((agent, outbox))
+}
+
+/// The names of the owner's agents in the tenant, except `except` (for a rename).
+async fn owner_agent_names(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    owner: UserId,
+    except: Option<AgentId>,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "select name from agents where tenant_id = $1 and owner_id = $2 \
+         and ($3::uuid is null or id <> $3)",
+    )
+    .bind(tenant)
+    .bind(owner)
+    .bind(except)
+    .fetch_all(&mut *conn)
+    .await?)
 }
 
 /// Issues an access token for an agent.
@@ -321,7 +350,13 @@ impl AgentStore for PgAgentStore {
         let role = caller_role(&mut tx, ctx).await?;
         check_access(relation(ctx, &agent, role), false)?;
         if let Some(n) = name {
-            agent.name = n;
+            agent.name = unique_agent_name(
+                &n,
+                owner_agent_names(&mut tx, ctx.tenant, agent.owner_id, Some(id))
+                    .await?
+                    .iter()
+                    .map(String::as_str),
+            );
         }
         if let Some(d) = description {
             agent.description = d;
@@ -347,7 +382,8 @@ impl AgentStore for PgAgentStore {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(subtree_error)?;
+        .map_err(subtree_error)
+        .map_err(|e| unique_to_conflict(e, "another agent of this user has this name"))?;
         let agent = agent_from(&r)?;
         audit(
             &mut tx,

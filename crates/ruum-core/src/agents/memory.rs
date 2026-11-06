@@ -135,11 +135,18 @@ impl MemoryAgentStore {
             if live >= limit {
                 return Err(agent_limit_reached(limit));
             }
+            let name = unique_agent_name(
+                &req.name,
+                st.agents
+                    .values()
+                    .filter(|a| a.tenant_id == ctx.tenant && a.owner_id == owner)
+                    .map(|a| a.name.as_str()),
+            );
             let agent = Agent {
                 id: AgentId::new(),
                 tenant_id: ctx.tenant,
                 owner_id: owner,
-                name: req.name,
+                name,
                 description: req.description,
                 scope: req.scope,
                 disabled_at: None,
@@ -283,6 +290,26 @@ impl AgentStore for MemoryAgentStore {
         }
         let agent = {
             let mut st = self.area.lock();
+            let name = match name {
+                Some(n) => {
+                    let owner = st
+                        .agents
+                        .get(&id)
+                        .filter(|a| a.tenant_id == ctx.tenant)
+                        .ok_or_else(|| Error::not_found("agent"))?
+                        .owner_id;
+                    Some(unique_agent_name(
+                        &n,
+                        st.agents
+                            .values()
+                            .filter(|a| {
+                                a.tenant_id == ctx.tenant && a.owner_id == owner && a.id != id
+                            })
+                            .map(|a| a.name.as_str()),
+                    ))
+                }
+                None => None,
+            };
             let a = st
                 .agents
                 .get_mut(&id)

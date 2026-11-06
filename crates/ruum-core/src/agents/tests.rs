@@ -864,7 +864,81 @@ async fn an_expired_scope_ends_the_agent(a: Area) {
     }
 }
 
+/// Agent names are unique per owner and tenant, ignoring case (decision 0003-5): a clash gets
+/// " (2)", " (3)", ...; another owner may use the same name; a rename follows the same rule;
+/// a long name is cut so that the suffix fits.
+async fn agent_names_are_unique_per_owner(a: Area) {
+    let t = team(&a).await;
+    let (oc, mc) = (ctx(t.tenant.id, t.owner.id), ctx(t.tenant.id, t.member.id));
+    let first = a
+        .agents
+        .register(&oc, new_agent("Kadri Kask", None))
+        .await
+        .unwrap();
+    assert_eq!(first.name, "Kadri Kask");
+    let second = a
+        .agents
+        .register(&oc, new_agent("kadri kask", None))
+        .await
+        .unwrap();
+    assert_eq!(second.name, "kadri kask (2)");
+    let third = a
+        .agents
+        .register(&oc, new_agent("Kadri Kask", None))
+        .await
+        .unwrap();
+    assert_eq!(third.name, "Kadri Kask (3)");
+    // Another owner's agent may have the same name; the owner's name tells them apart.
+    let other = a
+        .agents
+        .register(&mc, new_agent("Kadri Kask", None))
+        .await
+        .unwrap();
+    assert_eq!(other.name, "Kadri Kask");
+    // A rename to a taken name is numbered too; a rename to its own name keeps it.
+    let renamed = a
+        .agents
+        .update(
+            &oc,
+            third.id,
+            AgentUpdate {
+                name: Some("KADRI KASK".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "KADRI KASK (3)");
+    let same = a
+        .agents
+        .update(
+            &oc,
+            first.id,
+            AgentUpdate {
+                name: Some("Kadri Kask".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.name, "Kadri Kask");
+    // The longest name still fits with its suffix.
+    let long = "x".repeat(AGENT_NAME_MAX);
+    a.agents
+        .register(&oc, new_agent(&long, None))
+        .await
+        .unwrap();
+    let cut = a
+        .agents
+        .register(&oc, new_agent(&long, None))
+        .await
+        .unwrap();
+    assert_eq!(cut.name.chars().count(), AGENT_NAME_MAX);
+    assert!(cut.name.ends_with(" (2)"));
+}
+
 crate::conformance!(
+    agent_names_are_unique_per_owner,
     agents_belong_to_their_owner,
     a_scope_subtree_stays_in_the_tenant,
     the_agent_limit_holds,
@@ -917,4 +991,79 @@ fn redirect_uris_follow_the_contract() {
         "https://ruum.localhost/mcp"
     );
     assert!(resource_audience(Some("https://evil.example"), "https://ruum.localhost").is_err());
+}
+
+#[test]
+fn unique_agent_names_skip_taken_suffixes() {
+    assert_eq!(unique_agent_name("Bot", []), "Bot");
+    assert_eq!(unique_agent_name("Bot", ["bot"]), "Bot (2)");
+    assert_eq!(unique_agent_name("Bot", ["BOT", "bot (2)"]), "Bot (3)");
+    let long = "y".repeat(AGENT_NAME_MAX);
+    let n = unique_agent_name(&long, [long.as_str()]);
+    assert_eq!(n.chars().count(), AGENT_NAME_MAX);
+    assert!(n.ends_with(" (2)"));
+}
+
+/// Migration 0003 renames the duplicate agent names that exist before the unique index: the
+/// oldest keeps its name, the others are numbered by age, skipping names that are taken.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_migration_numbers_duplicate_agent_names(pool: sqlx::PgPool) {
+    let a = crate::identity::tests::postgres(pool.clone());
+    let t = team(&a).await;
+    let oc = ctx(t.tenant.id, t.owner.id);
+    let mut ids = Vec::new();
+    for n in ["a", "b", "c", "d"] {
+        ids.push(a.agents.register(&oc, new_agent(n, None)).await.unwrap().id);
+    }
+    let other = a
+        .agents
+        .register(&ctx(t.tenant.id, t.member.id), new_agent("m", None))
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("select set_config('ruum.system', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("drop index agents_owner_name_key")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Three agents named "Bot" (different case), one already named "Bot (2)", and the
+    // member's agent also named "Bot".
+    for (id, name) in [
+        (ids[0], "Bot"),
+        (ids[1], "bot"),
+        (ids[2], "Bot (2)"),
+        (ids[3], "BOT"),
+    ] {
+        sqlx::query("update agents set name = $2 where id = $1")
+            .bind(id)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    sqlx::query("update agents set name = 'Bot' where id = $1")
+        .bind(other.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/0003_agent_names_unique.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let mut names = Vec::new();
+    for id in ids.iter().chain([&other.id]) {
+        let n: String = sqlx::query_scalar("select name from agents where id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        names.push(n);
+    }
+    assert_eq!(names, ["Bot", "bot (3)", "Bot (2)", "BOT (4)", "Bot"]);
+    tx.commit().await.unwrap();
 }
