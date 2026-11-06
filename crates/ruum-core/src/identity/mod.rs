@@ -26,6 +26,7 @@ pub mod oidc;
 pub mod postgres;
 pub mod secret;
 pub mod setup;
+pub mod sweep;
 pub mod tokens;
 
 #[cfg(test)]
