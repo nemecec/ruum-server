@@ -82,7 +82,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   await move.getByRole('button', { name: 'Archive/' }).click()
   await expect(move.getByText('In Archive')).toBeVisible()
   await move.getByRole('button', { name: 'Move here' }).click()
-  await expect(page.getByRole('status')).toHaveText('renamed.bin moved.')
+  await expect(page.getByRole('status').filter({ hasText: 'renamed.bin moved.' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'renamed.bin', exact: true })).toHaveCount(0)
   await page.getByRole('link', { name: 'Archive', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Archive', level: 1 })).toBeVisible()
@@ -92,7 +92,8 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   await openDetails(page, 'renamed.bin')
   await page.getByRole('button', { name: 'Move to trash' }).click()
   await page.getByRole('dialog', { name: 'Move renamed.bin to the trash?' }).getByRole('button', { name: 'Move to trash' }).click()
-  await expect(page.getByRole('status')).toHaveText('renamed.bin is in the trash.')
+  // The folder reloads after the trash, so a 'Loading...' status can show beside the notice.
+  await expect(page.getByRole('status').filter({ hasText: 'renamed.bin is in the trash.' })).toBeVisible()
   await expect(page.getByText('This folder is empty.')).toBeVisible()
   const archiveUrl = page.url()
 
@@ -100,7 +101,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   await expect(page.getByRole('heading', { name: 'Trash', level: 1 })).toBeVisible()
   await expect(page.getByRole('rowheader', { name: 'renamed.bin' })).toBeVisible()
   await page.getByRole('button', { name: 'Restore renamed.bin' }).first().click()
-  await expect(page.getByRole('status')).toHaveText(/^renamed\.bin restored/)
+  await expect(page.getByRole('status').filter({ hasText: /^renamed\.bin restored/ })).toBeVisible()
 
   await page.goto(archiveUrl)
   await expect(page.getByRole('button', { name: 'renamed.bin', exact: true })).toBeVisible()

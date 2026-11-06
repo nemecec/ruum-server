@@ -41,12 +41,15 @@ test('sign-in with return_to comes back to that page', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Account', level: 1 })).toBeVisible()
 })
 
-test('sign out ends the session', async ({ page }) => {
+test('sign out ends the session', async ({ page, baseURL }) => {
   const ann = readRun().users.ann
+  const web = new URL(baseURL ?? 'http://localhost:5182').origin
   await signIn(page, ann)
   await page.getByRole('button', { name: 'Sign out' }).click()
-  // The server ends the session and sends the browser through Zitadel's end-session endpoint.
-  await page.waitForURL((u) => !u.pathname.startsWith('/t/'), { timeout: 15_000 })
+  // The server ends the session and sends the browser through Zitadel's end-session endpoint and
+  // back to the web UI. Wait for the end of that chain, so the next navigation does not race it.
+  await page.waitForURL((u) => u.origin === web && !u.pathname.startsWith('/t/'), { timeout: 15_000 })
+  await page.waitForLoadState('load')
   await page.goto('/')
   await expect(page).toHaveURL(/\/signin/)
   expect((await api(page, 'GET', '/v1/me')).status).toBe(401)

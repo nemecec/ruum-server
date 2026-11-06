@@ -346,6 +346,9 @@ impl Pg {
             Some(engine) => engine.clone(),
             None => Arc::new(MemoryAuthz::default()),
         };
+        // Every request reads at least as fresh as its tenant's newest applied outbox token
+        // (decision 0002-4), as in ruum-server.
+        s.freshness = Arc::new(ruum_core::authz::outbox::PgFreshness::new(pool.clone()));
         s.journal = Arc::new(PgJournal::new(pool.clone()));
         let nodes: Arc<dyn NodeStore> = Arc::new(PgNodeStore::new(pool.clone(), s.authz.clone()));
         s.nodes = nodes.clone();

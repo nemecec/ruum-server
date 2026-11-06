@@ -192,6 +192,21 @@ pub async fn with_request_freshness<F: std::future::Future>(f: F) -> F::Output {
     REQUEST_FLOOR.scope(Default::default(), f).await
 }
 
+/// Runs `f` with the freshness floor of the current request, for a task that the request
+/// spawns: the task reads what the request wrote, and its writes raise the same floor. Outside a
+/// request, `f` runs without a floor.
+pub fn in_current_request<F: std::future::Future>(
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let floor = REQUEST_FLOOR.try_with(|floor| floor.clone()).ok();
+    async move {
+        match floor {
+            Some(floor) => REQUEST_FLOOR.scope(floor, f).await,
+            None => f.await,
+        }
+    }
+}
+
 /// Whether the current task runs a request ([`with_request_freshness`]).
 pub fn in_request() -> bool {
     REQUEST_FLOOR.try_with(|_| ()).is_ok()

@@ -3,7 +3,8 @@
 # the web UI.
 #
 # It builds ruum-server, seeds the stack (`ruum-server seed-dev`), starts the server on
-# RUUM_E2E_BROWSER_PORT (default 8492) and the web UI (Vite) on RUUM_E2E_WEB_PORT (default 5182),
+# RUUM_E2E_BROWSER_PORT (default 8492), its WebDAV host on RUUM_E2E_BROWSER_DAV_PORT (default
+# 8496), and the web UI (Vite) on RUUM_E2E_WEB_PORT (default 5182),
 # and runs the specs in web/e2e. The specs make their own Zitadel users and sign in through the
 # real OIDC flow. The script stops what it started, also when a test fails.
 #
@@ -26,6 +27,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 PORT="${RUUM_E2E_BROWSER_PORT:-8492}"
+DAV_PORT="${RUUM_E2E_BROWSER_DAV_PORT:-8496}"
 WEB_PORT="${RUUM_E2E_WEB_PORT:-5182}"
 WEB_MODE="${RUUM_E2E_WEB:-dev}"
 SERVER_URL="http://127.0.0.1:$PORT"
@@ -78,7 +80,7 @@ eval "$("$DEV_ROOT/scripts/dev.sh" env)"
 [[ -n "${ZITADEL_WEB_CLIENT_ID:-}" ]] || die "Zitadel apps are missing; run scripts/dev.sh up"
 curl -fsS -o /dev/null "$ZITADEL_ISSUER/debug/healthz" || die "Zitadel does not answer at $ZITADEL_ISSUER; run scripts/dev.sh up"
 curl -fsS -o /dev/null "http://127.0.0.1:8025/readyz" || die "Mailpit does not answer on 8025"
-for p in "$PORT" "$WEB_PORT"; do
+for p in "$PORT" "$DAV_PORT" "$WEB_PORT"; do
   if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$p/"; then die "port $p is in use"; fi
 done
 gb="$(free_gb "$CARGO_TARGET_DIR" 2>/dev/null || free_gb "$ROOT")"
@@ -89,6 +91,9 @@ echo "   stack: $DEV_ROOT/deploy/dev, server $SERVER_URL, web $WEB_URL ($WEB_MOD
 export RUUM_TOKEN_SIGNING_KEY="${RUUM_TOKEN_SIGNING_KEY:-$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')}"
 export RUUM_CONTENT_SIGNING_KEY="${RUUM_CONTENT_SIGNING_KEY:-$(openssl rand -base64 32)}"
 export RUUM_BIND="127.0.0.1:$PORT"
+# The WebDAV host listens on its own port (decision 0002-3); the specs do not use it.
+export RUUM_DAV_BIND="127.0.0.1:$DAV_PORT"
+export RUUM_DAV_URL="http://127.0.0.1:$DAV_PORT/"
 # The browser sees one origin: Vite serves the UI and forwards /v1 to the server.
 export RUUM_PUBLIC_URL="$WEB_URL"
 export RUUM_OIDC_REDIRECT_URI="$WEB_URL/auth/callback"

@@ -822,7 +822,15 @@ async fn trashed_check(backend: &fixtures::Backend, op: &'static str, who: Who) 
         scope: None,
         idempotency_key: None,
     };
-    if let Err(e) = state.services.nodes.trash(&owner, t.plan, None).await {
+    // The owner trashes the plan as one request does: with the tenant's freshness floor
+    // (decision 0002-4), so a shared SpiceDB engine reads the seed of this world.
+    let services = &state.services;
+    let trashed = ruum_core::authz::with_request_freshness(async {
+        ruum_core::authz::load_request_floor(&*services.freshness, t.id).await?;
+        services.nodes.trash(&owner, t.plan, None).await
+    })
+    .await;
+    if let Err(e) = trashed {
         return Outcome::Failed(format!("trash: {e:?}"));
     }
     let app = client::app(state);

@@ -489,16 +489,21 @@ pub struct World {
 /// suites report the operations of that area and not a broken seed. `seeded` is true when the
 /// principals have real credentials.
 pub async fn seed(state: &AppState) -> World {
-    let mut a = TenantFixture::placeholder("alpha");
-    let mut b = TenantFixture::placeholder("bravo");
-    let ok_a = seed::tenant(state, &mut a).await;
-    let ok_b = seed::tenant(state, &mut b).await;
-    World {
-        a,
-        b,
-        seeded: ok_a && ok_b,
-        bridge: None,
-    }
+    // One freshness floor for the whole seed, as one request: each step reads the writes of the
+    // steps before it, also on a SpiceDB engine that other worlds share (decision 0002-4).
+    ruum_core::authz::with_request_freshness(async {
+        let mut a = TenantFixture::placeholder("alpha");
+        let mut b = TenantFixture::placeholder("bravo");
+        let ok_a = seed::tenant(state, &mut a).await;
+        let ok_b = seed::tenant(state, &mut b).await;
+        World {
+            a,
+            b,
+            seeded: ok_a && ok_b,
+            bridge: None,
+        }
+    })
+    .await
 }
 
 /// Adds the bridge user to a seeded world ([`World::bridge`]): a user who is a member of tenant
@@ -510,7 +515,9 @@ pub async fn seed(state: &AppState) -> World {
 /// of every query) stand between it and A's data. The isolation suite uses it for that probe.
 /// Returns false when a step fails.
 pub async fn seed_bridge(state: &AppState, w: &mut World) -> bool {
-    match seed::bridge(state, w).await {
+    // One freshness floor, as in [`seed`].
+    let bridge = ruum_core::authz::with_request_freshness(seed::bridge(state, w)).await;
+    match bridge {
         Some(p) => {
             w.bridge = Some(p);
             true
@@ -546,7 +553,7 @@ mod seed {
         F: Future<Output = ruum_core::Result<T>> + Send + 'static,
         T: Send + 'static,
     {
-        match tokio::spawn(fut).await {
+        match tokio::spawn(ruum_core::authz::in_current_request(fut)).await {
             Ok(Ok(v)) => Some(v),
             Ok(Err(e)) => {
                 eprintln!("fixtures::seed: {label}: {e}");

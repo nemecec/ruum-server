@@ -171,6 +171,7 @@ cmd_env() {
   local apps="$STATE/zitadel/apps.env"
   # shellcheck disable=SC1090
   [[ -f "$apps" ]] && source "$apps"
+  local dav_upstream=${RUUM_DAV_UPSTREAM:-host.docker.internal:8492}
   cat <<EOF
 export DATABASE_URL=postgres://ruum:$RUUM_DB_PASSWORD@127.0.0.1:5434/ruum
 export TEST_DATABASE_URL=postgres://ruum:$RUUM_DB_PASSWORD@127.0.0.1:5434/ruum_test
@@ -195,8 +196,7 @@ export SMTP_URL=smtp://127.0.0.1:1025
 export RUUM_PUBLIC_URL=https://ruum.localhost
 export RUUM_APPS_DOMAIN=ruumapps.localhost
 export RUUM_BIND=127.0.0.1:${RUUM_UPSTREAM##*:}
-DAV_UPSTREAM=${RUUM_DAV_UPSTREAM:-host.docker.internal:8492}
-export RUUM_DAV_BIND=127.0.0.1:${DAV_UPSTREAM##*:}
+export RUUM_DAV_BIND=127.0.0.1:${dav_upstream##*:}
 export RUUM_DAV_URL=https://dav.ruum.localhost/
 export RUUM_CONTENT_URL=https://content.ruumapps.localhost
 export RUUM_OIDC_ISSUER=$ZITADEL_URL
