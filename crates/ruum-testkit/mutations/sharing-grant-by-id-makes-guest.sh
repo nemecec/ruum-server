@@ -6,4 +6,4 @@
 DESCRIPTION="addGrant by user ID accepts a user outside the tenant"
 FILE="crates/ruum-core/src/sharing/memory.rs"
 PERL='s/if role\.is_none\(\) \{\s*return Err\(rules::no_such_user\(\)\);\s*\}//'
-TESTS="-p ruum-core --lib sharing::conformance::memory_sharing_conforms -- --include-ignored --exact"
+TESTS="-p ruum-core --lib sharing::conformance::memory_sharing_conforms -- --exact"

@@ -13,9 +13,6 @@
 //! ```
 //!
 //! plus tenant B with its own root and owner, and `outsider`, a user of no tenant.
-//!
-//! The suites need the journal append of the journal area; until it is merged they are ignored
-//! (`cargo test -p ruum-core -- --include-ignored` runs them).
 
 use super::*;
 use crate::actor::{PrincipalKind, PrincipalRef};
@@ -760,7 +757,6 @@ impl Backend for Memory {
 }
 
 #[tokio::test]
-#[ignore = "needs MemoryJournal::append (journal area)"]
 async fn memory_sharing_conforms() {
     let w = World::new();
     w.seed().await;
@@ -890,7 +886,6 @@ async fn seed_pg(pool: &PgPool, w: &World) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "needs journal::postgres::append (journal area)"]
 async fn postgres_sharing_conforms(pool: PgPool) {
     let w = World::new();
     w.seed().await;
