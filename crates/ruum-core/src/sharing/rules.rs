@@ -52,6 +52,17 @@ pub fn verify_password(phc: &str, password: &str) -> bool {
         .is_ok()
 }
 
+/// The answer to a user grantee who is not a member or guest of the tenant, the same as for an
+/// unknown user ID.
+pub fn no_such_user() -> Error {
+    Error::Api(
+        ApiError::new(ErrorCode::NotFound, "no such user in this tenant").with_hint(
+            "grant to an email address, or invite the person to the tenant; a grant by user ID \
+             works only for members and guests",
+        ),
+    )
+}
+
 pub fn validation(message: impl Into<String>) -> Error {
     Error::api(ErrorCode::ValidationFailed, message)
 }

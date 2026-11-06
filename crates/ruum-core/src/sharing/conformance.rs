@@ -492,11 +492,24 @@ async fn run(w: &World, b: &dyn Backend) {
     );
 
     // ---- guests and the policy
+    // A grant by user ID reaches only people in the tenant. A user of another tenant, or of no
+    // tenant, gets the answer of an unknown ID, and no guest membership is made (no oracle from
+    // user ID to email through listMembers, no tenant forced on the user).
+    for stranger in [w.outsider, w.owner_b, UserId::new()] {
+        assert_eq!(
+            code(
+                s.add_grant(&o, w.plan, user_grantee(stranger), Role::View)
+                    .await
+            ),
+            "404"
+        );
+    }
+    // A guest of the tenant can get more grants.
     let added = s
-        .add_grant(&o, w.plan, user_grantee(w.outsider), Role::View)
+        .add_grant(&o, w.plan, user_grantee(w.guest_edit), Role::View)
         .await
         .unwrap();
-    assert_eq!(added.value.grantee, user_grantee(w.outsider));
+    assert_eq!(added.value.grantee, user_grantee(w.guest_edit));
     b.set_policy(
         w,
         TenantPolicy {
@@ -508,6 +521,14 @@ async fn run(w: &World, b: &dyn Backend) {
     assert_eq!(
         code(
             s.add_grant(&o, w.private, user_grantee(w.owner_b), Role::View)
+                .await
+        ),
+        "404"
+    );
+    // While guests are off, an existing guest gets no new grant.
+    assert_eq!(
+        code(
+            s.add_grant(&o, w.private, user_grantee(w.guest_view), Role::View)
                 .await
         ),
         "403"
@@ -881,7 +902,7 @@ async fn postgres_sharing_conforms(pool: PgPool) {
     run(&w, &b).await;
     // Every outbox row was applied after its commit.
     assert_eq!(authz::outbox::pending_count(&pool).await.unwrap(), 0);
-    // The journal has one entry per write, and the guest membership was made.
+    // The journal has one entry per write, and no guest membership was made for a grant by ID.
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("set local ruum.system = 'on'")
         .execute(&mut *tx)
@@ -894,7 +915,7 @@ async fn postgres_sharing_conforms(pool: PgPool) {
             .fetch_optional(&mut *tx)
             .await
             .unwrap();
-    assert_eq!(role, Some(MemberRole::Guest));
+    assert_eq!(role, None);
     let types: Vec<String> =
         sqlx::query_scalar("select type from journal where tenant_id = $1 order by seq")
             .bind(w.a.0)

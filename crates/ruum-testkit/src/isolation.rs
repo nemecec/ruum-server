@@ -578,7 +578,40 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
         }
 
         // ------------------------------------------------------------ sharing
-        "addGrant" => addressed_case(NotFound, Some(("listGrants", o))),
+        "addGrant" => {
+            let mut p = addressed(op, w, NotFound, Some(("listGrants", o)));
+            // A grant by user ID reaches only members and guests of the tenant. A grant on B's
+            // own folder to a user of A is not found (as an unknown ID), makes no guest, and B's
+            // member list must not show that user's email afterwards (no oracle from user ID to
+            // email, no tenant forced on A's user).
+            // A's owner's tenant list must not gain tenant B.
+            p.push(
+                Probe::new(
+                    "B's owner grants A's owner by user ID on B's folder",
+                    o,
+                    RequestSpec::post(format!("/v1/nodes/{}/grants", b.projects))
+                        .tenant(b.id)
+                        .json(json!({
+                            "grantee": { "type": "user", "id": a.user_id(o) },
+                            "role": "view",
+                            "notify": false,
+                        })),
+                    NotFound,
+                )
+                .unchanged(o, std_req("listTenants", a)),
+            );
+            p.push(Probe::new(
+                "then B's member list holds no user of A",
+                o,
+                std_req("listMembers", b),
+                NoLeak,
+            ));
+            plain(
+                "addressed resource of tenant A; a grant by ID to a user of A shows nothing of \
+                 that user",
+                p,
+            )
+        }
         "updateGrant" | "removeGrant" => {
             let mut p = addressed(op, w, NotFound, Some(("listGrants", o)));
             let std = std_req(op, a);

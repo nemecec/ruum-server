@@ -238,8 +238,12 @@ impl SharingStore for MemorySharingStore {
         let policy = self.tenants.find(ctx.tenant).await?.policy;
         match &grantee {
             Grantee::User { id } => {
-                if !is_inside(self.tenants.role_of(ctx.tenant, *id).await?) && !policy.allow_guests
-                {
+                // Only people already in the tenant (see the Postgres store).
+                let role = self.tenants.role_of(ctx.tenant, *id).await?;
+                if role.is_none() {
+                    return Err(rules::no_such_user());
+                }
+                if !is_inside(role) && !policy.allow_guests {
                     return Err(rules::guests_refused());
                 }
             }

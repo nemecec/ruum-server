@@ -472,34 +472,18 @@ impl SharingStore for PgSharingStore {
         let mut updates = Vec::new();
         match &grantee {
             Grantee::User { id } => {
+                // A grant by user ID only reaches people already in the tenant (members and
+                // guests). It never makes a guest: that would show a stranger's email to the
+                // tenant (listMembers) and put the tenant in their list unasked. People from
+                // outside come in through an email grant or an invitation, which bind by token
+                // or verified email. An unknown ID and a user of another tenant get the same
+                // answer, so the call tells nothing about other tenants' users.
                 let role_in_tenant = member_role(&mut tx, ctx.tenant, *id).await?;
+                if role_in_tenant.is_none() {
+                    return Err(rules::no_such_user());
+                }
                 if !is_inside(role_in_tenant) && !policy.allow_guests {
                     return Err(rules::guests_refused());
-                }
-                if role_in_tenant.is_none() {
-                    // A grant to a person from outside makes them a guest of this tenant.
-                    let r = sqlx::query(
-                        "insert into memberships (tenant_id, user_id, role, created_kind, \
-                         created_by, created_obo) values ($1, $2, 'guest', $3, $4, $5) \
-                         on conflict do nothing",
-                    )
-                    .bind(ctx.tenant.0)
-                    .bind(id.0)
-                    .bind(ctx.actor.actor.kind)
-                    .bind(ctx.actor.actor.id.0)
-                    .bind(ctx.actor.on_behalf_of.map(|u| u.0))
-                    .execute(&mut *tx)
-                    .await;
-                    match r {
-                        Ok(_) => {}
-                        Err(e) if is_fk_violation(&e) => {
-                            return Err(rules::validation("no such user"));
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    updates.push(RelationshipUpdate::Touch(tuples::tenant_role(
-                        ctx.tenant, "guest", *id,
-                    )));
                 }
             }
             Grantee::Email { email } => {
@@ -558,7 +542,7 @@ impl SharingStore for PgSharingStore {
                     "this grantee already has a grant on the node",
                 ));
             }
-            Err(e) if is_fk_violation(&e) => return Err(rules::validation("no such user")),
+            Err(e) if is_fk_violation(&e) => return Err(rules::no_such_user()),
             Err(e) => return Err(e.into()),
         }
         if let Some(u) = user {
