@@ -11,10 +11,7 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use ruum_core::Services;
 use ruum_core::actor::Context;
-use ruum_core::blobs::{
-    ByteRange, ChunkRef, ChunkingParams, DEFAULT_CHUNKING, Hash, NewUpload, SMALL_CHUNKING,
-    UploadTarget,
-};
+use ruum_core::blobs::{ByteRange, ChunkRef, ChunkingParams, Hash, NewUpload, UploadTarget};
 use ruum_core::nodes::{Node, OnConflict};
 use ruum_core::tenants::Plan;
 use ruum_core::tenants::limits::{plan_limits, tenant_limits};
@@ -25,15 +22,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 
-// The chunking rule of the blobs area (`ruum_core::blobs::chunking_for` on swarm/blobs), kept
-// the same here so a file gets the same chunks through WebDAV and through REST or the CLI.
-// TODO(integration): when swarm/blobs is merged, call `ruum_core::blobs::chunking_for` and
-// delete `chunking`, `is_text` and these two constants.
-
-/// Files up to this size use the small chunks (section 5.3, part 1).
-const SMALL_FILE_BYTES: u64 = 4 * 1024 * 1024;
-/// Text files up to this size also use the small chunks.
-const SMALL_TEXT_BYTES: u64 = 64 * 1024 * 1024;
+// The chunks follow `ruum_core::blobs::chunking_for`, so a file gets the same chunks through
+// WebDAV and through REST or the CLI.
 
 // ------------------------------------------------------------------------------------- limits
 
@@ -367,7 +357,7 @@ impl Writer {
             return Err(FsError::GeneralFailure);
         }
         let content_type = content_type(self.name());
-        let params = chunking(self.written, Some(&content_type));
+        let params = ruum_core::blobs::chunking_for(self.written, Some(&content_type));
         let (chunks, file) = match self.spool.take() {
             None => (Vec::new(), None),
             Some(mut f) => {
@@ -565,46 +555,6 @@ fn cut(mut file: std::fs::File, p: &ChunkingParams) -> FsResult<(Vec<Cut>, Optio
     ))
 }
 
-/// The chunking parameters for a body of this size and type (section 5.3, part 1): the small
-/// chunks for small files and for text files up to [`SMALL_TEXT_BYTES`], the default chunks for
-/// the rest. The same rule as `chunking_for` of the blobs area.
-fn chunking(size: u64, content_type: Option<&str>) -> ChunkingParams {
-    if size <= SMALL_FILE_BYTES || (size <= SMALL_TEXT_BYTES && is_text(content_type)) {
-        SMALL_CHUNKING
-    } else {
-        DEFAULT_CHUNKING
-    }
-}
-
-/// Whether the MIME type is text-like (text, source, JSON, XML, CSV, YAML, SVG); as `is_text`
-/// of the blobs area.
-fn is_text(content_type: Option<&str>) -> bool {
-    let Some(ct) = content_type else {
-        return false;
-    };
-    let ct = ct
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    ct.starts_with("text/")
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
-        || matches!(
-            ct.as_str(),
-            "application/json"
-                | "application/xml"
-                | "application/javascript"
-                | "application/x-yaml"
-                | "application/yaml"
-                | "application/toml"
-                | "application/x-sh"
-                | "application/sql"
-                | "application/csv"
-        )
-}
-
 /// Writes the head content of the file `from` as a new head version of the file `to`, through
 /// the upload flow. Chunks the tenant already has are not stored again, so for the usual case
 /// (the same chunking) no chunk is written. Returns `to` after the write.
@@ -647,6 +597,7 @@ pub(crate) fn content_type(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruum_core::blobs::{DEFAULT_CHUNKING, SMALL_CHUNKING};
     use std::io::Write;
 
     #[test]
@@ -671,23 +622,32 @@ mod tests {
 
     #[test]
     fn picks_chunks_like_the_blobs_area() {
-        assert_eq!(chunking(10, Some("image/png")).id, SMALL_CHUNKING.id);
-        assert_eq!(chunking(4 << 20, None).id, SMALL_CHUNKING.id);
-        assert_eq!(chunking(10 << 20, Some("text/plain")).id, SMALL_CHUNKING.id);
         assert_eq!(
-            chunking(10 << 20, Some("application/json; charset=utf-8")).id,
+            ruum_core::blobs::chunking_for(10, Some("image/png")).id,
             SMALL_CHUNKING.id
         );
         assert_eq!(
-            chunking(100 << 20, Some("text/plain")).id,
+            ruum_core::blobs::chunking_for(4 << 20, None).id,
+            SMALL_CHUNKING.id
+        );
+        assert_eq!(
+            ruum_core::blobs::chunking_for(10 << 20, Some("text/plain")).id,
+            SMALL_CHUNKING.id
+        );
+        assert_eq!(
+            ruum_core::blobs::chunking_for(10 << 20, Some("application/json; charset=utf-8")).id,
+            SMALL_CHUNKING.id
+        );
+        assert_eq!(
+            ruum_core::blobs::chunking_for(100 << 20, Some("text/plain")).id,
             DEFAULT_CHUNKING.id
         );
         assert_eq!(
-            chunking(100 << 20, Some("video/mp4")).id,
+            ruum_core::blobs::chunking_for(100 << 20, Some("video/mp4")).id,
             DEFAULT_CHUNKING.id
         );
         assert_eq!(
-            chunking(10 << 20, Some("application/zip")).id,
+            ruum_core::blobs::chunking_for(10 << 20, Some("application/zip")).id,
             DEFAULT_CHUNKING.id
         );
         assert_eq!(content_type("a.txt"), "text/plain");

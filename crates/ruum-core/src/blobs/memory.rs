@@ -390,6 +390,21 @@ impl MemoryContentStore {
         Ok(Some(w.value.1))
     }
 
+    /// The versions of a node, oldest first, without a permission check. For tests and
+    /// inspection only.
+    pub fn versions_of(&self, node: NodeId) -> Vec<Version> {
+        let st = self.lock();
+        st.by_node
+            .get(&node)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| st.versions.get(id))
+                    .map(|s| s.version.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Forgets the versions of a purged node (the node store calls it when it purges a file).
     pub fn forget_node(&self, node: NodeId) {
         let mut st = self.lock();

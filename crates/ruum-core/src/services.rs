@@ -52,9 +52,24 @@ pub struct Services {
     pub idempotency: Arc<dyn IdempotencyStore>,
 }
 
+/// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
+/// that look inside them.
+#[derive(Clone)]
+pub struct MemoryHandles {
+    pub authz: Arc<MemoryAuthz>,
+    pub journal: Arc<MemoryJournal>,
+    pub nodes: Arc<MemoryNodeStore>,
+    pub content: Arc<MemoryContentStore>,
+}
+
 impl Services {
     /// All in-memory implementations. For unit tests and for running without Docker.
     pub fn in_memory() -> Self {
+        Self::in_memory_with_handles().0
+    }
+
+    /// [`Services::in_memory`] and the concrete stores behind it.
+    pub fn in_memory_with_handles() -> (Self, MemoryHandles) {
         // The modules that others read and write are built once, as concrete types (other
         // stores take them so), and shared.
         let tokens: Arc<dyn TokenIssuer> = Arc::new(MemoryTokenIssuer::default());
@@ -114,7 +129,13 @@ impl Services {
             content.clone(),
             content.clone(),
         ));
-        Self {
+        let handles = MemoryHandles {
+            authz: authz.clone(),
+            journal: journal.clone(),
+            nodes: nodes.clone(),
+            content: content.clone(),
+        };
+        let services = Self {
             tenants,
             identity: Arc::new(MemoryIdentityStore::new(area.clone())),
             oidc: Arc::new(MemoryOidcClient::default()),
@@ -133,6 +154,7 @@ impl Services {
             search,
             audit,
             idempotency: Arc::new(MemoryIdempotencyStore::default()),
-        }
+        };
+        (services, handles)
     }
 }

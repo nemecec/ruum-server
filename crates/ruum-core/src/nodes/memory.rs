@@ -178,6 +178,27 @@ impl MemoryNodeStore {
         Ok(row.node.clone())
     }
 
+    /// The node in any tenant, also a trashed one, without the caller fields and without a
+    /// permission check. For tests and inspection only.
+    pub fn peek(&self, id: NodeId) -> Option<Node> {
+        self.st().rows.get(&id).map(|r| r.node.clone())
+    }
+
+    /// The live child of `parent` with this name (case-insensitive), without a permission
+    /// check. For tests and inspection only.
+    pub fn peek_child(&self, parent: NodeId, name: &str) -> Option<Node> {
+        let name = name.to_lowercase();
+        self.st()
+            .rows
+            .values()
+            .find(|r| {
+                r.node.parent_id == Some(parent)
+                    && r.node.trashed_at.is_none()
+                    && r.node.name.to_lowercase() == name
+            })
+            .map(|r| r.node.clone())
+    }
+
     /// The live nodes of a tenant, without the caller fields (for search and tags).
     pub(crate) fn live_nodes(&self, tenant: TenantId) -> Vec<Node> {
         self.st()

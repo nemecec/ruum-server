@@ -1,6 +1,5 @@
-//! Serves `/dav` on the fixture world of `ruum-testkit` with the fake node tree of the tests, for
-//! manual checks with curl, `mount_webdav` or Finder while the nodes and blobs areas are not
-//! merged.
+//! Serves `/dav` on the fixture world of `ruum-testkit` with the in-memory stores, for manual
+//! checks with curl, `mount_webdav` or Finder without the laptop stack.
 //!
 //! ```sh
 //! cargo run -p ruum-webdav --example dav_fake_server -- 127.0.0.1:8497 /tmp/dav-creds.env

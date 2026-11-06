@@ -47,7 +47,8 @@ async fn server() -> Server {
                 description: None,
                 scope: AgentScope {
                     subtree: None,
-                    max_role: Role::Edit,
+                    // `rm` (trashNode) needs `manage`.
+                    max_role: Role::Manage,
                     expires_at: None,
                     budget: Budget::default(),
                 },
@@ -206,7 +207,15 @@ async fn file_flow(srv: &Server) -> anyhow::Result<()> {
         .ruum(&["--json", "versions", "/Projects/Garden/plan.md"])
         .await?;
     let versions: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(versions.as_array().unwrap().len(), 2, "{out}");
+    // Saves by the same actor within the coalescing window merge into one version (design
+    // 5.3), so the second upload replaced the content of the first version.
+    let versions = versions.as_array().unwrap();
+    assert_eq!(versions.len(), 1, "{out}");
+    assert_eq!(
+        versions[0]["content_hash"],
+        blake3::hash(b"# Garden plan\n\nv2\n").to_hex().as_str(),
+        "{out}"
+    );
 
     let back = srv.dir.path().join("back.md");
     srv.ruum(&[

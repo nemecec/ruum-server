@@ -149,8 +149,10 @@ pub async fn get_node(
 pub struct ChildrenQuery {
     pub sort: Option<String>,
     pub kind: Option<String>,
-    #[serde(flatten)]
-    pub paging: Paging,
+    // Not `#[serde(flatten)]`: a flattened query reads every value as a string, so a number
+    // (`limit=10`) or a bool would fail.
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
 }
 
 fn invalid(message: &str) -> Error {
@@ -187,7 +189,16 @@ pub async fn list_children(
     let mut p = state
         .services
         .nodes
-        .list_children(&ctx, id, order, q.paging.page()?)
+        .list_children(
+            &ctx,
+            id,
+            order,
+            Paging {
+                cursor: q.cursor.clone(),
+                limit: q.limit,
+            }
+            .page()?,
+        )
         .await?;
     if let Some(k) = kind {
         p.items.retain(|n| n.kind == k);
@@ -326,8 +337,10 @@ pub async fn restore_node(
 pub struct TrashQuery {
     #[serde(default)]
     pub all: bool,
-    #[serde(flatten)]
-    pub paging: Paging,
+    // Not `#[serde(flatten)]`: a flattened query reads every value as a string, so a number
+    // (`limit=10`) or a bool would fail.
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
 }
 
 /// List the trash. `GET /v1/trash` (operationId `listTrash`).
@@ -340,7 +353,15 @@ pub async fn list_trash(
     let p = state
         .services
         .nodes
-        .list_trash(&ctx, q.all, q.paging.page()?)
+        .list_trash(
+            &ctx,
+            q.all,
+            Paging {
+                cursor: q.cursor.clone(),
+                limit: q.limit,
+            }
+            .page()?,
+        )
         .await?;
     Ok(Json(to_json(&p)?))
 }

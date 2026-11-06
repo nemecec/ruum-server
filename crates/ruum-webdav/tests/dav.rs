@@ -1,7 +1,6 @@
 //! WebDAV tests: sign-in, the operations, versions, permissions, scopes and tenant isolation.
 //! They run the `/dav` router in memory on the fixture world of `ruum-testkit` (two team
-//! tenants with every principal), with the fake tree of `support` until the nodes and blobs
-//! areas are merged.
+//! tenants with every principal), on the real in-memory stores (`Services::in_memory`).
 
 mod support;
 
@@ -308,14 +307,15 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     let docs = t.h.tree.child(a.root, "Docs").unwrap();
     let file = t.h.tree.child(docs.id, "hello.txt").unwrap();
     let v1 = file.head_version.unwrap();
-    assert_eq!(r.header("etag"), format!("\"{v1}\""));
+    let tag1 = format!("\"{v1}-{}\"", file.revision);
+    assert_eq!(r.header("etag"), tag1);
     assert_eq!(file.node_type.as_deref(), Some("text/plain"));
 
     // GET, HEAD and ranges.
     let r = get(&t.app, "/dav/Docs/hello.txt", &auth).await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.body, b"hello world");
-    assert_eq!(r.header("etag"), format!("\"{v1}\""));
+    assert_eq!(r.header("etag"), tag1);
     assert!(r.header("content-type").starts_with("text/plain"));
     let r = send(
         &t.app,
@@ -355,17 +355,24 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
         "GET",
         "/dav/Docs/hello.txt",
         &auth,
-        &[("if-none-match", &format!("\"{v1}\""))],
+        &[("if-none-match", &tag1)],
         Body::empty(),
     )
     .await;
     assert_eq!(r.status, StatusCode::NOT_MODIFIED);
 
-    // PUT again: a new version of the same node.
+    // PUT again: new content of the same node. Saves by the same user within the coalescing
+    // window merge into the head version (design 5.3); the ETag still changes.
     let r = put(&t.app, "/dav/Docs/hello.txt", &auth, b"hello again!").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     let versions = t.h.tree.versions_of(file.id);
-    assert_eq!(versions.len(), 2);
+    assert_eq!(versions.len(), 1);
+    assert_ne!(
+        get(&t.app, "/dav/Docs/hello.txt", &auth)
+            .await
+            .header("etag"),
+        tag1
+    );
     assert_eq!(
         get(&t.app, "/dav/Docs/hello.txt", &auth).await.body,
         b"hello again!"
@@ -376,12 +383,12 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
         "PUT",
         "/dav/Docs/hello.txt",
         &auth,
-        &[("if-match", &format!("\"{v1}\"")), ("content-length", "1")],
+        &[("if-match", &tag1), ("content-length", "1")],
         Body::from("x"),
     )
     .await;
     assert_eq!(r.status, StatusCode::PRECONDITION_FAILED);
-    assert_eq!(t.h.tree.versions_of(file.id).len(), 2);
+    assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
 
     // PROPFIND of the file.
     let r = propfind(&t.app, "/dav/Docs/hello.txt", &auth, "0").await;
@@ -465,7 +472,8 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     )
     .await;
     assert_eq!(r.status, StatusCode::PRECONDITION_FAILED);
-    // Overwrite (default T) of a file by a file: a new version of the same node.
+    // Overwrite (default T) of a file by a file: new content of the same node (saves by the same
+    // user within the coalescing window merge into the head version, design 5.3).
     let r = mv(
         &t.app,
         "COPY",
@@ -476,7 +484,11 @@ async fn a_member_works_through_dav_and_every_write_is_the_user() {
     .await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     assert!(t.h.tree.node(file.id).unwrap().trashed_at.is_none());
-    assert_eq!(t.h.tree.versions_of(file.id).len(), 3);
+    assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
+    assert_eq!(
+        get(&t.app, "/dav/Projects/Renamed.txt", &auth).await.body,
+        b"hello again!"
+    );
     // Overwrite of a folder: the old folder goes to the trash.
     let docs2 = t.h.tree.child(a.root, "Docs2").unwrap();
     let r = mv(&t.app, "COPY", "/dav/Docs", "/dav/Docs2", &auth).await;
@@ -645,7 +657,8 @@ async fn safe_save_by_move_keeps_the_node_and_its_versions() {
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
     let now = t.h.tree.child(a.projects, "a.txt").unwrap();
     assert_eq!(now.id, file.id, "a.txt keeps its node ID");
-    assert_eq!(t.h.tree.versions_of(file.id).len(), 2);
+    // One version: the same user's saves within the coalescing window merge (design 5.3).
+    assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
     assert_eq!(
         get(&t.app, "/dav/Projects/a.txt", &auth).await.body,
         b"second"
@@ -668,7 +681,11 @@ async fn safe_save_by_move_keeps_the_node_and_its_versions() {
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
-    assert_eq!(t.h.tree.versions_of(file.id).len(), 2);
+    assert_eq!(t.h.tree.versions_of(file.id).len(), 1);
+    assert_eq!(
+        get(&t.app, "/dav/Projects/a.txt", &auth).await.body,
+        b"second"
+    );
 }
 
 #[tokio::test]

@@ -123,11 +123,13 @@ impl Meta {
     }
 }
 
-/// The entity tag of a node. For a file it is the head version ID, the same value that the REST
-/// API takes in `If-Match`; for a folder (and a file without content) the node ID and revision.
+/// The entity tag of a node. For a file it is the head version ID and the node revision: saves
+/// by the same actor within the coalescing window (design 5.3) change the content of the head
+/// version without a new version ID, but every save grows the revision. For a folder (and a
+/// file without content) the node ID and revision.
 pub(crate) fn etag(node: &Node) -> String {
     match (node.kind, node.head_version) {
-        (NodeKind::File, Some(v)) => v.to_string(),
+        (NodeKind::File, Some(v)) => format!("{v}-{}", node.revision),
         _ => format!("{}-{}", node.id, node.revision),
     }
 }

@@ -583,7 +583,7 @@ async fn create_node(w: &World, parent: &str, name: &str, kind: &str) -> Option<
         &w.app,
         &w.agent_token,
         "create_node",
-        json!({"parent_id": parent, "name": name, "kind": kind}),
+        json!({"body": {"parent_id": parent, "name": name, "kind": kind}}),
     )
     .await;
     if pending(&r) {
@@ -591,7 +591,7 @@ async fn create_node(w: &World, parent: &str, name: &str, kind: &str) -> Option<
     }
     assert_eq!(r["isError"], json!(false), "create_node {name}: {r}");
     Some(
-        r["structuredContent"]["id"]
+        r["structuredContent"]["node"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("no id: {r}"))
             .to_string(),
@@ -662,7 +662,7 @@ async fn an_agent_with_a_subtree_scope_sees_nothing_outside_it() {
         &w.app,
         &token,
         "create_node",
-        json!({"parent_id": inside, "name": "ok.md", "kind": "file"}),
+        json!({"body": {"parent_id": inside, "name": "ok.md", "kind": "file"}}),
     )
     .await;
     assert_eq!(r["isError"], json!(false), "{r}");
@@ -675,7 +675,7 @@ async fn an_agent_with_a_subtree_scope_sees_nothing_outside_it() {
         &w.app,
         &token,
         "create_node",
-        json!({"parent_id": outside, "name": "nope.md", "kind": "file"}),
+        json!({"body": {"parent_id": outside, "name": "nope.md", "kind": "file"}}),
     )
     .await;
     assert_eq!(error_code(&r), "not_found", "{r}");
@@ -704,5 +704,9 @@ async fn an_agent_with_max_role_view_cannot_write() {
     if pending(&r) {
         return;
     }
-    assert_eq!(error_code(&r), "permission_denied", "{r}");
+    // The user may write; the agent's scope leaves it out (`403 scope_exceeded`).
+    assert!(
+        ["permission_denied", "scope_exceeded"].contains(&error_code(&r)),
+        "{r}"
+    );
 }

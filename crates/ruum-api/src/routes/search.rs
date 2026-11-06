@@ -24,8 +24,10 @@ pub struct SearchParams {
     pub kind: Option<String>,
     pub tag: Option<Uuid>,
     pub within: Option<Uuid>,
-    #[serde(flatten)]
-    pub paging: Paging,
+    // Not `#[serde(flatten)]`: a flattened query reads every value as a string, so a number
+    // (`limit=10`) or a bool would fail.
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
 }
 
 /// Search by name. `GET /v1/search` (operationId `searchNodes`).
@@ -47,7 +49,11 @@ pub async fn search_nodes(
         kind: parse_kind(p.kind.as_deref())?,
         tag: p.tag.map(TagId),
         within: p.within.map(NodeId),
-        page: p.paging.page()?,
+        page: Paging {
+            cursor: p.cursor.clone(),
+            limit: p.limit,
+        }
+        .page()?,
     };
     let page = state.services.search.by_name(&ctx, query).await?;
     Ok(Json(to_json(&page)?))
