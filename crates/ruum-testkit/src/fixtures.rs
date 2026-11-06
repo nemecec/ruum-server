@@ -305,6 +305,9 @@ pub struct TenantFixture {
 impl TenantFixture {
     fn placeholder(prefix: &'static str) -> Self {
         let tenant = TenantId::new();
+        // Emails are unique per world: the worlds of a Postgres run share one database, where a
+        // verified email belongs to one user.
+        let world = &Uuid::new_v4().simple().to_string()[..8];
         let principals = Who::ALL
             .iter()
             .map(|&who| {
@@ -319,9 +322,12 @@ impl TenantFixture {
                     // Not valid for any server: replaced by real credentials in `seed`.
                     Credentials::Bearer(format!("ruum_test_placeholder_{prefix}_{}", who.name()))
                 };
-                let email = who
-                    .is_user()
-                    .then(|| format!("{prefix}-{}@example.test", who.name().replace('_', "-")));
+                let email = who.is_user().then(|| {
+                    format!(
+                        "{prefix}-{}-{world}@example.test",
+                        who.name().replace('_', "-")
+                    )
+                });
                 (
                     who,
                     Principal {
@@ -357,7 +363,7 @@ impl TenantFixture {
             chunk: format!("{prefix} chunk content").into_bytes(),
             invitation: InvitationId::new(),
             invitation_token: format!("{prefix}-invitation-token-{}", Uuid::now_v7().simple()),
-            invitation_email: format!("{prefix}-invitee@example.test"),
+            invitation_email: format!("{prefix}-invitee-{world}@example.test"),
             session: Uuid::now_v7(),
             app_password: AppPasswordId::new(),
             app_password_secret: format!("ruum_app_{prefix}{}", Uuid::now_v7().simple()),
@@ -468,6 +474,9 @@ pub struct World {
     pub b: TenantFixture,
     /// True when [`seed`] created the world in real services with real credentials.
     pub seeded: bool,
+    /// The bridge user, made by [`seed_bridge`]: a member of B and a guest of A with `manage`
+    /// on A's `Projects`. `None` until then.
+    pub bridge: Option<Principal>,
 }
 
 /// Makes the fixture world in the services of `state`. See the module comment.
@@ -488,6 +497,25 @@ pub async fn seed(state: &AppState) -> World {
         a,
         b,
         seeded: ok_a && ok_b,
+        bridge: None,
+    }
+}
+
+/// Adds the bridge user to a seeded world ([`World::bridge`]): a user who is a member of tenant
+/// B and a guest of tenant A with a `manage` grant on A's `Projects` (added as `edit`, then
+/// changed). Its email starts with `bravo-`.
+///
+/// The authz engine lets the bridge act on A's `Projects` subtree, so when it sends A's IDs
+/// with B's `Ruum-Tenant` header, only the tenant checks of the stores (the `tenant_id` filter
+/// of every query) stand between it and A's data. The isolation suite uses it for that probe.
+/// Returns false when a step fails.
+pub async fn seed_bridge(state: &AppState, w: &mut World) -> bool {
+    match seed::bridge(state, w).await {
+        Some(p) => {
+            w.bridge = Some(p);
+            true
+        }
+        None => false,
     }
 }
 
@@ -572,6 +600,72 @@ mod seed {
             .await?;
         let w = s.transfers.complete_upload(c, up.id).await?;
         Ok((w.value.0.id, w.value.1.id))
+    }
+
+    /// Makes the bridge user of [`super::seed_bridge`].
+    pub async fn bridge(state: &AppState, w: &super::World) -> Option<super::Principal> {
+        let s = state.services.clone();
+        let email = format!(
+            "{}-bridge-{}@example.test",
+            w.b.prefix,
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let login = VerifiedLogin {
+            issuer: ISSUER.into(),
+            subject: format!("bridge-{}", uuid::Uuid::now_v7()),
+            email: Some(email.clone()),
+            email_verified: true,
+            name: Some(format!("{} bridge", w.b.prefix)),
+            id_token: None,
+        };
+        let s2 = s.clone();
+        let user = step("bridge user", async move {
+            s2.identity.upsert_from_login(&login).await
+        })
+        .await?
+        .id;
+        // A member of B, a guest of A: both through invitations.
+        for (t, role) in [
+            (&w.b, ruum_core::tenants::MemberRole::Member),
+            (&w.a, ruum_core::tenants::MemberRole::Guest),
+        ] {
+            let (s2, c, email) = (
+                s.clone(),
+                ctx(t.id, Actor::user(t.user_id(Who::Owner))),
+                email.clone(),
+            );
+            step("bridge joins", async move {
+                let (_inv, token) = s2.tenants.invite(&c, email, role, None).await?;
+                s2.tenants
+                    .accept_invitation(&Actor::user(user), &token)
+                    .await
+            })
+            .await?;
+        }
+        let (s2, c, node) = (
+            s.clone(),
+            ctx(w.a.id, Actor::user(w.a.user_id(Who::Owner))),
+            w.a.projects,
+        );
+        // `edit` first, then `manage`: the `grant.updated` entry names the bridge as grantee,
+        // so A's feed has an entry for the bridge that B's feed must never show.
+        step("bridge grant", async move {
+            let g = s2
+                .sharing
+                .add_grant(&c, node, Grantee::User { id: user }, Role::Edit)
+                .await?;
+            s2.sharing
+                .update_grant(&c, node, g.value.id, Role::Manage)
+                .await
+        })
+        .await?;
+        let token = issue_user_token(s.tokens.as_ref(), user, TOKEN_SECONDS).ok()?;
+        Some(super::Principal {
+            who: Who::Member,
+            id: user.0,
+            email: Some(email),
+            credentials: Credentials::Bearer(token),
+        })
     }
 
     /// Seeds one tenant. Returns true when the principals got real credentials.
@@ -1032,13 +1126,10 @@ mod seed {
     }
 }
 
-/// The application state the suites run against: in-memory services.
-///
-/// A Postgres backend (`#[sqlx::test]` database) comes when the Postgres implementations of the
-/// core traits exist; then this function picks it when `DATABASE_URL` is set.
-pub fn app_state() -> AppState {
-    AppState::in_memory()
-}
+/// The application state of a new world, on the backend of `RUUM_SUITE_BACKEND`, comes from
+/// [`Backend::app_state`] (a shared database per run) or [`Backend::world`] (a database per
+/// world); see [`crate::backend`].
+pub use crate::backend::Backend;
 
 #[cfg(test)]
 mod tests {

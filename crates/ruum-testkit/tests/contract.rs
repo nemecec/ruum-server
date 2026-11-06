@@ -8,7 +8,7 @@ use ruum_testkit::requests::standard;
 /// Every operation has a standard request with the method and path of the contract.
 #[tokio::test]
 async fn standard_requests_fit_the_contract() {
-    let w = fixtures::seed(&fixtures::app_state()).await;
+    let w = fixtures::seed(&ruum_api::AppState::in_memory()).await;
     let mut bad = Vec::new();
     for op in operations() {
         match standard(&op.id, &w.a) {
@@ -26,7 +26,7 @@ async fn standard_requests_fit_the_contract() {
 /// Every operation of the contract has a route in `ruum-api` (no fallback 404, no 405).
 #[tokio::test]
 async fn every_operation_is_routed() {
-    let state = fixtures::app_state();
+    let state = ruum_api::AppState::in_memory();
     let w = fixtures::seed(&state).await;
     let app = client::app(state);
     let anyone = w.a.principal(Who::Owner);

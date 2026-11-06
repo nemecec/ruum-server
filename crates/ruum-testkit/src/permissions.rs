@@ -26,6 +26,7 @@ use crate::matrix::{SHARE_LINK_OPERATIONS, USER_ONLY_OPERATIONS};
 use crate::report::{Outcome, Report};
 use crate::requests::standard;
 use axum::http::StatusCode;
+use futures::stream::{self, StreamExt};
 use ruum_core::authz::Role;
 use ruum_core::tenants::MemberRole;
 use std::collections::BTreeSet;
@@ -688,28 +689,37 @@ pub fn evaluate(
     }
 }
 
-/// Runs the whole matrix: every operation as every principal, each in a fresh world.
+/// Runs the whole matrix on the backend of `RUUM_SUITE_BACKEND`.
 pub async fn run() -> Report {
-    let mut report = Report::new("permission matrix suite");
+    let backend = fixtures::Backend::start().await;
+    let report = run_on(&backend).await;
+    backend.finish().await;
+    report
+}
+
+/// Runs the whole matrix on `backend`: every operation as every principal, each in a fresh
+/// world.
+pub async fn run_on(backend: &fixtures::Backend) -> Report {
+    let mut report = Report::new(&format!("permission matrix suite [{}]", backend.name()));
     let ops = crate::contract::operations();
     for op in &ops {
         if rule(&op.id).is_none() {
             report.missing.push(op.id.clone());
         }
     }
-    for op in &ops {
-        let Some(rule) = rule(&op.id) else { continue };
-        for &who in Who::ALL {
-            let state = fixtures::app_state();
+    let jobs: Vec<(&str, Who)> = ops
+        .iter()
+        .filter(|op| rule(&op.id).is_some())
+        .flat_map(|op| Who::ALL.iter().map(move |&who| (op.id.as_str(), who)))
+        .collect();
+    let rows: Vec<(&str, Who, Outcome)> = stream::iter(jobs)
+        .map(|(op, who)| async move {
+            let rule = rule(op).expect("filtered above");
+            let state = backend.app_state().await;
             let w = fixtures::seed(&state).await;
             let app = client::app(state);
-            let Some(req) = standard(&op.id, &w.a) else {
-                report.add(
-                    &op.id,
-                    who.name(),
-                    Outcome::Failed("no standard request".into()),
-                );
-                continue;
+            let Some(req) = standard(op, &w.a) else {
+                return (op, who, Outcome::Failed("no standard request".into()));
             };
             let fallback = client::fallback_fingerprint(&app, w.a.principal(Who::Owner)).await;
             let res = client::send(&app, &req, w.a.principal(who)).await;
@@ -722,8 +732,13 @@ pub async fn run() -> Report {
                 &res,
                 &fallback,
             );
-            report.add(&op.id, who.name(), outcome);
-        }
+            (op, who, outcome)
+        })
+        .buffered(backend.jobs())
+        .collect()
+        .await;
+    for (op, who, outcome) in rows {
+        report.add(op, who.name(), outcome);
     }
     report
 }
@@ -769,52 +784,66 @@ pub fn trashed_read_rule(op: &'static str) -> Rule {
 /// - The changes feed shows the entries on the trashed file (its versions) only to principals
 ///   with `manage` on it; the others still get the `node.trashed` entry through the old place.
 pub async fn run_trashed() -> Report {
-    let mut report = Report::new("trashed file suite");
+    let backend = fixtures::Backend::start().await;
+    let report = run_trashed_on(&backend).await;
+    backend.finish().await;
+    report
+}
+
+/// [`run_trashed`] on `backend`.
+pub async fn run_trashed_on(backend: &fixtures::Backend) -> Report {
+    let mut report = Report::new(&format!("trashed file suite [{}]", backend.name()));
     let mut ops: Vec<&'static str> = TRASHED_FILE_READS.to_vec();
     ops.push("listChanges");
-    for op in ops {
-        for &who in Who::ALL {
-            let state = fixtures::app_state();
-            let w = fixtures::seed(&state).await;
-            let t = &w.a;
-            let owner = ruum_core::actor::Context {
-                tenant: t.id,
-                actor: ruum_core::actor::Actor::user(t.user_id(Who::Owner)),
-                scope: None,
-                idempotency_key: None,
-            };
-            if let Err(e) = state.services.nodes.trash(&owner, t.plan, None).await {
-                report.add(op, who.name(), Outcome::Failed(format!("trash: {e:?}")));
-                continue;
-            }
-            let app = client::app(state);
-            let Some(req) = standard(op, t) else {
-                report.add(
-                    op,
-                    who.name(),
-                    Outcome::Failed("no standard request".into()),
-                );
-                continue;
-            };
-            let fallback = client::fallback_fingerprint(&app, t.principal(Who::Owner)).await;
-            let res = client::send(&app, &req, t.principal(who)).await;
-            let outcome = if op == "listChanges" {
-                trashed_feed_outcome(who, t, &res)
-            } else {
-                evaluate(
-                    &trashed_read_rule(op),
-                    who,
-                    t,
-                    w.seeded,
-                    &req.sent_text(),
-                    &res,
-                    &fallback,
-                )
-            };
-            report.add(op, who.name(), outcome);
-        }
+    let jobs: Vec<(&'static str, Who)> = ops
+        .into_iter()
+        .flat_map(|op| Who::ALL.iter().map(move |&who| (op, who)))
+        .collect();
+    let rows: Vec<(&'static str, Who, Outcome)> = stream::iter(jobs)
+        .map(|(op, who)| async move { (op, who, trashed_check(backend, op, who).await) })
+        .buffered(backend.jobs())
+        .collect()
+        .await;
+    for (op, who, outcome) in rows {
+        report.add(op, who.name(), outcome);
     }
     report
+}
+
+/// One check of [`run_trashed`]: `who` sends the standard request of `op` after the owner
+/// trashed the plan, in a fresh world.
+async fn trashed_check(backend: &fixtures::Backend, op: &'static str, who: Who) -> Outcome {
+    let state = backend.app_state().await;
+    let w = fixtures::seed(&state).await;
+    let t = &w.a;
+    let owner = ruum_core::actor::Context {
+        tenant: t.id,
+        actor: ruum_core::actor::Actor::user(t.user_id(Who::Owner)),
+        scope: None,
+        idempotency_key: None,
+    };
+    if let Err(e) = state.services.nodes.trash(&owner, t.plan, None).await {
+        return Outcome::Failed(format!("trash: {e:?}"));
+    }
+    let app = client::app(state);
+    let Some(req) = standard(op, t) else {
+        return Outcome::Failed("no standard request".into());
+    };
+    let fallback = client::fallback_fingerprint(&app, t.principal(Who::Owner)).await;
+    let res = client::send(&app, &req, t.principal(who)).await;
+    if op == "listChanges" {
+        trashed_feed_outcome(who, t, &res)
+    } else {
+        evaluate(
+            &trashed_read_rule(op),
+            who,
+            t,
+            w.seeded,
+            &req.sent_text(),
+            &res,
+            &fallback,
+        )
+    }
 }
 
 /// The changes feed after the plan went to the trash: the version IDs of the plan show only to

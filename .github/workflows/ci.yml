@@ -72,17 +72,36 @@ jobs:
   security-suites:
     name: tenant isolation and permission suites
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ruum
+          POSTGRES_PASSWORD: ruum
+          POSTGRES_DB: ruum
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ruum" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # A handler that answers 501 counts as pending. Set the repository variable
+      # RUUM_REQUIRE_IMPLEMENTED=1 when step 1 is complete, so pending becomes a failure.
+      RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      # A handler that answers 501 counts as pending. Set the repository variable
-      # RUUM_REQUIRE_IMPLEMENTED=1 when step 1 is complete, so pending becomes a failure.
-      - name: Tenant isolation and permission matrix
+      - name: Tenant isolation and permission matrix (in-memory services)
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --locked -- --nocapture
+      # The superuser of the service container bypasses row-level security. The suites connect
+      # as a role without superuser (CREATEDB for the suite databases), as on the laptop stack.
+      - name: Role for the suites
+        run: psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_suite login password 'ruum_suite' createdb"
+      - name: Tenant isolation and permission matrix (Postgres stores)
         env:
-          RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
+          RUUM_SUITE_BACKEND: postgres
+          DATABASE_URL: postgres://ruum_suite:ruum_suite@localhost:5432/ruum
         run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --locked -- --nocapture
 
   cargo-deny:

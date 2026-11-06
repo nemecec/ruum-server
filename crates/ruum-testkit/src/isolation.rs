@@ -28,6 +28,8 @@ use crate::fixtures::{self, Principal, TenantFixture, Who, World};
 use crate::report::{Outcome, Report};
 use crate::requests::standard;
 use axum::http::{Method, StatusCode};
+use futures::stream::{self, StreamExt};
+use ruum_core::paging::MAX_PAGE_SIZE;
 use serde_json::json;
 
 /// The status a probe must get.
@@ -78,6 +80,8 @@ pub struct Probe {
     pub expect: Expect,
     /// A read by a principal of tenant A whose answer must not change because of the probe.
     pub unchanged: Option<(Who, RequestSpec)>,
+    /// Sent as the bridge user ([`World::bridge`]) instead of `actor`.
+    pub bridge: bool,
 }
 
 impl Probe {
@@ -88,7 +92,15 @@ impl Probe {
             request,
             expect,
             unchanged: None,
+            bridge: false,
         }
+    }
+
+    /// The same request, sent as the bridge user ([`World::bridge`]).
+    pub fn as_bridge(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self.bridge = true;
+        self
     }
 
     pub fn unchanged(mut self, who: Who, read: RequestSpec) -> Self {
@@ -113,7 +125,11 @@ fn std_req(op: &str, t: &TenantFixture) -> RequestSpec {
 ///
 /// - tenant B's owner sends the standard request with A's IDs and B's tenant header: `404`;
 /// - for operations with a tenant header, the same request with A's tenant header (B's owner
-///   claims to be in A): `403` or `404`.
+///   claims to be in A): `403` or `404`;
+/// - for operations with a tenant header, the bridge user (a member of B with `manage` on A's
+///   `Projects`, [`World::bridge`]) sends A's IDs with B's tenant header: the same status as
+///   B's owner. The authz engine lets the bridge act on A's nodes, so this probe tests the
+///   tenant checks of the stores (the `tenant_id` filter of every query).
 ///
 /// `read` names the read operation (as A's owner, or `reader`) that must not change.
 pub fn addressed(op: &str, w: &World, expect: Expect, read: Option<(&str, Who)>) -> Vec<Probe> {
@@ -128,8 +144,9 @@ pub fn addressed(op: &str, w: &World, expect: Expect, read: Option<(&str, Who)>)
         expect,
     );
     p.unchanged = unchanged.clone();
-    probes.push(p);
+    probes.push(p.clone());
     if has_header {
+        probes.push(p.as_bridge("the bridge user (in A and B), A's resource with B's Ruum-Tenant"));
         let mut p = Probe::new(
             "B's owner claims tenant A in Ruum-Tenant",
             Who::Owner,
@@ -145,7 +162,9 @@ pub fn addressed(op: &str, w: &World, expect: Expect, read: Option<(&str, Who)>)
 /// The probes of an operation that acts in the caller's own tenant (lists, search, creating):
 ///
 /// - tenant B's owner sends the standard request against B: no data of A in the answer;
-/// - for operations with a tenant header, the same request with A's tenant header: `403`/`404`.
+/// - for operations with a tenant header, the same request with A's tenant header: `403`/`404`;
+/// - for operations with a tenant header, the bridge user ([`World::bridge`]) sends the request
+///   against B: no data of A, although the bridge may see A's `Projects` in tenant A.
 pub fn own_tenant(op: &str, w: &World, read: Option<(&str, Who)>) -> Vec<Probe> {
     let req = std_req(op, &w.b);
     let has_header = req.tenant.is_some();
@@ -158,8 +177,9 @@ pub fn own_tenant(op: &str, w: &World, read: Option<(&str, Who)>) -> Vec<Probe> 
         Expect::NoLeak,
     );
     p.unchanged = unchanged.clone();
-    probes.push(p);
+    probes.push(p.clone());
     if has_header {
+        probes.push(p.as_bridge("the bridge user (in A and B) in tenant B"));
         let mut p = Probe::new(
             "B's owner claims tenant A in Ruum-Tenant",
             Who::Owner,
@@ -672,6 +692,17 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
         // ------------------------------------------------------------ changes and search
         "listChanges" => {
             let mut p = own_tenant(op, w, None);
+            // The whole feed of B in one page: A's `grant.updated` entry for the bridge user
+            // (`fixtures::seed_bridge`) is late in A's journal.
+            p.push(
+                Probe::new(
+                    "",
+                    o,
+                    RequestSpec::get(format!("/v1/changes?limit={MAX_PAGE_SIZE}")).tenant(b.id),
+                    NoLeak,
+                )
+                .as_bridge("the bridge user (in A and B) reads all of B's feed"),
+            );
             p.push(Probe::new(
                 "B's owner filters by A's node",
                 o,
@@ -708,7 +739,18 @@ pub async fn run_probe(
     fallback: &Response,
     probe: &Probe,
 ) -> Outcome {
-    let actor: &Principal = w.b.principal(probe.actor);
+    let actor: &Principal = if probe.bridge {
+        match &w.bridge {
+            Some(p) => p,
+            None => {
+                return Outcome::Failed(
+                    "the bridge user is missing (fixtures::seed_bridge failed)".into(),
+                );
+            }
+        }
+    } else {
+        w.b.principal(probe.actor)
+    };
     let before = match &probe.unchanged {
         Some((who, read)) => Some(client::send(app, read, w.a.principal(*who)).await),
         None => None,
@@ -729,11 +771,14 @@ pub async fn run_probe(
     // A leak is a failure even when the handler is otherwise unfinished.
     let sent = probe.request.sent_text();
     let text = res.text();
-    let leaked: Vec<String> =
-        w.a.markers()
-            .into_iter()
-            .filter(|m| !sent.contains(m.as_str()) && text.contains(m.as_str()))
-            .collect();
+    // The prefix of A's names and emails (`alpha-`) also finds A's data that is not in the
+    // marker list, and the data of any other world's tenant A in a shared database.
+    let mut markers = w.a.markers();
+    markers.push(format!("{}-", w.a.prefix));
+    let leaked: Vec<String> = markers
+        .into_iter()
+        .filter(|m| !sent.contains(m.as_str()) && text.contains(m.as_str()))
+        .collect();
     if !leaked.is_empty() {
         problems.push(format!("the answer holds data of tenant A: {leaked:?}"));
     }
@@ -787,36 +832,100 @@ pub async fn run_probe(
     }
 }
 
-/// Runs the whole suite and returns the report.
+/// Runs the whole suite on the backend of `RUUM_SUITE_BACKEND` and returns the report.
 pub async fn run() -> Report {
-    let mut report = Report::new("tenant isolation suite");
+    let backend = fixtures::Backend::start().await;
+    let report = run_on(&backend).await;
+    backend.finish().await;
+    report
+}
+
+/// Runs the case of `op` in a fresh world in `state` (with the bridge user) and returns its
+/// rows.
+async fn case_rows(op: &str, state: ruum_api::AppState) -> Vec<(&str, String, Outcome)> {
+    let mut w = fixtures::seed(&state).await;
+    if w.seeded {
+        fixtures::seed_bridge(&state, &mut w).await;
+    }
+    let Some(c) = case(op, &w) else {
+        return Vec::new();
+    };
+
+    let app = client::app(state);
+    let fallback = client::fallback_fingerprint(&app, w.b.principal(Who::Owner)).await;
+    let mut rows = Vec::new();
+    if c.probes.is_empty() {
+        rows.push((
+            op,
+            "case".to_string(),
+            Outcome::Failed("the case has no probes".into()),
+        ));
+    }
+    for p in &c.probes {
+        let outcome = run_probe(&app, &w, &fallback, p).await;
+        rows.push((op, p.label.clone(), outcome));
+    }
+    rows
+}
+
+/// Runs the whole suite on `backend`, each operation in a fresh world with a database of its
+/// own ([`fixtures::Backend::world`]).
+pub async fn run_on(backend: &fixtures::Backend) -> Report {
+    let mut report = Report::new(&format!("tenant isolation suite [{}]", backend.name()));
     let ops = crate::contract::operations();
 
     // Registration: every contract operation needs a case.
-    let probe_world = fixtures::seed(&fixtures::app_state()).await;
+    let (probe_state, probe_db) = backend.world().await;
+    let mut probe_world = fixtures::seed(&probe_state).await;
     for op in &ops {
         if case(&op.id, &probe_world).is_none() {
             report.missing.push(op.id.clone());
         }
     }
+    // The control of the bridge probes: in tenant A the bridge user does read A's plan,
+    // so its 404 with B's tenant header comes from the tenant checks and not from authz.
+    if probe_world.seeded {
+        let outcome = if fixtures::seed_bridge(&probe_state, &mut probe_world).await {
+            let app = client::app(probe_state);
+            let req = std_req("getNode", &probe_world.a);
+            let bridge = probe_world.bridge.as_ref().expect("seeded above");
+            let res = client::send(&app, &req, bridge).await;
+            if res.status.is_success() && res.text().contains(&probe_world.a.plan.to_string()) {
+                Outcome::Passed
+            } else {
+                Outcome::Failed(format!(
+                    "the bridge user cannot read A's plan in tenant A ({}), so its probes prove nothing",
+                    res.status
+                ))
+            }
+        } else {
+            Outcome::Failed("fixtures::seed_bridge failed".into())
+        };
+        report.add(
+            "(fixture)",
+            "bridge control: the bridge reads A's plan in A",
+            outcome,
+        );
+    }
+    if let Some(db) = probe_db {
+        db.finish().await;
+    }
 
-    for op in &ops {
-        let state = fixtures::app_state();
-        let w = fixtures::seed(&state).await;
-        let Some(c) = case(&op.id, &w) else { continue };
-        let app = client::app(state);
-        let fallback = client::fallback_fingerprint(&app, w.b.principal(Who::Owner)).await;
-        if c.probes.is_empty() {
-            report.add(
-                &op.id,
-                "case",
-                Outcome::Failed("the case has no probes".into()),
-            );
-        }
-        for p in &c.probes {
-            let outcome = run_probe(&app, &w, &fallback, p).await;
-            report.add(&op.id, &p.label, outcome);
-        }
+    let rows: Vec<Vec<(&str, String, Outcome)>> = stream::iter(ops.iter())
+        .map(|op| async move {
+            let op = op.id.as_str();
+            let (state, db) = backend.world().await;
+            let rows = case_rows(op, state).await;
+            if let Some(db) = db {
+                db.finish().await;
+            }
+            rows
+        })
+        .buffered(backend.jobs())
+        .collect()
+        .await;
+    for (op, label, outcome) in rows.into_iter().flatten() {
+        report.add(op, label, outcome);
     }
     report
 }

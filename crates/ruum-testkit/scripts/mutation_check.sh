@@ -15,6 +15,12 @@
 #   MUTATION_TARGET_DIR    the cargo target dir for the copies (default: <repo>/target/mutation);
 #                          the copy itself is in <MUTATION_TARGET_DIR>.work/repo
 #   RUUM_REQUIRE_IMPLEMENTED is passed through to the suites.
+#   DATABASE_URL           needed by the mutations whose ENV picks the Postgres backend
+#                          (eval "$(scripts/dev.sh env)" on the laptop).
+#
+# A mutation file sets DESCRIPTION, FILE, PERL, TESTS, optionally PLACEHOLDER=1 and ENV: extra
+# environment variables (NAME=value, separated by spaces) for its cargo test runs, for example
+# ENV="RUUM_SUITE_BACKEND=postgres RUUM_SUITE_RLS=off".
 #
 # Results: KILLED (good), SURVIVED, SKIP (placeholder: the file or pattern does not exist yet),
 # BROKEN (the mutated code does not compile: fix the mutation). Exit status 0 when no mutation
@@ -40,8 +46,9 @@ sync_copy() {
 }
 
 run_tests() {
-  # $1: cargo test arguments. Output goes to $work/log.
-  (cd "$copy" && cargo test $1 >"$work/log" 2>&1)
+  # $1: cargo test arguments, $2: extra environment (NAME=value ...). Output goes to $work/log.
+  # shellcheck disable=SC2086
+  (cd "$copy" && env $2 cargo test $1 >"$work/log" 2>&1)
 }
 
 if [ "$#" -gt 0 ]; then
@@ -55,13 +62,21 @@ echo "mutation check: ${#files[@]} mutations, strict=$strict, copy in $copy"
 # A fresh copy: every file gets a new mtime, so no build of an earlier run is taken as fresh.
 rm -rf "$copy"
 sync_copy
+# The copy and the repository may share one target dir (MUTATION_TARGET_DIR=<repo>/target), and
+# their crates then share build units. At the end, put the clean files back into the copy: they
+# get a new mtime, so cargo rebuilds a unit that was built from a mutated file and no later
+# build in the repository reuses it.
+trap 'sync_copy || true' EXIT
 
 # The suites must pass on the clean copy, or a failure proves nothing.
-baseline_tests="$(for f in "${files[@]}"; do (source "$f"; echo "$TESTS"); done | sort -u)"
-while IFS= read -r t; do
-  [ -z "$t" ] && continue
-  echo "baseline: cargo test $t"
-  if ! run_tests "$t"; then
+# Each line is "ENV|TESTS".
+baseline_tests="$(for f in "${files[@]}"; do (ENV=""; source "$f"; echo "$ENV|$TESTS"); done | sort -u)"
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  e="${line%%|*}"
+  t="${line#*|}"
+  echo "baseline: ${e:+$e }cargo test $t"
+  if ! run_tests "$t" "$e"; then
     tail -50 "$work/log"
     echo "FAIL: the suites fail without a mutation; fix them first" >&2
     exit 2
@@ -72,7 +87,7 @@ failed=0
 summary=()
 for f in "${files[@]}"; do
   name="$(basename "$f" .sh)"
-  DESCRIPTION="" FILE="" PERL="" TESTS="" PLACEHOLDER=0
+  DESCRIPTION="" FILE="" PERL="" TESTS="" PLACEHOLDER=0 ENV=""
   # shellcheck disable=SC1090
   source "$f"
   sync_copy
@@ -91,12 +106,12 @@ for f in "${files[@]}"; do
       result="BROKEN"
       why="the mutated code does not compile"
       tail -20 "$work/log"
-    elif run_tests "$TESTS"; then
+    elif run_tests "$TESTS" "$ENV"; then
       result="SURVIVED"
-      why="cargo test $TESTS passed with the mutation"
+      why="${ENV:+$ENV }cargo test $TESTS passed with the mutation"
     else
       result="KILLED"
-      why="cargo test $TESTS failed, as it must"
+      why="${ENV:+$ENV }cargo test $TESTS failed, as it must"
     fi
   fi
   case "$result" in

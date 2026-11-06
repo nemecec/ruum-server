@@ -18,17 +18,31 @@ jobs:
   mutation-check:
     name: mutation check of the security suites
     runs-on: ubuntu-latest
+    # The Postgres mutations (ENV="RUUM_SUITE_BACKEND=postgres ...", the Postgres conformance
+    # suites) need a database.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ruum
+          POSTGRES_PASSWORD: ruum
+          POSTGRES_DB: ruum
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ruum" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgres://ruum:ruum@localhost:5432/ruum
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      # Not strict while handlers answer 501: survived and placeholder mutations are warnings.
-      # Set the repository variable MUTATION_STRICT=1 when step 1 is complete.
+      # Strict: step 1 is built, so a survived or skipped mutation fails the run. Set the
+      # repository variable MUTATION_STRICT=0 to make them warnings again.
       - name: Break each security rule in a copy; the suites must fail
         env:
-          MUTATION_STRICT: ${{ vars.MUTATION_STRICT || '0' }}
+          MUTATION_STRICT: ${{ vars.MUTATION_STRICT || '1' }}
           RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
         run: crates/ruum-testkit/scripts/mutation_check.sh
 
