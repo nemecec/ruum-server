@@ -1,12 +1,12 @@
-// Names of people and agents for the IDs in API answers. The API's `PrincipalRef.display_name` and
-// the grantee's `display_name` are optional ("filled when known"); until the server fills them
-// everywhere (docs/ux/gap-analysis.md, contract need C-7), the UI looks the IDs up in what the
+// Names of people and agents for the IDs in API answers. The server fills `display_name` and
+// `on_behalf_of_display_name` in every answer (contract need C-7, decision 0003-5); the UI uses
+// them first. Only when a name is missing (an older server) does it look the ID up in what the
 // person may list: the members of the space (members and up) and the agents (their own; admins:
 // all). The UI never shows an ID in their place.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { client, unwrap, type Schemas } from '../api/client'
-import { actorLabel, NamesContext, useNames, type AgentInfo, type Names, type Person } from './useNames'
+import { client, unwrap } from '../api/client'
+import { actorLabel, NamesContext, useNames, type ActorLike, type AgentInfo, type Names, type Person } from './useNames'
 import { AgentGlyph } from '../components/ui'
 
 /** Loads the names of a space: members (if the person may list them) and agents. */
@@ -87,10 +87,10 @@ async function collect<T>(load: (cursor: string | undefined) => Promise<{ items:
   return all
 }
 
-/** Who did a change, with the agent mark for agents ("Claude Code for Ann", an agent for Ann). */
-export function Actor({ pair }: { pair: Schemas['ActorPair'] | { actor: Schemas['PrincipalRef']; on_behalf_of: string | null } }) {
+/** Who did a change, with the agent mark for agents ("Claude Code (agent of Ann)"). */
+export function Actor({ pair }: { pair: ActorLike }) {
   const names = useNames()
-  const { text, agent } = actorLabel(names, pair.actor, pair.on_behalf_of)
+  const { text, agent } = actorLabel(names, pair.actor, pair.on_behalf_of, pair.on_behalf_of_display_name)
   if (!agent) return <span>{text}</span>
   return (
     <span className="agent-name">

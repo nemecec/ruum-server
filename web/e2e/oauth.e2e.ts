@@ -57,7 +57,7 @@ test('the consent screen names the app, and the new agent gets its name', async 
   await expect.poll(() => callback?.searchParams.get('state') ?? null).toBe('e2e-state')
   expect(callback!.searchParams.get('code')).toBeTruthy()
 
-  // The agent carries the app's name, so its changes say "<app> for Ann", never "An app".
+  // The agent carries the app's name, so its changes say "<app> (agent of Ann)", never "An app".
   // (The page is on the app's callback now; the API answers on the UI's origin.)
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()

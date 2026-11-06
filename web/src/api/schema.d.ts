@@ -2142,7 +2142,7 @@ export interface components {
         PrincipalRef: {
             kind: components["schemas"]["PrincipalKind"];
             id: components["schemas"]["Uuid"];
-            /** @description Filled in responses when known. */
+            /** @description The name of the principal, filled in every response that names it (C-7, decision 0003-5): the current display name of a member or guest, the name of an agent, else the last name the tenant knew (a person who left). Absent when no name is known (also after a GDPR deletion). Anyone who may see the response may see the name. An agent's name is chosen by its client, so it can look like a person's name: tell agents apart by `kind`, and show them with the name of their user (`on_behalf_of_display_name`). Never filled for share-link bearers. */
             display_name?: string;
         };
         /** @description Who did a change, and for whom (design section 3.4). */
@@ -2150,6 +2150,8 @@ export interface components {
             actor: components["schemas"]["PrincipalRef"];
             /** @description The user for whom the actor acts. `null` when the actor is the user. */
             on_behalf_of: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `on_behalf_of` user, filled in responses when known (C-7, decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known. */
+            on_behalf_of_display_name?: string;
         };
         /** @description The change that a write made. */
         Change: {
@@ -2157,6 +2159,8 @@ export interface components {
             seq: number | null;
             actor: components["schemas"]["PrincipalRef"];
             on_behalf_of: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `on_behalf_of` user, filled in responses when known (C-7, decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known. */
+            on_behalf_of_display_name?: string;
             at: components["schemas"]["Timestamp"];
         };
         ChangeOnly: {
@@ -2194,6 +2198,8 @@ export interface components {
         Me: {
             actor: components["schemas"]["PrincipalRef"];
             on_behalf_of: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `on_behalf_of` user, filled in responses when known (C-7, decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known. */
+            on_behalf_of_display_name?: string;
             /** @description The user whose rights apply (the agent's owner for an agent). */
             user: components["schemas"]["User"];
             /** @description Set when the caller is an agent. */
@@ -2842,6 +2848,8 @@ export interface components {
             label: string | null;
             actor: components["schemas"]["PrincipalRef"];
             on_behalf_of: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `on_behalf_of` user, filled in responses when known (C-7, decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known. */
+            on_behalf_of_display_name?: string;
             created_at: components["schemas"]["Timestamp"];
         };
         VersionPage: {
@@ -2972,9 +2980,9 @@ export interface components {
              */
             type: "user";
             id: components["schemas"]["Uuid"];
-            /** @description Filled in responses. */
+            /** @description The name of the user, filled in responses (as `PrincipalRef.display_name`). */
             display_name?: string;
-            /** @description Filled in responses. */
+            /** @description Filled in responses only for callers who may share the node and who may list the members of the tenant (a member, admin or owner, or an agent of one). Absent for guests, so the grant list tells a guest no email address (decision 0003-5). */
             email?: string;
         };
         /** @description A person by email. A person who is not a member becomes a guest only when the invitation is accepted or the verified email claims it (see `addGrant`). */
@@ -3101,6 +3109,8 @@ export interface components {
             type: components["schemas"]["EventType"];
             actor: components["schemas"]["PrincipalRef"];
             on_behalf_of: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `on_behalf_of` user, filled in responses when known (C-7, decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known. */
+            on_behalf_of_display_name?: string;
             at: components["schemas"]["Timestamp"];
             data: {
                 [key: string]: unknown;
@@ -3146,6 +3156,8 @@ export interface components {
             action: string;
             actor: components["schemas"]["PrincipalRef"];
             on_behalf_of: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `on_behalf_of` user, filled in responses when known (C-7, decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known. */
+            on_behalf_of_display_name?: string;
             target_type: string | null;
             target_id: string | null;
             ip?: string | null;
@@ -6408,6 +6420,10 @@ export interface operations {
                 wait?: number;
                 /** @description Only changes inside this folder (at any depth). */
                 node?: components["schemas"]["Uuid"];
+                /** @description Only changes whose `actor.id` is this principal (a user or an agent). The filter applies after the visibility rules, so it never shows more. Entries that it leaves out also give no `resync` markers; a sync client does not use it. */
+                actor?: components["schemas"]["Uuid"];
+                /** @description Only changes at or after this time (`at`). Same rules as `actor`. */
+                since?: components["schemas"]["Timestamp"];
             };
             header?: {
                 /**

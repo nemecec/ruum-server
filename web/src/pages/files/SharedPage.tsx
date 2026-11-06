@@ -61,7 +61,7 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
         </thead>
         <tbody>
           {items.map(({ node, role, shared_by, shared_at }) => {
-            const by = actorLabel(names, shared_by.actor, shared_by.on_behalf_of)
+            const by = actorLabel(names, shared_by.actor, shared_by.on_behalf_of, shared_by.on_behalf_of_display_name)
             const sharer = by.text === 'Someone' ? `Someone in ${spaceName(node.tenant_id)}` : by.text
             return (
               <tr key={node.id}>

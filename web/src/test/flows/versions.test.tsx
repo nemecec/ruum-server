@@ -18,9 +18,22 @@ describe('versions panel', () => {
     expect(items).toHaveLength(3)
     expect(within(items[0]).getByText('Current')).toBeInTheDocument()
     // The agent shows with its name, the person it works for, and the agent mark.
-    expect(within(items[0]).getByText(/Claude Desktop for Ada Lovelace/)).toBeInTheDocument()
+    expect(within(items[0]).getByText(/Claude Desktop \(agent of Ada Lovelace\)/)).toBeInTheDocument()
     expect(within(items[0]).getByText('(an agent)')).toBeInTheDocument()
     expect(within(items[2]).getByText('First draft')).toBeInTheDocument()
+  })
+
+  it('marks an agent whose name looks like a person, with the name of its user (0003-5)', async () => {
+    // Agent names come from the client: this one calls itself like its user. The server's
+    // names are used as they come, and the agent mark and "agent of" still tell it apart.
+    const head = db.versions.find((v) => v.id === db.nodes.find((n) => n.id === ids.notes)!.head_version)!
+    head.actor = { kind: 'agent', id: ids.agentBackup, display_name: 'Ada Lovelace' }
+    head.on_behalf_of = ids.ada
+    head.on_behalf_of_display_name = 'Ada Lovelace'
+    const { panel } = await openVersions()
+    const items = await within(panel).findAllByRole('listitem')
+    expect(within(items[0]).getByText(/Ada Lovelace \(agent of Ada Lovelace\)/)).toBeInTheDocument()
+    expect(within(items[0]).getByText('(an agent)')).toBeInTheDocument()
   })
 
   it('compares an old version with the current one', async () => {

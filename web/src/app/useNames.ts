@@ -18,15 +18,24 @@ export function useNames(): Names {
   return useContext(NamesContext)
 }
 
-/** The text of who did a change: "Ada Lovelace", or "Claude Code for Ada Lovelace" for an agent. */
-export function actorLabel(names: Names, actor: Schemas['PrincipalRef'], onBehalfOf?: string | null): { text: string; agent: boolean } {
+/** The text of who did a change: "Ada Lovelace", or "Claude Code (agent of Ada Lovelace)" for an
+ * agent. Agent names come from the client and can look like a person's name, so an agent always
+ * carries the agent mark and the name of its user (decision 0003-5). The server's names
+ * (`display_name`, `on_behalf_of_display_name`) come first; the lists of the space are the
+ * fallback for older servers. */
+export function actorLabel(
+  names: Names,
+  actor: Schemas['PrincipalRef'],
+  onBehalfOf?: string | null,
+  onBehalfOfName?: string | null,
+): { text: string; agent: boolean } {
   switch (actor.kind) {
     case 'agent': {
       const info = names.agent(actor.id)
       const name = actor.display_name ?? info?.name ?? 'An agent'
       const forId = onBehalfOf ?? info?.ownerId
-      const person = names.person(forId)?.name
-      return { text: person ? `${name} for ${person}` : name, agent: true }
+      const person = onBehalfOfName ?? names.person(forId)?.name
+      return { text: person ? `${name} (agent of ${person})` : name, agent: true }
     }
     case 'share_link':
       return { text: 'Anyone with the link', agent: false }
@@ -37,8 +46,15 @@ export function actorLabel(names: Names, actor: Schemas['PrincipalRef'], onBehal
   }
 }
 
+/** Who did a change, as the API sends it (`ActorPair`, `Version`, `AuditEntry`, ...). */
+export type ActorLike = {
+  actor: Schemas['PrincipalRef']
+  on_behalf_of: string | null
+  on_behalf_of_display_name?: string | null
+}
+
 /** The plain-text form of `Actor`, for labels and toasts. */
 export function useActorText() {
   const names = useNames()
-  return (pair: { actor: Schemas['PrincipalRef']; on_behalf_of: string | null }) => actorLabel(names, pair.actor, pair.on_behalf_of).text
+  return (pair: ActorLike) => actorLabel(names, pair.actor, pair.on_behalf_of, pair.on_behalf_of_display_name).text
 }
