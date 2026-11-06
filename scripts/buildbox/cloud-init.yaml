@@ -1,0 +1,30 @@
+#cloud-config
+# The Ruum build server: Docker for the laptop stack, the Rust toolchain and build tools.
+# A user "ruum" with the same SSH key as root; password login is off.
+users:
+  - default
+  - name: ruum
+    groups: [docker, sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+ssh_pwauth: false
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - build-essential
+  - pkg-config
+  - cmake
+  - clang
+  - git
+  - rsync
+  - jq
+  - curl
+  - unzip
+  - postgresql-client
+  - python3
+runcmd:
+  - mkdir -p /home/ruum/.ssh && cp /root/.ssh/authorized_keys /home/ruum/.ssh/ && chown -R ruum:ruum /home/ruum/.ssh && chmod 700 /home/ruum/.ssh
+  - systemctl enable --now docker
+  - su - ruum -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99 -c rustfmt -c clippy'
+  - touch /home/ruum/.bootstrap-done

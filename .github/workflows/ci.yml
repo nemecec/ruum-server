@@ -4,8 +4,8 @@ name: ci
 
 on:
   pull_request:
+  # Every branch: agents push their work branches so the full suites run here in parallel.
   push:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}

@@ -1,0 +1,11 @@
+# gitleaks configuration: the default rules plus allow-lists for known non-secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Content hashes and test placeholders, not secrets"
+regexTarget = "line"
+regexes = [
+  # crates/ruum-mcp/src/tools.json records the SHA-256 of contracts/openapi.yaml.
+  '''"openapi_sha256": "[0-9a-f]{64}"''',
+]
