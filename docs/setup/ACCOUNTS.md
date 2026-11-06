@@ -94,7 +94,9 @@ French, so the data stays in the EU. One account for two needs means fewer keys.
    "Will this API key be used for Object Storage?", answer **Yes** and choose **ruum-staging** as the
    preferred project (S3 requests with this key then go to that project's buckets). Copy the access
    key and the secret key into `SCW_ACCESS_KEY` and `SCW_SECRET_KEY`.
-5. **Transactional Email → Add domain** `notify.staging.ruum.space` (production adds `notify.ruum.space`
+5. **Transactional Email**: Scaleway first asks for a plan. Choose the entry plan (pay as you go, called
+   "Essential" when this was written), with no dedicated IP. That is enough for staging and for the first
+   users; a dedicated IP only helps at high volume. Then **Add domain** `notify.staging.ruum.space` (production adds `notify.ruum.space`
    in its own project later). Scaleway shows DNS records (SPF, DKIM,
    DMARC, MX). You do not need to add them by hand: once step 2 is active, the agents add them
    through the Hetzner DNS API and start the check.
