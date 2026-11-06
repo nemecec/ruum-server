@@ -183,3 +183,43 @@ jobs:
             exit 1
           fi
           echo "::notice::No e2e suite yet; the end-to-end gate is a placeholder."
+
+  e2e-browser:
+    name: browser end-to-end (Playwright, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The laptop stack: Postgres, Garage, Zitadel, SpiceDB, Mailpit, ... (deploy/dev).
+      - name: Start the stack
+        run: scripts/dev.sh up
+      - name: Web dependencies and Chromium
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      # Builds the server, seeds, starts the server (8492) and Vite (5182), runs web/e2e, stops both.
+      - name: Browser end-to-end tests
+        env:
+          # The work folder (report, traces, logs) goes here, for the artifact below.
+          TMPDIR: ${{ runner.temp }}
+        run: scripts/e2e_browser.sh
+      - name: Keep the report and traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-browser-report
+          path: ${{ runner.temp }}/ruum-e2e-browser.*
+          if-no-files-found: ignore
+      - name: Stack logs
+        if: failure()
+        run: docker compose -f deploy/dev/docker-compose.yml --env-file deploy/dev/.env logs --tail=200

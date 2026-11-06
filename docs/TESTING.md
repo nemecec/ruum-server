@@ -262,3 +262,113 @@ Run it alone with `crates/ruum-testkit/scripts/mutation_check.sh <name>`.
   of `getOAuthClient` only checks that the answer holds no data of tenant A.
 - The standard upload names the chunking set `fastcdc-2020-16k-32k-64k` (an example of the
   contract); change `requests::CHUNKING` if the server publishes other IDs.
+
+## Browser end-to-end tests (`web/e2e`)
+
+Playwright specs drive the real web UI in Chromium against the real server and the laptop stack.
+Nothing is mocked: sign-in goes through Zitadel, files go to Postgres and Garage, rights go to
+SpiceDB, mails go to Mailpit.
+
+```sh
+scripts/dev.sh up                    # the stack must be healthy
+scripts/e2e_browser.sh               # build, seed, server on 8492, Vite on 5182, all specs, stop
+scripts/e2e_browser.sh sharing       # extra arguments go to `playwright test`
+RUUM_E2E_WEB=preview scripts/e2e_browser.sh   # the built files (`vite build`) instead of Vite dev
+```
+
+The script prints its work folder. It holds the server and Vite logs, the HTML report
+(`npx playwright show-report <folder>/report`) and a trace of each failed test. In a git worktree,
+the script uses the stack settings (`deploy/dev/.env`, `.state`) of the main worktree, or of
+`RUUM_DEV_ROOT`. The CI job `e2e-browser` (`.github/workflows/ci.yml`) runs the same script after
+`scripts/dev.sh up`; it has not run on GitHub yet.
+
+How the run is set up:
+
+- The server runs with `RUUM_PUBLIC_URL=http://localhost:5182`,
+  `RUUM_OIDC_REDIRECT_URI=http://localhost:5182/auth/callback` and
+  `RUUM_CONTENT_URL=http://content.localhost:8492` (Chromium sends `*.localhost` to the loopback
+  address, so downloads through the content domain work without Caddy).
+- `web/e2e/global-setup.ts` adds the callback of port 5182 to the `ruum-web` client in Zitadel
+  (idempotent), and makes three new Zitadel users with a verified email and a random password
+  (Ann, Ben, Cara) through the management API, as the bootstrap service account of
+  `scripts/dev.sh`. The users are in `<work folder>/run.json` (mode 0600).
+- Sign-in is the real OIDC flow: the sign-in page of the UI, `loginStart`, the Zitadel login UI
+  (login name, password, "Skip" on the 2-factor prompt), `loginCallback`, the session cookie. The
+  `setup` project signs in Ann and Ben and keeps their browser state for the other specs.
+- `ruum-server seed-dev` runs too, as a check that the stack and the token key work; the browser
+  specs use their own users, because the seed users have no Zitadel login.
+
+| Spec | What it checks |
+|---|---|
+| `auth.setup.e2e.ts` | sign-in through Zitadel, the personal space, `ruum_session` (HttpOnly) and `ruum_csrf`, `return_to`, sign-out |
+| `files.e2e.ts` | new folder, a 3 MB upload in many chunks, download through the content domain with the same SHA-256, rename (the name without its extension is selected), move with the folder picker, trash, restore from the Trash page; a second upload of the same bytes sends no chunks |
+| `versions.e2e.ts` | a labelled version, "Upload new version", the text diff (`ins`/`del`), restore, the restored content |
+| `sharing.e2e.ts` | Ann shares a folder by email, invites Ben as a guest (mail in Mailpit), Ben accepts and sees the folder with "Can view" only (no upload, rename or trash; the server answers `403` to a write), Ann removes the grant and Ben gets `404` |
+| `agents.e2e.ts` | register an agent, create a key (shown once), the agent works through the API with the key, its activity, "last used", the actor of the change, "Undo all" |
+| `admin.e2e.ts` | a new team, the members table, an invitation as member (mail in Mailpit), the new member, a role change, the audit log |
+
+Rules for new specs: file names end in `.e2e.ts` (Vitest ignores them); find elements by role and
+name, as a person or a screen reader does; give every folder a new name (`uniqueName`), because
+all specs share Ann's space; wait for the page of a folder (its heading) before you act in it.
+
+### Known gaps found by the browser tests
+
+The specs mark these with `test.fixme`. Each has the steps that must pass once it is fixed; remove
+the `fixme` then.
+
+| Gap | Where | Spec |
+|---|---|---|
+| A cold load of a protected page loses `return_to`: `/v1/me` and `/v1/tenants` both answer `401`, and the second redirect runs `signInPath()` on `/signin`. | `web/src/app/session.tsx` | `auth.setup.e2e.ts` |
+| The mail of an invitation links to `/invitations/accept?token=...`; the web UI has no such page ("Page not found"). The specs accept through the API. | `web/src/app/routes.tsx` | `admin.e2e.ts` |
+| An email grant to a person who already has an account never binds: a known identity returns before the binding at sign-in, and `addGrant` sends no invitation mail, although its contract says both. | `ruum-core` `identity/postgres.rs`, `sharing/postgres.rs` | `sharing.e2e.ts` |
+| An email grant that binds at a first sign-in does not make the person a guest. "Shared with me" lists the folder ("Another tenant", no link), but every read answers `404`. | `ruum-core` sharing and tenants | `sharing.e2e.ts` |
+| The name field of "New folder" and "Rename" does not get the focus: React's `autoFocus` runs before `showModal()`, which focuses the close button. | `web/src/components/ui.tsx` | `files.e2e.ts` |
+| While a folder loads after a click, the page keeps the toolbar of the previous folder; an upload started then lands in the previous folder. | `web/src/pages/files/FilesPage.tsx` | `files.e2e.ts` |
+
+Smaller gaps that the specs accept as they are (a comment in the spec says so): the share dialog
+shows a user grantee by ID (`listGrants` gives no name or email); the file list and "Shared with
+me" show an agent or a sharer by the first 8 characters of the ID (no `display_name` on the
+actor); the tenant switcher labels every personal tenant "(personal)", also when the user is a
+guest there.
+
+### Manual checklist: passkeys, Google and Microsoft
+
+These need real devices or real accounts, so no automatic test covers them. A person runs them
+before a release, on the laptop stack, with the web UI on `http://localhost:5182` (or
+`https://ruum.localhost`). It is optional. Today every sign-in button opens the Zitadel login
+page, because the server does not send the `idp` hint yet (docs/STATUS.md); choose the method there.
+
+Passkey (WebAuthn works on `localhost` without TLS):
+
+1. Sign in once with a password user, open the Zitadel console (`http://localhost:8180/ui/console`),
+   go to your user, and add a passwordless (passkey) authenticator: Touch ID, Windows Hello, or a
+   security key.
+2. Sign out of Ruum. Click "Sign in with a passkey", enter the login name, and choose the passkey.
+3. Check: you land on your files; `/v1/me` shows the same user as before; Account > Sign-in
+   methods lists the identity.
+4. Cancel the passkey prompt once. Check: the Zitadel page offers the password again, and nothing
+   breaks in Ruum.
+
+Google:
+
+1. In Google Cloud, make an OAuth client (web application) with the redirect URI
+   `http://localhost:8180/ui/login/login/externalidp/callback`.
+2. In the Zitadel console, add a Google identity provider with that client ID and secret, and
+   allow it in the login policy.
+3. Sign out of Ruum. Click "Continue with Google", choose Google on the Zitadel page, sign in.
+4. Check: a new account gets a personal space; an email that Google verified links to an existing
+   Ruum user with the same verified email (no second account); an email grant to that address
+   binds after the first sign-in.
+
+Microsoft (Entra ID):
+
+1. In Entra ID, register an application with the redirect URI
+   `http://localhost:8180/ui/login/login/externalidp/callback` and make a client secret.
+2. In the Zitadel console, add a Microsoft identity provider (tenant type as needed) and allow it
+   in the login policy.
+3. Sign out of Ruum. Click "Continue with Microsoft", choose Microsoft on the Zitadel page, sign
+   in with a work or school account and with a personal account.
+4. Check the same points as for Google. Also check that an account whose email Microsoft does not
+   mark as verified does not claim email grants or invitations.
+
+Remove the identity providers from Zitadel when you are done, if the laptop stack is shared.
