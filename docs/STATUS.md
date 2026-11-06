@@ -2,7 +2,7 @@
 
 This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06,
 the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, the quality wave (wave
-C) and the UX fixes of the web UI (`q/uxfix`), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+C), the UX fixes of the web UI (`q/uxfix`) and the synthetic-user fixes (`q/synthfix`), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -33,6 +33,21 @@ are in `docs/ux/decisions.md`.
 | Agents | `/t/<space>/agents/connect` (MCP address, steps for Claude Desktop, ChatGPT, Claude Code); consent defaults to one folder and 90 days; Pause/Resume, access summary, activity with item names. |
 | Files | Names instead of IDs (from `listMembers`, `listAgents`), agent marks in Changed, a coalescing warning before "Upload new version", one upload panel with a conflict question per batch, selection with bulk Move and Trash (Undo), sorting, error copy for every `ErrorCode` (`api/errors.ts`), welcome card and empty states. |
 | Tests | Flow tests for share links, invitations, uploads, selection, errors; `web/e2e/visual.e2e.ts` (88 snapshots on the mock UI, darwin only) and `web/e2e/a11y.e2e.ts` (axe, WCAG 2.2 A/AA); the 4 UI `test.fixme` of the browser tests now run. |
+
+Synthetic-user fixes (2026-11-06, `q/synthfix` fast-forwarded onto `main`, no conflicts; only
+`web/`, `docs/ux/decisions.md` and `scripts/ux/README.md` changed; no server or contract change):
+the 2 blockers and the majors that two synthetic users (design 18.9) found. Decisions S1 to S6
+and contract needs C-12 to C-14 are in `docs/ux/decisions.md`.
+
+| Area | What changed in the web UI |
+|---|---|
+| Share dialog | A share to a member or guest goes by user ID (`addGrant {type: "user"}`), so it reaches the account at once; the access from the space role ("Everyone in *Space* except guests: Can manage") is listed and a weaker share is called out; one "Email them an invitation" box for a person outside, plus "Use a link instead"; own row read-only; "added by". The mock API keeps email grants as email grants, like the server. |
+| Upload conflict | "Save as a new version" is the default and first names the person's own recent unnamed version ("Before the upload of HH:MM"), so nothing is lost. |
+| Activity log | Access, role, sharing rule, link and member entries name the item (a link), the person and the old and new values (from `AuditEntry.data`). |
+| Smaller | Change to Guest asks first; sharing rule inherit shows the parent's value and "Saved."; version times; "Keep forever..."; compare summary; image icon; sign-in labels. |
+
+The digest for the person is `docs/digests/2026-11-06.md`. The worktrees of `q/browser`,
+`q/decisions` and `q/synthfix` are removed; the branches stay.
 
 Fixes made during the `q/uxfix` integration:
 
@@ -211,7 +226,7 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-06, `main` after the `q/uxfix` integration, `DATABASE_URL` and SpiceDB from `dev.sh env`)
+## Checks (2026-11-06, `main` after the `q/synthfix` integration, `DATABASE_URL` and SpiceDB from `dev.sh env`)
 
 - `cargo fmt --all --check`, `cargo build --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`: pass.
@@ -222,15 +237,14 @@ For Zitadel sign-in through Vite, start the server with
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` on every backend: tenant isolation
   251/251, permission matrix 1209/1209, trashed file suite 78/78, 0 pending, 0 failed, with
   `RUUM_SUITE_BACKEND=memory`, `postgres` (memory authz) and `postgres` with
-  `RUUM_SUITE_AUTHZ=spicedb`.
+  `RUUM_SUITE_AUTHZ=spicedb`. The runs were one after another, not in parallel.
 - `MUTATION_STRICT=1 MUTATION_TARGET_DIR=$PWD/target crates/ruum-testkit/scripts/mutation_check.sh`:
   22 of 22 mutations killed, none survived or skipped.
 - `scripts/e2e_smoke.sh`: `PASSED: 52 checks`.
-- `scripts/e2e_browser.sh` (projects setup, chromium, visual; the mock UI on 5187 for the
-  visual project): 114 passed, 2 skipped (the server-gap `test.fixme` of `sharing.e2e.ts`),
-  twice in a row after the fixes.
-- `web/`: `npm ci`, `npm run lint`, `npm run build`, `npx vitest run` (16 files, 145 tests, 4
-  runs in a row), `npx tsc -p e2e/tsconfig.json`: pass.
+- `scripts/e2e_browser.sh` (projects setup, chromium, visual; ports 8571, 8572, 5291 and the mock
+  UI on 5297): 114 passed, 2 skipped (the server-gap `test.fixme` of `sharing.e2e.ts`).
+- `web/`: `npm run lint` (0 warnings), `npm run build`, `npx vitest run` (16 files, 149 tests),
+  `npx tsc -p e2e/tsconfig.json`: pass.
 - Flaky once: the SpiceDB run of `trashed_file_reads` failed one check
   (`getContentUrl [agent_of_guest_view]: 401, expected 404`) while it ran 595 s next to the
   permission matrix and a vitest run. Alone it passed (30 s), and the full SpiceDB run again
@@ -265,6 +279,12 @@ For Zitadel sign-in through Vite, start the server with
   share dialog people picker, grouping agent activity by runs, version day groups, Shift-range
   selection, the grid view, the app shell rail (UX-17), UX-20. The visual snapshots exist only
   for darwin; a Linux CI job needs its own reviewed set.
+- **After `q/synthfix`** (`docs/ux/decisions.md`): agents (MCP, CLI) and guests who share by
+  email still make email grants that never reach a member (C-12); `addGrant` sends no share
+  email and the invitation email names no role or end date (C-13); no code calls
+  `audit::events::sign_in`, so no space logs sign-ins (C-14); the accept page can't name the
+  space (C-9). A Member manages everything in a team space; a view-only member role is a
+  product question for the architect panel. No folder upload control.
 - **SpiceDB freshness inside a request.** A request reads at least as fresh as its tenant's
   newest token at its start and its own writes (decision 0002-4). Work that a handler spawns on
   another task (unless it uses `authz::in_current_request`), the outbox worker and `seed-dev`
