@@ -242,9 +242,13 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     let tools = v["result"]["tools"].as_array().expect("tools");
     let catalog = ruum_mcp::Catalog::load();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    let expected: Vec<&str> = catalog.tools.iter().map(|t| t.name.as_str()).collect();
+    // Tools of planned operations (decision 0004-22) are not offered.
+    let expected: Vec<&str> = catalog.offered().map(|t| t.name.as_str()).collect();
     assert_eq!(names, expected);
     assert_eq!(names.len(), 48);
+    for t in catalog.tools.iter().filter(|t| t.planned) {
+        assert!(!names.contains(&t.name.as_str()), "{} is planned", t.name);
+    }
     for t in tools {
         assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));

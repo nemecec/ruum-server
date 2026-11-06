@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.migration_applied.schema.json",
+  "title": "database.migration_applied",
+  "description": "A migration ran and was committed (`applyDatabaseMigration`). `node_id` of the entry is the database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.migration_applied`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "migration_id",
+    "name",
+    "checksum",
+    "restore_point_id",
+    "approval_id",
+    "new_columns",
+    "reset_columns"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "migration_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[0-9]{4}_[a-z0-9_]{1,100}$"
+    },
+    "checksum": {
+      "$ref": "common.schema.json#/$defs/hash"
+    },
+    "restore_point_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "approval_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "new_columns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reset_columns": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Columns that returned to unconfirmed (renamed, retyped, rebuilt or re-added)."
+    }
+  }
+}

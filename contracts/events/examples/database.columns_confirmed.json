@@ -1,0 +1,33 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 20410,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 3,
+  "type": "database.columns_confirmed",
+  "actor": {
+    "kind": "user",
+    "id": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d"
+  },
+  "on_behalf_of": null,
+  "at": "2026-11-06T10:15:00Z",
+  "data": {
+    "version_id": "0190b6c4-9002-7cc1-9a4b-1f2e3d4c5b71",
+    "approval_id": null,
+    "columns": [
+      {
+        "schema": "public",
+        "table": "plants",
+        "column": "latin_name",
+        "class": "normal",
+        "old_class": null
+      },
+      {
+        "schema": "public",
+        "table": "customers",
+        "column": "email",
+        "class": "personal",
+        "old_class": null
+      }
+    ]
+  }
+}

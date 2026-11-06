@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.branch_created.schema.json",
+  "title": "database.branch_created",
+  "description": "A branch of a database was made. `node_id` of the entry is the source database; `node.created` is written for the branch node. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.branch_created`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "branch_id",
+    "data",
+    "branch_at",
+    "constraints_left_out"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "branch_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "data": {
+      "enum": [
+        "masked",
+        "schema_only",
+        "full"
+      ]
+    },
+    "branch_at": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    },
+    "constraints_left_out": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Masked copy: constraints that could not be built again (pseudonym collisions); their names are in the branch status."
+    }
+  }
+}

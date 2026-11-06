@@ -49,6 +49,10 @@ pub struct ToolSpec {
     pub name: String,
     /// The `operationId`.
     pub operation: String,
+    /// The operation is `x-ruum-status: planned` (specified, not built): the server does not
+    /// offer the tool (decision 0004-22).
+    #[serde(default)]
+    pub planned: bool,
     pub description: String,
     pub notes: Option<String>,
     /// Upper case: `GET`, `POST`, ...
@@ -116,12 +120,41 @@ impl Catalog {
         }
     }
 
+    /// The tool of this name, if the server offers it (planned tools are left out).
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
-        self.tools.iter().find(|t| t.name == name)
+        self.offered().find(|t| t.name == name)
     }
 
-    /// The MCP tools, in contract order.
+    /// The tools the server offers: every tool whose operation is built (not planned).
+    pub fn offered(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.tools.iter().filter(|t| !t.planned)
+    }
+
+    /// The MCP tools, in contract order, without the planned ones.
     pub fn mcp_tools(&self) -> Vec<Tool> {
-        self.tools.iter().map(ToolSpec::tool).collect()
+        self.offered().map(ToolSpec::tool).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Catalog;
+
+    /// A tool of a planned operation is in the catalog file but never offered or callable.
+    #[test]
+    fn planned_tools_are_not_offered() {
+        let c = Catalog::load();
+        let planned: Vec<&str> = c
+            .tools
+            .iter()
+            .filter(|t| t.planned)
+            .map(|t| t.name.as_str())
+            .collect();
+        let offered: Vec<String> = c.mcp_tools().iter().map(|t| t.name.to_string()).collect();
+        for name in planned {
+            assert!(!offered.iter().any(|o| o == name), "{name} is offered");
+            assert!(c.get(name).is_none(), "{name} can be called");
+        }
+        assert_eq!(offered.len(), c.offered().count());
     }
 }

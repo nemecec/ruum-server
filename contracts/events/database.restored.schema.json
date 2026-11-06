@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.restored.schema.json",
+  "title": "database.restored",
+  "description": "A restore ended well. `node_id` of the entry is the source database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.restored`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "restore_id",
+    "target",
+    "target_node_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "restore_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "target": {
+      "enum": [
+        "new_node",
+        "in_place"
+      ]
+    },
+    "target_node_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    }
+  }
+}

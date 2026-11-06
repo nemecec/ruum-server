@@ -18,6 +18,11 @@
 #                a fresh Idempotency-Key for each tool call.
 #   notes        (optional) where the tool differs from the REST operation.
 #
+# Planned operations (x-ruum-status: planned in openapi.yaml, decision 0004-22) keep their tool
+# entry here, so the tool is designed with the contract, but gen-tools.mjs marks the tool
+# `planned` and the MCP server does not offer it (not in tools/list; a call answers "unknown
+# tool") until the build task removes the mark and runs gen-tools.mjs again.
+#
 # not_exposed lists every other operation with the reason. Operations marked
 # x-ruum-user-only are never tools. Every operationId of openapi.yaml is in exactly one of the two
 # lists; crates/ruum-mcp/tests/tools_contract.rs checks this.
@@ -243,7 +248,7 @@ tools:
     input: '#/paths/~1v1~1databases~1{node_id}~1query/post'
   - name: list_database_queries
     operation: listDatabaseQueries
-    description: 'Read your own entries in the query log of a database: the normalized statement, parameters as pseudonyms, outcome and time. Needs manage.'
+    description: 'Read your own entries in the query log of a database: the normalized statement, parameters as pseudonyms, outcome and time.'
     input: '#/paths/~1v1~1databases~1{node_id}~1queries/get'
   - name: list_database_columns
     operation: listDatabaseColumns
@@ -281,18 +286,26 @@ tools:
     operation: listDatabaseAccessGrants
     description: 'List your time-limited grants on a database (live writes, real personal values) and when they end.'
     input: '#/paths/~1v1~1databases~1{node_id}~1access-grants/get'
-  - name: revoke_database_access_grant
+  - name: request_database_access_grant
+    operation: requestDatabaseAccessGrant
+    description: 'Ask your user for a time-limited grant on a database (live writes or real personal values). Nothing is granted until they approve; give them the review_url.'
+    input: '#/paths/~1v1~1databases~1{node_id}~1access-grant-requests/post'
+  - name: remove_database_access_grant
     operation: revokeDatabaseAccessGrant
     description: 'Give back a grant on a database before it ends.'
     input: '#/paths/~1v1~1databases~1{node_id}~1access-grants~1{grant_id}/delete'
   - name: list_database_approvals
     operation: listDatabaseApprovals
-    description: 'List your destructive statements that wait for a person, and the decisions.'
+    description: 'List your requests on a database (statements, migrations, grants) that wait for a person, and the decisions.'
     input: '#/paths/~1v1~1databases~1{node_id}~1approvals/get'
   - name: get_database_approval
     operation: getDatabaseApproval
     description: 'Read one approval request; when it is approved, send the same statement again with its approval_id.'
     input: '#/paths/~1v1~1databases~1{node_id}~1approvals~1{approval_id}/get'
+  - name: list_pending_database_approvals
+    operation: listPendingDatabaseApprovals
+    description: 'List your requests that wait for a person across all databases of the tenant.'
+    input: '#/paths/~1v1~1database-approvals/get'
 
 not_exposed:
   - operation: health

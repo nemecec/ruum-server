@@ -27,7 +27,7 @@
       "enum": ["shared-small"]
     },
     "extensions": {
-      "description": "Postgres extensions to create in the database. Only names on the allow-list of the cluster are valid; `anon` (PostgreSQL Anonymizer) is managed by Ruum and is not listed here. Must be empty for `sqlite`.",
+      "description": "Postgres extensions to create in the database. Only names on the allow-list of the cluster are valid; Ruum does not use PostgreSQL Anonymizer; its masking is done by its own lens views in schemas the database owner cannot change (decision 0004-4). Must be empty for `sqlite`.",
       "type": "array",
       "uniqueItems": true,
       "maxItems": 16,

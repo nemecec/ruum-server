@@ -728,16 +728,132 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             plain("search in the caller's tenant", p)
         }
 
+        // ------------------------------------------------------------ databases (step 2, planned)
+        "createDatabase" => {
+            let mut p = addressed(op, w, NotFound, Some(("listChildren", o)));
+            p.push(
+                Probe::new(
+                    "B's owner, B's database from A's database as template",
+                    o,
+                    std_req(op, b).json(json!({
+                        "parent_id": b.projects,
+                        "name": "bravo copy of alpha",
+                        "manifest": { "engine": "sqlite", "version": "3", "plan": "shared-small" },
+                        "source": { "kind": "template", "node_id": a.database },
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listChildren", a)),
+            );
+            plain("parent folder or template database in tenant A", p)
+        }
+        "getDatabase"
+        | "getDatabaseSchema"
+        | "listDatabaseQueries"
+        | "listDatabaseColumns"
+        | "listDatabaseMigrations"
+        | "listDatabaseBranches"
+        | "listDatabaseRestorePoints"
+        | "listDatabaseAccessGrants"
+        | "listDatabaseApprovals" => addressed_case(NotFound, None),
+        "queryDatabase" => addressed_case(NotFound, Some(("listDatabaseQueries", o))),
+        "updateDatabaseManifest" | "confirmColumnClasses" | "applyDatabaseMigration" => {
+            addressed_case(NotFound, Some(("getDatabase", o)))
+        }
+        "suggestColumnClasses" => addressed_case(NotFound, Some(("listDatabaseColumns", o))),
+        "createDatabaseBranch" => addressed_case(NotFound, Some(("listDatabaseBranches", o))),
+        "createDatabaseRestorePoint" | "restoreDatabase" => {
+            addressed_case(NotFound, Some(("listDatabaseRestorePoints", o)))
+        }
+        "createDatabaseAccessGrant" => {
+            let mut p = addressed(op, w, NotFound, Some(("listDatabaseAccessGrants", o)));
+            p.push(
+                Probe::new(
+                    "B's member grants A's agent on B's database",
+                    Who::Member,
+                    RequestSpec::post(format!("/v1/databases/{}/access-grants", b.database))
+                        .tenant(b.id)
+                        .json(json!({
+                            "kind": "read_personal",
+                            "agent_id": a.agent_id(Who::Agent),
+                            "duration_minutes": 60,
+                        })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listDatabaseAccessGrants", a)),
+            );
+            plain("database or agent in tenant A", p)
+        }
+        "requestDatabaseAccessGrant" => {
+            addressed_case(NotFound, Some(("listDatabaseApprovals", o)))
+        }
+        "revokeDatabaseAccessGrant" => {
+            let mut p = addressed(op, w, NotFound, Some(("listDatabaseAccessGrants", o)));
+            p.push(
+                Probe::new(
+                    "B's owner, A's grant under B's database",
+                    o,
+                    RequestSpec::new(
+                        Method::DELETE,
+                        format!(
+                            "/v1/databases/{}/access-grants/{}",
+                            b.database, a.database_grant
+                        ),
+                    )
+                    .tenant(b.id),
+                    NotFound,
+                )
+                .unchanged(o, std_req("listDatabaseAccessGrants", a)),
+            );
+            plain("addressed resource of tenant A", p)
+        }
+        "getDatabaseApproval" | "decideDatabaseApproval" => {
+            let read = (op == "decideDatabaseApproval").then_some(("getDatabaseApproval", o));
+            let mut p = addressed(op, w, NotFound, read);
+            let std = std_req(op, a);
+            let rest = if op == "decideDatabaseApproval" {
+                "/decision"
+            } else {
+                ""
+            };
+            let mut mixed = RequestSpec::new(
+                std.method,
+                format!(
+                    "/v1/databases/{}/approvals/{}{rest}",
+                    b.database, a.database_approval
+                ),
+            )
+            .tenant(b.id);
+            mixed.body = std.body;
+            let mut probe = Probe::new(
+                "B's owner, A's request under B's database",
+                o,
+                mixed,
+                NotFound,
+            );
+            if let Some((r, who)) = read {
+                probe = probe.unchanged(who, std_req(r, a));
+            }
+            p.push(probe);
+            plain("addressed resource of tenant A", p)
+        }
+        "listPendingDatabaseApprovals" => plain(
+            "the requests in the caller's tenant",
+            own_tenant(op, w, None),
+        ),
+
         _ => None,
     }
 }
 
-/// Runs one probe in `app` and returns its outcome.
+/// Runs one probe in `app` and returns its outcome. `planned` says that the operation of the
+/// case is `x-ruum-status: planned`: a missing route or a `501` is then reported as planned.
 pub async fn run_probe(
     app: &axum::Router,
     w: &World,
     fallback: &Response,
     probe: &Probe,
+    planned: bool,
 ) -> Outcome {
     let actor: &Principal = if probe.bridge {
         match &w.bridge {
@@ -762,12 +878,6 @@ pub async fn run_probe(
     };
 
     let mut problems: Vec<String> = Vec::new();
-    if client::is_unrouted(&res, fallback) {
-        return Outcome::Failed(format!(
-            "{}: no handler answers this method and path (the route is missing)",
-            probe.request.label()
-        ));
-    }
     // A leak is a failure even when the handler is otherwise unfinished.
     let sent = probe.request.sent_text();
     let text = res.text();
@@ -782,7 +892,20 @@ pub async fn run_probe(
     if !leaked.is_empty() {
         problems.push(format!("the answer holds data of tenant A: {leaked:?}"));
     }
+    if client::is_unrouted(&res, fallback) {
+        if planned && problems.is_empty() {
+            return Outcome::Planned;
+        }
+        problems.push(format!(
+            "{}: no handler answers this method and path (the route is missing)",
+            probe.request.label()
+        ));
+        return Outcome::Failed(problems.join("; "));
+    }
     let pending = res.is_not_implemented();
+    if pending && planned && problems.is_empty() {
+        return Outcome::Planned;
+    }
     if !pending {
         if res.status.is_server_error() {
             problems.push(format!("server error {}", res.status));
@@ -861,8 +984,9 @@ async fn case_rows(op: &str, state: ruum_api::AppState) -> Vec<(&str, String, Ou
             Outcome::Failed("the case has no probes".into()),
         ));
     }
+    let planned = crate::matrix::PLANNED_OPERATIONS.contains(&op);
     for p in &c.probes {
-        let outcome = run_probe(&app, &w, &fallback, p).await;
+        let outcome = run_probe(&app, &w, &fallback, p, planned).await;
         rows.push((op, p.label.clone(), outcome));
     }
     rows

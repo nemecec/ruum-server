@@ -1,0 +1,21 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 20410,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 3,
+  "type": "database.grant_created",
+  "actor": {
+    "kind": "user",
+    "id": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d"
+  },
+  "on_behalf_of": null,
+  "at": "2026-11-06T10:15:00Z",
+  "data": {
+    "grant_id": "0190b6c4-9013-7cc1-9a4b-1f2e3d4c5b71",
+    "kind": "write_live",
+    "agent_id": "0190b6c4-7000-7cc1-9a4b-1f2e3d4c5b6c",
+    "expires_at": "2026-11-06T11:15:00Z",
+    "restore_point_id": "0190b6c4-9014-7cc1-9a4b-1f2e3d4c5b71",
+    "approval_id": null
+  }
+}

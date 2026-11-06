@@ -1,0 +1,20 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 20410,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 3,
+  "type": "typed_node.status_changed",
+  "actor": {
+    "kind": "user",
+    "id": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d"
+  },
+  "on_behalf_of": null,
+  "at": "2026-11-06T10:15:00Z",
+  "data": {
+    "type": "database",
+    "old_state": "provisioning",
+    "new_state": "ready",
+    "reason": null,
+    "observed_version_id": "0190b6c4-9001-7cc1-9a4b-1f2e3d4c5b71"
+  }
+}

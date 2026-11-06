@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/typed_node.status_changed.schema.json",
+  "title": "typed_node.status_changed",
+  "description": "The status of a typed node changed (provider contract `ProviderStatus`). `node_id` of the entry is the typed node. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `typed_node.status_changed`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "type",
+    "old_state",
+    "new_state",
+    "reason",
+    "observed_version_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "The provider type, for example `database`."
+    },
+    "old_state": {
+      "oneOf": [
+        {
+          "enum": [
+            "provisioning",
+            "ready",
+            "updating",
+            "degraded",
+            "suspended",
+            "failed",
+            "deleted"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "new_state": {
+      "enum": [
+        "provisioning",
+        "ready",
+        "updating",
+        "degraded",
+        "suspended",
+        "failed",
+        "deleted"
+      ]
+    },
+    "reason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "observed_version_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

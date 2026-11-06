@@ -129,6 +129,8 @@ for (const t of toolsDoc.tools) {
   tools.push({
     name: t.name,
     operation: t.operation,
+    // Specified but not built (decision 0004-22): the server does not offer the tool yet.
+    planned: op['x-ruum-status'] === 'planned',
     description: t.description,
     notes: t.notes ?? null,
     method: method.toUpperCase(),

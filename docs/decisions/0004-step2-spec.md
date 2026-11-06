@@ -12,9 +12,12 @@ the `databases` tag and four step 1 descriptions of `contracts/openapi.yaml`,
 safer option is taken and the text says so.
 
 Reviewer 1 (contract consistency, tenant isolation, the 8.5 privacy filter) gave 11 MUST items
-and one SHOULD item. Of reviewer 2, the orchestrator relayed only the first item (the role
-model); it asks for the same change as reviewer 1, item 1. The rest of reviewer 2's text did not
-reach this revision; see "Open" at the end.
+and one SHOULD item; items 1 to 13 below apply them. Reviewer 2 (later steps and swarm
+buildability) gave 12 required changes and 5 notes. The first revision saw only reviewer 2's
+first item (the same as reviewer 1, item 1). The second revision read both reviews in full and
+applied every reviewer 2 item that the branch did not satisfy yet (items 14 to 19 and 23), the UX
+contract needs C-15 to C-19 (item 20), and the architect decision on planned operations (items 21
+and 22). `ruum-server-wt/panel/step2-spec-v2-changes.md` maps each review item to its change.
 
 ## 1. Postgres sessions: untrusted SQL never runs as the admin role
 
@@ -244,9 +247,220 @@ list and the error copy of the new codes in `web/src/api/errors.ts` (its type ne
 - `estimated_rows` comes from `EXPLAIN` or a `count(*)` in a read-only transaction, never from a
   test run of `DROP` or `TRUNCATE` (which takes `ACCESS EXCLUSIVE` locks on live).
 
+## 14. Pooled sessions and app bindings (reviewer 2, items 1 and 3)
+
+**Decision.** Item 1 stands (LOGIN roles per database and kind). In addition: every request runs
+in its own transaction and sets options with `SET LOCAL` only; `SET`, `RESET` and
+`set_config(..., false)` of any session option are refused (`statement_not_allowed`); a
+connection returns to the pool only after `DISCARD ALL`, and a connection whose transaction did
+not end cleanly is closed. `dbhost_check.sh` (I-1) tests from sessions that log in as the role,
+not from `ruum_dbhost` with `SET ROLE`.
+
+Hiding `secret` values from people without `manage` stays in the engine (the `nosecret` lens),
+because reviewer 1 item 3 needs every clause masked and a query-layer filter cannot do that. So
+step 3 apps do not use the people's kinds: an app binding gets kinds of its own, `app_read` and
+`app_write` (lens `base`, real values and secrets, one pair per binding), added in step 3 as new
+values of `database_roles.kind`. The permission table has rows for app bindings (step 3) and
+share links (`403`), so the caller resolution of Q-1 does not change in step 3.
+
+**Reasons.** Session options set with `set_config(..., false)` outlive a request on a pooled
+connection. Reviewer 2's alternative (secrets hidden from people in the query layer only) would
+reopen reviewer 1's oracle (`WHERE token LIKE 'a%'`) for viewers.
+
+**Changes.** `database_roles` comment, STEP2 "The engine security model" (Postgres 1 and the
+kinds table), the permission table, `queryDatabase` ("Statements that never run"), cards I-1,
+E-2, Q-1.
+
+## 15. Spike S-1 before the role kinds freeze (reviewer 2, item 2)
+
+**Decision.** New card S-1 (after I-1; C-1's freeze waits for it). PostgreSQL Anonymizer is gone
+(item 4), so the spike proves what replaces it: LOGIN roles cannot reach other roles; masked
+roles read pseudonyms in every clause through the lens views and cannot read base tables, the key
+or `pg_stats` values; `ruum_mask.pseudonym` runs from a view but not by name without schema
+`USAGE`; `masked_write` writes plain columns through the view, cannot write masked columns, and
+a `WHERE` on a masked column compares the pseudonym (so `rows_affected` tells nothing new);
+`SET LOCAL` and `DISCARD ALL` leave nothing on a pooled connection; the SQL and Rust pseudonyms
+agree. If a point fails, C-1 changes the kinds or the lens before the freeze.
+
+**Reasons.** The lens design rests on Postgres behaviour that no test has shown yet (`EXECUTE`
+without schema `USAGE` through a view, writes through views with computed columns). Freezing
+`database_roles` first would make a failure reopen 0002 and the contract.
+
+**Changes.** STEP2 card S-1, C-1 "After" and "Done when", E-2 "After", order.
+
+## 16. The tenant pseudonym key (reviewer 2, item 9)
+
+**Decision.** One random 32-byte key per tenant in the new table `tenant_keys` (0002), stored
+only wrapped (AES-256-GCM) by a key-encryption key: an OpenBao transit key in production, a
+local KEK file on the laptop (`RUUM_LOCAL_KEK_FILE`, kept and removed together with the platform
+database volume), because dev OpenBao is in memory. The key is made on first use (the first
+database of the tenant), under the primary key, so two racing creates keep one key. A tenant
+export carries it re-wrapped for the target cell, so pseudonyms stay the same after a move
+(design 14). It is never rotated in step 2 (query logs, approvals and masked branches keep
+matching); a rotation would be a new `key_version` and is not specified. New card Q-4 owns it.
+
+**Changes.** `tenant_keys` in 0002 (with RLS), STEP2 infrastructure item 5, area 4, card Q-4.
+
+## 17. Branches keep their metadata; masking by type; no `at` (reviewer 2, items 4 and 5)
+
+**Decision.**
+
+- A branch gets copies of the source's `database_columns` rows (confirmed classes kept) and of
+  its applied `database_migrations` rows as of `branch_at`. Classes stay as they are, so in a
+  masked branch an agent without `read_personal` reads a pseudonym of the pseudonym: intended
+  (consistent inside the branch, never the real value; reviewer 2 note e).
+- Masking by type: a `personal` column becomes `text` with the pseudonym; a `secret` column
+  keeps its type and holds `NULL`, with its `NOT NULL` dropped; `CHECK` constraints that read a
+  masked column are dropped; keys, `UNIQUE`, indexes and foreign keys on masked columns are
+  built again after the copy (both sides of a foreign key hold the pseudonym of the same value),
+  and one that fails because of a pseudonym collision is left out and named in
+  `status.message` (names only); triggers are disabled during the copy.
+- `CreateDatabaseBranchRequest.at` and the provider `Source` branch `at` are removed for step 2:
+  a branch is always of the current state. A branch of an earlier time is a restore into a new
+  node followed by a branch, so D-3 needs no PITR (E-4).
+
+**Changes.** `createDatabaseBranch`, `CreateDatabaseBranchRequest`, provider `Source`,
+`databases.branch_at` comment, card D-3.
+
+## 18. Children of typed nodes (reviewer 2, item 6)
+
+**Decision.** `TypeDescriptor.child_types` is the only list of children a typed node may have,
+made only by the type's own operations, and the platform enforces it for every type:
+`createNode`, `createUpload` (`new_file`), `moveNode` and `copyNode` into a typed node give
+`409 conflict`; a child that `child_types` lists cannot move away from its parent (`409`);
+`copyNode` of a database copies no branch; trash and purge take the children along. A database
+has `child_types: [database]`.
+
+**Changes.** The descriptions of `createNode`, `createUpload`, `moveNode`, `copyNode` and
+`trashNode` (additive), `TypeDescriptor.child_types`, provider README "Children of a typed node",
+cards P-3 and T-1.
+
+## 19. Ownership and order for the swarm (reviewer 2, items 7, 8, 10, 11 and 12)
+
+**Decision.**
+
+- Item 7 was already applied (decision 11); C-1 may now change everything needed to keep main
+  green, and C-1 and C-2 land as one branch.
+- New card Q-0 makes `crates/ruum-core/src/privacy/mod.rs`: the marker types, the
+  `Pseudonymizer` trait and the `MaskingRules` hook (`classes_changed`). K-1 calls the hook; Q-2
+  and Q-3 implement it. This removes the K-1 to Q-2 inversion.
+- D-1 makes `routes/databases/mod.rs` with `501` stubs for every handler of the area and one
+  submodule per later card (`migrations`, `branches`, `backups`), and the same split in
+  `ruum-core/src/databases/`. D-2, D-3 and D-4 change only their submodule.
+- C-2 is in "After" of D-1, D-2, D-3, D-4, K-1, A-1 and A-2. The `sqlparser` approval (open
+  question 9) is a precondition of Q-1 and A-2.
+- Item 12 (SQLite sandbox) was mostly applied (decision 2); E-3 now also asserts that an
+  authorizer is set on every connection and that every `PRAGMA` that writes is denied, also in
+  read mode.
+
+**Changes.** STEP2 shared files, area 3 and 4 "Owns", cards C-1, C-2, Q-0, D-1 to D-4, K-1, A-1,
+A-2, Q-1, Q-2, E-3, order.
+
+## 20. UX contract needs C-15 to C-19
+
+**Decision.** All five are taken; no review argues against one.
+
+- **C-15, classes in the migration request.** `DatabaseApproval` gets `subject`
+  (`statement`, `migration`, `grant`), `migration_name` and `planned_columns`;
+  `decideDatabaseApproval` takes optional `classes`. Changed from the UX proposal (safer):
+  `planned_columns` come from parsing `up`, not from a dry run, because a dry run of a migration
+  on live takes `ACCESS EXCLUSIVE` locks (the same reason as decision 13 for `estimated_rows`).
+  The classes take effect in the same transaction as the approved migration, never before.
+- **C-16, web links for the agent's user.** `DatabaseApproval.review_url`; the `hint` of
+  `write_grant_required`, `class_read_required` and `user_required` (on `restoreDatabase` and
+  `confirmColumnClasses`) is the web URL of the right page. URLs hold IDs (and kind and minutes)
+  only: never a reason, a statement or a value (privacy; prompt injection, UX DB-8).
+- **C-17, an agent asks for a grant.** New operation `requestDatabaseAccessGrant` (MCP
+  `request_database_access_grant`): a pending `DatabaseApproval` with `subject: grant`; only the
+  agent's user decides, and the approval writes the grant with the rules and limits of
+  `createDatabaseAccessGrant`. A person calling it gets `403` (they give grants directly).
+- **C-18, "Waiting for you" across the tenant.** New operation `listPendingDatabaseApprovals`
+  (`GET /v1/database-approvals`): the requests the person may decide, or an agent's own.
+- **C-19, the agent's user reads what the agent ran.** `listDatabaseQueries` needs `view`; a
+  person with `view` sees their own entries and those of their own agents, `manage` all, an
+  agent its own. Statements are normalized (decision 9), so no literal reaches them.
+
+Also from the UX notes: the manifest's `extensions` text no longer names Anonymizer, and the MCP
+tool `revoke_database_access_grant` is renamed `remove_database_access_grant` (step 1 uses
+`remove` for grants; the operation ID stays). C-20 to C-23 wait (not asked for in this round).
+
+**Changes.** `openapi.yaml` (`DatabaseApproval`, `ApprovalSubject`, `PlannedColumn`,
+`GrantRequestDetails`, `DecideDatabaseApprovalRequest.classes`,
+`RequestDatabaseAccessGrantRequest`, the two new operations, `listDatabaseQueries`, hints),
+`database_approvals` (subject `grant`, grant fields, `planned_columns`), `tools.yaml`, the
+permission table, cards A-2, D-2, Q-1, T-1, U-1.
+
+## 21. Planned operations (architect decision)
+
+**Decision.** Operations that are specified but not built carry `x-ruum-status: planned` in
+`contracts/openapi.yaml`. `ruum-testkit` treats a planned operation like this, also with
+`RUUM_REQUIRE_IMPLEMENTED=1`: it must have a standard request and registered isolation and
+permission cases (the "every operation has a case" rule stays); its route may be missing or
+answer `501`, and those checks are reported as `planned`, not failed; any data leak in an answer
+still fails. A build task removes the mark when it builds the operation. A test keeps the list of
+planned operations (`matrix::PLANNED_OPERATIONS`) equal to the contract marks. All 24 step 2
+operations are planned.
+
+Details of the implementation:
+
+- The scanner of `contract.rs` reads the mark (only the value `planned` is valid; a mark outside
+  an operation fails the scan).
+- `Outcome::Planned`: it never fails a suite; a failure of any probe of the operation wins over
+  it. The leak checks run first: the isolation suite searches every answer for tenant A's
+  markers, and the permission suite now also searches `501` and unrouted answers for nodes the
+  principal cannot see (stricter than before, for pending operations too).
+- `every_operation_is_routed` skips planned operations, and fails when a planned operation
+  answers anything but a missing route or `501`, so a built operation cannot keep its mark.
+- The fixture has a database node `<prefix>-garden` in `Projects` (placeholder IDs until D-1,
+  A-1 and A-2 seed it), so the standard requests address tenant A's resources and the leak checks
+  know their markers.
+- The same rule for event types: the step 2 types are in `$defs/planned_types` of
+  `contracts/events/journal-entry.schema.json`; the envelope test of `ruum-core` keeps
+  `EventType` equal to the enum minus that list, and checks that every type has a payload schema.
+
+**Reasons.** The contract of a step lands before its code (design 18.1), and main must stay green
+with `RUUM_REQUIRE_IMPLEMENTED=1` (CI runs the security suites strictly). Without a mark, a
+contract-first branch either breaks CI or has to weaken the strict mode for every operation.
+
+**Changes.** `openapi.yaml` (the marks, a "Planned operations" section in `info`),
+`crates/ruum-testkit` (`contract.rs`, `report.rs`, `matrix.rs`, `fixtures.rs`, `requests.rs`,
+`isolation.rs`, `permissions.rs`, `tests/contract.rs`, `permission_matrix.md`),
+`crates/ruum-core/src/journal/mod.rs` (test), the event schemas, `docs/TESTING.md`, STEP2
+"Planned operations".
+
+## 22. MCP tools of planned operations
+
+**Decision.** Planned operations keep their tool entries in `contracts/mcp/tools.yaml` (so each
+tool is designed with its contract), but the server does not offer them: `gen-tools.mjs` writes
+`planned: true` for a tool whose operation is planned, and the MCP catalog leaves such tools out
+of `tools/list` and answers a call with "unknown tool". When a build task removes the mark and
+runs `gen-tools.mjs`, the tool appears.
+
+**Reasons.** An offered tool whose route is missing would fail for every agent and waste its
+turns; listing a tool as "planned" in `tools/list` has no place in the MCP protocol. Keeping the
+entries avoids a second contract change per operation.
+
+**Changes.** `tools.yaml` header, `gen-tools.mjs`, `crates/ruum-mcp/src/catalog.rs` (and a test),
+`tests/mcp_server.rs` (the offered list), `tools.json`.
+
+## 23. Reviewer 2 notes, recorded
+
+- (a) `Source` has no `import` kind and `provider_hook` has no `tenant_imported`. Moving a
+  tenant between cells needs both; additive for the API, new work for every provider. To add
+  before step 6 (external providers). The pseudonym key is already exportable (item 16).
+- (b) Grants are per agent with a 24 h cap. Standing grants per workspace in `project.yaml`
+  (design 8.5, 11.1) come in step 5 and need a nullable `agent_id` and a workspace subject.
+- (c) `database_queries` is one plain table (decision 13); partitioning stays open question 8.
+  A partitioned table needs `(tenant_id, at, id)` as the key, so the change is made in 0002 in
+  place if the panel wants it before step 2 ships.
+- (d) Branches count toward the plan's database count (they are databases, and parallel preview
+  sessions must not get around the limit).
+- (e) A masked branch is masked again for agents (a pseudonym of a pseudonym): intended (item
+  17).
+
 ## Open
 
-- Reviewer 2's items after the first one did not reach this revision (the relayed text ends in
-  the middle of its first item). The panel should check that its remaining items are covered.
 - Design 8.5 names PostgreSQL Anonymizer; item 4 replaces it. A person confirms, and the design
   text follows in a design change.
+- Spike S-1 is not run yet; C-1's freeze of the role kinds waits for it (item 15).
+- UX contract needs C-20 to C-23 are not in the contract yet.

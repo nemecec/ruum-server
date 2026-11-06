@@ -9,6 +9,7 @@
 //! │   │                              guest_manage=manage
 //! │   ├── <prefix>-plan.txt (X)  two versions v1 and v2, tag T attached
 //! │   ├── Archive/          (S)  editors_can_share = false (editors keep edit, lose share)
+//! │   ├── <prefix>-garden   (D)  a database node (step 2; planned: not seeded yet)
 //! │   └── <prefix>-old.txt  (Y)  in the trash (its old parent is Projects)
 //! └── Private/             (G)  no grants
 //! ```
@@ -23,6 +24,11 @@
 //! | `agent_of_guest_view` | the agent of `guest_view`: scope everything, `max_role: manage` |
 //! | `share_link` | the bearer of the `view` share link on `Projects` (the token of `resolveShareLink`) |
 //! | `anonymous` | no credentials |
+//!
+//! The database D (step 2) is planned (decision 0004-21): its operations are not built, so
+//! `seed` does not create it yet and its ID, the write grant of `agent` on it and the pending
+//! request of `agent` on it are placeholder IDs. Card D-1 seeds the database through the
+//! database provider, A-1 the grant and A-2 the request, and they keep these field names.
 //!
 //! The tag T was made by `member`. The upload sessions were started by `member`. The web session
 //! and the WebDAV app password belong to `member`. The invitation is for a new email address with the role `member`. The
@@ -210,6 +216,8 @@ pub enum Target {
     Archive,
     Old,
     Private,
+    /// The database node in `Projects` (step 2).
+    Database,
 }
 
 impl Target {
@@ -225,7 +233,7 @@ impl Target {
             || match self {
                 Target::Root => false,
                 Target::Projects | Target::Private => other == Target::Root,
-                Target::Plan | Target::Archive | Target::Old => {
+                Target::Plan | Target::Archive | Target::Old | Target::Database => {
                     other == Target::Projects || other == Target::Root
                 }
             }
@@ -279,6 +287,15 @@ pub struct TenantFixture {
     /// The `view` share link on `Projects`. Its bearer is the principal `share_link`.
     pub share_link: ShareLinkId,
     pub share_link_token: String,
+    /// The database node in `Projects` (step 2, planned: a placeholder ID until card D-1 seeds
+    /// it), and its name.
+    pub database: NodeId,
+    pub database_name: String,
+    /// A `write_live` grant of `agent` on the database, given by `member` (placeholder until A-1).
+    pub database_grant: Uuid,
+    /// A pending request of `agent` on the database: a `DELETE` without `WHERE` (placeholder
+    /// until A-2).
+    pub database_approval: Uuid,
     /// An upload of an empty file (no chunks), started by `member`, ready to complete.
     pub upload_empty: UploadId,
     /// An upload with one chunk ([`TenantFixture::chunk`]) not sent yet, started by `member`.
@@ -358,6 +375,10 @@ impl TenantFixture {
             grant: GrantId::new(),
             share_link: ShareLinkId::new(),
             share_link_token: format!("{prefix}-share-link-token-{}", Uuid::now_v7().simple()),
+            database: NodeId::new(),
+            database_name: format!("{prefix}-garden"),
+            database_grant: Uuid::now_v7(),
+            database_approval: Uuid::now_v7(),
             upload_empty: UploadId::new(),
             upload_chunked: UploadId::new(),
             chunk: format!("{prefix} chunk content").into_bytes(),
@@ -373,6 +394,12 @@ impl TenantFixture {
             oauth_redirect_uri: "http://127.0.0.1:33418/callback".into(),
             oauth_request: format!("{prefix}-oauth-request-{}", Uuid::now_v7().simple()),
         }
+    }
+
+    /// A tenant fixture with placeholder IDs and credentials, for unit tests of the suites.
+    #[cfg(test)]
+    pub(crate) fn placeholder_for_tests(prefix: &'static str) -> Self {
+        Self::placeholder(prefix)
     }
 
     pub fn principal(&self, who: Who) -> &Principal {
@@ -397,6 +424,7 @@ impl TenantFixture {
             Target::Archive => self.archive,
             Target::Old => self.old,
             Target::Private => self.private,
+            Target::Database => self.database,
         }
     }
 
@@ -426,6 +454,10 @@ impl TenantFixture {
             self.grant.to_string(),
             self.share_link.to_string(),
             self.share_link_token.clone(),
+            self.database.to_string(),
+            self.database_name.clone(),
+            self.database_grant.to_string(),
+            self.database_approval.to_string(),
             self.upload_empty.to_string(),
             self.upload_chunked.to_string(),
             self.invitation.to_string(),
@@ -463,6 +495,8 @@ impl TenantFixture {
             format!("{}-old.txt", self.prefix),
             self.v1.to_string(),
             self.v2.to_string(),
+            self.database.to_string(),
+            self.database_name.clone(),
         ]
     }
 }

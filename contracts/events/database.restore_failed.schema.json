@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.restore_failed.schema.json",
+  "title": "database.restore_failed",
+  "description": "A restore failed; the target is as before (`in_place`) or failed (`new_node`). `node_id` of the entry is the source database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.restore_failed`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "restore_id",
+    "target",
+    "target_node_id",
+    "reason"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "restore_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "target": {
+      "enum": [
+        "new_node",
+        "in_place"
+      ]
+    },
+    "target_node_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "reason": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    }
+  }
+}

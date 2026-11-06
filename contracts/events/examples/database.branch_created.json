@@ -1,0 +1,19 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 20410,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 3,
+  "type": "database.branch_created",
+  "actor": {
+    "kind": "agent",
+    "id": "0190b6c4-7000-7cc1-9a4b-1f2e3d4c5b6c"
+  },
+  "on_behalf_of": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d",
+  "at": "2026-11-06T10:15:00Z",
+  "data": {
+    "branch_id": "0190b6c4-9007-7cc1-9a4b-1f2e3d4c5b71",
+    "data": "masked",
+    "branch_at": "2026-11-06T10:14:58Z",
+    "constraints_left_out": 0
+  }
+}

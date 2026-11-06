@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.grant_revoked.schema.json",
+  "title": "database.grant_revoked",
+  "description": "A grant ended before or at its end time: revoked by a person, given back by the agent, or expired (written by the sweeper). `node_id` of the entry is the database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.grant_revoked`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "grant_id",
+    "kind",
+    "agent_id",
+    "cause"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "grant_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "kind": {
+      "enum": [
+        "write_live",
+        "read_personal"
+      ]
+    },
+    "agent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "cause": {
+      "enum": [
+        "revoked",
+        "given_back",
+        "expired"
+      ]
+    }
+  }
+}

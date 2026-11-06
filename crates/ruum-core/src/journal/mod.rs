@@ -376,15 +376,45 @@ mod tests {
         serde_json::from_str(ENVELOPE).unwrap()
     }
 
+    /// The event types of the envelope that are specified but not written yet
+    /// (`$defs/planned_types`, decision 0004-21). The task that builds the first writer of a type adds
+    /// it to [`EventType`] and removes it from that list.
+    fn planned_types(schema: &Value) -> BTreeSet<String> {
+        schema["$defs"]["planned_types"]["enum"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn event_types_match_the_envelope_schema() {
         let schema = schema();
-        let in_schema: BTreeSet<String> = schema["properties"]["type"]["enum"]
+        let all_in_schema: BTreeSet<String> = schema["properties"]["type"]["enum"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
+        let planned = planned_types(&schema);
+        assert!(
+            planned.is_subset(&all_in_schema),
+            "$defs/planned_types names types that are not in the enum: {:?}",
+            planned.difference(&all_in_schema)
+        );
+        // Every type in the enum has a payload schema in the `allOf` list.
+        let with_payload: BTreeSet<String> = schema["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                c["if"]["properties"]["type"]["const"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(with_payload, all_in_schema);
+        let in_schema: BTreeSet<String> = all_in_schema.difference(&planned).cloned().collect();
         let in_rust: BTreeSet<String> = ALL_EVENTS
             .iter()
             .map(|e| {

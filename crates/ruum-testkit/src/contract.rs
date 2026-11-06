@@ -1,7 +1,8 @@
 //! Reads the list of operations from `contracts/openapi.yaml`.
 //!
-//! The suites need only the method, the path template, the `operationId` and whether the
-//! operation is public (`security: []`). A small, strict line scanner reads them, so the test kit
+//! The suites need only the method, the path template, the `operationId`, whether the
+//! operation is public (`security: []`) and whether it is planned (`x-ruum-status: planned`,
+//! decision 0004-21: specified, not built yet). A small, strict line scanner reads them, so the test kit
 //! needs no YAML library. It depends on the layout of the file: path keys indented by two spaces
 //! under `paths:`, methods by four, and operation fields by six. If the layout changes, the
 //! scanner fails loudly; it never skips an operation in silence (it compares its count with the
@@ -20,6 +21,9 @@ pub struct Operation {
     pub path: String,
     /// True when the operation has `security: []` (no sign-in needed).
     pub public: bool,
+    /// True when the operation has `x-ruum-status: planned`: specified but not built. Its route
+    /// may be missing or answer `501`; the suites report its checks as planned, not failed.
+    pub planned: bool,
 }
 
 impl Operation {
@@ -68,19 +72,26 @@ pub fn parse(text: &str) -> Result<Vec<Operation>, String> {
     let mut ops: Vec<Operation> = Vec::new();
     let mut in_paths = false;
     let mut path: Option<String> = None;
-    // The operation being read: (method, path, id, public).
-    let mut cur: Option<(String, String, Option<String>, bool)> = None;
+    // The operation being read.
+    struct Cur {
+        method: String,
+        path: String,
+        id: Option<String>,
+        public: bool,
+        planned: bool,
+    }
+    let mut cur: Option<Cur> = None;
 
-    let finish = |cur: &mut Option<(String, String, Option<String>, bool)>,
-                  ops: &mut Vec<Operation>|
-     -> Result<(), String> {
-        if let Some((method, path, id, public)) = cur.take() {
-            let id = id.ok_or_else(|| format!("{method} {path} has no operationId"))?;
+    let finish = |cur: &mut Option<Cur>, ops: &mut Vec<Operation>| -> Result<(), String> {
+        if let Some(c) = cur.take() {
+            let id =
+                c.id.ok_or_else(|| format!("{} {} has no operationId", c.method, c.path))?;
             ops.push(Operation {
                 id,
-                method: method.to_uppercase(),
-                path,
-                public,
+                method: c.method.to_uppercase(),
+                path: c.path,
+                public: c.public,
+                planned: c.planned,
             });
         }
         Ok(())
@@ -124,15 +135,31 @@ pub fn parse(text: &str) -> Result<Vec<Operation>, String> {
                     let p = path
                         .clone()
                         .ok_or_else(|| format!("line {}: method outside a path", n + 1))?;
-                    cur = Some((key.to_string(), p, None, false));
+                    cur = Some(Cur {
+                        method: key.to_string(),
+                        path: p,
+                        id: None,
+                        public: false,
+                        planned: false,
+                    });
                 }
             }
             6 => {
                 if let Some(c) = cur.as_mut() {
                     if let Some(v) = body.strip_prefix("operationId:") {
-                        c.2 = Some(v.trim().to_string());
+                        c.id = Some(v.trim().to_string());
                     } else if let Some(v) = body.strip_prefix("security:") {
-                        c.3 = v.trim() == "[]";
+                        c.public = v.trim() == "[]";
+                    } else if let Some(v) = body.strip_prefix("x-ruum-status:") {
+                        match v.trim() {
+                            "planned" => c.planned = true,
+                            other => {
+                                return Err(format!(
+                                    "line {}: unknown x-ruum-status {other:?} (only `planned`)",
+                                    n + 1
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -157,7 +184,33 @@ pub fn parse(text: &str) -> Result<Vec<Operation>, String> {
             return Err(format!("operationId {} is not unique", op.id));
         }
     }
+    let marks = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("x-ruum-status:"))
+        .count();
+    let planned = ops.iter().filter(|o| o.planned).count();
+    if marks != planned {
+        return Err(format!(
+            "found {planned} planned operations but {marks} x-ruum-status lines; a mark is \
+             outside an operation or the layout of the file changed"
+        ));
+    }
     Ok(ops)
+}
+
+/// Whether the operation `id` is planned in `contracts/openapi.yaml`.
+pub fn is_planned(id: &str) -> bool {
+    use std::sync::OnceLock;
+    static PLANNED: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
+    PLANNED
+        .get_or_init(|| {
+            operations()
+                .into_iter()
+                .filter(|o| o.planned)
+                .map(|o| o.id)
+                .collect()
+        })
+        .contains(id)
 }
 
 #[cfg(test)]
@@ -182,6 +235,7 @@ paths:
         operationId: inside a text block is not counted
     delete:
       operationId: deleteNode
+      x-ruum-status: planned
 components:
   schemas: {}
 ";
@@ -200,6 +254,9 @@ components:
         assert_eq!(ops[1].path, "/v1/nodes/{node_id}");
         assert!(!ops[1].public);
         assert_eq!(ops[2].method, "DELETE");
+        assert!(ops[2].planned);
+        assert!(!ops[1].planned);
+        assert!(parse(&text.replace("x-ruum-status: planned", "x-ruum-status: built")).is_err());
     }
 
     #[test]
@@ -209,6 +266,7 @@ components:
             method: "GET".into(),
             path: "/v1/nodes/{node_id}/versions/{version_id}".into(),
             public: false,
+            planned: false,
         };
         assert!(op.matches("/v1/nodes/a/versions/b"));
         assert!(op.matches("/v1/nodes/a/versions/b?x=1"));

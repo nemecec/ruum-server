@@ -90,6 +90,21 @@ client                platform                                 provider
 5. **Export** (`exportTypedNode`). The provider writes the export as a file through the upload
    API, with a one-upload token, so quotas and downloads work as for any file.
 
+## Children of a typed node
+
+A typed node is not a folder. It may have only the children that its `TypeDescriptor.child_types`
+lists, and only the type's own operations make them (decision 0004-18). The platform enforces it
+for every type, so the app, repo and session nodes of steps 3 to 5 need no new rule:
+
+| Operation | On a typed node |
+|---|---|
+| `createNode`, `createUpload` (`new_file`) with a typed node as parent | `409 conflict` |
+| `moveNode` into a typed node | `409 conflict` |
+| `moveNode` of a child that `child_types` lists away from its parent (a database branch) | `409 conflict` |
+| `copyNode` into a typed node | `409 conflict` |
+| `copyNode` of a database | copies the database only, not its branches (the copy is a new live database) |
+| `trashNode`, `purgeNode` of a typed node | its children go along (they are its subtree); each gets its own `trashed` / `purged` hook |
+
 ## Versions of a typed node (section 5.3)
 
 The version API is the same for every node, but a typed node has two kinds of version:

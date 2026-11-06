@@ -39,6 +39,40 @@ pub const USER_ONLY_OPERATIONS: &[&str] = &[
     "decideDatabaseApproval",
 ];
 
+/// The operations that are specified but not built (`x-ruum-status: planned` in
+/// `contracts/openapi.yaml`, decision 0004-21). The suites need a standard request and the
+/// isolation and permission cases for each of them, like for any operation; while its route is
+/// missing or answers `501`, its checks are reported as planned, not failed, also with
+/// `RUUM_REQUIRE_IMPLEMENTED=1`. A data leak in any answer still fails. The task that builds an
+/// operation removes its mark in the contract and its name here (a test keeps the two equal).
+pub const PLANNED_OPERATIONS: &[&str] = &[
+    // Step 2 (databases, docs/STEP2.md).
+    "createDatabase",
+    "getDatabase",
+    "updateDatabaseManifest",
+    "getDatabaseSchema",
+    "queryDatabase",
+    "listDatabaseQueries",
+    "listDatabaseColumns",
+    "suggestColumnClasses",
+    "confirmColumnClasses",
+    "listDatabaseMigrations",
+    "applyDatabaseMigration",
+    "listDatabaseBranches",
+    "createDatabaseBranch",
+    "listDatabaseRestorePoints",
+    "createDatabaseRestorePoint",
+    "restoreDatabase",
+    "listDatabaseAccessGrants",
+    "createDatabaseAccessGrant",
+    "revokeDatabaseAccessGrant",
+    "requestDatabaseAccessGrant",
+    "listPendingDatabaseApprovals",
+    "listDatabaseApprovals",
+    "getDatabaseApproval",
+    "decideDatabaseApproval",
+];
+
 /// The operations that a share-link bearer may call (the `Users only` section of
 /// `contracts/openapi.yaml`): the node, content, version and diff reads, inside the link's
 /// subtree. An `edit` link may also call `putContent` and the upload operations; the fixture link
@@ -125,7 +159,7 @@ pub const CASES: &[Case] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::USER_ONLY_OPERATIONS;
+    use super::{PLANNED_OPERATIONS, USER_ONLY_OPERATIONS};
 
     const SPEC: &str = include_str!("../../../contracts/openapi.yaml");
     const MARK: &str = "      x-ruum-user-only: true\n";
@@ -148,6 +182,20 @@ mod tests {
             .map(|(i, _)| operation_at(i))
             .collect();
         let mut listed: Vec<&str> = USER_ONLY_OPERATIONS.to_vec();
+        marked.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(marked, listed);
+    }
+
+    #[test]
+    fn planned_list_matches_the_contract() {
+        let ops = crate::contract::parse(SPEC).expect("the contract scans");
+        let mut marked: Vec<&str> = ops
+            .iter()
+            .filter(|o| o.planned)
+            .map(|o| o.id.as_str())
+            .collect();
+        let mut listed: Vec<&str> = PLANNED_OPERATIONS.to_vec();
         marked.sort_unstable();
         listed.sort_unstable();
         assert_eq!(marked, listed);

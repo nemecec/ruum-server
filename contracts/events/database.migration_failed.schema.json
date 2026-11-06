@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.migration_failed.schema.json",
+  "title": "database.migration_failed",
+  "description": "A migration failed and was rolled back; the database is as before. `node_id` of the entry is the database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.migration_failed`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "migration_id",
+    "name",
+    "checksum",
+    "sqlstate",
+    "statement_index"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "migration_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[0-9]{4}_[a-z0-9_]{1,100}$"
+    },
+    "checksum": {
+      "$ref": "common.schema.json#/$defs/hash"
+    },
+    "sqlstate": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9A-Z]{5}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "statement_index": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

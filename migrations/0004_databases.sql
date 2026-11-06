@@ -131,10 +131,13 @@ create table databases (
     cluster             text not null,
     engine_name         text not null check (engine_name ~ '^[a-z0-9_./-]{1,200}$'),
     -- A branch (section 8.4, decision 18): the source database and what data it took. A branch
-    -- is a child node of its source (nodes.parent_id = branch_of).
+    -- is a child node of its source (nodes.parent_id = branch_of). It gets copies of the
+    -- source's `database_columns` rows (confirmed classes included) and of its applied
+    -- `database_migrations` rows as of `branch_at` (decision 0004-17), so a preview neither
+    -- loses the classes nor runs the source's migrations again.
     branch_of           uuid,
     branch_data         data_copy,
-    branch_at           timestamptz,                  -- the source's point in time
+    branch_at           timestamptz,                  -- when the copy was taken (always "now" in step 2)
     extensions          text[] not null default '{}',
     pitr_days           integer not null default 7 check (pitr_days = 7),
     size_bytes          bigint not null default 0 check (size_bytes >= 0),
@@ -178,6 +181,18 @@ create index databases_branch_idx on databases (tenant_id, branch_of) where bran
 --   mask          NOLOGIN; owns the lens views, the schema `ruum_mask`, the key table and the
 --                 pseudonym function. No session ever runs as it.
 -- The role names are neutral (`r_` + 16 random hex characters), like the database names.
+--
+-- Pooled sessions (decision 0004-1, reviewer 2): every request runs in its own transaction and
+-- sets its options with `SET LOCAL` only (statement_timeout, read-only); the query layer refuses
+-- `SET`, `RESET` and `set_config(..., false)` of session options (`statement_not_allowed`), and
+-- a connection goes back to the pool only after `DISCARD ALL`; a connection whose transaction
+-- did not end cleanly is closed, not reused.
+--
+-- Step 3 (apps, decision 15): an app binding gets kinds of its own, `app_read` and `app_write`
+-- (lens `base`: real values, secrets included, because an app must check its own password
+-- hashes and tokens), one pair per binding, added by step 3 as new values of `kind`. Hiding
+-- secrets from PEOPLE without manage stays in the engine (the `nosecret` lens) for the query
+-- API; an app binding never uses the people's kinds (decision 0004-14).
 create table database_roles (
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
@@ -356,20 +371,32 @@ create index database_access_grants_live_idx on database_access_grants (tenant_i
 create index database_access_grants_expiry_idx on database_access_grants (expires_at)
     where revoked_at is null;
 
--- Destructive statements and migrations of agents that wait for a person (section 8.5;
--- decision 0004: every agent migration on real data waits). `statement_hash` is BLAKE3 of the
--- statement and the canonical JSON of the parameters (for a migration: of the name and `up`),
--- so an approval allows exactly one statement with exactly those values, once. `params` holds the parameters as
--- markers (hidden values and pseudonyms), never raw personal or secret values; the raw values
--- are not needed, because the agent sends the statement again.
+-- Requests of agents that wait for a person (section 8.5; decision 0004): destructive
+-- statements (`subject = 'statement'`), every agent migration on real data (`'migration'`), and
+-- requests for a time-limited grant (`'grant'`, decision 0004-20, UX need C-17).
+-- `statement_hash` is BLAKE3 of the statement and the canonical JSON of the parameters (for a
+-- migration: of the name and `up`; for a grant request: of the canonical JSON of kind and
+-- minutes), so an approval allows exactly one statement with exactly those values, once.
+-- `params` holds the parameters as markers (hidden values and pseudonyms), never raw personal
+-- or secret values; the raw values are not needed, because the agent sends the statement again.
+-- `planned_columns` (migrations only) holds the columns that the parsed `up` adds, renames or
+-- retypes, with the author's classes (names and classes only, never values); the person can
+-- confirm classes in the same decision (decision 0004-20, UX need C-15). A grant request is
+-- decided only by the user the agent acts for; approving it writes the grant row
+-- (`database_access_grants`) in the same transaction.
 create table database_approvals (
     id                  uuid primary key,
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
     status              approval_status not null default 'pending',
-    subject             text not null default 'statement' check (subject in ('statement', 'migration')),
+    subject             text not null default 'statement' check (subject in ('statement', 'migration', 'grant')),
     migration_name      text check (migration_name is null or migration_name ~ '^[0-9]{4}_[a-z0-9_]{1,100}$'),
-    statement           text not null,                -- the statement, or the migration's `up`
+    statement           text,                         -- the statement, or the migration's `up`; null for a grant request
+    planned_columns     jsonb not null default '[]'::jsonb,
+    grant_kind          database_grant_kind,          -- grant requests only
+    grant_minutes       integer check (grant_minutes is null or grant_minutes between 1 and 1440),
+    grant_reason        text check (grant_reason is null or length(grant_reason) <= 500),
+    grant_id            uuid,                         -- the grant an approved grant request made
     statement_hash      bytea not null check (length(statement_hash) = 32),
     params              jsonb not null default '[]'::jsonb,
     reasons             text[] not null check (cardinality(reasons) > 0),
@@ -387,9 +414,17 @@ create table database_approvals (
     foreign key (tenant_id, node_id) references databases (tenant_id, node_id),
     check ((status in ('approved', 'denied', 'used')) = (decided_by is not null)),
     check ((status = 'used') = (used_at is not null)),
-    check ((subject = 'migration') = (migration_name is not null))
+    check ((subject = 'migration') = (migration_name is not null)),
+    check ((subject = 'grant') = (statement is null)),
+    check ((subject = 'grant') = (grant_kind is not null and grant_minutes is not null)),
+    check (subject = 'grant' or grant_id is null),
+    check (grant_kind is distinct from 'read_personal' or grant_minutes <= 480),
+    foreign key (tenant_id, grant_id) references database_access_grants (tenant_id, id)
 );
 create index database_approvals_pending_idx on database_approvals (tenant_id, node_id, created_at desc)
+    where status = 'pending';
+-- "Waiting for you" across a space (listPendingDatabaseApprovals, UX need C-18).
+create index database_approvals_tenant_pending_idx on database_approvals (tenant_id, created_at desc)
     where status = 'pending';
 
 -- The query log of the HTTP query API (sections 3.4, 8.5 and 11.2): every query with actor and
@@ -427,6 +462,32 @@ create table database_queries (
 create index database_queries_node_idx on database_queries (tenant_id, node_id, at desc);
 create index database_queries_actor_idx on database_queries (tenant_id, actor, at desc);
 
+-- ---------------------------------------------------------------------------- tenant keys
+
+-- The pseudonym key of a tenant (decision 0004-16, card Q-4). One random 32-byte key per
+-- tenant, made on first use (the first database of the tenant) under the primary key, so two
+-- racing creates keep one key. The key is stored WRAPPED only: AES-256-GCM with a
+-- key-encryption key (KEK) that the platform gets from OpenBao transit (`ruum-tenant-keys`,
+-- design section 4: each tenant has keys wrapped by a key in OpenBao); `kek_id` names the KEK
+-- and its version. On the laptop stack the KEK is a local file next to the platform database
+-- (`RUUM_LOCAL_KEK_FILE`), because OpenBao runs in dev mode and loses its data on a restart;
+-- both go away together with `dev.sh clean`. A tenant export (cells, design section 14) carries
+-- the key re-wrapped for the target cell, so pseudonyms stay the same after a move. The key is
+-- never rotated in step 2: query logs, approvals and masked branches keep matching. A rotation
+-- would be a new `key_version` with every lens view rebuilt; it is not specified yet.
+-- The engine copies the unwrapped key into each Postgres database (`ruum_mask.key`, owner
+-- `mask`) and registers it per SQLite connection; it never reaches a role that runs untrusted
+-- SQL.
+create table tenant_keys (
+    tenant_id           uuid not null references tenants (id),
+    purpose             text not null check (purpose in ('pseudonym')),
+    key_version         integer not null default 1 check (key_version = 1),
+    wrapped_key         bytea not null check (length(wrapped_key) between 44 and 128),
+    kek_id              text not null check (length(kek_id) between 1 and 200),
+    created_at          timestamptz not null default now(),
+    primary key (tenant_id, purpose, key_version)
+);
+
 -- ---------------------------------------------------------------------------- row-level security
 
 do $$
@@ -436,7 +497,7 @@ begin
     foreach t in array array[
         'typed_nodes', 'provider_deliveries', 'databases', 'database_roles', 'database_columns',
         'database_migrations', 'database_restore_points', 'database_restores',
-        'database_access_grants', 'database_approvals', 'database_queries'
+        'database_access_grants', 'database_approvals', 'database_queries', 'tenant_keys'
     ] loop
         execute format('alter table %I enable row level security', t);
         execute format('alter table %I force row level security', t);

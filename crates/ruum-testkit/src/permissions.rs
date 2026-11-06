@@ -595,9 +595,149 @@ fn operation_rule(op: &str) -> Option<Rule> {
             signed_in("only nodes the caller can see", Agents::Allow).hide(Plan, Role::View)
         }
 
+        // ------------------------------------------------------------ databases (step 2, planned)
+        // The permission table of docs/STEP2.md. The fixture database is in `Projects`; the
+        // standard requests use live data, no grant is in force for `agent` unless named.
+        "createDatabase" => guests_need_policy(node(
+            "Needs edit on the parent folder (agents: max_role edit); guests and agents of \
+             guests need guests_create_resources (default false: 403)",
+            Projects,
+            Role::Edit,
+        )),
+        "getDatabase"
+        | "getDatabaseSchema"
+        | "listDatabaseColumns"
+        | "listDatabaseMigrations"
+        | "listDatabaseBranches"
+        | "listDatabaseRestorePoints"
+        | "listDatabaseApprovals" => node("Needs view on the database", Database, Role::View),
+        "queryDatabase" => node(
+            "mode read needs view (agents read masked values); the standard query is a read",
+            Database,
+            Role::View,
+        ),
+        "listDatabaseQueries" => node(
+            "Needs view; entries are filtered (manage: all; view: own and own agents'; agents: \
+             own) (decision 0004-20, UX C-19)",
+            Database,
+            Role::View,
+        ),
+        "listDatabaseAccessGrants" => node(
+            "Needs view; an agent sees only its own grants",
+            Database,
+            Role::View,
+        ),
+        "updateDatabaseManifest" => node(
+            "Needs manage (settings); an agent may not change data_classes (unchanged here)",
+            Database,
+            Role::Manage,
+        ),
+        "suggestColumnClasses" | "createDatabaseRestorePoint" => {
+            node("Needs edit on the database", Database, Role::Edit)
+        }
+        "confirmColumnClasses" => node("users only; Needs manage", Database, Role::Manage),
+        "applyDatabaseMigration" => node(
+            "live database: Needs manage; an agent also needs write_live and an approval \
+             (no agent of the fixture has manage on the database)",
+            Database,
+            Role::Manage,
+        ),
+        "createDatabaseBranch" => guests_need_policy(node(
+            "masked branch: Needs edit; guests and agents of guests need \
+             guests_create_resources (default false: 403)",
+            Database,
+            Role::Edit,
+        )),
+        "restoreDatabase" => guests_need_policy(node(
+            "users only; Needs manage; new_node by a guest needs guests_create_resources",
+            Database,
+            Role::Manage,
+        )),
+        "createDatabaseAccessGrant" => database_rule(
+            "users only; only the user the agent acts for (member; read_personal needs view)",
+            |who| who == Who::Member,
+            true,
+        ),
+        "revokeDatabaseAccessGrant" => database_rule(
+            "the user who gave it (member), a person with manage, or the agent that holds it \
+             (agent)",
+            |who| {
+                who == Who::Agent
+                    || (!who.is_agent()
+                        && who
+                            .role_on(Target::Database)
+                            .is_some_and(|r| r >= Role::Manage))
+            },
+            false,
+        ),
+        "requestDatabaseAccessGrant" => database_rule(
+            "agents only, with view on the database; a person gets 403 (decision 0004-20, UX \
+             C-17)",
+            |who| who.is_agent(),
+            false,
+        ),
+        "getDatabaseApproval" => Rule::new(
+            "Needs view; an agent sees only its own requests (the request is agent's), others \
+             get 404",
+            |who| {
+                let base = node("", Target::Database, Role::View).access;
+                match base(who) {
+                    Access::Allow if who.is_agent() && who != Who::Agent => Access::Hidden,
+                    other => other,
+                }
+            },
+        ),
+        "decideDatabaseApproval" => database_rule(
+            "users only; the agent's user (member) or a person with manage, with the right the \
+             statement needs (edit: a DELETE without WHERE)",
+            |who| {
+                who == Who::Member
+                    || who
+                        .role_on(Target::Database)
+                        .is_some_and(|r| r >= Role::Manage)
+            },
+            false,
+        ),
+        "listPendingDatabaseApprovals" => signed_in(
+            "the requests the caller may decide (agents: their own), across the tenant; only \
+             on databases the caller can see",
+            Agents::Allow,
+        )
+        .hide(Database, Role::View),
+
         _ => return None,
     };
     Some(r)
+}
+
+/// The rule of decision 0002-2 / 0004-10: a guest, or an agent of a guest, gets `403` on an
+/// operation that makes a resource that counts against the host plan, while the tenant policy
+/// `guests_create_resources` is false (the fixture keeps the default).
+fn guests_need_policy(mut r: Rule) -> Rule {
+    let base = r.access;
+    r.access = Box::new(move |who| {
+        let user = who.acts_for().unwrap_or(who);
+        let guest = user.tenant_role() == Some(MemberRole::Guest);
+        match base(who) {
+            Access::Allow if guest => Access::Forbidden,
+            other => other,
+        }
+    });
+    r
+}
+
+/// A rule on the fixture database for a principal that is chosen by `allowed` (and must see
+/// the database): who cannot see the database gets `404` (or `403`/`404` when its user sees
+/// it), who sees it but is not chosen gets `403`. `users_only` leaves agents to the contract-wide
+/// user-only rule.
+fn database_rule(note: &'static str, allowed: fn(Who) -> bool, users_only: bool) -> Rule {
+    let sees = node("", Target::Database, Role::View).access;
+    Rule::new(note, move |who| match sees(who) {
+        Access::Allow if users_only && who.is_agent() => Access::Forbidden,
+        Access::Allow if allowed(who) => Access::Allow,
+        Access::Allow => Access::Forbidden,
+        other => other,
+    })
 }
 
 fn markers_of(t: &TenantFixture, target: Target) -> Vec<String> {
@@ -612,10 +752,14 @@ fn markers_of(t: &TenantFixture, target: Target) -> Vec<String> {
         Target::Old => vec![t.old.to_string(), format!("{}-old.txt", t.prefix)],
         Target::Archive => vec![t.archive.to_string()],
         Target::Private => vec![t.private.to_string()],
+        Target::Database => vec![t.database.to_string(), t.database_name.clone()],
     }
 }
 
-/// Checks one answer against the rule.
+/// Checks one answer against the rule. `planned` says that the operation is
+/// `x-ruum-status: planned`: a missing route or a `501` is then reported as planned (after the
+/// leak check), not as a failure.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     rule: &Rule,
     who: Who,
@@ -624,8 +768,10 @@ pub fn evaluate(
     sent: &str,
     res: &Response,
     fallback: &Response,
+    planned: bool,
 ) -> Outcome {
-    if client::is_unrouted(res, fallback) {
+    let unrouted = client::is_unrouted(res, fallback);
+    if unrouted && !planned {
         return Outcome::Failed("no handler answers this method and path".into());
     }
     let expected = (rule.access)(who);
@@ -637,8 +783,11 @@ pub fn evaluate(
             .collect()
     };
     let mut problems = Vec::new();
-    // A refusal never shows the hidden part of the tree.
-    if res.status.is_client_error() && who.role_on(Target::Projects).is_none() {
+    // A refusal (or an unfinished answer: no route, `501`) never shows the hidden part of the
+    // tree.
+    if (res.status.is_client_error() || res.is_not_implemented() || unrouted)
+        && who.role_on(Target::Projects).is_none()
+    {
         let l = leaks(t.projects_markers());
         if !l.is_empty() {
             problems.push(format!(
@@ -646,11 +795,13 @@ pub fn evaluate(
             ));
         }
     }
-    if res.is_not_implemented() {
-        return if problems.is_empty() {
-            Outcome::Pending
-        } else {
+    if unrouted || res.is_not_implemented() {
+        return if !problems.is_empty() {
             Outcome::Failed(problems.join("; "))
+        } else if planned {
+            Outcome::Planned
+        } else {
+            Outcome::Pending
         };
     }
     if res.status.is_server_error() {
@@ -731,6 +882,7 @@ pub async fn run_on(backend: &fixtures::Backend) -> Report {
                 &req.sent_text(),
                 &res,
                 &fallback,
+                crate::matrix::PLANNED_OPERATIONS.contains(&op),
             );
             (op, who, outcome)
         })
@@ -850,6 +1002,7 @@ async fn trashed_check(backend: &fixtures::Backend, op: &'static str, who: Who) 
             &req.sent_text(),
             &res,
             &fallback,
+            false,
         )
     }
 }
@@ -941,4 +1094,46 @@ pub fn render_matrix() -> String {
 /// The path of the committed matrix.
 pub fn matrix_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("permission_matrix.md")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn response(status: u16, body: &str) -> Response {
+        Response {
+            status: StatusCode::from_u16(status).unwrap(),
+            headers: HeaderMap::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// Decision 0004-21: a planned operation without a route or with `501` is planned, not
+    /// failed; a leak in the answer still fails; an operation that is not planned still fails
+    /// without a route.
+    #[test]
+    fn planned_operations_are_reported_as_planned_but_leaks_fail() {
+        let t = TenantFixture::placeholder_for_tests("alpha");
+        let rule = rule("getDatabase").expect("a rule");
+        let fallback = response(404, r#"{"error":{"code":"not_found"}}"#);
+        let unrouted = response(404, r#"{"error":{"code":"not_found"}}"#);
+        let todo = response(501, r#"{"error":{"code":"not_implemented"}}"#);
+        let leak = response(
+            501,
+            &format!(r#"{{"error":{{"message":"{}"}}}}"#, t.plan_name),
+        );
+        let ev = |who, res: &Response, planned| {
+            evaluate(&rule, who, &t, true, "", res, &fallback, planned)
+        };
+        assert_eq!(ev(Who::Owner, &unrouted, true), Outcome::Planned);
+        assert_eq!(ev(Who::Owner, &todo, true), Outcome::Planned);
+        assert!(matches!(
+            ev(Who::Owner, &unrouted, false),
+            Outcome::Failed(_)
+        ));
+        assert_eq!(ev(Who::Owner, &todo, false), Outcome::Pending);
+        // `guest` cannot see Projects: a refusal that names the plan is a leak.
+        assert!(matches!(ev(Who::Guest, &leak, true), Outcome::Failed(_)));
+    }
 }

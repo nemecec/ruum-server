@@ -92,6 +92,17 @@ failure in both modes.
 An operation of the contract without a registered case or rule fails the suite. So a new endpoint
 must come with its cases.
 
+**Planned operations** (decision 0004-21). An operation marked `x-ruum-status: planned` in
+`contracts/openapi.yaml` is specified but not built. It still needs its standard request
+(`requests.rs`), its isolation case and its permission rule, and it is listed in
+`matrix::PLANNED_OPERATIONS` (a test keeps that list equal to the marks). While its route is
+missing or answers `501`, its checks are **planned**: they pass in both modes, also with
+`RUUM_REQUIRE_IMPLEMENTED=1`. A data leak in any answer (a marker of tenant A, or a node the
+principal cannot see in a refusal or a `501`) still fails. The task that builds the operation
+removes the mark and the list entry; `tests/contract.rs` (`every_operation_is_routed`) fails when
+a planned operation answers anything but a missing route or `501`, so a built operation cannot
+keep the mark. The MCP server does not offer tools of planned operations.
+
 ### The tenant isolation suite
 
 The rule: a principal of tenant B acting on a resource of tenant A gets `404`, never data. For each

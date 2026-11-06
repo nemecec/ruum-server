@@ -590,7 +590,15 @@ components:
               type: string
         child_types:
           type: array
-          description: Typed nodes that may be children of this node (a database branch is a child `database`).
+          description: |
+            The ONLY children a node of this type may have (decision 0004-18): typed node types,
+            made by the type's own operations. An empty list means no children. The platform
+            enforces it for every type: `createNode`, `createUpload` (`new_file`), `moveNode` and
+            `copyNode` into a node of this type fail with `409 conflict`, and a child of this list
+            cannot move away from its parent (`409 conflict`). Trash and purge of the node take
+            its children along. A database has `[database]` (its branches); `copyNode` of a
+            database does not copy its branches.
+          default: []
           items:
             type: string
 
@@ -669,16 +677,11 @@ components:
           properties:
             kind:
               const: branch
-              description: A database branch (section 8.4); the new node is a child of `node_id`.
+              description: A database branch (section 8.4); the new node is a child of `node_id`. Always from the current state of the source (a branch from an earlier time is a restore into a new node, then a branch). The branch gets the source's column classes and applied migrations (decision 0004-17).
             node_id:
               $ref: '#/components/schemas/Uuid'
             data:
               $ref: '#/components/schemas/DataCopy'
-            at:
-              description: Branch from this point in time (inside the backup window) instead of now.
-              oneOf:
-                - $ref: '#/components/schemas/Timestamp'
-                - type: 'null'
         - type: object
           required: [kind, node_id]
           properties:

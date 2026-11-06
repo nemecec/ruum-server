@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.restore_started.schema.json",
+  "title": "database.restore_started",
+  "description": "A point-in-time restore started (`restoreDatabase`). `node_id` of the entry is the source database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.restore_started`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "restore_id",
+    "target",
+    "target_node_id",
+    "to",
+    "restore_point_id",
+    "safety_restore_point_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "restore_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "target": {
+      "enum": [
+        "new_node",
+        "in_place"
+      ]
+    },
+    "target_node_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "to": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    },
+    "restore_point_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "safety_restore_point_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid",
+          "description": "`in_place`: the restore point of the state before the restore."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

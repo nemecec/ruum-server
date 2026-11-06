@@ -942,7 +942,8 @@ export interface paths {
         /**
          * Create a folder, an empty file or a link
          * @description Needs `edit` on the parent. Typed nodes are made by the operation of their type
-         *     (`createDatabase` in step 2); `kind: typed` fails with `validation_failed`.
+         *     (`createDatabase` in step 2); `kind: typed` fails with `validation_failed`. A parent that
+         *     is a typed node fails with `409 conflict` (a database node holds only its branches).
          *
          *     Links (design section 2.3): the target must be a node of the same tenant as the link
          *     (the `Ruum-Tenant` of the call). A target in another tenant, or one that the caller cannot
@@ -1102,6 +1103,11 @@ export interface paths {
          * Move a node
          * @description Needs `manage` on the node and `edit` on the new parent. A folder cannot move into itself or
          *     its own subtree. Moves inside one tenant only. Writes `node.moved`.
+         *
+         *     Children of typed nodes (step 2): a typed node accepts only the children its provider
+         *     allows (`allowed_child_types` in the provider descriptor). A database node accepts only
+         *     its own branches, which `createDatabaseBranch` makes. A move into a typed node, and a move of a
+         *     database branch away from its source database, fail with `409 conflict`.
          */
         post: operations["moveNode"];
         delete?: never;
@@ -1141,7 +1147,8 @@ export interface paths {
          *     a copy never gives its maker more than they could read in the source. A guest, or an
          *     agent of a guest, cannot copy a typed node while the tenant policy
          *     `guests_create_resources` is false (`403 permission_denied`), because the copy counts
-         *     against the host tenant's plan.
+         *     against the host tenant's plan. A copy of a database does not copy its branches (a copy
+         *     is a new live database); a copy into a typed node fails with `409 conflict`.
          */
         post: operations["copyNode"];
         delete?: never;
@@ -1171,7 +1178,8 @@ export interface paths {
          * Move a node to the trash
          * @description Needs `manage`. The node and its subtree leave the tree; the name becomes free. The trash
          *     keeps them for the plan's trash period (30 days), then they are purged. The root cannot be
-         *     trashed. Writes `node.trashed`.
+         *     trashed. Writes `node.trashed`. A database goes with its branches (they are its children),
+         *     and is suspended while it is in the trash.
          */
         post: operations["trashNode"];
         delete?: never;
@@ -1277,6 +1285,7 @@ export interface paths {
          *     A `new_version` target that is a typed node (step 2: a database) fails with
          *     `409 conflict`: the content of a typed node is its manifest, which only the type's own
          *     operations change (`updateDatabaseManifest`, `confirmColumnClasses`, `restoreVersion`).
+         *     A `new_file` target whose parent is a typed node fails with `409 conflict` too.
          *
          *     Known risk (accepted for step 1, design section 5.1): `missing` tells a caller whether
          *     the tenant already stores a chunk, also one from a file the caller cannot read. A member
@@ -2316,7 +2325,8 @@ export interface paths {
          *     **Statements that never run** (`422 statement_not_allowed`, for people and agents):
          *     role and session statements (`SET ROLE`, `RESET ROLE`, `SET SESSION AUTHORIZATION`,
          *     `set_config` of `role` or `session_authorization`, `CREATE`/`ALTER`/`DROP ROLE`,
-         *     `GRANT`/`REVOKE` of roles), references to the platform's schemas (`ruum_*`), and on
+         *     `GRANT`/`REVOKE` of roles, and `SET`, `RESET` or `set_config(..., false)` of any session
+         *     option, because connections are pooled; options of one statement go in the request), references to the platform's schemas (`ruum_*`), and on
          *     SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension` and every `PRAGMA` outside the
          *     read-only allow-list. These checks are a first line only: the engine sessions are built
          *     so that such a statement cannot reach another role, file or database even if it runs.
@@ -2330,6 +2340,13 @@ export interface paths {
          *     of the constraint, table or column; the engine's `DETAIL`, `HINT` and `CONTEXT` (which
          *     can hold row values, for example `Key (email)=(...)`) are never returned. People with
          *     `manage` get the engine message.
+         *
+         *     **Links for the agent's user.** When an agent gets `403 write_grant_required` (here, on
+         *     `applyDatabaseMigration`) or `403 class_read_required`, the error `hint` is the web URL
+         *     of the database's Agent access tab with the grant prompt prefilled (kind, agent, a
+         *     default time; never a reason or a statement); the agent gives it to its user, who still
+         *     decides with a click. A `202` carries the request's `review_url`. The URLs hold IDs
+         *     only. An agent may also ask for the grant itself (`requestDatabaseAccessGrant`).
          *
          *     A JSON value that is itself an object with the key `$ruum` comes back wrapped as
          *     `{"$ruum": "literal", "value": ...}`, so it is never mistaken for a marker. The result is
@@ -2367,11 +2384,15 @@ export interface paths {
          * The query log of a database
          * @description Every query through the HTTP query API, newest first: who (`actor`, `on_behalf_of`),
          *     when, the mode, the normalized statement, the parameters as pseudonyms, the row count,
-         *     the time and the outcome. Needs `manage`. Raw values are never stored (design section
-         *     11.2): the server parses the statement and replaces every literal with a numbered
-         *     placeholder (`$L1`, `$L2`, ...) before it stores it, and stores each parameter as a
-         *     pseudonym. A statement that does not parse is stored as `<unparsed statement>` with its
-         *     hash only. An agent sees only its own entries (the `actor` filter is ignored for it).
+         *     the time and the outcome. Raw values are never stored (design section 11.2): the server
+         *     parses the statement and replaces every literal with a numbered placeholder (`$L1`,
+         *     `$L2`, ...) before it stores it, and stores each parameter as a pseudonym. A statement
+         *     that does not parse is stored as `<unparsed statement>` with its hash only.
+         *
+         *     Who sees which entries: a person with `manage` sees all entries. A person with `view`
+         *     sees their own entries and the entries of the agents that act for them (so a user sees
+         *     what their own agent ran); other entries are left out, not refused. An agent with
+         *     `view` sees only its own entries. The `actor` filter only narrows this set.
          */
         get: operations["listDatabaseQueries"];
         put?: never;
@@ -2467,7 +2488,8 @@ export interface paths {
          * @description A person confirms the classes (the suggestions filled in, changed where needed). Writes a
          *     new manifest version with the confirmed `data_classes` (`version.created`) and
          *     `database.columns_confirmed`. Needs `manage`. Users only: an agent can never lower the
-         *     class of a column.
+         *     class of a column; it gets `403 user_required`, with the web URL of the database's
+         *     Columns tab in `hint`, to give to its user.
          */
         post: operations["confirmColumnClasses"];
         delete?: never;
@@ -2570,10 +2592,27 @@ export interface paths {
          *     `data` is `masked` by default: `personal` columns become pseudonyms and non-empty
          *     `secret` values become `NULL`, so a preview never copies real personal data.
          *     `schema_only` copies no rows. `full` copies real data and needs a person with `manage`
-         *     (an agent gets `403 user_required`). A masked `personal` column that is not text holds
-         *     the pseudonym as `text` in the branch (its type changes; the branch's
-         *     `getDatabaseSchema` shows it), and its check constraints are dropped there. A source
-         *     larger than the plan's branch limit fails with `422 database_too_large`. Needs `edit`.
+         *     (an agent gets `403 user_required`). A source larger than the plan's branch limit fails
+         *     with `422 database_too_large`. Needs `edit`. A branch is always taken from the current
+         *     state of the source; a branch from an earlier time is a restore into a new database
+         *     (`restoreDatabase`, `target: new_node`) followed by a branch of it.
+         *
+         *     **What a branch keeps.** The branch gets the source's column classes (confirmed classes
+         *     included) and its applied migrations, so a preview does not count every column as
+         *     unconfirmed again and does not run the source's migrations a second time. The classes
+         *     stay as they are: a `personal` column of a masked branch holds pseudonyms and still
+         *     counts as `personal`, so an agent without `read_personal` reads a pseudonym of the
+         *     pseudonym (consistent within the branch, never the real value).
+         *
+         *     **Masking by type** (`masked` data). A `personal` column becomes `text` holding the
+         *     pseudonym, whatever its type (`int`, `date`, `uuid`, ...); the branch's
+         *     `getDatabaseSchema` shows the new type. A `secret` column keeps its type and holds
+         *     `NULL`; its `NOT NULL` constraint is dropped in the branch. `CHECK` constraints that read
+         *     a masked column are dropped. Primary keys, `UNIQUE` constraints, indexes and foreign keys
+         *     on masked columns are built again after the copy (both sides of a foreign key hold the
+         *     pseudonym of the same value, so it still holds); one that fails (two values with the
+         *     same pseudonym) is left out, and the branch's `status.message` names it (names only,
+         *     never values). Triggers are copied but disabled during the copy.
          *     Guests and their agents need the tenant policy `guests_create_resources`. Writes
          *     `node.created`, `version.created` and `database.branch_created`.
          *
@@ -2648,7 +2687,8 @@ export interface paths {
          *     next to this one (named `name`), and leaves this one as it is. `target: in_place`
          *     first records a restore point of the current state (so the restore can be undone),
          *     then replaces the data; the database refuses queries while it runs. Needs `manage`.
-         *     Users only. `new_node` by a guest needs the tenant policy `guests_create_resources`.
+         *     Users only: an agent gets `403 user_required`, with the web URL of the database's
+         *     Backups tab in `hint`, to give to its user. `new_node` by a guest needs the tenant policy `guests_create_resources`.
          *     Writes `database.restore_started`, and `database.restored` or
          *     `database.restore_failed` when it ends.
          */
@@ -2729,6 +2769,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/databases/{node_id}/access-grant-requests": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Ask your user for a time-limited grant
+         * @description An agent asks the user it acts for to give it a `write_live` or `read_personal` grant on
+         *     this database (section 8.5). Nothing is granted: the answer is a pending
+         *     `DatabaseApproval` with `subject: grant` and its `review_url`, which the agent gives to
+         *     its user. The user decides it with `decideDatabaseApproval` (only that user may). The
+         *     limits of `createDatabaseAccessGrant` apply (at most 24 hours, `read_personal` at most 8
+         *     hours; `write_live` needs a scope of `edit` or higher). Needs `view` on the database.
+         *     Agents only: a person gives a grant directly (`createDatabaseAccessGrant`) and gets
+         *     `403 permission_denied` here. One pending request per agent, database and kind: a second
+         *     one answers the first (`200`).
+         */
+        post: operations["requestDatabaseAccessGrant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/database-approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Requests that wait for you, across the tenant
+         * @description The "Waiting for you" list: requests of agents (statements, migrations, grants) across
+         *     every database of the tenant, newest first. For a person: the requests the person may
+         *     decide (`decideDatabaseApproval`: requests of their own agents, and requests on
+         *     databases they manage, with the right the request needs). For an agent: its own
+         *     requests. Databases the caller cannot see are left out. `status` defaults to `pending`.
+         */
+        get: operations["listPendingDatabaseApprovals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/databases/{node_id}/approvals": {
         parameters: {
             query?: never;
@@ -2746,8 +2846,9 @@ export interface paths {
         };
         /**
          * Statements that wait for a person
-         * @description Destructive statements of agents that wait for a decision, and recent decisions. Needs
-         *     `view`; an agent sees only its own requests.
+         * @description Requests of agents on this database (destructive statements, migrations and grant
+         *     requests) that wait for a decision, and recent decisions. Needs `view`; an agent sees
+         *     only its own requests. `listPendingDatabaseApprovals` lists them across the tenant.
          */
         get: operations["listDatabaseApprovals"];
         put?: never;
@@ -2806,7 +2907,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Approve or deny a destructive statement
+         * Approve or deny a request of an agent
          * @description The person sees the statement, its parameters (as markers) and the number of rows it
          *     touches, and approves or denies it. An approval lets the agent run exactly that
          *     statement with those parameters once, within 15 minutes. Who may decide: the user the
@@ -2815,6 +2916,17 @@ export interface paths {
          *     migrations), else `403 permission_denied`. Users only. An approval never replaces a
          *     `write_live` grant: when the agent sends the statement again, every other check runs
          *     again. Writes `database.approval_decided`.
+         *
+         *     A migration request (`subject: migration`) lists `planned_columns`; the person may
+         *     confirm their classes in the same decision (`classes`, needs `manage`), so the approval
+         *     and the classification are one step (design 8.5). The classes take effect in the same
+         *     transaction as the approved migration; until it runs, nothing changes.
+         *
+         *     A grant request (`subject: grant`) is decided only by the user the agent acts for, with
+         *     the right that `createDatabaseAccessGrant` needs. Approving it makes the grant at once
+         *     (the same rules, limits and restore point as `createDatabaseAccessGrant`; writes
+         *     `database.grant_created`); `grant_request.grant_id` names it. The approval cannot change
+         *     the kind or lengthen the time the agent asked for.
          */
         post: operations["decideDatabaseApproval"];
         delete?: never;
@@ -3842,10 +3954,12 @@ export interface components {
             next_cursor: components["schemas"]["NextCursor"];
         };
         /**
-         * @description The journal event types of step 1. Payloads are in `contracts/events/`.
+         * @description The journal event types. Payloads are in `contracts/events/`. The step 2 types
+         *     (`typed_node.*`, `database.*`) are planned: specified, not written by the server yet
+         *     (`$defs/planned_types` in `contracts/events/journal-entry.schema.json`, decision 0004-21).
          * @enum {string}
          */
-        EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.updated" | "grant.removed" | "share_link.created" | "share_link.revoked" | "node.sharing_updated";
+        EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.updated" | "grant.removed" | "share_link.created" | "share_link.revoked" | "node.sharing_updated" | "typed_node.status_changed" | "database.columns_confirmed" | "database.migration_applied" | "database.migration_failed" | "database.branch_created" | "database.restore_started" | "database.restored" | "database.restore_failed" | "database.grant_created" | "database.grant_revoked" | "database.approval_decided";
         /** @description One change. The envelope is `contracts/events/journal-entry.schema.json`; `data` follows `contracts/events/<type>.schema.json`. */
         JournalEntry: {
             tenant_id: components["schemas"]["Uuid"];
@@ -4345,8 +4459,6 @@ export interface components {
         CreateDatabaseBranchRequest: {
             name: components["schemas"]["NodeName"];
             data?: components["schemas"]["DataCopy"];
-            /** @description Branch from this point in time inside the backup window instead of now. */
-            at?: components["schemas"]["Timestamp"] | null;
             on_conflict?: components["schemas"]["OnConflict"];
         };
         RestorePoint: {
@@ -4420,15 +4532,55 @@ export interface components {
         };
         /** @enum {string} */
         ApprovalStatus: "pending" | "approved" | "denied" | "expired" | "used";
+        /**
+         * @description What waits for a person. `statement`: a destructive statement of an agent.
+         *     `migration`: an agent's migration on real data. `grant`: an agent asks for a
+         *     time-limited grant (`requestDatabaseAccessGrant`).
+         * @enum {string}
+         */
+        ApprovalSubject: "statement" | "migration" | "grant";
+        /**
+         * @description A column that a migration adds, renames or retypes, found by parsing `up` (nothing runs
+         *     before the approval), with the author's class. Names and classes only, never values.
+         */
+        PlannedColumn: components["schemas"]["ColumnRef"] & {
+            /** @enum {string} */
+            change: "added" | "renamed" | "retyped";
+            /** @description The declared SQL type, when the statement names one. */
+            type: string | null;
+            /** @description The class in the migration's `data_classes`, or `null`. */
+            suggested_class: components["schemas"]["DataClass"] | null;
+        };
+        GrantRequestDetails: {
+            kind: components["schemas"]["DatabaseAccessGrantKind"];
+            duration_minutes: number;
+            /** @description The agent's own words. Untrusted text; the UI marks it as not checked. */
+            reason: string | null;
+            /** @description The grant that the approval made, or `null`. */
+            grant_id?: components["schemas"]["Uuid"] | null;
+        };
         DatabaseApproval: {
             id: components["schemas"]["Uuid"];
             node_id: components["schemas"]["Uuid"];
+            subject: components["schemas"]["ApprovalSubject"];
             status: components["schemas"]["ApprovalStatus"];
-            statement: string;
+            /** @description The statement, or the migration's `up`; `null` for a grant request. */
+            statement: string | null;
+            /** @description The name of the migration (`subject: migration`), else `null`. */
+            migration_name: string | null;
+            /** @description `subject: migration`: the columns the migration adds, renames or retypes, so the person can confirm their classes in the same decision. Empty otherwise. */
+            planned_columns: components["schemas"]["PlannedColumn"][];
+            /** @description `subject: grant`: what the agent asks for; else `null`. */
+            grant_request: components["schemas"]["GrantRequestDetails"] | null;
+            /**
+             * Format: uri
+             * @description The web page where a person decides this request (the database's Agent access tab with the request open). Agents give it to their user. It holds IDs only, never values.
+             */
+            review_url: string;
             /** @description The parameters as the requester may see them (markers for `personal` and `secret` values). */
             params: components["schemas"]["QueryCell"][];
             /** @description Why the statement needs a person. */
-            reasons: ("drop" | "truncate" | "delete_without_where" | "update_without_where" | "schema_change" | "migration")[];
+            reasons: ("drop" | "truncate" | "delete_without_where" | "update_without_where" | "schema_change" | "migration" | "grant")[];
             /**
              * Format: int64
              * @description The rows the statement touches, from `EXPLAIN` or a `count(*)` in a read-only transaction (never a test run of the statement, which would take locks on live); `null` for schema changes and migrations.
@@ -4450,6 +4602,21 @@ export interface components {
             /** @enum {string} */
             decision: "approve" | "deny";
             comment?: string;
+            /**
+             * @description `subject: migration` only: the classes the person confirms for the planned columns,
+             *     in the same decision. They are stored with the approval and confirmed in the same
+             *     transaction as the approved migration when it runs; an entry that names no column of
+             *     the migration's result is ignored. Needs `manage` (as `confirmColumnClasses`).
+             */
+            classes?: (components["schemas"]["ColumnRef"] & {
+                class: components["schemas"]["DataClass"];
+            })[];
+        };
+        RequestDatabaseAccessGrantRequest: {
+            kind: components["schemas"]["DatabaseAccessGrantKind"];
+            /** @description `read_personal`: at most 480. */
+            duration_minutes: number;
+            reason?: string;
         };
     };
     responses: {
@@ -8048,7 +8215,6 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthenticated"];
-            403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
         };
     };
@@ -8563,6 +8729,88 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
+        };
+    };
+    requestDatabaseAccessGrant: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestDatabaseAccessGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description A pending request for the same kind already exists; this is it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseApproval"];
+                };
+            };
+            /** @description The pending request. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseApproval"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    listPendingDatabaseApprovals: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["ApprovalStatus"];
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of approvals, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseApprovalPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
         };
     };
     listDatabaseApprovals: {

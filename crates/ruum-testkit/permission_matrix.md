@@ -108,3 +108,27 @@ policy (`members_can_share`).
 | `listChanges` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | only entries on nodes the caller can see (agents: inside the scope) |
 | `getLatestCursor` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | every signed-in principal of the tenant |
 | `searchNodes` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | only nodes the caller can see |
+| `createDatabase` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | Needs edit on the parent folder (agents: max_role edit); guests and agents of guests need guests_create_resources (default false: 403) |
+| `getDatabase` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `updateDatabaseManifest` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage (settings); an agent may not change data_classes (unchanged here) |
+| `getDatabaseSchema` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `queryDatabase` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | mode read needs view (agents read masked values); the standard query is a read |
+| `listDatabaseQueries` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view; entries are filtered (manage: all; view: own and own agents'; agents: own) (decision 0004-20, UX C-19) |
+| `listDatabaseColumns` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `suggestColumnClasses` | 401 | ok | ok | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the database |
+| `confirmColumnClasses` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; Needs manage |
+| `listDatabaseMigrations` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `applyDatabaseMigration` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | live database: Needs manage; an agent also needs write_live and an approval (no agent of the fixture has manage on the database) |
+| `listDatabaseBranches` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `createDatabaseBranch` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | masked branch: Needs edit; guests and agents of guests need guests_create_resources (default false: 403) |
+| `listDatabaseRestorePoints` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `createDatabaseRestorePoint` | 401 | ok | ok | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the database |
+| `restoreDatabase` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs manage; new_node by a guest needs guests_create_resources |
+| `listDatabaseAccessGrants` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view; an agent sees only its own grants |
+| `createDatabaseAccessGrant` | 401 | 403 | 403 | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; only the user the agent acts for (member; read_personal needs view) |
+| `revokeDatabaseAccessGrant` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | ok | ok | 403/404 | 403 | 403 | the user who gave it (member), a person with manage, or the agent that holds it (agent) |
+| `requestDatabaseAccessGrant` | 401 | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | ok | 403/404 | ok | 403 | agents only, with view on the database; a person gets 403 (decision 0004-20, UX C-17) |
+| `listPendingDatabaseApprovals` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | the requests the caller may decide (agents: their own), across the tenant; only on databases the caller can see |
+| `listDatabaseApprovals` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
+| `getDatabaseApproval` | 401 | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | 404 | 403 | Needs view; an agent sees only its own requests (the request is agent's), others get 404 |
+| `decideDatabaseApproval` | 401 | ok | ok | ok | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; the agent's user (member) or a person with manage, with the right the statement needs (edit: a DELETE without WHERE) |

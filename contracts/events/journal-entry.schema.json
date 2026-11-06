@@ -65,8 +65,20 @@
         "grant.removed",
         "share_link.created",
         "share_link.revoked",
-        "node.sharing_updated"
-      ]
+        "node.sharing_updated",
+        "typed_node.status_changed",
+        "database.columns_confirmed",
+        "database.migration_applied",
+        "database.migration_failed",
+        "database.branch_created",
+        "database.restore_started",
+        "database.restored",
+        "database.restore_failed",
+        "database.grant_created",
+        "database.grant_revoked",
+        "database.approval_decided"
+      ],
+      "description": "The event type. The types in `$defs/planned_types` (step 2) are specified but not written by the server yet (decision 0004-21); the task that builds the first writer of a type removes it from that list."
     },
     "actor": {
       "$ref": "common.schema.json#/$defs/principal_ref",
@@ -436,6 +448,233 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "typed_node.status_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "typed_node.status_changed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.columns_confirmed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.columns_confirmed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.migration_applied"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.migration_applied.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.migration_failed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.migration_failed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.branch_created"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.branch_created.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.restore_started"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.restore_started.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.restored"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.restored.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.restore_failed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.restore_failed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.grant_created"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.grant_created.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.grant_revoked"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.grant_revoked.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "database.approval_decided"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "database.approval_decided.schema.json"
+          }
+        }
+      }
     }
-  ]
+  ],
+  "$defs": {
+    "planned_types": {
+      "description": "Event types that are specified but not written yet (decision 0004-21). Not used for validation; the envelope test of ruum-core keeps `EventType` equal to the `type` enum minus this list.",
+      "enum": [
+        "typed_node.status_changed",
+        "database.columns_confirmed",
+        "database.migration_applied",
+        "database.migration_failed",
+        "database.branch_created",
+        "database.restore_started",
+        "database.restored",
+        "database.restore_failed",
+        "database.grant_created",
+        "database.grant_revoked",
+        "database.approval_decided"
+      ]
+    }
+  }
 }

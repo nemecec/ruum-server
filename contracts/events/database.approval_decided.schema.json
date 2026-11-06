@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/database.approval_decided.schema.json",
+  "title": "database.approval_decided",
+  "description": "A person approved or denied a request of an agent (`decideDatabaseApproval`). `node_id` of the entry is the database. Names, IDs and counts only: never a row value, a parameter or an engine message (decision 0004-8). This schema is the `data` of a journal entry with `type` `database.approval_decided`. Step 2, planned (decision 0004-21).",
+  "type": "object",
+  "required": [
+    "approval_id",
+    "subject",
+    "decision",
+    "reasons",
+    "classes_confirmed"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "approval_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "subject": {
+      "enum": [
+        "statement",
+        "migration",
+        "grant"
+      ]
+    },
+    "decision": {
+      "enum": [
+        "approve",
+        "deny"
+      ]
+    },
+    "reasons": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "drop",
+          "truncate",
+          "delete_without_where",
+          "update_without_where",
+          "schema_change",
+          "migration",
+          "grant"
+        ]
+      }
+    },
+    "classes_confirmed": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}
