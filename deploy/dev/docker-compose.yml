@@ -1,0 +1,269 @@
+# The Ruum laptop stack (docs/DESIGN.md section 12.2). Use scripts/dev.sh, not this file directly.
+# All host ports bind to 127.0.0.1. The list of ports is in docs/DEVSTACK.md.
+name: ruum
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    build: ./postgres
+    image: ruum-dev/postgres:17-postgis-pgvector
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/dev.sh up}
+      RUUM_DB_PASSWORD: ${RUUM_DB_PASSWORD}
+      ZITADEL_DB_PASSWORD: ${ZITADEL_DB_PASSWORD}
+      SPICEDB_DB_PASSWORD: ${SPICEDB_DB_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=8MB
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ruum"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 1g
+    restart: unless-stopped
+    logging: *logging
+
+  garage:
+    image: dxflrs/garage:v2.5.0
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN}
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    ports:
+      - "127.0.0.1:3900:3900" # S3 API
+      - "127.0.0.1:3903:3903" # admin API
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v4.19.5
+    command: start-from-init --masterkeyFromEnv --tlsMode disabled
+    environment:
+      ZITADEL_MASTERKEY: ${ZITADEL_MASTERKEY}
+      ZITADEL_PORT: "8080"
+      ZITADEL_EXTERNALDOMAIN: localhost
+      ZITADEL_EXTERNALPORT: "8180"
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DATABASE_POSTGRES_HOST: postgres
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: ${ZITADEL_DB_PASSWORD}
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: ${POSTGRES_PASSWORD}
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_FIRSTINSTANCE_INSTANCENAME: Ruum
+      ZITADEL_FIRSTINSTANCE_ORG_NAME: Ruum
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: ${ZITADEL_ADMIN_USERNAME}
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: ${ZITADEL_ADMIN_PASSWORD}
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_ADDRESS: admin@ruum.localhost
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_VERIFIED: "true"
+      # A service account with a personal access token; scripts/dev.sh uses it to create the OIDC apps.
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: ruum-bootstrap
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Ruum bootstrap
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /bootstrap/bootstrap.pat
+      # Use the login UI built into Zitadel, so the stack needs no separate login container.
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "false"
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_HOST: mailpit:1025
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_TLS: "false"
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_FROM: noreply@ruum.localhost
+      ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_FROMNAME: Ruum
+    user: "0"
+    volumes:
+      - ./.state/zitadel:/bootstrap
+    ports:
+      - "127.0.0.1:8180:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/app/zitadel", "ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    mem_limit: 768m
+    restart: unless-stopped
+    logging: *logging
+
+  spicedb-migrate:
+    image: authzed/spicedb:v1.56.2
+    command: migrate head
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgres://spicedb:${SPICEDB_DB_PASSWORD}@postgres:5432/spicedb?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging: *logging
+
+  spicedb:
+    image: authzed/spicedb:v1.56.2
+    command: serve --http-enabled
+    environment:
+      SPICEDB_GRPC_PRESHARED_KEY: ${SPICEDB_PRESHARED_KEY}
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgres://spicedb:${SPICEDB_DB_PASSWORD}@postgres:5432/spicedb?sslmode=disable
+      SPICEDB_DATASTORE_CONN_POOL_READ_MAX_OPEN: "10"
+      SPICEDB_DATASTORE_CONN_POOL_WRITE_MAX_OPEN: "5"
+    ports:
+      - "127.0.0.1:50051:50051" # gRPC
+      - "127.0.0.1:8543:8443" # HTTP gateway
+    depends_on:
+      spicedb-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+
+  nats:
+    image: nats:2.15.2-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
+      - nats:/data
+    ports:
+      - "127.0.0.1:4222:4222" # client
+      - "127.0.0.1:8222:8222" # monitoring
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+
+  openbao:
+    image: openbao/openbao:2.7.2
+    command: server -dev
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: ${BAO_DEV_ROOT_TOKEN}
+      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      BAO_ADDR: http://127.0.0.1:8200
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "127.0.0.1:8200:8200"
+    healthcheck:
+      test: ["CMD", "bao", "status"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+
+  mailpit:
+    image: axllent/mailpit:v1.32.0
+    environment:
+      MP_MAX_MESSAGES: "2000"
+    ports:
+      - "127.0.0.1:8025:8025" # web UI and API
+      - "127.0.0.1:1025:1025" # SMTP
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    environment:
+      RUUM_UPSTREAM: ${RUUM_UPSTREAM:-host.docker.internal:8090}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+  # Step 4 (repos and builds). Not started by default: scripts/dev.sh up --step4
+  forgejo:
+    profiles: ["step4"]
+    image: codeberg.org/forgejo/forgejo:15.0.11
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__server__ROOT_URL: http://localhost:3001/
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__SSH_PORT: "2222"
+      FORGEJO__mailer__ENABLED: "true"
+      FORGEJO__mailer__PROTOCOL: smtp
+      FORGEJO__mailer__SMTP_ADDR: mailpit
+      FORGEJO__mailer__SMTP_PORT: "1025"
+      FORGEJO__mailer__FROM: forgejo@ruum.localhost
+    volumes:
+      - forgejo:/data
+    ports:
+      - "127.0.0.1:3001:3000" # web
+      - "127.0.0.1:2222:22" # SSH
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+    mem_limit: 512m
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  postgres:
+  garage-meta:
+  garage-data:
+  nats:
+  caddy-data:
+  caddy-config:
+  forgejo:

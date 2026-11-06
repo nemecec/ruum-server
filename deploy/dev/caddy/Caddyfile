@@ -1,0 +1,23 @@
+# Caddy, the HTTPS front of the laptop stack.
+# Certificates come from Caddy's own local CA. See docs/DEVSTACK.md to trust it.
+{
+	local_certs
+}
+
+ruum.localhost {
+	# Caddy answers this path itself, so you can check TLS before the Ruum server runs.
+	handle /caddy-health {
+		respond "ok" 200
+	}
+	# The Ruum server runs on the host (cargo run), not in Docker.
+	reverse_proxy {$RUUM_UPSTREAM}
+
+	handle_errors 502 503 504 {
+		respond "Ruum server is not running on {$RUUM_UPSTREAM}. Start it with cargo run." 502
+	}
+}
+
+*.ruumapps.localhost {
+	# The app gateway comes in step 3 (section 9). Until then, this only proves the wildcard certificate.
+	respond "Ruum app gateway: not built yet ({host})" 503
+}
