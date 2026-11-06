@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod limits;
 pub mod routes;
 pub mod state;
 
@@ -18,7 +19,8 @@ pub const TENANT_HEADER: &str = "ruum-tenant";
 /// The name of the request header with the idempotency key of a write.
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
-/// The full API router: all areas, plus the JSON 404 fallback.
+/// The full API router: all areas, plus the JSON 404 fallback, the idempotency layer and the
+/// rate limits of the operations that need no sign-in ([`limits`]).
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::system::router())
@@ -37,6 +39,10 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::idempotency,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            limits::RateLimiter::new(),
+            limits::rate_limit,
         ))
         .with_state(state)
 }

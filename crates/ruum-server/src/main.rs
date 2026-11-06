@@ -7,7 +7,11 @@ mod wiring;
 use anyhow::Context as _;
 use config::Config;
 use ruum_api::{ApiConfig, AppState};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+
+/// How often the sweeper runs.
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -38,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let sweep_pool = pool.clone();
     let services = wiring::services(&config.public_url, pool).await?;
     let state = AppState::new(
         services.clone(),
@@ -47,17 +52,34 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
+    // The sweeper deletes what has ended: unused OAuth clients, OAuth codes, idempotency keys
+    // and sessions.
+    if let Some(pool) = &sweep_pool {
+        tokio::spawn(ruum_core::identity::sweep::run(pool.clone(), SWEEP_EVERY));
+    }
+
+    // A request that has no answer after the timeout gets `408`. The longest long poll
+    // (`listChanges` with `wait`) is 30 seconds; streamed bodies are not cut (the timeout ends
+    // when the answer starts).
     let app = ruum_api::router(state)
         .merge(ruum_mcp::router(services.clone()))
-        .merge(ruum_webdav::router(services));
+        .merge(ruum_webdav::router(services))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            config.request_timeout,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&config.bind)
         .await
         .with_context(|| format!("bind {}", config.bind))?;
     tracing::info!(addr = %config.bind, "ruum-server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    // The peer address is the key of the rate limits (`ruum_api::limits`).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 

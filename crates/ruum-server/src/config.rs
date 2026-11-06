@@ -36,6 +36,9 @@ pub struct Config {
     pub s3_bucket: Option<String>,
     /// `RUUM_SPICEDB_ENDPOINT`
     pub spicedb_endpoint: Option<String>,
+    /// `RUUM_REQUEST_TIMEOUT_SECONDS`: a request without an answer after this time gets `408`
+    /// (default 120; the longest long poll is 30 seconds).
+    pub request_timeout: std::time::Duration,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -69,6 +72,14 @@ impl Config {
             s3_endpoint: var("RUUM_S3_ENDPOINT"),
             s3_bucket: var("RUUM_S3_BUCKET"),
             spicedb_endpoint: var("RUUM_SPICEDB_ENDPOINT"),
+            request_timeout: std::time::Duration::from_secs(
+                var("RUUM_REQUEST_TIMEOUT_SECONDS")
+                    .map(|v| v.parse::<u64>())
+                    .transpose()
+                    .context("RUUM_REQUEST_TIMEOUT_SECONDS must be a number")?
+                    .unwrap_or(120)
+                    .max(31),
+            ),
         })
     }
 }
