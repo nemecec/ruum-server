@@ -40,7 +40,7 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 | 8025 | Mailpit web UI and API |
 | 1025 | Mailpit SMTP |
 | 3001, 2222 | Forgejo web and SSH (profile `step4` only) |
-| 8090 | Reserved for the Ruum server on the host. Caddy proxies `https://ruum.localhost` to it. |
+| 8490 | Reserved for the Ruum server on the host (`RUUM_BIND`, the server default). Caddy proxies `https://ruum.localhost` to it. |
 
 ## Services
 
@@ -61,8 +61,11 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
   `dev.sh up` then creates the project `Ruum` with two apps and writes their IDs to
   `deploy/dev/.state/zitadel/apps.env`:
   - `ruum-web`: a public OIDC client (authorization code with PKCE, refresh token, device code).
-    The redirect URIs are `https://ruum.localhost/auth/callback`, `http://localhost:5173/auth/callback`
-    and `http://127.0.0.1:8976/callback` (for the CLI). Dev mode is on.
+    The redirect URIs are `https://ruum.localhost/v1/auth/callback` and
+    `http://127.0.0.1:8490/v1/auth/callback` (the server's callback of the contract),
+    `https://ruum.localhost/auth/callback`, `http://localhost:5173/auth/callback` and
+    `http://127.0.0.1:8976/callback` (for the CLI). Dev mode is on. A stack made before the
+    `/v1/auth/callback` URIs were added needs `scripts/dev.sh clean` and `up` to get them.
   - `ruum-api`: an API client with a client secret, for token introspection by the Ruum server.
 
   Zitadel uses the login UI that is built into it (login v2 is off), so the stack needs no
@@ -76,7 +79,7 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 - **Mailpit**: catches all mail. Open `http://localhost:8025`.
 - **Caddy**: the HTTPS front. It uses its own local CA for `ruum.localhost` and
   `*.ruumapps.localhost`. `https://ruum.localhost/caddy-health` answers `ok` from Caddy. All other
-  paths go to the Ruum server on the host port 8090 (`RUUM_UPSTREAM` in `.env`). If the server
+  paths go to the Ruum server on the host port 8490 (`RUUM_UPSTREAM` in `.env`). If the server
   does not run, Caddy answers 502 with a short message. `*.ruumapps.localhost` answers 503 until
   the app gateway exists (step 3).
 - **Forgejo**: only with `--step4`. It uses SQLite for now; step 4 decides the database.

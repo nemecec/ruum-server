@@ -118,7 +118,7 @@ init_zitadel() {
   fi
   web="$(zapi POST "/management/v1/projects/$project/apps/oidc" "$(jq -n '{
       name: "ruum-web",
-      redirectUris: ["https://ruum.localhost/auth/callback", "http://localhost:5173/auth/callback", "http://127.0.0.1:8976/callback"],
+      redirectUris: ["https://ruum.localhost/v1/auth/callback", "http://127.0.0.1:8490/v1/auth/callback", "https://ruum.localhost/auth/callback", "http://localhost:5173/auth/callback", "http://127.0.0.1:8976/callback"],
       postLogoutRedirectUris: ["https://ruum.localhost/", "http://localhost:5173/"],
       responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
       grantTypes: ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE", "OIDC_GRANT_TYPE_REFRESH_TOKEN", "OIDC_GRANT_TYPE_DEVICE_CODE"],
@@ -194,7 +194,13 @@ export BAO_TOKEN=$BAO_DEV_ROOT_TOKEN
 export SMTP_URL=smtp://127.0.0.1:1025
 export RUUM_PUBLIC_URL=https://ruum.localhost
 export RUUM_APPS_DOMAIN=ruumapps.localhost
-export RUUM_LISTEN=127.0.0.1:${RUUM_UPSTREAM##*:}
+export RUUM_BIND=127.0.0.1:${RUUM_UPSTREAM##*:}
+export RUUM_CONTENT_URL=https://content.ruumapps.localhost
+export RUUM_OIDC_ISSUER=$ZITADEL_URL
+export RUUM_OIDC_CLIENT_ID=${ZITADEL_WEB_CLIENT_ID:-}
+export RUUM_S3_ENDPOINT=http://127.0.0.1:3900
+export RUUM_S3_BUCKET=$S3_BUCKET
+export RUUM_SPICEDB_ENDPOINT=http://127.0.0.1:50051
 EOF
 }
 

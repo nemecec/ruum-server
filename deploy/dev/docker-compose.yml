@@ -210,7 +210,7 @@ services:
   caddy:
     image: caddy:2.11.7-alpine
     environment:
-      RUUM_UPSTREAM: ${RUUM_UPSTREAM:-host.docker.internal:8090}
+      RUUM_UPSTREAM: ${RUUM_UPSTREAM:-host.docker.internal:8490}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
