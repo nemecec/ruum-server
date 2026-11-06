@@ -1,0 +1,979 @@
+openapi: 3.1.0
+info:
+  title: Ruum provider contract
+  version: 0.1.0-draft
+  summary: How the platform and a provider of typed nodes work together (docs/DESIGN.md, section 7.1).
+  description: |
+    DRAFT for review (step 2 specify phase). Read `contracts/providers/README.md` first.
+
+    A typed node (`kind: typed`) is a placeholder in the tree. Its content is a **manifest**
+    (small JSON, versioned like a file) and the real thing lives in a **provider**. Databases are
+    the first typed node (step 2); web apps, repos, agent sessions and Kadakas drawings follow
+    and use the same contract.
+
+    This file has two parts:
+
+    - **Provider endpoints** (`/provider/v1/...`): what a provider serves. The platform is the
+      client. A first-party provider (the database provider of step 2) implements the same
+      operations as the Rust trait `ruum_core::providers::Provider` in the server process; the
+      HTTP form is for external providers (Kadakas CAD, step 6). Both pass the same conformance
+      suite.
+    - **Platform endpoints for providers** (`/v1/provider-api/...`, on the platform origin):
+      what a provider calls: the check API, status reports and provider versions.
+
+    ## Rules
+    - The platform owns the node: ID, name, parent, grants, trash, journal. The provider owns
+      the content behind the manifest. A provider never changes the tree.
+    - Every call from the platform carries `Ruum-Delivery-Id`. A provider must treat a second
+      call with the same delivery ID as the first one (idempotent). The platform retries with
+      backoff until it gets a `2xx` or a `4xx` other than `408` and `429`.
+    - Lifecycle hooks come from the journal in order per node (`seq`). A provider that answers
+      `202` reports the end of the work later with `reportStatus`.
+    - Long work is asynchronous: the platform shows the node status (`provisioning`, `ready`,
+      `failed: <reason>`, section 8.1) from the newest report.
+    - A provider never sees a user's platform token. It gets the tenant, the node and the
+      principal pair (`actor`, `on_behalf_of`) of the change, and asks the check API when it
+      needs to decide access.
+  license:
+    name: Apache 2.0
+    identifier: Apache-2.0
+servers:
+  - url: https://provider.example.invalid
+    description: The base URL of the provider, from its descriptor (`ProviderDescriptor.base_url`).
+security:
+  - platformToken: []
+tags:
+  - name: manifest
+    description: Validate a manifest before the platform stores it.
+  - name: lifecycle
+    description: Create, change and delete the content behind a typed node; lifecycle hooks.
+  - name: versions
+    description: How the versions of a typed node map to the provider (design section 5.3).
+  - name: export
+    description: Export of one node or of a whole tenant.
+  - name: platform
+    description: Platform endpoints that a provider calls.
+
+paths:
+  /provider/v1/descriptor:
+    get:
+      tags: [manifest]
+      operationId: getDescriptor
+      summary: The provider's descriptor
+      description: |
+        Read by the platform when a Ruum admin registers the provider, and again when the
+        provider announces a new version. A first-party provider returns the same value from
+        `Provider::descriptor()`.
+      responses:
+        '200':
+          description: The descriptor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderDescriptor'
+
+  /provider/v1/manifests/validate:
+    post:
+      tags: [manifest]
+      operationId: validateManifest
+      summary: Validate a manifest
+      description: |
+        The platform first validates the manifest against the type's JSON Schema
+        (`ProviderDescriptor.types[].manifest_schema`, for example
+        `contracts/manifests/database.schema.json`). Then it calls this operation for the rules
+        that a schema cannot hold (the extension exists on the cluster, the plan has room, a
+        change from the current manifest is allowed). Pure: no side effects. Called for the
+        first manifest (`current` is null) and for each change.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateRequest'
+      responses:
+        '200':
+          description: 'The result. `valid: false` is not an error of the call.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResult'
+        '400':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/nodes:
+    post:
+      tags: [lifecycle]
+      operationId: createTypedNode
+      summary: Make the content of a new typed node
+      description: |
+        Called after the platform committed the node row and its first manifest version (the
+        node shows `provisioning`). `source` says how the content starts: empty, as a copy of
+        another node (`copyNode` of the tree, a branch of a database), or from a template
+        (section 2.7). The provider answers `202` and reports `ready` or `failed` with
+        `reportStatus`, or answers `201` when it finished at once.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTypedNodeRequest'
+      responses:
+        '201':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '202':
+          description: Started; the result comes with `reportStatus`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '409':
+          $ref: '#/components/responses/ProviderError'
+        '422':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/nodes/{node_id}/manifest:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    put:
+      tags: [lifecycle]
+      operationId: applyManifest
+      summary: Apply a new manifest version
+      description: |
+        Called after a new manifest version is committed (`version.created` on a typed node), and
+        after `restoreVersion` of an older manifest version (the platform makes a new version with
+        the old content, as for files). The provider makes the real thing equal to the manifest
+        (the control loop of section 8.1) and reports `observed_version_id`. A manifest version
+        changes the configuration only, never the data.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyManifestRequest'
+      responses:
+        '200':
+          description: Applied at once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '202':
+          description: Started; the result comes with `reportStatus`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+        '422':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/nodes/{node_id}/status:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [lifecycle]
+      operationId: getTypedNodeStatus
+      summary: The current status of a node's content
+      description: |
+        The platform polls this when no report came in time (the reconciler), and before it
+        answers a status read that is older than the plan's status interval.
+      responses:
+        '200':
+          description: The status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/hooks:
+    post:
+      tags: [lifecycle]
+      operationId: deliverHook
+      summary: A lifecycle hook (from the journal)
+      description: |
+        One call per journal entry that touches a typed node of this provider, in `seq` order
+        per node, with retries (section 7.1). What a provider must do:
+
+        | Hook | Journal entry | Provider work |
+        |---|---|---|
+        | `copied` | `node.copied` | Copy the content to the new node (`target_node_id`). Often forgotten; required. A database copies schema and data (masked when the caller is an agent, as for branches). |
+        | `moved`, `renamed` | `node.moved`, `node.renamed` | Usually nothing (content is keyed by node ID). Update display names. |
+        | `trashed` | `node.trashed` | Stop serving (a database refuses new queries and connections), keep the content. |
+        | `restored` | `node.restored` | Serve again. |
+        | `purged` | `node.purged` | Delete the content for good, and its backups after the backup retention. Must succeed eventually: the platform retries until `2xx`. |
+        | `tenant_exported` | (tenant export job) | Write the export of every node of the tenant (see `exportTypedNode`). |
+        | `tenant_deleted` | (tenant deletion) | Delete everything of the tenant. |
+
+        A hook for a node the provider does not know answers `200` (idempotent delete) for
+        `trashed`, `purged` and `tenant_deleted`, and `404` otherwise.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HookDelivery'
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HookResult'
+        '202':
+          description: Started; the result comes with `reportStatus`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HookResult'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/nodes/{node_id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [versions]
+      operationId: listProviderVersions
+      summary: The provider's own versions of a node
+      description: |
+        Section 5.3: the version API is the same for all nodes, but a typed node has two kinds
+        of version, and the platform shows both in one version history:
+
+        1. **Manifest versions** are rows of the platform's `versions` table (encoding
+           `typed_manifest_v1`). They are the history of the configuration. The platform lists,
+           labels and restores them itself; restore calls `applyManifest`.
+        2. **Provider versions** are what the provider keeps: database restore points and
+           branches, repo commits, app deployments, drawing snapshots. They are listed here;
+           restore calls `restoreProviderVersion`.
+
+        For a database (step 2): `restore_point` (a named or automatic point in time inside the
+        backup window), and `branch` (a child database node; listed for the history, restored
+        as a node of its own). The point-in-time window itself is `ProviderVersionPage.window`.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderVersionPage'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/nodes/{node_id}/versions/restore:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [versions]
+      operationId: restoreProviderVersion
+      summary: Restore a provider version or a point in time
+      description: |
+        The platform checks the rights first (`manage` for a database) and records the restore
+        in the journal. `target: new_node` restores into a node that the platform already
+        created (`target_node_id`, status `provisioning`); `target: in_place` replaces the
+        content of this node, after the provider made a restore point of the current state, so
+        the restore can be undone.
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreRequest'
+      responses:
+        '202':
+          description: Started; the result comes with `reportStatus`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+        '422':
+          $ref: '#/components/responses/ProviderError'
+
+  /provider/v1/nodes/{node_id}/export:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [export]
+      operationId: exportTypedNode
+      summary: Export the content of a node
+      description: |
+        Writes the export as a file through the platform's upload API (the provider gets an
+        upload grant in the request), so export, quotas and downloads work as for files. A
+        database exports as `sql` (Postgres: `pg_dump` plain format; SQLite: `.dump`) or as the
+        engine's native file (`sqlite`). Exports of a database are full data: only a person with
+        `manage` starts one (the platform checks it; agents get masked exports only, see the
+        README).
+      parameters:
+        - $ref: '#/components/parameters/DeliveryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+      responses:
+        '202':
+          description: Started; the result comes with `reportStatus` (`export` filled).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderStatus'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+        '422':
+          $ref: '#/components/responses/ProviderError'
+
+  # ------------------------------------------------------------------ platform endpoints
+
+  /v1/provider-api/status:
+    servers:
+      - url: https://api.ruum.space
+        description: The platform
+    post:
+      tags: [platform]
+      operationId: reportStatus
+      summary: Report the status of a node's content
+      description: |
+        The provider reports the end of asynchronous work, or any change of status (a database
+        that fills its disk becomes `degraded`). The platform keeps the newest report by
+        `generation` and ignores older ones. Writes no journal entry for the status itself; a
+        change to `ready` or `failed` after create, apply or restore writes
+        `typed_node.status_changed` (see the README).
+      security:
+        - providerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatusReport'
+      responses:
+        '204':
+          description: Stored.
+        '404':
+          $ref: '#/components/responses/ProviderError'
+        '409':
+          description: An older generation than the stored one; ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/provider-api/check:
+    servers:
+      - url: https://api.ruum.space
+        description: The platform
+    post:
+      tags: [platform]
+      operationId: checkAccess
+      summary: May this principal do this on this node?
+      description: |
+        The check API of section 7.1. The answer is the platform's whole rule: the user's right
+        intersected with the agent's or app's scope, and the provider-specific rules (for a
+        database: the live write grant and the personal data grant of section 8.5). A provider
+        that keeps a session open subscribes to permission changes through `deliverHook`
+        (`access_changed`) and checks again.
+      security:
+        - providerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckRequest'
+      responses:
+        '200':
+          description: The decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckResult'
+        '404':
+          $ref: '#/components/responses/ProviderError'
+
+components:
+  securitySchemes:
+    platformToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A short-lived JWT signed by the platform (`iss` = the platform origin, `aud` = the
+        provider ID, `typ` = `platform_to_provider`, `tenant`, `node` when the call is about one
+        node, `exp` within 60 s). The provider checks it with the platform JWKS
+        (`/.well-known/jwks.json`). First-party providers in the server process skip it.
+    providerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        An access token of the provider principal (OAuth client credentials of the provider's
+        registration, `typ` = `provider`). It can only call `/v1/provider-api/...`, only for
+        nodes of the provider's own types.
+
+  parameters:
+    DeliveryId:
+      name: Ruum-Delivery-Id
+      in: header
+      required: true
+      description: A UUIDv7 per delivery. Retries keep it, so the provider can drop a second call.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    NodeId:
+      name: node_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    TenantId:
+      name: tenant_id
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
+
+  responses:
+    ProviderError:
+      description: An error of the provider.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: snake_case, as in the platform API.
+            message:
+              type: string
+            hint:
+              type: string
+
+    PrincipalRef:
+      type: object
+      required: [kind, id]
+      properties:
+        kind:
+          type: string
+          enum: [user, group, app, agent, share_link, provider]
+        id:
+          $ref: '#/components/schemas/Uuid'
+    ActorPair:
+      type: object
+      required: [actor, on_behalf_of]
+      properties:
+        actor:
+          $ref: '#/components/schemas/PrincipalRef'
+        on_behalf_of:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+
+    ProviderDescriptor:
+      type: object
+      description: |
+        The registration of a provider (stored by the platform; first-party providers are
+        registered in code). The database provider of step 2 has `id` `ruum.database`, one
+        type `database` (child type `database` for branches), `base_url` `null`, the hooks
+        `copied`, `moved`, `renamed`, `trashed`, `restored`, `purged`, `access_changed`,
+        `tenant_exported`, `tenant_deleted`, and the features `provider_versions`,
+        `restore_in_place`, `restore_new_node`, `export`.
+      required: [id, name, types, base_url, hooks]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z][a-z0-9_.-]{1,62}$'
+          description: '`ruum.database`, `ruum.webapp`, `kadakas`.'
+        name:
+          type: string
+        base_url:
+          type: [string, 'null']
+          format: uri
+          description: '`null` for a first-party provider in the server process.'
+        open_url:
+          type: [string, 'null']
+          format: uri
+          description: |
+            The "Open" flow of section 7.1: the platform sends the user to
+            `<open_url>?node=<id>&token=<signed token>` (`aud` = provider, `sub` = user, `node`,
+            `roles`, `exp`). `null` when the platform UI shows the node (databases).
+        types:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TypeDescriptor'
+        hooks:
+          type: array
+          description: The hooks the provider wants. `copied` and `purged` are required.
+          items:
+            $ref: '#/components/schemas/HookKind'
+        features:
+          type: array
+          items:
+            type: string
+            enum: [provider_versions, restore_in_place, restore_new_node, export, thumbnail, preview, search_text]
+    TypeDescriptor:
+      type: object
+      required: [type, manifest_schema, roles]
+      properties:
+        type:
+          type: string
+          pattern: '^[a-z][a-z0-9_.]{1,62}$'
+          description: The node type, for example `database`, `kadakas.drawing`.
+        display_name:
+          type: string
+        icon:
+          type: string
+        extension:
+          type: [string, 'null']
+          description: A file extension for downloads and the UI, for example `.db`.
+        manifest_schema:
+          type: string
+          description: The `$id` of the manifest JSON Schema, for example `https://ruum.space/contracts/manifests/database.schema.json`.
+        roles:
+          type: object
+          description: What each platform role means for this type (design section 3.2), for the UI and the docs.
+          required: [view, edit, manage]
+          properties:
+            view:
+              type: string
+            comment:
+              type: [string, 'null']
+            edit:
+              type: string
+            manage:
+              type: string
+        child_types:
+          type: array
+          description: Typed nodes that may be children of this node (a database branch is a child `database`).
+          items:
+            type: string
+
+    ValidateRequest:
+      type: object
+      required: [tenant_id, type, manifest, current]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          description: '`null` for a node that does not exist yet.'
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        type:
+          type: string
+        manifest:
+          type: object
+          description: The proposed manifest, already valid against the type's JSON Schema.
+        current:
+          description: The current manifest, `null` for a new node.
+          oneOf:
+            - type: object
+            - type: 'null'
+        plan:
+          type: string
+          description: The tenant plan (`free`, `personal`, `team`), for plan rules.
+        by:
+          $ref: '#/components/schemas/ActorPair'
+    ValidationResult:
+      type: object
+      required: [valid, problems]
+      properties:
+        valid:
+          type: boolean
+        normalized:
+          type: object
+          description: The manifest with defaults filled in. The platform stores this one.
+        problems:
+          type: array
+          items:
+            type: object
+            required: [pointer, code, message]
+            properties:
+              pointer:
+                type: string
+                description: A JSON pointer into the manifest, for example `/extensions/0`.
+              code:
+                type: string
+                description: snake_case, for example `unknown_extension`, `engine_change_not_allowed`, `plan_limit_reached`.
+              message:
+                type: string
+              hint:
+                type: string
+
+    Source:
+      description: How the content of a new node starts.
+      oneOf:
+        - type: object
+          required: [kind]
+          properties:
+            kind:
+              const: empty
+        - type: object
+          required: [kind, node_id]
+          properties:
+            kind:
+              const: copy
+              description: '`copyNode` of the tree.'
+            node_id:
+              $ref: '#/components/schemas/Uuid'
+            data:
+              $ref: '#/components/schemas/DataCopy'
+        - type: object
+          required: [kind, node_id, data]
+          properties:
+            kind:
+              const: branch
+              description: A database branch (section 8.4); the new node is a child of `node_id`.
+            node_id:
+              $ref: '#/components/schemas/Uuid'
+            data:
+              $ref: '#/components/schemas/DataCopy'
+            at:
+              description: Branch from this point in time (inside the backup window) instead of now.
+              oneOf:
+                - $ref: '#/components/schemas/Timestamp'
+                - type: 'null'
+        - type: object
+          required: [kind, node_id]
+          properties:
+            kind:
+              const: template
+              description: A node inside a template folder (section 2.7). Templates hold masked sample data only.
+            node_id:
+              $ref: '#/components/schemas/Uuid'
+            version_id:
+              $ref: '#/components/schemas/Uuid'
+    DataCopy:
+      type: string
+      description: |
+        What data a copy or branch takes. `masked` (the default): `personal` columns as
+        pseudonyms and `secret` values as NULL, so previews never copy real personal data
+        (section 8.5). `schema_only`: no rows. `full`: real data; only for a person with `manage`
+        on the source.
+      enum: [masked, schema_only, full]
+      default: masked
+
+    CreateTypedNodeRequest:
+      type: object
+      required: [tenant_id, node_id, type, version_id, manifest, source, by]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        type:
+          type: string
+        version_id:
+          $ref: '#/components/schemas/Uuid'
+          description: The manifest version to apply.
+        manifest:
+          type: object
+        source:
+          $ref: '#/components/schemas/Source'
+        by:
+          $ref: '#/components/schemas/ActorPair'
+    ApplyManifestRequest:
+      type: object
+      required: [tenant_id, version_id, manifest, previous_version_id, by]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        version_id:
+          $ref: '#/components/schemas/Uuid'
+        manifest:
+          type: object
+        previous_version_id:
+          $ref: '#/components/schemas/Uuid'
+        by:
+          $ref: '#/components/schemas/ActorPair'
+
+    ProviderState:
+      type: string
+      description: |
+        `provisioning`: being made. `ready`: serves. `updating`: serves while a manifest change or
+        restore runs. `degraded`: serves with a problem (`reason`). `suspended`: in the trash or
+        over a hard limit; keeps the content, serves nothing. `failed`: does not serve (`reason`).
+        `deleted`: the content is gone (after `purged`).
+      enum: [provisioning, ready, updating, degraded, suspended, failed, deleted]
+    ProviderStatus:
+      type: object
+      required: [node_id, state, generation, observed_version_id, reason, at]
+      properties:
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        state:
+          $ref: '#/components/schemas/ProviderState'
+        generation:
+          type: integer
+          format: int64
+          description: Grows with each report of this node. The platform keeps the highest.
+        observed_version_id:
+          description: The manifest version that the content matches now.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        reason:
+          description: A snake_case reason for `degraded`, `suspended` and `failed`, for example `disk_quota_exceeded`, `migration_failed`, `extension_not_available`.
+          type: [string, 'null']
+        message:
+          type: [string, 'null']
+        detail:
+          type: object
+          description: Type-specific facts for the UI, for example a database's `size_bytes`.
+          additionalProperties: true
+        export:
+          description: Set when an export finished.
+          oneOf:
+            - type: object
+              required: [node_id]
+              properties:
+                node_id:
+                  $ref: '#/components/schemas/Uuid'
+                  description: The file node that holds the export.
+            - type: 'null'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    StatusReport:
+      allOf:
+        - $ref: '#/components/schemas/ProviderStatus'
+        - type: object
+          required: [tenant_id]
+          properties:
+            tenant_id:
+              $ref: '#/components/schemas/Uuid'
+            delivery_id:
+              description: The delivery that this report ends, if any.
+              oneOf:
+                - $ref: '#/components/schemas/Uuid'
+                - type: 'null'
+
+    HookKind:
+      type: string
+      enum: [copied, moved, renamed, trashed, restored, purged, access_changed, tenant_exported, tenant_deleted]
+    HookDelivery:
+      type: object
+      required: [hook, tenant_id, by, at]
+      properties:
+        hook:
+          $ref: '#/components/schemas/HookKind'
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          description: The typed node. `null` for the tenant hooks.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        seq:
+          description: The journal sequence number of the entry, `null` for the tenant hooks.
+          oneOf:
+            - type: integer
+              format: int64
+            - type: 'null'
+        target_node_id:
+          description: '`copied`: the new node. The platform already created it (status `provisioning`).'
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        data:
+          description: The `data` of the journal entry (contracts/events/), or the export target for `tenant_exported`.
+          type: object
+          additionalProperties: true
+        by:
+          $ref: '#/components/schemas/ActorPair'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    HookResult:
+      type: object
+      required: [done]
+      properties:
+        done:
+          type: boolean
+          description: '`false` with `202`: the work goes on and ends with `reportStatus`.'
+
+    ProviderVersionKind:
+      type: string
+      description: The kinds of provider version. A database uses `restore_point` and `branch`.
+      enum: [restore_point, branch, snapshot, commit, deployment]
+    ProviderVersion:
+      type: object
+      required: [id, kind, label, created_at, by, restore_modes]
+      properties:
+        id:
+          type: string
+          description: The provider's ID of the version (a UUID for a restore point, a commit hash for a repo).
+        kind:
+          $ref: '#/components/schemas/ProviderVersionKind'
+        label:
+          type: [string, 'null']
+          description: For example "Before the write grant of 14:00", "Before migration 0003_add_tags".
+        reason:
+          type: [string, 'null']
+          description: '`manual`, `before_write_grant`, `before_migration`, `before_restore`, `daily`.'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        size_bytes:
+          type: [integer, 'null']
+          format: int64
+        node_id:
+          description: '`branch`: the branch node.'
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        by:
+          oneOf:
+            - $ref: '#/components/schemas/ActorPair'
+            - type: 'null'
+        restore_modes:
+          type: array
+          items:
+            type: string
+            enum: [in_place, new_node]
+    ProviderVersionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderVersion'
+        next_cursor:
+          type: [string, 'null']
+        window:
+          description: The point-in-time window, if the provider has one (for a database, the last 7 days).
+          oneOf:
+            - type: object
+              required: [earliest, latest]
+              properties:
+                earliest:
+                  $ref: '#/components/schemas/Timestamp'
+                latest:
+                  $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+    RestoreRequest:
+      type: object
+      required: [tenant_id, target, by]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        version:
+          description: A provider version ID. Give this or `at`.
+          type: [string, 'null']
+        at:
+          description: A point in time inside the window. Give this or `version`.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        target:
+          type: string
+          enum: [in_place, new_node]
+        target_node_id:
+          description: Required for `new_node`.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        by:
+          $ref: '#/components/schemas/ActorPair'
+
+    ExportRequest:
+      type: object
+      required: [tenant_id, format, upload, by]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        format:
+          type: string
+          description: One of the type's export formats; a database has `sql` and `sqlite` (SQLite only).
+        data:
+          $ref: '#/components/schemas/DataCopy'
+        upload:
+          type: object
+          description: Where to write the export, through the platform upload API.
+          required: [upload_id, token]
+          properties:
+            upload_id:
+              $ref: '#/components/schemas/Uuid'
+            token:
+              type: string
+              description: A short-lived token that may write only this upload.
+        by:
+          $ref: '#/components/schemas/ActorPair'
+
+    CheckRequest:
+      type: object
+      required: [tenant_id, node_id, principal, permission]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        principal:
+          $ref: '#/components/schemas/ActorPair'
+        permission:
+          type: string
+          description: |
+            A role (`view`, `comment`, `edit`, `manage`), `share`, or a type-specific permission.
+            A database has `query_read`, `query_write`, `change_schema`, `write_live` and
+            `read_personal` (contracts/authz/schema.zed).
+    CheckResult:
+      type: object
+      required: [allowed, role]
+      properties:
+        allowed:
+          type: boolean
+        role:
+          description: The principal's effective role on the node, after the scope.
+          type: [string, 'null']
+          enum: [view, comment, edit, manage, null]
+        expires_at:
+          description: When the answer stops being true (a time-limited grant, an agent scope expiry). The provider checks again then.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'

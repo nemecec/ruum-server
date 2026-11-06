@@ -45,6 +45,13 @@ relationships: |-
   node:beta_root#manager@tenant:beta#administer
   node:beta_root#team@tenant:beta
   node:beta_docs#parent@node:beta_root
+  node:garden_db#parent@node:garden
+  node:garden_db#viewer@user:kati
+  node:garden_db_preview#parent@node:garden_db
+  node:garden_db_preview#draft_branch@agent:*
+  node:garden_db#live_writer@agent:jaan_bot
+  node:garden_db#personal_reader@agent:jaan_bot
+  node:garden_db#live_writer@agent:writer_only_bot
 assertions:
   assertTrue:
     - node:plan#share@user:mari
@@ -77,6 +84,20 @@ assertions:
     # With members_can_share (tenant:beta#members_can_share@user:*) a member can share.
     - node:beta_docs#share@user:liis
     - node:beta_docs#manage@user:liis
+    # Step 2: a database inherits the roles of its folder. view = read-only queries,
+    # edit = read-write queries, manage = schema and settings.
+    - node:garden_db#query_read@user:jaan
+    - node:garden_db#query_write@user:jaan
+    - node:garden_db#query_read@user:kati
+    - node:garden_db#change_schema@user:mari
+    - node:garden_db#change_schema@user:tiit
+    # A branch is a child node: it inherits the grants of the database.
+    - node:garden_db_preview#query_write@user:jaan
+    - node:garden_db_preview#query_read@user:kati
+    # Agents write freely on a branch, and on the live database only with a grant in force.
+    - node:garden_db_preview#agent_write_live@agent:any_bot
+    - node:garden_db#agent_write_live@agent:jaan_bot
+    - node:garden_db#agent_read_personal@agent:jaan_bot
   assertFalse:
     - node:projects#view@user:jaan
     - node:plan#manage@user:jaan
@@ -100,3 +121,18 @@ assertions:
     - tenant:acme#administer@user:peeter
     # A guest editor never manages.
     - node:acme_ext#manage@user:gert
+    # Step 2: a viewer runs only read-only queries; an editor does not change the schema.
+    - node:garden_db#query_write@user:kati
+    - node:garden_db#change_schema@user:jaan
+    - node:garden_db_preview#change_schema@user:jaan
+    # No grant, no live writes and no real personal values for an agent.
+    - node:garden_db#agent_write_live@agent:any_bot
+    - node:garden_db#agent_read_personal@agent:any_bot
+    # The two grants are separate: a write grant does not show real personal values.
+    - node:garden_db#agent_read_personal@agent:writer_only_bot
+    # A grant on the live database does not give personal values on its branch, and a grant
+    # is never inherited by other nodes.
+    - node:garden_db_preview#agent_read_personal@agent:jaan_bot
+    - node:plan#agent_write_live@agent:jaan_bot
+    # The draft mark of a branch never reaches the live database above it.
+    - node:garden#agent_write_live@agent:any_bot

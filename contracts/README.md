@@ -5,7 +5,7 @@ The contracts are the shared ground between people and agents that work in paral
 
 | Contract | What it is | Checked by |
 |---|---|---|
-| `openapi.yaml` | The REST API of step 1 (OpenAPI 3.1): paths, request and response bodies, error codes, auth, paging, idempotency. The web UI client (`web/src/api/schema.d.ts`) is generated from it. | `npx @redocly/cli lint --config contracts/redocly.yaml contracts/openapi.yaml`; the router test in `crates/ruum-api` and the error code test in `crates/ruum-core` |
+| `openapi.yaml` | The REST API of step 1 (OpenAPI 3.1), and the step 2 database operations (tag `databases`, DRAFT; each with `x-ruum-area`): paths, request and response bodies, error codes, auth, paging, idempotency. The web UI client (`web/src/api/schema.d.ts`) is generated from it. | `npx @redocly/cli lint --config contracts/redocly.yaml contracts/openapi.yaml`; the router test in `crates/ruum-api` and the error code test in `crates/ruum-core` |
 | `redocly.yaml` | Lint rules for `openapi.yaml`, with the reason for each rule that is off. | - |
 | `authz/schema.zed` | The SpiceDB schema (design section 3.3): users, groups, tenants, agents, share links, nodes and their roles and permissions. | `zed validate contracts/authz/schema.test.yaml` |
 | `authz/schema.test.yaml` | Relationships and assertions that pin the permission rules (inheritance, member links, share links, team roots). The in-memory authz implementation must pass the same cases. | same |
@@ -13,6 +13,8 @@ The contracts are the shared ground between people and agents that work in paral
 | `events/<type>.schema.json` | The `data` of each event type of step 1: `node.created`, `node.renamed`, `node.moved`, `node.copied`, `node.trashed`, `node.restored`, `node.purged`, `node.sharing_updated`, `version.created`, `version.restored`, `version.labeled`, `tag.attached`, `tag.detached`, `grant.added`, `grant.updated`, `grant.removed`, `share_link.created`, `share_link.revoked`. | same |
 | `events/common.schema.json` | Shared definitions (IDs, times, hashes, roles, principals, grantees). | same |
 | `events/examples/` | Example entries that must validate. | same |
+| `providers/README.md`, `providers/provider.openapi.yaml` | The provider contract of typed nodes (design section 7.1; step 2, DRAFT): create, manifest validation, status, lifecycle hooks, export, and how the versions of a typed node map to the provider (section 5.3). Databases are the first typed node. | `npx @redocly/cli lint --config contracts/redocly.yaml contracts/providers/provider.openapi.yaml` |
+| `manifests/database.schema.json` | The manifest of a `database` node (design section 8; step 2, DRAFT): engine, version, plan, extensions, backups, data classes per column. | `ajv validate --spec=draft2020` |
 | `mcp/tools.yaml` | The MCP tool list: one tool per REST operation that makes sense for an agent (name, `operationId`, description, input by JSON pointer), and the operations that are not exposed, with the reason. | `cargo test -p ruum-mcp --test tools_contract` |
 
 The SQL schema in `migrations/` is a contract too, with its own rule: one migration change at a time.

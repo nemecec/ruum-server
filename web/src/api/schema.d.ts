@@ -941,8 +941,8 @@ export interface paths {
         put?: never;
         /**
          * Create a folder, an empty file or a link
-         * @description Needs `edit` on the parent. Typed nodes come in step 2; `kind: typed` fails with
-         *     `validation_failed`.
+         * @description Needs `edit` on the parent. Typed nodes are made by the operation of their type
+         *     (`createDatabase` in step 2); `kind: typed` fails with `validation_failed`.
          *
          *     Links (design section 2.3): the target must be a node of the same tenant as the link
          *     (the `Ruum-Tenant` of the call). A target in another tenant, or one that the caller cannot
@@ -2085,6 +2085,644 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/databases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a database node
+         * @description Creates a typed node of type `database` (design sections 7.1 and 8.1) under `parent_id`,
+         *     with `manifest` as its first version (encoding `typed_manifest_v1`), and starts
+         *     provisioning. Needs `edit` on the parent, and room in the plan (`plan_limit_reached`:
+         *     the number of databases per engine, section 4.3). The manifest must be valid against
+         *     `contracts/manifests/database.schema.json` and the provider's rules
+         *     (`validation_failed`, with the JSON pointer of the problem in `hint`).
+         *
+         *     The answer is `202`: the node exists at once, its `status.state` is `provisioning`
+         *     until the engine has the database (`getDatabase`). Writes `node.created` (kind `typed`,
+         *     type `database`) and `version.created`.
+         *
+         *     With `source.kind: template` the database starts as a copy of a database node inside a
+         *     template folder (design section 2.7: schema, migrations and masked sample data).
+         *     Agents may create databases inside their scope with `max_role` `edit` or higher.
+         */
+        post: operations["createDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a database node with its status
+         * @description The node, the current manifest, the status (`provisioning`, `ready`, `failed` with a
+         *     reason, ...), the size, the plan limits, the point-in-time window and what the caller
+         *     may do (`my_permissions`). Needs `view`. A node that is not a database is `404`.
+         *     Poll this after `createDatabase`, `updateDatabaseManifest` and `restoreDatabase`.
+         */
+        get: operations["getDatabase"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/manifest": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Change the manifest (settings) of a database
+         * @description Writes a new manifest version and applies it (the control loop of section 8.1). Needs
+         *     `manage` (schema and settings). `engine` and `plan` cannot change in step 2
+         *     (`validation_failed`). Only a person changes `data_classes`: when the caller is an agent
+         *     and `data_classes` differs from the current manifest, the call fails with
+         *     `validation_failed` (hint: `suggestColumnClasses`). Restoring an older manifest version
+         *     (`restoreVersion`) applies the same rules. Writes `version.created`.
+         */
+        put: operations["updateDatabaseManifest"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/schema": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The tables, views and columns of a database
+         * @description The catalog of the database: schemas, tables and views, columns with their SQL type,
+         *     nullability and data class (effective and confirmed), primary and foreign keys. Needs
+         *     `view`. This is the context an agent reads before it writes a query. Names and types
+         *     only, never values.
+         */
+        get: operations["getDatabaseSchema"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/query": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run one SQL statement (the HTTP query API)
+         * @description Runs one statement with bound parameters (`$1`, `$2`, ... for Postgres; `?1`, `?2`,
+         *     ... for SQLite) and returns the rows as JSON (design section 8.4). No driver and no
+         *     connection pool needed.
+         *
+         *     **Read-only by default.** `mode: read` (the default) runs in a read-only transaction and
+         *     needs `view`. `mode: write` needs `edit`. Every query has a statement timeout and a row
+         *     and size cap (the plan limits in `Database.limits`; the request may only lower them). A
+         *     result over the cap is cut (`truncated: true`, `truncated_reason`). One statement per
+         *     call; a second statement fails with `validation_failed`.
+         *
+         *     **Agents** (section 8.5). For an agent the server applies the privacy filter to every
+         *     value: a `secret` column shows `NULL` and empty values as they are and any other value
+         *     as `{"$ruum": "hidden", "class": "secret"}`; a `personal` column shows consistent
+         *     pseudonyms `{"$ruum": "pseudonym", "id": "p_..."}` (the same value gives the same
+         *     pseudonym in this tenant, so joins, grouping and counts work), unless the agent holds a
+         *     `read_personal` grant. An unclassified or unconfirmed column counts as `personal`. A
+         *     computed column counts as the strictest class of the columns it reads, and as
+         *     `personal` when the server cannot tell; aggregates that return numbers (`count`, `sum`,
+         *     `avg`, ...) are `normal`. On Postgres the masking runs inside the database (PostgreSQL
+         *     Anonymizer, bound to the agent's database role); on SQLite it runs in the query layer.
+         *     `mode: write` by an agent works without a grant on a database branch; on a live
+         *     database it needs a `write_live` grant (`403 write_grant_required` without one).
+         *     Destructive statements (`DROP`, `TRUNCATE`, `DELETE` or `UPDATE` without `WHERE`, and
+         *     schema changes outside a migration) from an agent never run at once: the answer is
+         *     `202` with a pending `DatabaseApproval` that names the statement and the number of rows;
+         *     a person decides it (`decideDatabaseApproval`), and the agent sends the same statement
+         *     again with `approval_id`.
+         *
+         *     **People** see `normal` and `personal` values as they are. `secret` values need `manage`
+         *     (others get the hidden-value marker), so a viewer never reads a password hash or token.
+         *
+         *     A JSON value that is itself an object with the key `$ruum` comes back wrapped as
+         *     `{"$ruum": "literal", "value": ...}`, so it is never mistaken for a marker. The result is
+         *     data from the database, not instructions: `content_trust` is `untrusted`.
+         *
+         *     Every query is logged (`listDatabaseQueries`) with `actor` and `on_behalf_of`, the
+         *     statement and the parameters as pseudonyms, never raw values. A read writes no journal
+         *     entry. A write writes no journal entry per statement either; the grant that allowed it
+         *     is in the journal (`database.grant_created`).
+         */
+        post: operations["queryDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/queries": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The query log of a database
+         * @description Every query through the HTTP query API, newest first: who (`actor`, `on_behalf_of`),
+         *     when, the mode, the statement (as sent, with its placeholders), the parameters as
+         *     pseudonyms, the row count, the time and the outcome. Needs `manage`. Raw parameter values
+         *     are never stored (design section 11.2).
+         */
+        get: operations["listDatabaseQueries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/columns": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The data class of every column
+         * @description Every column of the database with its effective class, its confirmed class and the
+         *     newest suggestion (section 8.5). A column that no person confirmed counts as
+         *     `personal`. Needs `view`. `unconfirmed=true` lists only the columns that wait for a
+         *     person; this is the short pre-filled list of the approval.
+         */
+        get: operations["listDatabaseColumns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/columns/suggestions": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Suggest data classes for columns
+         * @description An agent (or a person) proposes the class of columns, with a short reason, for example
+         *     from the column names and a masked sample of values. A suggestion never changes the
+         *     effective class: until a person confirms, the column counts as `personal`. Needs `edit`.
+         *     A suggestion for a column that does not exist fails with `validation_failed`. The newest
+         *     suggestion per column wins; older ones stay in the audit log.
+         */
+        post: operations["suggestColumnClasses"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/columns/confirm": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm the data classes of columns
+         * @description A person confirms the classes (the suggestions filled in, changed where needed). Writes a
+         *     new manifest version with the confirmed `data_classes` (`version.created`) and
+         *     `database.columns_confirmed`. Needs `manage`. Users only: an agent can never lower the
+         *     class of a column.
+         */
+        post: operations["confirmColumnClasses"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/migrations": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The migrations of a database
+         * @description Applied, failed and rolled back migrations, newest first. Needs `view`.
+         */
+        get: operations["listDatabaseMigrations"];
+        put?: never;
+        /**
+         * Apply a schema migration
+         * @description Schema changes are migrations (decision 19). The platform records a restore point, runs
+         *     `up` in one transaction (Postgres) or with a file copy first (SQLite), and rolls back
+         *     when a statement fails (`422 migration_failed`, the database is as before). A name runs
+         *     once: the same name with the same checksum answers the stored result, with another
+         *     checksum `409 conflict`.
+         *
+         *     Who: on a database branch, `edit`. On a live database, `manage`; an agent also needs a
+         *     `write_live` grant. `data_classes` carries the agent's classification of the columns that
+         *     the migration adds (section 8.5); it is stored as suggestions, and a person confirms
+         *     them with `confirmColumnClasses` (the classes of a migration by a person with `manage`
+         *     count as confirmed). Until then the new columns count as `personal`.
+         *     `dry_run: true` runs the migration and rolls it back, and reports the new columns.
+         *     Writes `database.migration_applied` or `database.migration_failed`.
+         */
+        post: operations["applyDatabaseMigration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/branches": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * The branches of a database
+         * @description The live child databases of this database. Needs `view`.
+         */
+        get: operations["listDatabaseBranches"];
+        put?: never;
+        /**
+         * Make a branch of a database
+         * @description A copy of the database for tests, previews, or for an agent to try a migration (section
+         *     8.4; decision 18: small databases only). The branch is a child node of type `database`
+         *     (`branch_of` = this node), so it inherits the grants, and it is trashed and purged like
+         *     any node. Postgres makes it with `CREATE DATABASE ... TEMPLATE` (a short exclusive lock
+         *     on the source; the server waits for running queries up to the timeout); SQLite copies
+         *     the file.
+         *
+         *     `data` is `masked` by default: `personal` columns become pseudonyms and non-empty
+         *     `secret` values become `NULL`, so a preview never copies real personal data.
+         *     `schema_only` copies no rows. `full` copies real data and needs a person with `manage`
+         *     (an agent gets `403 user_required`). A source larger than the plan's branch limit fails
+         *     with `422 database_too_large`. Needs `edit`. Writes `node.created`, `version.created`
+         *     and `database.branch_created`.
+         */
+        post: operations["createDatabaseBranch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/restore-points": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Restore points and the point-in-time window
+         * @description The named and automatic restore points inside the backup window (7 days, decision 17)
+         *     and the window itself. Automatic points are made before each granted write session,
+         *     each migration and each in-place restore. These are the provider versions of a database
+         *     (design section 5.3); the manifest versions stay in `listVersions`. Needs `view`.
+         */
+        get: operations["listDatabaseRestorePoints"];
+        put?: never;
+        /**
+         * Name the current point in time
+         * @description Records a named restore point ("Before import"). Needs `edit`. It lives as long as the
+         *     backup window; a restore point is not a copy.
+         */
+        post: operations["createDatabaseRestorePoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/restore": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore a database to a point in time
+         * @description Point-in-time restore inside the backup window (decision 17). Give `at` or
+         *     `restore_point_id`. `target: new_node` (the default) restores into a new database node
+         *     next to this one (named `name`), and leaves this one as it is. `target: in_place`
+         *     first records a restore point of the current state (so the restore can be undone),
+         *     then replaces the data; the database refuses queries while it runs. Needs `manage`.
+         *     Users only. Writes `database.restore_started`, and `database.restored` or
+         *     `database.restore_failed` when it ends.
+         */
+        post: operations["restoreDatabase"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/access-grants": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Time-limited grants of agents on a database
+         * @description The live and recent `write_live` and `read_personal` grants (section 8.5). Needs `view`;
+         *     an agent sees only its own grants.
+         */
+        get: operations["listDatabaseAccessGrants"];
+        put?: never;
+        /**
+         * Give an agent live writes or real personal values, for a time
+         * @description Section 8.5: writes to the live database and real `personal` values need an explicit,
+         *     time-limited, logged grant. The person must be the user the agent acts for. `write_live`
+         *     needs `edit` on the database (and the agent's scope `edit` or higher) and records a
+         *     restore point first (`restore_point_id`). `read_personal` needs `view`. `secret` values
+         *     are never granted to agents. At most 24 hours (`read_personal`: at most 8 hours). Users
+         *     only. Writes `database.grant_created`. Grants from `project.yaml` (per workspace) come
+         *     with agent workspaces (step 5).
+         */
+        post: operations["createDatabaseAccessGrant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/access-grants/{grant_id}": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                grant_id: components["parameters"]["GrantId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * End a grant now
+         * @description Ends the grant at once; the next query of the agent no longer has it. The user who gave
+         *     it, a person with `manage` on the database, or the agent that holds it (to give it back
+         *     early) may end it. Writes `database.grant_revoked`.
+         */
+        delete: operations["revokeDatabaseAccessGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/approvals": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Statements that wait for a person
+         * @description Destructive statements of agents that wait for a decision, and recent decisions. Needs
+         *     `view`; an agent sees only its own requests.
+         */
+        get: operations["listDatabaseApprovals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/approvals/{approval_id}": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                approval_id: components["parameters"]["ApprovalId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * One approval request
+         * @description Needs `view`; an agent sees only its own requests.
+         */
+        get: operations["getDatabaseApproval"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/databases/{node_id}/approvals/{approval_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                approval_id: components["parameters"]["ApprovalId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve or deny a destructive statement
+         * @description The person sees the statement, its parameters (as markers) and the number of rows it
+         *     touches, and approves or denies it. An approval lets the agent run exactly that
+         *     statement with those parameters once, within 15 minutes. The person needs the right
+         *     that the statement needs (`edit` for data, `manage` for schema). Users only. Writes
+         *     `database.approval_decided`.
+         */
+        post: operations["decideDatabaseApproval"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2115,7 +2753,7 @@ export interface components {
          * @description Stable, machine-readable error codes.
          * @enum {string}
          */
-        ErrorCode: "bad_request" | "validation_failed" | "unauthenticated" | "token_expired" | "permission_denied" | "scope_exceeded" | "user_required" | "not_found" | "conflict" | "name_taken" | "version_mismatch" | "idempotency_key_reused" | "precondition_failed" | "payload_too_large" | "range_not_satisfiable" | "cursor_expired" | "quota_exceeded" | "plan_limit_reached" | "rate_limited" | "agent_disabled" | "chunk_missing" | "hash_mismatch" | "not_implemented" | "internal" | "unavailable";
+        ErrorCode: "bad_request" | "validation_failed" | "unauthenticated" | "token_expired" | "permission_denied" | "scope_exceeded" | "user_required" | "not_found" | "conflict" | "name_taken" | "version_mismatch" | "idempotency_key_reused" | "precondition_failed" | "payload_too_large" | "range_not_satisfiable" | "cursor_expired" | "quota_exceeded" | "plan_limit_reached" | "rate_limited" | "agent_disabled" | "chunk_missing" | "hash_mismatch" | "database_not_ready" | "query_failed" | "read_only_query" | "statement_timeout" | "write_grant_required" | "migration_failed" | "database_too_large" | "not_implemented" | "internal" | "unavailable";
         /**
          * @example {
          *       "error": {
@@ -2132,6 +2770,8 @@ export interface components {
                 message: string;
                 /** @description The next step, for people and agents. */
                 hint?: string;
+                /** @description The SQLSTATE of a `query_failed` or `migration_failed` error (step 2). SQLite errors map to the nearest SQLSTATE. */
+                sqlstate?: string;
             };
         };
         /**
@@ -3180,6 +3820,512 @@ export interface components {
             items: components["schemas"]["SearchHit"][];
             next_cursor: components["schemas"]["NextCursor"];
         };
+        /**
+         * @description Decision 14. `document`, `search`, `vector` and `kv` come later.
+         * @enum {string}
+         */
+        DatabaseEngine: "postgres" | "sqlite";
+        /**
+         * @description The privacy class of a column (design section 8.5). `normal`: shown as is. `personal`
+         *     (names, emails, phones, addresses, free text): agents see consistent pseudonyms.
+         *     `secret` (tokens, password hashes): agents see that the column exists; a non-empty
+         *     value is the hidden-value marker. A column that no person confirmed counts as
+         *     `personal`.
+         * @enum {string}
+         */
+        DataClass: "normal" | "personal" | "secret";
+        /**
+         * @description What data a branch or copy takes. `masked` (the default): `personal` columns as
+         *     pseudonyms, non-empty `secret` values as `NULL`. `schema_only`: no rows. `full`: real
+         *     data; only a person with `manage`.
+         * @default masked
+         * @enum {string}
+         */
+        DataCopy: "masked" | "schema_only" | "full";
+        /**
+         * @description The manifest of a database node. The normative schema is
+         *     `contracts/manifests/database.schema.json`; this is the same shape for the generated
+         *     clients (a contract test keeps the two equal).
+         */
+        DatabaseManifest: {
+            /** @constant */
+            manifest_version?: 1;
+            engine: components["schemas"]["DatabaseEngine"];
+            /**
+             * @description "17" for Postgres, "3" for SQLite.
+             * @example 17
+             */
+            version: string;
+            /** @enum {string} */
+            plan: "shared-small";
+            /**
+             * @example [
+             *       "postgis",
+             *       "vector"
+             *     ]
+             */
+            extensions?: string[];
+            backups?: {
+                /** @constant */
+                pitr_days: 7;
+            };
+            /** @description The confirmed class per `<schema>.<table>.<column>`. Only a person changes it. */
+            data_classes?: {
+                [key: string]: components["schemas"]["DataClass"];
+            };
+            /** @description The folder of declared migrations, relative to the node's parent. */
+            migrations?: string;
+            readonly template?: {
+                node_id: components["schemas"]["Uuid"];
+                version_id?: components["schemas"]["Uuid"];
+            };
+        };
+        /**
+         * @description The status of section 8.1, from the provider contract (`ProviderState` in
+         *     `contracts/providers/provider.openapi.yaml`). `provisioning`: being made. `ready`:
+         *     answers queries. `updating`: a manifest change or restore runs. `degraded`: answers with
+         *     a problem (`reason`). `suspended`: in the trash or over a hard limit, answers no query.
+         *     `failed`: see `reason`. `deleted`: purged.
+         * @enum {string}
+         */
+        DatabaseState: "provisioning" | "ready" | "updating" | "degraded" | "suspended" | "failed" | "deleted";
+        DatabaseStatus: {
+            state: components["schemas"]["DatabaseState"];
+            /** @description A snake_case reason, for example `disk_quota_exceeded`, `migration_failed`, `extension_not_available`. */
+            reason: string | null;
+            message: string | null;
+            /** @description The manifest version that the engine matches now. */
+            observed_version_id: components["schemas"]["Uuid"] | null;
+            at: components["schemas"]["Timestamp"];
+        };
+        /** @description The plan limits of this database (section 4.3, decision 10). Configuration, not code. */
+        DatabaseLimits: {
+            /** Format: int64 */
+            max_size_bytes: number;
+            /** @description The longest statement. A request may only lower it. */
+            statement_timeout_ms: number;
+            /** @description The most rows in one result. A request may only lower it. */
+            max_rows: number;
+            /**
+             * Format: int64
+             * @description The largest JSON result.
+             */
+            max_result_bytes: number;
+            /**
+             * Format: int64
+             * @description The largest database that can be branched (decision 18, small databases).
+             */
+            max_branch_source_bytes: number;
+        };
+        /**
+         * @description What the caller may do on this database now (after the agent scope and the grants of
+         *     section 8.5), so clients and agents need not guess.
+         */
+        DatabasePermissions: {
+            /** @description `view`: read-only queries. */
+            query_read: boolean;
+            /** @description `edit`: read-write queries (for an agent on a live database also `write_live`). */
+            query_write: boolean;
+            /** @description `manage`: settings, migrations, restore. */
+            change_schema: boolean;
+            /** @description An agent with a `write_live` grant. Always true for a person with `edit`. */
+            write_live: boolean;
+            /** @description Sees real `personal` values (people with `view`; agents only with a grant). */
+            read_personal: boolean;
+            /** @description Sees real `secret` values (people with `manage`; agents never). */
+            read_secret: boolean;
+        };
+        Database: {
+            node: components["schemas"]["Node"];
+            manifest: components["schemas"]["DatabaseManifest"];
+            manifest_version_id: components["schemas"]["Uuid"];
+            status: components["schemas"]["DatabaseStatus"];
+            /** Format: int64 */
+            size_bytes: number;
+            limits: components["schemas"]["DatabaseLimits"];
+            /** @description The database this one is a branch of, or `null` for a live database. */
+            branch_of: components["schemas"]["Uuid"] | null;
+            /** @description What data the branch took. `null` for a live database. */
+            branch_data: components["schemas"]["DataCopy"] | null;
+            /** @description The point-in-time window, or `null` while there is no backup yet. */
+            pitr_window: components["schemas"]["PitrWindow"] | null;
+            /** @description Columns that wait for a person to confirm their class (they count as `personal`). */
+            unconfirmed_columns: number;
+            my_permissions?: components["schemas"]["DatabasePermissions"];
+        };
+        PitrWindow: {
+            earliest: components["schemas"]["Timestamp"];
+            latest: components["schemas"]["Timestamp"];
+        };
+        DatabasePage: {
+            items: components["schemas"]["Database"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        DatabaseWrite: {
+            database: components["schemas"]["Database"];
+            change: components["schemas"]["Change"];
+        };
+        CreateDatabaseRequest: {
+            parent_id: components["schemas"]["Uuid"];
+            name: components["schemas"]["NodeName"];
+            manifest: components["schemas"]["DatabaseManifest"];
+            /** @description `empty` (the default) or `template`: a database node inside a template folder. */
+            source?: {
+                /** @enum {string} */
+                kind: "empty" | "template";
+                node_id?: components["schemas"]["Uuid"];
+            };
+            on_conflict?: components["schemas"]["OnConflict"];
+        };
+        UpdateDatabaseManifestRequest: {
+            manifest: components["schemas"]["DatabaseManifest"];
+            /** @description A name for the new manifest version. */
+            label?: string;
+        };
+        /**
+         * @description The hidden-value marker (design section 8.5): a value that the caller may not see. Never
+         *     a look-alike string. `secret` for secrets (agents, and people without `manage`);
+         *     `personal` where pseudonyms are not allowed (public queries, section 9.9) or a value
+         *     was removed. The UI shows a chip "hidden: secret". Logs, metrics and traces use the
+         *     same marker as a reserved map attribute.
+         * @example {
+         *       "$ruum": "hidden",
+         *       "class": "secret"
+         *     }
+         */
+        HiddenValue: {
+            /** @constant */
+            $ruum: "hidden";
+            /** @enum {string} */
+            class: "secret" | "personal";
+        };
+        /**
+         * @description A consistent pseudonym of a `personal` value: a keyed hash (per tenant key) of the
+         *     value, so the same value always gives the same `id` in this tenant and joins, grouping
+         *     and counts still work. The UI shows a chip "person 8f3a91".
+         * @example {
+         *       "$ruum": "pseudonym",
+         *       "id": "p_8f3a91"
+         *     }
+         */
+        Pseudonym: {
+            /** @constant */
+            $ruum: "pseudonym";
+            id: string;
+        };
+        /** @description A real JSON value that is an object with the key `$ruum`, wrapped so that it is never read as a marker. */
+        LiteralValue: {
+            /** @constant */
+            $ruum: "literal";
+            value: unknown;
+        };
+        /**
+         * @description One value of a result row: a JSON value (`null`, boolean, number, string, array, or an
+         *     object without the key `$ruum`), or one of the typed markers. Numbers that do not fit a
+         *     double (`numeric`, `int8` beyond 2^53) come as strings. `bytea` and BLOB come as base64
+         *     strings. Times come as RFC 3339 strings.
+         */
+        QueryCell: components["schemas"]["HiddenValue"] | components["schemas"]["Pseudonym"] | components["schemas"]["LiteralValue"] | (null | boolean | number | string | unknown[]) | Record<string, never>;
+        /**
+         * @description `read` runs in a read-only transaction (the default); `write` may change data.
+         * @default read
+         * @enum {string}
+         */
+        QueryMode: "read" | "write";
+        QueryRequest: {
+            /** @description One SQL statement with placeholders. Never build it from values; pass them in `params`. */
+            sql: string;
+            /** @description The values of the placeholders, in order. */
+            params?: unknown[];
+            mode?: components["schemas"]["QueryMode"];
+            /** @description Lower than the plan's `max_rows`; the plan value when missing. */
+            max_rows?: number;
+            /** @description Lower than the plan's `statement_timeout_ms`; the plan value when missing. */
+            timeout_ms?: number;
+            /** @description An approved `DatabaseApproval` for exactly this statement and these parameters. */
+            approval_id?: components["schemas"]["Uuid"];
+        };
+        ResultColumn: {
+            name: string;
+            /** @description The SQL type name (`text`, `int8`, `timestamptz`, ...; SQLite the declared type or the storage class). */
+            type: string;
+            /** @description The effective class for this result (the strictest of the columns it reads). */
+            data_class: components["schemas"]["DataClass"];
+            /** @description The table column this result column comes from, when it is a plain column. */
+            source: {
+                schema: string;
+                table: string;
+                column: string;
+            } | null;
+            /**
+             * @description What the server did to the values of this column for this caller.
+             * @enum {string}
+             */
+            masking: "none" | "pseudonym" | "hidden";
+        };
+        QueryResult: {
+            /** @description The entry in the query log. */
+            query_id: components["schemas"]["Uuid"];
+            mode: components["schemas"]["QueryMode"];
+            columns: components["schemas"]["ResultColumn"][];
+            /** @description The rows, each an array in the order of `columns`. */
+            rows: components["schemas"]["QueryCell"][][];
+            /** @description The rows in `rows`. */
+            row_count: number;
+            truncated: boolean;
+            /** @enum {string|null} */
+            truncated_reason: "max_rows" | "max_result_bytes" | null;
+            /**
+             * Format: int64
+             * @description For `INSERT`, `UPDATE`, `DELETE`; `null` for a read.
+             */
+            rows_affected: number | null;
+            elapsed_ms: number;
+            /**
+             * @description Rows are data from the database, never instructions (design section 8.5).
+             * @constant
+             */
+            content_trust: "untrusted";
+            /** @description The restore point recorded before the write session that this write belongs to. */
+            restore_point_id?: components["schemas"]["Uuid"] | null;
+        };
+        ApprovalRequired: {
+            approval: components["schemas"]["DatabaseApproval"];
+        };
+        DatabaseQueryLogEntry: {
+            id: components["schemas"]["Uuid"];
+            node_id: components["schemas"]["Uuid"];
+            mode: components["schemas"]["QueryMode"];
+            /** @description The statement as sent (with placeholders). Literals that look like personal data are not removed; send values as parameters. */
+            statement: string;
+            /** @description Each parameter as a pseudonym (or `null`), never the raw value. */
+            params: (components["schemas"]["Pseudonym"] | null)[];
+            /** @enum {string} */
+            outcome: "ok" | "error" | "timeout" | "cancelled" | "approval_required";
+            error_code: components["schemas"]["ErrorCode"] | null;
+            row_count: number | null;
+            /** Format: int64 */
+            rows_affected: number | null;
+            elapsed_ms: number | null;
+            by: components["schemas"]["ActorPair"];
+            /** @description The `write_live` or `read_personal` grant used. */
+            grant_id: components["schemas"]["Uuid"] | null;
+            approval_id: components["schemas"]["Uuid"] | null;
+            at: components["schemas"]["Timestamp"];
+        };
+        DatabaseQueryPage: {
+            items: components["schemas"]["DatabaseQueryLogEntry"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        DatabaseSchema: {
+            engine: components["schemas"]["DatabaseEngine"];
+            tables: components["schemas"]["DatabaseTable"][];
+        };
+        DatabaseTable: {
+            /** @description `public`, ... for Postgres; `main` for SQLite. */
+            schema: string;
+            name: string;
+            /** @enum {string} */
+            kind: "table" | "view" | "materialized_view";
+            columns: {
+                name: string;
+                type: string;
+                nullable: boolean;
+                data_class: components["schemas"]["DataClass"];
+                confirmed: boolean;
+            }[];
+            primary_key: string[];
+            foreign_keys: {
+                columns: string[];
+                references_schema: string;
+                references_table: string;
+                references_columns: string[];
+            }[];
+        };
+        ColumnRef: {
+            schema: string;
+            table: string;
+            column: string;
+        };
+        ClassSuggestion: {
+            class: components["schemas"]["DataClass"];
+            reason: string;
+            by: components["schemas"]["ActorPair"];
+            at: components["schemas"]["Timestamp"];
+        };
+        DatabaseColumn: components["schemas"]["ColumnRef"] & {
+            type: string;
+            /** @description The effective class (`personal` while unconfirmed). */
+            data_class: components["schemas"]["DataClass"];
+            confirmed_class: components["schemas"]["DataClass"] | null;
+            confirmed_by: components["schemas"]["Uuid"] | null;
+            confirmed_at: components["schemas"]["Timestamp"] | null;
+            suggestion: components["schemas"]["ClassSuggestion"] | null;
+        };
+        DatabaseColumnPage: {
+            items: components["schemas"]["DatabaseColumn"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        DatabaseColumnList: {
+            items: components["schemas"]["DatabaseColumn"][];
+        };
+        SuggestColumnClassesRequest: {
+            suggestions: (components["schemas"]["ColumnRef"] & {
+                class: components["schemas"]["DataClass"];
+                reason: string;
+            })[];
+        };
+        ConfirmColumnClassesRequest: {
+            columns: (components["schemas"]["ColumnRef"] & {
+                class: components["schemas"]["DataClass"];
+            })[];
+        };
+        /** @enum {string} */
+        MigrationStatus: "applied" | "failed" | "rolled_back" | "dry_run";
+        DatabaseMigration: {
+            id: components["schemas"]["Uuid"];
+            node_id: components["schemas"]["Uuid"];
+            name: string;
+            /** @description BLAKE3 of `up`. */
+            checksum: components["schemas"]["Hash"];
+            status: components["schemas"]["MigrationStatus"];
+            /** @description Why it failed (the statement number and the engine message). */
+            error: string | null;
+            /** @description The columns the migration added, with their effective class. */
+            new_columns: components["schemas"]["DatabaseColumn"][];
+            restore_point_id: components["schemas"]["Uuid"] | null;
+            by: components["schemas"]["ActorPair"];
+            at: components["schemas"]["Timestamp"];
+        };
+        DatabaseMigrationPage: {
+            items: components["schemas"]["DatabaseMigration"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        DatabaseMigrationWrite: {
+            migration: components["schemas"]["DatabaseMigration"];
+            change: components["schemas"]["Change"];
+        };
+        ApplyDatabaseMigrationRequest: {
+            /** @example 0003_add_plant_tags */
+            name: string;
+            /** @description The SQL of the migration (several statements). */
+            up: string;
+            /** @description The author's classes for the columns this migration adds, by `<schema>.<table>.<column>`. */
+            data_classes?: {
+                [key: string]: components["schemas"]["DataClass"];
+            };
+            /** @default false */
+            dry_run: boolean;
+        };
+        CreateDatabaseBranchRequest: {
+            name: components["schemas"]["NodeName"];
+            data?: components["schemas"]["DataCopy"];
+            /** @description Branch from this point in time inside the backup window instead of now. */
+            at?: components["schemas"]["Timestamp"] | null;
+            on_conflict?: components["schemas"]["OnConflict"];
+        };
+        RestorePoint: {
+            id: components["schemas"]["Uuid"];
+            node_id: components["schemas"]["Uuid"];
+            label: string | null;
+            /** @enum {string} */
+            reason: "manual" | "before_write_grant" | "before_migration" | "before_restore";
+            at: components["schemas"]["Timestamp"];
+            by: components["schemas"]["ActorPair"];
+        };
+        RestorePointPage: {
+            items: components["schemas"]["RestorePoint"][];
+            next_cursor: components["schemas"]["NextCursor"];
+            window: components["schemas"]["PitrWindow"] | null;
+        };
+        RestorePointWrite: {
+            restore_point: components["schemas"]["RestorePoint"];
+            change: components["schemas"]["Change"];
+        };
+        CreateRestorePointRequest: {
+            label: string;
+        };
+        RestoreDatabaseRequest: {
+            /** @description A point in time inside the window. Give this or `restore_point_id`. */
+            at?: components["schemas"]["Timestamp"];
+            restore_point_id?: components["schemas"]["Uuid"];
+            /**
+             * @default new_node
+             * @enum {string}
+             */
+            target: "new_node" | "in_place";
+            /** @description `new_node`: the name of the new database (next to this one). Default "<name> (restored <time>)". */
+            name?: components["schemas"]["NodeName"];
+        };
+        /**
+         * @description `write_live`: writes to the live database. `read_personal`: real `personal` values.
+         * @enum {string}
+         */
+        DatabaseAccessGrantKind: "write_live" | "read_personal";
+        DatabaseAccessGrant: {
+            id: components["schemas"]["Uuid"];
+            node_id: components["schemas"]["Uuid"];
+            kind: components["schemas"]["DatabaseAccessGrantKind"];
+            agent_id: components["schemas"]["Uuid"];
+            /** @description The user who gave the grant (the agent acts for this user). */
+            granted_by: components["schemas"]["Uuid"];
+            reason: string | null;
+            starts_at: components["schemas"]["Timestamp"];
+            expires_at: components["schemas"]["Timestamp"];
+            revoked_at: components["schemas"]["Timestamp"] | null;
+            revoked_by: components["schemas"]["PrincipalRef"] | null;
+            /** @description `write_live`: the restore point recorded before the grant started. */
+            restore_point_id: components["schemas"]["Uuid"] | null;
+            created_at: components["schemas"]["Timestamp"];
+        };
+        DatabaseAccessGrantPage: {
+            items: components["schemas"]["DatabaseAccessGrant"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        DatabaseAccessGrantWrite: {
+            grant: components["schemas"]["DatabaseAccessGrant"];
+            change: components["schemas"]["Change"];
+        };
+        CreateDatabaseAccessGrantRequest: {
+            kind: components["schemas"]["DatabaseAccessGrantKind"];
+            agent_id: components["schemas"]["Uuid"];
+            /** @description `read_personal`: at most 480. */
+            duration_minutes: number;
+            reason?: string;
+        };
+        /** @enum {string} */
+        ApprovalStatus: "pending" | "approved" | "denied" | "expired" | "used";
+        DatabaseApproval: {
+            id: components["schemas"]["Uuid"];
+            node_id: components["schemas"]["Uuid"];
+            status: components["schemas"]["ApprovalStatus"];
+            statement: string;
+            /** @description The parameters as the requester may see them (markers for `personal` and `secret` values). */
+            params: components["schemas"]["QueryCell"][];
+            /** @description Why the statement needs a person. */
+            reasons: ("drop" | "truncate" | "delete_without_where" | "update_without_where" | "schema_change" | "alter_role")[];
+            /**
+             * Format: int64
+             * @description The rows the statement touches (from the plan or a count in a rolled-back run); `null` for schema changes.
+             */
+            estimated_rows: number | null;
+            requested_by: components["schemas"]["ActorPair"];
+            decided_by: components["schemas"]["Uuid"] | null;
+            decided_at: components["schemas"]["Timestamp"] | null;
+            comment: string | null;
+            /** @description A pending request expires after 24 hours; an approved one after 15 minutes if unused. */
+            expires_at: components["schemas"]["Timestamp"];
+            created_at: components["schemas"]["Timestamp"];
+        };
+        DatabaseApprovalPage: {
+            items: components["schemas"]["DatabaseApproval"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
+        DecideDatabaseApprovalRequest: {
+            /** @enum {string} */
+            decision: "approve" | "deny";
+            comment?: string;
+        };
     };
     responses: {
         /** @description The request is malformed. */
@@ -3282,6 +4428,28 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /**
+         * @description The engine refused the statement (`query_failed`, with the SQLSTATE in `sqlstate`), a
+         *     write in a read-only query (`read_only_query`), or the database is not ready
+         *     (`database_not_ready`).
+         */
+        QueryFailed: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description The statement ran longer than the timeout and was cancelled (`statement_timeout`). */
+        StatementTimeout: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
     };
     parameters: {
         /**
@@ -3312,6 +4480,7 @@ export interface components {
         GrantId: components["schemas"]["Uuid"];
         LinkId: components["schemas"]["Uuid"];
         AppPasswordId: components["schemas"]["Uuid"];
+        ApprovalId: components["schemas"]["Uuid"];
     };
     requestBodies: never;
     headers: {
@@ -6516,6 +7685,856 @@ export interface operations {
             };
             401: components["responses"]["Unauthenticated"];
             422: components["responses"]["ValidationFailed"];
+        };
+    };
+    createDatabase: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDatabaseRequest"];
+            };
+        };
+        responses: {
+            /** @description The new node; provisioning has started. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    getDatabase: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The database. */
+            200: {
+                headers: {
+                    ETag: components["headers"]["NodeETag"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Database"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateDatabaseManifest: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description The node ETag (`"<revision>"`). The write fails with `412 precondition_failed` if the node changed. */
+                "If-Match"?: components["parameters"]["IfMatch"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateDatabaseManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description The new version is stored; the status shows `updating` until it is applied. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    getDatabaseSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The catalog. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseSchema"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    queryDatabase: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryRequest"];
+            };
+        };
+        responses: {
+            /** @description The result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryResult"];
+                };
+            };
+            /** @description A destructive statement from an agent; nothing ran. A person must approve it first. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalRequired"];
+                };
+            };
+            400: components["responses"]["QueryFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
+            429: components["responses"]["RateLimited"];
+            504: components["responses"]["StatementTimeout"];
+        };
+    };
+    listDatabaseQueries: {
+        parameters: {
+            query?: {
+                /** @description Only queries by this principal (an agent ID or a user ID). */
+                actor?: components["schemas"]["Uuid"];
+                mode?: components["schemas"]["QueryMode"];
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of log entries. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseQueryPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listDatabaseColumns: {
+        parameters: {
+            query?: {
+                unconfirmed?: boolean;
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of columns. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseColumnPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    suggestColumnClasses: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SuggestColumnClassesRequest"];
+            };
+        };
+        responses: {
+            /** @description The columns with the new suggestions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseColumnList"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    confirmColumnClasses: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description The node ETag (`"<revision>"`). The write fails with `412 precondition_failed` if the node changed. */
+                "If-Match"?: components["parameters"]["IfMatch"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfirmColumnClassesRequest"];
+            };
+        };
+        responses: {
+            /** @description The database with the new manifest version. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    listDatabaseMigrations: {
+        parameters: {
+            query?: {
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of migrations. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseMigrationPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    applyDatabaseMigration: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyDatabaseMigrationRequest"];
+            };
+        };
+        responses: {
+            /** @description Applied (or the dry run passed). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseMigrationWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
+            504: components["responses"]["StatementTimeout"];
+        };
+    };
+    listDatabaseBranches: {
+        parameters: {
+            query?: {
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of branches. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabasePage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createDatabaseBranch: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDatabaseBranchRequest"];
+            };
+        };
+        responses: {
+            /** @description The branch node; it is `provisioning` until the copy is done. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    listDatabaseRestorePoints: {
+        parameters: {
+            query?: {
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of restore points, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestorePointPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createDatabaseRestorePoint: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRestorePointRequest"];
+            };
+        };
+        responses: {
+            /** @description The restore point. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestorePointWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    restoreDatabase: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreDatabaseRequest"];
+            };
+        };
+        responses: {
+            /** @description Started. The answer is the target database (`updating` or `provisioning`). */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    listDatabaseAccessGrants: {
+        parameters: {
+            query?: {
+                /** @description Only grants that are in force now. */
+                active?: boolean;
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of grants, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseAccessGrantPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createDatabaseAccessGrant: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDatabaseAccessGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description The grant. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseAccessGrantWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    revokeDatabaseAccessGrant: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                grant_id: components["parameters"]["GrantId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ended. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseAccessGrantWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listDatabaseApprovals: {
+        parameters: {
+            query?: {
+                status?: components["schemas"]["ApprovalStatus"];
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of approvals, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseApprovalPage"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    getDatabaseApproval: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                approval_id: components["parameters"]["ApprovalId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The approval. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseApproval"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    decideDatabaseApproval: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                approval_id: components["parameters"]["ApprovalId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecideDatabaseApprovalRequest"];
+            };
+        };
+        responses: {
+            /** @description The decided approval. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseApproval"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
 }

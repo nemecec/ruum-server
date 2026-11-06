@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/manifests/database.schema.json",
+  "title": "Database manifest",
+  "description": "The manifest of a typed node of type `database` (docs/DESIGN.md, sections 8.1 to 8.5; decisions 14 to 19). It is the node content: each change is a new version of the node (encoding `typed_manifest_v1`). The data lives in the engine, not in the manifest. A control loop makes the real database equal to the manifest and reports the status. Step 2 accepts only the engines `postgres` and `sqlite` and the plan `shared-small`. DRAFT for review (step 2 specify phase).",
+  "type": "object",
+  "required": ["engine", "version", "plan"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": {
+      "description": "The version of this schema. Missing means 1.",
+      "const": 1
+    },
+    "engine": {
+      "description": "The database engine (decision 14). `document`, `search`, `vector` and `kv` of section 8.1 come later; until then they fail validation.",
+      "type": "string",
+      "enum": ["postgres", "sqlite"]
+    },
+    "version": {
+      "description": "The major version of the engine. Postgres: \"17\" (the version of the shared cluster). SQLite: \"3\". A change of the major version is a planned operation, not a manifest edit, in step 2: a different value from the running one fails with `validation_failed`.",
+      "type": "string",
+      "pattern": "^[0-9]{1,3}$"
+    },
+    "plan": {
+      "description": "The placement (section 8.3). Only `shared-small` in step 2 (decision 16: dedicated plans later). Its limits (size, connections, statement timeout, row cap) come from the tenant plan (section 4.3), not from the manifest.",
+      "type": "string",
+      "enum": ["shared-small"]
+    },
+    "extensions": {
+      "description": "Postgres extensions to create in the database. Only names on the allow-list of the cluster are valid; `anon` (PostgreSQL Anonymizer) is managed by Ruum and is not listed here. Must be empty for `sqlite`.",
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "enum": ["postgis", "vector", "pg_trgm", "citext", "hstore", "uuid-ossp", "pgcrypto", "btree_gist", "unaccent"]
+      },
+      "default": []
+    },
+    "backups": {
+      "description": "Backups (decision 17: point-in-time restore for 7 days). Step 2 accepts only 7.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pitr_days"],
+      "properties": {
+        "pitr_days": {
+          "type": "integer",
+          "const": 7
+        }
+      },
+      "default": { "pitr_days": 7 }
+    },
+    "data_classes": {
+      "description": "The CONFIRMED data class of each column (section 8.5). The key is `<schema>.<table>.<column>` (SQLite: `main.<table>.<column>`), with each part quoted as in SQL when it contains a dot or a quote. A column that is not listed counts as `personal` (fail safe). Only a person changes this map: `confirmColumnClasses` writes a new manifest version, and `updateDatabaseManifest` from an agent may not change it (agents suggest classes with `suggestColumnClasses` or in a migration).",
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 5,
+        "maxLength": 400
+      },
+      "additionalProperties": { "$ref": "#/$defs/DataClass" },
+      "default": {}
+    },
+    "migrations": {
+      "description": "Where the declared migrations live (decision 19), as a path relative to the database node's parent folder, for example `migrations/`. The platform runs them in name order at deploy time and rolls back the one that fails. Optional in step 2: migrations can also be sent with `applyDatabaseMigration`.",
+      "type": "string",
+      "maxLength": 1024
+    },
+    "template": {
+      "description": "Set by the platform when the database was made from a template (section 2.7) or is a branch: the source node and its manifest version. Read-only for clients.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id"],
+      "properties": {
+        "node_id": { "type": "string", "format": "uuid" },
+        "version_id": { "type": "string", "format": "uuid" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "engine": { "const": "sqlite" } } },
+      "then": {
+        "properties": {
+          "version": { "const": "3" },
+          "extensions": { "type": "array", "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "engine": { "const": "postgres" } } },
+      "then": {
+        "properties": {
+          "version": { "const": "17" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "DataClass": {
+      "description": "`normal`: shown as is. `personal` (names, emails, phones, addresses, free text): agents see consistent pseudonyms. `secret` (tokens, password hashes): agents see that the column exists; a non-empty value is the hidden-value marker.",
+      "type": "string",
+      "enum": ["normal", "personal", "secret"]
+    }
+  },
+  "examples": [
+    {
+      "engine": "postgres",
+      "version": "17",
+      "plan": "shared-small",
+      "extensions": ["postgis", "vector"],
+      "backups": { "pitr_days": 7 },
+      "data_classes": {
+        "public.plants.name": "normal",
+        "public.users.email": "personal",
+        "public.users.password_hash": "secret"
+      },
+      "migrations": "migrations/"
+    },
+    {
+      "engine": "sqlite",
+      "version": "3",
+      "plan": "shared-small"
+    }
+  ]
+}

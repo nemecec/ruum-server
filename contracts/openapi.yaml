@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Ruum API
   version: 0.1.0
-  summary: Files, versions, tags, sharing, agents and the change journal of Ruum (step 1, Core).
+  summary: Files, versions, tags, sharing, agents and the change journal of Ruum (step 1, Core), and databases (step 2, draft).
   description: |
     The REST API of Ruum (`ruum.space`). Everything is a node in a tree, and one permission
     system protects all nodes. This contract covers step 1 (Core) of `docs/DESIGN.md`, section 16.
@@ -116,6 +116,11 @@ tags:
     description: Search by name.
   - name: audit
     description: The audit log of a tenant.
+  - name: databases
+    description: |
+      Step 2 (DRAFT): database nodes (Postgres and SQLite), the HTTP query API with the privacy
+      filter and typed hidden-value markers, column classes, migrations, branches, backups and
+      point-in-time restore, and time-limited grants for agents (design section 8).
 
 paths:
   /healthz:
@@ -1452,8 +1457,8 @@ paths:
       operationId: createNode
       summary: Create a folder, an empty file or a link
       description: |
-        Needs `edit` on the parent. Typed nodes come in step 2; `kind: typed` fails with
-        `validation_failed`.
+        Needs `edit` on the parent. Typed nodes are made by the operation of their type
+        (`createDatabase` in step 2); `kind: typed` fails with `validation_failed`.
 
         Links (design section 2.3): the target must be a node of the same tenant as the link
         (the `Ruum-Tenant` of the call). A target in another tenant, or one that the caller cannot
@@ -3081,6 +3086,836 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
+  # ================================================================== step 2: databases
+  # DRAFT for review (docs/STEP2.md). Every operation names its work area in `x-ruum-area`.
+
+  /v1/databases:
+    post:
+      tags: [databases]
+      operationId: createDatabase
+      x-ruum-area: databases
+      summary: Create a database node
+      description: |
+        Creates a typed node of type `database` (design sections 7.1 and 8.1) under `parent_id`,
+        with `manifest` as its first version (encoding `typed_manifest_v1`), and starts
+        provisioning. Needs `edit` on the parent, and room in the plan (`plan_limit_reached`:
+        the number of databases per engine, section 4.3). The manifest must be valid against
+        `contracts/manifests/database.schema.json` and the provider's rules
+        (`validation_failed`, with the JSON pointer of the problem in `hint`).
+
+        The answer is `202`: the node exists at once, its `status.state` is `provisioning`
+        until the engine has the database (`getDatabase`). Writes `node.created` (kind `typed`,
+        type `database`) and `version.created`.
+
+        With `source.kind: template` the database starts as a copy of a database node inside a
+        template folder (design section 2.7: schema, migrations and masked sample data).
+        Agents may create databases inside their scope with `max_role` `edit` or higher.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDatabaseRequest'
+      responses:
+        '202':
+          description: The new node; provisioning has started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: getDatabase
+      x-ruum-area: databases
+      summary: Get a database node with its status
+      description: |
+        The node, the current manifest, the status (`provisioning`, `ready`, `failed` with a
+        reason, ...), the size, the plan limits, the point-in-time window and what the caller
+        may do (`my_permissions`). Needs `view`. A node that is not a database is `404`.
+        Poll this after `createDatabase`, `updateDatabaseManifest` and `restoreDatabase`.
+      responses:
+        '200':
+          description: The database.
+          headers:
+            ETag:
+              $ref: '#/components/headers/NodeETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Database'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/databases/{node_id}/manifest:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    put:
+      tags: [databases]
+      operationId: updateDatabaseManifest
+      x-ruum-area: databases
+      summary: Change the manifest (settings) of a database
+      description: |
+        Writes a new manifest version and applies it (the control loop of section 8.1). Needs
+        `manage` (schema and settings). `engine` and `plan` cannot change in step 2
+        (`validation_failed`). Only a person changes `data_classes`: when the caller is an agent
+        and `data_classes` differs from the current manifest, the call fails with
+        `validation_failed` (hint: `suggestColumnClasses`). Restoring an older manifest version
+        (`restoreVersion`) applies the same rules. Writes `version.created`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDatabaseManifestRequest'
+      responses:
+        '202':
+          description: The new version is stored; the status shows `updating` until it is applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}/schema:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: getDatabaseSchema
+      x-ruum-area: query
+      summary: The tables, views and columns of a database
+      description: |
+        The catalog of the database: schemas, tables and views, columns with their SQL type,
+        nullability and data class (effective and confirmed), primary and foreign keys. Needs
+        `view`. This is the context an agent reads before it writes a query. Names and types
+        only, never values.
+      responses:
+        '200':
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseSchema'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/databases/{node_id}/query:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [databases]
+      operationId: queryDatabase
+      x-ruum-area: query
+      summary: Run one SQL statement (the HTTP query API)
+      description: |
+        Runs one statement with bound parameters (`$1`, `$2`, ... for Postgres; `?1`, `?2`,
+        ... for SQLite) and returns the rows as JSON (design section 8.4). No driver and no
+        connection pool needed.
+
+        **Read-only by default.** `mode: read` (the default) runs in a read-only transaction and
+        needs `view`. `mode: write` needs `edit`. Every query has a statement timeout and a row
+        and size cap (the plan limits in `Database.limits`; the request may only lower them). A
+        result over the cap is cut (`truncated: true`, `truncated_reason`). One statement per
+        call; a second statement fails with `validation_failed`.
+
+        **Agents** (section 8.5). For an agent the server applies the privacy filter to every
+        value: a `secret` column shows `NULL` and empty values as they are and any other value
+        as `{"$ruum": "hidden", "class": "secret"}`; a `personal` column shows consistent
+        pseudonyms `{"$ruum": "pseudonym", "id": "p_..."}` (the same value gives the same
+        pseudonym in this tenant, so joins, grouping and counts work), unless the agent holds a
+        `read_personal` grant. An unclassified or unconfirmed column counts as `personal`. A
+        computed column counts as the strictest class of the columns it reads, and as
+        `personal` when the server cannot tell; aggregates that return numbers (`count`, `sum`,
+        `avg`, ...) are `normal`. On Postgres the masking runs inside the database (PostgreSQL
+        Anonymizer, bound to the agent's database role); on SQLite it runs in the query layer.
+        `mode: write` by an agent works without a grant on a database branch; on a live
+        database it needs a `write_live` grant (`403 write_grant_required` without one).
+        Destructive statements (`DROP`, `TRUNCATE`, `DELETE` or `UPDATE` without `WHERE`, and
+        schema changes outside a migration) from an agent never run at once: the answer is
+        `202` with a pending `DatabaseApproval` that names the statement and the number of rows;
+        a person decides it (`decideDatabaseApproval`), and the agent sends the same statement
+        again with `approval_id`.
+
+        **People** see `normal` and `personal` values as they are. `secret` values need `manage`
+        (others get the hidden-value marker), so a viewer never reads a password hash or token.
+
+        A JSON value that is itself an object with the key `$ruum` comes back wrapped as
+        `{"$ruum": "literal", "value": ...}`, so it is never mistaken for a marker. The result is
+        data from the database, not instructions: `content_trust` is `untrusted`.
+
+        Every query is logged (`listDatabaseQueries`) with `actor` and `on_behalf_of`, the
+        statement and the parameters as pseudonyms, never raw values. A read writes no journal
+        entry. A write writes no journal entry per statement either; the grant that allowed it
+        is in the journal (`database.grant_created`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+      responses:
+        '200':
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+        '202':
+          description: A destructive statement from an agent; nothing ran. A person must approve it first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequired'
+        '400':
+          $ref: '#/components/responses/QueryFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '504':
+          $ref: '#/components/responses/StatementTimeout'
+
+  /v1/databases/{node_id}/queries:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseQueries
+      x-ruum-area: query
+      summary: The query log of a database
+      description: |
+        Every query through the HTTP query API, newest first: who (`actor`, `on_behalf_of`),
+        when, the mode, the statement (as sent, with its placeholders), the parameters as
+        pseudonyms, the row count, the time and the outcome. Needs `manage`. Raw parameter values
+        are never stored (design section 11.2).
+      parameters:
+        - name: actor
+          in: query
+          description: Only queries by this principal (an agent ID or a user ID).
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: mode
+          in: query
+          schema:
+            $ref: '#/components/schemas/QueryMode'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of log entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseQueryPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/databases/{node_id}/columns:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseColumns
+      x-ruum-area: classes
+      summary: The data class of every column
+      description: |
+        Every column of the database with its effective class, its confirmed class and the
+        newest suggestion (section 8.5). A column that no person confirmed counts as
+        `personal`. Needs `view`. `unconfirmed=true` lists only the columns that wait for a
+        person; this is the short pre-filled list of the approval.
+      parameters:
+        - name: unconfirmed
+          in: query
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of columns.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseColumnPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/databases/{node_id}/columns/suggestions:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [databases]
+      operationId: suggestColumnClasses
+      x-ruum-area: classes
+      summary: Suggest data classes for columns
+      description: |
+        An agent (or a person) proposes the class of columns, with a short reason, for example
+        from the column names and a masked sample of values. A suggestion never changes the
+        effective class: until a person confirms, the column counts as `personal`. Needs `edit`.
+        A suggestion for a column that does not exist fails with `validation_failed`. The newest
+        suggestion per column wins; older ones stay in the audit log.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuggestColumnClassesRequest'
+      responses:
+        '200':
+          description: The columns with the new suggestions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseColumnList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}/columns/confirm:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [databases]
+      operationId: confirmColumnClasses
+      x-ruum-area: classes
+      x-ruum-user-only: true
+      summary: Confirm the data classes of columns
+      description: |
+        A person confirms the classes (the suggestions filled in, changed where needed). Writes a
+        new manifest version with the confirmed `data_classes` (`version.created`) and
+        `database.columns_confirmed`. Needs `manage`. Users only: an agent can never lower the
+        class of a column.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmColumnClassesRequest'
+      responses:
+        '200':
+          description: The database with the new manifest version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}/migrations:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseMigrations
+      x-ruum-area: databases
+      summary: The migrations of a database
+      description: Applied, failed and rolled back migrations, newest first. Needs `view`.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of migrations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseMigrationPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [databases]
+      operationId: applyDatabaseMigration
+      x-ruum-area: databases
+      summary: Apply a schema migration
+      description: |
+        Schema changes are migrations (decision 19). The platform records a restore point, runs
+        `up` in one transaction (Postgres) or with a file copy first (SQLite), and rolls back
+        when a statement fails (`422 migration_failed`, the database is as before). A name runs
+        once: the same name with the same checksum answers the stored result, with another
+        checksum `409 conflict`.
+
+        Who: on a database branch, `edit`. On a live database, `manage`; an agent also needs a
+        `write_live` grant. `data_classes` carries the agent's classification of the columns that
+        the migration adds (section 8.5); it is stored as suggestions, and a person confirms
+        them with `confirmColumnClasses` (the classes of a migration by a person with `manage`
+        count as confirmed). Until then the new columns count as `personal`.
+        `dry_run: true` runs the migration and rolls it back, and reports the new columns.
+        Writes `database.migration_applied` or `database.migration_failed`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyDatabaseMigrationRequest'
+      responses:
+        '200':
+          description: Applied (or the dry run passed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseMigrationWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '504':
+          $ref: '#/components/responses/StatementTimeout'
+
+  /v1/databases/{node_id}/branches:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseBranches
+      x-ruum-area: databases
+      summary: The branches of a database
+      description: The live child databases of this database. Needs `view`.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of branches.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabasePage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [databases]
+      operationId: createDatabaseBranch
+      x-ruum-area: databases
+      summary: Make a branch of a database
+      description: |
+        A copy of the database for tests, previews, or for an agent to try a migration (section
+        8.4; decision 18: small databases only). The branch is a child node of type `database`
+        (`branch_of` = this node), so it inherits the grants, and it is trashed and purged like
+        any node. Postgres makes it with `CREATE DATABASE ... TEMPLATE` (a short exclusive lock
+        on the source; the server waits for running queries up to the timeout); SQLite copies
+        the file.
+
+        `data` is `masked` by default: `personal` columns become pseudonyms and non-empty
+        `secret` values become `NULL`, so a preview never copies real personal data.
+        `schema_only` copies no rows. `full` copies real data and needs a person with `manage`
+        (an agent gets `403 user_required`). A source larger than the plan's branch limit fails
+        with `422 database_too_large`. Needs `edit`. Writes `node.created`, `version.created`
+        and `database.branch_created`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDatabaseBranchRequest'
+      responses:
+        '202':
+          description: The branch node; it is `provisioning` until the copy is done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}/restore-points:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseRestorePoints
+      x-ruum-area: databases
+      summary: Restore points and the point-in-time window
+      description: |
+        The named and automatic restore points inside the backup window (7 days, decision 17)
+        and the window itself. Automatic points are made before each granted write session,
+        each migration and each in-place restore. These are the provider versions of a database
+        (design section 5.3); the manifest versions stay in `listVersions`. Needs `view`.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of restore points, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestorePointPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [databases]
+      operationId: createDatabaseRestorePoint
+      x-ruum-area: databases
+      summary: Name the current point in time
+      description: |
+        Records a named restore point ("Before import"). Needs `edit`. It lives as long as the
+        backup window; a restore point is not a copy.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRestorePointRequest'
+      responses:
+        '201':
+          description: The restore point.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestorePointWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/databases/{node_id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [databases]
+      operationId: restoreDatabase
+      x-ruum-area: databases
+      x-ruum-user-only: true
+      summary: Restore a database to a point in time
+      description: |
+        Point-in-time restore inside the backup window (decision 17). Give `at` or
+        `restore_point_id`. `target: new_node` (the default) restores into a new database node
+        next to this one (named `name`), and leaves this one as it is. `target: in_place`
+        first records a restore point of the current state (so the restore can be undone),
+        then replaces the data; the database refuses queries while it runs. Needs `manage`.
+        Users only. Writes `database.restore_started`, and `database.restored` or
+        `database.restore_failed` when it ends.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreDatabaseRequest'
+      responses:
+        '202':
+          description: Started. The answer is the target database (`updating` or `provisioning`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}/access-grants:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseAccessGrants
+      x-ruum-area: access
+      summary: Time-limited grants of agents on a database
+      description: |
+        The live and recent `write_live` and `read_personal` grants (section 8.5). Needs `view`;
+        an agent sees only its own grants.
+      parameters:
+        - name: active
+          in: query
+          description: Only grants that are in force now.
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of grants, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseAccessGrantPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [databases]
+      operationId: createDatabaseAccessGrant
+      x-ruum-area: access
+      x-ruum-user-only: true
+      summary: Give an agent live writes or real personal values, for a time
+      description: |
+        Section 8.5: writes to the live database and real `personal` values need an explicit,
+        time-limited, logged grant. The person must be the user the agent acts for. `write_live`
+        needs `edit` on the database (and the agent's scope `edit` or higher) and records a
+        restore point first (`restore_point_id`). `read_personal` needs `view`. `secret` values
+        are never granted to agents. At most 24 hours (`read_personal`: at most 8 hours). Users
+        only. Writes `database.grant_created`. Grants from `project.yaml` (per workspace) come
+        with agent workspaces (step 5).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDatabaseAccessGrantRequest'
+      responses:
+        '201':
+          description: The grant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseAccessGrantWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/databases/{node_id}/access-grants/{grant_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/GrantId'
+    delete:
+      tags: [databases]
+      operationId: revokeDatabaseAccessGrant
+      x-ruum-area: access
+      summary: End a grant now
+      description: |
+        Ends the grant at once; the next query of the agent no longer has it. The user who gave
+        it, a person with `manage` on the database, or the agent that holds it (to give it back
+        early) may end it. Writes `database.grant_revoked`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Ended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseAccessGrantWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/databases/{node_id}/approvals:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [databases]
+      operationId: listDatabaseApprovals
+      x-ruum-area: access
+      summary: Statements that wait for a person
+      description: |
+        Destructive statements of agents that wait for a decision, and recent decisions. Needs
+        `view`; an agent sees only its own requests.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ApprovalStatus'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of approvals, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseApprovalPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/databases/{node_id}/approvals/{approval_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/ApprovalId'
+    get:
+      tags: [databases]
+      operationId: getDatabaseApproval
+      x-ruum-area: access
+      summary: One approval request
+      description: Needs `view`; an agent sees only its own requests.
+      responses:
+        '200':
+          description: The approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseApproval'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/databases/{node_id}/approvals/{approval_id}/decision:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/ApprovalId'
+    post:
+      tags: [databases]
+      operationId: decideDatabaseApproval
+      x-ruum-area: access
+      x-ruum-user-only: true
+      summary: Approve or deny a destructive statement
+      description: |
+        The person sees the statement, its parameters (as markers) and the number of rows it
+        touches, and approves or denies it. An approval lets the agent run exactly that
+        statement with those parameters once, within 15 minutes. The person needs the right
+        that the statement needs (`edit` for data, `manage` for schema). Users only. Writes
+        `database.approval_decided`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecideDatabaseApprovalRequest'
+      responses:
+        '200':
+          description: The decided approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseApproval'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3236,6 +4071,12 @@ components:
       schema:
         $ref: '#/components/schemas/Uuid'
 
+    ApprovalId:
+      name: approval_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Uuid'
   headers:
     NodeETag:
       description: The node revision as `"<revision>"`. Send it in `If-Match`.
@@ -3317,6 +4158,21 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    QueryFailed:
+      description: |
+        The engine refused the statement (`query_failed`, with the SQLSTATE in `sqlstate`), a
+        write in a read-only query (`read_only_query`), or the database is not ready
+        (`database_not_ready`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    StatementTimeout:
+      description: The statement ran longer than the timeout and was cancelled (`statement_timeout`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
 
   schemas:
     # ------------------------------------------------------------ basics
@@ -3377,6 +4233,13 @@ components:
         - agent_disabled
         - chunk_missing
         - hash_mismatch
+        - database_not_ready
+        - query_failed
+        - read_only_query
+        - statement_timeout
+        - write_grant_required
+        - migration_failed
+        - database_too_large
         - not_implemented
         - internal
         - unavailable
@@ -3396,6 +4259,10 @@ components:
             hint:
               type: string
               description: The next step, for people and agents.
+            sqlstate:
+              type: string
+              pattern: '^[0-9A-Z]{5}$'
+              description: The SQLSTATE of a `query_failed` or `migration_failed` error (step 2). SQLite errors map to the nearest SQLSTATE.
       example:
         error:
           code: name_taken
@@ -5244,3 +6111,940 @@ components:
             $ref: '#/components/schemas/SearchHit'
         next_cursor:
           $ref: '#/components/schemas/NextCursor'
+
+    # ------------------------------------------------------------ databases (step 2, DRAFT)
+    DatabaseEngine:
+      type: string
+      description: Decision 14. `document`, `search`, `vector` and `kv` come later.
+      enum: [postgres, sqlite]
+    DataClass:
+      type: string
+      description: |
+        The privacy class of a column (design section 8.5). `normal`: shown as is. `personal`
+        (names, emails, phones, addresses, free text): agents see consistent pseudonyms.
+        `secret` (tokens, password hashes): agents see that the column exists; a non-empty
+        value is the hidden-value marker. A column that no person confirmed counts as
+        `personal`.
+      enum: [normal, personal, secret]
+    DataCopy:
+      type: string
+      description: |
+        What data a branch or copy takes. `masked` (the default): `personal` columns as
+        pseudonyms, non-empty `secret` values as `NULL`. `schema_only`: no rows. `full`: real
+        data; only a person with `manage`.
+      enum: [masked, schema_only, full]
+      default: masked
+    DatabaseManifest:
+      type: object
+      description: |
+        The manifest of a database node. The normative schema is
+        `contracts/manifests/database.schema.json`; this is the same shape for the generated
+        clients (a contract test keeps the two equal).
+      required: [engine, version, plan]
+      properties:
+        manifest_version:
+          type: integer
+          const: 1
+        engine:
+          $ref: '#/components/schemas/DatabaseEngine'
+        version:
+          type: string
+          description: '"17" for Postgres, "3" for SQLite.'
+          examples: ['17']
+        plan:
+          type: string
+          enum: [shared-small]
+        extensions:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+          examples: [[postgis, vector]]
+        backups:
+          type: object
+          required: [pitr_days]
+          properties:
+            pitr_days:
+              type: integer
+              const: 7
+        data_classes:
+          type: object
+          description: The confirmed class per `<schema>.<table>.<column>`. Only a person changes it.
+          additionalProperties:
+            $ref: '#/components/schemas/DataClass'
+        migrations:
+          type: string
+          description: The folder of declared migrations, relative to the node's parent.
+        template:
+          type: object
+          readOnly: true
+          required: [node_id]
+          properties:
+            node_id:
+              $ref: '#/components/schemas/Uuid'
+            version_id:
+              $ref: '#/components/schemas/Uuid'
+    DatabaseState:
+      type: string
+      description: |
+        The status of section 8.1, from the provider contract (`ProviderState` in
+        `contracts/providers/provider.openapi.yaml`). `provisioning`: being made. `ready`:
+        answers queries. `updating`: a manifest change or restore runs. `degraded`: answers with
+        a problem (`reason`). `suspended`: in the trash or over a hard limit, answers no query.
+        `failed`: see `reason`. `deleted`: purged.
+      enum: [provisioning, ready, updating, degraded, suspended, failed, deleted]
+    DatabaseStatus:
+      type: object
+      required: [state, reason, message, observed_version_id, at]
+      properties:
+        state:
+          $ref: '#/components/schemas/DatabaseState'
+        reason:
+          type: [string, 'null']
+          description: A snake_case reason, for example `disk_quota_exceeded`, `migration_failed`, `extension_not_available`.
+        message:
+          type: [string, 'null']
+        observed_version_id:
+          description: The manifest version that the engine matches now.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    DatabaseLimits:
+      type: object
+      description: The plan limits of this database (section 4.3, decision 10). Configuration, not code.
+      required: [max_size_bytes, statement_timeout_ms, max_rows, max_result_bytes, max_branch_source_bytes]
+      properties:
+        max_size_bytes:
+          type: integer
+          format: int64
+        statement_timeout_ms:
+          type: integer
+          description: The longest statement. A request may only lower it.
+        max_rows:
+          type: integer
+          description: The most rows in one result. A request may only lower it.
+        max_result_bytes:
+          type: integer
+          format: int64
+          description: The largest JSON result.
+        max_branch_source_bytes:
+          type: integer
+          format: int64
+          description: The largest database that can be branched (decision 18, small databases).
+    DatabasePermissions:
+      type: object
+      description: |
+        What the caller may do on this database now (after the agent scope and the grants of
+        section 8.5), so clients and agents need not guess.
+      required: [query_read, query_write, change_schema, write_live, read_personal, read_secret]
+      properties:
+        query_read:
+          type: boolean
+          description: '`view`: read-only queries.'
+        query_write:
+          type: boolean
+          description: '`edit`: read-write queries (for an agent on a live database also `write_live`).'
+        change_schema:
+          type: boolean
+          description: '`manage`: settings, migrations, restore.'
+        write_live:
+          type: boolean
+          description: An agent with a `write_live` grant. Always true for a person with `edit`.
+        read_personal:
+          type: boolean
+          description: Sees real `personal` values (people with `view`; agents only with a grant).
+        read_secret:
+          type: boolean
+          description: Sees real `secret` values (people with `manage`; agents never).
+    Database:
+      type: object
+      required: [node, manifest, manifest_version_id, status, size_bytes, limits, branch_of, branch_data, pitr_window, unconfirmed_columns]
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        manifest:
+          $ref: '#/components/schemas/DatabaseManifest'
+        manifest_version_id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/DatabaseStatus'
+        size_bytes:
+          type: integer
+          format: int64
+        limits:
+          $ref: '#/components/schemas/DatabaseLimits'
+        branch_of:
+          description: The database this one is a branch of, or `null` for a live database.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        branch_data:
+          description: What data the branch took. `null` for a live database.
+          oneOf:
+            - $ref: '#/components/schemas/DataCopy'
+            - type: 'null'
+        pitr_window:
+          description: The point-in-time window, or `null` while there is no backup yet.
+          oneOf:
+            - $ref: '#/components/schemas/PitrWindow'
+            - type: 'null'
+        unconfirmed_columns:
+          type: integer
+          description: Columns that wait for a person to confirm their class (they count as `personal`).
+        my_permissions:
+          $ref: '#/components/schemas/DatabasePermissions'
+    PitrWindow:
+      type: object
+      required: [earliest, latest]
+      properties:
+        earliest:
+          $ref: '#/components/schemas/Timestamp'
+        latest:
+          $ref: '#/components/schemas/Timestamp'
+    DatabasePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Database'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    DatabaseWrite:
+      type: object
+      required: [database, change]
+      properties:
+        database:
+          $ref: '#/components/schemas/Database'
+        change:
+          $ref: '#/components/schemas/Change'
+    CreateDatabaseRequest:
+      type: object
+      required: [parent_id, name, manifest]
+      properties:
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+        manifest:
+          $ref: '#/components/schemas/DatabaseManifest'
+        source:
+          description: '`empty` (the default) or `template`: a database node inside a template folder.'
+          type: object
+          required: [kind]
+          properties:
+            kind:
+              type: string
+              enum: [empty, template]
+            node_id:
+              $ref: '#/components/schemas/Uuid'
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    UpdateDatabaseManifestRequest:
+      type: object
+      required: [manifest]
+      properties:
+        manifest:
+          $ref: '#/components/schemas/DatabaseManifest'
+        label:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: A name for the new manifest version.
+
+    # ------------------------------------------------------------ hidden-value markers
+    HiddenValue:
+      type: object
+      description: |
+        The hidden-value marker (design section 8.5): a value that the caller may not see. Never
+        a look-alike string. `secret` for secrets (agents, and people without `manage`);
+        `personal` where pseudonyms are not allowed (public queries, section 9.9) or a value
+        was removed. The UI shows a chip "hidden: secret". Logs, metrics and traces use the
+        same marker as a reserved map attribute.
+      required: [$ruum, class]
+      additionalProperties: false
+      properties:
+        $ruum:
+          type: string
+          const: hidden
+        class:
+          type: string
+          enum: [secret, personal]
+      examples:
+        - {$ruum: hidden, class: secret}
+    Pseudonym:
+      type: object
+      description: |
+        A consistent pseudonym of a `personal` value: a keyed hash (per tenant key) of the
+        value, so the same value always gives the same `id` in this tenant and joins, grouping
+        and counts still work. The UI shows a chip "person 8f3a91".
+      required: [$ruum, id]
+      additionalProperties: false
+      properties:
+        $ruum:
+          type: string
+          const: pseudonym
+        id:
+          type: string
+          pattern: '^p_[0-9a-f]{6,32}$'
+      examples:
+        - {$ruum: pseudonym, id: p_8f3a91}
+    LiteralValue:
+      type: object
+      description: A real JSON value that is an object with the key `$ruum`, wrapped so that it is never read as a marker.
+      required: [$ruum, value]
+      additionalProperties: false
+      properties:
+        $ruum:
+          type: string
+          const: literal
+        value: {}
+    QueryCell:
+      description: |
+        One value of a result row: a JSON value (`null`, boolean, number, string, array, or an
+        object without the key `$ruum`), or one of the typed markers. Numbers that do not fit a
+        double (`numeric`, `int8` beyond 2^53) come as strings. `bytea` and BLOB come as base64
+        strings. Times come as RFC 3339 strings.
+      anyOf:
+        - $ref: '#/components/schemas/HiddenValue'
+        - $ref: '#/components/schemas/Pseudonym'
+        - $ref: '#/components/schemas/LiteralValue'
+        - type: ['null', boolean, number, string, array]
+        - type: object
+          not:
+            required: [$ruum]
+
+    # ------------------------------------------------------------ query API
+    QueryMode:
+      type: string
+      description: '`read` runs in a read-only transaction (the default); `write` may change data.'
+      enum: [read, write]
+      default: read
+    QueryRequest:
+      type: object
+      required: [sql]
+      properties:
+        sql:
+          type: string
+          minLength: 1
+          maxLength: 100000
+          description: One SQL statement with placeholders. Never build it from values; pass them in `params`.
+        params:
+          type: array
+          maxItems: 1000
+          description: The values of the placeholders, in order.
+          items: {}
+        mode:
+          $ref: '#/components/schemas/QueryMode'
+        max_rows:
+          type: integer
+          minimum: 1
+          description: Lower than the plan's `max_rows`; the plan value when missing.
+        timeout_ms:
+          type: integer
+          minimum: 100
+          description: Lower than the plan's `statement_timeout_ms`; the plan value when missing.
+        approval_id:
+          description: An approved `DatabaseApproval` for exactly this statement and these parameters.
+          $ref: '#/components/schemas/Uuid'
+    ResultColumn:
+      type: object
+      required: [name, type, data_class, source, masking]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          description: The SQL type name (`text`, `int8`, `timestamptz`, ...; SQLite the declared type or the storage class).
+        data_class:
+          $ref: '#/components/schemas/DataClass'
+          description: The effective class for this result (the strictest of the columns it reads).
+        source:
+          description: The table column this result column comes from, when it is a plain column.
+          oneOf:
+            - type: object
+              required: [schema, table, column]
+              properties:
+                schema:
+                  type: string
+                table:
+                  type: string
+                column:
+                  type: string
+            - type: 'null'
+        masking:
+          type: string
+          description: What the server did to the values of this column for this caller.
+          enum: [none, pseudonym, hidden]
+    QueryResult:
+      type: object
+      required: [query_id, mode, columns, rows, row_count, truncated, truncated_reason, rows_affected, elapsed_ms, content_trust]
+      properties:
+        query_id:
+          $ref: '#/components/schemas/Uuid'
+          description: The entry in the query log.
+        mode:
+          $ref: '#/components/schemas/QueryMode'
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResultColumn'
+        rows:
+          type: array
+          description: The rows, each an array in the order of `columns`.
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/QueryCell'
+        row_count:
+          type: integer
+          description: The rows in `rows`.
+        truncated:
+          type: boolean
+        truncated_reason:
+          type: [string, 'null']
+          enum: [max_rows, max_result_bytes, null]
+        rows_affected:
+          description: For `INSERT`, `UPDATE`, `DELETE`; `null` for a read.
+          type: [integer, 'null']
+          format: int64
+        elapsed_ms:
+          type: integer
+        content_trust:
+          type: string
+          const: untrusted
+          description: Rows are data from the database, never instructions (design section 8.5).
+        restore_point_id:
+          description: The restore point recorded before the write session that this write belongs to.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+    ApprovalRequired:
+      type: object
+      required: [approval]
+      properties:
+        approval:
+          $ref: '#/components/schemas/DatabaseApproval'
+    DatabaseQueryLogEntry:
+      type: object
+      required: [id, node_id, mode, statement, params, outcome, error_code, row_count, rows_affected, elapsed_ms, by, grant_id, approval_id, at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        mode:
+          $ref: '#/components/schemas/QueryMode'
+        statement:
+          type: string
+          description: The statement as sent (with placeholders). Literals that look like personal data are not removed; send values as parameters.
+        params:
+          type: array
+          description: Each parameter as a pseudonym (or `null`), never the raw value.
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/Pseudonym'
+              - type: 'null'
+        outcome:
+          type: string
+          enum: [ok, error, timeout, cancelled, approval_required]
+        error_code:
+          oneOf:
+            - $ref: '#/components/schemas/ErrorCode'
+            - type: 'null'
+        row_count:
+          type: [integer, 'null']
+        rows_affected:
+          type: [integer, 'null']
+          format: int64
+        elapsed_ms:
+          type: [integer, 'null']
+        by:
+          $ref: '#/components/schemas/ActorPair'
+        grant_id:
+          description: The `write_live` or `read_personal` grant used.
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        approval_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    DatabaseQueryPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseQueryLogEntry'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # ------------------------------------------------------------ catalog and classes
+    DatabaseSchema:
+      type: object
+      required: [engine, tables]
+      properties:
+        engine:
+          $ref: '#/components/schemas/DatabaseEngine'
+        tables:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseTable'
+    DatabaseTable:
+      type: object
+      required: [schema, name, kind, columns, primary_key, foreign_keys]
+      properties:
+        schema:
+          type: string
+          description: '`public`, ... for Postgres; `main` for SQLite.'
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [table, view, materialized_view]
+        columns:
+          type: array
+          items:
+            type: object
+            required: [name, type, nullable, data_class, confirmed]
+            properties:
+              name:
+                type: string
+              type:
+                type: string
+              nullable:
+                type: boolean
+              data_class:
+                $ref: '#/components/schemas/DataClass'
+              confirmed:
+                type: boolean
+        primary_key:
+          type: array
+          items:
+            type: string
+        foreign_keys:
+          type: array
+          items:
+            type: object
+            required: [columns, references_schema, references_table, references_columns]
+            properties:
+              columns:
+                type: array
+                items:
+                  type: string
+              references_schema:
+                type: string
+              references_table:
+                type: string
+              references_columns:
+                type: array
+                items:
+                  type: string
+    ColumnRef:
+      type: object
+      required: [schema, table, column]
+      properties:
+        schema:
+          type: string
+        table:
+          type: string
+        column:
+          type: string
+    ClassSuggestion:
+      type: object
+      required: [class, reason, by, at]
+      properties:
+        class:
+          $ref: '#/components/schemas/DataClass'
+        reason:
+          type: string
+          maxLength: 500
+        by:
+          $ref: '#/components/schemas/ActorPair'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    DatabaseColumn:
+      allOf:
+        - $ref: '#/components/schemas/ColumnRef'
+        - type: object
+          required: [type, data_class, confirmed_class, confirmed_by, confirmed_at, suggestion]
+          properties:
+            type:
+              type: string
+            data_class:
+              $ref: '#/components/schemas/DataClass'
+              description: The effective class (`personal` while unconfirmed).
+            confirmed_class:
+              oneOf:
+                - $ref: '#/components/schemas/DataClass'
+                - type: 'null'
+            confirmed_by:
+              oneOf:
+                - $ref: '#/components/schemas/Uuid'
+                - type: 'null'
+            confirmed_at:
+              oneOf:
+                - $ref: '#/components/schemas/Timestamp'
+                - type: 'null'
+            suggestion:
+              oneOf:
+                - $ref: '#/components/schemas/ClassSuggestion'
+                - type: 'null'
+    DatabaseColumnPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseColumn'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    DatabaseColumnList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseColumn'
+    SuggestColumnClassesRequest:
+      type: object
+      required: [suggestions]
+      properties:
+        suggestions:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            allOf:
+              - $ref: '#/components/schemas/ColumnRef'
+              - type: object
+                required: [class, reason]
+                properties:
+                  class:
+                    $ref: '#/components/schemas/DataClass'
+                  reason:
+                    type: string
+                    minLength: 1
+                    maxLength: 500
+    ConfirmColumnClassesRequest:
+      type: object
+      required: [columns]
+      properties:
+        columns:
+          type: array
+          minItems: 1
+          maxItems: 2000
+          items:
+            allOf:
+              - $ref: '#/components/schemas/ColumnRef'
+              - type: object
+                required: [class]
+                properties:
+                  class:
+                    $ref: '#/components/schemas/DataClass'
+
+    # ------------------------------------------------------------ migrations
+    MigrationStatus:
+      type: string
+      enum: [applied, failed, rolled_back, dry_run]
+    DatabaseMigration:
+      type: object
+      required: [id, node_id, name, checksum, status, error, new_columns, restore_point_id, by, at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+        checksum:
+          $ref: '#/components/schemas/Hash'
+          description: BLAKE3 of `up`.
+        status:
+          $ref: '#/components/schemas/MigrationStatus'
+        error:
+          description: Why it failed (the statement number and the engine message).
+          type: [string, 'null']
+        new_columns:
+          type: array
+          description: The columns the migration added, with their effective class.
+          items:
+            $ref: '#/components/schemas/DatabaseColumn'
+        restore_point_id:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        by:
+          $ref: '#/components/schemas/ActorPair'
+        at:
+          $ref: '#/components/schemas/Timestamp'
+    DatabaseMigrationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseMigration'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    DatabaseMigrationWrite:
+      type: object
+      required: [migration, change]
+      properties:
+        migration:
+          $ref: '#/components/schemas/DatabaseMigration'
+        change:
+          $ref: '#/components/schemas/Change'
+    ApplyDatabaseMigrationRequest:
+      type: object
+      required: [name, up]
+      properties:
+        name:
+          type: string
+          pattern: '^[0-9]{4}_[a-z0-9_]{1,100}$'
+          examples: [0003_add_plant_tags]
+        up:
+          type: string
+          minLength: 1
+          maxLength: 1000000
+          description: The SQL of the migration (several statements).
+        data_classes:
+          type: object
+          description: The author's classes for the columns this migration adds, by `<schema>.<table>.<column>`.
+          additionalProperties:
+            $ref: '#/components/schemas/DataClass'
+        dry_run:
+          type: boolean
+          default: false
+
+    # ------------------------------------------------------------ branches and backups
+    CreateDatabaseBranchRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          $ref: '#/components/schemas/NodeName'
+        data:
+          $ref: '#/components/schemas/DataCopy'
+        at:
+          description: Branch from this point in time inside the backup window instead of now.
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    RestorePoint:
+      type: object
+      required: [id, node_id, label, reason, at, by]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        label:
+          type: [string, 'null']
+        reason:
+          type: string
+          enum: [manual, before_write_grant, before_migration, before_restore]
+        at:
+          $ref: '#/components/schemas/Timestamp'
+        by:
+          $ref: '#/components/schemas/ActorPair'
+    RestorePointPage:
+      type: object
+      required: [items, next_cursor, window]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestorePoint'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+        window:
+          oneOf:
+            - $ref: '#/components/schemas/PitrWindow'
+            - type: 'null'
+    RestorePointWrite:
+      type: object
+      required: [restore_point, change]
+      properties:
+        restore_point:
+          $ref: '#/components/schemas/RestorePoint'
+        change:
+          $ref: '#/components/schemas/Change'
+    CreateRestorePointRequest:
+      type: object
+      required: [label]
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 200
+    RestoreDatabaseRequest:
+      type: object
+      properties:
+        at:
+          description: A point in time inside the window. Give this or `restore_point_id`.
+          $ref: '#/components/schemas/Timestamp'
+        restore_point_id:
+          $ref: '#/components/schemas/Uuid'
+        target:
+          type: string
+          enum: [new_node, in_place]
+          default: new_node
+        name:
+          $ref: '#/components/schemas/NodeName'
+          description: '`new_node`: the name of the new database (next to this one). Default "<name> (restored <time>)".'
+
+    # ------------------------------------------------------------ grants and approvals
+    DatabaseAccessGrantKind:
+      type: string
+      description: '`write_live`: writes to the live database. `read_personal`: real `personal` values.'
+      enum: [write_live, read_personal]
+    DatabaseAccessGrant:
+      type: object
+      required: [id, node_id, kind, agent_id, granted_by, reason, starts_at, expires_at, revoked_at, revoked_by, restore_point_id, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        kind:
+          $ref: '#/components/schemas/DatabaseAccessGrantKind'
+        agent_id:
+          $ref: '#/components/schemas/Uuid'
+        granted_by:
+          $ref: '#/components/schemas/Uuid'
+          description: The user who gave the grant (the agent acts for this user).
+        reason:
+          type: [string, 'null']
+        starts_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        revoked_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        revoked_by:
+          oneOf:
+            - $ref: '#/components/schemas/PrincipalRef'
+            - type: 'null'
+        restore_point_id:
+          description: '`write_live`: the restore point recorded before the grant started.'
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    DatabaseAccessGrantPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseAccessGrant'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    DatabaseAccessGrantWrite:
+      type: object
+      required: [grant, change]
+      properties:
+        grant:
+          $ref: '#/components/schemas/DatabaseAccessGrant'
+        change:
+          $ref: '#/components/schemas/Change'
+    CreateDatabaseAccessGrantRequest:
+      type: object
+      required: [kind, agent_id, duration_minutes]
+      properties:
+        kind:
+          $ref: '#/components/schemas/DatabaseAccessGrantKind'
+        agent_id:
+          $ref: '#/components/schemas/Uuid'
+        duration_minutes:
+          type: integer
+          minimum: 1
+          maximum: 1440
+          description: '`read_personal`: at most 480.'
+        reason:
+          type: string
+          maxLength: 500
+    ApprovalStatus:
+      type: string
+      enum: [pending, approved, denied, expired, used]
+    DatabaseApproval:
+      type: object
+      required: [id, node_id, status, statement, params, reasons, estimated_rows, requested_by, decided_by, decided_at, comment, expires_at, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          $ref: '#/components/schemas/ApprovalStatus'
+        statement:
+          type: string
+        params:
+          type: array
+          description: The parameters as the requester may see them (markers for `personal` and `secret` values).
+          items:
+            $ref: '#/components/schemas/QueryCell'
+        reasons:
+          type: array
+          description: Why the statement needs a person.
+          items:
+            type: string
+            enum: [drop, truncate, delete_without_where, update_without_where, schema_change, alter_role]
+        estimated_rows:
+          description: The rows the statement touches (from the plan or a count in a rolled-back run); `null` for schema changes.
+          type: [integer, 'null']
+          format: int64
+        requested_by:
+          $ref: '#/components/schemas/ActorPair'
+        decided_by:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        decided_at:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        comment:
+          type: [string, 'null']
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: A pending request expires after 24 hours; an approved one after 15 minutes if unused.
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    DatabaseApprovalPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatabaseApproval'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    DecideDatabaseApprovalRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [approve, deny]
+        comment:
+          type: string
+          maxLength: 500

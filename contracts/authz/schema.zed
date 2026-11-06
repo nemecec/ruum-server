@@ -1,4 +1,5 @@
-// Ruum SpiceDB schema, step 1 (docs/DESIGN.md, section 3; docs/decisions/0001).
+// Ruum SpiceDB schema, step 1 (docs/DESIGN.md, section 3; docs/decisions/0001), with the
+// step 2 additions for database nodes (section 8.4 and 8.5; DRAFT, docs/STEP2.md).
 //
 // Roles follow Google Drive: view < comment < edit < manage. A higher role includes all lower
 // ones. Roles are inherited from parent folders; in step 1 a grant on a child can only add rights
@@ -138,6 +139,45 @@ definition node {
 
     // Change grants and share links (a permission, not a role).
     permission share = sharing_manager + (sharing_editor - editors_cannot_share)
+
+    // ---------------------------------------------------------------- step 2: databases (DRAFT)
+    // Database nodes are ordinary nodes (kind `typed`, type `database`), so the roles above
+    // apply; these permissions name what each role means for a database (design section 3.2):
+    //   view   = read-only queries (`query_read`)
+    //   edit   = read-write queries (`query_write`)
+    //   manage = schema, settings, backups, restore, branches (`change_schema`)
+    // The core checks them with the subject of the request (the user, also for an agent), and
+    // intersects the answer with the agent's scope, as for every node.
+    permission query_read = view
+    permission query_write = edit
+    permission change_schema = manage
+
+    // The agent rules of section 8.5. The subject of these checks is the AGENT principal (not
+    // its user). The core allows an agent's write on a live database only when BOTH hold:
+    // `query_write` for its user (after the scope) and `agent_write_live` for the agent. The
+    // same for real personal values: `query_read` for the user and `agent_read_personal` for
+    // the agent. `secret` values are never shown to agents: there is no relation for it.
+
+    // Written ONLY on a database branch node (`databases.branch_of` is set): every agent may
+    // write there, within its user's `edit` and its scope (drafts write freely, section 8.5).
+    relation draft_branch: agent:*
+
+    // A time-limited grant (createDatabaseAccessGrant, table `database_access_grants`). The
+    // expiry is NOT in the graph: like the agent scope, the core checks
+    // `database_access_grants.expires_at` and `revoked_at` after the check, and the sweeper
+    // deletes the tuple when the grant ends or is revoked. (SpiceDB relationship expiration,
+    // `use expiration`, would move the expiry into the graph; the in-memory engine of
+    // crates/ruum-core/src/authz/schema.rs does not read it yet. Open question in docs/STEP2.md.)
+    relation live_writer: agent
+    relation personal_reader: agent
+
+    // An agent may write: on a branch always, on a live database only with a grant.
+    // Not inherited: a grant on one database never reaches its branches' parent or siblings,
+    // and a branch is a database of its own.
+    permission agent_write_live = draft_branch + live_writer
+
+    // An agent may see real `personal` values (otherwise pseudonyms).
+    permission agent_read_personal = personal_reader
 }
 
 // Roles that a web app declares in its manifest (design section 9.3). ID: "<app-node-id>/<role>".
@@ -177,3 +217,11 @@ definition app_role {
 // A share link S with role r on node N: node:N#link_<viewer|commenter|editor>@share_link:S.
 // The setting editors_can_share of node N: false -> node:N#editors_share_off@user:*,
 //   true -> node:N#editors_share_on@user:*, null (inherit) -> neither.
+//
+// Step 2 (DRAFT), database nodes:
+//   a branch B of database D (B is a child node of D):  node:B#parent@node:D
+//                                                       node:B#draft_branch@agent:*
+//   a write_live grant to agent A on D:                node:D#live_writer@agent:A
+//   a read_personal grant to agent A on D:             node:D#personal_reader@agent:A
+//   The grant's end (expiry or revoke) deletes its tuple; the core also checks the row in
+//   `database_access_grants`, so a tuple that the sweeper has not deleted yet gives nothing.
