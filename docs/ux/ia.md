@@ -62,6 +62,40 @@ CLI's `--json` output and MCP field names.
 | upload | **upload** | transfer, put | |
 | chunk, hash, manifest | (never shown) | | Upload panel shows "Checking", "Uploading", "Finishing". |
 
+### Step 2: databases
+
+Added for step 2 (`databases/README.md`). The same rules apply: one word per concept.
+
+| Concept (DESIGN.md / API) | UI word | Never in the UI | Notes |
+|---|---|---|---|
+| typed node of type `database` | **database** | db, typed node, instance, resource | An item in Files with its own page. |
+| `engine` `postgres` / `sqlite` | **Postgres** / **SQLite**; field label "Kind of database" | engine | One line of meaning under each choice (copy.md 3.8). |
+| database manifest | **settings**; its versions **settings history** | manifest, config | The Versions tab of a database is called "Settings history", so nobody mistakes it for a backup of the data. |
+| `restoreVersion` of a database | **Restore these settings** | | Never "restore" alone on that tab: "restore" of data is a restore point. |
+| `DatabaseState` | **Setting up**, **Ready**, **Updating**, **Needs attention**, **Paused**, **Didn't start** | provisioning, degraded, suspended, failed | `deleted` is never shown (the item is gone). |
+| statement, HTTP query API | **query**; the tab **Query** | statement, SQL console | Error copy may say "query" for any statement. |
+| `mode: read` / `mode: write` | **Read only** / **Can change data** | read mode, write mode, RO, RW | |
+| column | **column** | field, attribute | |
+| data class | **privacy class**; values **Normal**, **Personal**, **Secret** | data class, sensitivity, label | Column header "Privacy". |
+| unconfirmed column | **not confirmed** ("Personal until you confirm") | unclassified, pending | |
+| class suggestion | **suggested** ("Suggested by *Agent* for *Person*: looks like an email address") | proposal, recommendation | |
+| pseudonym | **stand-in**; chip "person 8f3a91" | pseudonym, hash, token, anonymised | Running text: "Agents see a stand-in, the same for the same value." |
+| hidden-value marker | **hidden**; chip "hidden: secret" | masked, redacted, `****` | |
+| `DataCopy` `masked` / `schema_only` / `full` | **masked copy** / **tables only** / **full copy** | anonymised copy, empty copy | "Masked copy: personal values become stand-ins, secrets are removed." |
+| branch | **branch** ("a copy of the database to try changes") | fork, clone, sandbox, preview database | Explained once in the "New branch" dialog. |
+| migration | **migration** ("a change to the tables") | schema change (alone), DDL | Shown to people in the approval and the Overview list. |
+| restore point | **restore point** | snapshot, backup point, checkpoint | Automatic ones say why: "Before write access for Claude Code". |
+| point-in-time restore | **Restore to an earlier time** | PITR, roll back, revert | |
+| `target: new_node` / `in_place` | **Restore as a new database** / **Replace the data in *name*** | in place, new node | |
+| `pitr_window` | "You can go back to any time since *5 Nov, 14:05*." | PITR window, retention | |
+| `write_live` grant | **write access** ("Change data") | write grant, live write, write_live | Always with the end time: "Write access until 15:42". |
+| `read_personal` grant | **personal data access** ("See personal data") | read_personal, PII grant | |
+| `revokeDatabaseAccessGrant` | **End now** (a person); "gave it back" (the agent) | revoke | |
+| `DatabaseApproval` | **request**; heading **Waiting for you**; actions **Approve** / **Deny** | approval request, ticket | Status words: Waiting, Approved, Denied, Ended, Used. |
+| destructive statement | "a query that deletes or replaces data" | destructive statement, DDL | The request names the reason in words (copy.md 3.8). |
+| query log | **Query log** | audit, statement log | Values in a query show as "value 1", "value 2" (they are never stored). |
+| `my_permissions` | **Your access** (a sentence) | permissions | "You can read and change data. Only people who can manage it see secret values." |
+
 Rules:
 
 - **One word per concept.** If two screens need different words, the concept is different: add a
@@ -137,6 +171,10 @@ segment stays, because it is in links already; the UI never says "tenant".
 | Accept an invitation | `/invitations/accept?token=` | anybody; sign-in needed to accept | Join *Space* |
 | Connect an app (OAuth) | `/oauth/consent?request=` | signed-in user | Connect *App* to Ruum |
 | Not found | any other URL | everybody | Page not found |
+| Database (step 2) | `/t/<space>/databases/<id>` (tab Overview) | view and up | the database name |
+| Database tabs | `.../databases/<id>/query`, `/columns`, `/access`, `/log`, `/backups` | see `databases/screens.md` | Query, Columns, Agent access, Query log, Backups |
+| A request of an agent | `.../databases/<id>/access?request=<approval id>` | the agent's user, people who can manage | the database name; the request opens as a dialog |
+| Give write access (prefilled) | `.../databases/<id>/access?give=write_live&agent=<agent id>&minutes=60` | the agent's user | the prompt opens as a dialog; nothing is given without a click |
 
 The `/s#<token>` and `/invitations/accept` pages are the targets of the links that the server
 already sends (share links and invitation emails). They are missing in the UI today

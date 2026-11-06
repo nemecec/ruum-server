@@ -1,7 +1,8 @@
 # Design system
 
-Status: `provisional`. The tokens and components of the Ruum web UI for step 1. The target is
-WCAG 2.2 level AA everywhere. The names of things follow `ia.md`; the strings follow `copy.md`.
+Status: `provisional`. The tokens and components of the Ruum web UI for step 1, and the database
+components of step 2 (section 4b). The target is WCAG 2.2 level AA everywhere. The names of
+things follow `ia.md`; the strings follow `copy.md`.
 
 ## 1. Identity
 
@@ -173,7 +174,7 @@ These hold for every component below.
 11. **Language.** `<html lang>` matches the UI language; file names keep their own direction
     (`dir="auto"`).
 12. **Tests in CI** (design 18.4.1): axe on every main screen in both themes, and keyboard paths
-    for J1-J6 in Playwright.
+    for J1-J6 (and J7-J14 of `databases/journeys.md`) in Playwright.
 
 ## 4. Components
 
@@ -438,6 +439,12 @@ back, in the body; the button repeats the verb and the object ("Delete 12 items 
 | Remove a member | Yes, with the effects | Danger |
 | Undo agent changes | Yes, after the dry run | Primary |
 | Pause an agent | Yes | Secondary |
+| Run a query that deletes or replaces data (a person, DB-4) | Yes, with the row count when known | Danger |
+| Give an agent access (4.23) | The prompt is the confirm | Primary |
+| End an agent's access now | No; toast | Quiet (row action) |
+| Approve or deny a request (4.24) | The request dialog is the confirm | Primary / Secondary |
+| Restore a database as a new database | No (the dialog is the confirm) | Primary |
+| Replace the data in a database | Yes (it can be undone from a restore point) | Primary |
 
 **States.** Busy: the main button shows a spinner and "Deleting..." and all buttons are
 disabled; Escape still closes when nothing is in flight. Error: an error note above the footer;
@@ -529,6 +536,270 @@ Offline banner: `--color-warning-soft`, the text "You're offline. Changes wait u
 and no close button; it leaves by itself with "Back online" for 3 s. It uses `role="status"`.
 Session ended dialog: "You've been signed out" / "Sign in again to keep working. What you typed
 stays here." / "Sign in again" (primary).
+
+## 4b. Components of step 2 (databases)
+
+Added for step 2 (`databases/`). They use the tokens of section 2 only; no new colour token is
+needed. Two rules hold for all of them:
+
+- **Markers never look like data.** A stand-in or a hidden value is a chip with a dashed
+  `--color-border-control` border, an icon and words, on `--color-sunken`. It is never plain
+  text, never asterisks, never a colour alone.
+- **The agent colour stays for agents.** Chips, privacy badges and write mode do not use
+  `--color-agent`; the agent mark keeps its meaning (an agent did or asked this).
+
+### 4.19 Database item and status badge
+
+**In Files.** A row with the "database" outline icon (Lucide `database`), the name, a status
+badge when the state is not Ready, the size (the data size from `size_bytes`), Changed. Quiet
+links in the name cell when they apply: "*1* request", "*3* columns to confirm", "*2* branches".
+A click on the name opens the database page (not the details panel). The details panel of a
+database shows Kind, Status, Size, Created, Where, "Your access", and the primary button "Open
+database".
+
+**Status badge** (4.17 badge rules, text always present):
+
+| State | Badge | Style |
+|---|---|---|
+| `provisioning` | Setting up | neutral, with a 12 px spinner (none with reduced motion) |
+| `ready` | Ready | success text; shown on the database page, not in Files rows |
+| `updating` | Updating (or Restoring during a restore) | neutral, spinner |
+| `degraded` | Needs attention | warning |
+| `suspended` | Paused | warning |
+| `failed` | Didn't start | danger |
+
+**Accessibility.** The row reads "garden, database, Setting up". On the database page the badge
+sits in a `role="status"` region, so a change ("Ready") is announced once, politely.
+
+### 4.20 Query editor
+
+**Anatomy.** A mode row: the radio pair "Read only" / "Can change data" (the second only with
+Can edit). The editor: a code area in `--font-mono`, `--text-md`, line numbers in
+`--color-text-faint`, `--color-sunken` background, `--radius-md`, at least 6 lines high, grows to
+20 lines, then scrolls. Below: the "Values" row with one labelled field per placeholder found
+(`$1`, `$2` for Postgres; `?1`, `?2` for SQLite; the dialect label "Postgres" or "SQLite" sits at
+the editor's top right); the helper "Put values here, not in the query. Ruum never stores them."
+Footer: "Copy" menu (enabled when there is a result) and the primary button "Run query" with the
+shortcut hint "Cmd+Enter" (Ctrl+Enter on other systems).
+
+**Behaviour.** Cmd/Ctrl+Enter runs. Tab inserts two spaces; Escape then Tab leaves the editor
+(so Tab is not a trap, WCAG 2.1.2); the helper text under the editor says so. Syntax colours are
+optional and must pass 4.5:1 on `--color-sunken`; keywords may be medium weight instead of a
+colour. A table or column clicked in the tables list inserts its name at the cursor (quoted when
+needed). One statement per run: the editor does not split statements.
+
+**States.** Default; focus (the ring around the whole editor); running (button "Running...",
+`aria-busy`, a "Stop" link after 2 s); write mode (the frame is 2 px `--color-warning`, a label
+"Can change data" with a warning icon above the editor, the button reads "Run and change data");
+error (the error note under the editor, the line of the error marked with a `--color-danger`
+gutter mark and the visually hidden text "Error on line 2"); disabled (offline, database not
+ready: the reason under the button).
+
+**Accessibility.** The code area is a `textarea` (or an editor with `role="textbox"
+aria-multiline="true"`) labelled "Query"; the values fields are labelled "Value for $1". Results
+are announced once when they arrive: "2 rows" or the error title, through `role="status"`
+(errors: `role="alert"`).
+
+### 4.21 Result grid and hidden-value chips
+
+**Anatomy.** A `<table>` in a scroll region (`tabindex="0"`, labelled "Result", both directions
+inside the region, never the page). The header row per column: the name (`--text-md`, 600), the
+type in `--text-sm` muted mono, and a privacy badge for Personal and Secret ("Personal",
+"Secret"; Normal shows none). A column whose class is not confirmed adds "not confirmed" to the
+badge with a dashed outline. A sticky header and a sticky first column on wide results. Footer
+under the region: "*12* rows · *34* ms · Read only" or "Changed *3* rows · *12* ms". Above the
+region, when it applies: the cut note (4.14 info) and, on a masked branch, the masked note.
+
+**Cells.**
+
+| Value | Shown as |
+|---|---|
+| text, numbers, dates | as text; numbers right-aligned with tabular figures; long text cut at 200 characters with "..." and the whole value in a popover on Enter or click |
+| `null` | "NULL" in `--color-text-faint`, italic |
+| boolean | "true" / "false" |
+| array, object | compact JSON in mono, cut, popover for the whole value |
+| `LiteralValue` (`$ruum: literal`) | its `value` as JSON, like any object; never as a marker |
+| `HiddenValue` (`class: secret`) | the **hidden chip**: lock icon + "hidden: secret" |
+| `HiddenValue` (`class: personal`) | the hidden chip: lock icon + "hidden: personal" |
+| `Pseudonym` | the **stand-in chip**: person icon + "person 8f3a91" (the first 6 hex characters after `p_`) |
+| a `p_` + 12 hex string in a Personal column of a masked branch (DB-9) | the stand-in chip, as above |
+
+**Chip.** Height 24 px, `--radius-sm`, `--color-sunken` background, 1 px dashed
+`--color-border-control` border, a 14 px icon and `--text-sm` text in `--color-text-muted`; the
+id part in mono. Tooltip on hover and focus: hidden chip "Hidden. Only people who can manage
+*garden* see secret values." (for agents' views in the log and requests: "Hidden from agents.");
+stand-in chip "A stand-in for a personal value: *p_8f3a91c2d4e5*. The same value always gets the
+same stand-in." The chip is focusable only when the cell is (one tab stop for the grid, arrow
+keys inside, as the grid pattern).
+
+**Copy and export.** "Copy as CSV", "Copy as table", "Download CSV". Markers are written as
+`[hidden: secret]`, `[hidden: personal]` and `[person 8f3a91]` (DB-7). The header row is
+included. Toast "Copied *12* rows."
+
+**States.** Loading (old result dimmed, `aria-busy`), no rows ("No rows match." under the
+header), cut, error (no grid, the editor note), masked branch note.
+
+**Accessibility.** The table has a caption ("Result of the query, 12 rows") and `scope="col"` on
+headers. Screen-reader text of the chips: "Hidden secret value" and "Stand-in for a personal
+value, person 8 f 3 a 9 1". The privacy badge is text, so a screen reader reads "owner, text,
+Personal".
+
+### 4.22 Classification review list
+
+Used in the request dialog of a migration (4.24), in "Review columns" (Columns tab), and later in
+the publish approval of steps 3 and 4 (design 8.5 and 9.6).
+
+**Anatomy.** An intro line with the three classes in plain words (copy.md 3.8). Then one group
+per table (h3 with the table name), and per column one row:
+
+- the column name (mono) and type (muted);
+- a radio group (`fieldset`, legend = "Privacy of *table.column*"): Normal, Personal, Secret, as
+  a segmented control of three buttons-as-radios, 36 px high (44 px on touch);
+- under it, the suggestion: "Suggested by *Claude Desktop*: *looks like an email address*." with
+  the agent mark when an agent suggested it, or "Suggested by Ruum: *the name looks like an email
+  column*." for the rule-based suggester; none when there is no suggestion (then Personal is
+  preselected and the line says "No suggestion. Personal until you choose.");
+- for people who can manage, the quiet link "Show 3 example values", which runs a read-only
+  `SELECT <column> FROM <table> LIMIT 3` and shows the values inline (never stored).
+
+Preselected: the suggestion; else Personal. Choosing a class **lower** than the suggestion (or
+than Personal when there is none) shows a warning note under the row: "Agents will see the real
+values of *phone*." (to Normal) or "Agents will see stand-ins for *token* instead of hiding it."
+(Secret to Personal). Choosing higher shows nothing. A column that was reset by a rename shows
+"Renamed from *mail* on 6 Nov. Choose again."
+
+The submit button counts: "Confirm *4* columns" or, in a request, "Approve and confirm *4*
+columns". It is always enabled: every row has a value.
+
+**States.** Loading (skeleton rows), all confirmed ("All columns are confirmed."), saving (the
+button busy), error (`precondition_failed`: the list reloads with a note), read only (people
+without Can manage: the radios are replaced by the suggested class as text and "Ask *owner* to
+confirm these.").
+
+**Accessibility.** Each row is a `fieldset` with a `legend`; arrow keys move inside the radio
+group; the warning note is linked with `aria-describedby` and announced politely when it
+appears. The count in the button updates without moving focus.
+
+### 4.23 Write-grant prompt
+
+The dialog to give an agent extra access to one database for a short time (`write_live` or
+`read_personal`). Opened by "Give access" or by a link from an agent (`?give=`).
+
+**Anatomy** (480 px dialog; a sheet on the phone):
+
+1. Title "Give an agent access to *garden*".
+2. When opened from a link: a quoted block with the agent mark: "Claude Code asks for: Change
+   data, 1 hour." and, when the link carries one, "Reason from Claude Code (Ruum didn't check
+   this): *fix the 12 plants with a wrong family*." The reason is plain text, never rendered as
+   a link or markup.
+3. "Agent": a select of the person's own agents that can reach this database, with the agent
+   mark and the access line ("Can edit in Projects/Garden planner").
+4. "Access": two large radio cards: **Change data** (pencil icon): "Insert, update and delete
+   rows in *garden*. Queries that delete or replace data still ask you." **See personal data**
+   (eye icon): "See real names, emails and other personal values instead of stand-ins. Secret
+   values stay hidden."
+5. "For": a segmented control 15 min / 1 hour / 4 hours / 8 hours / 24 hours ("See personal
+   data": up to 8 hours; longer choices are disabled with the reason).
+6. "Reason (optional)": a text field, prefilled from the link.
+7. The summary (an info note): "*Claude Code* can change data in *garden* until *15:42* today.
+   Ruum records a restore point first, so you can go back to *14:42*."
+8. Footer: "Cancel", primary "Give access for 1 hour" (the button names the time).
+
+**Rules.** Defaults: Change data (or the kind from the link), 1 hour. Values from a link are
+capped to the contract limits and the cap is said in words. An agent that is paused, whose access
+is Can view only (for Change data), or that belongs to another person cannot be chosen; the
+reason is shown. Nothing is given without the button.
+
+**States.** Loading agents (skeleton select), busy (button), error (`permission_denied`,
+`validation_failed`: a note above the footer), no own agents ("You have no agent that can reach
+*garden*." with "Connect an agent").
+
+**Grant rows** (Agent access tab, "Access now" and "Earlier"): agent mark and name, the kind
+("Change data" / "See personal data"), "until 15:42 (58 min left)" (updated each minute, not each
+second; a visually hidden text gives the end time only), "Restore point 14:42" link, "Used *4*
+times" when known, "End now" (quiet). Ended rows say how they ended: "Ended at 15:42", "Ended by
+Jonas Kask at 15:10", "Claude Code gave it back at 15:10", and offer "Go back to before this
+access" (opens 4.25 with the grant's restore point).
+
+**Accessibility.** The radio cards are a `fieldset` of radios with their descriptions linked by
+`aria-describedby`. The countdown is not a live region.
+
+### 4.24 Request card and request dialog
+
+**Card** (Overview and Agent access, "Waiting for you"): `--color-surface`, `--radius-lg`, a
+3 px left edge in `--color-warning`, the agent mark and the request in one line ("*Claude Code*
+for *Jonas* wants to delete rows in *plants*"), a second line "About *1,240* rows. Asked *3 min*
+ago. Ends in *23 h 57 min*.", and "Review" (secondary). Decided requests leave the card list and
+move to "Requests, decided" (a plain list).
+
+**Dialog** (screens.md S5): title "Review the change from *Agent*", the by-line with the agent
+mark, the change in words (from `reasons`: copy.md 3.8), the statement in mono in a scroll box
+with the values as chips (parameters as the requester saw them: markers), "About *n* rows"
+(`estimated_rows`; "Ruum can't count the rows for this change." when null), the effect line,
+and for a migration the classification review list (4.22). Footer: "Deny" (secondary; opens an
+optional reason field in place) and the primary "Approve" or "Approve and confirm *n* columns".
+
+**Rules.** The statement is shown exactly as the agent sent it, in mono, never reformatted.
+Statement text and comments in it are untrusted: they are shown as text, never as markup or
+links. "Approve" says in the dialog that it lets the agent run exactly this query once, in the
+next 15 minutes, and that write access is still needed.
+
+**States.** Pending, ended ("This request has ended. *Agent* can ask again."), decided by someone
+else, read only (cannot decide: "Only *Liis Tamm* or people who can manage *Plant list* can
+decide this."), busy, error.
+
+**Accessibility.** The card is an `article` with the request as its heading. The statement box is
+a labelled scroll region ("The query"). Focus goes to "Deny" first (the safe choice, 4.12).
+
+### 4.25 Restore picker
+
+**Anatomy** (480 px dialog; a sheet on the phone):
+
+1. Title "Restore *tracker* to an earlier time".
+2. The window: "You can go back to any time since *30 Oct, 11:02*."
+3. "Go back to": a radio pair. **A time**: a native date field and a time field (24 h, minutes),
+   with the time zone as helper text ("Tallinn time (UTC+2)"), limited to the window; under it,
+   the nearest restore point in words ("That's 20 minutes before *Before import* (11:20)").
+   **A restore point**: a list of the points (time, label or reason, who), one selectable.
+4. "Restore how": two radio cards. **As a new database next to *tracker* (recommended)** with a
+   "Name" field (default "*tracker* (restored *6 Nov 11:00*)"). **Replace the data in
+   *tracker***: "*tracker* answers no queries while Ruum restores it, usually a few minutes.
+   Ruum records a restore point of the data now, so you can undo this."
+5. Footer: "Cancel", primary "Restore" (for a new database) or "Replace the data..." (opens the
+   confirm of 4.12).
+
+**Rules.** Default "A time" when opened from the button, "A restore point" with the point chosen
+when opened from a row or from "Go back to before this access". Default "As a new database".
+Times are sent as RFC 3339 with the offset. A guest without the policy sees only "Replace the
+data" (and only with Can manage).
+
+**States.** No backup yet (the dialog does not open; the button is disabled with the reason),
+time outside the window (field error), restore running ("A restore of *tracker* is already
+running."), busy, error.
+
+**Accessibility.** The date and time fields have labels and the format as helper text; the
+radio cards are a `fieldset`; the window line is the dialog description.
+
+### 4.26 Query log list
+
+**Anatomy.** A filter row (three menu buttons: "Who", "What", "Outcome"; the state is in the
+URL), the note "Ruum never stores the values in queries. They show as value 1, value 2.", and a
+list of entries. An entry: time; who (agent mark and "*Agent* for *Person*", or the person); the
+mode badge "Read" or "Changed data"; the statement on one line in mono, cut with "..." (the
+stored `$L1`, `$L2` render as the chips "value 1", "value 2": same chip style as 4.21 with a
+"#" icon, so they are never read as numbers); the outcome ("*12* rows", "Changed *12* rows",
+"Failed: *the code in words*", "Stopped: took too long", "Cancelled", "Waiting for you"); the
+time taken; "with write access" when a grant was used. Failed entries have a danger icon and the
+word "Failed" (never colour alone).
+
+**Details sheet.** The whole statement (wrapped), the values as stand-in chips (stored as
+pseudonyms) or "none", outcome and error code ("Details": the code and the SQLSTATE), rows, time,
+the grant (link) and the request (link) used, the query ID with a copy button.
+
+**States.** Loading, empty, filter with no match, error, hidden without the right (journeys J14).
+
+**Accessibility.** The list is a `ul` of `article` entries, each with a heading "*15:12*,
+*Claude Code for Jonas*, Changed data". The value chips read "value 1".
 
 ## 5. Screen checklist for UI task cards
 

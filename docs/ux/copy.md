@@ -186,6 +186,202 @@ Calm, plain, a little warm. We are a careful colleague who keeps your work safe.
 | Empty trash, confirm | Title: Delete 12 items for good? Body: Everything in the trash is deleted, with its versions. You can't undo this. Button: Delete 12 items for good |
 | Empty toast | Deleted 12 items for good. |
 
+### 3.8 Databases (step 2)
+
+Journeys J7 to J14 (`databases/journeys.md`), screens S1 to S10 (`databases/screens.md`).
+
+**Create (J7, S1)**
+
+| Where | Copy |
+|---|---|
+| New menu | Folder / Database |
+| Disabled, guest | Guests can't create databases in this space. An admin can turn this on in Sharing rules. |
+| Dialog | Title: New database. Label: Name. Placeholder: garden. Button: Create database |
+| Kind of database | Postgres (recommended): For most apps. Tables, search, maps and vectors. / SQLite: One small file. For small apps with one writer. |
+| More options | More options / Extensions |
+| Extensions | postgis: Maps and places / vector: Search by meaning (embeddings) / pg_trgm: Search with typos / citext: Text that ignores upper and lower case / hstore: Key and value pairs / uuid-ossp: Make UUIDs / pgcrypto: Hashes and encryption in SQL / btree_gist: Ranges that must not overlap / unaccent: Search that ignores accents |
+| Plan line | Plan: Shared small, up to *1 GB*, queries up to *30 s*. |
+| Access line, personal | Everyone who can see *Folder* can read it. Agents read personal data as stand-ins. [See who has access] |
+| Access line, team | Everyone who can see *Folder* can read it, also guests. People who can edit it can change data. [See who has access] |
+| Setting up | Ruum is setting up *garden*. This takes a few seconds. |
+| Ready toast | *garden* is ready. |
+| Next steps | Next: run a query, or let an agent add tables. [Run a query] [Connect an agent] |
+| Created by agent | Created by *Agent* for *Person* |
+| Sharing rules switch | Guests can create databases / Their databases, branches and copies count against *Space*'s plan. |
+
+**Status (J8, S2)**
+
+| Where | Copy |
+|---|---|
+| Badges | Setting up / Ready / Updating / Restoring / Needs attention / Paused / Didn't start |
+| Facts | Size: *120 MB* of *1 GB* / Backups: You can go back to any time since *30 Oct, 14:05*. / Your access / Created: *6 Nov 2026* by *name* |
+| Your access | You can read *garden*. / You can read and change data. / You can read and change data, change the tables and see secret values. / Secret values are hidden from you. Only people who can manage *garden* see them. |
+| Limits | Limits / Longest query: *30 s*. Rows per result: *10,000*. Largest result: *10 MB*. Largest database to branch: *1 GB*. |
+| Updating | Ruum is applying new settings to *garden*. |
+| Restoring | Ruum is restoring *garden* to *5 Nov, 14:00*. It answers no queries until this is done. |
+| Paused, trash | *garden* is in the trash. It answers no queries. Restore it from the trash to use it again. |
+| Paused, over limit | *garden* is over your plan's limit of *1 GB*. It answers no queries until you free some space or change your plan. |
+| Didn't start | *garden* didn't start: *reason*. [Try again] [Move to trash] |
+| Status reasons | `disk_quota_exceeded`: it is over the size your plan allows / `migration_failed`: the last migration failed, and nothing changed / `extension_not_available`: an extension in its settings isn't available / other: Ruum couldn't reach it. Ruum keeps trying. |
+| Offline status | Last checked *14:02* |
+| Row links in Files | *1* request / *3* columns to confirm / *2* branches |
+| Unconfirmed banner | *3* columns are not confirmed. They count as Personal until you confirm them. [Review columns] |
+| Copy a database, masked | The copy gets masked data: personal values become stand-ins and secrets are removed. |
+| Copy toast | Copied *garden*. The copy has masked data. / Copied *garden* with all its data. |
+| Settings history (tab) | Settings history / Restore these settings |
+| Settings saved | Saved. Ruum is applying the new settings. |
+| Kind fixed | Can't change after the database is made. |
+
+**Query (J9, S3)**
+
+| Where | Copy |
+|---|---|
+| Tab | Query |
+| Mode | Read only / Can change data |
+| Editor label / placeholder | Query / SELECT * FROM plants LIMIT 20 |
+| Values | Values / Value for *$1* / Put values here, not in the query. Ruum never stores them. |
+| Buttons | Run query / Run and change data / Running... / Stop |
+| Editor help | Escape, then Tab, leaves the editor. |
+| Footer | *12* rows · *34* ms · Read only / Changed *3* rows · *12* ms / *1* row |
+| No rows | No rows match. |
+| Cut | Showing the first *10,000* rows, the most your plan allows in one result. Add a WHERE or LIMIT to see the rest. / The result is larger than *10 MB*, the most your plan allows. Ruum shows the first *4,210* rows. |
+| No tables | No tables yet. Tables come from migrations, or from a CREATE TABLE in Can change data. |
+| Read only for viewers | You can read *garden*. Ask *owner name* to change data. |
+| Chips | hidden: secret / hidden: personal / person *8f3a91* |
+| Chip tooltips | Hidden. Only people who can manage *garden* see secret values. / Hidden from agents. / A stand-in for a personal value: *p_8f3a91c2d4e5*. The same value always gets the same stand-in. |
+| Privacy badges | Personal / Secret / not confirmed |
+| Masked branch note | This branch has masked data. Values like *person 8f3a91* are stand-ins, not real data. |
+| Copy menu | Copy as CSV / Copy as table / Download CSV |
+| Copy toast | Copied *12* rows. |
+| Confirm, person's delete (DB-4) | Title: Delete every row of *plants*? Body: This query has no WHERE, so it changes every row. You can restore *garden* to the moment before, on the Backups tab. Button: Run and delete rows |
+| Confirm, person's drop | Title: Remove the table *plants*? Body: The table and its rows go away. You can restore *garden* to the moment before, on the Backups tab. Button: Run and remove table |
+| Confirm, row count (C-20) | About *1,240* rows. |
+
+**Columns and classes (J10, S4, 4.22)**
+
+| Where | Copy |
+|---|---|
+| Tab | Columns |
+| Intro | Privacy classes decide what agents see. Normal: the real value. Personal: a stand-in, the same for the same value. Secret: hidden. |
+| Class choices | Normal: Agents see the real value. For amounts, dates, plant names. / Personal: Agents see a stand-in like person 8f3a91. For names, emails, phones, addresses and notes. / Secret: Only people who can manage see it; agents see "hidden". For passwords, tokens and keys. |
+| Filter | All columns / Only not confirmed (*3*) |
+| Column state | confirmed / not confirmed / Personal until you confirm |
+| Suggestion | Suggested by *Agent*: *reason*. / Suggested by Ruum: *reason*. / No suggestion. Personal until you choose. |
+| Rule reasons | the name looks like an email column / a phone column / a name column / an address column / a password or token column / a notes column |
+| Lowered warning | Agents will see the real values of *phone*. / Agents will see stand-ins for *token* instead of hiding it. |
+| Reset by rename | Renamed from *mail* on *6 Nov*. Choose again. |
+| Sample values | Show 3 example values / Ruum doesn't keep these values. |
+| Buttons | Review *3* columns / Confirm *3* columns / Confirm 1 column |
+| Read only | Ask *owner name* to confirm these. |
+| All confirmed | All columns are confirmed. |
+| Confirm toast | Confirmed *3* columns. Agents see them as you chose. |
+| Changed meanwhile | The columns changed while you were looking. Review them again. |
+
+**Requests (J10, J11, S5, 4.24)**
+
+| Where | Copy |
+|---|---|
+| Section | Waiting for you |
+| Card | *Agent* for *Person* wants to *what* in *table*. / About *1,240* rows. Asked *3 min* ago. Ends in *23 h 57 min*. [Review] |
+| What, by reason | `drop`: remove the table *t* / `truncate`: empty the table *t* / `delete_without_where`: delete every row of *t* / `update_without_where`: change every row of *t* / `schema_change`: change the tables of *db* / `migration`: change the tables of *db* (migration *name*) |
+| Dialog title | Review the change from *Agent* |
+| Migration body | Adds the table *customers* with *4* columns. / Changes *2* tables. [Show the migration (SQL)] |
+| Migration effect | Ruum records a restore point first. If the change fails, nothing changes. |
+| Statement effect | If you approve, *Agent* can run exactly this query once, in the next 15 minutes. It still needs write access. |
+| No count | Ruum can't count the rows for this change. |
+| Columns heading | Who can see the new columns |
+| Buttons | Deny / Approve / Approve and confirm *4* columns |
+| Deny reason | Tell *Agent* why (optional) |
+| Two-step (DB-10) | Approved. *Agent* can run the change in the next 15 minutes. Ruum will ask you to confirm the columns once it has run. / The change has run. Confirm the *4* new columns. [Confirm 4 columns] |
+| Toasts | Approved. *Agent* can make the change now. / Denied. *Agent* was told. |
+| Ended | This request has ended. *Agent* can ask again. |
+| Decided by another | *Name* already approved this at *14:05*. / *Name* already denied this at *14:05*. |
+| Cannot decide | Only *Person* or people who can manage *db* can decide this. |
+| Status words | Waiting / Approved / Denied / Ended / Used |
+| Migration failed | The change from *Agent* failed. Nothing changed. |
+
+**Agent access (J11, S6, 4.23)**
+
+| Where | Copy |
+|---|---|
+| Tab | Agent access |
+| Intro | Agents read *garden*, with personal data as stand-ins and secrets hidden. Extra access is for a short time, and you can end it at any time. |
+| Button | Give access |
+| Prompt title | Give an agent access to *garden* |
+| From a link | *Agent* asks for: *Change data*, *1 hour*. / Reason from *Agent* (Ruum didn't check this): *reason* |
+| Fields | Agent / Access / For / Reason (optional) |
+| Access choices | Change data: Insert, update and delete rows in *garden*. Queries that delete or replace data still ask you. / See personal data: See real names, emails and other personal values instead of stand-ins. Secret values stay hidden. |
+| Durations | 15 minutes / 1 hour / 4 hours / 8 hours / 24 hours |
+| Duration cap | *Agent* asked for *48 hours*. The most is 24 hours. / Personal data can be shown for at most 8 hours. |
+| Summary, write | *Agent* can change data in *garden* until *15:42* today. Ruum records a restore point first, so you can go back to *14:42*. |
+| Summary, personal | *Agent* can see personal data in *garden* until *15:42* today. Secret values stay hidden. |
+| Give button | Give access for *1 hour* |
+| Give toast | *Agent* can change data in *garden* until *15:42*. / *Agent* can see personal data in *garden* until *15:42*. |
+| Agent not allowed | *Agent*'s access is Can view. Change its access on the Agents page first. / *Agent* is paused. Resume it first. / This link is for an agent of *Name*. Only *Name* can give it access. |
+| Viewer cannot give write | You can only read *garden*, so you can't give write access. |
+| No own agent | You have no agent that can reach *garden*. [Connect an agent] |
+| Sections | Waiting for you / Access now / Earlier / Requests, decided |
+| Grant row | Change data / See personal data / until *15:42* (*58 min* left) / Restore point *14:42* / Used *4* times |
+| Ended row | Ended at *15:42* / Ended by *Name* at *15:10* / *Agent* gave it back at *15:10* |
+| Row actions | End now / Go back to before this access |
+| End toast | Ended write access for *Agent*. / Ended personal data access for *Agent*. |
+
+**Branches (J12, S7)**
+
+| Where | Copy |
+|---|---|
+| Section | Branches / New branch |
+| Dialog | Title: New branch of *garden*. Intro: A branch is a copy of the database to try changes. Agents can change data in a masked branch without asking. Label: Name. Button: Make branch |
+| Default name | *garden* branch *1* |
+| Data choices | Masked copy (recommended): Personal values become stand-ins, secret values are removed. Personal columns that are not text become text. / Tables only: The tables and columns, no rows. / Full copy: Real data, also personal values. Agents need write access to change it. |
+| From | From / Now / An earlier time / Pick a time after *30 Oct, 14:05*. |
+| Full copy disabled | Only people who can manage *garden* can make a full copy. |
+| Too large | *garden* is *2.3 GB*. Branches work for databases up to *1 GB*. Make a branch with tables only. |
+| Banner | Branch of *garden* · masked copy · made by *Name* at *14:10*. Agents can change data here without asking. / Branch of *garden* · full copy · made by *Name* at *14:10*. Agents need write access to change data here. |
+| Toast | Made the branch *garden branch 1*. |
+
+**Backups and restore (J13, S8, 4.25)**
+
+| Where | Copy |
+|---|---|
+| Tab | Backups |
+| Window | You can go back to any time since *30 Oct, 11:02*. |
+| No backup yet | Ruum makes the first backup within a few minutes. After that you can go back to any time in the last 7 days. |
+| Buttons | Name this moment / Restore to an earlier time / Restore... |
+| Point reasons | Before write access for *Agent* / Before migration *name* / Before a restore / (the label of a named point) |
+| Points note | Restore points stay for 7 days, like the backups. |
+| No points | No restore points yet. Ruum makes one before each migration and each write access. |
+| Name dialog | Title: Name this moment. Label: Name. Placeholder: Before import. Button: Save name |
+| Name toast | Named this moment *Before import*. |
+| Picker title | Restore *tracker* to an earlier time |
+| Go back to | Go back to / A time / A restore point / *Tallinn* time (UTC+2) / That's *20 minutes* before *Before import* (*11:20*). |
+| Restore how | Restore how / As a new database next to *tracker* (recommended) / Replace the data in *tracker* |
+| New name default | *tracker* (restored *6 Nov 11:00*) |
+| In-place helper | *tracker* answers no queries while Ruum restores it, usually a few minutes. Ruum records a restore point of the data now, so you can undo this. |
+| Buttons | Restore / Replace the data... |
+| In-place confirm | Title: Replace the data in *tracker*? Body: The data goes back to *6 Nov, 11:00*. Changes after that are kept in the restore point Before a restore (now), so you can undo this. Button: Replace the data |
+| Toasts | Restoring *tracker* to *6 Nov, 11:00* as a new database. [Show] / *tracker (restored 6 Nov 11:00)* is ready. / Restored *tracker* to *6 Nov, 11:00*. [Undo] |
+| Failed | The restore didn't work. *tracker* is as it was. |
+| Running | A restore of *tracker* is already running. |
+| Outside window | Pick a time after *30 Oct, 11:02*. |
+| Cannot restore | Only people who can manage *tracker* can restore it. |
+
+**Query log (J14, S9, 4.26)**
+
+| Where | Copy |
+|---|---|
+| Tab | Query log |
+| Filters | Who: Everyone / People / *Agent* · What: All / Reads / Changes · Outcome: All / Failed |
+| Note | Ruum never stores the values in queries. They show as value 1, value 2. |
+| Mode badges | Read / Changed data |
+| Outcomes | *12* rows / Changed *12* rows / Failed: *code in words* / Stopped: took too long / Cancelled / Waiting for you |
+| Grant used | with write access / with personal data access |
+| Value chips | value *1* |
+| Details | The query / Values / None / Outcome / With write access until *15:42* / Approved by *Name* at *15:05* / Query ID |
+| No access | Only people who can manage *garden* see the query log. |
+| Agent activity line | Queries are in each database's Query log. |
+| Agent activity verbs (journal, card C-2) | Got write access to *db* for *1 hour* / Got personal data access to *db* for *1 hour* / Gave back access to *db* / Applied the migration *name* in *db* / A migration failed in *db* / Made the branch *name* / Restored *db* to *time* |
+
 ## 4. Errors
 
 The UI maps each API error `code` (`crates/ruum-core/src/error.rs`) to copy for people. The API's
@@ -211,6 +407,16 @@ and the request ID.
 | `rate_limited` | That was a lot at once. Wait a minute and try again. | Retry |
 | `agent_disabled` | (agents only; for people: the agent's Paused state) | |
 | `chunk_missing`, `hash_mismatch` | *name* didn't upload completely. Ruum will try again. | Auto retry once, then "Try again" |
+| `database_not_ready` | *garden* isn't ready yet. Ruum is still setting it up or restoring it. | Wait; the page checks again by itself |
+| `query_failed` | The database couldn't run this query: *the sanitized message, in a sentence*. Check the query and try again. | Note under the editor; "Details" with the SQLSTATE |
+| `read_only_query` | This query changes data. Turn on Can change data to run it. (Can view: "You can only read *garden*.") | Note under the editor |
+| `statement_timeout` | The query ran longer than *30 s*, the most your plan allows. Narrow it with WHERE or LIMIT. | Note under the editor |
+| `write_grant_required` | (agents only; for people, the agent's request shows in Agent access) | |
+| `migration_failed` | The migration *name* failed. Nothing changed. | "Details" with the statement number and the SQLSTATE |
+| `database_too_large` | *garden* is too large for a branch. Branches work for databases up to *1 GB*. Make a branch with tables only. | Select "Tables only" |
+| `statement_not_allowed` | Ruum doesn't run this kind of query (it changes roles, settings or files of the server). Leave that part out. | Note under the editor |
+| `class_read_required` | This change reads or writes secret columns, which only people who can manage *garden* may see. Leave out *column*. | Note under the editor |
+| several statements (`validation_failed` on a query) | Run one query at a time. This has *2*. | Note under the editor |
 | `cursor_expired`, `range_not_satisfiable` | (not shown; the UI recovers by reloading) | |
 | `not_implemented` | This isn't available yet. | Close |
 | `internal`, `unavailable`, network error | Ruum couldn't do this just now. Try again in a moment. If it keeps happening, contact support with the code below. | Try again |
@@ -242,6 +448,17 @@ Never show a stack trace, an HTTP status number or an internal path to people.
 | Invitations | No open invitations | | Invite people |
 | Activity log | No activity yet | Changes in *Space* show up here. | |
 | App passwords | No app passwords | Make one to open your files in Finder or Explorer. | New app password |
+| Database tables (Query) | No tables yet | Tables come from migrations, or from a CREATE TABLE in Can change data. | |
+| Query result | No rows match | | |
+| Columns | All columns are confirmed | Agents see each column as you chose. | |
+| Waiting for you | (section hidden) | | |
+| Agent access, grants | No extra access | No agent has extra access to *garden*. Agents can read it, with personal data as stand-ins. | Give access |
+| Branches | No branches yet | Make one to try changes without touching *garden*. | New branch |
+| Migrations | No migrations yet | Migrations change the tables. They show up here with who ran them. | |
+| Backups, no backup | No backup yet | Ruum makes the first backup within a few minutes. After that you can go back to any time in the last 7 days. | |
+| Restore points | No restore points yet | Ruum makes one before each migration and each write access. | Name this moment (can edit) |
+| Query log | No queries yet | Every query on *garden*, by people and agents, shows up here. | |
+| Query log, filtered | No queries match these filters | | Clear filters |
 
 ## 6. Emails
 
