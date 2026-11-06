@@ -88,8 +88,10 @@ French, so the data stays in the EU. One account for two needs means fewer keys.
 3. **IAM → Applications → Create application** named `ruum-agents`. Give it a policy for the
    project **ruum-staging** with the permission sets **ObjectStorageFullAccess** and
    **TransactionalEmailFullAccess**. (A narrow key: it cannot touch anything else.)
-4. **IAM → API keys → Generate API key** for the application `ruum-agents`. Copy the access key and
-   the secret key into `SCW_ACCESS_KEY` and `SCW_SECRET_KEY`.
+4. **IAM → API keys → Generate API key** for the application `ruum-agents`. When Scaleway asks
+   "Will this API key be used for Object Storage?", answer **Yes** and choose **ruum-staging** as the
+   preferred project (S3 requests with this key then go to that project's buckets). Copy the access
+   key and the secret key into `SCW_ACCESS_KEY` and `SCW_SECRET_KEY`.
 5. **Transactional Email → Add domain** `notify.staging.ruum.space` (production adds `notify.ruum.space`
    in its own project later). Scaleway shows DNS records (SPF, DKIM,
    DMARC, MX). You do not need to add them by hand: once step 2 is active, the agents add them
