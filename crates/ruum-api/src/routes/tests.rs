@@ -69,6 +69,10 @@ async fn stub_routes_answer_501_with_error_json() {
         (Method::PATCH, format!("/v1/nodes/{id}/grants/{id}")),
         (Method::GET, format!("/v1/tenants/{id}/audit")),
         (Method::GET, "/v1/search?q=garden".to_string()),
+        (Method::PATCH, format!("/v1/nodes/{id}/sharing")),
+        (Method::GET, "/v1/me/app-passwords".to_string()),
+        (Method::POST, "/v1/me/app-passwords".to_string()),
+        (Method::DELETE, format!("/v1/me/app-passwords/{id}")),
     ];
     for (method, uri) in cases {
         let (status, body) = call(method.clone(), &uri).await;

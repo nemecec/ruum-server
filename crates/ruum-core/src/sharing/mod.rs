@@ -50,7 +50,8 @@ pub struct Grant {
     pub created_at: OffsetDateTime,
 }
 
-/// The roles a share link can have. Never `manage` or `share` (also checked in SQL).
+/// The roles a share link can have. Never `manage` (also checked in SQL), and a link never has
+/// the `share` permission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareLinkRole {
@@ -66,6 +67,16 @@ impl ShareLinkRole {
             ShareLinkRole::View => Role::View,
             ShareLinkRole::Comment => Role::Comment,
             ShareLinkRole::Edit => Role::Edit,
+        }
+    }
+
+    /// The SpiceDB relation on `node` that a link of this role writes (`node:N#<relation>@share_link:S`).
+    /// Links have their own relations, so that they never get the `share` permission.
+    pub fn relation(self) -> &'static str {
+        match self {
+            ShareLinkRole::View => "link_viewer",
+            ShareLinkRole::Comment => "link_commenter",
+            ShareLinkRole::Edit => "link_editor",
         }
     }
 }

@@ -78,9 +78,12 @@ the probe.
 ### The permission matrix
 
 The principals of tenant A: `anonymous`, `owner`, `admin`, `member`, `guest`, guests with one grant
-on `Projects` (`guest_view` to `guest_share`), the bearer of a `view` share link on `Projects`
-(`share_link`), and three agents. Members have `manager` on the team root and, by the default
-tenant policy `members_can_share`, `sharer` too, so they have `share` on the whole team tree. `agent` acts for `member` with scope
+on `Projects` (`guest_view` to `guest_manage`), the bearer of a `view` share link on `Projects`
+(`share_link`), and three agents. Roles are `view < comment < edit < manage`; `share` is a
+permission (decision 0001-1, `Who::can_share`): `manage` always, `edit` where the node setting
+`editors_can_share` is true (the fixture sets it to false on `Archive`). Members manage the team
+tree through the team root and, by the default tenant policy `members_can_share`, share there
+too. `agent` acts for `member` with scope
 `Projects` and `max_role: view` (the narrow agent). `agent_out` has scope `Private`.
 `agent_of_guest_view` has a wide scope but acts for `guest_view`, so it never gets more than `view`.
 

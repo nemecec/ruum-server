@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
             "/v1/nodes/{node_id}/share-links",
             get(list_share_links).post(create_share_link),
         )
+        .route("/v1/nodes/{node_id}/sharing", patch(update_node_sharing))
         .route("/v1/share-links/{link_id}", delete(revoke_share_link))
         .route("/v1/share-links/resolve", post(resolve_share_link))
         .route("/v1/shared-with-me", get(list_shared_with_me))
@@ -43,6 +44,12 @@ pub async fn update_grant() -> HttpError {
 /// Remove a grant. `DELETE /v1/nodes/{node_id}/grants/{grant_id}` (operationId `removeGrant`).
 pub async fn remove_grant() -> HttpError {
     not_implemented("removeGrant")
+}
+
+/// Change the sharing settings of a node (`editors_can_share`). `PATCH /v1/nodes/{node_id}/sharing`
+/// (operationId `updateNodeSharing`).
+pub async fn update_node_sharing() -> HttpError {
+    not_implemented("updateNodeSharing")
 }
 
 /// List share links. `GET /v1/nodes/{node_id}/share-links` (operationId `listShareLinks`).

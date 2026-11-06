@@ -149,7 +149,7 @@ mod tests {
         };
         let scope = Scope {
             subtree: None,
-            max_role: Role::Share,
+            max_role: Role::Manage,
             expires_at: None,
         };
         assert_eq!(agent.effective_user(), Some(owner));

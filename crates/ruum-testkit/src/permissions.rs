@@ -3,8 +3,10 @@
 //! For every operation, [`rule`] says what each principal of the fixture tenant may do with the
 //! standard request of [`crate::requests::standard`]. The rules come from:
 //!
-//! - the roles of section 3.2 (`view < comment < edit < manage < share`, inherited down the tree,
-//!   grants only add rights) and the "Needs ..." lines of `contracts/openapi.yaml`;
+//! - the roles of section 3.2 (`view < comment < edit < manage`, inherited down the tree, grants
+//!   only add rights), the `share` permission of decision 0001-1 (`manage` always; `edit` where
+//!   `editors_can_share` is true; [`crate::fixtures::Who::can_share`]) and the "Needs ..." lines
+//!   of `contracts/openapi.yaml`;
 //! - the tenant roles (`guest < member < admin < owner`) of the contract;
 //! - the agent rule of section 3.3: the agent's right is the user's right intersected with the
 //!   agent's scope ([`crate::fixtures::Who::role_on`]);
@@ -199,6 +201,17 @@ fn node2(note: &'static str, target: Target, role: Role, second: Option<(Target,
     })
 }
 
+/// The `share` permission on `target` ([`Who::can_share`]). A principal that cannot see the node
+/// gets `404`; one that can see it but cannot share gets `403`.
+fn node_share(note: &'static str, target: Target) -> Rule {
+    let sees = node("", target, Role::View).access;
+    Rule::new(note, move |who| match sees(who) {
+        Access::Allow if who.can_share(target) => Access::Allow,
+        Access::Allow => Access::Forbidden,
+        other => other,
+    })
+}
+
 /// The owner of the narrow agent (`member`), and tenant admins when `admins` is true.
 fn agent_owner(note: &'static str, admins: bool, hidden_from_others: bool) -> Rule {
     user_rule(note, Agents::Denied, move |who| match who {
@@ -336,6 +349,22 @@ fn operation_rule(op: &str) -> Option<Rule> {
         "listMyIdentities" | "listMySessions" => signed_in(
             "users only (agents and share links: 403 user_required)",
             Agents::Forbidden,
+        ),
+        "listAppPasswords" | "createAppPassword" => user_rule(
+            "users only; the caller's own app passwords in the tenant (members and guests)",
+            Agents::Forbidden,
+            |_| Access::Allow,
+        ),
+        "revokeAppPassword" => user_rule(
+            "users only; only the user who made it (member), others do not see it",
+            Agents::Forbidden,
+            |who| {
+                if who == Who::Member {
+                    Access::Allow
+                } else {
+                    Access::Hidden
+                }
+            },
         ),
         "endSession" => user_rule(
             "users only; only the user of the session (member), others do not see it",
@@ -536,7 +565,15 @@ fn operation_rule(op: &str) -> Option<Rule> {
         // ------------------------------------------------------------ sharing
         "listGrants" => node("Needs view", Projects, Role::View),
         "addGrant" | "updateGrant" | "removeGrant" | "listShareLinks" | "createShareLink"
-        | "revokeShareLink" => node("Needs share on the node", Projects, Role::Share),
+        | "revokeShareLink" => node_share(
+            "Needs share on the node (manage, or edit with editors_can_share)",
+            Projects,
+        ),
+        "updateNodeSharing" => node(
+            "Needs manage (Archive: the node with editors_can_share false)",
+            Archive,
+            Role::Manage,
+        ),
         "listSharedWithMe" => signed_in(
             "the roots of grants to the caller; for agents only inside the scope",
             Agents::Allow,
@@ -702,8 +739,10 @@ pub fn render_matrix() -> String {
          `403/404` = either, `401`, `any` = not decided by the contract (open question).\n\
          The principals are described in `crates/ruum-testkit/src/fixtures.rs`. The narrow agent\n\
          `agent` acts for `member` with scope `Projects` and `max_role: view`. `share_link` is the\n\
-         bearer of a `view` share link on `Projects`. Members have `share` on the team root by\n\
-         the default tenant policy (`members_can_share`).\n"
+         bearer of a `view` share link on `Projects`. Roles are `view < comment < edit < manage`;\n\
+         `share` is a permission: `manage` always, `edit` where `editors_can_share` is true (not\n\
+         in `Archive`). Members manage the team tree and share there by the default tenant\n\
+         policy (`members_can_share`).\n"
     );
     let _ = write!(s, "| operation |");
     for who in Who::ALL {

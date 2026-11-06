@@ -1,16 +1,25 @@
-// Ruum SpiceDB schema, step 1 (docs/DESIGN.md, section 3).
+// Ruum SpiceDB schema, step 1 (docs/DESIGN.md, section 3; docs/decisions/0001).
 //
-// One small set of roles applies to all nodes: view < comment < edit < manage < share.
-// A higher role includes all lower ones. Roles are inherited from parent folders; in step 1 a
-// grant on a child can only add rights (decision 8). "Restricted" folders come later.
+// Roles follow Google Drive: view < comment < edit < manage. A higher role includes all lower
+// ones. Roles are inherited from parent folders; in step 1 a grant on a child can only add rights
+// (decision 8). "Restricted" folders come later.
+//
+// `share` (change grants and share links) is a PERMISSION, not a role:
+// - `manage` always has it;
+// - `edit` has it while the effective node setting `editors_can_share` is true (the default);
+//   a manager sets it per node, and children inherit it until a child sets its own value
+//   (Drive: "Editors can change permissions and share");
+// - in a team tenant, members get `manage` from the team root, but `share` from it only while
+//   the tenant policy `members_can_share` is true;
+// - share links never have it.
 //
 // The right of an agent or an app that acts for a user is the user's right intersected with the
 // agent's scope (subtree, highest role, expiry). The core service applies that intersection
 // after the check (crates/ruum-core/src/authz); this schema does not model it.
 //
 // Object IDs are the UUIDs of the platform tables. Every relationship that the core writes is
-// also implied by a row in Postgres (nodes.parent_id, grants, share_links, memberships), so the
-// graph can be rebuilt from the database.
+// also implied by a row in Postgres (nodes.parent_id, nodes.editors_can_share, grants,
+// share_links, memberships, tenants.settings), so the graph can be rebuilt from the database.
 
 // A person.
 definition user {}
@@ -29,8 +38,18 @@ definition tenant {
     relation member: user | group#member
     relation guest: user
 
+    // `user:*` while the tenant policy `members_can_share` is true (the default for team
+    // tenants). The core writes or deletes this one tuple when the policy changes.
+    relation members_can_share: user:*
+
     // Change tenant settings, members, invitations; read the audit log.
     permission administer = owner + admin
+
+    // Every member: the people who manage the team tree through the team root.
+    permission team_member = member
+
+    // The members who get `share` from the team root: every member while the policy is on.
+    permission sharing_member = member & members_can_share
 }
 
 // A deployed web app with its own identity (step 3). Kept here so node relations can name it.
@@ -71,28 +90,54 @@ definition node {
     // creator who leaves a team keeps no rights on what they made.
     relation owner: user
 
-    // Grants. One relation per role.
-    relation sharer: user | group#member | tenant#member | tenant#administer
+    // The team of a team tenant. Written ONLY on the root of a team tenant. Every member gets
+    // `manage` on the team tree; `share` only while the policy `members_can_share` is true.
+    relation team: tenant
+
+    // Grants to people (and apps). One relation per role.
     relation manager: user | group#member | tenant#member | tenant#administer
-    relation editor: user | group#member | app | tenant#member | share_link
-    relation commenter: user | group#member | tenant#member | share_link
+    relation editor: user | group#member | app | tenant#member
+    relation commenter: user | group#member | tenant#member
     // `user:*` is for public files and apps; not used in step 1 (decision 9).
-    relation viewer: user | group#member | app | tenant#member | share_link | user:*
+    relation viewer: user | group#member | app | tenant#member | user:*
 
-    // Change grants and share links.
-    permission share = owner + sharer + parent->share
+    // Share links, one relation per link role. Kept apart from the grants to people so that a
+    // link never gets `share` (and never `manage`: there is no relation for it).
+    relation link_editor: share_link
+    relation link_commenter: share_link
+    relation link_viewer: share_link
 
-    // Move, trash, restore.
-    permission manage = share + manager + parent->manage
+    // The node setting `editors_can_share` (nodes.editors_can_share). The core writes `user:*`
+    // on `editors_share_off` when a manager sets it to false, on `editors_share_on` when a
+    // manager sets it to true, and neither when the node inherits (null).
+    relation editors_share_off: user:*
+    relation editors_share_on: user:*
+
+    // True (for every user) where the effective `editors_can_share` is false: the node sets
+    // false, or it inherits false from the nearest ancestor that sets a value.
+    permission editors_cannot_share = editors_share_off + (parent->editors_cannot_share - editors_share_on)
+
+    // Move, trash, restore; change node settings such as `editors_can_share`.
+    permission manage = owner + manager + team->team_member + parent->manage
 
     // Change content, upload versions, rename, create children.
-    permission edit = manage + editor + parent->edit
+    permission edit = manage + editor + link_editor + parent->edit
 
     // Comment (comments come after step 1; the role exists now).
-    permission comment = edit + commenter + parent->comment
+    permission comment = edit + commenter + link_commenter + parent->comment
 
     // Read, download, list.
-    permission view = comment + viewer + parent->view + collection->view
+    permission view = comment + viewer + link_viewer + parent->view + collection->view
+
+    // The `manage` that always shares: ownership, manager grants, and team members while the
+    // policy `members_can_share` is true.
+    permission sharing_manager = owner + manager + team->sharing_member + parent->sharing_manager
+
+    // The `edit` grants to people (never share links), inherited down the tree.
+    permission sharing_editor = editor + parent->sharing_editor
+
+    // Change grants and share links (a permission, not a role).
+    permission share = sharing_manager + (sharing_editor - editors_cannot_share)
 }
 
 // Roles that a web app declares in its manifest (design section 9.3). ID: "<app-node-id>/<role>".
@@ -115,15 +160,20 @@ definition app_role {
 //   team tenant T made by user U, root folder R:
 //     tenant:T#owner@user:U   tenant:T#member@user:U
 //     node:R#tenant@tenant:T
-//     node:R#sharer@tenant:T#administer  (owners and admins share everything in the team tree)
-//     node:R#manager@tenant:T#member     (every member can work in the team tree: edit, and
-//                                         move, trash and restore, also what others made)
-//     node:R#sharer@tenant:T#member      (only while the policy `members_can_share` is true;
-//                                         the core writes or deletes it when the policy changes)
+//     node:R#manager@tenant:T#administer  (owners and admins manage, and so share, everything
+//                                          in the team tree)
+//     node:R#team@tenant:T                (every member manages the team tree: edit, move,
+//                                          trash and restore, also what others made)
+//     tenant:T#members_can_share@user:*   (only while the policy `members_can_share` is true;
+//                                          the core writes or deletes it when the policy changes)
 //
 // No tuple names the creator of a node. Members who leave lose `tenant#member` and with it
 // every right that came from the team root.
 //
 // Tuples per node: node:N#parent@node:P and node:N#tenant@tenant:T.
 // A member link L in folder F to target X: node:X#collection@node:F.
-// A grant of role r to principal p on node N: node:N#<relation of r>@<p>.
+// A grant of role r to principal p on node N: node:N#<relation of r>@<p>, where the relation of
+//   view, comment, edit, manage is viewer, commenter, editor, manager.
+// A share link S with role r on node N: node:N#link_<viewer|commenter|editor>@share_link:S.
+// The setting editors_can_share of node N: false -> node:N#editors_share_off@user:*,
+//   true -> node:N#editors_share_on@user:*, null (inherit) -> neither.

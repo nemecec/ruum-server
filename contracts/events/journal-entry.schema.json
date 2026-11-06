@@ -64,7 +64,8 @@
         "grant.updated",
         "grant.removed",
         "share_link.created",
-        "share_link.revoked"
+        "share_link.revoked",
+        "node.sharing_updated"
       ]
     },
     "actor": {
@@ -409,6 +410,25 @@
         "properties": {
           "data": {
             "$ref": "share_link.revoked.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "node.sharing_updated"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "node.sharing_updated.schema.json"
           }
         }
       }

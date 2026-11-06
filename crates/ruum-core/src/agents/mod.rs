@@ -163,6 +163,7 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         GrantRemoved => Some("add the grant again"),
         ShareLinkCreated => Some("revoke the link"),
         ShareLinkRevoked => None,
+        NodeSharingUpdated => Some("set the old editors_can_share"),
     }
 }
 

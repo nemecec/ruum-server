@@ -1,0 +1,359 @@
+# The MCP tool list of step 1 (docs/DESIGN.md, sections 11 and 18.1; docs/decisions/0001, decision 6).
+#
+# The MCP server (/mcp, area 6) exposes one tool per REST operation of contracts/openapi.yaml that
+# makes sense for an AI agent. A tool calls the same core service as its operation, so it never
+# has rights that the REST operation does not have (the agent's right is its user's right
+# intersected with its scope).
+#
+# Each tool has:
+#   name         snake_case, verb_noun; unique.
+#   operation    the operationId it maps to (exactly one operation per tool).
+#   description  one line for the AI agent that reads the tool list.
+#   input        a JSON pointer into openapi.yaml to the operation. The MCP input schema is made
+#                from it: every path and query parameter becomes a top-level property with the same
+#                name, type and required flag; a header parameter other than Ruum-Tenant and
+#                Idempotency-Key becomes a property in snake_case (If-Match -> if_match); a JSON
+#                request body becomes the property `body` with the body schema (required when the
+#                body is required). Ruum-Tenant comes from the agent token, and the MCP server sets
+#                a fresh Idempotency-Key for each tool call.
+#   notes        (optional) where the tool differs from the REST operation.
+#
+# not_exposed lists every other operation with the reason. Operations marked
+# x-ruum-user-only are never tools. Every operationId of openapi.yaml is in exactly one of the two
+# lists; crates/ruum-mcp/tests/tools_contract.rs checks this.
+
+version: 1
+openapi: ../openapi.yaml
+
+tools:
+  - name: get_me
+    operation: getMe
+    description: 'Show who you are: your agent identity, the user you act for, and your scope (subtree, max_role, expiry).'
+    input: '#/paths/~1v1~1me/get'
+  - name: list_tenants
+    operation: listTenants
+    description: 'List the tenants you can work in. Your token is bound to one of them.'
+    input: '#/paths/~1v1~1tenants/get'
+  - name: get_tenant
+    operation: getTenant
+    description: 'Read a tenant: name, plan, root folder ID and sharing policy.'
+    input: '#/paths/~1v1~1tenants~1{tenant_id}/get'
+  - name: list_members
+    operation: listMembers
+    description: 'List the members and guests of the tenant, to find user IDs for grants.'
+    input: '#/paths/~1v1~1tenants~1{tenant_id}~1members/get'
+  - name: get_limits
+    operation: getLimits
+    description: 'Read the plan limits and current usage of the tenant (storage, largest file, agents).'
+    input: '#/paths/~1v1~1tenants~1{tenant_id}~1limits/get'
+  - name: get_root
+    operation: getRoot
+    description: 'Get the root folder of the tenant. Start here to browse the tree.'
+    input: '#/paths/~1v1~1nodes~1root/get'
+  - name: create_node
+    operation: createNode
+    description: 'Create a folder, an empty file or a link inside a folder. Use write_file afterwards to give a file content.'
+    input: '#/paths/~1v1~1nodes/post'
+  - name: get_node_by_path
+    operation: getNodeByPath
+    description: 'Find a file or folder by its path from the root, for example Projects/Garden/plan.md.'
+    input: '#/paths/~1v1~1nodes~1by-path~1{path}/get'
+  - name: get_node
+    operation: getNode
+    description: 'Read the metadata of a file or folder by ID, including your role (my_role) and whether you may share it (my_can_share).'
+    input: '#/paths/~1v1~1nodes~1{node_id}/get'
+  - name: purge_node
+    operation: purgeNode
+    description: 'Delete a trashed item for ever. This cannot be undone; prefer trash_node.'
+    input: '#/paths/~1v1~1nodes~1{node_id}/delete'
+  - name: list_children
+    operation: listChildren
+    description: 'List the files and folders inside a folder, one page at a time.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1children/get'
+  - name: rename_node
+    operation: renameNode
+    description: 'Rename a file or folder in place.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1rename/post'
+  - name: move_node
+    operation: moveNode
+    description: 'Move a file or folder to another folder (needs manage on it and edit on the target).'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1move/post'
+  - name: copy_node
+    operation: copyNode
+    description: 'Copy a file or folder into a folder. The copy shares content, so it is cheap.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1copy/post'
+  - name: trash_node
+    operation: trashNode
+    description: 'Move a file or folder to the trash. It can be restored for the trash period.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1trash/post'
+  - name: restore_node
+    operation: restoreNode
+    description: 'Bring a trashed file or folder back from the trash.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1restore/post'
+  - name: list_trash
+    operation: listTrash
+    description: 'List the trashed items you can restore.'
+    input: '#/paths/~1v1~1trash/get'
+  - name: empty_trash
+    operation: emptyTrash
+    description: 'Delete for ever every trashed item you may purge. This cannot be undone.'
+    input: '#/paths/~1v1~1trash~1empty/post'
+  - name: read_file
+    operation: downloadContent
+    description: 'Read the content of a file (the head version, or an older version by ID).'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1content/get'
+    notes: 'Returns text for text files and base64 for binary files. Large files: use get_content_url instead.'
+  - name: write_file
+    operation: putContent
+    description: 'Replace the content of a file with new content. Makes a new version; older versions stay in the history.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1content/put'
+    notes: 'Input `body` is replaced by `content` (string) and `encoding` (`utf8` or `base64`). For large files use the REST upload operations or the ruum CLI.'
+  - name: get_content_url
+    operation: getContentUrl
+    description: 'Get a short-lived signed URL to download a file, for large or binary files.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1content-url/get'
+  - name: list_versions
+    operation: listVersions
+    description: 'List the version history of a file, newest first, with who made each version.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1versions/get'
+  - name: get_version
+    operation: getVersion
+    description: 'Read the metadata of one version of a file.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1versions~1{version_id}/get'
+  - name: restore_version
+    operation: restoreVersion
+    description: 'Make an older version the current content again (as a new version).'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1versions~1{version_id}~1restore/post'
+  - name: label_version
+    operation: setVersionLabel
+    description: 'Give a version a name, such as ''before refactor'', so it is kept and easy to find.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1versions~1{version_id}~1label/put'
+  - name: diff_versions
+    operation: diffVersions
+    description: 'Show what changed between two versions of a file (text, JSON, XML or image diff).'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1diff/get'
+  - name: list_diff_plugins
+    operation: listDiffPlugins
+    description: 'List the diff methods available for a file.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1diff~1plugins/get'
+  - name: list_tags
+    operation: listTags
+    description: 'List the tags of the tenant.'
+    input: '#/paths/~1v1~1tags/get'
+  - name: create_tag
+    operation: createTag
+    description: 'Create a new tag in the tenant.'
+    input: '#/paths/~1v1~1tags/post'
+  - name: get_tag
+    operation: getTag
+    description: 'Read one tag.'
+    input: '#/paths/~1v1~1tags~1{tag_id}/get'
+  - name: delete_tag
+    operation: deleteTag
+    description: 'Delete a tag and remove it from every node.'
+    input: '#/paths/~1v1~1tags~1{tag_id}/delete'
+  - name: update_tag
+    operation: updateTag
+    description: 'Change the name or color of a tag.'
+    input: '#/paths/~1v1~1tags~1{tag_id}/patch'
+  - name: list_nodes_by_tag
+    operation: listNodesByTag
+    description: 'List the files and folders that carry a tag.'
+    input: '#/paths/~1v1~1tags~1{tag_id}~1nodes/get'
+  - name: list_node_tags
+    operation: listNodeTags
+    description: 'List the tags on a file or folder.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1tags/get'
+  - name: attach_tag
+    operation: attachTag
+    description: 'Put a tag on a file or folder.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1tags~1{tag_id}/put'
+  - name: detach_tag
+    operation: detachTag
+    description: 'Remove a tag from a file or folder.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1tags~1{tag_id}/delete'
+  - name: list_grants
+    operation: listGrants
+    description: 'List who has access to a file or folder, direct and inherited.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1grants/get'
+  - name: add_grant
+    operation: addGrant
+    description: 'Give a person access to a file or folder with a role (view, comment, edit or manage). Needs the share permission; you can give at most your own role.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1grants/post'
+  - name: remove_grant
+    operation: removeGrant
+    description: 'Take away a grant. Needs the share permission.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1grants~1{grant_id}/delete'
+  - name: update_grant
+    operation: updateGrant
+    description: 'Change the role of an existing grant. Needs the share permission.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1grants~1{grant_id}/patch'
+  - name: update_node_sharing
+    operation: updateNodeSharing
+    description: 'Set whether editors may share a file or folder (editors_can_share: true, false, or null to inherit). Needs manage.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1sharing/patch'
+  - name: list_share_links
+    operation: listShareLinks
+    description: 'List the share links of a file or folder. Needs the share permission.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1share-links/get'
+  - name: create_share_link
+    operation: createShareLink
+    description: 'Make a secret link that gives anyone with it view, comment or edit access. Needs the share permission and the tenant policy.'
+    input: '#/paths/~1v1~1nodes~1{node_id}~1share-links/post'
+  - name: revoke_share_link
+    operation: revokeShareLink
+    description: 'Turn off a share link at once.'
+    input: '#/paths/~1v1~1share-links~1{link_id}/delete'
+  - name: list_shared_with_me
+    operation: listSharedWithMe
+    description: 'List the files and folders other people shared with the user you act for.'
+    input: '#/paths/~1v1~1shared-with-me/get'
+  - name: list_changes
+    operation: listChanges
+    description: 'Read the change journal after a cursor, to see what changed (can long-poll with wait).'
+    input: '#/paths/~1v1~1changes/get'
+  - name: get_latest_cursor
+    operation: getLatestCursor
+    description: 'Get the newest journal cursor, to start following changes from now.'
+    input: '#/paths/~1v1~1changes~1latest/get'
+  - name: search_nodes
+    operation: searchNodes
+    description: 'Search files and folders by name, optionally by kind, tag or inside a folder.'
+    input: '#/paths/~1v1~1search/get'
+
+not_exposed:
+  - operation: health
+    reason: not_for_agents
+    note: 'plumbing: liveness check'
+  - operation: getJwks
+    reason: not_for_agents
+    note: 'plumbing: token verification keys'
+  - operation: getProtectedResourceMetadata
+    reason: not_for_agents
+    note: 'plumbing: OAuth discovery, used by the MCP client itself'
+  - operation: getAuthorizationServerMetadata
+    reason: not_for_agents
+    note: 'plumbing: OAuth discovery, used by the MCP client itself'
+  - operation: loginStart
+    reason: not_for_agents
+    note: 'plumbing: browser sign-in'
+  - operation: loginCallback
+    reason: not_for_agents
+    note: 'plumbing: browser sign-in'
+  - operation: logout
+    reason: not_for_agents
+    note: 'plumbing: ends a web session'
+  - operation: listMyIdentities
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listMySessions
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: endSession
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listAppPasswords
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: createAppPassword
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: revokeAppPassword
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: createTenant
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: updateTenant
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: removeMember
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: updateMember
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listInvitations
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: createInvitation
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: revokeInvitation
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: acceptInvitation
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listAudit
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listAgents
+    reason: not_for_agents
+    note: 'agents do not manage agents; get_me shows your own scope'
+  - operation: registerAgent
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: getAgent
+    reason: not_for_agents
+    note: 'agents do not manage agents; get_me shows your own scope'
+  - operation: updateAgent
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: disableAgent
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: enableAgent
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listAgentKeys
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: createAgentKey
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: revokeAgentKey
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: listAgentActivity
+    reason: not_for_agents
+    note: 'the owner or an admin reads it (agents get 403/404 in the permission matrix)'
+  - operation: undoAgent
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: registerOAuthClient
+    reason: not_for_agents
+    note: 'plumbing: OAuth dynamic client registration, done by the MCP client'
+  - operation: getOAuthClient
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: oauthAuthorize
+    reason: not_for_agents
+    note: 'plumbing: OAuth authorization, done by the MCP client and the user'
+  - operation: oauthConsent
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: exchangeToken
+    reason: not_for_agents
+    note: 'plumbing: token endpoint, done by the MCP client or the CLI'
+  - operation: createUpload
+    reason: not_for_agents
+    note: 'chunked binary transfer; use write_file, or the REST API or the ruum CLI for large files'
+  - operation: getChunkingParams
+    reason: not_for_agents
+    note: 'chunked binary transfer; use write_file, or the REST API or the ruum CLI for large files'
+  - operation: getUpload
+    reason: not_for_agents
+    note: 'chunked binary transfer; use write_file, or the REST API or the ruum CLI for large files'
+  - operation: abortUpload
+    reason: not_for_agents
+    note: 'chunked binary transfer; use write_file, or the REST API or the ruum CLI for large files'
+  - operation: putChunk
+    reason: not_for_agents
+    note: 'chunked binary transfer; use write_file, or the REST API or the ruum CLI for large files'
+  - operation: completeUpload
+    reason: not_for_agents
+    note: 'chunked binary transfer; use write_file, or the REST API or the ruum CLI for large files'
+  - operation: resolveShareLink
+    reason: not_for_agents
+    note: 'plumbing: opens a share link for an anonymous visitor'

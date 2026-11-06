@@ -4,12 +4,15 @@
 
 /// The operations that only a signed-in user may call (`x-ruum-user-only: true` in
 /// `contracts/openapi.yaml`). For each one the suite calls the endpoint with an agent token whose
-/// user is allowed (owner and tenant admin, scope `max_role: share`, no subtree) and with a
+/// user is allowed (owner and tenant admin, scope `max_role: manage`, no subtree) and with a
 /// share-link token, and expects `403 user_required` both times.
 pub const USER_ONLY_OPERATIONS: &[&str] = &[
     "listMyIdentities",
     "listMySessions",
     "endSession",
+    "listAppPasswords",
+    "createAppPassword",
+    "revokeAppPassword",
     "createTenant",
     "updateTenant",
     "updateMember",
@@ -62,7 +65,7 @@ pub const CASES: &[Case] = &[
     Case {
         name: "agent_cannot_escalate",
         given: "an agent of a tenant admin calls each of USER_ONLY_OPERATIONS, including \
-                updateAgent on itself with scope {subtree: null, max_role: share} and \
+                updateAgent on itself with scope {subtree: null, max_role: manage} and \
                 createAgentKey for itself",
         expect: "403 user_required; the agent row and its keys are unchanged",
     },
@@ -83,6 +86,23 @@ pub const CASES: &[Case] = &[
         name: "team_member_manages",
         given: "a team member (not admin) moves and trashes a file another member made",
         expect: "200; with members_can_share false, addGrant by the same member is 403",
+    },
+    Case {
+        name: "editors_can_share",
+        given: "guest_edit (edit grant on Projects) calls addGrant with role edit on Projects, \
+                addGrant with role manage on Projects, and addGrant on Archive \
+                (editors_can_share false); then a manager sets editors_can_share null on Archive \
+                and guest_edit calls addGrant on Archive again",
+        expect: "201, 403 (a caller grants at most its own role), 403, then 201; a share link \
+                 with role edit never shares (addGrant with its token: 403 user_required)",
+    },
+    Case {
+        name: "app_password_is_the_user",
+        given: "member makes an app password for tenant A and writes a file through /dav with \
+                HTTP Basic (member's email + the password); then uses it against /v1 and against \
+                tenant B; then an admin removes member",
+        expect: "the journal entry has actor = member (kind user, on_behalf_of null); /v1 \
+                 refuses it (401); tenant B refuses it; after removeMember it is revoked (401)",
     },
     Case {
         name: "token_audience_and_type",

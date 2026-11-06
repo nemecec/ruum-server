@@ -106,6 +106,10 @@ id_type!(
     /// A resumable upload session.
     UploadId
 );
+id_type!(
+    /// A WebDAV app password of a user, for one tenant.
+    AppPasswordId
+);
 
 impl From<UserId> for PrincipalId {
     fn from(id: UserId) -> Self {

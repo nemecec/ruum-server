@@ -8,10 +8,10 @@ work areas are in `docs/STEP1.md`.
 
 | Part | Where | State |
 |---|---|---|
-| Contracts | `contracts/` | OpenAPI (89 operations), SpiceDB schema and its tests, event JSON Schemas. Reviewed once (commit `151a5fd`). See `contracts/README.md`. |
+| Contracts | `contracts/` | OpenAPI (93 operations), SpiceDB schema and its tests, event JSON Schemas, MCP tool list. Reviewed once (commit `151a5fd`); architect decisions in `docs/decisions/0001-step1-contract-decisions.md`. See `contracts/README.md`. |
 | Migration | `migrations/0001_core.sql` | All step 1 tables, row-level security, the cross-tenant link trigger. Applies to Postgres 17 of the stack. |
 | Rust workspace | `crates/` | `ruum-core` (types, traits, in-memory implementations), `ruum-api` (router; every operation has a route that answers `501`), `ruum-server` (binary), `ruum-mcp`, `ruum-webdav`, `ruum-cli` (stubs), `ruum-testkit`. |
-| Security harness | `crates/ruum-testkit` | Tenant isolation suite, permission matrix (14 principals x 89 operations), fixtures, contract checks, mutation check. See `docs/TESTING.md`. |
+| Security harness | `crates/ruum-testkit` | Tenant isolation suite, permission matrix (13 principals x 93 operations), fixtures, contract checks, mutation check. See `docs/TESTING.md`. |
 | CI | `.github/workflows/` | `ci.yml`: fmt, clippy, tests, migrations, security suites, cargo-deny, contract lint and diff, web. `nightly.yml`: mutation check, strict suites. |
 | Licenses and sources | `deny.toml` | Permissive licenses only; crates.io only; `openssl` banned. |
 | Laptop stack | `deploy/dev/`, `scripts/dev.sh` | Postgres 17 (PostGIS, pgvector), Garage, Zitadel, SpiceDB, NATS, OpenBao, Mailpit, Caddy; Forgejo with `--step4`. See `docs/DEVSTACK.md`. |
@@ -95,9 +95,9 @@ Checked on 2026-11-06 on `main`:
   placeholder until `tests/e2e` exists. `sqlx-cli` is not installed on this Mac; CI installs it.
 - `oauth_clients` has no `tenant_id`: an OAuth client registration belongs to no tenant. This is
   an exception to the rule "every table has `tenant_id`" in `CLAUDE.md`, made by the contract
-  review; the architect should confirm it.
+  review; the architect confirmed it (decision 0001-3).
 - Open readings of the contract in the permission matrix are marked "assumption" or
   "open question" in `crates/ruum-testkit/permission_matrix.md`, and the contract gaps are listed
-  in `docs/TESTING.md`. The open points of the contract review are in `docs/STEP1.md`.
+  in `docs/TESTING.md`. The open points of the contract review are decided in `docs/decisions/0001-step1-contract-decisions.md`.
 - The share-link principal of the harness is a `view` link. The rules for an `edit` link
   (`putContent` and uploads) are not in the matrix yet.

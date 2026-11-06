@@ -62,7 +62,7 @@ Rules from the contract review (all areas):
 | Implements (OpenAPI) | tags `nodes`, `tags`, `search`: `getRoot`, `createNode`, `getNodeByPath`, `getNode`, `listChildren`, `renameNode`, `moveNode`, `copyNode`, `trashNode`, `restoreNode`, `listTrash`, `purgeNode`, `emptyTrash`, `listTags`, `createTag`, `getTag`, `updateTag`, `deleteTag`, `listNodesByTag`, `listNodeTags`, `attachTag`, `detachTag`, `searchNodes` |
 | Events | `node.created`, `node.renamed`, `node.moved`, `node.copied`, `node.trashed`, `node.restored`, `node.purged`, `tag.attached`, `tag.detached` |
 | Tables | `nodes` (unique live name index), `tags`, `node_tags` |
-| Notes | Links of kind `shortcut` and `member`; the target is in the same tenant (also a database trigger); a `member` link needs `share` on the target and then acts like a `view` grant by its creator. Names: NFC, at most 255 characters, unique case-insensitively (`validate_name` returns the NFC name). A copy of a file shares chunks and makes one version (calls the versions area). Trash: members see and restore for `trash_days`, admins until `admin_restore_days`, then purge; on team plans only admins purge by hand. Node responses fill `my_role`. Search uses the trigram index and filters with `Authz::check_bulk`. |
+| Notes | Links of kind `shortcut` and `member`; the target is in the same tenant (also a database trigger); a `member` link needs the `share` permission on the target and then acts like a `view` grant by its creator. Names: NFC, at most 255 characters, unique case-insensitively (`validate_name` returns the NFC name). A copy of a file shares chunks and makes one version (calls the versions area). Trash: members see and restore for `trash_days`, admins until `admin_restore_days`, then purge; on team plans only admins purge by hand. Node responses fill `my_role`, `my_can_share`, `editors_can_share` (column `nodes.editors_can_share`, null = inherit) and `editors_can_share_effective` (decision 0001-1); the `Node` type in `nodes/mod.rs` needs these fields. Search uses the trigram index and filters with `Authz::check_bulk`. |
 
 ### 2. Blobs, versions and diff
 
@@ -79,21 +79,21 @@ Rules from the contract review (all areas):
 | | |
 |---|---|
 | Owns | `crates/ruum-core/src/authz/`, `crates/ruum-core/src/sharing/`, `crates/ruum-api/src/routes/sharing.rs` |
-| Implements (OpenAPI) | tag `sharing`: `listGrants`, `addGrant`, `updateGrant`, `removeGrant`, `listShareLinks`, `createShareLink`, `revokeShareLink`, `resolveShareLink`, `listSharedWithMe` |
+| Implements (OpenAPI) | tag `sharing`: `listGrants`, `addGrant`, `updateGrant`, `removeGrant`, `updateNodeSharing`, `listShareLinks`, `createShareLink`, `revokeShareLink`, `resolveShareLink`, `listSharedWithMe` |
 | Contract | `contracts/authz/schema.zed`; the in-memory `Authz` must pass the cases of `contracts/authz/schema.test.yaml` |
-| Events | `grant.added`, `grant.updated`, `grant.removed`, `share_link.created`, `share_link.revoked` |
+| Events | `grant.added`, `grant.updated`, `grant.removed`, `share_link.created`, `share_link.revoked`, `node.sharing_updated` |
 | Tables | `grants`, `share_links`, `share_index`, `authz_outbox` |
-| Notes | `authz::require` (with the node ancestry for scope subtrees) and `authz::effective_role` (the subject's right intersected with `ctx.scope`) are used by every other area, so build them first. SpiceDB client with consistency tokens; all writes through the outbox (`authz::outbox`). Grants only add rights (decision 8). Guests and links yes, public files later (decision 9), under the tenant policy (`TenantPolicy`: links, edit links, link expiry, guests). Email grants bind only through the invitation token or a verified email of a trusted provider. Share links have `ShareLinkRole` (never `manage` or `share`). |
+| Notes | `authz::require` (with the node ancestry for scope subtrees) and `authz::effective_role` (the subject's right intersected with `ctx.scope`) are used by every other area, so build them first. SpiceDB client with consistency tokens; all writes through the outbox (`authz::outbox`). Grants only add rights (decision 8). Guests and links yes, public files later (decision 9), under the tenant policy (`TenantPolicy`: links, edit links, link expiry, guests). Email grants bind only through the invitation token or a verified email of a trusted provider. Roles are `view < comment < edit < manage`; `share` is a permission (`authz::Permission::Share`, decision 0001-1): `manage` always, `edit` while the effective `editors_can_share` is true, team members from the root only while `members_can_share`, share links never. A caller grants at most its own role. `updateNodeSharing` writes `nodes.editors_can_share` and the tuples `editors_share_off` / `editors_share_on`. Share links have `ShareLinkRole` (never `manage`, never `share`) and write the relations `link_viewer`, `link_commenter`, `link_editor` (`ShareLinkRole::relation`). |
 
 ### 4. Identity, tenants and agents
 
 | | |
 |---|---|
 | Owns | `crates/ruum-core/src/identity/`, `crates/ruum-core/src/tenants/`, `crates/ruum-core/src/agents/`, `crates/ruum-api/src/auth.rs`, `crates/ruum-api/src/routes/{auth,tenants,agents}.rs`, `getJwks` in `crates/ruum-api/src/routes/system.rs` |
-| Implements (OpenAPI) | tags `auth`, `tenants`, `agents`: `getProtectedResourceMetadata`, `getAuthorizationServerMetadata`, `registerOAuthClient`, `getOAuthClient`, `oauthAuthorize`, `oauthConsent`, `loginStart`, `loginCallback`, `logout`, `getMe`, `listMyIdentities`, `listMySessions`, `endSession`, `listTenants`, `createTenant`, `getTenant`, `updateTenant`, `listMembers`, `updateMember`, `removeMember`, `listInvitations`, `createInvitation`, `revokeInvitation`, `acceptInvitation`, `getLimits`, `listAgents`, `registerAgent`, `getAgent`, `updateAgent`, `disableAgent`, `enableAgent`, `listAgentKeys`, `createAgentKey`, `revokeAgentKey`, `exchangeToken`, `listAgentActivity`, `undoAgent`, `getJwks` |
+| Implements (OpenAPI) | tags `auth`, `tenants`, `agents`: `getProtectedResourceMetadata`, `getAuthorizationServerMetadata`, `registerOAuthClient`, `getOAuthClient`, `oauthAuthorize`, `oauthConsent`, `loginStart`, `loginCallback`, `logout`, `getMe`, `listMyIdentities`, `listMySessions`, `endSession`, `listAppPasswords`, `createAppPassword`, `revokeAppPassword`, `listTenants`, `createTenant`, `getTenant`, `updateTenant`, `listMembers`, `updateMember`, `removeMember`, `listInvitations`, `createInvitation`, `revokeInvitation`, `acceptInvitation`, `getLimits`, `listAgents`, `registerAgent`, `getAgent`, `updateAgent`, `disableAgent`, `enableAgent`, `listAgentKeys`, `createAgentKey`, `revokeAgentKey`, `exchangeToken`, `listAgentActivity`, `undoAgent`, `getJwks` |
 | Contract | `RequestContext` extractor: session cookie + CSRF, bearer token, `Ruum-Tenant`, `Idempotency-Key` (table `idempotency_keys`) |
-| Tables | `tenants`, `journal_counters`, `users`, `identities`, `sessions`, `memberships`, `invitations`, `agents`, `agent_keys`, `oauth_clients`, `agent_oauth_grants`, `oauth_codes`, `idempotency_keys` |
-| Notes | Zitadel OIDC code flow with PKCE (passkeys, Google, Microsoft; decision 6). `users.email_verified`: only verified emails are unique and claim invitations. Personal tenant at first sign-in; small teams (decision 7). Tenant policy in `tenants.settings` (`TenantPolicy`); `members_can_share` writes or deletes the team root tuple. Plan limits from configuration (section 4.3, decision 10), including `admin_restore_days`. OAuth 2.1 for MCP clients (decision 3; `agents::oauth`): dynamic registration, authorize, consent screen that creates or binds an agent with its scope, code with PKCE, rotating refresh tokens; Ruum signs the agent tokens. API keys `ruum_agent_...` for scripts and the CLI, SHA-256 only, with expiry; exchange for 15-minute tokens. Tokens: `aud` + `typ` (`AccessClaims`); agent tokens carry no scope, the agent row is read on each request. Agents only owned by a person (decision 13). `removeMember` also removes the member's direct grants, revokes the share links they or their agents made, disables their agents and ends their OAuth grants. Undo (`AgentStore::undo`, `undo_action`) inverts every event type, by time range or by `seqs`. The auth extractor blocks every other endpoint, so build it first. |
+| Tables | `tenants`, `journal_counters`, `users`, `identities`, `sessions`, `memberships`, `invitations`, `agents`, `agent_keys`, `oauth_clients`, `agent_oauth_grants`, `oauth_codes`, `idempotency_keys`, `app_passwords` |
+| Notes | Zitadel OIDC code flow with PKCE (passkeys, Google, Microsoft; decision 6). `users.email_verified`: only verified emails are unique and claim invitations. Personal tenant at first sign-in; small teams (decision 7). Tenant policy in `tenants.settings` (`TenantPolicy`); `members_can_share` writes or deletes the tuple `tenant:<id>#members_can_share@user:*`; a team root gets `node:<root>#manager@tenant:<id>#administer` and `node:<root>#team@tenant:<id>` (decision 0001-4). Plan limits from configuration (section 4.3, decision 10), including `admin_restore_days`. OAuth 2.1 for MCP clients (decision 3; `agents::oauth`): dynamic registration, authorize, consent screen that creates or binds an agent with its scope, code with PKCE, rotating refresh tokens; Ruum signs the agent tokens. API keys `ruum_agent_...` for scripts and the CLI, SHA-256 only, with expiry; exchange for 15-minute tokens. Tokens: `aud` + `typ` (`AccessClaims`); agent tokens carry no scope, the agent row is read on each request. Agents only owned by a person (decision 13). `removeMember` also removes the member's direct grants, revokes the share links they or their agents made, disables their agents, ends their OAuth grants and revokes their app passwords for the tenant. App passwords (decision 0001-7): `ruum_app_...`, one tenant, name and optional expiry, shown once, SHA-256 only, revocable; they are the user (actor = the user) and work only for WebDAV. Undo (`AgentStore::undo`, `undo_action`) inverts every event type, by time range or by `seqs`. The auth extractor blocks every other endpoint, so build it first. |
 
 ### 5. Journal and audit (may join area 1)
 
@@ -111,7 +111,7 @@ Rules from the contract review (all areas):
 |---|---|
 | Owns | `crates/ruum-mcp/`, `crates/ruum-cli/` |
 | Implements | The MCP endpoint `/mcp` (remote, OAuth, `rmcp`), one tool per REST operation of step 1, calling the same core services; the `ruum` CLI over the REST API with an agent key |
-| Contract | The MCP tool list is not written yet. The first task of this area is a contract change that adds it (for example `contracts/mcp/tools.yaml`) |
+| Contract | `contracts/mcp/tools.yaml` (decision 0001-6), checked by `crates/ruum-mcp/tests/tools_contract.rs` |
 | Notes | MCP clients use OAuth 2.1 with dynamic client registration (decision 3, sections 3.4 and 4.2; the endpoints of area 4): `/mcp` answers `401` with `WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource"`. The CLI uses an agent API key and token exchange. |
 
 ### 7. WebDAV
@@ -120,7 +120,7 @@ Rules from the contract review (all areas):
 |---|---|
 | Owns | `crates/ruum-webdav/` |
 | Implements | `/dav` (decision 12) with `dav-server`: PROPFIND, GET with ranges, PUT (a new version), MKCOL, MOVE, COPY, DELETE (to the trash), on one tenant's tree |
-| Contract | No own contract; it uses the core traits (`NodeStore`, `Transfers`, `VersionStore`) and the same auth (agent token or a per-user app password, to decide in a contract change) |
+| Contract | No own contract; it uses the core traits (`NodeStore`, `Transfers`, `VersionStore`). Auth (decision 0001-7): HTTP Basic with the user's email and an app password (table `app_passwords`, looked up by SHA-256 as a system lookup; writes record actor = the user), or a Bearer agent token |
 
 ### 8. Web UI
 
@@ -137,38 +137,23 @@ Rules from the contract review (all areas):
 2. Then everything else in parallel, against the in-memory implementations first.
 3. The Postgres, Garage and SpiceDB implementations, each with the conformance suite of its trait.
 
-## Open points for the architect
+## Decisions of the architect
 
-- **Role `share`**: section 3.3 of the design sketches `permission share = manage`, but section 3.2
-  lists `share` as its own role. The schema makes the roles a strict order
-  `view < comment < edit < manage < share`, so a `manage` grant can move and trash but not change
-  grants. This deviates from the text of section 3.3. Confirm it with a decision record, or change
-  the schema in a contract change.
-- **Tenant selection**: node, tag, upload, agent, change and search calls name the tenant in the
-  `Ruum-Tenant` header (paths stay as in the design, `/v1/nodes/...`); tenant administration uses
-  `/v1/tenants/{tenant_id}`. The header is optional in the contract (agent and share-link tokens
-  are bound to a tenant) and required for users by the server.
-- **`users`, `identities`, `sessions`** are global by nature. Their `tenant_id` is the user's
-  personal (home) tenant; the RLS policies also let a tenant see its members.
-- **`oauth_clients`** is the one table without `tenant_id`: a dynamic registration exists before
-  a user picks a tenant and holds no tenant data. Only system lookups can read it. The consent
-  bindings (`agent_oauth_grants`) and codes have a tenant.
-- **Team root** (decided in the contract review): members get `manager` (edit, move, trash,
-  restore), owners and admins `sharer`; members also get `sharer` while the tenant policy
-  `members_can_share` is true (the default). No tuple names the creator of a node.
-- **Cross-tenant links** are refused in step 1 (database trigger). "Add to my drive" for nodes
-  shared from another tenant needs a contract change later (a nullable `link_target_tenant_id`
-  and a policy check against the target tenant).
-- **Member links and their creator**: a member link acts like a `view` grant by its creator and
-  stays when the creator loses `share` (the same as a grant). Showing the member links that point
-  at a node to the people who can share it (in `listGrants`) is not in the contract yet.
-- **Known gaps, accepted for step 1**: `grantee_kind` has no `group` or `app` yet, and there is
-  no `groups` table (SCIM and app bindings need an enum and table change later); `plan` is an
-  enum in SQL and OpenAPI although plans are configuration (section 4.3); grant events and
-  `listGrants` show grantee emails to everyone with `view` on the node; the `missing` list of
-  `createUpload` tells a member whether the tenant already stores a chunk (per tenant only).
-- **MCP tool list** and **WebDAV authentication** have no contract yet (areas 6 and 7). They are
-  the first task cards of those areas, before any implementation there. The database manifest and
-  the provider contract belong to step 2.
-- **Migration 0001** was changed in place by the contract review (it was never applied outside
-  laptops). Recreate local databases (`scripts/dev.sh clean`) once.
+The open points of the contract review are decided in
+`docs/decisions/0001-step1-contract-decisions.md`: roles `view < comment < edit < manage` with
+`share` as a permission (Google Drive model, node setting `editors_can_share`); the `Ruum-Tenant`
+header; global `users`, `identities` and `sessions` with a home tenant, and `oauth_clients`
+without `tenant_id`; team root grants (members get `manage`, and `share` while
+`members_can_share`); no cross-tenant links in step 1; member-link listing in `listGrants` later;
+the known gaps below accepted for step 1; the MCP tool list (`contracts/mcp/tools.yaml`); WebDAV
+app passwords.
+
+Known gaps, accepted for step 1: `grantee_kind` has no `group` or `app` yet, and there is no
+`groups` table (SCIM and app bindings need an enum and table change later); `plan` is an enum in
+SQL and OpenAPI although plans are configuration (section 4.3); grant events and `listGrants`
+show grantee emails to everyone with `view` on the node; the `missing` list of `createUpload`
+tells a member whether the tenant already stores a chunk (per tenant only). The database
+manifest and the provider contract belong to step 2.
+
+Migration 0001 is changed in place by contract changes until it is released (it was never
+applied outside laptops). Recreate local databases (`scripts/dev.sh clean`) after such a change.

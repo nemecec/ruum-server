@@ -153,6 +153,9 @@ One small set of roles applies to all nodes. Each node type says what a role mea
 | `manage` | move, delete, restore | schema, size, backups, branches | domains, secrets, bindings | settings, CI | settings |
 | `share` | change grants | change grants | change who may use it | change grants | change grants |
 
+Since decision 0001-1 (`docs/decisions/`), `share` is a permission, not a role: `manage` always
+has it, and `edit` has it while the node setting `editors_can_share` is true (as in Google Drive).
+
 Roles are inherited from parent folders. A grant on a child can add rights, but it cannot remove an
 inherited right (this is the Google Drive rule; it is simple to explain). A folder can be marked
 "restricted" to stop inheritance from above, for confidential sub-folders.
@@ -973,6 +976,8 @@ drawing diff in step 5; DOCX/XLSX redlines and three-way merge with the sync cli
 ## 17. Decisions
 
 Decided on 2026-11-06 for steps 1-4. "Default" means the recommended answer was taken.
+
+The step 1 contract decisions (roles and the `share` permission, tenant header, team roots, MCP tool list, WebDAV app passwords) are in `docs/decisions/0001-step1-contract-decisions.md`.
 
 ### 17.1 For all steps
 

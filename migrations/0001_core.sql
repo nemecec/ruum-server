@@ -15,7 +15,8 @@
 --   set local ruum.user_id   = '<uuid>';   -- the effective user (for "shared with me")
 --   set local ruum.system    = 'on';       -- only for the few cross-tenant lookups: sign-in,
 --                                          -- key exchange, OAuth codes and refresh tokens,
---                                          -- share link and invitation tokens
+--                                          -- share link and invitation tokens, WebDAV app
+--                                          -- passwords
 -- The policies are FORCEd, so they also apply to the table owner. Superusers (tests with
 -- #[sqlx::test]) bypass them.
 
@@ -29,7 +30,9 @@ create type plan as enum ('free', 'personal', 'team');
 create type member_role as enum ('guest', 'member', 'admin', 'owner');
 create type node_kind as enum ('folder', 'file', 'link', 'typed');
 create type link_kind as enum ('shortcut', 'member');
-create type grant_role as enum ('view', 'comment', 'edit', 'manage', 'share');
+-- The roles of docs/DESIGN.md 3.2 (Google Drive model). `share` is a permission, not a role
+-- (docs/decisions/0001-step1-contract-decisions.md).
+create type grant_role as enum ('view', 'comment', 'edit', 'manage');
 create type grantee_kind as enum ('user', 'email', 'tenant_members');
 create type upload_status as enum ('open', 'completed', 'aborted', 'expired');
 create type agent_disabled_reason as enum ('by_owner', 'by_admin', 'owner_left');
@@ -183,6 +186,11 @@ create table nodes (
     link_kind       link_kind,
     link_target     uuid,
     head_version    uuid,
+    -- The sharing setting "editors can share" (Google Drive: "Editors can change permissions and
+    -- share"). Null inherits the value of the parent; the root inherits the default, true. Set by
+    -- a manager (updateNodeSharing). The SpiceDB tuples `editors_share_off` / `editors_share_on`
+    -- follow this column.
+    editors_can_share boolean,
     -- The user who created the node (the owner, for a personal tree). Display and accounting
     -- only: it gives no rights. The SpiceDB `owner` tuple is written only on personal roots.
     owner_id        uuid not null references users (id),
@@ -401,6 +409,34 @@ create table agent_keys (
     foreign key (tenant_id, agent_id) references agents (tenant_id, id)
 );
 create index agent_keys_agent_idx on agent_keys (tenant_id, agent_id);
+
+-- App passwords for WebDAV (design 4.2, machine identities; decision 0001-7). A user makes one
+-- for one tenant. The client signs in with HTTP Basic: the user's email and the password. The
+-- password is the user (not an agent): every write through it records actor = the user. Only the
+-- SHA-256 of the password is stored. Passwords start with `ruum_app_`. The WebDAV sign-in looks
+-- the hash up as a system lookup (`ruum.system = on`), then checks the email, the expiry and that
+-- the user is still a member or guest of the tenant.
+create table app_passwords (
+    id              uuid primary key,
+    tenant_id       uuid not null references tenants (id),
+    user_id         uuid not null references users (id),
+    name            text not null check (length(name) between 1 and 100),
+    prefix          text not null check (prefix like 'ruum\_app\_%'),
+    secret_hash     bytea not null unique check (length(secret_hash) = 32),
+    created_at      timestamptz not null default now(),
+    created_kind    principal_kind not null check (created_kind = 'user'),
+    created_by      uuid not null,
+    created_obo     uuid,
+    expires_at      timestamptz,                  -- null: no expiry
+    last_used_at    timestamptz,
+    revoked_at      timestamptz,
+    revoked_kind    principal_kind,
+    revoked_by      uuid,
+    revoked_obo     uuid,
+    unique (tenant_id, id),
+    check (expires_at is null or expires_at > created_at)
+);
+create index app_passwords_user_idx on app_passwords (tenant_id, user_id) where revoked_at is null;
 
 -- ---------------------------------------------------------------------------- OAuth for agents
 
@@ -622,7 +658,7 @@ begin
         'journal_counters', 'identities', 'sessions', 'invitations', 'nodes', 'versions',
         'chunks', 'uploads', 'tags', 'node_tags', 'agents', 'agent_keys', 'grants',
         'share_links', 'journal', 'audit', 'idempotency_keys', 'agent_oauth_grants',
-        'oauth_codes', 'authz_outbox'
+        'oauth_codes', 'authz_outbox', 'app_passwords'
     ] loop
         execute format('alter table %I enable row level security', t);
         execute format('alter table %I force row level security', t);

@@ -14,45 +14,89 @@ relationships: |-
   node:album#parent@node:mari_root
   node:photo#collection@node:album
   node:album#viewer@user:kati
-  node:plan#viewer@share_link:link1
+  node:plan#link_viewer@share_link:link1
+  node:garden#link_editor@share_link:link2
+  node:projects#manager@user:tiit
+  node:secret#parent@node:projects
+  node:secret#editors_share_off@user:*
+  node:secret#editor@user:jaan
+  node:secret_doc#parent@node:secret
+  node:open_again#parent@node:secret
+  node:open_again#editors_share_on@user:*
+  node:open_doc#parent@node:open_again
   tenant:acme#owner@user:olga
   tenant:acme#member@user:olga
   tenant:acme#member@user:peeter
+  tenant:acme#admin@user:anna
+  tenant:acme#member@user:anna
   node:acme_root#tenant@tenant:acme
-  node:acme_root#sharer@tenant:acme#administer
-  node:acme_root#manager@tenant:acme#member
+  node:acme_root#manager@tenant:acme#administer
+  node:acme_root#team@tenant:acme
   node:acme_docs#parent@node:acme_root
+  node:acme_shared#parent@node:acme_root
+  node:acme_shared#manager@user:peeter
+  node:acme_ext#parent@node:acme_root
+  node:acme_ext#editor@user:gert
   tenant:beta#owner@user:olga
   tenant:beta#member@user:olga
   tenant:beta#member@user:liis
+  tenant:beta#members_can_share@user:*
   node:beta_root#tenant@tenant:beta
-  node:beta_root#sharer@tenant:beta#administer
-  node:beta_root#manager@tenant:beta#member
-  node:beta_root#sharer@tenant:beta#member
+  node:beta_root#manager@tenant:beta#administer
+  node:beta_root#team@tenant:beta
   node:beta_docs#parent@node:beta_root
 assertions:
   assertTrue:
     - node:plan#share@user:mari
+    - node:plan#manage@user:mari
     - node:plan#edit@user:jaan
     - node:plan#view@user:jaan
+    # An editor shares while editors_can_share is true (the default).
+    - node:plan#share@user:jaan
     - node:photo#view@user:kati
     - node:plan#view@share_link:link1
+    - node:plan#edit@share_link:link2
+    # manage always shares, also where editors_can_share is false.
+    - node:secret_doc#share@user:tiit
+    - node:secret_doc#manage@user:tiit
+    # An editor still edits where editors_can_share is false.
+    - node:secret_doc#edit@user:jaan
+    # A child that sets editors_can_share back to true lets editors share again below it.
+    - node:open_doc#share@user:jaan
     - node:acme_docs#edit@user:peeter
-    # A team member can move, trash and restore in the team tree (team root: manager@tenant#member).
+    # A team member can move, trash and restore in the team tree (team root: team@tenant).
     - node:acme_docs#manage@user:peeter
     - tenant:acme#administer@user:olga
+    - tenant:acme#administer@user:anna
     - node:acme_docs#share@user:olga
-    # With members_can_share (team root: sharer@tenant#member) a member can share.
+    - node:acme_docs#share@user:anna
+    # A manager grant always shares, also when members_can_share is false.
+    - node:acme_shared#share@user:peeter
+    # A guest editor shares under editors_can_share (default true).
+    - node:acme_ext#share@user:gert
+    # With members_can_share (tenant:beta#members_can_share@user:*) a member can share.
     - node:beta_docs#share@user:liis
+    - node:beta_docs#manage@user:liis
   assertFalse:
     - node:projects#view@user:jaan
     - node:plan#manage@user:jaan
     - node:photo#edit@user:kati
     - node:plan#edit@share_link:link1
+    # Share links never share or manage, not even edit links.
+    - node:plan#share@share_link:link2
+    - node:plan#manage@share_link:link2
+    - node:plan#share@share_link:link1
+    # A viewer never shares.
+    - node:photo#share@user:kati
+    # editors_can_share false on `secret` stops editors there and below.
+    - node:secret#share@user:jaan
+    - node:secret_doc#share@user:jaan
     - node:plan#view@user:peeter
-    # Without members_can_share only owners and admins share.
+    # Without members_can_share a member manages the team tree but does not share there.
     - node:acme_docs#share@user:peeter
     - node:acme_docs#view@user:mari
     # A former member who created acme_docs has no tuple left (no owner tuple for creators).
     - node:acme_docs#view@user:ex_member
     - tenant:acme#administer@user:peeter
+    # A guest editor never manages.
+    - node:acme_ext#manage@user:gert

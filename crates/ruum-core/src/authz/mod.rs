@@ -4,6 +4,11 @@
 //! that the rest of the core uses, an in-memory implementation for unit tests, and later the
 //! SpiceDB client. In step 1 grants only add rights (decision 8).
 //!
+//! Roles follow Google Drive: `view < comment < edit < manage` ([`Role`]). `share` is a
+//! [`Permission`], not a role (`docs/decisions/0001-step1-contract-decisions.md`): `manage`
+//! always has it, `edit` has it while the node's effective `editors_can_share` is true, and share
+//! links never have it.
+//!
 //! The right of an agent is the right of its user intersected with the agent scope
 //! ([`effective_role`]). The same rule applies to share-link bearers (the link's node, role and
 //! expiry) and later to apps that act on behalf of a user: all of them carry a [`Scope`].
@@ -22,7 +27,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-/// The roles of section 3.2, from lowest to highest. A higher role includes all lower ones.
+/// The roles of section 3.2 (the Google Drive model), from lowest to highest. A higher role
+/// includes all lower ones. There is no `share` role: see [`Permission::Share`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -30,29 +36,64 @@ pub enum Role {
     Comment,
     Edit,
     Manage,
-    Share,
 }
 
 impl Role {
-    /// The SpiceDB relation on `node` that a grant of this role writes.
+    /// The SpiceDB relation on `node` that a grant of this role to a person (or app) writes.
+    /// Share links use [`crate::sharing::ShareLinkRole::relation`].
     pub fn relation(self) -> &'static str {
         match self {
             Role::View => "viewer",
             Role::Comment => "commenter",
             Role::Edit => "editor",
             Role::Manage => "manager",
-            Role::Share => "sharer",
         }
     }
 
     /// The SpiceDB permission that checks this role.
     pub fn permission(self) -> &'static str {
+        Permission::from(self).name()
+    }
+}
+
+/// What [`require`] checks: one of the roles, or the `share` permission.
+///
+/// `share` (change grants and share links) is not a role. In the graph (`schema.zed`) `manage`
+/// always has it, `edit` has it while the node's effective `editors_can_share` is true, team
+/// members have it from the team root only while the tenant policy `members_can_share` is true,
+/// and share links never have it. After the scope: an agent or app with `max_role` `manage`
+/// shares where its user does; with `max_role` `edit` only where its user does and the node's
+/// effective `editors_can_share` is true; below `edit`, and for share-link bearers, never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    View,
+    Comment,
+    Edit,
+    Manage,
+    Share,
+}
+
+impl Permission {
+    /// The SpiceDB permission on `node`.
+    pub fn name(self) -> &'static str {
         match self {
-            Role::View => "view",
-            Role::Comment => "comment",
-            Role::Edit => "edit",
-            Role::Manage => "manage",
-            Role::Share => "share",
+            Permission::View => "view",
+            Permission::Comment => "comment",
+            Permission::Edit => "edit",
+            Permission::Manage => "manage",
+            Permission::Share => "share",
+        }
+    }
+}
+
+impl From<Role> for Permission {
+    fn from(r: Role) -> Self {
+        match r {
+            Role::View => Permission::View,
+            Role::Comment => Permission::Comment,
+            Role::Edit => Permission::Edit,
+            Role::Manage => Permission::Manage,
         }
     }
 }
@@ -163,9 +204,10 @@ pub fn effective_role(
     todo!("authz: effective_role")
 }
 
-/// Checks that the actor in `ctx` has at least `role` on `node`; fails with `not_found` when the
-/// actor cannot see the node, `permission_denied` when the subject lacks the role, and
-/// `scope_exceeded` when only the scope stops it.
+/// Checks that the actor in `ctx` has `permission` on `node` (a [`Role`] or
+/// [`Permission::Share`]); fails with `not_found` when the actor cannot see the node,
+/// `permission_denied` when the subject lacks the permission, and `scope_exceeded` when only the
+/// scope stops it. For [`Permission::Share`] the scope rule is the one of [`Permission`].
 ///
 /// The scope subtree is checked by tree ancestry with [`NodeStore::ancestors`] for agents and
 /// apps: a node is inside when the subtree root is the node or one of its ancestors. Member-link
@@ -177,20 +219,45 @@ pub async fn require(
     _nodes: &dyn NodeStore,
     _ctx: &Context,
     _node: NodeId,
-    _role: Role,
+    _permission: impl Into<Permission> + Send,
 ) -> Result<()> {
     todo!("authz: require")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Role;
+    use super::{Permission, Role};
 
     #[test]
     fn roles_are_ordered() {
         assert!(Role::View < Role::Comment);
         assert!(Role::Comment < Role::Edit);
         assert!(Role::Edit < Role::Manage);
-        assert!(Role::Manage < Role::Share);
+    }
+
+    #[test]
+    fn share_is_a_permission_not_a_role() {
+        assert!(serde_json::from_str::<Role>("\"share\"").is_err());
+        assert_eq!(Permission::Share.name(), "share");
+        assert_eq!(Role::Manage.permission(), "manage");
+        assert_eq!(Role::Manage.relation(), "manager");
+    }
+
+    /// The relations and permissions named here exist in the SpiceDB schema.
+    #[test]
+    fn names_exist_in_the_schema() {
+        const SCHEMA: &str = include_str!("../../../../contracts/authz/schema.zed");
+        for r in [Role::View, Role::Comment, Role::Edit, Role::Manage] {
+            assert!(
+                SCHEMA.contains(&format!("relation {}:", r.relation())),
+                "{r:?}"
+            );
+            assert!(
+                SCHEMA.contains(&format!("permission {} =", r.permission())),
+                "{r:?}"
+            );
+        }
+        assert!(SCHEMA.contains("permission share ="));
+        assert!(!SCHEMA.contains("relation sharer"));
     }
 }

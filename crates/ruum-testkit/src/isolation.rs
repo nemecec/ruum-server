@@ -212,6 +212,15 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             )
         }
         "endSession" => addressed_case(NotFound, Some(("listMySessions", Who::Member))),
+        "listAppPasswords" => plain(
+            "the caller's app passwords in its own tenant",
+            own_tenant(op, w, None),
+        ),
+        "createAppPassword" => plain(
+            "creates in the caller's own tenant; claiming tenant A is refused",
+            own_tenant(op, w, Some(("listAppPasswords", Who::Member))),
+        ),
+        "revokeAppPassword" => addressed_case(NotFound, Some(("listAppPasswords", Who::Member))),
 
         // ------------------------------------------------------------ tenants
         "createTenant" => plain(
@@ -584,6 +593,13 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
                     .unchanged(o, std_req("listGrants", a)),
             );
             plain("addressed resource of tenant A", p)
+        }
+        "updateNodeSharing" => {
+            let mut p = addressed(op, w, NotFound, None);
+            for x in p.iter_mut() {
+                x.unchanged = Some((o, node_get(a, a.archive, "")));
+            }
+            plain("addressed node of tenant A; its setting stays", p)
         }
         "createShareLink" | "revokeShareLink" => {
             addressed_case(NotFound, Some(("listShareLinks", o)))

@@ -49,6 +49,15 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         "listMyIdentities" => RequestSpec::get("/v1/me/identities"),
         "listMySessions" => RequestSpec::get("/v1/me/sessions"),
         "endSession" => RequestSpec::new(Method::DELETE, format!("/v1/me/sessions/{}", t.session)),
+        "listAppPasswords" => RequestSpec::get("/v1/me/app-passwords").tenant(tid),
+        "createAppPassword" => RequestSpec::post("/v1/me/app-passwords")
+            .tenant(tid)
+            .json(json!({ "name": format!("{}-finder", t.prefix) })),
+        "revokeAppPassword" => RequestSpec::new(
+            Method::DELETE,
+            format!("/v1/me/app-passwords/{}", t.app_password),
+        )
+        .tenant(tid),
 
         // ------------------------------------------------------------ tenants
         "listTenants" => RequestSpec::get("/v1/tenants"),
@@ -254,6 +263,9 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
             node(t.projects, &format!("/grants/{}", t.grant)),
         )
         .tenant(tid),
+        "updateNodeSharing" => RequestSpec::new(Method::PATCH, node(t.archive, "/sharing"))
+            .tenant(tid)
+            .json(json!({ "editors_can_share": null })),
         "listShareLinks" => RequestSpec::get(node(t.projects, "/share-links")).tenant(tid),
         "createShareLink" => RequestSpec::post(node(t.projects, "/share-links"))
             .tenant(tid)

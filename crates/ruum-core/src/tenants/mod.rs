@@ -58,8 +58,9 @@ pub struct TenantPolicy {
     pub share_link_max_days: Option<u32>,
     /// Grants and invitations to people outside the tenant are allowed.
     pub allow_guests: bool,
-    /// Team tenants: every member has `share` on the team tree (the tuple
-    /// `node:<root>#sharer@tenant:<id>#member`, written or deleted when this changes).
+    /// Team tenants: members manage the team tree through the team root, and while this is true
+    /// they also have the `share` permission there (the tuple
+    /// `tenant:<id>#members_can_share@user:*`, written or deleted when this changes).
     pub members_can_share: bool,
 }
 

@@ -43,8 +43,7 @@
         "view",
         "comment",
         "edit",
-        "manage",
-        "share"
+        "manage"
       ]
     },
     "principal_kind": {

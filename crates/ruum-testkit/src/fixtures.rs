@@ -6,26 +6,26 @@
 //! ```text
 //! root
 //! ├── Projects/            (F)  grants: guest_view=view, guest_comment=comment, guest_edit=edit,
-//! │   │                              guest_manage=manage, guest_share=share
+//! │   │                              guest_manage=manage
 //! │   ├── <prefix>-plan.txt (X)  two versions v1 and v2, tag T attached
-//! │   ├── Archive/          (S)
+//! │   ├── Archive/          (S)  editors_can_share = false (editors keep edit, lose share)
 //! │   └── <prefix>-old.txt  (Y)  in the trash (its old parent is Projects)
 //! └── Private/             (G)  no grants
 //! ```
 //!
 //! | Principal | What it is |
 //! |---|---|
-//! | `owner`, `admin`, `member` | tenant roles; owners and admins have `share` on the root; members have `manager` on the team root, plus `sharer` while the tenant policy `members_can_share` is true (the default), so `share` too |
+//! | `owner`, `admin`, `member` | tenant roles; owners and admins have `manage` (and so `share`) on the root; members have `manage` from the team root (`node:<root>#team@tenant`), and `share` while the tenant policy `members_can_share` is true (the default) |
 //! | `guest` | a guest without grants |
-//! | `guest_view` ... `guest_share` | guests with one grant on `Projects` |
+//! | `guest_view` ... `guest_manage` | guests with one grant on `Projects`; `guest_edit` shares where `editors_can_share` is true (not in `Archive`), `guest_manage` everywhere below `Projects` |
 //! | `agent` | the agent of `member`: scope `Projects`, `max_role: view` (the narrow agent) |
-//! | `agent_out` | the agent of `member`: scope `Private`, `max_role: share` |
-//! | `agent_of_guest_view` | the agent of `guest_view`: scope everything, `max_role: share` |
+//! | `agent_out` | the agent of `member`: scope `Private`, `max_role: manage` |
+//! | `agent_of_guest_view` | the agent of `guest_view`: scope everything, `max_role: manage` |
 //! | `share_link` | the bearer of the `view` share link on `Projects` (the token of `resolveShareLink`) |
 //! | `anonymous` | no credentials |
 //!
 //! The tag T was made by `member`. The upload sessions were started by `member`. The web session
-//! belongs to `member`. The invitation is for a new email address with the role `member`. The
+//! and the WebDAV app password belong to `member`. The invitation is for a new email address with the role `member`. The
 //! OAuth client is a registered public client (OAuth clients belong to no tenant); the OAuth
 //! request is the signed consent request of `oauthAuthorize` for that client.
 //!
@@ -42,8 +42,8 @@ use ruum_api::AppState;
 use ruum_core::authz::Role;
 use ruum_core::tenants::MemberRole;
 use ruum_core::{
-    AgentId, AgentKeyId, GrantId, InvitationId, NodeId, ShareLinkId, TagId, TenantId, UploadId,
-    UserId, VersionId,
+    AgentId, AgentKeyId, AppPasswordId, GrantId, InvitationId, NodeId, ShareLinkId, TagId,
+    TenantId, UploadId, UserId, VersionId,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -60,7 +60,6 @@ pub enum Who {
     GuestComment,
     GuestEdit,
     GuestManage,
-    GuestShare,
     Agent,
     AgentOut,
     AgentOfGuestView,
@@ -79,7 +78,6 @@ impl Who {
         Who::GuestComment,
         Who::GuestEdit,
         Who::GuestManage,
-        Who::GuestShare,
         Who::Agent,
         Who::AgentOut,
         Who::AgentOfGuestView,
@@ -97,7 +95,6 @@ impl Who {
             Who::GuestComment => "guest_comment",
             Who::GuestEdit => "guest_edit",
             Who::GuestManage => "guest_manage",
-            Who::GuestShare => "guest_share",
             Who::Agent => "agent",
             Who::AgentOut => "agent_out",
             Who::AgentOfGuestView => "agent_of_guest_view",
@@ -111,12 +108,9 @@ impl Who {
             Who::Owner => Some(MemberRole::Owner),
             Who::Admin => Some(MemberRole::Admin),
             Who::Member => Some(MemberRole::Member),
-            Who::Guest
-            | Who::GuestView
-            | Who::GuestComment
-            | Who::GuestEdit
-            | Who::GuestManage
-            | Who::GuestShare => Some(MemberRole::Guest),
+            Who::Guest | Who::GuestView | Who::GuestComment | Who::GuestEdit | Who::GuestManage => {
+                Some(MemberRole::Guest)
+            }
             _ => None,
         }
     }
@@ -128,7 +122,6 @@ impl Who {
             Who::GuestComment => Some(Role::Comment),
             Who::GuestEdit => Some(Role::Edit),
             Who::GuestManage => Some(Role::Manage),
-            Who::GuestShare => Some(Role::Share),
             _ => None,
         }
     }
@@ -159,8 +152,8 @@ impl Who {
     pub fn scope(self) -> Option<(Option<Target>, Role)> {
         match self {
             Who::Agent => Some((Some(Target::Projects), Role::View)),
-            Who::AgentOut => Some((Some(Target::Private), Role::Share)),
-            Who::AgentOfGuestView => Some((None, Role::Share)),
+            Who::AgentOut => Some((Some(Target::Private), Role::Manage)),
+            Who::AgentOfGuestView => Some((None, Role::Manage)),
             _ => None,
         }
     }
@@ -176,8 +169,8 @@ impl Who {
             return user.role_on(target).map(|r| r.min(max_role));
         }
         match self {
-            // Members: `manager` and, by the default tenant policy, `sharer` on the team root.
-            Who::Owner | Who::Admin | Who::Member => Some(Role::Share),
+            // Owners and admins: `manager@tenant#administer`; members: `team@tenant` on the root.
+            Who::Owner | Who::Admin | Who::Member => Some(Role::Manage),
             // The `view` share link on `Projects`.
             Who::ShareLink if target.is_inside(Target::Projects) => Some(Role::View),
             Who::ShareLink => None,
@@ -186,6 +179,25 @@ impl Who {
                 _ => None,
             },
         }
+    }
+
+    /// Whether this principal has the `share` permission on a node of the fixture tree
+    /// (`schema.zed`, decision 0001-1): `manage` always shares; `edit` shares where the effective
+    /// `editors_can_share` is true; members share from the team root by the default tenant policy
+    /// `members_can_share`; share links never. For agents: the user shares, and the scope has
+    /// `max_role` `manage`, or `edit` where `editors_can_share` is true.
+    pub fn can_share(self, target: Target) -> bool {
+        if self.is_share_link() {
+            return false;
+        }
+        let Some(role) = self.role_on(target) else {
+            return false;
+        };
+        if let Some(user) = self.acts_for() {
+            return user.can_share(target)
+                && (role >= Role::Manage || (role == Role::Edit && target.editors_can_share()));
+        }
+        role >= Role::Manage || (role == Role::Edit && target.editors_can_share())
     }
 }
 
@@ -201,6 +213,12 @@ pub enum Target {
 }
 
 impl Target {
+    /// The effective node setting `editors_can_share`. `Archive` sets it to false; every other
+    /// node inherits the default, true.
+    pub fn editors_can_share(self) -> bool {
+        self != Target::Archive
+    }
+
     /// Whether this node is `other` or below it.
     pub fn is_inside(self, other: Target) -> bool {
         self == other
@@ -271,6 +289,9 @@ pub struct TenantFixture {
     pub invitation_email: String,
     /// The web session of `member`.
     pub session: Uuid,
+    /// The WebDAV app password of `member` in this tenant, and its secret.
+    pub app_password: AppPasswordId,
+    pub app_password_secret: String,
     /// The API key of the narrow agent (`agent`).
     pub agent_key: AgentKeyId,
     pub agent_key_secret: String,
@@ -338,6 +359,8 @@ impl TenantFixture {
             invitation_token: format!("{prefix}-invitation-token-{}", Uuid::now_v7().simple()),
             invitation_email: format!("{prefix}-invitee@example.test"),
             session: Uuid::now_v7(),
+            app_password: AppPasswordId::new(),
+            app_password_secret: format!("ruum_app_{prefix}{}", Uuid::now_v7().simple()),
             agent_key: AgentKeyId::new(),
             agent_key_secret: format!("ruum_agent_{prefix}{}", Uuid::now_v7().simple()),
             oauth_client_id: format!("{prefix}-oauth-client-{}", Uuid::now_v7().simple()),
@@ -403,6 +426,8 @@ impl TenantFixture {
             self.invitation_token.clone(),
             self.invitation_email.clone(),
             self.session.to_string(),
+            self.app_password.to_string(),
+            self.app_password_secret.clone(),
             self.agent_key.to_string(),
             self.agent_key_secret.clone(),
             self.oauth_request.clone(),
@@ -477,8 +502,9 @@ mod tests {
         assert_eq!(Who::Agent.role_on(Target::Plan), Some(Role::View));
         assert_eq!(Who::Agent.role_on(Target::Root), None);
         assert_eq!(Who::Agent.role_on(Target::Private), None);
-        // Scope Private with share: the member has share there through the team root.
-        assert_eq!(Who::AgentOut.role_on(Target::Private), Some(Role::Share));
+        // Scope Private with manage: the member manages there through the team root.
+        assert_eq!(Who::AgentOut.role_on(Target::Private), Some(Role::Manage));
+        assert!(Who::AgentOut.can_share(Target::Private));
         assert_eq!(Who::AgentOut.role_on(Target::Plan), None);
         // A wide scope never lifts the user's right.
         assert_eq!(
@@ -493,9 +519,24 @@ mod tests {
         assert_eq!(Who::GuestEdit.role_on(Target::Archive), Some(Role::Edit));
         assert_eq!(Who::GuestEdit.role_on(Target::Root), None);
         assert_eq!(Who::Guest.role_on(Target::Plan), None);
-        assert_eq!(Who::Member.role_on(Target::Root), Some(Role::Share));
+        assert_eq!(Who::Member.role_on(Target::Root), Some(Role::Manage));
         assert_eq!(Who::ShareLink.role_on(Target::Plan), Some(Role::View));
         assert_eq!(Who::ShareLink.role_on(Target::Private), None);
-        assert_eq!(Who::Admin.role_on(Target::Private), Some(Role::Share));
+        assert_eq!(Who::Admin.role_on(Target::Private), Some(Role::Manage));
+    }
+
+    #[test]
+    fn share_is_a_permission() {
+        // manage always shares; edit shares where editors_can_share is true.
+        assert!(Who::GuestManage.can_share(Target::Archive));
+        assert!(Who::GuestEdit.can_share(Target::Projects));
+        assert!(!Who::GuestEdit.can_share(Target::Archive));
+        assert!(!Who::GuestComment.can_share(Target::Projects));
+        assert!(Who::Member.can_share(Target::Projects));
+        // Share links never share; the narrow agent (max_role view) never shares.
+        assert!(!Who::ShareLink.can_share(Target::Projects));
+        assert!(!Who::Agent.can_share(Target::Projects));
+        // A wide scope never lifts the user's right.
+        assert!(!Who::AgentOfGuestView.can_share(Target::Projects));
     }
 }

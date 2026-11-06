@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/node.sharing_updated.schema.json",
+  "title": "node.sharing_updated",
+  "description": "A manager changed the sharing setting `editors_can_share` of the node (`updateNodeSharing`). `null` means the node inherits the value of its parent. This schema is the `data` of a journal entry with `type` `node.sharing_updated`.",
+  "type": "object",
+  "required": [
+    "old_editors_can_share",
+    "new_editors_can_share"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "old_editors_can_share": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "new_editors_can_share": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  }
+}

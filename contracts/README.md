@@ -10,9 +10,10 @@ The contracts are the shared ground between people and agents that work in paral
 | `authz/schema.zed` | The SpiceDB schema (design section 3.3): users, groups, tenants, agents, share links, nodes and their roles and permissions. | `zed validate contracts/authz/schema.test.yaml` |
 | `authz/schema.test.yaml` | Relationships and assertions that pin the permission rules (inheritance, member links, share links, team roots). The in-memory authz implementation must pass the same cases. | same |
 | `events/journal-entry.schema.json` | The envelope of one journal entry (design section 2.5): `tenant_id`, `seq`, `node_id`, `revision`, `type`, `actor`, `on_behalf_of`, `at`, `data`. Entries of `GET /v1/changes` and agent activity validate against it (the API may add `actor.display_name`). Used by the changes feed, agent activity, the outbox and webhooks. | `ajv validate --spec=draft2020` |
-| `events/<type>.schema.json` | The `data` of each event type of step 1: `node.created`, `node.renamed`, `node.moved`, `node.copied`, `node.trashed`, `node.restored`, `node.purged`, `version.created`, `version.restored`, `version.labeled`, `tag.attached`, `tag.detached`, `grant.added`, `grant.updated`, `grant.removed`, `share_link.created`, `share_link.revoked`. | same |
+| `events/<type>.schema.json` | The `data` of each event type of step 1: `node.created`, `node.renamed`, `node.moved`, `node.copied`, `node.trashed`, `node.restored`, `node.purged`, `node.sharing_updated`, `version.created`, `version.restored`, `version.labeled`, `tag.attached`, `tag.detached`, `grant.added`, `grant.updated`, `grant.removed`, `share_link.created`, `share_link.revoked`. | same |
 | `events/common.schema.json` | Shared definitions (IDs, times, hashes, roles, principals, grantees). | same |
 | `events/examples/` | Example entries that must validate. | same |
+| `mcp/tools.yaml` | The MCP tool list: one tool per REST operation that makes sense for an agent (name, `operationId`, description, input by JSON pointer), and the operations that are not exposed, with the reason. | `cargo test -p ruum-mcp --test tools_contract` |
 
 The SQL schema in `migrations/` is a contract too, with its own rule: one migration change at a time.
 

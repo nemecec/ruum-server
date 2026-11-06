@@ -29,8 +29,8 @@ pub mod versions;
 pub use actor::{Actor, Context, PrincipalKind, PrincipalRef};
 pub use error::{ApiError, Error, ErrorCode, Result};
 pub use ids::{
-    AgentId, AgentKeyId, GrantId, InvitationId, NodeId, PrincipalId, ShareLinkId, TagId, TenantId,
-    UploadId, UserId, VersionId,
+    AgentId, AgentKeyId, AppPasswordId, GrantId, InvitationId, NodeId, PrincipalId, ShareLinkId,
+    TagId, TenantId, UploadId, UserId, VersionId,
 };
 pub use paging::{Cursor, Page, PageRequest};
 pub use services::Services;

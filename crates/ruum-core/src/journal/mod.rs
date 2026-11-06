@@ -64,6 +64,8 @@ pub enum EventType {
     ShareLinkCreated,
     #[serde(rename = "share_link.revoked")]
     ShareLinkRevoked,
+    #[serde(rename = "node.sharing_updated")]
+    NodeSharingUpdated,
 }
 
 /// One row of the journal.
@@ -176,6 +178,7 @@ mod tests {
         EventType::GrantRemoved,
         EventType::ShareLinkCreated,
         EventType::ShareLinkRevoked,
+        EventType::NodeSharingUpdated,
     ];
 
     fn schema() -> Value {

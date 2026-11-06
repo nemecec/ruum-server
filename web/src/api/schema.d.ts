@@ -229,6 +229,72 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/app-passwords": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * App passwords of the signed-in user
+         * @description Users only (agents and share links get `user_required`). The caller's app passwords for
+         *     the tenant of `Ruum-Tenant`, also revoked and expired ones. Secrets are not shown again.
+         */
+        get: operations["listAppPasswords"];
+        put?: never;
+        /**
+         * Create an app password
+         * @description Users only (agents and share links get `user_required`). Makes an app password for
+         *     WebDAV clients (Finder, Windows Explorer, rclone) in the tenant of `Ruum-Tenant`; the
+         *     caller must be a member or a guest there. The client signs in with HTTP Basic: the
+         *     caller's email and the password. The password acts as the caller (`actor` is the user,
+         *     not an agent) with the caller's rights in that one tenant. The secret is in this response
+         *     only; the server stores its SHA-256. Members and guests who leave the tenant lose their
+         *     app passwords (`removeMember`).
+         */
+        post: operations["createAppPassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/me/app-passwords/{app_password_id}": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                app_password_id: components["parameters"]["AppPasswordId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke an app password
+         * @description Users only (agents and share links get `user_required`). Only the user who made it; the
+         *     app passwords of other people answer `404`. WebDAV clients that use it fail at once.
+         */
+        delete: operations["revokeAppPassword"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants": {
         parameters: {
             query?: never;
@@ -320,7 +386,8 @@ export interface paths {
          *       invites them again with role `guest` and grants again;
          *     - revokes the share links that the user or the user's agents made in this tenant
          *       (`share_link.revoked` for each), because the user may still hold their URLs;
-         *     - disables the user's agents in this tenant (`owner_left`) and ends their OAuth grants.
+         *     - disables the user's agents in this tenant (`owner_left`) and ends their OAuth grants;
+         *     - revokes the user's app passwords for this tenant.
          *     Grants and member links that the user made for other people stay: they were made for the
          *     tenant. The actor of these entries is the caller.
          */
@@ -692,6 +759,7 @@ export interface paths {
          *     | `grant.removed` | add the grant again |
          *     | `share_link.created` | revoke the link |
          *     | `share_link.revoked` | none: skipped with reason `irreversible` (the token is gone) |
+         *     | `node.sharing_updated` | set the old `editors_can_share` |
          *
          *     An entry whose node another actor changed later is skipped with reason
          *     `changed_later`, and an entry whose inverse the caller may not do is skipped with reason
@@ -1726,8 +1794,10 @@ export interface paths {
         put?: never;
         /**
          * Add a grant
-         * @description Needs `share` on the node. Grants only add rights (decision 8). An agent can never grant
-         *     more than its own scope. Writes `grant.added`.
+         * @description Needs `share` on the node. Grants only add rights (decision 8). The caller grants at most
+         *     its own role on the node: a caller who shares through `edit` (with `editors_can_share`)
+         *     grants up to `edit`; a manager up to `manage`. An agent can never grant more than its own
+         *     scope. Writes `grant.added`.
          *
          *     A grant to a user from another tenant makes them a guest of this tenant. A grant to an
          *     email stays an email grant (no user) and sends an invitation with a secret token. It
@@ -1773,10 +1843,42 @@ export interface paths {
         /**
          * Change the role of a grant
          * @description Needs `share` on the node. Changes the role in one step (one journal entry,
-         *     `grant.updated`). An agent can never set a role above its own scope. Inherited grants are
-         *     changed on the node that holds them.
+         *     `grant.updated`). The caller sets at most its own role on the node, and changes a grant
+         *     above its own role only when it has `manage`. An agent can never set a role above its own
+         *     scope. Inherited grants are changed on the node that holds them.
          */
         patch: operations["updateGrant"];
+        trace?: never;
+    };
+    "/v1/nodes/{node_id}/sharing": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change the sharing settings of a node
+         * @description Needs `manage`. Sets `editors_can_share` on the node: `true` or `false`, or `null` to
+         *     inherit from the parent again. Children without their own value inherit it. Where the
+         *     effective value is false, editors keep `edit` but lose the `share` permission; managers
+         *     always share. Writes `node.sharing_updated`.
+         */
+        patch: operations["updateNodeSharing"];
         trace?: never;
     };
     "/v1/nodes/{node_id}/share-links": {
@@ -1806,7 +1908,8 @@ export interface paths {
          *     an optional password. The response has the token and URL once. The tenant policy
          *     (`TenantPolicy`) applies: without `allow_share_links` this fails with `permission_denied`;
          *     `edit` needs `allow_edit_links`; with `share_link_max_days` set, `expires_at` is required
-         *     and at most that many days ahead (`validation_failed`). Writes `share_link.created`.
+         *     and at most that many days ahead (`validation_failed`). The link role is at most the
+         *     caller's own role on the node, and never `manage`. Writes `share_link.created`.
          */
         post: operations["createShareLink"];
         delete?: never;
@@ -2043,10 +2146,12 @@ export interface components {
             change: components["schemas"]["Change"];
         };
         /**
-         * @description The roles of design section 3.2, from lowest to highest. A higher role includes the lower ones.
+         * @description The roles of design section 3.2 (the Google Drive model), from lowest to highest. A higher
+         *     role includes the lower ones. `share` is a permission, not a role: `manage` always has it,
+         *     `edit` has it while the node's effective `editors_can_share` is true.
          * @enum {string}
          */
-        Role: "view" | "comment" | "edit" | "manage" | "share";
+        Role: "view" | "comment" | "edit" | "manage";
         LogoutResult: {
             /**
              * Format: uri
@@ -2098,6 +2203,36 @@ export interface components {
             /** @description True for the session of this request. */
             current: boolean;
         };
+        /**
+         * @description A password for WebDAV clients, made by a user for one tenant. It is the user: writes
+         *     through it record the user as `actor`.
+         */
+        AppPassword: {
+            id: components["schemas"]["Uuid"];
+            tenant_id: components["schemas"]["Uuid"];
+            /** @example Finder on my laptop */
+            name: string;
+            /**
+             * @description The first characters of the password, to recognise it.
+             * @example ruum_app_7hQ2
+             */
+            prefix: string;
+            created_at: components["schemas"]["Timestamp"];
+            /** @description `null` means no expiry. */
+            expires_at: components["schemas"]["Timestamp"] | null;
+            last_used_at: components["schemas"]["Timestamp"] | null;
+            revoked_at: components["schemas"]["Timestamp"] | null;
+        };
+        CreateAppPasswordRequest: {
+            name: string;
+            /** @description Optional. Without it the password does not expire. */
+            expires_at?: components["schemas"]["Timestamp"];
+        };
+        AppPasswordCreated: {
+            app_password: components["schemas"]["AppPassword"];
+            /** @description The app password. Shown only once. */
+            secret: string;
+        };
         /** @enum {string} */
         TenantKind: "personal" | "team";
         /** @enum {string} */
@@ -2133,8 +2268,10 @@ export interface components {
              */
             allow_guests: boolean;
             /**
-             * @description Team tenants: every member has `share` on the team tree (the tuple
-             *     `node:<root>#sharer@tenant:<id>#member`). When false, only owners and admins share.
+             * @description Team tenants: members manage the team tree through the team root, and while this is
+             *     true they also have the `share` permission there (the tuple
+             *     `tenant:<id>#members_can_share@user:*`). When false, members share only where a grant
+             *     gives them `manage`, or `edit` with `editors_can_share`; owners and admins always share.
              * @default true
              */
             members_can_share: boolean;
@@ -2236,6 +2373,11 @@ export interface components {
         AgentScope: {
             /** @description The folder the agent may touch. `null` means everything the user can reach in the tenant. */
             subtree: components["schemas"]["Uuid"] | null;
+            /**
+             * @description The highest role the agent may use. The `share` permission follows it: with `manage`
+             *     the agent shares where its user may; with `edit` only where its user may and the
+             *     node's effective `editors_can_share` is true; below `edit` never.
+             */
             max_role: components["schemas"]["Role"];
             expires_at?: components["schemas"]["Timestamp"] | null;
             budget?: components["schemas"]["Budget"];
@@ -2520,6 +2662,19 @@ export interface components {
              *     agents know what they may do. Set in responses of node reads and writes when known.
              */
             my_role?: components["schemas"]["Role"] | null;
+            /**
+             * @description Whether the caller has the `share` permission on this node (after the agent or link
+             *     scope): may change grants and share links. Set when `my_role` is set.
+             */
+            my_can_share?: boolean;
+            /**
+             * @description The sharing setting of this node: whether editors may share it (Google Drive:
+             *     "Editors can change permissions and share"). `null` inherits the value of the parent;
+             *     the root inherits the default, `true`. Changed with `updateNodeSharing`.
+             */
+            editors_can_share?: boolean | null;
+            /** @description The value of `editors_can_share` after inheritance. Set in node reads when known. */
+            editors_can_share_effective?: boolean;
         };
         NodePage: {
             items: components["schemas"]["Node"][];
@@ -2845,6 +3000,10 @@ export interface components {
             grant: components["schemas"]["Grant"];
             change: components["schemas"]["Change"];
         };
+        UpdateNodeSharingRequest: {
+            /** @description `true`, `false`, or `null` to inherit from the parent. */
+            editors_can_share: boolean | null;
+        };
         ShareLink: {
             id: components["schemas"]["Uuid"];
             node_id: components["schemas"]["Uuid"];
@@ -2869,7 +3028,7 @@ export interface components {
             password?: string;
         };
         /**
-         * @description The roles a share link can have. Never `manage` or `share`.
+         * @description The roles a share link can have. Never `manage`, and a link never has the `share` permission.
          * @enum {string}
          */
         ShareLinkRole: "view" | "comment" | "edit";
@@ -2907,7 +3066,7 @@ export interface components {
          * @description The journal event types of step 1. Payloads are in `contracts/events/`.
          * @enum {string}
          */
-        EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.updated" | "grant.removed" | "share_link.created" | "share_link.revoked";
+        EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.updated" | "grant.removed" | "share_link.created" | "share_link.revoked" | "node.sharing_updated";
         /** @description One change. The envelope is `contracts/events/journal-entry.schema.json`; `data` follows `contracts/events/<type>.schema.json`. */
         JournalEntry: {
             tenant_id: components["schemas"]["Uuid"];
@@ -3117,6 +3276,7 @@ export interface components {
         TagId: components["schemas"]["Uuid"];
         GrantId: components["schemas"]["Uuid"];
         LinkId: components["schemas"]["Uuid"];
+        AppPasswordId: components["schemas"]["Uuid"];
     };
     requestBodies: never;
     headers: {
@@ -3372,6 +3532,112 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description The session is ended. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listAppPasswords: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The app passwords. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["AppPassword"][];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createAppPassword: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAppPasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description The app password with its secret. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppPasswordCreated"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    revokeAppPassword: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                app_password_id: components["parameters"]["AppPasswordId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked. */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5899,6 +6165,50 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    updateNodeSharing: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description The node ETag (`"<revision>"`). The write fails with `412 precondition_failed` if the node changed. */
+                "If-Match"?: components["parameters"]["IfMatch"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateNodeSharingRequest"];
+            };
+        };
+        responses: {
+            /** @description The node with its new setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["ValidationFailed"];
         };
     };
