@@ -1,6 +1,6 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "9e8729e0b2e2bbc7ab3a49c6e51170c58759065196128988923f19ed471e077a",
+ "openapi_sha256": "671368242e055495915444ac8649cd631bd0dac5a8a7ec80f1a252f37aea7ed0",
  "tools_sha256": "b8240adbb2dccfb5ec503805abad7d34e37714b3aa0406ccec1d01453800c91f",
  "tools": [
   {
@@ -1694,7 +1694,7 @@
          },
          {
           "type": "object",
-          "description": "A person by email. Without a Ruum account, or from another tenant, they become a guest.",
+          "description": "A person by email. A person who is not a member becomes a guest only when the invitation is accepted or the verified email claims it (see `addGrant`).",
           "required": [
            "type",
            "email"

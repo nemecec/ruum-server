@@ -11,7 +11,9 @@ info:
     - **Web UI**: the server runs the OIDC code flow with Zitadel (`/v1/auth/login`,
       `/v1/auth/callback`) and sets the HttpOnly cookie `ruum_session`. A cookie-authenticated
       request that changes state must also send the header `Ruum-Csrf` with the value of the
-      cookie `ruum_csrf` (double submit).
+      cookie `ruum_csrf` (double submit). The value is bound to the session: a value that the
+      server did not issue for this session fails with `403 permission_denied`, also when the
+      header and the cookie are equal.
     - **Native clients and the CLI**: `Authorization: Bearer <token>` with a platform token.
     - **Agents, first choice (decision 3)**: OAuth 2.1. MCP clients find the authorization server
       through `/.well-known/oauth-protected-resource`, register with dynamic client registration
@@ -26,10 +28,11 @@ info:
       never a bearer token.
     - **Share links**: `POST /v1/share-links/resolve` returns a short-lived bearer token for the
       link (see `bearerAuth` for the claims).
-    - **WebDAV** (`/dav`, not part of this REST contract): HTTP Basic with the user's email and an
-      app password (`ruum_app_...`, see `createAppPassword`), or a bearer agent token. An app
-      password is the user, bound to one tenant: writes through it record the user as `actor`.
-      The REST API does not accept app passwords.
+    - **WebDAV** (a separate host, `https://dav.<domain>/`, that never sets or reads cookies;
+      not part of this REST contract): HTTP Basic with the user's email and an app password
+      (`ruum_app_...`, see `createAppPassword`), or a bearer agent token. An app password is the
+      user, bound to one tenant: writes through it record the user as `actor`. The REST API
+      does not accept app passwords, and the platform origin does not serve WebDAV.
 
     ## Roles and the share permission
     Roles follow Google Drive: `view < comment < edit < manage` (`Role`). `share` (change grants
@@ -267,7 +270,11 @@ paths:
       tags: [auth]
       operationId: logout
       summary: Sign out
-      description: Ends the session, clears the cookies and returns the end-session URL of the identity provider.
+      description: >-
+        Ends the caller's web session, clears the cookies and returns the end-session URL of the
+        identity provider. A caller with a bearer token (a user or an agent token) has no
+        session: the call ends nothing and answers `200`; the token stays valid until it
+        expires.
       responses:
         '200':
           description: Signed out.
@@ -403,7 +410,8 @@ paths:
       summary: Create an app password
       description: |
         Users only (agents and share links get `user_required`). Makes an app password for
-        WebDAV clients (Finder, Windows Explorer, rclone) in the tenant of `Ruum-Tenant`; the
+        WebDAV clients (Finder, Windows Explorer, rclone) on the WebDAV host (`dav_url` in the
+        answer, not the platform origin) in the tenant of `Ruum-Tenant`; the
         caller must be a member or a guest there. The client signs in with HTTP Basic: the
         caller's email and the password. The password acts as the caller (`actor` is the user,
         not an agent) with the caller's rights in that one tenant. The secret is in this response
@@ -567,6 +575,9 @@ paths:
       tags: [tenants]
       operationId: listMembers
       summary: List members and guests
+      description: >-
+        Members, admins and owners (and their agents). Guests get `permission_denied`: the list
+        holds the emails of everybody in the tenant.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -844,7 +855,9 @@ paths:
       tags: [agents]
       operationId: listAgents
       summary: List agents
-      description: The caller's agents. Tenant admins see all agents of the tenant.
+      description: >-
+        The caller's agents. Tenant admins see all agents of the tenant. An agent caller sees
+        only itself.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - name: owner
@@ -870,7 +883,11 @@ paths:
       summary: Register an agent
       description: |
         Users only (agents get `user_required`). Registers an agent that acts for the signed-in user
-        (no team agents in step 1). Fails with `plan_limit_reached` at the agent limit.
+        (no team agents in step 1). Members and guests may register agents. A guest's live agents
+        count against a per-guest limit (one member's allowance), not against the tenant's agent
+        limit; each limit fails with `plan_limit_reached`. A guest gets `permission_denied` while
+        the tenant policy has `allow_guests: false`. The agents of a guest who leaves or is
+        removed are disabled (`owner_left`).
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1089,7 +1106,9 @@ paths:
       tags: [agents]
       operationId: listAgentActivity
       summary: Changes made by an agent
-      description: The journal entries where the agent is the actor, newest first.
+      description: >-
+        The journal entries where the agent is the actor, newest first. The owner of the agent or
+        a tenant admin. Agents (also the agent itself) get `403` or `404`.
       parameters:
         - name: since
           in: query
@@ -1309,7 +1328,8 @@ paths:
       description: |
         Users only (agents get `user_required`). The consent screen of the web UI calls it with the
         `request` value from `oauthAuthorize`. On approval the server creates a new agent of the
-        user in `tenant_id` with `new_agent` (fails with `plan_limit_reached` at the agent limit),
+        user in `tenant_id` with `new_agent` (the rules of `registerAgent` apply: the agent limits,
+        and a guest gets `permission_denied` while the tenant policy has `allow_guests: false`),
         or binds the client to the existing agent `agent_id` of the user, and stores the binding
         (table `agent_oauth_grants`). It returns the client's `redirect_uri` with a one-time code
         (valid 60 seconds). On denial it returns the `redirect_uri` with `error=access_denied`.
@@ -1482,6 +1502,8 @@ paths:
         Resolves a path from the tenant root, for example `/v1/nodes/by-path/Projects/Garden`.
         The `path` parameter spans the rest of the URL and may contain `/`; each name is
         percent-encoded. Trashed nodes are not found. A link is returned as the link, not its target.
+        Needs `view` on the target, as `getNode`; the caller need not see the folders on the way
+        (a guest with a grant on `Projects/Garden` resolves `Projects/Garden`).
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - name: path
@@ -2410,7 +2432,9 @@ paths:
       tags: [tags]
       operationId: createTag
       summary: Create a tag
-      description: Any member (not guests). Names are unique in the tenant, case-insensitive.
+      description: >-
+        Any member (not guests). Names are unique in the tenant, case-insensitive. An agent
+        needs a scope `max_role` of at least `edit`.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -2444,6 +2468,9 @@ paths:
       tags: [tags]
       operationId: getTag
       summary: Get a tag
+      description: >-
+        Members see every tag. Guests, and agents, see a tag only when they can see a node with
+        it (inside the agent's scope); otherwise `404`.
       responses:
         '200':
           description: The tag.
@@ -2459,7 +2486,9 @@ paths:
       tags: [tags]
       operationId: updateTag
       summary: Change a tag
-      description: Any member (not guests).
+      description: >-
+        Any member (not guests). An agent needs a scope `max_role` of at least `edit` and must
+        see the tag (`getTag`).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2489,7 +2518,10 @@ paths:
       tags: [tags]
       operationId: deleteTag
       summary: Delete a tag
-      description: Tenant admins, or the creator of the tag. Detaches the tag from all nodes (one `tag.detached` per node).
+      description: >-
+        Tenant admins, or the creator of the tag. An agent needs a scope `max_role` of at least
+        `edit` and must see the tag (`getTag`). Detaches the tag from all nodes (one
+        `tag.detached` per node).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -2510,7 +2542,9 @@ paths:
       tags: [tags]
       operationId: listNodesByTag
       summary: Nodes with a tag
-      description: The live nodes with the tag that the caller can see.
+      description: >-
+        The live nodes with the tag that the caller can see. Who cannot see the tag (`getTag`)
+        gets `404`.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -2633,13 +2667,16 @@ paths:
         grants up to `edit`; a manager up to `manage`. An agent can never grant more than its own
         scope. Writes `grant.added`.
 
-        A grant to a user from another tenant makes them a guest of this tenant. A grant to an
-        email stays an email grant (no user) and sends an invitation with a secret token. It
-        becomes a grant to a user only when (a) a signed-in user accepts that invitation token, or
-        (b) a user signs in with that email as a verified email of a trusted provider
-        (`email_verified`). An unverified email never claims an email grant. Grants to people
-        outside the tenant fail with `permission_denied` when the tenant policy has
-        `allow_guests: false`.
+        A grant to a user by ID reaches only members and guests of this tenant. Any other user
+        ID, unknown or a user of another tenant, fails with `404 not_found`. The answer is the
+        same for both, so the call tells nothing about other tenants' users, and it never makes
+        anyone a guest. To share with a person outside the tenant, grant to their email. It stays
+        an email grant (no user) and sends an invitation with a secret token. It becomes a grant
+        to a user, and the person a guest of this tenant, only when (a) a signed-in user accepts
+        that invitation token, or (b) a user signs in with that email as a verified email of a
+        trusted provider (`email_verified`). An unverified email never claims an email grant.
+        When the tenant policy has `allow_guests: false`, a grant to a guest, or to an email that
+        is not the verified email of a member, fails with `permission_denied`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -3558,6 +3595,14 @@ components:
           type: string
           description: The app password. Shown only once.
           pattern: '^ruum_app_[A-Za-z0-9_-]{43}$'
+        dav_url:
+          type: string
+          format: uri
+          description: >-
+            The URL to mount in a WebDAV client: the root of the WebDAV host, for example
+            `https://dav.ruum.space/`. Guests and agents with a scope mount the folder they can
+            see below it.
+          examples: ['https://dav.ruum.space/']
 
     # ------------------------------------------------------------ tenants
     TenantKind:
@@ -4791,7 +4836,9 @@ components:
           description: Filled in responses.
     GranteeEmail:
       type: object
-      description: A person by email. Without a Ruum account, or from another tenant, they become a guest.
+      description: >-
+        A person by email. A person who is not a member becomes a guest only when the invitation
+        is accepted or the verified email claims it (see `addGrant`).
       required: [type, email]
       properties:
         type:

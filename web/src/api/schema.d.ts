@@ -140,7 +140,7 @@ export interface paths {
         put?: never;
         /**
          * Sign out
-         * @description Ends the session, clears the cookies and returns the end-session URL of the identity provider.
+         * @description Ends the caller's web session, clears the cookies and returns the end-session URL of the identity provider. A caller with a bearer token (a user or an agent token) has no session: the call ends nothing and answers `200`; the token stays valid until it expires.
          */
         post: operations["logout"];
         delete?: never;
@@ -252,7 +252,8 @@ export interface paths {
         /**
          * Create an app password
          * @description Users only (agents and share links get `user_required`). Makes an app password for
-         *     WebDAV clients (Finder, Windows Explorer, rclone) in the tenant of `Ruum-Tenant`; the
+         *     WebDAV clients (Finder, Windows Explorer, rclone) on the WebDAV host (`dav_url` in the
+         *     answer, not the platform origin) in the tenant of `Ruum-Tenant`; the
          *     caller must be a member or a guest there. The client signs in with HTTP Basic: the
          *     caller's email and the password. The password acts as the caller (`actor` is the user,
          *     not an agent) with the caller's rights in that one tenant. The secret is in this response
@@ -353,7 +354,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List members and guests */
+        /**
+         * List members and guests
+         * @description Members, admins and owners (and their agents). Guests get `permission_denied`: the list holds the emails of everybody in the tenant.
+         */
         get: operations["listMembers"];
         put?: never;
         post?: never;
@@ -527,14 +531,18 @@ export interface paths {
         };
         /**
          * List agents
-         * @description The caller's agents. Tenant admins see all agents of the tenant.
+         * @description The caller's agents. Tenant admins see all agents of the tenant. An agent caller sees only itself.
          */
         get: operations["listAgents"];
         put?: never;
         /**
          * Register an agent
          * @description Users only (agents get `user_required`). Registers an agent that acts for the signed-in user
-         *     (no team agents in step 1). Fails with `plan_limit_reached` at the agent limit.
+         *     (no team agents in step 1). Members and guests may register agents. A guest's live agents
+         *     count against a per-guest limit (one member's allowance), not against the tenant's agent
+         *     limit; each limit fails with `plan_limit_reached`. A guest gets `permission_denied` while
+         *     the tenant policy has `allow_guests: false`. The agents of a guest who leaves or is
+         *     removed are disabled (`owner_left`).
          */
         post: operations["registerAgent"];
         delete?: never;
@@ -708,7 +716,7 @@ export interface paths {
         };
         /**
          * Changes made by an agent
-         * @description The journal entries where the agent is the actor, newest first.
+         * @description The journal entries where the agent is the actor, newest first. The owner of the agent or a tenant admin. Agents (also the agent itself) get `403` or `404`.
          */
         get: operations["listAgentActivity"];
         put?: never;
@@ -858,7 +866,8 @@ export interface paths {
          * Approve or deny an OAuth authorization
          * @description Users only (agents get `user_required`). The consent screen of the web UI calls it with the
          *     `request` value from `oauthAuthorize`. On approval the server creates a new agent of the
-         *     user in `tenant_id` with `new_agent` (fails with `plan_limit_reached` at the agent limit),
+         *     user in `tenant_id` with `new_agent` (the rules of `registerAgent` apply: the agent limits,
+         *     and a guest gets `permission_denied` while the tenant policy has `allow_guests: false`),
          *     or binds the client to the existing agent `agent_id` of the user, and stores the binding
          *     (table `agent_oauth_grants`). It returns the client's `redirect_uri` with a one-time code
          *     (valid 60 seconds). On denial it returns the `redirect_uri` with `error=access_denied`.
@@ -966,6 +975,8 @@ export interface paths {
          * @description Resolves a path from the tenant root, for example `/v1/nodes/by-path/Projects/Garden`.
          *     The `path` parameter spans the rest of the URL and may contain `/`; each name is
          *     percent-encoded. Trashed nodes are not found. A link is returned as the link, not its target.
+         *     Needs `view` on the target, as `getNode`; the caller need not see the folders on the way
+         *     (a guest with a grant on `Projects/Garden` resolves `Projects/Garden`).
          */
         get: operations["getNodeByPath"];
         put?: never;
@@ -1640,7 +1651,7 @@ export interface paths {
         put?: never;
         /**
          * Create a tag
-         * @description Any member (not guests). Names are unique in the tenant, case-insensitive.
+         * @description Any member (not guests). Names are unique in the tenant, case-insensitive. An agent needs a scope `max_role` of at least `edit`.
          */
         post: operations["createTag"];
         delete?: never;
@@ -1664,20 +1675,23 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Get a tag */
+        /**
+         * Get a tag
+         * @description Members see every tag. Guests, and agents, see a tag only when they can see a node with it (inside the agent's scope); otherwise `404`.
+         */
         get: operations["getTag"];
         put?: never;
         post?: never;
         /**
          * Delete a tag
-         * @description Tenant admins, or the creator of the tag. Detaches the tag from all nodes (one `tag.detached` per node).
+         * @description Tenant admins, or the creator of the tag. An agent needs a scope `max_role` of at least `edit` and must see the tag (`getTag`). Detaches the tag from all nodes (one `tag.detached` per node).
          */
         delete: operations["deleteTag"];
         options?: never;
         head?: never;
         /**
          * Change a tag
-         * @description Any member (not guests).
+         * @description Any member (not guests). An agent needs a scope `max_role` of at least `edit` and must see the tag (`getTag`).
          */
         patch: operations["updateTag"];
         trace?: never;
@@ -1699,7 +1713,7 @@ export interface paths {
         };
         /**
          * Nodes with a tag
-         * @description The live nodes with the tag that the caller can see.
+         * @description The live nodes with the tag that the caller can see. Who cannot see the tag (`getTag`) gets `404`.
          */
         get: operations["listNodesByTag"];
         put?: never;
@@ -1799,13 +1813,16 @@ export interface paths {
          *     grants up to `edit`; a manager up to `manage`. An agent can never grant more than its own
          *     scope. Writes `grant.added`.
          *
-         *     A grant to a user from another tenant makes them a guest of this tenant. A grant to an
-         *     email stays an email grant (no user) and sends an invitation with a secret token. It
-         *     becomes a grant to a user only when (a) a signed-in user accepts that invitation token, or
-         *     (b) a user signs in with that email as a verified email of a trusted provider
-         *     (`email_verified`). An unverified email never claims an email grant. Grants to people
-         *     outside the tenant fail with `permission_denied` when the tenant policy has
-         *     `allow_guests: false`.
+         *     A grant to a user by ID reaches only members and guests of this tenant. Any other user
+         *     ID, unknown or a user of another tenant, fails with `404 not_found`. The answer is the
+         *     same for both, so the call tells nothing about other tenants' users, and it never makes
+         *     anyone a guest. To share with a person outside the tenant, grant to their email. It stays
+         *     an email grant (no user) and sends an invitation with a secret token. It becomes a grant
+         *     to a user, and the person a guest of this tenant, only when (a) a signed-in user accepts
+         *     that invitation token, or (b) a user signs in with that email as a verified email of a
+         *     trusted provider (`email_verified`). An unverified email never claims an email grant.
+         *     When the tenant policy has `allow_guests: false`, a grant to a guest, or to an email that
+         *     is not the verified email of a member, fails with `permission_denied`.
          */
         post: operations["addGrant"];
         delete?: never;
@@ -2232,6 +2249,12 @@ export interface components {
             app_password: components["schemas"]["AppPassword"];
             /** @description The app password. Shown only once. */
             secret: string;
+            /**
+             * Format: uri
+             * @description The URL to mount in a WebDAV client: the root of the WebDAV host, for example `https://dav.ruum.space/`. Guests and agents with a scope mount the folder they can see below it.
+             * @example https://dav.ruum.space/
+             */
+            dav_url?: string;
         };
         /** @enum {string} */
         TenantKind: "personal" | "team";
@@ -2954,7 +2977,7 @@ export interface components {
             /** @description Filled in responses. */
             email?: string;
         };
-        /** @description A person by email. Without a Ruum account, or from another tenant, they become a guest. */
+        /** @description A person by email. A person who is not a member becomes a guest only when the invitation is accepted or the verified email claims it (see `addGrant`). */
         GranteeEmail: {
             /**
              * @description discriminator enum property added by openapi-typescript
