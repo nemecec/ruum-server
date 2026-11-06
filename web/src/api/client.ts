@@ -1,6 +1,7 @@
-// A small typed fetch helper over the generated contract types (src/api/schema.d.ts).
-// Regenerate the types with `npm run gen:api` after a contract change; never edit them by hand.
+// The typed API client. All types come from the generated contract types (src/api/schema.d.ts).
+// Regenerate them with `npm run gen:api` after a contract change; never edit them by hand.
 
+import createClient, { type Middleware } from 'openapi-fetch'
 import type { components, paths } from './schema'
 
 export type Schemas = components['schemas']
@@ -15,6 +16,7 @@ export class RuumApiError extends Error {
 
   constructor(status: number, body: ApiError) {
     super(body.message)
+    this.name = 'RuumApiError'
     this.status = status
     this.code = body.code
     this.hint = body.hint
@@ -28,6 +30,10 @@ export function setTenant(tenantId: string | null): void {
   currentTenant = tenantId
 }
 
+export function getTenant(): string | null {
+  return currentTenant
+}
+
 function readCookie(name: string): string | undefined {
   return document.cookie
     .split('; ')
@@ -35,25 +41,89 @@ function readCookie(name: string): string | undefined {
     ?.slice(name.length + 1)
 }
 
-/** Calls the API with the session cookie, the tenant header and the CSRF header. */
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers)
-  headers.set('Accept', 'application/json')
-  if (currentTenant) headers.set('Ruum-Tenant', currentTenant)
-  const method = (init.method ?? 'GET').toUpperCase()
-  if (method !== 'GET' && method !== 'HEAD') {
-    const csrf = readCookie('ruum_csrf')
-    if (csrf) headers.set('Ruum-Csrf', csrf)
-  }
-  const res = await fetch(path, { ...init, headers, credentials: 'same-origin' })
-  const text = await res.text()
-  const body: unknown = text ? JSON.parse(text) : undefined
-  if (!res.ok) {
-    const err = (body as Schemas['Error'] | undefined)?.error ?? {
-      code: 'internal' as const,
-      message: `HTTP ${res.status}`,
+/**
+ * The paths of the operations that declare the `TenantHeader` parameter in the contract. Only these
+ * get the current tenant by default. User-level calls (`/v1/me`, `/v1/tenants`, OAuth consent) and
+ * `listSharedWithMe` (which spans all tenants) must not carry it.
+ */
+const TENANT_PATHS = [
+  /^\/v1\/nodes(\/|$)/,
+  /^\/v1\/tags(\/|$)/,
+  /^\/v1\/trash(\/|$)/,
+  /^\/v1\/search(\/|$)/,
+  /^\/v1\/agents(\/|$)/,
+  /^\/v1\/uploads(\/|$)/,
+  /^\/v1\/changes(\/|$)/,
+  /^\/v1\/share-links\/(?!resolve$)[^/]+$/,
+  /^\/v1\/me\/app-passwords(\/|$)/,
+]
+
+/** True when the operation at this path takes the `Ruum-Tenant` header. */
+export function takesTenantHeader(pathname: string): boolean {
+  return TENANT_PATHS.some((re) => re.test(pathname))
+}
+
+/** Adds the tenant header, the CSRF header and an idempotency key to each call. */
+const ruumHeaders: Middleware = {
+  onRequest({ request }) {
+    request.headers.set('Accept', 'application/json')
+    const pathname = new URL(request.url).pathname
+    if (currentTenant && !request.headers.has('Ruum-Tenant') && takesTenantHeader(pathname)) {
+      request.headers.set('Ruum-Tenant', currentTenant)
     }
-    throw new RuumApiError(res.status, err)
+    const method = request.method.toUpperCase()
+    if (method !== 'GET' && method !== 'HEAD') {
+      const csrf = readCookie('ruum_csrf')
+      if (csrf) request.headers.set('Ruum-Csrf', csrf)
+      if (!request.headers.has('Idempotency-Key')) {
+        request.headers.set('Idempotency-Key', crypto.randomUUID())
+      }
+    }
+    return request
+  },
+}
+
+/**
+ * The client. `fetch` is looked up on each call (not captured once), so the mock API of the tests
+ * can replace it.
+ */
+export const client = createClient<paths>({
+  baseUrl: typeof window === 'undefined' ? '' : window.location.origin,
+  credentials: 'same-origin',
+  fetch: (request: Request) => globalThis.fetch(request),
+})
+client.use(ruumHeaders)
+
+/** Listeners for `401 unauthenticated`, so the app can send the user to sign-in. */
+const unauthenticatedListeners = new Set<() => void>()
+
+export function onUnauthenticated(listener: () => void): () => void {
+  unauthenticatedListeners.add(listener)
+  return () => unauthenticatedListeners.delete(listener)
+}
+
+type Result<T> = { data?: T; error?: unknown; response: Response }
+
+/**
+ * Returns the data of a call, or throws a `RuumApiError` with the standard error body.
+ * Use it as `await unwrap(client.GET('/v1/me'))`.
+ */
+export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
+  const { data, error, response } = await call
+  if (!response.ok) {
+    const body = (error as Schemas['Error'] | undefined)?.error ?? {
+      code: response.status === 401 ? ('unauthenticated' as const) : ('internal' as const),
+      message: `HTTP ${response.status}`,
+    }
+    if (response.status === 401) unauthenticatedListeners.forEach((l) => l())
+    throw new RuumApiError(response.status, body)
   }
-  return body as T
+  return data as T
+}
+
+/** A short text of an error for the user. */
+export function errorText(e: unknown): string {
+  if (e instanceof RuumApiError) return e.hint ? `${e.message} ${e.hint}` : e.message
+  if (e instanceof Error) return e.message
+  return String(e)
 }
