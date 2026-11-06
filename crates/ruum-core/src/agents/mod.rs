@@ -315,6 +315,17 @@ pub fn check_live(agent: &Agent) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// How many live agents one guest may own in a tenant: the allowance of one member of the plan.
+///
+/// The tenant's agent limit grows only with its members (not guests, `tenant_limits`), so the
+/// agents of guests are counted apart: each guest has this limit of their own, and the tenant's
+/// limit counts only the agents of owners, admins and members. So a guest cannot use up the
+/// host tenant's agents (security review of 2026-11-06). Whether guests may own agents at all
+/// in step 1 is open for the architect (the contract of `registerAgent` says nothing about it).
+pub fn guest_agent_limit(plan: crate::tenants::Plan) -> u32 {
+    crate::tenants::limits::plan_limits(plan).agents
+}
+
 /// The error of the agent limit of the plan.
 pub fn agent_limit_reached(limit: u32) -> Error {
     Error::Api(

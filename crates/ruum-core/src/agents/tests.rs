@@ -284,6 +284,74 @@ async fn the_agent_limit_holds(a: Area) {
         .unwrap();
 }
 
+/// A guest's agents have their own limit and do not use up the tenant's (security review of
+/// 2026-11-06: a guest without grants filled the host's agent limit, and the owner got
+/// `plan_limit_reached`).
+async fn guests_cannot_use_up_the_tenant_agent_limit(a: Area) {
+    let t = team(&a).await;
+    let (tid, oc) = (t.tenant.id, ctx(t.tenant.id, t.owner.id));
+    let guest = user(&a, "guest").await;
+    let (_i, token) = a
+        .tenants
+        .invite(&oc, guest.email.clone(), MemberRole::Guest, None)
+        .await
+        .unwrap();
+    a.tenants
+        .accept_invitation(&Actor::user(guest.id), &token)
+        .await
+        .unwrap();
+    assert_eq!(
+        a.tenants.role_of(tid, guest.id).await.unwrap(),
+        Some(MemberRole::Guest)
+    );
+    let gc = ctx(tid, guest.id);
+    let own = guest_agent_limit(t.tenant.plan);
+    let team_limit = crate::tenants::tenant_limits(t.tenant.plan, 2).agents;
+    assert!(own < team_limit);
+    let mut first = None;
+    for i in 0..own {
+        let ag = a
+            .agents
+            .register(&gc, new_agent(&format!("guest {i}"), None))
+            .await
+            .unwrap();
+        first.get_or_insert(ag.id);
+    }
+    // The guest reaches their own limit ...
+    assert_eq!(
+        code(a.agents.register(&gc, new_agent("one more", None)).await),
+        ErrorCode::PlanLimitReached
+    );
+    // ... and the tenant's agents are untouched: the owner and the member register up to the
+    // tenant's limit, and the guest's agents are not in the usage.
+    let mc = ctx(tid, t.member.id);
+    for i in 0..team_limit {
+        let c = if i % 2 == 0 { &oc } else { &mc };
+        a.agents
+            .register(c, new_agent(&format!("team {i}"), None))
+            .await
+            .unwrap();
+    }
+    assert_eq!(a.tenants.usage(&oc).await.unwrap().agents, team_limit);
+    assert_eq!(
+        code(a.agents.register(&oc, new_agent("over", None)).await),
+        ErrorCode::PlanLimitReached
+    );
+    // A disabled agent of the guest frees a place for the guest only.
+    a.agents
+        .set_disabled(&gc, first.unwrap(), true)
+        .await
+        .unwrap();
+    a.agents
+        .register(&gc, new_agent("again", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(a.agents.register(&oc, new_agent("over", None)).await),
+        ErrorCode::PlanLimitReached
+    );
+}
+
 async fn keys_exchange_for_short_tokens(a: Area) {
     let t = team(&a).await;
     let (tid, oc, mc) = (
@@ -718,6 +786,7 @@ crate::conformance!(
     agents_belong_to_their_owner,
     a_scope_subtree_stays_in_the_tenant,
     the_agent_limit_holds,
+    guests_cannot_use_up_the_tenant_agent_limit,
     keys_exchange_for_short_tokens,
     oauth_code_flow_with_pkce_and_rotation,
     an_expired_scope_ends_the_agent,

@@ -25,3 +25,9 @@ fn matrix_file_is_up_to_date() {
         path.display()
     );
 }
+
+/// Reads of a trashed file and the changes feed follow the trash rule (`run_trashed`).
+#[tokio::test]
+async fn trashed_file_reads() {
+    ruum_testkit::permissions::run_trashed().await.finish();
+}

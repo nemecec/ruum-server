@@ -40,7 +40,7 @@ pub(crate) async fn handle(
 }
 
 /// The decoded path below `/dav` of a URL path, for example `/Projects/a b.txt`.
-fn dav_path(url_path: &str) -> Option<String> {
+pub(crate) fn dav_path(url_path: &str) -> Option<String> {
     if url_path != DAV_PATH && !url_path.starts_with("/dav/") {
         return None;
     }

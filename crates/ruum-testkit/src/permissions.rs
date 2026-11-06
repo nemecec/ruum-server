@@ -725,6 +725,130 @@ pub async fn run() -> Report {
     report
 }
 
+/// The operations that read the content or the versions of a file, checked on a trashed file by
+/// [`run_trashed`].
+pub const TRASHED_FILE_READS: &[&str] = &[
+    "downloadContent",
+    "getContentUrl",
+    "listVersions",
+    "getVersion",
+    "diffVersions",
+];
+
+/// The rule for a read of a trashed file (the trash rule of the nodes area, as `getNode`): a
+/// trashed node has left the tree, so only principals with `manage` on it (those who may
+/// restore it) read it; everyone else gets `404`, also with `view` or `edit`.
+pub fn trashed_read_rule(op: &'static str) -> Rule {
+    contract_wide(
+        op,
+        Rule::new(
+            "the trash rule: manage on the trashed file, else 404",
+            |who| {
+                if who == Who::Anonymous {
+                    Access::Unauthenticated
+                } else if who.role_on(Target::Plan).is_some_and(|r| r >= Role::Manage) {
+                    Access::Allow
+                } else {
+                    Access::Hidden
+                }
+            },
+        ),
+    )
+}
+
+/// The trashed-file suite (security review of 2026-11-06): the owner trashes the plan (a file
+/// with versions v1 and v2), then every principal sends the standard requests of
+/// [`TRASHED_FILE_READS`] and of `listChanges`.
+///
+/// - The reads follow [`trashed_read_rule`]. Before the fix, a principal with `view` or `edit`
+///   (not `manage`) still downloaded the trashed file, got a content URL and listed its
+///   versions for the whole trash period, although `getNode` answered `404`.
+/// - The changes feed shows the entries on the trashed file (its versions) only to principals
+///   with `manage` on it; the others still get the `node.trashed` entry through the old place.
+pub async fn run_trashed() -> Report {
+    let mut report = Report::new("trashed file suite");
+    let mut ops: Vec<&'static str> = TRASHED_FILE_READS.to_vec();
+    ops.push("listChanges");
+    for op in ops {
+        for &who in Who::ALL {
+            let state = fixtures::app_state();
+            let w = fixtures::seed(&state).await;
+            let t = &w.a;
+            let owner = ruum_core::actor::Context {
+                tenant: t.id,
+                actor: ruum_core::actor::Actor::user(t.user_id(Who::Owner)),
+                scope: None,
+                idempotency_key: None,
+            };
+            if let Err(e) = state.services.nodes.trash(&owner, t.plan, None).await {
+                report.add(op, who.name(), Outcome::Failed(format!("trash: {e:?}")));
+                continue;
+            }
+            let app = client::app(state);
+            let Some(req) = standard(op, t) else {
+                report.add(
+                    op,
+                    who.name(),
+                    Outcome::Failed("no standard request".into()),
+                );
+                continue;
+            };
+            let fallback = client::fallback_fingerprint(&app, t.principal(Who::Owner)).await;
+            let res = client::send(&app, &req, t.principal(who)).await;
+            let outcome = if op == "listChanges" {
+                trashed_feed_outcome(who, t, &res)
+            } else {
+                evaluate(
+                    &trashed_read_rule(op),
+                    who,
+                    t,
+                    w.seeded,
+                    &req.sent_text(),
+                    &res,
+                    &fallback,
+                )
+            };
+            report.add(op, who.name(), outcome);
+        }
+    }
+    report
+}
+
+/// The changes feed after the plan went to the trash: the version IDs of the plan show only to
+/// principals with `manage` on it, and they do show to them (so the check is not empty).
+fn trashed_feed_outcome(who: Who, t: &TenantFixture, res: &Response) -> Outcome {
+    let expected = match who {
+        Who::Anonymous => Access::Unauthenticated,
+        Who::ShareLink => Access::Forbidden,
+        _ => Access::Allow,
+    };
+    if !expected.accepts(res.status) {
+        return Outcome::Failed(format!("got {}, expected {}", res.status, expected.code()));
+    }
+    if !res.status.is_success() {
+        return Outcome::Passed;
+    }
+    let text = res.text();
+    let versions = [t.v1.to_string(), t.v2.to_string()];
+    let shown: Vec<&String> = versions
+        .iter()
+        .filter(|v| text.contains(v.as_str()))
+        .collect();
+    let manages = who.role_on(Target::Plan).is_some_and(|r| r >= Role::Manage);
+    if manages && shown.len() != versions.len() {
+        return Outcome::Failed(format!(
+            "a manager of the trashed file misses its versions in the feed ({} of 2)",
+            shown.len()
+        ));
+    }
+    if !manages && !shown.is_empty() {
+        return Outcome::Failed(format!(
+            "the feed shows the versions of a trashed file to a principal without manage: {shown:?}"
+        ));
+    }
+    Outcome::Passed
+}
+
 /// The matrix as a Markdown table, for `permission_matrix.md`.
 pub fn render_matrix() -> String {
     let ops = crate::contract::operations();

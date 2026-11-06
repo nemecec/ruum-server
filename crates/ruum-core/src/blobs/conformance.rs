@@ -102,6 +102,8 @@ trait Harness: Send + Sync {
     /// Makes a new empty file in `Docs` and runs `copy_head` from `from` to it (what `copyNode`
     /// of the nodes area does). Returns the new file and the version it got.
     async fn copy_head(&self, from: NodeId) -> (NodeId, Option<crate::versions::Version>);
+    /// Moves the file to the trash, as `trashNode` of the nodes area does to the `nodes` row.
+    async fn trash(&self, node: NodeId);
 }
 
 fn code<T: std::fmt::Debug>(r: crate::Result<T>) -> ErrorCode {
@@ -223,7 +225,7 @@ async fn content_suite(h: &dyn Harness) {
         ),
         ErrorCode::NameTaken
     );
-    let (renamed, _) = upload(
+    let (renamed, renamed_v) = upload(
         &*t,
         &owner,
         new_file(h.docs(), "a.bin", OnConflict::Rename),
@@ -427,6 +429,55 @@ async fn content_suite(h: &dyn Harness) {
     assert_eq!(read_all(&*t, &owner, node.id, None).await, b"two");
     assert_eq!(read_all(&*t, &owner, renamed.id, None).await, b"x");
     assert_eq!(read_all(&*t, &owner, copy, None).await, b"two");
+
+    // The trash rule of the nodes area (security review of 2026-11-06): a trashed file has left
+    // the tree. Viewers and editors (no manage) get 404 on every read of content and versions;
+    // the owner (manage) still reads it, as `NodeStore::get` lets them; nobody writes.
+    h.trash(renamed.id).await;
+    for who in [&viewer, &editor] {
+        assert_eq!(
+            code(t.open_content(who, renamed.id, None, None).await),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            code(
+                t.open_content(who, renamed.id, Some(renamed_v.id), None)
+                    .await
+            ),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            code(
+                t.content_grant(who, renamed.id, None, super::Disposition::Attachment)
+                    .await
+            ),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            code(vs.list(who, renamed.id, PageRequest::default()).await),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            code(vs.get(who, renamed.id, renamed_v.id).await),
+            ErrorCode::NotFound
+        );
+    }
+    assert_eq!(read_all(&*t, &owner, renamed.id, None).await, b"x");
+    assert_eq!(
+        vs.list(&owner, renamed.id, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        code(
+            t.put_content(&owner, renamed.id, Bytes::from_static(b"y"), None, None)
+                .await
+        ),
+        ErrorCode::NotFound
+    );
 }
 
 struct MemoryHarness(World);
@@ -489,6 +540,11 @@ impl Harness for MemoryHarness {
             id,
             w.store.copy_head(&w.owner_ctx(), from, to).await.unwrap(),
         )
+    }
+    async fn trash(&self, node: NodeId) {
+        let mut nodes = self.0.nodes.nodes.write().unwrap();
+        let n = nodes.get_mut(&node).expect("the node");
+        n.trashed_at = Some(crate::now());
     }
 }
 
@@ -856,6 +912,17 @@ impl Harness for PgHarness {
             .unwrap();
         tx.commit().await.unwrap();
         (to, v)
+    }
+    async fn trash(&self, node: NodeId) {
+        sqlx::query(
+            "update nodes set trashed_at = now(), trash_root = id, \
+             purge_after = now() + interval '30 days' where tenant_id = $1 and id = $2",
+        )
+        .bind(self.tenant.0)
+        .bind(node.0)
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
 }
 

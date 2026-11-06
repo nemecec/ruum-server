@@ -207,7 +207,8 @@ async fn node_row(
     })
 }
 
-/// The live file `id` of the tenant (for writes; reads accept a trashed file).
+/// The file `id` of the tenant: live for writes; reads of a trashed file also pass
+/// [`PgContentStore::require_trashed_read`].
 fn check_file(n: &NodeRow, write: bool) -> Result<()> {
     if n.kind != NodeKind::File {
         return Err(logic::not_a_file());
@@ -350,6 +351,11 @@ impl PgContentStore {
 
     async fn require(&self, ctx: &Context, node: NodeId, role: Role) -> Result<()> {
         authz::require(&*self.authz, &*self.nodes, ctx, node, role).await
+    }
+
+    /// A read of a trashed file needs `manage` (`logic::require_trashed_read`).
+    async fn require_trashed_read(&self, ctx: &Context, n: &NodeRow) -> Result<()> {
+        logic::require_trashed_read(&*self.authz, &*self.nodes, ctx, n.id, n.trashed).await
     }
 
     /// Makes the new head version (or merges the save into the head), sets the file's head,
@@ -1123,6 +1129,7 @@ impl Transfers for PgContentStore {
         let mut tx = journal::postgres::begin_tenant(&self.pool, ctx.tenant).await?;
         let n = node_row(&mut tx, ctx.tenant, node, false).await?;
         check_file(&n, false)?;
+        self.require_trashed_read(ctx, &n).await?;
         let v = version_or_head(&mut tx, ctx.tenant, &n, version).await?;
         tx.commit().await?;
         let range = logic::resolve_range(range, v.manifest.size)?;
@@ -1193,6 +1200,7 @@ impl Transfers for PgContentStore {
         let mut tx = journal::postgres::begin_tenant(&self.pool, ctx.tenant).await?;
         let n = node_row(&mut tx, ctx.tenant, node, false).await?;
         check_file(&n, false)?;
+        self.require_trashed_read(ctx, &n).await?;
         let v = version_or_head(&mut tx, ctx.tenant, &n, version).await?;
         tx.commit().await?;
         let claims = ContentSigner::claims(
@@ -1240,6 +1248,7 @@ impl VersionStore for PgContentStore {
         let mut tx = journal::postgres::begin_tenant(&self.pool, ctx.tenant).await?;
         let n = node_row(&mut tx, ctx.tenant, node, false).await?;
         check_file(&n, false)?;
+        self.require_trashed_read(ctx, &n).await?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "select {VERSION_COLUMNS} from versions where tenant_id = $1 and node_id = $2 \
              and ($3::principal_kind is null or actor_kind = $3) \
@@ -1275,6 +1284,7 @@ impl VersionStore for PgContentStore {
         let mut tx = journal::postgres::begin_tenant(&self.pool, ctx.tenant).await?;
         let n = node_row(&mut tx, ctx.tenant, node, false).await?;
         check_file(&n, false)?;
+        self.require_trashed_read(ctx, &n).await?;
         let v = version_row(&mut tx, ctx.tenant, node, version, false).await?;
         tx.commit().await?;
         Ok(v.version)

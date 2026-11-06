@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::actor::{Actor, PrincipalRef};
+use crate::authz::Role;
 use crate::ids::{PrincipalId, TenantId, UserId};
 use crate::journal::NewEntry;
 use crate::journal::memory::MemoryJournal;

@@ -171,6 +171,80 @@ pub fn tenant_of_host(host: &str) -> Option<TenantId> {
     host.split('.').next().and_then(|l| l.parse().ok())
 }
 
+/// The CSP of every response that carries user content (REST downloads, the content domain,
+/// WebDAV `GET`): the content never runs as a page of the platform (design section 15).
+pub const CONTENT_CSP: &str = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'";
+
+/// The `Content-Disposition` value for a file: `filename*=UTF-8''...` (RFC 6266 / 8187) plus an
+/// ASCII `filename` fallback.
+pub fn disposition_header(kind: Disposition, name: &str) -> String {
+    let mut encoded = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    let ascii: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let kind = match kind {
+        Disposition::Attachment => "attachment",
+        Disposition::Inline => "inline",
+    };
+    format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+}
+
+/// Whether a browser shows content of this MIME type passively: it cannot run script or load
+/// other documents (plain text, raster images, audio, video, PDF and a few data formats). Every
+/// other type (HTML, SVG, XML, JavaScript, CSS, unknown types) is active or may be; a response
+/// on the platform origin sends it as `application/octet-stream` ([`passive_content_type`]).
+pub fn is_passive_content_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let Some((top, sub)) = essence.split_once('/') else {
+        return false;
+    };
+    if sub.contains("xml") || sub.contains("svg") || sub.contains("html") {
+        return false;
+    }
+    match top {
+        "audio" | "video" => true,
+        "image" => matches!(
+            sub,
+            "png" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "tiff" | "x-icon" | "heic" | "heif"
+        ),
+        "text" => matches!(sub, "plain" | "csv" | "markdown" | "tab-separated-values"),
+        "application" => matches!(
+            sub,
+            "octet-stream" | "pdf" | "json" | "zip" | "gzip" | "x-tar" | "x-7z-compressed"
+        ),
+        _ => false,
+    }
+}
+
+/// The content type to send for user content on the platform origin: the type itself when it
+/// is passive ([`is_passive_content_type`]), else `application/octet-stream`.
+pub fn passive_content_type(content_type: &str) -> &str {
+    if is_passive_content_type(content_type) {
+        content_type
+    } else {
+        "application/octet-stream"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +306,37 @@ mod tests {
         let c = claims(crate::now());
         assert_eq!(a.sign(&c), b.sign(&c));
         assert!(ContentSigner::from_base64("c2hvcnQ").is_err());
+    }
+
+    #[test]
+    fn active_types_are_not_passive() {
+        for t in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "text/xml",
+            "application/xml",
+            "text/xsl",
+            "application/javascript",
+            "text/javascript",
+            "text/css",
+            "multipart/x-mixed-replace",
+            "TEXT/HTML",
+            "nonsense",
+            "",
+        ] {
+            assert!(!is_passive_content_type(t), "{t}");
+            assert_eq!(passive_content_type(t), "application/octet-stream");
+        }
+        for t in [
+            "text/plain; charset=utf-8",
+            "image/png",
+            "video/mp4",
+            "application/pdf",
+        ] {
+            assert!(is_passive_content_type(t), "{t}");
+            assert_eq!(passive_content_type(t), t);
+        }
     }
 }

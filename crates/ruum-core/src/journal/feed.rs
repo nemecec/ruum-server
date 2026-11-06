@@ -3,7 +3,8 @@
 //! The feed reads the journal of the caller's tenant and keeps the entries that the caller may
 //! see. Visibility is checked against the state before and after each change:
 //!
-//! - after: the caller can see the node now (for agents: inside the scope, too);
+//! - after: the caller can see the node now (for agents: inside the scope, too; a trashed node
+//!   only with `manage`, as `NodeStore::get`);
 //! - before: the caller could see the node's old place (`old_parent_id` of a move or a restore,
 //!   `parent_id` of a rename or a trash, the last known parent of a purged node), or the caller
 //!   was the grantee of a removed or changed grant. For a trash or a purge, also: the caller had
@@ -27,7 +28,6 @@ use super::{
     encode_cursor, parent_before,
 };
 use crate::actor::{Context, PrincipalKind};
-use crate::authz::{self, Role};
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::NodeId;
 use crate::paging::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
@@ -114,7 +114,8 @@ pub trait FeedAccess: Send + Sync {
     async fn is_member(&self) -> Result<bool>;
 }
 
-/// [`FeedAccess`] from the core services: `authz::require` for visibility (with the scope),
+/// [`FeedAccess`] from the core services: `NodeStore::get` for visibility (with the scope and the
+/// trash rule),
 /// `NodeStore::ancestors` and `TenantStore::role_of`.
 pub struct ServicesAccess<'a> {
     pub services: &'a Services,
@@ -134,16 +135,12 @@ fn is_hidden(e: &Error) -> bool {
 #[async_trait]
 impl FeedAccess for ServicesAccess<'_> {
     async fn can_view(&self, node: NodeId) -> Result<bool> {
-        match authz::require(
-            self.services.authz.as_ref(),
-            self.services.nodes.as_ref(),
-            self.ctx,
-            node,
-            Role::View,
-        )
-        .await
-        {
-            Ok(()) => Ok(true),
+        // `NodeStore::get` checks `view` with the scope, and the trash rule of the nodes area: a
+        // trashed node has left the tree, and only those who may restore it (`manage`) still
+        // see it. The trash entry itself still reaches the others through its old place
+        // ("before").
+        match self.services.nodes.get(self.ctx, node).await {
+            Ok(_) => Ok(true),
             Err(e) if is_hidden(&e) => Ok(false),
             Err(e) => Err(e),
         }

@@ -188,7 +188,8 @@ impl MemoryContentStore {
         Ok(n)
     }
 
-    /// Loads a live file after the permission check.
+    /// Loads a file after the permission check: live for writes; a trashed file only for
+    /// readers with `manage` (`logic::require_trashed_read`).
     async fn file(&self, ctx: &Context, id: NodeId, role: Role) -> Result<Node> {
         let n = self.node(ctx, id, role).await?;
         if n.kind != NodeKind::File {
@@ -197,6 +198,15 @@ impl MemoryContentStore {
         if role >= Role::Edit && n.trashed_at.is_some() {
             return Err(Error::not_found("node"));
         }
+        // Reads of a trashed file need `manage`, whatever the node store checks.
+        logic::require_trashed_read(
+            &*self.deps.authz,
+            &*self.deps.nodes,
+            ctx,
+            id,
+            n.trashed_at.is_some(),
+        )
+        .await?;
         Ok(n)
     }
 

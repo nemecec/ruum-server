@@ -24,6 +24,11 @@ impl PgAgentStore {
     }
 }
 
+/// The condition (on `agents a`) of an agent counted against the tenant's agent limit: its
+/// owner is not a guest of the tenant (`guest_agent_limit`).
+pub(crate) const MEMBER_AGENT: &str = "not exists (select 1 from memberships m \
+     where m.tenant_id = a.tenant_id and m.user_id = a.owner_id and m.role = 'guest')";
+
 const AGENT_COLS: &str = "id, tenant_id, owner_id, name, description, scope_subtree, \
      scope_max_role::text as scope_max_role, scope_expires_at, budget, disabled_at, \
      disabled_reason::text as disabled_reason, created_at, last_used_at";
@@ -130,18 +135,44 @@ pub(crate) async fn insert_agent(
     .bind(t)
     .fetch_one(&mut *conn)
     .await?;
-    let limit = tenant_limits(plan, members as u32).agents;
+    let guest: bool = sqlx::query_scalar(
+        "select exists (select 1 from memberships where tenant_id = $1 and user_id = $2 \
+         and role = 'guest')",
+    )
+    .bind(t)
+    .bind(owner)
+    .fetch_one(&mut *conn)
+    .await?;
+    // A guest's agents have their own limit, so guests cannot use up the tenant's
+    // (`guest_agent_limit`).
+    let limit = if guest {
+        guest_agent_limit(plan)
+    } else {
+        tenant_limits(plan, members as u32).agents
+    };
     // Lock the tenant's agents while counting, so two requests do not both pass the limit.
     sqlx::query("select 1 from tenants where id = $1 for update")
         .bind(t)
         .execute(&mut *conn)
         .await?;
-    let live: i64 = sqlx::query_scalar(
-        "select count(*) from agents where tenant_id = $1 and disabled_at is null",
-    )
-    .bind(t)
-    .fetch_one(&mut *conn)
-    .await?;
+    let live: i64 = if guest {
+        sqlx::query_scalar(
+            "select count(*) from agents where tenant_id = $1 and owner_id = $2 \
+             and disabled_at is null",
+        )
+        .bind(t)
+        .bind(owner)
+        .fetch_one(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_scalar(crate::sql!(
+            "select count(*) from agents a where a.tenant_id = $1 and a.disabled_at is null \
+             and {MEMBER_AGENT}"
+        ))
+        .bind(t)
+        .fetch_one(&mut *conn)
+        .await?
+    };
     if live as u32 >= limit {
         return Err(agent_limit_reached(limit));
     }

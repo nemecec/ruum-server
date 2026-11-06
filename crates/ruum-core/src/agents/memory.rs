@@ -104,14 +104,30 @@ impl MemoryAgentStore {
                 .get(&ctx.tenant)
                 .cloned()
                 .ok_or_else(|| Error::not_found("tenant"))?;
-            if st.role_of(ctx.tenant, owner).is_none() {
+            let Some(role) = st.role_of(ctx.tenant, owner) else {
                 return Err(Error::not_found("tenant"));
-            }
-            let limit = tenant_limits(t.plan, st.member_count(ctx.tenant)).agents;
+            };
+            // A guest's agents have their own limit, so guests cannot use up the tenant's
+            // (`agent_pool`, security review of 2026-11-06).
+            let guest = role == MemberRole::Guest;
+            let limit = if guest {
+                guest_agent_limit(t.plan)
+            } else {
+                tenant_limits(t.plan, st.member_count(ctx.tenant)).agents
+            };
             let live = st
                 .agents
                 .values()
                 .filter(|a| a.tenant_id == ctx.tenant && a.disabled_at.is_none())
+                .filter(|a| {
+                    let owner_is_guest =
+                        st.role_of(ctx.tenant, a.owner_id) == Some(MemberRole::Guest);
+                    if guest {
+                        a.owner_id == owner
+                    } else {
+                        !owner_is_guest
+                    }
+                })
                 .count() as u32;
             if live >= limit {
                 return Err(agent_limit_reached(limit));

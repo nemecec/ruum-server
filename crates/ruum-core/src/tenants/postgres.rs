@@ -1023,11 +1023,15 @@ impl TenantStore for PgTenantStore {
             role_in(&mut tx, ctx.tenant, user).await?,
             MemberRole::Member,
         )?;
-        let r = sqlx::query(
+        // `agents`: the agents counted against the tenant's limit (not those of guests,
+        // `agents::guest_agent_limit`).
+        let member_agent = crate::agents::postgres::MEMBER_AGENT;
+        let r = sqlx::query(sqlx::AssertSqlSafe(format!(
             "select (select coalesce(sum(size_bytes), 0)::bigint from nodes where tenant_id = $1) \
              as storage, (select count(*) from nodes where tenant_id = $1) as nodes, \
-             (select count(*) from agents where tenant_id = $1 and disabled_at is null) as agents",
-        )
+             (select count(*) from agents a where a.tenant_id = $1 and a.disabled_at is null \
+             and {member_agent}) as agents"
+        )))
         .bind(ctx.tenant)
         .fetch_one(&mut *tx)
         .await?;

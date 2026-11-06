@@ -555,10 +555,13 @@ impl TenantStore for MemoryTenantStore {
         Ok(Usage {
             storage_bytes: 0,
             nodes: 0,
+            // The agents counted against the tenant's limit (not those of guests,
+            // `agents::guest_agent_limit`).
             agents: st
                 .agents
                 .values()
                 .filter(|a| a.tenant_id == ctx.tenant && a.disabled_at.is_none())
+                .filter(|a| st.role_of(ctx.tenant, a.owner_id) != Some(MemberRole::Guest))
                 .count() as u32,
             members: st.member_count(ctx.tenant),
         })

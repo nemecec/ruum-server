@@ -498,6 +498,27 @@ pub fn numbered_name(name: &str, n: u32) -> String {
     }
 }
 
+/// The trash rule of the nodes area for reads of content and versions: a trashed file has left
+/// the tree, so only those who may restore it (`manage`, as `NodeStore::get`) read it; everyone
+/// else gets `404`, also with `view` or `edit` (security review of 2026-11-06).
+pub async fn require_trashed_read(
+    authz: &dyn crate::authz::Authz,
+    nodes: &dyn crate::nodes::NodeStore,
+    ctx: &Context,
+    node: crate::ids::NodeId,
+    trashed: bool,
+) -> Result<()> {
+    if !trashed {
+        return Ok(());
+    }
+    crate::authz::require(authz, nodes, ctx, node, Role::Manage)
+        .await
+        .map_err(|e| match e {
+            Error::Api(_) => crate::nodes::rules::node_not_found(),
+            other => other,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

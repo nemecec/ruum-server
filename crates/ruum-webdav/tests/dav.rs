@@ -1171,3 +1171,89 @@ async fn the_router_merges_with_the_rest_api_as_in_the_server() {
     let r = send(&app, "GET", "/v1/me", &Auth::None, &[], Body::empty()).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
+
+// ------------------------------------------------------------------------- content safety
+
+/// `/dav` shares the origin of the web UI and the API (`deploy/dev/caddy/Caddyfile`), so a file
+/// opened there in a browser must never run as the platform (design section 15; security
+/// finding of 2026-11-06: an uploaded `.html` or `.svg` with a script was served as active
+/// content without CSP, `nosniff` or `attachment`).
+#[tokio::test]
+async fn files_are_served_as_sandboxed_attachments() {
+    let t = setup().await;
+    let a = &t.w.a;
+    let auth = member_basic(a);
+    let html = b"<html><script>fetch('/v1/me/app-passwords',{method:'POST'})</script></html>";
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+    for (name, body) in [
+        ("evil.html", &html[..]),
+        ("evil.svg", &svg[..]),
+        ("evil.xhtml", &html[..]),
+        ("evil.xml", &svg[..]),
+        ("evil.js", &b"alert(1)"[..]),
+    ] {
+        let path = format!("/dav/Projects/{name}");
+        assert_eq!(
+            put(&t.app, &path, &auth, body).await.status,
+            StatusCode::CREATED,
+            "{name}"
+        );
+        for method in ["GET", "HEAD"] {
+            let r = send(&t.app, method, &path, &auth, &[], Body::empty()).await;
+            assert_eq!(r.status, StatusCode::OK, "{method} {name}");
+            let csp = r.header("content-security-policy");
+            assert!(csp.starts_with("sandbox"), "{method} {name}: CSP {csp:?}");
+            assert_eq!(csp, ruum_core::blobs::signed::CONTENT_CSP);
+            assert_eq!(r.header("x-content-type-options"), "nosniff", "{name}");
+            let disposition = r.header("content-disposition");
+            assert!(
+                disposition.starts_with("attachment;") && disposition.contains(name),
+                "{method} {name}: {disposition:?}"
+            );
+            assert_eq!(
+                r.header("content-type"),
+                "application/octet-stream",
+                "{method} {name}"
+            );
+        }
+        // A range read is a GET too.
+        let r = send(
+            &t.app,
+            "GET",
+            &path,
+            &auth,
+            &[("range", "bytes=0-3")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PARTIAL_CONTENT, "{name}");
+        assert!(r.header("content-disposition").starts_with("attachment;"));
+        assert_eq!(r.header("content-type"), "application/octet-stream");
+    }
+    // Passive types keep their type, still as sandboxed attachments; the name is encoded.
+    let path = "/dav/Projects/n%C3%A4me%20one.txt";
+    assert_eq!(
+        put(&t.app, path, &auth, b"plain").await.status,
+        StatusCode::CREATED
+    );
+    let r = get(&t.app, path, &auth).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.header("content-type").starts_with("text/plain"));
+    assert_eq!(r.header("x-content-type-options"), "nosniff");
+    assert!(
+        r.header("content-security-policy").starts_with("sandbox"),
+        "{:?}",
+        r.headers
+    );
+    assert!(
+        r.header("content-disposition")
+            .contains("filename*=UTF-8''n%C3%A4me%20one.txt"),
+        "{}",
+        r.header("content-disposition")
+    );
+    // PROPFIND answers carry the CSP and nosniff too (they are XML).
+    let r = propfind(&t.app, "/dav/Projects/", &auth, "1").await;
+    assert_eq!(r.status, StatusCode::MULTI_STATUS);
+    assert!(r.header("content-security-policy").starts_with("sandbox"));
+    assert_eq!(r.header("x-content-type-options"), "nosniff");
+}

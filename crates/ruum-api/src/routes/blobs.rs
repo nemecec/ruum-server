@@ -16,7 +16,7 @@ use axum::routing::{get, post, put};
 use futures::StreamExt;
 use ruum_core::actor::Context;
 use ruum_core::blobs::logic::{api, check_link_may_write};
-use ruum_core::blobs::signed::{content_url, tenant_of_host};
+use ruum_core::blobs::signed::{CONTENT_CSP, content_url, disposition_header, tenant_of_host};
 use ruum_core::blobs::{
     ByteRange, Content, Disposition, Hash, MAX_CHUNK_BYTES, MAX_PUT_CONTENT_BYTES, NewUpload,
     chunking_for,
@@ -258,36 +258,6 @@ fn none_match(headers: &HeaderMap, tag: &str) -> bool {
         t == "*" || t.strip_prefix("W/").unwrap_or(t) == tag
     })
 }
-
-/// `filename*=UTF-8''...` (RFC 6266 / 8187) plus an ASCII `filename` fallback.
-fn disposition_header(kind: Disposition, name: &str) -> String {
-    let mut encoded = String::new();
-    for b in name.bytes() {
-        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
-            encoded.push(b as char);
-        } else {
-            encoded.push_str(&format!("%{b:02X}"));
-        }
-    }
-    let ascii: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let kind = match kind {
-        Disposition::Attachment => "attachment",
-        Disposition::Inline => "inline",
-    };
-    format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
-}
-
-/// The CSP of every content response: the content never runs as a page of the platform.
-const CONTENT_CSP: &str = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'";
 
 fn set(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
     if let Ok(v) = HeaderValue::from_str(value) {

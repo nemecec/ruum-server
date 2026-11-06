@@ -24,6 +24,11 @@
 //! - The root `/dav/` is the tenant root folder. Guests and agents scoped to a subtree cannot
 //!   see it (`403`); they mount the folder they can see by its URL, for example
 //!   `/dav/Projects/Garden/`.
+//! - User content never runs as a page of the platform (design section 15): `/dav` shares the
+//!   origin of the web UI and the API, so every answer carries the content CSP (`sandbox`) and
+//!   `X-Content-Type-Options: nosniff`, and `GET` and `HEAD` of a file also carry
+//!   `Content-Disposition: attachment` and send active types (HTML, SVG, XML, scripts) as
+//!   `application/octet-stream` ([`content_safety`]).
 //! - Not supported in step 1: partial PUT (`Content-Range`) and PATCH, PROPPATCH of dead
 //!   properties, links and typed nodes (they are not listed).
 
@@ -36,11 +41,14 @@ mod ops;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::any;
 use dav_server::fakels::FakeLs;
 use dav_server::{DavHandler, DavMethod, DavMethodSet};
 use ruum_core::Services;
+use ruum_core::blobs::Disposition;
+use ruum_core::blobs::signed::{CONTENT_CSP, disposition_header, passive_content_type};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -111,6 +119,53 @@ pub fn router_with(services: Services, options: Options) -> Router {
 }
 
 async fn handle(State(st): State<Arc<DavState>>, req: Request) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let mut res = dispatch(&st, req).await;
+    content_safety(&method, &path, &mut res);
+    res
+}
+
+/// Makes an answer safe to open in a browser on the platform origin (design section 15): the
+/// content CSP (`sandbox`) and `nosniff` on every answer; on a successful `GET` or `HEAD` also
+/// `Content-Disposition: attachment` with the file name, and a passive content type
+/// (`blobs::signed::passive_content_type`).
+fn content_safety(method: &Method, path: &str, res: &mut Response) {
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_CSP),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if (method != Method::GET && method != Method::HEAD)
+        || !(res.status().is_success() || res.status() == StatusCode::NOT_MODIFIED)
+    {
+        return;
+    }
+    let h = res.headers_mut();
+    let ct = h
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let safe = passive_content_type(&ct);
+    if safe != ct
+        && let Ok(v) = HeaderValue::from_str(safe)
+    {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    let name = ops::dav_path(path)
+        .and_then(|p| fs::names(&p).last().map(|n| n.to_string()))
+        .unwrap_or_else(|| "download".to_string());
+    if let Ok(v) = HeaderValue::from_str(&disposition_header(Disposition::Attachment, &name)) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+}
+
+async fn dispatch(st: &DavState, req: Request) -> Response {
     let ctx = match auth::context(&st.services, req.headers()).await {
         Ok(ctx) => ctx,
         Err(res) => return *res,

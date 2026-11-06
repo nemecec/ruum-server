@@ -1,7 +1,7 @@
 # Status of step 1
 
-This page says what works on `main` after the wave B merge (2026-11-06), how to run it, the test
-counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+This page says what works on `main` after the wave B merge and the security fixes of 2026-11-06,
+how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -35,6 +35,19 @@ All 93 operations of `contracts/openapi.yaml` are built. No route answers `501`.
   key is set) with the outbox worker, chunks go to S3/Garage (`RUUM_S3_*` or `S3_*`), and
   sign-in uses Zitadel (`RUUM_OIDC_ISSUER`, `RUUM_OIDC_CLIENT_ID`). The log says
   `authz engine: SpiceDB` and `stores: Postgres`.
+
+## Security findings and fixes (2026-11-06)
+
+| Finding | Severity | Fix | Regression test |
+|---|---|---|---|
+| WebDAV `GET` served user files on the platform origin (`/dav` shares the origin of the web UI and `/v1`) with the stored type (`text/html`, `image/svg+xml`) and no CSP, `nosniff` or `Content-Disposition`. A script in an uploaded file ran as the platform (session riding with the readable `ruum_csrf` cookie). Reported twice. | must fix | `ruum-webdav` `content_safety`: every `/dav` answer carries `Content-Security-Policy` = `blobs::signed::CONTENT_CSP` (`sandbox; ...`) and `X-Content-Type-Options: nosniff`; a successful `GET`/`HEAD` also carries `Content-Disposition: attachment` with the file name, and every type that is not passive (`blobs::signed::is_passive_content_type`: plain text, raster images, audio, video, PDF, JSON, archives) goes out as `application/octet-stream`. `CONTENT_CSP` and `disposition_header` moved from `routes/blobs.rs` to `ruum_core::blobs::signed`, so REST and WebDAV share them. | `crates/ruum-webdav/tests/dav.rs` `files_are_served_as_sandboxed_attachments` (`.html`, `.svg`, `.xhtml`, `.xml`, `.js`; `GET`, `HEAD`, range); mutation `webdav-content-safety` |
+| Content and version reads ignored the trash rule: a viewer or editor (not `manage`) of a trashed file still downloaded it, got a content URL and listed its versions, although `getNode` answered `404`. The changes feed had the same gap. | should fix | `blobs::logic::require_trashed_read`: `open_content`, `content_grant`, `list_filtered` and `get` of versions (Postgres and memory; `diffVersions` goes through them and `NodeStore::get`) need `manage` on a trashed file and answer `404` otherwise. The feed's `ServicesAccess::can_view` uses `NodeStore::get`, so entries on a trashed node reach only those who may restore it; the others still get `node.trashed` through the old place. | `ruum-testkit` `trashed_file_reads` (`permissions::run_trashed`: every principal, `downloadContent`, `getContentUrl`, `listVersions`, `getVersion`, `diffVersions`, `listChanges` after the plan is trashed; 78 checks); the content conformance suite (memory with a node store that does not check the trash, and Postgres); mutations `blobs-trashed-read-postgres`, `blobs-trashed-read-memory`, `feed-trashed-node-visible` |
+| A guest without grants registered agents (`registerAgent`, `oauthConsent` with `new_agent`) that counted against the host tenant's agent limit, so a guest could block owners and members (`plan_limit_reached`). | should fix | A guest's agents are counted apart: each guest may own `agents::guest_agent_limit(plan)` live agents (one member's allowance), and the tenant's limit counts only the agents of owners, admins and members (`agents::postgres::MEMBER_AGENT`). `getLimits` usage counts the same agents. Guests may still register agents, as the permission matrix assumes. | `agents::tests::guests_cannot_use_up_the_tenant_agent_limit` (memory and Postgres); mutations `agents-guest-uses-tenant-limit`, `agents-guest-uses-tenant-limit-postgres` |
+
+Open for the architect: whether guests may own agents at all in step 1 (the contract of
+`registerAgent` says nothing about guests; the matrix rule is marked "assumption"). If not,
+`insert_agent` refuses role `guest` with `permission_denied` and the matrix rules of
+`registerAgent` and `oauthConsent` change.
 
 ## How to run it
 
@@ -130,23 +143,42 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-06, `main`, `DATABASE_URL` from `dev.sh env`)
+## Checks (2026-11-06, `main`, after the security fixes, `DATABASE_URL` from `dev.sh env`)
 
 - `cargo build --workspace`, `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: all pass. ruum-core 188 (1 ignored: `tenants/mail.rs`, needs SMTP),
+- `cargo test --workspace`: all pass. ruum-core 191 (1 ignored: `tenants/mail.rs`, needs SMTP),
   ruum-api 34, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-mcp 4 + 15 (server) + 5
-  (tools contract), ruum-server 1, ruum-testkit 7 + 2 (contract) + 1 (isolation) + 2
-  (permissions), ruum-webdav 5 + 18.
+  (tools contract), ruum-server 1, ruum-testkit 7 + 2 (contract) + 1 (isolation) + 3
+  (permissions), ruum-webdav 5 + 19.
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit`: pass. Tenant isolation suite: 188
-  checks, 188 passed, 0 pending, 0 failed. Permission matrix: 1209 checks, 1209 passed, 0
-  pending, 0 failed.
+  checks, 188 passed. Permission matrix: 1209 checks, 1209 passed. Trashed file suite: 78
+  checks, 78 passed. 0 pending, 0 failed.
+- `crates/ruum-testkit/scripts/mutation_check.sh` (with `MUTATION_TARGET_DIR=$PWD/target`, so
+  it uses the shared cargo cache, and `DATABASE_URL` set): exit 0. 11 of 13 mutations killed,
+  among them the 6 new ones (`webdav-content-safety`, `blobs-trashed-read-postgres`,
+  `blobs-trashed-read-memory`, `feed-trashed-node-visible`, `agents-guest-uses-tenant-limit`,
+  `agents-guest-uses-tenant-limit-postgres`). Not killed, as before: `nodes-tenant-filter`
+  (SKIP: its pattern does not match the Postgres node queries) and `sharing-tenant-filter`
+  (SURVIVED: the isolation suite runs in memory only; see the gaps).
 - `scripts/e2e_smoke.sh`: 47 checks passed.
 - `web/`: `npm ci`, `npm run gen:api` (no diff), `npm run lint`, `npm run build`, `npm test`
   (12 files, 88 tests): pass. `npm audit --omit=dev`: 0 vulnerabilities.
 
 ## Known gaps
 
+- **WebDAV is still on the platform origin.** The content-safety headers make `/dav` files
+  inert in a browser, but the stronger fix of design section 15 is a host without the session
+  cookie (for example `dav.<domain>`). The REST download (`downloadContent`) keeps the stored
+  type under its CSP sandbox; only WebDAV maps active types to `application/octet-stream`.
+- **Signed content URLs and the trash.** A content URL made before the file went to the trash
+  works until it expires (at most `CONTENT_URL_SECONDS`, 5 minutes).
+- **Guests and agents.** Guests may own agents (own limit per guest); whether they may at all
+  is open for the architect (see the security findings above).
+- **Mutation check.** `nodes-tenant-filter` does not match the Postgres node queries (SKIP) and
+  `sharing-tenant-filter` survives, because the isolation suite runs in memory only. By
+  default the script builds into `target/mutation`; pass `MUTATION_TARGET_DIR=$PWD/target` to
+  share the cache.
 - **The security suites run in memory only.** `ruum_testkit::fixtures::app_state` uses
   `AppState::in_memory()`. The Postgres stores are covered by their conformance suites
   (`#[sqlx::test]`) and by `scripts/e2e_smoke.sh`, not by the isolation and permission suites.
