@@ -7,9 +7,14 @@ a veto, the decisions stand.
 
 Scope: the step 2 contracts (`contracts/providers/`, `contracts/manifests/database.schema.json`,
 the `databases` tag and four step 1 descriptions of `contracts/openapi.yaml`,
-`contracts/authz/schema.zed`, `contracts/mcp/tools.yaml`, `migrations/0002_databases.sql`) and
+`contracts/authz/schema.zed`, `contracts/mcp/tools.yaml`, `migrations/0004_databases.sql`) and
 `docs/STEP2.md`. Where the reviewers did not agree, or where a fix had more than one form, the
 safer option is taken and the text says so.
+
+Migration number: the draft was written as `0002_databases.sql`. At the integration on 2026-11-07,
+decision 0003 had already taken 0002 and 0003 (`principal_names`, `agent_names_unique`), so the
+file is now `0004_databases.sql`, and "0004" in this record and in `docs/STEP2.md` means that
+migration. The content did not change.
 
 Reviewer 1 (contract consistency, tenant isolation, the 8.5 privacy filter) gave 11 MUST items
 and one SHOULD item; items 1 to 13 below apply them. Reviewer 2 (later steps and swarm
@@ -291,13 +296,13 @@ agree. If a point fails, C-1 changes the kinds or the lens before the freeze.
 
 **Reasons.** The lens design rests on Postgres behaviour that no test has shown yet (`EXECUTE`
 without schema `USAGE` through a view, writes through views with computed columns). Freezing
-`database_roles` first would make a failure reopen 0002 and the contract.
+`database_roles` first would make a failure reopen 0004 and the contract.
 
 **Changes.** STEP2 card S-1, C-1 "After" and "Done when", E-2 "After", order.
 
 ## 16. The tenant pseudonym key (reviewer 2, item 9)
 
-**Decision.** One random 32-byte key per tenant in the new table `tenant_keys` (0002), stored
+**Decision.** One random 32-byte key per tenant in the new table `tenant_keys` (0004), stored
 only wrapped (AES-256-GCM) by a key-encryption key: an OpenBao transit key in production, a
 local KEK file on the laptop (`RUUM_LOCAL_KEK_FILE`, kept and removed together with the platform
 database volume), because dev OpenBao is in memory. The key is made on first use (the first
@@ -307,7 +312,7 @@ export carries it re-wrapped for the target cell, so pseudonyms stay the same af
 sources); a rotation would be a new `key_version` and is not specified. New card Q-4 owns it.
 Items 25 and 30 add the key of a draft branch and the path of a key into the engine.
 
-**Changes.** `tenant_keys` in 0002 (with RLS), STEP2 infrastructure item 5, area 4, card Q-4.
+**Changes.** `tenant_keys` in 0004 (with RLS), STEP2 infrastructure item 5, area 4, card Q-4.
 
 ## 17. Branches keep their metadata; masking by type; no `at` (reviewer 2, items 4 and 5)
 
@@ -460,7 +465,7 @@ entries avoids a second contract change per operation.
 - (b) Grants are per agent with a 24 h cap. Standing grants per workspace in `project.yaml`
   (design 8.5, 11.1) come in step 5 and need a nullable `agent_id` and a workspace subject.
 - (c) `database_queries` is one plain table (decision 13); partitioning stays open question 8.
-  A partitioned table needs `(tenant_id, at, id)` as the key, so the change is made in 0002 in
+  A partitioned table needs `(tenant_id, at, id)` as the key, so the change is made in 0004 in
   place if the panel wants it before step 2 ships.
 - (d) Branches count toward the plan's database count (they are databases, and parallel preview
   sessions must not get around the limit).
@@ -484,7 +489,7 @@ value's pseudonym, then compare it with masked columns: a read-only pseudonym or
 breaks item 4 ("parameters are never pseudonymized").
 
 **Changes.** `openapi.yaml` (`listDatabaseQueries`, `queryDatabase`, the two `params` schemas:
-`HiddenValue` or `null`), 0002 comments of `database_approvals` and `database_queries`, STEP2
+`HiddenValue` or `null`), 0004 comments of `database_approvals` and `database_queries`, STEP2
 Postgres item 4, "Both engines", area 4, cards Q-1, A-2, T-2 (a parameter in the log or an
 approval never equals the lens pseudonym of the same value), MCP `list_database_queries` text.
 
@@ -493,7 +498,7 @@ approval never equals the lens pseudonym of the same value), MCP `list_database_
 **Decision.** The lens of a database where an agent may write rows or DDL without a person's
 approval (a branch with `masked` or `schema_only` data) uses a key derived for that database:
 `HMAC-SHA-256(tenant_key, 'db:' || key_node_id)`. New column `databases.key_node_id`: `NULL`
-means the tenant key; a masked or schema_only branch sets its own node ID (0002 checks it); a
+means the tenant key; a masked or schema_only branch sets its own node ID (0004 checks it); a
 copy (`copyNode`) and a restore into a new node keep the value of their source, so the key
 follows the data (otherwise a person's full copy of a draft branch would give agents
 tenant-key pseudonyms of values an agent wrote). A `full` branch keeps its source's key; agents
@@ -509,7 +514,7 @@ lens would show them as tenant-key pseudonyms. That is an offline dictionary for
 personal data of the live database, without `read_personal`, which item 4's accepted risk
 excluded.
 
-**Changes.** 0002 (`databases.key_node_id` and two checks; `tenant_keys` comment), `openapi.yaml`
+**Changes.** 0004 (`databases.key_node_id` and two checks; `tenant_keys` comment), `openapi.yaml`
 (`createDatabaseBranch`, `copyNode`, `restoreDatabase`, `Pseudonym`), provider `Source` branch
 text, STEP2 Postgres item 4, SQLite item 3, "Both engines", "Accepted risk", area 4, open
 question 4, cards Q-0, Q-4, Q-2, Q-3, D-3, D-4, P-3, T-2 (the same value through a draft branch's
@@ -547,7 +552,7 @@ restore for a source in use) is not taken: decision 18 names `TEMPLATE`, and a d
 database is slower for the same small sizes.
 
 **Changes.** `createDatabaseBranch`, `copyNode`, `createDatabase` (template), provider `Source`
-template text, 0002 `databases` comment, STEP2 Postgres item 7, cards E-2 (done when: a branch
+template text, 0004 `databases` comment, STEP2 Postgres item 7, cards E-2 (done when: a branch
 succeeds with open pools of several kinds and a long statement), D-3, P-3.
 
 ## 28. Branch column identity comes from the branch (re-review: reviewer 2, item 2)
@@ -562,7 +567,7 @@ source, and a catalog sync of the branch changes nothing.
 that is not a `TEMPLATE` copy gets new OIDs; with the source's identity, the first sync would
 reset every such column to `retyped` and fill the digest.
 
-**Changes.** `createDatabaseBranch`, provider `Source` branch text, 0002 `databases` comment,
+**Changes.** `createDatabaseBranch`, provider `Source` branch text, 0004 `databases` comment,
 card D-3.
 
 ## 29. Exports never hold the key (re-review: reviewer 2, item 3)
@@ -579,7 +584,7 @@ registration.
 an agent's masked export, would get the tenant key and an offline dictionary attack on every
 database of the tenant.
 
-**Changes.** `exportTypedNode`, provider README "Export", 0002 `tenant_keys` comment, STEP2
+**Changes.** `exportTypedNode`, provider README "Export", 0004 `tenant_keys` comment, STEP2
 Postgres item 8, cards E-1, E-2, Q-4 (done when), T-2 export cases.
 
 ## 30. The key reaches the engine through the trait (re-review: reviewer 2, item 4)
@@ -594,7 +599,7 @@ item 25.
 fixed test key while production runs with none.
 
 **Changes.** STEP2 area 2, infrastructure item 5, cards E-1, E-2, D-1 (done when: two databases of
-one tenant give the same pseudonym for a value, two tenants do not), D-3, D-4, P-3; 0002
+one tenant give the same pseudonym for a value, two tenants do not), D-3, D-4, P-3; 0004
 `tenant_keys` comment.
 
 ## 31. Q-3 owns the SQLite lens (re-review: reviewer 2, item 5)
@@ -616,7 +621,7 @@ a role by a role reference (database, kind, optional binding). So step 3 adds tw
 nothing else at this border. Option (a) is taken over (b) because it costs one column and keeps
 0004-14's claim true.
 
-**Changes.** 0002 `database_roles`, STEP2 Postgres item 1 and the kinds table, area 2, the
+**Changes.** 0004 `database_roles`, STEP2 Postgres item 1 and the kinds table, area 2, the
 permission table, card E-1.
 
 ## 33. Re-review notes, applied

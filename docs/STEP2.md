@@ -27,7 +27,7 @@ swarm (section 18.3). It follows the decisions of section 17.3:
 | REST API | `contracts/openapi.yaml`, tag `databases` (24 operations, each with `x-ruum-area` and `x-ruum-status: planned`) |
 | MCP tools | `contracts/mcp/tools.yaml` (20 tools, not offered while their operations are planned; the 4 user-only operations are not exposed) |
 | SpiceDB schema | `contracts/authz/schema.zed` (database permissions and agent rules), `schema.test.yaml` |
-| SQL | `migrations/0002_databases.sql` |
+| SQL | `migrations/0004_databases.sql` |
 | Journal events | `contracts/events/` (11 step 2 types, planned: `$defs/planned_types` in `journal-entry.schema.json`), card C-2 |
 
 The step 1 operations keep their shape. `oasdiff breaking` (CI's check, `--fail-on ERR`) reports
@@ -426,7 +426,7 @@ files are not listed again under "May change".
 ID:          C-1
 Goal:        Review and freeze the step 2 contracts of f/step2spec (this draft).
 Contracts:   contracts/providers/*, contracts/manifests/database.schema.json, the `databases` tag of
-             openapi.yaml, schema.zed, mcp/tools.yaml, migrations/0002_databases.sql.
+             openapi.yaml, schema.zed, mcp/tools.yaml, migrations/0004_databases.sql.
 May change:  those files, the generated web/src/api/schema.d.ts and crates/ruum-mcp/src/tools.json;
              crates/ruum-testkit/ (USER_ONLY_OPERATIONS, PLANNED_OPERATIONS, the planned outcome,
              the database fixture fields, standard requests, isolation cases and permission
@@ -471,7 +471,7 @@ Out of scope: provider webhooks over HTTP (step 6).
 ```markdown
 ID:          S-1
 Goal:        Spike: prove the Postgres engine security model before the role kinds freeze.
-Contracts:   docs/STEP2.md "The engine security model"; database_roles in 0002.
+Contracts:   docs/STEP2.md "The engine security model"; database_roles in 0004.
 May change:  spikes/step2-roles/ (new, scripts and a short README), docs/decisions/0004 (result).
 Must not:    crates/, contracts (a contract change that the result needs goes to C-1).
 Done when:   on the postgres-data cluster of I-1, a script shows: (1) a LOGIN role of each kind,
@@ -600,12 +600,12 @@ Out of scope: the key store (Q-4), the lens views (Q-2, Q-3).
 
 ```markdown
 ID:          Q-4
-Goal:        The tenant pseudonym key: tenant_keys (0002), the key-encryption key behind a
+Goal:        The tenant pseudonym key: tenant_keys (0004), the key-encryption key behind a
              KeyWrapper trait (OpenBao transit in production; a local KEK file on the laptop and
              in tests), the key made on first use, exported and imported with the tenant; the
              pseudonym key of a database (`database_key(tenant, key_node_id)`: the tenant key,
              or the key derived for a masked / schema_only branch, decision 0004-25).
-Contracts:   migrations/0002_databases.sql (tenant_keys), decision 0004-16.
+Contracts:   migrations/0004_databases.sql (tenant_keys), decision 0004-16.
 May change:  crates/ruum-core/src/privacy/keys.rs, scripts/dev.sh (RUUM_LOCAL_KEK_FILE in
              up/env/clean), docs/DEVSTACK.md.
 Must not:    other modules, contracts.
@@ -680,7 +680,7 @@ Out of scope: the HTTP adapter for external providers.
 ```markdown
 ID:          P-2
 Goal:        typed_nodes and provider_deliveries in Postgres; the reconciler and the delivery worker.
-Contracts:   migrations/0002_databases.sql, provider.openapi.yaml.
+Contracts:   migrations/0004_databases.sql, provider.openapi.yaml.
 May change:  crates/ruum-core/src/providers/{postgres,reconciler,deliveries}.rs.
 Must not:    other modules, contracts.
 Done when:   memory and Postgres pass the same suite; a failed delivery is retried in seq order per
@@ -1031,7 +1031,7 @@ After:       all D, Q, K, A cards
 7. **Harden**: T-3, the security reviewers (two lenses: tenancy and privacy), the agent benchmark
    with database tasks, synthetic users on the database pages.
 
-Migrations go through the queue: 0002 is the only migration of the step; a change to it during
+Migrations go through the queue: 0004 is the only migration of the step; a change to it during
 step 2 is made in place (it is not released) by a migration task, and local databases are
 recreated.
 
@@ -1064,7 +1064,7 @@ recreated.
    destructive statement also ask (a confirm in the UI)? Recommended: UI confirm only, no API
    rule.
 8. **Query log retention and size.** One row per query can be large. Recommended: the audit
-   retention of the plan, monthly partitions (not in 0002 yet: one plain table), and no row for
+   retention of the plan, monthly partitions (not in 0004 yet: one plain table), and no row for
    repeated identical reads within one second (a counter instead). Statements are stored
    normalized (0004-9).
 9. **`sqlparser` as a new dependency** (statement count, destructive statement detection, column
