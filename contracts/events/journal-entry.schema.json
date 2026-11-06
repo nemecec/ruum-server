@@ -8,6 +8,7 @@
     "tenant_id",
     "seq",
     "node_id",
+    "revision",
     "type",
     "actor",
     "on_behalf_of",
@@ -33,6 +34,18 @@
         }
       ]
     },
+    "revision": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The revision of the node after the change (`nodes.revision`), so clients can order and dedupe per node. Null when the entry has no node or the node is purged."
+    },
     "type": {
       "enum": [
         "node.created",
@@ -48,6 +61,7 @@
         "tag.attached",
         "tag.detached",
         "grant.added",
+        "grant.updated",
         "grant.removed",
         "share_link.created",
         "share_link.revoked"
@@ -319,6 +333,25 @@
         "properties": {
           "data": {
             "$ref": "grant.added.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "grant.updated"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "grant.updated.schema.json"
           }
         }
       }

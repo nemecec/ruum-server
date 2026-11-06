@@ -10,7 +10,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/nodes/root", get(get_root))
         .route("/v1/nodes", post(create_node))
         .route("/v1/nodes/by-path/{*path}", get(get_node_by_path))
-        .route("/v1/nodes/{node_id}", get(get_node))
+        .route("/v1/nodes/{node_id}", get(get_node).delete(purge_node))
         .route("/v1/nodes/{node_id}/children", get(list_children))
         .route("/v1/nodes/{node_id}/rename", post(rename_node))
         .route("/v1/nodes/{node_id}/move", post(move_node))
@@ -18,6 +18,17 @@ pub fn router() -> Router<AppState> {
         .route("/v1/nodes/{node_id}/trash", post(trash_node))
         .route("/v1/nodes/{node_id}/restore", post(restore_node))
         .route("/v1/trash", get(list_trash))
+        .route("/v1/trash/empty", post(empty_trash))
+}
+
+/// Delete a trashed node permanently. `DELETE /v1/nodes/{node_id}` (operationId `purgeNode`).
+pub async fn purge_node() -> HttpError {
+    not_implemented("purgeNode")
+}
+
+/// Empty the trash. `POST /v1/trash/empty` (operationId `emptyTrash`).
+pub async fn empty_trash() -> HttpError {
+    not_implemented("emptyTrash")
 }
 
 /// The root folder of the tenant. `GET /v1/nodes/root` (operationId `getRoot`).

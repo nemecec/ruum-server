@@ -7,7 +7,12 @@ pub struct MemorySharingStore {}
 
 #[async_trait]
 impl SharingStore for MemorySharingStore {
-    async fn list_grants(&self, _ctx: &Context, _node: NodeId) -> Result<Vec<Grant>> {
+    async fn list_grants(
+        &self,
+        _ctx: &Context,
+        _node: NodeId,
+        _page: PageRequest,
+    ) -> Result<Page<Grant>> {
         todo!("sharing: list_grants")
     }
     async fn add_grant(
@@ -19,6 +24,15 @@ impl SharingStore for MemorySharingStore {
     ) -> Result<Written<Grant>> {
         todo!("sharing: add_grant")
     }
+    async fn update_grant(
+        &self,
+        _ctx: &Context,
+        _node: NodeId,
+        _grant: GrantId,
+        _role: Role,
+    ) -> Result<Written<Grant>> {
+        todo!("sharing: update_grant")
+    }
     async fn remove_grant(
         &self,
         _ctx: &Context,
@@ -27,7 +41,12 @@ impl SharingStore for MemorySharingStore {
     ) -> Result<Written<()>> {
         todo!("sharing: remove_grant")
     }
-    async fn list_share_links(&self, _ctx: &Context, _node: NodeId) -> Result<Vec<ShareLink>> {
+    async fn list_share_links(
+        &self,
+        _ctx: &Context,
+        _node: NodeId,
+        _page: PageRequest,
+    ) -> Result<Page<ShareLink>> {
         todo!("sharing: list_share_links")
     }
     async fn create_share_link(
@@ -45,7 +64,7 @@ impl SharingStore for MemorySharingStore {
         &self,
         _token: &str,
         _password: Option<&str>,
-    ) -> Result<(TenantId, Node, Role)> {
+    ) -> Result<(TenantId, Node, ShareLink)> {
         todo!("sharing: resolve_share_link")
     }
     async fn shared_with_me(&self, _ctx: &Context, _page: PageRequest) -> Result<Page<SharedItem>> {

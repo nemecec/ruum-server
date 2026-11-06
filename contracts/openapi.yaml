@@ -13,15 +13,38 @@ info:
       request that changes state must also send the header `Ruum-Csrf` with the value of the
       cookie `ruum_csrf` (double submit).
     - **Native clients and the CLI**: `Authorization: Bearer <token>` with a platform token.
-    - **Agents**: exchange an API key (`ruum_agent_...`) for a short-lived access token at
-      `POST /v1/oauth/token`, then send it as a bearer token. The key itself is never a bearer
-      token.
+    - **Agents, first choice (decision 3)**: OAuth 2.1. MCP clients find the authorization server
+      through `/.well-known/oauth-protected-resource`, register with dynamic client registration
+      (`POST /v1/oauth/register`, RFC 7591), send the user to `GET /v1/oauth/authorize` and get
+      tokens from `POST /v1/oauth/token` (`authorization_code` with PKCE, then `refresh_token`).
+      The user signs in (Zitadel) and approves the client in a consent screen of the web UI. The
+      consent creates an agent, or binds the client to an existing agent of the user, with an
+      `AgentScope`. Ruum is the authorization server for agent tokens and signs them itself;
+      Zitadel only signs the user in.
+    - **Agents, scripts**: exchange an API key (`ruum_agent_...`) for a short-lived access token at
+      `POST /v1/oauth/token` (token exchange), then send it as a bearer token. The key itself is
+      never a bearer token.
+    - **Share links**: `POST /v1/share-links/resolve` returns a short-lived bearer token for the
+      link (see `bearerAuth` for the claims).
+
+    ## Users only
+    Operations marked `x-ruum-user-only: true` need a signed-in user (a web session or a user
+    token). When the caller is an agent or a share-link bearer, they fail with
+    `403 user_required`, even when the agent's user would be allowed. This covers registering,
+    changing, enabling, disabling and undoing agents, their keys and OAuth consent, all writes on
+    `/v1/tenants/...` and the audit log, invitations, and the caller's identities and sessions. So
+    an agent can never widen its own scope, mint keys for itself, or act as a tenant admin.
+    Share-link bearers can call only the node, content, version and diff reads (and, for an
+    `edit` link, `putContent` and the upload operations) inside the link's subtree; every other
+    operation fails for them with `403 user_required`.
 
     ## Tenants
     Calls on nodes, uploads, tags, agents, changes, trash and search act in one tenant. The client
-    names it in the `Ruum-Tenant` header. Agent tokens are bound to one tenant; for them the header
-    is optional and, if sent, must match. Tenant administration uses `/v1/tenants/{tenant_id}`.
-    Guests send the ID of the owner tenant.
+    names it in the `Ruum-Tenant` header. Agent and share-link tokens are bound to one tenant; for
+    them the header is optional and, if sent, must match. For a user it is required: a user call
+    without it fails with `400 bad_request`. Tenant administration uses `/v1/tenants/{tenant_id}`.
+    Guests send the ID of the owner tenant. No operation reads or writes two tenants: a link, a
+    move and a copy stay inside one tenant.
 
     ## Who did it
     Every write records `actor` (the user, agent or app that did the write) and `on_behalf_of`
@@ -99,7 +122,10 @@ paths:
       tags: [system]
       operationId: getJwks
       summary: Public keys of the Ruum token issuer
-      description: The keys that verify Ruum access tokens (agents and share links), as a JWKS.
+      description: |
+        The keys that verify Ruum access tokens (agents, users of native clients and share links),
+        as a JWKS. The same issuer signs other token types later (provider and app tokens); they
+        have another `aud` and `typ`, and the API refuses them (see `bearerAuth`).
       security: []
       responses:
         '200':
@@ -108,6 +134,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Jwks'
+
+  /.well-known/oauth-protected-resource:
+    get:
+      tags: [system]
+      operationId: getProtectedResourceMetadata
+      summary: OAuth protected resource metadata (RFC 9728)
+      description: |
+        Tells OAuth and MCP clients which authorization server issues tokens for this API. A `401`
+        from the API or from `/mcp` has `WWW-Authenticate: Bearer resource_metadata="<this URL>"`.
+      security: []
+      responses:
+        '200':
+          description: The metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProtectedResourceMetadata'
+
+  /.well-known/oauth-authorization-server:
+    get:
+      tags: [system]
+      operationId: getAuthorizationServerMetadata
+      summary: OAuth authorization server metadata (RFC 8414)
+      description: |
+        Ruum is the authorization server for agent tokens. The endpoints are
+        `/v1/oauth/authorize`, `/v1/oauth/token` and `/v1/oauth/register`. Only the
+        `authorization_code` (with PKCE `S256`), `refresh_token` and token exchange grants exist.
+      security: []
+      responses:
+        '200':
+          description: The metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizationServerMetadata'
 
   # ---------------------------------------------------------------- auth
   /v1/auth/login:
@@ -225,7 +286,9 @@ paths:
     get:
       tags: [auth]
       operationId: listMyIdentities
+      x-ruum-user-only: true
       summary: Linked identities of the signed-in user
+      description: Users only (agents and share links get `user_required`).
       responses:
         '200':
           description: The identities.
@@ -241,12 +304,16 @@ paths:
                       $ref: '#/components/schemas/Identity'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
 
   /v1/me/sessions:
     get:
       tags: [auth]
       operationId: listMySessions
+      x-ruum-user-only: true
       summary: Web sessions of the signed-in user
+      description: Users only (agents and share links get `user_required`).
       responses:
         '200':
           description: The sessions.
@@ -262,12 +329,16 @@ paths:
                       $ref: '#/components/schemas/Session'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
 
   /v1/me/sessions/{session_id}:
     delete:
       tags: [auth]
       operationId: endSession
+      x-ruum-user-only: true
       summary: End one web session
+      description: Users only (agents and share links get `user_required`).
       parameters:
         - $ref: '#/components/parameters/SessionId'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -276,6 +347,8 @@ paths:
           description: The session is ended.
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -304,8 +377,9 @@ paths:
     post:
       tags: [tenants]
       operationId: createTenant
+      x-ruum-user-only: true
       summary: Create a team tenant
-      description: The caller becomes the owner. Agents cannot create tenants.
+      description: Users only (agents and share links get `user_required`). The caller becomes the owner.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -349,8 +423,12 @@ paths:
     patch:
       tags: [tenants]
       operationId: updateTenant
-      summary: Rename a tenant
-      description: Needs the tenant role `admin` or `owner`.
+      x-ruum-user-only: true
+      summary: Rename a tenant or change its policy
+      description: |
+        Users only (agents get `user_required`). Needs the tenant role `admin` or `owner`. A change
+        of `policy` applies at once to new grants, links and invitations; existing share links
+        that the new policy forbids stop working (`allow_share_links`, `allow_edit_links`).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -406,8 +484,9 @@ paths:
     patch:
       tags: [tenants]
       operationId: updateMember
+      x-ruum-user-only: true
       summary: Change the role of a member
-      description: Needs `admin`. Only an `owner` can make or remove owners. A tenant keeps at least one owner.
+      description: Users only (agents get `user_required`). Needs `admin`. Only an `owner` can make or remove owners. A tenant keeps at least one owner. A member made `guest` loses `tenant#member` and keeps only direct grants.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -438,8 +517,20 @@ paths:
     delete:
       tags: [tenants]
       operationId: removeMember
+      x-ruum-user-only: true
       summary: Remove a member
-      description: Needs `admin`, or the member removes themselves. The agents of the member in this tenant are disabled.
+      description: |
+        Users only (agents get `user_required`). Needs `admin`, or the member removes themselves.
+        In one transaction the server:
+        - removes the membership (and so `tenant#member` and `tenant#administer`);
+        - removes every direct grant to the user on nodes of this tenant (`grant.removed` for
+          each), so the user does not stay a silent guest. To keep the person as a guest, an admin
+          invites them again with role `guest` and grants again;
+        - revokes the share links that the user or the user's agents made in this tenant
+          (`share_link.revoked` for each), because the user may still hold their URLs;
+        - disables the user's agents in this tenant (`owner_left`) and ends their OAuth grants.
+        Grants and member links that the user made for other people stay: they were made for the
+        tenant. The actor of these entries is the caller.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -460,7 +551,9 @@ paths:
     get:
       tags: [tenants]
       operationId: listInvitations
+      x-ruum-user-only: true
       summary: List open invitations
+      description: Users only (agents get `user_required`). Needs `admin`.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -478,8 +571,10 @@ paths:
     post:
       tags: [tenants]
       operationId: createInvitation
+      x-ruum-user-only: true
       summary: Invite a person
-      description: Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit.
+      description: >-
+        Users only (agents get `user_required`). Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit, and with `permission_denied` for role `guest` when the tenant policy has `allow_guests: false`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -511,7 +606,9 @@ paths:
     delete:
       tags: [tenants]
       operationId: revokeInvitation
+      x-ruum-user-only: true
       summary: Revoke an invitation
+      description: Users only (agents get `user_required`). Needs `admin`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -528,8 +625,13 @@ paths:
     post:
       tags: [tenants]
       operationId: acceptInvitation
+      x-ruum-user-only: true
       summary: Accept an invitation
-      description: The signed-in user joins the tenant with the role of the invitation. Agents cannot accept invitations.
+      description: |
+        Users only (agents and share links get `user_required`). The signed-in user joins the tenant
+        with the role of the invitation. The token binds the invitation to the user who presents
+        it; the email of the user does not have to match. Email grants (`addGrant` with an email)
+        to this invitation's email become grants to this user.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -552,6 +654,8 @@ paths:
                 $ref: '#/components/schemas/Member'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -585,9 +689,10 @@ paths:
     get:
       tags: [audit]
       operationId: listAudit
+      x-ruum-user-only: true
       summary: The audit log of a tenant
       description: |
-        Newest first. Needs the tenant role `admin`. With `Accept: application/x-ndjson` the server
+        Users only (agents get `user_required`). Newest first. Needs the tenant role `admin`. With `Accept: application/x-ndjson` the server
         streams all matching entries as one JSON object per line (export).
       parameters:
         - name: since
@@ -653,10 +758,11 @@ paths:
     post:
       tags: [agents]
       operationId: registerAgent
+      x-ruum-user-only: true
       summary: Register an agent
       description: |
-        Registers an agent that acts for the signed-in user (no team agents in step 1). Only a user
-        can register an agent; an agent cannot. Fails with `plan_limit_reached` at the agent limit.
+        Users only (agents get `user_required`). Registers an agent that acts for the signed-in user
+        (no team agents in step 1). Fails with `plan_limit_reached` at the agent limit.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -702,8 +808,10 @@ paths:
     patch:
       tags: [agents]
       operationId: updateAgent
+      x-ruum-user-only: true
       summary: Change an agent's name or scope
-      description: Only the owner of the agent. A new scope applies to new access tokens at once and to old ones within their lifetime.
+      description: >-
+        Users only (agents get `user_required`, also for their own record). Only the owner of the agent. A new scope applies at once to every request: the API reads the scope of the agent row on each request, not from the token.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -735,8 +843,9 @@ paths:
     post:
       tags: [agents]
       operationId: disableAgent
+      x-ruum-user-only: true
       summary: Disable an agent
-      description: The owner or a tenant admin. Key exchange and all requests of the agent fail with `agent_disabled`.
+      description: Users only (agents get `user_required`). The owner or a tenant admin. Key exchange, refresh and all requests of the agent fail with `agent_disabled`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -760,8 +869,9 @@ paths:
     post:
       tags: [agents]
       operationId: enableAgent
+      x-ruum-user-only: true
       summary: Enable an agent
-      description: Only the owner. An agent that was disabled because its user left the tenant cannot be enabled.
+      description: Users only (agents get `user_required`). Only the owner. An agent that was disabled because its user left the tenant cannot be enabled.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -785,8 +895,9 @@ paths:
     get:
       tags: [agents]
       operationId: listAgentKeys
+      x-ruum-user-only: true
       summary: List the API keys of an agent
-      description: Metadata only. The secret is never shown again after creation.
+      description: Users only (agents get `user_required`). The owner or a tenant admin. Metadata only. The secret is never shown again after creation.
       responses:
         '200':
           description: The keys.
@@ -809,10 +920,12 @@ paths:
     post:
       tags: [agents]
       operationId: createAgentKey
+      x-ruum-user-only: true
       summary: Create an API key
       description: |
-        Only the owner of the agent. The response has the secret once. The server stores only a
-        hash. Keys always expire (default 90 days, at most 1 year).
+        Users only (agents get `user_required`, so an agent cannot mint keys for itself). Only the
+        owner of the agent. The response has the secret once. The server stores only a hash. Keys
+        always expire (default 90 days, at most 1 year).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -845,8 +958,9 @@ paths:
     delete:
       tags: [agents]
       operationId: revokeAgentKey
+      x-ruum-user-only: true
       summary: Revoke an API key
-      description: The owner or a tenant admin. Access tokens from this key stop working within their lifetime (at most 15 minutes).
+      description: Users only (agents get `user_required`). The owner or a tenant admin. Access tokens from this key stop working within their lifetime (at most 15 minutes).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -896,12 +1010,34 @@ paths:
     post:
       tags: [agents]
       operationId: undoAgent
-      summary: Undo what an agent did since a time
+      x-ruum-user-only: true
+      summary: Undo what an agent did
       description: |
-        Reverts the changes of the agent since `since`, newest first: restores earlier versions,
-        moves nodes back, restores trashed nodes and trashes created ones. A change that another
-        actor changed later is skipped and reported. The undo itself is a set of new changes by the
-        caller. Only the owner of the agent or a tenant admin. With `dry_run` nothing changes.
+        Users only (agents get `user_required`). Only the owner of the agent or a tenant admin.
+        Reverts the journal entries of the agent between `since` and `until` (or only the entries
+        in `seqs`), newest first. With `dry_run` nothing changes. The undo itself is a set of new
+        changes by the caller. Every event type has an inverse:
+
+        | Event | Inverse |
+        |---|---|
+        | `node.created`, `node.copied` | trash the node |
+        | `node.renamed` | rename back |
+        | `node.moved` | move back to the old parent and name |
+        | `node.trashed` | restore |
+        | `node.restored` | trash again |
+        | `node.purged` | none: skipped with reason `irreversible` |
+        | `version.created`, `version.restored` | restore the version before it (a new head) |
+        | `version.labeled` | set the old label |
+        | `tag.attached` / `tag.detached` | detach / attach |
+        | `grant.added` | remove the grant |
+        | `grant.updated` | set the old role |
+        | `grant.removed` | add the grant again |
+        | `share_link.created` | revoke the link |
+        | `share_link.revoked` | none: skipped with reason `irreversible` (the token is gone) |
+
+        An entry whose node another actor changed later is skipped with reason
+        `changed_later`, and an entry whose inverse the caller may not do is skipped with reason
+        `permission_denied`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -924,16 +1060,201 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /v1/oauth/register:
+    post:
+      tags: [agents]
+      operationId: registerOAuthClient
+      summary: Register an OAuth client (RFC 7591)
+      description: |
+        Dynamic client registration for MCP clients. No sign-in needed. Only public clients with
+        PKCE (`token_endpoint_auth_method: none`). Redirect URIs must be `https`, or `http` on a
+        loopback address (`127.0.0.1`, `[::1]`, `localhost`) for native clients. A registration
+        gives no access: access needs the consent of a user (`POST /v1/oauth/consent`). Unused
+        registrations are deleted after 30 days. Errors use the OAuth error body (`OAuthError`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OAuthClientRegistration'
+      responses:
+        '201':
+          description: The registered client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClient'
+        '400':
+          description: '`invalid_redirect_uri` or `invalid_client_metadata`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/oauth/clients/{client_id}:
+    parameters:
+      - name: client_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [agents]
+      operationId: getOAuthClient
+      summary: Get a registered OAuth client
+      description: The public metadata of a client, for the consent screen. Users only.
+      x-ruum-user-only: true
+      responses:
+        '200':
+          description: The client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClient'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/oauth/authorize:
+    get:
+      tags: [agents]
+      operationId: oauthAuthorize
+      summary: Start an OAuth authorization (RFC 6749, PKCE)
+      description: |
+        The browser comes here from the OAuth client. The server checks `client_id`,
+        `redirect_uri` (an exact match with a registered URI) and the PKCE challenge (`S256`
+        only). Then it redirects to the consent screen of the web UI,
+        `/oauth/consent?request=<request>`, through sign-in when there is no session. `request`
+        is a signed, short-lived (10 minutes) value that holds the checked parameters; the server
+        keeps no row for it. An unknown client or a wrong redirect URI is a `400` page, never a
+        redirect. Other errors redirect to `redirect_uri` with `error` and `state` (RFC 6749,
+        section 4.1.2.1).
+      security: []
+      parameters:
+        - name: response_type
+          in: query
+          required: true
+          schema:
+            type: string
+            const: code
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: redirect_uri
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uri
+        - name: code_challenge
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 43
+            maxLength: 128
+        - name: code_challenge_method
+          in: query
+          required: true
+          schema:
+            type: string
+            const: S256
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: scope
+          in: query
+          description: Ignored in step 1 except for `offline_access`. The user picks the `AgentScope` in the consent screen.
+          schema:
+            type: string
+        - name: resource
+          in: query
+          description: RFC 8707. Must be the API origin or its `/mcp` URL; it becomes the `aud` of the tokens.
+          schema:
+            type: string
+            format: uri
+      responses:
+        '302':
+          description: Redirect to the consent screen, to sign-in, or back to the client with an error.
+          headers:
+            Location:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/oauth/consent:
+    post:
+      tags: [agents]
+      operationId: oauthConsent
+      summary: Approve or deny an OAuth authorization
+      description: |
+        Users only (agents get `user_required`). The consent screen of the web UI calls it with the
+        `request` value from `oauthAuthorize`. On approval the server creates a new agent of the
+        user in `tenant_id` with `new_agent` (fails with `plan_limit_reached` at the agent limit),
+        or binds the client to the existing agent `agent_id` of the user, and stores the binding
+        (table `agent_oauth_grants`). It returns the client's `redirect_uri` with a one-time code
+        (valid 60 seconds). On denial it returns the `redirect_uri` with `error=access_denied`.
+        Writes the audit entry `agent.oauth_approved` or `agent.oauth_denied`.
+      x-ruum-user-only: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OAuthConsentRequest'
+      responses:
+        '200':
+          description: Where the browser goes next.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [redirect_to]
+                properties:
+                  redirect_to:
+                    type: string
+                    format: uri
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
   /v1/oauth/token:
     post:
       tags: [agents]
       operationId: exchangeToken
-      summary: Exchange an API key for an access token
+      summary: Get an access token
       description: |
-        Token exchange (RFC 8693 shape). The `subject_token` is an agent API key
-        (`ruum_agent_...`). The result is a short-lived bearer token (15 minutes) bound to the
-        agent's tenant, user and scope. Errors use the Ruum error body; codes are
-        `unauthenticated` (unknown, revoked or expired key) and `agent_disabled`.
+        The OAuth token endpoint. Ruum signs all agent access tokens itself (15 minutes, bound to
+        the agent's tenant; see `bearerAuth`). Three grants:
+        - `authorization_code`: the code from the consent, with the PKCE `code_verifier`,
+          `client_id` and the same `redirect_uri`. Returns an access token and a refresh token.
+        - `refresh_token`: a refresh token rotates on each use (the old one stops working; reuse
+          of an old one ends the whole grant). Refresh tokens live 30 days from the last use, and
+          stop when the agent is disabled or its grant is ended.
+        - token exchange (RFC 8693 shape): the `subject_token` is an agent API key
+          (`ruum_agent_...`), for scripts and the CLI. No refresh token.
+
+        Errors use the OAuth error body (`OAuthError`, RFC 6749 section 5.2) with the Ruum code in
+        `ruum_code`: `invalid_grant` (unknown, used, revoked or expired code, key or refresh
+        token; `ruum_code` `unauthenticated` or `agent_disabled`), `invalid_client`,
+        `invalid_request`, `unsupported_grant_type`.
       security: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -942,10 +1263,10 @@ paths:
         content:
           application/x-www-form-urlencoded:
             schema:
-              $ref: '#/components/schemas/TokenExchangeRequest'
+              $ref: '#/components/schemas/TokenRequest'
           application/json:
             schema:
-              $ref: '#/components/schemas/TokenExchangeRequest'
+              $ref: '#/components/schemas/TokenRequest'
       responses:
         '200':
           description: The access token.
@@ -957,13 +1278,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TokenExchangeResponse'
+                $ref: '#/components/schemas/TokenResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: The OAuth error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
         '401':
-          $ref: '#/components/responses/Unauthenticated'
-        '403':
-          $ref: '#/components/responses/PermissionDenied'
+          description: '`invalid_client`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
         '429':
           $ref: '#/components/responses/RateLimited'
 
@@ -996,8 +1323,18 @@ paths:
       operationId: createNode
       summary: Create a folder, an empty file or a link
       description: |
-        Needs `edit` on the parent. A `member` link also needs `share` on the target (design
-        section 2.3). Typed nodes come in step 2; `kind: typed` fails with `validation_failed`.
+        Needs `edit` on the parent. Typed nodes come in step 2; `kind: typed` fails with
+        `validation_failed`.
+
+        Links (design section 2.3): the target must be a node of the same tenant as the link
+        (the `Ruum-Tenant` of the call). A target in another tenant, or one that the caller cannot
+        see, fails with `404 not_found`; the database checks it too. So "Add to my drive" of a
+        node that another tenant shared with you is not a link in step 1. A `member` link also
+        needs `share` on the target. A member link acts like a grant of `view` made by its
+        creator: it stays when the creator later loses `share`, and it ends when the link is
+        trashed or the target leaves the tenant. Whoever can view the folder that holds the link
+        can view the target, so sharing that folder (to guests, or by a share link) shares the
+        target too, under the same tenant policy (`TenantPolicy`) as any other grant.
         To create a file with content, use `POST /v1/uploads` with a `new_file` target, or create
         an empty file and `PUT /v1/nodes/{node_id}/content`.
       parameters:
@@ -1067,7 +1404,10 @@ paths:
       tags: [nodes]
       operationId: getNode
       summary: Get a node
-      description: Needs `view`. A node that the caller cannot see is `404`, not `403`, so IDs do not leak.
+      description: |
+        Needs `view`. A node that the caller cannot see is `404`, not `403`, so IDs do not leak.
+        Node responses carry `my_role`, the caller's effective role on the node (after the agent
+        scope), so clients know what they may do.
       responses:
         '200':
           description: The node.
@@ -1082,6 +1422,33 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [nodes]
+      operationId: purgeNode
+      summary: Delete a trashed node permanently
+      description: |
+        Only for a trashed root (a live node fails with `409 conflict`; trash it first). Needs
+        `manage`. On a plan with `admin_restore_days` greater than `trash_days` (team plans), it
+        also needs the tenant role `admin`, so a member cannot cut the admin restore window short.
+        Deletes the subtree and its versions; chunks go to garbage collection. Links to purged
+        nodes stay as broken links. Writes `node.purged`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Purged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOnly'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
 
   /v1/nodes/{node_id}/children:
     parameters:
@@ -1277,9 +1644,11 @@ paths:
       summary: Restore a node from the trash
       description: |
         Needs `manage`. Restores into the old parent, or into `parent_id` when given or when the old
-        parent is gone. Writes `node.restored`.
+        parent is gone. Writes `node.restored`. Within the trash period any caller with `manage`
+        can restore; after it, until `admin_restore_days` (team plans), only tenant admins can.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: false
         content:
@@ -1301,15 +1670,26 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
 
   /v1/trash:
     get:
       tags: [nodes]
       operationId: listTrash
       summary: List the trash
-      description: The trashed roots (not their children) that the caller can manage, newest first.
+      description: |
+        The trashed roots (not their children) that the caller can manage, newest first, within
+        the plan's trash period. With `all=true` a tenant admin also sees the roots after the
+        trash period that are still inside `admin_restore_days` (team plans).
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
+        - name: all
+          in: query
+          description: Tenant admins only.
+          schema:
+            type: boolean
+            default: false
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -1321,6 +1701,39 @@ paths:
                 $ref: '#/components/schemas/NodePage'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /v1/trash/empty:
+    post:
+      tags: [nodes]
+      operationId: emptyTrash
+      summary: Empty the trash
+      description: |
+        Purges every trashed root (with its subtree) that the caller may purge (see `purgeNode`).
+        Other roots stay. Writes `node.purged` for each purged root.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: What was purged.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [purged, change]
+                properties:
+                  purged:
+                    type: integer
+                    description: The number of purged roots.
+                  change:
+                    description: The last change, or `null` if nothing was purged.
+                    oneOf:
+                      - $ref: '#/components/schemas/Change'
+                      - type: 'null'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
 
   # ---------------------------------------------------------------- uploads and content
   /v1/uploads:
@@ -1329,12 +1742,20 @@ paths:
       operationId: createUpload
       summary: Start a resumable upload
       description: |
-        The client cuts the file into chunks with the published chunking parameters (FastCDC,
-        1 MiB minimum, 2 MiB average, 4 MiB maximum), hashes each chunk and the whole content with
-        BLAKE3, and sends the list. The response says which chunks the server does not have yet;
-        the client uploads only those, then calls `complete`. Needs `edit` on the target file, or on
-        the parent folder for a new file. Fails with `quota_exceeded` or `payload_too_large`
-        (largest file of the plan) before any byte is sent. The session expires after 24 hours.
+        The client first gets the chunking parameters for the file from
+        `GET /v1/uploads/params` (for example FastCDC with 1 MiB minimum, 2 MiB average, 4 MiB
+        maximum; smaller chunks for small and text files), cuts the file into chunks, hashes each
+        chunk and the whole content with BLAKE3, and sends the list with the `chunking` it used.
+        The server refuses a `chunking` that it does not publish (`validation_failed`). The
+        response says which chunks the server does not have yet; the client uploads only those,
+        then calls `complete`. Needs `edit` on the target file, or on the parent folder for a new
+        file. Fails with `quota_exceeded` or `payload_too_large` (largest file of the plan) before
+        any byte is sent. The session expires after 24 hours.
+
+        Known risk (accepted for step 1, design section 5.1): `missing` tells a caller whether
+        the tenant already stores a chunk, also one from a file the caller cannot read. A member
+        with `edit` somewhere could test whether known content exists in the tenant. Dedup is per
+        tenant, so this never crosses tenants.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -1361,6 +1782,40 @@ paths:
           $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/uploads/params:
+    get:
+      tags: [uploads]
+      operationId: getChunkingParams
+      summary: The chunking parameters for a file
+      description: |
+        The parameters that `POST /v1/uploads` accepts for a file of this size and type. They
+        depend only on these two inputs and on the server version, so a client may cache them by
+        `id`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: size
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: content_type
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChunkingParams'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
@@ -1484,7 +1939,9 @@ paths:
         Needs `view`. Returns the head version, or `version` when given. Supports one byte range
         (`Range: bytes=start-end`) and `HEAD`. The response always has
         `Content-Disposition: attachment` and a strict `Content-Security-Policy: sandbox`, so an
-        uploaded HTML file cannot run as the platform.
+        uploaded HTML file cannot run as the platform. This API-origin download is for the CLI,
+        agents and WebDAV. Browsers (downloads and previews in the web UI) use
+        `getContentUrl`, which serves the bytes from the separate content domain (decision 1).
       parameters:
         - name: version
           in: query
@@ -1594,6 +2051,43 @@ paths:
           $ref: '#/components/responses/PreconditionFailed'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+
+  /v1/nodes/{node_id}/content-url:
+    parameters:
+      - $ref: '#/components/parameters/TenantHeader'
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [uploads]
+      operationId: getContentUrl
+      summary: A short-lived URL of the content on the content domain
+      description: |
+        Needs `view`. Returns a signed URL on the user-content domain
+        (`https://<tenant-id>.content.ruumapps.net/...`, decision 1 and design section 15) that
+        serves one version for 5 minutes, without cookies. `disposition=inline` is for previews:
+        the content domain sends a strict CSP sandbox and never runs the content as the
+        platform. The URL supports `Range`.
+      parameters:
+        - name: version
+          in: query
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: disposition
+          in: query
+          schema:
+            type: string
+            enum: [attachment, inline]
+            default: attachment
+      responses:
+        '200':
+          description: The URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContentUrl'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   # ---------------------------------------------------------------- versions
   /v1/nodes/{node_id}/versions:
@@ -2006,19 +2500,16 @@ paths:
       operationId: listGrants
       summary: List grants
       description: The direct grants on the node and the inherited ones (with `inherited_from`). Needs `view`.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
-          description: The grants.
+          description: One page of grants.
           content:
             application/json:
               schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Grant'
+                $ref: '#/components/schemas/GrantPage'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '404':
@@ -2028,10 +2519,16 @@ paths:
       operationId: addGrant
       summary: Add a grant
       description: |
-        Needs `share` on the node. Grants only add rights (decision 8). A grant to an email of a
-        person without a Ruum account, or from another tenant, makes them a guest of this tenant
-        and sends an invitation. An agent can never grant more than its own scope. Writes
-        `grant.added`.
+        Needs `share` on the node. Grants only add rights (decision 8). An agent can never grant
+        more than its own scope. Writes `grant.added`.
+
+        A grant to a user from another tenant makes them a guest of this tenant. A grant to an
+        email stays an email grant (no user) and sends an invitation with a secret token. It
+        becomes a grant to a user only when (a) a signed-in user accepts that invitation token, or
+        (b) a user signs in with that email as a verified email of a trusted provider
+        (`email_verified`). An unverified email never claims an email grant. Grants to people
+        outside the tenant fail with `permission_denied` when the tenant policy has
+        `allow_guests: false`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2063,6 +2560,41 @@ paths:
       - $ref: '#/components/parameters/TenantHeader'
       - $ref: '#/components/parameters/NodeId'
       - $ref: '#/components/parameters/GrantId'
+    patch:
+      tags: [sharing]
+      operationId: updateGrant
+      summary: Change the role of a grant
+      description: |
+        Needs `share` on the node. Changes the role in one step (one journal entry,
+        `grant.updated`). An agent can never set a role above its own scope. Inherited grants are
+        changed on the node that holds them.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  $ref: '#/components/schemas/Role'
+      responses:
+        '200':
+          description: The grant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantWrite'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
     delete:
       tags: [sharing]
       operationId: removeGrant
@@ -2093,19 +2625,16 @@ paths:
       operationId: listShareLinks
       summary: List share links
       description: Needs `share`. Tokens are not shown again.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
       responses:
         '200':
-          description: The share links.
+          description: One page of share links.
           content:
             application/json:
               schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/ShareLink'
+                $ref: '#/components/schemas/ShareLinkPage'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -2118,8 +2647,10 @@ paths:
       summary: Create a share link
       description: |
         Needs `share`. Makes a secret link (`anyone_with_link`) with a role, an optional expiry and
-        an optional password. The response has the token and URL once. A tenant can forbid links;
-        then this fails with `permission_denied`. Writes `share_link.created`.
+        an optional password. The response has the token and URL once. The tenant policy
+        (`TenantPolicy`) applies: without `allow_share_links` this fails with `permission_denied`;
+        `edit` needs `allow_edit_links`; with `share_link_max_days` set, `expires_at` is required
+        and at most that many days ahead (`validation_failed`). Writes `share_link.created`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2176,8 +2707,9 @@ paths:
       summary: Open a share link
       description: |
         No sign-in needed. The token is in the body, not the URL, so it does not reach logs.
-        Returns the node and a short-lived access token for the link's role on that subtree. An
-        expired, revoked or unknown link is `404`. A wrong password is `401`.
+        Returns the node and a short-lived access token (`typ` `share_link`, see `bearerAuth`) for
+        the link's role on that subtree. An expired, revoked or unknown link, or one that the
+        tenant policy no longer allows, is `404`. A wrong password is `401`.
       security: []
       requestBody:
         required: true
@@ -2228,10 +2760,24 @@ paths:
       operationId: listChanges
       summary: The changes feed
       description: |
-        The journal of the tenant, oldest first, after `cursor`. Only entries on nodes that the caller
-        can see (for agents: inside the scope). Sync clients keep `next_cursor` and call again. With
-        `wait` the call waits up to that many seconds for new entries (long poll). A cursor older than
-        the journal retention fails with `410 cursor_expired`; the client must then do a full listing.
+        The journal of the tenant, oldest first, after `cursor`. Sync clients keep `next_cursor`
+        and call again. With `wait` the call waits up to that many seconds for new entries (long
+        poll). A cursor older than the journal retention fails with `410 cursor_expired`; the
+        client must then do a full listing.
+
+        Visibility is checked against the state before and after each change. An entry is sent
+        when the caller could see its node before the change or can see it after it (for agents:
+        inside the scope, too). So a client learns that a node left its view: a `node.moved` to a
+        folder it cannot see, `node.trashed`, `node.purged`, or a `grant.removed`. Entries on
+        nodes that the caller never saw are left out. A tenant-level entry (`node_id` `null`) is
+        sent to members only.
+
+        A change can also change what the caller sees of a whole subtree without an entry per
+        node: a grant added or removed (also through `tenant#member`), a member link added or
+        removed, a node moved into or out of a visible folder, a restore. Then the page carries a
+        marker in `resync`: the client lists that subtree again (`access: gained`) or drops it
+        (`access: lost`), at the position `seq` of the marker. Clients order and dedupe entries
+        by `seq`, and per node by `revision`.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - name: cursor
@@ -2338,7 +2884,28 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: A platform access token, or a Ruum access token from `POST /v1/oauth/token`.
+      description: |
+        A platform access token, or a Ruum access token (`POST /v1/oauth/token`,
+        `POST /v1/share-links/resolve`). Ruum access tokens are JWTs signed with the keys of
+        `/.well-known/jwks.json`. Their claims:
+
+        | Claim | Value |
+        |---|---|
+        | `iss` | the Ruum issuer, for example `https://api.ruum.space` |
+        | `aud` | the API origin (`https://api.ruum.space`; `https://ruum.localhost` on the laptop) |
+        | `typ` | `agent`, `user` or `share_link` |
+        | `sub` | the actor: the agent ID, the user ID, or the share link ID |
+        | `tid` | the tenant the token is bound to (all agent and share-link tokens) |
+        | `obo` | the user an agent acts for; absent for users and share links |
+        | `agent` | the agent ID (`typ` `agent`) |
+        | `share_link` | the share link ID (`typ` `share_link`) |
+        | `scope` | for `share_link`: `{ subtree, max_role, expires_at }` of the link |
+        | `iat`, `exp`, `jti` | as in RFC 7519 |
+
+        The API accepts a Ruum token only when `aud` is its own origin and `typ` is one of the three
+        above. Tokens for providers (step 2) and apps (step 3) have another `aud` and `typ`, so they
+        cannot be replayed against the API. An agent token carries no scope: the API reads the
+        agent row (scope, disabled) on each request.
     sessionCookie:
       type: apiKey
       in: cookie
@@ -2349,8 +2916,10 @@ components:
     TenantHeader:
       name: Ruum-Tenant
       in: header
-      required: true
-      description: The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match.
+      required: false
+      description: |
+        The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+        agent and share-link tokens, which are bound to one tenant; if sent, it must match.
       schema:
         $ref: '#/components/schemas/Uuid'
     IdempotencyKey:
@@ -2482,7 +3051,7 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     PermissionDenied:
-      description: The caller lacks the right (`permission_denied`, `scope_exceeded`, `agent_disabled`, `plan_limit_reached`, `quota_exceeded`).
+      description: The caller lacks the right (`permission_denied`, `scope_exceeded`, `user_required`, `agent_disabled`, `plan_limit_reached`, `quota_exceeded`).
       content:
         application/json:
           schema:
@@ -2583,6 +3152,7 @@ components:
         - token_expired
         - permission_denied
         - scope_exceeded
+        - user_required
         - not_found
         - conflict
         - name_taken
@@ -2692,7 +3262,7 @@ components:
           description: The end-session URL at the identity provider. The browser goes there next.
     User:
       type: object
-      required: [id, home_tenant_id, email, display_name, created_at]
+      required: [id, home_tenant_id, email, email_verified, display_name, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Uuid'
@@ -2701,6 +3271,11 @@ components:
         email:
           type: string
           format: email
+        email_verified:
+          type: boolean
+          description: |
+            True when a trusted provider verified the email. Only a verified email is unique
+            among users, and only a verified email claims email grants and invitations.
         display_name:
           type: string
         avatar_url:
@@ -2779,9 +3354,38 @@ components:
       type: string
       description: The role in a tenant. A guest sees only what is shared with them.
       enum: [guest, member, admin, owner]
+    TenantPolicy:
+      type: object
+      description: |
+        What the tenant allows (design section 4.1). Stored in `tenants.settings`. Allowed
+        identity providers and retention overrides come later.
+      properties:
+        allow_share_links:
+          type: boolean
+          default: true
+          description: Share links may be made. When it turns off, existing links stop working.
+        allow_edit_links:
+          type: boolean
+          default: false
+          description: Share links may have the role `edit`.
+        share_link_max_days:
+          type: [integer, 'null']
+          minimum: 1
+          default: null
+          description: When set, every share link needs an expiry at most this many days ahead.
+        allow_guests:
+          type: boolean
+          default: true
+          description: Grants and invitations to people outside the tenant are allowed.
+        members_can_share:
+          type: boolean
+          default: true
+          description: |
+            Team tenants: every member has `share` on the team tree (the tuple
+            `node:<root>#sharer@tenant:<id>#member`). When false, only owners and admins share.
     Tenant:
       type: object
-      required: [id, name, kind, plan, region, root_node_id, created_at]
+      required: [id, name, kind, plan, region, root_node_id, policy, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Uuid'
@@ -2796,6 +3400,8 @@ components:
           examples: [hel1]
         root_node_id:
           $ref: '#/components/schemas/Uuid'
+        policy:
+          $ref: '#/components/schemas/TenantPolicy'
         created_at:
           $ref: '#/components/schemas/Timestamp'
     TenantMembership:
@@ -2816,12 +3422,15 @@ components:
           maxLength: 100
     UpdateTenantRequest:
       type: object
-      required: [name]
+      minProperties: 1
       properties:
         name:
           type: string
           minLength: 1
           maxLength: 100
+        policy:
+          $ref: '#/components/schemas/TenantPolicy'
+          description: Fields that are left out keep their value.
     Member:
       type: object
       required: [tenant_id, user_id, email, display_name, role, joined_at]
@@ -2896,7 +3505,7 @@ components:
     Limits:
       type: object
       description: The limits of the plan (design section 4.3). `null` means no limit.
-      required: [storage_bytes, max_file_bytes, version_days, version_count, trash_days, agents, members]
+      required: [storage_bytes, max_file_bytes, version_days, version_count, trash_days, admin_restore_days, agents, members]
       properties:
         storage_bytes:
           type: integer
@@ -2910,6 +3519,10 @@ components:
           type: [integer, 'null']
         trash_days:
           type: integer
+          description: How long members see a node in the trash and can restore it.
+        admin_restore_days:
+          type: integer
+          description: How long tenant admins can restore a trashed node (60 on team plans; equal to `trash_days` otherwise). The node is purged after this.
         agents:
           type: integer
         members:
@@ -3080,6 +3693,53 @@ components:
           type: string
           description: The API key. Shown only once.
           pattern: '^ruum_agent_[A-Za-z0-9_-]{43}$'
+    TokenRequest:
+      description: The body of the token endpoint, by `grant_type`.
+      oneOf:
+        - $ref: '#/components/schemas/AuthorizationCodeGrant'
+        - $ref: '#/components/schemas/RefreshTokenGrant'
+        - $ref: '#/components/schemas/TokenExchangeRequest'
+      discriminator:
+        propertyName: grant_type
+        mapping:
+          authorization_code: '#/components/schemas/AuthorizationCodeGrant'
+          refresh_token: '#/components/schemas/RefreshTokenGrant'
+          urn:ietf:params:oauth:grant-type:token-exchange: '#/components/schemas/TokenExchangeRequest'
+    AuthorizationCodeGrant:
+      type: object
+      required: [grant_type, code, code_verifier, client_id, redirect_uri]
+      properties:
+        grant_type:
+          type: string
+          const: authorization_code
+        code:
+          type: string
+        code_verifier:
+          type: string
+          minLength: 43
+          maxLength: 128
+        client_id:
+          type: string
+        redirect_uri:
+          type: string
+          format: uri
+        resource:
+          type: string
+          format: uri
+    RefreshTokenGrant:
+      type: object
+      required: [grant_type, refresh_token, client_id]
+      properties:
+        grant_type:
+          type: string
+          const: refresh_token
+        refresh_token:
+          type: string
+        client_id:
+          type: string
+        resource:
+          type: string
+          format: uri
     TokenExchangeRequest:
       type: object
       required: [grant_type, subject_token, subject_token_type]
@@ -3093,9 +3753,9 @@ components:
         subject_token_type:
           type: string
           const: urn:ruum:params:oauth:token-type:api-key
-    TokenExchangeResponse:
+    TokenResponse:
       type: object
-      required: [access_token, token_type, expires_in, issued_token_type]
+      required: [access_token, token_type, expires_in]
       properties:
         access_token:
           type: string
@@ -3105,15 +3765,196 @@ components:
         expires_in:
           type: integer
           description: Seconds. 900 by default.
+        refresh_token:
+          type: string
+          description: Only for `authorization_code` and `refresh_token`. Opaque; stored as a hash.
         issued_token_type:
           type: string
           const: urn:ietf:params:oauth:token-type:access_token
+          description: Only for token exchange.
+        scope:
+          type: string
+    OAuthError:
+      type: object
+      description: The OAuth error body (RFC 6749 section 5.2, RFC 7591 section 3.2.2), used only by the OAuth endpoints.
+      required: [error]
+      properties:
+        error:
+          type: string
+          examples: [invalid_grant, invalid_client, invalid_request, unsupported_grant_type, invalid_redirect_uri, invalid_client_metadata]
+        error_description:
+          type: string
+        ruum_code:
+          $ref: '#/components/schemas/ErrorCode'
+    OAuthClientRegistration:
+      type: object
+      required: [client_name, redirect_uris]
+      properties:
+        client_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        redirect_uris:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items:
+            type: string
+            format: uri
+        grant_types:
+          type: array
+          items:
+            type: string
+            enum: [authorization_code, refresh_token]
+          default: [authorization_code, refresh_token]
+        response_types:
+          type: array
+          items:
+            type: string
+            const: code
+        token_endpoint_auth_method:
+          type: string
+          const: none
+          default: none
+        client_uri:
+          type: string
+          format: uri
+        logo_uri:
+          type: string
+          format: uri
+        software_id:
+          type: string
+        software_version:
+          type: string
+    OAuthClient:
+      type: object
+      required: [client_id, client_id_issued_at, client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method]
+      properties:
+        client_id:
+          type: string
+        client_id_issued_at:
+          type: integer
+          format: int64
+          description: Seconds since the epoch.
+        client_name:
+          type: string
+        redirect_uris:
+          type: array
+          items:
+            type: string
+            format: uri
+        grant_types:
+          type: array
+          items:
+            type: string
+        response_types:
+          type: array
+          items:
+            type: string
+        token_endpoint_auth_method:
+          type: string
+          const: none
+        client_uri:
+          type: [string, 'null']
+          format: uri
+        logo_uri:
+          type: [string, 'null']
+          format: uri
+    OAuthConsentRequest:
+      type: object
+      description: Give `agent_id` to bind an existing agent, or `new_agent` to create one; not both. Only `approve` and `request` are needed for a denial.
+      required: [request, approve]
+      properties:
+        request:
+          type: string
+          description: The `request` value of the consent screen URL.
+        approve:
+          type: boolean
+        tenant_id:
+          $ref: '#/components/schemas/Uuid'
+        agent_id:
+          $ref: '#/components/schemas/Uuid'
+        new_agent:
+          $ref: '#/components/schemas/RegisterAgentRequest'
+    ProtectedResourceMetadata:
+      type: object
+      description: RFC 9728.
+      required: [resource, authorization_servers]
+      properties:
+        resource:
+          type: string
+          format: uri
+          examples: [https://api.ruum.space]
+        authorization_servers:
+          type: array
+          items:
+            type: string
+            format: uri
+        bearer_methods_supported:
+          type: array
+          items:
+            type: string
+        resource_documentation:
+          type: string
+          format: uri
+    AuthorizationServerMetadata:
+      type: object
+      description: RFC 8414.
+      required: [issuer, authorization_endpoint, token_endpoint, registration_endpoint, response_types_supported, grant_types_supported, code_challenge_methods_supported, token_endpoint_auth_methods_supported]
+      properties:
+        issuer:
+          type: string
+          format: uri
+        authorization_endpoint:
+          type: string
+          format: uri
+        token_endpoint:
+          type: string
+          format: uri
+        registration_endpoint:
+          type: string
+          format: uri
+        jwks_uri:
+          type: string
+          format: uri
+        response_types_supported:
+          type: array
+          items:
+            type: string
+        grant_types_supported:
+          type: array
+          items:
+            type: string
+        code_challenge_methods_supported:
+          type: array
+          items:
+            type: string
+        token_endpoint_auth_methods_supported:
+          type: array
+          items:
+            type: string
+        scopes_supported:
+          type: array
+          items:
+            type: string
     UndoRequest:
       type: object
-      required: [since, dry_run]
+      description: Give `since` (and optionally `until`), or `seqs`.
+      required: [dry_run]
       properties:
         since:
           $ref: '#/components/schemas/Timestamp'
+        until:
+          $ref: '#/components/schemas/Timestamp'
+          description: Default is now.
+        seqs:
+          type: array
+          description: Only these journal entries of the agent (partial undo).
+          minItems: 1
+          maxItems: 1000
+          items:
+            type: integer
+            format: int64
         dry_run:
           type: boolean
           description: When true, only report what would be reverted.
@@ -3132,7 +3973,8 @@ components:
           $ref: '#/components/schemas/EventType'
         reason:
           type: [string, 'null']
-          description: Why the change was skipped.
+          enum: [changed_later, irreversible, permission_denied, null]
+          description: Why the change was skipped. `null` for reverted entries.
     UndoReport:
       type: object
       required: [dry_run, reverted, skipped, change]
@@ -3173,7 +4015,11 @@ components:
       type: string
       minLength: 1
       maxLength: 255
-      description: Unique among the live children of a folder. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.
+      description: |
+        The server stores names in Unicode NFC, and `maxLength` counts characters (code points)
+        after NFC, in every layer. Names are case-preserving but unique case-insensitively among
+        the live children of a folder (`Plan.txt` and `plan.txt` clash), as WebDAV, macOS and
+        Windows clients expect. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.
     Node:
       type: object
       required: [id, tenant_id, parent_id, name, kind, type, link_kind, link_target, head_version, owner_id, size_bytes, revision, trashed_at, created_at, updated_at, created_by, updated_by]
@@ -3208,6 +4054,7 @@ components:
             - type: 'null'
         owner_id:
           $ref: '#/components/schemas/Uuid'
+          description: The user who created the node (for the owner of a personal tree, the owner). Only for display and accounting; it gives no rights.
         size_bytes:
           type: integer
           format: int64
@@ -3227,6 +4074,13 @@ components:
           $ref: '#/components/schemas/ActorPair'
         updated_by:
           $ref: '#/components/schemas/ActorPair'
+        my_role:
+          description: |
+            The caller's effective role on this node (after the agent or link scope), so the UI and
+            agents know what they may do. Set in responses of node reads and writes when known.
+          oneOf:
+            - $ref: '#/components/schemas/Role'
+            - type: 'null'
     NodePage:
       type: object
       required: [items, next_cursor]
@@ -3260,7 +4114,7 @@ components:
           type: string
           description: A MIME type for a file, or a folder type such as `album` or `project`.
         link:
-          description: Required when `kind` is `link`.
+          description: Required when `kind` is `link`. The target must be in the same tenant.
           type: object
           required: [kind, target]
           properties:
@@ -3321,8 +4175,12 @@ components:
           maximum: 4194304
     ChunkingParams:
       type: object
-      required: [algorithm, min_size, avg_size, max_size]
+      required: [id, algorithm, min_size, avg_size, max_size]
       properties:
+        id:
+          type: string
+          description: A stable name of this parameter set.
+          examples: [fastcdc-2020-1m-2m-4m, fastcdc-2020-16k-32k-64k]
         algorithm:
           type: string
           const: fastcdc-2020
@@ -3378,10 +4236,13 @@ components:
       allOf:
         - $ref: '#/components/schemas/UploadTarget'
         - type: object
-          required: [size, content_hash, chunks]
+          required: [size, content_hash, chunking, chunks]
           properties:
             content_type:
               type: string
+            chunking:
+              type: string
+              description: The `id` of the chunking parameters the client used (from `getChunkingParams`).
             size:
               type: integer
               format: int64
@@ -3428,6 +4289,18 @@ components:
               $ref: '#/components/schemas/Timestamp'
             created_by:
               $ref: '#/components/schemas/ActorPair'
+    ContentUrl:
+      type: object
+      required: [url, expires_at, version_id]
+      properties:
+        url:
+          type: string
+          format: uri
+          examples: ['https://0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a.content.ruumapps.net/c/eyJhbGciOi...']
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        version_id:
+          $ref: '#/components/schemas/Uuid'
     ContentWrite:
       type: object
       required: [node, version, change]
@@ -3720,6 +4593,16 @@ components:
           $ref: '#/components/schemas/ActorPair'
         created_at:
           $ref: '#/components/schemas/Timestamp'
+    GrantPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Grant'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
     AddGrantRequest:
       type: object
       required: [grantee, role]
@@ -3752,8 +4635,7 @@ components:
         node_id:
           $ref: '#/components/schemas/Uuid'
         role:
-          type: string
-          enum: [view, comment, edit]
+          $ref: '#/components/schemas/ShareLinkRole'
         token:
           type: string
           description: The secret. Only in the create response; stored as a hash.
@@ -3780,15 +4662,28 @@ components:
       required: [role]
       properties:
         role:
-          type: string
-          enum: [view, comment, edit]
-          description: '`edit` only when the tenant allows it.'
+          $ref: '#/components/schemas/ShareLinkRole'
+          description: '`edit` only when the tenant policy has `allow_edit_links`.'
         expires_at:
           $ref: '#/components/schemas/Timestamp'
         password:
           type: string
           minLength: 8
           maxLength: 200
+    ShareLinkRole:
+      type: string
+      description: The roles a share link can have. Never `manage` or `share`.
+      enum: [view, comment, edit]
+    ShareLinkPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShareLink'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
     ShareLinkWrite:
       type: object
       required: [share_link, change]
@@ -3814,7 +4709,7 @@ components:
         node:
           $ref: '#/components/schemas/Node'
         role:
-          $ref: '#/components/schemas/Role'
+          $ref: '#/components/schemas/ShareLinkRole'
         access_token:
           type: string
           description: A bearer token for this node and its subtree with `role`.
@@ -3861,13 +4756,14 @@ components:
         - tag.attached
         - tag.detached
         - grant.added
+        - grant.updated
         - grant.removed
         - share_link.created
         - share_link.revoked
     JournalEntry:
       type: object
-      description: One change. `data` follows `contracts/events/<type>.schema.json`.
-      required: [tenant_id, seq, node_id, type, actor, on_behalf_of, at, data]
+      description: One change. The envelope is `contracts/events/journal-entry.schema.json`; `data` follows `contracts/events/<type>.schema.json`.
+      required: [tenant_id, seq, node_id, revision, type, actor, on_behalf_of, at, data]
       properties:
         tenant_id:
           $ref: '#/components/schemas/Uuid'
@@ -3877,6 +4773,12 @@ components:
         node_id:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+        revision:
+          description: The revision of the node after the change, or `null` when the entry has no node or the node is purged.
+          oneOf:
+            - type: integer
+              format: int64
             - type: 'null'
         type:
           $ref: '#/components/schemas/EventType'
@@ -3901,14 +4803,35 @@ components:
             $ref: '#/components/schemas/JournalEntry'
         next_cursor:
           $ref: '#/components/schemas/NextCursor'
+    ResyncMarker:
+      type: object
+      description: The caller's access to a subtree changed at `seq`, without one entry per node.
+      required: [seq, node_id, access]
+      properties:
+        seq:
+          type: integer
+          format: int64
+          description: The entry that caused the change. Apply the marker after the entries up to this `seq`.
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+          description: The root of the subtree.
+        access:
+          type: string
+          enum: [gained, lost]
+          description: '`gained`: list the subtree again. `lost`: drop it from the local copy.'
     ChangesPage:
       type: object
-      required: [items, next_cursor, has_more]
+      required: [items, resync, next_cursor, has_more]
       properties:
         items:
           type: array
           items:
             $ref: '#/components/schemas/JournalEntry'
+        resync:
+          type: array
+          description: Per-caller markers for this page, ordered by `seq`. Often empty.
+          items:
+            $ref: '#/components/schemas/ResyncMarker'
         next_cursor:
           type: string
           description: Always set. Keep it and pass it to the next call, also when `items` is empty.

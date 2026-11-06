@@ -17,6 +17,8 @@ pub enum ErrorCode {
     TokenExpired,
     PermissionDenied,
     ScopeExceeded,
+    /// The operation needs a signed-in user; agents and share-link bearers cannot call it.
+    UserRequired,
     NotFound,
     Conflict,
     NameTaken,
@@ -46,6 +48,7 @@ impl ErrorCode {
         ErrorCode::TokenExpired,
         ErrorCode::PermissionDenied,
         ErrorCode::ScopeExceeded,
+        ErrorCode::UserRequired,
         ErrorCode::NotFound,
         ErrorCode::Conflict,
         ErrorCode::NameTaken,
@@ -73,7 +76,7 @@ impl ErrorCode {
             BadRequest => 400,
             ValidationFailed => 422,
             Unauthenticated | TokenExpired => 401,
-            PermissionDenied | ScopeExceeded | AgentDisabled => 403,
+            PermissionDenied | ScopeExceeded | UserRequired | AgentDisabled => 403,
             NotFound => 404,
             Conflict | NameTaken | VersionMismatch | IdempotencyKeyReused | ChunkMissing => 409,
             PreconditionFailed => 412,
@@ -99,6 +102,7 @@ impl ErrorCode {
             TokenExpired => "token_expired",
             PermissionDenied => "permission_denied",
             ScopeExceeded => "scope_exceeded",
+            UserRequired => "user_required",
             NotFound => "not_found",
             Conflict => "conflict",
             NameTaken => "name_taken",
@@ -172,6 +176,16 @@ impl Error {
         Self::api(
             ErrorCode::PermissionDenied,
             "you do not have the permission for this action",
+        )
+    }
+
+    pub fn user_required() -> Self {
+        Self::Api(
+            ApiError::new(
+                ErrorCode::UserRequired,
+                "only a signed-in user can do this; agents and share links cannot",
+            )
+            .with_hint("ask the user to do it in the web UI"),
         )
     }
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ruum.space/contracts/events/node.purged.schema.json",
   "title": "node.purged",
-  "description": "A trashed node was deleted for good (trash period over). Its content is gone after garbage collection. This schema is the `data` of a journal entry with `type` `node.purged`.",
+  "description": "A trashed node was deleted for good: its trash period ended, or a user purged it (`purgeNode`, `emptyTrash`). Its content is gone after garbage collection. This schema is the `data` of a journal entry with `type` `node.purged`.",
   "type": "object",
   "required": [
     "name",
@@ -16,6 +16,13 @@
     "subtree_count": {
       "type": "integer",
       "minimum": 1
+    },
+    "reason": {
+      "enum": [
+        "expired",
+        "by_request"
+      ],
+      "description": "`expired`: the trash period ended. `by_request`: a user purged it."
     }
   }
 }

@@ -19,8 +19,13 @@ impl TenantStore for MemoryTenantStore {
     async fn get(&self, _ctx: &Context) -> Result<Tenant> {
         todo!("tenants: get")
     }
-    async fn rename(&self, _ctx: &Context, _name: String) -> Result<Tenant> {
-        todo!("tenants: rename")
+    async fn update(
+        &self,
+        _ctx: &Context,
+        _name: Option<String>,
+        _policy: Option<TenantPolicyChange>,
+    ) -> Result<Tenant> {
+        todo!("tenants: update")
     }
     async fn role_of(&self, _tenant: TenantId, _user: UserId) -> Result<Option<MemberRole>> {
         todo!("tenants: role_of")

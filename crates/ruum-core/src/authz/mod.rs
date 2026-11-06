@@ -5,16 +5,22 @@
 //! SpiceDB client. In step 1 grants only add rights (decision 8).
 //!
 //! The right of an agent is the right of its user intersected with the agent scope
-//! ([`effective_role`]).
+//! ([`effective_role`]). The same rule applies to share-link bearers (the link's node, role and
+//! expiry) and later to apps that act on behalf of a user: all of them carry a [`Scope`].
+//!
+//! Writes to the graph go through the outbox ([`outbox`]): the Postgres change and its
+//! relationship updates commit together, then the updates are applied to SpiceDB.
 
 pub mod memory;
+pub mod outbox;
 
-use crate::actor::Context;
-use crate::agents::AgentScope;
+use crate::actor::{Context, PrincipalKind};
 use crate::error::Result;
 use crate::ids::NodeId;
+use crate::nodes::NodeStore;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// The roles of section 3.2, from lowest to highest. A higher role includes all lower ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -49,6 +55,19 @@ impl Role {
             Role::Share => "share",
         }
     }
+}
+
+/// What a principal with limited credentials may touch: one subtree, roles up to `max_role`,
+/// until `expires_at`. Used for agents (from the agent row), share-link bearers (the link) and
+/// apps acting for a user (step 3). The principal itself is `Context::actor`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    /// The root of the subtree, or `None` for the whole tenant.
+    pub subtree: Option<NodeId>,
+    /// The highest role that may be used.
+    pub max_role: Role,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// An object in the relationship graph, for example `node:<uuid>`.
@@ -112,19 +131,54 @@ pub trait Authz: Send + Sync {
     async fn read(&self, object: &ObjectRef) -> Result<Vec<Relationship>>;
 }
 
-/// The highest role of the actor on a node, after the agent scope. `user_role` is the role of the
-/// user for whom the actor acts. `in_subtree` says whether the node is inside the scope subtree.
+/// The graph subject whose rights apply to the request: `user:<id>` for a user and for an agent
+/// (its user, `on_behalf_of`), `share_link:<id>` for a share-link bearer, `app:<id>` for an app
+/// without a user. The scope in `ctx` then narrows that right.
+pub fn subject_of(ctx: &Context) -> SubjectRef {
+    let (object_type, id) = match (ctx.actor.effective_user(), ctx.actor.actor.kind) {
+        (Some(user), _) => ("user", user.0),
+        (None, PrincipalKind::ShareLink) => ("share_link", ctx.actor.actor.id.0),
+        (None, PrincipalKind::App) => ("app", ctx.actor.actor.id.0),
+        (None, PrincipalKind::Group) => ("group", ctx.actor.actor.id.0),
+        (None, PrincipalKind::Agent | PrincipalKind::User) => ("user", ctx.actor.actor.id.0),
+    };
+    SubjectRef {
+        object: ObjectRef {
+            object_type: object_type.to_string(),
+            object_id: id.to_string(),
+        },
+        relation: None,
+    }
+}
+
+/// The highest role of the actor on a node, after the scope. `subject_role` is the role of the
+/// subject of [`subject_of`] in the graph. `in_subtree` says whether the node is inside the scope
+/// subtree (true when the scope has no subtree). An expired scope gives `None`.
 pub fn effective_role(
-    _user_role: Option<Role>,
-    _scope: Option<&AgentScope>,
+    _subject_role: Option<Role>,
+    _scope: Option<&Scope>,
     _in_subtree: bool,
+    _now: OffsetDateTime,
 ) -> Option<Role> {
     todo!("authz: effective_role")
 }
 
-/// Checks that the actor in `ctx` has at least `role` on `node`; fails with
-/// `permission_denied` or `scope_exceeded`.
-pub async fn require(_authz: &dyn Authz, _ctx: &Context, _node: NodeId, _role: Role) -> Result<()> {
+/// Checks that the actor in `ctx` has at least `role` on `node`; fails with `not_found` when the
+/// actor cannot see the node, `permission_denied` when the subject lacks the role, and
+/// `scope_exceeded` when only the scope stops it.
+///
+/// The scope subtree is checked by tree ancestry with [`NodeStore::ancestors`] for agents and
+/// apps: a node is inside when the subtree root is the node or one of its ancestors. Member-link
+/// targets outside the subtree are outside an agent's scope. For a share-link bearer the graph
+/// already limits the link to its node, its subtree and its member-link targets, so only
+/// `max_role` and `expires_at` of the scope are checked.
+pub async fn require(
+    _authz: &dyn Authz,
+    _nodes: &dyn NodeStore,
+    _ctx: &Context,
+    _node: NodeId,
+    _role: Role,
+) -> Result<()> {
     todo!("authz: require")
 }
 

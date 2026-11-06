@@ -1,4 +1,7 @@
 //! In-memory journal, for unit tests. Not implemented yet.
+//!
+//! The in-memory stores share one `MemoryJournal` and call [`MemoryJournal::append`] for each
+//! change.
 
 use super::{Journal, JournalEntry, NewEntry};
 use crate::actor::Context;
@@ -9,12 +12,15 @@ use async_trait::async_trait;
 #[derive(Debug, Default)]
 pub struct MemoryJournal {}
 
-#[async_trait]
-impl Journal for MemoryJournal {
-    async fn append(&self, _ctx: &Context, _entry: NewEntry) -> Result<JournalEntry> {
+impl MemoryJournal {
+    /// Appends one entry at once and returns it with its `seq`.
+    pub fn append(&self, _ctx: &Context, _entry: NewEntry) -> Result<JournalEntry> {
         todo!("journal: append")
     }
+}
 
+#[async_trait]
+impl Journal for MemoryJournal {
     async fn read(
         &self,
         _ctx: &Context,

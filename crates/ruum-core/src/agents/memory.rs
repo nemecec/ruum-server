@@ -55,13 +55,7 @@ impl AgentStore for MemoryAgentStore {
     ) -> Result<Page<JournalEntry>> {
         todo!("agents: activity")
     }
-    async fn undo_since(
-        &self,
-        _ctx: &Context,
-        _id: AgentId,
-        _since: OffsetDateTime,
-        _dry_run: bool,
-    ) -> Result<UndoReport> {
-        todo!("agents: undo_since")
+    async fn undo(&self, _ctx: &Context, _id: AgentId, _req: UndoRequest) -> Result<UndoReport> {
+        todo!("agents: undo")
     }
 }

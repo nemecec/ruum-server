@@ -21,7 +21,33 @@ pub fn router() -> Router<AppState> {
         )
         .route("/v1/agents/{agent_id}/activity", get(list_agent_activity))
         .route("/v1/agents/{agent_id}/undo", post(undo_agent))
+        .route("/v1/oauth/register", post(register_oauth_client))
+        .route("/v1/oauth/clients/{client_id}", get(get_oauth_client))
+        .route("/v1/oauth/authorize", get(oauth_authorize))
+        .route("/v1/oauth/consent", post(oauth_consent))
         .route("/v1/oauth/token", post(exchange_token))
+}
+
+/// Register an OAuth client (RFC 7591). `POST /v1/oauth/register` (operationId
+/// `registerOAuthClient`).
+pub async fn register_oauth_client() -> HttpError {
+    not_implemented("registerOAuthClient")
+}
+
+/// Get a registered OAuth client. `GET /v1/oauth/clients/{client_id}` (operationId
+/// `getOAuthClient`).
+pub async fn get_oauth_client() -> HttpError {
+    not_implemented("getOAuthClient")
+}
+
+/// Start an OAuth authorization. `GET /v1/oauth/authorize` (operationId `oauthAuthorize`).
+pub async fn oauth_authorize() -> HttpError {
+    not_implemented("oauthAuthorize")
+}
+
+/// Approve or deny an OAuth authorization. `POST /v1/oauth/consent` (operationId `oauthConsent`).
+pub async fn oauth_consent() -> HttpError {
+    not_implemented("oauthConsent")
 }
 
 /// List agents. `GET /v1/agents` (operationId `listAgents`).
@@ -74,12 +100,13 @@ pub async fn list_agent_activity() -> HttpError {
     not_implemented("listAgentActivity")
 }
 
-/// Undo what an agent did since a time. `POST /v1/agents/{agent_id}/undo` (operationId `undoAgent`).
+/// Undo what an agent did. `POST /v1/agents/{agent_id}/undo` (operationId `undoAgent`).
 pub async fn undo_agent() -> HttpError {
     not_implemented("undoAgent")
 }
 
-/// Exchange an API key for an access token. `POST /v1/oauth/token` (operationId `exchangeToken`).
+/// Get an access token (authorization code, refresh token or API key exchange).
+/// `POST /v1/oauth/token` (operationId `exchangeToken`).
 pub async fn exchange_token() -> HttpError {
     not_implemented("exchangeToken")
 }

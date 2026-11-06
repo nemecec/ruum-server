@@ -21,7 +21,8 @@
     "node_name": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 255
+      "maxLength": 255,
+      "description": "Unicode NFC; the length counts characters (code points) after NFC."
     },
     "node_kind": {
       "enum": [
@@ -68,6 +69,10 @@
         },
         "id": {
           "$ref": "#/$defs/uuid"
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Filled by the API when known (for example in GET /v1/changes). Never stored in the journal."
         }
       }
     },
@@ -118,6 +123,13 @@
             }
           }
         }
+      ]
+    },
+    "share_link_role": {
+      "enum": [
+        "view",
+        "comment",
+        "edit"
       ]
     }
   }

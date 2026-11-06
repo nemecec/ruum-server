@@ -4,6 +4,10 @@
 //! A grant writes a relationship to the authz engine and a row to `share_index` (the roots of
 //! grants per principal), so "Shared with me" is a list query, not a graph walk.
 //! Guests from other tenants and share links are allowed (decision 9); public files come later.
+//! The tenant policy (`crate::tenants::TenantPolicy`) can forbid guests, links or edit links.
+//!
+//! Relationship writes go through the outbox ([`crate::authz::outbox`]), so Postgres and SpiceDB
+//! never diverge.
 
 pub mod memory;
 
@@ -24,8 +28,9 @@ use time::OffsetDateTime;
 pub enum Grantee {
     /// A user by ID (a member or a guest).
     User { id: UserId },
-    /// A person by email. Without a Ruum account, or from another tenant, they become a guest
-    /// and get an invitation.
+    /// A person by email. The grant stays an email grant and sends an invitation. It binds to a
+    /// user only through the invitation token, or a verified email of a trusted provider; an
+    /// unverified email never claims it.
     Email { email: String },
     /// Everybody in the tenant of the node (`tenant#member`).
     TenantMembers,
@@ -45,13 +50,32 @@ pub struct Grant {
     pub created_at: OffsetDateTime,
 }
 
+/// The roles a share link can have. Never `manage` or `share` (also checked in SQL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareLinkRole {
+    View,
+    Comment,
+    /// Only when the tenant policy has `allow_edit_links`.
+    Edit,
+}
+
+impl ShareLinkRole {
+    pub fn as_role(self) -> Role {
+        match self {
+            ShareLinkRole::View => Role::View,
+            ShareLinkRole::Comment => Role::Comment,
+            ShareLinkRole::Edit => Role::Edit,
+        }
+    }
+}
+
 /// A secret share link (`anyone_with_link`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShareLink {
     pub id: ShareLinkId,
     pub node_id: NodeId,
-    /// `view` or `comment`; `edit` only when the tenant allows it.
-    pub role: Role,
+    pub role: ShareLinkRole,
     /// The secret token. Only the create response has it; it is stored as a hash.
     pub token: Option<String>,
     pub url: Option<String>,
@@ -68,7 +92,7 @@ pub struct ShareLink {
 /// A request to make a share link.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewShareLink {
-    pub role: Role,
+    pub role: ShareLinkRole,
     #[serde(with = "time::serde::rfc3339::option", default)]
     pub expires_at: Option<OffsetDateTime>,
     pub password: Option<String>,
@@ -87,7 +111,12 @@ pub struct SharedItem {
 #[async_trait]
 pub trait SharingStore: Send + Sync {
     /// The direct and inherited grants on a node. Needs `view` on the node.
-    async fn list_grants(&self, ctx: &Context, node: NodeId) -> Result<Vec<Grant>>;
+    async fn list_grants(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        page: PageRequest,
+    ) -> Result<Page<Grant>>;
     /// Adds a grant. Needs the `share` permission on the node.
     async fn add_grant(
         &self,
@@ -96,13 +125,26 @@ pub trait SharingStore: Send + Sync {
         grantee: Grantee,
         role: Role,
     ) -> Result<Written<Grant>>;
+    /// Changes the role of a grant in one step (`grant.updated`). Needs `share` on the node.
+    async fn update_grant(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        grant: GrantId,
+        role: Role,
+    ) -> Result<Written<Grant>>;
     async fn remove_grant(
         &self,
         ctx: &Context,
         node: NodeId,
         grant: GrantId,
     ) -> Result<Written<()>>;
-    async fn list_share_links(&self, ctx: &Context, node: NodeId) -> Result<Vec<ShareLink>>;
+    async fn list_share_links(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        page: PageRequest,
+    ) -> Result<Page<ShareLink>>;
     async fn create_share_link(
         &self,
         ctx: &Context,
@@ -110,12 +152,13 @@ pub trait SharingStore: Send + Sync {
         req: NewShareLink,
     ) -> Result<Written<ShareLink>>;
     async fn revoke_share_link(&self, ctx: &Context, link: ShareLinkId) -> Result<Written<()>>;
-    /// Resolves a share link token without sign-in. Returns the tenant, node and role.
+    /// Resolves a share link token without sign-in. Returns the link, its tenant and node. A link
+    /// that the tenant policy no longer allows is `not_found`.
     async fn resolve_share_link(
         &self,
         token: &str,
         password: Option<&str>,
-    ) -> Result<(TenantId, Node, Role)>;
+    ) -> Result<(TenantId, Node, ShareLink)>;
     /// The grant roots for the actor's user, across all tenants where the user is a member or
     /// guest. `ctx.tenant` is ignored for this call.
     async fn shared_with_me(&self, ctx: &Context, page: PageRequest) -> Result<Page<SharedItem>>;

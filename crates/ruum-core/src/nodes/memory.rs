@@ -49,7 +49,12 @@ impl NodeStore for MemoryNodeStore {
     async fn copy(&self, _ctx: &Context, _id: NodeId, _req: CopyRequest) -> Result<Written<Node>> {
         todo!("nodes: copy")
     }
-    async fn trash(&self, _ctx: &Context, _id: NodeId) -> Result<Written<Node>> {
+    async fn trash(
+        &self,
+        _ctx: &Context,
+        _id: NodeId,
+        _if_revision: Option<i64>,
+    ) -> Result<Written<Node>> {
         todo!("nodes: trash")
     }
     async fn restore(
@@ -60,10 +65,24 @@ impl NodeStore for MemoryNodeStore {
     ) -> Result<Written<Node>> {
         todo!("nodes: restore")
     }
-    async fn list_trash(&self, _ctx: &Context, _page: PageRequest) -> Result<Page<Node>> {
+    async fn list_trash(
+        &self,
+        _ctx: &Context,
+        _all: bool,
+        _page: PageRequest,
+    ) -> Result<Page<Node>> {
         todo!("nodes: list_trash")
+    }
+    async fn purge(&self, _ctx: &Context, _id: NodeId) -> Result<Written<()>> {
+        todo!("nodes: purge")
+    }
+    async fn empty_trash(&self, _ctx: &Context) -> Result<(u32, Option<ChangeInfo>)> {
+        todo!("nodes: empty_trash")
     }
     async fn path_of(&self, _ctx: &Context, _id: NodeId) -> Result<String> {
         todo!("nodes: path_of")
+    }
+    async fn ancestors(&self, _ctx: &Context, _id: NodeId) -> Result<Vec<NodeId>> {
+        todo!("nodes: ancestors")
     }
 }

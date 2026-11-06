@@ -3,7 +3,11 @@
 //! `ruum-server` builds one `Services` at start (Postgres, object storage and SpiceDB backed).
 //! Tests use [`Services::in_memory`].
 
-use crate::agents::{AgentStore, memory::MemoryAgentStore};
+use crate::agents::{
+    AgentStore,
+    memory::MemoryAgentStore,
+    oauth::{MemoryOAuthServer, OAuthServer},
+};
 use crate::audit::{AuditLog, memory::MemoryAuditLog};
 use crate::authz::{Authz, memory::MemoryAuthz};
 use crate::blobs::{
@@ -34,6 +38,7 @@ pub struct Services {
     pub oidc: Arc<dyn OidcClient>,
     pub tokens: Arc<dyn TokenIssuer>,
     pub agents: Arc<dyn AgentStore>,
+    pub oauth: Arc<dyn OAuthServer>,
     pub nodes: Arc<dyn NodeStore>,
     pub blobs: Arc<dyn BlobStore>,
     pub transfers: Arc<dyn Transfers>,
@@ -56,6 +61,7 @@ impl Services {
             oidc: Arc::new(MemoryOidcClient::default()),
             tokens: Arc::new(MemoryTokenIssuer::default()),
             agents: Arc::new(MemoryAgentStore::default()),
+            oauth: Arc::new(MemoryOAuthServer::default()),
             nodes: Arc::new(MemoryNodeStore::default()),
             blobs: Arc::new(MemoryBlobStore::default()),
             transfers: Arc::new(MemoryTransfers::default()),

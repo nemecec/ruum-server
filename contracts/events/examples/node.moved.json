@@ -2,6 +2,7 @@
   "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
   "seq": 18233,
   "node_id": "0190b6c4-6a00-7cc1-9a4b-1f2e3d4c5b6b",
+  "revision": 4,
   "type": "node.moved",
   "actor": {
     "kind": "agent",

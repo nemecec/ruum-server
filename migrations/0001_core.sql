@@ -14,7 +14,8 @@
 --   set local ruum.tenant_id = '<uuid>';   -- the tenant of the request
 --   set local ruum.user_id   = '<uuid>';   -- the effective user (for "shared with me")
 --   set local ruum.system    = 'on';       -- only for the few cross-tenant lookups: sign-in,
---                                          -- key exchange, share link and invitation tokens
+--                                          -- key exchange, OAuth codes and refresh tokens,
+--                                          -- share link and invitation tokens
 -- The policies are FORCEd, so they also apply to the table owner. Superusers (tests with
 -- #[sqlx::test]) bypass them.
 
@@ -59,7 +60,9 @@ create table tenants (
     plan            plan not null default 'free',
     region          text not null default 'hel1',
     root_node_id    uuid,                         -- set in the same transaction as the root node
-    -- Tenant policy: allowed sharing, identity providers, retention overrides.
+    -- The tenant policy: `TenantPolicy` of openapi.yaml, `ruum_core::tenants::TenantPolicy`.
+    -- Missing keys take the defaults of the contract. Allowed identity providers and retention
+    -- overrides come later.
     settings        jsonb not null default '{}'::jsonb,
     created_at      timestamptz not null default now(),
     created_kind    principal_kind not null,
@@ -83,17 +86,22 @@ $$;
 
 -- A person. `tenant_id` is the personal (home) tenant, made at first sign-in. A user can be a
 -- member or guest of other tenants through `memberships`.
+-- `email_verified` is true only when a trusted provider verified the email. Only verified emails
+-- are unique, so an unverified sign-in can never take an address from its real owner, and only a
+-- verified email claims email grants and invitations (section 4.2: no linking by email alone).
 create table users (
     id              uuid primary key,
     tenant_id       uuid not null references tenants (id),
     email           text not null,
+    email_verified  boolean not null default false,
     display_name    text not null,
     avatar_url      text,
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now(),
     deleted_at      timestamptz
 );
-create unique index users_email_key on users (lower(email)) where deleted_at is null;
+create unique index users_email_key on users (lower(email)) where deleted_at is null and email_verified;
+create index users_email_idx on users (lower(email)) where deleted_at is null;
 
 -- A linked identity at an identity provider (through Zitadel). Linked only by an explicit action
 -- of the signed-in user, or by a verified email from a trusted provider.
@@ -167,13 +175,16 @@ create table nodes (
     id              uuid primary key,             -- UUIDv7, never changes
     tenant_id       uuid not null references tenants (id),
     parent_id       uuid,                         -- null only for the tenant root
+    -- Names are stored in NFC; the length counts characters after NFC (as in openapi.yaml).
     name            text not null check (length(name) between 1 and 255 and name not in ('.', '..')
-                                         and position('/' in name) = 0),
+                                         and position('/' in name) = 0 and name is nfc normalized),
     kind            node_kind not null,
     type            text,                         -- MIME type, 'album', 'project', 'database', ...
     link_kind       link_kind,
     link_target     uuid,
     head_version    uuid,
+    -- The user who created the node (the owner, for a personal tree). Display and accounting
+    -- only: it gives no rights. The SpiceDB `owner` tuple is written only on personal roots.
     owner_id        uuid not null references users (id),
     size_bytes      bigint not null default 0 check (size_bytes >= 0),
     revision        bigint not null default 1,
@@ -197,14 +208,18 @@ create table nodes (
     -- The parent is in the same tenant.
     foreign key (tenant_id, parent_id) references nodes (tenant_id, id),
     -- Only links have link fields. `link_target` has no foreign key: a link stays when its
-    -- target is purged (a broken link, which the UI hides; section 2.3).
+    -- target is purged (a broken link, which the UI hides; section 2.3). The trigger
+    -- `nodes_link_target_check` makes sure that a new target is a node of the same tenant.
+    -- Cross-tenant links ("Add to my drive" of a node from another tenant) are not in step 1;
+    -- they would add a nullable `link_target_tenant_id` column later.
     check ((kind = 'link') = (link_kind is not null and link_target is not null)),
     check (kind <> 'link' or head_version is null),
     check ((trashed_at is null) = (trash_root is null))
 );
 
--- A name is unique among the live (not trashed) children of a folder (section 2.6).
-create unique index nodes_live_name_key on nodes (tenant_id, parent_id, name) where trashed_at is null;
+-- A name is unique among the live (not trashed) children of a folder (section 2.6), without regard
+-- to case (names keep their case), as WebDAV, macOS and Windows clients expect.
+create unique index nodes_live_name_key on nodes (tenant_id, parent_id, lower(name)) where trashed_at is null;
 -- One root per tenant.
 create unique index nodes_root_key on nodes (tenant_id) where parent_id is null;
 create index nodes_children_idx on nodes (tenant_id, parent_id, kind, name) where trashed_at is null;
@@ -216,6 +231,24 @@ create index nodes_name_trgm_idx on nodes using gin (lower(name) gin_trgm_ops) w
 alter table tenants
     add foreign key (id, root_node_id) references nodes (tenant_id, id) deferrable initially deferred;
 
+-- A link and its target are in the same tenant (no cross-tenant links in step 1). Checked when
+-- the target is set; a later purge of the target leaves a broken link.
+create function ruum_check_link_target() returns trigger
+language plpgsql as $$
+begin
+    if new.link_target is not null and not exists (
+        select 1 from nodes n where n.tenant_id = new.tenant_id and n.id = new.link_target
+    ) then
+        raise exception 'link target % is not a node of tenant %', new.link_target, new.tenant_id
+            using errcode = 'foreign_key_violation';
+    end if;
+    return new;
+end
+$$;
+create trigger nodes_link_target_check
+    before insert or update of link_target, tenant_id on nodes
+    for each row execute function ruum_check_link_target();
+
 -- ---------------------------------------------------------------------------- blobs and versions
 
 -- One version of a node: a complete manifest (snapshot model, section 5.3).
@@ -224,6 +257,9 @@ create table versions (
     tenant_id       uuid not null references tenants (id),
     node_id         uuid not null,
     manifest        bytea not null,               -- encoded list of chunk hashes, or the typed-node manifest
+    -- The format of `manifest` (`ruum_core::blobs::ManifestFormat`). Step 2 adds
+    -- 'typed_manifest_v1'; later versions may add delta encodings.
+    encoding        text not null default 'chunks_v1' check (encoding in ('chunks_v1')),
     size_bytes      bigint not null check (size_bytes >= 0),
     content_hash    bytea not null check (length(content_hash) = 32),   -- BLAKE3 of the whole content
     content_type    text,
@@ -270,7 +306,8 @@ create table uploads (
     content_type    text,
     size_bytes      bigint not null check (size_bytes >= 0),
     content_hash    bytea not null check (length(content_hash) = 32),
-    manifest        bytea not null,               -- the chunk list the client sent
+    manifest        bytea not null,               -- the chunk list the client sent ('chunks_v1')
+    chunking        text not null,                -- the id of the chunking parameters the client used
     status          upload_status not null default 'open',
     result_version  uuid,
     created_at      timestamptz not null default now(),
@@ -365,6 +402,64 @@ create table agent_keys (
 );
 create index agent_keys_agent_idx on agent_keys (tenant_id, agent_id);
 
+-- ---------------------------------------------------------------------------- OAuth for agents
+
+-- OAuth clients from dynamic client registration (RFC 7591), for MCP clients (decision 3).
+-- The one table without `tenant_id`: a registration exists before any user picks a tenant, and it
+-- holds no tenant data (a name and redirect URIs). Only system lookups (`ruum.system = on`) can
+-- read it. Unused registrations are deleted after 30 days.
+create table oauth_clients (
+    client_id                   text primary key,
+    client_name                 text not null check (length(client_name) between 1 and 100),
+    redirect_uris               text[] not null check (cardinality(redirect_uris) between 1 and 10),
+    grant_types                 text[] not null default array['authorization_code', 'refresh_token'],
+    client_uri                  text,
+    logo_uri                    text,
+    software_id                 text,
+    software_version            text,
+    created_at                  timestamptz not null default now(),
+    last_used_at                timestamptz
+);
+
+-- The consent of a user: an OAuth client bound to one agent of the user, in one tenant. Ruum
+-- signs the access tokens; the refresh token is opaque and stored as SHA-256. It rotates on each
+-- use; `previous_refresh_hash` detects reuse of an old token, which ends the grant.
+create table agent_oauth_grants (
+    id                      uuid primary key,
+    tenant_id               uuid not null references tenants (id),
+    agent_id                uuid not null,
+    client_id               text not null references oauth_clients (client_id),
+    audience                text not null,            -- the `resource` (RFC 8707), the token `aud`
+    refresh_token_hash      bytea unique check (length(refresh_token_hash) = 32),
+    previous_refresh_hash   bytea check (length(previous_refresh_hash) = 32),
+    refresh_expires_at      timestamptz,
+    created_at              timestamptz not null default now(),
+    created_kind            principal_kind not null,
+    created_by              uuid not null,            -- the user who approved
+    created_obo             uuid,
+    last_used_at            timestamptz,
+    ended_at                timestamptz,
+    ended_kind              principal_kind,
+    ended_by                uuid,
+    unique (tenant_id, id),
+    foreign key (tenant_id, agent_id) references agents (tenant_id, id)
+);
+create unique index agent_oauth_grants_live_key on agent_oauth_grants (tenant_id, agent_id, client_id)
+    where ended_at is null;
+
+-- One-time authorization codes (60 seconds), with the PKCE challenge.
+create table oauth_codes (
+    code_hash       bytea primary key check (length(code_hash) = 32),
+    tenant_id       uuid not null references tenants (id),
+    grant_id        uuid not null,
+    code_challenge  text not null,
+    redirect_uri    text not null,
+    created_at      timestamptz not null default now(),
+    expires_at      timestamptz not null,
+    used_at         timestamptz,
+    foreign key (tenant_id, grant_id) references agent_oauth_grants (tenant_id, id)
+);
+
 -- ---------------------------------------------------------------------------- sharing
 
 -- Grants of a role on a node. The authz engine (SpiceDB) holds the same facts as relationships;
@@ -381,6 +476,11 @@ create table grants (
     created_kind        principal_kind not null,
     created_by          uuid not null,
     created_obo         uuid,
+    -- The last role change (updateGrant, `grant.updated`).
+    updated_at          timestamptz,
+    updated_kind        principal_kind,
+    updated_by          uuid,
+    updated_obo         uuid,
     foreign key (tenant_id, node_id) references nodes (tenant_id, id),
     check (
         (grantee_kind = 'user' and grantee_user_id is not null and grantee_email is null) or
@@ -391,6 +491,7 @@ create table grants (
 create unique index grants_user_key on grants (tenant_id, node_id, grantee_user_id) where grantee_kind = 'user';
 create unique index grants_email_key on grants (tenant_id, node_id, lower(grantee_email)) where grantee_kind = 'email';
 create unique index grants_members_key on grants (tenant_id, node_id) where grantee_kind = 'tenant_members';
+create index grants_user_idx on grants (tenant_id, grantee_user_id) where grantee_kind = 'user';
 
 -- Secret share links (`anyone_with_link`). Only hashes of the token and password are stored.
 create table share_links (
@@ -412,6 +513,9 @@ create table share_links (
     foreign key (tenant_id, node_id) references nodes (tenant_id, id)
 );
 create index share_links_node_idx on share_links (tenant_id, node_id) where revoked_at is null;
+-- removeMember revokes the links that the user (or the user's agents) made.
+create index share_links_creator_idx on share_links (tenant_id, coalesce(created_obo, created_by))
+    where revoked_at is null;
 
 -- "Shared with me": the roots of grants per principal (section 3.3), so the list is a query and
 -- not a graph walk. `tenant_members` grants are expanded at read time from memberships.
@@ -439,6 +543,7 @@ create table journal (
     tenant_id       uuid not null references tenants (id),
     seq             bigint not null,
     node_id         uuid,
+    revision        bigint,                       -- nodes.revision after the change
     type            text not null,
     actor_kind      principal_kind not null,
     actor           uuid not null,
@@ -449,6 +554,26 @@ create table journal (
 );
 create index journal_node_idx on journal (tenant_id, node_id, seq);
 create index journal_actor_idx on journal (tenant_id, actor, seq desc);
+
+-- The outbox of relationship writes to SpiceDB. A write that changes relationships (a node, a
+-- link, a grant, a membership, a share link) inserts its updates here in the same transaction as
+-- the Postgres change. After the commit the core applies them to SpiceDB (touch and delete are
+-- idempotent), stores the ZedToken and sets `applied_at`. A worker retries rows that are not
+-- applied. Checks after a write use the newest ZedToken of the tenant for read-after-write
+-- consistency. `updates` is a JSON list of `ruum_core::authz::RelationshipUpdate`.
+create table authz_outbox (
+    tenant_id       uuid not null references tenants (id),
+    id              bigint generated always as identity,
+    updates         jsonb not null,
+    created_at      timestamptz not null default now(),
+    applied_at      timestamptz,
+    zed_token       text,
+    attempts        integer not null default 0,
+    last_error      text,
+    primary key (tenant_id, id)
+);
+create index authz_outbox_pending_idx on authz_outbox (id) where applied_at is null;
+create index authz_outbox_token_idx on authz_outbox (tenant_id, id desc) where applied_at is not null;
 
 -- The audit log per tenant (section 15): auth, members, agents, keys, sharing, and node changes.
 create table audit (
@@ -496,7 +621,8 @@ begin
     foreach t in array array[
         'journal_counters', 'identities', 'sessions', 'invitations', 'nodes', 'versions',
         'chunks', 'uploads', 'tags', 'node_tags', 'agents', 'agent_keys', 'grants',
-        'share_links', 'journal', 'audit', 'idempotency_keys'
+        'share_links', 'journal', 'audit', 'idempotency_keys', 'agent_oauth_grants',
+        'oauth_codes', 'authz_outbox'
     ] loop
         execute format('alter table %I enable row level security', t);
         execute format('alter table %I force row level security', t);
@@ -542,3 +668,10 @@ alter table share_index force row level security;
 create policy tenant_isolation on share_index
     using (tenant_id = ruum_current_tenant() or ruum_is_system() or principal_id = ruum_current_user())
     with check (tenant_id = ruum_current_tenant() or ruum_is_system());
+
+-- OAuth clients: no tenant; only system lookups (registration, authorize, token endpoint).
+alter table oauth_clients enable row level security;
+alter table oauth_clients force row level security;
+create policy system_only on oauth_clients
+    using (ruum_is_system())
+    with check (ruum_is_system());

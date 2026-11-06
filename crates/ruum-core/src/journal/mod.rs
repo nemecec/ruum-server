@@ -5,8 +5,18 @@
 //! event bus (through an outbox), agent activity and undo, and the audit log.
 //!
 //! Event payloads are described in `contracts/events/*.schema.json`.
+//!
+//! Writing: the Postgres stores call [`postgres::append`] on their own transaction, so the change
+//! and its entry commit together. The in-memory stores call
+//! [`memory::MemoryJournal::append`]. The [`Journal`] trait is the read side.
+//!
+//! The changes feed checks visibility against the state before and after each change: an entry
+//! is sent when the caller could see its node before or can see it after. When a change alters
+//! what the caller sees of a whole subtree (grants, member links, moves across visible folders,
+//! restores), the feed adds a [`ResyncMarker`] for the caller.
 
 pub mod memory;
+pub mod postgres;
 
 use crate::actor::{Actor, Context};
 use crate::error::Result;
@@ -46,6 +56,8 @@ pub enum EventType {
     TagDetached,
     #[serde(rename = "grant.added")]
     GrantAdded,
+    #[serde(rename = "grant.updated")]
+    GrantUpdated,
     #[serde(rename = "grant.removed")]
     GrantRemoved,
     #[serde(rename = "share_link.created")]
@@ -61,6 +73,9 @@ pub struct JournalEntry {
     /// Grows by one per change in the tenant. Also the cursor of the changes feed.
     pub seq: i64,
     pub node_id: Option<NodeId>,
+    /// The revision of the node after the change (`nodes.revision`); `None` when the entry has
+    /// no node or the node is purged.
+    pub revision: Option<i64>,
     #[serde(rename = "type")]
     pub event: EventType,
     #[serde(flatten)]
@@ -69,6 +84,23 @@ pub struct JournalEntry {
     pub at: OffsetDateTime,
     /// Event-specific data, as in the event schema.
     pub data: serde_json::Value,
+}
+
+/// Whether the caller gained or lost access to a subtree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    Gained,
+    Lost,
+}
+
+/// A per-caller marker of the changes feed (`ResyncMarker` in `openapi.yaml`): the caller's
+/// access to the subtree at `node_id` changed at `seq`, without one entry per node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResyncMarker {
+    pub seq: i64,
+    pub node_id: NodeId,
+    pub access: Access,
 }
 
 /// What a write response says about the change it made (section 3.4).
@@ -93,17 +125,16 @@ pub struct Written<T> {
 #[derive(Clone, Debug)]
 pub struct NewEntry {
     pub node_id: Option<NodeId>,
+    /// The revision of the node after the change.
+    pub revision: Option<i64>,
     pub event: EventType,
     pub data: serde_json::Value,
 }
 
-/// The journal. The Postgres implementation appends inside the caller's transaction; the
-/// in-memory one appends at once.
+/// The read side of the journal. Appending is not in this trait: it must run in the
+/// transaction of the change ([`postgres::append`], [`memory::MemoryJournal::append`]).
 #[async_trait]
 pub trait Journal: Send + Sync {
-    /// Appends one entry and returns it with its `seq`.
-    async fn append(&self, ctx: &Context, entry: NewEntry) -> Result<JournalEntry>;
-
     /// Reads the entries after `after` (exclusive), oldest first, at most `limit`.
     /// The cursor of the returned page is the `seq` of the last entry.
     async fn read(
@@ -115,4 +146,107 @@ pub trait Journal: Send + Sync {
 
     /// The newest `seq` of the tenant, or 0 when the journal is empty.
     async fn latest_seq(&self, ctx: &Context) -> Result<i64>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::UserId;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    const ENVELOPE: &str = include_str!("../../../../contracts/events/journal-entry.schema.json");
+
+    const ALL_EVENTS: &[EventType] = &[
+        EventType::NodeCreated,
+        EventType::NodeRenamed,
+        EventType::NodeMoved,
+        EventType::NodeCopied,
+        EventType::NodeTrashed,
+        EventType::NodeRestored,
+        EventType::NodePurged,
+        EventType::VersionCreated,
+        EventType::VersionRestored,
+        EventType::VersionLabeled,
+        EventType::TagAttached,
+        EventType::TagDetached,
+        EventType::GrantAdded,
+        EventType::GrantUpdated,
+        EventType::GrantRemoved,
+        EventType::ShareLinkCreated,
+        EventType::ShareLinkRevoked,
+    ];
+
+    fn schema() -> Value {
+        serde_json::from_str(ENVELOPE).unwrap()
+    }
+
+    #[test]
+    fn event_types_match_the_envelope_schema() {
+        let schema = schema();
+        let in_schema: BTreeSet<String> = schema["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let in_rust: BTreeSet<String> = ALL_EVENTS
+            .iter()
+            .map(|e| {
+                serde_json::to_value(e)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(in_rust, in_schema);
+        for e in ALL_EVENTS {
+            assert!(
+                crate::agents::undo_action(*e).is_some()
+                    || matches!(e, EventType::NodePurged | EventType::ShareLinkRevoked),
+                "{e:?} has no inverse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_serialized_entry_has_the_envelope_fields() {
+        let schema = schema();
+        let entry = JournalEntry {
+            tenant_id: TenantId(Uuid::now_v7()),
+            seq: 1,
+            node_id: Some(NodeId(Uuid::now_v7())),
+            revision: Some(2),
+            event: EventType::NodeRenamed,
+            actor: Actor::user(UserId(Uuid::now_v7())),
+            at: OffsetDateTime::UNIX_EPOCH,
+            data: serde_json::json!({}),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        let keys: BTreeSet<String> = value.as_object().unwrap().keys().cloned().collect();
+        let required: BTreeSet<String> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let allowed: BTreeSet<String> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            required.is_subset(&keys),
+            "missing: {:?}",
+            required.difference(&keys)
+        );
+        assert!(
+            keys.is_subset(&allowed),
+            "extra: {:?}",
+            keys.difference(&allowed)
+        );
+    }
 }

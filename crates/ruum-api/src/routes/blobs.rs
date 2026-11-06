@@ -8,6 +8,7 @@ use axum::routing::{get, post, put};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/uploads", post(create_upload))
+        .route("/v1/uploads/params", get(get_chunking_params))
         .route(
             "/v1/uploads/{upload_id}",
             get(get_upload).delete(abort_upload),
@@ -18,6 +19,18 @@ pub fn router() -> Router<AppState> {
             "/v1/nodes/{node_id}/content",
             get(download_content).put(put_content),
         )
+        .route("/v1/nodes/{node_id}/content-url", get(get_content_url))
+}
+
+/// The chunking parameters for a file. `GET /v1/uploads/params` (operationId `getChunkingParams`).
+pub async fn get_chunking_params() -> HttpError {
+    not_implemented("getChunkingParams")
+}
+
+/// A short-lived URL of the content on the content domain. `GET /v1/nodes/{node_id}/content-url`
+/// (operationId `getContentUrl`).
+pub async fn get_content_url() -> HttpError {
+    not_implemented("getContentUrl")
 }
 
 /// Start a resumable upload. `POST /v1/uploads` (operationId `createUpload`).

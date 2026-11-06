@@ -5,11 +5,15 @@
 //! - API keys start with [`API_KEY_PREFIX`], are stored only as a hash and have an expiry.
 //! - The agent's right is the user's right intersected with the agent's scope.
 //! - If the user leaves the tenant, the agent is disabled.
+//! - Only a user can register, change, enable, disable or undo an agent, or make its keys
+//!   ([`crate::actor::require_user_actor`]); an agent can never widen its own scope.
+//! - MCP clients connect with OAuth ([`oauth`]); scripts and the CLI use API keys.
 
 pub mod memory;
+pub mod oauth;
 
 use crate::actor::Context;
-use crate::authz::Role;
+use crate::authz::{Role, Scope};
 use crate::error::Result;
 use crate::ids::{AgentId, AgentKeyId, NodeId, TenantId, UserId};
 use crate::journal::JournalEntry;
@@ -41,6 +45,17 @@ pub struct AgentScope {
     pub expires_at: Option<OffsetDateTime>,
     #[serde(default)]
     pub budget: Budget,
+}
+
+impl AgentScope {
+    /// The part of the scope that limits rights, for [`Context::scope`].
+    pub fn as_scope(&self) -> Scope {
+        Scope {
+            subtree: self.subtree,
+            max_role: self.max_role,
+            expires_at: self.expires_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,14 +120,61 @@ pub struct AccessToken {
     pub issued_token_type: String,
 }
 
+/// What to undo: the agent's entries between `since` and `until`, or only the entries in `seqs`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UndoRequest {
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub since: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub until: Option<OffsetDateTime>,
+    pub seqs: Option<Vec<i64>>,
+    pub dry_run: bool,
+}
+
+/// Why an undo skipped an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UndoSkipReason {
+    /// Another actor changed the node later.
+    ChangedLater,
+    /// The event has no inverse (`node.purged`, `share_link.revoked`).
+    Irreversible,
+    /// The caller may not do the inverse.
+    PermissionDenied,
+}
+
+/// The inverse of each event type, as in the `undoAgent` description of `openapi.yaml`.
+/// `None` means the event cannot be undone.
+pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
+    use crate::journal::EventType::*;
+    match event {
+        NodeCreated | NodeCopied => Some("trash the node"),
+        NodeRenamed => Some("rename back"),
+        NodeMoved => Some("move back to the old parent and name"),
+        NodeTrashed => Some("restore"),
+        NodeRestored => Some("trash again"),
+        NodePurged => None,
+        VersionCreated | VersionRestored => Some("restore the version before it"),
+        VersionLabeled => Some("set the old label"),
+        TagAttached => Some("detach the tag"),
+        TagDetached => Some("attach the tag"),
+        GrantAdded => Some("remove the grant"),
+        GrantUpdated => Some("set the old role"),
+        GrantRemoved => Some("add the grant again"),
+        ShareLinkCreated => Some("revoke the link"),
+        ShareLinkRevoked => None,
+    }
+}
+
 /// One change that an undo reverts, or could not revert.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UndoItem {
     pub seq: i64,
     pub node_id: Option<NodeId>,
+    #[serde(rename = "type")]
     pub event: crate::journal::EventType,
-    /// Why the change could not be reverted, for example "changed later by another actor".
-    pub reason: Option<String>,
+    /// Why the change was skipped; `None` for a reverted change.
+    pub reason: Option<UndoSkipReason>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +197,8 @@ pub fn hash_key(_secret: &str) -> [u8; 32] {
 
 #[async_trait]
 pub trait AgentStore: Send + Sync {
+    // Every write below is for users only: it calls `require_user_actor` first.
+
     /// Registers an agent for the actor's user. Fails with `plan_limit_reached` at the limit.
     async fn register(&self, ctx: &Context, req: NewAgent) -> Result<Agent>;
     /// The user's agents; tenant admins see all agents of the tenant.
@@ -168,13 +232,7 @@ pub trait AgentStore: Send + Sync {
         id: AgentId,
         page: PageRequest,
     ) -> Result<Page<JournalEntry>>;
-    /// Reverts the changes of the agent since a time, newest first. Changes that others changed
-    /// later are skipped and reported.
-    async fn undo_since(
-        &self,
-        ctx: &Context,
-        id: AgentId,
-        since: OffsetDateTime,
-        dry_run: bool,
-    ) -> Result<UndoReport>;
+    /// Reverts the changes of the agent, newest first, with the inverse of each event type
+    /// ([`undo_action`]). Changes that others changed later are skipped and reported. Users only.
+    async fn undo(&self, ctx: &Context, id: AgentId, req: UndoRequest) -> Result<UndoReport>;
 }

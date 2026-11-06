@@ -8,12 +8,20 @@
 //!
 //! Identities are linked only by an explicit action of the signed-in user, or by a verified email
 //! from a trusted provider. Never by email alone.
+//!
+//! Email rules:
+//! - `users.email_verified` is true only when a trusted provider verified the email. Only verified
+//!   emails are unique among users, so an unverified sign-in never takes an address from its real
+//!   owner, and the code never needs to auto-link by email.
+//! - An email grant or invitation binds to a user only through its secret invitation token, or
+//!   when the user signs in with that email as a verified email of a trusted provider.
 
 pub mod memory;
 
 use crate::actor::Actor;
+use crate::authz::Scope;
 use crate::error::Result;
-use crate::ids::{AgentId, TenantId, UserId};
+use crate::ids::{AgentId, ShareLinkId, TenantId, UserId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -29,6 +37,8 @@ pub struct User {
     /// The personal tenant of the user, made at first sign-in.
     pub home_tenant_id: TenantId,
     pub email: String,
+    /// True when a trusted provider verified the email.
+    pub email_verified: bool,
     pub display_name: String,
     pub avatar_url: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -108,18 +118,42 @@ pub trait OidcClient: Send + Sync {
     async fn logout_url(&self, id_token_hint: Option<String>) -> Result<String>;
 }
 
-/// The claims of a Ruum access token (agents, and users of native clients after exchange).
+/// The type of a Ruum access token (claim `typ`). The API accepts only these three; tokens for
+/// providers (step 2) and apps (step 3) get their own types and audiences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenType {
+    Agent,
+    User,
+    ShareLink,
+}
+
+/// The claims of a Ruum access token (agents, users of native clients, share-link bearers). The
+/// claim set is documented in `bearerAuth` of `contracts/openapi.yaml`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccessClaims {
     pub iss: String,
-    /// The actor: an agent ID or a user ID.
+    /// The audience: the API origin, for example `https://api.ruum.space`. The API refuses a
+    /// token whose `aud` is not its own origin.
+    pub aud: String,
+    /// The token type. The API refuses other types.
+    pub typ: TokenType,
+    /// The actor: an agent ID, a user ID or a share link ID.
     pub sub: Uuid,
-    /// The tenant the token is for.
-    pub tid: TenantId,
-    /// The user for whom the actor acts.
+    /// The tenant the token is bound to. Always set for agent and share-link tokens.
+    pub tid: Option<TenantId>,
+    /// The user for whom the actor acts (agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obo: Option<UserId>,
-    /// The agent, when the actor is an agent.
+    /// The agent, when `typ` is `agent`. Its scope is read from the agent row on each request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentId>,
+    /// The share link, when `typ` is `share_link`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_link: Option<ShareLinkId>,
+    /// The scope of a share-link token: the link's node, role and expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
     pub iat: i64,
     pub exp: i64,
     pub jti: Uuid,
@@ -129,10 +163,11 @@ pub struct AccessClaims {
 #[derive(Clone, Debug)]
 pub struct Authenticated {
     pub actor: Actor,
-    /// The tenant the credentials are bound to (agent tokens). `None` for user sessions, which
-    /// choose the tenant per request.
+    /// The tenant the credentials are bound to (agent and share-link tokens). `None` for user
+    /// sessions, which choose the tenant per request.
     pub bound_tenant: Option<TenantId>,
-    pub scope: Option<crate::agents::AgentScope>,
+    /// The scope of the credentials (agents, share links), as in [`crate::actor::Context`].
+    pub scope: Option<Scope>,
 }
 
 /// Signs and verifies Ruum access tokens (asymmetric keys, published as JWKS).

@@ -16,11 +16,7 @@
       "$ref": "common.schema.json#/$defs/uuid"
     },
     "role": {
-      "enum": [
-        "view",
-        "comment",
-        "edit"
-      ]
+      "$ref": "common.schema.json#/$defs/share_link_role"
     },
     "expires_at": {
       "oneOf": [

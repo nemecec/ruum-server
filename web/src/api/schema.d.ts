@@ -30,9 +30,54 @@ export interface paths {
         };
         /**
          * Public keys of the Ruum token issuer
-         * @description The keys that verify Ruum access tokens (agents and share links), as a JWKS.
+         * @description The keys that verify Ruum access tokens (agents, users of native clients and share links),
+         *     as a JWKS. The same issuer signs other token types later (provider and app tokens); they
+         *     have another `aud` and `typ`, and the API refuses them (see `bearerAuth`).
          */
         get: operations["getJwks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/.well-known/oauth-protected-resource": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * OAuth protected resource metadata (RFC 9728)
+         * @description Tells OAuth and MCP clients which authorization server issues tokens for this API. A `401`
+         *     from the API or from `/mcp` has `WWW-Authenticate: Bearer resource_metadata="<this URL>"`.
+         */
+        get: operations["getProtectedResourceMetadata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/.well-known/oauth-authorization-server": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * OAuth authorization server metadata (RFC 8414)
+         * @description Ruum is the authorization server for agent tokens. The endpoints are
+         *     `/v1/oauth/authorize`, `/v1/oauth/token` and `/v1/oauth/register`. Only the
+         *     `authorization_code` (with PKCE `S256`), `refresh_token` and token exchange grants exist.
+         */
+        get: operations["getAuthorizationServerMetadata"];
         put?: never;
         post?: never;
         delete?: never;
@@ -131,7 +176,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Linked identities of the signed-in user */
+        /**
+         * Linked identities of the signed-in user
+         * @description Users only (agents and share links get `user_required`).
+         */
         get: operations["listMyIdentities"];
         put?: never;
         post?: never;
@@ -148,7 +196,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Web sessions of the signed-in user */
+        /**
+         * Web sessions of the signed-in user
+         * @description Users only (agents and share links get `user_required`).
+         */
         get: operations["listMySessions"];
         put?: never;
         post?: never;
@@ -168,7 +219,10 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** End one web session */
+        /**
+         * End one web session
+         * @description Users only (agents and share links get `user_required`).
+         */
         delete: operations["endSession"];
         options?: never;
         head?: never;
@@ -190,7 +244,7 @@ export interface paths {
         put?: never;
         /**
          * Create a team tenant
-         * @description The caller becomes the owner. Agents cannot create tenants.
+         * @description Users only (agents and share links get `user_required`). The caller becomes the owner.
          */
         post: operations["createTenant"];
         delete?: never;
@@ -216,8 +270,10 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * Rename a tenant
-         * @description Needs the tenant role `admin` or `owner`.
+         * Rename a tenant or change its policy
+         * @description Users only (agents get `user_required`). Needs the tenant role `admin` or `owner`. A change
+         *     of `policy` applies at once to new grants, links and invitations; existing share links
+         *     that the new policy forbids stop working (`allow_share_links`, `allow_edit_links`).
          */
         patch: operations["updateTenant"];
         trace?: never;
@@ -256,14 +312,24 @@ export interface paths {
         post?: never;
         /**
          * Remove a member
-         * @description Needs `admin`, or the member removes themselves. The agents of the member in this tenant are disabled.
+         * @description Users only (agents get `user_required`). Needs `admin`, or the member removes themselves.
+         *     In one transaction the server:
+         *     - removes the membership (and so `tenant#member` and `tenant#administer`);
+         *     - removes every direct grant to the user on nodes of this tenant (`grant.removed` for
+         *       each), so the user does not stay a silent guest. To keep the person as a guest, an admin
+         *       invites them again with role `guest` and grants again;
+         *     - revokes the share links that the user or the user's agents made in this tenant
+         *       (`share_link.revoked` for each), because the user may still hold their URLs;
+         *     - disables the user's agents in this tenant (`owner_left`) and ends their OAuth grants.
+         *     Grants and member links that the user made for other people stay: they were made for the
+         *     tenant. The actor of these entries is the caller.
          */
         delete: operations["removeMember"];
         options?: never;
         head?: never;
         /**
          * Change the role of a member
-         * @description Needs `admin`. Only an `owner` can make or remove owners. A tenant keeps at least one owner.
+         * @description Users only (agents get `user_required`). Needs `admin`. Only an `owner` can make or remove owners. A tenant keeps at least one owner. A member made `guest` loses `tenant#member` and keeps only direct grants.
          */
         patch: operations["updateMember"];
         trace?: never;
@@ -277,12 +343,15 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List open invitations */
+        /**
+         * List open invitations
+         * @description Users only (agents get `user_required`). Needs `admin`.
+         */
         get: operations["listInvitations"];
         put?: never;
         /**
          * Invite a person
-         * @description Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit.
+         * @description Users only (agents get `user_required`). Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit, and with `permission_denied` for role `guest` when the tenant policy has `allow_guests: false`.
          */
         post: operations["createInvitation"];
         delete?: never;
@@ -304,7 +373,10 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Revoke an invitation */
+        /**
+         * Revoke an invitation
+         * @description Users only (agents get `user_required`). Needs `admin`.
+         */
         delete: operations["revokeInvitation"];
         options?: never;
         head?: never;
@@ -322,7 +394,10 @@ export interface paths {
         put?: never;
         /**
          * Accept an invitation
-         * @description The signed-in user joins the tenant with the role of the invitation. Agents cannot accept invitations.
+         * @description Users only (agents and share links get `user_required`). The signed-in user joins the tenant
+         *     with the role of the invitation. The token binds the invitation to the user who presents
+         *     it; the email of the user does not have to match. Email grants (`addGrant` with an email)
+         *     to this invitation's email become grants to this user.
          */
         post: operations["acceptInvitation"];
         delete?: never;
@@ -364,7 +439,7 @@ export interface paths {
         };
         /**
          * The audit log of a tenant
-         * @description Newest first. Needs the tenant role `admin`. With `Accept: application/x-ndjson` the server
+         * @description Users only (agents get `user_required`). Newest first. Needs the tenant role `admin`. With `Accept: application/x-ndjson` the server
          *     streams all matching entries as one JSON object per line (export).
          */
         get: operations["listAudit"];
@@ -391,8 +466,8 @@ export interface paths {
         put?: never;
         /**
          * Register an agent
-         * @description Registers an agent that acts for the signed-in user (no team agents in step 1). Only a user
-         *     can register an agent; an agent cannot. Fails with `plan_limit_reached` at the agent limit.
+         * @description Users only (agents get `user_required`). Registers an agent that acts for the signed-in user
+         *     (no team agents in step 1). Fails with `plan_limit_reached` at the agent limit.
          */
         post: operations["registerAgent"];
         delete?: never;
@@ -404,9 +479,12 @@ export interface paths {
     "/v1/agents/{agent_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -422,7 +500,7 @@ export interface paths {
         head?: never;
         /**
          * Change an agent's name or scope
-         * @description Only the owner of the agent. A new scope applies to new access tokens at once and to old ones within their lifetime.
+         * @description Users only (agents get `user_required`, also for their own record). Only the owner of the agent. A new scope applies at once to every request: the API reads the scope of the agent row on each request, not from the token.
          */
         patch: operations["updateAgent"];
         trace?: never;
@@ -430,9 +508,12 @@ export interface paths {
     "/v1/agents/{agent_id}/disable": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -443,7 +524,7 @@ export interface paths {
         put?: never;
         /**
          * Disable an agent
-         * @description The owner or a tenant admin. Key exchange and all requests of the agent fail with `agent_disabled`.
+         * @description Users only (agents get `user_required`). The owner or a tenant admin. Key exchange, refresh and all requests of the agent fail with `agent_disabled`.
          */
         post: operations["disableAgent"];
         delete?: never;
@@ -455,9 +536,12 @@ export interface paths {
     "/v1/agents/{agent_id}/enable": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -468,7 +552,7 @@ export interface paths {
         put?: never;
         /**
          * Enable an agent
-         * @description Only the owner. An agent that was disabled because its user left the tenant cannot be enabled.
+         * @description Users only (agents get `user_required`). Only the owner. An agent that was disabled because its user left the tenant cannot be enabled.
          */
         post: operations["enableAgent"];
         delete?: never;
@@ -480,9 +564,12 @@ export interface paths {
     "/v1/agents/{agent_id}/keys": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -491,14 +578,15 @@ export interface paths {
         };
         /**
          * List the API keys of an agent
-         * @description Metadata only. The secret is never shown again after creation.
+         * @description Users only (agents get `user_required`). The owner or a tenant admin. Metadata only. The secret is never shown again after creation.
          */
         get: operations["listAgentKeys"];
         put?: never;
         /**
          * Create an API key
-         * @description Only the owner of the agent. The response has the secret once. The server stores only a
-         *     hash. Keys always expire (default 90 days, at most 1 year).
+         * @description Users only (agents get `user_required`, so an agent cannot mint keys for itself). Only the
+         *     owner of the agent. The response has the secret once. The server stores only a hash. Keys
+         *     always expire (default 90 days, at most 1 year).
          */
         post: operations["createAgentKey"];
         delete?: never;
@@ -510,9 +598,12 @@ export interface paths {
     "/v1/agents/{agent_id}/keys/{key_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -525,7 +616,7 @@ export interface paths {
         post?: never;
         /**
          * Revoke an API key
-         * @description The owner or a tenant admin. Access tokens from this key stop working within their lifetime (at most 15 minutes).
+         * @description Users only (agents get `user_required`). The owner or a tenant admin. Access tokens from this key stop working within their lifetime (at most 15 minutes).
          */
         delete: operations["revokeAgentKey"];
         options?: never;
@@ -536,9 +627,12 @@ export interface paths {
     "/v1/agents/{agent_id}/activity": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -561,9 +655,12 @@ export interface paths {
     "/v1/agents/{agent_id}/undo": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -573,13 +670,133 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Undo what an agent did since a time
-         * @description Reverts the changes of the agent since `since`, newest first: restores earlier versions,
-         *     moves nodes back, restores trashed nodes and trashes created ones. A change that another
-         *     actor changed later is skipped and reported. The undo itself is a set of new changes by the
-         *     caller. Only the owner of the agent or a tenant admin. With `dry_run` nothing changes.
+         * Undo what an agent did
+         * @description Users only (agents get `user_required`). Only the owner of the agent or a tenant admin.
+         *     Reverts the journal entries of the agent between `since` and `until` (or only the entries
+         *     in `seqs`), newest first. With `dry_run` nothing changes. The undo itself is a set of new
+         *     changes by the caller. Every event type has an inverse:
+         *
+         *     | Event | Inverse |
+         *     |---|---|
+         *     | `node.created`, `node.copied` | trash the node |
+         *     | `node.renamed` | rename back |
+         *     | `node.moved` | move back to the old parent and name |
+         *     | `node.trashed` | restore |
+         *     | `node.restored` | trash again |
+         *     | `node.purged` | none: skipped with reason `irreversible` |
+         *     | `version.created`, `version.restored` | restore the version before it (a new head) |
+         *     | `version.labeled` | set the old label |
+         *     | `tag.attached` / `tag.detached` | detach / attach |
+         *     | `grant.added` | remove the grant |
+         *     | `grant.updated` | set the old role |
+         *     | `grant.removed` | add the grant again |
+         *     | `share_link.created` | revoke the link |
+         *     | `share_link.revoked` | none: skipped with reason `irreversible` (the token is gone) |
+         *
+         *     An entry whose node another actor changed later is skipped with reason
+         *     `changed_later`, and an entry whose inverse the caller may not do is skipped with reason
+         *     `permission_denied`.
          */
         post: operations["undoAgent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/oauth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register an OAuth client (RFC 7591)
+         * @description Dynamic client registration for MCP clients. No sign-in needed. Only public clients with
+         *     PKCE (`token_endpoint_auth_method: none`). Redirect URIs must be `https`, or `http` on a
+         *     loopback address (`127.0.0.1`, `[::1]`, `localhost`) for native clients. A registration
+         *     gives no access: access needs the consent of a user (`POST /v1/oauth/consent`). Unused
+         *     registrations are deleted after 30 days. Errors use the OAuth error body (`OAuthError`).
+         */
+        post: operations["registerOAuthClient"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/oauth/clients/{client_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a registered OAuth client
+         * @description The public metadata of a client, for the consent screen. Users only.
+         */
+        get: operations["getOAuthClient"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/oauth/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start an OAuth authorization (RFC 6749, PKCE)
+         * @description The browser comes here from the OAuth client. The server checks `client_id`,
+         *     `redirect_uri` (an exact match with a registered URI) and the PKCE challenge (`S256`
+         *     only). Then it redirects to the consent screen of the web UI,
+         *     `/oauth/consent?request=<request>`, through sign-in when there is no session. `request`
+         *     is a signed, short-lived (10 minutes) value that holds the checked parameters; the server
+         *     keeps no row for it. An unknown client or a wrong redirect URI is a `400` page, never a
+         *     redirect. Other errors redirect to `redirect_uri` with `error` and `state` (RFC 6749,
+         *     section 4.1.2.1).
+         */
+        get: operations["oauthAuthorize"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/oauth/consent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve or deny an OAuth authorization
+         * @description Users only (agents get `user_required`). The consent screen of the web UI calls it with the
+         *     `request` value from `oauthAuthorize`. On approval the server creates a new agent of the
+         *     user in `tenant_id` with `new_agent` (fails with `plan_limit_reached` at the agent limit),
+         *     or binds the client to the existing agent `agent_id` of the user, and stores the binding
+         *     (table `agent_oauth_grants`). It returns the client's `redirect_uri` with a one-time code
+         *     (valid 60 seconds). On denial it returns the `redirect_uri` with `error=access_denied`.
+         *     Writes the audit entry `agent.oauth_approved` or `agent.oauth_denied`.
+         */
+        post: operations["oauthConsent"];
         delete?: never;
         options?: never;
         head?: never;
@@ -596,11 +813,21 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Exchange an API key for an access token
-         * @description Token exchange (RFC 8693 shape). The `subject_token` is an agent API key
-         *     (`ruum_agent_...`). The result is a short-lived bearer token (15 minutes) bound to the
-         *     agent's tenant, user and scope. Errors use the Ruum error body; codes are
-         *     `unauthenticated` (unknown, revoked or expired key) and `agent_disabled`.
+         * Get an access token
+         * @description The OAuth token endpoint. Ruum signs all agent access tokens itself (15 minutes, bound to
+         *     the agent's tenant; see `bearerAuth`). Three grants:
+         *     - `authorization_code`: the code from the consent, with the PKCE `code_verifier`,
+         *       `client_id` and the same `redirect_uri`. Returns an access token and a refresh token.
+         *     - `refresh_token`: a refresh token rotates on each use (the old one stops working; reuse
+         *       of an old one ends the whole grant). Refresh tokens live 30 days from the last use, and
+         *       stop when the agent is disabled or its grant is ended.
+         *     - token exchange (RFC 8693 shape): the `subject_token` is an agent API key
+         *       (`ruum_agent_...`), for scripts and the CLI. No refresh token.
+         *
+         *     Errors use the OAuth error body (`OAuthError`, RFC 6749 section 5.2) with the Ruum code in
+         *     `ruum_code`: `invalid_grant` (unknown, used, revoked or expired code, key or refresh
+         *     token; `ruum_code` `unauthenticated` or `agent_disabled`), `invalid_client`,
+         *     `invalid_request`, `unsupported_grant_type`.
          */
         post: operations["exchangeToken"];
         delete?: never;
@@ -637,8 +864,18 @@ export interface paths {
         put?: never;
         /**
          * Create a folder, an empty file or a link
-         * @description Needs `edit` on the parent. A `member` link also needs `share` on the target (design
-         *     section 2.3). Typed nodes come in step 2; `kind: typed` fails with `validation_failed`.
+         * @description Needs `edit` on the parent. Typed nodes come in step 2; `kind: typed` fails with
+         *     `validation_failed`.
+         *
+         *     Links (design section 2.3): the target must be a node of the same tenant as the link
+         *     (the `Ruum-Tenant` of the call). A target in another tenant, or one that the caller cannot
+         *     see, fails with `404 not_found`; the database checks it too. So "Add to my drive" of a
+         *     node that another tenant shared with you is not a link in step 1. A `member` link also
+         *     needs `share` on the target. A member link acts like a grant of `view` made by its
+         *     creator: it stays when the creator later loses `share`, and it ends when the link is
+         *     trashed or the target leaves the tenant. Whoever can view the folder that holds the link
+         *     can view the target, so sharing that folder (to guests, or by a share link) shares the
+         *     target too, under the same tenant policy (`TenantPolicy`) as any other grant.
          *     To create a file with content, use `POST /v1/uploads` with a `new_file` target, or create
          *     an empty file and `PUT /v1/nodes/{node_id}/content`.
          */
@@ -674,9 +911,12 @@ export interface paths {
     "/v1/nodes/{node_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -686,11 +926,21 @@ export interface paths {
         /**
          * Get a node
          * @description Needs `view`. A node that the caller cannot see is `404`, not `403`, so IDs do not leak.
+         *     Node responses carry `my_role`, the caller's effective role on the node (after the agent
+         *     scope), so clients know what they may do.
          */
         get: operations["getNode"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete a trashed node permanently
+         * @description Only for a trashed root (a live node fails with `409 conflict`; trash it first). Needs
+         *     `manage`. On a plan with `admin_restore_days` greater than `trash_days` (team plans), it
+         *     also needs the tenant role `admin`, so a member cannot cut the admin restore window short.
+         *     Deletes the subtree and its versions; chunks go to garbage collection. Links to purged
+         *     nodes stay as broken links. Writes `node.purged`.
+         */
+        delete: operations["purgeNode"];
         options?: never;
         head?: never;
         patch?: never;
@@ -699,9 +949,12 @@ export interface paths {
     "/v1/nodes/{node_id}/children": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -724,9 +977,12 @@ export interface paths {
     "/v1/nodes/{node_id}/rename": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -749,9 +1005,12 @@ export interface paths {
     "/v1/nodes/{node_id}/move": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -775,9 +1034,12 @@ export interface paths {
     "/v1/nodes/{node_id}/copy": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -803,9 +1065,12 @@ export interface paths {
     "/v1/nodes/{node_id}/trash": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -830,9 +1095,12 @@ export interface paths {
     "/v1/nodes/{node_id}/restore": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -844,7 +1112,8 @@ export interface paths {
         /**
          * Restore a node from the trash
          * @description Needs `manage`. Restores into the old parent, or into `parent_id` when given or when the old
-         *     parent is gone. Writes `node.restored`.
+         *     parent is gone. Writes `node.restored`. Within the trash period any caller with `manage`
+         *     can restore; after it, until `admin_restore_days` (team plans), only tenant admins can.
          */
         post: operations["restoreNode"];
         delete?: never;
@@ -862,11 +1131,34 @@ export interface paths {
         };
         /**
          * List the trash
-         * @description The trashed roots (not their children) that the caller can manage, newest first.
+         * @description The trashed roots (not their children) that the caller can manage, newest first, within
+         *     the plan's trash period. With `all=true` a tenant admin also sees the roots after the
+         *     trash period that are still inside `admin_restore_days` (team plans).
          */
         get: operations["listTrash"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/trash/empty": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Empty the trash
+         * @description Purges every trashed root (with its subtree) that the caller may purge (see `purgeNode`).
+         *     Other roots stay. Writes `node.purged` for each purged root.
+         */
+        post: operations["emptyTrash"];
         delete?: never;
         options?: never;
         head?: never;
@@ -884,14 +1176,44 @@ export interface paths {
         put?: never;
         /**
          * Start a resumable upload
-         * @description The client cuts the file into chunks with the published chunking parameters (FastCDC,
-         *     1 MiB minimum, 2 MiB average, 4 MiB maximum), hashes each chunk and the whole content with
-         *     BLAKE3, and sends the list. The response says which chunks the server does not have yet;
-         *     the client uploads only those, then calls `complete`. Needs `edit` on the target file, or on
-         *     the parent folder for a new file. Fails with `quota_exceeded` or `payload_too_large`
-         *     (largest file of the plan) before any byte is sent. The session expires after 24 hours.
+         * @description The client first gets the chunking parameters for the file from
+         *     `GET /v1/uploads/params` (for example FastCDC with 1 MiB minimum, 2 MiB average, 4 MiB
+         *     maximum; smaller chunks for small and text files), cuts the file into chunks, hashes each
+         *     chunk and the whole content with BLAKE3, and sends the list with the `chunking` it used.
+         *     The server refuses a `chunking` that it does not publish (`validation_failed`). The
+         *     response says which chunks the server does not have yet; the client uploads only those,
+         *     then calls `complete`. Needs `edit` on the target file, or on the parent folder for a new
+         *     file. Fails with `quota_exceeded` or `payload_too_large` (largest file of the plan) before
+         *     any byte is sent. The session expires after 24 hours.
+         *
+         *     Known risk (accepted for step 1, design section 5.1): `missing` tells a caller whether
+         *     the tenant already stores a chunk, also one from a file the caller cannot read. A member
+         *     with `edit` somewhere could test whether known content exists in the tenant. Dedup is per
+         *     tenant, so this never crosses tenants.
          */
         post: operations["createUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/uploads/params": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The chunking parameters for a file
+         * @description The parameters that `POST /v1/uploads` accepts for a file of this size and type. They
+         *     depend only on these two inputs and on the server version, so a client may cache them by
+         *     `id`.
+         */
+        get: operations["getChunkingParams"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -901,9 +1223,12 @@ export interface paths {
     "/v1/uploads/{upload_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 upload_id: components["parameters"]["UploadId"];
@@ -927,9 +1252,12 @@ export interface paths {
     "/v1/uploads/{upload_id}/chunks/{hash}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 upload_id: components["parameters"]["UploadId"];
@@ -956,9 +1284,12 @@ export interface paths {
     "/v1/uploads/{upload_id}/complete": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 upload_id: components["parameters"]["UploadId"];
@@ -984,9 +1315,12 @@ export interface paths {
     "/v1/nodes/{node_id}/content": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -998,7 +1332,9 @@ export interface paths {
          * @description Needs `view`. Returns the head version, or `version` when given. Supports one byte range
          *     (`Range: bytes=start-end`) and `HEAD`. The response always has
          *     `Content-Disposition: attachment` and a strict `Content-Security-Policy: sandbox`, so an
-         *     uploaded HTML file cannot run as the platform.
+         *     uploaded HTML file cannot run as the platform. This API-origin download is for the CLI,
+         *     agents and WebDAV. Browsers (downloads and previews in the web UI) use
+         *     `getContentUrl`, which serves the bytes from the separate content domain (decision 1).
          */
         get: operations["downloadContent"];
         /**
@@ -1015,12 +1351,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/nodes/{node_id}/content-url": {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * A short-lived URL of the content on the content domain
+         * @description Needs `view`. Returns a signed URL on the user-content domain
+         *     (`https://<tenant-id>.content.ruumapps.net/...`, decision 1 and design section 15) that
+         *     serves one version for 5 minutes, without cookies. `disposition=inline` is for previews:
+         *     the content domain sends a strict CSP sandbox and never runs the content as the
+         *     platform. The URL supports `Range`.
+         */
+        get: operations["getContentUrl"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/nodes/{node_id}/versions": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1043,9 +1414,12 @@ export interface paths {
     "/v1/nodes/{node_id}/versions/{version_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1069,9 +1443,12 @@ export interface paths {
     "/v1/nodes/{node_id}/versions/{version_id}/restore": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1096,9 +1473,12 @@ export interface paths {
     "/v1/nodes/{node_id}/versions/{version_id}/label": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1122,9 +1502,12 @@ export interface paths {
     "/v1/nodes/{node_id}/diff": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1149,9 +1532,12 @@ export interface paths {
     "/v1/nodes/{node_id}/diff/plugins": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1198,9 +1584,12 @@ export interface paths {
     "/v1/tags/{tag_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 tag_id: components["parameters"]["TagId"];
@@ -1228,9 +1617,12 @@ export interface paths {
     "/v1/tags/{tag_id}/nodes": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 tag_id: components["parameters"]["TagId"];
@@ -1253,9 +1645,12 @@ export interface paths {
     "/v1/nodes/{node_id}/tags": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1278,9 +1673,12 @@ export interface paths {
     "/v1/nodes/{node_id}/tags/{tag_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1308,9 +1706,12 @@ export interface paths {
     "/v1/nodes/{node_id}/grants": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1325,10 +1726,16 @@ export interface paths {
         put?: never;
         /**
          * Add a grant
-         * @description Needs `share` on the node. Grants only add rights (decision 8). A grant to an email of a
-         *     person without a Ruum account, or from another tenant, makes them a guest of this tenant
-         *     and sends an invitation. An agent can never grant more than its own scope. Writes
-         *     `grant.added`.
+         * @description Needs `share` on the node. Grants only add rights (decision 8). An agent can never grant
+         *     more than its own scope. Writes `grant.added`.
+         *
+         *     A grant to a user from another tenant makes them a guest of this tenant. A grant to an
+         *     email stays an email grant (no user) and sends an invitation with a secret token. It
+         *     becomes a grant to a user only when (a) a signed-in user accepts that invitation token, or
+         *     (b) a user signs in with that email as a verified email of a trusted provider
+         *     (`email_verified`). An unverified email never claims an email grant. Grants to people
+         *     outside the tenant fail with `permission_denied` when the tenant policy has
+         *     `allow_guests: false`.
          */
         post: operations["addGrant"];
         delete?: never;
@@ -1340,9 +1747,12 @@ export interface paths {
     "/v1/nodes/{node_id}/grants/{grant_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1360,15 +1770,24 @@ export interface paths {
         delete: operations["removeGrant"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Change the role of a grant
+         * @description Needs `share` on the node. Changes the role in one step (one journal entry,
+         *     `grant.updated`). An agent can never set a role above its own scope. Inherited grants are
+         *     changed on the node that holds them.
+         */
+        patch: operations["updateGrant"];
         trace?: never;
     };
     "/v1/nodes/{node_id}/share-links": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -1384,8 +1803,10 @@ export interface paths {
         /**
          * Create a share link
          * @description Needs `share`. Makes a secret link (`anyone_with_link`) with a role, an optional expiry and
-         *     an optional password. The response has the token and URL once. A tenant can forbid links;
-         *     then this fails with `permission_denied`. Writes `share_link.created`.
+         *     an optional password. The response has the token and URL once. The tenant policy
+         *     (`TenantPolicy`) applies: without `allow_share_links` this fails with `permission_denied`;
+         *     `edit` needs `allow_edit_links`; with `share_link_max_days` set, `expires_at` is required
+         *     and at most that many days ahead (`validation_failed`). Writes `share_link.created`.
          */
         post: operations["createShareLink"];
         delete?: never;
@@ -1397,9 +1818,12 @@ export interface paths {
     "/v1/share-links/{link_id}": {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 link_id: components["parameters"]["LinkId"];
@@ -1431,8 +1855,9 @@ export interface paths {
         /**
          * Open a share link
          * @description No sign-in needed. The token is in the body, not the URL, so it does not reach logs.
-         *     Returns the node and a short-lived access token for the link's role on that subtree. An
-         *     expired, revoked or unknown link is `404`. A wrong password is `401`.
+         *     Returns the node and a short-lived access token (`typ` `share_link`, see `bearerAuth`) for
+         *     the link's role on that subtree. An expired, revoked or unknown link, or one that the
+         *     tenant policy no longer allows, is `404`. A wrong password is `401`.
          */
         post: operations["resolveShareLink"];
         delete?: never;
@@ -1472,10 +1897,24 @@ export interface paths {
         };
         /**
          * The changes feed
-         * @description The journal of the tenant, oldest first, after `cursor`. Only entries on nodes that the caller
-         *     can see (for agents: inside the scope). Sync clients keep `next_cursor` and call again. With
-         *     `wait` the call waits up to that many seconds for new entries (long poll). A cursor older than
-         *     the journal retention fails with `410 cursor_expired`; the client must then do a full listing.
+         * @description The journal of the tenant, oldest first, after `cursor`. Sync clients keep `next_cursor`
+         *     and call again. With `wait` the call waits up to that many seconds for new entries (long
+         *     poll). A cursor older than the journal retention fails with `410 cursor_expired`; the
+         *     client must then do a full listing.
+         *
+         *     Visibility is checked against the state before and after each change. An entry is sent
+         *     when the caller could see its node before the change or can see it after it (for agents:
+         *     inside the scope, too). So a client learns that a node left its view: a `node.moved` to a
+         *     folder it cannot see, `node.trashed`, `node.purged`, or a `grant.removed`. Entries on
+         *     nodes that the caller never saw are left out. A tenant-level entry (`node_id` `null`) is
+         *     sent to members only.
+         *
+         *     A change can also change what the caller sees of a whole subtree without an entry per
+         *     node: a grant added or removed (also through `tenant#member`), a member link added or
+         *     removed, a node moved into or out of a visible folder, a restore. Then the page carries a
+         *     marker in `resync`: the client lists that subtree again (`access: gained`) or drops it
+         *     (`access: lost`), at the position `seq` of the marker. Clients order and dedupe entries
+         *     by `seq`, and per node by `revision`.
          */
         get: operations["listChanges"];
         put?: never;
@@ -1556,7 +1995,7 @@ export interface components {
          * @description Stable, machine-readable error codes.
          * @enum {string}
          */
-        ErrorCode: "bad_request" | "validation_failed" | "unauthenticated" | "token_expired" | "permission_denied" | "scope_exceeded" | "not_found" | "conflict" | "name_taken" | "version_mismatch" | "idempotency_key_reused" | "precondition_failed" | "payload_too_large" | "range_not_satisfiable" | "cursor_expired" | "quota_exceeded" | "plan_limit_reached" | "rate_limited" | "agent_disabled" | "chunk_missing" | "hash_mismatch" | "not_implemented" | "internal" | "unavailable";
+        ErrorCode: "bad_request" | "validation_failed" | "unauthenticated" | "token_expired" | "permission_denied" | "scope_exceeded" | "user_required" | "not_found" | "conflict" | "name_taken" | "version_mismatch" | "idempotency_key_reused" | "precondition_failed" | "payload_too_large" | "range_not_satisfiable" | "cursor_expired" | "quota_exceeded" | "plan_limit_reached" | "rate_limited" | "agent_disabled" | "chunk_missing" | "hash_mismatch" | "not_implemented" | "internal" | "unavailable";
         /**
          * @example {
          *       "error": {
@@ -1620,6 +2059,11 @@ export interface components {
             home_tenant_id: components["schemas"]["Uuid"];
             /** Format: email */
             email: string;
+            /**
+             * @description True when a trusted provider verified the email. Only a verified email is unique
+             *     among users, and only a verified email claims email grants and invitations.
+             */
+            email_verified: boolean;
             display_name: string;
             /** Format: uri */
             avatar_url?: string | null;
@@ -1663,6 +2107,38 @@ export interface components {
          * @enum {string}
          */
         MemberRole: "guest" | "member" | "admin" | "owner";
+        /**
+         * @description What the tenant allows (design section 4.1). Stored in `tenants.settings`. Allowed
+         *     identity providers and retention overrides come later.
+         */
+        TenantPolicy: {
+            /**
+             * @description Share links may be made. When it turns off, existing links stop working.
+             * @default true
+             */
+            allow_share_links: boolean;
+            /**
+             * @description Share links may have the role `edit`.
+             * @default false
+             */
+            allow_edit_links: boolean;
+            /**
+             * @description When set, every share link needs an expiry at most this many days ahead.
+             * @default null
+             */
+            share_link_max_days: number | null;
+            /**
+             * @description Grants and invitations to people outside the tenant are allowed.
+             * @default true
+             */
+            allow_guests: boolean;
+            /**
+             * @description Team tenants: every member has `share` on the team tree (the tuple
+             *     `node:<root>#sharer@tenant:<id>#member`). When false, only owners and admins share.
+             * @default true
+             */
+            members_can_share: boolean;
+        };
         Tenant: {
             id: components["schemas"]["Uuid"];
             name: string;
@@ -1671,6 +2147,7 @@ export interface components {
             /** @example hel1 */
             region: string;
             root_node_id: components["schemas"]["Uuid"];
+            policy: components["schemas"]["TenantPolicy"];
             created_at: components["schemas"]["Timestamp"];
         };
         TenantMembership: {
@@ -1681,7 +2158,9 @@ export interface components {
             name: string;
         };
         UpdateTenantRequest: {
-            name: string;
+            name?: string;
+            /** @description Fields that are left out keep their value. */
+            policy?: components["schemas"]["TenantPolicy"];
         };
         Member: {
             tenant_id: components["schemas"]["Uuid"];
@@ -1724,7 +2203,10 @@ export interface components {
             max_file_bytes: number;
             version_days: number | null;
             version_count: number | null;
+            /** @description How long members see a node in the trash and can restore it. */
             trash_days: number;
+            /** @description How long tenant admins can restore a trashed node (60 on team plans; equal to `trash_days` otherwise). The node is purged after this. */
+            admin_restore_days: number;
             agents: number;
             members: number | null;
         };
@@ -1810,25 +2292,160 @@ export interface components {
             /** @description The API key. Shown only once. */
             secret: string;
         };
+        /** @description The body of the token endpoint, by `grant_type`. */
+        TokenRequest: components["schemas"]["AuthorizationCodeGrant"] | components["schemas"]["RefreshTokenGrant"] | components["schemas"]["TokenExchangeRequest"];
+        AuthorizationCodeGrant: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            grant_type: "authorization_code";
+            code: string;
+            code_verifier: string;
+            client_id: string;
+            /** Format: uri */
+            redirect_uri: string;
+            /** Format: uri */
+            resource?: string;
+        };
+        RefreshTokenGrant: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            grant_type: "refresh_token";
+            refresh_token: string;
+            client_id: string;
+            /** Format: uri */
+            resource?: string;
+        };
         TokenExchangeRequest: {
-            /** @constant */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             grant_type: "urn:ietf:params:oauth:grant-type:token-exchange";
             /** @description The agent API key. */
             subject_token: string;
             /** @constant */
             subject_token_type: "urn:ruum:params:oauth:token-type:api-key";
         };
-        TokenExchangeResponse: {
+        TokenResponse: {
             access_token: string;
             /** @constant */
             token_type: "Bearer";
             /** @description Seconds. 900 by default. */
             expires_in: number;
-            /** @constant */
-            issued_token_type: "urn:ietf:params:oauth:token-type:access_token";
+            /** @description Only for `authorization_code` and `refresh_token`. Opaque; stored as a hash. */
+            refresh_token?: string;
+            /**
+             * @description Only for token exchange.
+             * @constant
+             */
+            issued_token_type?: "urn:ietf:params:oauth:token-type:access_token";
+            scope?: string;
         };
+        /** @description The OAuth error body (RFC 6749 section 5.2, RFC 7591 section 3.2.2), used only by the OAuth endpoints. */
+        OAuthError: {
+            /**
+             * @example invalid_grant
+             * @example invalid_client
+             * @example invalid_request
+             * @example unsupported_grant_type
+             * @example invalid_redirect_uri
+             * @example invalid_client_metadata
+             */
+            error: string;
+            error_description?: string;
+            ruum_code?: components["schemas"]["ErrorCode"];
+        };
+        OAuthClientRegistration: {
+            client_name: string;
+            redirect_uris: string[];
+            /**
+             * @default [
+             *       "authorization_code",
+             *       "refresh_token"
+             *     ]
+             */
+            grant_types: ("authorization_code" | "refresh_token")[];
+            response_types?: "code"[];
+            /**
+             * @default none
+             * @constant
+             */
+            token_endpoint_auth_method: "none";
+            /** Format: uri */
+            client_uri?: string;
+            /** Format: uri */
+            logo_uri?: string;
+            software_id?: string;
+            software_version?: string;
+        };
+        OAuthClient: {
+            client_id: string;
+            /**
+             * Format: int64
+             * @description Seconds since the epoch.
+             */
+            client_id_issued_at: number;
+            client_name: string;
+            redirect_uris: string[];
+            grant_types: string[];
+            response_types: string[];
+            /** @constant */
+            token_endpoint_auth_method: "none";
+            /** Format: uri */
+            client_uri?: string | null;
+            /** Format: uri */
+            logo_uri?: string | null;
+        };
+        /** @description Give `agent_id` to bind an existing agent, or `new_agent` to create one; not both. Only `approve` and `request` are needed for a denial. */
+        OAuthConsentRequest: {
+            /** @description The `request` value of the consent screen URL. */
+            request: string;
+            approve: boolean;
+            tenant_id?: components["schemas"]["Uuid"];
+            agent_id?: components["schemas"]["Uuid"];
+            new_agent?: components["schemas"]["RegisterAgentRequest"];
+        };
+        /** @description RFC 9728. */
+        ProtectedResourceMetadata: {
+            /**
+             * Format: uri
+             * @example https://api.ruum.space
+             */
+            resource: string;
+            authorization_servers: string[];
+            bearer_methods_supported?: string[];
+            /** Format: uri */
+            resource_documentation?: string;
+        };
+        /** @description RFC 8414. */
+        AuthorizationServerMetadata: {
+            /** Format: uri */
+            issuer: string;
+            /** Format: uri */
+            authorization_endpoint: string;
+            /** Format: uri */
+            token_endpoint: string;
+            /** Format: uri */
+            registration_endpoint: string;
+            /** Format: uri */
+            jwks_uri?: string;
+            response_types_supported: string[];
+            grant_types_supported: string[];
+            code_challenge_methods_supported: string[];
+            token_endpoint_auth_methods_supported: string[];
+            scopes_supported?: string[];
+        };
+        /** @description Give `since` (and optionally `until`), or `seqs`. */
         UndoRequest: {
-            since: components["schemas"]["Timestamp"];
+            since?: components["schemas"]["Timestamp"];
+            /** @description Default is now. */
+            until?: components["schemas"]["Timestamp"];
+            /** @description Only these journal entries of the agent (partial undo). */
+            seqs?: number[];
             /** @description When true, only report what would be reverted. */
             dry_run: boolean;
         };
@@ -1837,8 +2454,11 @@ export interface components {
             seq: number;
             node_id: components["schemas"]["Uuid"] | null;
             type: components["schemas"]["EventType"];
-            /** @description Why the change was skipped. */
-            reason: string | null;
+            /**
+             * @description Why the change was skipped. `null` for reverted entries.
+             * @enum {string|null}
+             */
+            reason: "changed_later" | "irreversible" | "permission_denied" | null;
         };
         UndoReport: {
             dry_run: boolean;
@@ -1862,7 +2482,12 @@ export interface components {
          * @enum {string}
          */
         OnConflict: "fail" | "rename";
-        /** @description Unique among the live children of a folder. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces. */
+        /**
+         * @description The server stores names in Unicode NFC, and `maxLength` counts characters (code points)
+         *     after NFC, in every layer. Names are case-preserving but unique case-insensitively among
+         *     the live children of a folder (`Plan.txt` and `plan.txt` clash), as WebDAV, macOS and
+         *     Windows clients expect. No `/`, no NUL, not `.` or `..`, no leading or trailing spaces.
+         */
         NodeName: string;
         Node: {
             id: components["schemas"]["Uuid"];
@@ -1876,6 +2501,7 @@ export interface components {
             link_kind: components["schemas"]["LinkKind"] | null;
             link_target: components["schemas"]["Uuid"] | null;
             head_version: components["schemas"]["Uuid"] | null;
+            /** @description The user who created the node (for the owner of a personal tree, the owner). Only for display and accounting; it gives no rights. */
             owner_id: components["schemas"]["Uuid"];
             /** Format: int64 */
             size_bytes: number;
@@ -1889,6 +2515,11 @@ export interface components {
             updated_at: components["schemas"]["Timestamp"];
             created_by: components["schemas"]["ActorPair"];
             updated_by: components["schemas"]["ActorPair"];
+            /**
+             * @description The caller's effective role on this node (after the agent or link scope), so the UI and
+             *     agents know what they may do. Set in responses of node reads and writes when known.
+             */
+            my_role?: components["schemas"]["Role"] | null;
         };
         NodePage: {
             items: components["schemas"]["Node"][];
@@ -1905,7 +2536,7 @@ export interface components {
             kind: "folder" | "file" | "link";
             /** @description A MIME type for a file, or a folder type such as `album` or `project`. */
             type?: string;
-            /** @description Required when `kind` is `link`. */
+            /** @description Required when `kind` is `link`. The target must be in the same tenant. */
             link?: {
                 kind: components["schemas"]["LinkKind"];
                 target: components["schemas"]["Uuid"];
@@ -1937,6 +2568,12 @@ export interface components {
             size: number;
         };
         ChunkingParams: {
+            /**
+             * @description A stable name of this parameter set.
+             * @example fastcdc-2020-1m-2m-4m
+             * @example fastcdc-2020-16k-32k-64k
+             */
+            id: string;
             /** @constant */
             algorithm: "fastcdc-2020";
             /** @example 1048576 */
@@ -1974,6 +2611,8 @@ export interface components {
             target: "CreateUploadRequest";
         } & (Omit<components["schemas"]["UploadTarget"], "target"> & {
             content_type?: string;
+            /** @description The `id` of the chunking parameters the client used (from `getChunkingParams`). */
+            chunking: string;
             /** Format: int64 */
             size: number;
             content_hash: components["schemas"]["Hash"];
@@ -1998,6 +2637,15 @@ export interface components {
             expires_at: components["schemas"]["Timestamp"];
             created_by: components["schemas"]["ActorPair"];
         });
+        ContentUrl: {
+            /**
+             * Format: uri
+             * @example https://0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a.content.ruumapps.net/c/eyJhbGciOi...
+             */
+            url: string;
+            expires_at: components["schemas"]["Timestamp"];
+            version_id: components["schemas"]["Uuid"];
+        };
         ContentWrite: {
             node: components["schemas"]["Node"];
             version: components["schemas"]["Version"];
@@ -2179,6 +2827,10 @@ export interface components {
             created_by: components["schemas"]["ActorPair"];
             created_at: components["schemas"]["Timestamp"];
         };
+        GrantPage: {
+            items: components["schemas"]["Grant"][];
+            next_cursor: components["schemas"]["NextCursor"];
+        };
         AddGrantRequest: {
             grantee: components["schemas"]["Grantee"];
             role: components["schemas"]["Role"];
@@ -2196,8 +2848,7 @@ export interface components {
         ShareLink: {
             id: components["schemas"]["Uuid"];
             node_id: components["schemas"]["Uuid"];
-            /** @enum {string} */
-            role: "view" | "comment" | "edit";
+            role: components["schemas"]["ShareLinkRole"];
             /** @description The secret. Only in the create response; stored as a hash. */
             token?: string;
             /**
@@ -2212,13 +2863,19 @@ export interface components {
             revoked_at: components["schemas"]["Timestamp"] | null;
         };
         CreateShareLinkRequest: {
-            /**
-             * @description `edit` only when the tenant allows it.
-             * @enum {string}
-             */
-            role: "view" | "comment" | "edit";
+            /** @description `edit` only when the tenant policy has `allow_edit_links`. */
+            role: components["schemas"]["ShareLinkRole"];
             expires_at?: components["schemas"]["Timestamp"];
             password?: string;
+        };
+        /**
+         * @description The roles a share link can have. Never `manage` or `share`.
+         * @enum {string}
+         */
+        ShareLinkRole: "view" | "comment" | "edit";
+        ShareLinkPage: {
+            items: components["schemas"]["ShareLink"][];
+            next_cursor: components["schemas"]["NextCursor"];
         };
         ShareLinkWrite: {
             share_link: components["schemas"]["ShareLink"];
@@ -2231,7 +2888,7 @@ export interface components {
         ResolvedShareLink: {
             tenant_id: components["schemas"]["Uuid"];
             node: components["schemas"]["Node"];
-            role: components["schemas"]["Role"];
+            role: components["schemas"]["ShareLinkRole"];
             /** @description A bearer token for this node and its subtree with `role`. */
             access_token: string;
             expires_in: number;
@@ -2250,13 +2907,15 @@ export interface components {
          * @description The journal event types of step 1. Payloads are in `contracts/events/`.
          * @enum {string}
          */
-        EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.removed" | "share_link.created" | "share_link.revoked";
-        /** @description One change. `data` follows `contracts/events/<type>.schema.json`. */
+        EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.updated" | "grant.removed" | "share_link.created" | "share_link.revoked";
+        /** @description One change. The envelope is `contracts/events/journal-entry.schema.json`; `data` follows `contracts/events/<type>.schema.json`. */
         JournalEntry: {
             tenant_id: components["schemas"]["Uuid"];
             /** Format: int64 */
             seq: number;
             node_id: components["schemas"]["Uuid"] | null;
+            /** @description The revision of the node after the change, or `null` when the entry has no node or the node is purged. */
+            revision: number | null;
             type: components["schemas"]["EventType"];
             actor: components["schemas"]["PrincipalRef"];
             on_behalf_of: components["schemas"]["Uuid"] | null;
@@ -2269,8 +2928,25 @@ export interface components {
             items: components["schemas"]["JournalEntry"][];
             next_cursor: components["schemas"]["NextCursor"];
         };
+        /** @description The caller's access to a subtree changed at `seq`, without one entry per node. */
+        ResyncMarker: {
+            /**
+             * Format: int64
+             * @description The entry that caused the change. Apply the marker after the entries up to this `seq`.
+             */
+            seq: number;
+            /** @description The root of the subtree. */
+            node_id: components["schemas"]["Uuid"];
+            /**
+             * @description `gained`: list the subtree again. `lost`: drop it from the local copy.
+             * @enum {string}
+             */
+            access: "gained" | "lost";
+        };
         ChangesPage: {
             items: components["schemas"]["JournalEntry"][];
+            /** @description Per-caller markers for this page, ordered by `seq`. Often empty. */
+            resync: components["schemas"]["ResyncMarker"][];
             /** @description Always set. Keep it and pass it to the next call, also when `items` is empty. */
             next_cursor: string;
             /** @description True when more entries are ready now. */
@@ -2330,7 +3006,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description The caller lacks the right (`permission_denied`, `scope_exceeded`, `agent_disabled`, `plan_limit_reached`, `quota_exceeded`). */
+        /** @description The caller lacks the right (`permission_denied`, `scope_exceeded`, `user_required`, `agent_disabled`, `plan_limit_reached`, `quota_exceeded`). */
         PermissionDenied: {
             headers: {
                 [name: string]: unknown;
@@ -2414,7 +3090,10 @@ export interface components {
         };
     };
     parameters: {
-        /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
+        /**
+         * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+         *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+         */
         TenantHeader: components["schemas"]["Uuid"];
         /**
          * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
@@ -2486,6 +3165,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Jwks"];
+                };
+            };
+        };
+    };
+    getProtectedResourceMetadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProtectedResourceMetadata"];
+                };
+            };
+        };
+    };
+    getAuthorizationServerMetadata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The metadata. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthorizationServerMetadata"];
                 };
             };
         };
@@ -2608,6 +3327,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
         };
     };
     listMySessions: {
@@ -2631,6 +3351,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
         };
     };
     endSession: {
@@ -2658,6 +3379,7 @@ export interface operations {
                 content?: never;
             };
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
         };
     };
@@ -3002,6 +3724,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
         };
@@ -3075,9 +3798,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;
@@ -3099,9 +3825,12 @@ export interface operations {
     registerAgent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3134,9 +3863,12 @@ export interface operations {
     getAgent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -3161,9 +3893,12 @@ export interface operations {
     updateAgent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3199,9 +3934,12 @@ export interface operations {
     disableAgent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3232,9 +3970,12 @@ export interface operations {
     enableAgent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3265,9 +4006,12 @@ export interface operations {
     listAgentKeys: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -3295,9 +4039,12 @@ export interface operations {
     createAgentKey: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3333,9 +4080,12 @@ export interface operations {
     revokeAgentKey: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3370,9 +4120,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 agent_id: components["parameters"]["AgentId"];
@@ -3398,9 +4151,12 @@ export interface operations {
     undoAgent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3432,6 +4188,133 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    registerOAuthClient: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OAuthClientRegistration"];
+            };
+        };
+        responses: {
+            /** @description The registered client. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthClient"];
+                };
+            };
+            /** @description `invalid_redirect_uri` or `invalid_client_metadata`. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthError"];
+                };
+            };
+            429: components["responses"]["RateLimited"];
+        };
+    };
+    getOAuthClient: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The client. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthClient"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    oauthAuthorize: {
+        parameters: {
+            query: {
+                response_type: "code";
+                client_id: string;
+                redirect_uri: string;
+                code_challenge: string;
+                code_challenge_method: "S256";
+                state?: string;
+                /** @description Ignored in step 1 except for `offline_access`. The user picks the `AgentScope` in the consent screen. */
+                scope?: string;
+                /** @description RFC 8707. Must be the API origin or its `/mcp` URL; it becomes the `aud` of the tokens. */
+                resource?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Redirect to the consent screen, to sign-in, or back to the client with an error. */
+            302: {
+                headers: {
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+        };
+    };
+    oauthConsent: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OAuthConsentRequest"];
+            };
+        };
+        responses: {
+            /** @description Where the browser goes next. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** Format: uri */
+                        redirect_to: string;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
     exchangeToken: {
         parameters: {
             query?: never;
@@ -3447,8 +4330,8 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/x-www-form-urlencoded": components["schemas"]["TokenExchangeRequest"];
-                "application/json": components["schemas"]["TokenExchangeRequest"];
+                "application/x-www-form-urlencoded": components["schemas"]["TokenRequest"];
+                "application/json": components["schemas"]["TokenRequest"];
             };
         };
         responses: {
@@ -3459,21 +4342,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TokenExchangeResponse"];
+                    "application/json": components["schemas"]["TokenResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
-            401: components["responses"]["Unauthenticated"];
-            403: components["responses"]["PermissionDenied"];
+            /** @description The OAuth error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthError"];
+                };
+            };
+            /** @description `invalid_client`. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OAuthError"];
+                };
+            };
             429: components["responses"]["RateLimited"];
         };
     };
     getRoot: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;
@@ -3497,9 +4398,12 @@ export interface operations {
     createNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3534,9 +4438,12 @@ export interface operations {
     getNodeByPath: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 /** @description Names separated by `/`, each percent-encoded. */
@@ -3563,9 +4470,12 @@ export interface operations {
     getNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -3588,6 +4498,43 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    purgeNode: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Purged. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangeOnly"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
     listChildren: {
         parameters: {
             query?: {
@@ -3597,9 +4544,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -3625,9 +4575,12 @@ export interface operations {
     renameNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3667,9 +4620,12 @@ export interface operations {
     moveNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3709,9 +4665,12 @@ export interface operations {
     copyNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3748,9 +4707,12 @@ export interface operations {
     trashNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3784,14 +4746,19 @@ export interface operations {
     restoreNode: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
                  */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+                /** @description The node ETag (`"<revision>"`). The write fails with `412 precondition_failed` if the node changed. */
+                "If-Match"?: components["parameters"]["IfMatch"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -3817,18 +4784,24 @@ export interface operations {
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
         };
     };
     listTrash: {
         parameters: {
             query?: {
+                /** @description Tenant admins only. */
+                all?: boolean;
                 /** @description The `next_cursor` of the previous page. */
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;
@@ -3845,14 +4818,55 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+        };
+    };
+    emptyTrash: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What was purged. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description The number of purged roots. */
+                        purged: number;
+                        /** @description The last change, or `null` if nothing was purged. */
+                        change: components["schemas"]["Change"] | null;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
         };
     };
     createUpload: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3885,12 +4899,46 @@ export interface operations {
             422: components["responses"]["ValidationFailed"];
         };
     };
+    getChunkingParams: {
+        parameters: {
+            query: {
+                size: number;
+                content_type?: string;
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The parameters. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChunkingParams"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
     getUpload: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 upload_id: components["parameters"]["UploadId"];
@@ -3915,9 +4963,12 @@ export interface operations {
     abortUpload: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3945,9 +4996,12 @@ export interface operations {
     putChunk: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -3984,9 +5038,12 @@ export interface operations {
     completeUpload: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4021,9 +5078,12 @@ export interface operations {
             query?: {
                 version?: components["schemas"]["Uuid"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 Range?: string;
                 "If-None-Match"?: string;
             };
@@ -4077,9 +5137,12 @@ export interface operations {
     putContent: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4116,6 +5179,39 @@ export interface operations {
             413: components["responses"]["PayloadTooLarge"];
         };
     };
+    getContentUrl: {
+        parameters: {
+            query?: {
+                version?: components["schemas"]["Uuid"];
+                disposition?: "attachment" | "inline";
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The URL. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContentUrl"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            404: components["responses"]["NotFound"];
+        };
+    };
     listVersions: {
         parameters: {
             query?: {
@@ -4127,9 +5223,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4154,9 +5253,12 @@ export interface operations {
     getVersion: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4182,9 +5284,12 @@ export interface operations {
     restoreVersion: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4216,9 +5321,12 @@ export interface operations {
     setVersionLabel: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4261,9 +5369,12 @@ export interface operations {
                 /** @description A plugin name from `listDiffPlugins`, for example `text`. */
                 plugin?: string;
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4289,9 +5400,12 @@ export interface operations {
     listDiffPlugins: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4322,9 +5436,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;
@@ -4346,9 +5463,12 @@ export interface operations {
     createTag: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4382,9 +5502,12 @@ export interface operations {
     getTag: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 tag_id: components["parameters"]["TagId"];
@@ -4409,9 +5532,12 @@ export interface operations {
     deleteTag: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4440,9 +5566,12 @@ export interface operations {
     updateTag: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4483,9 +5612,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 tag_id: components["parameters"]["TagId"];
@@ -4510,9 +5642,12 @@ export interface operations {
     listNodeTags: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4539,9 +5674,12 @@ export interface operations {
     attachTag: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4573,9 +5711,12 @@ export interface operations {
     detachTag: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4606,10 +5747,17 @@ export interface operations {
     };
     listGrants: {
         parameters: {
-            query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            query?: {
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4618,15 +5766,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The grants. */
+            /** @description One page of grants. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: components["schemas"]["Grant"][];
-                    };
+                    "application/json": components["schemas"]["GrantPage"];
                 };
             };
             401: components["responses"]["Unauthenticated"];
@@ -4636,9 +5782,12 @@ export interface operations {
     addGrant: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4675,9 +5824,12 @@ export interface operations {
     removeGrant: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4706,12 +5858,63 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
-    listShareLinks: {
+    updateGrant: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                node_id: components["parameters"]["NodeId"];
+                grant_id: components["parameters"]["GrantId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    role: components["schemas"]["Role"];
+                };
+            };
+        };
+        responses: {
+            /** @description The grant. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GrantWrite"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
+    listShareLinks: {
+        parameters: {
+            query?: {
+                /** @description The `next_cursor` of the previous page. */
+                cursor?: components["parameters"]["Cursor"];
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path: {
                 node_id: components["parameters"]["NodeId"];
@@ -4720,15 +5923,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The share links. */
+            /** @description One page of share links. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: components["schemas"]["ShareLink"][];
-                    };
+                    "application/json": components["schemas"]["ShareLinkPage"];
                 };
             };
             401: components["responses"]["Unauthenticated"];
@@ -4739,9 +5940,12 @@ export interface operations {
     createShareLink: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4777,9 +5981,12 @@ export interface operations {
     revokeShareLink: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
                 /**
                  * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
                  *     server keeps the first response for 24 hours per tenant, actor and key.
@@ -4869,9 +6076,12 @@ export interface operations {
                 /** @description Only changes inside this folder (at any depth). */
                 node?: components["schemas"]["Uuid"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;
@@ -4894,9 +6104,12 @@ export interface operations {
     getLatestCursor: {
         parameters: {
             query?: never;
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;
@@ -4931,9 +6144,12 @@ export interface operations {
                 cursor?: components["parameters"]["Cursor"];
                 limit?: components["parameters"]["Limit"];
             };
-            header: {
-                /** @description The tenant of the call. Optional for agent tokens (bound to one tenant); if sent, it must match. */
-                "Ruum-Tenant": components["parameters"]["TenantHeader"];
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
             };
             path?: never;
             cookie?: never;

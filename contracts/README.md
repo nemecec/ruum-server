@@ -9,8 +9,8 @@ The contracts are the shared ground between people and agents that work in paral
 | `redocly.yaml` | Lint rules for `openapi.yaml`, with the reason for each rule that is off. | - |
 | `authz/schema.zed` | The SpiceDB schema (design section 3.3): users, groups, tenants, agents, share links, nodes and their roles and permissions. | `zed validate contracts/authz/schema.test.yaml` |
 | `authz/schema.test.yaml` | Relationships and assertions that pin the permission rules (inheritance, member links, share links, team roots). The in-memory authz implementation must pass the same cases. | same |
-| `events/journal-entry.schema.json` | The envelope of one journal entry (design section 2.5): `tenant_id`, `seq`, `node_id`, `type`, `actor`, `on_behalf_of`, `at`, `data`. Used by the changes feed, agent activity, the outbox and webhooks. | `ajv validate --spec=draft2020` |
-| `events/<type>.schema.json` | The `data` of each event type of step 1: `node.created`, `node.renamed`, `node.moved`, `node.copied`, `node.trashed`, `node.restored`, `node.purged`, `version.created`, `version.restored`, `version.labeled`, `tag.attached`, `tag.detached`, `grant.added`, `grant.removed`, `share_link.created`, `share_link.revoked`. | same |
+| `events/journal-entry.schema.json` | The envelope of one journal entry (design section 2.5): `tenant_id`, `seq`, `node_id`, `revision`, `type`, `actor`, `on_behalf_of`, `at`, `data`. Entries of `GET /v1/changes` and agent activity validate against it (the API may add `actor.display_name`). Used by the changes feed, agent activity, the outbox and webhooks. | `ajv validate --spec=draft2020` |
+| `events/<type>.schema.json` | The `data` of each event type of step 1: `node.created`, `node.renamed`, `node.moved`, `node.copied`, `node.trashed`, `node.restored`, `node.purged`, `version.created`, `version.restored`, `version.labeled`, `tag.attached`, `tag.detached`, `grant.added`, `grant.updated`, `grant.removed`, `share_link.created`, `share_link.revoked`. | same |
 | `events/common.schema.json` | Shared definitions (IDs, times, hashes, roles, principals, grantees). | same |
 | `events/examples/` | Example entries that must validate. | same |
 
@@ -36,6 +36,9 @@ stop and ask for one.
 - IDs are UUIDv7 strings. Times are RFC 3339 in UTC.
 - Errors: `{ "error": { "code": "snake_case_code", "message": "...", "hint": "..." } }`. The code list
   is the `ErrorCode` schema in `openapi.yaml` and `ErrorCode` in `crates/ruum-core/src/error.rs`.
+  Only the OAuth endpoints (`/v1/oauth/register`, `/v1/oauth/token`) use the OAuth error body
+  (`OAuthError`), because OAuth clients expect it.
+- Operations with `x-ruum-user-only: true` refuse agents and share links (`403 user_required`).
 - Writes accept `Idempotency-Key`. Write responses carry `change` with `actor` and `on_behalf_of`.
 - Lists use cursor paging: `cursor`, `limit`, and `{ items, next_cursor }`.
 - Tenant-scoped calls name the tenant in the `Ruum-Tenant` header.

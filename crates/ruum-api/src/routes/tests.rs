@@ -55,6 +55,18 @@ async fn stub_routes_answer_501_with_error_json() {
         (Method::GET, "/v1/changes".to_string()),
         (Method::POST, format!("/v1/agents/{id}/undo")),
         (Method::POST, "/v1/oauth/token".to_string()),
+        (Method::POST, "/v1/oauth/register".to_string()),
+        (Method::GET, "/v1/oauth/authorize".to_string()),
+        (Method::POST, "/v1/oauth/consent".to_string()),
+        (
+            Method::GET,
+            "/.well-known/oauth-protected-resource".to_string(),
+        ),
+        (Method::DELETE, format!("/v1/nodes/{id}")),
+        (Method::POST, "/v1/trash/empty".to_string()),
+        (Method::GET, "/v1/uploads/params?size=1".to_string()),
+        (Method::GET, format!("/v1/nodes/{id}/content-url")),
+        (Method::PATCH, format!("/v1/nodes/{id}/grants/{id}")),
         (Method::GET, format!("/v1/tenants/{id}/audit")),
         (Method::GET, "/v1/search?q=garden".to_string()),
     ];

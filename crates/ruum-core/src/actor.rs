@@ -3,6 +3,8 @@
 //! Every write records two principals: `actor` (the user, agent or app that did the write) and
 //! `on_behalf_of` (the user, when the actor is an agent or an app).
 
+use crate::authz::Scope;
+use crate::error::{Error, Result};
 use crate::ids::{PrincipalId, TenantId, UserId};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +68,12 @@ impl Actor {
     pub fn is_agent(&self) -> bool {
         self.actor.kind == PrincipalKind::Agent
     }
+
+    /// True when the actor is a signed-in user acting for themselves (not an agent, an app or a
+    /// share-link bearer).
+    pub fn is_user(&self) -> bool {
+        self.actor.kind == PrincipalKind::User && self.on_behalf_of.is_none()
+    }
 }
 
 /// The request context that every core operation takes: the tenant and the actor.
@@ -73,10 +81,96 @@ impl Actor {
 #[derive(Clone, Debug)]
 pub struct Context {
     pub tenant: TenantId,
+    /// The principal (`actor.actor`) and the user it acts for (`actor.on_behalf_of`).
     pub actor: Actor,
-    /// The agent scope, when the actor is an agent. The effective right is the user's right
-    /// intersected with this scope (section 3.3).
-    pub scope: Option<crate::agents::AgentScope>,
+    /// The scope of the credentials: the agent scope for an agent, the link's node, role and
+    /// expiry for a share-link bearer, the app scope for an app later. `None` for a user. The
+    /// effective right is the principal's right intersected with this scope (section 3.3).
+    pub scope: Option<Scope>,
     /// The idempotency key of the request, if the client sent one.
     pub idempotency_key: Option<String>,
+}
+
+/// Checks that the caller is a signed-in user, not an agent, an app or a share-link bearer, and
+/// returns the user. Every operation marked `x-ruum-user-only` in `contracts/openapi.yaml` calls
+/// this first: registering and changing agents and their keys, OAuth consent, undo, tenant
+/// administration, invitations, the audit log, and the caller's identities and sessions. It fails
+/// with `user_required` (403), also when the agent's user would be allowed, so an agent can never
+/// widen its own scope or act as a tenant admin.
+pub fn require_user_actor(ctx: &Context) -> Result<UserId> {
+    if ctx.actor.is_user() && ctx.scope.is_none() {
+        Ok(UserId(ctx.actor.actor.id.0))
+    } else {
+        Err(Error::user_required())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authz::Role;
+    use crate::error::ErrorCode;
+    use uuid::Uuid;
+
+    fn ctx(actor: Actor, scope: Option<Scope>) -> Context {
+        Context {
+            tenant: TenantId(Uuid::now_v7()),
+            actor,
+            scope,
+            idempotency_key: None,
+        }
+    }
+
+    fn code(r: Result<UserId>) -> Option<ErrorCode> {
+        match r {
+            Err(Error::Api(e)) => Some(e.code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_user_passes() {
+        let user = UserId(Uuid::now_v7());
+        assert_eq!(
+            require_user_actor(&ctx(Actor::user(user), None)).ok(),
+            Some(user)
+        );
+    }
+
+    #[test]
+    fn an_agent_is_refused_even_for_its_owner() {
+        let owner = UserId(Uuid::now_v7());
+        let agent = Actor {
+            actor: PrincipalRef {
+                kind: PrincipalKind::Agent,
+                id: PrincipalId(Uuid::now_v7()),
+            },
+            on_behalf_of: Some(owner),
+        };
+        let scope = Scope {
+            subtree: None,
+            max_role: Role::Share,
+            expires_at: None,
+        };
+        assert_eq!(agent.effective_user(), Some(owner));
+        assert_eq!(
+            code(require_user_actor(&ctx(agent, Some(scope)))),
+            Some(ErrorCode::UserRequired)
+        );
+    }
+
+    #[test]
+    fn a_share_link_is_refused() {
+        let link = Actor {
+            actor: PrincipalRef {
+                kind: PrincipalKind::ShareLink,
+                id: PrincipalId(Uuid::now_v7()),
+            },
+            on_behalf_of: None,
+        };
+        assert_eq!(
+            code(require_user_actor(&ctx(link, None))),
+            Some(ErrorCode::UserRequired)
+        );
+    }
 }

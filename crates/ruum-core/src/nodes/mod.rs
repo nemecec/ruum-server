@@ -2,24 +2,30 @@
 //! create, get, by path, list children, rename, move, copy, trash and restore.
 //!
 //! Rules:
-//! - A name is unique among the live (not trashed) children of a folder.
-//! - Links point to the node ID, not to the path. A `member` link needs the `share` permission on
-//!   the target (section 2.3).
-//! - Every write appends a journal entry in the same transaction.
+//! - Names are stored in Unicode NFC. A name is unique among the live (not trashed) children of a
+//!   folder without regard to case (names keep their case).
+//! - Links point to the node ID, not to the path. The target is in the same tenant as the link.
+//!   A `member` link needs the `share` permission on the target (section 2.3); after that it acts
+//!   like a `view` grant by its creator.
+//! - `owner_id` is the creator, for display and accounting; it gives no rights.
+//! - Every write appends a journal entry in the same transaction
+//!   ([`crate::journal::postgres::append`] in the Postgres implementation).
 
 pub mod memory;
 
 use crate::actor::{Actor, Context};
+use crate::authz::Role;
 use crate::error::Result;
 use crate::ids::{NodeId, TenantId, UserId, VersionId};
-use crate::journal::Written;
+use crate::journal::{ChangeInfo, Written};
 use crate::paging::{Page, PageRequest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-/// The longest allowed node name, in bytes.
-pub const MAX_NAME_BYTES: usize = 255;
+/// The longest allowed node name, in characters (Unicode code points) after NFC. The same unit
+/// as `NodeName.maxLength` in `openapi.yaml` and `length(name)` in the SQL check.
+pub const MAX_NAME_CHARS: usize = 255;
 
 /// The four kinds of node that the core knows (section 2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
@@ -59,6 +65,7 @@ pub struct Node {
     pub link_kind: Option<LinkKind>,
     pub link_target: Option<NodeId>,
     pub head_version: Option<VersionId>,
+    /// The creator (the owner, for a personal tree). Display and accounting only.
     pub owner_id: UserId,
     pub size_bytes: i64,
     /// Grows by one on each change of the node row; used with `If-Match`.
@@ -71,6 +78,9 @@ pub struct Node {
     pub updated_at: OffsetDateTime,
     pub created_by: Actor,
     pub updated_by: Actor,
+    /// The caller's effective role on the node (after the scope), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_role: Option<Role>,
 }
 
 /// What to do when the name is taken.
@@ -141,11 +151,14 @@ pub struct RestoreRequest {
     pub parent_id: Option<NodeId>,
     #[serde(default)]
     pub on_conflict: OnConflict,
+    /// The expected revision of the trashed node (`If-Match`).
+    pub if_revision: Option<i64>,
 }
 
-/// Checks a node name: not empty, at most [`MAX_NAME_BYTES`], no `/`, no NUL, not `.` or `..`,
-/// no leading or trailing spaces.
-pub fn validate_name(_name: &str) -> Result<()> {
+/// Normalizes a node name to NFC and checks it: not empty, at most [`MAX_NAME_CHARS`]
+/// characters after NFC, no `/`, no NUL, not `.` or `..`, no leading or trailing spaces.
+/// Returns the normalized name, which is the one to store and to compare.
+pub fn validate_name(_name: &str) -> Result<String> {
     todo!("nodes: validate_name")
 }
 
@@ -182,16 +195,31 @@ pub trait NodeStore: Send + Sync {
     async fn move_node(&self, ctx: &Context, id: NodeId, req: MoveRequest)
     -> Result<Written<Node>>;
     async fn copy(&self, ctx: &Context, id: NodeId, req: CopyRequest) -> Result<Written<Node>>;
-    /// Moves a node (and its subtree) to the trash.
-    async fn trash(&self, ctx: &Context, id: NodeId) -> Result<Written<Node>>;
+    /// Moves a node (and its subtree) to the trash. `if_revision` is the `If-Match` revision.
+    async fn trash(
+        &self,
+        ctx: &Context,
+        id: NodeId,
+        if_revision: Option<i64>,
+    ) -> Result<Written<Node>>;
     async fn restore(
         &self,
         ctx: &Context,
         id: NodeId,
         req: RestoreRequest,
     ) -> Result<Written<Node>>;
-    /// The trashed roots that the actor can see, newest first.
-    async fn list_trash(&self, ctx: &Context, page: PageRequest) -> Result<Page<Node>>;
+    /// The trashed roots that the actor can manage, newest first, within the trash period. With
+    /// `all`, a tenant admin also gets the roots inside `admin_restore_days`.
+    async fn list_trash(&self, ctx: &Context, all: bool, page: PageRequest) -> Result<Page<Node>>;
+    /// Deletes a trashed root and its subtree for good (`purgeNode`). Needs `manage`; on plans
+    /// with an admin restore window, also the tenant role `admin`.
+    async fn purge(&self, ctx: &Context, id: NodeId) -> Result<Written<()>>;
+    /// Purges every trashed root that the actor may purge (`emptyTrash`). Returns the count and
+    /// the last change.
+    async fn empty_trash(&self, ctx: &Context) -> Result<(u32, Option<ChangeInfo>)>;
     /// The display path of a node from the tenant root, for example `/Projects/Garden`.
     async fn path_of(&self, ctx: &Context, id: NodeId) -> Result<String>;
+    /// The ancestors of a node, root first, without the node. No permission check: for
+    /// [`crate::authz::require`] (scope subtrees) and the changes feed.
+    async fn ancestors(&self, ctx: &Context, id: NodeId) -> Result<Vec<NodeId>>;
 }

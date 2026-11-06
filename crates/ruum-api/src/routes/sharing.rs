@@ -3,7 +3,7 @@
 use crate::error::{HttpError, not_implemented};
 use crate::state::AppState;
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -13,7 +13,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/v1/nodes/{node_id}/grants/{grant_id}",
-            delete(remove_grant),
+            patch(update_grant).delete(remove_grant),
         )
         .route(
             "/v1/nodes/{node_id}/share-links",
@@ -32,6 +32,12 @@ pub async fn list_grants() -> HttpError {
 /// Add a grant. `POST /v1/nodes/{node_id}/grants` (operationId `addGrant`).
 pub async fn add_grant() -> HttpError {
     not_implemented("addGrant")
+}
+
+/// Change the role of a grant. `PATCH /v1/nodes/{node_id}/grants/{grant_id}` (operationId
+/// `updateGrant`).
+pub async fn update_grant() -> HttpError {
+    not_implemented("updateGrant")
 }
 
 /// Remove a grant. `DELETE /v1/nodes/{node_id}/grants/{grant_id}` (operationId `removeGrant`).

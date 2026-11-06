@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/grant.updated.schema.json",
+  "title": "grant.updated",
+  "description": "The role of a grant on the node changed. This schema is the `data` of a journal entry with `type` `grant.updated`.",
+  "type": "object",
+  "required": [
+    "grant_id",
+    "grantee",
+    "old_role",
+    "new_role"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "grant_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "grantee": {
+      "$ref": "common.schema.json#/$defs/grantee"
+    },
+    "old_role": {
+      "$ref": "common.schema.json#/$defs/role"
+    },
+    "new_role": {
+      "$ref": "common.schema.json#/$defs/role"
+    }
+  }
+}

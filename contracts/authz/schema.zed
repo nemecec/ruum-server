@@ -59,9 +59,16 @@ definition node {
 
     // Folders that hold a `member` link to this node (design section 2.3). People who can view
     // such a folder can view this node; a member link never gives more than `view`.
+    // Rules the core keeps (they are not in the graph):
+    // - The link and its target are in the same tenant (a database trigger checks it).
+    // - Making a member link needs `share` on the target. After that the link acts like a grant
+    //   of `view` made by its creator: it stays when the creator loses `share`, and the tuple is
+    //   deleted when the link is trashed or purged, or the target is purged.
     relation collection: node
 
-    // The owner of a personal node tree has every right on it.
+    // The owner of a personal node tree has every right on it. Written ONLY on the root of a
+    // personal tenant. `nodes.owner_id` (the creator) never becomes an `owner` tuple, so a
+    // creator who leaves a team keeps no rights on what they made.
     relation owner: user
 
     // Grants. One relation per role.
@@ -108,8 +115,14 @@ definition app_role {
 //   team tenant T made by user U, root folder R:
 //     tenant:T#owner@user:U   tenant:T#member@user:U
 //     node:R#tenant@tenant:T
-//     node:R#sharer@tenant:T#administer  (owners and admins manage and share the team tree)
-//     node:R#editor@tenant:T#member   (every member can work in the team tree)
+//     node:R#sharer@tenant:T#administer  (owners and admins share everything in the team tree)
+//     node:R#manager@tenant:T#member     (every member can work in the team tree: edit, and
+//                                         move, trash and restore, also what others made)
+//     node:R#sharer@tenant:T#member      (only while the policy `members_can_share` is true;
+//                                         the core writes or deletes it when the policy changes)
+//
+// No tuple names the creator of a node. Members who leave lose `tenant#member` and with it
+// every right that came from the team root.
 //
 // Tuples per node: node:N#parent@node:P and node:N#tenant@tenant:T.
 // A member link L in folder F to target X: node:X#collection@node:F.

@@ -10,6 +10,26 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(health))
         .route("/.well-known/jwks.json", get(get_jwks))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(get_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(get_authorization_server_metadata),
+        )
+}
+
+/// OAuth protected resource metadata (RFC 9728). `GET /.well-known/oauth-protected-resource`
+/// (operationId `getProtectedResourceMetadata`). Owned by the identity + tenants + agents area.
+pub async fn get_protected_resource_metadata() -> HttpError {
+    not_implemented("getProtectedResourceMetadata")
+}
+
+/// OAuth authorization server metadata (RFC 8414). `GET /.well-known/oauth-authorization-server`
+/// (operationId `getAuthorizationServerMetadata`). Owned by the identity + tenants + agents area.
+pub async fn get_authorization_server_metadata() -> HttpError {
+    not_implemented("getAuthorizationServerMetadata")
 }
 
 /// Liveness check. `GET /healthz` (operationId `health`).

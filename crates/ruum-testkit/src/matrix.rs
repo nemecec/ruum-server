@@ -1,0 +1,112 @@
+//! The permission matrix: the cases that the permission suite must run for every endpoint, from
+//! the contract review of step 1. The test harness task turns each case into a test against the
+//! API router; until then this list is the definition of done for those cases.
+
+/// The operations that only a signed-in user may call (`x-ruum-user-only: true` in
+/// `contracts/openapi.yaml`). For each one the suite calls the endpoint with an agent token whose
+/// user is allowed (owner and tenant admin, scope `max_role: share`, no subtree) and with a
+/// share-link token, and expects `403 user_required` both times.
+pub const USER_ONLY_OPERATIONS: &[&str] = &[
+    "listMyIdentities",
+    "listMySessions",
+    "endSession",
+    "createTenant",
+    "updateTenant",
+    "updateMember",
+    "removeMember",
+    "listInvitations",
+    "createInvitation",
+    "revokeInvitation",
+    "acceptInvitation",
+    "listAudit",
+    "registerAgent",
+    "updateAgent",
+    "disableAgent",
+    "enableAgent",
+    "listAgentKeys",
+    "createAgentKey",
+    "revokeAgentKey",
+    "undoAgent",
+    "getOAuthClient",
+    "oauthConsent",
+];
+
+/// One case of the permission suite.
+#[derive(Clone, Copy, Debug)]
+pub struct Case {
+    pub name: &'static str,
+    pub given: &'static str,
+    pub expect: &'static str,
+}
+
+/// Cases beyond the role-by-endpoint grid.
+pub const CASES: &[Case] = &[
+    Case {
+        name: "agent_cannot_escalate",
+        given: "an agent of a tenant admin calls each of USER_ONLY_OPERATIONS, including \
+                updateAgent on itself with scope {subtree: null, max_role: share} and \
+                createAgentKey for itself",
+        expect: "403 user_required; the agent row and its keys are unchanged",
+    },
+    Case {
+        name: "member_link_same_tenant",
+        given: "a user with share on file X in tenant A creates a member link to X in a folder \
+                of tenant B (Ruum-Tenant: B)",
+        expect: "404 not_found; no node and no collection tuple is written",
+    },
+    Case {
+        name: "remove_member_cleans_up",
+        given: "member M has a direct edit grant on folder F and made a share link on F, then \
+                an admin removes M",
+        expect: "the grant is gone (grant.removed), the link is revoked (share_link.revoked), \
+                 M gets 404 on F and the link token resolves to 404",
+    },
+    Case {
+        name: "team_member_manages",
+        given: "a team member (not admin) moves and trashes a file another member made",
+        expect: "200; with members_can_share false, addGrant by the same member is 403",
+    },
+    Case {
+        name: "token_audience_and_type",
+        given: "a Ruum-signed token with another aud, or with a typ other than agent, user or \
+                share_link",
+        expect: "401 unauthenticated",
+    },
+    Case {
+        name: "share_link_token_reads_only",
+        given: "a share-link token calls a node read inside the link's subtree, a node read \
+                outside it, and listTenants",
+        expect: "200, 404, 403 user_required",
+    },
+];
+
+#[cfg(test)]
+mod tests {
+    use super::USER_ONLY_OPERATIONS;
+
+    const SPEC: &str = include_str!("../../../contracts/openapi.yaml");
+    const MARK: &str = "      x-ruum-user-only: true\n";
+
+    /// The operationId of the operation that holds the mark at `pos`.
+    fn operation_at(pos: usize) -> &'static str {
+        let before = &SPEC[..pos];
+        let start = before
+            .rfind("operationId: ")
+            .expect("an operationId before the mark")
+            + "operationId: ".len();
+        let end = start + SPEC[start..].find('\n').unwrap();
+        &SPEC[start..end]
+    }
+
+    #[test]
+    fn user_only_list_matches_the_contract() {
+        let mut marked: Vec<&str> = SPEC
+            .match_indices(MARK)
+            .map(|(i, _)| operation_at(i))
+            .collect();
+        let mut listed: Vec<&str> = USER_ONLY_OPERATIONS.to_vec();
+        marked.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(marked, listed);
+    }
+}

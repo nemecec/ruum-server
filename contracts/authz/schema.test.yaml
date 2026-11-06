@@ -20,8 +20,16 @@ relationships: |-
   tenant:acme#member@user:peeter
   node:acme_root#tenant@tenant:acme
   node:acme_root#sharer@tenant:acme#administer
-  node:acme_root#editor@tenant:acme#member
+  node:acme_root#manager@tenant:acme#member
   node:acme_docs#parent@node:acme_root
+  tenant:beta#owner@user:olga
+  tenant:beta#member@user:olga
+  tenant:beta#member@user:liis
+  node:beta_root#tenant@tenant:beta
+  node:beta_root#sharer@tenant:beta#administer
+  node:beta_root#manager@tenant:beta#member
+  node:beta_root#sharer@tenant:beta#member
+  node:beta_docs#parent@node:beta_root
 assertions:
   assertTrue:
     - node:plan#share@user:mari
@@ -30,14 +38,21 @@ assertions:
     - node:photo#view@user:kati
     - node:plan#view@share_link:link1
     - node:acme_docs#edit@user:peeter
+    # A team member can move, trash and restore in the team tree (team root: manager@tenant#member).
+    - node:acme_docs#manage@user:peeter
     - tenant:acme#administer@user:olga
     - node:acme_docs#share@user:olga
+    # With members_can_share (team root: sharer@tenant#member) a member can share.
+    - node:beta_docs#share@user:liis
   assertFalse:
     - node:projects#view@user:jaan
     - node:plan#manage@user:jaan
     - node:photo#edit@user:kati
     - node:plan#edit@share_link:link1
     - node:plan#view@user:peeter
-    - node:acme_docs#manage@user:peeter
+    # Without members_can_share only owners and admins share.
+    - node:acme_docs#share@user:peeter
     - node:acme_docs#view@user:mari
+    # A former member who created acme_docs has no tuple left (no owner tuple for creators).
+    - node:acme_docs#view@user:ex_member
     - tenant:acme#administer@user:peeter
