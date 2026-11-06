@@ -355,6 +355,93 @@ async fn wait_for_wakes_on_append(h: Arc<dyn Harness>) {
     assert!(j.wait_for(&ctx, 0, Duration::from_secs(10)).await.unwrap());
 }
 
+/// The feed on this journal: a purge reaches an agent only when it saw the node. `/b` is
+/// trashed, then the agent's user gets `manage` on the root, then `/b` is purged. An agent scoped
+/// to `/b` with `edit` never saw it (in the trash only `manage` sees a node); with `manage` it
+/// could restore it. Found by the property test of the feed; the feed reads the trash and grant
+/// entries through `node_entries`, so both journals run it.
+async fn the_feed_sends_a_purge_only_to_who_saw_the_node(h: &dyn Harness) {
+    use super::feed::{ChangesQuery, FeedAccess, list_changes};
+    use crate::authz::{Role, Scope};
+
+    /// The agent sees nothing of the tree now (`/b` is gone, the root is outside its scope).
+    struct Nothing;
+    #[async_trait]
+    impl FeedAccess for Nothing {
+        async fn can_view(&self, _: NodeId) -> Result<bool> {
+            Ok(false)
+        }
+        async fn ancestors(&self, _: NodeId) -> Result<Option<Vec<NodeId>>> {
+            Ok(None)
+        }
+        async fn is_member(&self) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    let t = h.tenant().await;
+    let owner = user_ctx(t);
+    let user = UserId::new();
+    let (root, b) = (NodeId::new(), NodeId::new());
+    h.append(&owner, created(b, root)).await;
+    let trash = h
+        .append(
+            &owner,
+            NewEntry {
+                node_id: Some(b),
+                revision: Some(2),
+                event: EventType::NodeTrashed,
+                data: json!({
+                    "parent_id": root, "name": "b", "subtree_count": 1,
+                    "purge_after": "2026-12-06T00:00:00Z"
+                }),
+            },
+        )
+        .await;
+    h.append(
+        &owner,
+        NewEntry {
+            node_id: Some(root),
+            revision: Some(1),
+            event: EventType::GrantAdded,
+            data: json!({
+                "grant_id": Uuid::now_v7(), "grantee": { "type": "user", "id": user },
+                "role": "manage"
+            }),
+        },
+    )
+    .await;
+    let purge = h
+        .append(
+            &owner,
+            NewEntry {
+                node_id: Some(b),
+                revision: None,
+                event: EventType::NodePurged,
+                data: json!({ "name": "b", "subtree_count": 1, "reason": "by_request" }),
+            },
+        )
+        .await;
+    let j = h.journal();
+    for (max_role, want) in [(Role::Edit, vec![]), (Role::Manage, vec![purge.seq])] {
+        let mut agent = agent_ctx(t, user);
+        agent.scope = Some(Scope {
+            subtree: Some(b),
+            max_role,
+            expires_at: None,
+        });
+        let query = ChangesQuery {
+            after: Some(trash.seq),
+            ..Default::default()
+        };
+        let page = list_changes(j.as_ref(), &Nothing, &agent, query)
+            .await
+            .unwrap();
+        let got: Vec<i64> = page.items.iter().map(|e| e.seq).collect();
+        assert_eq!(got, want, "{max_role:?}");
+    }
+}
+
 async fn run_all(h: Arc<dyn Harness>) {
     an_empty_journal(h.as_ref()).await;
     appends_get_gapless_seqs_and_keep_both_principals(h.as_ref()).await;
@@ -363,6 +450,7 @@ async fn run_all(h: Arc<dyn Harness>) {
     the_last_parent_comes_from_the_entries(h.as_ref()).await;
     the_last_parent_skips_entries_without_a_parent(h.as_ref()).await;
     node_entries_filter_by_node_type_and_seq(h.as_ref()).await;
+    the_feed_sends_a_purge_only_to_who_saw_the_node(h.as_ref()).await;
     wait_for_wakes_on_append(h).await;
 }
 

@@ -8,9 +8,10 @@
 //! - before: the caller could see the node's old place (`old_parent_id` of a move or a restore,
 //!   `parent_id` of a rename or a trash, the last known parent of a purged node), or the caller
 //!   was the grantee of a removed or changed grant. For a trash or a purge, also: the caller had
-//!   a grant (from the journal: added and not removed before the change) on the node or on one of
-//!   its ancestors as the journal knows them (`parent_id` entries), and for an agent the node was
-//!   inside the scope.
+//!   a grant (from the journal: added and not removed) on the node or on one of its ancestors as
+//!   the journal knows them (`parent_id` entries) before the node went to the trash; or, for a
+//!   purge, a `manage` grant while the node was in the trash (for an agent: only when its scope
+//!   allows `manage`). For an agent the node must be inside the scope.
 //!
 //! An entry is sent when either holds. A tenant-level entry (`node_id` `null`) is sent to members
 //! only (not to guests).
@@ -28,6 +29,7 @@ use super::{
     encode_cursor, parent_before,
 };
 use crate::actor::{Context, PrincipalKind};
+use crate::authz::Role;
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::NodeId;
 use crate::paging::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
@@ -258,43 +260,50 @@ impl Memo<'_> {
         }
     }
 
-    /// Whether the caller had a grant on `node` before `seq`, from the grant entries of the
-    /// journal: a grant whose newest entry is `grant.added` or `grant.updated` with the caller
-    /// as grantee.
-    async fn had_grant(&mut self, node: NodeId, seq: i64) -> Result<bool> {
+    /// The caller's grants on `node` in the window `since..before`, from the grant entries of
+    /// the journal: for each grant whose state is `grant.added` or `grant.updated` with the
+    /// caller as grantee, its role, and whether that state held already at `since` (the grant's
+    /// newest entry before `since`) or began inside the window. A grant that was removed has no
+    /// state.
+    async fn grant_states(
+        &mut self,
+        node: NodeId,
+        since: i64,
+        before: i64,
+    ) -> Result<Vec<(bool, Role)>> {
         let entries = self
             .journal
-            .node_entries(self.ctx, node, seq, GRANT_EVENTS, u32::MAX)
+            .node_entries(self.ctx, node, before, GRANT_EVENTS, u32::MAX)
             .await?;
-        // Newest first: the first entry of each grant is its state before `seq`.
-        let mut seen = HashSet::new();
+        // Newest first: the first entry of a grant before `since` is its state at `since`;
+        // older ones do not count.
+        let mut settled = HashSet::new();
+        let mut out = Vec::new();
         for e in &entries {
             let id = e.data["grant_id"].as_str().unwrap_or_default().to_string();
-            if !seen.insert(id) || e.event == EventType::GrantRemoved {
+            if settled.contains(&id) {
                 continue;
             }
-            if self.grantee_is_caller(e).await? {
-                return Ok(true);
+            let at_since = e.seq < since;
+            if at_since {
+                settled.insert(id);
             }
+            if e.event == EventType::GrantRemoved || !self.grantee_is_caller(e).await? {
+                continue;
+            }
+            // An unknown role counts as the lowest one.
+            let role = serde_json::from_value(e.data["role"].clone()).unwrap_or(Role::View);
+            out.push((at_since, role));
         }
-        Ok(false)
+        Ok(out)
     }
 
-    /// Whether the caller could see a trashed or purged node before the change, beyond its old
-    /// place: through a grant on the node or on an ancestor (also one that is now gone or in
-    /// the trash), or through an ancestor it can still see. The ancestors come from the journal
-    /// (`parent_id` of the entries), up to [`MAX_GONE_DEPTH`].
-    async fn saw_gone_node(&mut self, node: NodeId, seq: i64) -> Result<bool> {
+    /// The ancestors of a gone node as the journal knows them before `seq` (`parent_id` of the
+    /// entries), the node first, up to [`MAX_GONE_DEPTH`].
+    async fn gone_chain(&mut self, node: NodeId, seq: i64) -> Result<Vec<NodeId>> {
         let mut chain = vec![node];
-        let mut granted = false;
         let mut cur = node;
-        for _ in 0..MAX_GONE_DEPTH {
-            if !granted && self.had_grant(cur, seq).await? {
-                granted = true;
-            }
-            if cur != node && self.can_view(cur).await? {
-                return Ok(true);
-            }
+        while chain.len() < MAX_GONE_DEPTH {
             match self.journal.last_parent(self.ctx, cur, seq).await? {
                 Some(p) if !chain.contains(&p) => {
                     chain.push(p);
@@ -303,14 +312,85 @@ impl Memo<'_> {
                 _ => break,
             }
         }
-        if !granted {
-            return Ok(false);
-        }
-        // An agent (or another scoped principal) sees only inside its subtree.
-        Ok(match self.ctx.scope.as_ref().and_then(|s| s.subtree) {
+        Ok(chain)
+    }
+
+    /// Whether a chain from [`Self::gone_chain`] is inside the scope subtree of an agent (or
+    /// another scoped principal); always true without a subtree.
+    fn chain_in_scope(&self, chain: &[NodeId]) -> bool {
+        match self.ctx.scope.as_ref().and_then(|s| s.subtree) {
             Some(root) => chain.contains(&root),
             None => true,
-        })
+        }
+    }
+
+    /// Whether the caller could see a trashed or purged node before the change, beyond its old
+    /// place:
+    ///
+    /// - for a member: through an ancestor it can still see;
+    /// - in the tree, before the node went to the trash: a grant on the node or on an ancestor
+    ///   (also one that is now gone or in the trash);
+    /// - for a purge, in the trash: a `manage` grant on the node or on an ancestor while the
+    ///   node was in the trash (only those who may restore a trashed node see it). For an agent
+    ///   the role is capped by the scope (`max_role`): the agent's right is the user's right
+    ///   intersected with its scope.
+    ///
+    /// The ancestors come from the journal (`parent_id` of the entries). A grant through an
+    /// ancestor counts for an agent only when the node is inside its subtree. A grant added
+    /// after the trash with less than `manage` never showed the node, so it does not count; nor
+    /// does, for a guest, an ancestor that a grant added after the change shows now.
+    async fn saw_gone_node(&mut self, node: NodeId, entry: &JournalEntry) -> Result<bool> {
+        let seq = entry.seq;
+        let chain = self.gone_chain(node, seq).await?;
+        // A member's access comes from the membership, which the journal does not date, so an
+        // ancestor it sees now stands for one it saw then (the step 1 "now" rule). A guest (or
+        // its agent) sees only what grants give it, and the journal dates those: below.
+        if self.is_member().await? {
+            for cur in &chain[1..] {
+                if self.can_view(*cur).await? {
+                    return Ok(true);
+                }
+            }
+        }
+        // The moment the node left the tree: the trash entry for a purge (a purged node is a
+        // trashed root), the change itself for a trash.
+        let trashed = match entry.event {
+            EventType::NodePurged => self
+                .journal
+                .node_entries(self.ctx, node, seq, &[EventType::NodeTrashed], 1)
+                .await?
+                .first()
+                .map(|e| e.seq),
+            _ => None,
+        };
+        let since = trashed.unwrap_or(seq);
+
+        // In the tree, before the trash.
+        let chain_before = match trashed {
+            Some(t) => self.gone_chain(node, t).await?,
+            None => chain.clone(),
+        };
+        if self.chain_in_scope(&chain_before) {
+            for cur in &chain_before {
+                let states = self.grant_states(*cur, since, since).await?;
+                if !states.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // In the trash, with the right to restore it.
+        let cap = self.ctx.scope.as_ref().map_or(Role::Manage, |s| s.max_role);
+        if trashed.is_none() || cap < Role::Manage || !self.chain_in_scope(&chain) {
+            return Ok(false);
+        }
+        for cur in &chain {
+            let states = self.grant_states(*cur, since, seq).await?;
+            if states.iter().any(|(_, role)| *role >= Role::Manage) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether the caller held the grant of a grant entry on `node`: it is the grantee, and for
@@ -441,7 +521,7 @@ impl Memo<'_> {
             }
             EventType::NodeTrashed | EventType::NodePurged => {
                 if !now && !before {
-                    before = self.saw_gone_node(node, entry.seq).await?;
+                    before = self.saw_gone_node(node, entry).await?;
                 }
                 if (now || before)
                     && let Some(target) = self.member_link_target(entry).await?

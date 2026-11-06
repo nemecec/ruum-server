@@ -712,3 +712,152 @@ async fn an_agent_gets_no_grant_entries_outside_its_scope() {
     assert_eq!(seqs(&page), vec![s]);
     assert_eq!(markers(&page), vec![(s, inner, Access::Lost)]);
 }
+
+/// Found by the property test `feed::the_feed_sends_each_visible_change_once_in_order`
+/// (`tests/properties`); its shrunk case: `/b` is trashed, then the user gets `manage` on the
+/// root, then `/b` is purged. An agent of the user, scoped to `/b` with `edit`, got the
+/// `node.purged` entry with the name of `/b`. It never saw `/b`: before the trash the user had no
+/// grant, and in the trash only those who may restore it (`manage`) see it, while the agent's
+/// right is the user's right capped by its scope.
+#[tokio::test]
+async fn an_agent_that_could_not_restore_a_trashed_node_gets_no_purge() {
+    let fake = Fake::default();
+    let mut w = world(&fake);
+    w.ctx.actor = Actor {
+        actor: PrincipalRef {
+            kind: crate::actor::PrincipalKind::Agent,
+            id: PrincipalId(Uuid::now_v7()),
+        },
+        on_behalf_of: Some(w.user),
+    };
+    // Outside the scope, the agent sees nothing of the tree; `b` is gone.
+    fake.node(w.root, None, false);
+    fake.node(w.open, Some(w.root), false);
+    let b = NodeId::new();
+    let me = json!({ "type": "user", "id": w.user });
+    w.created(b, w.root);
+    let start = w.add(Some(b), EventType::NodeTrashed, trashed(w.root));
+    w.add(
+        Some(w.root),
+        EventType::GrantAdded,
+        json!({ "grant_id": Uuid::now_v7(), "grantee": me, "role": "manage" }),
+    );
+    let p = w.add(Some(b), EventType::NodePurged, purged());
+    let query = ChangesQuery {
+        after: Some(start),
+        ..Default::default()
+    };
+    for (max_role, want) in [
+        (Role::View, vec![]),
+        (Role::Edit, vec![]),
+        // With `manage` in its scope, the agent could restore `b` and saw it in the trash.
+        (Role::Manage, vec![p]),
+    ] {
+        w.ctx.scope = Some(crate::authz::Scope {
+            subtree: Some(b),
+            max_role,
+            expires_at: None,
+        });
+        assert_eq!(
+            seqs(&w.feed(&fake, query.clone()).await),
+            want,
+            "{max_role:?}"
+        );
+    }
+
+    // A grant from before the trash: the agent saw `b` in the tree, so it gets the purge with
+    // any role.
+    let c = NodeId::new();
+    w.created(c, w.root);
+    w.add(
+        Some(w.root),
+        EventType::GrantAdded,
+        json!({ "grant_id": Uuid::now_v7(), "grantee": me, "role": "view" }),
+    );
+    let start = w.add(Some(c), EventType::NodeTrashed, trashed(w.root));
+    let p = w.add(Some(c), EventType::NodePurged, purged());
+    w.ctx.scope = Some(crate::authz::Scope {
+        subtree: Some(c),
+        max_role: Role::Edit,
+        expires_at: None,
+    });
+    let query = ChangesQuery {
+        after: Some(start),
+        ..Default::default()
+    };
+    assert_eq!(seqs(&w.feed(&fake, query).await), vec![p]);
+}
+
+/// The same rule for a user: a grant with less than `manage` that was added after the trash never
+/// showed the trashed node, also when it is on a folder that is gone now.
+#[tokio::test]
+async fn a_grant_after_the_trash_shows_a_purge_only_with_manage() {
+    for (role, sent) in [("view", false), ("edit", false), ("manage", true)] {
+        let fake = Fake::default();
+        let w = world(&fake);
+        let me = json!({ "type": "user", "id": w.user });
+        // `secret/folder/n`: `n` goes to the trash, the user gets a grant on `folder`, `folder`
+        // goes to the trash too (the user no longer sees it), and `n` is purged.
+        let (folder, n) = (NodeId::new(), NodeId::new());
+        w.created(folder, w.secret);
+        w.created(n, folder);
+        let start = w.add(Some(n), EventType::NodeTrashed, trashed(folder));
+        w.add(
+            Some(folder),
+            EventType::GrantAdded,
+            json!({ "grant_id": Uuid::now_v7(), "grantee": me, "role": role }),
+        );
+        w.add(Some(folder), EventType::NodeTrashed, trashed(w.secret));
+        let p = w.add(Some(n), EventType::NodePurged, purged());
+        let page = w
+            .feed(
+                &fake,
+                ChangesQuery {
+                    after: Some(start),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let got: Vec<i64> = seqs(&page).into_iter().filter(|s| *s == p).collect();
+        assert_eq!(got, if sent { vec![p] } else { vec![] }, "{role}");
+    }
+}
+
+/// Found by the same property test with more cases (saved case `cc a8fd5c92...`): `/a/c` goes
+/// to the trash, then `/a`, then the guest gets `view` on the root. The guest got the
+/// `node.trashed` entry of `c` with its name, because it sees the root now. It never saw `a` or
+/// `c`. A guest sees only what grants give it, and the journal dates the grants; a member's
+/// access comes from the membership, so for a member an ancestor it sees now still counts.
+#[tokio::test]
+async fn a_guest_does_not_learn_a_trash_through_an_ancestor_it_sees_only_now() {
+    for member in [false, true] {
+        let fake = Fake {
+            member,
+            ..Default::default()
+        };
+        let w = world(&fake);
+        let me = json!({ "type": "user", "id": w.user });
+        // `a` and `c` are in the trash now; the root is visible (through the late grant).
+        let (a, c) = (NodeId::new(), NodeId::new());
+        let start = w.created(a, w.root);
+        w.created(c, a);
+        let tc = w.add(Some(c), EventType::NodeTrashed, trashed(a));
+        let ta = w.add(Some(a), EventType::NodeTrashed, trashed(w.root));
+        w.add(
+            Some(w.root),
+            EventType::GrantAdded,
+            json!({ "grant_id": Uuid::now_v7(), "grantee": me, "role": "view" }),
+        );
+        let query = ChangesQuery {
+            after: Some(start),
+            ..Default::default()
+        };
+        let got: Vec<i64> = seqs(&w.feed(&fake, query).await)
+            .into_iter()
+            .filter(|s| *s == tc || *s == ta)
+            .collect();
+        // `a` was right under the root, its old place: that rule stays.
+        let want = if member { vec![tc, ta] } else { vec![ta] };
+        assert_eq!(got, want, "member: {member}");
+    }
+}

@@ -153,20 +153,35 @@ impl Run {
         run
     }
 
-    /// Whether the node is inside the scope subtree of the observer (true without a scope).
+    /// Whether the node is inside the scope subtree of the observer (true without a scope). A
+    /// purged node has no ancestors now; it counts when it was inside the subtree after some
+    /// operation (through the parents recorded by `snapshot`).
     async fn in_scope(&self, o: usize, n: NodeId) -> bool {
         let Some(root) = self.observers[o].1.scope.as_ref().and_then(|s| s.subtree) else {
             return true;
         };
+        if n == root {
+            return true;
+        }
         let owner = &self.observers[0].1;
-        n == root
-            || self
-                .team
-                .s
-                .nodes
-                .ancestors(owner, n)
-                .await
-                .is_ok_and(|a| a.contains(&root))
+        match self.team.s.nodes.ancestors(owner, n).await {
+            Ok(a) => a.contains(&root),
+            Err(_) => {
+                let mut seen = HashSet::from([n]);
+                let mut queue = vec![n];
+                while let Some(x) = queue.pop() {
+                    for p in self.parents.get(&x).into_iter().flatten() {
+                        if *p == root {
+                            return true;
+                        }
+                        if seen.insert(*p) {
+                            queue.push(*p);
+                        }
+                    }
+                }
+                false
+            }
+        }
     }
 
     fn pick(&self, i: &Index) -> NodeId {
@@ -494,4 +509,69 @@ proptest! {
             }
         });
     }
+}
+
+/// The saved case `cc 91d871ae...` of the property above, without proptest, on the core
+/// services: `/b` goes to the trash, the guest gets `manage` on the root, `/b` is purged. An
+/// agent of the guest scoped to `/b` with `edit` never saw `/b` (a trashed node shows only to
+/// those who may restore it), so it must not get the `node.purged` entry with its name. With
+/// `manage` in its scope it could restore `/b`, saw it in the trash, and gets the entry.
+#[test]
+fn an_agent_that_could_not_restore_a_trashed_node_gets_no_purge() {
+    block_on(async {
+        let team = Team::new(&[MemberRole::Guest]).await;
+        let owner = team.owner();
+        let s = &team.s;
+        let b = s
+            .nodes
+            .create(&owner, new_node(team.root, "b", NodeKind::Folder, None))
+            .await
+            .unwrap()
+            .value
+            .id;
+        s.nodes.trash(&owner, b, None).await.unwrap();
+        let grantee = Grantee::User {
+            id: team.users[GUEST].0,
+        };
+        s.sharing
+            .add_grant(&owner, team.root, grantee, Role::Manage)
+            .await
+            .unwrap();
+        s.nodes.purge(&owner, b).await.unwrap();
+
+        for (max_role, sent) in [(Role::Edit, false), (Role::Manage, true)] {
+            let agent = Context {
+                tenant: team.tenant,
+                actor: Actor {
+                    actor: PrincipalRef {
+                        kind: PrincipalKind::Agent,
+                        id: PrincipalId(uuid::Uuid::now_v7()),
+                    },
+                    on_behalf_of: Some(team.users[GUEST].0),
+                },
+                scope: Some(Scope {
+                    subtree: Some(b),
+                    max_role,
+                    expires_at: None,
+                }),
+                idempotency_key: None,
+            };
+            let access = ServicesAccess {
+                services: s,
+                ctx: &agent,
+            };
+            let q = ChangesQuery {
+                limit: Some(1000),
+                ..Default::default()
+            };
+            let page = list_changes(s.journal.as_ref(), &access, &agent, q)
+                .await
+                .unwrap();
+            let purged = page
+                .items
+                .iter()
+                .any(|e| e.event == EventType::NodePurged && e.node_id == Some(b));
+            assert_eq!(purged, sent, "{max_role:?}");
+        }
+    });
 }
