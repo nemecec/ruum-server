@@ -42,7 +42,7 @@ them only with a decision record):
 | `ruum.space`, `staging.ruum.space` | the web UI and the API |
 | `auth.ruum.space`, `auth.staging.ruum.space` | sign-in (Zitadel) |
 | `*.ruumapps.net`, `*.staging.ruumapps.net` | user apps and user content |
-| `notify.ruum.space` | the sending domain for email |
+| `notify.ruum.space`, `notify.staging.ruum.space` | the sending domains for email |
 
 ## 1. Hetzner (servers and object storage), about 15 minutes
 
@@ -82,13 +82,16 @@ French, so the data stays in the EU. One account for two needs means fewer keys.
 
 1. Go to <https://console.scaleway.com> and create an account (a card is needed; there may be an ID
    check).
-2. Create a project named **ruum**. Copy its project ID into `SCW_DEFAULT_PROJECT_ID`.
+2. Create a project named **ruum-staging**. Copy its project ID into `SCW_DEFAULT_PROJECT_ID`.
+   Production gets its own project (`ruum-prod`) later, as at Hetzner, so that a staging key can never
+   read or delete production backups or send email as production.
 3. **IAM → Applications → Create application** named `ruum-agents`. Give it a policy for the
-   project **ruum** with the permission sets **ObjectStorageFullAccess** and
+   project **ruum-staging** with the permission sets **ObjectStorageFullAccess** and
    **TransactionalEmailFullAccess**. (A narrow key: it cannot touch anything else.)
 4. **IAM → API keys → Generate API key** for the application `ruum-agents`. Copy the access key and
    the secret key into `SCW_ACCESS_KEY` and `SCW_SECRET_KEY`.
-5. **Transactional Email → Add domain** `notify.ruum.space`. Scaleway shows DNS records (SPF, DKIM,
+5. **Transactional Email → Add domain** `notify.staging.ruum.space` (production adds `notify.ruum.space`
+   in its own project later). Scaleway shows DNS records (SPF, DKIM,
    DMARC, MX). You do not need to add them by hand: once step 2 is active, the agents add them
    through the Hetzner DNS API and start the check.
 6. A new Transactional Email project starts with a low sending limit. That is enough for staging.
