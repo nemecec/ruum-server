@@ -313,6 +313,35 @@ impl Memo<'_> {
         })
     }
 
+    /// Whether the caller held the grant of a grant entry on `node`: it is the grantee, and for
+    /// an agent (or another scoped principal) the node is inside the scope subtree. The user's
+    /// grant outside the subtree is not the agent's business (design 3.3).
+    async fn held_grant(&mut self, entry: &JournalEntry, node: NodeId) -> Result<bool> {
+        if !self.grantee_is_caller(entry).await? {
+            return Ok(false);
+        }
+        let Some(root) = self.ctx.scope.as_ref().and_then(|s| s.subtree) else {
+            return Ok(true);
+        };
+        if self.inside(node, root).await? {
+            return Ok(true);
+        }
+        // A node that is gone: its ancestors as the journal knows them.
+        let mut cur = node;
+        let mut chain = vec![node];
+        for _ in 0..MAX_GONE_DEPTH {
+            match self.journal.last_parent(self.ctx, cur, entry.seq).await? {
+                Some(p) if p == root => return Ok(true),
+                Some(p) if !chain.contains(&p) => {
+                    chain.push(p);
+                    cur = p;
+                }
+                _ => break,
+            }
+        }
+        Ok(false)
+    }
+
     /// The target of a member link, from the data of its `node.created` entry (the entry
     /// itself, or the newest one on the node before it).
     async fn member_link_target(&mut self, entry: &JournalEntry) -> Result<Option<NodeId>> {
@@ -375,11 +404,11 @@ impl Memo<'_> {
                     markers.push(marker(node, Access::Gained));
                 }
                 if entry.event == EventType::GrantUpdated {
-                    before = before || self.grantee_is_caller(entry).await?;
+                    before = before || self.held_grant(entry, node).await?;
                 }
             }
             EventType::GrantRemoved => {
-                let was_grantee = self.grantee_is_caller(entry).await?;
+                let was_grantee = self.held_grant(entry, node).await?;
                 before = before || was_grantee;
                 if was_grantee && !now {
                     markers.push(marker(node, Access::Lost));

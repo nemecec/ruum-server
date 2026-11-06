@@ -660,3 +660,55 @@ fn query_parameters_are_parsed_and_clamped() {
     assert_eq!(q.limit(), DEFAULT_PAGE_SIZE);
     assert!(ChangesQuery::from_params(Some("garbage"), None, None, None).is_err());
 }
+
+/// An agent does not get the grant entries of its user outside its scope. Found by the property
+/// test `feed::the_feed_sends_each_visible_change_once_in_order` (`tests/properties`); its
+/// shrunk case: the user gets a `view` grant on the root and loses it, and an agent scoped to a
+/// folder got the `grant.removed` entry and a `lost` marker on the root, a node outside its
+/// scope that it never saw.
+#[tokio::test]
+async fn an_agent_gets_no_grant_entries_outside_its_scope() {
+    let fake = Fake::default();
+    let mut w = world(&fake);
+    w.ctx.actor = Actor {
+        actor: PrincipalRef {
+            kind: crate::actor::PrincipalKind::Agent,
+            id: PrincipalId(Uuid::now_v7()),
+        },
+        on_behalf_of: Some(w.user),
+    };
+    w.ctx.scope = Some(crate::authz::Scope {
+        subtree: Some(w.open),
+        max_role: Role::View,
+        expires_at: None,
+    });
+    let me = json!({ "type": "user", "id": w.user });
+    // Outside the scope: the agent cannot see `secret`, before or after.
+    let g = Uuid::now_v7();
+    w.add(
+        Some(w.secret),
+        EventType::GrantAdded,
+        json!({ "grant_id": g, "grantee": me, "role": "view" }),
+    );
+    w.add(
+        Some(w.secret),
+        EventType::GrantUpdated,
+        json!({ "grant_id": g, "grantee": me, "role": "edit", "old_role": "view" }),
+    );
+    w.add(
+        Some(w.secret),
+        EventType::GrantRemoved,
+        json!({ "grant_id": g, "grantee": me, "role": "edit" }),
+    );
+    // Inside the scope: a node under `open` that the agent no longer sees after the removal.
+    let inner = NodeId::new();
+    fake.node(inner, Some(w.open), false);
+    let s = w.add(
+        Some(inner),
+        EventType::GrantRemoved,
+        json!({ "grant_id": Uuid::now_v7(), "grantee": me, "role": "view" }),
+    );
+    let page = w.feed(&fake, ChangesQuery::default()).await;
+    assert_eq!(seqs(&page), vec![s]);
+    assert_eq!(markers(&page), vec![(s, inner, Access::Lost)]);
+}
