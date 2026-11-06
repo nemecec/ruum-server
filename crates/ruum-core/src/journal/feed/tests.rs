@@ -9,6 +9,7 @@ use crate::journal::memory::MemoryJournal;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -17,6 +18,8 @@ struct Fake {
     /// Parent of each node; a node missing here does not exist.
     parents: Mutex<HashMap<NodeId, Option<NodeId>>>,
     member: bool,
+    /// When the member joined; `None` means long ago.
+    joined: Option<OffsetDateTime>,
 }
 
 impl Fake {
@@ -50,6 +53,11 @@ impl FeedAccess for Fake {
     }
     async fn is_member(&self) -> Result<bool> {
         Ok(self.member)
+    }
+    async fn member_since(&self) -> Result<Option<OffsetDateTime>> {
+        Ok(self
+            .member
+            .then(|| self.joined.unwrap_or(OffsetDateTime::UNIX_EPOCH)))
     }
 }
 
@@ -268,11 +276,18 @@ async fn tenant_level_entries_go_to_members_only() {
     assert_eq!(w.feed(&fake, ChangesQuery::default()).await.items.len(), 1);
 }
 
+/// The caller sees `open` through a grant from before the purge (decision 0002-6: access must
+/// date from before the node left the tree).
 #[tokio::test]
 async fn a_purge_is_sent_when_the_last_parent_was_visible() {
     let fake = Fake::default();
     let w = world(&fake);
     let (gone, gone_hidden) = (NodeId::new(), NodeId::new());
+    let start = w.add(
+        Some(w.open),
+        EventType::GrantAdded,
+        grant(json!({ "type": "user", "id": w.user })),
+    );
     w.created(gone, w.open);
     w.created(gone_hidden, w.secret);
     let purged = || json!({ "name": "n", "subtree_count": 1 });
@@ -282,7 +297,7 @@ async fn a_purge_is_sent_when_the_last_parent_was_visible() {
         .feed(
             &fake,
             ChangesQuery {
-                after: Some(2),
+                after: Some(start + 2),
                 ..Default::default()
             },
         )
@@ -428,6 +443,12 @@ async fn a_removed_member_link_loses_its_target() {
     fake.node(target, Some(w.secret), true);
     fake.node(kept, Some(w.open), true);
     let link_data = |t: NodeId| json!({ "parent_id": w.open, "name": "l", "kind": "link", "link_kind": "member", "link_target": t });
+    // The caller sees `open` through a grant from the start (decision 0002-6).
+    w.add(
+        Some(w.open),
+        EventType::GrantAdded,
+        grant(json!({ "type": "user", "id": w.user })),
+    );
     fake.node(link, Some(w.open), true);
     w.add(Some(link), EventType::NodeCreated, link_data(target));
     // The link goes to the trash; the caller no longer sees its target.
@@ -856,8 +877,212 @@ async fn a_guest_does_not_learn_a_trash_through_an_ancestor_it_sees_only_now() {
             .into_iter()
             .filter(|s| *s == tc || *s == ta)
             .collect();
-        // `a` was right under the root, its old place: that rule stays.
-        let want = if member { vec![tc, ta] } else { vec![ta] };
+        // Decision 0002-6: the old place `/` that the guest sees now does not reveal `a`
+        // either; the access began after the trash. The member joined long ago.
+        let want = if member { vec![tc, ta] } else { vec![] };
         assert_eq!(got, want, "member: {member}");
     }
+}
+
+/// Decision 0002-6: access that began after the trash never reveals the node. `/a/c` is renamed
+/// and goes to the trash; then the guest gets `view` on `/a`. The guest sees the old place `/a`
+/// now, but it never saw `c`: neither the rename nor the trash (both name `c`) reach it.
+#[tokio::test]
+async fn a_guest_who_gets_the_old_place_after_the_trash_does_not_learn_the_node() {
+    let fake = Fake::default();
+    let w = world(&fake);
+    let me = json!({ "type": "user", "id": w.user });
+    let (a, c) = (NodeId::new(), NodeId::new());
+    fake.node(a, Some(w.secret), true);
+    let start = w.created(a, w.secret);
+    w.created(c, a);
+    w.add(
+        Some(c),
+        EventType::NodeRenamed,
+        json!({ "parent_id": a, "old_name": "n", "new_name": "c" }),
+    );
+    w.add(Some(c), EventType::NodeTrashed, trashed(a));
+    let g = w.add(
+        Some(a),
+        EventType::GrantAdded,
+        json!({ "grant_id": Uuid::now_v7(), "grantee": me, "role": "view" }),
+    );
+    let p = w.add(Some(c), EventType::NodePurged, purged());
+    let page = w
+        .feed(
+            &fake,
+            ChangesQuery {
+                after: Some(start),
+                ..Default::default()
+            },
+        )
+        .await;
+    // Only the grant on `a`, which the guest sees now.
+    assert_eq!(seqs(&page), vec![g], "purge at {p}");
+}
+
+/// Decision 0002-6 for members: membership counts only from the time the user joined (or
+/// changed role). `/a/c` is renamed, trashed and purged. A member who joined after the purge
+/// learns nothing of `c`. A member who joined while `c` was in the trash could restore it
+/// (members `manage` the team tree), so it gets the entries; its agent only with `manage` in
+/// the scope.
+#[tokio::test]
+async fn a_member_who_joins_after_the_trash_learns_the_node_only_if_it_could_restore_it() {
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
+    let mut fake = Fake {
+        member: true,
+        ..Default::default()
+    };
+    let w = world(&fake);
+    let (a, c) = (NodeId::new(), NodeId::new());
+    fake.node(a, Some(w.root), true);
+    let start = w.created(a, w.root);
+    w.created(c, a);
+    let rn = w.add(
+        Some(c),
+        EventType::NodeRenamed,
+        json!({ "parent_id": a, "old_name": "n", "new_name": "c" }),
+    );
+    let tr = w.add(Some(c), EventType::NodeTrashed, trashed(a));
+    pause().await;
+    let during = OffsetDateTime::now_utc();
+    pause().await;
+    let pu = w.add(Some(c), EventType::NodePurged, purged());
+    pause().await;
+    let after = OffsetDateTime::now_utc();
+    let query = ChangesQuery {
+        after: Some(start + 1),
+        ..Default::default()
+    };
+    let all = vec![rn, tr, pu];
+
+    for (joined, want) in [
+        (None, all.clone()),
+        (Some(during), all.clone()),
+        (Some(after), vec![]),
+    ] {
+        fake.joined = joined;
+        assert_eq!(
+            seqs(&w.feed(&fake, query.clone()).await),
+            want,
+            "{joined:?}"
+        );
+    }
+
+    // The member's agent, scoped to `a`, joined while `c` was in the trash.
+    fake.joined = Some(during);
+    let mut agent = w;
+    agent.ctx.actor = Actor {
+        actor: PrincipalRef {
+            kind: crate::actor::PrincipalKind::Agent,
+            id: PrincipalId(Uuid::now_v7()),
+        },
+        on_behalf_of: Some(agent.user),
+    };
+    for (max_role, want) in [(Role::Edit, vec![]), (Role::Manage, all)] {
+        agent.ctx.scope = Some(crate::authz::Scope {
+            subtree: Some(a),
+            max_role,
+            expires_at: None,
+        });
+        assert_eq!(
+            seqs(&agent.feed(&fake, query.clone()).await),
+            want,
+            "{max_role:?}"
+        );
+    }
+}
+
+/// Found by the feed property test (saved case `cc 34ab2b05...`): `/b/x` is trashed; the
+/// user gets `manage` on the root, which is changed to `view`; then `/b` moves into `/c`. An agent
+/// scoped to `/c` with `manage` never could restore `x`: while the user had `manage`, `x` was
+/// outside `/c`. A `manage` grant counts with the tree as it was while the grant held.
+#[tokio::test]
+async fn a_manage_grant_counts_with_the_tree_of_its_time() {
+    for move_first in [false, true] {
+        let fake = Fake::default();
+        let mut w = world(&fake);
+        fake.node(w.root, None, false);
+        let (b, c, x) = (NodeId::new(), NodeId::new(), NodeId::new());
+        w.created(b, w.root);
+        w.created(c, w.root);
+        w.created(x, b);
+        let tr = w.add(Some(x), EventType::NodeTrashed, trashed(b));
+        let me = json!({ "type": "user", "id": w.user });
+        let gid = Uuid::now_v7();
+        let moved = json!({
+            "old_parent_id": w.root, "new_parent_id": c, "old_name": "b", "new_name": "b"
+        });
+        if move_first {
+            w.add(Some(b), EventType::NodeMoved, moved.clone());
+        }
+        w.add(
+            Some(w.root),
+            EventType::GrantAdded,
+            json!({ "grant_id": gid, "grantee": me, "role": "manage" }),
+        );
+        w.add(
+            Some(w.root),
+            EventType::GrantUpdated,
+            json!({ "grant_id": gid, "grantee": me, "role": "view", "old_role": "manage" }),
+        );
+        if !move_first {
+            w.add(Some(b), EventType::NodeMoved, moved);
+        }
+        w.ctx.actor = Actor {
+            actor: PrincipalRef {
+                kind: crate::actor::PrincipalKind::Agent,
+                id: PrincipalId(Uuid::now_v7()),
+            },
+            on_behalf_of: Some(w.user),
+        };
+        w.ctx.scope = Some(crate::authz::Scope {
+            subtree: Some(c),
+            max_role: Role::Manage,
+            expires_at: None,
+        });
+        let page = w
+            .feed(
+                &fake,
+                ChangesQuery {
+                    after: Some(tr - 1),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let got: Vec<i64> = seqs(&page).into_iter().filter(|s| *s == tr).collect();
+        let want = if move_first { vec![tr] } else { vec![] };
+        assert_eq!(got, want, "move first: {move_first}");
+    }
+}
+
+/// Found by the feed property test (saved case `cc 30385285...`): `/a/c` is trashed, then
+/// `/a`, then `/a` is purged (and `c` with it); then the guest gets `manage` on the root. The
+/// purge of `/a` ended the trash time of `c` too, so the late `manage` never let the guest
+/// restore `c`.
+#[tokio::test]
+async fn the_purge_of_an_ancestor_ends_the_trash_time() {
+    let fake = Fake::default();
+    let w = world(&fake);
+    let (a, c) = (NodeId::new(), NodeId::new());
+    let start = w.created(a, w.root);
+    w.created(c, a);
+    w.add(Some(c), EventType::NodeTrashed, trashed(a));
+    w.add(Some(a), EventType::NodeTrashed, trashed(w.root));
+    w.add(Some(a), EventType::NodePurged, purged());
+    let g = w.add(
+        Some(w.root),
+        EventType::GrantAdded,
+        json!({ "grant_id": Uuid::now_v7(), "grantee": { "type": "user", "id": w.user }, "role": "manage" }),
+    );
+    let page = w
+        .feed(
+            &fake,
+            ChangesQuery {
+                after: Some(start + 1),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(seqs(&page), vec![g]);
 }

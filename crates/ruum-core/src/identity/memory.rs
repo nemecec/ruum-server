@@ -79,6 +79,8 @@ pub(crate) struct AppPasswordRow {
 pub(crate) struct MembershipRow {
     pub role: MemberRole,
     pub joined_at: OffsetDateTime,
+    /// The join or the last change of the role (`memberships.updated_at` in Postgres).
+    pub role_since: OffsetDateTime,
     /// Insertion order, for stable member lists.
     pub order: u64,
 }
@@ -291,6 +293,7 @@ impl MemoryArea {
             MembershipRow {
                 role: MemberRole::Owner,
                 joined_at: tenant.created_at,
+                role_since: tenant.created_at,
                 order,
             },
         );

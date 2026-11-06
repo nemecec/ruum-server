@@ -245,6 +245,53 @@ supplies the names. Tags: a tag is tenant data; an agent with a read-only scope 
 and an agent sees a tag only through a node in its scope, so the scope also bounds what tags it
 learns.
 
+## 6. Who learns about a node in the trash
+
+Status: `provisional`, an architect decision added on 2026-11-06 after the review of commit
+`c9ba107`. It closes the "old place" gap of the changes feed.
+
+**Rule.** A `node.trashed` or `node.purged` entry, and any other entry on a node that is in the
+trash or purged now, reaches a subject only when one of these holds:
+
+- (a) the subject could see the node just before it went to the trash: through a grant, a
+  membership, or access to an ancestor that it held at that moment;
+- (b) the subject could restore the node while it was in the trash: `manage`, capped by an
+  agent's scope.
+
+Access that began after the trash never reveals the node. Seeing the old place now is not
+enough. For an agent, the node must also be inside its scope subtree.
+
+**Members.** This applies to members too: a membership counts only from the time the user
+joined. Members get `manage` on the whole team tree from the team root. So a member who joins
+while the node is still in the trash could restore it, and (b) holds: the member sees the node
+in the trash list and gets its entries. A member who joins after the purge learns nothing. An
+agent of such a member gets the entries only when its scope allows `manage`.
+
+**Dates.** The feed uses the dates that the records already have:
+
+- grants: the journal (`grant.added`, `grant.updated`, `grant.removed` and their `seq`);
+- the trash time: the `node.trashed` entry that took the node out of the tree (its own or the
+  one of an ancestor), until the `node.restored` or `node.purged` entry;
+- memberships: `memberships.updated_at`, the join or the last change of the role
+  (`TenantStore::member_since`). The journal has no `member.added` entry. A change between
+  member, admin and owner also moves this time, so the answer is never too early; the feed may
+  then hold back an entry from a member who had it before. The membership time comes from the
+  database clock and the journal time from the server clock.
+
+**What stays.** "Now" stays enough: an entry on a node that the subject sees now is sent. A node
+in the trash shows now only to those who may restore it, so that is (b). Entries on nodes in the
+tree keep the old "before" rules (old place, grantee of a removed grant).
+
+**What does not count yet.** Member links: the journal does not date the access that they give,
+so they never satisfy (a) or (b). The feed sends less, never more. Entries that name a gone node
+only in their data (for example the `old_parent_id` of a move) are not covered.
+
+**Tests.** `journal::feed::tests` (a guest who gets `/a` after `/a/c` was trashed; members who
+join during the trash and after the purge; their agents), a journal conformance case for the
+memory and Postgres journals, `member_since` in the tenant conformance suite, and the reference
+model of the feed property test. Mutations: `feed-gone-node-old-place`,
+`feed-gone-node-ancestor-now`, `feed-member-joined-after-purge`.
+
 ## Contract diff
 
 All changes to `contracts/openapi.yaml` are wording, plus one optional response field

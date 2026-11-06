@@ -517,6 +517,20 @@ impl TenantStore for PgTenantStore {
         Ok(r)
     }
 
+    async fn member_since(&self, tenant: TenantId, user: UserId) -> Result<Option<OffsetDateTime>> {
+        let mut tx = self.area.system().await?;
+        let since: Option<OffsetDateTime> = sqlx::query_scalar(
+            "select updated_at from memberships \
+             where tenant_id = $1 and user_id = $2 and role <> 'guest'",
+        )
+        .bind(tenant.0)
+        .bind(user.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(since)
+    }
+
     async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
         let mut tx = self.area.system().await?;
         // The same query as the email grant of `sharing::postgres::add_grant`.

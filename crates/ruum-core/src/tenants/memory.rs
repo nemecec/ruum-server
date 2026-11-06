@@ -155,6 +155,15 @@ impl TenantStore for MemoryTenantStore {
         Ok(self.area.lock().role_of(tenant, user))
     }
 
+    async fn member_since(&self, tenant: TenantId, user: UserId) -> Result<Option<OffsetDateTime>> {
+        let st = self.area.lock();
+        Ok(st
+            .memberships
+            .get(&(tenant, user))
+            .filter(|m| m.role != MemberRole::Guest)
+            .map(|m| m.role_since))
+    }
+
     async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
         let st = self.area.lock();
         Ok(st.memberships.iter().any(|((t, u), m)| {
@@ -221,6 +230,7 @@ impl TenantStore for MemoryTenantStore {
             }
             if let Some(m) = st.memberships.get_mut(&(ctx.tenant, user)) {
                 m.role = role;
+                m.role_since = crate::now();
             }
             (
                 old,
@@ -519,10 +529,14 @@ impl TenantStore for MemoryTenantStore {
                 let order = st.next_order();
                 st.memberships
                     .entry((inv.tenant_id, user))
-                    .and_modify(|m| m.role = new)
+                    .and_modify(|m| {
+                        m.role = new;
+                        m.role_since = now;
+                    })
                     .or_insert(MembershipRow {
                         role: new,
                         joined_at: now,
+                        role_since: now,
                         order,
                     });
                 if let Some(r) = st.invitations.get_mut(&id) {

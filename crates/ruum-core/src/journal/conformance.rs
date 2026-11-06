@@ -377,6 +377,9 @@ async fn the_feed_sends_a_purge_only_to_who_saw_the_node(h: &dyn Harness) {
         async fn is_member(&self) -> Result<bool> {
             Ok(false)
         }
+        async fn member_since(&self) -> Result<Option<time::OffsetDateTime>> {
+            Ok(None)
+        }
     }
 
     let t = h.tenant().await;
@@ -442,6 +445,102 @@ async fn the_feed_sends_a_purge_only_to_who_saw_the_node(h: &dyn Harness) {
     }
 }
 
+/// The feed on this journal, decision 0002-6: access that began after the trash never reveals
+/// the node. `/a/c` is renamed and trashed, then the guest gets `view` on `/a`, then `c` is
+/// purged. The guest sees the old place `/a` now, but gets nothing about `c`.
+async fn the_feed_keeps_a_trash_from_access_that_began_after_it(h: &dyn Harness) {
+    use super::feed::{ChangesQuery, FeedAccess, list_changes};
+
+    /// A guest who sees only `/a`, now.
+    struct SeesOnly(NodeId);
+    #[async_trait]
+    impl FeedAccess for SeesOnly {
+        async fn can_view(&self, n: NodeId) -> Result<bool> {
+            Ok(n == self.0)
+        }
+        async fn ancestors(&self, _: NodeId) -> Result<Option<Vec<NodeId>>> {
+            Ok(None)
+        }
+        async fn is_member(&self) -> Result<bool> {
+            Ok(false)
+        }
+        async fn member_since(&self) -> Result<Option<time::OffsetDateTime>> {
+            Ok(None)
+        }
+    }
+
+    let t = h.tenant().await;
+    let owner = user_ctx(t);
+    let guest = user_ctx(t);
+    let user = guest.actor.effective_user().unwrap();
+    let (root, a, c) = (NodeId::new(), NodeId::new(), NodeId::new());
+    let start = h.append(&owner, created(a, root)).await;
+    h.append(&owner, created(c, a)).await;
+    let entry = |node, revision, event, data| NewEntry {
+        node_id: Some(node),
+        revision,
+        event,
+        data,
+    };
+    h.append(
+        &owner,
+        entry(
+            c,
+            Some(2),
+            EventType::NodeRenamed,
+            json!({ "parent_id": a, "old_name": "a.txt", "new_name": "c.txt" }),
+        ),
+    )
+    .await;
+    h.append(
+        &owner,
+        entry(
+            c,
+            Some(3),
+            EventType::NodeTrashed,
+            json!({
+                "parent_id": a, "name": "c.txt", "subtree_count": 1,
+                "purge_after": "2026-12-06T00:00:00Z"
+            }),
+        ),
+    )
+    .await;
+    let g = h
+        .append(
+            &owner,
+            entry(
+                a,
+                Some(2),
+                EventType::GrantAdded,
+                json!({
+                    "grant_id": Uuid::now_v7(), "grantee": { "type": "user", "id": user },
+                    "role": "view"
+                }),
+            ),
+        )
+        .await;
+    h.append(
+        &owner,
+        entry(
+            c,
+            None,
+            EventType::NodePurged,
+            json!({ "name": "c.txt", "subtree_count": 1, "reason": "by_request" }),
+        ),
+    )
+    .await;
+    let j = h.journal();
+    let query = ChangesQuery {
+        after: Some(start.seq + 1),
+        ..Default::default()
+    };
+    let page = list_changes(j.as_ref(), &SeesOnly(a), &guest, query)
+        .await
+        .unwrap();
+    let got: Vec<i64> = page.items.iter().map(|e| e.seq).collect();
+    assert_eq!(got, vec![g.seq], "only the grant on /a");
+}
+
 async fn run_all(h: Arc<dyn Harness>) {
     an_empty_journal(h.as_ref()).await;
     appends_get_gapless_seqs_and_keep_both_principals(h.as_ref()).await;
@@ -451,6 +550,7 @@ async fn run_all(h: Arc<dyn Harness>) {
     the_last_parent_skips_entries_without_a_parent(h.as_ref()).await;
     node_entries_filter_by_node_type_and_seq(h.as_ref()).await;
     the_feed_sends_a_purge_only_to_who_saw_the_node(h.as_ref()).await;
+    the_feed_keeps_a_trash_from_access_that_began_after_it(h.as_ref()).await;
     wait_for_wakes_on_append(h).await;
 }
 

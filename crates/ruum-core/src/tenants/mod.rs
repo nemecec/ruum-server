@@ -226,6 +226,15 @@ pub trait TenantStore: Send + Sync {
     ) -> Result<Tenant>;
     /// The role of a user in the tenant, or `None`. A system lookup.
     async fn role_of(&self, tenant: TenantId, user: UserId) -> Result<Option<MemberRole>>;
+    /// Since when the user is a member, admin or owner of the tenant (not a guest): the join or
+    /// the last change of the role, whichever is newer (`memberships.updated_at`). `None` for a
+    /// guest or a stranger. A system lookup for the changes feed (decision 0002-6): access through
+    /// the membership counts only from this time. A change between member, admin and owner also
+    /// moves the time, so the answer is never too early. The default answers `None`.
+    async fn member_since(&self, tenant: TenantId, user: UserId) -> Result<Option<OffsetDateTime>> {
+        let _ = (tenant, user);
+        Ok(None)
+    }
     /// Whether `email` is the verified email of a member, admin or owner (not a guest) of the
     /// tenant, case-insensitive. A system lookup for the `allow_guests` policy of email grants
     /// (decision 0002-1). The default answers `false`, which refuses the grant.

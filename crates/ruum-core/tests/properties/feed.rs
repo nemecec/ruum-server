@@ -16,7 +16,8 @@
 //!   gets every tenant-level entry and every purge. A guest gets no tenant-level entry.
 //! - No leak: an entry that is sent is about a node that the observer could see at some moment
 //!   of the run (after some operation, or now), or a node whose parent (at some moment) the
-//!   observer could see then.
+//!   observer could see then. A trash, a purge, and any entry on a node that is out of the tree
+//!   at the end (decision 0002-6): only a node the observer saw itself, or sees now.
 //! - Resync markers: each marker belongs to an entry that is sent; a grant to the caller added
 //!   on a node it now sees gives `gained`; a grant to the caller removed from a node it no longer
 //!   sees gives `lost`; a move across the edge of what the caller sees now gives `gained` or
@@ -182,6 +183,29 @@ impl Run {
                 false
             }
         }
+    }
+
+    /// Whether the node is out of the tree now: purged, or in the trash itself or below a
+    /// trashed folder.
+    async fn gone_now(&self, n: NodeId) -> bool {
+        let s = &self.team.s;
+        let owner = &self.observers[0].1;
+        let Ok(node) = s.nodes.get(owner, n).await else {
+            return true;
+        };
+        if node.trashed_at.is_some() {
+            return true;
+        }
+        for a in s.nodes.ancestors(owner, n).await.unwrap_or_default() {
+            if s.nodes
+                .get(owner, a)
+                .await
+                .is_ok_and(|x| x.trashed_at.is_some())
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn pick(&self, i: &Index) -> NodeId {
@@ -459,11 +483,26 @@ proptest! {
                             && who != "owner"
                             && grantee_is_guest(e, &run)
                             && run.in_scope(o, n).await;
-                        assert!(
-                            own_grant || places.iter().any(|p| seen.contains(p)),
-                            "{who}: entry {} ({:?}, data {}) is about a node it never saw",
-                            e.seq, e.event, e.data
-                        );
+                        // Decision 0002-6: a trash or a purge, and any entry on a node that is
+                        // out of the tree now, reaches only those who saw the node itself (just
+                        // before the trash, or in the trash with the right to restore it, which
+                        // `seen` records too), or see it now. Seeing its old place is not enough,
+                        // and the grantee rule above does not apply.
+                        let gone_rule = matches!(e.event, EventType::NodeTrashed | EventType::NodePurged)
+                            || run.gone_now(n).await;
+                        if gone_rule {
+                            assert!(
+                                now || seen.contains(&n),
+                                "{who}: entry {} ({:?}, data {}) is about a gone node it never saw",
+                                e.seq, e.event, e.data
+                            );
+                        } else {
+                            assert!(
+                                own_grant || places.iter().any(|p| seen.contains(p)),
+                                "{who}: entry {} ({:?}, data {}) is about a node it never saw",
+                                e.seq, e.event, e.data
+                            );
+                        }
                     }
                 }
 
@@ -486,12 +525,20 @@ proptest! {
                         }
                         // For the agent, only inside its scope: the user's grants elsewhere
                         // are not the agent's business.
+                        // On a node that is out of the tree now, decision 0002-6 may keep the
+                        // entry (and so the marker) from a grantee that never saw it.
                         EventType::GrantRemoved
-                            if grantee_is_guest(e, &run) && !now && run.in_scope(o, n).await =>
+                            if grantee_is_guest(e, &run)
+                                && !now
+                                && run.in_scope(o, n).await
+                                && (sent.contains(&e.seq) || !run.gone_now(n).await) =>
                         {
                             assert!(has(e.seq, n, Access::Lost), "{who}: no lost marker for grant {}", e.seq);
                         }
-                        EventType::NodeMoved => {
+                        // The same for a move of a node that is out of the tree now.
+                        EventType::NodeMoved
+                            if sent.contains(&e.seq) || !run.gone_now(n).await =>
+                        {
                             let before = match parent_before(e) {
                                 Some(p) => can_view_now(p).await,
                                 None => false,

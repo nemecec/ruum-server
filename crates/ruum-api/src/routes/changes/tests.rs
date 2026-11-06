@@ -74,6 +74,9 @@ impl FeedAccess for SeesAll {
     async fn is_member(&self) -> Result<bool> {
         Ok(true)
     }
+    async fn member_since(&self) -> Result<Option<time::OffsetDateTime>> {
+        Ok(Some(time::OffsetDateTime::UNIX_EPOCH))
+    }
 }
 
 fn agent_ctx(tenant: TenantId, owner: UserId) -> Context {

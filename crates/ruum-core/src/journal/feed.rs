@@ -7,14 +7,18 @@
 //!   only with `manage`, as `NodeStore::get`);
 //! - before: the caller could see the node's old place (`old_parent_id` of a move or a restore,
 //!   `parent_id` of a rename or a trash, the last known parent of a purged node), or the caller
-//!   was the grantee of a removed or changed grant. For a trash or a purge, also: the caller had
-//!   a grant (from the journal: added and not removed) on the node or on one of its ancestors as
-//!   the journal knows them (`parent_id` entries) before the node went to the trash; or, for a
-//!   purge, a `manage` grant while the node was in the trash (for an agent: only when its scope
-//!   allows `manage`). For an agent the node must be inside the scope.
+//!   was the grantee of a removed or changed grant.
 //!
 //! An entry is sent when either holds. A tenant-level entry (`node_id` `null`) is sent to members
 //! only (not to guests).
+//!
+//! The trash (decision 0002-6): a `node.trashed` or `node.purged` entry, and any entry on a node
+//! that is in the trash or purged now, is sent only when the caller sees the node now (in the
+//! trash: only with `manage`), or could see it just before it went to the trash, or could restore
+//! it while it was in the trash. "Could" uses dated access only: grants from the journal, and a
+//! membership from `TenantStore::member_since` (members `manage` the team tree). `manage` is
+//! capped by an agent's scope, and for an agent the node must be inside its subtree. Seeing the
+//! old place now is not enough: access that began after the trash never reveals the node.
 //!
 //! When a change alters what the caller sees of a whole subtree, the page also carries a
 //! [`ResyncMarker`] for the caller: a grant to the caller (directly or through
@@ -39,6 +43,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use time::OffsetDateTime;
 
 /// How many ancestors the feed follows up from a trashed or purged node through the journal.
 const MAX_GONE_DEPTH: usize = 64;
@@ -114,11 +119,15 @@ pub trait FeedAccess: Send + Sync {
     async fn ancestors(&self, node: NodeId) -> Result<Option<Vec<NodeId>>>;
     /// Whether the caller's user is a member of the tenant (not a guest).
     async fn is_member(&self) -> Result<bool>;
+    /// Since when the caller's user is a member, admin or owner (not a guest), or `None`
+    /// (`TenantStore::member_since`). Members see the whole team tree through the team root
+    /// (`manage`); the feed counts that access only from this time (decision 0002-6).
+    async fn member_since(&self) -> Result<Option<OffsetDateTime>>;
 }
 
 /// [`FeedAccess`] from the core services: `NodeStore::get` for visibility (with the scope and the
 /// trash rule),
-/// `NodeStore::ancestors` and `TenantStore::role_of`.
+/// `NodeStore::ancestors`, `TenantStore::role_of` and `TenantStore::member_since`.
 pub struct ServicesAccess<'a> {
     pub services: &'a Services,
     pub ctx: &'a Context,
@@ -139,8 +148,7 @@ impl FeedAccess for ServicesAccess<'_> {
     async fn can_view(&self, node: NodeId) -> Result<bool> {
         // `NodeStore::get` checks `view` with the scope, and the trash rule of the nodes area: a
         // trashed node has left the tree, and only those who may restore it (`manage`) still
-        // see it. The trash entry itself still reaches the others through its old place
-        // ("before").
+        // see it. Who else learns of a trash follows decision 0002-6 (`Memo::may_learn`).
         match self.services.nodes.get(self.ctx, node).await {
             Ok(_) => Ok(true),
             Err(e) if is_hidden(&e) => Ok(false),
@@ -162,6 +170,16 @@ impl FeedAccess for ServicesAccess<'_> {
         };
         let role = self.services.tenants.role_of(self.ctx.tenant, user).await?;
         Ok(role.is_some_and(|r| r >= MemberRole::Member))
+    }
+
+    async fn member_since(&self) -> Result<Option<OffsetDateTime>> {
+        let Some(user) = self.ctx.actor.effective_user() else {
+            return Ok(None);
+        };
+        self.services
+            .tenants
+            .member_since(self.ctx.tenant, user)
+            .await
     }
 }
 
@@ -192,6 +210,17 @@ struct Memo<'a> {
     view: HashMap<NodeId, bool>,
     ancestors: HashMap<NodeId, Option<Vec<NodeId>>>,
     member: Option<bool>,
+    member_since: Option<Option<OffsetDateTime>>,
+    gone: HashMap<NodeId, Option<Gone>>,
+}
+
+/// The time a node spent in the trash, from the journal: the `node.trashed` entry that took it
+/// out of the tree (its own, or the one of an ancestor), and the entry that ended it (a restore
+/// or a purge), `None` while it is still in the trash.
+#[derive(Clone)]
+struct Gone {
+    trashed: JournalEntry,
+    ended: Option<JournalEntry>,
 }
 
 impl Memo<'_> {
@@ -209,6 +238,15 @@ impl Memo<'_> {
             Some(n) => self.can_view(n).await,
             None => Ok(false),
         }
+    }
+
+    async fn member_since(&mut self) -> Result<Option<OffsetDateTime>> {
+        if let Some(m) = self.member_since {
+            return Ok(m);
+        }
+        let m = self.access.member_since().await?;
+        self.member_since = Some(m);
+        Ok(m)
     }
 
     async fn is_member(&mut self) -> Result<bool> {
@@ -262,19 +300,22 @@ impl Memo<'_> {
 
     /// The caller's grants on `node` in the window `since..before`, from the grant entries of
     /// the journal: for each grant whose state is `grant.added` or `grant.updated` with the
-    /// caller as grantee, its role, and whether that state held already at `since` (the grant's
-    /// newest entry before `since`) or began inside the window. A grant that was removed has no
-    /// state.
+    /// caller's user as grantee, the `seq` of the entry that set the state, whether that state
+    /// held already at `since` (the grant's newest entry before `since`) or began inside the
+    /// window, and its role. A grant that was removed
+    /// has no state. `tenant_members` grants are left out: the membership itself gives more
+    /// (`manage` from the team root), dated by [`FeedAccess::member_since`].
     async fn grant_states(
         &mut self,
         node: NodeId,
         since: i64,
         before: i64,
-    ) -> Result<Vec<(bool, Role)>> {
+    ) -> Result<Vec<(i64, bool, Role)>> {
         let entries = self
             .journal
             .node_entries(self.ctx, node, before, GRANT_EVENTS, u32::MAX)
             .await?;
+        let user = self.ctx.actor.effective_user().map(|u| u.0.to_string());
         // Newest first: the first entry of a grant before `since` is its state at `since`;
         // older ones do not count.
         let mut settled = HashSet::new();
@@ -288,17 +329,21 @@ impl Memo<'_> {
             if at_since {
                 settled.insert(id);
             }
-            if e.event == EventType::GrantRemoved || !self.grantee_is_caller(e).await? {
+            let grantee = &e.data["grantee"];
+            let mine = grantee["type"].as_str() == Some("user")
+                && user.is_some()
+                && grantee["id"].as_str() == user.as_deref();
+            if e.event == EventType::GrantRemoved || !mine {
                 continue;
             }
             // An unknown role counts as the lowest one.
             let role = serde_json::from_value(e.data["role"].clone()).unwrap_or(Role::View);
-            out.push((at_since, role));
+            out.push((e.seq, at_since, role));
         }
         Ok(out)
     }
 
-    /// The ancestors of a gone node as the journal knows them before `seq` (`parent_id` of the
+    /// The ancestors of a node as the journal knows them before `seq` (`parent_id` of the
     /// entries), the node first, up to [`MAX_GONE_DEPTH`].
     async fn gone_chain(&mut self, node: NodeId, seq: i64) -> Result<Vec<NodeId>> {
         let mut chain = vec![node];
@@ -324,70 +369,163 @@ impl Memo<'_> {
         }
     }
 
-    /// Whether the caller could see a trashed or purged node before the change, beyond its old
-    /// place:
-    ///
-    /// - for a member: through an ancestor it can still see;
-    /// - in the tree, before the node went to the trash: a grant on the node or on an ancestor
-    ///   (also one that is now gone or in the trash);
-    /// - for a purge, in the trash: a `manage` grant on the node or on an ancestor while the
-    ///   node was in the trash (only those who may restore a trashed node see it). For an agent
-    ///   the role is capped by the scope (`max_role`): the agent's right is the user's right
-    ///   intersected with its scope.
-    ///
-    /// The ancestors come from the journal (`parent_id` of the entries). A grant through an
-    /// ancestor counts for an agent only when the node is inside its subtree. A grant added
-    /// after the trash with less than `manage` never showed the node, so it does not count; nor
-    /// does, for a guest, an ancestor that a grant added after the change shows now.
-    async fn saw_gone_node(&mut self, node: NodeId, entry: &JournalEntry) -> Result<bool> {
-        let seq = entry.seq;
-        let chain = self.gone_chain(node, seq).await?;
-        // A member's access comes from the membership, which the journal does not date, so an
-        // ancestor it sees now stands for one it saw then (the step 1 "now" rule). A guest (or
-        // its agent) sees only what grants give it, and the journal dates those: below.
-        if self.is_member().await? {
-            for cur in &chain[1..] {
-                if self.can_view(*cur).await? {
-                    return Ok(true);
+    /// The trash time of a trash or purge entry: for a trash, until the next restore or purge
+    /// of the node, or a purge of an ancestor; for a purge, from the trash before it (the purge itself when the journal has
+    /// none) until the purge.
+    async fn window_of(&mut self, entry: &JournalEntry, node: NodeId) -> Result<Gone> {
+        const ENDS: &[EventType] = &[EventType::NodeRestored, EventType::NodePurged];
+        Ok(match entry.event {
+            EventType::NodePurged => {
+                let trashed = self
+                    .journal
+                    .node_entries(self.ctx, node, entry.seq, &[EventType::NodeTrashed], 1)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| entry.clone());
+                Gone {
+                    trashed,
+                    ended: Some(entry.clone()),
                 }
             }
+            _ => {
+                let later = self
+                    .journal
+                    .node_entries(self.ctx, node, i64::MAX, ENDS, u32::MAX)
+                    .await?;
+                // Newest first: the last one after the trash is the first after it.
+                let mut ended = later.into_iter().rfind(|e| e.seq > entry.seq);
+                // A purge of an ancestor ends the trash time too.
+                let chain = self.gone_chain(node, i64::MAX).await?;
+                for x in &chain[1..] {
+                    let purges = self
+                        .journal
+                        .node_entries(self.ctx, *x, i64::MAX, &[EventType::NodePurged], 1)
+                        .await?;
+                    if let Some(p) = purges.into_iter().next()
+                        && p.seq > entry.seq
+                        && ended.as_ref().is_none_or(|e| p.seq < e.seq)
+                    {
+                        ended = Some(p);
+                    }
+                }
+                Gone {
+                    trashed: entry.clone(),
+                    ended,
+                }
+            }
+        })
+    }
+
+    /// Whether the node is out of the tree now (in the trash, itself or below a trashed folder,
+    /// or purged), from the journal, and since which trash. The node itself and each ancestor as
+    /// the journal knows them count; the earliest trash that has not ended took the node out.
+    async fn gone_now(&mut self, node: NodeId) -> Result<Option<Gone>> {
+        if let Some(g) = self.gone.get(&node) {
+            return Ok(g.clone());
         }
-        // The moment the node left the tree: the trash entry for a purge (a purged node is a
-        // trashed root), the change itself for a trash.
-        let trashed = match entry.event {
-            EventType::NodePurged => self
+        const STATES: &[EventType] = &[
+            EventType::NodeTrashed,
+            EventType::NodeRestored,
+            EventType::NodePurged,
+        ];
+        let chain = self.gone_chain(node, i64::MAX).await?;
+        let mut out: Option<Gone> = None;
+        for x in chain {
+            let newest = self
                 .journal
-                .node_entries(self.ctx, node, seq, &[EventType::NodeTrashed], 1)
-                .await?
-                .first()
-                .map(|e| e.seq),
-            _ => None,
-        };
-        let since = trashed.unwrap_or(seq);
+                .node_entries(self.ctx, x, i64::MAX, STATES, 1)
+                .await?;
+            let g = match newest.first() {
+                Some(e) if e.event == EventType::NodeTrashed => Gone {
+                    trashed: e.clone(),
+                    ended: None,
+                },
+                Some(e) if e.event == EventType::NodePurged => self.window_of(e, x).await?,
+                _ => continue,
+            };
+            out = Some(match out {
+                // The earliest trash, and the earliest end (a purge above ends it too).
+                Some(o) => Gone {
+                    trashed: if g.trashed.seq < o.trashed.seq {
+                        g.trashed
+                    } else {
+                        o.trashed
+                    },
+                    ended: match (o.ended, g.ended) {
+                        (Some(a), Some(b)) => Some(if a.seq < b.seq { a } else { b }),
+                        (a, b) => a.or(b),
+                    },
+                },
+                None => g,
+            });
+        }
+        self.gone.insert(node, out.clone());
+        Ok(out)
+    }
 
-        // In the tree, before the trash.
-        let chain_before = match trashed {
-            Some(t) => self.gone_chain(node, t).await?,
-            None => chain.clone(),
-        };
-        if self.chain_in_scope(&chain_before) {
-            for cur in &chain_before {
-                let states = self.grant_states(*cur, since, since).await?;
-                if !states.is_empty() {
+    /// Decision 0002-6: whether the caller may learn about a node for the trash time `g`. Either
+    /// it could see the node just before the trash, or it could restore the node while it was in
+    /// the trash. Access that began after the trash never counts.
+    ///
+    /// - Just before the trash: a grant to the caller's user (any role) on the node or on an
+    ///   ancestor at that moment, or a membership that began before the trash. For an agent the
+    ///   node must be inside its scope subtree then.
+    /// - In the trash: `manage` from a grant on the node or an ancestor, or from a membership
+    ///   (the team root), at some moment before the end of the trash time; for an agent only
+    ///   when its scope allows `manage` and the node is inside its subtree.
+    ///
+    /// Member links do not count here: the journal does not date their access.
+    async fn may_learn(&mut self, node: NodeId, g: &Gone) -> Result<bool> {
+        let t = &g.trashed;
+        let member_since = self.member_since().await?;
+
+        let chain_then = self.gone_chain(node, t.seq).await?;
+        if self.chain_in_scope(&chain_then) {
+            if member_since.is_some_and(|m| m <= t.at) {
+                return Ok(true);
+            }
+            for cur in &chain_then {
+                if !self.grant_states(*cur, t.seq, t.seq).await?.is_empty() {
                     return Ok(true);
                 }
             }
         }
 
-        // In the trash, with the right to restore it.
         let cap = self.ctx.scope.as_ref().map_or(Role::Manage, |s| s.max_role);
-        if trashed.is_none() || cap < Role::Manage || !self.chain_in_scope(&chain) {
+        if cap < Role::Manage {
             return Ok(false);
         }
-        for cur in &chain {
-            let states = self.grant_states(*cur, since, seq).await?;
-            if states.iter().any(|(_, role)| *role >= Role::Manage) {
-                return Ok(true);
+        let end = g.ended.as_ref().map_or(i64::MAX, |e| e.seq);
+        let chain_end = self.gone_chain(node, end).await?;
+        // A member until the end (or now) manages the whole team tree; the scope must hold the
+        // node at the end. (At the trash itself, (a) above already answered.)
+        let member_in_time = match (member_since, &g.ended) {
+            (Some(m), Some(e)) => m <= e.at,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if member_in_time && self.chain_in_scope(&chain_end) {
+            return Ok(true);
+        }
+        // A `manage` grant counts at the moment it held: the grant's node must be an ancestor
+        // of the node then, and for an agent the node inside its subtree then.
+        let mut candidates = chain_end.clone();
+        candidates.extend(chain_then.iter().filter(|c| !chain_end.contains(c)));
+        for cur in candidates {
+            let states = self.grant_states(cur, t.seq, end).await?;
+            for (seq, at_since, role) in states {
+                if role < Role::Manage {
+                    continue;
+                }
+                let chain_at = if at_since {
+                    chain_then.clone()
+                } else {
+                    self.gone_chain(node, seq + 1).await?
+                };
+                if chain_at.contains(&cur) && self.chain_in_scope(&chain_at) {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -520,8 +658,12 @@ impl Memo<'_> {
                 }
             }
             EventType::NodeTrashed | EventType::NodePurged => {
-                if !now && !before {
-                    before = self.saw_gone_node(node, entry).await?;
+                // Decision 0002-6: a trash or a purge reaches only those who could see the node
+                // just before the trash or could restore it, whatever they see now of its old
+                // place.
+                if !now {
+                    let g = self.window_of(entry, node).await?;
+                    before = self.may_learn(node, &g).await?;
                 }
                 if (now || before)
                     && let Some(target) = self.member_link_target(entry).await?
@@ -531,6 +673,18 @@ impl Memo<'_> {
                 }
             }
             _ => {}
+        }
+        // Decision 0002-6: any other entry on a node that is out of the tree now (in the trash
+        // or purged) follows the same rule. "Now" stays enough: a node in the trash shows now
+        // only to those who may restore it.
+        if !now
+            && before
+            && !matches!(entry.event, EventType::NodeTrashed | EventType::NodePurged)
+            && let Some(g) = self.gone_now(node).await?
+            && !self.may_learn(node, &g).await?
+        {
+            markers.clear();
+            return Ok(false);
         }
         Ok(now || before)
     }
@@ -556,6 +710,8 @@ pub async fn list_changes(
         view: HashMap::new(),
         ancestors: HashMap::new(),
         member: None,
+        member_since: None,
+        gone: HashMap::new(),
     };
     if let Some(folder) = query.node
         && !memo.can_view(folder).await?
@@ -601,6 +757,8 @@ pub async fn list_changes(
                 memo.view.clear();
                 memo.ancestors.clear();
                 memo.member = None;
+                memo.member_since = None;
+                memo.gone.clear();
                 continue;
             }
         }

@@ -4,6 +4,6 @@
 # those who may restore it (manage), so a lower grant added after the trash never showed it.
 DESCRIPTION="the feed counts grants up to the purge, not up to the trash, as having seen the node"
 FILE="crates/ruum-core/src/journal/feed.rs"
-PERL='s/let since = trashed\.unwrap_or\(seq\);/let since = seq;/'
+PERL='s/self\.grant_states\(\*cur, t\.seq, t\.seq\)/self.grant_states(*cur, i64::MAX, i64::MAX)/'
 TESTS="-p ruum-core --lib journal::feed::tests::a_grant_after_the_trash_shows_a_purge_only_with_manage"
 PLACEHOLDER=0

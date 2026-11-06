@@ -552,6 +552,33 @@ async fn usage_and_limits(a: Area) {
     );
 }
 
+/// `member_since` dates the membership for the changes feed (decision 0002-6): from the join
+/// or the last role change; `None` for guests and strangers.
+async fn member_since_dates_the_membership(a: Area) {
+    let t = team(&a).await;
+    let tid = t.tenant.id;
+    let ms = |u: UserId| {
+        let a = &a;
+        async move { a.tenants.member_since(tid, u).await.unwrap() }
+    };
+    let owner = ms(t.owner.id).await.expect("the owner is a member");
+    let member = ms(t.member.id).await.expect("a member");
+    assert!(owner <= member, "the owner joined first");
+    assert_eq!(ms(t.guest.id).await, None);
+    assert_eq!(ms(UserId::new()).await, None);
+    // A guest who becomes a member is one from then on. Postgres dates with its own clock.
+    let before = crate::now() - time::Duration::seconds(5);
+    a.tenants
+        .set_member_role(&ctx(tid, t.owner.id), t.guest.id, MemberRole::Member)
+        .await
+        .unwrap();
+    let promoted = ms(t.guest.id).await.expect("now a member");
+    assert!(
+        promoted >= before && promoted > member,
+        "{promoted} vs {member}"
+    );
+}
+
 crate::conformance!(
     a_team_tenant_has_its_owner_and_root,
     members_and_roles_follow_the_rules,
@@ -559,4 +586,5 @@ crate::conformance!(
     invitations_bind_by_token,
     guests_follow_the_policy,
     usage_and_limits,
+    member_since_dates_the_membership,
 );
