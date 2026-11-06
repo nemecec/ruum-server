@@ -1376,6 +1376,27 @@ Not in the first UI: the photo timeline, rich previews for every type, offline u
 The **Ruum admin console** is separate, for platform admins only: tenants, plans, approval of public
 apps and custom domains, abuse reports and takedown, and system health.
 
+### 12.4 Localisation
+
+The UI is localisable from the start of the work on it (decided 2026-11-07, provisional):
+
+- **FormatJS (`react-intl`) with ICU MessageFormat**, so plurals, cases, dates and numbers are right in
+  every language (Estonian needs plural and case forms that string concatenation cannot make).
+- **Languages:** English is the source; **Estonian** is the first translation. The list of languages
+  is configuration.
+- **Every UI string is in a message catalogue** (`web/src/locales/<lang>.json`, keys by screen and
+  meaning). A lint rule fails the build on literal text in components.
+- **A pseudo-locale** (accented, about 40% longer text) runs in the browser tests and the visual
+  tests, so untranslated strings and layouts that break with longer text are caught.
+- **Locale choice:** a user preference stored with the account (an additive contract change), then
+  the browser's language, then English. Dates, times, numbers and sizes use `Intl` with that locale.
+- **Server texts:** API errors keep their stable code; the UI shows a localised text per code and
+  falls back to the server's English `message`. Emails and invitations are localised on the server
+  by the recipient's language. MCP tool descriptions stay in English (for agents).
+- **Right-to-left ready:** CSS uses logical properties (`margin-inline-start`, not `margin-left`).
+- **Translations** are made by a translator agent and checked by a second agent; until a person
+  checks them they are marked "machine translated" in the catalogue metadata.
+
 ## 13. Hetzner
 
 Hetzner is a good fit for the start: low prices, traffic included in dedicated servers, cheap large
