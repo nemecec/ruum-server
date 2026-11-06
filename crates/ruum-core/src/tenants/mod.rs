@@ -20,7 +20,9 @@ use crate::ids::{InvitationId, NodeId, TenantId, UserId};
 use crate::paging::{Page, PageRequest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 pub use limits::{Limits, PlanTable, configure_plans, plan_limits, tenant_limits};
 
@@ -167,6 +169,19 @@ pub struct Usage {
     pub members: u32,
 }
 
+/// What answers show of a principal (contract need C-7, decision 0003-5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrincipalName {
+    /// The current name of a member, guest or agent, or the last name the tenant knew of a
+    /// person who left.
+    pub display_name: String,
+    /// The email of a current member or guest. `None` for agents and for people who left. The
+    /// API shows it only to callers who may list the members.
+    pub email: Option<String>,
+    /// The user an agent acts for. `None` for users.
+    pub owner: Option<UserId>,
+}
+
 /// How long an invitation stays open.
 pub const INVITATION_DAYS: i64 = 14;
 /// The visible prefix of invitation tokens.
@@ -241,6 +256,21 @@ pub trait TenantStore: Send + Sync {
     async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
         let _ = (tenant, email);
         Ok(false)
+    }
+    /// The names of `ids` in the tenant, for the names in answers (C-7, decision 0003-5). A
+    /// lookup in this tenant only, with no access check: the API calls it only for principals
+    /// that an answer it may send already names. In this order: current members and guests
+    /// (their current name, from `users`), agents of the tenant (their name), then the
+    /// tenant's snapshot of people who left (`principal_names`). Principals with none of these
+    /// (unknown IDs, share-link bearers, other tenants' principals) are not in the map. The
+    /// default knows no names.
+    async fn principal_names(
+        &self,
+        tenant: TenantId,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, PrincipalName>> {
+        let _ = (tenant, ids);
+        Ok(HashMap::new())
     }
     /// Members and guests, in the order they joined. Needs the tenant role `member`.
     async fn list_members(&self, ctx: &Context, page: PageRequest) -> Result<Page<Member>>;

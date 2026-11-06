@@ -18,6 +18,7 @@ use crate::identity::{check_email, check_name, secret};
 use crate::journal::{EventType, NewEntry};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -547,6 +548,90 @@ impl TenantStore for PgTenantStore {
         Ok(inside)
     }
 
+    async fn principal_names(
+        &self,
+        tenant: TenantId,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, PrincipalName>> {
+        let mut names = HashMap::new();
+        if ids.is_empty() {
+            return Ok(names);
+        }
+        // Under the tenant's row-level security: `users` shows only members and guests of this
+        // tenant (decision 0001-3), so the lookup cannot reach another tenant's people.
+        let mut tx = self.area.tenant(tenant, None).await?;
+        let users = sqlx::query(
+            "select u.id, u.display_name, u.email from memberships m \
+             join users u on u.id = m.user_id \
+             where m.tenant_id = $1 and m.user_id = any($2) and u.deleted_at is null",
+        )
+        .bind(tenant)
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        for r in &users {
+            names.insert(
+                r.try_get::<Uuid, _>("id")?,
+                PrincipalName {
+                    display_name: r.try_get("display_name")?,
+                    email: Some(r.try_get("email")?),
+                    owner: None,
+                },
+            );
+        }
+        let rest: Vec<Uuid> = ids
+            .iter()
+            .filter(|i| !names.contains_key(i))
+            .copied()
+            .collect();
+        if !rest.is_empty() {
+            let agents = sqlx::query(
+                "select id, name, owner_id from agents where tenant_id = $1 and id = any($2)",
+            )
+            .bind(tenant)
+            .bind(&rest)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in &agents {
+                names.insert(
+                    r.try_get::<Uuid, _>("id")?,
+                    PrincipalName {
+                        display_name: r.try_get("name")?,
+                        email: None,
+                        owner: Some(UserId(r.try_get("owner_id")?)),
+                    },
+                );
+            }
+        }
+        let rest: Vec<Uuid> = ids
+            .iter()
+            .filter(|i| !names.contains_key(i))
+            .copied()
+            .collect();
+        if !rest.is_empty() {
+            let gone = sqlx::query(
+                "select principal_id, display_name from principal_names \
+                 where tenant_id = $1 and principal_id = any($2)",
+            )
+            .bind(tenant)
+            .bind(&rest)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in &gone {
+                names.insert(
+                    r.try_get::<Uuid, _>("principal_id")?,
+                    PrincipalName {
+                        display_name: r.try_get("display_name")?,
+                        email: None,
+                        owner: None,
+                    },
+                );
+            }
+        }
+        tx.commit().await?;
+        Ok(names)
+    }
+
     async fn list_members(&self, ctx: &Context, page_req: PageRequest) -> Result<Page<Member>> {
         let user = caller_user(ctx)?;
         let off = offset(&page_req)?;
@@ -652,6 +737,18 @@ impl TenantStore for PgTenantStore {
         )?;
 
         let mut tuples = relations::membership(t, user, Some(target_role), None);
+        // Keep the name for the activity log of this tenant (decision 0003-5). It must be read
+        // before the membership goes: then the user is no longer visible here.
+        sqlx::query(
+            "insert into principal_names (tenant_id, principal_id, principal_kind, display_name) \
+             select $1, u.id, 'user', u.display_name from users u where u.id = $2 \
+             on conflict (tenant_id, principal_id) do update \
+             set display_name = excluded.display_name, updated_at = now()",
+        )
+        .bind(t)
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("delete from memberships where tenant_id = $1 and user_id = $2")
             .bind(t)
             .bind(user)

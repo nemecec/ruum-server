@@ -579,7 +579,107 @@ async fn member_since_dates_the_membership(a: Area) {
     );
 }
 
+/// Names for answers (C-7, decision 0003-5): members, guests and agents of the tenant by their
+/// current name; a person who left by the name the tenant kept; nobody of another tenant.
+async fn principal_names_follow_the_tenant(a: Area) {
+    let t = team(&a).await;
+    let tid = t.tenant.id;
+    let mc = ctx(tid, t.member.id);
+    let agent = a
+        .agents
+        .register(
+            &mc,
+            NewAgent {
+                name: "Helper".into(),
+                description: None,
+                scope: AgentScope {
+                    subtree: None,
+                    max_role: Role::Edit,
+                    expires_at: None,
+                    budget: Budget::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // Carol has her own tenant with an agent; neither is named in Acme.
+    let carol = user(&a, "carol").await;
+    let carol_tenant = a.tenants.list_for_user(carol.id).await.unwrap()[0].0.id;
+    let carol_agent = a
+        .agents
+        .register(
+            &ctx(carol_tenant, carol.id),
+            NewAgent {
+                name: "Carol bot".into(),
+                description: None,
+                scope: AgentScope {
+                    subtree: None,
+                    max_role: Role::View,
+                    expires_at: None,
+                    budget: Budget::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let unknown = Uuid::now_v7();
+    let ids = [
+        t.owner.id.0,
+        t.member.id.0,
+        t.guest.id.0,
+        agent.id.0,
+        carol.id.0,
+        carol_agent.id.0,
+        unknown,
+    ];
+    let names = a.tenants.principal_names(tid, &ids).await.unwrap();
+    assert_eq!(names.len(), 4, "{names:?}");
+    let m = &names[&t.member.id.0];
+    assert_eq!(m.display_name, t.member.display_name);
+    assert_eq!(m.email.as_deref(), Some(t.member.email.as_str()));
+    assert_eq!(names[&t.guest.id.0].display_name, t.guest.display_name);
+    let ag = &names[&agent.id.0];
+    assert_eq!(ag.display_name, "Helper");
+    assert_eq!(ag.owner, Some(t.member.id));
+    assert_eq!(ag.email, None);
+    assert!(!names.contains_key(&carol.id.0));
+    assert!(!names.contains_key(&carol_agent.id.0));
+    // The guest leaves: the name stays for Acme, without the email.
+    a.tenants
+        .remove_member(&ctx(tid, t.guest.id), t.guest.id)
+        .await
+        .unwrap();
+    let names = a
+        .tenants
+        .principal_names(tid, &[t.guest.id.0])
+        .await
+        .unwrap();
+    let g = &names[&t.guest.id.0];
+    assert_eq!(g.display_name, t.guest.display_name);
+    assert_eq!(g.email, None);
+    // The member is removed; the agent keeps its name (agents stay in the tenant).
+    a.tenants
+        .remove_member(&ctx(tid, t.owner.id), t.member.id)
+        .await
+        .unwrap();
+    let names = a
+        .tenants
+        .principal_names(tid, &[t.member.id.0, agent.id.0])
+        .await
+        .unwrap();
+    assert_eq!(names[&t.member.id.0].display_name, t.member.display_name);
+    assert_eq!(names[&agent.id.0].display_name, "Helper");
+    // The snapshot is per tenant: Carol's tenant never learns the names of Acme.
+    let names = a
+        .tenants
+        .principal_names(carol_tenant, &[t.member.id.0, t.guest.id.0, agent.id.0])
+        .await
+        .unwrap();
+    assert!(names.is_empty(), "{names:?}");
+}
+
 crate::conformance!(
+    principal_names_follow_the_tenant,
     a_team_tenant_has_its_owner_and_root,
     members_and_roles_follow_the_rules,
     removing_a_member_cleans_up,

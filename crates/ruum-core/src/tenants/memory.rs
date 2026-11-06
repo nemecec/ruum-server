@@ -12,7 +12,9 @@ use crate::error::{Error, ErrorCode};
 use crate::identity::memory::{InvitationRow, MembershipRow, MemoryArea, page_of};
 use crate::identity::{check_email, check_name, secret};
 use crate::ids::AgentId;
+use std::collections::HashMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Clone, Default)]
 pub struct MemoryTenantStore {
@@ -175,6 +177,49 @@ impl TenantStore for MemoryTenantStore {
         }))
     }
 
+    async fn principal_names(
+        &self,
+        tenant: TenantId,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, PrincipalName>> {
+        let st = self.area.lock();
+        let mut names = HashMap::new();
+        for id in ids {
+            let user = UserId(*id);
+            let name = if let (Some(_), Some(u)) =
+                (st.memberships.get(&(tenant, user)), st.users.get(&user))
+            {
+                Some(PrincipalName {
+                    display_name: u.user.display_name.clone(),
+                    email: Some(u.user.email.clone()),
+                    owner: None,
+                })
+            } else if let Some(a) = st
+                .agents
+                .get(&AgentId(*id))
+                .filter(|a| a.tenant_id == tenant)
+            {
+                Some(PrincipalName {
+                    display_name: a.name.clone(),
+                    email: None,
+                    owner: Some(a.owner_id),
+                })
+            } else {
+                st.principal_names
+                    .get(&(tenant, *id))
+                    .map(|n| PrincipalName {
+                        display_name: n.clone(),
+                        email: None,
+                        owner: None,
+                    })
+            };
+            if let Some(n) = name {
+                names.insert(*id, n);
+            }
+        }
+        Ok(names)
+    }
+
     async fn list_members(&self, ctx: &Context, page: PageRequest) -> Result<Page<Member>> {
         let user = caller_user(ctx)?;
         let items = {
@@ -282,6 +327,10 @@ impl TenantStore for MemoryTenantStore {
         let ended_agents: Vec<AgentId> = {
             let mut st = self.area.lock();
             let now = crate::now();
+            // Keep the name for the activity log of this tenant (decision 0003-5).
+            if let Some(name) = st.users.get(&user).map(|u| u.user.display_name.clone()) {
+                st.principal_names.insert((ctx.tenant, user.0), name);
+            }
             st.memberships.remove(&(ctx.tenant, user));
             let mut ended = Vec::new();
             for a in st.agents.values_mut() {

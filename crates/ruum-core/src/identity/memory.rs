@@ -133,6 +133,8 @@ pub(crate) struct State {
     pub oauth_clients: HashMap<String, OAuthClient>,
     pub oauth_grants: HashMap<Uuid, OAuthGrantRow>,
     pub oauth_codes: HashMap<[u8; 32], OAuthCodeRow>,
+    /// The last known names of people who left a tenant (`principal_names`, decision 0003-5).
+    pub principal_names: HashMap<(TenantId, Uuid), String>,
     pub order: u64,
 }
 
