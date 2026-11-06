@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { Navigate, NavLink, Outlet, useLocation, useNavigate, useParams } from 'react-router'
-import { client, setTenant, unwrap, type Schemas } from '../api/client'
+import { client, RuumApiError, setSigningOut, setTenant, unwrap, type Schemas } from '../api/client'
 import { memberRoleLabels } from '../components/format'
 import { useToast } from '../components/useToast'
 import { Dialog, ErrorNote } from '../components/ui'
@@ -127,11 +127,17 @@ function Header({ tenantId, isAdmin, unlisted }: { tenantId: string; isAdmin: bo
   }
 
   async function signOut() {
+    // Calls still under way answer 401 once the session ends: they must not race the browser's
+    // way to the end-session page with a navigation to sign-in.
+    setSigningOut(true)
     try {
       const res = await unwrap(client.POST('/v1/auth/logout'))
       browser.assign(res.logout_url)
     } catch (e) {
-      setSignOutError(e)
+      setSigningOut(false)
+      // The session had ended already: that is signed out too.
+      if (e instanceof RuumApiError && e.status === 401) navigate('/signin', { replace: true })
+      else setSignOutError(e)
     }
   }
 

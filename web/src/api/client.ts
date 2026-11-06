@@ -102,6 +102,17 @@ export function onUnauthenticated(listener: () => void): () => void {
   return () => unauthenticatedListeners.delete(listener)
 }
 
+/**
+ * True while the person signs out. The server ends the session before the browser leaves for the
+ * identity provider's end-session page, so calls still under way answer 401. They must not send
+ * the browser to sign-in (with a `return_to`) at the same time as that navigation.
+ */
+let signingOut = false
+
+export function setSigningOut(value: boolean) {
+  signingOut = value
+}
+
 type Result<T> = { data?: T; error?: unknown; response: Response }
 
 /**
@@ -115,7 +126,7 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
       code: response.status === 401 ? ('unauthenticated' as const) : ('internal' as const),
       message: `HTTP ${response.status}`,
     }
-    if (response.status === 401) unauthenticatedListeners.forEach((l) => l())
+    if (response.status === 401 && !signingOut) unauthenticatedListeners.forEach((l) => l())
     throw new RuumApiError(response.status, body)
   }
   return data as T

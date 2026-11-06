@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup } from '@testing-library/react'
 import { afterAll, afterEach, beforeAll, beforeEach, expect } from 'vitest'
-import { setTenant } from '../api/client'
+import { setSigningOut, setTenant } from '../api/client'
 import { resetDb } from '../mocks/db'
 import { contractViolations, setRequestCheck } from '../mocks/handlers'
 import { server } from '../mocks/node'
@@ -25,6 +25,7 @@ afterEach(() => {
   server.events.removeAllListeners()
   resetDb()
   setTenant(null)
+  setSigningOut(false)
   localStorage.clear()
 })
 afterAll(() => server.close())

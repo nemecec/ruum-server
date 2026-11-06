@@ -1,7 +1,10 @@
 import { screen, within } from '@testing-library/react'
+import { http, HttpResponse } from 'msw'
 import { describe, expect, it, vi } from 'vitest'
+import { client, unwrap } from '../../api/client'
 import { loginUrl, safeReturnTo } from '../../app/auth'
 import { db } from '../../mocks/db'
+import { server } from '../../mocks/node'
 import { personal, renderApp } from '../render'
 import { recordRequests } from '../requests'
 
@@ -47,6 +50,36 @@ describe('sign-in', () => {
     await user.click(within(nav).getByRole('button', { name: 'Sign out' }))
     await vi.waitFor(() => expect(assign).toHaveBeenCalledWith('/signin?signed_out=1'))
     expect(seen.some((r) => r.method === 'POST' && r.path === '/v1/auth/logout')).toBe(true)
+  })
+
+  it('does not send the browser to sign-in when calls answer 401 while it signs out', async () => {
+    // The server ends the session first; a call that is still under way answers 401 before the
+    // logout answer arrives. The browser must only follow the logout URL (no race of two
+    // navigations, no return_to to the page the person left).
+    server.use(
+      http.post('*/v1/auth/logout', async () => {
+        db.signedIn = false
+        await unwrap(client.GET('/v1/me')).catch(() => undefined)
+        return HttpResponse.json({ logout_url: '/signin?signed_out=1' })
+      }),
+    )
+    const { user, assign, router } = renderApp(`${personal}/files`)
+    const paths: string[] = []
+    router.subscribe((state) => paths.push(state.location.pathname))
+    const nav = await screen.findByRole('navigation', { name: 'Main' })
+    await user.click(within(nav).getByRole('button', { name: 'Sign out' }))
+    await vi.waitFor(() => expect(assign).toHaveBeenCalledWith('/signin?signed_out=1'))
+    expect(paths).not.toContain('/signin')
+  })
+
+  it('lands on sign-in when the session had ended before Sign out', async () => {
+    const { user, assign, router } = renderApp(`${personal}/files`)
+    const nav = await screen.findByRole('navigation', { name: 'Main' })
+    db.signedIn = false
+    await user.click(within(nav).getByRole('button', { name: 'Sign out' }))
+    expect(await screen.findByRole('heading', { name: 'Sign in to Ruum' })).toBeInTheDocument()
+    expect(router.state.location.pathname).toBe('/signin')
+    expect(assign).not.toHaveBeenCalled()
   })
 
   it('goes to sign-in when a later call answers 401', async () => {

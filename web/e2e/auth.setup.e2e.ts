@@ -45,8 +45,10 @@ test('sign out ends the session', async ({ page, baseURL }) => {
   await signIn(page, ann)
   await page.getByRole('button', { name: 'Sign out' }).click()
   // The server ends the session and sends the browser through Zitadel's end-session endpoint and
-  // back to the web UI. Wait for the end of that chain, so the next navigation does not race it.
-  await page.waitForURL((u) => u.origin === web && !u.pathname.startsWith('/t/'), { timeout: 15_000 })
+  // back to the web UI, which sends a visitor without a session to /signin. Wait for the end of
+  // that chain (not only for the web origin: the client-side step to /signin can still be under
+  // way), so the next navigation does not race it (net::ERR_ABORTED).
+  await page.waitForURL((u) => u.origin === web && u.pathname.startsWith('/signin'), { timeout: 15_000 })
   await page.waitForLoadState('load')
   await page.goto('/')
   await expect(page).toHaveURL(/\/signin/)
