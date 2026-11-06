@@ -333,7 +333,12 @@ paths:
         database exports as `sql` (Postgres: `pg_dump` plain format; SQLite: `.dump`) or as the
         engine's native file (`sqlite`). Exports of a database are full data: only a person with
         `manage` starts one (the platform checks it; agents get masked exports only, see the
-        README).
+        README). A database export never holds the pseudonym key or a Ruum object: the Postgres
+        export leaves out the schemas `ruum_mask`, `ruum_masked` and `ruum_nosecret`, the
+        per-database roles and the grants (`pg_dump --exclude-schema=... --no-owner
+        --no-privileges`); a SQLite file never holds the key. A restore or import of an export
+        into a new database builds the Ruum schemas again and installs the key from the
+        platform (`tenant_keys`), never from the file (decision 0004-29).
       parameters:
         - $ref: '#/components/parameters/DeliveryId'
       requestBody:
@@ -677,7 +682,7 @@ components:
           properties:
             kind:
               const: branch
-              description: A database branch (section 8.4); the new node is a child of `node_id`. Always from the current state of the source (a branch from an earlier time is a restore into a new node, then a branch). The branch gets the source's column classes and applied migrations (decision 0004-17).
+              description: A database branch (section 8.4); the new node is a child of `node_id`. Always from the current state of the source (a branch from an earlier time is a restore into a new node, then a branch). The branch gets the source's column classes and applied migrations (decision 0004-17), with the column identity read from the branch after the copy (decision 0004-28). A branch of a branch is refused. A `masked` or `schema_only` branch gets a pseudonym key of its own (decision 0004-25).
             node_id:
               $ref: '#/components/schemas/Uuid'
             data:
@@ -687,7 +692,7 @@ components:
           properties:
             kind:
               const: template
-              description: A node inside a template folder (section 2.7). Templates hold masked sample data only.
+              description: A node inside a template folder (section 2.7). Templates hold masked sample data only. Postgres takes the copy like a branch (a short pause of the source).
             node_id:
               $ref: '#/components/schemas/Uuid'
             version_id:

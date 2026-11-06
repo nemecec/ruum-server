@@ -88,7 +88,11 @@ client                platform                                 provider
    | `tenant_deleted` | the tenant is deleted | delete everything of the tenant |
 
 5. **Export** (`exportTypedNode`). The provider writes the export as a file through the upload
-   API, with a one-upload token, so quotas and downloads work as for any file.
+   API, with a one-upload token, so quotas and downloads work as for any file. An export holds
+   the content only, never the platform's keys or access objects: a database export leaves out
+   the Ruum schemas (`ruum_mask` with the pseudonym key, `ruum_masked`, `ruum_nosecret`), the
+   roles and the grants. A restore or import installs the key again from the platform (decision
+   0004-29).
 
 ## Children of a typed node
 

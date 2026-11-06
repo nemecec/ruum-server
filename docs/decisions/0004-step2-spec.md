@@ -1,4 +1,4 @@
-# 0004: Step 2 specification decisions (first panel review)
+# 0004: Step 2 specification decisions (panel reviews)
 
 Status: `provisional`, decided by the agent panel on 2026-11-06 (design section 18.9: one
 architect agent drafted the step 2 contracts on `f/step2spec`, two reviewer agents asked for
@@ -17,7 +17,10 @@ buildability) gave 12 required changes and 5 notes. The first revision saw only 
 first item (the same as reviewer 1, item 1). The second revision read both reviews in full and
 applied every reviewer 2 item that the branch did not satisfy yet (items 14 to 19 and 23), the UX
 contract needs C-15 to C-19 (item 20), and the architect decision on planned operations (items 21
-and 22). `ruum-server-wt/panel/step2-spec-v2-changes.md` maps each review item to its change.
+and 22). The third revision applies the re-review of the second revision (reviewer 1: three
+required changes; reviewer 2: six required changes and notes): items 24 to 33. Earlier items that
+these change say so in place. `ruum-server-wt/panel/step2-spec-v2-changes.md` maps each review
+item to its change.
 
 ## 1. Postgres sessions: untrusted SQL never runs as the admin role
 
@@ -92,7 +95,8 @@ Q-3, T-2 oracle cases (`WHERE`, `ORDER BY`, `GROUP BY`, `LIKE`, `min`, `length`,
   branches and copies (a non-text column is retyped to `text`; its check constraints are
   dropped in the copy). `ResultColumn.type` says `text`.
 - Expressions that read no column (constants, parameters) are `normal` and never pseudonymized,
-  so `SELECT 'guess'` does not give the pseudonym of a guess.
+  so `SELECT 'guess'` does not give the pseudonym of a guess. The query log and approvals store
+  parameters as hidden markers, never as pseudonyms (item 24).
 - PostgreSQL Anonymizer is not used in step 2. Its masking rules are security labels that every
   role can read in `pg_seclabels`, and a salt in a setting is readable too. The lens views keep
   the intent of design 8.5 ("masks inside the database, bound to the agent's database role").
@@ -101,11 +105,13 @@ Q-3, T-2 oracle cases (`WHERE`, `ORDER BY`, `GROUP BY`, `LIKE`, `min`, `length`,
 - Collisions: 48 bits; about 0.2 % for 10^6 distinct values of a tenant and about 16 % for
   10^7. Accepted: a collision makes two values look equal; it never shows a real value.
 
-**Accepted risk.** An agent that may write can insert a guessed value and read its pseudonym,
-then compare: an online test of one guess per write, logged and rate limited, needing a write
-right. A `DO` block on a draft branch that gets around the missing schema `USAGE` gives the
-same online test. Neither gives the key or an offline dictionary attack. Relates to STEP2 open
-question 4 (pseudonym scope).
+**Accepted risk** (narrowed by items 24 and 25). An agent with a `write_live` grant on real data
+can insert a guessed value and read its pseudonym, then compare: an online test of one guess per
+write, logged and rate limited, needing a grant a person gave. On a draft branch (`masked` or
+`schema_only` data), where an agent writes without a person, the lens uses the branch's own key,
+so rows, migrations and `DO` blocks there give pseudonyms that match nothing outside the branch.
+None of this gives the key or an offline dictionary attack. Relates to STEP2 open question 4
+(pseudonym scope).
 
 **Changes.** STEP2 "The engine security model" items 3 to 5 and "Accepted risk", infrastructure
 item 1 (no `anon`), cards I-1, E-2, Q-2, D-3, T-2 pseudonym cases; `DataCopy`, `ResultColumn`,
@@ -188,8 +194,8 @@ cards Q-1, D-2, E-2, T-2 leak cases.
 
 **Decision.** Both reviewer options are taken (safer): the log stores the normalized statement
 (every literal replaced by `$L1`, `$L2`, ... after a parse; `<unparsed statement>` when it does
-not parse) and the parameters as pseudonyms, and an agent with `manage` sees only its own
-entries.
+not parse) and an agent with `manage` sees only its own entries. Parameters were stored as
+pseudonyms; item 24 replaces that with hidden markers.
 
 **Changes.** `listDatabaseQueries`, `DatabaseQueryLogEntry.statement`, `database_queries`
 comment (also: the table is one plain table; the partition remark was wrong), the MCP tool
@@ -260,8 +266,9 @@ Hiding `secret` values from people without `manage` stays in the engine (the `no
 because reviewer 1 item 3 needs every clause masked and a query-layer filter cannot do that. So
 step 3 apps do not use the people's kinds: an app binding gets kinds of its own, `app_read` and
 `app_write` (lens `base`, real values and secrets, one pair per binding), added in step 3 as new
-values of `database_roles.kind`. The permission table has rows for app bindings (step 3) and
-share links (`403`), so the caller resolution of Q-1 does not change in step 3.
+values of `database_roles.kind`, with the binding in `database_roles.binding_id` (item 32). The
+permission table has rows for app bindings (step 3) and share links (`403`), so the caller
+resolution of Q-1 does not change in step 3.
 
 **Reasons.** Session options set with `set_config(..., false)` outlive a request on a pooled
 connection. Reviewer 2's alternative (secrets hidden from people in the query layer only) would
@@ -296,8 +303,9 @@ local KEK file on the laptop (`RUUM_LOCAL_KEK_FILE`, kept and removed together w
 database volume), because dev OpenBao is in memory. The key is made on first use (the first
 database of the tenant), under the primary key, so two racing creates keep one key. A tenant
 export carries it re-wrapped for the target cell, so pseudonyms stay the same after a move
-(design 14). It is never rotated in step 2 (query logs, approvals and masked branches keep
-matching); a rotation would be a new `key_version` and is not specified. New card Q-4 owns it.
+(design 14). It is never rotated in step 2 (masked branches and copies keep matching their
+sources); a rotation would be a new `key_version` and is not specified. New card Q-4 owns it.
+Items 25 and 30 add the key of a draft branch and the path of a key into the engine.
 
 **Changes.** `tenant_keys` in 0002 (with RLS), STEP2 infrastructure item 5, area 4, card Q-4.
 
@@ -306,7 +314,8 @@ matching); a rotation would be a new `key_version` and is not specified. New car
 **Decision.**
 
 - A branch gets copies of the source's `database_columns` rows (confirmed classes kept) and of
-  its applied `database_migrations` rows as of `branch_at`. Classes stay as they are, so in a
+  its applied `database_migrations` rows as of `branch_at` (their column identity comes from the
+  branch's catalog, item 28). Classes stay as they are, so in a
   masked branch an agent without `read_personal` reads a pseudonym of the pseudonym: intended
   (consistent inside the branch, never the real value; reviewer 2 note e).
 - Masking by type: a `personal` column becomes `text` with the pseudonym; a `secret` column
@@ -457,6 +466,176 @@ entries avoids a second contract change per operation.
   sessions must not get around the limit).
 - (e) A masked branch is masked again for agents (a pseudonym of a pseudonym): intended (item
   17).
+
+## 24. Parameters are never stored as pseudonyms (re-review: reviewer 1, item 1)
+
+**Decision.** The query log (`database_queries.params`, `DatabaseQueryLogEntry.params`) and
+approvals (`database_approvals.params`, `DatabaseApproval.params`) store each parameter as a
+hidden-value marker (`{"$ruum": "hidden", "class": "personal"}`, JSON `null` for a `NULL`), never
+as a raw value and never as a pseudonym. Of the reviewer's two options, the safer one is taken:
+hidden markers (option b) leak nothing, while a separate log key (option a) still gives an agent
+a pseudonym of any value under some key. The approval still binds the values: `statement_hash`
+covers the canonical parameters, and the agent sends them again. The Rust pseudonym is used for
+SQLite only.
+
+**Reasons.** An agent with `view` reads its own log entries and its own approvals. With
+pseudonyms under the tenant key, it could send any value as a parameter and read back that
+value's pseudonym, then compare it with masked columns: a read-only pseudonym oracle that
+breaks item 4 ("parameters are never pseudonymized").
+
+**Changes.** `openapi.yaml` (`listDatabaseQueries`, `queryDatabase`, the two `params` schemas:
+`HiddenValue` or `null`), 0002 comments of `database_approvals` and `database_queries`, STEP2
+Postgres item 4, "Both engines", area 4, cards Q-1, A-2, T-2 (a parameter in the log or an
+approval never equals the lens pseudonym of the same value), MCP `list_database_queries` text.
+
+## 25. A draft branch has a pseudonym key of its own (re-review: reviewer 1, item 2)
+
+**Decision.** The lens of a database where an agent may write rows or DDL without a person's
+approval (a branch with `masked` or `schema_only` data) uses a key derived for that database:
+`HMAC-SHA-256(tenant_key, 'db:' || key_node_id)`. New column `databases.key_node_id`: `NULL`
+means the tenant key; a masked or schema_only branch sets its own node ID (0002 checks it); a
+copy (`copyNode`) and a restore into a new node keep the value of their source, so the key
+follows the data (otherwise a person's full copy of a draft branch would give agents
+tenant-key pseudonyms of values an agent wrote). A `full` branch keeps its source's key; agents
+need `write_live` there. The masking of a copy computes the pseudonyms with the source's key, so
+the branch's base tables hold the same pseudonyms that a masked read of the source shows; then
+the engine installs the branch's key in `ruum_mask.key` before the branch is `ready`. The
+"pseudonym of the pseudonym" rule of item 17 still holds, consistent inside the branch. No SQL
+joins a branch with its source, so nothing needs them to match.
+
+**Reasons.** On a draft branch an agent with `edit` applies migrations without approval, and
+migrations run as `owner`, so it can write any rows; new columns count as `personal`, and the
+lens would show them as tenant-key pseudonyms. That is an offline dictionary for low-entropy
+personal data of the live database, without `read_personal`, which item 4's accepted risk
+excluded.
+
+**Changes.** 0002 (`databases.key_node_id` and two checks; `tenant_keys` comment), `openapi.yaml`
+(`createDatabaseBranch`, `copyNode`, `restoreDatabase`, `Pseudonym`), provider `Source` branch
+text, STEP2 Postgres item 4, SQLite item 3, "Both engines", "Accepted risk", area 4, open
+question 4, cards Q-0, Q-4, Q-2, Q-3, D-3, D-4, P-3, T-2 (the same value through a draft branch's
+lens and its source's lens gives different pseudonyms), MCP `create_database_branch` text, UX
+agent rules.
+
+## 26. Agents dry-run migrations only on draft branches (re-review: reviewer 1, item 3)
+
+**Decision.** An agent's `dry_run: true` on a live database or a `full` branch fails with `403
+user_required` (hint `dry_run_on_draft_branch`) before anything runs; no approval is made. On a
+`masked` or `schema_only` branch it runs as before. A person dry-runs with the rights of the
+migration. Of the reviewer's two options (an approval for the dry run, or draft branches only),
+the stricter one is taken: an approval for a dry run would need its own hash (so it cannot be
+used for the real run) and still lets an agent take `ACCESS EXCLUSIVE` locks on live after one
+click; a draft branch gives the agent the same answer with no risk.
+
+**Reasons.** A dry run runs as `owner` and takes the migration's locks (item 5, item 20).
+
+**Changes.** `applyDatabaseMigration`, `ApplyDatabaseMigrationRequest.dry_run`, STEP2 permission
+table and "Both engines", cards D-2 and T-1, MCP `apply_database_migration` text, UX agent error
+table.
+
+## 27. A TEMPLATE copy drains the source (re-review: reviewer 2, item 1)
+
+**Decision.** PostgreSQL refuses `CREATE DATABASE ... TEMPLATE x` while any session is connected
+to `x`, and the platform keeps pooled connections open (items 1, 14). The engine drains the
+source: it stops handing out sessions and sets `ALLOW_CONNECTIONS false`; it closes every pooled
+connection of every kind (step 3 app pools too); it waits up to 5 seconds for running statements,
+then cancels them and ends the remaining sessions; it takes the copy; it allows connections again
+and reopens the pools (the reconciler repairs a crash in the middle). Requests during the pause
+wait up to 10 seconds, then fail with the retryable `database_not_ready` (hint `retry`). The same
+path serves `copyNode` of a database and `source.kind: template`. Decision 18 (small databases
+only) keeps the pause to seconds; the cost is stated and accepted. The other option (dump and
+restore for a source in use) is not taken: decision 18 names `TEMPLATE`, and a dump of a live
+database is slower for the same small sizes.
+
+**Changes.** `createDatabaseBranch`, `copyNode`, `createDatabase` (template), provider `Source`
+template text, 0002 `databases` comment, STEP2 Postgres item 7, cards E-2 (done when: a branch
+succeeds with open pools of several kinds and a long statement), D-3, P-3.
+
+## 28. Branch column identity comes from the branch (re-review: reviewer 2, item 2)
+
+**Decision.** The copied `database_columns` rows of a branch take their identity (`rel_oid`,
+`attnum`, `type_oid`, `data_type`) from the branch's own catalog after the copy and the masking,
+matched by schema, table and column name at that moment. The retype of the masking is not a
+reset. So after a masked branch, the branch shows no unconfirmed column that was confirmed in the
+source, and a catalog sync of the branch changes nothing.
+
+**Reasons.** The masking retypes every `personal` column to `text` (new `type_oid`), and a copy
+that is not a `TEMPLATE` copy gets new OIDs; with the source's identity, the first sync would
+reset every such column to `retyped` and fill the digest.
+
+**Changes.** `createDatabaseBranch`, provider `Source` branch text, 0002 `databases` comment,
+card D-3.
+
+## 29. Exports never hold the key (re-review: reviewer 2, item 3)
+
+**Decision.** A database export leaves out the Ruum schemas (`ruum_mask`, `ruum_masked`,
+`ruum_nosecret`), the per-database roles and the grants (`pg_dump --exclude-schema=...
+--no-owner --no-privileges`); a SQLite file never holds the key. A restore or import into a new
+database builds the Ruum schemas again and installs the key from `tenant_keys` (the tenant export
+of design 14 carries the key re-wrapped, item 16). The only plain copies of a key are
+`ruum_mask.key` inside the engine databases (owner `mask`) and the per-connection SQLite
+registration.
+
+**Reasons.** A plain `pg_dump` includes `ruum_mask.key`: every reader of an export file, also of
+an agent's masked export, would get the tenant key and an offline dictionary attack on every
+database of the tenant.
+
+**Changes.** `exportTypedNode`, provider README "Export", 0002 `tenant_keys` comment, STEP2
+Postgres item 8, cards E-1, E-2, Q-4 (done when), T-2 export cases.
+
+## 30. The key reaches the engine through the trait (re-review: reviewer 2, item 4)
+
+**Decision.** The `DatabaseEngine` trait (E-1) takes the pseudonym key of the database (a key
+handle) when it creates a database, copies one (branch, copy, restore into a new node) and opens
+a SQLite connection. D-1 runs after Q-4 and loads the tenant key through it; P-3 (copy), D-3
+(branch) and D-4 (restore into a new node) do the same for their new databases, with the key of
+item 25.
+
+**Reasons.** No card connected the key store (Q-4) with the engine; E-2 and Q-2 could pass with a
+fixed test key while production runs with none.
+
+**Changes.** STEP2 area 2, infrastructure item 5, cards E-1, E-2, D-1 (done when: two databases of
+one tenant give the same pseudonym for a value, two tenants do not), D-3, D-4, P-3; 0002
+`tenant_keys` comment.
+
+## 31. Q-3 owns the SQLite lens (re-review: reviewer 2, item 5)
+
+**Decision.** Q-3 may change `crates/ruum-core/src/privacy/sqlite.rs` and
+`crates/ruum-dbengine/src/sqlite/lens.rs`, as Q-2 does for Postgres. E-3 builds the authorizer
+hook, the hardening and the `ruum_pseudonym` registration; Q-3 fills in the TEMP lens views and
+the restricted-column rules.
+
+**Changes.** Cards E-3 and Q-3.
+
+## 32. App binding roles have a key now (re-review: reviewer 2, item 6)
+
+**Decision.** Option (a): `database_roles` gets `id` (primary key) and a nullable `binding_id`,
+with `unique nulls not distinct (tenant_id, node_id, kind, binding_id)` and a check that
+`binding_id` is set exactly for the app kinds (`app_read`, `app_write`, not allowed by the
+`kind` check until step 3). Pools are per role (database, kind, binding). The engine trait selects
+a role by a role reference (database, kind, optional binding). So step 3 adds two kind values and
+nothing else at this border. Option (a) is taken over (b) because it costs one column and keeps
+0004-14's claim true.
+
+**Changes.** 0002 `database_roles`, STEP2 Postgres item 1 and the kinds table, area 2, the
+permission table, card E-1.
+
+## 33. Re-review notes, applied
+
+- Postgres: the pseudonym function has `search_path` `pg_catalog, pg_temp`, and `REVOKE TEMPORARY
+  ON DATABASE ... FROM PUBLIC` runs on every database (STEP2 Postgres item 1, infrastructure item
+  2, E-2 done when).
+- Module declarations: D-1 declares all six submodules of `ruum-core/src/databases/`, Q-1 the
+  two masking submodules of `query/`, Q-0 `keys`, `postgres` and `sqlite` in `privacy/`, each as
+  an empty file, so no parallel card edits a shared `mod.rs`.
+- Planned marks: the integrator resolves the mechanical conflicts of `PLANNED_OPERATIONS`, the
+  marks and the generated files by regenerating after the rebase (STEP2 shared files).
+- Raw values in a masked branch's history: the point-in-time window of a branch starts at its
+  `ready` time (`422` before), so a restore never brings back the values of the copy
+  (`createDatabaseBranch`, `restoreDatabase`, D-3, D-4, T-1).
+- Step 3 network path: `pg_hba.conf` lines for the app kinds from the app pool come with step 3
+  (STEP2 Postgres item 1, infrastructure item 2).
+- Branch of a branch: refused with `409 conflict` (open question 10 decided for step 2; D-3, T-1,
+  provider `Source`).
 
 ## Open
 

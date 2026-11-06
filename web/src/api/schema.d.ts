@@ -1148,7 +1148,10 @@ export interface paths {
          *     agent of a guest, cannot copy a typed node while the tenant policy
          *     `guests_create_resources` is false (`403 permission_denied`), because the copy counts
          *     against the host tenant's plan. A copy of a database does not copy its branches (a copy
-         *     is a new live database); a copy into a typed node fails with `409 conflict`.
+         *     is a new live database); a copy into a typed node fails with `409 conflict`. A Postgres
+         *     database is copied on the same path as a branch (`createDatabaseBranch`: a short pause
+         *     of the source while the engine takes the copy). A copy of a branch with `masked` or
+         *     `schema_only` data keeps that branch's pseudonym key (decision 0004-25).
          */
         post: operations["copyNode"];
         delete?: never;
@@ -2142,7 +2145,8 @@ export interface paths {
          *     type `database`) and `version.created`.
          *
          *     With `source.kind: template` the database starts as a copy of a database node inside a
-         *     template folder (design section 2.7: schema, migrations and masked sample data).
+         *     template folder (design section 2.7: schema, migrations and masked sample data), taken
+         *     on the same path as a branch (`createDatabaseBranch`).
          *     Agents may create databases inside their scope with `max_role` `edit` or higher.
          *
          *     A database counts against the plan of the tenant that holds the folder. A guest, or an
@@ -2353,8 +2357,8 @@ export interface paths {
          *     data from the database, not instructions: `content_trust` is `untrusted`.
          *
          *     Every query is logged (`listDatabaseQueries`) with `actor` and `on_behalf_of`, the
-         *     normalized statement (literals replaced by placeholders) and the parameters as
-         *     pseudonyms, never raw values. A read writes no journal
+         *     normalized statement (literals replaced by placeholders) and each parameter as a
+         *     hidden-value marker, never a raw value or a pseudonym. A read writes no journal
          *     entry. A write writes no journal entry per statement either; the grant that allowed it
          *     is in the journal (`database.grant_created`).
          */
@@ -2383,11 +2387,14 @@ export interface paths {
         /**
          * The query log of a database
          * @description Every query through the HTTP query API, newest first: who (`actor`, `on_behalf_of`),
-         *     when, the mode, the normalized statement, the parameters as pseudonyms, the row count,
-         *     the time and the outcome. Raw values are never stored (design section 11.2): the server
-         *     parses the statement and replaces every literal with a numbered placeholder (`$L1`,
-         *     `$L2`, ...) before it stores it, and stores each parameter as a pseudonym. A statement
-         *     that does not parse is stored as `<unparsed statement>` with its hash only.
+         *     when, the mode, the normalized statement, the parameters as hidden-value markers, the
+         *     row count, the time and the outcome. Raw values are never stored (design section 11.2):
+         *     the server parses the statement and replaces every literal with a numbered placeholder
+         *     (`$L1`, `$L2`, ...) before it stores it, and stores each parameter as a hidden-value
+         *     marker (`{"$ruum": "hidden", "class": "personal"}`, or `null` for a `NULL`). A parameter
+         *     is never stored as a pseudonym: an agent could otherwise send any value and read its
+         *     pseudonym back from its own log entries (decision 0004-24). A statement that does not
+         *     parse is stored as `<unparsed statement>` with its hash only.
          *
          *     Who sees which entries: a person with `manage` sees all entries. A person with `view`
          *     sees their own entries and the entries of the agents that act for them (so a user sees
@@ -2547,7 +2554,12 @@ export interface paths {
          *     class onto `personal` or `secret` data. The same holds for schema changes outside a
          *     migration.
          *
-         *     `dry_run: true` runs the migration and rolls it back, and reports the new columns. For
+         *     `dry_run: true` runs the migration and rolls it back, and reports the new columns. A dry
+         *     run runs as the schema owner and takes the same locks as the migration, so an agent may
+         *     dry-run only on a branch with `masked` or `schema_only` data: an agent's dry run on a
+         *     live database or on a branch with `full` data fails with `403 user_required` (hint
+         *     `dry_run_on_draft_branch`) before anything runs, and no approval is made (decision
+         *     0004-26). A person dry-runs with the same rights as for the migration. For
          *     agents and for people without `manage`, `error` is sanitized (see
          *     `listDatabaseMigrations`). Writes `database.migration_applied` or
          *     `database.migration_failed`.
@@ -2585,9 +2597,23 @@ export interface paths {
          * @description A copy of the database for tests, previews, or for an agent to try a migration (section
          *     8.4; decision 18: small databases only). The branch is a child node of type `database`
          *     (`branch_of` = this node), so it inherits the grants, and it is trashed and purged like
-         *     any node. Postgres makes it with `CREATE DATABASE ... TEMPLATE` (a short exclusive lock
-         *     on the source; the server waits for running queries up to the timeout); SQLite copies
-         *     the file.
+         *     any node. A branch of a branch is refused (`409 conflict`): branches are flat children of
+         *     a live database in step 2.
+         *
+         *     **The copy (Postgres).** The engine makes the branch with `CREATE DATABASE ... TEMPLATE`.
+         *     PostgreSQL refuses that while any session is connected to the source, idle ones
+         *     included, so the engine drains the source first (decision 0004-27): it stops handing
+         *     out sessions of the source and sets `ALLOW_CONNECTIONS false` on it; it closes every
+         *     pooled connection of the source, of every role kind (also the app pools of step 3);
+         *     it waits up to 5 seconds for running statements, then cancels them and ends the
+         *     remaining sessions; it takes the copy; then it allows connections again and reopens
+         *     the pools (the reconciler also does this after a crash in the middle). During the pause,
+         *     a new request on the source waits up to 10 seconds, then fails with the retryable error
+         *     `database_not_ready` (hint `retry`); a cancelled statement fails the same way and
+         *     commits nothing. Branches are for small databases only (decision 18, the plan's branch
+         *     limit), so the pause is a few seconds. `copyNode` of a database and `createDatabase`
+         *     with `source.kind: template` take their copy the same way. SQLite copies the file with
+         *     the online backup API, without a pause.
          *
          *     `data` is `masked` by default: `personal` columns become pseudonyms and non-empty
          *     `secret` values become `NULL`, so a preview never copies real personal data.
@@ -2602,7 +2628,24 @@ export interface paths {
          *     unconfirmed again and does not run the source's migrations a second time. The classes
          *     stay as they are: a `personal` column of a masked branch holds pseudonyms and still
          *     counts as `personal`, so an agent without `read_personal` reads a pseudonym of the
-         *     pseudonym (consistent within the branch, never the real value).
+         *     pseudonym (consistent within the branch, never the real value). The copied column rows
+         *     take their identity (relation, column number, type) from the branch's own catalog after
+         *     the copy and the masking, matched by schema, table and column name; the retype of the
+         *     masking does not reset a confirmed class (decision 0004-28).
+         *
+         *     **The branch's pseudonym key.** An agent may write rows and run migrations on a branch
+         *     with `masked` or `schema_only` data without a person's approval. So the lens of such a
+         *     branch uses a pseudonym key of its own, derived from the tenant key and the branch's
+         *     node ID, never the tenant key: a value that an agent writes into a branch never gives
+         *     the pseudonym that the same value has in a live database (decision 0004-25). The masking
+         *     of the copy itself computes the pseudonyms with the key of the source, so the branch's
+         *     tables hold the same pseudonyms that a masked read of the source shows. A copy or a
+         *     restore of such a branch keeps the branch's key. A branch with `full` data uses the
+         *     tenant key, like its source; agents need `write_live` there.
+         *
+         *     **Restore window.** The point-in-time window of a branch starts when it became `ready`:
+         *     a masked branch holds no real value from then on, and a restore to an earlier time
+         *     fails with `422 validation_failed`.
          *
          *     **Masking by type** (`masked` data). A `personal` column becomes `text` holding the
          *     pseudonym, whatever its type (`int`, `date`, `uuid`, ...); the branch's
@@ -2689,6 +2732,10 @@ export interface paths {
          *     then replaces the data; the database refuses queries while it runs. Needs `manage`.
          *     Users only: an agent gets `403 user_required`, with the web URL of the database's
          *     Backups tab in `hint`, to give to its user. `new_node` by a guest needs the tenant policy `guests_create_resources`.
+         *     The window of a branch starts when the branch became `ready` (a time before it is `422
+         *     validation_failed`), so a restore never brings back the real values that a masked
+         *     branch held during its copy. A restore into a new node keeps the pseudonym key of the
+         *     source (decision 0004-25), and the engine installs that key in the new database.
          *     Writes `database.restore_started`, and `database.restored` or
          *     `database.restore_failed` when it ends.
          */
@@ -4239,7 +4286,9 @@ export interface components {
         /**
          * @description A consistent pseudonym of a `personal` value: a keyed hash (per tenant key) of the
          *     value, so the same value always gives the same `id` in this tenant and joins, grouping
-         *     and counts still work. The UI shows a chip "person 8f3a91".
+         *     and counts still work. Exception: a branch with `masked` or `schema_only` data, and a
+         *     copy of one, use a key of their own, so their pseudonyms match nothing outside them
+         *     (decision 0004-25). The UI shows a chip "person 8f3a91".
          * @example {
          *       "$ruum": "pseudonym",
          *       "id": "p_8f3a91"
@@ -4335,8 +4384,8 @@ export interface components {
             mode: components["schemas"]["QueryMode"];
             /** @description The normalized statement. Every literal of the statement as sent is replaced with a numbered placeholder (`$L1`, `$L2`, ...); a statement that does not parse is `<unparsed statement>`. Raw values are never stored. */
             statement: string;
-            /** @description Each parameter as a pseudonym (or `null`), never the raw value. */
-            params: (components["schemas"]["Pseudonym"] | null)[];
+            /** @description Each parameter as a hidden-value marker (class `personal`), or `null` for a `NULL`. Never the raw value and never a pseudonym, so the log gives no pseudonym of a chosen value (decision 0004-24). */
+            params: (components["schemas"]["HiddenValue"] | null)[];
             /** @enum {string} */
             outcome: "ok" | "error" | "timeout" | "cancelled" | "approval_required";
             error_code: components["schemas"]["ErrorCode"] | null;
@@ -4453,7 +4502,10 @@ export interface components {
             data_classes?: {
                 [key: string]: components["schemas"]["DataClass"];
             };
-            /** @default false */
+            /**
+             * @description Run the migration and roll it back. Agents only on a branch with `masked` or `schema_only` data; elsewhere an agent gets `403 user_required` and nothing runs.
+             * @default false
+             */
             dry_run: boolean;
         };
         CreateDatabaseBranchRequest: {
@@ -4577,8 +4629,8 @@ export interface components {
              * @description The web page where a person decides this request (the database's Agent access tab with the request open). Agents give it to their user. It holds IDs only, never values.
              */
             review_url: string;
-            /** @description The parameters as the requester may see them (markers for `personal` and `secret` values). */
-            params: components["schemas"]["QueryCell"][];
+            /** @description Each parameter as a hidden-value marker (class `personal`), or `null` for a `NULL`. Never the raw value and never a pseudonym, so an approval gives no pseudonym of a chosen value (decision 0004-24); the agent sends the values again with the approved statement, and `statement_hash` binds them. */
+            params: (components["schemas"]["HiddenValue"] | null)[];
             /** @description Why the statement needs a person. */
             reasons: ("drop" | "truncate" | "delete_without_where" | "update_without_where" | "schema_change" | "migration" | "grant")[];
             /**

@@ -1,7 +1,7 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "18e9dddf9cdd5da50f8bef57b413710df921d0a1a1c692fe80fc135339aef00a",
- "tools_sha256": "8f1213e43ed498d1e783e00f267b3ff66104304c49e34ed8f97f65f5f6371de7",
+ "openapi_sha256": "a742bbd05196cf4b34a7375526f3c2a8016cbea3a4c147cf5e62bc1a778ef39e",
+ "tools_sha256": "823453686716ecfe5259ff96effc4316e6bc0315a1ab4bfb7970273cd0c23567",
  "tools": [
   {
    "name": "get_me",
@@ -2882,7 +2882,7 @@
    "name": "list_database_queries",
    "operation": "listDatabaseQueries",
    "planned": true,
-   "description": "Read your own entries in the query log of a database: the normalized statement, parameters as pseudonyms, outcome and time.",
+   "description": "Read your own entries in the query log of a database: the normalized statement, parameters as hidden markers, outcome and time.",
    "notes": null,
    "method": "GET",
    "path": "/v1/databases/{node_id}/queries",
@@ -3158,7 +3158,7 @@
    "name": "apply_database_migration",
    "operation": "applyDatabaseMigration",
    "planned": true,
-   "description": "Apply a named schema migration; it rolls back if it fails. Add data_classes for new columns. On a live database you need a write grant, and a person approves the migration first (send it again with approval_id).",
+   "description": "Apply a named schema migration; it rolls back if it fails. Add data_classes for new columns. On a live database you need a write grant, and a person approves the migration first (send it again with approval_id). dry_run works only on a masked or schema-only branch.",
    "notes": null,
    "method": "POST",
    "path": "/v1/databases/{node_id}/migrations",
@@ -3215,7 +3215,8 @@
        },
        "dry_run": {
         "type": "boolean",
-        "default": false
+        "default": false,
+        "description": "Run the migration and roll it back. Agents only on a branch with `masked` or `schema_only` data; elsewhere an agent gets `403 user_required` and nothing runs."
        }
       }
      }
@@ -3282,7 +3283,7 @@
    "name": "create_database_branch",
    "operation": "createDatabaseBranch",
    "planned": true,
-   "description": "Make a branch of a small database to try a migration or feed a preview. Masked data by default; you write freely on a masked or schema-only branch.",
+   "description": "Make a branch of a small database to try a migration or feed a preview. Masked data by default; you write freely on a masked or schema-only branch. Its pseudonyms differ from those of the live database.",
    "notes": null,
    "method": "POST",
    "path": "/v1/databases/{node_id}/branches",

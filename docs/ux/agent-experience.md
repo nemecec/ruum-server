@@ -220,7 +220,9 @@ person's side of the same flows. Status: `provisional`.
    `{"$ruum": "hidden", "class": "secret"}` is a hidden value. An agent must never present a
    stand-in as a real name, email or ID to its user, never try to reverse it, and never try to
    get around the mask (another query, another clause, a branch, a copy). When it tells its user
-   about such a value, it uses the UI's words: "person 8f3a91", "hidden".
+   about such a value, it uses the UI's words: "person 8f3a91", "hidden". Stand-ins of a
+   branch with masked or schema-only data differ from those of the live database (each such
+   branch has its own key, decision 0004-25), so an agent never compares them across databases.
 3. **The person decides in the web UI.** Agents cannot give themselves grants, confirm classes,
    restore, or approve requests (the four `x-ruum-user-only` operations). The tool text and the
    hints say what to ask the user, and where (the page and tab names of `ia.md`; a URL when C-16
@@ -321,7 +323,8 @@ only a person can fix it. Proposed hints (MCP form; the CLI form names the `ruum
 | `class_read_required` (personal) | leave out the columns *owner*, *email*, or ask your user for personal data access to *db* in the web UI (tab Agent access) |
 | `class_read_required` (secret) | leave out the columns *token*; secret columns are never available to agents |
 | `statement_not_allowed` | leave out the role, session, ATTACH, VACUUM or PRAGMA part; it never runs through the query API |
-| `migration_failed` | fix the migration; nothing changed. Try it with dry_run: true or on a branch first |
+| `migration_failed` | fix the migration; nothing changed. Try it first on a branch with masked or schema-only data (dry_run: true works there, not on live) |
+| `user_required` with hint `dry_run_on_draft_branch` | make a branch (create_database_branch) and dry-run the migration there |
 | `database_too_large` | make a branch with data: schema_only, or work on the live database with your user's write access |
 | `user_required` (restoreDatabase, confirmColumnClasses, a full branch) | ask your user to do this in the web UI: *restore on the database page, tab Backups* / *confirm the columns on the tab Columns* / *make a full branch on the Overview* |
 | `permission_denied` with hint `guests_create_resources` | ask an admin of the space to turn on "Guests can create databases" in Sharing rules |

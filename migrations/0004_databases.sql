@@ -134,11 +134,24 @@ create table databases (
     -- is a child node of its source (nodes.parent_id = branch_of). It gets copies of the
     -- source's `database_columns` rows (confirmed classes included) and of its applied
     -- `database_migrations` rows as of `branch_at` (decision 0004-17), so a preview neither
-    -- loses the classes nor runs the source's migrations again.
+    -- loses the classes nor runs the source's migrations again. The copied column rows take
+    -- their identity (`rel_oid`, `attnum`, `type_oid`, `data_type`) from the BRANCH's catalog
+    -- after the copy and the masking, matched by schema, table and column name; the retype of
+    -- the masking is not a reset (decision 0004-28). A branch of a branch is refused (the
+    -- service checks that the source has no `branch_of`). Postgres takes the copy with
+    -- `CREATE DATABASE ... TEMPLATE` after draining the source (decision 0004-27). The
+    -- point-in-time window of a branch starts when it became `ready`.
     branch_of           uuid,
     branch_data         data_copy,
     branch_at           timestamptz,                  -- when the copy was taken (always "now" in step 2)
-    extensions          text[] not null default '{}',
+    -- The pseudonym key of the lens (decision 0004-25). NULL: the tenant key of `tenant_keys`.
+    -- Else the key is derived: HMAC-SHA-256(tenant key, 'db:' || key_node_id). A branch with
+    -- `masked` or `schema_only` data sets it to its own node ID, because an agent may write rows
+    -- and run migrations there without a person's approval; a value it writes must never get
+    -- the pseudonym that the same value has in a live database. A copy or a restore into a new
+    -- node keeps the value of its source, so the key follows the data. No foreign key: the key
+    -- stays derivable after the branch is purged.
+    key_node_id         uuid,    extensions          text[] not null default '{}',
     pitr_days           integer not null default 7 check (pitr_days = 7),
     size_bytes          bigint not null default 0 check (size_bytes >= 0),
     size_measured_at    timestamptz,
@@ -150,6 +163,8 @@ create table databases (
     unique (cluster, engine_name),
     check ((branch_of is null) = (branch_data is null)),
     check (branch_at is null or branch_of is not null),
+    check (branch_data is distinct from 'full' or key_node_id is distinct from node_id),
+    check (branch_data not in ('masked', 'schema_only') or key_node_id = node_id),
     check (engine <> 'sqlite' or extensions = '{}')
 );
 create index databases_branch_idx on databases (tenant_id, branch_of) where branch_of is not null;
@@ -159,7 +174,7 @@ create index databases_branch_idx on databases (tenant_id, branch_of) where bran
 -- Untrusted SQL (every statement of the query API and every migration) runs ONLY in a session
 -- whose session_user is the role of the kind the request needs. Those roles have LOGIN with a
 -- short-lived random password (`VALID UNTIL` a few minutes ahead) that the platform sets when it
--- opens connections and never stores; connections are pooled per (database, kind) and closed
+-- opens connections and never stores; connections are pooled per role (database, kind, binding) and closed
 -- before the password ends. Each such role is a member of NO other role, holds no ADMIN option,
 -- has CONNECT on its own database only, and is NOINHERIT. So `RESET ROLE`, `SET ROLE` and
 -- `set_config('role', ...)`, also inside a DO block or a function, can only return to the role
@@ -190,18 +205,25 @@ create index databases_branch_idx on databases (tenant_id, branch_of) where bran
 --
 -- Step 3 (apps, decision 15): an app binding gets kinds of its own, `app_read` and `app_write`
 -- (lens `base`: real values, secrets included, because an app must check its own password
--- hashes and tokens), one pair per binding, added by step 3 as new values of `kind`. Hiding
--- secrets from PEOPLE without manage stays in the engine (the `nosecret` lens) for the query
--- API; an app binding never uses the people's kinds (decision 0004-14).
+-- hashes and tokens), one pair per binding (decision 0004-32). Step 3 adds the two values to
+-- the `kind` check and sets `binding_id`; the key and the column exist now, so the key, the
+-- pool key (database, kind, binding) and the engine's role reference do not change in step 3.
+-- In step 2 `binding_id` is always NULL. Hiding secrets from PEOPLE without manage stays in
+-- the engine (the `nosecret` lens) for the query API; an app binding never uses the people's
+-- kinds (decision 0004-14).
 create table database_roles (
+    id                  uuid primary key,
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
     kind                text not null check (kind in ('read', 'write', 'owner', 'masked_read', 'masked_write', 'secret_read', 'mask')),
+    -- The app binding of step 3 (`app_read`, `app_write`); NULL for every other kind.
+    binding_id          uuid,
     role_name           text not null check (role_name ~ '^[a-z][a-z0-9_]{1,62}$'),
     can_login           boolean not null generated always as (kind <> 'mask') stored,
     created_at          timestamptz not null default now(),
-    primary key (tenant_id, node_id, kind),
-    foreign key (tenant_id, node_id) references databases (tenant_id, node_id)
+    unique nulls not distinct (tenant_id, node_id, kind, binding_id),
+    foreign key (tenant_id, node_id) references databases (tenant_id, node_id),
+    check ((binding_id is not null) = (kind in ('app_read', 'app_write')))
 );
 create unique index database_roles_name_key on database_roles (role_name);
 
@@ -377,8 +399,10 @@ create index database_access_grants_expiry_idx on database_access_grants (expire
 -- `statement_hash` is BLAKE3 of the statement and the canonical JSON of the parameters (for a
 -- migration: of the name and `up`; for a grant request: of the canonical JSON of kind and
 -- minutes), so an approval allows exactly one statement with exactly those values, once.
--- `params` holds the parameters as markers (hidden values and pseudonyms), never raw personal
--- or secret values; the raw values are not needed, because the agent sends the statement again.
+-- `params` holds each parameter as a hidden-value marker (or JSON null for a NULL), never a raw
+-- value and never a pseudonym: a pseudonym of a parameter would give the requesting agent the
+-- pseudonym of any value it chooses (decision 0004-24). The raw values are not needed, because
+-- the agent sends the statement again and `statement_hash` binds them.
 -- `planned_columns` (migrations only) holds the columns that the parsed `up` adds, renames or
 -- retypes, with the author's classes (names and classes only, never values); the person can
 -- confirm classes in the same decision (decision 0004-20, UX need C-15). A grant request is
@@ -429,8 +453,9 @@ create index database_approvals_tenant_pending_idx on database_approvals (tenant
 
 -- The query log of the HTTP query API (sections 3.4, 8.5 and 11.2): every query with actor and
 -- on_behalf_of, the NORMALIZED statement (every literal replaced by `$L1`, `$L2`, ... after a
--- parse; `<unparsed statement>` when it does not parse) and the parameters as pseudonyms,
--- never raw values. `statement_hash` is BLAKE3 of the statement as sent. Agents read only
+-- parse; `<unparsed statement>` when it does not parse) and each parameter as a hidden-value
+-- marker (JSON null for a NULL), never a raw value and never a pseudonym (decision 0004-24:
+-- an agent reads its own entries, so a pseudonym of a parameter would be a pseudonym oracle). `statement_hash` is BLAKE3 of the statement as sent. Agents read only
 -- their own rows. High volume: one plain table in step 2, kept by the audit retention;
 -- partitioning is open question 8 of docs/STEP2.md.
 create table database_queries (
@@ -475,9 +500,14 @@ create index database_queries_actor_idx on database_queries (tenant_id, actor, a
 -- the key re-wrapped for the target cell, so pseudonyms stay the same after a move. The key is
 -- never rotated in step 2: query logs, approvals and masked branches keep matching. A rotation
 -- would be a new `key_version` with every lens view rebuilt; it is not specified yet.
--- The engine copies the unwrapped key into each Postgres database (`ruum_mask.key`, owner
--- `mask`) and registers it per SQLite connection; it never reaches a role that runs untrusted
--- SQL.
+-- The platform unwraps the key and hands the engine the key of each database (the tenant key,
+-- or the key derived for `databases.key_node_id`, decision 0004-25) when it creates the
+-- database and when it opens a SQLite connection (decision 0004-30). The engine stores it in
+-- the Postgres database (`ruum_mask.key`, owner `mask`) and registers it per SQLite
+-- connection; it never reaches a role that runs untrusted SQL. Database exports leave out
+-- `ruum_mask` (decision 0004-29); a restore or import installs the key again from here. So
+-- the only plain copies of a key are `ruum_mask.key` inside the engine databases and the
+-- per-connection SQLite registration.
 create table tenant_keys (
     tenant_id           uuid not null references tenants (id),
     purpose             text not null check (purpose in ('pseudonym')),
