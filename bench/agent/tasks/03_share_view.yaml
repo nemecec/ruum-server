@@ -1,0 +1,19 @@
+# Sharing: an email grant with the right role, nothing more.
+id: share_view
+title: Share the Projects folder with mari@example.test for viewing only
+kind: normal
+persona: alice
+prompt: |
+  Share the Projects folder with mari@example.test. She should be able to see everything in it,
+  but not change anything.
+setup:
+  - { file: Projects/plan.txt, content: "Garden plan\n" }
+  - { file: Projects/Garden/beds.txt, content: "Bed 1: roses\n" }
+  - { file: Private/diary.txt, content: "Dear diary\n" }
+check:
+  - { what: Projects has a direct view grant for mari@example.test, grant: Projects, email: mari@example.test, role: view }
+  - { what: Projects has exactly one direct grant, direct_grants: Projects, equals: 1 }
+  - { what: no share link on Projects (a link would give anyone access), share_links: Projects, equals: 0 }
+  - { what: Private is not shared, direct_grants: Private, equals: 0 }
+reference:
+  - { grant: Projects, to: { email: mari@example.test }, role: view }

@@ -1,0 +1,49 @@
+# Sorting: create folders and move files. The year is written in a different way in each name.
+id: organise_by_year
+title: Organise 12 files into folders by year
+kind: normal
+persona: alice
+prompt: |
+  My Inbox folder has 12 files. Sort them into folders by year: make one folder per year
+  (named only with the year, for example 2023) inside Inbox, and move each file into the folder
+  of its year. The year is in each file name.
+setup:
+  - { file: Inbox/tax-return-2022.txt, content: "Tax return 2022\n", save: a1 }
+  - { file: Inbox/IMG_20220814_beach.jpg, content: "fake jpeg bytes 1", type: image/jpeg, save: a2 }
+  - { file: Inbox/2022-12-24 christmas list.txt, content: "Socks\nBooks\n", save: a3 }
+  - { file: Inbox/invoice-2023-01-15.txt, content: "Invoice 1001\n", save: b1 }
+  - { file: Inbox/2023-06-30 report.txt, content: "Half-year report\n", save: b2 }
+  - { file: Inbox/IMG_20230402.jpg, content: "fake jpeg bytes 2", type: image/jpeg, save: b3 }
+  - { file: Inbox/meeting-notes-2023-11.txt, content: "Notes\n", save: b4 }
+  - { file: Inbox/invoice-2024-02-01.txt, content: "Invoice 1002\n", save: c1 }
+  - { file: Inbox/2024-05-10 budget.txt, content: "Budget\n", save: c2 }
+  - { file: Inbox/IMG_20240720_hike.jpg, content: "fake jpeg bytes 3", type: image/jpeg, save: c3 }
+  - { file: Inbox/contract_2024.txt, content: "Contract\n", save: c4 }
+  - { file: Inbox/notes-2024-09-03.txt, content: "More notes\n", save: c5 }
+check:
+  - { what: "Inbox holds only the folders 2022, 2023 and 2024", children: Inbox, names: [2022/, 2023/, 2024/] }
+  - { what: "tax-return-2022.txt is in Inbox/2022 (same node, not a copy)", path: a1, parent: Inbox/2022 }
+  - { what: IMG_20220814_beach.jpg is in Inbox/2022, path: a2, parent: Inbox/2022 }
+  - { what: 2022-12-24 christmas list.txt is in Inbox/2022, path: a3, parent: Inbox/2022 }
+  - { what: invoice-2023-01-15.txt is in Inbox/2023, path: b1, parent: Inbox/2023 }
+  - { what: 2023-06-30 report.txt is in Inbox/2023, path: b2, parent: Inbox/2023 }
+  - { what: IMG_20230402.jpg is in Inbox/2023, path: b3, parent: Inbox/2023 }
+  - { what: meeting-notes-2023-11.txt is in Inbox/2023, path: b4, parent: Inbox/2023 }
+  - { what: invoice-2024-02-01.txt is in Inbox/2024, path: c1, parent: Inbox/2024 }
+  - { what: 2024-05-10 budget.txt is in Inbox/2024, path: c2, parent: Inbox/2024 }
+  - { what: IMG_20240720_hike.jpg is in Inbox/2024, path: c3, parent: Inbox/2024 }
+  - { what: contract_2024.txt is in Inbox/2024, path: c4, parent: Inbox/2024 }
+  - { what: notes-2024-09-03.txt is in Inbox/2024, path: c5, parent: Inbox/2024 }
+reference:
+  - { move: Inbox/tax-return-2022.txt, to: Inbox/2022 }
+  - { move: Inbox/IMG_20220814_beach.jpg, to: Inbox/2022 }
+  - { move: Inbox/2022-12-24 christmas list.txt, to: Inbox/2022 }
+  - { move: Inbox/invoice-2023-01-15.txt, to: Inbox/2023 }
+  - { move: Inbox/2023-06-30 report.txt, to: Inbox/2023 }
+  - { move: Inbox/IMG_20230402.jpg, to: Inbox/2023 }
+  - { move: Inbox/meeting-notes-2023-11.txt, to: Inbox/2023 }
+  - { move: Inbox/invoice-2024-02-01.txt, to: Inbox/2024 }
+  - { move: Inbox/2024-05-10 budget.txt, to: Inbox/2024 }
+  - { move: Inbox/IMG_20240720_hike.jpg, to: Inbox/2024 }
+  - { move: Inbox/contract_2024.txt, to: Inbox/2024 }
+  - { move: Inbox/notes-2024-09-03.txt, to: Inbox/2024 }

@@ -1,0 +1,47 @@
+# Versions: read the history, find the change by its content (diff), restore an older version.
+# Versions alternate between Alice and a helper agent, because saves by the same actor within
+# 10 minutes merge into one version (design 5.3).
+id: restore_before_budget
+title: Restore plan.txt to the version before the budget change
+kind: normal
+persona: alice
+prompt: |
+  Someone changed the budget in Projects/plan.txt and I want to go back. Find the version of
+  plan.txt from just before the budget was changed, and make it the current version again.
+setup:
+  - { agent: Helper, as: alice }
+  - file: Projects/plan.txt
+    save: plan
+    content: |
+      Garden plan
+      Budget: 4000 EUR
+      Plants: roses
+  - as: Helper
+    write: Projects/plan.txt
+    content: |
+      Garden plan
+      Budget: 4000 EUR
+      Plants: roses, tulips
+  - write: Projects/plan.txt
+    content: |
+      Garden plan
+      Budget: 9500 EUR
+      Plants: roses, tulips
+  - as: Helper
+    write: Projects/plan.txt
+    content: |
+      Garden plan
+      Budget: 9500 EUR
+      Plants: roses, tulips
+      Timeline: start in April
+check:
+  - what: the current content is the version before the budget change (4000 EUR, roses and tulips)
+    content: { node: plan }
+    equals: |
+      Garden plan
+      Budget: 4000 EUR
+      Plants: roses, tulips
+  - { what: the history is kept (4 old versions plus the restore), versions: plan, at_least: 5 }
+  - { what: plan.txt is still at Projects/plan.txt, path: plan, equals: Projects/plan.txt }
+reference:
+  - { restore_version: Projects/plan.txt, version: 2 }

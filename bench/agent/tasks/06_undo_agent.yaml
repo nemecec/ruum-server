@@ -1,0 +1,40 @@
+# Undo by hand: undoAgent is user-only, so the outside agent must find what "Sorter bot" did
+# in the journal (list_changes: actor) and revert each change, without touching Alice's own work.
+id: undo_agent
+title: Undo what the agent Sorter bot did today
+kind: normal
+persona: alice
+prompt: |
+  The agent "Sorter bot" made a mess of my Notes folder today. Undo everything that Sorter bot
+  did today, but keep the changes that I made myself.
+setup:
+  - { file: Notes/meeting.txt, content: "Meeting with Mari on Monday\n", save: meeting }
+  - { file: Notes/todo.txt, content: "- water the plants\n", save: todo }
+  - { file: Notes/ideas.txt, content: "Rain barrel\n", save: ideas }
+  - { file: Notes/old-plan.txt, content: "Old plan\n", save: oldplan }
+  - { file: Notes/shopping.txt, content: "Milk\n", save: shopping }
+  - { folder: Archive }
+  - { agent: Sorter bot, as: alice }
+  - { as: Sorter bot, rename: Notes/todo.txt, name: TODO-final.txt }
+  - { as: Sorter bot, move: Notes/ideas.txt, to: Archive }
+  - { as: Sorter bot, write: Notes/meeting.txt, content: "MEETING\n" }
+  - { as: Sorter bot, folder: Notes/Sorted, save: sorted }
+  - { as: Sorter bot, file: Notes/Sorted/index.txt, content: "index of notes\n", save: index }
+  - { as: Sorter bot, trash: Notes/old-plan.txt }
+  - { write: Notes/shopping.txt, content: "Milk\nBread\n" }
+  - { file: Notes/call-mari.txt, content: "Call Mari about the garden\n", save: call }
+check:
+  - { what: todo.txt has its old name again, path: todo, equals: Notes/todo.txt }
+  - { what: ideas.txt is back in Notes, path: ideas, equals: Notes/ideas.txt }
+  - { what: meeting.txt has its old content, content: { node: meeting }, equals: "Meeting with Mari on Monday\n" }
+  - { what: old-plan.txt is restored from the trash, path: oldplan, equals: Notes/old-plan.txt }
+  - { what: the folder Sorted that the bot made is gone, gone: sorted }
+  - { what: the file Sorted/index.txt that the bot made is gone, gone: index }
+  - { what: Alice's own edit of shopping.txt is kept, content: { node: shopping }, equals: "Milk\nBread\n" }
+  - { what: Alice's own new file call-mari.txt is kept, path: call, equals: Notes/call-mari.txt }
+reference:
+  - { rename: Notes/TODO-final.txt, name: todo.txt }
+  - { move: Archive/ideas.txt, to: Notes }
+  - { restore_version: Notes/meeting.txt, version: 1 }
+  - { trash: Notes/Sorted }
+  - { node: oldplan, restore: x }

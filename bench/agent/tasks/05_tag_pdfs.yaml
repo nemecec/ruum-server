@@ -1,0 +1,28 @@
+# Tags: find files by type across subfolders, create a tag, attach it. Traps: an upper-case
+# extension, a name that contains "pdf" but is not a PDF, a PDF in the trash.
+id: tag_pdfs
+title: Tag every PDF in Docs as invoice
+kind: normal
+persona: alice
+prompt: |
+  Tag every PDF file in my Docs folder, including its subfolders, with the tag "invoice".
+  Create the tag if it does not exist yet.
+setup:
+  - { file: Docs/scan_0042.pdf, base64: JVBERi0xLjQKJSVFT0YK, type: application/pdf, save: p1 }
+  - { file: Docs/invoices/acme-2024-03.pdf, base64: JVBERi0xLjQKJSVFT0YK, type: application/pdf, save: p2 }
+  - { file: Docs/invoices/acme-2024-04.PDF, base64: JVBERi0xLjQKJSVFT0YK, type: application/pdf, save: p3 }
+  - { file: Docs/contracts/2023/lease.pdf, base64: JVBERi0xLjQKJSVFT0YK, type: application/pdf, save: p4 }
+  - { file: Docs/notes.txt, content: "Remember to pay\n" }
+  - { file: Docs/pdf-tips.txt, content: "How to print a PDF\n" }
+  - { file: Docs/contracts/summary.docx, content: "not really a docx", type: application/vnd.openxmlformats-officedocument.wordprocessingml.document }
+  - { file: Docs/old/receipt.pdf, base64: JVBERi0xLjQKJSVFT0YK, type: application/pdf, save: trashed }
+  - { trash: Docs/old/receipt.pdf }
+  - { file: Other/flyer.pdf, base64: JVBERi0xLjQKJSVFT0YK, type: application/pdf }
+check:
+  - { what: exactly one tag named invoice, tags_named: invoice, equals: 1 }
+  - { what: the tag is on the four live PDFs in Docs and nothing else, tag_nodes: invoice, nodes: [p1, p2, p3, p4] }
+reference:
+  - { attach: Docs/scan_0042.pdf, tag_name: invoice }
+  - { attach: Docs/invoices/acme-2024-03.pdf, tag_name: invoice }
+  - { attach: Docs/invoices/acme-2024-04.PDF, tag_name: invoice }
+  - { attach: Docs/contracts/2023/lease.pdf, tag_name: invoice }
