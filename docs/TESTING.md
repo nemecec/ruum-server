@@ -245,6 +245,7 @@ PLACEHOLDER=0                                    # 1 while FILE or the pattern d
 ```
 
 Run it alone with `crates/ruum-testkit/scripts/mutation_check.sh <name>`.
+If you source a mutation file by hand instead, do it in bash: zsh does not word-split an unquoted `$TESTS`, so `cargo test $TESTS` fails on its arguments and every mutation looks `KILLED`.
 
 ## Contract gaps found by the harness
 
