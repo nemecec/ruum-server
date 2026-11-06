@@ -1,7 +1,11 @@
 //! The Ruum core service. It reads its config from the environment, wires the modules and serves
 //! the REST API (`/v1`), the MCP server (`/mcp`) and WebDAV (`/dav`).
+//!
+//! `ruum-server seed-dev <file>` instead makes test users, a tenant and credentials on a laptop
+//! stack and exits (see `seed.rs`).
 
 mod config;
+mod seed;
 mod wiring;
 
 use anyhow::Context as _;
@@ -22,6 +26,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let seed_out = match args.as_slice() {
+        [] => None,
+        [cmd, out] if cmd == "seed-dev" => Some(out.clone()),
+        _ => anyhow::bail!("usage: ruum-server [seed-dev <file>]"),
+    };
 
     let pool = if let Some(url) = &config.database_url {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -44,6 +54,9 @@ async fn main() -> anyhow::Result<()> {
 
     let sweep_pool = pool.clone();
     let services = wiring::services(&config.public_url, pool).await?;
+    if let Some(out) = seed_out {
+        return seed::run(&services, &config.public_url, &out).await;
+    }
     let state = AppState::new(
         services.clone(),
         ApiConfig {
