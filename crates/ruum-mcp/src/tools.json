@@ -1,7 +1,7 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "2d14ae0bcad65b7ac63d99f22cb6f2738279c3da07d959e5b32133b4c0dd5856",
- "tools_sha256": "b8240adbb2dccfb5ec503805abad7d34e37714b3aa0406ccec1d01453800c91f",
+ "openapi_sha256": "16a7d349d6f2fe612297f21cbcf44a15d3e827afd441fa58c4b33bf089c7890f",
+ "tools_sha256": "1a786851976155f1b9541727b5b672643fda7cfb0a56d2bbbde94a72927f1380",
  "tools": [
   {
    "name": "get_me",
@@ -1684,11 +1684,11 @@
            },
            "display_name": {
             "type": "string",
-            "description": "Filled in responses."
+            "description": "The name of the user, filled in responses (as `PrincipalRef.display_name`)."
            },
            "email": {
             "type": "string",
-            "description": "Filled in responses."
+            "description": "Filled in responses only for callers who may share the node and who may list the members of the tenant (a member, admin or owner, or an agent of one). Absent for guests, so the grant list tells a guest no email address (decision 0003-5)."
            }
           }
          },
@@ -2096,7 +2096,7 @@
   {
    "name": "list_changes",
    "operation": "listChanges",
-   "description": "Read the change journal after a cursor, to see what changed (can long-poll with wait).",
+   "description": "Read the change journal after a cursor, to see what changed (can long-poll with wait). Filter by actor (a principal ID) and since (a time). Each entry names its actor: actor.display_name, and for an agent actor.kind is agent and on_behalf_of and on_behalf_of_display_name name its user. Tell agents from people by actor.kind, never by the name.",
    "notes": null,
    "method": "GET",
    "path": "/v1/changes",
@@ -2120,6 +2120,16 @@
      "name": "node",
      "in": "query",
      "prop": "node"
+    },
+    {
+     "name": "actor",
+     "in": "query",
+     "prop": "actor"
+    },
+    {
+     "name": "since",
+     "in": "query",
+     "prop": "since"
     }
    ],
    "body": null,
@@ -2146,6 +2156,16 @@
       "type": "string",
       "format": "uuid",
       "description": "A UUIDv7."
+     },
+     "actor": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "since": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339, UTC."
      }
     },
     "additionalProperties": false

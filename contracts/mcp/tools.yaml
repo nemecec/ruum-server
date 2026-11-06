@@ -210,7 +210,7 @@ tools:
     input: '#/paths/~1v1~1shared-with-me/get'
   - name: list_changes
     operation: listChanges
-    description: 'Read the change journal after a cursor, to see what changed (can long-poll with wait).'
+    description: 'Read the change journal after a cursor, to see what changed (can long-poll with wait). Filter by actor (a principal ID) and since (a time). Each entry names its actor: actor.display_name, and for an agent actor.kind is agent and on_behalf_of and on_behalf_of_display_name name its user. Tell agents from people by actor.kind, never by the name.'
     input: '#/paths/~1v1~1changes/get'
   - name: get_latest_cursor
     operation: getLatestCursor
