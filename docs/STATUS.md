@@ -2,7 +2,9 @@
 
 This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06,
 the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, the quality wave (wave
-C), the UX fixes of the web UI (`q/uxfix`) and the synthetic-user fixes (`q/synthfix`), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+C), the UX fixes of the web UI (`q/uxfix`), the synthetic-user fixes (`q/synthfix`), the
+names of actors (decision 0003, `f/followups`) and the step 2 specification (decision 0004,
+`f/step2spec`), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -46,8 +48,27 @@ and contract needs C-12 to C-14 are in `docs/ux/decisions.md`.
 | Activity log | Access, role, sharing rule, link and member entries name the item (a link), the person and the old and new values (from `AuditEntry.data`). |
 | Smaller | Change to Guest asks first; sharing rule inherit shows the parent's value and "Saved."; version times; "Keep forever..."; compare summary; image icon; sign-in labels. |
 
-The digest for the person is `docs/digests/2026-11-06.md`. The worktrees of `q/browser`,
-`q/decisions` and `q/synthfix` are removed; the branches stay.
+Night integration (2026-11-07, rebased onto `main` and fast-forwarded, in this order; linear
+history, no merge commit):
+
+| Branch | What it adds |
+|---|---|
+| `f/followups` | Decision record 0003 (step 1 follow-ups, `provisional`; items 1 to 8 decided) and its item 5 (C-7, names of actors): migrations `0002_principal_names.sql` and `0003_agent_names_unique.sql`; `display_name` and `on_behalf_of_display_name` in every answer (middleware `ruum-api/src/names.rs`, MCP included); unique agent names per owner (" (2)"); `listChanges` filters `actor` and `since`; the web UI shows server names, an agent as "*Agent* (agent of *User*)"; bench task `09_undo_agent_two_bots`. |
+| `f/step2spec` | The step 2 (Databases) specification and decision record 0004 (`provisional`, items 1 to 33): `contracts/providers/`, `contracts/manifests/database.schema.json`, 24 database operations in `contracts/openapi.yaml` marked `x-ruum-status: planned`, `schema.zed` relations for databases, step 2 event schemas, `migrations/0004_databases.sql` (draft), `docs/STEP2.md` (task cards), `docs/ux/databases/`. The test kit reports the checks of planned operations as planned (also with `RUUM_REQUIRE_IMPLEMENTED=1`) and still fails on leaks; the MCP server offers no tool of a planned operation. |
+
+Fixes made during the night integration:
+
+- The rebase of `f/step2spec` renamed its migration `0002_databases.sql` to `0004_databases.sql`
+  (0002 and 0003 went to decision 0003); the SQL did not change. `docs/STEP2.md` and decision
+  0004 say "0004" now.
+- `crates/ruum-mcp/src/tools.json` and `web/src/api/schema.d.ts` were regenerated at each
+  rebased commit (both branches changed `openapi.yaml` and `tools.yaml`; the YAML merged without
+  conflicts).
+
+The digest for the person is `docs/digests/2026-11-06-night.md` (earlier:
+`docs/digests/2026-11-06.md`, `docs/digests/2026-11-06-evening.md`). The worktrees of
+`q/browser`, `q/decisions`, `q/synthfix`, `f/followups` and `f/step2spec` are removed; the
+branches stay.
 
 Fixes made during the `q/uxfix` integration:
 
@@ -79,7 +100,9 @@ Fixes made during the integration:
 - `web/e2e`: two timing races. `files.e2e.ts` matched any `status` element while the folder
   showed `Loading...`; `auth.setup.e2e.ts` navigated while the sign-out redirect chain still ran.
 
-All 93 operations of `contracts/openapi.yaml` are built. No route answers `501`.
+All 93 step 1 operations of `contracts/openapi.yaml` are built. The 24 step 2 database
+operations are specified and marked `x-ruum-status: planned` (decision 0004-21); they are not
+built yet.
 
 | Area | What works |
 |---|---|
@@ -227,39 +250,59 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-06, `main` after the `q/synthfix` integration, `DATABASE_URL` and SpiceDB from `dev.sh env`)
+## Checks (2026-11-07, `main` after the night integration of `f/followups` and `f/step2spec`, `DATABASE_URL` and SpiceDB from `dev.sh env`)
 
-- `cargo fmt --all --check`, `cargo build --workspace`,
-  `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 331 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
-  ruum-core 195 + 13 (properties), ruum-api 37, ruum-cli 4 + 12 (mock server) + 3 (real
-  server), ruum-mcp 4 + 15 (server) + 5 (tools contract), ruum-server 5, ruum-testkit 7 + 2
-  (contract) + 1 (isolation) + 3 (permissions), ruum-webdav 5 + 20.
+The Rust, suite and web checks ran on the rebased `f/step2spec` tip; `main` has the same tree
+plus four commits to `docs/setup/ACCOUNTS.md` (made while the checks ran, so `f/step2spec` was
+rebased once more without a change to code). The smoke test and the mutation check ran on `main`.
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace`: 355 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
+  ruum-core 210 + 15 (properties), ruum-api 39, ruum-cli 4 + 12 (mock server) + 3 (real
+  server), ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5, ruum-testkit 10 + 2
+  (contract) + 1 (isolation) + 1 (names) + 3 (permissions), ruum-webdav 5 + 20.
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` on every backend: tenant isolation
-  251/251, permission matrix 1209/1209, trashed file suite 78/78, 0 pending, 0 failed, with
-  `RUUM_SUITE_BACKEND=memory`, `postgres` (memory authz) and `postgres` with
-  `RUUM_SUITE_AUTHZ=spicedb`. The runs were one after another, not in parallel.
+  328 checks (251 passed, 77 planned), permission matrix 1521 checks (1209 passed, 312
+  planned), trashed file suite 78/78; 0 pending, 0 failed, with `RUUM_SUITE_BACKEND=memory`,
+  `postgres` (memory authz) and `postgres` with `RUUM_SUITE_AUTHZ=spicedb`. The runs were one
+  after another, not in parallel.
 - `MUTATION_STRICT=1 MUTATION_TARGET_DIR=$PWD/target crates/ruum-testkit/scripts/mutation_check.sh`:
-  22 of 22 mutations killed, none survived or skipped. Since then the rule count grew to 27
-  (the feed rules of 2026-11-06); the full mutation check has not been run again.
+  31 of 31 mutations killed, none survived or skipped (the 27 rules of 2026-11-06 and the 4
+  `names-*` rules of decision 0003-5).
 - `scripts/e2e_smoke.sh`: `PASSED: 52 checks`.
-- `scripts/e2e_browser.sh` (projects setup, chromium, visual; ports 8571, 8572, 5291 and the mock
-  UI on 5297): 114 passed, 2 skipped (the server-gap `test.fixme` of `sharing.e2e.ts`).
-- `web/`: `npm run lint` (0 warnings), `npm run build`, `npx vitest run` (16 files, 149 tests),
+- `web/`: `npm run lint` (0 warnings), `npm run build`, `npx vitest run` (16 files, 159 tests),
   `npx tsc -p e2e/tsconfig.json`: pass.
-- Flaky once: the SpiceDB run of `trashed_file_reads` failed one check
-  (`getContentUrl [agent_of_guest_view]: 401, expected 404`) while it ran 595 s next to the
-  permission matrix and a vitest run. Alone it passed (30 s), and the full SpiceDB run again
-  passed. The cause of a `401` under load is not known.
-- Not repeated at the integration: `oasdiff`/`redocly` (no contract change after
-  `q/decisions`), `crates/ruum-webdav/scripts/smoke.sh`, `cargo deny check`.
+- `oasdiff breaking --fail-on ERR` (`tufin/oasdiff:v1.11.4`, as in CI) from the old `main`
+  (`9c86f0d`) to the new contract: 0 errors, 2438 warnings, all
+  `response-property-enum-value-added` (new `ErrorCode` values in the shared error schema).
+- On `f/followups` alone (before the step 2 merge): the same checks passed (workspace 348 passed,
+  1 ignored, suites memory and Postgres 251/1209/78, web 150 tests), except three
+  SpiceDB tests that could not write their schema to the shared SpiceDB (see "One SpiceDB for all
+  worktrees" below).
+- Not run at this integration: `scripts/e2e_browser.sh` (the Linux snapshots of 0003-5 come from
+  CI), `redocly`, `zed validate`, `crates/ruum-webdav/scripts/smoke.sh`, `cargo deny check`.
 
 ## Known gaps
 
 - **Step 1 follow-ups** (decision 0003, `provisional`): item 5 (C-7, names of actors) is built
-  on `f/followups`. Items 1 (content role), 2 (C-12), 3 (C-13), 4 (C-14), 6 (C-8 to C-11), 7
+  and merged. Items 1 (content role), 2 (C-12), 3 (C-13), 4 (C-14), 6 (C-8 to C-11), 7
   (search `type`, batch, hints, `safe_stop`) and 8 (IDs of gone nodes) are decided and not built.
 
+- **Step 2** (decision 0004, `provisional`): only the specification is merged. The 24 database
+  operations have no route yet and count as planned in the suites (77 isolation and 312 matrix
+  checks). `migrations/0004_databases.sql` is a draft, but it is applied like any migration (by
+  `sqlx::test`, the suites, and the server at start while `RUUM_MIGRATE` is on, the default), so
+  a change to it before step 2 is built needs a fresh database. Open: spike S-1 before the role kinds freeze, the PostgreSQL Anonymizer change of
+  design 8.5 (a person confirms), UX contract needs C-20 to C-23.
+- **Linux visual snapshots.** Decision 0003-5 changed `versions-desktop-light` and
+  `versions-desktop-dark`; the darwin references are updated, the Linux references
+  (`web/e2e/visual.e2e.ts-snapshots/*-visual-linux.png`) must be refreshed by CI.
+- **One SpiceDB for all worktrees.** The SpiceDB of the laptop stack holds one schema. After a
+  branch with new relations (here `f/step2spec`) wrote its schema and relationships, a branch
+  without those relations cannot write its schema (`cannot delete relation ...`), and its SpiceDB
+  tests fail (`spicedb_authz_conforms`, `spicedb_agrees_with_the_memory_engine`,
+  `writes_of_another_server_hold_at_once`). This hit `f/followups` before the step 2 merge; on
+  `main` they pass.
 - **Cookie names.** The session and CSRF cookies keep their names (`ruum_session`,
   `ruum_csrf`); the `__Host-` prefix is a later hardening, because the rename breaks the
   contract (decision 0002-3). The CSRF value is bound to the session. The REST download
@@ -278,7 +321,7 @@ For Zitadel sign-in through Vite, start the server with
   account never binds, and `addGrant` sends no mail. `docs/TESTING.md` still lists the fixed UI
   gaps and has no rows for `visual.e2e.ts` and `a11y.e2e.ts`.
 - **Web UI after `q/uxfix`** (`docs/ux/decisions.md`): names come from the server since
-  decision 0003-5 (C-7, branch `f/followups`: `display_name` and `on_behalf_of_display_name` in
+  decision 0003-5 (C-7: `display_name` and `on_behalf_of_display_name` in
   every answer; agents show as "*Agent* (agent of *User*)"); the space
   name of an unlisted space is unknown (C-10); the server still coalesces an explicit upload
   when the person picks "Replace it" (C-8). Not done: the session-ended dialog (UX-09), pausing
