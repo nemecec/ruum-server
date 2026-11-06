@@ -157,8 +157,10 @@ test('an upload right after opening a folder lands in that folder', async ({ pag
   await page.getByRole('dialog', { name: 'New folder' }).getByLabel('Folder name').fill(name)
   await page.getByRole('dialog', { name: 'New folder' }).getByRole('button', { name: 'Create' }).click()
   await page.getByRole('link', { name, exact: true }).click()
+  // A person can only press Upload once the folder is shown. Setting the file before that reached
+  // the previous view's input, which was then removed, and the upload was lost (flaky on CI).
+  await expect(page.getByRole('heading', { name, level: 1 })).toBeVisible()
   await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath(), 'quick.txt', 'quick\n'))
   await expect(toast(page, 'Uploaded quick.txt.')).toBeVisible()
-  await expect(page.getByRole('heading', { name, level: 1 })).toBeVisible()
   await expect(page.getByRole('button', { name: 'quick.txt', exact: true })).toBeVisible()
 })

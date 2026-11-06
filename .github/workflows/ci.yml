@@ -64,10 +64,13 @@ jobs:
           sqlx migrate run --source migrations
           sqlx migrate info --source migrations
       # The superuser of the service container bypasses row-level security, so tests that check
-      # RLS would fail. The tests connect as a role without superuser (CREATEDB for the per-test
-      # databases), as on the laptop stack.
+      # RLS would fail. The tests connect as a role without superuser, as on the laptop stack:
+      # CREATEDB for the per-test databases, and CREATE on the main database for the schema in which
+      # sqlx keeps its list of test databases.
       - name: Role for the tests
-        run: psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
+        run: |
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant create on database ruum to ruum_test"
       # Unit and conformance tests. `#[sqlx::test]` tests use DATABASE_URL (one database per test).
       - name: Unit and conformance tests
         env:
