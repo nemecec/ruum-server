@@ -27,7 +27,7 @@ only report which names are present, never the values.
 | `HCLOUD_TOKEN` | Hetzner Cloud API token | 1 |
 | `HETZNER_S3_ACCESS_KEY`, `HETZNER_S3_SECRET_KEY` | Hetzner Object Storage credentials | 1 |
 | `HETZNER_DNS_TOKEN` | only if Hetzner DNS asks for its own token | 2 |
-| `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID` | Scaleway API key (backups and email) | 3 |
+| `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_ORGANIZATION_ID` | Scaleway API key, project and organisation (backups and email) | 3 |
 | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Google sign-in | 4 |
 | `MS_OAUTH_CLIENT_ID`, `MS_OAUTH_CLIENT_SECRET` | Microsoft sign-in | 5 |
 | `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY` | Stripe, test mode | 6 |
@@ -82,7 +82,9 @@ French, so the data stays in the EU. One account for two needs means fewer keys.
 
 1. Go to <https://console.scaleway.com> and create an account (a card is needed; there may be an ID
    check).
-2. Create a project named **ruum-staging**. Copy its project ID into `SCW_DEFAULT_PROJECT_ID`.
+2. Create a project named **ruum-staging**. Copy its project ID into `SCW_DEFAULT_PROJECT_ID`, and the
+   organisation ID (in the organisation settings) into `SCW_DEFAULT_ORGANIZATION_ID`; the Scaleway CLI and
+   Terraform read both names.
    Production gets its own project (`ruum-prod`) later, as at Hetzner, so that a staging key can never
    read or delete production backups or send email as production.
 3. **IAM → Applications → Create application** named `ruum-agents`. Give it a policy for the
