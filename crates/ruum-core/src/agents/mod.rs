@@ -290,6 +290,31 @@ pub fn agent_disabled() -> Error {
     )
 }
 
+/// The error of an agent whose scope has expired (`scope.expires_at`).
+pub fn agent_scope_expired() -> Error {
+    Error::Api(
+        crate::error::ApiError::new(
+            ErrorCode::AgentDisabled,
+            "the scope of the agent has expired",
+        )
+        .with_hint("the owner of the agent can give it a new scope expiry in the web UI"),
+    )
+}
+
+/// Refuses an agent that is disabled or whose scope has expired: the agent works "until time
+/// T" (design 3.3), for every operation, not only for node rights. Every path that
+/// authenticates an agent or issues it a token calls this (`AgentStore::authenticate`,
+/// `exchange_key`, the OAuth code and refresh grants).
+pub fn check_live(agent: &Agent) -> crate::error::Result<()> {
+    if agent.disabled_at.is_some() {
+        return Err(agent_disabled());
+    }
+    if agent.scope.expires_at.is_some_and(|t| t <= crate::now()) {
+        return Err(agent_scope_expired());
+    }
+    Ok(())
+}
+
 /// The error of the agent limit of the plan.
 pub fn agent_limit_reached(limit: u32) -> Error {
     Error::Api(

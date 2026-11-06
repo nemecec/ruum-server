@@ -557,9 +557,7 @@ impl AgentStore for PgAgentStore {
         let tenant: TenantId = r.try_get("tenant_id")?;
         let agent_id: AgentId = r.try_get("agent_id")?;
         let agent = agent_in(&mut tx, tenant, agent_id).await?;
-        if agent.disabled_at.is_some() {
-            return Err(agent_disabled());
-        }
+        check_live(&agent)?;
         sqlx::query("update agent_keys set last_used_at = now() where id = $1")
             .bind(key)
             .execute(&mut *tx)
@@ -592,9 +590,7 @@ impl AgentStore for PgAgentStore {
                 "get a new access token",
             )
         })?;
-        if agent.disabled_at.is_some() {
-            return Err(agent_disabled());
-        }
+        check_live(&agent)?;
         let now = crate::now();
         if agent
             .last_used_at
@@ -715,9 +711,7 @@ impl PgOAuthServer {
         let agent = agent_in(conn, tenant, agent_id)
             .await
             .map_err(|_| OAuthError::invalid_grant("the agent does not exist"))?;
-        if agent.disabled_at.is_some() {
-            return Err(agent_disabled().into());
-        }
+        check_live(&agent)?;
         let refresh = secret::random_secret(REFRESH_PREFIX);
         sqlx::query(
             "update agent_oauth_grants set previous_refresh_hash = refresh_token_hash, \

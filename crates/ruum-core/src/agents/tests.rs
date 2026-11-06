@@ -633,12 +633,94 @@ async fn oauth_code_flow_with_pkce_and_rotation(a: Area) {
     );
 }
 
+/// An agent whose scope has expired (`scope.expires_at`) is refused everywhere: per request
+/// (`authenticate`), at the key exchange, and at the OAuth code and refresh grants. Before the
+/// expiry all of them work.
+async fn an_expired_scope_ends_the_agent(a: Area) {
+    let t = team(&a).await;
+    let mc = ctx(t.tenant.id, t.member.id);
+    let member = Actor::user(t.member.id);
+    let mut req = new_agent("short-lived", None);
+    req.scope.expires_at = Some(crate::now() + time::Duration::seconds(2));
+    let agent = a.agents.register(&mc, req).await.unwrap();
+    let (_key, secret) = a
+        .agents
+        .create_key(&mc, agent.id, None, None)
+        .await
+        .unwrap();
+    assert!(a.agents.exchange_key(&secret).await.is_ok());
+    assert!(a.agents.authenticate(t.tenant.id, agent.id).await.is_ok());
+    let client = register_client(&a).await;
+    let consent = |sealed: String| Consent {
+        request: sealed,
+        approve: true,
+        tenant_id: Some(t.tenant.id),
+        agent_id: Some(agent.id),
+        new_agent: None,
+    };
+    let exchange = |code: &str| TokenRequest::AuthorizationCode {
+        code: code.into(),
+        code_verifier: VERIFIER.into(),
+        client_id: client.client_id.clone(),
+        redirect_uri: REDIRECT.into(),
+        resource: None,
+    };
+    // A refresh token from before the expiry; it rotates while the scope is live.
+    let sealed = a
+        .oauth
+        .start_authorization(request(&client, &a))
+        .await
+        .unwrap();
+    let redirect = a.oauth.consent(&member, consent(sealed)).await.unwrap();
+    let first = a
+        .oauth
+        .token(exchange(&query_param(&redirect, "code").unwrap()))
+        .await
+        .unwrap()
+        .refresh_token
+        .unwrap();
+    let refresh_req = |rt: String| TokenRequest::RefreshToken {
+        refresh_token: rt,
+        client_id: client.client_id.clone(),
+        resource: None,
+    };
+    let refresh = a
+        .oauth
+        .token(refresh_req(first))
+        .await
+        .unwrap()
+        .refresh_token
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    assert_eq!(
+        code(a.agents.authenticate(t.tenant.id, agent.id).await),
+        ErrorCode::AgentDisabled
+    );
+    assert_eq!(
+        code(a.agents.exchange_key(&secret).await),
+        ErrorCode::AgentDisabled
+    );
+    assert!(a.oauth.token(refresh_req(refresh)).await.is_err());
+    // A new code for the expired agent gives no token (the consent itself may refuse it).
+    let sealed = a
+        .oauth
+        .start_authorization(request(&client, &a))
+        .await
+        .unwrap();
+    if let Ok(redirect) = a.oauth.consent(&member, consent(sealed)).await {
+        let code_value = query_param(&redirect, "code").unwrap();
+        assert!(a.oauth.token(exchange(&code_value)).await.is_err());
+    }
+}
+
 crate::conformance!(
     agents_belong_to_their_owner,
     a_scope_subtree_stays_in_the_tenant,
     the_agent_limit_holds,
     keys_exchange_for_short_tokens,
     oauth_code_flow_with_pkce_and_rotation,
+    an_expired_scope_ends_the_agent,
 );
 
 #[test]

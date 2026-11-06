@@ -470,9 +470,7 @@ impl AgentStore for MemoryAgentStore {
                 .map(|k| (k.key.id, k.key.agent_id))
                 .ok_or_else(refuse)?;
             let agent = st.agents.get(&agent_id).cloned().ok_or_else(refuse)?;
-            if agent.disabled_at.is_some() {
-                return Err(agent_disabled());
-            }
+            check_live(&agent)?;
             if let Some(k) = st.keys.get_mut(&kid) {
                 k.key.last_used_at = Some(now);
             }
@@ -498,9 +496,7 @@ impl AgentStore for MemoryAgentStore {
                     "get a new access token",
                 )
             })?;
-        if a.disabled_at.is_some() {
-            return Err(agent_disabled());
-        }
+        check_live(a)?;
         let now = crate::now();
         if a.last_used_at
             .is_none_or(|t| now - t >= time::Duration::seconds(AGENT_TOUCH_SECONDS))

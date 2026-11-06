@@ -285,9 +285,7 @@ impl OAuthServer for MemoryOAuthServer {
                         .get(&g.agent_id)
                         .cloned()
                         .ok_or_else(|| OAuthError::invalid_grant("the agent does not exist"))?;
-                    if agent.disabled_at.is_some() {
-                        return Err(crate::agents::agent_disabled().into());
-                    }
+                    crate::agents::check_live(&agent)?;
                     let audience = g.audience.clone();
                     let refresh = secret::random_secret(REFRESH_PREFIX);
                     if let Some(g) = st.oauth_grants.get_mut(&grant_id) {
@@ -354,9 +352,7 @@ impl OAuthServer for MemoryOAuthServer {
                         .get(&g.agent_id)
                         .cloned()
                         .ok_or_else(|| OAuthError::invalid_grant("the agent does not exist"))?;
-                    if agent.disabled_at.is_some() {
-                        return Err(crate::agents::agent_disabled().into());
-                    }
+                    crate::agents::check_live(&agent)?;
                     let audience = g.audience.clone();
                     let refresh = secret::random_secret(REFRESH_PREFIX);
                     if let Some(g) = st.oauth_grants.get_mut(&grant_id) {
