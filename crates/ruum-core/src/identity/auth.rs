@@ -139,6 +139,14 @@ async fn authenticate_bearer_for(
                     "ask the owner for access",
                 ));
             }
+            // The same for edit links: a token of an edit link stops when the tenant turns
+            // edit links off, not only at its expiry (the role comes from the signed claims).
+            if scope.max_role > crate::authz::Role::Comment && !t.policy.allow_edit_links {
+                return Err(unauthenticated(
+                    "edit links are turned off in this tenant",
+                    "ask the owner for access",
+                ));
+            }
             Ok(Authenticated {
                 actor: Actor {
                     actor: PrincipalRef {
@@ -258,5 +266,85 @@ mod audience_tests {
         assert!(authenticate_mcp_bearer(&s, &mcp).await.is_ok());
         assert!(authenticate_bearer(&s, &plain, &origin).await.is_ok());
         assert!(authenticate_bearer(&s, &mcp, &origin).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authz::{Role, Scope};
+    use crate::identity::{AccessClaims, VerifiedLogin};
+    use crate::ids::ShareLinkId;
+    use crate::tenants::TenantPolicyChange;
+    use uuid::Uuid;
+
+    fn link_token(s: &Services, tenant: TenantId, role: Role) -> String {
+        let now = crate::now().unix_timestamp();
+        let link = ShareLinkId::new();
+        s.tokens
+            .issue(&AccessClaims {
+                iss: s.tokens.audience().into(),
+                aud: s.tokens.audience().into(),
+                typ: TokenType::ShareLink,
+                sub: link.0,
+                tid: Some(tenant),
+                obo: None,
+                agent: None,
+                share_link: Some(link),
+                scope: Some(Scope {
+                    subtree: None,
+                    max_role: role,
+                    expires_at: None,
+                }),
+                iat: now,
+                exp: now + 600,
+                jti: Uuid::now_v7(),
+            })
+            .unwrap()
+    }
+
+    /// Tokens of edit links stop when the tenant turns edit links off; view and comment links
+    /// go on.
+    #[tokio::test]
+    async fn edit_link_tokens_stop_when_edit_links_are_turned_off() {
+        let s = Services::in_memory();
+        let user = s
+            .identity
+            .upsert_from_login(&VerifiedLogin {
+                issuer: "https://idp.ruum.test".into(),
+                subject: "links".into(),
+                email: Some("links@example.test".into()),
+                email_verified: true,
+                name: None,
+                id_token: None,
+            })
+            .await
+            .unwrap();
+        let tenant = user.home_tenant_id;
+        let ctx = Context {
+            tenant,
+            actor: Actor::user(user.id),
+            scope: None,
+            idempotency_key: None,
+        };
+        let on = TenantPolicyChange {
+            allow_edit_links: Some(true),
+            ..TenantPolicyChange::default()
+        };
+        s.tenants.update(&ctx, None, Some(on)).await.unwrap();
+        let aud = s.tokens.audience().to_string();
+        let edit = link_token(&s, tenant, Role::Edit);
+        let view = link_token(&s, tenant, Role::View);
+        let comment = link_token(&s, tenant, Role::Comment);
+        assert!(authenticate_bearer(&s, &edit, &aud).await.is_ok());
+        let off = TenantPolicyChange {
+            allow_edit_links: Some(false),
+            ..TenantPolicyChange::default()
+        };
+        s.tenants.update(&ctx, None, Some(off)).await.unwrap();
+        let err = authenticate_bearer(&s, &edit, &aud).await.unwrap_err();
+        assert_eq!(err.to_api().code, ErrorCode::Unauthenticated);
+        assert!(authenticate_bearer(&s, &view, &aud).await.is_ok());
+        assert!(authenticate_bearer(&s, &comment, &aud).await.is_ok());
     }
 }
