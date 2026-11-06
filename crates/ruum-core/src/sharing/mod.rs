@@ -10,6 +10,11 @@
 //! never diverge.
 
 pub mod memory;
+pub mod postgres;
+pub mod rules;
+
+#[cfg(test)]
+mod conformance;
 
 use crate::actor::{Actor, Context};
 use crate::authz::Role;
@@ -88,7 +93,10 @@ pub struct ShareLink {
     pub node_id: NodeId,
     pub role: ShareLinkRole,
     /// The secret token. Only the create response has it; it is stored as a hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// The link to give to people. Only the create response has it (the API fills it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
@@ -162,6 +170,7 @@ pub trait SharingStore: Send + Sync {
         node: NodeId,
         req: NewShareLink,
     ) -> Result<Written<ShareLink>>;
+    /// Revokes a link. Needs `share` on the link's node. A link of another tenant is `not_found`.
     async fn revoke_share_link(&self, ctx: &Context, link: ShareLinkId) -> Result<Written<()>>;
     /// Resolves a share link token without sign-in. Returns the link, its tenant and node. A link
     /// that the tenant policy no longer allows is `not_found`.
@@ -171,6 +180,18 @@ pub trait SharingStore: Send + Sync {
         password: Option<&str>,
     ) -> Result<(TenantId, Node, ShareLink)>;
     /// The grant roots for the actor's user, across all tenants where the user is a member or
-    /// guest. `ctx.tenant` is ignored for this call.
+    /// guest. `ctx.tenant` is ignored for this call, except for agents: an agent sees only the
+    /// items of its own tenant that are inside its scope.
     async fn shared_with_me(&self, ctx: &Context, page: PageRequest) -> Result<Page<SharedItem>>;
+    /// Sets the node setting `editors_can_share` (`true`, `false`, or `None` to inherit) and
+    /// writes the tuples `editors_share_off` / `editors_share_on` (`updateNodeSharing`). Needs
+    /// `manage`. `if_revision` is the `If-Match` revision of the node. Writes
+    /// `node.sharing_updated`. Returns the node after the change.
+    async fn update_node_sharing(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        editors_can_share: Option<bool>,
+        if_revision: Option<i64>,
+    ) -> Result<Written<Node>>;
 }

@@ -55,22 +55,34 @@ pub struct Services {
 impl Services {
     /// All in-memory implementations. For unit tests and for running without Docker.
     pub fn in_memory() -> Self {
+        // The modules that others read and write are built once and shared, so that (for
+        // example) the grants of `sharing` are in the same engine that every area checks.
+        let tenants = Arc::new(MemoryTenantStore::default());
+        let nodes = Arc::new(MemoryNodeStore::default());
+        let authz = Arc::new(MemoryAuthz::default());
+        let journal = Arc::new(MemoryJournal::default());
+        let sharing = Arc::new(MemorySharingStore::new(
+            authz.clone(),
+            nodes.clone(),
+            tenants.clone(),
+            journal.clone(),
+        ));
         Self {
-            tenants: Arc::new(MemoryTenantStore::default()),
+            tenants,
             identity: Arc::new(MemoryIdentityStore::default()),
             oidc: Arc::new(MemoryOidcClient::default()),
             tokens: Arc::new(MemoryTokenIssuer::default()),
             agents: Arc::new(MemoryAgentStore::default()),
             oauth: Arc::new(MemoryOAuthServer::default()),
-            nodes: Arc::new(MemoryNodeStore::default()),
+            nodes,
             blobs: Arc::new(MemoryBlobStore::default()),
             transfers: Arc::new(MemoryTransfers::default()),
             versions: Arc::new(MemoryVersionStore::default()),
             diffs: Arc::new(MemoryDiffService::default()),
             tags: Arc::new(MemoryTagStore::default()),
-            authz: Arc::new(MemoryAuthz::default()),
-            sharing: Arc::new(MemorySharingStore::default()),
-            journal: Arc::new(MemoryJournal::default()),
+            authz,
+            sharing,
+            journal,
             search: Arc::new(MemorySearch::default()),
             audit: Arc::new(MemoryAuditLog::default()),
         }

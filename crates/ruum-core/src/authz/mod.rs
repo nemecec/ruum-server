@@ -18,10 +18,20 @@
 
 pub mod memory;
 pub mod outbox;
+pub mod schema;
+pub mod spicedb;
+pub mod tuples;
+
+#[cfg(test)]
+mod conformance;
+#[cfg(test)]
+pub(crate) mod testing;
+#[cfg(test)]
+mod tests_require;
 
 use crate::actor::{Context, PrincipalKind};
-use crate::error::Result;
-use crate::ids::NodeId;
+use crate::error::{ApiError, Error, ErrorCode, Result};
+use crate::ids::{NodeId, TenantId, UserId};
 use crate::nodes::NodeStore;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -196,12 +206,132 @@ pub fn subject_of(ctx: &Context) -> SubjectRef {
 /// subject of [`subject_of`] in the graph. `in_subtree` says whether the node is inside the scope
 /// subtree (true when the scope has no subtree). An expired scope gives `None`.
 pub fn effective_role(
-    _subject_role: Option<Role>,
-    _scope: Option<&Scope>,
-    _in_subtree: bool,
-    _now: OffsetDateTime,
+    subject_role: Option<Role>,
+    scope: Option<&Scope>,
+    in_subtree: bool,
+    now: OffsetDateTime,
 ) -> Option<Role> {
-    todo!("authz: effective_role")
+    let role = subject_role?;
+    let Some(scope) = scope else {
+        return Some(role);
+    };
+    if scope.expires_at.is_some_and(|t| t <= now) || !in_subtree {
+        return None;
+    }
+    Some(role.min(scope.max_role))
+}
+
+/// The error for a node that the actor cannot see. The same as for a node that does not exist,
+/// so that the answer does not tell whether it exists.
+fn node_not_found() -> Error {
+    Error::not_found("node")
+}
+
+/// The error when the subject would have the right, but the scope of the credentials stops it.
+pub fn scope_exceeded() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::ScopeExceeded,
+            "the scope of these credentials does not allow this action",
+        )
+        .with_hint("ask the user to widen the agent's scope, or to do it themselves"),
+    )
+}
+
+/// Whether the subtree of the scope is checked by tree ancestry for this actor. Share-link
+/// bearers are limited by the graph (the link's relation on its node), so not for them.
+fn checks_subtree(ctx: &Context) -> bool {
+    ctx.actor.actor.kind != PrincipalKind::ShareLink
+}
+
+/// Whether `node` is inside the scope subtree of `ctx` (true without a scope or a subtree, and
+/// for share-link bearers).
+pub async fn in_scope_subtree(nodes: &dyn NodeStore, ctx: &Context, node: NodeId) -> Result<bool> {
+    let Some(root) = ctx.scope.as_ref().and_then(|s| s.subtree) else {
+        return Ok(true);
+    };
+    if !checks_subtree(ctx) || root == node {
+        return Ok(true);
+    }
+    Ok(nodes.ancestors(ctx, node).await?.contains(&root))
+}
+
+/// The highest role that `subject` has on `node` in the graph, without any scope. Asks from the
+/// top (`manage`) down, so it stops at the first role it finds.
+pub async fn graph_role(
+    authz: &dyn Authz,
+    subject: &SubjectRef,
+    node: NodeId,
+) -> Result<Option<Role>> {
+    let object = ObjectRef::node(node);
+    for role in [Role::Manage, Role::Edit, Role::Comment, Role::View] {
+        if authz
+            .check(subject, role.permission(), &object, None)
+            .await?
+        {
+            return Ok(Some(role));
+        }
+    }
+    Ok(None)
+}
+
+/// The effective role of the actor in `ctx` on `node` (the `my_role` of a node response): the
+/// subject's role in the graph intersected with the scope.
+pub async fn role_on(
+    authz: &dyn Authz,
+    nodes: &dyn NodeStore,
+    ctx: &Context,
+    node: NodeId,
+) -> Result<Option<Role>> {
+    if ctx
+        .scope
+        .as_ref()
+        .is_some_and(|s| s.expires_at.is_some_and(|t| t <= crate::now()))
+    {
+        return Ok(None);
+    }
+    let in_subtree = in_scope_subtree(nodes, ctx, node).await?;
+    if !in_subtree {
+        return Ok(None);
+    }
+    let role = graph_role(authz, &subject_of(ctx), node).await?;
+    Ok(effective_role(
+        role,
+        ctx.scope.as_ref(),
+        in_subtree,
+        crate::now(),
+    ))
+}
+
+/// The effective node setting `editors_can_share` of `node` (the
+/// `editors_can_share_effective` of a node response): false where the node or its nearest
+/// ancestor with a value sets false. Read from the graph (`editors_cannot_share`).
+pub async fn editors_can_share_effective(authz: &dyn Authz, node: NodeId) -> Result<bool> {
+    // `editors_cannot_share` is built only from `user:*` relations, so any user answers it.
+    let anyone = SubjectRef::user(UserId(uuid::Uuid::nil()));
+    Ok(!authz
+        .check(
+            &anyone,
+            "editors_cannot_share",
+            &ObjectRef::node(node),
+            None,
+        )
+        .await?)
+}
+
+/// Whether the actor in `ctx` has the `share` permission on `node` after the scope (the
+/// `my_can_share` of a node response).
+pub async fn can_share(
+    authz: &dyn Authz,
+    nodes: &dyn NodeStore,
+    ctx: &Context,
+    node: NodeId,
+) -> Result<bool> {
+    match require(authz, nodes, ctx, node, Permission::Share).await {
+        Ok(()) => Ok(true),
+        Err(Error::Api(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Checks that the actor in `ctx` has `permission` on `node` (a [`Role`] or
@@ -214,14 +344,157 @@ pub fn effective_role(
 /// targets outside the subtree are outside an agent's scope. For a share-link bearer the graph
 /// already limits the link to its node, its subtree and its member-link targets, so only
 /// `max_role` and `expires_at` of the scope are checked.
+///
+/// This function does not check that the node belongs to `ctx.tenant`: the store that loads the
+/// node filters by tenant and answers `not_found` for a node of another tenant.
 pub async fn require(
-    _authz: &dyn Authz,
-    _nodes: &dyn NodeStore,
-    _ctx: &Context,
-    _node: NodeId,
-    _permission: impl Into<Permission> + Send,
+    authz: &dyn Authz,
+    nodes: &dyn NodeStore,
+    ctx: &Context,
+    node: NodeId,
+    permission: impl Into<Permission> + Send,
 ) -> Result<()> {
-    todo!("authz: require")
+    let permission = permission.into();
+    if let Some(scope) = &ctx.scope {
+        if scope.expires_at.is_some_and(|t| t <= crate::now()) {
+            return Err(node_not_found());
+        }
+        if !in_scope_subtree(nodes, ctx, node).await? {
+            return Err(node_not_found());
+        }
+    }
+    let subject = subject_of(ctx);
+    let object = ObjectRef::node(node);
+    if !authz
+        .check(&subject, permission.name(), &object, None)
+        .await?
+    {
+        let sees =
+            permission != Permission::View && authz.check(&subject, "view", &object, None).await?;
+        return Err(if sees {
+            Error::permission_denied()
+        } else {
+            node_not_found()
+        });
+    }
+    let Some(scope) = &ctx.scope else {
+        return Ok(());
+    };
+    // The highest role the scope leaves (`effective_role` of a subject with every role).
+    let cap = effective_role(Some(Role::Manage), Some(scope), true, crate::now());
+    let allowed = match permission {
+        Permission::Share => {
+            if ctx.actor.actor.kind == PrincipalKind::ShareLink {
+                return Err(Error::permission_denied());
+            }
+            match cap {
+                Some(Role::Manage) => true,
+                Some(Role::Edit) => editors_can_share_effective(authz, node).await?,
+                _ => false,
+            }
+        }
+        Permission::View => cap.is_some(),
+        Permission::Comment => cap >= Some(Role::Comment),
+        Permission::Edit => cap >= Some(Role::Edit),
+        Permission::Manage => cap >= Some(Role::Manage),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(scope_exceeded())
+    }
+}
+
+impl ObjectRef {
+    pub fn new(object_type: &str, id: impl ToString) -> Self {
+        Self {
+            object_type: object_type.to_string(),
+            object_id: id.to_string(),
+        }
+    }
+    pub fn node(id: NodeId) -> Self {
+        Self::new("node", id)
+    }
+    pub fn tenant(id: TenantId) -> Self {
+        Self::new("tenant", id)
+    }
+}
+
+impl SubjectRef {
+    /// A plain subject (no relation).
+    pub fn object(object: ObjectRef) -> Self {
+        Self {
+            object,
+            relation: None,
+        }
+    }
+    pub fn user(id: UserId) -> Self {
+        Self::object(ObjectRef::new("user", id))
+    }
+    /// `user:*`, every user.
+    pub fn any_user() -> Self {
+        Self::object(ObjectRef::new("user", "*"))
+    }
+    /// A subject set, for example `tenant:<id>#member`.
+    pub fn set(object: ObjectRef, relation: &str) -> Self {
+        Self {
+            object,
+            relation: Some(relation.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for ObjectRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.object_type, self.object_id)
+    }
+}
+
+impl std::fmt::Display for SubjectRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.relation {
+            Some(r) => write!(f, "{}#{r}", self.object),
+            None => write!(f, "{}", self.object),
+        }
+    }
+}
+
+impl std::fmt::Display for Relationship {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}@{}", self.object, self.relation, self.subject)
+    }
+}
+
+fn parse_object(s: &str) -> Result<ObjectRef> {
+    match s.split_once(':') {
+        Some((t, id)) if !t.is_empty() && !id.is_empty() => Ok(ObjectRef::new(t, id)),
+        _ => Err(Error::Internal(format!("authz: bad object {s:?}"))),
+    }
+}
+
+impl std::str::FromStr for SubjectRef {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s.split_once('#') {
+            Some((o, r)) => SubjectRef::set(parse_object(o)?, r),
+            None => SubjectRef::object(parse_object(s)?),
+        })
+    }
+}
+
+impl std::str::FromStr for Relationship {
+    type Err = Error;
+    /// Parses `type:id#relation@type:id[#relation]` (the format of `schema.test.yaml`).
+    fn from_str(s: &str) -> Result<Self> {
+        let bad = || Error::Internal(format!("authz: bad relationship {s:?}"));
+        let (left, subject) = s.trim().split_once('@').ok_or_else(bad)?;
+        let (object, relation) = left.split_once('#').ok_or_else(bad)?;
+        Ok(Relationship {
+            object: parse_object(object)?,
+            relation: relation.to_string(),
+            subject: subject.parse()?,
+        })
+    }
 }
 
 #[cfg(test)]
