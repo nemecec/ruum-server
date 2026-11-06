@@ -1,0 +1,8 @@
+{
+  "name": "ruum-ux-tools",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway screenshot script for the UX review (docs/ux). Chromium only.",
+  "scripts": { "shots": "node screenshots.mjs" },
+  "devDependencies": { "playwright-core": "1.56.1" }
+}
