@@ -1,7 +1,8 @@
 # Status of step 1
 
-This page says what works on `main` after the wave B merge and the security fixes of 2026-11-06,
-how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06 and
+the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, how to run it, the test
+counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -19,7 +20,7 @@ All 93 operations of `contracts/openapi.yaml` are built. No route answers `501`.
 | 4. Identity, tenants, agents | Sign-in with Zitadel (PKCE), sessions with CSRF, tenants, members, invitations, plans and limits, agents and API keys, token exchange, OAuth 2.1 for MCP clients, app passwords, undo, the sweeper. |
 | 5. Journal, audit | The changes feed (cursor, long poll, resync markers), the audit log (JSON and NDJSON). |
 | 6. MCP, CLI | `/mcp` (stateless streamable HTTP, OAuth-protected, one tool per entry of `contracts/mcp/tools.yaml`). The `ruum` CLI with an agent API key. |
-| 7. WebDAV | `/dav`: PROPFIND, GET with ranges, PUT (a version), MKCOL, MOVE, COPY, DELETE (to the trash), LOCK, quota properties. HTTP Basic with an app password, or an agent token. |
+| 7. WebDAV | Its own host (`https://dav.ruum.localhost/`, listener `RUUM_DAV_BIND`, default `127.0.0.1:8492`; decision 0002-3): PROPFIND, GET with ranges, PUT (a version), MKCOL, MOVE, COPY, DELETE (to the trash), LOCK, quota properties. HTTP Basic with an app password, or an agent token. |
 | 8. Web UI | All step 1 pages, chunked resumable uploads in the browser, diff view, previews through the content domain. |
 
 ### Links between the areas (integration)
@@ -44,10 +45,15 @@ All 93 operations of `contracts/openapi.yaml` are built. No route answers `501`.
 | Content and version reads ignored the trash rule: a viewer or editor (not `manage`) of a trashed file still downloaded it, got a content URL and listed its versions, although `getNode` answered `404`. The changes feed had the same gap. | should fix | `blobs::logic::require_trashed_read`: `open_content`, `content_grant`, `list_filtered` and `get` of versions (Postgres and memory; `diffVersions` goes through them and `NodeStore::get`) need `manage` on a trashed file and answer `404` otherwise. The feed's `ServicesAccess::can_view` uses `NodeStore::get`, so entries on a trashed node reach only those who may restore it; the others still get `node.trashed` through the old place. | `ruum-testkit` `trashed_file_reads` (`permissions::run_trashed`: every principal, `downloadContent`, `getContentUrl`, `listVersions`, `getVersion`, `diffVersions`, `listChanges` after the plan is trashed; 78 checks); the content conformance suite (memory with a node store that does not check the trash, and Postgres); mutations `blobs-trashed-read-postgres`, `blobs-trashed-read-memory`, `feed-trashed-node-visible` |
 | A guest without grants registered agents (`registerAgent`, `oauthConsent` with `new_agent`) that counted against the host tenant's agent limit, so a guest could block owners and members (`plan_limit_reached`). | should fix | A guest's agents are counted apart: each guest may own `agents::guest_agent_limit(plan)` live agents (one member's allowance), and the tenant's limit counts only the agents of owners, admins and members (`agents::postgres::MEMBER_AGENT`). `getLimits` usage counts the same agents. Guests may still register agents, as the permission matrix assumes. | `agents::tests::guests_cannot_use_up_the_tenant_agent_limit` (memory and Postgres); mutations `agents-guest-uses-tenant-limit`, `agents-guest-uses-tenant-limit-postgres` |
 
-Open for the architect: whether guests may own agents at all in step 1 (the contract of
-`registerAgent` says nothing about guests; the matrix rule is marked "assumption"). If not,
-`insert_agent` refuses role `guest` with `permission_denied` and the matrix rules of
-`registerAgent` and `oauthConsent` change.
+## Panel decisions (2026-11-06, decision 0002, `provisional`)
+
+| Question | Decision | Tests |
+|---|---|---|
+| 1. `addGrant` by user ID | Members and guests of the tenant only; any other ID is `404`, no guest is made. Contract text fixed. With `allow_guests: false` the in-memory store now accepts an email grant to a member's verified email, as Postgres does. | `sharing::conformance` (memory, Postgres); mutation `sharing-email-grant-policy-memory` |
+| 2. Guests and agents | Guests may own agents (own limit), but register none while `allow_guests` is false (`registerAgent`, `oauthConsent` with `new_agent`: `403`). | `agents::tests::guests_register_no_agents_while_guests_are_off`; mutations `agents-guest-register-policy`, `agents-guest-register-policy-postgres` |
+| 3. WebDAV host | WebDAV moved to its own host and listener; the platform origin answers `404` for `/dav`; the WebDAV host has no API, never reads or sets cookies, keeps the content headers. `createAppPassword` returns `dav_url`. The CSRF value is bound to the session (cookie tossing). Cookie names stay (`__Host-` later). | `app::tests::*`, `dav.rs` `the_dav_host_*`, `the_csrf_value_is_bound_to_the_session`, `a_new_app_password_names_the_dav_host`; mutation `csrf-not-session-bound`; e2e |
+| 4. SpiceDB freshness | Every tenant request reads at least as fresh as the tenant's newest outbox token (`PgFreshness`, under RLS); a lookup error fails the request. | `wiring::tests::writes_of_another_server_hold_at_once` (two servers, SpiceDB), `freshness_reads_the_tenant_token_under_rls`, `a_failed_freshness_lookup_fails_the_request`; mutations `authz-ignores-tenant-token`, `authz-spicedb-ignores-request-floor`; e2e without the 6 s wait |
+| 5. Matrix rules | Every "assumption" and "open question" rule decided; `logout` and `listAgents` for agents: `any` becomes `ok`. Contract wording for these operations. | permission matrix (1209 checks) |
 
 ## How to run it
 
@@ -63,7 +69,8 @@ export CARGO_TARGET_DIR=$PWD/target CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=
 scripts/dev.sh up                 # Postgres, Garage, Zitadel, SpiceDB, ...; see docs/DEVSTACK.md
 scripts/dev.sh status             # all services healthy
 eval "$(scripts/dev.sh env)"
-cargo run -p ruum-server          # http://127.0.0.1:8490 and https://ruum.localhost (Caddy)
+cargo run -p ruum-server          # http://127.0.0.1:8490 and https://ruum.localhost (Caddy);
+                                  # WebDAV: http://127.0.0.1:8492 and https://dav.ruum.localhost
 ```
 
 Set these too, or tokens and content URLs end at each restart:
@@ -72,8 +79,10 @@ Set these too, or tokens and content URLs end at each restart:
   (`openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '='`).
 - `RUUM_CONTENT_SIGNING_KEY`: base64 of 32 random bytes (`openssl rand -base64 32`).
 
-Other settings: `RUUM_REQUEST_TIMEOUT_SECONDS` (default 120), `RUUM_DAV_SPOOL_DIR` (WebDAV
-upload spool), `RUUM_PLAN_LIMITS`, `SMTP_URL`, `RUUM_MAIL_FROM`.
+Other settings: `RUUM_REQUEST_TIMEOUT_SECONDS` (default 120), `RUUM_DAV_BIND` (the WebDAV
+listener, default `127.0.0.1:8492`), `RUUM_DAV_URL` (the public URL of the WebDAV host, default
+`https://dav.<host>/` for an https public URL, else `http://<RUUM_DAV_BIND>/`),
+`RUUM_DAV_SPOOL_DIR` (WebDAV upload spool), `RUUM_PLAN_LIMITS`, `SMTP_URL`, `RUUM_MAIL_FROM`.
 
 ### Test users without a browser
 
@@ -86,19 +95,23 @@ It refuses to run unless `RUUM_PUBLIC_URL` is a loopback or `.localhost` origin.
 tenant with Alice (owner), Bob (a guest without grants), Carol (her own tenant), an agent of
 Alice with an API key, and an app password of Alice. The file holds 1-hour user tokens
 (`ALICE_TOKEN`, ...), `AGENT_KEY`, `APP_PASSWORD`, `TENANT_A`, `TENANT_B` and the user IDs. The
-server sees the seed's SpiceDB tuples after about 5 seconds (see the gaps).
+server sees the seed's relationships at once: each request reads at least as fresh as its
+tenant's newest outbox token (decision 0002-4).
 
 ### End-to-end smoke test
 
 ```sh
-scripts/e2e_smoke.sh              # the stack must be up; RUUM_E2E_PORT, default 8491
+scripts/e2e_smoke.sh              # the stack must be up; RUUM_E2E_PORT (default 8491),
+                                  # RUUM_E2E_DAV_PORT (default 8493), RUUM_DEV_SH (for worktrees)
 ```
 
-It builds and starts the server against the stack, seeds, and checks 47 steps: CLI login,
+It builds and starts the server against the stack, seeds, and checks 52 steps: CLI login,
 folders, a 3 MB upload in 73 chunks and a download with the same SHA-256, a named version and a
 second version, a copy, a share to Bob and his access, Shared with me, the changes feed, MCP
-(`initialize`, `tools/list`, `tools/call list_children`), WebDAV (PROPFIND, PUT, GET) and tenant
-isolation (Carol gets `404`). Last run on 2026-11-06: `PASSED: 47 checks`.
+(`initialize`, `tools/list`, `tools/call list_children`), WebDAV on its own host (PROPFIND, PUT,
+GET, `dav_url`, no cookie, no API there, `404` for `/dav` on the platform origin) and tenant
+isolation (Carol gets `404`). There is no wait after the seed. Last run on 2026-11-06 (branch
+`q/decisions`): `PASSED: 52 checks`.
 
 ### CLI
 
@@ -127,9 +140,10 @@ argument `body` (see `crates/ruum-mcp/src/tools.json`).
 
 ### WebDAV
 
-`https://ruum.localhost/dav/` or `http://127.0.0.1:8490/dav/`, HTTP Basic with the user's email
-and an app password (`POST /v1/me/app-passwords`, one tenant). Agents send their access token as
-Bearer. `crates/ruum-webdav/scripts/smoke.sh` has Finder-like curl requests.
+`https://dav.ruum.localhost/` or `http://127.0.0.1:8492/` (its own host, decision 0002-3), HTTP
+Basic with the user's email and an app password (`POST /v1/me/app-passwords`, one tenant; the
+answer's `dav_url` is the URL to mount). Agents send their access token as Bearer. The platform
+origin has no `/dav`. `crates/ruum-webdav/scripts/smoke.sh` has Finder-like curl requests.
 
 ### Web UI
 
@@ -143,38 +157,41 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-06, `main`, after the security fixes, `DATABASE_URL` from `dev.sh env`)
+## Checks (2026-11-06, branch `q/decisions`, after the panel decisions, `DATABASE_URL` and SpiceDB from `dev.sh env`)
 
-- `cargo build --workspace`, `cargo fmt --all --check`,
-  `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: all pass. ruum-core 191 (1 ignored: `tenants/mail.rs`, needs SMTP),
-  ruum-api 34, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-mcp 4 + 15 (server) + 5
-  (tools contract), ruum-server 1, ruum-testkit 7 + 2 (contract) + 1 (isolation) + 3
-  (permissions), ruum-webdav 5 + 19.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace`: all pass. ruum-core 194 (1 ignored: `tenants/mail.rs`, needs SMTP),
+  ruum-api 37, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-mcp 4 + 15 (server) + 5
+  (tools contract), ruum-server 5 (one needs SpiceDB: two servers on one database),
+  ruum-testkit 7 + 2 (contract) + 1 (isolation) + 3 (permissions), ruum-webdav 5 + 20.
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit`: pass. Tenant isolation suite: 188
   checks, 188 passed. Permission matrix: 1209 checks, 1209 passed. Trashed file suite: 78
   checks, 78 passed. 0 pending, 0 failed.
-- `crates/ruum-testkit/scripts/mutation_check.sh` (with `MUTATION_TARGET_DIR=$PWD/target`, so
-  it uses the shared cargo cache, and `DATABASE_URL` set): exit 0. 11 of 13 mutations killed,
-  among them the 6 new ones (`webdav-content-safety`, `blobs-trashed-read-postgres`,
-  `blobs-trashed-read-memory`, `feed-trashed-node-visible`, `agents-guest-uses-tenant-limit`,
-  `agents-guest-uses-tenant-limit-postgres`). Not killed, as before: `nodes-tenant-filter`
-  (SKIP: its pattern does not match the Postgres node queries) and `sharing-tenant-filter`
-  (SURVIVED: the isolation suite runs in memory only; see the gaps).
-- `scripts/e2e_smoke.sh`: 47 checks passed.
-- `web/`: `npm ci`, `npm run gen:api` (no diff), `npm run lint`, `npm run build`, `npm test`
-  (12 files, 88 tests): pass. `npm audit --omit=dev`: 0 vulnerabilities.
+- Contracts: `redocly lint`: valid. `oasdiff breaking` against `main`: no breaking change
+  (changelog: one optional response property, `dav_url`).
+- `crates/ruum-testkit/scripts/mutation_check.sh` (with `MUTATION_TARGET_DIR=$PWD/target`) for
+  the new and related mutations: all 8 killed (`sharing-email-grant-policy-memory`,
+  `agents-guest-register-policy`, `agents-guest-register-policy-postgres`,
+  `csrf-not-session-bound`, `authz-ignores-tenant-token`, `authz-spicedb-ignores-request-floor`,
+  `sharing-grant-by-id-makes-guest`, `webdav-content-safety`). The full run was not repeated on
+  this branch; before it, `nodes-tenant-filter` (SKIP) and `sharing-tenant-filter` (SURVIVED)
+  were the known exceptions.
+- `scripts/e2e_smoke.sh`: 52 checks passed (no wait after the seed).
+- `crates/ruum-webdav/scripts/smoke.sh` against `dav_fake_server` at the root path: all passed.
+- `web/`: `npm ci`, `npm run gen:api`, `npm run lint`, `npm run build`, `npm test` (12 files,
+  88 tests): pass.
 
 ## Known gaps
 
-- **WebDAV is still on the platform origin.** The content-safety headers make `/dav` files
-  inert in a browser, but the stronger fix of design section 15 is a host without the session
-  cookie (for example `dav.<domain>`). The REST download (`downloadContent`) keeps the stored
-  type under its CSP sandbox; only WebDAV maps active types to `application/octet-stream`.
+- **Cookie names.** The session and CSRF cookies keep their names (`ruum_session`,
+  `ruum_csrf`); the `__Host-` prefix is a later hardening, because the rename breaks the
+  contract (decision 0002-3). The CSRF value is bound to the session. The REST download
+  (`downloadContent`) keeps the stored type under its CSP sandbox; only WebDAV maps active types
+  to `application/octet-stream`.
+- **Caddy on a running stack.** The new `dav.ruum.localhost` block needs the Caddy container to
+  be recreated (it reads the Caddyfile at start; `RUUM_DAV_UPSTREAM` is new in compose).
 - **Signed content URLs and the trash.** A content URL made before the file went to the trash
   works until it expires (at most `CONTENT_URL_SECONDS`, 5 minutes).
-- **Guests and agents.** Guests may own agents (own limit per guest); whether they may at all
-  is open for the architect (see the security findings above).
 - **Mutation check.** `nodes-tenant-filter` does not match the Postgres node queries (SKIP) and
   `sharing-tenant-filter` survives, because the isolation suite runs in memory only. By
   default the script builds into `target/mutation`; pass `MUTATION_TARGET_DIR=$PWD/target` to
@@ -183,15 +200,10 @@ For Zitadel sign-in through Vite, start the server with
   `AppState::in_memory()`. The Postgres stores are covered by their conformance suites
   (`#[sqlx::test]`) and by `scripts/e2e_smoke.sh`, not by the isolation and permission suites.
   Next step: a Postgres backend for `app_state` when `DATABASE_URL` is set.
-- **SpiceDB freshness across processes.** The SpiceDB engine reads at least as fresh as the
-  newest ZedToken that this process wrote or saw. `authz::outbox::latest_token` (the tenant's
-  newest token) is not passed to checks yet, so writes made by another process (another server,
-  `seed-dev`) are visible only after SpiceDB's quantization window (5 s by default). With more
-  than one server this also delays revocations by up to that window.
-- **Contract text of `addGrant`.** Commit `653ee9a` makes a grant by user ID reach only members
-  and guests of the tenant (`404` for others, no guest is made). The `addGrant` description in
-  `contracts/openapi.yaml` still says that a user from another tenant becomes a guest. A contract
-  change must settle the text (the `GranteeUser` schema already says "a member or a guest").
+- **SpiceDB freshness inside a request.** A request reads at least as fresh as its tenant's
+  newest token at its start and its own writes (decision 0002-4). Work that a handler spawns on
+  another task, the outbox worker and `seed-dev` have no request floor and read at the process
+  token, as before.
 - **Coalescing.** Saves by the same actor within 10 minutes merge into the head version (design
   5.3), also through the CLI, WebDAV and MCP. Name a version (`setVersionLabel`) to keep it. The
   WebDAV ETag of a file is `"<head version>-<revision>"`, because a merged save keeps the version

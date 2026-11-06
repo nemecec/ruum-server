@@ -100,7 +100,8 @@ on everything except the public operations and the node, content, version and di
 When you change a rule, run
 `RUUM_UPDATE_MATRIX=1 cargo test -p ruum-testkit --test permissions` and review the diff of
 `permission_matrix.md`. Rules with "assumption" or "open question" in the note are readings of the
-contract that the architect must confirm.
+contract that the architect must confirm. Decision 0002-5 settled all such rules of step 1; their
+notes say "decided (0002-...)".
 
 ### Seeding: what the auth area must do
 
@@ -157,8 +158,9 @@ Run it alone with `crates/ruum-testkit/scripts/mutation_check.sh <name>`.
   admin routes answer like unknown ones.
 - `registerAgent` has no `404`; a scope subtree in another tenant is accepted as `403`, `404` or
   `422`.
-- The contract does not say what an agent gets from `logout` and `listAgents` (`any` in the
-  matrix). The step 1 contract review settled `listMyIdentities` and `listMySessions`: users only.
+- `logout` and `listAgents` with an agent caller: settled by decision 0002-5 (`200`; an agent
+  sees only itself in `listAgents`). The step 1 contract review settled `listMyIdentities` and
+  `listMySessions`: users only.
 - `getContentUrl` has no `403` response in the contract; an agent whose user can see the node but
   whose scope leaves it out is accepted as `403` or `404`.
 - `oauth_clients` has no `tenant_id` (a registration belongs to no tenant), so the isolation case
