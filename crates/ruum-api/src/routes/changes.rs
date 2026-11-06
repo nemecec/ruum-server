@@ -12,9 +12,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ruum_core::journal::Journal;
 use ruum_core::journal::feed::{
-    self, ChangesPage, ChangesQuery, FeedAccess, LatestCursor, ServicesAccess,
+    self, ChangesFilter, ChangesPage, ChangesQuery, FeedAccess, LatestCursor, ServicesAccess,
 };
-use ruum_core::{ApiError, Context, Error, ErrorCode, NodeId};
+use ruum_core::{ApiError, Context, Error, ErrorCode, NodeId, PrincipalId};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -31,6 +31,11 @@ pub struct ChangesParams {
     pub limit: Option<u32>,
     pub wait: Option<u64>,
     pub node: Option<Uuid>,
+    /// Only entries of this actor (decision 0003-5).
+    pub actor: Option<Uuid>,
+    /// Only entries at or after this time, RFC 3339 (decision 0003-5).
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub since: Option<time::OffsetDateTime>,
 }
 
 /// A query string that does not parse: `400 bad_request` with the standard error JSON.
@@ -64,7 +69,13 @@ pub(crate) async fn changes_page(
     let Query(p) = params.map_err(bad_query)?;
     let query =
         ChangesQuery::from_params(p.cursor.as_deref(), p.limit, p.wait, p.node.map(NodeId))?;
-    Ok(Json(feed::list_changes(journal, access, ctx, query).await?))
+    let filter = ChangesFilter {
+        actor: p.actor.map(PrincipalId),
+        since: p.since,
+    };
+    Ok(Json(
+        feed::list_changes_filtered(journal, access, ctx, query, &filter).await?,
+    ))
 }
 
 /// The newest cursor. `GET /v1/changes/latest` (operationId `getLatestCursor`).

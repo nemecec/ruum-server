@@ -188,7 +188,10 @@ pub async fn tenant_context(
     if who.bound_tenant.is_some_and(|b| b != tenant) {
         return Err(Error::not_found("tenant"));
     }
-    auth::context_for(&state.services, who, Some(tenant), idempotency_key(headers)).await
+    let ctx =
+        auth::context_for(&state.services, who, Some(tenant), idempotency_key(headers)).await?;
+    crate::names::note_tenant(&ctx);
+    Ok(ctx)
 }
 
 impl FromRequestParts<AppState> for Principal {
@@ -199,7 +202,10 @@ impl FromRequestParts<AppState> for Principal {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         match authenticate(state, &parts.method, &parts.headers).await {
-            Ok(Some(who)) => Ok(Principal(who)),
+            Ok(Some(who)) => {
+                crate::names::note_signed_in(who.actor.actor.kind);
+                Ok(Principal(who))
+            }
             Ok(None) => Err(AuthRejection::new(
                 state,
                 unauthenticated(
@@ -250,15 +256,16 @@ impl FromRequestParts<AppState> for RequestContext {
         let Principal(who) =
             <Principal as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
         let tenant = tenant_header(&parts.headers).map_err(|e| AuthRejection::new(state, e))?;
-        auth::context_for(
+        let ctx = auth::context_for(
             &state.services,
             &who,
             tenant,
             idempotency_key(&parts.headers),
         )
         .await
-        .map(RequestContext)
-        .map_err(|e| AuthRejection::new(state, e))
+        .map_err(|e| AuthRejection::new(state, e))?;
+        crate::names::note_tenant(&ctx);
+        Ok(RequestContext(ctx))
     }
 }
 

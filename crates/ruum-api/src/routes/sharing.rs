@@ -17,6 +17,7 @@ use ruum_core::identity::{AccessClaims, TokenType};
 use ruum_core::paging::{Cursor, PageRequest};
 use ruum_core::sharing::rules::{LINK_ACCESS_TOKEN_SECONDS, link_scope};
 use ruum_core::sharing::{Grantee, NewShareLink, ShareLinkRole};
+use ruum_core::tenants::MemberRole;
 use ruum_core::{ApiError, Error, ErrorCode, GrantId, NodeId, ShareLinkId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -103,6 +104,27 @@ fn if_match(headers: &HeaderMap) -> Result<Option<i64>, Error> {
 }
 
 /// List grants. `GET /v1/nodes/{node_id}/grants` (operationId `listGrants`).
+/// Whether the caller may see the emails of user grantees on `node` (decision 0003-5): the
+/// caller (or the agent's user) is a member, admin or owner, who may list the members' emails
+/// anyway, and may share the node. Guests never see emails here, so the grant list is no
+/// lookup from user to email for them.
+async fn may_see_grantee_emails(state: &AppState, ctx: &Context, node: NodeId) -> ApiResult<bool> {
+    let Some(user) = ctx.actor.effective_user() else {
+        return Ok(false);
+    };
+    let role = state.services.tenants.role_of(ctx.tenant, user).await?;
+    if role.is_none_or(|r| r < MemberRole::Member) {
+        return Ok(false);
+    }
+    Ok(ruum_core::authz::can_share(
+        state.services.authz.as_ref(),
+        state.services.nodes.as_ref(),
+        ctx,
+        node,
+    )
+    .await?)
+}
+
 pub async fn list_grants(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
@@ -115,6 +137,9 @@ pub async fn list_grants(
         .sharing
         .list_grants(&ctx, node, page(q)?)
         .await?;
+    if may_see_grantee_emails(&state, &ctx, node).await? {
+        crate::names::allow_grantee_emails();
+    }
     Ok(Json(to_json(&p)?))
 }
 
@@ -151,6 +176,9 @@ pub async fn add_grant(
         .sharing
         .add_grant(&ctx, node, b.grantee, b.role)
         .await?;
+    if may_see_grantee_emails(&state, &ctx, node).await? {
+        crate::names::allow_grantee_emails();
+    }
     Ok((
         StatusCode::CREATED,
         Json(json!({ "grant": to_json(&w.value)?, "change": to_json(&w.change)? })),
@@ -178,6 +206,9 @@ pub async fn update_grant(
         .sharing
         .update_grant(&ctx, NodeId(node), GrantId(grant), b.role)
         .await?;
+    if may_see_grantee_emails(&state, &ctx, NodeId(node)).await? {
+        crate::names::allow_grantee_emails();
+    }
     Ok(Json(
         json!({ "grant": to_json(&w.value)?, "change": to_json(&w.change)? }),
     ))

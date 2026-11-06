@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod error;
 pub mod limits;
+pub mod names;
 pub mod routes;
 pub mod state;
 
@@ -36,6 +37,11 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::search::router())
         .merge(routes::audit::router())
         .fallback(error::route_not_found)
+        // Inside the idempotency layer, so a replayed answer keeps its names.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            names::fill_names,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::idempotency,

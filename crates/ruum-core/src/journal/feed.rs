@@ -702,6 +702,35 @@ pub async fn list_changes(
     ctx: &Context,
     query: ChangesQuery,
 ) -> Result<ChangesPage> {
+    list_changes_filtered(journal, access, ctx, query, &ChangesFilter::default()).await
+}
+
+/// The optional filters of `listChanges` (`actor`, `since`; decision 0003-5). They apply after
+/// the visibility rules, so they never show more. An entry they leave out gives no resync
+/// marker either, as with the `node` filter.
+#[derive(Clone, Debug, Default)]
+pub struct ChangesFilter {
+    /// Only entries whose `actor.id` is this principal.
+    pub actor: Option<crate::ids::PrincipalId>,
+    /// Only entries at or after this time.
+    pub since: Option<OffsetDateTime>,
+}
+
+impl ChangesFilter {
+    fn keeps(&self, entry: &JournalEntry) -> bool {
+        self.actor.is_none_or(|a| entry.actor.actor.id == a)
+            && self.since.is_none_or(|t| entry.at >= t)
+    }
+}
+
+/// [`list_changes`] with the filters of [`ChangesFilter`].
+pub async fn list_changes_filtered(
+    journal: &dyn Journal,
+    access: &dyn FeedAccess,
+    ctx: &Context,
+    query: ChangesQuery,
+    filter: &ChangesFilter,
+) -> Result<ChangesPage> {
     require_feed_caller(ctx)?;
     let mut memo = Memo {
         access,
@@ -736,6 +765,9 @@ pub async fn list_changes(
         let mut items = Vec::new();
         let mut resync = Vec::new();
         for entry in entries {
+            if !filter.keeps(&entry) {
+                continue;
+            }
             if let Some(f) = query.node
                 && !memo.in_folder(&entry, f).await?
             {
