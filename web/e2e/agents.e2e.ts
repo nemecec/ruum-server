@@ -69,7 +69,7 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Files' }).click()
   const folderRow = page.getByRole('row').filter({ has: page.getByRole('link', { name: folder, exact: true }) })
   // The Changed column names the agent and the person it acts for, with the agent mark; never an ID.
-  await expect(folderRow).toContainText(`${name} for ${users.ann.displayName}`)
+  await expect(folderRow).toContainText(`${name} (agent of ${users.ann.displayName})`)
   await expect(folderRow).toContainText('(an agent)')
 
   // Undo what the agent did: a dry run first, then the undo; the folder goes away.
