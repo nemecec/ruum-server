@@ -83,6 +83,10 @@
       ],
       "description": "The user for whom the actor acted; null when the actor is the user."
     },
+    "on_behalf_of_display_name": {
+      "type": "string",
+      "description": "The current name of the `on_behalf_of` user. Filled by the API when known (for example in GET /v1/changes). Never stored in the journal."
+    },
     "at": {
       "$ref": "common.schema.json#/$defs/timestamp"
     },

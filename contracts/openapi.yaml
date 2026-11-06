@@ -2988,6 +2988,19 @@ paths:
           description: Only changes inside this folder (at any depth).
           schema:
             $ref: '#/components/schemas/Uuid'
+        - name: actor
+          in: query
+          description: >-
+            Only changes whose `actor.id` is this principal (a user or an agent). The filter
+            applies after the visibility rules, so it never shows more. Entries that it leaves out
+            also give no `resync` markers; a sync client does not use it.
+          schema:
+            $ref: '#/components/schemas/Uuid'
+        - name: since
+          in: query
+          description: Only changes at or after this time (`at`). Same rules as `actor`.
+          schema:
+            $ref: '#/components/schemas/Timestamp'
       responses:
         '200':
           description: One page of changes.
@@ -3404,7 +3417,14 @@ components:
           $ref: '#/components/schemas/Uuid'
         display_name:
           type: string
-          description: Filled in responses when known.
+          description: >-
+            The name of the principal, filled in every response that names it (C-7, decision
+            0003-5): the current display name of a member or guest, the name of an agent, else
+            the last name the tenant knew (a person who left). Absent when no name is known (also
+            after a GDPR deletion). Anyone who may see the response may see the name. An agent's name is
+            chosen by its client, so it can look like a person's name: tell agents apart by
+            `kind`, and show them with the name of their user (`on_behalf_of_display_name`).
+            Never filled for share-link bearers.
     ActorPair:
       type: object
       description: Who did a change, and for whom (design section 3.4).
@@ -3417,6 +3437,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        on_behalf_of_display_name:
+          description: >-
+            The current name of the `on_behalf_of` user, filled in responses when known (C-7,
+            decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known.
+          type: string
     Change:
       type: object
       description: The change that a write made.
@@ -3434,6 +3459,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        on_behalf_of_display_name:
+          description: >-
+            The current name of the `on_behalf_of` user, filled in responses when known (C-7,
+            decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known.
+          type: string
         at:
           $ref: '#/components/schemas/Timestamp'
     ChangeOnly:
@@ -3492,6 +3522,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        on_behalf_of_display_name:
+          description: >-
+            The current name of the `on_behalf_of` user, filled in responses when known (C-7,
+            decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known.
+          type: string
         user:
           $ref: '#/components/schemas/User'
           description: The user whose rights apply (the agent's owner for an agent).
@@ -4624,6 +4659,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        on_behalf_of_display_name:
+          description: >-
+            The current name of the `on_behalf_of` user, filled in responses when known (C-7,
+            decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known.
+          type: string
         created_at:
           $ref: '#/components/schemas/Timestamp'
     VersionPage:
@@ -4830,10 +4870,13 @@ components:
           $ref: '#/components/schemas/Uuid'
         display_name:
           type: string
-          description: Filled in responses.
+          description: The name of the user, filled in responses (as `PrincipalRef.display_name`).
         email:
           type: string
-          description: Filled in responses.
+          description: >-
+            Filled in responses only for callers who may share the node and who may list the
+            members of the tenant (a member, admin or owner, or an agent of one). Absent for
+            guests, so the grant list tells a guest no email address (decision 0003-5).
     GranteeEmail:
       type: object
       description: >-
@@ -5079,6 +5122,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        on_behalf_of_display_name:
+          description: >-
+            The current name of the `on_behalf_of` user, filled in responses when known (C-7,
+            decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known.
+          type: string
         at:
           $ref: '#/components/schemas/Timestamp'
         data:
@@ -5147,6 +5195,11 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        on_behalf_of_display_name:
+          description: >-
+            The current name of the `on_behalf_of` user, filled in responses when known (C-7,
+            decision 0003-5). Absent when `on_behalf_of` is `null` or the name is not known.
+          type: string
         target_type:
           type: [string, 'null']
         target_id:
