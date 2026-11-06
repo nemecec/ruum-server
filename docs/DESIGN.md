@@ -1099,17 +1099,43 @@ one migration task at a time.
 
 | Role | Done by | Job |
 |---|---|---|
-| Architect | person, with an agent as helper | design, contracts, approval of contract PRs and of security-sensitive merges |
+| Architect | agent panel; a person is optional (section 18.9) | design, contracts, approval of contract PRs and of security-sensitive merges |
+| UX designer | agent, with a UX review panel; a person is optional (section 18.9) | user journeys, information architecture, the design system, wireframes and UI copy before the UI task cards; the "agent experience" of MCP tools, CLI output and error hints; approval of UI merges (section 18.4.1) |
 | Planner | agent | breaks a step into task cards with dependencies (a task graph), in the issue tracker |
 | Test writer | agent | writes acceptance tests from the contracts, before the code |
 | Implementer | many agents in parallel | one task card each, in its own git worktree, until CI is green |
 | Reviewer | agent with a fresh context (ideally another model) | reviews the diff against the card and the contracts; only reads |
-| Security reviewer | agent, plus a person for auth, crypto and tenancy | extra review for changes in those areas |
+| Security reviewer | two agents with different lenses; a person is optional (section 18.9) | extra review for changes in auth, crypto, tenancy and secrets |
 | Integrator | agent | merges in order, fixes conflicts, runs the full suite and the local stack |
 
-Rules for implementers: three failed attempts at the same problem → stop and escalate to a person.
+Rules for implementers: three failed attempts at the same problem → stop and escalate (section 18.9).
 No new dependency without approval (`cargo-deny` allow-list, supply-chain risk). No production
 credentials; agents work against the laptop stack and staging only.
+
+#### 18.4.1 UX design
+
+Agents build screens fast, but without a design each screen solves the same problem in its own way.
+The UX designer works one step ahead of the UI implementers, as the architect does for the code:
+
+- **Before the build** (in the Specify phase): the user journeys of the step (for step 1: first
+  sign-in, upload, share with a colleague, find an old version, connect an agent), the information
+  architecture (navigation, names of things), wireframes or a clickable prototype, and the
+  **design system** (tokens for colour, type and spacing, and the components: file list, share
+  dialog, version panel, empty states, errors). UX needs can drive contract changes (a field the
+  screen needs) before the contracts freeze.
+- **In the task card** of a UI task: the journey, the wireframe or prototype link, every state
+  (loading, empty, error, no permission, phone width, dark mode) and the exact UI copy.
+- **Review**: a UX review agent compares screenshots of each UI branch (Playwright, desktop and
+  phone, light and dark) with the design and the card. The UX review panel (section 18.9), or a
+  person when one is available, approves UI merges.
+- **Checks in CI**: accessibility (axe, WCAG 2.2 AA) and visual snapshots of the main screens, so
+  an agent's change cannot quietly break a screen.
+- **Agent experience**: AI agents are users too. The designer also owns the names and descriptions
+  of MCP tools, the CLI output, and the hints in error messages, and reads the agent benchmark
+  results (section 18.7) like usability test results.
+- **Users**: at the end of each step, a usability test with synthetic users (section 18.9), and
+  with 3-5 real people from the target group when they are available. The findings become task
+  cards.
 
 ### 18.5 CI gates
 
@@ -1128,8 +1154,8 @@ end-to-end suite on staging, and a restore test of the backups.
 
 ### 18.7 Rhythm per step
 
-1. **Specify** (person + agent): contracts, acceptance tests, task graph. About a quarter of the
-   time of the step. Do not skip it; it is what makes parallel work possible.
+1. **Specify** (person + agent): contracts, user journeys and wireframes (section 18.4.1),
+   acceptance tests, task graph. About a quarter of the time of the step. Do not skip it; it is what makes parallel work possible.
 2. **Build** (swarm): task cards in parallel, merged continuously.
 3. **Harden**: a pass of reviewer and security agents over the whole step, load tests, a restore
    test.
@@ -1137,6 +1163,46 @@ end-to-end suite on staging, and a restore test of the backups.
    of tasks such as "build a to-do app with Postgres and sign-in", done by outside agents (Claude,
    ChatGPT) through the MCP server against staging. The success rate is a release gate, because
    "easy for AI agents" is the product.
+
+### 18.9 Running without people
+
+People are **optional** in this method. Each gate that a person would hold has an agent
+replacement, so the work continues when nobody has time. A person who has time can still take any
+role, or veto a decision later.
+
+| Gate | Agent replacement |
+|---|---|
+| Architect decisions and contract changes | An **architect panel**: one agent proposes; two independent agents with fresh context (ideally another model) review it from different angles (consistency with the design, cost of later steps). Both must accept. The contract diff must show no breaking change, or the change is additive. The result is a decision record marked `provisional`. |
+| Open product questions | The panel takes the recommended answer, records it as a `provisional` decision with its reasons, and goes on. |
+| Security-sensitive merges | Two security reviewers with different lenses, the isolation and permission suites, and the mutation check in strict mode. Any `must_fix` blocks the merge. |
+| UX design and approval of UI merges | A UX designer agent, and a **UX review panel**: a heuristic review (Nielsen's ten heuristics), an accessibility review (axe and keyboard), and a consistency review against the design system, all on screenshots at desktop and phone width, light and dark. |
+| Real users | **Synthetic users**: persona agents (for example "freelance landscape architect, not technical", "small team admin", "developer with Claude Code") drive the real UI in a browser with tasks and think aloud. Measure task success, steps and errors. Outside AI agents do the agent benchmark over MCP. |
+| Escalation after three failed attempts | A fresh senior agent with the whole context tries once. If it also fails, the task card is parked as `blocked`, with a written question, and the swarm goes on with other cards. |
+| Release of a step | Automatic gates: all CI gates, the end-to-end suite, the synthetic user tests above their thresholds, and the agent benchmark above its threshold. |
+
+What agents cannot replace well, and how the method handles it:
+
+- **Synthetic users are not real users.** They find problems of clarity, discoverability and broken
+  flows. They cannot show what real people need, want to pay for, or do in their own work. Their
+  findings are labelled as synthetic, and the product decisions they lead to stay `provisional`
+  until real users confirm them.
+- **Agent panels share blind spots.** Use different models where possible, give each reviewer a
+  different lens, and keep the automatic checks (suites, mutation check, contract diff) as the
+  hard floor.
+
+**Things that stay with a person**, because they are outward-facing, cost money or cannot be
+undone: registering domains, creating cloud and Hetzner accounts, payments, pushing to a public or
+shared remote, publishing public apps, sending email to real people, and any production
+credentials. Agents prepare these steps and stop.
+
+**The person's view.** After each run, the agents publish a short **digest**: what was built, the
+decisions made (with links to the decision records), the risks, and the parked questions. A person
+can read it in a few minutes, and veto or change any `provisional` decision. Without a veto, the
+decisions stand.
+
+**Guardrails for unattended runs**: a token and time budget per run, the disk check before builds,
+no network actions outside the laptop stack and package registries, and a stop when a guardrail is
+hit, with a report.
 
 ### 18.8 The first tasks
 
