@@ -18,7 +18,9 @@ ENV_FILE="$DEV/.env"
 STATE="$DEV/.state"
 ZITADEL_URL="http://localhost:8180"
 
-compose() { docker compose --project-directory "$DEV" -f "$DEV/docker-compose.yml" --env-file "$ENV_FILE" "$@"; }
+# No provenance attestation: it carries a build time, so every `up --build` would give the postgres
+# image a new ID and recreate the container (seen with buildx and the containerd image store).
+compose() { BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --project-directory "$DEV" -f "$DEV/docker-compose.yml" --env-file "$ENV_FILE" "$@"; }
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
