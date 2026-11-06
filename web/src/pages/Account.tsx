@@ -1,9 +1,9 @@
 import { useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router'
 import { client, unwrap } from '../api/client'
 import { useApi } from '../api/useApi'
 import { useSession } from '../app/useSession'
-import { tenantPath, useTenant } from '../app/tenant'
+import { StartTeamDialog } from '../app/Shell'
+import { useTenant } from '../app/tenant'
 import { formatDate } from '../components/format'
 import { ConfirmButton, Dialog, ErrorNote, Loaded, Notice, SecretBox } from '../components/ui'
 
@@ -55,7 +55,7 @@ export function AccountPage() {
       </section>
 
       <section className="card" aria-labelledby="sessions-title">
-        <h2 id="sessions-title">Sessions</h2>
+        <h2 id="sessions-title">Signed-in devices</h2>
         <Loaded state={sessions}>
           {({ items }) => (
             <ul className="rows">
@@ -137,11 +137,11 @@ function AppPasswords() {
                   <span className="muted small"> - last used {p.last_used_at ? formatDate(p.last_used_at) : 'never'}</span>
                 </span>
                 <ConfirmButton
-                  label="Revoke"
-                  ariaLabel={`Revoke app password ${p.name}`}
-                  title="Revoke this app password?"
-                  message="Clients that use it must sign in again."
-                  confirmLabel="Revoke"
+                  label="Turn off"
+                  ariaLabel={`Turn off app password ${p.name}`}
+                  title="Turn off this app password?"
+                  message="Programs that use it stop working at once and must sign in again."
+                  confirmLabel="Turn off app password"
                   danger
                   onConfirm={async () => {
                     await unwrap(client.DELETE('/v1/me/app-passwords/{app_password_id}', { params: { path: { app_password_id: p.id } } }))
@@ -193,36 +193,15 @@ function AppPasswords() {
 }
 
 function NewTeam() {
-  const { reloadTenants } = useSession()
-  const navigate = useNavigate()
-  const [name, setName] = useState('')
-  const [error, setError] = useState<unknown>()
-
-  async function submit(e: FormEvent) {
-    e.preventDefault()
-    setError(undefined)
-    try {
-      const t = await unwrap(client.POST('/v1/tenants', { body: { name: name.trim() } }))
-      reloadTenants()
-      navigate(tenantPath(t.id, 'admin'))
-    } catch (err) {
-      setError(err)
-    }
-  }
-
+  const [open, setOpen] = useState(false)
   return (
     <section className="card" aria-labelledby="team-title">
-      <h2 id="team-title">Start a team</h2>
-      <form className="inline-form" onSubmit={submit}>
-        <label className="grow">
-          Team name
-          <input required value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
-        <button type="submit" disabled={!name.trim()}>
-          Create team
-        </button>
-      </form>
-      <ErrorNote error={error} />
+      <h2 id="team-title">Team spaces</h2>
+      <p className="muted">A team space is shared by the people you invite. You'll be its owner.</p>
+      <button type="button" onClick={() => setOpen(true)}>
+        Start a team space
+      </button>
+      {open && <StartTeamDialog onClose={() => setOpen(false)} />}
     </section>
   )
 }

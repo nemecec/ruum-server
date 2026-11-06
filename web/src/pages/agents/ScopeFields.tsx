@@ -7,13 +7,18 @@ import { FolderPicker } from '../files/dialogs'
 
 const roles: Schemas['Role'][] = ['view', 'comment', 'edit', 'manage']
 
-/** Form fields of an `AgentScope`: the folder, the highest role and the end date. */
+/**
+ * Form fields of an `AgentScope`: where, the highest role, the end date and the changes per hour.
+ * `subtree: ''` means "only in a folder" with no folder chosen yet; the form must not send it.
+ */
 export function ScopeFields(props: {
   /** The tenant of the agent. Calls send it explicitly (the consent page is outside a tenant). */
   tenantId: string
   scope: Schemas['AgentScope']
   onChange: (scope: Schemas['AgentScope']) => void
   idPrefix: string
+  /** The name of the space, for "Everywhere you have access in <space>". */
+  spaceName?: string
 }) {
   const { scope, onChange, idPrefix, tenantId } = props
   const [picking, setPicking] = useState(false)
@@ -29,22 +34,31 @@ export function ScopeFields(props: {
   return (
     <fieldset className="stack">
       <legend>What the agent may do</legend>
-      <div>
-        <span id={`${idPrefix}-where`}>Where</span>
-        <div className="row" aria-labelledby={`${idPrefix}-where`}>
-          <span className="grow">
-            {scope.subtree ? (subtree.data ? `Folder ${subtree.data.name}` : 'A folder') : 'Everything I can access in this tenant'}
-          </span>
-          <button type="button" onClick={() => setPicking(true)}>
-            Choose folder
-          </button>
-          {scope.subtree && (
-            <button type="button" onClick={() => onChange({ ...scope, subtree: null })}>
-              Everything
+      <p className="muted small">An agent never gets more access than you have.</p>
+      <fieldset className="stack plain">
+        <legend>Where</legend>
+        <label className="check">
+          <input
+            type="radio"
+            name={`${idPrefix}-where`}
+            checked={typeof scope.subtree === 'string'}
+            onChange={() => onChange({ ...scope, subtree: scope.subtree ?? '' })}
+          />
+          Only in a folder
+        </label>
+        {typeof scope.subtree === 'string' && (
+          <div className="row indent">
+            <span className="grow">{scope.subtree ? (subtree.data ? `Folder ${subtree.data.name}` : 'A folder') : 'No folder chosen yet'}</span>
+            <button type="button" onClick={() => setPicking(true)}>
+              Choose folder
             </button>
-          )}
-        </div>
-      </div>
+          </div>
+        )}
+        <label className="check">
+          <input type="radio" name={`${idPrefix}-where`} checked={typeof scope.subtree !== 'string'} onChange={() => onChange({ ...scope, subtree: null })} />
+          Everywhere you have access in {props.spaceName ?? 'this space'}
+        </label>
+      </fieldset>
       <label>
         Highest role
         <select value={scope.max_role} onChange={(e) => onChange({ ...scope, max_role: e.target.value as Schemas['Role'] })}>
@@ -55,9 +69,8 @@ export function ScopeFields(props: {
           ))}
         </select>
       </label>
-      <p className="muted small">The agent never gets more than you have yourself.</p>
       <label>
-        Access ends on (optional)
+        Ends on (optional)
         <input
           type="date"
           value={expires}
@@ -67,7 +80,7 @@ export function ScopeFields(props: {
         />
       </label>
       <label>
-        Writes per hour at most (optional)
+        Changes per hour, at most (optional)
         <input
           type="number"
           min={1}
@@ -84,7 +97,7 @@ export function ScopeFields(props: {
         <Dialog title="Choose a folder for the agent" open onClose={() => setPicking(false)}>
           <FolderPicker
             tenantId={tenantId}
-            startId={scope.subtree ?? undefined}
+            startId={scope.subtree || undefined}
             pickLabel="Use this folder"
             onPick={(folder) => {
               onChange({ ...scope, subtree: folder.parent_id ? folder.id : null })

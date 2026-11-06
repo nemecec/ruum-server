@@ -5,8 +5,12 @@ import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useSession } from '../../app/useSession'
 import { useTenant } from '../../app/tenant'
-import { actorText, formatBytes, formatDate, memberRoleLabels } from '../../components/format'
-import { ConfirmButton, ErrorNote, Loaded, LoadMore, Notice } from '../../components/ui'
+import { Actor } from '../../app/names'
+import { StartTeamDialog } from '../../app/Shell'
+import { formatBytes, formatDate, formatWhen, memberRoleLabels, memberRoleMeanings } from '../../components/format'
+import { useToast } from '../../components/useToast'
+import { ConfirmButton, EmptyState, ErrorNote, Loaded, LoadMore } from '../../components/ui'
+import { auditText } from './audit'
 
 /** The tenant admin layout: a sub-navigation and one admin page. */
 export function AdminLayout() {
@@ -14,7 +18,7 @@ export function AdminLayout() {
   if (!isAdmin) {
     return (
       <div className="page-body">
-        <h1>Admin</h1>
+        <h1>Space settings</h1>
         <p>Only admins and owners of {tenant.name} can open these pages.</p>
       </div>
     )
@@ -22,13 +26,13 @@ export function AdminLayout() {
   const tabs: [string, string][] = [
     ['members', 'Members'],
     ['invitations', 'Invitations'],
-    ['policy', 'Policy'],
-    ['limits', 'Plan and limits'],
-    ['audit', 'Audit log'],
+    ['policy', 'Sharing rules'],
+    ['limits', 'Plan'],
+    ['audit', 'Activity log'],
   ]
   return (
     <div className="page-body">
-      <h1>Admin: {tenant.name}</h1>
+      <h1>Space settings: {tenant.name}</h1>
       <nav aria-label="Admin" className="tabs">
         <ul>
           {tabs.map(([to, label]) => (
@@ -48,7 +52,7 @@ const assignable: Schemas['MemberRole'][] = ['guest', 'member', 'admin', 'owner'
 export function MembersPage() {
   const { tenant, role: myRole } = useTenant()
   const { me } = useSession()
-  const [notice, setNotice] = useState<string | null>(null)
+  const { toast } = useToast()
   const [error, setError] = useState<unknown>()
   const members = usePagedApi(
     (cursor) => unwrap(client.GET('/v1/tenants/{tenant_id}/members', { params: { path: { tenant_id: tenant.id }, query: cursor ? { cursor } : {} } })),
@@ -64,7 +68,7 @@ export function MembersPage() {
           body: { role },
         }),
       )
-      setNotice(`${m.display_name} is now ${memberRoleLabels[role].toLowerCase()}.`)
+      toast(`${m.display_name} is now ${memberRoleLabels[role].toLowerCase()}.`)
     } catch (e) {
       setError(e)
     }
@@ -75,7 +79,6 @@ export function MembersPage() {
     <section aria-labelledby="members-title">
       <h2 id="members-title">Members</h2>
       <ErrorNote error={error} />
-      <Notice text={notice} />
       <Loaded state={members}>
         {({ items }) => (
           <table className="table">
@@ -127,9 +130,9 @@ export function MembersPage() {
                         <ConfirmButton
                           label="Remove"
                           ariaLabel={`Remove ${m.display_name}`}
-                          title={`Remove ${m.display_name}?`}
-                          message="They lose access to the tenant. Their agents in this tenant are disabled."
-                          confirmLabel="Remove member"
+                          title={`Remove ${m.display_name} from ${tenant.name}?`}
+                          message="They lose access to everything in this space at once. Their agents are paused, their links are turned off, and their app passwords stop working. Their files stay."
+                          confirmLabel={`Remove ${m.display_name}`}
                           danger
                           onConfirm={async () => {
                             await unwrap(
@@ -137,7 +140,7 @@ export function MembersPage() {
                                 params: { path: { tenant_id: tenant.id, user_id: m.user_id } },
                               }),
                             )
-                            setNotice(`${m.display_name} removed.`)
+                            toast(`Removed ${m.display_name} from ${tenant.name}.`)
                             members.reload()
                           }}
                         />
@@ -155,68 +158,115 @@ export function MembersPage() {
   )
 }
 
+/** The member roles a space can still take, from its plan: a personal space has room only for its owner. */
+function useRoomForMembers(tenantId: string) {
+  return useApi(
+    async () => {
+      const res = await unwrap(client.GET('/v1/tenants/{tenant_id}/limits', { params: { path: { tenant_id: tenantId } } }))
+      return res.limits.members === null || res.usage.members < res.limits.members
+    },
+    [tenantId],
+  )
+}
+
 export function InvitationsPage() {
   const { tenant } = useTenant()
-  const [email, setEmail] = useState('')
-  const [role, setRole] = useState<Schemas['CreateInvitationRequest']['role']>('member')
+  const { toast } = useToast()
+  const room = useRoomForMembers(tenant.id)
+  // A personal space is for one person: it takes guests, not members (the plan's member limit).
+  const membersAllowed = tenant.kind !== 'personal' && room.data !== false
+  const [emails, setEmails] = useState('')
+  const [role, setRole] = useState<Schemas['CreateInvitationRequest']['role']>(tenant.kind === 'personal' ? 'guest' : 'member')
   const [message, setMessage] = useState('')
-  const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<unknown>()
+  const [startTeam, setStartTeam] = useState(false)
   const invitations = usePagedApi(
     (cursor) => unwrap(client.GET('/v1/tenants/{tenant_id}/invitations', { params: { path: { tenant_id: tenant.id }, query: cursor ? { cursor } : {} } })),
     [tenant.id],
   )
+  const effectiveRole = membersAllowed ? role : 'guest'
 
   async function invite(e: FormEvent) {
     e.preventDefault()
     setError(undefined)
+    const list = emails
+      .split(/[\s,;]+/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+    const sent: string[] = []
     try {
-      await unwrap(
-        client.POST('/v1/tenants/{tenant_id}/invitations', {
-          params: { path: { tenant_id: tenant.id } },
-          body: { email: email.trim(), role, ...(message.trim() ? { message: message.trim() } : {}) },
-        }),
-      )
-      setNotice(`Invitation sent to ${email.trim()}.`)
-      setEmail('')
-      setMessage('')
-      invitations.reload()
+      for (const email of list) {
+        await unwrap(
+          client.POST('/v1/tenants/{tenant_id}/invitations', {
+            params: { path: { tenant_id: tenant.id } },
+            body: { email, role: effectiveRole, ...(message.trim() ? { message: message.trim() } : {}) },
+          }),
+        )
+        sent.push(email)
+      }
     } catch (err) {
       setError(err)
+    }
+    if (sent.length) {
+      toast(sent.length === 1 ? `Invitation sent to ${sent[0]}.` : `${sent.length} invitations sent.`)
+      setEmails(list.filter((x) => !sent.includes(x)).join(', '))
+      if (sent.length === list.length) setMessage('')
+      invitations.reload()
     }
   }
 
   return (
     <section aria-labelledby="inv-title">
       <h2 id="inv-title">Invitations</h2>
-      <form className="stack card" onSubmit={invite} aria-label="Invite someone">
+      <form className="stack card" onSubmit={invite} aria-label="Invite people">
         <div className="inline-form">
           <label className="grow">
-            Email
-            <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+            Emails
+            <input required value={emails} onChange={(e) => setEmails(e.target.value)} placeholder="name@example.com" aria-describedby="inv-emails-help" />
           </label>
           <label>
             Role
-            <select value={role} onChange={(e) => setRole(e.target.value as typeof role)}>
+            <select value={effectiveRole} onChange={(e) => setRole(e.target.value as typeof role)} aria-describedby="inv-role-help">
               <option value="guest">Guest</option>
-              <option value="member">Member</option>
-              <option value="admin">Admin</option>
+              {membersAllowed && <option value="member">Member</option>}
+              {membersAllowed && <option value="admin">Admin</option>}
             </select>
           </label>
         </div>
+        <p id="inv-emails-help" className="muted small">
+          One or more, separated by commas
+        </p>
+        <p id="inv-role-help" className="muted small">
+          {memberRoleLabels[effectiveRole]}: {memberRoleMeanings[effectiveRole]}
+        </p>
+        {!membersAllowed && (
+          <div className="note">
+            <p>
+              {tenant.kind === 'personal'
+                ? `${tenant.name} is a personal space, just for you. Invite people as guests to share items with them, or start a team space to work together.`
+                : `${tenant.name} has reached the member limit of its plan. Invite people as guests, or change the plan.`}
+            </p>
+            {tenant.kind === 'personal' && (
+              <button type="button" onClick={() => setStartTeam(true)}>
+                Start a team space
+              </button>
+            )}
+          </div>
+        )}
         <label>
           Message (optional)
           <textarea rows={2} value={message} onChange={(e) => setMessage(e.target.value)} />
         </label>
-        {!tenant.policy.allow_guests && role === 'guest' && <p className="error">Guests are off in the policy of this tenant.</p>}
-        <ErrorNote error={error} />
+        {!tenant.policy.allow_guests && effectiveRole === 'guest' && (
+          <p className="error">Guests are turned off in the sharing rules of this space.</p>
+        )}
+        <ErrorNote error={error} context={{ space: tenant.name }} />
         <div className="actions">
           <button type="submit" className="primary">
-            Send invitation
+            Send invitations
           </button>
         </div>
       </form>
-      <Notice text={notice} />
       <Loaded state={invitations}>
         {({ items }) => (
           <ul className="rows">
@@ -225,14 +275,16 @@ export function InvitationsPage() {
               <li key={i.id} className="row">
                 <span className="grow">
                   {i.email} <span className="badge">{memberRoleLabels[i.role]}</span>
-                  <span className="muted small"> - expires {formatDate(i.expires_at)}</span>
+                  <span className="muted small block">
+                    Invited, waiting. Ends {new Date(i.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}.
+                  </span>
                 </span>
                 <ConfirmButton
-                  label="Revoke"
-                  ariaLabel={`Revoke invitation of ${i.email}`}
-                  title="Revoke this invitation?"
+                  label="Cancel invitation"
+                  ariaLabel={`Cancel invitation: ${i.email}`}
+                  title="Cancel this invitation?"
                   message={`${i.email} can no longer join with it.`}
-                  confirmLabel="Revoke"
+                  confirmLabel="Cancel invitation"
                   danger
                   onConfirm={async () => {
                     await unwrap(
@@ -249,6 +301,7 @@ export function InvitationsPage() {
         )}
       </Loaded>
       <LoadMore state={invitations} />
+      {startTeam && <StartTeamDialog onClose={() => setStartTeam(false)} />}
     </section>
   )
 }
@@ -256,9 +309,9 @@ export function InvitationsPage() {
 export function PolicyPage() {
   const { tenant } = useTenant()
   const { reloadTenants } = useSession()
+  const { toast } = useToast()
   const [name, setName] = useState(tenant.name)
   const [policy, setPolicy] = useState<Schemas['TenantPolicy']>(tenant.policy)
-  const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<unknown>()
 
   async function save(e: FormEvent) {
@@ -266,8 +319,8 @@ export function PolicyPage() {
     setError(undefined)
     try {
       await unwrap(client.PATCH('/v1/tenants/{tenant_id}', { params: { path: { tenant_id: tenant.id } }, body: { name: name.trim(), policy } }))
-      setNotice('Policy saved.')
-      reloadTenants()
+      toast('Saved the sharing rules.')
+      await reloadTenants()
     } catch (err) {
       setError(err)
     }
@@ -282,20 +335,20 @@ export function PolicyPage() {
 
   return (
     <section aria-labelledby="policy-title">
-      <h2 id="policy-title">Policy</h2>
+      <h2 id="policy-title">Sharing rules</h2>
       <form className="stack card" onSubmit={save}>
         <label>
-          Tenant name
+          Space name
           <input required value={name} onChange={(e) => setName(e.target.value)} />
         </label>
         <fieldset className="stack">
           <legend>Sharing</legend>
-          {check('members_can_share', 'Members can share with others')}
-          {check('allow_guests', 'Allow guests (people outside the tenant)')}
-          {check('allow_share_links', 'Allow share links')}
-          {check('allow_edit_links', 'Allow share links that can edit', !policy.allow_share_links)}
+          {check('members_can_share', 'Members can share')}
+          {check('allow_guests', 'Allow guests (people outside this space)')}
+          {check('allow_share_links', 'Allow links')}
+          {check('allow_edit_links', 'Allow links that can edit', !policy.allow_share_links)}
           <label>
-            Share links expire after at most (days, empty for no limit)
+            Links end after at most (days, empty for no limit)
             <input
               type="number"
               min={1}
@@ -306,10 +359,9 @@ export function PolicyPage() {
           </label>
         </fieldset>
         <ErrorNote error={error} />
-        <Notice text={notice} />
         <div className="actions">
           <button type="submit" className="primary">
-            Save policy
+            Save
           </button>
         </div>
       </form>
@@ -339,7 +391,7 @@ export function LimitsPage() {
   )
   return (
     <section aria-labelledby="limits-title">
-      <h2 id="limits-title">Plan and limits</h2>
+      <h2 id="limits-title">Plan</h2>
       <Loaded state={limits}>
         {({ plan, limits: l, usage: u }) => (
           <div className="stack card">
@@ -355,13 +407,13 @@ export function LimitsPage() {
               <dt>Versions kept</dt>
               <dd>
                 {l.version_days === null ? 'Forever' : `${l.version_days} days`}
-                {l.version_count !== null && `, at most ${l.version_count} per file`}
+                {l.version_count !== null && `, at most ${l.version_count} per file`}. Named versions are kept forever.
               </dd>
               <dt>Trash kept</dt>
               <dd>{l.trash_days} days</dd>
               <dt>Admin restore</dt>
               <dd>{l.admin_restore_days ? `${l.admin_restore_days} days` : 'Not in this plan'}</dd>
-              <dt>Nodes</dt>
+              <dt>Items</dt>
               <dd>{u.nodes}</dd>
             </dl>
           </div>
@@ -375,7 +427,7 @@ export function AuditPage() {
   const { tenant } = useTenant()
   const [action, setAction] = useState('')
   const [filter, setFilter] = useState('')
-  // The audit log also comes as NDJSON (for export); the UI asks for JSON pages.
+  // The activity log also comes as NDJSON (for export); the UI asks for JSON pages.
   const audit = usePagedApi(
     async (cursor) =>
       (await unwrap(
@@ -387,50 +439,48 @@ export function AuditPage() {
   )
   return (
     <section aria-labelledby="audit-title">
-      <h2 id="audit-title">Audit log</h2>
+      <h2 id="audit-title">Activity log</h2>
       <form
         className="inline-form"
         onSubmit={(e) => {
           e.preventDefault()
-          setFilter(action.trim())
+          setFilter(action)
         }}
       >
         <label className="grow">
-          Action starts with
-          <input value={action} onChange={(e) => setAction(e.target.value)} placeholder="member." />
+          Show
+          <select value={action} onChange={(e) => setAction(e.target.value)}>
+            <option value="">Everything</option>
+            <option value="auth.">Sign-ins</option>
+            <option value="member.">Members</option>
+            <option value="invitation.">Invitations</option>
+            <option value="grant.">Access</option>
+            <option value="share_link.">Links</option>
+            <option value="agent.">Agents</option>
+            <option value="node.">Items</option>
+            <option value="version.">Versions</option>
+          </select>
         </label>
-        <button type="submit">Filter</button>
+        <button type="submit">Show</button>
       </form>
       <Loaded state={audit}>
         {({ items }) => (
           <>
             {items.length === 0 ? (
-              <p className="empty">No entries.</p>
+              <EmptyState title="No activity yet" text={`Changes in ${tenant.name} show up here.`} />
             ) : (
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th scope="col">When</th>
-                    <th scope="col">Action</th>
-                    <th scope="col">Who</th>
-                    <th scope="col" className="hide-narrow">
-                      Target
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((a) => (
-                    <tr key={a.id}>
-                      <td>{formatDate(a.at)}</td>
-                      <th scope="row">
-                        <code>{a.action}</code>
-                      </th>
-                      <td>{actorText(a.actor, a.on_behalf_of)}</td>
-                      <td className="hide-narrow">{a.target_type ? `${a.target_type} ${a.target_id ?? ''}` : '-'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <ul className="rows audit">
+                {items.map((a) => (
+                  <li key={a.id} className="row">
+                    <span className="grow">
+                      <Actor pair={a} /> {auditText(a)}
+                    </span>
+                    <span className="muted small" title={formatDate(a.at)}>
+                      {formatWhen(a.at)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             )}
           </>
         )}

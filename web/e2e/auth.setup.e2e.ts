@@ -10,7 +10,7 @@ for (const key of ['ann', 'ben'] as const) {
     await signIn(page, user)
     await expect(page).toHaveURL(/\/t\/[0-9a-f-]{36}\/files$/)
     await expect(page.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()
-    await expect(page.getByRole('combobox', { name: 'Tenant' })).toContainText(`${user.displayName}'s space (personal)`)
+    await expect(page.getByRole('combobox', { name: 'Space' })).toContainText(`${user.displayName}'s space (personal)`)
 
     // The session is a cookie with a CSRF partner; /v1/me answers for this user.
     const me = await api<{ user: { email: string; email_verified: boolean } }>(page, 'GET', '/v1/me')
@@ -25,11 +25,9 @@ for (const key of ['ann', 'ben'] as const) {
   })
 }
 
-// Known UI bug (web/src/app/session.tsx): on a cold load of a protected page, /v1/me and
-// /v1/tenants both answer 401. The first 401 goes to /signin?return_to=..., the second one runs
-// signInPath() on /signin, which drops return_to. The user lands on /signin and, after sign-in,
-// on the files page instead of the page they opened. Remove fixme when that is fixed.
-test.fixme('a protected page without a session keeps return_to on the way to sign-in', async ({ page }) => {
+// On a cold load of a protected page, /v1/me and /v1/tenants both answer 401; the second answer
+// must not drop return_to (web/src/app/session.tsx).
+test('a protected page without a session keeps return_to on the way to sign-in', async ({ page }) => {
   await page.goto('/account')
   await expect(page).toHaveURL(/\/signin\?return_to=%2Faccount$/)
 })

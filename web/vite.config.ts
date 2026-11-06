@@ -60,6 +60,8 @@ export default defineConfig(({ mode }) => {
         ? {}
         : {
             '/v1': toServer(),
+            // The MCP server: the address that "Connect an agent" shows is <origin>/mcp.
+            '/mcp': toServer(),
             '/healthz': toServer(),
             '/.well-known': toServer(),
             '/auth/callback': toServer({ rewrite: (path) => `/v1${path}` }),

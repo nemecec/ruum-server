@@ -1,5 +1,6 @@
 import { client, RuumApiError, unwrap, type Schemas } from '../../api/client'
 import { browser } from '../../app/browser'
+import { tenantPath } from '../../app/tenant'
 import type { UploadTarget } from '../../upload/upload'
 
 export type Node = Schemas['Node']
@@ -19,7 +20,9 @@ export async function loadAncestors(folder: Node): Promise<Node[]> {
   // A folder tree is not deep; the limit only stops a loop on bad data.
   for (let i = 0; i < 64 && cur.parent_id; i++) {
     try {
-      cur = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: cur.parent_id } } }))
+      cur = await unwrap(
+        client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: cur.parent_id }, header: { 'Ruum-Tenant': folder.tenant_id } } }),
+      )
     } catch (e) {
       if (isNoAccess(e)) break
       throw e
@@ -110,4 +113,66 @@ export async function previewNode(node: Node): Promise<void> {
     tab?.close()
     throw e
   }
+}
+
+/** What a bulk action did, and how to undo it. */
+export type Undoable = { done: Node[]; undo: () => Promise<void> }
+
+/**
+ * Moves nodes to the trash, one call each. Undo restores them (with a new name when the old one is
+ * taken). If one call fails, the nodes moved before it stay in the trash and the error is thrown.
+ */
+export async function trashNodes(nodes: Node[]): Promise<Undoable> {
+  const done: Node[] = []
+  for (const n of nodes) {
+    await unwrap(client.POST('/v1/nodes/{node_id}/trash', { params: { path: { node_id: n.id }, header: { 'Ruum-Tenant': n.tenant_id } } }))
+    done.push(n)
+  }
+  return {
+    done,
+    undo: async () => {
+      for (const n of done) {
+        await unwrap(
+          client.POST('/v1/nodes/{node_id}/restore', {
+            params: { path: { node_id: n.id }, header: { 'Ruum-Tenant': n.tenant_id } },
+            body: { on_conflict: 'rename' },
+          }),
+        )
+      }
+    },
+  }
+}
+
+/** Moves nodes into `target`. Undo moves each one back to the folder it came from. */
+export async function moveNodes(nodes: Node[], target: Node): Promise<Undoable> {
+  const done: Node[] = []
+  for (const n of nodes) {
+    if (n.parent_id === target.id) continue
+    await unwrap(
+      client.POST('/v1/nodes/{node_id}/move', {
+        params: { path: { node_id: n.id }, header: { 'Ruum-Tenant': n.tenant_id } },
+        body: { parent_id: target.id, on_conflict: 'fail' },
+      }),
+    )
+    done.push(n)
+  }
+  return {
+    done,
+    undo: async () => {
+      for (const n of done) {
+        if (!n.parent_id) continue
+        await unwrap(
+          client.POST('/v1/nodes/{node_id}/move', {
+            params: { path: { node_id: n.id }, header: { 'Ruum-Tenant': n.tenant_id } },
+            body: { parent_id: n.parent_id, on_conflict: 'rename' },
+          }),
+        )
+      }
+    },
+  }
+}
+
+/** The page of a shared item: a folder opens in the file browser, a file in its own page. */
+export function sharedItemPath(node: Node): string {
+  return node.kind === 'folder' ? tenantPath(node.tenant_id, 'files', node.id) : tenantPath(node.tenant_id, 'item', node.id)
 }

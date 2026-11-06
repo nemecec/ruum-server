@@ -6,6 +6,7 @@ import { browser } from '../app/browser'
 import { clientIdOfRequest, redirectUriOfRequest } from '../app/oauth'
 import { useSession } from '../app/useSession'
 import { roleLabels } from '../components/format'
+import { accessSummary } from './agents/status'
 import { ErrorNote, Loaded } from '../components/ui'
 import { ScopeFields } from './agents/ScopeFields'
 
@@ -48,7 +49,13 @@ export function OAuthConsentPage() {
   const [mode, setMode] = useState<'new' | 'existing'>('new')
   const [agentId, setAgentId] = useState('')
   const [agentName, setAgentName] = useState('')
-  const [scope, setScope] = useState<Schemas['AgentScope']>({ subtree: null, max_role: 'edit', expires_at: null })
+  // Defaults of journeys J5 step 3: only in a folder the person chooses, ending in 90 days.
+  const [scope, setScope] = useState<Schemas['AgentScope']>(() => ({
+    subtree: '',
+    max_role: 'edit',
+    expires_at: new Date(Date.now() + 90 * 86400_000).toISOString(),
+  }))
+  const [done, setDone] = useState(false)
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
 
@@ -60,13 +67,15 @@ export function OAuthConsentPage() {
   if (!request) {
     return (
       <main className="page narrow" id="main">
-        <h1>Authorization request missing</h1>
-        <p>Start the connection again from the application.</p>
+        <h1>This connection request has ended</h1>
+        <p>Start the connection again from the app.</p>
       </main>
     )
   }
 
-  const appName = oauthClient.data?.client_name ?? 'An application'
+  const appName = oauthClient.data?.client_name ?? 'An app'
+  const spaceName = tenants.find((t) => t.tenant.id === tenantId)?.tenant.name ?? 'your space'
+  const folderMissing = mode === 'new' && scope.subtree === ''
 
   async function answer(approve: boolean) {
     setBusy(true)
@@ -83,11 +92,21 @@ export function OAuthConsentPage() {
           }
         : { request, approve: false }
       const res = await unwrap(client.POST('/v1/oauth/consent', { body }))
+      if (approve) setDone(true)
       browser.assign(res.redirect_to)
     } catch (e) {
       setError(e)
       setBusy(false)
     }
+  }
+
+  if (done) {
+    return (
+      <main className="page narrow" id="main">
+        <h1>Connected</h1>
+        <p>You can go back to {appName}.</p>
+      </main>
+    )
   }
 
   function submit(e: FormEvent) {
@@ -97,11 +116,11 @@ export function OAuthConsentPage() {
 
   return (
     <main className="page narrow" id="main">
-      <h1>Connect {appName} to Ruum</h1>
+      <h1>{appName} wants to connect to Ruum</h1>
       <Loaded state={oauthClient}>
         {(c) => {
           if (!c) {
-            return <p className="muted">Ruum could not show the name of the application. Continue only if you started this.</p>
+            return <p className="warning" role="note">Ruum can't show the name of this app. Continue only if you started this.</p>
           }
           const from = hostOf(c.client_uri)
           const href = c.client_uri ? safeHref(c.client_uri) : undefined
@@ -113,7 +132,7 @@ export function OAuthConsentPage() {
           return (
             <div className="stack">
               <p className="warning" role="note">
-                The application chose its name and web address itself. Ruum did not check them (unverified).
+                Ruum can't check the name or address of this app. Continue only if you started this.
               </p>
               <p className="muted">
                 {from ? (
@@ -128,19 +147,19 @@ export function OAuthConsentPage() {
         }}
       </Loaded>
       <p>
-        {appName} will act as an agent for you, <strong>{me.user.display_name}</strong>. It gets at most the access you choose, and
-        never more than you have. You can disable it at any time on the Agents page.
+        It will act as an agent for you, <strong>{me.user.display_name}</strong>. It gets only the access you choose here, and never
+        more than you have. You can pause it at any time on the Agents page.
       </p>
       <form className="stack" onSubmit={submit}>
         <label>
-          Tenant
+          Space
           <select
             value={tenantId}
             onChange={(e) => {
               setTenantId(e.target.value)
               setAgentId('')
               // A folder of one tenant is not valid in another.
-              setScope((s) => ({ ...s, subtree: null }))
+              setScope((s) => ({ ...s, subtree: typeof s.subtree === 'string' ? '' : null }))
             }}
           >
             {tenants.map((t) => (
@@ -162,7 +181,8 @@ export function OAuthConsentPage() {
                 Agent name
                 <input value={agentName} placeholder={appName} onChange={(e) => setAgentName(e.target.value)} />
               </label>
-              <ScopeFields tenantId={tenantId} scope={scope} onChange={setScope} idPrefix="consent" />
+              <ScopeFields tenantId={tenantId} spaceName={spaceName} scope={scope} onChange={setScope} idPrefix="consent" />
+              {!folderMissing && <p className="note">{accessSummary(scope, null, spaceName)}.</p>}
             </div>
           )}
           <label className="check">
@@ -194,12 +214,13 @@ export function OAuthConsentPage() {
         <ErrorNote error={error} />
         <div className="actions">
           <button type="button" disabled={busy} onClick={() => answer(false)}>
-            Deny
+            Don't allow
           </button>
-          <button type="submit" className="primary" disabled={busy || (mode === 'existing' && !agentId)}>
+          <button type="submit" className="primary" disabled={busy || (mode === 'existing' && !agentId) || folderMissing}>
             Allow
           </button>
         </div>
+        {folderMissing && <p className="muted small">Choose a folder first, or choose Everywhere.</p>}
       </form>
     </main>
   )

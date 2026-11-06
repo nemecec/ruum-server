@@ -2,6 +2,10 @@
  * Reads `client_id` from the `request` value of `oauthAuthorize`, if it is a JWS (`a.b.c`).
  * The contract says only that `request` is signed and short-lived; the server checks it. If the UI
  * cannot read it, the screen still works, without the client's name.
+ *
+ * The server seals the checked parameters as `{ iss, aud, iat, exp, v: { client_id, redirect_uri, ... } }`
+ * (ruum-core `identity::tokens::Sealed`). The claims are read from `v`, and from the top level as
+ * a fallback.
  */
 export function clientIdOfRequest(request: string): string | null {
   return claimOfRequest(request, 'client_id')
@@ -21,6 +25,9 @@ function claimOfRequest(request: string, claim: string): string | null {
   try {
     const json = atob(part.replace(/-/g, '+').replace(/_/g, '/'))
     const payload = JSON.parse(json) as Record<string, unknown>
+    const sealed = payload.v
+    const inner = sealed && typeof sealed === 'object' ? (sealed as Record<string, unknown>)[claim] : undefined
+    if (typeof inner === 'string') return inner
     const value = payload[claim]
     return typeof value === 'string' ? value : null
   } catch {

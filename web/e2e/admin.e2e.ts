@@ -1,7 +1,8 @@
-// Tenant admin as Ann: a new team, its members, an invitation through Mailpit, and a role change.
+// Space settings as Ann: a new team space, its members, an invitation through Mailpit and the
+// accept page, and a role change.
 import { expect, test } from '@playwright/test'
 import { readRun, storageStatePath } from './support/env.ts'
-import { acceptInvitation, invite, signIn, uniqueName } from './support/app.ts'
+import { invite, signIn, toast, uniqueName } from './support/app.ts'
 
 test('a team: members, an invitation by mail, a new member and a role change', async ({ browser }) => {
   const { run, users } = readRun()
@@ -9,14 +10,23 @@ test('a team: members, an invitation by mail, a new member and a role change', a
 
   const annContext = await browser.newContext({ storageState: storageStatePath('ann') })
   const ann = await annContext.newPage()
-  await ann.goto('/account')
-  await expect(ann.getByRole('heading', { name: 'Account', level: 1 })).toBeVisible()
-  const start = ann.getByRole('region', { name: 'Start a team' })
+  await ann.goto('/')
+  await expect(ann.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()
+  // A personal space takes guests only, and points to a team space.
+  await invitePage(ann)
+  const form = ann.getByRole('form', { name: 'Invite people' })
+  await expect(form.getByLabel('Role').locator('option')).toHaveText(['Guest'])
+  await expect(form).toContainText('is a personal space, just for you')
+  // "Start a team space" in the space switcher (journeys J6 step 1).
+  await ann.getByRole('combobox', { name: 'Space' }).selectOption({ label: 'Start a team space...' })
+  const start = ann.getByRole('dialog', { name: 'Start a team space' })
   await start.getByLabel('Team name').fill(team)
-  await start.getByRole('button', { name: 'Create team' }).click()
-  await expect(ann.getByRole('heading', { name: `Admin: ${team}`, level: 1 })).toBeVisible()
-  await expect(ann.getByRole('combobox', { name: 'Tenant' })).toHaveValue(/[0-9a-f-]{36}/)
-  await expect(ann.getByRole('combobox', { name: 'Tenant' }).locator('option:checked')).toHaveText(`${team} (owner)`)
+  await start.getByRole('button', { name: 'Create team space' }).click()
+  await expect(toast(ann, `${team} is ready. Invite the people you work with.`)).toBeVisible()
+  await expect(ann.getByRole('heading', { name: `Space settings: ${team}`, level: 1 })).toBeVisible()
+  await expect(ann.getByRole('combobox', { name: 'Space' })).toHaveValue(/[0-9a-f-]{36}/)
+  await expect(ann.getByRole('combobox', { name: 'Space' }).locator('option:checked')).toHaveText(`${team} (owner)`)
+  await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Members' }).click()
 
   // Members: Ann alone, as the owner; she cannot change her own role.
   const members = ann.getByRole('region', { name: 'Members' })
@@ -30,17 +40,17 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   const link = await invite(ann, users.cara.email, 'Member')
   expect(new URL(link).origin).toBe(new URL(ann.url()).origin)
 
-  // Cara signs in and accepts.
+  // Cara opens the link of the mail without a session: sign-in, then back on the accept page.
   const caraContext = await browser.newContext()
   const cara = await caraContext.newPage()
-  await signIn(cara, users.cara)
-  await acceptInvitation(cara, link)
-  await cara.reload()
-  const option = cara.getByRole('combobox', { name: 'Tenant' }).getByRole('option', { name: `${team} (member)` })
-  await expect(option).toHaveCount(1)
-  await cara.getByRole('combobox', { name: 'Tenant' }).selectOption({ label: `${team} (member)` })
+  const url = new URL(link)
+  await signIn(cara, users.cara, url.pathname + url.search, { shell: false })
+  await expect(cara.getByRole('heading', { name: "You're invited to a space in Ruum" })).toBeVisible()
+  await cara.getByRole('button', { name: 'Join the space' }).click()
+  await expect(toast(cara, `You've joined ${team}.`)).toBeVisible()
   await expect(cara.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()
-  await expect(cara.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Admin' })).toHaveCount(0)
+  await expect(cara.getByRole('combobox', { name: 'Space' }).locator('option:checked')).toHaveText(`${team} (member)`)
+  await expect(cara.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Space settings' })).toHaveCount(0)
 
   // Ann sees Cara among the members, and no open invitation; she makes Cara an admin.
   await ann.reload()
@@ -50,34 +60,24 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   await expect(caraRow).toContainText(users.cara.displayName)
   await expect(caraRow.getByRole('combobox')).toHaveValue('member')
   await caraRow.getByRole('combobox').selectOption('admin')
-  await expect(ann.getByRole('status').filter({ hasText: `${users.cara.displayName} is now admin.` })).toBeVisible()
+  await expect(toast(ann, `${users.cara.displayName} is now admin.`)).toBeVisible()
   await expect(caraRow.getByRole('combobox')).toHaveValue('admin')
 
   // Cara now has the admin pages of the team.
   await cara.reload()
-  await expect(cara.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Admin' })).toBeVisible()
+  await expect(cara.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Space settings' })).toBeVisible()
 
-  // The audit log records the invitation and the role change.
-  await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Audit log' }).click()
-  await expect(ann.getByRole('region', { name: 'Audit log' })).toContainText(/invitation/i)
+  // The activity log records the invitation and the role change, in plain words.
+  await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Activity log' }).click()
+  const log = ann.getByRole('region', { name: 'Activity log' })
+  await expect(log).toContainText(/invited someone|accepted an invitation/)
+  await expect(log).not.toContainText('invitation.created')
 
   await annContext.close()
   await caraContext.close()
 })
 
-// Known UI gap: the invitation mail links to /invitations/accept?token=..., but the web UI has no
-// such route (it shows "not found"). The specs accept through the API instead (acceptInvitation).
-test.fixme('the invitation link opens an accept page in the web UI', async ({ browser }) => {
-  const { users } = readRun()
-  const annContext = await browser.newContext({ storageState: storageStatePath('ann') })
-  const ann = await annContext.newPage()
-  await ann.goto('/')
-  const link = await invite(ann, `nobody-${readRun().run}@example.test`, 'Guest')
-  const benContext = await browser.newContext({ storageState: storageStatePath('ben') })
-  const ben = await benContext.newPage()
-  await ben.goto(link)
-  await ben.getByRole('button', { name: /accept/i }).click()
-  await expect(ben.getByRole('combobox', { name: 'Tenant' })).toContainText(users.ann.displayName)
-  await annContext.close()
-  await benContext.close()
-})
+async function invitePage(page: import('@playwright/test').Page) {
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Space settings' }).click()
+  await page.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Invitations' }).click()
+}

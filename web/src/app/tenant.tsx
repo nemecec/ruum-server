@@ -5,6 +5,8 @@ export type TenantInfo = {
   tenant: Schemas['Tenant']
   role: Schemas['MemberRole']
   isAdmin: boolean
+  /** False for a space that is not in the person's list (only shared items of it are visible). */
+  listed?: boolean
 }
 
 export const TenantContext = createContext<TenantInfo | null>(null)

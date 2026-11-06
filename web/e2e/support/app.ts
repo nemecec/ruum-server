@@ -11,7 +11,7 @@ import { env, type TestUser } from './env.ts'
  * Zitadel login UI (login name, password, skip the 2-factor prompt), `loginCallback` and back to the
  * UI. Ends on the files page of the user's home tenant.
  */
-export async function signIn(page: Page, user: TestUser, returnTo = '/'): Promise<void> {
+export async function signIn(page: Page, user: TestUser, returnTo = '/', opts: { shell?: boolean } = {}): Promise<void> {
   await page.goto(returnTo)
   await expect(page.getByRole('heading', { name: 'Sign in to Ruum' })).toBeVisible()
   // The buttons pass an `idp` hint that the server does not send to Zitadel yet (docs/STATUS.md),
@@ -33,7 +33,12 @@ export async function signIn(page: Page, user: TestUser, returnTo = '/'): Promis
     page.waitForURL((u) => u.origin === home, { timeout: 15_000 }).catch(() => {}),
   ])
   await page.waitForURL((u) => u.origin === home && !u.pathname.startsWith('/signin'), { timeout: 15_000 })
-  await expect(page.getByRole('link', { name: user.displayName })).toBeVisible()
+  if (opts.shell !== false) await expect(page.getByRole('link', { name: user.displayName })).toBeVisible()
+}
+
+/** A toast (or a status message in a dialog) with this text; the newest one when there are several. */
+export function toast(page: Page, text: string | RegExp) {
+  return page.getByRole('status').filter({ hasText: text }).last()
 }
 
 /** The tenant ID in the current URL (`/t/<tenant>/...`). */
@@ -126,16 +131,16 @@ export function uniqueName(prefix: string, run: string): string {
   return `${prefix} ${run}-${crypto.randomBytes(2).toString('hex')}`
 }
 
-/** Invites `email` on Admin > Invitations of the page's current tenant; returns the accept URL from Mailpit. */
+/** Invites `email` on Space settings > Invitations of the page's current space; returns the accept URL from Mailpit. */
 export async function invite(page: Page, email: string, role: 'Guest' | 'Member' | 'Admin'): Promise<string> {
-  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Admin' }).click()
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Space settings' }).click()
   await page.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Invitations' }).click()
-  const form = page.getByRole('form', { name: 'Invite someone' })
-  await form.getByLabel('Email').fill(email)
+  const form = page.getByRole('form', { name: 'Invite people' })
+  await form.getByLabel('Emails').fill(email)
   await form.getByLabel('Role').selectOption({ label: role })
   await form.getByLabel('Message (optional)').fill('Welcome to the e2e run.')
-  await form.getByRole('button', { name: 'Send invitation' }).click()
-  await expect(page.getByRole('status').filter({ hasText: `Invitation sent to ${email}.` })).toBeVisible()
+  await form.getByRole('button', { name: 'Send invitations' }).click()
+  await expect(toast(page, `Invitation sent to ${email}.`)).toBeVisible()
   await expect(page.getByRole('listitem').filter({ hasText: email })).toContainText(role)
 
   const mail = await waitForMail(email)
@@ -146,13 +151,15 @@ export async function invite(page: Page, email: string, role: 'Guest' | 'Member'
 }
 
 /**
- * Accepts an invitation as the signed-in user of `page`. The link of the mail opens a page that the
- * web UI does not have yet (a gap, see docs/TESTING.md), so the token goes to acceptInvitation
- * from the page, as that page would send it.
+ * Accepts an invitation as the signed-in user of `page`: the link of the mail opens the accept page
+ * of the web UI, and "Join the space" joins. Ends on the files of the space.
  */
 export async function acceptInvitation(page: Page, link: string): Promise<void> {
   const url = new URL(link)
-  expect(url.origin).toBe(new URL(page.url()).origin)
-  const res = await api(page, 'POST', '/v1/invitations/accept', { body: { token: url.searchParams.get('token') } })
-  expect(res.status, JSON.stringify(res.body)).toBe(200)
+  expect(url.origin).toBe(new URL(env.webUrl).origin)
+  await page.goto(url.pathname + url.search)
+  await expect(page.getByRole('heading', { name: "You're invited to a space in Ruum" })).toBeVisible()
+  await page.getByRole('button', { name: 'Join the space' }).click()
+  await expect(toast(page, /^You've joined /)).toBeVisible()
+  await page.waitForURL(/\/t\/[0-9a-f-]{36}\/files$/)
 }

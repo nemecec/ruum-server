@@ -29,6 +29,8 @@ type Ctx<P extends keyof paths, M extends Method> = {
   body: Body<P, M>
   tenant: string
   request: Request
+  /** The share link of a link bearer (`Authorization: Bearer mocklink.<id>`). */
+  link?: Schemas['ShareLink']
 }
 
 /** An error answer with the standard error body. Throw it from a resolver. */
@@ -45,7 +47,13 @@ class Fail {
 
 const notFound = (what: string) => new Fail(404, 'not_found', `${what} not found.`)
 
-type Options = { status?: number; public?: boolean; rawBody?: boolean }
+type Options = {
+  status?: number
+  public?: boolean
+  rawBody?: boolean
+  /** The bearer of a share link may call it (node, children and content-url reads). */
+  link?: boolean
+}
 
 /** Latency of the mock API in the browser, so loading states are visible. Off in tests. */
 let latencyMs = 0
@@ -93,7 +101,14 @@ function route<P extends keyof paths, M extends Method>(
   return http[method](mswPath, async ({ request, params }) => {
     if (latencyMs) await new Promise((r) => setTimeout(r, latencyMs))
     try {
-      if (!options.public && !db.signedIn) throw new Fail(401, 'unauthenticated', 'Sign in first.')
+      // A share link's access token from resolveShareLink: only the reads of the link's subtree.
+      const auth = request.headers.get('Authorization') ?? ''
+      const linkId = auth.startsWith('Bearer mocklink.') ? auth.slice('Bearer mocklink.'.length) : null
+      const link = linkId ? db.shareLinks.find((l) => l.id === linkId && !l.revoked_at) : undefined
+      if (linkId) {
+        if (!link) throw new Fail(401, 'unauthenticated', 'The link token does not work.')
+        if (!options.link) throw new Fail(403, 'user_required', 'Share links cannot call this operation.')
+      } else if (!options.public && !db.signedIn) throw new Fail(401, 'unauthenticated', 'Sign in first.')
       let body: unknown = undefined
       if (!options.rawBody && method !== 'get' && method !== 'delete') {
         const text = await request.clone().text()
@@ -101,7 +116,7 @@ function route<P extends keyof paths, M extends Method>(
       }
       // Cookie sessions: a state-changing request must send `Ruum-Csrf` with the value of the cookie
       // `ruum_csrf` (double submit).
-      if (method !== 'get' && !options.public) {
+      if (method !== 'get' && !options.public && !link) {
         const csrf = cookie('ruum_csrf')
         if (!csrf || request.headers.get('Ruum-Csrf') !== csrf) {
           contractViolations.push(`${method.toUpperCase()} ${String(path)}: Ruum-Csrf is missing or wrong.`)
@@ -119,6 +134,7 @@ function route<P extends keyof paths, M extends Method>(
         body: body as Body<P, M>,
         tenant: request.headers.get('Ruum-Tenant') ?? '',
         request,
+        link,
       })
       if (result === undefined) return new HttpResponse(null, { status: 204 })
       return HttpResponse.json(result as never, { status: options.status ?? 200 })
@@ -155,6 +171,15 @@ function findNode(id: string, tenant: string): Schemas['Node'] {
   const n = db.nodes.find((x) => x.id === id && x.tenant_id === tenant && !db.hidden.has(x.id))
   if (!n) throw notFound('Node')
   return n
+}
+
+/** For a link bearer: the node must be the link's node or inside it. */
+function checkLink(link: Schemas['ShareLink'] | undefined, n: Schemas['Node']) {
+  if (!link) return
+  for (let cur: Schemas['Node'] | undefined = n; cur; cur = db.nodes.find((x) => x.id === cur!.parent_id)) {
+    if (cur.id === link.node_id) return
+  }
+  throw notFound('Node')
 }
 
 function membership(tenant: string) {
@@ -417,7 +442,7 @@ export const handlers: HttpHandler[] = [
       db.tenants.push({ tenant, role: 'owner' })
       db.nodes.push({ ...db.nodes.find((n) => n.id === ids.personalRoot)!, id: root, tenant_id: id })
       db.members.push({ tenant_id: id, user_id: ids.ada, email: db.user.email, display_name: db.user.display_name, role: 'owner', joined_at: now() })
-      db.limits[id] = { ...db.limits[ids.personal], usage: { storage_bytes: 0, nodes: 1, agents: 0, members: 1 } }
+      db.limits[id] = { ...db.limits[ids.team], usage: { storage_bytes: 0, nodes: 1, agents: 0, members: 1 } }
       return tenant
     },
     { status: 201 },
@@ -480,6 +505,27 @@ export const handlers: HttpHandler[] = [
   route('delete', '/v1/tenants/{tenant_id}/invitations/{invitation_id}', ({ params }) => {
     requireAdmin(params.tenant_id)
     db.invitations = db.invitations.filter((i) => i.id !== params.invitation_id)
+  }),
+  route('post', '/v1/invitations/accept', ({ body }) => {
+    if (!db.invitationTokens.has(body.token)) throw notFound('Invitation')
+    db.invitationTokens.delete(body.token)
+    const id = newId()
+    const root = newId()
+    const tenant: Schemas['Tenant'] = {
+      id,
+      name: 'Lovelace Lab',
+      kind: 'team',
+      plan: 'team',
+      region: 'hel1',
+      root_node_id: root,
+      policy: { allow_share_links: true, allow_edit_links: true, share_link_max_days: null, allow_guests: true, members_can_share: true },
+      created_at: now(),
+    }
+    db.tenants.push({ tenant, role: 'member' })
+    db.nodes.push({ ...db.nodes.find((n) => n.id === ids.teamRoot)!, id: root, tenant_id: id, my_role: 'manage' })
+    const member: Schemas['Member'] = { tenant_id: id, user_id: ids.ada, email: db.user.email, display_name: db.user.display_name, role: 'member', joined_at: now() }
+    db.members.push(member)
+    return member
   }),
   route('get', '/v1/tenants/{tenant_id}/limits', ({ params }) => {
     membership(params.tenant_id)
@@ -600,11 +646,16 @@ export const handlers: HttpHandler[] = [
       type: j.type,
       reason,
     })
-    // The mock treats a purge as irreversible and everything else as revertible.
-    const reverted = entries.filter((j) => j.type !== 'node.purged').map((j) => item(j, null))
-    const skipped = entries.filter((j) => j.type === 'node.purged').map((j) => item(j, 'irreversible'))
+    // The mock treats a purge as irreversible, an entry undone before as changed later (the undo
+    // was a later change), and everything else as revertible. Like the server, the journal keeps
+    // the entries: the activity still lists them.
+    const undone = (j: Schemas['JournalEntry']) => db.undoneSeqs.has(j.seq)
+    const reverted = entries.filter((j) => j.type !== 'node.purged' && !undone(j)).map((j) => item(j, null))
+    const skipped = entries
+      .filter((j) => j.type === 'node.purged' || undone(j))
+      .map((j) => item(j, j.type === 'node.purged' ? 'irreversible' : 'changed_later'))
     if (body.dry_run) return { dry_run: true, reverted, skipped, change: null }
-    db.journal = db.journal.filter((j) => !reverted.some((r) => r.seq === j.seq))
+    for (const r of reverted) db.undoneSeqs.add(r.seq)
     return { dry_run: false, reverted, skipped, change: change() }
   }),
   route('get', '/v1/oauth/clients/{client_id}', ({ params }) => {
@@ -674,21 +725,37 @@ export const handlers: HttpHandler[] = [
     },
     { status: 201 },
   ),
-  route('get', '/v1/nodes/{node_id}', ({ params, tenant }) => findNode(params.node_id, tenant)),
+  route(
+    'get',
+    '/v1/nodes/{node_id}',
+    ({ params, tenant, link }) => {
+      const n = findNode(params.node_id, tenant)
+      checkLink(link, n)
+      return link ? { ...n, my_role: link.role, my_can_share: false } : n
+    },
+    { link: true },
+  ),
   route('delete', '/v1/nodes/{node_id}', ({ params, tenant }) => {
     const n = findNode(params.node_id, tenant)
     if (!n.trashed_at) throw new Fail(409, 'conflict', 'Move the node to the trash first.')
     db.nodes = db.nodes.filter((x) => !isInside(x.id, n.id, tenant))
     return { change: record('node.purged', n.id, tenant) }
   }),
-  route('get', '/v1/nodes/{node_id}/children', ({ params, tenant, query }) => {
-    const parent = findNode(params.node_id, tenant)
-    const items = db.nodes
-      .filter((n) => n.tenant_id === tenant && n.parent_id === parent.id && !n.trashed_at && !db.hidden.has(n.id))
-      .filter((n) => !query.get('kind') || n.kind === query.get('kind'))
-      .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'folder' ? -1 : 1))
-    return page(items, query)
-  }),
+  route(
+    'get',
+    '/v1/nodes/{node_id}/children',
+    ({ params, tenant, query, link }) => {
+      const parent = findNode(params.node_id, tenant)
+      checkLink(link, parent)
+      const items = db.nodes
+        .filter((n) => n.tenant_id === tenant && n.parent_id === parent.id && !n.trashed_at && !db.hidden.has(n.id))
+        .filter((n) => !query.get('kind') || n.kind === query.get('kind'))
+        .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'folder' ? -1 : 1))
+        .map((n) => (link ? { ...n, my_role: link.role, my_can_share: false } : n))
+      return page(items, query)
+    },
+    { link: true },
+  ),
   route('post', '/v1/nodes/{node_id}/rename', ({ params, body, tenant }) => {
     const n = findNode(params.node_id, tenant)
     if (!body.name.trim() || /[/\\]/.test(body.name)) throw new Fail(422, 'validation_failed', 'Names cannot be empty or contain slashes.')
@@ -845,8 +912,9 @@ export const handlers: HttpHandler[] = [
     u.status = 'completed'
     return { node: n, version, change: record('version.created', n.id, tenant) }
   }),
-  route('get', '/v1/nodes/{node_id}/content-url', ({ params, query, tenant }) => {
+  route('get', '/v1/nodes/{node_id}/content-url', ({ params, query, tenant, link }) => {
     const n = findNode(params.node_id, tenant)
+    checkLink(link, n)
     const versionId = query.get('version') ?? n.head_version
     if (!versionId) throw notFound('Content')
     const text = db.contents.get(versionId) ?? ''
@@ -855,13 +923,19 @@ export const handlers: HttpHandler[] = [
       expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
       version_id: versionId,
     }
-  }),
+  }, { link: true }),
   route('get', '/v1/nodes/{node_id}/versions', ({ params, tenant, query }) => {
     findNode(params.node_id, tenant)
     return page(
       db.versions.filter((v) => v.node_id === params.node_id).sort((a, b) => b.created_at.localeCompare(a.created_at)),
       query,
     )
+  }),
+  route('get', '/v1/nodes/{node_id}/versions/{version_id}', ({ params, tenant }) => {
+    findNode(params.node_id, tenant)
+    const v = db.versions.find((x) => x.id === params.version_id && x.node_id === params.node_id)
+    if (!v) throw notFound('Version')
+    return v
   }),
   route('post', '/v1/nodes/{node_id}/versions/{version_id}/restore', ({ params, tenant }) => {
     const n = findNode(params.node_id, tenant)
@@ -988,13 +1062,16 @@ export const handlers: HttpHandler[] = [
       const policy = membership(tenant).tenant.policy
       if (!policy.allow_share_links) throw new Fail(403, 'permission_denied', 'Share links are off in this tenant.')
       if (body.role === 'edit' && !policy.allow_edit_links) throw new Fail(403, 'permission_denied', 'Edit links are off in this tenant.')
-      const token = newId().replace(/-/g, '')
+      const token = `ruum_link_${secretChars(32)}`
+      const id = newId()
+      db.linkSecrets.set(token, { linkId: id, password: body.password })
       const share_link: Schemas['ShareLink'] = {
-        id: newId(),
+        id,
         node_id: n.id,
         role: body.role,
         token,
-        url: `${typeof location === 'undefined' ? 'https://ruum.localhost' : location.origin}/s/${token}`,
+        // As the server: the token is in the fragment, so it never reaches a server log.
+        url: `${typeof location === 'undefined' ? 'https://ruum.localhost' : location.origin}/s#${token}`,
         expires_at: body.expires_at ?? null,
         has_password: Boolean(body.password),
         created_by: byUser(),
@@ -1012,6 +1089,25 @@ export const handlers: HttpHandler[] = [
     l.revoked_at = now()
     return { change: record('share_link.revoked', l.node_id, tenant) }
   }),
+  route(
+    'post',
+    '/v1/share-links/resolve',
+    ({ body }) => {
+      const secret = db.linkSecrets.get(body.token)
+      const link = secret && db.shareLinks.find((l) => l.id === secret.linkId && !l.revoked_at)
+      if (!secret || !link || (link.expires_at && link.expires_at < now())) throw notFound('Share link')
+      if (link.has_password && body.password !== secret.password) throw new Fail(401, 'unauthenticated', 'The password is wrong.')
+      const node = db.nodes.find((n) => n.id === link.node_id)!
+      return {
+        tenant_id: node.tenant_id,
+        node: { ...node, my_role: link.role, my_can_share: false },
+        role: link.role,
+        access_token: `mocklink.${link.id}`,
+        expires_in: 3600,
+      }
+    },
+    { public: true },
+  ),
   // Across all tenants of the user; the operation takes no Ruum-Tenant header. Newest first.
   route('get', '/v1/shared-with-me', ({ query }) =>
     page([...db.shared].sort((a, b) => b.shared_at.localeCompare(a.shared_at)), query),

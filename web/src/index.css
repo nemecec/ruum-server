@@ -2,37 +2,67 @@
 
 :root {
   color-scheme: light dark;
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', sans-serif;
   line-height: 1.5;
-  --fg: #1f2328;
+  /* Tokens of docs/ux/design-system.md section 2.1 (light). */
+  --fg: #24211c;
   --bg: #ffffff;
-  --bg-soft: #f6f8fa;
-  --border: #d1d9e0;
-  --muted: #59636e;
-  --accent: #0b5cd5;
+  --canvas: #faf8f4;
+  --bg-soft: #f2efe9;
+  --border: #e0dbd2;
+  --border-control: #8a8377;
+  --muted: #5c564c;
+  --accent: #1d5c57;
+  --accent-hover: #164844;
   --accent-fg: #ffffff;
-  --danger: #c4231c;
-  --ok: #1a7f37;
-  --warn: #9a6700;
-  --focus: #0b5cd5;
-  --selected: #ddf4ff;
+  --accent-soft: #e2eeeb;
+  --link: #1d5c57;
+  --danger: #a3301c;
+  --danger-fg: #ffffff;
+  --danger-soft: #f7e6e1;
+  --ok: #2b6439;
+  --ok-soft: #e4efe5;
+  --warn: #7f5300;
+  --warn-soft: #faefd8;
+  --agent: #8a4718;
+  --agent-soft: #f5e7da;
+  --focus: #1d5c57;
+  --selected: #e2eeeb;
   --radius: 6px;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --fg: #e6edf3;
-    --bg: #0d1117;
-    --bg-soft: #151b23;
-    --border: #3d444d;
-    --muted: #9198a1;
-    --accent: #4493f8;
-    --accent-fg: #0d1117;
-    --danger: #f85149;
-    --ok: #3fb950;
-    --warn: #d29922;
-    --focus: #4493f8;
-    --selected: #1f2f45;
+    --fg: #ede9e2;
+    --bg: #1e1c19;
+    --canvas: #161513;
+    --bg-soft: #121110;
+    --border: #37332d;
+    --border-control: #7d766a;
+    --muted: #aba497;
+    --accent: #72c2b9;
+    --accent-hover: #8fd1c9;
+    --accent-fg: #0e1d1c;
+    --accent-soft: #1e3431;
+    --link: #82cbc2;
+    --danger: #f08b74;
+    --danger-fg: #1a0c08;
+    --danger-soft: #3b201a;
+    --ok: #82c291;
+    --ok-soft: #1d2e21;
+    --warn: #e2b455;
+    --warn-soft: #33280f;
+    --agent: #e9a672;
+    --agent-soft: #3a2a1d;
+    --focus: #72c2b9;
+    --selected: #1e3431;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
   }
 }
 
@@ -43,7 +73,7 @@
 body {
   margin: 0;
   color: var(--fg);
-  background: var(--bg);
+  background: var(--canvas);
 }
 
 h1 {
@@ -60,7 +90,7 @@ h3 {
 }
 
 a {
-  color: var(--accent);
+  color: var(--link);
 }
 
 :focus-visible {
@@ -165,10 +195,10 @@ button.danger {
   color: var(--danger);
 }
 button.primary.danger,
-.actions button.danger:last-child {
+.dialog .actions button.danger:last-child {
   background: var(--danger);
   border-color: var(--danger);
-  color: var(--accent-fg);
+  color: var(--danger-fg);
 }
 button.link {
   border: 0;
@@ -201,7 +231,7 @@ textarea {
   min-height: 2.25rem;
   margin-top: 0.25rem;
   padding: 0.35rem 0.5rem;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   border-radius: var(--radius);
   background: var(--bg);
 }
@@ -278,6 +308,7 @@ legend {
   border-radius: var(--radius);
   padding: 1rem;
   margin-bottom: 1rem;
+  background: var(--bg);
 }
 
 /* Pages */
@@ -452,14 +483,14 @@ legend {
 }
 .kind {
   flex: none;
-  width: 1rem;
-  height: 0.8rem;
-  border: 1.5px solid var(--muted);
-  border-radius: 2px;
+  display: inline-flex;
+  color: var(--muted);
 }
 .kind-folder {
-  background: var(--muted);
-  border-radius: 1px 4px 2px 2px;
+  color: var(--accent);
+}
+.glyph {
+  display: block;
 }
 
 .rows {
@@ -501,6 +532,7 @@ legend {
   border-radius: var(--radius);
   padding: 1rem;
   align-self: start;
+  background: var(--bg);
 }
 .panel-head {
   display: flex;
@@ -618,16 +650,33 @@ legend {
   font-weight: 600;
 }
 
-/* Uploads */
+/* Uploads: the panel at the bottom right of every page (design-system 4.5) */
 
-.uploads {
-  margin: 0 0 1rem;
+.upload-panel {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 20;
+  width: min(22rem, calc(100vw - 2rem));
+  max-height: min(24rem, 60vh);
+  overflow: auto;
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--bg-soft);
+  background: var(--bg);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.18);
 }
-.uploads ul {
+.upload-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.upload-panel-head h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.upload-panel ul {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -764,4 +813,258 @@ legend {
 .table select {
   width: auto;
   margin-top: 0;
+}
+
+/* Toasts (design-system 4.13) */
+
+.toasts {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  z-index: 30;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(32rem, calc(100vw - 2rem));
+  pointer-events: none;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.5rem 0.5rem 0.9rem;
+  border-radius: var(--radius);
+  background: var(--fg);
+  color: var(--canvas);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.2);
+  pointer-events: auto;
+}
+.toast p {
+  flex: 1;
+  margin: 0;
+}
+.toast button {
+  background: transparent;
+  color: inherit;
+  border-color: currentColor;
+  min-height: 2rem;
+}
+.toast button.icon {
+  border-color: transparent;
+}
+.toast-error {
+  background: var(--danger);
+  color: var(--danger-fg);
+}
+
+/* Notes, errors and empty states */
+
+.note {
+  padding: 0.6rem 0.8rem;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+.note p {
+  margin: 0 0 0.5rem;
+}
+.note p:last-child {
+  margin: 0;
+}
+.warning {
+  padding: 0.6rem 0.8rem;
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+}
+.error-note {
+  margin: 0.25rem 0;
+}
+.error-note .error {
+  margin: 0;
+}
+.error-note pre {
+  white-space: pre-wrap;
+  margin: 0.25rem 0 0;
+}
+.empty-state {
+  padding: 2rem 1rem;
+  text-align: center;
+}
+.empty-title {
+  margin: 0 0 0.25rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+.actions.center {
+  justify-content: center;
+}
+.block {
+  display: block;
+}
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+.notice {
+  margin: 0;
+}
+
+/* Agents */
+
+.agent-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--agent);
+}
+.agent-name a {
+  color: inherit;
+}
+.agent-glyph {
+  flex: none;
+}
+.row.undone .grow {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+.row.undone .badge {
+  text-decoration: none;
+}
+.steps {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+/* File list: selection, drop zone, the Changed column */
+
+.check-cell {
+  width: 2rem;
+}
+.check-cell input {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+.changed-by {
+  display: block;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.selection-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+.drop-zone {
+  border-radius: var(--radius);
+  outline: 2px dashed transparent;
+  outline-offset: 4px;
+}
+.drop-zone.active {
+  outline-color: var(--accent);
+  background: var(--accent-soft);
+}
+.drop-hint {
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+.table tr.drop {
+  outline: 2px dashed var(--accent);
+}
+.welcome ul {
+  margin: 0 0 0.75rem;
+  padding-left: 1.25rem;
+}
+.picker-item {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  border: 0;
+  background: none;
+  min-height: 2.25rem;
+  text-align: left;
+}
+.picker-item .glyph {
+  color: var(--accent);
+}
+.picker li {
+  padding: 0 0.2rem;
+}
+fieldset.plain {
+  border: 0;
+  padding: 0;
+}
+.narrow-body {
+  max-width: 40rem;
+}
+.diff-values {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin: 0.15rem 0 0.4rem;
+}
+.dialog.full {
+  width: min(64rem, calc(100vw - 2rem));
+  height: min(48rem, calc(100vh - 2rem));
+}
+.audit .row {
+  align-items: baseline;
+}
+
+@media (max-width: 640px) {
+  /* The details panel is a sheet over the list on the phone, so it is always in view. */
+  .files-aside {
+    position: fixed;
+    inset: auto 0 0 0;
+    z-index: 15;
+    max-height: 85vh;
+    overflow: auto;
+    border-radius: var(--radius) var(--radius) 0 0;
+    box-shadow: 0 -6px 24px rgb(0 0 0 / 0.25);
+  }
+  .dialog.full {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100vh;
+    max-height: 100vh;
+    margin: 0;
+    border-radius: 0;
+  }
+  .upload-panel {
+    right: 0.5rem;
+    left: 0.5rem;
+    bottom: 0.5rem;
+    width: auto;
+  }
+}
+
+.offline {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  margin: 0;
+  padding: 0.5rem 1rem;
+  text-align: center;
+  background: var(--warn-soft);
+  color: var(--fg);
+  border-bottom: 1px solid var(--warn);
+}
+
+.table button.sort {
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-weight: 600;
+  color: inherit;
 }

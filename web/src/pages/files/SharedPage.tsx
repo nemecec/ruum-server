@@ -2,16 +2,16 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import type { Schemas } from '../../api/client'
 import { usePagedApi } from '../../api/usePagedApi'
-import { tenantPath } from '../../app/tenant'
+import { actorLabel, useNames } from '../../app/useNames'
 import { useSession } from '../../app/useSession'
-import { actorText, formatDate, roleLabels } from '../../components/format'
-import { ErrorNote, Loaded, LoadMore } from '../../components/ui'
-import { downloadNode, listSharedWithMe } from './api'
+import { formatDate, formatWhen, roleLabels } from '../../components/format'
+import { EmptyState, ErrorNote, FileIcon, FolderIcon, Loaded, LoadMore } from '../../components/ui'
+import { downloadNode, listSharedWithMe, sharedItemPath } from './api'
 
 /**
- * "Shared with me": the nodes that other people shared with the user, across all tenants where the
- * user is a member or guest. Each item belongs to its own tenant (`node.tenant_id`): its link and
- * its download use that tenant, not the tenant of the page.
+ * "Shared with me": the items that other people shared with the person, across all spaces where
+ * they are a member or guest. Each item belongs to its own space (`node.tenant_id`): its link and
+ * its download use that space, not the space of the page.
  */
 export function SharedPage() {
   const shared = usePagedApi(listSharedWithMe, [])
@@ -20,7 +20,11 @@ export function SharedPage() {
       <h1>Shared with me</h1>
       <Loaded state={shared}>
         {({ items }) =>
-          items.length === 0 ? <p className="empty">Nothing is shared with you yet.</p> : <SharedTable items={items} showTenant />
+          items.length === 0 ? (
+            <EmptyState title="Nothing shared with you yet" text="When someone shares a file or folder with you, it shows up here." />
+          ) : (
+            <SharedTable items={items} showSpace />
+          )
         }
       </Loaded>
       <LoadMore state={shared} />
@@ -28,11 +32,12 @@ export function SharedPage() {
   )
 }
 
-/** A table of shared items. Folders link to the file browser of their own tenant. */
-export function SharedTable({ items, showTenant }: { items: Schemas['SharedItem'][]; showTenant?: boolean }) {
+/** A table of shared items. Every item links to a page that works with the person's grant. */
+export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem'][]; showSpace?: boolean }) {
   const { tenants } = useSession()
+  const names = useNames()
   const [error, setError] = useState<unknown>()
-  const tenantName = (id: string) => tenants.find((t) => t.tenant.id === id)?.tenant.name
+  const spaceName = (id: string) => tenants.find((t) => t.tenant.id === id)?.tenant.name ?? 'A shared space'
   return (
     <>
       <ErrorNote error={error} />
@@ -41,7 +46,7 @@ export function SharedTable({ items, showTenant }: { items: Schemas['SharedItem'
         <thead>
           <tr>
             <th scope="col">Name</th>
-            {showTenant && <th scope="col">Tenant</th>}
+            {showSpace && <th scope="col">Space</th>}
             <th scope="col">Your access</th>
             <th scope="col" className="hide-narrow">
               Shared by
@@ -56,17 +61,22 @@ export function SharedTable({ items, showTenant }: { items: Schemas['SharedItem'
         </thead>
         <tbody>
           {items.map(({ node, role, shared_by, shared_at }) => {
-            // Guest tenants are in the user's tenant list too; a link only works for a listed one.
-            const known = tenantName(node.tenant_id) !== undefined
+            const by = actorLabel(names, shared_by.actor, shared_by.on_behalf_of)
+            const sharer = by.text === 'Someone' ? `Someone in ${spaceName(node.tenant_id)}` : by.text
             return (
               <tr key={node.id}>
                 <th scope="row">
-                  {node.kind === 'folder' && known ? <Link to={tenantPath(node.tenant_id, 'files', node.id)}>{node.name}</Link> : node.name}
+                  <span className="name-cell">
+                    <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon />}</span>
+                    <Link to={sharedItemPath(node)}>{node.name}</Link>
+                  </span>
                 </th>
-                {showTenant && <td>{tenantName(node.tenant_id) ?? 'Another tenant'}</td>}
+                {showSpace && <td>{spaceName(node.tenant_id)}</td>}
                 <td>{roleLabels[role]}</td>
-                <td className="hide-narrow">{actorText(shared_by.actor, shared_by.on_behalf_of)}</td>
-                <td className="hide-narrow">{formatDate(shared_at)}</td>
+                <td className="hide-narrow">{sharer}</td>
+                <td className="hide-narrow">
+                  <span title={formatDate(shared_at)}>{formatWhen(shared_at)}</span>
+                </td>
                 <td className="row-actions">
                   {node.kind === 'file' && (
                     <button

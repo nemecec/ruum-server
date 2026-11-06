@@ -11,7 +11,7 @@ describe('account page', () => {
     const methods = screen.getByRole('region', { name: 'Sign-in methods' })
     expect(await within(methods).findByText('Google')).toBeInTheDocument()
     expect(within(methods).getByText('Passkey')).toBeInTheDocument()
-    const sessions = screen.getByRole('region', { name: 'Sessions' })
+    const sessions = screen.getByRole('region', { name: 'Signed-in devices' })
     expect(await within(sessions).findByText('This device')).toBeInTheDocument()
   })
 
@@ -38,11 +38,13 @@ describe('account page', () => {
     expect(await within(section).findByText('Explorer')).toBeInTheDocument()
   })
 
-  it('starts a team and opens its admin pages', async () => {
+  it('starts a team space and opens its invitations', async () => {
     const { user, router } = renderApp(`${personal}/account`)
-    await user.type(await screen.findByRole('textbox', { name: 'Team name' }), 'Lab')
-    await user.click(screen.getByRole('button', { name: 'Create team' }))
-    await waitFor(() => expect(router.state.location.pathname).toMatch(/\/admin\/members$/))
-    expect(await screen.findByRole('heading', { name: 'Admin: Lab' })).toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Start a team space' }))
+    const d = await dialog('Start a team space')
+    await user.type(within(d).getByRole('textbox', { name: 'Team name' }), 'Lab')
+    await user.click(within(d).getByRole('button', { name: 'Create team space' }))
+    await waitFor(() => expect(router.state.location.pathname).toMatch(/\/admin\/invitations$/))
+    expect(await screen.findByRole('heading', { name: 'Space settings: Lab' })).toBeInTheDocument()
   })
 })

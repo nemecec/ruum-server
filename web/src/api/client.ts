@@ -121,9 +121,25 @@ export async function unwrap<T>(call: Promise<Result<T>>): Promise<T> {
   return data as T
 }
 
-/** A short text of an error for the user. */
-export function errorText(e: unknown): string {
-  if (e instanceof RuumApiError) return e.hint ? `${e.message} ${e.hint}` : e.message
-  if (e instanceof Error) return e.message
-  return String(e)
+/**
+ * A client for a visitor of a share link: it sends the link's access token as Bearer, no cookies,
+ * no CSRF header. The token stays in memory; it never goes into a URL.
+ */
+export function linkClient(accessToken: string, tenantId: string) {
+  const c = createClient<paths>({
+    baseUrl: typeof window === 'undefined' ? '' : window.location.origin,
+    credentials: 'omit',
+    fetch: (request: Request) => globalThis.fetch(request),
+  })
+  c.use({
+    onRequest({ request }) {
+      request.headers.set('Accept', 'application/json')
+      request.headers.set('Authorization', `Bearer ${accessToken}`)
+      if (takesTenantHeader(new URL(request.url).pathname) && !request.headers.has('Ruum-Tenant')) {
+        request.headers.set('Ruum-Tenant', tenantId)
+      }
+      return request
+    },
+  })
+  return c
 }

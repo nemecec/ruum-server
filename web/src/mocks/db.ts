@@ -311,12 +311,29 @@ function seed() {
       node_id: ids.report,
       role: 'view',
       expires_at: '2026-12-01T00:00:00Z',
+      has_password: true,
+      created_by: byUser(),
+      created_at: t0,
+      revoked_at: null,
+    },
+    {
+      id: '0190a000-0000-7000-8000-000000000802',
+      node_id: ids.documents,
+      role: 'view',
+      expires_at: '2026-12-01T00:00:00Z',
       has_password: false,
       created_by: byUser(),
       created_at: t0,
       revoked_at: null,
     },
   ]
+  // The secrets of the share links (the server keeps only a hash): `/s#<token>` opens the link.
+  const linkSecrets = new Map<string, { linkId: string; password?: string }>([
+    ['demo-folder', { linkId: '0190a000-0000-7000-8000-000000000802' }],
+    ['demo-locked', { linkId: '0190a000-0000-7000-8000-000000000801', password: 'open sesame' }],
+  ])
+  // Invitation tokens of the mock: `/invitations/accept?token=demo-invite` joins a new team space.
+  const invitationTokens = new Set<string>(['demo-invite'])
   const shared: Schemas['SharedItem'][] = [
     { node: nodes.find((n) => n.id === ids.sharedDoc)!, role: 'comment', shared_by: byUser(ids.charles), shared_at: '2026-10-15T08:00:00Z' },
     { node: nodes.find((n) => n.id === ids.guestDrawings)!, role: 'edit', shared_by: byUser(ids.charles), shared_at: '2026-10-20T08:00:00Z' },
@@ -364,7 +381,7 @@ function seed() {
   const journal: Schemas['JournalEntry'][] = [
     { tenant_id: ids.personal, seq: 41, node_id: ids.notes, revision: 2, type: 'version.created', actor: claudeRef, on_behalf_of: ids.ada, at: '2026-11-05T16:10:00Z', data: { name: 'notes.md' } },
     { tenant_id: ids.personal, seq: 42, node_id: ids.notes, revision: 3, type: 'version.created', actor: claudeRef, on_behalf_of: ids.ada, at: '2026-11-05T16:20:00Z', data: { name: 'notes.md' } },
-    { tenant_id: ids.personal, seq: 43, node_id: ids.plan, revision: 1, type: 'node.renamed', actor: claudeRef, on_behalf_of: ids.ada, at: '2026-11-05T16:25:00Z', data: { from: 'todo.txt', to: 'plan.txt' } },
+    { tenant_id: ids.personal, seq: 43, node_id: ids.plan, revision: 1, type: 'node.renamed', actor: claudeRef, on_behalf_of: ids.ada, at: '2026-11-05T16:25:00Z', data: { parent_id: ids.documents, old_name: 'todo.txt', new_name: 'plan.txt' } },
   ]
 
   const members: Schemas['Member'][] = [
@@ -386,9 +403,9 @@ function seed() {
     },
   ]
   const audit: Schemas['AuditEntry'][] = [
-    { id: '0190a000-0000-7000-8000-000000000b01', action: 'member.invited', actor: userRef(), on_behalf_of: null, target_type: 'invitation', target_id: 'alan@example.com', ip: '127.0.0.1', at: '2026-11-01T10:00:00Z', data: {} },
-    { id: '0190a000-0000-7000-8000-000000000b02', action: 'agent.registered', actor: userRef(), on_behalf_of: null, target_type: 'agent', target_id: ids.agentClaude, ip: '127.0.0.1', at: t0, data: {} },
-    { id: '0190a000-0000-7000-8000-000000000b03', action: 'tenant.policy_updated', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'tenant', target_id: ids.team, ip: '127.0.0.1', at: '2026-10-05T09:00:00Z', data: { allow_edit_links: true } },
+    { id: '0190a000-0000-7000-8000-000000000b01', action: 'invitation.created', actor: userRef(), on_behalf_of: null, target_type: 'invitation', target_id: 'alan@example.com', ip: '127.0.0.1', at: '2026-11-01T10:00:00Z', data: { email: 'alan@example.com' } },
+    { id: '0190a000-0000-7000-8000-000000000b02', action: 'agent.registered', actor: userRef(), on_behalf_of: null, target_type: 'agent', target_id: ids.agentClaude, ip: '127.0.0.1', at: t0, data: { name: 'Claude Desktop' } },
+    { id: '0190a000-0000-7000-8000-000000000b03', action: 'tenant.updated', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'tenant', target_id: ids.team, ip: '127.0.0.1', at: '2026-10-05T09:00:00Z', data: { allow_edit_links: true } },
   ]
   const limits: Record<string, Schemas['LimitsAndUsage']> = {
     [ids.personal]: {
@@ -444,10 +461,14 @@ function seed() {
     nodeTags,
     grants,
     shareLinks,
+    linkSecrets,
+    invitationTokens,
     shared,
     agents,
     agentKeys,
     journal,
+    /** The journal entries that an undo reverted (the journal itself is append-only). */
+    undoneSeqs: new Set<number>(),
     members,
     invitations,
     audit,

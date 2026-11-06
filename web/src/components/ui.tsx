@@ -1,9 +1,25 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
-import { errorText } from '../api/client'
+import { errorDetails, errorText, type ErrorContext } from '../api/errors'
+import { selectBaseName } from './dom'
 
 /**
- * A modal dialog on the native `<dialog>` element: it traps the focus, closes with Escape and
- * gives the focus back to the button that opened it.
+ * Where the focus goes when a dialog opens: an element marked `data-autofocus`, else the first
+ * field of the body, else the first button of the body (for a confirm dialog that is "Cancel",
+ * the least destructive action). Never the close button of the header.
+ */
+function firstFocus(d: HTMLDialogElement): HTMLElement | null {
+  return (
+    d.querySelector<HTMLElement>('[data-autofocus]') ??
+    d.querySelector<HTMLElement>(
+      '.dialog-body input:not([type=hidden]):not([disabled]):not([readonly]), .dialog-body select:not([disabled]), .dialog-body textarea:not([disabled])',
+    ) ??
+    d.querySelector<HTMLElement>('.dialog-body button:not([disabled])')
+  )
+}
+
+/**
+ * A modal dialog on the native `<dialog>` element: it traps the focus, closes with Escape, puts
+ * the focus on the first field, and gives the focus back to the button that opened it.
  */
 export function Dialog(props: {
   title: string
@@ -11,10 +27,11 @@ export function Dialog(props: {
   onClose: () => void
   children: ReactNode
   wide?: boolean
+  full?: boolean
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const titleId = useId()
-  const { open, onClose } = props
+  const { open } = props
 
   useEffect(() => {
     const d = ref.current
@@ -22,6 +39,13 @@ export function Dialog(props: {
     if (open && !d.open) {
       const opener = document.activeElement as HTMLElement | null
       d.showModal()
+      // showModal() focuses the first focusable element, which is the close button of the header.
+      // Move the focus to where the person works.
+      const target = firstFocus(d)
+      if (target) {
+        target.focus()
+        if (target instanceof HTMLInputElement && target.dataset.selectBase !== undefined) selectBaseName(target)
+      }
       return () => {
         if (d.open) d.close()
         opener?.focus?.()
@@ -30,19 +54,20 @@ export function Dialog(props: {
   }, [open])
 
   if (!open) return null
+  const cls = ['dialog', props.wide ? 'wide' : '', props.full ? 'full' : ''].filter(Boolean).join(' ')
   return (
     <dialog
       ref={ref}
-      className={props.wide ? 'dialog wide' : 'dialog'}
+      className={cls}
       aria-labelledby={titleId}
       onCancel={(e) => {
         e.preventDefault()
-        onClose()
+        props.onClose()
       }}
     >
       <header className="dialog-head">
         <h2 id={titleId}>{props.title}</h2>
-        <button type="button" className="icon" aria-label="Close" onClick={onClose}>
+        <button type="button" className="icon" aria-label="Close" onClick={props.onClose}>
           ×
         </button>
       </header>
@@ -61,62 +86,92 @@ export function ConfirmButton(props: {
   danger?: boolean
   className?: string
   ariaLabel?: string
+  disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<unknown>()
   return (
     <>
       <button
         type="button"
         className={props.className ?? (props.danger ? 'danger' : undefined)}
         aria-label={props.ariaLabel}
-        onClick={() => {
-          setError(undefined)
-          setOpen(true)
-        }}
+        disabled={props.disabled}
+        onClick={() => setOpen(true)}
       >
         {props.label}
       </button>
-      <Dialog title={props.title} open={open} onClose={() => setOpen(false)}>
-        <div className="stack">
-          <div>{props.message}</div>
-          <ErrorNote error={error} />
-          <div className="actions">
-            <button type="button" onClick={() => setOpen(false)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              className={props.danger ? 'danger' : 'primary'}
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true)
-                try {
-                  await props.onConfirm()
-                  setOpen(false)
-                } catch (e) {
-                  setError(e)
-                } finally {
-                  setBusy(false)
-                }
-              }}
-            >
-              {props.confirmLabel}
-            </button>
-          </div>
-        </div>
-      </Dialog>
+      {open && (
+        <ConfirmDialog
+          title={props.title}
+          message={props.message}
+          confirmLabel={props.confirmLabel}
+          danger={props.danger}
+          onConfirm={props.onConfirm}
+          onClose={() => setOpen(false)}
+        />
+      )}
     </>
   )
 }
 
-export function ErrorNote({ error }: { error: unknown }) {
-  if (!error) return null
+/** A confirm dialog: Cancel (focused first) and the action. */
+export function ConfirmDialog(props: {
+  title: string
+  message: ReactNode
+  confirmLabel: string
+  danger?: boolean
+  onConfirm: () => Promise<unknown> | void
+  onClose: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<unknown>()
   return (
-    <p className="error" role="alert">
-      {errorText(error)}
-    </p>
+    <Dialog title={props.title} open onClose={props.onClose}>
+      <div className="stack">
+        <div>{props.message}</div>
+        <ErrorNote error={error} />
+        <div className="actions">
+          <button type="button" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={props.danger ? 'danger' : 'primary'}
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true)
+              setError(undefined)
+              try {
+                await props.onConfirm()
+                props.onClose()
+              } catch (e) {
+                setError(e)
+                setBusy(false)
+              }
+            }}
+          >
+            {props.confirmLabel}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  )
+}
+
+/** An error note in plain words, with the code and the API's message under "Details". */
+export function ErrorNote({ error, context }: { error: unknown; context?: ErrorContext }) {
+  if (!error) return null
+  const details = errorDetails(error)
+  return (
+    <div className="error-note" role="alert">
+      <p className="error">{errorText(error, context)}</p>
+      {details && (
+        <details className="small muted">
+          <summary>Details</summary>
+          <pre>{details}</pre>
+        </details>
+      )}
+    </div>
   )
 }
 
@@ -129,14 +184,18 @@ export function Loading({ label = 'Loading' }: { label?: string }) {
 }
 
 /** Shows loading and error states of `useApi` and renders `children` with the data. */
-export function Loaded<T>(props: { state: { data: T | undefined; error: unknown; loading: boolean }; children: (data: T) => ReactNode }) {
+export function Loaded<T>(props: {
+  state: { data: T | undefined; error: unknown; loading: boolean }
+  children: (data: T) => ReactNode
+  context?: ErrorContext
+}) {
   const { data, error, loading } = props.state
-  if (error) return <ErrorNote error={error} />
+  if (error) return <ErrorNote error={error} context={props.context} />
   if (data === undefined) return loading ? <Loading /> : null
   return <>{props.children(data)}</>
 }
 
-/** A short status message for screen readers and sighted users (for example "Saved."). */
+/** A short status message inside a dialog or a form (for example "Link copied."). */
 export function Notice({ text }: { text: string | null }) {
   return (
     <p className="notice" role="status" aria-live="polite">
@@ -145,20 +204,32 @@ export function Notice({ text }: { text: string | null }) {
   )
 }
 
-/** A secret shown once, with a copy button. */
-export function SecretBox({ label, secret }: { label: string; secret: string }) {
+/** An empty place: what it is for, and the next step. */
+export function EmptyState(props: { title: string; text?: ReactNode; children?: ReactNode }) {
+  return (
+    <div className="empty-state">
+      <p className="empty-title">{props.title}</p>
+      {props.text && <p className="muted">{props.text}</p>}
+      {props.children && <div className="actions center">{props.children}</div>}
+    </div>
+  )
+}
+
+/** A value with a copy button (a link, an address or a command). */
+export function CopyField({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
   const [copied, setCopied] = useState(false)
   return (
     <div className="secret">
       <label>
         {label}
-        <input readOnly value={secret} onFocus={(e) => e.currentTarget.select()} />
+        <input readOnly value={value} className={mono ? 'mono' : undefined} onFocus={(e) => e.currentTarget.select()} />
       </label>
       <button
         type="button"
+        aria-label={`Copy ${label.toLowerCase()}`}
         onClick={async () => {
           try {
-            await navigator.clipboard.writeText(secret)
+            await navigator.clipboard.writeText(value)
             setCopied(true)
           } catch {
             setCopied(false)
@@ -167,7 +238,16 @@ export function SecretBox({ label, secret }: { label: string; secret: string }) 
       >
         {copied ? 'Copied' : 'Copy'}
       </button>
-      <p className="muted">Copy it now. Ruum shows it only once.</p>
+    </div>
+  )
+}
+
+/** A secret shown once, with a copy button. */
+export function SecretBox({ label, secret, note }: { label: string; secret: string; note?: string }) {
+  return (
+    <div className="stack">
+      <CopyField label={label} value={secret} />
+      <p className="muted small">{note ?? 'Copy it now. Ruum shows it only once.'}</p>
     </div>
   )
 }
@@ -189,5 +269,33 @@ export function LoadMore({
         </button>
       </p>
     </div>
+  )
+}
+
+/** The glyph of a folder (an outline with a tab). Decorative. */
+export function FolderIcon() {
+  return (
+    <svg className="glyph" viewBox="0 0 20 20" width="20" height="20" aria-hidden="true" focusable="false">
+      <path d="M2.5 5.5a1 1 0 0 1 1-1h4l1.6 1.8h7.4a1 1 0 0 1 1 1v8.2a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1z" fill="currentColor" opacity="0.85" />
+    </svg>
+  )
+}
+
+/** The glyph of a file (a page with a folded corner and lines). Decorative. */
+export function FileIcon() {
+  return (
+    <svg className="glyph" viewBox="0 0 20 20" width="20" height="20" aria-hidden="true" focusable="false">
+      <path d="M5 2.5h6.5L15.5 6.5v11H5z" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+      <path d="M11.5 2.5v4h4M7.5 10h5M7.5 12.8h5" fill="none" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
+/** The agent mark: a small spark glyph in the agent colour. Decorative; the text says "agent". */
+export function AgentGlyph() {
+  return (
+    <svg className="agent-glyph" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+      <path d="M8 1.5l1.6 4.2 4.4.3-3.4 2.8 1.1 4.3L8 10.7l-3.7 2.4 1.1-4.3L2 6l4.4-.3z" fill="currentColor" />
+    </svg>
   )
 }
