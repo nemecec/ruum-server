@@ -17,3 +17,7 @@ cards, agents) is in section 18.
 
 Run the core service without Docker: `cargo run -p ruum-server` (listens on `127.0.0.1:8490`; set
 `RUUM_BIND` to change it, and `DATABASE_URL` to use Postgres and run the migrations).
+
+## License
+
+Ruum is licensed under the Apache License 2.0. See `LICENSE`.

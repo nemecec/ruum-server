@@ -127,6 +127,25 @@ Every table has `tenant_id`, and every query filters on it. Postgres row-level s
 `tenant_id` is a second guard. No query joins two tenants. This rule makes sharding (section 14)
 possible later.
 
+### 2.7 Templates
+
+A **template** is a folder of type `template` that serves as a blueprint. "New … from template"
+copies it and runs its setup. Two kinds in the first versions:
+
+- **Project templates**: the folder structure, `project.yaml` (agent settings, bindings), an
+  `AGENTS.md`, issue templates, database manifests with migrations and masked sample data, an app
+  scaffold in a repo, smart folders, and placeholders for roles ("client: comment"). The setup
+  creates the database, the repo, the app and the first preview, then asks for the role
+  placeholders. Examples: "web app + Postgres + sign-in", "client portal", "internal tool",
+  "static site", "landscape project" (with Kadakas drawings).
+- **Issue templates** (section 9.7): the fields of one kind of issue.
+
+Templates come from Ruum (a gallery), from the tenant (any project can be saved as a template), and
+later from other people (a public gallery). A template has versions, and a project records the
+template and version it came from, so it can later be **updated from the template** (a diff and
+merge through the plugins of section 5.4, reviewed like any change). Agents use templates through
+the API and MCP ("create a project from a template").
+
 ## 3. Permissions
 
 ### 3.1 Principals
@@ -600,6 +619,46 @@ The hard part is **permissions**. Every access to the mount uses Mari's external
 Tenant admins choose which mount providers are allowed. Some organisations will forbid personal
 Google Drive mounts to stop data leaving the company.
 
+### 7.5 Other Ruum instances and federation (later)
+
+Ruum is open source (Apache 2.0), so anyone can run an instance. Instances can work together at two
+levels. Both sides share the node model, so versions, tags, links, comments and the journal map one
+to one, which no other storage service gives.
+
+**Level 1: mount another instance where you have an account.** A mount provider of 7.4 for Ruum: the
+person connects their account on the other instance with OAuth (instances already speak OAuth 2.1
+with dynamic client registration, for MCP clients). The mount follows the other instance's
+**changes feed** with a cursor (section 2.5), so versions, tags and comments come through natively,
+and diff plugins work. The rules of 7.4 apply: personal by default, the other instance's rights
+always apply, content streams unless a copy is chosen.
+
+**Level 2: federation, sharing between instances.** A person shares a folder with
+`jaan@ruum.example.org`, a user of another instance.
+
+- **The open standard, not an own protocol**: **Open Cloud Mesh (OCM)**, the protocol for sharing
+  between instances that Nextcloud, ownCloud, Seafile and CERNBox use, so Ruum can also share with
+  them. Ruum's own features (versions, tags, typed markers) go in an OCM extension.
+- **The owning instance stays the source of truth.** Jaan's instance shows the share as a mount
+  ("shared from ruum.space"); every request is checked by the owner's instance; data leaves only when
+  Jaan opens or caches it; a revocation takes effect at once.
+- **Federated principals**: a new principal kind `remote_user` in the authz schema, with the usual
+  roles. Resharing is off by default and needs `share`. Agents on Jaan's side act for Jaan within
+  their scope.
+- **Trust between servers**: each instance publishes its keys and capabilities at a well-known
+  address (`/.well-known/ocm` and `/.well-known/ruum`); requests are signed with HTTP Message
+  Signatures (RFC 9421); each share has its own token; the recipient must accept a share (against
+  spam); content from other instances is untrusted (prompt injection, malware).
+- **Tenant policy**: federation off, an allow-list of instances, or open; admins can block
+  instances (decision 40).
+- **Files and folders first.** Databases, apps and other typed nodes show as read-only placeholders;
+  federating them needs their providers to take part, later.
+- **Optional: "Sign in with another Ruum".** Every instance is an OpenID Connect provider (Zitadel),
+  so a person can use their `ruum.space` account on a self-hosted instance.
+
+**Self-hosting.** Open source with federation needs a supported self-hosting package (a single-machine
+Docker Compose setup, later a Helm chart) and a versioned federation protocol, so instances of
+different versions can talk to each other.
+
 ## 8. Databases
 
 ### 8.1 The node
@@ -655,6 +714,40 @@ databases that AI agents make. One writer at a time is enough for most small app
   serverless code like this; no driver and no connection pool needed.
 - **Branches** (later): a copy of a database for tests, or for an agent to try a migration. For
   small databases `CREATE DATABASE ... TEMPLATE` is enough. A branch is a child node.
+
+### 8.5 Agents and data: read-only by default, a privacy filter, writes when granted
+
+- **Read-only by default.** An agent session can query the databases bound to its workspace, in a
+  read-only transaction, with a statement timeout, a row and size cap, and every query logged with
+  `actor` and `on_behalf_of`.
+- **Privacy filter.** Each column is classified `personal` (names, emails, phones, addresses, free
+  text), `secret` (tokens, password hashes) or `normal`. **The agent suggests the class** of every
+  new column: the agent that writes a migration puts its classification in the migration, and for
+  existing data an agent proposes classes from the column names and a sample of values. The person
+  confirms them in the approval they already give (the publish of the migration), as one short list
+  with the suggestions filled in. Until confirmed, a column counts as `personal`, so a forgotten
+  column fails safe, and the digest lists unconfirmed columns. Agents see that `secret` columns
+  exist; `NULL` and empty values are shown as they are, and any other value is replaced by the
+  **hidden-value marker** (below), never the value. They see
+  `personal` columns as **consistent pseudonyms** (the same value always gives the same pseudonym),
+  so joins, grouping and counts still work. Aggregates are allowed. Real values only through an
+  explicit, time-limited, logged grant ("show personal data in this session for one hour").
+  Postgres: the **PostgreSQL Anonymizer** extension masks inside the database, bound to the agent's
+  database role, so nothing unmasked leaves the database. SQLite: masking in the HTTP query layer.
+- **Writes in steps.** On a draft, the agent writes freely to a **database branch**, made with
+  masked data by default, so previews do not copy real personal data. Schema changes are
+  migrations (decision 19). Writes to the **live** database need a grant: per workspace in
+  `project.yaml` or per session through a prompt, limited in time and revocable. Destructive
+  statements (DROP, TRUNCATE, DELETE or UPDATE without WHERE) always ask, with the statement and the
+  number of rows. The backup point in time is recorded before each granted write session.
+- **Typed markers, not look-alike strings.** A hidden or pseudonymised value is a distinct typed value,
+  so nobody mistakes it for real data: in JSON results (the HTTP query API, MCP) a secret is
+  `{"$ruum": "hidden", "class": "secret"}` and a pseudonym is `{"$ruum": "pseudonym", "id":
+  "p_8f3a91"}`; in logs and traces the same as a reserved map attribute. The UI shows them as chips
+  ("hidden: secret", "person 8f3a91"). The same markers are used for columns, logs, metrics and
+  traces.
+- Outside agents over MCP follow the same rules. Data rows reach agents marked as untrusted, like
+  log lines (section 9.6).
 
 ## 9. Web applications
 
@@ -765,6 +858,226 @@ AI-generated code is untrusted code. Plan for strong isolation from day one:
   whole registered domain. That must never be the domain of the sign-in page. Downloads and
   previews of user files use the same apps domain (`<id>.content.ruumapps.net`).
 
+### 9.6 Logs, metrics and errors of apps
+
+Every app gets observability without setup by its author, and agents get it too: an agent that
+learns about errors only when a person complains ships broken apps.
+
+**What is collected:**
+
+- **Backend:** the app's logs (standard output), request metrics (rate, latency, errors), CPU,
+  memory and cold starts, traces through OpenTelemetry (the runtime adds the instrumentation),
+  database slow queries, errors and failed migrations, and build logs.
+- **Frontend:** a small Ruum browser script records JavaScript errors, unhandled rejections,
+  console errors, failed requests and Core Web Vitals. Always on in previews. In live apps a
+  **privacy-aware mode is on by default**: errors and Web Vitals only; end users only as pairwise
+  pseudonyms; no IP addresses stored; URLs without query strings; no request bodies, cookies or
+  form values; PII scrubbed. It needs no cookies of its own, and Ruum gives the app author a
+  ready paragraph for the app's privacy notice. The **full mode** (breadcrumbs of user actions,
+  failed request details, performance traces) is offered with one click at the first publish and
+  in the app's settings, with a plain explanation of what it records.
+- **Source maps** are uploaded at build time and kept private, so a minified stack trace shows
+  `src/PlantList.tsx:42`.
+- **Issues:** errors are grouped by fingerprint (type and top frames) into issues with a count,
+  first and last seen, the app version where they started, and how many users they affect.
+
+Storage: the platform's Grafana stack (Loki, Mimir, Tempo) with one storage tenant per Ruum tenant;
+retention by plan (section 4.3).
+
+**Access:** API and MCP tools to search logs, read metric summaries, list issues, read an issue
+with its stack trace and recent events, and compare before and after a deploy. Scoped like
+everything else; logs can hold personal data, so reading them needs `edit` on the app.
+
+**Errors reach agents without being asked**, at three levels:
+
+1. **A check after every build and preview**, built into the session loop (it does not depend on
+   the agent remembering): a headless browser opens the main routes and collects console errors,
+   failing requests, server errors and new issues. The agent gets the result as a message and
+   fixes the problems before it asks the person to look.
+2. **Push to the active session:** a new or regressed issue of the workspace's app reaches the
+   session at the next turn ("TypeError in PlantList.tsx:42, 37 times in 5 minutes since your
+   last publish"). On drafts and previews the agent may investigate and fix by itself; publishing
+   needs the usual approval.
+3. **A guardian when no session is open** (optional, per workspace, with its own budget): it triages
+   new live errors, opens a session with a diagnosis and a proposed fix on a draft, and notifies the
+   owner. It never publishes, removes duplicates and is rate-limited, so it cannot loop.
+
+**The platform protects live apps without any agent:** if the error rate rises clearly after a
+publish, Ruum rolls back to the previous version and then tells the session.
+
+**Telemetry privacy, like database columns.** Logs, metric labels and trace attributes use the
+same three data classes as columns (section 8.5), with one difference for secrets:
+
+| Class | Columns | Logs, metrics, traces |
+|---|---|---|
+| `secret` | the column is visible; non-empty values become the hidden-value marker | **the value is never recorded**: a non-empty value becomes the hidden-value marker (section 8.5), at the source and again at ingestion; null and empty values are serialised by the logging library as usual |
+| `personal` | pseudonyms for agents | keyed pseudonyms before storage; optionally a short-lived encrypted raw copy (below) |
+| `normal` | readable | readable by agents without a special grant |
+
+- **Analysis during development.** A privacy review agent (section 11.2) reads every log, metric and
+  trace statement in the app's code and classifies each field. The result is a file in the repo,
+  `telemetry-privacy.yaml`. The person confirms new fields in the publish approval they already
+  give, as a short pre-filled list, as for columns.
+- **Structured logs.** The Ruum logging helpers write message templates with named fields
+  ("order {order_id} paid by {customer}"), so the template stays readable and each field has a class.
+  Free text without a template is treated as `personal` and scrubbed (patterns and name
+  recognition) before storage.
+- **Pseudonyms before storage, raw values only by choice.** Storing raw personal values in logs makes
+  erasure requests hard (log stores cannot delete single entries well), widens what a leak or a
+  broad grant exposes, and keeps personal data longer than debugging needs. So by default a
+  `personal` value is replaced before storage by a **keyed pseudonym** (an HMAC with a per-tenant
+  key). Debugging still works: Ruum computes the pseudonym of a known value ("what happened to
+  kati@example.com?") and finds every entry about that person, without storing the email. An app can
+  also keep an **encrypted raw copy** with a short retention (7 days by default), each end user's
+  values under their own key: a grant can decrypt them for a while, and deleting an end user deletes
+  their key, which makes all their stored values unreadable at once (crypto-shredding).
+- **Enforcement** happens twice: a lint rule in the app's checks blocks `secret` fields in log
+  calls, and the ingestion pipeline (OpenTelemetry Collector processors driven by
+  `telemetry-privacy.yaml`) replaces non-empty `secret` values with the hidden-value marker and
+  pseudonymises `personal` ones. Unclassified
+  fields count as `personal`. Metric labels with personal values are refused, because they also
+  explode the number of series.
+- Log lines still reach agents marked as untrusted data, because user input ends up in them.
+
+### 9.7 Issues, and reports from app users
+
+**Issues are nodes.** An issue is a file of type `issue` in a folder of the project (`Issues/` by
+default; any folder works, like sessions). Its content is structured fields plus a text body; its
+versions are its history; comments are node comments; labels are tags; a board is a smart folder
+grouped by status. Issues have a status, an assignee (a person **or an agent**) and links: to error
+issues of section 9.6, to the sessions that work on them, to the drafts that fix them.
+
+**Issue templates** (section 2.7) give each kind of issue its own fields, as a JSON Schema plus a
+form layout: a bug (steps, expected, actual, severity, app version), a feature request (problem,
+proposal, who needs it), a question, or the tenant's own kinds. The template of an issue is
+recorded in it, so old issues still read correctly after a template changes.
+
+**One concept for problems.** A user report, an error from monitoring (section 9.6), a person and
+an agent all create the same kind of issue, with a `source` field. **Every new error opens an
+issue**, because one error can be serious: the first occurrence of a fingerprint creates the issue,
+and every later occurrence only links to it and counts. The issue shows the count, first and last
+seen, the affected users and a trend, all as fields to sort and filter by. A closed issue whose
+error comes back is reopened as "regressed". An issue can be muted (it keeps counting, without
+notifications). **A mute always expires**: 7 days by default, at most 30; then the issue notifies again as
+usual. When one publish brings many new fingerprints at once, they are grouped under one
+parent issue for that publish, so a bad release is one thing to look at, not hundreds.
+
+**"Fix in a session".** An issue has a button that opens an agent session in its workspace with the
+issue, its attachments and the linked errors as context; the session links back, and publishing
+the fix closes the issue (after the person confirms, or automatically when the error stops).
+
+**Reports from the people who use an app.** Ruum adds a **report widget** to live apps (on by
+default, small, the author can move or turn it off) and an automatic prompt when the app breaks
+("Something went wrong. Tell us what you were doing."). A report attaches, after the reporter sees
+and can remove each item:
+
+- a screenshot, with the same drawing tools as preview annotations (section 11.1) and a blur tool
+  to hide private parts;
+- the route, browser, screen size and app version;
+- **the logs of this visit**, frontend and backend (linked by trace IDs): by default every log record
+  of the visit is a candidate. Ruum checks them for `personal` fields and shows the records that
+  have any. The reporter decides, per field or for all at once:
+  - **include as it is**: Ruum decrypts the reporter's own values from the encrypted raw copy
+    (section 9.6), only for this issue; possible only when the app keeps that copy;
+  - **pseudonymise**: the keyed pseudonym (the default choice);
+  - **remove**: replaced by the hidden-value marker with no way to recover it.
+
+  Everything else in the record stays (time, level, message template, other fields), so it is still
+  clear that a record of that kind was there. Only records of the reporter's own visit are offered;
+  records about other people are never attached. The choices are stored with the issue as the
+  reporter's consent.
+
+  **Asking again later.** While investigating, a person working on the issue (or an agent, through
+  that person's approval) can ask the reporter to reveal specific fields, with a short reason. The
+  reporter gets the request on their receipt link, and by email if they left one, and approves or
+  refuses per field. Nobody can ask again about fields the reporter refused, but the reporter can
+  change their mind at any time on the receipt link and allow access after all (for example after
+  pressing the wrong button). This works only
+  while the encrypted raw copy exists, so filing a report **holds** the raw copies of that visit's
+  records until the issue is closed, at most 30 days; then they are deleted on the normal schedule. `secret` values were never recorded, so there is nothing to choose for them;
+- the reporter as a pairwise pseudonym, plus an email only if the reporter types one for a reply.
+
+The report becomes an issue from the app's bug template, linked to the matching error group.
+Reporters who are not members of the tenant get a receipt link that shows only the status of their
+report. Public apps limit reports per visitor and per app, to stop spam.
+
+### 9.8 Apps that write to files and external services (later)
+
+**Data files.** An app can bind to a file node (a binding as in 9.1) and use a **records API** on it:
+append a row, query, update, with a schema. Formats: CSV, JSON Lines, XLSX/ODS, Markdown tables. The
+file stays readable and editable by people in Ruum: a contact-form app appends to `Leads.csv`, and
+the owner opens that file.
+
+- Ruum serialises the writes to one file and merges appends into one version per time window
+  (section 5.3), not one version per row. When a person edits the file while the app writes, the
+  row-level three-way merge plugin (section 5.4) resolves it.
+- Above a size or write rate (for example 100,000 rows), Ruum suggests **"graduate to a database"**:
+  one click imports the file into a Postgres table and can keep the file as a synced export.
+- SQLite already puts a database in a file, but a binary one that people cannot read or edit. The
+  next step after data files is a native **table** node type: a spreadsheet grid for people, a table
+  API for apps, export to CSV and XLSX, stored in SQLite or Postgres underneath.
+
+**Connectors to external services.** An app binds to an external resource through a **connection**
+(OAuth, the same mechanism as mounts in 7.4): a Google Sheet, Airtable, Notion, a Slack channel, a
+webhook.
+
+- **One records API.** A Google Sheet inside a mounted Google Drive is a node; binding to it gives the
+  same records API as a local file, and Ruum translates the calls to the Google Sheets API. The app
+  code is the same for a local file and a Google Sheet.
+- **The app never holds the credentials.** They stay in OpenBao; Ruum makes the calls. Writes go
+  through an outbox with retries, so an outage of the other service loses nothing. Every write is
+  logged with `actor` and `on_behalf_of`.
+- The owner of the connection decides whose account is used (a personal one, or an organisation
+  account owned by a group). Tenant admins choose which connectors are allowed.
+- **Data leaving Ruum** is checked against the data classes (section 8.5): writing a `personal`
+  field to an external service shows a warning, and the publish approval asks for confirmation.
+- Connectors are providers (section 7.1); later they can wrap existing MCP servers to cover many
+  services quickly.
+
+### 9.9 Public projects
+
+A person can make a project public so that others can use the app, read its source and inspect its
+data, without writing anything through Ruum. The audience is `public` (anyone, no sign-in) or
+"anyone signed in to Ruum", with the role `view`: the app can be used (its default app role), the
+repo can be read (code, history, diffs), and the database answers read-only queries through the
+HTTP query API. Public apps need platform admin approval (decision 22).
+
+**Secrets stay hidden by construction.** App secrets are never in the code or the archive; the
+manifest lists only their names and how each one is made, and the values are **write-only** in
+OpenBao (nobody reads them back; only the running app gets them). Three kinds:
+
+1. **Generated** (most of them): session signing keys, encryption keys, webhook secrets, keys between
+   the app's own parts. The manifest says `SESSION_KEY: { generate: random-32-bytes, rotate: 90d }`;
+   Ruum creates the value, stores it, rotates it on schedule and never shows it.
+2. **From a connection**, where possible: a third-party service connected with OAuth (section 9.8),
+   so nobody copies a key.
+3. **Entered**, only when there is no other way (a service that issues only a key string): a person
+   with `manage` on the app (or an agent with that person's approval) pastes it once.
+ There is no database password at
+all: the app reaches its database as the `app` principal through its binding, and the proxy gives it
+a short-lived role. A viewer sees the binding in the manifest, which is a right of the app, not a
+credential.
+
+**A public project publishes a chosen set, not the whole folder.** Grants only add rights
+(decision 8), so a public grant on the project folder would expose agent sessions (transcripts can
+hold personal data or pasted secrets), the agents' memory, issues with reporters' attachments and
+logs. "Make public" therefore offers a checklist (the app, the repo, the database, optionally the
+issues) and keeps sessions, agent memory, logs and report data private. **Public projects wait for
+restricted folders** (decision 8), so the private parts are protected by the tree, not by care.
+
+**Databases are not public by default.** The owner chooses tables or views for a **public schema**;
+the public sees nothing else. `personal` columns are fully hidden for the public (the hidden-value
+marker), because consistent pseudonyms would still let outsiders link records. Public queries have a
+short timeout, a row cap, a rate limit per visitor and caching.
+
+**Writes through the app are the app's business.** Visitors cannot write through Ruum (API, repo,
+database), but the app itself has write access through its binding, so a form in the app can still
+store what visitors enter, as the app's code allows. An app that must be read-only for the public
+checks the visitor's app role (section 9.3).
+
+**Remix** (backlog): a visitor copies a public project into their own Ruum: the code, the schema and
+masked sample data, never the secrets or the real data (built on project templates, section 2.7).
+
 ## 10. Source code and builds
 
 Store code in **Git**, even if the user never sees Git. Do not invent a new version control system.
@@ -794,7 +1107,182 @@ Store code in **Git**, even if the user never sees Git. Do not invent a new vers
 - **Budgets and quotas** per agent and per project (compute, storage, number of databases, egress),
   with a hard stop. Agents in a loop create resources fast.
 - **Good errors**: machine-readable error codes with a hint for the next step.
-- **Templates**: "web app + Postgres + sign-in" as a ready project that an agent copies.
+- **Templates** (section 2.7): "web app + Postgres + sign-in" as a ready project that an agent copies.
+
+### 11.1 Agent workspaces (agent sessions inside Ruum)
+
+People should be able to change their apps from inside Ruum: open the app, open its agent, type the
+change, look at the preview, press Publish. Two concepts make this work, and both are nodes, so they
+get versions, sharing, scope and the agent identity of section 3.4 without new mechanisms:
+
+| | Workspace | Session |
+|---|---|---|
+| What | the **project folder** (`type: project`) with agent settings; any folder can become one ("Use agents here") | a file in it (`type: agent_session`) |
+| Holds | defaults (harness, model), instructions (`AGENTS.md`), the scope (the folder itself), budget, approval rules, the environment (sandbox image, repo, bindings, secrets), **shared memory** that all sessions read and add to | one conversation: its transcript (versioned), its own draft branch and preview, its token use |
+| Lifetime | as long as the project | short or long; can be closed, reopened or forked |
+
+```yaml
+# /Projects/Garden planner/project.yaml   (the workspace settings)
+agents:
+  harness: claude-agent-sdk   # or codex, gemini-cli, opencode ... (harness providers)
+  model: claude-sonnet-5-5
+  instructions: ./AGENTS.md
+  memory: ./.agents/memory/   # shared by all sessions of the workspace
+  budget: { tokens_per_day: 2000000 }
+  approvals: { publish: ask, delete: ask, share: never }
+```
+
+```yaml
+# /Projects/Garden planner/Sessions/Sortable plant list   (type: agent_session)
+started_by: mari
+draft: drafts/sortable-plant-list
+harness: claude-agent-sdk     # the workspace default unless changed
+```
+
+- **The session node.** The transcript is the node's content, with versions, so a session can be
+  shared, read later, or forked. Who can `edit` the session can type into it; `view` can only read
+  it. Who can `edit` the workspace can start sessions in it.
+- **Parallel sessions.** Each active session has its own sandbox and its own draft, so two sessions
+  ("fix the sign-in bug", "redesign the plant list") do not clash, and each is published on its own.
+- **Organising sessions.** Sessions are ordinary nodes, so folders, tags, search, shortcut links,
+  smart folders, sharing and trash work on them as on any file. `Sessions/` is only the default place
+  for new sessions. A session belongs to its **nearest ancestor that is a workspace**, so it can sit
+  in subfolders at any depth. Moved into another workspace, its next turns use that workspace's
+  settings and scope (after a warning); the old transcript stays as it is. Moved outside every
+  workspace, it becomes a read-only archive that can be read and forked. A shortcut to a session
+  does not change its workspace.
+- **The identity.** A session runs as an agent principal that acts for the person who types, with
+  the session's scope. Every change shows "Garden agent acting for Mari", and "undo what this agent
+  did" works (section 3.4).
+- **"Open agent" on any node.** It starts a session in the node's workspace, or reopens the last one,
+  with the context ready: the repo checkout and its `AGENTS.md` / `CLAUDE.md`, the app manifest and
+  bindings, recent logs and errors of the app, the database schema, recent changes from the
+  journal, and the node the person started from.
+- **Drafts and previews.** The agent works on a draft (section 10) and shows the preview deployment
+  beside the chat. "Publish" merges and deploys. Nothing reaches the live app without a publish
+  (approval rules in the manifest).
+- **The runtime.** One sandbox per active session (from the workspace's environment) in the tenant app pool (gVisor, scale to zero,
+  section 9.5): a checkout of the repo node, the `ruum` CLI and MCP server preconfigured with the
+  session's agent token, internet only through the egress proxy. An idle session sleeps; the
+  transcript stays in the node.
+- **Data access** (section 8.5): read-only with a privacy filter by default; writes on database
+  branches, and on the live database only when granted.
+- **Errors come to the agent** (section 9.6): a check after every build and preview, new issues
+  pushed to the active session, and an optional guardian when no session is open.
+- **The UI.** A chat view in the web UI that shows the harness's event stream: messages, tool
+  calls, diffs, approval prompts, and the preview. A terminal tab (xterm.js) for developers.
+
+**Preview annotations.** People give feedback on the UI by pointing and drawing, not only by
+typing, and the agent gets that feedback with its context. Two modes in the preview pane:
+
+1. **Point at an element** and attach a comment. The agent gets a stable selector, the role and
+   accessible name, a short HTML snippet, the key computed styles, the size and position, the
+   route and viewport, the console errors of that moment, a cropped screenshot and **the source
+   location** (`src/PlantList.tsx:42`). Preview builds add a build plugin that marks each element
+   with its source file and line; live builds never have it.
+2. **Draw on the screen**: Ruum captures exactly what the person sees and opens it in a drawing
+   layer with freehand lines, rectangles, ellipses, arrows, text attached to shapes, colours, an
+   eraser and undo (**Excalidraw**, MIT licence, embedded). The agent gets the composite image and
+   the drawing as shapes with their text. When capture in the browser fails, Ruum renders the same
+   route and viewport in a headless browser.
+
+How it works:
+
+- A small **annotation script is added to preview pages only** (never to live apps) by the app
+  gateway. It talks to the Ruum UI with `postMessage`. Previews run on the apps domain, so the script
+  cannot reach Ruum's own origin.
+- **Annotations are comments** anchored to a preview version, a route and an element or a drawing.
+  They are stored in the session, with its permissions. Anyone with the `comment` role can annotate,
+  so a client can mark up a shared preview and the agent sees it.
+- Several notes can be sent as **one batch**; each turn carries its annotations as images and data.
+- **Status loop**: when the agent says it fixed a note, the note becomes "fixed?". On the next
+  preview Ruum finds the same element again and shows the note there; the person confirms or
+  reopens it.
+- **Outside agents** get the same context through MCP tools: list preview annotations, resolve an
+  annotation.
+- **Screenshots can hold personal data**: they are nodes with the session's permissions.
+- **Comments from other people are input, not commands**: the agent sees who wrote each one, and
+  publishing still needs approval (prompt injection, as with any shared file).
+
+**Harnesses are providers** (section 7.1). The UI talks to every harness through one protocol,
+the **Agent Client Protocol (ACP)**, the open protocol between editors and coding agents; Claude
+Code, Codex and Gemini CLI have ACP adapters. The first harness is the **Claude Agent SDK**
+(Anthropic's library with the agent loop and tools of Claude Code, made for building products).
+The Claude Code CLI itself can run in the terminal tab, after a check of Anthropic's terms for
+hosting it for other people.
+
+**Anthropic's own web views cannot be embedded.** Claude Code on the web (claude.ai/code) and the
+Claude apps run on Anthropic's side, with the person's own Claude login; claude.ai does not allow
+framing, and Ruum must not handle a person's Claude credentials. Ruum offers link-outs instead:
+
+- for a repo linked to GitHub (the GitHub provider of section 10), "Open in Claude Code on the
+  web", which works on that repository in Anthropic's cloud;
+- for developers, "Open in Claude Code" on their own machine: a ready command with the Ruum MCP
+  server and a scoped agent key.
+
+**Who pays for the model** (decision 38): third-party products may not offer "sign in with your
+Claude subscription" (Agent SDK terms, unless Anthropic approves it). Ruum offers both: the person's
+own API key first (kept in OpenBao; no billing needed), then Ruum pays the model provider and bills
+the use through the AI gateway (decision 24), metered per session.
+
+**Harness order** (decision 39):
+
+1. Inside Ruum, the **Claude Agent SDK**, with the ACP layer in place.
+2. **Every outside agent over MCP**: ChatGPT, Claude.ai, Claude Code, Codex and others connect to
+   Ruum's remote MCP server and use the person's own subscription; Ruum runs and pays for no model.
+   For app work, the MCP tools cover the whole loop: edit code in the repo, run a build, open a
+   preview, publish (with the same approvals as in a session).
+3. Soon after, **OpenAI Codex inside Ruum** (open-source CLI and SDK, with an ACP adapter), so that
+   non-technical people who use ChatGPT get the same one-screen experience without setting up a
+   connector. It starts with the person's own OpenAI API key. Codex can also sign in with a ChatGPT
+   plan; whether a hosted product may use that is the same terms question as for Claude, so it is
+   not used without a check.
+
+**Risks.** Prompt injection: the agent reads files, also files that other people shared, and they
+can contain instructions for it. The scope is the main limit (a session sees only its project),
+plus approvals for publish, delete and share, and no secrets beyond its bindings. Cost: a budget
+per session and per day with a hard stop.
+
+### 11.2 The development system for users' projects
+
+Ruum gives every project the same kind of development system that builds Ruum itself (section 18),
+running in the background: the person describes a change, and a set of agents builds, checks and
+reviews it before the person sees the result. Ruum sets the default; a project template can bring
+its own; a person can change it later in `project.yaml` or in the project settings.
+
+```yaml
+# project.yaml
+agents:
+  pipeline:
+    on_change:                       # every draft of a session
+      - tests        # a test-writer agent adds or updates tests for the change
+      - checks       # build, lint, tests, the post-build browser check (section 9.6)
+      - review       # a reviewer agent with fresh context reads the diff
+      - security     # only when auth, data access or secrets change
+      - privacy      # classes for new columns and telemetry fields (sections 8.5, 9.6)
+      - hygiene      # structured logging and parameterised SQL (below)
+      - ux           # heuristics and accessibility on screenshots of changed screens
+    on_publish:
+      - journeys     # synthetic users run the key journeys of the project
+    gate: must_pass  # must_pass | warn
+    budget: { tokens_per_day: 3000000 }
+```
+
+- The results appear as review comments on the draft, with a summary in the session. The session
+  agent fixes what the reviewers find before it asks the person to look.
+- `gate: must_pass` blocks the publish until the checks pass; the person can override with a reason
+  (recorded).
+- **Cost.** Background agents use tokens. The default is light: tests, checks and one review on every
+  change, the specialist reviews only when their area changes, cheaper models for routine checks.
+  The budget is per project, with a hard stop. Who pays follows decision 38.
+- The pipeline stages are providers, so a team can add its own (for example a reviewer that knows
+  its domain rules).
+- **Structured logging and parameterised SQL are required, not only advised.** The default
+  `AGENTS.md` says so; lint rules in the `hygiene` stage block log messages built by string
+  concatenation or interpolation (use message templates with named fields) and SQL built from
+  strings (use bound parameters or a query builder); the reviewer checks it too. Parameterised SQL
+  also prevents SQL injection, and query logs then store the statement template with classified
+  parameters, never raw values.
 
 ## 12. Architecture
 
@@ -958,20 +1446,34 @@ Each step is useful alone.
    This step also defines the **provider contract** (section 7.1), because a database is the first
    typed node.
 3. **Web apps**: static first, then containers in gVisor with scale to zero; the gateway with
-   platform sign-in, app roles and bindings to databases.
+   platform sign-in, app roles and bindings to databases; logs, metrics and errors (section 9.6);
+   telemetry privacy classes; issues, issue templates and the report widget (section 9.7); project
+   templates (section 2.7); generated secrets (section 9.9).
 4. **Repos and builds**: Forgejo provider, drafts and previews, the GitHub provider.
-5. **Kadakas CAD** as the first external provider (section 7.3).
-6. **Photos**: pipeline, timeline view, albums as `member` links.
-7. **Desktop sync client** and mobile auto-upload. Sync is the hardest part of Dropbox; do it when the
+5. **Agent workspaces** (section 11.1) and the development system for projects (section 11.2):
+   workspaces (project folders) and sessions as nodes, the chat UI with previews, the
+   Claude Agent SDK harness, ACP for other harnesses, the link-outs. An "Open in Claude Code"
+   command for developers can come earlier, in step 1 or 2.
+6. **Kadakas CAD** as the first external provider (section 7.3).
+7. **Photos**: pipeline, timeline view, albums as `member` links.
+8. **Desktop sync client** and mobile auto-upload. Sync is the hardest part of Dropbox; do it when the
    journal and the delta API are stable. Until then, web, API, MCP and a mount through WebDAV are
    enough.
-8. **Mounted external drives** (section 7.4): Google Drive and OneDrive first, then S3 and WebDAV.
-9. **Encrypted vaults** (section 5.5), together with or after the native apps. Get an external
+9. **Mounted external drives** (section 7.4): Google Drive and OneDrive first, then S3 and WebDAV;
+   then other Ruum instances and federation with OCM (section 7.5), with the self-hosting package;
+   then data files, native tables and connectors for apps (section 9.8).
+10. **Encrypted vaults** (section 5.5), together with or after the native apps. Get an external
    cryptography review before launch.
 
 Version and diff plugins (sections 5.3 and 5.4) grow along the way: the plugin runtime, text,
 JSON/XML and image diff in step 1; syntax-tree diff for code with the repos in step 4; the Kadakas
-drawing diff in step 5; DOCX/XLSX redlines and three-way merge with the sync client in step 7.
+drawing diff in step 6; DOCX/XLSX redlines and three-way merge with the sync client in step 8.
+
+**After restricted folders:** public projects (section 9.9).
+
+### Backlog (not scheduled)
+
+- **Remix** of public projects (section 9.9).
 
 ## 17. Decisions
 
@@ -1043,6 +1545,13 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
 35. **Vaults in the browser**: native apps only at first, or a web client with the risk documented?
 36. **Vault recovery**: the organisation recovery key, on or off by default?
 37. **AI gateway**: models, billing and limits (needs a short design of its own).
+38. **Who pays for the model in agent workspaces** (section 11.1). *Decided 2026-11-06: both; the
+    person's own API key first, Ruum billing through the AI gateway later.*
+39. **First harnesses.** *Decided 2026-11-06: the Claude Agent SDK inside Ruum with the ACP layer in
+    place; every outside agent (ChatGPT, Claude.ai, Claude Code, Codex) over MCP with full app tools;
+    then OpenAI Codex inside Ruum soon after, for non-technical ChatGPT users.*
+40. **Default federation policy** (section 7.5). *Decided 2026-11-06: off for team tenants until an
+    admin turns it on; personal accounts can turn it on themselves.*
 
 ## 18. How to build Ruum with a swarm of AI agents
 

@@ -18,9 +18,9 @@ ignore = [
 ]
 
 [licenses]
-# Ruum is a proprietary product. Allow only permissive licenses, which put no source-disclosure
-# duty on Ruum. Copyleft licenses (GPL, AGPL, LGPL as the only choice, SSPL, EUPL) are not
-# allowed. MPL-2.0 is allowed: it is file-level copyleft and applies only to changes of the MPL
+# Ruum is licensed under Apache-2.0. Allow only permissive licenses that are compatible with it
+# and put no source-disclosure duty on Ruum or on people who build on it. Copyleft licenses (GPL,
+# AGPL, LGPL as the only choice, SSPL, EUPL) are not allowed. MPL-2.0 is allowed: it is file-level copyleft and applies only to changes of the MPL
 # files themselves, which Ruum does not make.
 allow = [
     "Apache-2.0",
@@ -44,7 +44,7 @@ confidence-threshold = 0.9
 unused-allowed-license = "allow"
 
 [licenses.private]
-# The Ruum crates are not published (publish = false); their license is LicenseRef-Proprietary.
+# The Ruum crates are not published to crates.io (publish = false); their license is Apache-2.0.
 ignore = true
 
 [bans]

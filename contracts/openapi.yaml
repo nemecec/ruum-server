@@ -78,8 +78,8 @@ info:
     Every error has the body `{ "error": { "code": "snake_case_code", "message": "...", "hint": "..." } }`.
     `code` is stable and machine-readable; `hint` tells the next step.
   license:
-    name: Proprietary
-    identifier: LicenseRef-Proprietary
+    name: Apache 2.0
+    identifier: Apache-2.0
   contact:
     name: Ruum
     url: https://ruum.space

@@ -36,3 +36,9 @@ them. The working method is section 18.
 ## Writing
 
 Docs and comments: plain English, short sentences, active voice.
+
+## Commits
+
+Author: Neeme Praks <neeme@praks.net> (set in the local git config). Do not add `Co-Authored-By` trailers.
+Keep the history linear: no merge commits. Integrate a branch with `git rebase main` and a fast-forward
+(`git merge --ff-only`), or as one squashed commit when its own commits are noise.

@@ -43,5 +43,5 @@
     "vitest": "^4.1.12",
     "yaml": "^2.8.1"
   },
-  "license": "UNLICENSED"
+  "license": "Apache-2.0"
 }

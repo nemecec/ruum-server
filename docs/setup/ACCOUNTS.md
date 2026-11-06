@@ -1,0 +1,170 @@
+# Accounts to set up (one sitting)
+
+This page lists the accounts that only a person can create for Ruum. It takes about one hour in
+total. Do the steps in order. The agents do everything else (servers, buckets, DNS records,
+configuration) with the keys you create here.
+
+Web consoles change their menus often. If a label here does not match what you see, look for the
+nearest equivalent. The goal of each step is in its first line.
+
+## Where to put the keys
+
+Never paste a key in chat, an issue or the repository (the repository is public). Put all keys in
+one file on your Mac:
+
+```bash
+mkdir -p ~/.config/ruum && touch ~/.config/ruum/secrets.env && chmod 600 ~/.config/ruum/secrets.env
+```
+
+Open the file in a text editor and add one line per key, `NAME=value`, with the names given
+below. When you are done, tell the agents "secrets are in place". They read only that file and
+only report which names are present, never the values.
+
+## The names (overview)
+
+| Name | From | Step |
+|---|---|---|
+| `HCLOUD_TOKEN` | Hetzner Cloud API token | 1 |
+| `HETZNER_S3_ACCESS_KEY`, `HETZNER_S3_SECRET_KEY` | Hetzner Object Storage credentials | 1 |
+| `HETZNER_DNS_TOKEN` | only if Hetzner DNS asks for its own token | 2 |
+| `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID` | Scaleway API key (backups and email) | 3 |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Google sign-in | 4 |
+| `MS_OAUTH_CLIENT_ID`, `MS_OAUTH_CLIENT_SECRET` | Microsoft sign-in | 5 |
+| `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY` | Stripe, test mode | 6 |
+
+## The names of the Ruum addresses
+
+The steps below need these addresses. They are decided here (provisional; the agents may change
+them only with a decision record):
+
+| Address | What |
+|---|---|
+| `ruum.space`, `staging.ruum.space` | the web UI and the API |
+| `auth.ruum.space`, `auth.staging.ruum.space` | sign-in (Zitadel) |
+| `*.ruumapps.net`, `*.staging.ruumapps.net` | user apps and user content |
+| `notify.ruum.space` | the sending domain for email |
+
+## 1. Hetzner (servers and object storage), about 15 minutes
+
+Goal: a Hetzner Cloud project for staging, an API token and object storage keys.
+
+1. Go to <https://console.hetzner.com> and create an account. Hetzner may ask for an ID check or a
+   payment method; that can take a few hours.
+2. Create a project named **ruum-staging**. (Production gets its own project later.)
+3. In the project: **Security → API tokens → Generate API token**. Name `ruum-agents`, permission
+   **Read & Write**. Copy the token into `HCLOUD_TOKEN`. It is shown only once.
+4. In the project: **Object Storage → S3 credentials → Generate credentials** (or **Security →
+   S3 credentials**). Copy the access key and the secret key into `HETZNER_S3_ACCESS_KEY` and
+   `HETZNER_S3_SECRET_KEY`. Do not create buckets; the agents do that, in Helsinki (`hel1`).
+5. You do not need to add an SSH key. The agents make one and register it with the token.
+
+Cost: staging is about 3 small servers, a load balancer and object storage, roughly 30-50 euros
+per month. The agents create nothing that costs money until you say "start staging".
+
+## 2. DNS at Hetzner, about 5 minutes
+
+Goal: Hetzner answers DNS for `ruum.space` and `ruumapps.net`, so the agents can manage the records.
+
+1. In the Hetzner Console, open **DNS** and add the zones `ruum.space` and `ruumapps.net`. Hetzner
+   shows its name servers (three names, for example `hydrogen.ns.hetzner.com`).
+2. At the registrar of each domain, replace the name servers with Hetzner's. The change can take up
+   to a day to spread.
+3. If the DNS page asks you for its own API token (the older `dns.hetzner.com` console), create one
+   and save it as `HETZNER_DNS_TOKEN`. If DNS is inside the Cloud project, the `HCLOUD_TOKEN` is
+   enough.
+4. If `ruumapps.com` is registered too, add it the same way. It will only redirect.
+
+## 3. Scaleway (off-site backups and email), about 15 minutes
+
+Goal: one Scaleway account gives a second provider for backups (in Amsterdam, another country and
+another company than Hetzner) and the service that sends email (invitations, sign-in mails). It is
+French, so the data stays in the EU. One account for two needs means fewer keys.
+
+1. Go to <https://console.scaleway.com> and create an account (a card is needed; there may be an ID
+   check).
+2. Create a project named **ruum**. Copy its project ID into `SCW_DEFAULT_PROJECT_ID`.
+3. **IAM → Applications → Create application** named `ruum-agents`. Give it a policy for the
+   project **ruum** with the permission sets **ObjectStorageFullAccess** and
+   **TransactionalEmailFullAccess**. (A narrow key: it cannot touch anything else.)
+4. **IAM → API keys → Generate API key** for the application `ruum-agents`. Copy the access key and
+   the secret key into `SCW_ACCESS_KEY` and `SCW_SECRET_KEY`.
+5. **Transactional Email → Add domain** `notify.ruum.space`. Scaleway shows DNS records (SPF, DKIM,
+   DMARC, MX). You do not need to add them by hand: once step 2 is active, the agents add them
+   through the Hetzner DNS API and start the check.
+6. A new Transactional Email project starts with a low sending limit. That is enough for staging.
+   Before real users, ask Scaleway support to raise it (the agents will remind you).
+
+Nothing to do for backups beyond the key; the agents create the bucket in `nl-ams`, with object
+lock (write once) where available.
+
+## 4. Google sign-in, about 10 minutes
+
+Goal: "Sign in with Google" for Ruum, through Zitadel.
+
+1. Go to <https://console.cloud.google.com> and create a project named **ruum**.
+2. Open **Google Auth Platform** (formerly "OAuth consent screen"):
+   - **Branding**: app name **Ruum**, support email, the home page `https://ruum.space`, the
+     authorised domain `ruum.space`. Skip the logo for now; a logo starts a verification review.
+   - **Audience**: user type **External**. When the rest is done, press **Publish app** so that
+     any Google account can sign in. With only the basic scopes below, Google does not need a
+     review.
+   - **Data access**: the scopes `openid`, `.../auth/userinfo.email` and `.../auth/userinfo.profile`
+     only.
+3. **Clients → Create client**, type **Web application**, name `ruum-zitadel`. Add these
+   **Authorised redirect URIs** (all of them; they cover the laptop, staging and production, and
+   both Zitadel login versions):
+   ```text
+   http://localhost:8180/ui/login/login/externalidp/callback
+   http://localhost:8180/idps/callback
+   https://auth.staging.ruum.space/ui/login/login/externalidp/callback
+   https://auth.staging.ruum.space/idps/callback
+   https://auth.ruum.space/ui/login/login/externalidp/callback
+   https://auth.ruum.space/idps/callback
+   ```
+4. Copy the client ID and the client secret into `GOOGLE_OAUTH_CLIENT_ID` and
+   `GOOGLE_OAUTH_CLIENT_SECRET`.
+
+## 5. Microsoft sign-in, about 10 minutes
+
+Goal: "Sign in with Microsoft" for work and personal Microsoft accounts.
+
+1. Go to <https://entra.microsoft.com> (sign in with any Microsoft account; a free Entra tenant is
+   created if you have none).
+2. **Applications → App registrations → New registration**:
+   - name **Ruum**;
+   - supported account types: **Accounts in any organizational directory and personal Microsoft
+     accounts**;
+   - redirect URI: platform **Web**, `https://auth.ruum.space/ui/login/login/externalidp/callback`.
+3. In the new app, **Authentication → Add URI** for the other five redirect URIs of step 4.3 above.
+4. **Certificates & secrets → New client secret**, description `ruum-zitadel`, expiry 24 months.
+   Copy the **Value** (not the secret ID) into `MS_OAUTH_CLIENT_SECRET`. Note the expiry date in
+   your calendar; the agents also record it.
+5. From **Overview**, copy the **Application (client) ID** into `MS_OAUTH_CLIENT_ID`.
+6. **API permissions**: the default `User.Read` is enough; `openid`, `email` and `profile` are added
+   by the sign-in itself.
+
+Later, before many organisations use Ruum: Microsoft shows unverified apps with a warning, and some
+organisations block them. "Publisher verification" needs a Microsoft Partner (MPN) ID. This is not
+needed for staging.
+
+## 6. Stripe (payments), about 10 minutes
+
+Goal: a Stripe account in **test mode**, so the agents can build plans and checkout without real
+money.
+
+1. Go to <https://dashboard.stripe.com/register> and create an account. Choose your country.
+2. Stay in **test mode** (the "Test mode" switch, or a sandbox). Do not activate payments yet.
+3. **Developers → API keys**: copy the **publishable key** (`pk_test_...`) into
+   `STRIPE_PUBLISHABLE_KEY` and the **secret key** (`sk_test_...`) into `STRIPE_SECRET_KEY`.
+4. Nothing else for now. The agents create the products, prices and the webhook in test mode.
+
+Later, to take real payments, you must activate the account: the business (company or sole
+trader), a bank account, an address and an ID check. EU VAT for digital services (Stripe Tax and
+the EU OSS scheme) is a question for that moment; the agents will prepare it when step "plans and
+billing" comes.
+
+## When you are done
+
+Tell the agents "secrets are in place" (and which steps you skipped). They check the file, create
+nothing that costs money until you say "start staging", and list in the next digest what they set
+up.
