@@ -1,10 +1,11 @@
 //! Builds the `Services` set: the real implementations that exist, in-memory for the rest.
 //!
-//! With `DATABASE_URL` the journal, audit log, sharing and the identity, tenants and agents area
-//! use Postgres, and the authz engine is SpiceDB (when a preshared key is set) with the outbox
-//! worker. Without it every module is in memory. With it the nodes, tags and search use Postgres
-//! too. The modules of areas that are not merged yet (blobs, versions) stay in memory in both
-//! cases.
+//! Without `DATABASE_URL` every module is in memory. With it every store uses Postgres: the
+//! journal, audit log, sharing, nodes, tags, search, the content store (uploads, versions, diff)
+//! and the identity, tenants and agents area. The authz engine is SpiceDB (when a preshared key
+//! is set) with the outbox worker. Chunks go to S3 (Garage on the laptop) when the `RUUM_S3_*`
+//! or `S3_*` settings are set, and stay in memory otherwise. Sign-in uses Zitadel when
+//! `RUUM_OIDC_ISSUER` and `RUUM_OIDC_CLIENT_ID` are set (`identity::setup`).
 
 use anyhow::Context as _;
 use ruum_core::Services;
@@ -12,6 +13,7 @@ use ruum_core::audit::postgres::PgAuditLog;
 use ruum_core::authz::Authz;
 use ruum_core::authz::outbox;
 use ruum_core::authz::spicedb::{SpiceDbAuthz, SpiceDbConfig};
+use ruum_core::blobs::setup::{ContentSettings, install_postgres};
 use ruum_core::identity::setup::{IdentitySettings, install};
 use ruum_core::journal::postgres::PgJournal;
 use ruum_core::nodes::NodeStore;
@@ -59,6 +61,12 @@ pub async fn services(public_url: &str, pool: Option<sqlx::PgPool>) -> anyhow::R
             services.authz.clone(),
             services.nodes.clone(),
         ));
+        // The content store writes the `nodes` rows of files in its own transactions, so it
+        // comes after the Postgres node store. It starts the maintenance job (upload expiry,
+        // version retention, chunk garbage collection).
+        install_postgres(&mut services, pool.clone(), &ContentSettings::from_env())
+            .context("set up the content store")?;
+        tracing::info!("stores: Postgres");
     }
     // The identity, tenants and agents area: token key, OIDC, mail, plans, Postgres stores. It
     // takes `services.authz`, so it runs after the engine is chosen.

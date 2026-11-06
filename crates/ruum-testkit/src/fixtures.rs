@@ -720,8 +720,14 @@ mod seed {
         if let Some(n) = step("Archive", async move { s2.nodes.create(&c, req).await }).await {
             t.archive = n.value.id;
         }
-        // TODO(sharing area): set `editors_can_share = false` on Archive when the sharing store
-        // has the method of `updateNodeSharing`.
+        // Editors keep `edit` on Archive but lose `share` (`updateNodeSharing`).
+        let (s2, c, archive) = (s.clone(), owner_ctx.clone(), t.archive);
+        step("Archive editors_can_share", async move {
+            s2.sharing
+                .update_node_sharing(&c, archive, Some(false), None)
+                .await
+        })
+        .await;
 
         // The plan with two versions (by two actors, so they do not coalesce).
         let (s2, c, target, data) = (
