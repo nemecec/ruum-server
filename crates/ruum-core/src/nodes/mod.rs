@@ -264,6 +264,10 @@ pub trait ContentCopy: Send + Sync {
         source: &Node,
         target: NodeId,
     ) -> Result<Option<VersionId>>;
+
+    /// The nodes are purged: forget their versions. For the in-memory stores; the Postgres
+    /// node store deletes the `versions` rows in the purge transaction.
+    fn purged(&self, _nodes: &[NodeId]) {}
 }
 
 /// The node tree. Every method filters by `ctx.tenant` and checks permissions through

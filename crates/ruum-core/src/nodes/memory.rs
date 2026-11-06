@@ -373,6 +373,10 @@ impl MemoryNodeStore {
             )?
         };
         self.relate(updates).await?;
+        // The versions of purged files go too, so garbage collection can free their chunks.
+        if let Some(content) = self.content.get() {
+            content.purged(&ids);
+        }
         Ok(change)
     }
 }
@@ -778,8 +782,8 @@ impl NodeStore for MemoryNodeStore {
         }
         let content = self.content.get().cloned();
         if content.is_none() && sources.iter().any(|n| n.head_version.is_some()) {
-            // TODO(integrator): wire the versions area (`set_content_copy`) in
-            // `Services::in_memory` when its in-memory store exists.
+            // A store without the versions area (`set_content_copy`; `Services::in_memory` sets
+            // it) cannot copy content.
             return Err(Error::not_implemented("copying file content in memory"));
         }
         // Member links stay member links only where the caller may share the target.

@@ -535,6 +535,12 @@ impl crate::nodes::ContentCopy for MemoryContentStore {
             .await?
             .map(|v| v.id))
     }
+
+    fn purged(&self, nodes: &[NodeId]) {
+        for n in nodes {
+            self.forget_node(*n);
+        }
+    }
 }
 
 #[async_trait]
