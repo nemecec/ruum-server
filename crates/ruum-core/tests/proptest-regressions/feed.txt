@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7f4ebaeb6b6011817f90cd93e25b431add5d7b2b82399cbb19b495186a2918dc # shrinks to ops = [Grant(Index(0), View), Ungrant(Index(880663504))], agent_scope = Index(11565452317648604851), agent_role = View, cursors = [(Index(2476078772865780708), 6), (Index(9003797883025603498), 1), (Index(10219444080606848580), 2)]
+cc 00c87785f1d74fcdc62e3658471344720eccc7689cc52fcbb275bb370c85c630 # shrinks to ops = [File(Index(13835058055282163712)), Copy(Index(11068046444227403506), Index(7984701065745455767))], agent_scope = Index(17480704220005263011), agent_role = Edit, cursors = [(Index(3158868236961372473), 1), (Index(165182861947547429), 1), (Index(9139195472064440588), 6)]
+cc 68ae12b53d7b0beb9e2a6d2772b18f626dc3952202fc8da82109cb140835444e # shrinks to ops = [Folder(Index(3761939382)), Trash(Index(11211691870229683857)), Trash(Index(18093536443445189361)), Grant(Index(17409455090637439367), Comment), Ungrant(Index(12343495387104583795))], agent_scope = Index(3088801296195810004), agent_role = Edit, cursors = [(Index(11267290021754821625), 6), (Index(5406969108566506629), 2), (Index(7982544474834160198), 5)]

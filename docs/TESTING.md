@@ -158,6 +158,46 @@ handler that checks the token answers `401`, and the suites report that as a fai
    probes for IDs of the other tenant in the body).
 4. Add the rule in `permissions::rule`, then regenerate `permission_matrix.md`.
 
+## Property tests
+
+`crates/ruum-core/tests/properties/` holds the property tests of design section 18.2, written
+with `proptest`. Each module states its model at the top. The default case counts keep the
+whole binary at a few seconds; set `PROPTEST_CASES` to run more of every test.
+
+```sh
+cargo test -p ruum-core --test properties
+eval "$(scripts/dev.sh env)"                     # adds the SpiceDB comparison
+PROPTEST_CASES=1000 cargo test -p ruum-core --test properties feed
+```
+
+| Module | Cases | The property |
+|---|---|---|
+| `authz` | 48, 48, 48 | A random team world built through `Services::in_memory` (tree of folders, files, shortcut and member links; grants to users and to all members; share links; `editors_can_share`; `members_can_share`; agents with a subtree and a highest role). `authz::require` and `authz::role_on` agree with a reference model in the test for every principal, node and permission, including the error (`not_found`, `permission_denied`, `scope_exceeded`). Model-free: an agent never has a permission or role that its user lacks; a share link never has `manage` or `share`; dropping every `collection` tuple changes a role only from `view` to none. A member link is refused exactly when it would close a loop. |
+| `authz` (SpiceDB) | 8 | The relationships that the stores wrote give the same answers in SpiceDB as in the in-memory engine (every user and link subject, every node, `view` to `share` and `editors_cannot_share`). Skipped without `SPICEDB_PRESHARED_KEY`; deletes its tuples afterwards. |
+| `feed` | 32 | A random sequence of node operations (create, member links, rename, move, copy, trash, restore, purge, grants to a guest added, changed and removed, `editors_can_share`). For the owner, a guest and an agent of the guest: reading from any cursor with any page size gives the entries and resync markers of one big read, each once and in order; an entry on a node the observer sees now is sent; a sent entry is about a node (or a parent of it) that the observer saw at some moment, or is the documented grant rule; markers for grants to the caller and for moves across the edge of the view. |
+| `chunking` | 24, 24, 8 | FastCDC (`SMALL_CHUNKING`): chunks cover the data in order with valid sizes and hashes, and join to the same bytes and BLAKE3; after an insert, chunks that end before it keep their offset and chunks that start 4 maximum chunks after it keep their hash; manifests encode and decode; an upload through the content store downloads as the same bytes. |
+| `diff` | 256, 256, 256, 256, 128 | Text: the line changes applied to the old text give the new text (after `\r\n` and final-newline normalisation). JSON: the changes applied to the old value give the new value. Identical inputs give no changes (text, also with `\r\n`; JSON, also in another layout; XML; binary). |
+
+When a property fails, `proptest` shrinks the case and saves its seed in
+`crates/ruum-core/tests/proptest-regressions/`; the seed runs first on every later run, so keep
+these files in git. A real bug gets a fix in a separate `fix:` commit with the shrunk case as a
+plain regression test next to the code.
+
+Bugs found so far:
+
+- A member link inside its own target (directly, or through other member links) made a loop of
+  `view` in the graph; every check that walked it failed ("check is too deep" in memory, "max
+  depth exceeded" in SpiceDB), so the target answered `500`. The stores now refuse such links on
+  create, move and restore (`422 validation_failed`) and copy them as shortcuts
+  (`nodes::rules::member_link_loop`; regression: `nodes::conformance::member_link_loops`).
+- The changes feed gave an agent the `grant.updated` and `grant.removed` entries (and a `lost`
+  marker) of its user's grants outside the agent's scope (regression:
+  `journal::feed::tests::an_agent_gets_no_grant_entries_outside_its_scope`).
+
+Open question for the architect: by the documented "before" rule, the grantee of a removed or
+changed grant gets that entry even when it never saw the node, for example a grant on a node in
+the trash (only managers see trashed nodes). The `feed` property accepts this as documented.
+
 ## The mutation check
 
 `crates/ruum-testkit/scripts/mutation_check.sh` copies the repository to
