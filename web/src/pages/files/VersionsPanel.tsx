@@ -87,7 +87,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                   return (
                     <li key={v.id} className={current ? 'version current' : 'version'}>
                       <div>
-                        <strong>{formatWhen(v.created_at)}</strong> <span className="muted small">{formatShortDate(v.created_at)}</span>
+                        <strong>{versionWhen(v.created_at)}</strong>
                         {current && <span className="badge">Current</span>}
                         {v.label && <span className="badge label">{v.label}</span>}
                       </div>
@@ -153,6 +153,17 @@ const kindLabels: Record<Schemas['DiffChangeKind'], string> = {
   move: 'Moved',
   format: 'Format',
   replace: 'Replaced',
+}
+
+/**
+ * When a version was made, always with the time of day, so "yesterday's" version is easy to find:
+ * "13 minutes ago (15:13)", "Yesterday at 18:20", "20 Oct 2026, 14:00".
+ */
+function versionWhen(iso: string): string {
+  const rel = formatWhen(iso)
+  if (/ago$|^Just now$/.test(rel)) return `${rel} (${new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })})`
+  if (rel.includes(' at ')) return rel
+  return formatDate(iso)
 }
 
 /** "1 change", "3 changes": the plain summary of a comparison (the counts by kind confused people). */

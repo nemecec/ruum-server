@@ -85,3 +85,105 @@ contract. The contract needs at the end go to the architect panel, with C-1 to C
 Server gaps seen again (not UI work): an email grant that binds at sign-in does not make the
 person a guest, so every read answers `404`; an email grant to an existing account never binds
 (`docs/TESTING.md`, known gaps).
+
+# Synthetic-user round (branch `q/synthfix`)
+
+Status: `provisional`, 2026-11-06. The synthetic users (personas Kati, a garden designer in a
+personal space, and Jaan, the admin of the team space "Tamm Consulting") found 2 blockers,
+6 majors and a list of minor points. This round fixes the blockers and the majors in `web/` and
+some minor points. It changes no contract and no server code. Decisions 1, 3 and 4 above are
+replaced by decisions S1 to S3 below.
+
+## Decisions
+
+S1. **A share to a person of the space goes to their account.** The share dialog looks up the
+   typed email in the space's people (`listMembers`; members and up may list them). For a member
+   or guest it sends `addGrant` with `{type: "user", id}` (decision 0002-1), so the item shows
+   at once under their Shared with me. Before, it sent an email grant, which by the contract stays
+   an email grant until an invitation is accepted, so it never reached a person who had joined
+   already (the blocker). A guest who shares cannot list the people; the dialog then still sends
+   an email grant (contract need C-12). The mock API now keeps an email grant as an email grant,
+   as the server does; it hid the blocker before.
+
+S2. **The dialog shows access that comes from the space role, and says when a share can't limit
+   it.** In a team space, owners, admins and members manage everything through the team root
+   (decision 0001-4), and share there while `members_can_share` is on. "People with access" now
+   starts with "Everyone in *Space* except guests: Can manage" and how many people that is. The
+   add form warns when the email is a member's ("A share can't give them less. To let them see
+   only some folders, make them a guest"), a grant row of such a person says the role wins, and
+   the sharing rule says it does not apply to them. The role help says what Member means
+   ("can see, change, delete and share everything in the team space") and that Guest is the role
+   for per-folder limits. A change to Guest on the Members page asks first and says what the
+   person loses. A member role that can only view is a product question for the architect panel
+   (not a UI change).
+
+S3. **The share dialog says only what Ruum does.** The disabled "Send an email" box and "Ruum
+   can't send emails for shares yet" are gone. For a person outside the space the one box is
+   "Email them an invitation" (on by default, admins of a space that allows guests): "*email* is
+   new here. With the invitation they make a free Ruum account, then they can open *item*." The
+   words "space" and "guest" are not used for that person. "Use a link instead" moves the focus
+   to the link form, the way that needs no account. For a person of the space the form says Ruum
+   sends no email and they find it under Shared with me. The invitation's message leads with the
+   item: `I shared "<item>" with you. Accept this invitation and make a free Ruum account to open
+   it.` The email itself still starts with the space (server template, see C-13).
+
+S4. **A conflict upload keeps every version by default.** "Save as a new version" is the default
+   choice. When the current version is the person's own unnamed save of the last 10 minutes,
+   the server would join the upload into it (design 5.3), so the dialog names that version first
+   ("Before the upload of 15:13", editable) and says "Ruum keeps that version under this name, so
+   nothing is lost". Named versions never join and are kept forever; that is the cost of this
+   default, and it is visible in Versions. If the person clears the name, the dialog says in
+   plain words that the upload replaces the version. "Keep both" says that it makes two files.
+   C-8 (`coalesce: false`) stays the real fix; with it the automatic name can go.
+
+S5. **The activity log names what changed.** Access, role, sharing rule, link and member entries
+   are written from the entry's `data` (the server already stores the grantee, the role, the old
+   and new role or rule) and `target_id`: "Ada Lovelace gave Grace Hopper edit access to
+   *engine-specs.txt*", "changed Grace Hopper from Guest to Member", "changed the sharing rule of
+   *X*: people who can edit can also share, from same as the folder above to no". The item is a
+   link (name from `getNode`; an item the admin can't read stays "an item"). People come from
+   the names directory (C-7 would make this complete for removed people).
+
+S6. **Smaller fixes of this round.** The sharing rule explains itself, its inherit choice shows
+   the parent's effective value ("Standard" at the top level), and "Saved." confirms the save. A
+   person's own grant row has no controls; a grant added by someone other than the owner says
+   "added by *name*". Versions show the time of day with the relative age ("13 minutes ago
+   (15:13)", "20 Oct 2026, 14:00"); "Name" is "Keep forever..."; Compare says "3 changes" and
+   keeps "Compare as" behind "More options". Images have a picture icon. The sign-in button that
+   opens the Zitadel login is "Sign in with email", and a sign-in on the way to an invitation says
+   so. The welcome card no longer promises folder upload. The accept page says that the
+   invitation email names the space, the person and the role (C-9 stays open).
+
+## Findings of the round
+
+| Finding | Severity | State |
+|---|---|---|
+| Share by email to a member or guest stays "Invited, not joined yet" | blocker | Fixed (S1); e2e `sharing.e2e.ts` shares again with Ben after he joined |
+| Member role gives "Can manage" everywhere; share and rule don't limit it, no warning | blocker | Fixed in the UI (S2): shown, warned, role help, confirm before Guest. A view-only member role needs the architect panel |
+| Dialog says Ruum sent an invitation and that it can't send emails | major | Fixed (S3) |
+| Sharing with a client becomes "join the space as a guest", account needed | major | Fixed in the dialog (S3); the email still leads with the space (C-13); a share email without an account needs C-13 too |
+| Conflict dialog reads as "your earlier note is lost"; "Keep both" default makes copies | major | Fixed (S4) |
+| "People with access" hides role access | major | Fixed (S2) |
+| Activity log says "gave access: an item" | major | Fixed (S5) |
+| Accept page names nothing | major | Not fixed: needs C-9. The copy now points to the email |
+| Sharing rule inherit option shows the folder's own value, no save confirmation | minor | Fixed (S6) |
+| Rule question on a top-level folder of a personal space | minor | Explained in place (S6), not hidden: in a personal space it still governs guests with Can edit |
+| Versions show only a relative age; "Name" unclear; Compare in technical words | minor | Fixed (S6) |
+| Photos and notes have the same icon | minor | Fixed (S6) |
+| "Upload files and folders" but no folder upload | minor | Text fixed (S6); folder upload is not built |
+| "Sign in with a passkey" opens a login name and password | minor | Label fixed (S6). The Zitadel login theme ("Login Name") and the 2FA prompt are Zitadel settings of `scripts/dev.sh`, not changed here |
+| Sign-in from an invitation link gives no context | minor | Fixed (S6) |
+| Member role change without confirmation | minor | Fixed for a change to Guest (S2); no Undo |
+| Share rows: who added a grant; own row editable | minor | Fixed (S6) |
+| No sign-ins in the team space's activity log | minor | Not fixed: no server code calls `audit::events::sign_in`, so no space records a sign-in (C-14) |
+| Invitation email is plain text, no role or end date | minor | Not fixed: server template (C-13) |
+| `scripts/ux/drive.mjs` `fill` output | minor (tooling) | Not changed |
+
+## Contract and server needs found in this round
+
+| ID | Need | Why | Proposal |
+|---|---|---|---|
+| C-12 | An email grant to a person of the tenant binds at once | Agents (MCP, CLI) and guests who share, who cannot list members, still make email grants that never reach a member or guest (the blocker of S1 outside the web UI) | `addGrant` with the email of a member or guest of the tenant stores a grant to that user (a contract change: the text says it "stays an email grant") |
+| C-13 | Share and invitation emails that lead with the item | Kati's client should read "Kati Tamm shared Garden Parna 12 with you", and should get a view link without an account if Kati wants that; the role and the end date belong in the invitation email | Implement `notify` of `addGrant` (the J3 email: item name, sharer, an "Open" button, HTML part); an invitation created from a share carries the item; the invitation email names the role and the end date |
+| C-14 | Sign-ins in each space's activity log (server gap, no contract change) | An admin asks "who signed in to Tamm Consulting"; the filter "Sign-ins" is always empty | Call `audit::events::sign_in` at `loginCallback` for every tenant of the person (or record the first use of a session per tenant) |
+| C-9 | (again, now a major) | The accept page can't name the space, the inviter or the role | As proposed above |

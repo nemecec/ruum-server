@@ -30,7 +30,7 @@ test('version history: label, new version, diff and restore', async ({ page }, i
   const panel = page.getByRole('region', { name: 'Versions of plan.txt' })
   await expect(panel.getByRole('listitem')).toHaveCount(1)
   await expect(panel.getByText('This is the only version')).toBeVisible()
-  await panel.getByRole('button', { name: /^Name version of/ }).click()
+  await panel.getByRole('button', { name: /^Keep forever: name the version of/ }).click()
   const nameDialog = page.getByRole('dialog', { name: 'Name this version' })
   await expect(nameDialog).toContainText('Named versions are kept forever')
   await nameDialog.getByLabel('Version name').fill('first')
@@ -101,13 +101,13 @@ test('"Upload new version" warns before it replaces your own version of the last
   await expect(panel.getByText('before two', { exact: true })).toBeVisible()
 
   // A conflict on upload asks once. The current version is Ann's own unnamed one from just now,
-  // so a new version would replace it: the dialog says so, and "Keep both" is the default.
+  // so "Save as a new version" (the default) names it first and says so: nothing is lost.
   await page.getByRole('button', { name: 'Back to details' }).click()
   await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath('c'), 'plan.txt', 'one\ntwo\nthree\n'))
   const conflict = page.getByRole('dialog', { name: 'plan.txt is already here' })
-  await expect(conflict.getByRole('note')).toContainText('a new version replaces that version')
-  await expect(conflict.getByRole('radio', { name: /^Replace your version from / })).not.toBeChecked()
-  await expect(conflict.getByRole('radio', { name: 'Keep both' })).toBeChecked()
+  await expect(conflict.getByRole('radio', { name: 'Save as a new version' })).toBeChecked()
+  await expect(conflict).toContainText('Ruum keeps that version under this name, so nothing is lost.')
+  await conflict.getByRole('radio', { name: 'Keep both, as two separate files' }).check()
   await conflict.getByRole('button', { name: 'Continue' }).click()
   await expect(page.getByRole('region', { name: 'Uploads' })).toContainText('Done, saved as plan (2).txt')
   await expect(page.getByRole('button', { name: 'plan (2).txt', exact: true })).toBeVisible()
@@ -124,23 +124,28 @@ test('a name conflict on upload does not silently replace your own version of th
   await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath('a'), 'plan.txt', 'plan v1'))
   await expect(toast(page, 'Uploaded plan.txt.')).toBeVisible()
 
-  // The same name again, a moment later. Enter takes the default: keep both, nothing is replaced.
+  // The same name again, a moment later. Enter takes the default: a new version, and the
+  // earlier one is kept under a name, so both versions are there.
   await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath('b'), 'plan.txt', 'plan v2 changed'))
   let conflict = page.getByRole('dialog', { name: 'plan.txt is already here' })
-  await expect(conflict.getByRole('note')).toContainText('You changed plan.txt')
+  await expect(conflict).toContainText('You changed plan.txt')
+  await expect(conflict.getByLabel('Name of the earlier version')).toHaveValue(/^Before the upload of \d\d:\d\d$/)
   await page.keyboard.press('Enter')
-  await expect(page.getByRole('region', { name: 'Uploads' })).toContainText('Done, saved as plan (2).txt')
-
-  // "Replace" with a name keeps the old content as its own version.
-  await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath('c'), 'plan.txt', 'plan v3'))
-  conflict = page.getByRole('dialog', { name: 'plan.txt is already here' })
-  await conflict.getByRole('radio', { name: /^Replace your version from / }).check()
-  await conflict.getByLabel('Name the current version to keep it (optional)').fill('first plan')
-  await conflict.getByRole('button', { name: 'Keep it and upload' }).click()
   await expect(toast(page, /^Uploaded plan\.txt\.$/)).toBeVisible()
   await page.getByRole('button', { name: 'Details of plan.txt' }).click()
   await page.getByRole('button', { name: 'Versions', exact: true }).click()
   const panel = page.getByRole('region', { name: 'Versions of plan.txt' })
   await expect(panel.getByRole('listitem')).toHaveCount(2)
-  await expect(panel.getByText('first plan', { exact: true })).toBeVisible()
+  await expect(panel.getByText(/^Before the upload of /)).toBeVisible()
+  await page.getByRole('button', { name: 'Back to details' }).click()
+
+  // Without a name the dialog says the upload replaces the version of the last minutes.
+  await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath('c'), 'plan.txt', 'plan v3'))
+  conflict = page.getByRole('dialog', { name: 'plan.txt is already here' })
+  await conflict.getByLabel('Name of the earlier version').fill('')
+  await expect(conflict.getByRole('note')).toContainText('Without a name, the new upload replaces your version from')
+  await conflict.getByRole('button', { name: 'Continue' }).click()
+  await expect(toast(page, /^Uploaded plan\.txt\. It replaced your version from /)).toBeVisible()
+  await page.getByRole('button', { name: 'Versions', exact: true }).click()
+  await expect(panel.getByRole('listitem')).toHaveCount(2)
 })

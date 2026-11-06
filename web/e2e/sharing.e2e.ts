@@ -29,15 +29,18 @@ async function annSharesFolder(browser: Browser, email: string, outDir: string) 
   const form = share.getByRole('form', { name: 'Add people' })
   await form.getByLabel('Email', { exact: true }).fill(email)
   await expect(form.getByLabel('Access')).toHaveValue('view')
-  // The server sends no email for a share yet; the UI does not promise one.
-  await expect(form.getByLabel('Send an email')).toBeDisabled()
-  await expect(form).toContainText("Ruum can't send emails for shares yet")
-  // The person is not in Ann's space: a share alone would not let them open the folder, so the
-  // dialog says so and also invites them as a guest (on by default).
-  await expect(form).toContainText(`${email} is not in`)
-  await expect(form.getByRole('checkbox', { name: /^Also invite them to .* as a guest$/ })).toBeChecked()
+  // No out-of-date "can't send emails" text: the one box says what Ruum emails.
+  await expect(form).not.toContainText("can't send emails")
+  await expect(form.getByLabel('Send an email')).toHaveCount(0)
+  // The person is new here: a share alone would not let them open the folder, so the dialog says
+  // so in plain words and emails them an invitation (on by default). A link is the way without an account.
+  await expect(form).toContainText(`${email} is new here. With the invitation they make a free Ruum account, then they can open ${folder}.`)
+  await expect(form.getByRole('checkbox', { name: 'Email them an invitation' })).toBeChecked()
+  await expect(form.getByRole('button', { name: 'Use a link instead' })).toBeVisible()
   await form.getByRole('button', { name: 'Share' }).click()
-  await expect(share.getByRole('status').filter({ hasText: `Shared with ${email}. Ruum sent them an invitation to join` })).toBeVisible()
+  await expect(
+    share.getByRole('status').filter({ hasText: `Shared ${folder} with ${email}. Ruum emailed them an invitation: they make a free account, then they can open it.` }),
+  ).toBeVisible()
   const people = share.getByRole('region', { name: 'People with access' })
   await expect(people).toContainText(email)
   await expect(people).toContainText('Invited, not joined yet')
@@ -88,7 +91,7 @@ test('Ann shares a folder with Ben, who joins as a guest by invitation and sees 
   // Ben is a person outside Ann's space: he joins it as a guest through the invitation mail that
   // the share dialog sent, which also binds the email grant to him.
   const mail = await waitForMail(users.ben.email)
-  expect(mail.text).toContain(`I shared ${folder} with you.`)
+  expect(mail.text).toContain(`I shared "${folder}" with you.`)
   const link = /https?:\/\/\S+\/invitations\/accept\?token=\S+/.exec(mail.text)?.[0]
   expect(link, mail.text).toBeTruthy()
   const benContext = await browser.newContext({ storageState: storageStatePath('ben') })
@@ -116,6 +119,19 @@ test('Ann shares a folder with Ben, who joins as a guest by invitation and sees 
   await share.getByRole('button', { name: `Remove access for ${users.ben.displayName}` }).click()
   await expect(share.getByRole('status').filter({ hasText: `Removed access for ${users.ben.displayName}.` })).toBeVisible()
   await expect.poll(async () => (await api(ben, 'GET', `/v1/nodes/${folderId}`, { tenant })).status, { timeout: 15_000 }).toBe(404)
+
+  // Ben is a guest of the space now. A new share to his email goes to his account at once (by
+  // user ID): the row names him, never "Invited, not joined yet", and he can open the folder
+  // without a new invitation (the synthetic-user blocker).
+  const form = share.getByRole('form', { name: 'Add people' })
+  await form.getByLabel('Email', { exact: true }).fill(users.ben.email)
+  await expect(form).toContainText(`${users.ben.displayName} is in`)
+  await expect(form.getByRole('checkbox', { name: 'Email them an invitation' })).toHaveCount(0)
+  await form.getByRole('button', { name: 'Share' }).click()
+  await expect(share.getByRole('status').filter({ hasText: `Shared ${folder} with ${users.ben.displayName}. They find it under Shared with me.` })).toBeVisible()
+  await expect(people).toContainText(users.ben.displayName)
+  await expect(people).not.toContainText('Invited, not joined yet')
+  await expect.poll(async () => (await api(ben, 'GET', `/v1/nodes/${folderId}`, { tenant })).status, { timeout: 15_000 }).toBe(200)
 
   await context.close()
   await benContext.close()
