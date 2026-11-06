@@ -35,6 +35,15 @@ struct State {
     rows: HashMap<NodeId, Row>,
 }
 
+/// A change that a check must see before it is made ([`State::view_reaches`]).
+#[derive(Default)]
+struct Pending {
+    /// New parents.
+    parents: HashMap<NodeId, NodeId>,
+    /// Trashed nodes that come back.
+    revived: HashSet<NodeId>,
+}
+
 impl State {
     fn row(&self, tenant: TenantId, id: NodeId) -> Result<&Row> {
         self.rows
@@ -98,6 +107,64 @@ impl State {
     fn has_member_link(&self, tenant: TenantId, folder: NodeId, target: NodeId) -> bool {
         self.live_children(tenant, folder)
             .any(|r| rules::member_target(&r.node) == Some(target))
+    }
+
+    /// Whether `goal` can be reached from `from` along the edges that the graph follows for
+    /// `view` (`parent->view`, `collection->view`): from a node to its parent, and from the
+    /// target of a live member link to the folder that holds the link. `pending` describes a
+    /// change that is not made yet.
+    fn view_reaches(
+        &self,
+        tenant: TenantId,
+        from: NodeId,
+        goal: NodeId,
+        pending: &Pending,
+    ) -> bool {
+        let parent_of = |r: &Row| {
+            pending
+                .parents
+                .get(&r.node.id)
+                .copied()
+                .or(r.node.parent_id)
+        };
+        let mut folders: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for r in self.rows.values().filter(|r| r.node.tenant_id == tenant) {
+            let live = r.node.trashed_at.is_none() || pending.revived.contains(&r.node.id);
+            if let (true, Some(t), Some(p)) = (live, rules::member_target(&r.node), parent_of(r)) {
+                folders.entry(t).or_default().push(p);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(x) = stack.pop() {
+            if x == goal {
+                return true;
+            }
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Some(r) = self.rows.get(&x) {
+                stack.extend(parent_of(r));
+            }
+            if let Some(f) = folders.get(&x) {
+                stack.extend(f.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Whether the new edges (`(a, b)`: the view of `a` follows `b`) close a loop in the state
+    /// after the change `pending` (see [`rules::member_link_loop`]). The state before has no
+    /// loop, so a new loop goes through a new edge.
+    fn closes_view_loop(
+        &self,
+        tenant: TenantId,
+        edges: &[(NodeId, NodeId)],
+        pending: &Pending,
+    ) -> bool {
+        edges
+            .iter()
+            .any(|&(a, b)| a == b || self.view_reaches(tenant, b, a, pending))
     }
 
     fn ancestors(&self, tenant: TenantId, id: NodeId) -> Result<Vec<NodeId>> {
@@ -477,6 +544,15 @@ impl NodeStore for MemoryNodeStore {
         let (node, change) = {
             let mut st = self.st();
             st.live(ctx.tenant, req.parent_id)?;
+            if let Some(l) = link.as_ref().filter(|l| l.kind == LinkKind::Member)
+                && st.closes_view_loop(
+                    ctx.tenant,
+                    &[(l.target, req.parent_id)],
+                    &Pending::default(),
+                )
+            {
+                return Err(rules::member_link_loop());
+            }
             let taken = st.taken(ctx.tenant, req.parent_id, None);
             let name = rules::pick_name(&name, req.kind, req.on_conflict, &taken)?;
             let now = crate::now();
@@ -697,6 +773,17 @@ impl NodeStore for MemoryNodeStore {
             if old_parent == req.parent_id && row.node.name == wanted {
                 Err(row.node)
             } else {
+                if old_parent != req.parent_id {
+                    let mut edges = vec![(id, req.parent_id)];
+                    edges.extend(rules::member_target(&row.node).map(|t| (t, req.parent_id)));
+                    let pending = Pending {
+                        parents: HashMap::from([(id, req.parent_id)]),
+                        ..Pending::default()
+                    };
+                    if st.closes_view_loop(ctx.tenant, &edges, &pending) {
+                        return Err(rules::member_link_loop());
+                    }
+                }
                 let taken = st.taken(ctx.tenant, req.parent_id, Some(id));
                 let name = rules::pick_name(&wanted, row.node.kind, req.on_conflict, &taken)?;
                 let r = st.row_mut(ctx.tenant, id)?;
@@ -810,6 +897,16 @@ impl NodeStore for MemoryNodeStore {
                 req.on_conflict,
                 &taken,
             )?;
+            // A copied member link makes its target depend on the copy, which is inside the
+            // new parent: a loop when the new parent's view already follows the target. Such
+            // links are copied as shortcuts (`rules::member_link_loop`).
+            let loops: HashSet<NodeId> = targets
+                .iter()
+                .copied()
+                .filter(|t| {
+                    st.closes_view_loop(ctx.tenant, &[(*t, req.parent_id)], &Pending::default())
+                })
+                .collect();
             for (i, src) in sources.iter().enumerate() {
                 let new_id = NodeId::new();
                 map.insert(src.id, new_id);
@@ -821,7 +918,9 @@ impl NodeStore for MemoryNodeStore {
                         .ok_or_else(|| Error::Internal("nodes: copy without the parent".into()))?
                 };
                 let link_kind = match (src.link_kind, src.link_target) {
-                    (Some(LinkKind::Member), Some(t)) if !shares.contains(&t) => {
+                    (Some(LinkKind::Member), Some(t))
+                        if !shares.contains(&t) || loops.contains(&t) =>
+                    {
                         Some(LinkKind::Shortcut)
                     }
                     (k, _) => k,
@@ -1039,6 +1138,26 @@ impl NodeStore for MemoryNodeStore {
                 .into_iter()
                 .filter(|n| st.rows.get(n).is_some_and(|r| r.trash_root == Some(id)))
                 .collect();
+            let pending = Pending {
+                parents: HashMap::from([(id, dest)]),
+                revived: members.iter().copied().collect(),
+            };
+            let mut edges = vec![(id, dest)];
+            for n in &members {
+                if let Some(r) = st.rows.get(n)
+                    && let Some(t) = rules::member_target(&r.node)
+                {
+                    let folder = if *n == id {
+                        Some(dest)
+                    } else {
+                        r.node.parent_id
+                    };
+                    edges.extend(folder.map(|f| (t, f)));
+                }
+            }
+            if st.closes_view_loop(ctx.tenant, &edges, &pending) {
+                return Err(rules::member_link_loop());
+            }
             for n in &members {
                 let r = st.row_mut(ctx.tenant, *n)?;
                 r.node.trashed_at = None;

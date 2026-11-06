@@ -190,6 +190,7 @@ async fn run(w: &World, b: &dyn Backend) {
     rename_move_copy(w, b).await;
     trash_and_restore(w, b).await;
     links(w, b).await;
+    member_link_loops(w, b).await;
     isolation(w, b).await;
     tags(w, b).await;
     search(w, b).await;
@@ -653,6 +654,84 @@ async fn links(w: &World, b: &dyn Backend) {
     s.purge(&w.user(w.owner), photos.id).await.unwrap();
     assert!(!w.sees(w.guest, pic.id).await);
     assert_eq!(s.get(&m, ml.id).await.unwrap().link_target, Some(pic.id));
+}
+
+/// Member links never form a loop of `view` (`rules::member_link_loop`). Found by the property
+/// test `authz::engine_agrees_with_the_model` (`tests/properties`): its shrunk case was a member
+/// link in a folder inside the link's own target; every `view` check of the target by someone
+/// without access then failed with "check is too deep" (SpiceDB: "max depth exceeded").
+async fn member_link_loops(w: &World, b: &dyn Backend) {
+    let m = w.user(w.member);
+    let s = b.nodes();
+    let refused = |r: Result<Written<Node>>| assert_eq!(code(r), "422");
+    // The shrunk case: /T/F holds a member link to /T.
+    let t = mk(b, &m, folder(w.root, "LoopT")).await;
+    let f = mk(b, &m, folder(t.id, "F")).await;
+    refused(s.create(&m, link(f.id, "up", LinkKind::Member, t.id)).await);
+    refused(
+        s.create(&m, link(t.id, "self", LinkKind::Member, t.id))
+            .await,
+    );
+    assert!(!w.sees(w.guest, t.id).await);
+    // A shortcut there is fine, and so is a member link from outside.
+    mk(b, &m, link(f.id, "short", LinkKind::Shortcut, t.id)).await;
+    let out = mk(b, &m, folder(w.root, "LoopOut")).await;
+    let ml = mk(b, &m, link(out.id, "in", LinkKind::Member, t.id)).await;
+    // Two links that chain back: /LoopOut holds a link to /T, so /T/F may not link to /LoopOut.
+    refused(
+        s.create(&m, link(f.id, "back", LinkKind::Member, out.id))
+            .await,
+    );
+    // Moving the link into its target, or the folder of the link into the target.
+    let mv = |parent: NodeId| MoveRequest {
+        parent_id: parent,
+        name: None,
+        on_conflict: OnConflict::Rename,
+        if_revision: None,
+    };
+    refused(s.move_node(&m, ml.id, mv(f.id)).await);
+    refused(s.move_node(&m, out.id, mv(f.id)).await);
+    assert!(!w.sees(w.guest, t.id).await);
+    // A copy of the folder of the link into the target: the copied link is a shortcut.
+    let c = s
+        .copy(
+            &m,
+            out.id,
+            CopyRequest {
+                parent_id: f.id,
+                name: None,
+                on_conflict: OnConflict::Fail,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let copied = s
+        .list_children(&m, c.id, ChildOrder::Name, PageRequest::default())
+        .await
+        .unwrap()
+        .items;
+    assert_eq!(copied.len(), 1);
+    assert_eq!(copied[0].link_kind, Some(LinkKind::Shortcut));
+    // A restore into the target of a link that comes back with it.
+    s.trash(&m, out.id, None).await.unwrap();
+    refused(
+        s.restore(
+            &m,
+            out.id,
+            RestoreRequest {
+                parent_id: Some(f.id),
+                // F holds the copy of the same name.
+                on_conflict: OnConflict::Rename,
+                ..RestoreRequest::default()
+            },
+        )
+        .await,
+    );
+    s.restore(&m, out.id, RestoreRequest::default())
+        .await
+        .unwrap();
+    assert!(!w.sees(w.guest, t.id).await);
 }
 
 async fn isolation(w: &World, b: &dyn Backend) {

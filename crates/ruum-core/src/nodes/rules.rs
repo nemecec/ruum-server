@@ -249,6 +249,23 @@ pub fn created_tuples(node: &Node) -> Vec<RelationshipUpdate> {
     v
 }
 
+/// The error when a change would make member links form a loop.
+///
+/// `view` follows `parent->view` and `collection->view` (`schema.zed`). A member link in folder
+/// F to target T makes T depend on F. When F is T or inside T, or member links chain back to T
+/// in another way, the graph has a loop: SpiceDB then fails every check that walks it ("max
+/// depth exceeded"), and so does the in-memory engine. The stores refuse such links (create,
+/// move, restore) and copy them as shortcuts.
+pub fn member_link_loop() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::ValidationFailed,
+            "a member link cannot be inside its own target, directly or through other member links",
+        )
+        .with_hint("put the link in a folder outside the target, or use a shortcut link"),
+    )
+}
+
 /// The target of a member link.
 pub fn member_target(node: &Node) -> Option<NodeId> {
     match (node.kind, node.link_kind, node.link_target) {

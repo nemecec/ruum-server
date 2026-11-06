@@ -181,6 +181,48 @@ async fn pick_name(
     rules::pick_name(wanted, kind, on_conflict, &taken)
 }
 
+/// Whether `goal` can be reached from `from` along the edges that the graph follows for `view`
+/// (`parent->view`, `collection->view`): from a node to its parent, and from the target of a
+/// live member link to the folder that holds the link. Reads the state of the transaction.
+async fn view_reaches(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    from: NodeId,
+    goal: NodeId,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "with recursive deps(id) as ( \
+             select $2::uuid \
+             union \
+             select n.parent_id from deps d join nodes n on n.tenant_id = $1 \
+             and n.parent_id is not null \
+             and (n.id = d.id \
+                  or (n.link_kind = 'member' and n.link_target = d.id and n.trashed_at is null))) \
+         select exists (select 1 from deps where id = $3)",
+    )
+    .bind(tenant.0)
+    .bind(from.0)
+    .bind(goal.0)
+    .fetch_one(conn)
+    .await?)
+}
+
+/// Fails with [`rules::member_link_loop`] when one of the edges (`(a, b)`: the view of `a`
+/// follows `b`), which the transaction has made, closes a loop. The state before had no loop,
+/// so a new loop goes through a new edge.
+async fn refuse_view_loop(
+    conn: &mut PgConnection,
+    tenant: TenantId,
+    edges: &[(NodeId, NodeId)],
+) -> Result<()> {
+    for &(a, b) in edges {
+        if a == b || view_reaches(conn, tenant, b, a).await? {
+            return Err(rules::member_link_loop());
+        }
+    }
+    Ok(())
+}
+
 /// Whether a live member link in `folder` points at `target`.
 async fn has_member_link(
     conn: &mut PgConnection,
@@ -616,6 +658,9 @@ impl NodeStore for PgNodeStore {
             editors_can_share_effective: None,
         };
         Self::insert(&mut t, &node).await?;
+        if let Some(target) = rules::member_target(&node) {
+            refuse_view_loop(&mut t.tx, ctx.tenant, &[(target, req.parent_id)]).await?;
+        }
         let change = Self::journal(
             &mut t,
             ctx,
@@ -897,6 +942,9 @@ impl NodeStore for PgNodeStore {
             .await
             .map_err(name_error(&name))?;
         if old_parent != req.parent_id {
+            let mut edges = vec![(id, req.parent_id)];
+            edges.extend(rules::member_target(&row.node).map(|tg| (tg, req.parent_id)));
+            refuse_view_loop(&mut t.tx, ctx.tenant, &edges).await?;
             t.updates
                 .push(RelationshipUpdate::Delete(tuples::node_parent(
                     id, old_parent,
@@ -1001,6 +1049,16 @@ impl NodeStore for PgNodeStore {
             req.on_conflict,
         )
         .await?;
+        // A copied member link makes its target depend on the copy, which is inside the new
+        // parent: a loop when the new parent's view already follows the target. Such links are
+        // copied as shortcuts (`rules::member_link_loop`).
+        let mut loops: HashSet<NodeId> = HashSet::new();
+        for tg in targets.iter().copied() {
+            if tg == req.parent_id || view_reaches(&mut t.tx, ctx.tenant, req.parent_id, tg).await?
+            {
+                loops.insert(tg);
+            }
+        }
         let now = crate::now();
         let mut map: HashMap<NodeId, NodeId> = HashMap::new();
         let mut made: Vec<(Node, NodeId)> = Vec::with_capacity(sources.len());
@@ -1015,7 +1073,9 @@ impl NodeStore for PgNodeStore {
                     .ok_or_else(|| Error::Internal("nodes: copy without the parent".into()))?
             };
             let link_kind = match (src.link_kind, src.link_target) {
-                (Some(LinkKind::Member), Some(tg)) if !shares.contains(&tg) => {
+                (Some(LinkKind::Member), Some(tg))
+                    if !shares.contains(&tg) || loops.contains(&tg) =>
+                {
                     Some(LinkKind::Shortcut)
                 }
                 (k, _) => k,
@@ -1302,6 +1362,9 @@ impl NodeStore for PgNodeStore {
         .bind(id.0)
         .fetch_all(&mut *t.tx)
         .await?;
+        let mut edges = vec![(id, dest)];
+        edges.extend(links.iter().map(|(tg, p)| (NodeId(*tg), NodeId(*p))));
+        refuse_view_loop(&mut t.tx, ctx.tenant, &edges).await?;
         for (tg, p) in links {
             t.updates
                 .push(RelationshipUpdate::Touch(tuples::member_link(
