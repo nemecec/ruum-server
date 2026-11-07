@@ -24,7 +24,9 @@ async function annSharesFolder(browser: Browser, email: string, outDir: string) 
 
   const [, tenant, folderId] = /\/t\/([0-9a-f-]{36})\/files\/([0-9a-f-]{36})/.exec(ann.url())!
   await ann.getByRole('navigation', { name: 'Breadcrumbs' }).getByRole('link').first().click()
-  await ann.getByRole('button', { name: `Details of ${folder}`, exact: true }).click()
+  // By keyboard: after an upload, the uploads panel and the toast at the bottom right can cover
+  // the folder row (its random name decides where it sorts), and they take the pointer.
+  await ann.getByRole('button', { name: `Details of ${folder}`, exact: true }).press('Enter')
   await ann.getByRole('button', { name: 'Share', exact: true }).click()
   const share = ann.getByRole('dialog', { name: `Share ${folder}` })
   const form = share.getByRole('form', { name: 'Add people' })
@@ -169,7 +171,9 @@ test('a link made in the share dialog opens for a visitor without an account', a
   await ann.getByLabel('Upload files').setInputFiles(testFile(info.outputPath(), 'site.txt', 'site plan\n'))
   await expect(toast(ann, 'Uploaded site.txt.')).toBeVisible()
   await ann.getByRole('navigation', { name: 'Breadcrumbs' }).getByRole('link').first().click()
-  await ann.getByRole('button', { name: `Details of ${folder}`, exact: true }).click()
+  // By keyboard: after an upload, the uploads panel and the toast at the bottom right can cover
+  // the folder row (its random name decides where it sorts), and they take the pointer.
+  await ann.getByRole('button', { name: `Details of ${folder}`, exact: true }).press('Enter')
   await ann.getByRole('button', { name: 'Share', exact: true }).click()
   const share = ann.getByRole('dialog', { name: `Share ${folder}` })
   const linkForm = share.getByRole('form', { name: 'Create a link' })
