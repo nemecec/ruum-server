@@ -343,6 +343,9 @@ not_exposed:
   - operation: listMySessions
     reason: user_only
     note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
+  - operation: updateMyPreferences
+    reason: user_only
+    note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'
   - operation: endSession
     reason: user_only
     note: 'x-ruum-user-only: a signed-in user only (agents get 403 user_required)'

@@ -318,6 +318,41 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthenticated'
 
+  /v1/me/preferences:
+    patch:
+      tags: [auth]
+      operationId: updateMyPreferences
+      x-ruum-user-only: true
+      summary: Change the preferences of the signed-in user
+      description: |
+        Users only (agents and share links get `user_required`). Sets the preferences of the
+        caller's own account (design 12.4); they hold for the user in every tenant. A property
+        that is left out keeps its value; `null` clears it. `getMe` returns the preferences in
+        `preferences`. Nobody else can read or change them.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserPreferencesRequest'
+      responses:
+        '200':
+          description: The preferences after the change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPreferences'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
   /v1/me/identities:
     get:
       tags: [auth]
@@ -4912,6 +4947,40 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Uuid'
             - type: 'null'
+        preferences:
+          description: >-
+            The preferences of the signed-in user (`updateMyPreferences`, design 12.4). Present
+            when the caller is a user; absent for an agent.
+          allOf:
+            - $ref: '#/components/schemas/UserPreferences'
+    UserPreferences:
+      type: object
+      required: [locale]
+      properties:
+        locale:
+          description: >-
+            The language of the user interface as a BCP 47 tag (`en`, `et`, `en-GB`), or `null`
+            to follow the browser. The web UI uses it when it has that language and falls back
+            to the browser's language, then English.
+          oneOf:
+            - $ref: '#/components/schemas/LocaleTag'
+            - type: 'null'
+    UpdateUserPreferencesRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        locale:
+          description: The new language, or `null` to follow the browser. Left out, it stays.
+          oneOf:
+            - $ref: '#/components/schemas/LocaleTag'
+            - type: 'null'
+    LocaleTag:
+      description: >-
+        A BCP 47 language tag: a language of 2 or 3 letters, an optional script and an optional
+        region (`et`, `en-GB`, `sr-Latn-RS`, `en-XA` for the pseudo-locale of the tests).
+      type: string
+      maxLength: 35
+      pattern: '^[a-z]{2,3}(-[A-Z][a-z]{3})?(-([A-Z]{2}|[0-9]{3}))?$'
     Identity:
       type: object
       required: [id, issuer, subject, email_verified, linked_at]

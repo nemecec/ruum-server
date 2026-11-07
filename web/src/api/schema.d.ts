@@ -173,6 +173,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me/preferences": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change the preferences of the signed-in user
+         * @description Users only (agents and share links get `user_required`). Sets the preferences of the
+         *     caller's own account (design 12.4); they hold for the user in every tenant. A property
+         *     that is left out keeps its value; `null` clears it. `getMe` returns the preferences in
+         *     `preferences`. Nobody else can read or change them.
+         */
+        patch: operations["updateMyPreferences"];
+        trace?: never;
+    };
     "/v1/me/identities": {
         parameters: {
             query?: never;
@@ -3227,7 +3250,19 @@ export interface components {
             agent?: components["schemas"]["Agent"] | null;
             /** @description The tenant the token is bound to (agent tokens). */
             bound_tenant_id?: components["schemas"]["Uuid"] | null;
+            /** @description The preferences of the signed-in user (`updateMyPreferences`, design 12.4). Present when the caller is a user; absent for an agent. */
+            preferences?: components["schemas"]["UserPreferences"];
         };
+        UserPreferences: {
+            /** @description The language of the user interface as a BCP 47 tag (`en`, `et`, `en-GB`), or `null` to follow the browser. The web UI uses it when it has that language and falls back to the browser's language, then English. */
+            locale: components["schemas"]["LocaleTag"] | null;
+        };
+        UpdateUserPreferencesRequest: {
+            /** @description The new language, or `null` to follow the browser. Left out, it stays. */
+            locale?: components["schemas"]["LocaleTag"] | null;
+        };
+        /** @description A BCP 47 language tag: a language of 2 or 3 letters, an optional script and an optional region (`et`, `en-GB`, `sr-Latn-RS`, `en-XA` for the pseudo-locale of the tests). */
+        LocaleTag: string;
         Identity: {
             id: components["schemas"]["Uuid"];
             issuer: string;
@@ -5182,6 +5217,40 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthenticated"];
+        };
+    };
+    updateMyPreferences: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateUserPreferencesRequest"];
+            };
+        };
+        responses: {
+            /** @description The preferences after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserPreferences"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            422: components["responses"]["ValidationFailed"];
         };
     };
     listMyIdentities: {
