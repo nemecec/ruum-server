@@ -296,9 +296,16 @@ rebased once more without a change to code). The smoke test and the mutation che
 ## Known gaps
 
 - **Step 1 follow-ups** (decision 0003, `provisional`): item 5 (C-7, names of actors) is built
-  and merged; item 1 (content role) is built on `f/content-role` without its web UI (a card).
-  Items 2 (C-12), 3 (C-13), 4 (C-14), 6 (C-8 to C-11), 7
-  (search `type`, batch, hints, `safe_stop`) and 8 (IDs of gone nodes) are decided and not built.
+  and merged; item 1 (content role) is built on `f/content-role`. Items 2 (C-12, email grants
+  bind) and 3 (C-13, share and invitation emails) are built on the server in `f/email-grants`,
+  stacked on `f/content-role` (migration `0006_email_grants_and_mail.sql`, the mail outbox
+  worker, `addGrant` answers `notified`). Their web UI parts are cards in
+  `ruum-server-wt/panel/ui-followups.md`, built on the design system (`w/design-system`).
+  Items 4 (C-14), 6 (C-8 to C-11), 7 (search `type`, batch, hints, `safe_stop`) and 8 (IDs of
+  gone nodes) are decided and not built here.
+- **Mail.** Mail goes only to the relay of `SMTP_URL` (Mailpit on the laptop). Production
+  sending stays with a person (design 18.9). There is no GDPR deletion job yet; it must delete
+  a user's `mail_outbox` rows (and `principal_names`).
 
 - **Step 2** (decision 0004, `provisional`): only the specification is merged. The 24 database
   operations have no route yet and count as planned in the suites (77 isolation and 312 matrix
@@ -328,9 +335,10 @@ rebased once more without a change to code). The smoke test and the mutation che
   `MUTATION_TARGET_DIR=$PWD/target` to share the cache.
 - **Product gaps found by the browser tests** (`test.fixme`, see `docs/TESTING.md`): the 4 web
   UI gaps (dialog focus, upload race, cold-load `return_to`, no `/invitations/accept` page) are
-  fixed by `q/uxfix`. Server gaps remain: an email grant that binds at first sign-in does not
-  make the person a guest (reads answer `404`); an email grant to a user who already has an
-  account never binds, and `addGrant` sends no mail. `docs/TESTING.md` still lists the fixed UI
+  fixed by `q/uxfix`. The server gaps behind the two sharing `test.fixme` are closed in
+  `f/email-grants` (a bind makes the person a guest; every sign-in and web session binds;
+  `addGrant` queues a share email); the tests stay `fixme` until the web UI card sends
+  `notify: true`. `docs/TESTING.md` still lists the fixed UI
   gaps and has no rows for `visual.e2e.ts` and `a11y.e2e.ts`.
 - **Web UI after `q/uxfix`** (`docs/ux/decisions.md`): names come from the server since
   decision 0003-5 (C-7: `display_name` and `on_behalf_of_display_name` in

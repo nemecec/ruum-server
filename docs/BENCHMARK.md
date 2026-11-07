@@ -231,7 +231,9 @@ Product and contract changes (each is a separate task card):
 
 - The benchmark found no tool error caused by an unclear input schema: every tool call had valid
   arguments the first time.
-- `share_view` sends an invitation email to `mari@example.test`; on the laptop it goes to Mailpit.
+- `share_view` (an `add_grant` to `mari@example.test`) sends no invitation. Since decision
+  0003-3 it queues a share email (no token) when `notify` is true, the default; on the laptop it
+  goes to Mailpit. Score C-13 from the code and its tests, not from this note.
 - The benchmark runs on the laptop stack, not on staging (design 18.7 says staging, from step 3).
 - The run used the copy of `target/debug/ruum-server` built from `c89bff7`, so builds by other
   worktrees in the shared cargo cache could not change the binary during the run.

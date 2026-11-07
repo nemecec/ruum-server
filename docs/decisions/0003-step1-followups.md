@@ -13,17 +13,17 @@ The panel files are in `ruum-server-wt/panel/` (outside the repository).
 ## Implementation status
 
 The proposal's order of work is item 5, then 1, 2, 3, then 4, 6, 7 and 8. Item 5 is built
-(branch `f/followups`), and item 1 is built (branch `f/content-role`), each in full. Items 2, 3,
-4, 6, 7 and 8 are decided here and not built yet; each is a separate change, in that order. No
-item is half built. The web UI part of item 1 (Members page, invite form, share dialog copy) is
-a card in `ruum-server-wt/panel/ui-followups.md`: the web UI is being rebuilt on the design
-system, and the card is built there.
+(branch `f/followups`), and item 1 is built (branch `f/content-role`), each in full. Items 2
+and 3 are built on the server (branch `f/email-grants`, stacked on `f/content-role`). Items 4,
+6, 7 and 8 are decided here and not built yet; each is a separate change. The web UI parts of
+items 1, 2 and 3 are cards in `ruum-server-wt/panel/ui-followups.md`, built on the design
+system.
 
 | Item | Decision | Built |
 |---|---|---|
 | 1. A content role for members | below | **yes**, server, contract and tests (branch `f/content-role`); the UI is a card |
-| 2. C-12: email grants bind | below | no |
-| 3. C-13: share and invitation emails | below | no |
+| 2. C-12: email grants bind | below | **yes**, server (branch `f/email-grants`) |
+| 3. C-13: share and invitation emails | below | **yes**, server (branch `f/email-grants`); web UI on the card |
 | 4. C-14: sign-ins in the audit log | below | no |
 | 5. C-7: names of actors | below | **yes** (branch `f/followups`) |
 | 6. C-8 to C-11 | below | no |
@@ -32,8 +32,9 @@ system, and the card is built there.
 
 Migrations are numbered in the order they are made, not by the numbers of the proposal (which
 assumed item 1 first): item 5 made `0002_principal_names.sql` and
-`0003_agent_names_unique.sql`, decision 0004 took `0004_databases.sql`, and item 1 made
-`0005_member_content_role.sql`. The next items take the next free numbers.
+`0003_agent_names_unique.sql`, decision 0004 took `0004_databases.sql`, item 1 made
+`0005_member_content_role.sql`, and items 2 and 3 made `0006_email_grants_and_mail.sql`. The
+next items take the next free numbers.
 
 ## 1. A content role for team members
 
@@ -195,6 +196,84 @@ Mailpit, production sending stays with a person.
   Acceptable while mail goes only to Mailpit; it goes on the card for the production mail
   sender, which stays with a person.
 
+## Items 2 and 3: how they are built
+
+**Code.** `sharing::SharingStore::share` (`addGrant` with `notify` and `message`; `add_grant`
+is `share` without a mail), memory and Postgres. `mailing::rate` (fixed-window counters in
+`rate_counters`, and in memory), `mailing::outbox` (the mail outbox: `queue`, the worker
+`run_worker`, `run_once`, `clean`), `mailing::{ShareFields, InvitationFields}`.
+`tenants::mail`: `Mail.html` and `Mail.reply_to`, `multipart/alternative`, RFC 2047 subjects,
+`share_mail`, `invitation_mail`, `header_text`, `message_text`, `html_escape`, `check_address`.
+`IdentityStore::bind_email_grants(user, session, force)` (Postgres: `sessions.bind_checked_at`;
+memory: the sharing store's `verified_email_signed_in`). `tenants::postgres::
+bind_email_grants_on_sign_in` makes the guest (`member.added` with `via: email_grant`,
+`grant_ids`, `granted_by`). `TenantStore::verified_person` and
+`TenantStore::add_guest_from_email_grant` (memory). `PgTenantStore::invite` queues the mail;
+`accept_invitation` looks the token up in `invitation_tokens`. `ruum-api`: `addGrant` answers
+`notified`; the sign-in (`loginCallback`) binds with `force`; `getMe` and `listSharedWithMe`
+bind for session cookies (`routes::auth::bind_for_session`); `listSharedWithMe` takes
+`check_email_grants`. `ruum-server` starts the mail worker next to the sweeper (every 5
+seconds, and at once when a change commits a mail).
+
+**Contract** (additive; `oasdiff breaking` against `main`: nothing): the `addGrant` text (rules
+(a), (a'), (b), (c), the share email, the limits) and its `429`; `AddGrantRequest.notify` and
+`message` texts; `GrantWrite.notified`; the `GranteeEmail` text; the `getMe` and
+`listSharedWithMe` texts and the `check_email_grants` parameter; the `createInvitation` text;
+`may_add_guest` in the `grant.added` event schema; the `add_grant` tool text (`tools.json`
+regenerated); `web/src/api/schema.d.ts` regenerated.
+
+**Choices made while building** (each the safer or the non-breaking option):
+
+- `may_add_guest: true` is in the data of every `grant.added` of an email grant (journal, and
+  so the audit log), not computed per address. Every stored email grant may add a guest
+  (callers who may list members get a user grant for the persons of the tenant; while guests
+  are off an email grant to an outsider is refused), so a feed reader, also the guest who
+  shared, learns nothing about the address. The event schema gets the optional property.
+- The share mail row holds the mail's fields, not the rendered mail; the worker renders it with
+  its public URL. The row still holds no secret.
+- No share mail goes to the caller's own address, or to a user grantee without a verified
+  email. The sharer's name is the effective user's name (an agent shares in its user's name).
+- `TenantStore::invite` still returns a token to callers inside the server (the seed, the
+  tests). It is stored as a hash in `invitation_tokens` and goes into no mail; the worker mints
+  the mailed token. Both work until the invitation ends.
+- `invitation_tokens` rows of an ended invitation are deleted 7 days after it ended, so a later
+  `previewInvitation` (item 6) can still answer `accepted`, `revoked` or `expired` for a week.
+- The accept link keeps `?token=`: the current accept page reads only the query, and the web UI
+  is out of scope here. Moving the token into the fragment (`#token=`) is on the UI card; the
+  server change is only `tenants::memory::accept_url`.
+- The invitation mail names no content role yet: item 1 is not built.
+- `session_tenants` (item 4) does not exist yet, so its clean-up rule waits for item 4.
+- The in-memory stores send mail at once (they have no outbox, as they have no authz outbox).
+- The `addGrant` limit counts in the sharing stores, before every other check, in its own
+  committed transaction; MCP tools and the CLI go through the same path.
+- Until the web UI card is built, the share dialog keeps sending `notify: false` and its own
+  `createInvitation`, so the web UI sends no share email and its flow does not change.
+
+**Tests.** `sharing::conformance` on memory and Postgres: `email_grants` (rules (a), (a'),
+agents, `allow_guests: false` gives a guest the same `403` for every email), `share_emails`
+(the mail, its link, message, escaping, no token; `notify: false`; email grants; no mail for
+`tenant_members`; one mail per recipient and node in 10 minutes), `add_grant_limits` (60 calls,
+refused calls count, an agent shares its user's counter, another user is not limited, a second
+store on the same database shares the counter), `share_mail_limits` (the 51st grant in an hour
+is made without a mail); `postgres_mail_outbox_worker` (retry, give-up and cleared payload, a
+removed grant drops the mail, a grant bound before the send still sends, the 7-day clean-up,
+old counter windows); `tenants::tests::email_grants` (a web session binds and makes a guest with
+`member.added`, the 60-second throttle and `force`, another user's or an ended session binds
+nothing, an unverified email and a tenant without guests bind nothing, a revoked invitation
+sends no mail and mints no token, the clean-up of ended invitations' tokens);
+`invitations_bind_by_token` (the mail names role and end date; the mailed token works and the
+accept ends it); `tenants::mail::tests` (CR/LF and control characters, cut names, escaping, no
+link from the message, multipart, encoded subjects, unsafe addresses); `ruum-api`
+`email_grants_bind_in_web_sessions_only` (sign-in binds and makes a guest, the throttle of
+`getMe`, `check_email_grants`, a bearer token never binds, `notified`);
+`scripts/e2e_smoke.sh` (a share email reaches the Mailpit API with the folder link and no
+token). Mutations `guest-add-grant-resolves-email` (memory, `-postgres`),
+`guest-email-grant-oracle` (Postgres, `-memory`), `email-bind-any-session`,
+`email-grant-binds-unverified`, `email-bind-no-guest-policy`,
+`mail-outbox-ignores-removed-grant`; `sharing-email-grant-policy-memory` now breaks the
+lookup of rule (a), because its old form became equivalent once rule (a) resolves members'
+emails first.
+
 ## 4. C-14: sign-ins in the audit log
 
 **Decision.** As v2 4.1 to 4.3: `auth.login` in the home tenant at sign-in, synchronous and
@@ -319,4 +398,6 @@ recorded").
 From v2 7.7 and the reviews: an agent-facing undo preview; the rate limits of `limits.rs` in
 the shared counters; an email match for admin invitations; a view link in the share email if
 real users ask; the GDPR deletion job (`principal_names`, `mail_outbox`); per-person caps for
-the production mail sender.
+the production mail sender. From items 2 and 3: the web UI card (share dialog, item page
+states, accept link in the fragment), the clean-up of `session_tenants` with item 4, and the
+content role in the invitation mail with item 1.
