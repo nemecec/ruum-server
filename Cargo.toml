@@ -26,6 +26,7 @@ ruum-api = { path = "crates/ruum-api" }
 ruum-mcp = { path = "crates/ruum-mcp" }
 ruum-webdav = { path = "crates/ruum-webdav" }
 ruum-testkit = { path = "crates/ruum-testkit" }
+ruum-dbengine = { path = "crates/ruum-dbengine" }
 
 # Async runtime and HTTP
 tokio = { version = "1.54", features = ["full"] }
@@ -66,6 +67,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fm
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid", "time", "json", "migrate", "derive"] }
 object_store = { version = "0.14.2", features = ["aws"] }
 blake3 = "1.8.7"
+# SQLite for the database engines of step 2 (crates/ruum-dbengine): the memory engine (E-1) and
+# the SQLite engine (E-3). `bundled` builds SQLite from source (no system library); `hooks` gives
+# the authorizer and the progress handler (timeouts); `functions` registers `ruum_pseudonym`;
+# `limits` sets SQLITE_LIMIT_ATTACHED; `backup` copies a database online (branches);
+# `column_metadata` and `column_decltype` name the source column and type of a result column.
+# 0.39 because sqlx-sqlite (in the lock through sqlx) links libsqlite3-sys 0.37: one `sqlite3` only.
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "hooks", "functions", "limits", "backup", "column_metadata", "column_decltype"] }
 fastcdc = "5.0.0"
 zstd = "0.14.3"
 
