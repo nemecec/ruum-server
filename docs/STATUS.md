@@ -5,7 +5,9 @@ the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, the quali
 C), the UX fixes of the web UI (`q/uxfix`), the synthetic-user fixes (`q/synthfix`), the
 names of actors (decision 0003, `f/followups`), the step 2 specification (decision 0004,
 `f/step2spec`) and the morning integration of 2026-11-07 (decision 0003 items 1 to 4 and 7, spike
-S-1, the first step 2 cards, the design system and localisation of the web UI), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+S-1, the first step 2 cards, the design system and localisation of the web UI), the afternoon
+integration of 2026-11-07 (decision 0003 item 6, the C-1 acceptance, cards E-2, Q-4 and P-2),
+how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -116,8 +118,46 @@ Fixes made during the morning integration:
   `integ/s2-spike`, `integ/s2-q-0`, `integ/s2-p-1`, `integ/s2-e-1`, `integ/s2-i-1` and
   `integ/design-system` (the old branch names keep the pre-rebase commits; no force push).
 
-The digest for the person is `docs/digests/2026-11-07.md` (earlier:
-`docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
+Afternoon integration (2026-11-07, each branch rebased onto `main`, checked on the build server,
+pushed and green in GitHub CI, then fast-forwarded, in this order; linear history, no merge
+commit, no co-author line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `w/fixes` | Web UI: an upload whose name the server says is taken (`name_taken`, a name the list did not show yet) comes back to the conflict question, and a new version starts from the head the server has now; agent names wrap like text at phone width. Linux and darwin references of the changed phone screens. | no panel review file (UI fixes) |
+| `f/ux-c8-c11` | Decision 0003-6 (C-8 to C-11): `coalesce` on new versions and `putContent` (the web UI always sends `false`), `0010_upload_coalesce.sql`; `previewInvitation` (public, rate limited per IP) and the accept and sign-in pages that use it; `SharedItem.tenant_name`; `UndoItem.changed_by`. Localised in en and et. | built from decision 0003-6; no review file of the build |
+| `c/c1-acceptance` | Decision 0004-35: card C-1 is accepted and the step 2 contracts are frozen (additive changes only from now on). One `contract:` commit with the required changes of both reviews: the 0004-34 rules in `queryDatabase` and `applyDatabaseMigration`, unqualified table names, names next to principal IDs, `database_not_ready` as `503` with `Retry-After`. | accepted with changes, applied (`c1-acceptance-review-1.md`, `c1-acceptance-review-2.md`) |
+| `s2/e-2` | Card E-2: the Postgres engine of `ruum-dbengine` on the shared data cluster (pool, sessions, setup, lens, catalog, copy, export, split). The copy steps that change tenant tables run as the copy's owner in its own session, with tenant triggers, rules and forced RLS parked; hostile copy tests. CI builds `postgres-data` and installs `pg_dump` 17. | changes requested (B-1, cross-tenant role escalation through tenant rules and triggers during a copy), fixed on the branch (`review-E-2.md`) |
+| `s2/q-4` | Card Q-4: the tenant pseudonym key (`tenant_keys`), wrapped with AES-256-GCM by a local key-encryption key (`RUUM_LOCAL_KEK_FILE`) or OpenBao transit; export and import re-wrap; `database_key`. `dev.sh env` sets the local KEK file. New dependency: `aes-gcm` 0.11.1. | accepted (`review-Q-4.md`) |
+| `s2/p-2` | Card P-2: `typed_nodes` and `provider_deliveries` in Postgres, the delivery worker (per-node and per-tenant order, backoff, "never twice") and the reconciler; three Postgres mutations. `purged` and `tenant_deleted` are retried until they succeed. | rejected for one finding (a `purged` delivery ended on a `4xx`), fixed on the branch (`review-P-2.md`) |
+
+Fixes made during the afternoon integration:
+
+- `f/ux-c8-c11` on `w/fixes`: `FilesPage.tsx`, `uploads.tsx` and `useUploads.ts` conflicted.
+  Kept from `w/fixes`: the `name_taken` round trip (`askAgain`, `onNameTaken`, `nameKey`) and
+  the fresh head before a new version (`refreshNode`). Kept from C-8: no coalescing UI (no
+  `recent`, no version name in the conflict dialog, no "replaced" toast) and
+  `newVersionTarget` with `coalesce: false`.
+- `c/c1-acceptance`: `tools.json` regenerated (`gen-tools.mjs`) and `schema.d.ts` checked
+  (`npm run gen:api`, no change) after the rebase onto the C-8 contract.
+- `web/e2e/sharing.e2e.ts`: two tests open a folder's details by keyboard after an upload.
+  The uploads panel and the upload toast covered the Details button when the random folder name
+  sorted near the bottom; "a person signed in with another address ..." failed in 5 of 7 CI
+  runs. No assertion changed (commit on `s2/p-2`).
+- The mutation rule of review-Q-4 note 1 (`privacy-tenant-keys-tenant-filter-postgres`) is in
+  `crates/ruum-testkit/mutations/` (review-P-2 finding 9).
+- CI: the unit job of `integ/s2-e-2` and `integ/s2-p-2` failed once each while downloading the
+  PGDG key (`curl: (56)`); the re-run passed. The browser job failed once on
+  the C-8 test of `versions.e2e.ts` ("Upload new version" always makes a new version: the
+  older version downloaded the newer content) and once on the visual `pseudo-locale › share` (2 % of pixels);
+  each re-run passed.
+- The rebased branches were pushed as `integ/f-ux-c8-c11`, `integ/c-c1-acceptance`,
+  `integ/s2-e-2`, `integ/s2-q-4` and `integ/s2-p-2` (no force push) and deleted from GitHub
+  after the fast-forward (each is part of `main`). The old branch names on GitHub keep the
+  pre-rebase commits. `w/fixes` needed no rebase.
+
+The digest for the person is `docs/digests/2026-11-07-afternoon.md` (earlier:
+`docs/digests/2026-11-07.md`, `docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
 `docs/digests/2026-11-06-evening.md`). The worktrees of the merged branches are removed; the
 branches stay.
 
@@ -301,40 +341,47 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-07, `main` after the morning integration, on the build server)
+## Checks (2026-11-07, `main` after the afternoon integration, on the build server)
 
-Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and SpiceDB).
+Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and SpiceDB). `run.sh`
+keeps the file times of the worktree, so after a rebase cargo can reuse a stale test binary on a
+target it built before: the checks first run `find crates contracts migrations -type f -exec
+touch {} +` on the server.
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 467 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
-  ruum-api 45, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-core 281 + 15
-  (properties), ruum-dbengine 33, ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5,
-  ruum-testkit 11 + 1 (batch) + 2 (contract) + 1 (isolation) + 1 (names) + 3 (permissions),
+- `cargo test --workspace`: 565 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
+  ruum-api 47, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-core 326 + 15
+  (properties), ruum-dbengine 83, ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5,
+  ruum-testkit 11 + 1 (batch) + 2 (contract) + 1 (isolation) + 2 (names) + 3 (permissions),
   ruum-webdav 5 + 20.
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` with `RUUM_SUITE_BACKEND=memory` and
-  `postgres`: tenant isolation 339 checks (262 passed, 77 planned), permission matrix 1920
-  checks (1536 passed, 384 planned), trashed file suite 96/96; 0 pending, 0 failed. The SpiceDB
+  `postgres`: tenant isolation 342 checks (265 passed, 77 planned), permission matrix 1936
+  checks (1552 passed, 384 planned), trashed file suite 96/96; 0 pending, 0 failed. The SpiceDB
   variant (`RUUM_SUITE_AUTHZ=spicedb`) was not run at this integration; CI runs memory authz.
-- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 45 of 45 mutations
-  killed, none survived or skipped.
-- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`, against the agent's own Postgres and SpiceDB.
-  Against the shared stack Postgres of the build server it fails at start ("migration 5 was
-  previously applied but has been modified"): that database had an old branch's 0005. Its
-  `ruum` database must be dropped and made again once no agent uses it.
-- `web/` (on the `w/design-system` tip): `npm run lint`, `npm run build`, `npx vitest run`
-  (21 files, 280 tests), `npm run e2e:typecheck`: pass.
-- `oasdiff breaking --fail-on ERR` (`tufin/oasdiff:v1.11.4`) from `e4ae45b`: 0 changes reported.
-- GitHub CI: green on `integ/email-grants`, `integ/audit-mcp`, `integ/s2-spike`,
-  `integ/s2-q-0`, `integ/s2-p-1`, `integ/s2-e-1`, `integ/s2-i-1` and `f/content-role`. On
-  `integ/design-system` only the 47 Linux visual references fail (see "Known gaps").
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 51 of 51 mutations
+  killed, none survived or skipped (45 this morning; new: the two `previewInvitation` rules of
+  C-9, the three provider rules of P-2 and the tenant key rule of Q-4).
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`, against the agent's own Postgres and SpiceDB
+  (`RUUM_DEV_SH` set to a wrapper that prints `dev.sh env` and then the agent's `DATABASE_URL`
+  and SpiceDB settings). Against the shared stack Postgres of the build server it still fails
+  at start ("migration 5 was previously applied but has been modified"): that database had an
+  old branch's 0005. Its `ruum` database must be dropped and made again once no agent uses it.
+- `web/` (on the `main` tree, in a web worktree): `npm run lint`, `npm run build`,
+  `npx vitest run` (21 files, 289 tests), `npm run e2e:typecheck`: pass.
+- `oasdiff breaking --fail-on ERR` (`tufin/oasdiff:v1.11.4`) from `1b344d6`: 0 changes reported.
+- GitHub CI: green on `w/fixes` (`4028a89`), `integ/f-ux-c8-c11`, `integ/c-c1-acceptance`,
+  `integ/s2-e-2`, `integ/s2-q-4` and `integ/s2-p-2` (`450e397`), some after a re-run of a
+  failed job (see the afternoon fixes). The last commit of `main` (the Q-4 mutation file) ran
+  only on the build server.
 - Not run at this integration: `scripts/e2e_browser.sh` locally (CI runs it),
-  `scripts/dbhost_check.sh` (needs `postgres-data`), `cargo deny check` (CI runs it).
+  `scripts/dbhost_check.sh` locally (CI's unit job runs it with `postgres-data`), `cargo deny
+  check` (CI runs it).
 
 ## Known gaps
 
 - **Step 1 follow-ups** (decision 0003, `provisional`): items 1 (content role), 2 (C-12), 3
   (C-13), 4 (C-14), 5 (C-7) and 7 are built and merged, server and web UI; item 8 is recorded.
-  Item 6 (C-8 to C-11) is built on branch `f/ux-c8-c11` (server, contract, web UI; migration
+  Item 6 (C-8 to C-11) is merged (server, contract, web UI; migration
   `0010_upload_coalesce.sql`). The rate limit of `previewInvitation` is per process (`limits.rs`). Not built of 4, 7 and 8: the metric
   `ruum_auth_login_failed_total` (no metrics registry), the IP of WebDAV app password rows, the
   property test and mutation of item 8. The benchmark was not run with the new tools.
@@ -343,25 +390,34 @@ Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and Spi
   a user's `mail_outbox` rows (and `principal_names`).
 
 - **Step 2** (decision 0004, `provisional`): the specification, spike S-1 (passed; the role
-  kinds are frozen) and the foundation cards Q-0, P-1, E-1 and I-1 are merged. No database
-  operation has a route yet; the 24 operations count as planned in the suites.
+  kinds are frozen), the foundation cards Q-0, P-1, E-1 and I-1, the C-1 acceptance (0004-35:
+  the step 2 contracts are frozen, later changes are additive) and cards E-2 (Postgres engine),
+  Q-4 (tenant pseudonym key) and P-2 (typed node store, delivery worker, reconciler) are
+  merged. No database operation has a route yet; the 24 operations count as planned in the
+  suites. Nothing wires the engine, the tenant keys or the delivery worker into `Services` yet
+  (card D-1). OpenBao is not in CI: `openbao_transit_wrapper_round_trip` returns early and
+  reports `ok` there (review-Q-4 note 2). `wrapper_from_env_needs_a_kek` asserts nothing where
+  `dev.sh env` sets `RUUM_LOCAL_KEK_FILE` (review-Q-4 note 6). Notes for later cards:
+  review-E-2 N-3 to N-6 (Q-2, I-2), review-Q-4 notes 3 to 5 (tenant export of design 14, D-1),
+  review-P-2 findings 2 to 8 (D-1, P-3, step 6 HTTP adapter, tenant deletion).
   `migrations/0004_databases.sql` is a draft, but it is applied like any migration (by
   `sqlx::test`, the suites, and the server at start while `RUUM_MIGRATE` is on, the default), so
   a change to it before step 2 is built needs a fresh database. Open: card C-1 takes the text
-  change of 0004-34 (d) (transaction control in "Statements that never run"); the PostgreSQL
+  change of 0004-34 (d) (done in 0004-35); the PostgreSQL
   Anonymizer change of design 8.5 (a person confirms); UX contract needs C-20 to C-23; the
   notes of the card reviews for later cards (Q-2: `int2`/`int4`, `real`, BC dates; P-2: agent
   copies, delivery keys per tenant; I-2 and later: review-I-1 findings 1 and 2).
   `scripts/dbhost_check.sh` needs the `postgres-data` service and was not run at this
   integration.
-- **Linux visual snapshots.** The CI job `browser end-to-end` fails only on 47 Linux references
-  of `web/e2e/visual.e2e.ts-snapshots/` (`<screen>-<variant>-visual-linux.png`), changed by the
-  web UI of decision 0003 and the UX panel fixes; CI must refresh them (take the
-  `*-actual.png` files of the `e2e-browser-report` artifact): phone-light and phone-dark of
-  account, activity-log, details, files, folder, invitations, members, not-found, share,
-  share-link, shared, trash and versions; desktop-light and desktop-dark of activity-log, agent,
-  details, members, share and versions; pseudo-locale of activity-log, agent, details, files,
-  members, not-found, share, trash and versions. The darwin references are up to date.
+- **Linux visual snapshots.** The 47 Linux references of the morning were refreshed from CI
+  (`1b344d6`); `w/fixes` and `f/ux-c8-c11` brought their own Linux references from CI. The
+  browser job is green on `integ/s2-p-2` (the tree of `main` without the last mutation
+  commit), so no Linux reference waits for a refresh. The visual `pseudo-locale › share`
+  failed once (2 % of pixels) and passed on the re-run.
+- **Flaky browser tests.** `versions.e2e.ts` "a name conflict on upload ..." (morning) and the
+  C-8 test of "Upload new version" (once this afternoon: the
+  version without "Current" downloaded the newer content, probably a stale Versions list) can
+  fail in CI; a re-run passed.
 - **One SpiceDB for all worktrees.** The SpiceDB of the laptop stack holds one schema. After a
   branch with new relations (here `f/step2spec`) wrote its schema and relationships, a branch
   without those relations cannot write its schema (`cannot delete relation ...`), and its SpiceDB
@@ -408,7 +464,8 @@ Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and Spi
   have no request floor and read at the process token. Concurrent writers outside a request can
   overwrite the process token with an older one; the suites hit this before the integration fix.
 - **Coalescing.** Saves by the same actor within 10 minutes merge into the head version (design
-  5.3), also through the CLI, WebDAV and MCP. Name a version (`setVersionLabel`) to keep it. The
+  5.3), also through the CLI, WebDAV and MCP, unless the request sends `coalesce: false` (C-8;
+  the web UI always does). Name a version (`setVersionLabel`) to keep it. The
   WebDAV ETag of a file is `"<head version>-<revision>"`, because a merged save keeps the version
   ID.
 - **Request timeout.** `RUUM_REQUEST_TIMEOUT_SECONDS` (default 120) also covers the body of a
@@ -416,9 +473,16 @@ Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and Spi
 - In-memory `TenantStore::usage` reports 0 bytes and 0 nodes (Postgres reports real usage).
 - Passkeys, Google and Microsoft sign-in are only in the manual checklist of `docs/TESTING.md`.
 - The WebDAV example `dav_fake_server` keeps its name but now runs on `Services::in_memory`.
-- CI (`.github/workflows/`) has not run on GitHub; nothing is pushed.
+- CI (`.github/workflows/`) runs on the pushed branches; `main` itself is not pushed.
 - Older gaps of `docs/FOUNDATION.md` still apply (`node.sharing_updated` is not undone, the
   `idp` hint of `loginStart` is not sent, the in-memory `Arc` cycle).
+
+## Dependencies added on 2026-11-07 (afternoon)
+
+- `aes-gcm` 0.11.1 (workspace, ruum-core; Apache-2.0 OR MIT; `default-features = false`,
+  `aes` and `alloc`): the local key-encryption key of card Q-4 (decision 0004-16). It waits for
+  a person's approval. `ruum-dbengine` now also uses the workspace dependencies `sqlx` and
+  `tracing` (card E-2).
 
 ## Dependencies added in wave B
 
