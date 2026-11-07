@@ -213,9 +213,14 @@ function touch(n: Schemas['Node']) {
   n.updated_by = byUser()
 }
 
+function sameName(a: string, b: string) {
+  return a.normalize('NFC').toLowerCase() === b.normalize('NFC').toLowerCase()
+}
+
 function nameTaken(parentId: string | null, name: string, tenant: string, except?: string) {
   return db.nodes.some(
-    (n) => n.tenant_id === tenant && n.parent_id === parentId && n.name === name && !n.trashed_at && n.id !== except,
+    // Like the server: NFC and case-insensitive (`Plan.txt` and `plan.txt` clash).
+    (n) => n.tenant_id === tenant && n.parent_id === parentId && sameName(n.name, name) && !n.trashed_at && n.id !== except,
   )
 }
 

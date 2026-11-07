@@ -68,6 +68,40 @@ describe('uploads, conflicts and the file list', () => {
     expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_version' })
   })
 
+  it('asks when the server answers that a name is taken that the list on the screen did not show yet', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${personal}/files`)
+    await screen.findByRole('link', { name: 'Documents' })
+    // The name is taken after the list was read: by the upload just before, or another tab.
+    const notes = db.nodes.find((n) => n.id === ids.notes)!
+    const late = { ...notes, id: crypto.randomUUID(), name: 'late.txt' }
+    db.nodes.push(late)
+    await user.upload(screen.getByLabelText('Upload files'), new File(['mine'], 'Late.txt', { type: 'text/plain' }))
+    const d = await dialog('Late.txt is already here')
+    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_file', on_conflict: 'fail' })
+    // The file left the upload list while the question is open; it is not a failure.
+    expect(screen.queryByText(/failed/i)).not.toBeInTheDocument()
+    await user.click(within(d).getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByText(/^Uploaded late\.txt\./)).toBeInTheDocument()
+    const creates = seen.filter((r) => r.method === 'POST' && r.path === '/v1/uploads')
+    expect(creates.at(-1)?.body).toMatchObject({ target: 'new_version', node_id: late.id })
+    // Nothing was renamed or replaced without the answer.
+    expect(db.nodes.filter((n) => n.parent_id === ids.personalRoot && /^late/i.test(n.name))).toHaveLength(1)
+  })
+
+  it('keeps both on "Keep both" also when the name was taken after the list was read', async () => {
+    const { user } = renderApp(`${personal}/files`)
+    await screen.findByRole('link', { name: 'Documents' })
+    const notes = db.nodes.find((n) => n.id === ids.notes)!
+    db.nodes.push({ ...notes, id: crypto.randomUUID(), name: 'late.txt' })
+    await user.upload(screen.getByLabelText('Upload files'), new File(['mine'], 'late.txt', { type: 'text/plain' }))
+    const d = await dialog('late.txt is already here')
+    await user.click(within(d).getByRole('radio', { name: 'Keep both, as two separate files' }))
+    await user.click(within(d).getByRole('button', { name: 'Continue' }))
+    const panel = await screen.findByRole('region', { name: 'Uploads' })
+    expect(await within(panel).findByText('Done, saved as late (2).txt')).toBeInTheDocument()
+  })
+
   it('keeps both, and shows the name the file was saved under', async () => {
     const { user } = renderApp(`${personal}/files`)
     await screen.findByRole('link', { name: 'Documents' })

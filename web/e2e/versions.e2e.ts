@@ -126,6 +126,9 @@ test('a name conflict on upload does not silently replace your own version of th
   await expect(page.getByRole('heading', { name: folder, level: 1 })).toBeVisible()
   await page.getByLabel('Upload files').setInputFiles(testFile(info.outputPath('a'), 'plan.txt', 'plan v1'))
   await expect(toast(page, 'Uploaded plan.txt.')).toBeVisible()
+  // Like a person, upload the next one when plan.txt is in the list. (The product asks also when
+  // the list is a moment old: the server answers name_taken; the Vitest flows cover that race.)
+  await expect(page.getByRole('button', { name: 'plan.txt', exact: true })).toBeVisible()
 
   // The same name again, a moment later. Enter takes the default: a new version, and the
   // earlier one is kept under a name, so both versions are there.

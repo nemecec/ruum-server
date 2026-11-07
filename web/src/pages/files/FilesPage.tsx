@@ -39,7 +39,7 @@ import {
   useToast,
   VisuallyHidden,
 } from '../../ui'
-import { listChildren, listSharedWithMe, loadFolder, moveNodes, trashNodes, type Node } from './api'
+import { findFilesByName, listChildren, listSharedWithMe, loadFolder, moveNodes, nameKey, refreshNode, trashNodes, type Node } from './api'
 import { MoveDialog, NameDialog } from './dialogs'
 import { focusPageHeading } from '../../components/dom'
 import { EmailShareCheck } from './EmailShareCheck'
@@ -51,8 +51,12 @@ import { useUploads, useUploadsDone, type UploadPlan } from './useUploads'
 import { VersionsPanel } from './VersionsPanel'
 import { currentIntl, t } from '../../i18n'
 
-/** Files whose names are taken, and the folder they go to, while the conflict dialog is open. */
-type Pending = { files: File[]; folder: Node; existing: Map<string, Node>; recent: Node[] }
+/**
+ * Files whose names are taken, and the folder they go to, while the conflict dialog is open.
+ * `existing` maps `nameKey` to the file of that name. `again` is set when the server answered
+ * `name_taken` for files of an earlier plan (see `askAgain`).
+ */
+type Pending = { files: File[]; folder: Node; existing: Map<string, Node>; recent: Node[]; again: boolean }
 
 /** The file browser: one folder, its breadcrumbs, its children and the details of one child. */
 export function FilesPage() {
@@ -102,19 +106,55 @@ export function FilesPage() {
     setParams(next, { replace: true })
   }
 
-  /** Starts uploads into `folder`; asks once when names are already there (copy.md 3.2). */
-  async function startUploads(files: File[], folder: Node, siblings: Node[]) {
+  // What the page shows now, for uploads that the server answers after a while (`askAgain`).
+  const here = useRef<{ folderId?: string; asking: boolean }>({ asking: false })
+  useEffect(() => {
+    here.current = { folderId: state.data?.folder?.id, asking: pending !== null }
+  })
+  useEffect(() => () => {
+    here.current = { asking: false }
+  }, [])
+
+  /**
+   * Starts uploads into `folder`; asks once when names are already there (copy.md 3.2).
+   * `siblings` can be a moment old (the list reloads after an upload), so the plan never trusts
+   * it alone: a file that looks new goes with `on_conflict: fail`, and a `name_taken` answer
+   * brings it back to the dialog (`askAgain`). `again` is set for such files.
+   */
+  async function startUploads(files: File[], folder: Node, siblings: Node[], again = false) {
     setError(undefined)
-    const existing = new Map(siblings.filter((n) => n.kind === 'file').map((n) => [n.name, n]))
-    const taken = files.map((f) => existing.get(f.name)).filter((n): n is Node => n !== undefined)
+    const existing = new Map(siblings.filter((n) => n.kind === 'file').map((n) => [nameKey(n.name), n]))
+    const taken = [...new Set(files.map((f) => existing.get(nameKey(f.name))).filter((n): n is Node => n !== undefined))]
     if (taken.length) {
+      // The new version starts from the head the server has now, not from the list on the screen.
+      const fresh = await Promise.all(taken.map(refreshNode))
+      taken.forEach((old, i) => existing.set(nameKey(old.name), fresh[i]))
       // A new version of the person's own unnamed save of the last 10 minutes replaces it
       // (coalescing, design 5.3): the dialog says so before, as "Upload new version" does.
-      const checks = await Promise.all(taken.map((n) => replacesOwnSave(n, me.user.id)))
-      setPending({ files, folder, existing, recent: taken.filter((_, i) => checks[i]) })
+      const checks = await Promise.all(fresh.map((n) => replacesOwnSave(n, me.user.id)))
+      setPending({ files, folder, existing, recent: fresh.filter((_, i) => checks[i]), again })
       return
     }
-    uploads.add(plansFor(files, folder, existing, 'keep'), folder.tenant_id, folderLabel(folder))
+    uploads.add(plansFor(files, folder, existing, 'keep', undefined, again), folder.tenant_id, folderLabel(folder))
+  }
+
+  /**
+   * The server answered `name_taken` for `files`: their names were taken after the page read its
+   * list (for example by the upload just before, while the list reloaded). Read the names again
+   * and ask, so that no upload replaces or renames a file without the person's answer. Returns
+   * `false` when the page cannot ask now: it shows another folder or another question.
+   */
+  function askAgain(files: File[], folder: Node): boolean {
+    if (here.current.folderId !== folder.id || here.current.asking) return false
+    here.current = { ...here.current, asking: true }
+    void (async () => {
+      try {
+        await startUploads(files, folder, await findFilesByName(folder, files.map((f) => f.name)), true)
+      } catch (err) {
+        setError(err)
+      }
+    })()
+    return true
   }
 
   function plansFor(
@@ -123,10 +163,13 @@ export function FilesPage() {
     existing: Map<string, Node>,
     choice: ConflictChoice,
     named = new Set<string>(),
+    again = false,
   ): UploadPlan[] {
     const plans: UploadPlan[] = []
+    // One callback for the batch, so the queue gives its files back together, in one question.
+    const onNameTaken = (taken: File[]) => askAgain(taken, folder)
     for (const file of files) {
-      const old = existing.get(file.name)
+      const old = existing.get(nameKey(file.name))
       if (old && choice === 'skip') continue
       if (old && choice === 'version') {
         const mine = old.updated_by.actor.kind === 'user' && old.updated_by.actor.id === me.user.id
@@ -135,8 +178,15 @@ export function FilesPage() {
           target: { target: 'new_version', node_id: old.id, base_version: old.head_version },
           previousAt: mine && !named.has(old.id) ? old.updated_at : undefined,
         })
-      } else {
+      } else if (old || again) {
+        // "Keep both", or a name that is still taken by something that is not a file (a folder).
         plans.push({ file, target: { target: 'new_file', parent_id: folder.id, name: file.name, on_conflict: 'rename' } })
+      } else {
+        plans.push({
+          file,
+          target: { target: 'new_file', parent_id: folder.id, name: file.name, on_conflict: 'fail' },
+          onNameTaken,
+        })
       }
     }
     return plans
@@ -379,7 +429,7 @@ export function FilesPage() {
                 )}
                 {pending && (
                   <ConflictDialog
-                    names={pending.files.filter((f) => pending.existing.has(f.name)).map((f) => f.name)}
+                    names={pending.files.filter((f) => pending.existing.has(nameKey(f.name))).map((f) => f.name)}
                     recent={pending.recent}
                     onClose={() => setPending(null)}
                     onChoose={async (choice, label) => {
@@ -391,7 +441,7 @@ export function FilesPage() {
                           named.add(n.id)
                         }
                       }
-                      const plans = plansFor(pending.files, pending.folder, pending.existing, choice, named)
+                      const plans = plansFor(pending.files, pending.folder, pending.existing, choice, named, pending.again)
                       setPending(null)
                       if (plans.length) uploads.add(plans, pending.folder.tenant_id, folderLabel(pending.folder))
                     }}

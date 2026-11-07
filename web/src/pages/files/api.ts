@@ -60,6 +60,53 @@ export function listChildren(folderId: string, cursor: string | undefined, kind?
   )
 }
 
+/**
+ * The key under which the server compares names in a folder: Unicode NFC, case-insensitive
+ * (`Plan.txt` and `plan.txt` clash).
+ */
+export function nameKey(name: string): string {
+  return name.normalize('NFC').toLowerCase() // i18n-ignore: a key that matches the server, never shown
+}
+
+/**
+ * The files in `folder` whose names clash with `names`, read from the server now and not from
+ * the list on the screen, which can be a moment old. Reads pages until it found every name.
+ */
+export async function findFilesByName(folder: Node, names: string[]): Promise<Node[]> {
+  const wanted = new Set(names.map(nameKey))
+  const found: Node[] = []
+  let cursor: string | undefined
+  // A folder has a bounded number of pages; the limit only stops a loop on bad data.
+  for (let i = 0; i < 1000 && wanted.size; i++) {
+    const page = await unwrap(
+      client.GET('/v1/nodes/{node_id}/children', {
+        params: {
+          path: { node_id: folder.id },
+          query: { kind: 'file', ...(cursor ? { cursor } : {}) },
+          header: { 'Ruum-Tenant': folder.tenant_id },
+        },
+      }),
+    )
+    for (const n of page.items) {
+      if (wanted.delete(nameKey(n.name))) found.push(n)
+    }
+    if (!page.next_cursor) break
+    cursor = page.next_cursor
+  }
+  return found
+}
+
+/** The node as the server has it now; the node itself when that read fails. */
+export async function refreshNode(node: Node): Promise<Node> {
+  try {
+    return await unwrap(
+      client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: node.id }, header: { 'Ruum-Tenant': node.tenant_id } } }),
+    )
+  } catch {
+    return node
+  }
+}
+
 /** One page of "shared with me", across all tenants (the call takes no `Ruum-Tenant` header). */
 export function listSharedWithMe(cursor: string | undefined) {
   return unwrap(client.GET('/v1/shared-with-me', { params: { query: cursor ? { cursor } : {} } }))

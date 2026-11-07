@@ -16,7 +16,19 @@ export type UploadItem = {
 }
 
 /** Where one file goes, and what the UI knows to tell the person about it afterwards. */
-export type UploadPlan = { file: File; target: UploadTarget; previousAt?: string }
+export type UploadPlan = {
+  file: File
+  target: UploadTarget
+  previousAt?: string
+  /**
+   * For a new file that the page thought had a free name (`on_conflict: fail`): the server
+   * answered `name_taken`, because the name was taken after the page read its list. At the end of
+   * the round the queue gives these files back, once per callback, so the page can ask the
+   * person instead of replacing or renaming a file silently. It returns `false` when it cannot
+   * ask (the page is gone); the files then fail with the server's answer.
+   */
+  onNameTaken?: (files: File[]) => boolean
+}
 
 
 export type DoneListener = (nodes: Node[]) => void

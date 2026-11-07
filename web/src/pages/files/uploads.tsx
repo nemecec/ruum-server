@@ -3,6 +3,7 @@
 // the bottom right.
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { RuumApiError } from '../../api/client'
 import { errorText } from '../../api/errors'
 import { formatBytes, formatWhenInline } from '../../components/format'
 import {
@@ -39,12 +40,7 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<UploadItem[]>([])
   const queue = useRef<Job[]>([])
   const running = useRef(false)
-  const round = useRef<{ nodes: Node[]; failed: number; folders: Set<string>; replaced: UploadItem[] }>({
-    nodes: [],
-    failed: 0,
-    folders: new Set(),
-    replaced: [],
-  })
+  const round = useRef<Round>(newRound())
   const controllers = useRef(new Map<string, AbortController>())
   const listeners = useRef(new Set<DoneListener>())
   const busy = items.some((i) => i.status === 'active' || i.status === 'waiting')
@@ -91,7 +87,9 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
         if (job.folderName) round.current.folders.add(job.folderName)
         if (replaced) round.current.replaced.push({ ...job.item, ...done })
       } catch (error) {
-        if (job.controller.signal.aborted) {
+        if (job.onNameTaken && error instanceof RuumApiError && error.code === 'name_taken' && !job.controller.signal.aborted) {
+          round.current.nameTaken.push({ job, error })
+        } else if (job.controller.signal.aborted) {
           update(job.item.id, { status: 'canceled' })
         } else {
           update(job.item.id, { status: 'failed', error })
@@ -103,7 +101,20 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
     }
     running.current = false
     const r = round.current
-    round.current = { nodes: [], failed: 0, folders: new Set(), replaced: [] }
+    round.current = newRound()
+    // Files whose name was taken after the page read its list go back to the page, which asks
+    // the person (copy.md 3.2). When it cannot ask, they fail with the server's answer.
+    const byPage = new Map<(files: File[]) => boolean, { job: Job; error: unknown }[]>()
+    for (const x of r.nameTaken) byPage.set(x.job.onNameTaken!, [...(byPage.get(x.job.onNameTaken!) ?? []), x])
+    for (const [ask, taken] of byPage) {
+      const ids = new Set(taken.map((x) => x.job.item.id))
+      if (ask(taken.map((x) => x.job.file))) {
+        setItems((list) => list.filter((i) => !ids.has(i.id)))
+      } else {
+        for (const x of taken) update(x.job.item.id, { status: 'failed', error: x.error })
+        r.failed += taken.length
+      }
+    }
     if (r.nodes.length || r.failed) toast(summary(r))
     listeners.current.forEach((l) => l(r.nodes))
   }, [toast])
@@ -155,8 +166,15 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
   )
 }
 
+/** What one round of the queue did, for the toast at its end. */
+type Round = { nodes: Node[]; failed: number; folders: Set<string>; replaced: UploadItem[]; nameTaken: { job: Job; error: unknown }[] }
+
+function newRound(): Round {
+  return { nodes: [], failed: 0, folders: new Set(), replaced: [], nameTaken: [] }
+}
+
 /** The toast at the end of a round (copy.md 3.2). */
-function summary(r: { nodes: Node[]; failed: number; folders: Set<string>; replaced: UploadItem[] }): string {
+function summary(r: Round): string {
   const n = r.nodes.length
   const folder = r.folders.size === 1 ? [...r.folders][0] : null
   let text: string

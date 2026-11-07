@@ -97,7 +97,8 @@ describe('file browser', () => {
       target: 'new_file',
       parent_id: ids.personalRoot,
       name: 'hello.txt',
-      on_conflict: 'rename',
+      // The list on the screen can be a moment old: a taken name comes back as name_taken.
+      on_conflict: 'fail',
       size: 10,
       chunking: 'fastcdc-2020-16k-32k-64k',
       content_type: 'text/plain',
