@@ -509,6 +509,26 @@ async fn keys_exchange_for_short_tokens(a: Area) {
             .revoked_at
             .is_some()
     );
+    // Decision 0003-4: each exchange is audited in the agent's tenant, as the agent for its
+    // owner; a refused known key with its reason; an unknown key names no tenant.
+    let entries = crate::identity::tests::audit_actions(&a, tid).await;
+    let used: Vec<_> = entries
+        .iter()
+        .filter(|e| e.action == "agent.key_used")
+        .collect();
+    assert_eq!(used.len(), 1);
+    assert_eq!(used[0].actor.actor.id.0, agent.id.0);
+    assert_eq!(used[0].actor.on_behalf_of, Some(t.member.id));
+    assert_eq!(
+        used[0].target_id.as_deref(),
+        Some(key.id.to_string().as_str())
+    );
+    let refused: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.action == "agent.key_refused")
+        .map(|e| e.data["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(refused, vec!["agent_disabled", "revoked"]);
     assert_eq!(
         code(a.agents.revoke_key(&oc, agent.id, AgentKeyId::new()).await),
         ErrorCode::NotFound
@@ -749,6 +769,22 @@ async fn oauth_code_flow_with_pkce_and_rotation(a: Area) {
     assert_eq!(
         a.oauth.token(refresh_req(&r3)).await.unwrap_err().error,
         "invalid_grant"
+    );
+    // Decision 0003-4: every issue is audited in the agent's tenant, with its grant type.
+    let grants: Vec<String> = crate::identity::tests::audit_actions(&a, t.tenant.id)
+        .await
+        .into_iter()
+        .filter(|e| e.action == "agent.token_issued")
+        .map(|e| e.data["grant"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        grants,
+        vec![
+            "authorization_code",
+            "authorization_code",
+            "refresh_token",
+            "refresh_token"
+        ]
     );
 
     // Disabling the agent ends its grants.

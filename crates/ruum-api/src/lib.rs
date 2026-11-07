@@ -55,10 +55,16 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Runs each request with its own authz freshness floor (`ruum_core::authz::with_request_freshness`).
+/// Runs each request with its own authz freshness floor (`ruum_core::authz::with_request_freshness`)
+/// and its client (IP and user agent, [`auth::current_client`]) for audit entries.
 async fn request_freshness(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    ruum_core::authz::with_request_freshness(next.run(req)).await
+    let client = auth::client_info(Some(req.extensions()), req.headers());
+    auth::with_client(
+        client,
+        ruum_core::authz::with_request_freshness(next.run(req)),
+    )
+    .await
 }

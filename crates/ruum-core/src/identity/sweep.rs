@@ -7,6 +7,7 @@
 //! | `oauth_codes` | expired codes (used or not) |
 //! | `idempotency_keys` | expired keys |
 //! | `sessions` | sessions that ended or expired more than [`OLD_SESSION_DAYS`] days ago |
+//! | `session_tenants` | markers of sessions that ended or expired, or are gone (decision 0003-4) |
 //!
 //! `ruum-server` runs [`run`] when it has a database.
 
@@ -26,6 +27,7 @@ pub struct Swept {
     pub oauth_codes: u64,
     pub idempotency_keys: u64,
     pub sessions: u64,
+    pub session_tenants: u64,
 }
 
 /// One sweep, in one system transaction.
@@ -57,12 +59,21 @@ pub async fn sweep(pool: &PgPool) -> Result<Swept> {
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    // The first-use markers (decision 0003-4) are needed only while their session lives.
+    let session_tenants = sqlx::query(
+        "delete from session_tenants st where not exists (select 1 from sessions s \
+         where s.id = st.session_id and s.ended_at is null and s.expires_at > now())",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     tx.commit().await?;
     Ok(Swept {
         oauth_clients,
         oauth_codes,
         idempotency_keys,
         sessions,
+        session_tenants,
     })
 }
 
@@ -141,11 +152,12 @@ mod tests {
             (3u8, "10 days", Some("-1 day")),
             (4u8, "10 days", None),
         ] {
+            let session = Uuid::now_v7();
             sqlx::query(
                 "insert into sessions (id, tenant_id, user_id, secret_hash, expires_at, ended_at) \
                  values ($1, $2, $3, $4, now() + $5::interval, now() + $6::interval)",
             )
-            .bind(Uuid::now_v7())
+            .bind(session)
             .bind(t)
             .bind(u)
             .bind(vec![hash; 32])
@@ -154,7 +166,21 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
+            // A first-use marker of each session: only the one of the live session stays.
+            sqlx::query("insert into session_tenants (tenant_id, session_id) values ($1, $2)")
+                .bind(t)
+                .bind(session)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
         }
+        // A marker whose session row is gone.
+        sqlx::query("insert into session_tenants (tenant_id, session_id) values ($1, $2)")
+            .bind(t)
+            .bind(Uuid::now_v7())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
 
         let swept = sweep(&pool).await.unwrap();
@@ -165,6 +191,7 @@ mod tests {
                 oauth_codes: 0,
                 idempotency_keys: 1,
                 sessions: 2,
+                session_tenants: 4,
             }
         );
         let mut tx = pool.begin().await.unwrap();
@@ -187,6 +214,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions, 2);
+        let markers: i64 = sqlx::query_scalar("select count(*) from session_tenants")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(markers, 1);
         drop(tx);
         assert_eq!(sweep(&pool).await.unwrap(), Swept::default());
     }

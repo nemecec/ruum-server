@@ -112,7 +112,7 @@ async fn records_and_lists_newest_first_with_the_journal(h: &dyn Harness) {
         ip: Some("2001:db8::1".into()),
         user_agent: Some("Firefox".into()),
     };
-    events::sign_in(h.log(), t, user, "passkey", &client)
+    events::sign_in(h.log(), t, user, "passkey", None, &client)
         .await
         .unwrap();
     tick().await;
@@ -308,11 +308,58 @@ async fn tenants_are_apart(h: &dyn Harness) {
     assert_eq!(all(h.log(), &a, AuditQuery::default()).await.len(), 2);
 }
 
+/// The first use of a session in a tenant writes one `auth.login` with the marker; a second
+/// use of the same session writes nothing; another session or another tenant writes again
+/// (decision 0003-4).
+async fn the_first_use_of_a_session_is_recorded_once(h: &dyn Harness) {
+    let (ta, tb) = (h.tenant().await, h.tenant().await);
+    let user = UserId::new();
+    let (s1, s2) = (Uuid::now_v7(), Uuid::now_v7());
+    let client = ClientInfo {
+        ip: Some("192.0.2.7".into()),
+        user_agent: Some("Safari".into()),
+    };
+    assert!(
+        events::session_first_use(h.log(), ta, user, s1, &client)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !events::session_first_use(h.log(), ta, user, s1, &client)
+            .await
+            .unwrap()
+    );
+    assert!(
+        events::session_first_use(h.log(), ta, user, s2, &client)
+            .await
+            .unwrap()
+    );
+    assert!(
+        events::session_first_use(h.log(), tb, user, s1, &client)
+            .await
+            .unwrap()
+    );
+    let a = all(h.log(), &ctx(ta, Actor::user(user)), AuditQuery::default()).await;
+    assert_eq!(a.len(), 2);
+    let first = a
+        .iter()
+        .find(|e| e.data["session_id"] == json!(s1))
+        .unwrap();
+    assert_eq!(first.action, "auth.login");
+    assert_eq!(first.data["via"], "session_first_use");
+    assert_eq!(first.ip.as_deref(), Some("192.0.2.7"));
+    assert_eq!(first.user_agent.as_deref(), Some("Safari"));
+    assert_eq!(first.actor, Actor::user(user));
+    let b = all(h.log(), &ctx(tb, Actor::user(user)), AuditQuery::default()).await;
+    assert_eq!(b.len(), 1);
+}
+
 async fn run_all(h: &dyn Harness) {
     records_and_lists_newest_first_with_the_journal(h).await;
     filters(h).await;
     pages_without_gaps_or_repeats(h).await;
     tenants_are_apart(h).await;
+    the_first_use_of_a_session_is_recorded_once(h).await;
 }
 
 #[tokio::test]

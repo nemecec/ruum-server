@@ -754,10 +754,11 @@ impl IdentityStore for PgIdentityStore {
         Ok(())
     }
 
-    async fn authenticate_app_password(
+    async fn authenticate_app_password_from(
         &self,
         email: &str,
         secret_value: &str,
+        client: &crate::audit::events::ClientInfo,
     ) -> Result<Authenticated> {
         let refuse = || {
             unauthenticated(
@@ -789,6 +790,28 @@ impl IdentityStore for PgIdentityStore {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        // At most one `auth.app_password_used` per password and hour: one statement reads the
+        // audit table and writes, so all server processes share the check.
+        let entry = crate::audit::events::app_password_used_entry(id, client).normalized()?;
+        sqlx::query(
+            "insert into audit (id, tenant_id, action, actor_kind, actor, target_type, \
+             target_id, ip, user_agent, data) \
+             select $1, $2, $3, 'user', $4, $5, $6, $7::inet, $8, $9 \
+             where not exists (select 1 from audit where tenant_id = $2 and actor = $4 \
+             and action = $3 and target_id = $6 and at > now() - make_interval(secs => $10))",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(&entry.action)
+        .bind(user)
+        .bind(&entry.target_type)
+        .bind(&entry.target_id)
+        .bind(&entry.ip)
+        .bind(&entry.user_agent)
+        .bind(&entry.data)
+        .bind(crate::audit::events::APP_PASSWORD_AUDIT_SECONDS as f64)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(Authenticated {
             actor: Actor::user(user),

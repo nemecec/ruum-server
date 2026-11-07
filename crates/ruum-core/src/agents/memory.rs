@@ -494,7 +494,12 @@ impl AgentStore for MemoryAgentStore {
             .await
     }
 
-    async fn exchange_key(&self, secret: &str) -> Result<AccessToken> {
+    async fn exchange_key_from(
+        &self,
+        secret: &str,
+        client: &crate::audit::events::ClientInfo,
+    ) -> Result<AccessToken> {
+        use crate::audit::events;
         let refuse = || {
             unauthenticated(
                 "the API key is not valid",
@@ -506,25 +511,59 @@ impl AgentStore for MemoryAgentStore {
         }
         let hash = hash_key(secret);
         let now = crate::now();
-        let agent = {
+        let (agent, key, refused) = {
             let mut st = self.area.lock();
-            let (kid, agent_id) = st
+            let (kid, agent_id, revoked, expired) = st
                 .keys
                 .values()
                 .find(|k| crate::identity::secret::constant_time_eq(&k.hash, &hash))
-                .filter(|k| k.key.revoked_at.is_none() && k.key.expires_at > now)
-                .map(|k| (k.key.id, k.key.agent_id))
+                .map(|k| {
+                    (
+                        k.key.id,
+                        k.key.agent_id,
+                        k.key.revoked_at.is_some(),
+                        k.key.expires_at <= now,
+                    )
+                })
                 .ok_or_else(refuse)?;
             let agent = st.agents.get(&agent_id).cloned().ok_or_else(refuse)?;
-            check_live(&agent)?;
-            if let Some(k) = st.keys.get_mut(&kid) {
-                k.key.last_used_at = Some(now);
+            let refused = if revoked {
+                Some("revoked")
+            } else if expired {
+                Some("expired")
+            } else {
+                crate::agents::refusal(&agent)
+            };
+            if refused.is_none() {
+                if let Some(k) = st.keys.get_mut(&kid) {
+                    k.key.last_used_at = Some(now);
+                }
+                if let Some(a) = st.agents.get_mut(&agent_id) {
+                    a.last_used_at = Some(now);
+                }
             }
-            if let Some(a) = st.agents.get_mut(&agent_id) {
-                a.last_used_at = Some(now);
-            }
-            agent
+            (agent, kid, refused)
         };
+        let ctx = events::context(
+            agent.tenant_id,
+            events::agent_actor(agent.id, agent.owner_id),
+        );
+        if let Some(reason) = refused {
+            self.area
+                .record_audit(
+                    &ctx,
+                    events::agent_key_refused_entry(agent.id, key, reason, client),
+                )
+                .await?;
+            return Err(if reason == "revoked" || reason == "expired" {
+                refuse()
+            } else {
+                check_live(&agent).expect_err("refused above")
+            });
+        }
+        self.area
+            .record_audit(&ctx, events::agent_key_used_entry(agent.id, key, client))
+            .await?;
         let mut t = Self::token_for(&self.area, &agent, None)?;
         t.issued_token_type = Some(ACCESS_TOKEN_TYPE.into());
         Ok(t)

@@ -74,6 +74,30 @@ impl AuditLog for PgAuditLog {
         Ok(())
     }
 
+    async fn record_first_use(
+        &self,
+        ctx: &Context,
+        session: Uuid,
+        entry: NewAuditEntry,
+    ) -> Result<bool> {
+        let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        let new = sqlx::query(
+            "insert into session_tenants (tenant_id, session_id) values ($1, $2) \
+             on conflict do nothing",
+        )
+        .bind(ctx.tenant.0)
+        .bind(session)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if new {
+            record_in(&mut tx, ctx, entry).await?;
+        }
+        tx.commit().await?;
+        Ok(new)
+    }
+
     /// Keyset per source: at most `limit + 1` rows from `audit` (index `audit_tenant_at_idx`)
     /// and from `journal`, each in the order (`at` desc, `id` desc), merged here. The id of a
     /// journal row grows with its `seq` ([`journal_audit_id`]), so `seq` desc is its `id` order.

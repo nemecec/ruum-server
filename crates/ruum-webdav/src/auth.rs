@@ -33,8 +33,16 @@ pub(crate) async fn context(
     };
     let who = match parse(value) {
         Some(Credentials::Basic { email, password }) => {
+            // The WebDAV listener does not know the peer here; the user agent is enough.
+            let client = ruum_core::audit::events::ClientInfo {
+                ip: None,
+                user_agent: headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            };
             s.identity
-                .authenticate_app_password(&email, &password)
+                .authenticate_app_password_from(&email, &password, &client)
                 .await
         }
         Some(Credentials::Bearer(token)) => {

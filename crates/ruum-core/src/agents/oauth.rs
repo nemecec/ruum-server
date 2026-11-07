@@ -396,8 +396,20 @@ pub trait OAuthServer: Send + Sync {
     /// `error=access_denied`.
     async fn consent(&self, who: &Actor, consent: Consent) -> Result<String>;
     /// The token endpoint: the `authorization_code` and `refresh_token` grants. The token
-    /// exchange of API keys is [`crate::agents::AgentStore::exchange_key`].
-    async fn token(&self, req: TokenRequest) -> std::result::Result<TokenResponse, OAuthError>;
+    /// exchange of API keys is [`crate::agents::AgentStore::exchange_key`]. The same as
+    /// [`OAuthServer::token_from`] without a client.
+    async fn token(&self, req: TokenRequest) -> std::result::Result<TokenResponse, OAuthError> {
+        self.token_from(req, &crate::audit::events::ClientInfo::default())
+            .await
+    }
+    /// [`OAuthServer::token`] for a request from `client`. Each issue writes
+    /// `agent.token_issued` in the agent's tenant (decision 0003-4); in Postgres in the
+    /// transaction that rotates the refresh token, so a failed write issues nothing.
+    async fn token_from(
+        &self,
+        req: TokenRequest,
+        client: &crate::audit::events::ClientInfo,
+    ) -> std::result::Result<TokenResponse, OAuthError>;
     /// Ends all OAuth grants of an agent (disable, owner left).
     async fn end_grants(&self, tenant: TenantId, agent: AgentId) -> Result<u32>;
 }

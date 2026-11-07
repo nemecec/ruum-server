@@ -22,6 +22,8 @@ pub(crate) struct Area {
     pub oauth: Arc<dyn OAuthServer>,
     pub tokens: Arc<dyn TokenIssuer>,
     pub mailer: Arc<MemoryMailer>,
+    /// The audit log the stores write to (decision 0003-4 checks read it).
+    pub audit: Arc<dyn crate::audit::AuditLog>,
     pub pool: Option<sqlx::PgPool>,
     /// The in-memory engine that the in-memory stores write their tuples to (`None` for
     /// Postgres, whose tuples go to `authz_outbox`).
@@ -224,12 +226,15 @@ pub(crate) fn memory() -> Area {
     let authz = Arc::new(crate::authz::memory::MemoryAuthz::new(
         crate::authz::schema::Schema::contract(),
     ));
+    let audit: Arc<dyn crate::audit::AuditLog> =
+        Arc::new(crate::audit::memory::MemoryAuditLog::default());
     let area = Arc::new(memory::MemoryArea::new(memory::MemoryDeps {
         tokens: tokens.clone(),
         authz: Some(authz.clone()),
         nodes: Some(roots.clone()),
         root_created: Some(roots),
         mailer: mailer.clone(),
+        audit: Some(audit.clone()),
         ..memory::MemoryDeps::default()
     }));
     Area {
@@ -239,6 +244,7 @@ pub(crate) fn memory() -> Area {
         oauth: Arc::new(crate::agents::oauth::MemoryOAuthServer::new(area)),
         tokens,
         mailer,
+        audit,
         pool: None,
         authz: Some(authz),
     }
@@ -257,6 +263,7 @@ pub(crate) fn postgres(pool: sqlx::PgPool) -> Area {
         oauth: Arc::new(crate::agents::postgres::PgOAuthServer::new(area)),
         tokens,
         mailer,
+        audit: Arc::new(crate::audit::postgres::PgAuditLog::new(pool.clone())),
         pool: Some(pool),
         authz: None,
     }
@@ -445,6 +452,26 @@ async fn app_passwords_are_the_user_in_one_tenant(a: Area) {
         .unwrap();
     assert_eq!(who.actor, Actor::user(u.id));
     assert_eq!(who.bound_tenant, Some(u.home_tenant_id));
+    // Decision 0003-4: a second sign-in within the hour writes no second audit row.
+    let client = crate::audit::events::ClientInfo {
+        ip: Some("198.51.100.4".into()),
+        user_agent: Some("WebDAVFS/3.0".into()),
+    };
+    a.identity
+        .authenticate_app_password_from(&u.email, &secret, &client)
+        .await
+        .unwrap();
+    let used: Vec<_> = audit_actions(&a, u.home_tenant_id)
+        .await
+        .into_iter()
+        .filter(|e| e.action == "auth.app_password_used")
+        .collect();
+    assert_eq!(used.len(), 1);
+    assert_eq!(used[0].actor, Actor::user(u.id));
+    assert_eq!(
+        used[0].target_id.as_deref(),
+        Some(pw.id.to_string().as_str())
+    );
     assert_eq!(
         code(
             a.identity
@@ -713,4 +740,17 @@ mod idempotency_tests {
             );
         }
     }
+}
+
+/// The actions of the audit entries of `tenant`, oldest first.
+pub(crate) async fn audit_actions(a: &Area, tenant: TenantId) -> Vec<crate::audit::AuditEntry> {
+    let ctx = ctx(tenant, UserId::new());
+    let mut items = a
+        .audit
+        .list(&ctx, crate::audit::AuditQuery::default())
+        .await
+        .unwrap()
+        .items;
+    items.reverse();
+    items
 }

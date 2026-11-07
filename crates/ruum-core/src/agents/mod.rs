@@ -336,13 +336,26 @@ pub fn agent_scope_expired() -> Error {
 /// authenticates an agent or issues it a token calls this (`AgentStore::authenticate`,
 /// `exchange_key`, the OAuth code and refresh grants).
 pub fn check_live(agent: &Agent) -> crate::error::Result<()> {
-    if agent.disabled_at.is_some() {
-        return Err(agent_disabled());
-    }
-    if agent.scope.expires_at.is_some_and(|t| t <= crate::now()) {
-        return Err(agent_scope_expired());
+    if let Some(reason) = refusal(agent) {
+        return Err(if reason == "agent_disabled" {
+            agent_disabled()
+        } else {
+            agent_scope_expired()
+        });
     }
     Ok(())
+}
+
+/// Why [`check_live`] refuses the agent (`agent_disabled`, `scope_expired`), as the reason of
+/// an `agent.key_refused` audit entry.
+pub fn refusal(agent: &Agent) -> Option<&'static str> {
+    if agent.disabled_at.is_some() {
+        return Some("agent_disabled");
+    }
+    if agent.scope.expires_at.is_some_and(|t| t <= crate::now()) {
+        return Some("scope_expired");
+    }
+    None
 }
 
 /// How many live agents one guest may own in a tenant: the allowance of one member of the plan.
@@ -415,8 +428,21 @@ pub trait AgentStore: Send + Sync {
     /// The owner or a tenant admin.
     async fn revoke_key(&self, ctx: &Context, id: AgentId, key: AgentKeyId) -> Result<()>;
     /// Exchanges a key for a short-lived access token. No session is needed. A system lookup by
-    /// the hash of the key.
-    async fn exchange_key(&self, secret: &str) -> Result<AccessToken>;
+    /// the hash of the key. The same as [`AgentStore::exchange_key_from`] without a client.
+    async fn exchange_key(&self, secret: &str) -> Result<AccessToken> {
+        self.exchange_key_from(secret, &crate::audit::events::ClientInfo::default())
+            .await
+    }
+    /// [`AgentStore::exchange_key`] for a request from `client`. It writes `agent.key_used` in
+    /// the agent's tenant, in the transaction of the exchange (a failed write fails it), and
+    /// `agent.key_refused` with the reason (`revoked`, `expired`, `agent_disabled`,
+    /// `scope_expired`) when a known key is refused (decision 0003-4). An unknown key writes
+    /// nothing: it names no tenant.
+    async fn exchange_key_from(
+        &self,
+        secret: &str,
+        client: &crate::audit::events::ClientInfo,
+    ) -> Result<AccessToken>;
     /// A system lookup of an agent for authentication: the live row (scope, disabled). Fails
     /// with `agent_disabled` for a disabled agent and `unauthenticated` for an unknown one.
     async fn authenticate(&self, tenant: TenantId, id: AgentId) -> Result<Agent>;

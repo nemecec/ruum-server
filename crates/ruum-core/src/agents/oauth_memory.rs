@@ -222,7 +222,11 @@ impl OAuthServer for MemoryOAuthServer {
         )
     }
 
-    async fn token(&self, req: TokenRequest) -> std::result::Result<TokenResponse, OAuthError> {
+    async fn token_from(
+        &self,
+        req: TokenRequest,
+        client: &crate::audit::events::ClientInfo,
+    ) -> std::result::Result<TokenResponse, OAuthError> {
         let now = crate::now();
         match req {
             TokenRequest::AuthorizationCode {
@@ -299,6 +303,22 @@ impl OAuthServer for MemoryOAuthServer {
                     (agent, audience, refresh)
                 };
                 let access = MemoryAgentStore::token_for(&self.area, &agent, Some(&audience))?;
+                {
+                    use crate::audit::events;
+                    self.area
+                        .record_audit(
+                            &events::context(
+                                agent.tenant_id,
+                                events::agent_actor(agent.id, agent.owner_id),
+                            ),
+                            events::agent_token_issued_entry(
+                                agent.id,
+                                "authorization_code",
+                                client,
+                            ),
+                        )
+                        .await?;
+                }
                 Ok(TokenResponse {
                     access,
                     refresh_token: Some(refresh),
@@ -366,6 +386,18 @@ impl OAuthServer for MemoryOAuthServer {
                     (agent, audience, refresh)
                 };
                 let access = MemoryAgentStore::token_for(&self.area, &agent, Some(&audience))?;
+                {
+                    use crate::audit::events;
+                    self.area
+                        .record_audit(
+                            &events::context(
+                                agent.tenant_id,
+                                events::agent_actor(agent.id, agent.owner_id),
+                            ),
+                            events::agent_token_issued_entry(agent.id, "refresh_token", client),
+                        )
+                        .await?;
+                }
                 Ok(TokenResponse {
                     access,
                     refresh_token: Some(refresh),

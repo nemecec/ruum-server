@@ -140,6 +140,16 @@ pub struct AuditQuery {
 pub trait AuditLog: Send + Sync {
     /// Stores one entry in the tenant of `ctx`, with the actor of `ctx`.
     async fn record(&self, ctx: &Context, entry: NewAuditEntry) -> Result<()>;
+    /// Records `entry` for the first use of the web session `session` in the tenant of `ctx`
+    /// (decision 0003-4): the marker (`session_tenants`) and the entry in one transaction.
+    /// Returns `false`, and writes nothing, when the session was used there before. `session`
+    /// is the `sessions.id` row ID, never anything derived from the cookie secret.
+    async fn record_first_use(
+        &self,
+        ctx: &Context,
+        session: Uuid,
+        entry: NewAuditEntry,
+    ) -> Result<bool>;
     /// Newest first, the `audit` table and the journal merged. No permission check: the caller
     /// checks [`require_admin`] first.
     async fn list(&self, ctx: &Context, query: AuditQuery) -> Result<Page<AuditEntry>>;

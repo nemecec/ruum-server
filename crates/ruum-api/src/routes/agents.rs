@@ -282,7 +282,7 @@ pub async fn exchange_token(
                 state
                     .services
                     .agents
-                    .exchange_key(&subject_token)
+                    .exchange_key_from(&subject_token, &crate::auth::current_client())
                     .await
                     .map(|access| TokenResponse {
                         access,
@@ -291,7 +291,13 @@ pub async fn exchange_token(
                     .map_err(OAuthError::from)
             }
         }
-        other => state.services.oauth.token(other).await,
+        other => {
+            state
+                .services
+                .oauth
+                .token_from(other, &crate::auth::current_client())
+                .await
+        }
     };
     match result {
         Ok(t) => {

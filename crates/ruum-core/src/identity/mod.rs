@@ -340,7 +340,25 @@ pub trait IdentityStore: Send + Sync {
     /// The WebDAV sign-in (HTTP Basic): the user's email and an app password. A system lookup by
     /// the hash; then it checks the email, the expiry and that the user is still a member or
     /// guest of the tenant. The result is the user (actor = the user) bound to that tenant.
-    async fn authenticate_app_password(&self, email: &str, secret: &str) -> Result<Authenticated>;
+    async fn authenticate_app_password(&self, email: &str, secret: &str) -> Result<Authenticated> {
+        self.authenticate_app_password_from(
+            email,
+            secret,
+            &crate::audit::events::ClientInfo::default(),
+        )
+        .await
+    }
+    /// [`IdentityStore::authenticate_app_password`] for a request from `client`. A successful
+    /// sign-in writes `auth.app_password_used` in the password's tenant, at most once per
+    /// [`crate::audit::events::APP_PASSWORD_AUDIT_SECONDS`] per password (decision 0003-4). The
+    /// check reads the audit table in the same statement that writes, so every server process
+    /// shares it.
+    async fn authenticate_app_password_from(
+        &self,
+        email: &str,
+        secret: &str,
+        client: &crate::audit::events::ClientInfo,
+    ) -> Result<Authenticated>;
 }
 
 /// A web session checks for email grants to bind at most once in this many seconds

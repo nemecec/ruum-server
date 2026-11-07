@@ -122,7 +122,7 @@ async fn world() -> World {
         ip: Some("192.0.2.7".into()),
         user_agent: Some("curl/8".into()),
     };
-    events::sign_in(log.as_ref(), tenant, member, "google", &client)
+    events::sign_in(log.as_ref(), tenant, member, "google", None, &client)
         .await
         .unwrap();
     let agent = AgentId::new();

@@ -12,14 +12,19 @@ use crate::actor::{Actor, Context, PrincipalKind, PrincipalRef};
 use crate::error::Result;
 use crate::ids::{AgentId, AgentKeyId, AppPasswordId, TenantId, UserId};
 use serde_json::json;
+use uuid::Uuid;
 
 /// The action names of the audit log. Other areas may add their own (`member.removed`,
 /// `tenant.updated`, ...) with the same dotted form.
 pub mod actions {
-    /// A user signed in (web session). Recorded in the user's home tenant and in the tenant the
-    /// session starts in, if different.
+    /// A user signed in (web session). Recorded in the user's home tenant at sign-in
+    /// ([`super::sign_in`]), and once per session in each other tenant where the user is a
+    /// member, admin or owner, at the first use of the session there
+    /// ([`super::session_first_use`], `data.via = session_first_use`). Never in a tenant where
+    /// the user is a guest (decision 0003-4).
     pub const AUTH_LOGIN: &str = "auth.login";
-    /// A sign-in failed after the identity provider answered (no secrets in `data`).
+    /// A sign-in of a known user failed after the identity provider answered (no secrets in
+    /// `data`). Only in the user's home tenant; failures without a known user go to no tenant.
     pub const AUTH_LOGIN_FAILED: &str = "auth.login_failed";
     /// A user signed out, or ended one of their sessions.
     pub const AUTH_LOGOUT: &str = "auth.logout";
@@ -58,7 +63,8 @@ pub struct ClientInfo {
     pub user_agent: Option<String>,
 }
 
-fn context(tenant: TenantId, actor: Actor) -> Context {
+/// The context of an audit event of `actor` in `tenant`.
+pub fn context(tenant: TenantId, actor: Actor) -> Context {
     Context {
         tenant,
         actor,
@@ -67,7 +73,8 @@ fn context(tenant: TenantId, actor: Actor) -> Context {
     }
 }
 
-fn agent_actor(agent: AgentId, owner: UserId) -> Actor {
+/// The actor of an agent that acts for `owner`.
+pub fn agent_actor(agent: AgentId, owner: UserId) -> Actor {
     Actor {
         actor: PrincipalRef {
             kind: PrincipalKind::Agent,
@@ -77,20 +84,50 @@ fn agent_actor(agent: AgentId, owner: UserId) -> Actor {
     }
 }
 
-/// A user signed in. `method` names how (`passkey`, `google`, `microsoft`, `oidc`).
+/// A user signed in. `method` names how (`passkey`, `google`, `microsoft`, `oidc`). `session`
+/// is the `sessions.id` row ID of the new web session, if any (never derived from the cookie
+/// secret). The sign-in writes this in the user's home tenant only.
 pub async fn sign_in(
     log: &dyn AuditLog,
     tenant: TenantId,
     user: UserId,
     method: &str,
+    session: Option<Uuid>,
     client: &ClientInfo,
 ) -> Result<()> {
+    let mut data = json!({ "method": method });
+    if let Some(s) = session {
+        data["session_id"] = json!(s);
+    }
     log.record(
         &context(tenant, Actor::user(user)),
         NewAuditEntry::new(actions::AUTH_LOGIN)
             .target("user", user)
             .client(client.ip.clone(), client.user_agent.clone())
-            .data(json!({ "method": method })),
+            .data(data),
+    )
+    .await
+}
+
+/// The first use of a web session in a tenant that is not the user's home tenant, where the user
+/// is a member, admin or owner (the caller checks the role; guests get no row). Writes the
+/// `session_tenants` marker and one `auth.login` with `data.via = session_first_use` in one
+/// transaction; `Ok(false)` when the session was used there before. `session` is the
+/// `sessions.id` row ID.
+pub async fn session_first_use(
+    log: &dyn AuditLog,
+    tenant: TenantId,
+    user: UserId,
+    session: Uuid,
+    client: &ClientInfo,
+) -> Result<bool> {
+    log.record_first_use(
+        &context(tenant, Actor::user(user)),
+        session,
+        NewAuditEntry::new(actions::AUTH_LOGIN)
+            .target("user", user)
+            .client(client.ip.clone(), client.user_agent.clone())
+            .data(json!({ "via": "session_first_use", "session_id": session })),
     )
     .await
 }
@@ -141,12 +178,17 @@ pub async fn agent_key_used(
 ) -> Result<()> {
     log.record(
         &context(tenant, agent_actor(agent, owner)),
-        NewAuditEntry::new(actions::AGENT_KEY_USED)
-            .target("agent_key", key)
-            .client(client.ip.clone(), client.user_agent.clone())
-            .data(json!({ "agent_id": agent })),
+        agent_key_used_entry(agent, key, client),
     )
     .await
+}
+
+/// The entry of [`agent_key_used`], for stores that write it in their own transaction.
+pub fn agent_key_used_entry(agent: AgentId, key: AgentKeyId, client: &ClientInfo) -> NewAuditEntry {
+    NewAuditEntry::new(actions::AGENT_KEY_USED)
+        .target("agent_key", key)
+        .client(client.ip.clone(), client.user_agent.clone())
+        .data(json!({ "agent_id": agent }))
 }
 
 /// An agent API key was refused. `reason`: `expired`, `revoked`, `agent_disabled`, ...
@@ -161,12 +203,22 @@ pub async fn agent_key_refused(
 ) -> Result<()> {
     log.record(
         &context(tenant, agent_actor(agent, owner)),
-        NewAuditEntry::new(actions::AGENT_KEY_REFUSED)
-            .target("agent_key", key)
-            .client(client.ip.clone(), client.user_agent.clone())
-            .data(json!({ "agent_id": agent, "reason": reason })),
+        agent_key_refused_entry(agent, key, reason, client),
     )
     .await
+}
+
+/// The entry of [`agent_key_refused`], for stores that write it in their own transaction.
+pub fn agent_key_refused_entry(
+    agent: AgentId,
+    key: AgentKeyId,
+    reason: &str,
+    client: &ClientInfo,
+) -> NewAuditEntry {
+    NewAuditEntry::new(actions::AGENT_KEY_REFUSED)
+        .target("agent_key", key)
+        .client(client.ip.clone(), client.user_agent.clone())
+        .data(json!({ "agent_id": agent, "reason": reason }))
 }
 
 /// An OAuth token was issued to an agent. `grant` is `authorization_code` or `refresh_token`.
@@ -180,12 +232,17 @@ pub async fn agent_token_issued(
 ) -> Result<()> {
     log.record(
         &context(tenant, agent_actor(agent, owner)),
-        NewAuditEntry::new(actions::AGENT_TOKEN_ISSUED)
-            .target("agent", agent)
-            .client(client.ip.clone(), client.user_agent.clone())
-            .data(json!({ "grant": grant })),
+        agent_token_issued_entry(agent, grant, client),
     )
     .await
+}
+
+/// The entry of [`agent_token_issued`], for stores that write it in their own transaction.
+pub fn agent_token_issued_entry(agent: AgentId, grant: &str, client: &ClientInfo) -> NewAuditEntry {
+    NewAuditEntry::new(actions::AGENT_TOKEN_ISSUED)
+        .target("agent", agent)
+        .client(client.ip.clone(), client.user_agent.clone())
+        .data(json!({ "grant": grant }))
 }
 
 /// A WebDAV app password signed in. The actor is the user (decision 0001-7).
@@ -198,9 +255,18 @@ pub async fn app_password_used(
 ) -> Result<()> {
     log.record(
         &context(tenant, Actor::user(user)),
-        NewAuditEntry::new(actions::AUTH_APP_PASSWORD_USED)
-            .target("app_password", password)
-            .client(client.ip.clone(), client.user_agent.clone()),
+        app_password_used_entry(password, client),
     )
     .await
+}
+
+/// How often `auth.app_password_used` is written for one app password, at most: once per this
+/// many seconds (decision 0003-4). The stores check the audit table itself, a shared store.
+pub const APP_PASSWORD_AUDIT_SECONDS: i64 = 3600;
+
+/// The entry of [`app_password_used`], for stores that write it in their own transaction.
+pub fn app_password_used_entry(password: AppPasswordId, client: &ClientInfo) -> NewAuditEntry {
+    NewAuditEntry::new(actions::AUTH_APP_PASSWORD_USED)
+        .target("app_password", password)
+        .client(client.ip.clone(), client.user_agent.clone())
 }

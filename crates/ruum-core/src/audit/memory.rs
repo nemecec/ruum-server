@@ -3,12 +3,14 @@
 use super::*;
 use crate::ids::TenantId;
 use crate::journal::memory::MemoryJournal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
 pub struct MemoryAuditLog {
     entries: Mutex<HashMap<TenantId, Vec<AuditEntry>>>,
+    /// The (tenant, session) pairs of [`AuditLog::record_first_use`].
+    first_uses: Mutex<HashSet<(TenantId, Uuid)>>,
     /// The journal whose entries [`AuditLog::list`] merges in. `None`: only recorded events.
     journal: Option<Arc<MemoryJournal>>,
 }
@@ -18,6 +20,7 @@ impl MemoryAuditLog {
     pub fn with_journal(journal: Arc<MemoryJournal>) -> Self {
         Self {
             entries: Mutex::default(),
+            first_uses: Mutex::default(),
             journal: Some(journal),
         }
     }
@@ -45,6 +48,25 @@ impl AuditLog for MemoryAuditLog {
             .or_default()
             .push(row);
         Ok(())
+    }
+
+    async fn record_first_use(
+        &self,
+        ctx: &Context,
+        session: Uuid,
+        entry: NewAuditEntry,
+    ) -> Result<bool> {
+        let entry = entry.normalized()?;
+        if !self
+            .first_uses
+            .lock()
+            .expect("audit lock")
+            .insert((ctx.tenant, session))
+        {
+            return Ok(false);
+        }
+        self.record(ctx, entry).await?;
+        Ok(true)
     }
 
     async fn list(&self, ctx: &Context, query: AuditQuery) -> Result<Page<AuditEntry>> {

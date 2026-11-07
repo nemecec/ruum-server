@@ -2,7 +2,8 @@
 //! signed-in principal and WebDAV app passwords. See `docs/STEP1.md` for the owner of this file.
 
 use crate::auth::{
-    JsonBody, Principal, QueryParams, RequestContext, cookie, refuse_share_link, require_user,
+    JsonBody, Principal, QueryParams, RequestContext, cookie, current_client, refuse_share_link,
+    require_user,
 };
 use crate::error::{ApiResult, HttpError};
 use crate::state::AppState;
@@ -13,6 +14,7 @@ use axum::http::header::{LOCATION, SET_COOKIE, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use ruum_core::audit::events;
 use ruum_core::identity::{
     CSRF_COOKIE, LOGIN_COOKIE, LoginStart, SESSION_COOKIE, SESSION_DAYS, secret,
 };
@@ -145,25 +147,44 @@ pub struct CallbackQuery {
     error: Option<String>,
 }
 
+/// A sign-in that failed before a known user was found (bad state, bad code, an error of the
+/// identity provider). It goes to no tenant: a row there would let anyone write into a victim's
+/// log (decision 0003-4). It is a `tracing` security event with a short reason code.
+fn login_refused(reason: &'static str, error: HttpError) -> HttpError {
+    tracing::warn!(target: "ruum::security", event = "auth.login_failed", reason, "a sign-in failed");
+    error
+}
+
 /// OIDC callback. `GET /v1/auth/callback` (operationId `loginCallback`).
+///
+/// A sign-in writes `auth.login` (IP, user agent, the `sessions.id` of the new session) in the
+/// user's home tenant, and nowhere else (decision 0003-4); other tenants get their row at the
+/// first use of the session there ([`crate::auth::note_session_use`]). The write is
+/// synchronous: when it fails, the new session ends and the sign-in fails (design 15).
 pub async fn login_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
     QueryParams(q): QueryParams<CallbackQuery>,
 ) -> ApiResult<Response> {
     if let Some(e) = q.error {
-        return Err(HttpError(Error::Api(
-            ApiError::new(
-                ErrorCode::Unauthenticated,
-                format!("the identity provider refused the sign-in: {e}"),
-            )
-            .with_hint("start the sign-in again at /v1/auth/login"),
-        )));
+        return Err(login_refused(
+            "provider_error",
+            HttpError(Error::Api(
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    format!("the identity provider refused the sign-in: {e}"),
+                )
+                .with_hint("start the sign-in again at /v1/auth/login"),
+            )),
+        ));
     }
     let sealed = cookie(&headers, LOGIN_COOKIE).ok_or_else(|| {
-        bad_request(
-            "the sign-in state cookie is missing",
-            "start the sign-in again at /v1/auth/login",
+        login_refused(
+            "state_missing",
+            bad_request(
+                "the sign-in state cookie is missing",
+                "start the sign-in again at /v1/auth/login",
+            ),
         )
     })?;
     let start: LoginStart = state
@@ -173,23 +194,36 @@ pub async fn login_callback(
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .ok_or_else(|| {
-            bad_request(
-                "the sign-in state is not valid or has expired",
-                "start the sign-in again at /v1/auth/login",
+            login_refused(
+                "state_invalid",
+                bad_request(
+                    "the sign-in state is not valid or has expired",
+                    "start the sign-in again at /v1/auth/login",
+                ),
             )
         })?;
     let state_param = q.state.unwrap_or_default();
     if !secret::constant_time_eq(state_param.as_bytes(), start.state.as_bytes()) {
-        return Err(bad_request(
-            "the sign-in state does not match",
-            "start the sign-in again at /v1/auth/login",
+        return Err(login_refused(
+            "state_mismatch",
+            bad_request(
+                "the sign-in state does not match",
+                "start the sign-in again at /v1/auth/login",
+            ),
         ));
     }
-    let code = q
-        .code
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| bad_request("the code is missing", "start the sign-in again"))?;
-    let login = state.services.oidc.finish_login(&code, &start).await?;
+    let code = q.code.filter(|c| !c.is_empty()).ok_or_else(|| {
+        login_refused(
+            "code_missing",
+            bad_request("the code is missing", "start the sign-in again"),
+        )
+    })?;
+    let login = state
+        .services
+        .oidc
+        .finish_login(&code, &start)
+        .await
+        .map_err(|e| login_refused("code_refused", HttpError(e)))?;
     let user = state.services.identity.upsert_from_login(&login).await?;
     let user_agent = headers
         .get(USER_AGENT)
@@ -200,6 +234,27 @@ pub async fn login_callback(
         .identity
         .create_session(user.id, user_agent)
         .await?;
+    if let Err(e) = events::sign_in(
+        state.services.audit.as_ref(),
+        user.home_tenant_id,
+        user.id,
+        "oidc",
+        Some(session.id),
+        &current_client(),
+    )
+    .await
+    {
+        // Fail closed: no audit row, no session.
+        if let Err(end) = state
+            .services
+            .identity
+            .end_session(user.id, session.id)
+            .await
+        {
+            tracing::warn!(error = %end, "could not end the session of a failed sign-in");
+        }
+        return Err(HttpError(e));
+    }
     // Every sign-in binds the email grants of the user's verified email (decision 0003-2
     // (b)). A failure does not fail the sign-in; the grants stay email grants.
     if let Err(e) = state
@@ -235,6 +290,9 @@ pub async fn logout(
 ) -> ApiResult<Response> {
     refuse_share_link(&who)?;
     if let (Some(session), Some(user)) = (who.session_id, who.user()) {
+        // `auth.logout` in the home tenant first: a failed write fails the sign-out (design 15).
+        let home = state.services.identity.get_user(user).await?.home_tenant_id;
+        events::sign_out(state.services.audit.as_ref(), home, user, &current_client()).await?;
         state.services.identity.end_session(user, session).await?;
     }
     let logout_url = state.services.oidc.logout_url(None).await?;
@@ -351,7 +409,10 @@ pub async fn end_session(
     let id: Uuid = session_id
         .parse()
         .map_err(|_| HttpError(Error::not_found("session")))?;
+    // Another user's session is `not_found` here, before any audit row.
     state.services.identity.end_session(user, id).await?;
+    let home = state.services.identity.get_user(user).await?.home_tenant_id;
+    events::sign_out(state.services.audit.as_ref(), home, user, &current_client()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1021,5 +1082,307 @@ pub(crate) mod tests {
         .await;
         assert_eq!(bad.status, StatusCode::BAD_REQUEST);
         assert_eq!(bad.body["error"], "invalid_redirect_uri");
+    }
+
+    /// The audit entries of `tenant`, oldest first.
+    async fn audit_of(state: &AppState, tenant: ruum_core::TenantId) -> Vec<Value> {
+        let ctx = ruum_core::Context {
+            tenant,
+            actor: ruum_core::Actor::user(ruum_core::UserId::new()),
+            scope: None,
+            idempotency_key: None,
+        };
+        let mut items = state
+            .services
+            .audit
+            .list(&ctx, ruum_core::audit::AuditQuery::default())
+            .await
+            .unwrap()
+            .items;
+        items.reverse();
+        items.into_iter().map(|e| json!(e)).collect()
+    }
+
+    /// Signs in and returns the cookie header, the CSRF value, the user ID and the home tenant.
+    async fn signed_in(
+        app: &axum::Router,
+        oidc: &MemoryOidcClient,
+        email: &str,
+    ) -> (String, String, ruum_core::UserId, ruum_core::TenantId) {
+        let (session, csrf) = sign_in(app, oidc, email).await;
+        let cookie = format!("ruum_session={session}; ruum_csrf={csrf}");
+        let me = call(app, Method::GET, "/v1/me", &[("cookie", &cookie)], None).await;
+        let user: ruum_core::UserId = me.body["user"]["id"].as_str().unwrap().parse().unwrap();
+        let home: ruum_core::TenantId = me.body["user"]["home_tenant_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (cookie, csrf, user, home)
+    }
+
+    /// Decision 0003-4 (C-14): a sign-in writes `auth.login` in the home tenant only; the first
+    /// use of the session in a team tenant (as a member) writes one `auth.login` there with
+    /// `via: session_first_use`; later requests write none; a new session writes again; a guest
+    /// gets no row in the host tenant; sign-out writes `auth.logout` in the home tenant.
+    #[tokio::test]
+    async fn sign_ins_are_audited_in_the_home_tenant_and_at_first_use() {
+        use ruum_core::tenants::MemberRole;
+        let (app, oidc, state) = app();
+        let (owner_cookie, _, owner, owner_home) =
+            signed_in(&app, &oidc, "owner@example.test").await;
+        let team = state
+            .services
+            .tenants
+            .create_team(&ruum_core::Actor::user(owner), "Team".into())
+            .await
+            .unwrap();
+        let owner_ctx = ruum_core::Context {
+            tenant: team.id,
+            actor: ruum_core::Actor::user(owner),
+            scope: None,
+            idempotency_key: None,
+        };
+        let (member_cookie, member_csrf, member, member_home) =
+            signed_in(&app, &oidc, "member@example.test").await;
+        let (guest_cookie, _, guest, _) = signed_in(&app, &oidc, "guest@example.test").await;
+        for (who, email, role) in [
+            (member, "member@example.test", MemberRole::Member),
+            (guest, "guest@example.test", MemberRole::Guest),
+        ] {
+            let (_, token) = state
+                .services
+                .tenants
+                .invite(&owner_ctx, email.into(), role, None)
+                .await
+                .unwrap();
+            state
+                .services
+                .tenants
+                .accept_invitation(&ruum_core::Actor::user(who), &token)
+                .await
+                .unwrap();
+        }
+
+        // The sign-in wrote only in the home tenant, with the session row ID.
+        let home = audit_of(&state, member_home).await;
+        assert_eq!(home.len(), 1, "{home:?}");
+        assert_eq!(home[0]["action"], "auth.login");
+        assert_eq!(home[0]["actor"]["id"], json!(member));
+        assert!(home[0]["data"]["session_id"].is_string());
+        assert_eq!(audit_of(&state, owner_home).await.len(), 1);
+        let logins = |v: &[Value]| v.iter().filter(|e| e["action"] == "auth.login").count();
+        assert_eq!(logins(&audit_of(&state, team.id).await), 0);
+
+        // The first use of the member's session in the team writes one row; the next none.
+        let team_id = team.id.to_string();
+        for _ in 0..2 {
+            let r = call(
+                &app,
+                Method::GET,
+                "/v1/me/app-passwords",
+                &[("cookie", &member_cookie), ("ruum-tenant", &team_id)],
+                None,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK);
+        }
+        let r = call(
+            &app,
+            Method::GET,
+            &format!("/v1/tenants/{team_id}"),
+            &[("cookie", &member_cookie), ("user-agent", "Firefox")],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let rows = audit_of(&state, team.id).await;
+        let first: Vec<&Value> = rows
+            .iter()
+            .filter(|e| e["action"] == "auth.login")
+            .collect();
+        assert_eq!(first.len(), 1, "{rows:?}");
+        assert_eq!(first[0]["actor"]["id"], json!(member));
+        assert_eq!(first[0]["data"]["via"], "session_first_use");
+        assert_eq!(
+            first[0]["data"]["session_id"],
+            home[0]["data"]["session_id"]
+        );
+
+        // A guest's requests in the host tenant write nothing.
+        for _ in 0..2 {
+            let r = call(
+                &app,
+                Method::GET,
+                "/v1/me/app-passwords",
+                &[("cookie", &guest_cookie), ("ruum-tenant", &team_id)],
+                None,
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK);
+        }
+        assert_eq!(logins(&audit_of(&state, team.id).await), 1);
+        // The owner's own team: also a first use there (the home tenant is the personal one).
+        let r = call(
+            &app,
+            Method::GET,
+            "/v1/me/app-passwords",
+            &[("cookie", &owner_cookie), ("ruum-tenant", &team_id)],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(logins(&audit_of(&state, team.id).await), 2);
+
+        // Sign-out writes auth.logout in the home tenant; a new session counts again.
+        let out = call(
+            &app,
+            Method::POST,
+            "/v1/auth/logout",
+            &[("cookie", &member_cookie), ("ruum-csrf", &member_csrf)],
+            None,
+        )
+        .await;
+        assert_eq!(out.status, StatusCode::OK);
+        let home = audit_of(&state, member_home).await;
+        assert_eq!(home.last().unwrap()["action"], "auth.logout");
+        let (again, _, _, _) = signed_in(&app, &oidc, "member@example.test").await;
+        let r = call(
+            &app,
+            Method::GET,
+            "/v1/me/app-passwords",
+            &[("cookie", &again), ("ruum-tenant", &team_id)],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(logins(&audit_of(&state, team.id).await), 3);
+    }
+
+    /// An audit log whose writes of one action fail.
+    struct FailingAudit {
+        inner: Arc<dyn ruum_core::audit::AuditLog>,
+        action: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ruum_core::audit::AuditLog for FailingAudit {
+        async fn record(
+            &self,
+            ctx: &ruum_core::Context,
+            entry: ruum_core::audit::NewAuditEntry,
+        ) -> ruum_core::error::Result<()> {
+            if entry.action == self.action {
+                return Err(ruum_core::Error::Internal("the audit log is down".into()));
+            }
+            self.inner.record(ctx, entry).await
+        }
+        async fn record_first_use(
+            &self,
+            ctx: &ruum_core::Context,
+            session: uuid::Uuid,
+            entry: ruum_core::audit::NewAuditEntry,
+        ) -> ruum_core::error::Result<bool> {
+            if entry.action == self.action {
+                return Err(ruum_core::Error::Internal("the audit log is down".into()));
+            }
+            self.inner.record_first_use(ctx, session, entry).await
+        }
+        async fn list(
+            &self,
+            ctx: &ruum_core::Context,
+            query: ruum_core::audit::AuditQuery,
+        ) -> ruum_core::error::Result<ruum_core::Page<ruum_core::audit::AuditEntry>> {
+            self.inner.list(ctx, query).await
+        }
+    }
+
+    /// A failed `auth.login` write fails the sign-in: `500`, no session cookie, and the new
+    /// session is ended (design 15, decision 0003-4).
+    #[tokio::test]
+    async fn a_failed_sign_in_audit_fails_the_sign_in() {
+        let (_, oidc, mut state) = app();
+        state.services.audit = Arc::new(FailingAudit {
+            inner: state.services.audit.clone(),
+            action: "auth.login",
+        });
+        let app = router(state.clone());
+        let start = call(&app, Method::GET, "/v1/auth/login", &[], None).await;
+        let location = start.headers["location"].to_str().unwrap().to_string();
+        let st = url::Url::parse(&location)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let login_cookie = cookie_value(&start, "ruum_login");
+        oidc.add_login(
+            "code-9",
+            VerifiedLogin {
+                issuer: MemoryOidcClient::ISSUER.into(),
+                subject: "down@example.test".into(),
+                email: Some("down@example.test".into()),
+                email_verified: true,
+                name: None,
+                id_token: None,
+            },
+        );
+        let cb = call(
+            &app,
+            Method::GET,
+            &format!("/v1/auth/callback?code=code-9&state={st}"),
+            &[("cookie", &format!("ruum_login={login_cookie}"))],
+            None,
+        )
+        .await;
+        assert_eq!(cb.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(cookie_value(&cb, "ruum_session"), "");
+        let user = state
+            .services
+            .identity
+            .find_verified_email("down@example.test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            state
+                .services
+                .identity
+                .sessions_of(user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A first use whose audit write fails fails the request (design 15).
+    #[tokio::test]
+    async fn a_failed_first_use_audit_fails_the_request() {
+        let (_, oidc, mut state) = app();
+        let audit = state.services.audit.clone();
+        let app = router(state.clone());
+        let (_, _, owner, _) = signed_in(&app, &oidc, "boss@example.test").await;
+        let team = state
+            .services
+            .tenants
+            .create_team(&ruum_core::Actor::user(owner), "Team".into())
+            .await
+            .unwrap();
+        let (cookie, _, _, _) = signed_in(&app, &oidc, "boss@example.test").await;
+        state.services.audit = Arc::new(FailingAudit {
+            inner: audit,
+            action: "auth.login",
+        });
+        let app = router(state);
+        let r = call(
+            &app,
+            Method::GET,
+            "/v1/me/app-passwords",
+            &[("cookie", &cookie), ("ruum-tenant", &team.id.to_string())],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

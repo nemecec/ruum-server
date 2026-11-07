@@ -608,7 +608,12 @@ impl AgentStore for PgAgentStore {
         Ok(())
     }
 
-    async fn exchange_key(&self, secret_value: &str) -> Result<AccessToken> {
+    async fn exchange_key_from(
+        &self,
+        secret_value: &str,
+        client: &crate::audit::events::ClientInfo,
+    ) -> Result<AccessToken> {
+        use crate::audit::events;
         let refuse = || {
             unauthenticated(
                 "the API key is not valid",
@@ -620,8 +625,8 @@ impl AgentStore for PgAgentStore {
         }
         let mut tx = self.area.system().await?;
         let r = sqlx::query(
-            "select id, tenant_id, agent_id from agent_keys where key_hash = $1 \
-             and revoked_at is null and expires_at > now()",
+            "select id, tenant_id, agent_id, revoked_at is not null as revoked, \
+             expires_at <= now() as expired from agent_keys where key_hash = $1",
         )
         .bind(&hash_key(secret_value)[..])
         .fetch_optional(&mut *tx)
@@ -630,8 +635,32 @@ impl AgentStore for PgAgentStore {
         let key: AgentKeyId = r.try_get("id")?;
         let tenant: TenantId = r.try_get("tenant_id")?;
         let agent_id: AgentId = r.try_get("agent_id")?;
+        let revoked: bool = r.try_get("revoked")?;
+        let expired: bool = r.try_get("expired")?;
         let agent = agent_in(&mut tx, tenant, agent_id).await?;
-        check_live(&agent)?;
+        let ctx = events::context(tenant, events::agent_actor(agent_id, agent.owner_id));
+        let refused = if revoked {
+            Some("revoked")
+        } else if expired {
+            Some("expired")
+        } else {
+            crate::agents::refusal(&agent)
+        };
+        if let Some(reason) = refused {
+            // The refusal is recorded (and committed) although the exchange fails.
+            crate::audit::postgres::record_in(
+                &mut tx,
+                &ctx,
+                events::agent_key_refused_entry(agent_id, key, reason, client),
+            )
+            .await?;
+            tx.commit().await?;
+            return Err(if revoked || expired {
+                refuse()
+            } else {
+                check_live(&agent).expect_err("refused above")
+            });
+        }
         sqlx::query("update agent_keys set last_used_at = now() where id = $1")
             .bind(key)
             .execute(&mut *tx)
@@ -641,6 +670,13 @@ impl AgentStore for PgAgentStore {
             .bind(agent_id)
             .execute(&mut *tx)
             .await?;
+        // In the transaction of the exchange: a failed write fails it (design 15).
+        crate::audit::postgres::record_in(
+            &mut tx,
+            &ctx,
+            events::agent_key_used_entry(agent_id, key, client),
+        )
+        .await?;
         tx.commit().await?;
         let mut t = token_for(self.area.tokens.as_ref(), &agent, None)?;
         t.issued_token_type = Some(ACCESS_TOKEN_TYPE.into());
@@ -774,6 +810,10 @@ const CLIENT_COLS: &str =
 impl PgOAuthServer {
     /// Issues tokens for a live grant and rotates its refresh token, in the caller's
     /// transaction. Checks the agent.
+    /// Rotates the refresh token of `grant` and issues tokens to its agent. Writes
+    /// `agent.token_issued` (`grant_type`: `authorization_code` or `refresh_token`) in the same
+    /// transaction (decision 0003-4).
+    #[allow(clippy::too_many_arguments)]
     async fn issue(
         &self,
         conn: &mut PgConnection,
@@ -781,6 +821,8 @@ impl PgOAuthServer {
         grant: Uuid,
         agent_id: AgentId,
         audience: &str,
+        grant_type: &str,
+        client: &crate::audit::events::ClientInfo,
     ) -> std::result::Result<TokenResponse, OAuthError> {
         let agent = agent_in(conn, tenant, agent_id)
             .await
@@ -806,6 +848,15 @@ impl PgOAuthServer {
             .await
             .map_err(Error::from)?;
         let access = token_for(self.area.tokens.as_ref(), &agent, Some(audience))?;
+        {
+            use crate::audit::events;
+            crate::audit::postgres::record_in(
+                conn,
+                &events::context(tenant, events::agent_actor(agent_id, agent.owner_id)),
+                events::agent_token_issued_entry(agent_id, grant_type, client),
+            )
+            .await?;
+        }
         Ok(TokenResponse {
             access,
             refresh_token: Some(refresh),
@@ -1005,7 +1056,11 @@ impl OAuthServer for PgOAuthServer {
         )
     }
 
-    async fn token(&self, req: TokenRequest) -> std::result::Result<TokenResponse, OAuthError> {
+    async fn token_from(
+        &self,
+        req: TokenRequest,
+        client: &crate::audit::events::ClientInfo,
+    ) -> std::result::Result<TokenResponse, OAuthError> {
         match req {
             TokenRequest::AuthorizationCode {
                 code,
@@ -1100,7 +1155,15 @@ impl OAuthServer for PgOAuthServer {
                     .await
                     .map_err(Error::from)?;
                 let out = self
-                    .issue(&mut tx, tenant, grant, agent_id, &audience)
+                    .issue(
+                        &mut tx,
+                        tenant,
+                        grant,
+                        agent_id,
+                        &audience,
+                        "authorization_code",
+                        client,
+                    )
                     .await;
                 tx.commit().await.map_err(Error::from)?;
                 out
@@ -1159,7 +1222,15 @@ impl OAuthServer for PgOAuthServer {
                     ));
                 }
                 let out = self
-                    .issue(&mut tx, tenant, grant, agent_id, &audience)
+                    .issue(
+                        &mut tx,
+                        tenant,
+                        grant,
+                        agent_id,
+                        &audience,
+                        "refresh_token",
+                        client,
+                    )
                     .await;
                 tx.commit().await.map_err(Error::from)?;
                 out

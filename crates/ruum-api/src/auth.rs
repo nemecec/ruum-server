@@ -23,7 +23,9 @@ use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
+use ruum_core::audit::events::{self, ClientInfo};
 use ruum_core::identity::{Authenticated, CSRF_HEADER, SESSION_COOKIE, auth, unauthenticated};
+use ruum_core::tenants::MemberRole;
 use ruum_core::{ApiError, Context, Error, ErrorCode, TenantId};
 
 /// The context of an authenticated request in one tenant.
@@ -190,8 +192,82 @@ pub async fn tenant_context(
     }
     let ctx =
         auth::context_for(&state.services, who, Some(tenant), idempotency_key(headers)).await?;
+    note_session_use(state, who, &ctx).await?;
     crate::names::note_tenant(&ctx);
     Ok(ctx)
+}
+
+tokio::task_local! {
+    /// The client of the request being served ([`client_info`]), set by [`crate::router`].
+    static CLIENT: ClientInfo;
+}
+
+/// Runs `f` with `client` as the client of the request ([`current_client`]).
+pub async fn with_client<F: std::future::Future>(client: ClientInfo, f: F) -> F::Output {
+    CLIENT.scope(client, f).await
+}
+
+/// The client of the request being served (IP and user agent, for audit entries); empty outside
+/// a request of [`crate::router`].
+pub fn current_client() -> ClientInfo {
+    CLIENT.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// The client of a request for the audit log: the client IP (as [`crate::limits::client_ip`]
+/// finds it: the peer, or the last `X-Forwarded-For` address that a local proxy added) and the
+/// `User-Agent` header. Without a known peer (tests that call the router directly) the IP is
+/// `None`.
+pub fn client_info(extensions: Option<&axum::http::Extensions>, headers: &HeaderMap) -> ClientInfo {
+    let ip = extensions
+        .and_then(|e| e.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>())
+        .map(|c| crate::limits::client_ip(c.0.ip(), headers).to_string());
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    ClientInfo { ip, user_agent }
+}
+
+/// Records the first use of a web session in a tenant (decision 0003-4, contract need C-14).
+///
+/// Only for a session cookie, in a tenant that is not the user's home tenant (the sign-in wrote
+/// `auth.login` there), where the user is a member, admin or owner. It writes the
+/// `session_tenants` marker and one `auth.login` with `via: session_first_use`, IP and user
+/// agent, in one transaction in that tenant. A guest gets no row and no marker, so a host does
+/// not learn when a guest is active. A failed write fails the request (design 15). Pairs that
+/// are done are kept in [`crate::state::SessionsSeen`]; a guest is not kept, so a later
+/// promotion to member is recorded.
+pub async fn note_session_use(
+    state: &AppState,
+    who: &Authenticated,
+    ctx: &Context,
+) -> Result<(), Error> {
+    let (Some(session), Some(user)) = (who.session_id, who.user()) else {
+        return Ok(());
+    };
+    if state.sessions_seen.contains(session, ctx.tenant) {
+        return Ok(());
+    }
+    let home = state.services.identity.get_user(user).await?.home_tenant_id;
+    if home == ctx.tenant {
+        state.sessions_seen.insert(session, ctx.tenant);
+        return Ok(());
+    }
+    match state.services.tenants.role_of(ctx.tenant, user).await? {
+        Some(r) if r >= MemberRole::Member => {
+            events::session_first_use(
+                state.services.audit.as_ref(),
+                ctx.tenant,
+                user,
+                session,
+                &current_client(),
+            )
+            .await?;
+            state.sessions_seen.insert(session, ctx.tenant);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl FromRequestParts<AppState> for Principal {
@@ -264,6 +340,9 @@ impl FromRequestParts<AppState> for RequestContext {
         )
         .await
         .map_err(|e| AuthRejection::new(state, e))?;
+        note_session_use(state, &who, &ctx)
+            .await
+            .map_err(|e| AuthRejection::new(state, e))?;
         crate::names::note_tenant(&ctx);
         Ok(RequestContext(ctx))
     }

@@ -74,6 +74,8 @@ pub(crate) struct AppPasswordRow {
     pub pw: AppPassword,
     pub user_id: UserId,
     pub secret_hash: [u8; 32],
+    /// When `auth.app_password_used` was last written for it.
+    pub audited_at: Option<OffsetDateTime>,
 }
 
 pub(crate) struct MembershipRow {
@@ -232,6 +234,18 @@ impl MemoryArea {
         }
         if let Some(a) = &self.deps.authz {
             a.write(updates).await?;
+        }
+        Ok(())
+    }
+
+    /// Writes a whole audit entry (with the client), if there is an audit log.
+    pub(crate) async fn record_audit(
+        &self,
+        ctx: &Context,
+        entry: crate::audit::NewAuditEntry,
+    ) -> Result<()> {
+        if let Some(a) = &self.deps.audit {
+            a.record(ctx, entry).await?;
         }
         Ok(())
     }
@@ -679,6 +693,7 @@ impl IdentityStore for MemoryIdentityStore {
                     pw: pw.clone(),
                     user_id: user,
                     secret_hash: secret::sha256(&secret_value),
+                    audited_at: None,
                 },
             );
             (pw, secret_value)
@@ -719,10 +734,11 @@ impl IdentityStore for MemoryIdentityStore {
             .await
     }
 
-    async fn authenticate_app_password(
+    async fn authenticate_app_password_from(
         &self,
         email: &str,
         secret_value: &str,
+        client: &crate::audit::events::ClientInfo,
     ) -> Result<Authenticated> {
         let refuse = || {
             unauthenticated(
@@ -735,27 +751,45 @@ impl IdentityStore for MemoryIdentityStore {
         }
         let hash = secret::sha256(secret_value);
         let now = crate::now();
-        let mut st = self.area.lock();
-        let (user_id, tenant_id, id) = {
-            let r = st
-                .app_passwords
-                .values()
-                .find(|r| secret::constant_time_eq(&r.secret_hash, &hash))
-                .ok_or_else(refuse)?;
-            if r.pw.revoked_at.is_some() || r.pw.expires_at.is_some_and(|e| e <= now) {
+        let (user_id, tenant_id, id, audit) = {
+            let mut st = self.area.lock();
+            let (user_id, tenant_id, id) = {
+                let r = st
+                    .app_passwords
+                    .values()
+                    .find(|r| secret::constant_time_eq(&r.secret_hash, &hash))
+                    .ok_or_else(refuse)?;
+                if r.pw.revoked_at.is_some() || r.pw.expires_at.is_some_and(|e| e <= now) {
+                    return Err(refuse());
+                }
+                (r.user_id, r.pw.tenant_id, r.pw.id)
+            };
+            let user = st.users.get(&user_id).ok_or_else(refuse)?;
+            if !user.user.email.eq_ignore_ascii_case(email.trim()) {
                 return Err(refuse());
             }
-            (r.user_id, r.pw.tenant_id, r.pw.id)
+            if st.role_of(tenant_id, user_id).is_none() {
+                return Err(refuse());
+            }
+            let mut audit = false;
+            if let Some(r) = st.app_passwords.get_mut(&id) {
+                r.pw.last_used_at = Some(now);
+                let every =
+                    time::Duration::seconds(crate::audit::events::APP_PASSWORD_AUDIT_SECONDS);
+                if r.audited_at.is_none_or(|t| now - t >= every) {
+                    r.audited_at = Some(now);
+                    audit = true;
+                }
+            }
+            (user_id, tenant_id, id, audit)
         };
-        let user = st.users.get(&user_id).ok_or_else(refuse)?;
-        if !user.user.email.eq_ignore_ascii_case(email.trim()) {
-            return Err(refuse());
-        }
-        if st.role_of(tenant_id, user_id).is_none() {
-            return Err(refuse());
-        }
-        if let Some(r) = st.app_passwords.get_mut(&id) {
-            r.pw.last_used_at = Some(now);
+        if audit {
+            self.area
+                .record_audit(
+                    &ctx_of(tenant_id, user_id),
+                    crate::audit::events::app_password_used_entry(id, client),
+                )
+                .await?;
         }
         Ok(Authenticated {
             actor: Actor::user(user_id),
@@ -763,6 +797,15 @@ impl IdentityStore for MemoryIdentityStore {
             scope: None,
             session_id: None,
         })
+    }
+}
+
+fn ctx_of(tenant: TenantId, user: UserId) -> Context {
+    Context {
+        tenant,
+        actor: Actor::user(user),
+        scope: None,
+        idempotency_key: None,
     }
 }
 
