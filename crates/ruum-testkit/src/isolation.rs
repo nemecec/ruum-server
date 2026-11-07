@@ -473,7 +473,21 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
                 })),
                 NotFound,
             ));
-            plain("parent or link target in tenant A", p)
+            p.push(
+                Probe::new(
+                    "B's owner, a folder inside A's database",
+                    o,
+                    RequestSpec::post("/v1/nodes").tenant(b.id).json(json!({
+                        "parent_id": a.database, "name": "bravo inside alpha", "kind": "folder",
+                    })),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            plain(
+                "parent or link target in tenant A (a folder or a database)",
+                p,
+            )
         }
         "getNodeByPath" => plain(
             "the path resolves in the caller's tenant only: A's file name finds nothing in B",
@@ -502,7 +516,20 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             "empties the caller's own trash; A's trash stays",
             own_tenant(op, w, Some(("listTrash", o))),
         ),
-        "renameNode" | "trashNode" => addressed_case(NotFound, Some(("getNode", o))),
+        "renameNode" => addressed_case(NotFound, Some(("getNode", o))),
+        "trashNode" => {
+            let mut p = addressed(op, w, NotFound, Some(("getNode", o)));
+            p.push(
+                Probe::new(
+                    "B's owner trashes A's database",
+                    o,
+                    RequestSpec::post(format!("/v1/nodes/{}/trash", a.database)).tenant(b.id),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            plain("addressed node of tenant A (a file or a database)", p)
+        }
         "moveNode" | "copyNode" => {
             let mut p = addressed(op, w, NotFound, Some(("getNode", o)));
             p.push(
@@ -520,7 +547,33 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
                 )
                 .unchanged(o, node_get(a, a.archive, "/children")),
             );
-            plain("node or new parent in tenant A", p)
+            let verb = if op == "moveNode" { "move" } else { "copy" };
+            p.push(
+                Probe::new(
+                    "B's owner, B's file into A's database",
+                    o,
+                    RequestSpec::post(format!("/v1/nodes/{}/{verb}", b.plan))
+                        .tenant(b.id)
+                        .json(json!({ "parent_id": a.database })),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            p.push(
+                Probe::new(
+                    "B's owner, A's database into B's folder",
+                    o,
+                    RequestSpec::post(format!("/v1/nodes/{}/{verb}", a.database))
+                        .tenant(b.id)
+                        .json(json!({ "parent_id": b.projects, "on_conflict": "rename" })),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            plain(
+                "node or new parent in tenant A (a file, a folder or a database)",
+                p,
+            )
         }
         "moveNodes" => {
             let mut p = addressed(op, w, NotFound, Some(("getNode", o)));
@@ -571,12 +624,54 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
                 })),
                 NotFound,
             ));
-            plain("target in tenant A", p)
+            p.push(
+                Probe::new(
+                    "B's owner, new version of A's database",
+                    o,
+                    RequestSpec::post("/v1/uploads").tenant(b.id).json(json!({
+                        "target": "new_version", "node_id": a.database, "size": 0,
+                        "content_hash": crate::requests::EMPTY_HASH,
+                        "chunking": crate::requests::CHUNKING, "chunks": [],
+                    })),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            p.push(
+                Probe::new(
+                    "B's owner, new file inside A's database",
+                    o,
+                    RequestSpec::post("/v1/uploads").tenant(b.id).json(json!({
+                        "target": "new_file", "parent_id": a.database, "name": "bravo.txt",
+                        "size": 0, "content_hash": crate::requests::EMPTY_HASH,
+                        "chunking": crate::requests::CHUNKING, "chunks": [],
+                    })),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            plain("target in tenant A (a file, a folder or a database)", p)
         }
         "getUpload" => addressed_case(NotFound, None),
         "abortUpload" | "putChunk" => addressed_case(NotFound, Some(("getUpload", Who::Member))),
         "completeUpload" => addressed_case(NotFound, Some(("listChildren", o))),
-        "putContent" => addressed_case(NotFound, Some(("listVersions", o))),
+        "putContent" => {
+            let mut p = addressed(op, w, NotFound, Some(("listVersions", o)));
+            p.push(
+                Probe::new(
+                    "B's owner writes content into A's database",
+                    o,
+                    {
+                        let mut r = std_req(op, a).with_tenant(Some(b.id));
+                        r.uri = format!("/v1/nodes/{}/content", a.database);
+                        r
+                    },
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.database, "")),
+            );
+            plain("addressed node of tenant A (a file or a database)", p)
+        }
 
         // ------------------------------------------------------------ versions and diff
         "getVersion" | "restoreVersion" => {
@@ -832,17 +927,62 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             );
             plain("parent folder or template database in tenant A", p)
         }
+        "listDatabaseQueries" => {
+            let mut p = addressed(op, w, NotFound, None);
+            p.push(Probe::new(
+                "B's owner filters B's query log by A's agent",
+                o,
+                RequestSpec::get(format!(
+                    "/v1/databases/{}/queries?actor={}",
+                    b.database,
+                    a.agent_id(Who::Agent).0
+                ))
+                .tenant(b.id),
+                NoLeak,
+            ));
+            plain(
+                "addressed resource of tenant A; a filter by A's principal finds nothing",
+                p,
+            )
+        }
         "getDatabase"
         | "getDatabaseSchema"
-        | "listDatabaseQueries"
         | "listDatabaseColumns"
         | "listDatabaseMigrations"
         | "listDatabaseBranches"
         | "listDatabaseRestorePoints"
         | "listDatabaseAccessGrants"
         | "listDatabaseApprovals" => addressed_case(NotFound, None),
-        "queryDatabase" => addressed_case(NotFound, Some(("listDatabaseQueries", o))),
-        "updateDatabaseManifest" | "confirmColumnClasses" | "applyDatabaseMigration" => {
+        "queryDatabase" | "applyDatabaseMigration" => {
+            let read = if op == "queryDatabase" {
+                ("listDatabaseQueries", o)
+            } else {
+                ("getDatabase", o)
+            };
+            let mut p = addressed(op, w, NotFound, Some(read));
+            // A's approval sent with a statement on B's database: an approval binds one
+            // database of one tenant, so it never counts here. The answer may refuse the ID or
+            // ignore it (a person needs no approval), but it holds nothing of A, and A's
+            // request does not change (it is not used up).
+            let mut with_approval = std_req(op, b);
+            if let crate::client::Body::Json(body) = &mut with_approval.body {
+                body["approval_id"] = json!(a.database_approval);
+            }
+            p.push(
+                Probe::new(
+                    "B's owner, B's database with A's approval",
+                    o,
+                    with_approval,
+                    NoLeak,
+                )
+                .unchanged(o, std_req("getDatabaseApproval", a)),
+            );
+            plain(
+                "addressed resource of tenant A; an approval of tenant A in the body is not used",
+                p,
+            )
+        }
+        "updateDatabaseManifest" | "confirmColumnClasses" => {
             addressed_case(NotFound, Some(("getDatabase", o)))
         }
         "suggestColumnClasses" => addressed_case(NotFound, Some(("listDatabaseColumns", o))),
