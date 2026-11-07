@@ -334,7 +334,8 @@ Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and Spi
 
 - **Step 1 follow-ups** (decision 0003, `provisional`): items 1 (content role), 2 (C-12), 3
   (C-13), 4 (C-14), 5 (C-7) and 7 are built and merged, server and web UI; item 8 is recorded.
-  Item 6 (C-8 to C-11) is decided and not built. Not built of 4, 7 and 8: the metric
+  Item 6 (C-8 to C-11) is built on branch `f/ux-c8-c11` (server, contract, web UI; migration
+  `0010_upload_coalesce.sql`). The rate limit of `previewInvitation` is per process (`limits.rs`). Not built of 4, 7 and 8: the metric
   `ruum_auth_login_failed_total` (no metrics registry), the IP of WebDAV app password rows, the
   property test and mutation of item 8. The benchmark was not run with the new tools.
 - **Mail.** Mail goes only to the relay of `SMTP_URL` (Mailpit on the laptop). Production
@@ -387,9 +388,9 @@ Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and Spi
   gaps and has no rows for `visual.e2e.ts` and `a11y.e2e.ts`.
 - **Web UI after `q/uxfix`** (`docs/ux/decisions.md`): names come from the server since
   decision 0003-5 (C-7: `display_name` and `on_behalf_of_display_name` in
-  every answer; agents show as "*Agent* (agent of *User*)"); the space
-  name of an unlisted space is unknown (C-10); the server still coalesces an explicit upload
-  when the person picks "Replace it" (C-8). Not done: the session-ended dialog (UX-09), pausing
+  every answer; agents show as "*Agent* (agent of *User*)"); an unlisted space is named from
+  Shared with me (C-10, branch `f/ux-c8-c11`); uploads from the web UI never coalesce (C-8).
+  Not done: the session-ended dialog (UX-09), pausing
   uploads offline, the "Changed by agents" filter (C-2), the "Shared" mark on rows (C-1), the
   share dialog people picker, grouping agent activity by runs, version day groups, Shift-range
   selection, the grid view, the app shell rail (UX-17), UX-20. The visual snapshots exist only
@@ -397,8 +398,8 @@ Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and Spi
 - **After `q/synthfix`** (`docs/ux/decisions.md`): agents (MCP, CLI) and guests who share by
   email still make email grants that never reach a member (C-12); `addGrant` sends no share
   email and the invitation email names no role or end date (C-13); no code calls
-  `audit::events::sign_in`, so no space logs sign-ins (C-14); the accept page can't name the
-  space (C-9). A Member manages everything in a team space; a view-only member role is a
+  `audit::events::sign_in`, so no space logs sign-ins (C-14). (The accept page names the space,
+  the inviter and the role since C-9, branch `f/ux-c8-c11`.) A Member manages everything in a team space; a view-only member role is a
   product question for the architect panel. No folder upload control. (C-14 is built on
   `f/audit-mcp`, decision 0003-4.)
 - **SpiceDB freshness inside a request.** A request reads at least as fresh as its tenant's

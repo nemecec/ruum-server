@@ -15,8 +15,8 @@ The panel files are in `ruum-server-wt/panel/` (outside the repository).
 The proposal's order of work is item 5, then 1, 2, 3, then 4, 6, 7 and 8. Item 5 is built
 (branch `f/followups`), and item 1 is built (branch `f/content-role`), each in full. Items 2
 and 3 are built on the server (branch `f/email-grants`, stacked on `f/content-role`). Items 4
-and 7 are built, and item 8 is recorded, on branch `f/audit-mcp`. Item 6 is decided here and
-not built yet. The web UI parts of items 1, 2 and 3 are cards in
+and 7 are built, and item 8 is recorded, on branch `f/audit-mcp`. Item 6 is built on branch
+`f/ux-c8-c11` (server, contract and web UI). The web UI parts of items 1, 2 and 3 are cards in
 `ruum-server-wt/panel/ui-followups.md`, built on the design system.
 
 | Item | Decision | Built |
@@ -26,7 +26,7 @@ not built yet. The web UI parts of items 1, 2 and 3 are cards in
 | 3. C-13: share and invitation emails | below | **yes**, server (branch `f/email-grants`); web UI on the card |
 | 4. C-14: sign-ins in the audit log | below | **yes** (branch `f/audit-mcp`) |
 | 5. C-7: names of actors | below | **yes** (branch `f/followups`) |
-| 6. C-8 to C-11 | below | no |
+| 6. C-8 to C-11 | below | **yes**, server, contract, web UI and tests (branch `f/ux-c8-c11`) |
 | 7. MCP and benchmark fixes, safe stop | below | **yes** (branch `f/audit-mcp`; fixes 1 and 2 by item 5, fix 3 deferred on purpose) |
 | 8. IDs of gone nodes in entry data | below | **recorded** (branch `f/audit-mcp`: 0002-6, the contract text, a feed test) |
 
@@ -36,7 +36,7 @@ assumed item 1 first): item 5 made `0002_principal_names.sql` and
 `0005_member_content_role.sql`, items 2 and 3 made `0006_email_grants_and_mail.sql`, and
 `f/audit-mcp` made `0007_session_tenants.sql` (item 4) and `0008_nodes_type_index.sql` (item
 7); it was written as 0005 and 0006 and renumbered at its rebase (the SQL did not change). The
-next items take the next free numbers.
+user locale took `0009_user_locale.sql`, and item 6 made `0010_upload_coalesce.sql`.
 
 ## 1. A content role for team members
 
@@ -406,6 +406,77 @@ email, state); C-10 `SharedItem.tenant_name`; C-11 `UndoItem.changed_by`.
 
 **Review outcome.** No required change. Reviewer 1 note: `previewInvitation` shows ended
 invitations, so ended tokens are "no longer accepted", not deleted (see item 3).
+
+**Built** (branch `f/ux-c8-c11`). Choices made while building, each the safer or the
+non-breaking option:
+
+- C-8: `UploadTargetNewVersion.coalesce` and the `coalesce` query parameter of `putContent`,
+  both default `true`. The flag is stored with the upload session (migration
+  `0010_upload_coalesce.sql`, column `uploads.may_coalesce`: `coalesce` is an SQL keyword),
+  because the version is made at `completeUpload`. `false` only stops the save from joining the
+  head; a later default save by the same actor within the window may still join the version
+  that `false` made (the version policy is unchanged; a named version never joins). The web UI
+  sends `false` for every new version it uploads ("Upload new version" and "Save as a new
+  version" of the conflict dialog), so the warning dialog, the name field of the conflict
+  dialog and the automatic name "Before the upload of HH:MM" (S4) are gone, with their
+  messages. WebDAV and the CLI do not change. The `write_file` tool text names the flag.
+- C-9: `previewInvitation` (`POST /v1/invitations/preview`, `security: []`), 30 per minute per
+  client IP in `limits.rs`. The proposal listed every property; the safer reading of its test
+  "a revoked invitation shows `revoked` and nothing else" is applied: a **pending or expired**
+  invitation shows the space name and kind, the inviter's name (as the space knows it, C-7),
+  role, content role, end date and the masked email; a **revoked or accepted** one shows only
+  `state`. So every property but `state` is optional in `InvitationPreview`. An unknown token
+  and a token whose invitation ended more than 7 days ago are `404` (the stores check the 7 days
+  themselves, so the answer does not hang on the clean-up). The mask keeps the first character
+  of the name and of the domain and the last part of the domain (`k***@e***.ee`). The lookup is
+  a read-only system lookup, as at `acceptInvitation`. Not an MCP tool (`not_for_agents`).
+  The web UI calls it on the sign-in page (when the return address is the accept page) and on
+  the accept page: "*Person* invited you to *Space*", what the role lets the person do, the end
+  date, a warning when the masked address is not the signed-in one, "Join *Space*"; expired,
+  revoked, accepted and unknown tokens each get their own ended page, with no Join button.
+- C-10: `SharedItem.tenant_name` is **required** in responses (as v2 said; the web UI may
+  change in this branch, so its mock API sends it). Postgres reads the names in the system
+  transaction that already expands the user's memberships, only for the tenants of the user's
+  own shared items. The web UI names the space of each row from it, and the shell names a space
+  that is not in the person's list from Shared with me (one call, kept for the session).
+- C-11: `UndoItem.changed_by` (`ActorPair`, names filled by the C-7 middleware) is the first
+  change of the node by another actor after the agent's entry, only for `changed_later`. When
+  the inverse conflicted with the current state and no other actor changed the node, it is
+  absent. The undo confirm says "*Person* changed it again later".
+
+**Changes (item 6).** Contract (additive; `oasdiff breaking` against `main`: nothing): the
+properties and the operation above, the schemas `PreviewInvitationRequest`, `InvitationState`
+and `InvitationPreview`, the `putContent` and `undoAgent` texts, the `write_file` tool text
+(`tools.json` and `web/src/api/schema.d.ts` regenerated). Code: `blobs` (`Transfers::
+put_content_with`, `commit` and `commit_version` take `coalesce`), `tenants` (`InvitationPreview`,
+`TenantStore::preview_invitation`, `rules::{invitation_state, invitation_ended_at,
+preview_still_answers, preview_shows_details, mask_email}`), `sharing` (`tenant_name`),
+`agents::undo` (`changed_by`), `ruum-api` (`putContent` query, the preview route, `limits.rs`),
+the test kit (request, rule and isolation probes of `previewInvitation`; matrix regenerated).
+Web: `newVersionTarget`, `uploads.tsx`, `FilesPage.tsx`, `NodeDetails.tsx` (`coalesce.ts`
+removed), `AcceptInvitation.tsx`, `SignIn.tsx`, `invitationPreview.ts`, `SharedPage.tsx`,
+`Shell.tsx`, `sharedSpaces.ts`, `AgentPage.tsx`, the mock API, the en and et catalogues.
+
+**Tests (item 6).** Blob conformance on memory and Postgres (an upload and a `putContent` with
+`coalesce: false` make versions, the default still joins); `routes::blobs::tests::
+put_content_without_coalesce_makes_a_new_version` and the upload JSON test; tenant conformance
+`previewing_an_invitation_shows_what_it_is_for` on memory and Postgres (pending with every
+detail and no email in clear, the mailed token, nothing changes, unknown tokens, accepted and
+revoked show only the state, expired shows details, 8 days after the end `404`);
+`rules::tests::{emails_are_masked, invitation_states_and_the_preview_window}`;
+`limits::tests::invitation_previews_are_limited_per_client_ip`; sharing conformance
+(`tenant_name`); `agents::undo::tests::changed_later_names_the_first_later_change`; test kit
+`names.rs` (`tenant_name` through the router; `invitation_previews_name_the_space_and_the_inviter`
+without sign-in, for tenants A and B); the isolation suite (unknown token `404`, B's token leaks
+nothing of A, also anonymously) and the permission matrix (`previewInvitation` public for every
+principal). Mutations `invitation-preview-shows-ended-details`,
+`invitation-preview-email-in-clear`. Web flow tests (Vitest): uploads (`coalesce: false`, no
+dialog, no label), invitation (names, other address, unknown, expired, revoked, used, the
+sign-in page), shell (an unlisted space named from Shared with me; Shared with me rows), agents
+(the undo names who changed an item later). Browser tests: `versions.e2e.ts` (both coalescing
+tests now check that a new version never joins), `admin.e2e.ts` (sign-in and accept pages name
+the space and the inviter), `sharing.e2e.ts` (`tenant_name` and the Shared with me row),
+`agents.e2e.ts` (the undo names Ann); the five `accept-invitation` visual references.
 
 ## 7. MCP fixes, benchmark fixes and the safe stop
 

@@ -212,10 +212,12 @@ Status: `provisional` (design 18.9). The panel files are `ruum-server-wt/panel/u
 
 ## Not done in this round
 
-- Decision 0003 item 6 (C-8 to C-11): no server branch has built them yet (`coalesce` on
-  `UploadTargetNewVersion`, `previewInvitation`, `SharedItem.tenant_name`, `UndoItem.changed_by`),
-  so their UI waits. The accept page still names nothing (C-9); a space that is not in the
-  person's list is still "A shared space" (C-10).
+- Decision 0003 item 6 (C-8 to C-11) was built later, on branch `f/ux-c8-c11`: uploads of a new
+  version send `coalesce: false`, so the "Keep your last change" dialog, the name field of the
+  conflict dialog and the automatic name "Before the upload of HH:MM" are gone (C-8); the
+  sign-in and accept pages name the space, the inviter, the role, the end date and the masked
+  address, and the ended states (C-9); Shared with me and the shell name a space from
+  `SharedItem.tenant_name` (C-10); the undo confirm says who changed an item later (C-11).
 - Optional cards of items 4 and 7: the search "Type" filter and bulk move and tag with
   `moveNodes` / `attachTagToNodes` need `f/audit-mcp`, which this branch does not include.
 - Minors left as cards: versions grouped by day, the compare summary in lines, the consent form's
