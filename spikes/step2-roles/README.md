@@ -46,8 +46,8 @@ that logs in as the per-database role, with a short-lived password, over TCP.
    `WHERE` on a masked column compares the pseudonym. Constraint errors show no value of a
    column the role cannot read.
 5. `SET LOCAL` and `DISCARD ALL` leave no session option, prepared statement, cursor, advisory
-   lock or `LISTEN` on a pooled connection. It also shows what they do not cover (findings B
-   and C).
+   lock or `LISTEN` on a pooled connection. It also shows what they do not cover (decision 0004-34 (c)
+   and (d)). Checks named "finding (x)" show a gap that item (x) of decision 0004-34 fixes.
 6. The SQL and the Rust pseudonym agree on 29 values (text, integers, numeric, floats, times,
    dates, bytea, booleans, UUIDs) while the SQL session has hostile settings (`TimeZone`,
    `DateStyle`, `extra_float_digits`, `bytea_output`, `IntervalStyle`).

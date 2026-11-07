@@ -182,7 +182,7 @@ as B_owner "$DBB" "create table t (v text); insert into t values ('tenant B row'
 
 echo "== objects owned by mask (as ruum_dbhost)"
 # Without membership, ruum_dbhost cannot make an object owned by mask (PG16+ rule for OWNER TO).
-err "finding A: ruum_dbhost cannot give an object to mask without SET membership" dbhost "$DBA" '
+err "finding (a): ruum_dbhost cannot give an object to mask without SET membership" dbhost "$DBA" '
   create table ruum_mask.probe (i int); alter table ruum_mask.probe owner to @mask@' 'must be able to SET ROLE|must be member'
 ok "ruum_dbhost grants itself SET-only membership in mask (INHERIT FALSE)" dbhost "$DBA" '
   drop table if exists ruum_mask.probe; grant @mask@ to ruum_dbhost with inherit false, set true'
@@ -324,7 +324,7 @@ noleak "masked_read: function bodies in pg_proc hold no key" masked_read "$DBA" 
 err "masked_read: cannot read public.users" masked_read "$DBA" "select * from public.users" 'permission denied for schema public'
 err "masked_read: cannot read the base table through query_to_xml" masked_read "$DBA" "select query_to_xml('select * from public.users', true, true, '')" 'permission denied'
 ok "masked_read: pg_stats shows no row of the base tables" masked_read "$DBA" "select count(*) from pg_stats where tablename in ('users', 'orders')" 0
-ok "finding E: the stack image has PostGIS in template1 (public.spatial_ref_sys in every new database)" masked_read "$DBA" "select count(*) > 0 from pg_stats where schemaname = 'public' and tablename = 'spatial_ref_sys'" t
+ok "finding (g): the stack image has PostGIS in template1 (public.spatial_ref_sys in every new database)" masked_read "$DBA" "select count(*) > 0 from pg_stats where schemaname = 'public' and tablename = 'spatial_ref_sys'" t
 err "masked_read: pg_statistic is closed" masked_read "$DBA" "select * from pg_statistic" 'permission denied'
 OUT="$(su_sql "$DBA" "select count(*) from pg_stats where schemaname = 'public' and most_common_vals::text like '%carol@example.com%'")"
 fact "(control) the superuser sees carol in pg_stats, so the stats exist" '[[ $OUT == 1 ]]'
@@ -435,7 +435,7 @@ set local statement_timeout = '700ms';
 commit;
 select pg_sleep(1.2) is not null as ran_without_timeout;
 EOF
-fact "finding C: a COMMIT statement ends the platform's transaction (next statement has no timeout)" 'grep -q "^t$" <<<"$OUT" && ! grep -q "statement timeout" <<<"$OUT"'
+fact "finding (d): a COMMIT statement ends the platform's transaction (next statement has no timeout)" 'grep -q "^t$" <<<"$OUT" && ! grep -q "statement timeout" <<<"$OUT"'
 
 as_script owner "$DBA" <<'EOF'
 begin;
@@ -447,19 +447,19 @@ rollback;
 EOF
 OUT2="$OUT"
 OUT="$(su_sql "$DBA" "select count(*) from pg_class where relname = 'mig_part1'")"
-fact "finding C: COMMIT inside a migration's 'up' breaks its one-transaction rollback" '[[ $OUT == 1 ]]'
+fact "finding (d): COMMIT inside a migration's 'up' breaks its one-transaction rollback" '[[ $OUT == 1 ]]'
 su_sql "$DBA" "drop table if exists mig_part1, mig_part2" >/dev/null
 err "PREPARE TRANSACTION is off (max_prepared_transactions = 0)" masked_read "$DBA" "begin; prepare transaction 'x'" 'prepared transactions are disabled|cannot'
 
-ok "finding B: a role can ALTER ROLE itself SET a session default" masked_read "$DBA" "alter role current_user set timezone = 'Pacific/Chatham'"
-ok "finding B: the default survives DISCARD ALL into the next connection" masked_read "$DBA" "show timezone" "Pacific/Chatham"
-ok "finding B: a role can change its own password" masked_read "$DBA" "alter role current_user password 'known'"
+ok "finding (c): a role can ALTER ROLE itself SET a session default" masked_read "$DBA" "alter role current_user set timezone = 'Pacific/Chatham'"
+ok "finding (c): the default survives DISCARD ALL into the next connection" masked_read "$DBA" "show timezone" "Pacific/Chatham"
+ok "finding (c): a role can change its own password" masked_read "$DBA" "alter role current_user password 'known'"
 PW[masked_read]=known
-ok "finding B fix: ruum_dbhost resets the role (RESET ALL, new password) before it opens connections" dbhost "$DBA" "alter role @masked_read@ reset all; alter role @masked_read@ set search_path = ruum_masked; alter role @masked_read@ password '$(pw)' valid until '$VALID_UNTIL'"
+ok "finding (c) fix: ruum_dbhost resets the role (RESET ALL, new password) before it opens connections" dbhost "$DBA" "alter role @masked_read@ reset all; alter role @masked_read@ set search_path = ruum_masked; alter role @masked_read@ password '$(pw)' valid until '$VALID_UNTIL'"
 PW[masked_read]=known
-err "finding B fix: the password the role chose no longer works" masked_read "$DBA" "select 1" 'password authentication failed'
+err "finding (c) fix: the password the role chose no longer works" masked_read "$DBA" "select 1" 'password authentication failed'
 OUT="$(su_sql "$DBA" "select coalesce(string_agg(array_to_string(setconfig, ','), ';'), '') from pg_db_role_setting where setrole = '@masked_read@'::regrole")"
-fact "finding B fix: only the platform's search_path is left on the role" '[[ $OUT == "search_path=ruum_masked" ]]'
+fact "finding (c) fix: only the platform's search_path is left on the role" '[[ $OUT == "search_path=ruum_masked" ]]'
 
 echo "== (6) the SQL and the Rust pseudonym agree"
 RUST="$(cargo run -q --manifest-path "$HERE/pseudonym/Cargo.toml" <"$HERE/values.tsv")"
@@ -498,7 +498,7 @@ select ruum_mask.pseudonym('2026-11-07T12:34:56+02:00'::timestamptz);
 EOF
 )"
 mapfile -t L <<<"$OUT"
-fact "finding D: pseudonym(v::text) depends on the session (TimeZone); the typed overloads do not" '[[ ${L[0]} != "${L[1]}" && ${L[2]} == "${L[3]}" ]]'
+fact "finding (e): pseudonym(v::text) depends on the session (TimeZone); the typed overloads do not" '[[ ${L[0]} != "${L[1]}" && ${L[2]} == "${L[3]}" ]]'
 
 echo "== (7) extensions of the manifest allow-list, created by ruum_dbhost (not a superuser)"
 R[cdb]="d_$(hex16)"
@@ -514,9 +514,9 @@ done
 as dbhost "${R[cdb]}" "create extension if not exists pg_trgm schema extensions" &&
   as dbhost "${R[cdb]}" "grant connect on database ${R[cdb]} to @masked_write@" &&
   as masked_write "${R[cdb]}" "select extensions.similarity('abc', 'abd') > 0"
-fact "finding E: a lens role reaches extension functions only with USAGE on their schema" 'grep -q "permission denied for schema extensions" <<<"$OUT"'
-ok "finding E: with USAGE on the schema 'extensions' it can use them" dbhost "${R[cdb]}" "grant usage on schema extensions to @masked_write@"
-ok "finding E: (masked_write) similarity() from schema extensions" masked_write "${R[cdb]}" "select extensions.similarity('abc', 'abd') > 0" t
+fact "finding (g): a lens role reaches extension functions only with USAGE on their schema" 'grep -q "permission denied for schema extensions" <<<"$OUT"'
+ok "finding (g): with USAGE on the schema 'extensions' it can use them" dbhost "${R[cdb]}" "grant usage on schema extensions to @masked_write@"
+ok "finding (g): (masked_write) similarity() from schema extensions" masked_write "${R[cdb]}" "select extensions.similarity('abc', 'abd') > 0" t
 
 echo "== (8) the owner kind (untrusted migrations) cannot widen a lens"
 as owner "$DBA" "grant usage on schema public to @masked_write@"
@@ -529,13 +529,13 @@ err "owner: cannot replace a lens view" owner "$DBA" "create or replace view ruu
 err "owner: cannot create a schema" owner "$DBA" "create schema evil" 'permission denied for database'
 err "owner: cannot create an extension" owner "$DBA" "create extension pgcrypto" 'permission denied'
 err "owner: cannot ALTER the default privileges of mask" owner "$DBA" "alter default privileges for role @mask@ grant select on tables to @masked_write@" 'permission denied|must be member'
-err "finding F: a lens view blocks ALTER COLUMN TYPE in a migration" owner "$DBA" "alter table users alter column age type bigint" 'cannot alter type of a column used by a view or rule'
-err "finding F: a lens view blocks DROP COLUMN in a migration" owner "$DBA" "alter table users drop column name" 'other objects depend on it'
-ok "finding F: RENAME COLUMN works with the lens views in place" owner "$DBA" "alter table users rename column name to full_name"
+err "finding (f): a lens view blocks ALTER COLUMN TYPE in a migration" owner "$DBA" "alter table users alter column age type bigint" 'cannot alter type of a column used by a view or rule'
+err "finding (f): a lens view blocks DROP COLUMN in a migration" owner "$DBA" "alter table users drop column name" 'other objects depend on it'
+ok "finding (f): RENAME COLUMN works with the lens views in place" owner "$DBA" "alter table users rename column name to full_name"
 OUT="$(su_sql "$DBA" "select pg_get_viewdef('ruum_masked.users'::regclass) like '%pseudonym(full_name) AS name%'")"
-fact "finding F: the lens view follows the renamed column (by attnum, not by name)" '[[ $OUT == t ]]'
+fact "finding (f): the lens view follows the renamed column (by attnum, not by name)" '[[ $OUT == t ]]'
 as owner "$DBA" "drop table orders cascade"
-fact "finding F: DROP TABLE ... CASCADE by the owner drops mask's lens views too" 'grep -q "drop cascades to view ruum_masked.orders" <<<"$OUT"'
+fact "finding (f): DROP TABLE ... CASCADE by the owner drops mask's lens views too" 'grep -q "drop cascades to view ruum_masked.orders" <<<"$OUT"'
 err "masked_write: the dropped lens view is gone (no fallback to anything)" masked_write "$DBA" "select * from orders" 'does not exist'
 
 echo "== result: $PASS passed, $FAIL failed"
