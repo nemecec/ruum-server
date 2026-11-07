@@ -1,4 +1,4 @@
-//! The mail outbox in Postgres (`mail_outbox`, migration 0005; decision 0003-3).
+//! The mail outbox in Postgres (`mail_outbox`, migration 0006; decision 0003-3).
 //!
 //! A change writes a row with [`queue`] in its own transaction, so a mail exists exactly when
 //! the change committed (`GrantWrite.notified` means "queued", not "delivered"). After the

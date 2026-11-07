@@ -1,5 +1,5 @@
 //! Fixed-window counters (decision 0003-2 and 0003-3). The Postgres counters live in
-//! `rate_counters` (migration 0005), under the tenant's row-level security, so every server
+//! `rate_counters` (migration 0006), under the tenant's row-level security, so every server
 //! process shares them. One upsert per counted call. The mail worker deletes windows older than
 //! a day ([`super::outbox::clean`]).
 //!
