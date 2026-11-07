@@ -161,9 +161,23 @@ pub struct DatabaseStatus {
 impl DatabaseStatus {
     /// The status of a `typed_nodes` row. A row that is `ready` but behind its newest manifest
     /// version shows `updating` (`updateDatabaseManifest`: "the status shows `updating` until
-    /// it is applied").
-    pub fn of(row: &TypedNodeRow) -> Self {
+    /// it is applied"). A node in the trash shows `suspended` (reason `in_trash`; `DatabaseState`:
+    /// "in the trash ... answers no query"), whatever the provider reported last.
+    pub fn of(row: &TypedNodeRow, trashed: bool) -> Self {
         let behind = row.observed_version != Some(row.desired_version);
+        let serving = !matches!(
+            row.state,
+            ProviderState::Failed | ProviderState::Deleted | ProviderState::Suspended
+        );
+        if trashed && serving {
+            return Self {
+                state: ProviderState::Suspended,
+                reason: Some("in_trash".into()),
+                message: None,
+                observed_version_id: row.observed_version,
+                at: row.state_at,
+            };
+        }
         let state = match row.state {
             ProviderState::Ready if behind => ProviderState::Updating,
             s => s,
@@ -1159,7 +1173,7 @@ impl DatabaseService {
         let my_permissions = Some(DatabasePermissions::of(node.my_role, ctx.actor.is_agent()));
         Ok(Database {
             manifest_version_id: row.desired_version,
-            status: DatabaseStatus::of(&row),
+            status: DatabaseStatus::of(&row, node.trashed_at.is_some()),
             size_bytes,
             limits: DatabaseLimits {
                 max_size_bytes: max_size.unwrap_or(i64::MAX),
@@ -1577,8 +1591,11 @@ mod tests {
             .0,
             403
         );
-        // In the trash: 409.
+        // In the trash: suspended, and a manifest change is 409.
         w.s.nodes.trash(&a, id, None).await.unwrap();
+        let trashed = w.s.databases.get(&a, id).await.unwrap();
+        assert_eq!(trashed.status.state, ProviderState::Suspended);
+        assert_eq!(trashed.status.reason.as_deref(), Some("in_trash"));
         assert_eq!(
             code(
                 w.s.databases
