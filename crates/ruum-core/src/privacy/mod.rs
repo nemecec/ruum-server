@@ -41,9 +41,12 @@
 //! `-infinity` (the SQL side uses `v::text` for them): pass it as [`SqlValue::Other`].
 //!
 //! The SQL side needs one typed overload per row of the table. Spike S-1 built `text`,
-//! `bigint` (`int2` and `int4` reach it by the implicit cast, with the same decimal text),
-//! `numeric`, `double precision`, `timestamptz`, `date`, `bytea`, `boolean` and `uuid`. Card
-//! Q-2 adds two more: `real` (the implicit cast to `double precision` adds digits: `0.1::float4`
+//! `bigint`, `numeric`, `double precision`, `timestamptz`, `date`, `bytea`, `boolean` and
+//! `uuid`. An `int2` or `int4` value does not reach the `bigint` overload: PostgreSQL resolves
+//! it to `double precision`, the preferred type of the numeric category. The text is the same
+//! today (every `int4` value is exact in `float8` and prints in decimal), but card Q-2 must not
+//! depend on it: it adds `int2` and `int4` overloads, or casts to `bigint` in the lens view.
+//! Card Q-2 also adds `real` (the implicit cast to `double precision` adds digits: `0.1::float4`
 //! is `0.10000000149011612` as a `float8`) and `timestamp` (a cast to `timestamptz` follows the
 //! session's `TimeZone`).
 //!
