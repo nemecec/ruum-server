@@ -190,6 +190,41 @@ fn is_snake_case(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// An agent asked for `data: full`: the call is refused (`403` or `422`) and makes no content,
+/// or the new node holds no personal and no secret value.
+async fn agent_gets_no_real_data<T: std::fmt::Debug>(
+    f: &dyn Fixture,
+    tenant: TenantId,
+    node: NodeId,
+    m: &Markers,
+    result: Result<T>,
+) {
+    match result {
+        Err(e) => {
+            assert!(matches!(status_code(&e), 403 | 422), "{e}");
+            assert!(
+                f.content(tenant, node).await.is_none(),
+                "a refused copy has no content"
+            );
+        }
+        Ok(_) => {
+            let mut content = None;
+            for _ in 0..200 {
+                content = f.content(tenant, node).await;
+                if content.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let content = content.expect("the copy has content");
+            assert!(
+                !content.contains(&m.personal) && !content.contains(&m.secret),
+                "an agent got real data: {content}"
+            );
+        }
+    }
+}
+
 // -------------------------------------------------------------------------------- cases
 
 /// The descriptor follows the rules of the contract and names the fixture's types.
@@ -333,6 +368,31 @@ pub(crate) async fn create_node(f: &dyn Fixture) {
         "a node of another tenant does not change this one"
     );
 
+    // A delivery ID is recorded per tenant: the same ID in another tenant is another delivery
+    // and gives nothing of the first one.
+    let theirs = NodeId::new();
+    let reused = p
+        .create_typed_node(delivery, create_request(f, other, theirs))
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.body().node_id,
+        theirs,
+        "not the answer of another tenant"
+    );
+    wait_ready(f, other, theirs).await;
+    let still = p.get_typed_node_status(tenant, node).await.unwrap();
+    assert_eq!(
+        (still.generation, still.observed_version_id),
+        (after.generation, after.observed_version_id),
+        "a delivery of another tenant does not change this node"
+    );
+    // And the first tenant still gets its own answer for the ID.
+    assert_eq!(
+        p.create_typed_node(delivery, req.clone()).await.unwrap(),
+        first
+    );
+
     // A manifest the provider refuses makes no node.
     let bad_node = NodeId::new();
     let mut bad = create_request(f, tenant, bad_node);
@@ -387,6 +447,24 @@ pub(crate) async fn create_node(f: &dyn Fixture) {
     assert!(matches!(status_code(&err), 404 | 422), "{err}");
     assert!(f.content(other, stolen).await.is_none());
 
+    // An agent never gets real data from a copy: refused, or the copy holds no personal or
+    // secret value (design 8.5; the same rule as for an export).
+    let copy = NodeId::new();
+    let mut req = create_request(f, tenant, copy);
+    req.by = agent();
+    req.source = Source::Copy {
+        node_id: src,
+        data: Some(DataCopy::Full),
+    };
+    agent_gets_no_real_data(
+        f,
+        tenant,
+        copy,
+        &m,
+        p.create_typed_node(DeliveryId::new(), req).await,
+    )
+    .await;
+
     // Branches: a child type, masked by default, listed as a provider version of the source;
     // a branch of a branch is refused.
     if let Some(branch_type) = f.branch_type() {
@@ -402,6 +480,25 @@ pub(crate) async fn create_node(f: &dyn Fixture) {
         wait_ready(f, tenant, branch).await;
         let content = f.content(tenant, branch).await.unwrap();
         assert!(holds_masked_only(&content, &m), "{content}");
+
+        // An agent's branch with data full: refused, or it holds no real data.
+        let agent_branch = NodeId::new();
+        let mut req = create_request(f, tenant, agent_branch);
+        req.type_name = branch_type.clone();
+        req.parent_id = Some(src);
+        req.by = agent();
+        req.source = Source::Branch {
+            node_id: src,
+            data: DataCopy::Full,
+        };
+        agent_gets_no_real_data(
+            f,
+            tenant,
+            agent_branch,
+            &m,
+            p.create_typed_node(DeliveryId::new(), req).await,
+        )
+        .await;
         let versions = p
             .list_provider_versions(tenant, src, PageRequest::default())
             .await
@@ -615,6 +712,51 @@ pub(crate) async fn hooks(f: &dyn Fixture) {
         &f.content(tenant, target).await.unwrap(),
         &m
     ));
+
+    // copied with data full from an agent: refused, or the copy holds no real data.
+    let agent_target = NodeId::new();
+    let mut h = hook(HookKind::Copied, tenant, Some(node));
+    h.target_node_id = Some(agent_target);
+    h.by = agent();
+    let mut d = serde_json::Map::new();
+    d.insert("data".into(), serde_json::to_value(DataCopy::Full).unwrap());
+    h.data = Some(d);
+    agent_gets_no_real_data(
+        f,
+        tenant,
+        agent_target,
+        &m,
+        p.deliver_hook(DeliveryId::new(), h).await,
+    )
+    .await;
+
+    // copied never writes over content: not over another node, not over the source. Refused,
+    // or an idempotent replay that changes nothing.
+    let (full_node, full_m) = create_seeded(f, tenant).await;
+    for (onto, onto_m) in [(full_node, &full_m), (node, &m)] {
+        let before = p.get_typed_node_status(tenant, onto).await.unwrap();
+        let mut h = hook(HookKind::Copied, tenant, Some(node));
+        h.target_node_id = Some(onto);
+        let mut d = serde_json::Map::new();
+        d.insert(
+            "data".into(),
+            serde_json::to_value(DataCopy::Masked).unwrap(),
+        );
+        h.data = Some(d);
+        if let Err(e) = p.deliver_hook(DeliveryId::new(), h).await {
+            assert!(matches!(status_code(&e), 409 | 422), "{e}");
+        }
+        let content = f.content(tenant, onto).await.unwrap();
+        assert!(
+            holds_all(&content, onto_m),
+            "copied wrote over content: {content}"
+        );
+        let after = p.get_typed_node_status(tenant, onto).await.unwrap();
+        assert_eq!(
+            after.generation, before.generation,
+            "copied changed the target"
+        );
+    }
 
     // moved and renamed change nothing of the content.
     for kind in [HookKind::Moved, HookKind::Renamed] {

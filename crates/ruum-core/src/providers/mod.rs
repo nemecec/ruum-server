@@ -21,8 +21,12 @@
 //! The wire types serialize exactly as the schemas of the contract: a required field that can be
 //! `null` is written as `null`, an optional field that is not set is left out.
 
+pub mod deliveries;
 pub mod memory;
+pub mod postgres;
+pub mod reconciler;
 pub mod registry;
+pub mod store;
 
 #[cfg(test)]
 pub(crate) mod conformance;

@@ -20,6 +20,8 @@
 //! `tenant_exported` takes `data.upload` (`{ "upload_id", "token" }`): the provider writes one
 //! JSON file with every node of the tenant there. `copied` takes `data.data` (a `DataCopy`,
 //! default `masked`) and an optional `data.version_id` (the manifest version of the new node).
+//! `copied` refuses a target that already has content, and an agent gets no `full` data
+//! (copy, branch, `copied` or export).
 //!
 //! Both are safe to share between tasks. Neither holds a lock across an `await`.
 
@@ -66,8 +68,9 @@ pub struct MemoryProvider {
 #[derive(Default)]
 struct Inner {
     nodes: HashMap<(TenantId, NodeId), Node>,
-    /// The answer of each delivery, so that a second call with the same ID does nothing.
-    deliveries: HashMap<DeliveryId, Recorded>,
+    /// The answer of each delivery, so that a second call with the same ID does nothing. Keyed
+    /// by tenant: a delivery ID of one tenant tells nothing about another.
+    deliveries: HashMap<(TenantId, DeliveryId), Recorded>,
 }
 
 #[derive(Clone)]
@@ -356,8 +359,11 @@ impl MemoryProvider {
         self.descriptor.type_descriptor(type_name).is_some()
     }
 
-    fn recorded(&self, delivery: DeliveryId) -> Option<Recorded> {
-        lock(&self.inner).deliveries.get(&delivery).cloned()
+    fn recorded(&self, tenant: TenantId, delivery: DeliveryId) -> Option<Recorded> {
+        lock(&self.inner)
+            .deliveries
+            .get(&(tenant, delivery))
+            .cloned()
     }
 
     async fn report(&self, tenant: TenantId, delivery: Option<DeliveryId>, status: ProviderStatus) {
@@ -508,7 +514,7 @@ impl Provider for MemoryProvider {
         delivery: DeliveryId,
         req: CreateTypedNodeRequest,
     ) -> Result<Reply<ProviderStatus>> {
-        if let Some(Recorded::Status(r)) = self.recorded(delivery) {
+        if let Some(Recorded::Status(r)) = self.recorded(req.tenant_id, delivery) {
             return Ok(r);
         }
         if !self.owns(&req.type_name) {
@@ -520,6 +526,19 @@ impl Provider for MemoryProvider {
         let (manifest, problems) = check_manifest(&req.manifest, None, None)?;
         if !problems.is_empty() {
             return Err(problems_error(&problems));
+        }
+        let full = matches!(
+            req.source,
+            Source::Copy {
+                data: Some(DataCopy::Full),
+                ..
+            } | Source::Branch {
+                data: DataCopy::Full,
+                ..
+            }
+        );
+        if full && req.by.is_agent() {
+            return Err(agent_full());
         }
         let tenant = req.tenant_id;
         let (reply, later) = {
@@ -597,7 +616,7 @@ impl Provider for MemoryProvider {
             inner.nodes.insert((tenant, req.node_id), node);
             inner
                 .deliveries
-                .insert(delivery, Recorded::Status(reply.clone()));
+                .insert((tenant, delivery), Recorded::Status(reply.clone()));
             (reply, later)
         };
         if let Some(s) = later {
@@ -612,7 +631,7 @@ impl Provider for MemoryProvider {
         node: NodeId,
         req: ApplyManifestRequest,
     ) -> Result<Reply<ProviderStatus>> {
-        if let Some(Recorded::Status(r)) = self.recorded(delivery) {
+        if let Some(Recorded::Status(r)) = self.recorded(req.tenant_id, delivery) {
             return Ok(r);
         }
         let mut inner = lock(&self.inner);
@@ -642,7 +661,7 @@ impl Provider for MemoryProvider {
         let reply = Reply::Done(status);
         inner
             .deliveries
-            .insert(delivery, Recorded::Status(reply.clone()));
+            .insert((req.tenant_id, delivery), Recorded::Status(reply.clone()));
         Ok(reply)
     }
 
@@ -663,10 +682,10 @@ impl Provider for MemoryProvider {
         delivery: DeliveryId,
         hook: HookDelivery,
     ) -> Result<Reply<HookResult>> {
-        if let Some(Recorded::Hook(r)) = self.recorded(delivery) {
+        let tenant = hook.tenant_id;
+        if let Some(Recorded::Hook(r)) = self.recorded(tenant, delivery) {
             return Ok(r);
         }
-        let tenant = hook.tenant_id;
         let done = Reply::Done(HookResult { done: true });
         let mut reports = Vec::new();
         let mut export: Option<(UploadTarget, Vec<u8>)> = None;
@@ -709,7 +728,7 @@ impl Provider for MemoryProvider {
                     if hook.hook.is_idempotent_delete() {
                         inner
                             .deliveries
-                            .insert(delivery, Recorded::Hook(done.clone()));
+                            .insert((tenant, delivery), Recorded::Hook(done.clone()));
                         return Ok(done);
                     }
                     return Err(node_not_found(node));
@@ -727,6 +746,18 @@ impl Provider for MemoryProvider {
                             .transpose()
                             .map_err(|e| bad_request(format!("data.data: {e}")))?
                             .unwrap_or_default();
+                        // The same guard as an export: an agent never gets real data.
+                        if data == DataCopy::Full && hook.by.is_agent() {
+                            return Err(agent_full());
+                        }
+                        // A copy makes a new node; it never writes over content (also not
+                        // over the source itself).
+                        if inner.nodes.contains_key(&(tenant, target)) {
+                            return Err(invalid(
+                                format!("typed node {target} already has content"),
+                                "copy into a new node",
+                            ));
+                        }
                         let version: Option<VersionId> = hook
                             .data
                             .as_ref()
@@ -807,7 +838,7 @@ impl Provider for MemoryProvider {
             }
             inner
                 .deliveries
-                .insert(delivery, Recorded::Hook(done.clone()));
+                .insert((tenant, delivery), Recorded::Hook(done.clone()));
         }
         self.report_all(tenant, Some(delivery), reports).await;
         Ok(done)
@@ -857,10 +888,10 @@ impl Provider for MemoryProvider {
         node: NodeId,
         req: RestoreRequest,
     ) -> Result<ProviderStatus> {
-        if let Some(Recorded::Status(r)) = self.recorded(delivery) {
+        let tenant = req.tenant_id;
+        if let Some(Recorded::Status(r)) = self.recorded(tenant, delivery) {
             return Ok(r.into_inner());
         }
-        let tenant = req.tenant_id;
         let (started, later) = {
             let mut inner = lock(&self.inner);
             let n = live_mut(&mut inner, tenant, node)?;
@@ -945,9 +976,10 @@ impl Provider for MemoryProvider {
                 }
             }
         };
-        lock(&self.inner)
-            .deliveries
-            .insert(delivery, Recorded::Status(Reply::Started(started.clone())));
+        lock(&self.inner).deliveries.insert(
+            (tenant, delivery),
+            Recorded::Status(Reply::Started(started.clone())),
+        );
         self.report(tenant, Some(delivery), later).await;
         Ok(started)
     }
@@ -958,7 +990,7 @@ impl Provider for MemoryProvider {
         node: NodeId,
         req: ExportRequest,
     ) -> Result<ProviderStatus> {
-        if let Some(Recorded::Status(r)) = self.recorded(delivery) {
+        if let Some(Recorded::Status(r)) = self.recorded(req.tenant_id, delivery) {
             return Ok(r.into_inner());
         }
         if req.format != Self::FORMAT {
@@ -969,10 +1001,7 @@ impl Provider for MemoryProvider {
         }
         let data = req.data.unwrap_or_default();
         if data == DataCopy::Full && req.by.is_agent() {
-            return Err(invalid(
-                "an agent gets masked exports only",
-                "export with data masked",
-            ));
+            return Err(agent_full());
         }
         let tenant = req.tenant_id;
         let (started, bytes) = {
@@ -992,9 +1021,10 @@ impl Provider for MemoryProvider {
             .await?;
         let later = {
             let mut inner = lock(&self.inner);
-            inner
-                .deliveries
-                .insert(delivery, Recorded::Status(Reply::Started(started.clone())));
+            inner.deliveries.insert(
+                (tenant, delivery),
+                Recorded::Status(Reply::Started(started.clone())),
+            );
             inner.nodes.get_mut(&(tenant, node)).map(|n| {
                 let (state, reason) = (n.state, n.reason.clone());
                 let mut s = n.set(node, state, reason.as_deref());
@@ -1007,6 +1037,15 @@ impl Provider for MemoryProvider {
         }
         Ok(started)
     }
+}
+
+/// `validation_failed` for `data: full` from an agent: an agent gets masked copies, branches
+/// and exports only (`docs/DESIGN.md`, section 8.5).
+fn agent_full() -> Error {
+    invalid(
+        "an agent gets masked data only",
+        "copy, branch or export with data masked",
+    )
 }
 
 fn live_source(inner: &Inner, tenant: TenantId, node: NodeId) -> Result<&Node> {
