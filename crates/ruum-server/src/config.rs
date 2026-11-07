@@ -44,6 +44,11 @@ pub struct Config {
     pub s3_bucket: Option<String>,
     /// `RUUM_SPICEDB_ENDPOINT`
     pub spicedb_endpoint: Option<String>,
+    /// `RUUM_DBHOST_URL`: the `ruum_dbhost` URL of the data cluster (card D-1). Without it the
+    /// server has no database engine and `createDatabase` answers `422` (no node is made).
+    /// With it the server needs a key-encryption key (`RUUM_LOCAL_KEK_FILE` or
+    /// `RUUM_OPENBAO_ADDR`) or it does not start. `wiring::install_databases` reads it.
+    pub dbhost_url: Option<String>,
     /// `RUUM_REQUEST_TIMEOUT_SECONDS`: a request without an answer after this time gets `408`
     /// (default 120; the longest long poll is 30 seconds).
     pub request_timeout: std::time::Duration,
@@ -87,6 +92,7 @@ impl Config {
             s3_endpoint: var("RUUM_S3_ENDPOINT"),
             s3_bucket: var("RUUM_S3_BUCKET"),
             spicedb_endpoint: var("RUUM_SPICEDB_ENDPOINT"),
+            dbhost_url: var("RUUM_DBHOST_URL"),
             request_timeout: std::time::Duration::from_secs(
                 var("RUUM_REQUEST_TIMEOUT_SECONDS")
                     .map(|v| v.parse::<u64>())

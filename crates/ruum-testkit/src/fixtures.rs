@@ -9,7 +9,7 @@
 //! │   │                              guest_manage=manage
 //! │   ├── <prefix>-plan.txt (X)  two versions v1 and v2, tag T attached
 //! │   ├── Archive/          (S)  editors_can_share = false (editors keep edit, lose share)
-//! │   ├── <prefix>-garden   (D)  a database node (step 2; planned: not seeded yet)
+//! │   ├── <prefix>-garden   (D)  a database node (SQLite 3), made by `member` (card D-1)
 //! │   └── <prefix>-old.txt  (Y)  in the trash (its old parent is Projects)
 //! └── Private/             (G)  no grants
 //! ```
@@ -26,10 +26,10 @@
 //! | `share_link` | the bearer of the `view` share link on `Projects` (the token of `resolveShareLink`) |
 //! | `anonymous` | no credentials |
 //!
-//! The database D (step 2) is planned (decision 0004-21): its operations are not built, so
-//! `seed` does not create it yet and its ID, the write grant of `agent` on it and the pending
-//! request of `agent` on it are placeholder IDs. Card D-1 seeds the database through the
-//! database provider, A-1 the grant and A-2 the request, and they keep these field names.
+//! The database D is made by `member` through `createDatabase` (the database provider, card
+//! D-1), and `seed` waits until it is `ready`. The write grant of `agent` on it and the pending
+//! request of `agent` on it are placeholder IDs until A-1 and A-2 seed them (they keep these
+//! field names).
 //!
 //! The tag T was made by `member`. The upload sessions were started by `member`. The web session
 //! and the WebDAV app password belong to `member`. The invitation is for a new email address with the role `member`. The
@@ -317,8 +317,8 @@ pub struct TenantFixture {
     /// The `view` share link on `Projects`. Its bearer is the principal `share_link`.
     pub share_link: ShareLinkId,
     pub share_link_token: String,
-    /// The database node in `Projects` (step 2, planned: a placeholder ID until card D-1 seeds
-    /// it), and its name.
+    /// The database node in `Projects` (SQLite 3, made by `member` through `createDatabase`,
+    /// card D-1), and its name.
     pub database: NodeId,
     pub database_name: String,
     /// A `write_live` grant of `agent` on the database, given by `member` (placeholder until A-1).
@@ -897,6 +897,44 @@ mod seed {
                 .await
         })
         .await;
+
+        // The database `<prefix>-garden`, made by `member` through the database provider, and
+        // ready before the suites start.
+        let (s2, c, req) = (
+            s.clone(),
+            member_ctx.clone(),
+            ruum_core::databases::CreateDatabase {
+                parent_id: t.projects,
+                name: t.database_name.clone(),
+                manifest: serde_json::json!({
+                    "engine": "sqlite", "version": "3", "plan": "shared-small",
+                }),
+                source: None,
+                on_conflict: OnConflict::Fail,
+            },
+        );
+        if let Some(w) = step(
+            "database",
+            async move { s2.databases.create(&c, req).await },
+        )
+        .await
+        {
+            t.database = w.value.node.id;
+            let (s2, c, id) = (s.clone(), member_ctx.clone(), t.database);
+            step("database ready", async move {
+                for _ in 0..200 {
+                    let db = s2.databases.get(&c, id).await?;
+                    if db.status.state == ruum_core::providers::ProviderState::Ready {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(ruum_core::Error::Internal(
+                    "the fixture database is not ready after 5 s".into(),
+                ))
+            })
+            .await;
+        }
 
         // The plan with two versions (by two actors, so they do not coalesce).
         let (s2, c, target, data) = (

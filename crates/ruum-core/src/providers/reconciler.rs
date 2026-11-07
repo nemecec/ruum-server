@@ -11,7 +11,14 @@
 //!   ([`apply_delivery_id`]), so each round sends the same delivery again until the provider
 //!   reports, and the provider does the work once.
 //! - Else (the node is busy at the desired version, or the provider never reported a version):
-//!   `getTypedNodeStatus`.
+//!   `getTypedNodeStatus`. When the provider never reported (`observed_version` null) and the
+//!   poll answers `404`, the create never reached it (for example a crash after the commit of
+//!   the node): the reconciler sends `createTypedNode` again with the newest manifest, its
+//!   author and a delivery ID from the tenant, the node and the version
+//!   ([`create_delivery_id`]), so the provider makes the content once (review-P-2 note 2).
+//! - A `4xx` other than `408` and `429` from `applyManifest` or `createTypedNode` is final: the
+//!   row moves to `failed` (reason `manifest_refused` or `create_refused`), so it is not sent
+//!   again in every round. A new manifest version or a person starts it again.
 //!
 //! The answer goes into the store like a status report ([`TypedNodeStore::report`]): only a
 //! newer generation changes the row. A row whose state changed less than `settled` ago waits
@@ -19,7 +26,7 @@
 //!
 //! How the server starts the reconciler is the server's wiring ([`Reconciler::run`] in a task).
 
-use super::store::{ReconcileItem, ReportOutcome, TypedNodeStore, error_text};
+use super::store::{ReconcileItem, ReportOutcome, TypedNodeRow, TypedNodeStore, error_text};
 use super::*;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -44,6 +51,30 @@ pub fn apply_delivery_id(tenant: TenantId, node: NodeId, version: VersionId) -> 
     DeliveryId(Uuid::from_bytes(b))
 }
 
+/// The delivery ID of `createTypedNode` of a node with its first manifest `version`: the same
+/// for the platform's first call and every call of the reconciler, so the provider does the
+/// work once. Made like [`apply_delivery_id`], with its own prefix.
+pub fn create_delivery_id(tenant: TenantId, node: NodeId, version: VersionId) -> DeliveryId {
+    let mut h = Sha256::new();
+    h.update(b"ruum.reconcile.create\0");
+    h.update(tenant.0.as_bytes());
+    h.update(node.0.as_bytes());
+    h.update(version.0.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b[..6].copy_from_slice(&version.0.as_bytes()[..6]);
+    b[6..].copy_from_slice(&digest[..10]);
+    b[6] = (b[6] & 0x0f) | 0x70;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    DeliveryId(Uuid::from_bytes(b))
+}
+
+/// True for an error that a retry does not change: a `4xx` other than `408` and `429`.
+fn is_final(e: &Error) -> bool {
+    let s = e.http_status();
+    (400..500).contains(&s) && s != 408 && s != 429
+}
+
 /// What one round did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReconcileRound {
@@ -51,6 +82,10 @@ pub struct ReconcileRound {
     pub applied: usize,
     /// `getTypedNodeStatus` calls.
     pub polled: usize,
+    /// `createTypedNode` calls again (the poll of a row that never reported answered `404`).
+    pub created: usize,
+    /// Rows moved to `failed` because the provider refused for good.
+    pub failed: usize,
     /// Answers that changed a row.
     pub stored: usize,
     /// Calls that failed (logged; the row is tried again in a later round).
@@ -126,7 +161,7 @@ impl Reconciler {
             Some(observed) if observed != row.desired_version => {
                 round.applied += 1;
                 let delivery = apply_delivery_id(row.tenant_id, row.node_id, row.desired_version);
-                provider
+                let applied = provider
                     .apply_manifest(
                         delivery,
                         row.node_id,
@@ -138,14 +173,57 @@ impl Reconciler {
                             by: item.by,
                         },
                     )
-                    .await?
-                    .into_inner()
+                    .await;
+                match applied {
+                    Ok(reply) => reply.into_inner(),
+                    Err(e) if is_final(&e) => {
+                        round.failed += 1;
+                        return self.fail(row, "manifest_refused", &e).await;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             _ => {
                 round.polled += 1;
-                provider
+                match provider
                     .get_typed_node_status(row.tenant_id, row.node_id)
-                    .await?
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e)
+                        if row.observed_version.is_none()
+                            && e.to_api().code == ErrorCode::NotFound =>
+                    {
+                        // The create never reached the provider: send it again.
+                        round.created += 1;
+                        let delivery =
+                            create_delivery_id(row.tenant_id, row.node_id, row.desired_version);
+                        let created = provider
+                            .create_typed_node(
+                                delivery,
+                                CreateTypedNodeRequest {
+                                    tenant_id: row.tenant_id,
+                                    node_id: row.node_id,
+                                    parent_id: None,
+                                    type_name: row.type_name.clone(),
+                                    version_id: row.desired_version,
+                                    manifest: item.manifest.clone(),
+                                    source: Source::Empty,
+                                    by: item.by,
+                                },
+                            )
+                            .await;
+                        match created {
+                            Ok(reply) => reply.into_inner(),
+                            Err(e) if is_final(&e) => {
+                                round.failed += 1;
+                                return self.fail(row, "create_refused", &e).await;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
         if status.node_id != row.node_id {
@@ -154,6 +232,35 @@ impl Reconciler {
                 row.provider
             )));
         }
+        Ok(self.store.report(row.tenant_id, &status).await? == ReportOutcome::Stored)
+    }
+
+    /// Moves a row to `failed` after a final refusal of its provider: a status one generation
+    /// newer than the stored one, with the observed version unchanged. The text holds the
+    /// status and the code of the error, never its message.
+    async fn fail(&self, row: &TypedNodeRow, reason: &str, e: &Error) -> Result<bool> {
+        tracing::warn!(
+            tenant = %row.tenant_id,
+            node = %row.node_id,
+            provider = %row.provider,
+            error = %error_text(e),
+            reason,
+            "the provider refused; the row is failed"
+        );
+        let status = ProviderStatus {
+            node_id: row.node_id,
+            state: ProviderState::Failed,
+            generation: row.generation + 1,
+            observed_version_id: row.observed_version,
+            reason: Some(reason.to_string()),
+            message: Some(format!(
+                "The provider refused the change ({}).",
+                error_text(e)
+            )),
+            detail: None,
+            export: None,
+            at: crate::now(),
+        };
         Ok(self.store.report(row.tenant_id, &status).await? == ReportOutcome::Stored)
     }
 
@@ -183,5 +290,23 @@ mod tests {
         assert_ne!(id, apply_delivery_id(TenantId::new(), n, v));
         assert_ne!(id, apply_delivery_id(t, NodeId::new(), v));
         assert_ne!(id, apply_delivery_id(t, n, VersionId::new()));
+        let c = create_delivery_id(t, n, v);
+        assert_eq!(c, create_delivery_id(t, n, v));
+        assert_eq!(c.0.get_version_num(), 7);
+        assert_ne!(
+            c, id,
+            "a create and an apply of one version are two deliveries"
+        );
+        assert_ne!(c, create_delivery_id(TenantId::new(), n, v));
+    }
+
+    #[test]
+    fn final_errors_are_the_4xx_but_408_and_429() {
+        assert!(is_final(&Error::not_found("x")));
+        assert!(is_final(&invalid("x", "y")));
+        assert!(is_final(&conflict("x")));
+        assert!(!is_final(&Error::api(ErrorCode::RateLimited, "x")));
+        assert!(!is_final(&Error::Internal("x".into())));
+        assert!(!is_final(&Error::api(ErrorCode::Unavailable, "x")));
     }
 }

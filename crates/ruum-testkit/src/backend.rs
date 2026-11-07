@@ -28,6 +28,12 @@
 //! maintenance job and no outbox worker run. [`Backend::finish`] drops the databases of the
 //! run; databases of runs that ended early are dropped by a later run after [`STALE_SECONDS`].
 //!
+//! **Databases** (card D-1). The Postgres worlds use the Postgres stores of the database area
+//! (`databases`, `typed_nodes`, `tenant_keys` with a throwaway KEK). The engine of `postgres`
+//! manifests is the Postgres engine of `RUUM_DBHOST_URL` when it is set and answers, else the
+//! memory engine; `sqlite` manifests use the memory engine (card E-3 brings the SQLite engine).
+//! The memory engine is for tests only; a server never uses it.
+//!
 //! **Row-level security.** The policies of `migrations/` are FORCEd, so they apply to the
 //! table owner (the `ruum` role of the laptop stack is no superuser). Then a query that forgets
 //! its `tenant_id` filter is still held by the policy. `RUUM_SUITE_RLS=off` turns `FORCE` off
@@ -44,10 +50,15 @@ use ruum_core::authz::spicedb::{SpiceDbAuthz, SpiceDbConfig};
 use ruum_core::blobs::memory::MemoryBlobStore;
 use ruum_core::blobs::postgres::PgContentStore;
 use ruum_core::blobs::{BlobStore, ContentSigner};
+use ruum_core::databases::engine::DatabaseEngine;
+use ruum_core::databases::engine::postgres::{PostgresConfig, PostgresEngine};
+use ruum_core::databases::{self, DatabaseParts, Engines, PgDatabaseStore};
 use ruum_core::identity::setup::{IdentitySettings, install};
 use ruum_core::journal::postgres::PgJournal;
 use ruum_core::nodes::NodeStore;
 use ruum_core::nodes::postgres::PgNodeStore;
+use ruum_core::privacy::keys::{PgTenantKeyStore, TenantKeys};
+use ruum_core::providers::postgres::PgTypedNodeStore;
 use ruum_core::search::postgres::PgSearch;
 use ruum_core::sharing::postgres::PgSharingStore;
 use ruum_core::tags::postgres::PgTagStore;
@@ -109,6 +120,8 @@ struct Pg {
     /// The shared SpiceDB engine; `None`: a new in-memory engine per world.
     spicedb: Option<Arc<dyn Authz>>,
     rls: bool,
+    /// The database engines of the run.
+    engines: Engines,
 }
 
 /// The backend of one suite run.
@@ -302,6 +315,31 @@ impl Pg {
             }
             Some(other) => panic!("{AUTHZ_ENV}={other}: use memory or spicedb"),
         };
+        let memory = Engines::memory();
+        let postgres = match PostgresConfig::from_env() {
+            Some(config) => match PostgresEngine::connect(config).await {
+                Ok(e) => Some(Arc::new(e) as Arc<dyn DatabaseEngine>),
+                Err(e) => {
+                    eprintln!(
+                        "suite backend: the data cluster does not answer ({e}); postgres databases use the memory engine"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let engines = Engines {
+            postgres: postgres.clone().or(memory.postgres.clone()),
+            sqlite: memory.sqlite,
+        };
+        eprintln!(
+            "suite backend: database engine for postgres manifests: {}",
+            if postgres.is_some() {
+                "postgres (RUUM_DBHOST_URL)"
+            } else {
+                "memory"
+            }
+        );
         eprintln!(
             "suite backend: postgres, databases {name}_*, authz {}, rls {}",
             if spicedb.is_some() {
@@ -319,6 +357,7 @@ impl Pg {
             blobs: Arc::new(MemoryBlobStore::default()),
             spicedb,
             rls,
+            engines,
         }
     }
 
@@ -380,6 +419,16 @@ impl Pg {
             ..IdentitySettings::default()
         };
         install(&mut s, &settings, Some(pool.clone())).expect("install the identity area");
+        let parts = DatabaseParts {
+            engines: self.engines.clone(),
+            keys: Arc::new(TenantKeys::new(
+                Arc::new(PgTenantKeyStore::new(pool.clone())),
+                databases::throwaway_kek(),
+            )),
+            store: Arc::new(PgDatabaseStore::new(pool.clone())),
+            typed: Arc::new(PgTypedNodeStore::new(pool.clone())),
+        };
+        databases::install(&mut s, parts).expect("install the database area");
         s
     }
 

@@ -17,6 +17,7 @@ pub mod agents;
 pub mod audit;
 pub mod authz;
 pub mod blobs;
+pub mod databases;
 pub mod identity;
 pub mod journal;
 pub mod mailing;

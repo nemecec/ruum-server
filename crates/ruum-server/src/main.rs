@@ -61,6 +61,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(out) = seed_out {
         return seed::run(&services, &config.public_url, &out).await;
     }
+    // The delivery worker and the reconciler of typed nodes (card D-1).
+    wiring::start_typed_node_tasks(&services);
     let state = AppState::new(
         services.clone(),
         ApiConfig {

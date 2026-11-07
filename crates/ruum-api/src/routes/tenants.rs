@@ -301,7 +301,9 @@ pub async fn get_limits(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let ctx = ctx_of(&state, &who, &tenant_id, &headers).await?;
-    let usage = state.services.tenants.usage(&ctx).await?;
+    let mut usage = state.services.tenants.usage(&ctx).await?;
+    // C-21: the databases of the tenant, from the databases area.
+    usage.databases = Some(state.services.databases.usage(ctx.tenant).await?);
     let tenant = state.services.tenants.get(&ctx).await?;
     let limits = tenant_limits(tenant.plan, usage.members);
     Ok(Json(json!({

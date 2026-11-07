@@ -691,7 +691,7 @@ mod tests {
     use crate::providers::deliveries::{Backoff, DeliveryWorker, Round, outcome_of};
     use crate::providers::memory::{MemoryPlatform, MemoryProvider};
     use crate::providers::postgres::{self as pg, PgTypedNodeStore};
-    use crate::providers::reconciler::{Reconciler, apply_delivery_id};
+    use crate::providers::reconciler::{Reconciler, apply_delivery_id, create_delivery_id};
     use sqlx::PgPool;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1401,12 +1401,14 @@ mod tests {
             )
             .await
             .unwrap();
-        // And a row the provider does not know: an error, tried again later.
-        let (lost, _) = node_with_row(h, b).await;
+        // And a row the provider does not know (the create never reached it): the poll
+        // answers 404, so the reconciler sends createTypedNode again (review-P-2 note 2,
+        // card D-1) with a stable delivery ID.
+        let (lost, lv1) = node_with_row(h, b).await;
         let round = rec.run_once().await.unwrap();
         assert_eq!(
-            (round.polled, round.stored, round.errors),
-            (2, 1, 1),
+            (round.polled, round.created, round.stored, round.errors),
+            (2, 1, 2, 0),
             "{round:?}"
         );
         let row = s.get(b, polled).await.unwrap().unwrap();
@@ -1415,10 +1417,73 @@ mod tests {
             (ProviderState::Ready, Some(pv1))
         );
         let row = s.get(b, lost).await.unwrap().unwrap();
-        assert_eq!(
-            (row.state, row.generation),
-            (ProviderState::Provisioning, 0)
+        assert!(
+            row.generation > 0,
+            "the create reached the provider: {row:?}"
         );
+        let at_provider = provider.get_typed_node_status(b, lost).await.unwrap();
+        assert_eq!(at_provider.node_id, lost);
+        // The same delivery again is the same create for the provider.
+        let again = provider
+            .create_typed_node(
+                create_delivery_id(b, lost, lv1),
+                CreateTypedNodeRequest {
+                    tenant_id: b,
+                    node_id: lost,
+                    parent_id: None,
+                    type_name: TYPE.into(),
+                    version_id: lv1,
+                    manifest: serde_json::json!({ "title": "A" }),
+                    source: Source::Empty,
+                    by: person().into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.body().node_id, lost);
+        // A row whose create the provider refuses for good (an invalid manifest, 422): failed,
+        // not sent again every round.
+        let (refused, rv1) = (NodeId::new(), VersionId::new());
+        h.typed_node(
+            b,
+            refused,
+            rv1,
+            &serde_json::json!({ "title": "R", "fail": "yes" }),
+            person(),
+        )
+        .await;
+        let round = rec.run_once().await.unwrap();
+        assert_eq!((round.created, round.failed), (1, 1), "{round:?}");
+        let row = s.get(b, refused).await.unwrap().unwrap();
+        assert_eq!(row.state, ProviderState::Failed);
+        assert_eq!(row.reason.as_deref(), Some("create_refused"));
+        assert_eq!(row.observed_version, None);
+        assert_eq!(
+            rec.run_once().await.unwrap().created,
+            0,
+            "failed stops the loop"
+        );
+        // A 4xx from applyManifest (an invalid manifest) is final too: failed, not retried.
+        let pv2 = VersionId::new();
+        h.new_version(
+            b,
+            polled,
+            pv2,
+            &serde_json::json!({ "title": "P", "fail": "yes" }),
+            person(),
+        )
+        .await;
+        let round = rec.run_once().await.unwrap();
+        assert_eq!((round.applied, round.failed), (1, 1), "{round:?}");
+        let row = s.get(b, polled).await.unwrap().unwrap();
+        assert_eq!(row.state, ProviderState::Failed);
+        assert_eq!(row.reason.as_deref(), Some("manifest_refused"));
+        assert_eq!(row.observed_version, Some(pv1));
+        assert!(
+            row.message.as_deref().is_some_and(|m| m.contains("422")),
+            "{row:?}"
+        );
+        assert_eq!(rec.run_once().await.unwrap().applied, 0);
         // The failed node of tenant a did not move.
         assert_eq!(
             s.get(a, node).await.unwrap().unwrap().state,

@@ -78,6 +78,10 @@ pub struct TenantPolicy {
     /// they also have the `share` permission there (the tuple
     /// `tenant:<id>#members_can_share@user:*`, written or deleted when this changes).
     pub members_can_share: bool,
+    /// Guests and the agents of guests may create resources that count against this tenant's
+    /// plan (`createDatabase`; decision 0004-10). Missing means false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub guests_create_resources: bool,
 }
 
 impl Default for TenantPolicy {
@@ -88,6 +92,7 @@ impl Default for TenantPolicy {
             share_link_max_days: None,
             allow_guests: true,
             members_can_share: true,
+            guests_create_resources: false,
         }
     }
 }
@@ -101,6 +106,8 @@ pub struct TenantPolicyChange {
     pub share_link_max_days: Option<Option<u32>>,
     pub allow_guests: Option<bool>,
     pub members_can_share: Option<bool>,
+    #[serde(default)]
+    pub guests_create_resources: Option<bool>,
 }
 
 /// `Option<Option<T>>` for JSON: absent is `None`, `null` is `Some(None)`.
@@ -310,6 +317,13 @@ pub trait TenantStore: Send + Sync {
         name: Option<String>,
         policy: Option<TenantPolicyChange>,
     ) -> Result<Tenant>;
+    /// The members of the tenant (owners, admins and members; not guests), at least 1: the
+    /// multiplier of the team plan limits ([`tenant_limits`]). A system lookup for the plan
+    /// checks of other areas (`createDatabase`). The default answers 1.
+    async fn member_count(&self, tenant: TenantId) -> Result<u32> {
+        let _ = tenant;
+        Ok(1)
+    }
     /// The role of a user in the tenant, or `None`. A system lookup.
     async fn role_of(&self, tenant: TenantId, user: UserId) -> Result<Option<MemberRole>>;
     /// Since when the user is a member, admin or owner of the tenant (not a guest): the join or

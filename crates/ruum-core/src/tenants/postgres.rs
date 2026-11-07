@@ -599,6 +599,13 @@ impl TenantStore for PgTenantStore {
         Ok(r)
     }
 
+    async fn member_count(&self, tenant: TenantId) -> Result<u32> {
+        let mut tx = self.area.system().await?;
+        let n = member_count(&mut tx, tenant).await?;
+        tx.commit().await?;
+        Ok(n.max(1))
+    }
+
     async fn member_since(&self, tenant: TenantId, user: UserId) -> Result<Option<OffsetDateTime>> {
         let mut tx = self.area.system().await?;
         let since: Option<OffsetDateTime> = sqlx::query_scalar(

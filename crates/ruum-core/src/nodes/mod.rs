@@ -20,6 +20,10 @@
 //!   Trashing a node that is already in the trash is a no-op (no journal entry).
 //! - Node responses fill `my_role`, `my_can_share` and `editors_can_share_effective`
 //!   ([`rules::decorate`]).
+//! - Typed nodes (section 7.1) come only from the provider operations (`createDatabase`), through
+//!   [`NodeStore::create_typed`]: the node, its first manifest version and its `typed_nodes`
+//!   row in one transaction. The public `createNode` refuses the kind `typed`. The other rules
+//!   of typed nodes (content writes, children, copy, move, trash and purge hooks) are card P-3.
 
 pub mod memory;
 pub mod postgres;
@@ -154,6 +158,50 @@ pub struct NewNode {
     pub on_conflict: OnConflict,
 }
 
+/// A new typed node ([`NodeStore::create_typed`]). Only the provider operations make typed
+/// nodes; the manifest is already valid for its type.
+#[derive(Clone, Debug)]
+pub struct NewTyped {
+    pub parent_id: NodeId,
+    pub name: String,
+    /// The node type, for example `database`.
+    pub node_type: String,
+    /// The provider that owns the type, for example `ruum.database`.
+    pub provider: String,
+    /// The first manifest version.
+    pub manifest: serde_json::Value,
+    pub on_conflict: OnConflict,
+}
+
+/// The format of a manifest version of a typed node (`versions.encoding`, migration 0004).
+pub const TYPED_MANIFEST_ENCODING: &str = "typed_manifest_v1";
+
+/// The stored form of a typed node's manifest: its canonical JSON (keys sorted) and the BLAKE3
+/// of it (`versions.manifest`, `versions.content_hash`).
+pub fn typed_manifest_bytes(manifest: &serde_json::Value) -> (Vec<u8>, [u8; 32]) {
+    // `serde_json` keeps object keys sorted (no `preserve_order`), so this is canonical.
+    let bytes = serde_json::to_vec(manifest).unwrap_or_default();
+    let hash = *blake3::hash(&bytes).as_bytes();
+    (bytes, hash)
+}
+
+/// The `data` of `version.created` for a manifest version of a typed node.
+pub fn typed_version_created_data(
+    version: VersionId,
+    previous: Option<VersionId>,
+    size_bytes: usize,
+    hash: &[u8; 32],
+) -> serde_json::Value {
+    serde_json::json!({
+        "version_id": version,
+        "previous_version_id": previous,
+        "size_bytes": size_bytes,
+        "content_hash": hex::encode(hash),
+        "content_type": "application/json",
+        "coalesced": false,
+    })
+}
+
 /// The order of a child list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -277,6 +325,18 @@ pub trait NodeStore: Send + Sync {
     /// The root folder of the tenant.
     async fn root(&self, ctx: &Context) -> Result<Node>;
     async fn create(&self, ctx: &Context, req: NewNode) -> Result<Written<Node>>;
+    /// Creates a typed node (`kind: typed`) with its first manifest version (encoding
+    /// [`TYPED_MANIFEST_ENCODING`]) as its head, and its `typed_nodes` row (state
+    /// `provisioning`), in one transaction; writes `node.created` and `version.created` and
+    /// returns the change of the last. Needs `edit` on the parent folder. For the provider
+    /// operations only (`createDatabase`); the public `createNode` refuses typed nodes. A store
+    /// without typed nodes fails.
+    async fn create_typed(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
+        let _ = (ctx, req);
+        Err(crate::error::Error::Internal(
+            "this node store makes no typed nodes".into(),
+        ))
+    }
     async fn get(&self, ctx: &Context, id: NodeId) -> Result<Node>;
     /// Resolves a path from the tenant root. Trashed nodes are not found.
     async fn get_by_path(&self, ctx: &Context, path: &str) -> Result<Node>;

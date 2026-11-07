@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::changes::router())
         .merge(routes::search::router())
         .merge(routes::audit::router())
+        .merge(routes::databases::router())
         .fallback(error::route_not_found)
         // Inside the idempotency layer, so a replayed answer keeps its names.
         .layer(axum::middleware::from_fn_with_state(

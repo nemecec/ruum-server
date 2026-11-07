@@ -14,6 +14,9 @@ use crate::blobs::{
     BlobStore, ContentSigner, Transfers,
     memory::{ContentDeps, MemoryBlobStore, MemoryContentStore},
 };
+use crate::databases::{
+    DatabaseParts, DatabaseService, Engines, MemoryDatabaseStore, build as build_databases,
+};
 use crate::identity::{
     IdentityStore, OidcClient, TokenIssuer,
     idempotency::{IdempotencyStore, MemoryIdempotencyStore},
@@ -21,6 +24,9 @@ use crate::identity::{
 };
 use crate::journal::{Journal, memory::MemoryJournal};
 use crate::nodes::{NodeStore, memory::MemoryNodeStore};
+use crate::privacy::keys::{LocalKekWrapper, MemoryTenantKeyStore, TenantKeys};
+use crate::providers::ProviderRegistry;
+use crate::providers::store::{MemoryTypedNodeStore, TypedNodeStore};
 use crate::search::{Search, memory::MemorySearch};
 use crate::sharing::{SharingStore, memory::MemorySharingStore};
 use crate::tags::{TagStore, memory::MemoryTagStore};
@@ -53,6 +59,19 @@ pub struct Services {
     pub audit: Arc<dyn AuditLog>,
     /// The `Idempotency-Key` store of writes.
     pub idempotency: Arc<dyn IdempotencyStore>,
+    /// The database engines (card D-1): Postgres on the data cluster (E-2) on a server, the
+    /// memory engine in [`Services::in_memory`] only. A missing engine refuses
+    /// `createDatabase` (`422`, no node).
+    pub database_engines: Engines,
+    /// The tenant pseudonym keys (card Q-4), wrapped by the KEK of `wrapper_from_env` on a
+    /// server, by a random in-memory KEK in [`Services::in_memory`].
+    pub tenant_keys: Arc<TenantKeys>,
+    /// The `typed_nodes` rows and the hook deliveries (card P-2).
+    pub typed_nodes: Arc<dyn TypedNodeStore>,
+    /// The providers of typed nodes: `ruum.database`.
+    pub providers: Arc<ProviderRegistry>,
+    /// `createDatabase`, `getDatabase`, `updateDatabaseManifest`.
+    pub databases: Arc<DatabaseService>,
 }
 
 /// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
@@ -63,6 +82,8 @@ pub struct MemoryHandles {
     pub journal: Arc<MemoryJournal>,
     pub nodes: Arc<MemoryNodeStore>,
     pub content: Arc<MemoryContentStore>,
+    pub typed: Arc<MemoryTypedNodeStore>,
+    pub databases: Arc<MemoryDatabaseStore>,
 }
 
 impl Services {
@@ -79,6 +100,8 @@ impl Services {
         let authz = Arc::new(MemoryAuthz::default());
         let journal = Arc::new(MemoryJournal::default());
         let nodes = Arc::new(MemoryNodeStore::new(authz.clone(), journal.clone()));
+        let typed = Arc::new(MemoryTypedNodeStore::new());
+        nodes.set_typed(typed.clone());
         let audit = Arc::new(MemoryAuditLog::with_journal(journal.clone()));
         // The stores of the identity, tenants and agents area share one state. The sharing
         // store is the member cleanup and the node store holds the root folders (set below).
@@ -134,11 +157,31 @@ impl Services {
             content.clone(),
             content.clone(),
         ));
+        // The database area: the memory engine, a random in-memory KEK, the memory stores.
+        let database_store = Arc::new(MemoryDatabaseStore::new(
+            nodes.clone(),
+            journal.clone(),
+            typed.clone(),
+        ));
+        let parts = DatabaseParts {
+            engines: Engines::memory(),
+            keys: Arc::new(TenantKeys::new(
+                Arc::new(MemoryTenantKeyStore::new()),
+                Arc::new(LocalKekWrapper::from_bytes(&rand::random())),
+            )),
+            store: database_store.clone(),
+            typed: typed.clone(),
+        };
+        let (providers, databases) =
+            build_databases(nodes.clone(), authz.clone(), tenants.clone(), &parts)
+                .expect("the database provider registers");
         let handles = MemoryHandles {
             authz: authz.clone(),
             journal: journal.clone(),
             nodes: nodes.clone(),
             content: content.clone(),
+            typed: typed.clone(),
+            databases: database_store,
         };
         let services = Self {
             tenants,
@@ -160,6 +203,11 @@ impl Services {
             search,
             audit,
             idempotency: Arc::new(MemoryIdempotencyStore::default()),
+            database_engines: parts.engines,
+            tenant_keys: parts.keys,
+            typed_nodes: typed,
+            providers,
+            databases,
         };
         (services, handles)
     }

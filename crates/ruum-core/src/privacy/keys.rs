@@ -653,6 +653,19 @@ impl TenantKeys {
         Ok(PseudonymKey::for_database(&tenant_key, key_node_id))
     }
 
+    /// The pseudonym key of a database as the engine's handle (decision 0004-30): the key of
+    /// [`TenantKeys::database_key`], handed over inside this module, so no caller outside
+    /// `privacy` touches the key bytes. The engine installs it and never gives it back.
+    /// `createDatabase` calls it with `key_node_id: None` (the tenant key).
+    pub async fn engine_key(
+        &self,
+        tenant: TenantId,
+        key_node_id: Option<NodeId>,
+    ) -> Result<ruum_dbengine::PseudonymKey> {
+        let key = self.database_key(tenant, key_node_id).await?;
+        Ok(ruum_dbengine::PseudonymKey::from_bytes(*key.as_bytes()))
+    }
+
     /// The tenant key re-wrapped for the KEK of another cell, for the tenant export of design
     /// section 14. `None` when the tenant has no key yet (it never had a database); the export
     /// then carries none, and the target makes one on first use.
@@ -1115,8 +1128,10 @@ mod tests {
         );
     }
 
-    /// No platform table holds a plain key: after first uses, exports and imports, no row of
-    /// any table of the database holds the key in hex.
+    /// No platform table holds a plain key: after first uses, exports and imports, and after the
+    /// key paths of card D-1 (the engine key of a new database, handed to an engine that makes
+    /// the database), no row of any table of the database holds the key in any form of
+    /// [`key_forms`] (hex in both cases, base64, the `Debug` of the bytes, a part).
     #[sqlx::test(migrations = "../../migrations")]
     async fn postgres_no_plain_key_in_any_table(pool: PgPool) {
         let h = Pg::new(pool.clone()).await;
@@ -1125,6 +1140,26 @@ mod tests {
         let key = keys.tenant_key(t).await.unwrap();
         let node = NodeId::new();
         let derived = keys.database_key(t, Some(node)).await.unwrap();
+        // D-1: createDatabase hands the engine key (key_node_id NULL) to the engine.
+        {
+            use ruum_dbengine::DatabaseEngine;
+            let engine = ruum_dbengine::memory::MemoryEngine::new();
+            let handle = keys.engine_key(t, None).await.unwrap();
+            assert_eq!(format!("{handle:?}"), "PseudonymKey(<hidden>)");
+            engine
+                .create_database(
+                    &ruum_dbengine::NewDatabase {
+                        tenant_id: t.0,
+                        node_id: node.0,
+                        engine_version: "3".into(),
+                        extensions: Vec::new(),
+                    },
+                    &handle,
+                )
+                .await
+                .unwrap();
+            let _ = keys.engine_key(t, Some(node)).await.unwrap();
+        }
         let exported = keys.export_for(t, kek(13).as_ref()).await.unwrap().unwrap();
         let target = TenantKeys::new(h.empty_cell(t).await, kek(13));
         target.import(&exported).await.unwrap();
@@ -1146,16 +1181,18 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         for k in [&key, &derived] {
-            let hex = hex::encode(k.as_bytes());
-            for table in &tables {
-                let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                    "select count(*) from {table} as r where strpos(lower(r::text), $1) > 0"
-                )))
-                .bind(&hex)
-                .fetch_one(&h.system)
-                .await
-                .unwrap();
-                assert_eq!(n, 0, "{table} holds a plain key");
+            for form in key_forms(k.as_bytes()) {
+                for table in &tables {
+                    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                        "select count(*) from {table} as r \
+                         where strpos(r::text, $1) > 0 or strpos(lower(r::text), lower($1)) > 0"
+                    )))
+                    .bind(&form)
+                    .fetch_one(&h.system)
+                    .await
+                    .unwrap();
+                    assert_eq!(n, 0, "{table} holds a plain key");
+                }
             }
         }
     }

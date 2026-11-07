@@ -76,15 +76,31 @@ pub fn outcome_of(e: &Error, kind: HookKind, failed: i32, backoff: &Backoff) -> 
     }
 }
 
-/// Delivers to the provider that the registry names for the delivery.
+/// Delivers to the provider that the registry names for the delivery. A call that takes longer
+/// than the timeout is a retry (`503 unavailable`): the worker holds the delivery's row lock while it
+/// calls, so long hook work must answer `202` and report later (review-P-2 note 3).
 pub struct RegistryDeliver {
     registry: Arc<ProviderRegistry>,
     backoff: Backoff,
+    timeout: Duration,
 }
 
 impl RegistryDeliver {
+    /// The default timeout of one provider call.
+    pub const TIMEOUT: Duration = Duration::from_secs(30);
+
     pub fn new(registry: Arc<ProviderRegistry>, backoff: Backoff) -> Self {
-        Self { registry, backoff }
+        Self {
+            registry,
+            backoff,
+            timeout: Self::TIMEOUT,
+        }
+    }
+
+    /// Sets the timeout of one provider call.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -98,7 +114,18 @@ impl Deliver for RegistryDeliver {
                 after: self.backoff.after(d.attempts + 1),
             };
         };
-        match provider.deliver_hook(d.delivery_id, d.hook.clone()).await {
+        let call = tokio::time::timeout(
+            self.timeout,
+            provider.deliver_hook(d.delivery_id, d.hook.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::api(
+                ErrorCode::Unavailable,
+                "the provider did not answer in time",
+            ))
+        });
+        match call {
             Ok(_) => DeliveryOutcome::Delivered,
             Err(e) => {
                 let kind = d.hook.hook;

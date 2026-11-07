@@ -6,6 +6,7 @@ pub mod audit;
 pub mod auth;
 pub mod blobs;
 pub mod changes;
+pub mod databases;
 pub mod nodes;
 pub mod search;
 pub mod sharing;

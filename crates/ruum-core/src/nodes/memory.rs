@@ -11,6 +11,9 @@
 //! File content: the blobs and versions area sets the head version of a file with
 //! [`MemoryNodeStore::set_head`], and copies content for `copyNode` through
 //! [`MemoryNodeStore::set_content_copy`] ([`ContentCopy`]).
+//!
+//! Typed nodes: the store writes their `typed_nodes` rows (and manifest versions) into the
+//! [`MemoryTypedNodeStore`] set with [`MemoryNodeStore::set_typed`].
 
 use super::rules::{self, ChildKey, TrashWindows};
 use super::*;
@@ -18,6 +21,7 @@ use crate::authz::{self, Authz, ObjectRef, Permission, RelationshipUpdate, tuple
 use crate::error::Error;
 use crate::journal::memory::MemoryJournal;
 use crate::journal::{EventType, NewEntry};
+use crate::providers::store::{MemoryTypedNodeStore, NewTypedNode};
 use crate::tenants::{Plan, RootCreated, Tenant, TenantStore};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -188,6 +192,7 @@ pub struct MemoryNodeStore {
     journal: Arc<MemoryJournal>,
     tenants: OnceLock<Arc<dyn TenantStore>>,
     content: OnceLock<Arc<dyn ContentCopy>>,
+    typed: OnceLock<Arc<MemoryTypedNodeStore>>,
     state: Mutex<State>,
     /// Held across a whole write, so the checks and the change of one write see one state.
     writes: tokio::sync::Mutex<()>,
@@ -208,6 +213,7 @@ impl MemoryNodeStore {
             journal,
             tenants: OnceLock::new(),
             content: OnceLock::new(),
+            typed: OnceLock::new(),
             state: Mutex::new(State::default()),
             writes: tokio::sync::Mutex::new(()),
         }
@@ -222,6 +228,12 @@ impl MemoryNodeStore {
     /// first call counts.
     pub fn set_content_copy(&self, content: Arc<dyn ContentCopy>) {
         let _ = self.content.set(content);
+    }
+
+    /// Sets the store of the `typed_nodes` rows, for [`NodeStore::create_typed`]. Only the first
+    /// call counts.
+    pub fn set_typed(&self, typed: Arc<MemoryTypedNodeStore>) {
+        let _ = self.typed.set(typed);
     }
 
     /// Sets the head version and the size of a file (for the blobs and versions area: a new
@@ -593,6 +605,94 @@ impl NodeStore for MemoryNodeStore {
                 Some(node.revision),
                 EventType::NodeCreated,
                 rules::created_data(&node, None),
+            )?;
+            (node, change)
+        };
+        self.relate(rules::created_tuples(&node)).await?;
+        Ok(Written {
+            value: self.out(ctx, node).await?,
+            change,
+        })
+    }
+
+    async fn create_typed(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
+        let name = validate_name(&req.name)?;
+        let owner = rules::owner_of(ctx)?;
+        let typed = self
+            .typed
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::Internal("nodes: no typed node store".into()))?;
+        self.require(ctx, req.parent_id, Role::Edit).await?;
+        let parent = self.live(ctx.tenant, req.parent_id)?;
+        if parent.node.kind != NodeKind::Folder {
+            return Err(rules::invalid("the parent is not a folder"));
+        }
+        let (bytes, hash) = typed_manifest_bytes(&req.manifest);
+        let _w = self.writes.lock().await;
+        let (node, change) = {
+            let mut st = self.st();
+            st.live(ctx.tenant, req.parent_id)?;
+            let taken = st.taken(ctx.tenant, req.parent_id, None);
+            let name = rules::pick_name(&name, NodeKind::Typed, req.on_conflict, &taken)?;
+            let now = crate::now();
+            let version = VersionId::new();
+            let node = Node {
+                id: NodeId::new(),
+                tenant_id: ctx.tenant,
+                parent_id: Some(req.parent_id),
+                name,
+                kind: NodeKind::Typed,
+                node_type: Some(req.node_type.clone()),
+                link_kind: None,
+                link_target: None,
+                head_version: Some(version),
+                owner_id: owner,
+                size_bytes: 0,
+                revision: 1,
+                trashed_at: None,
+                created_at: now,
+                updated_at: now,
+                created_by: ctx.actor,
+                updated_by: ctx.actor,
+                my_role: None,
+                my_can_share: None,
+                editors_can_share: None,
+                editors_can_share_effective: None,
+            };
+            // The `typed_nodes` row and the first manifest version, then the node: one unit.
+            typed.insert(
+                NewTypedNode {
+                    tenant_id: ctx.tenant,
+                    node_id: node.id,
+                    provider: req.provider.clone(),
+                    type_name: req.node_type.clone(),
+                    desired_version: version,
+                },
+                req.manifest.clone(),
+                ctx.actor.into(),
+            )?;
+            st.rows.insert(
+                node.id,
+                Row {
+                    node: node.clone(),
+                    trash_root: None,
+                    purge_after: None,
+                },
+            );
+            self.append(
+                ctx,
+                node.id,
+                Some(node.revision),
+                EventType::NodeCreated,
+                rules::created_data(&node, None),
+            )?;
+            let change = self.append(
+                ctx,
+                node.id,
+                Some(node.revision),
+                EventType::VersionCreated,
+                typed_version_created_data(version, None, bytes.len(), &hash),
             )?;
             (node, change)
         };

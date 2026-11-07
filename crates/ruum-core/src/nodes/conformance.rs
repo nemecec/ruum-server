@@ -123,6 +123,8 @@ trait Backend: Send + Sync {
     fn search(&self) -> &dyn Search;
     /// The event types of the journal of tenant A, oldest first.
     async fn events(&self, w: &World) -> Vec<String>;
+    /// The `typed_nodes` row of a node.
+    fn typed(&self) -> &dyn crate::providers::store::TypedNodeStore;
 }
 
 fn code<T: std::fmt::Debug>(r: Result<T>) -> &'static str {
@@ -194,9 +196,11 @@ async fn run(w: &World, b: &dyn Backend) {
     isolation(w, b).await;
     tags(w, b).await;
     search(w, b).await;
+    typed_nodes(w, b).await;
     let events = b.events(w).await;
     for e in [
         "node.created",
+        "version.created",
         "node.renamed",
         "node.moved",
         "node.copied",
@@ -208,6 +212,102 @@ async fn run(w: &World, b: &dyn Backend) {
     ] {
         assert!(events.iter().any(|x| x == e), "no {e} in {events:?}");
     }
+}
+
+/// Typed nodes come only through `create_typed` (card D-1): the node, its first manifest version
+/// and its `typed_nodes` row in one unit; `createNode` refuses the kind `typed`.
+async fn typed_nodes(w: &World, b: &dyn Backend) {
+    let m = w.user(w.member);
+    let s = b.nodes();
+    let dbs = mk(b, &m, folder(w.root, "Typed")).await;
+    let manifest =
+        serde_json::json!({ "engine": "sqlite", "version": "3", "plan": "shared-small" });
+    let req = |name: &str, on_conflict| NewTyped {
+        parent_id: dbs.id,
+        name: name.to_string(),
+        node_type: "database".into(),
+        provider: "ruum.database".into(),
+        manifest: manifest.clone(),
+        on_conflict,
+    };
+    let before = b.events(w).await.len();
+    let w1 = s
+        .create_typed(&m, req("Garden", OnConflict::Fail))
+        .await
+        .unwrap();
+    let node = w1.value;
+    assert_eq!(node.kind, NodeKind::Typed);
+    assert_eq!(node.node_type.as_deref(), Some("database"));
+    assert_eq!(node.parent_id, Some(dbs.id));
+    let version = node
+        .head_version
+        .expect("the first manifest version is the head");
+    let events = b.events(w).await;
+    assert_eq!(&events[before..], ["node.created", "version.created"]);
+    assert!(w1.change.seq.is_some());
+    let row = b
+        .typed()
+        .get(w.a, node.id)
+        .await
+        .unwrap()
+        .expect("the typed_nodes row");
+    assert_eq!(row.provider, "ruum.database");
+    assert_eq!(row.type_name, "database");
+    assert_eq!(row.desired_version, version);
+    assert_eq!(row.observed_version, None);
+    assert_eq!(row.state, crate::providers::ProviderState::Provisioning);
+    // The node reads like any other; tenant B finds neither the node nor the row.
+    assert_eq!(s.get(&m, node.id).await.unwrap().kind, NodeKind::Typed);
+    assert!(b.typed().get(w.b, node.id).await.unwrap().is_none());
+    assert_eq!(code(s.get(&w.user(w.owner_b), node.id).await), "404");
+    // The name rules of the folder hold.
+    assert_eq!(
+        code(s.create_typed(&m, req("garden", OnConflict::Fail)).await),
+        "409"
+    );
+    let renamed = s
+        .create_typed(&m, req("garden", OnConflict::Rename))
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(renamed.name, "garden (2)");
+    // `edit` on the parent folder: a guest without a grant does not see it; another tenant
+    // neither; a viewer gets 403.
+    assert_eq!(
+        code(
+            s.create_typed(&w.user(w.guest), req("g", OnConflict::Fail))
+                .await
+        ),
+        "404"
+    );
+    assert_eq!(
+        code(
+            s.create_typed(&w.user(w.owner_b), req("b", OnConflict::Fail))
+                .await
+        ),
+        "404"
+    );
+    w.grant(dbs.id, Role::View, w.viewer).await;
+    assert_eq!(
+        code(
+            s.create_typed(&w.user(w.viewer), req("v", OnConflict::Fail))
+                .await
+        ),
+        "403"
+    );
+    // A typed node is not a folder: nothing is made inside it.
+    let inside = NewTyped {
+        parent_id: node.id,
+        ..req("inner", OnConflict::Fail)
+    };
+    assert_eq!(code(s.create_typed(&m, inside).await), "422");
+    // The public create refuses the kind `typed`.
+    let public = NewNode {
+        kind: NodeKind::Typed,
+        node_type: Some("database".into()),
+        ..folder(dbs.id, "public")
+    };
+    assert_eq!(code(s.create(&m, public).await), "422");
 }
 
 async fn names_and_tree(w: &World, b: &dyn Backend) {
@@ -1140,6 +1240,7 @@ struct Mem {
     tags: Arc<crate::tags::memory::MemoryTagStore>,
     search: crate::search::memory::MemorySearch,
     journal: Arc<MemoryJournal>,
+    typed: Arc<crate::providers::store::MemoryTypedNodeStore>,
 }
 
 #[async_trait]
@@ -1159,6 +1260,9 @@ impl Backend for Mem {
             .into_iter()
             .map(|e| e.event.as_str().to_string())
             .collect()
+    }
+    fn typed(&self) -> &dyn crate::providers::store::TypedNodeStore {
+        &*self.typed
     }
 }
 
@@ -1185,6 +1289,8 @@ async fn memory_stores_conform() {
         journal.clone(),
     ));
     nodes.set_tenants(w.tenants.clone());
+    let typed = Arc::new(crate::providers::store::MemoryTypedNodeStore::new());
+    nodes.set_typed(typed.clone());
     nodes.root_created(&tenant(w.a, w.root), w.owner);
     nodes.root_created(&tenant(w.b, w.root_b), w.owner_b);
     let tags = Arc::new(crate::tags::memory::MemoryTagStore::new(
@@ -1200,6 +1306,7 @@ async fn memory_stores_conform() {
         tags,
         search,
         journal,
+        typed,
     };
     run(&w, &b).await;
 }
@@ -1211,6 +1318,7 @@ struct Pg {
     tags: crate::tags::postgres::PgTagStore,
     search: crate::search::postgres::PgSearch,
     pool: PgPool,
+    typed: crate::providers::postgres::PgTypedNodeStore,
 }
 
 #[async_trait]
@@ -1234,6 +1342,9 @@ impl Backend for Pg {
             .fetch_all(&mut *tx)
             .await
             .unwrap()
+    }
+    fn typed(&self) -> &dyn crate::providers::store::TypedNodeStore {
+        &self.typed
     }
 }
 
@@ -1323,6 +1434,7 @@ async fn postgres_stores_conform(pool: PgPool) {
         ),
         nodes,
         pool: pool.clone(),
+        typed: crate::providers::postgres::PgTypedNodeStore::new(pool.clone()),
     };
     run(&w, &b).await;
     // Every outbox row was applied after its commit.

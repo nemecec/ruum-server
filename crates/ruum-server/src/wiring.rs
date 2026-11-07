@@ -6,6 +6,14 @@
 //! is set) with the outbox worker. Chunks go to S3 (Garage on the laptop) when the `RUUM_S3_*`
 //! or `S3_*` settings are set, and stay in memory otherwise. Sign-in uses Zitadel when
 //! `RUUM_OIDC_ISSUER` and `RUUM_OIDC_CLIENT_ID` are set (`identity::setup`).
+//!
+//! Databases (card D-1, [`install_databases`]): the Postgres engine on the data cluster of
+//! `RUUM_DBHOST_URL`, the tenant keys wrapped by the KEK of `RUUM_LOCAL_KEK_FILE` or OpenBao
+//! (`RUUM_OPENBAO_ADDR`), the typed node store and the provider `ruum.database`. The server
+//! never uses the memory engine: without `RUUM_DBHOST_URL` it has no engine, and every
+//! `createDatabase` answers `422 validation_failed` (hint: no database cluster) before a node
+//! exists; `engine: sqlite` answers so too until card E-3. With `RUUM_DBHOST_URL` but no KEK,
+//! the server refuses to start.
 
 use anyhow::Context as _;
 use ruum_core::Services;
@@ -14,11 +22,20 @@ use ruum_core::authz::Authz;
 use ruum_core::authz::outbox;
 use ruum_core::authz::spicedb::{SpiceDbAuthz, SpiceDbConfig};
 use ruum_core::blobs::setup::{ContentSettings, install_postgres};
+use ruum_core::databases::engine::postgres::{PostgresConfig, PostgresEngine};
+use ruum_core::databases::{self, DatabaseParts, Engines, PgDatabaseStore};
 use ruum_core::identity::setup::{IdentitySettings, install};
 use ruum_core::journal::postgres::PgJournal;
 use ruum_core::nodes::NodeStore;
 use ruum_core::nodes::postgres::PgNodeStore;
+use ruum_core::privacy::keys::{
+    MemoryTenantKeyStore, PgTenantKeyStore, TenantKeys, wrapper_from_env,
+};
+use ruum_core::providers::deliveries::{Backoff, DeliveryWorker};
+use ruum_core::providers::postgres::PgTypedNodeStore;
+use ruum_core::providers::reconciler::Reconciler;
 use ruum_core::search::postgres::PgSearch;
+use ruum_core::services::MemoryHandles;
 use ruum_core::sharing::postgres::PgSharingStore;
 use ruum_core::tags::postgres::PgTagStore;
 use std::sync::Arc;
@@ -36,7 +53,7 @@ pub async fn services_with(
     pool: Option<sqlx::PgPool>,
     identity: &IdentitySettings,
 ) -> anyhow::Result<Services> {
-    let mut services = Services::in_memory();
+    let (mut services, handles) = Services::in_memory_with_handles();
     if let Some(pool) = &pool {
         match SpiceDbConfig::from_env() {
             Some(cfg) => {
@@ -81,8 +98,112 @@ pub async fn services_with(
     }
     // The identity, tenants and agents area: token key, OIDC, mail, plans, Postgres stores. It
     // takes `services.authz`, so it runs after the engine is chosen.
-    install(&mut services, identity, pool).context("set up the identity area")?;
+    install(&mut services, identity, pool.clone()).context("set up the identity area")?;
+    install_databases(&mut services, pool, &handles).await?;
     Ok(services)
+}
+
+/// The database area of the server (see the module docs). Runs after the node, tenant and
+/// authz stores are chosen.
+pub async fn install_databases(
+    services: &mut Services,
+    pool: Option<sqlx::PgPool>,
+    handles: &MemoryHandles,
+) -> anyhow::Result<()> {
+    let mut engines = Engines::none();
+    let cluster = PostgresConfig::from_env();
+    let wrapper = match (wrapper_from_env(), &cluster) {
+        (Ok(w), _) => w,
+        (Err(e), Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "RUUM_DBHOST_URL is set but there is no key-encryption key: {e}"
+            ));
+        }
+        (Err(_), None) => {
+            // No engine, so no key is ever made; a throwaway KEK keeps the type whole.
+            databases::throwaway_kek()
+        }
+    };
+    if let Some(config) = cluster {
+        let engine = PostgresEngine::connect(config)
+            .await
+            .context("connect to the data cluster (RUUM_DBHOST_URL)")?;
+        engines.postgres = Some(Arc::new(engine));
+        tracing::info!("database engine: postgres on the data cluster");
+    } else {
+        tracing::warn!(
+            "RUUM_DBHOST_URL is not set; createDatabase answers 422 (no database cluster)"
+        );
+    }
+    let parts = match pool {
+        Some(pool) => DatabaseParts {
+            engines,
+            keys: Arc::new(TenantKeys::new(
+                Arc::new(PgTenantKeyStore::new(pool.clone())),
+                wrapper,
+            )),
+            store: Arc::new(PgDatabaseStore::new(pool.clone())),
+            typed: Arc::new(PgTypedNodeStore::new(pool)),
+        },
+        None => DatabaseParts {
+            engines,
+            keys: Arc::new(TenantKeys::new(
+                Arc::new(MemoryTenantKeyStore::new()),
+                wrapper,
+            )),
+            store: handles.databases.clone(),
+            typed: handles.typed.clone(),
+        },
+    };
+    databases::install(services, parts).context("set up the database area")?;
+    Ok(())
+}
+
+/// How often the delivery worker looks for due hook deliveries.
+const DELIVERY_EVERY: Duration = Duration::from_secs(5);
+/// How often the reconciler runs a round.
+const RECONCILE_EVERY: Duration = Duration::from_secs(10);
+
+/// Starts the delivery worker and the reconciler of typed nodes as tasks. Each round runs in a
+/// task of its own, so a panic in a provider ends the round, not the loop (re-review-P-2 F-2).
+pub fn start_typed_node_tasks(services: &Services) {
+    let worker = Arc::new(DeliveryWorker::new(
+        services.typed_nodes.clone(),
+        services.providers.clone(),
+        Backoff::default(),
+    ));
+    tokio::spawn(async move {
+        loop {
+            let w = worker.clone();
+            match tokio::spawn(async move { w.run_once(DeliveryWorker::ROUND_LIMIT).await }).await {
+                Ok(Ok(round)) if round.delivered + round.retried + round.refused > 0 => {
+                    tracing::debug!(?round, "hook deliveries");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "the delivery worker failed a round"),
+                Err(e) => tracing::error!(error = %e, "a delivery round panicked"),
+            }
+            tokio::time::sleep(DELIVERY_EVERY).await;
+        }
+    });
+    let reconciler = Arc::new(Reconciler::new(
+        services.typed_nodes.clone(),
+        services.providers.clone(),
+    ));
+    tokio::spawn(async move {
+        loop {
+            let r = reconciler.clone();
+            match tokio::spawn(async move { r.run_once().await }).await {
+                Ok(Ok(round)) if round != Default::default() => {
+                    tracing::debug!(?round, "reconciler round");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "the reconciler failed a round"),
+                Err(e) => tracing::error!(error = %e, "a reconciler round panicked"),
+            }
+            tokio::time::sleep(RECONCILE_EVERY).await;
+        }
+    });
 }
 
 #[cfg(test)]

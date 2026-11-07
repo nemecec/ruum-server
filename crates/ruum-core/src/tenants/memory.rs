@@ -158,6 +158,10 @@ impl TenantStore for MemoryTenantStore {
         Ok(self.area.lock().role_of(tenant, user))
     }
 
+    async fn member_count(&self, tenant: TenantId) -> Result<u32> {
+        Ok(self.area.lock().member_count(tenant).max(1))
+    }
+
     async fn member_since(&self, tenant: TenantId, user: UserId) -> Result<Option<OffsetDateTime>> {
         let st = self.area.lock();
         Ok(st

@@ -140,6 +140,9 @@ pub fn apply_policy(policy: &TenantPolicy, change: &TenantPolicyChange) -> Resul
     if let Some(v) = change.members_can_share {
         p.members_can_share = v;
     }
+    if let Some(v) = change.guests_create_resources {
+        p.guests_create_resources = v;
+    }
     Ok(p)
 }
 

@@ -22,10 +22,14 @@ futures.workspace = true
 hex.workspace = true
 image.workspace = true
 jsonwebtoken.workspace = true
+# The manifest schema of database nodes (card D-1): `contracts/manifests/database.schema.json`.
+jsonschema.workspace = true
 object_store.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+# The database engines of step 2 (card D-1 wires them into `Services`).
+ruum-dbengine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
