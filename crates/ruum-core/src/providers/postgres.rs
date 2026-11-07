@@ -337,7 +337,16 @@ impl TypedNodeStore for PgTypedNodeStore {
             Ok(hook) => hook,
             Err(e) => {
                 // A payload that does not read is refused for good, so its queue goes on.
-                tracing::error!(%tenant, %delivery, error = %e, "a delivery payload does not read");
+                // Log the category and the place of the error only: its text can quote a
+                // part of the payload, and a payload can hold an upload token.
+                tracing::error!(
+                    %tenant,
+                    %delivery,
+                    category = ?e.classify(),
+                    line = e.line(),
+                    column = e.column(),
+                    "a delivery payload does not read"
+                );
                 return self.refuse_unreadable(tx, tenant, delivery).await;
             }
         };

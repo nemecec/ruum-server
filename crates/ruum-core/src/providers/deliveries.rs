@@ -10,9 +10,12 @@
 //! delivery for the provider.
 //!
 //! The rules of the contract: the platform retries with backoff until it gets a `2xx` or a
-//! `4xx` other than `408` and `429` (that `4xx` ends the delivery, refused). There is no last
-//! attempt: `purged` must succeed eventually. `last_error` holds the status and the code of the
-//! error only, never its message (a provider may quote values in it).
+//! `4xx` other than `408` and `429` (that `4xx` ends the delivery, refused). The hooks that
+//! delete data, `purged` and `tenant_deleted`, must succeed eventually: the platform retries
+//! them until it gets a `2xx`, also after a `4xx` (a provider answers `200` for a node it does
+//! not know, so any `4xx` is a provider error). There is no last attempt. `last_error` holds
+//! the status and the code of the error only, never its message (a provider may quote values
+//! in it).
 //!
 //! How the server starts the worker is the server's wiring ([`DeliveryWorker::run`] in a task).
 
@@ -50,12 +53,20 @@ impl Backoff {
     }
 }
 
-/// The outcome of a provider error: refused for good for a `4xx` other than `408` and `429`,
-/// else a retry after the backoff of `failed` failed attempts.
-pub fn outcome_of(e: &Error, failed: i32, backoff: &Backoff) -> DeliveryOutcome {
+/// True for the hooks that delete data (`purged`, `tenant_deleted`). They must succeed
+/// eventually, so no error ends them.
+pub fn must_succeed(kind: HookKind) -> bool {
+    matches!(kind, HookKind::Purged | HookKind::TenantDeleted)
+}
+
+/// The outcome of a provider error for a hook of `kind`: refused for good for a `4xx` other
+/// than `408` and `429`, else a retry after the backoff of `failed` failed attempts. A hook
+/// that [`must_succeed`] is never refused: every error is a retry.
+pub fn outcome_of(e: &Error, kind: HookKind, failed: i32, backoff: &Backoff) -> DeliveryOutcome {
     let status = e.http_status();
     let error = error_text(e);
-    if (400..500).contains(&status) && status != 408 && status != 429 {
+    let final_4xx = (400..500).contains(&status) && status != 408 && status != 429;
+    if final_4xx && !must_succeed(kind) {
         DeliveryOutcome::Refused { error }
     } else {
         DeliveryOutcome::Retry {
@@ -90,14 +101,30 @@ impl Deliver for RegistryDeliver {
         match provider.deliver_hook(d.delivery_id, d.hook.clone()).await {
             Ok(_) => DeliveryOutcome::Delivered,
             Err(e) => {
-                tracing::info!(
-                    tenant = %d.tenant_id,
-                    delivery = %d.delivery_id,
-                    provider = %d.provider,
-                    error = %error_text(&e),
-                    "a hook delivery failed"
-                );
-                outcome_of(&e, d.attempts + 1, &self.backoff)
+                let kind = d.hook.hook;
+                let status = e.http_status();
+                if must_succeed(kind) && (400..500).contains(&status) {
+                    // The provider breaks the contract: a delete must succeed. Retry anyway,
+                    // so the data does not stay with the provider.
+                    tracing::warn!(
+                        tenant = %d.tenant_id,
+                        delivery = %d.delivery_id,
+                        provider = %d.provider,
+                        hook = ?kind,
+                        error = %error_text(&e),
+                        "a provider refused a delete hook; it is retried until it succeeds"
+                    );
+                } else {
+                    tracing::info!(
+                        tenant = %d.tenant_id,
+                        delivery = %d.delivery_id,
+                        provider = %d.provider,
+                        hook = ?kind,
+                        error = %error_text(&e),
+                        "a hook delivery failed"
+                    );
+                }
+                outcome_of(&e, kind, d.attempts + 1, &self.backoff)
             }
         }
     }
@@ -206,11 +233,35 @@ mod tests {
             (Error::Internal("x".into()), false),
             (Error::api(ErrorCode::Unavailable, "x"), false),
         ] {
-            let o = outcome_of(&e, 1, &b);
+            let o = outcome_of(&e, HookKind::Moved, 1, &b);
             assert_eq!(matches!(o, DeliveryOutcome::Refused { .. }), refused, "{e}");
+            // The hooks that delete data are never refused: every error is a retry.
+            for kind in [HookKind::Purged, HookKind::TenantDeleted] {
+                let o = outcome_of(&e, kind, 2, &b);
+                assert_eq!(
+                    o,
+                    DeliveryOutcome::Retry {
+                        error: error_text(&e),
+                        after: Duration::from_secs(20)
+                    },
+                    "{kind:?} {e}"
+                );
+            }
+        }
+        for kind in HookKind::ALL {
+            assert_eq!(
+                must_succeed(*kind),
+                matches!(kind, HookKind::Purged | HookKind::TenantDeleted),
+                "{kind:?}"
+            );
         }
         // The text holds the status and the code, not the message.
-        let o = outcome_of(&Error::Internal("secret value 42".into()), 1, &b);
+        let o = outcome_of(
+            &Error::Internal("secret value 42".into()),
+            HookKind::Moved,
+            1,
+            &b,
+        );
         assert_eq!(
             o,
             DeliveryOutcome::Retry {

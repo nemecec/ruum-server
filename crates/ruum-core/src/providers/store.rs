@@ -254,11 +254,15 @@ pub struct PendingDelivery {
 pub enum DeliveryOutcome {
     /// The provider took the hook (`200` or `202`).
     Delivered,
-    /// The attempt failed (`5xx`, `408`, `429`, no answer); try again after `after`.
+    /// The attempt failed (`5xx`, `408`, `429`, no answer, or any error of a hook that must
+    /// succeed); try again after `after`.
     /// `error` is a status and a code, never a value of the content.
     Retry { error: String, after: Duration },
     /// The provider refused the hook for good (a `4xx` other than `408` and `429`). The
     /// delivery ends (`delivered_at` is set) and `error` says why, so the queue goes on.
+    /// Never for `purged` and `tenant_deleted`: they must succeed eventually, so every error
+    /// of theirs is a [`DeliveryOutcome::Retry`]
+    /// ([`must_succeed`](super::deliveries::must_succeed)).
     Refused { error: String },
 }
 
@@ -684,7 +688,7 @@ mod tests {
     use super::*;
     use crate::actor::Actor;
     use crate::ids::UserId;
-    use crate::providers::deliveries::{Backoff, DeliveryWorker, outcome_of};
+    use crate::providers::deliveries::{Backoff, DeliveryWorker, Round, outcome_of};
     use crate::providers::memory::{MemoryPlatform, MemoryProvider};
     use crate::providers::postgres::{self as pg, PgTypedNodeStore};
     use crate::providers::reconciler::{Reconciler, apply_delivery_id};
@@ -1765,6 +1769,7 @@ mod tests {
             leaky.delivery_id,
             vec![outcome_of(
                 &Error::Internal(marker.clone()),
+                HookKind::Moved,
                 1,
                 &Backoff::default(),
             )],
@@ -1773,6 +1778,137 @@ mod tests {
         let st = s.delivery(t, leaky.delivery_id).await.unwrap().unwrap();
         assert_eq!(st.last_error.as_deref(), Some("500 internal"));
         assert!(!format!("{st:?}").contains(&marker));
+    }
+
+    /// A provider that answers every hook with `422` and delegates the rest to the memory
+    /// provider: it breaks the contract for the hooks that delete data.
+    struct RefusesHooks(MemoryProvider);
+
+    #[async_trait]
+    impl Provider for RefusesHooks {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.0.descriptor()
+        }
+        async fn validate_manifest(
+            &self,
+            delivery: DeliveryId,
+            req: ValidateRequest,
+        ) -> Result<ValidationResult> {
+            self.0.validate_manifest(delivery, req).await
+        }
+        async fn create_typed_node(
+            &self,
+            delivery: DeliveryId,
+            req: CreateTypedNodeRequest,
+        ) -> Result<Reply<ProviderStatus>> {
+            self.0.create_typed_node(delivery, req).await
+        }
+        async fn apply_manifest(
+            &self,
+            delivery: DeliveryId,
+            node: NodeId,
+            req: ApplyManifestRequest,
+        ) -> Result<Reply<ProviderStatus>> {
+            self.0.apply_manifest(delivery, node, req).await
+        }
+        async fn get_typed_node_status(
+            &self,
+            tenant: TenantId,
+            node: NodeId,
+        ) -> Result<ProviderStatus> {
+            self.0.get_typed_node_status(tenant, node).await
+        }
+        async fn deliver_hook(
+            &self,
+            _delivery: DeliveryId,
+            _hook: HookDelivery,
+        ) -> Result<Reply<HookResult>> {
+            Err(invalid("the hook does not validate", "a test provider"))
+        }
+        async fn list_provider_versions(
+            &self,
+            tenant: TenantId,
+            node: NodeId,
+            page: PageRequest,
+        ) -> Result<ProviderVersionPage> {
+            self.0.list_provider_versions(tenant, node, page).await
+        }
+        async fn restore_provider_version(
+            &self,
+            delivery: DeliveryId,
+            node: NodeId,
+            req: RestoreRequest,
+        ) -> Result<ProviderStatus> {
+            self.0.restore_provider_version(delivery, node, req).await
+        }
+        async fn export_typed_node(
+            &self,
+            delivery: DeliveryId,
+            node: NodeId,
+            req: ExportRequest,
+        ) -> Result<ProviderStatus> {
+            self.0.export_typed_node(delivery, node, req).await
+        }
+    }
+
+    /// `purged` and `tenant_deleted` must succeed eventually: a final `4xx` does not end them,
+    /// it is retried with the backoff. Another hook with the same error is refused.
+    async fn a_delete_hook_is_retried_after_a_4xx(h: &dyn Harness) {
+        let s = h.store();
+        let platform = Arc::new(StoreReports::new(
+            s.clone(),
+            Arc::new(MemoryPlatform::new()),
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(Arc::new(RefusesHooks(MemoryProvider::new(platform))))
+            .unwrap();
+        let w = DeliveryWorker::new(
+            s.clone(),
+            Arc::new(registry),
+            Backoff {
+                first: HOUR,
+                max: HOUR,
+            },
+        );
+        let t = h.tenant().await;
+        let purged = delivery(HookKind::Purged, t, Some(NodeId::new()));
+        h.enqueue(purged.clone()).await;
+        let moved = delivery(HookKind::Moved, t, Some(NodeId::new()));
+        h.enqueue(moved.clone()).await;
+        let gone = delivery(HookKind::TenantDeleted, t, None);
+        h.enqueue(gone.clone()).await;
+
+        let round = w.run_once(100).await.unwrap();
+        assert_eq!(
+            (round.delivered, round.refused, round.retried),
+            (0, 1, 2),
+            "{round:?}"
+        );
+        for d in [&purged, &gone] {
+            let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+            assert!(
+                st.delivered_at.is_none(),
+                "{:?} is still due later",
+                st.hook
+            );
+            assert_eq!(st.attempts, 1);
+            assert_eq!(st.last_error.as_deref(), Some("422 validation_failed"));
+            assert!(st.next_attempt_at > crate::now() + Duration::from_secs(1800));
+        }
+        let st = s.delivery(t, moved.delivery_id).await.unwrap().unwrap();
+        assert!(st.delivered_at.is_some(), "moved is refused for good");
+        assert_eq!(st.attempts, 1);
+        assert_eq!(st.last_error.as_deref(), Some("422 validation_failed"));
+
+        // Nothing is due now; "retry now" sends the delete again, and it is still retried.
+        assert_eq!(w.run_once(100).await.unwrap(), Round::default());
+        assert!(s.retry_now(t, purged.delivery_id).await.unwrap());
+        let round = w.run_once(100).await.unwrap();
+        assert_eq!((round.retried, round.refused), (1, 0), "{round:?}");
+        let st = s.delivery(t, purged.delivery_id).await.unwrap().unwrap();
+        assert!(st.delivered_at.is_none());
+        assert_eq!(st.attempts, 2);
     }
 
     macro_rules! suite {
@@ -1807,6 +1943,7 @@ mod tests {
         deliveries_are_keyed_by_tenant,
         workers_never_deliver_one_row_twice,
         the_worker_delivers_through_the_registry,
+        a_delete_hook_is_retried_after_a_4xx,
     );
 
     /// Several workers on several threads (memory): the same rules as above.
