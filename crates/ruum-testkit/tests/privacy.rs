@@ -1,7 +1,7 @@
 //! The privacy suite. See `ruum_testkit::privacy` and `docs/TESTING.md`.
 
 use ruum_testkit::backend::Kind;
-use ruum_testkit::privacy::{self, Engine, Memory, SQLITE_WAITS_FOR};
+use ruum_testkit::privacy::{self, Engine, Filter, Memory, SQLITE_WAITS_FOR};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -134,10 +134,25 @@ fn the_card_is_covered() {
 }
 
 /// A planned case is never skipped in silence: every case that cannot run says why, and the
-/// memory run of the lens cases says that the memory lens is not masked.
+/// memory run of the lens cases says that the memory lens is not masked. A case that needs
+/// the privacy filter names the filter card of its engine while that card has not landed
+/// (review-T-2 R-2), and no case runs on the memory engine (review-T-2 R-1).
 #[test]
 fn planned_cases_name_their_reason() {
     for c in privacy::cases() {
+        assert!(
+            matches!(c.memory, Memory::Planned(_)),
+            "{}: no privacy case may run on the memory engine (memory/mod.rs)",
+            c.id
+        );
+        if c.memory == privacy::MEMORY_LENS {
+            assert_eq!(
+                c.filter,
+                Filter::Needed,
+                "{}: a lens case needs the filter",
+                c.id
+            );
+        }
         for e in c.engines {
             for kind in [Kind::Memory, Kind::Postgres] {
                 if let Some(why) = c.planned_reason(*e, kind) {
@@ -147,6 +162,19 @@ fn planned_cases_name_their_reason() {
             if *e == Engine::Sqlite && SQLITE_WAITS_FOR.is_some() {
                 let why = c.planned_reason(*e, Kind::Postgres).unwrap_or_default();
                 assert!(why.contains("SQLite"), "{}: {why}", c.id);
+            }
+            if c.filter == Filter::Needed
+                && let Some(card) = privacy::filter_waits_for(*e)
+            {
+                for kind in [Kind::Memory, Kind::Postgres] {
+                    let why = c.planned_reason(*e, kind).unwrap_or_default();
+                    assert!(
+                        why.contains(&format!("waits for {card}: the privacy filter")),
+                        "{}@{}: {why}",
+                        c.id,
+                        e.name()
+                    );
+                }
             }
             if c.memory == privacy::MEMORY_LENS {
                 let why = c.planned_reason(*e, Kind::Memory).unwrap_or_default();

@@ -6,6 +6,9 @@
 # mutation_check.sh does not read. Moves up to mutations/ with card A-2: that card writes
 # the real FILE and PERL, checks that the mutation is KILLED under MUTATION_STRICT=1, sets
 # PLACEHOLDER=0 and moves the file.
+# Its cases also wait for the privacy filter (FILTER_WAITS_FOR in privacy.rs: Q-2 removes
+# the Postgres entry, Q-3 the SQLite entry). If they are still planned when CARD lands, the
+# file moves up with the card that removes the last wait (review-T-2 R-2).
 CARD="A-2"
 CASES="poracle.approval_param,approval.params_hidden"
 DESCRIPTION="an approval stores each parameter as its pseudonym (or as it is)"

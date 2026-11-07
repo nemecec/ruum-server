@@ -177,7 +177,7 @@ handler that checks the token answers `401`, and the suites report that as a fai
 raw value. Run it with:
 
 ```sh
-cargo test -p ruum-testkit --test privacy                       # memory
+cargo test -p ruum-testkit --test privacy                       # memory (all planned)
 RUUM_SUITE_BACKEND=postgres cargo test -p ruum-testkit --test privacy
 RUUM_PRIVACY_CASES=oracle.,write. cargo test -p ruum-testkit --test privacy   # some cases
 ```
@@ -198,8 +198,14 @@ every class but `people.note` (unconfirmed, so `personal`), and inserts seven pe
 orders. `agent_out` is the agent; `member_view` and `member_edit` are the people without
 `manage`.
 
-**Markers.** Every `personal` value holds `ruum-raw-<tag>-p<n>` and every `secret` value
-`ruum-raw-<tag>-s<n>`, with a new tag per case run. One helper (`privacy::leaks`) checks every
+**Markers.** Most `personal` values hold `ruum-raw-<tag>-p<n>` and most `secret` values
+`ruum-raw-<tag>-s<n>`, with a new tag per case run. Three values have no marker by design:
+`people.handle` (personal), `people.pin` (secret) and the email of person 7 (personal, the
+value shared with the branch cases). Their normal copies in `orders` must be readable by the
+agent, so a marker there would fail every query of `orders`. The helper does not catch a leak
+of these three values: only the explicit checks of each case do (the oracles, the side
+channels, the check violation, the approval and the log). Do not rely on the helper for these
+columns. One helper (`privacy::leaks`) checks every
 answer: the body, each decoded JSON string (the error `message` and `hint`, cells, marker
 JSON) and each header. A marker that the caller may not see fails the case. On Postgres, at the
 end of each case, no marker may be in the stored rows of `database_queries`, the parameters of
@@ -222,11 +228,20 @@ all its reasons, also with `RUUM_REQUIRE_IMPLEMENTED=1`:
 - it waits for no card (`Case::waits`: copies wait for P-3; exports wait for a public export
   operation, a contract gap for the panel);
 - its engine is in `Services` (SQLite: `SQLITE_WAITS_FOR`, card E-3 sets it to `None`);
-- on the memory backend, it does not need the masked lens ("the memory lens is not masked
-  (Q-2)") or a real engine.
+- if it needs the privacy filter (`Case::filter` is `Filter::Needed`), the filter card of its
+  engine has landed (`FILTER_WAITS_FOR`: Q-2 for Postgres, Q-3 for SQLite). Q-1 builds the query
+  for people only, and Q-2 and Q-3 remove no planned mark, so without this wait the lens cases
+  would run, and fail, between Q-1 and Q-2 (Postgres) and between E-3 and Q-3 (SQLite). A case
+  needs the filter when it sends a statement as an agent or reads a masked value or a marker.
+  Only `schema.names_only`, `leak.failed_migration`, `leak.status_message`, the `file.*` cases
+  and `export.person_full` do not;
+- it does not run on the memory backend. No case does: the memory engine is SQLite in memory,
+  also for an `@postgres` run, so the Postgres fixture (`public`, `::jsonb`) does not run there,
+  and it reads real values (`MEMORY_ENGINE`, `MEMORY_LENS` "the memory lens is not masked
+  (Q-2)", `MEMORY_FAKE`). The memory run only lists the planned cases.
 
 An operation that is not planned but answers `501` makes the case `pending`. The report lists
-the planned case runs by reason. Today all 99 case runs (55 cases) are planned.
+the planned case runs by reason. Today all 99 case runs (56 cases) are planned.
 
 **Mutation rules.** The rules guard code that does not exist yet, so they are placeholders in
 `crates/ruum-testkit/mutations/planned/privacy-*.sh`. `mutation_check.sh` does not read that
@@ -236,7 +251,9 @@ and moves the file up to `mutations/`. A test (`every_rule_has_a_planned_mutatio
 case under at least one mutation.
 
 **When a card lands.** The card removes its planned marks (or its `waits` entry, or sets
-`SQLITE_WAITS_FOR` to `None`). The cases then run without a change to the suite. If a case
+`SQLITE_WAITS_FOR` to `None`; Q-2 and Q-3 remove their entry of `FILTER_WAITS_FOR`). A
+mutation whose cases still wait for the filter when its `CARD` lands moves up with the card
+that removes the last wait. The cases then run without a change to the suite. If a case
 fails and the case looks wrong, stop and say so; do not change the case to make it pass.
 
 Gaps found while writing the suite (for the panel):

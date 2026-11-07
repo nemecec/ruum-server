@@ -19,9 +19,12 @@
 //! and six orders. `agent_out` (the agent of `member`, scope `Private`, `max_role: manage`) is
 //! the agent of the cases; `member_view` and `member_edit` are the people without `manage`.
 //!
-//! Every `personal` and `secret` value of the fixture holds a unique marker:
+//! Most `personal` and `secret` values of the fixture hold a unique marker:
 //! `ruum-raw-<tag>-p<n>` (personal) and `ruum-raw-<tag>-s<n>` (secret), with a fresh `<tag>`
-//! per case run. [`Ctx::send`] checks every answer with [`leaks`]: the body as sent, every
+//! per case run. Three values have no marker by design (review-T-2 N-4): `handle` (personal),
+//! `pin` (secret) and the shared email of person 7 (personal). Their normal copies in `orders`
+//! must be readable by the agent. [`leaks`] does not catch a leak of them; only the explicit
+//! checks of each case do. Do not rely on the helper for these columns. [`Ctx::send`] checks every answer with [`leaks`]: the body as sent, every
 //! string inside the JSON body after decoding (so an escaped marker counts too), and every
 //! header. A marker that the caller may not see fails the case, whatever the status. At the end
 //! of a case on Postgres, the same check runs on the stored rows of `database_queries`, the
@@ -38,9 +41,11 @@
 //!
 //! A case runs only when none of its operations is planned (`x-ruum-status: planned`, decision
 //! 0004-21), when it waits for no card ([`Case::waits`]), when its engine exists in `Services`
-//! (SQLite: [`SQLITE_WAITS_FOR`], card E-3), and, on the memory backend, when it does not need
-//! the masked lens ([`Memory`]: "the memory lens is not masked (Q-2)"). Otherwise it reports
-//! `planned` with all its reasons; it is never skipped silently. A planned case passes in both
+//! (SQLite: [`SQLITE_WAITS_FOR`], card E-3), when the privacy filter of its engine exists if
+//! it needs one ([`Filter`], [`FILTER_WAITS_FOR`]: Q-2 for Postgres, Q-3 for SQLite), and not
+//! on the memory backend ([`Memory`]: no case runs on the memory engine, which is SQLite in
+//! memory with real values). Otherwise it reports `planned` with all its reasons; it is never
+//! skipped silently. A planned case passes in both
 //! modes, also with `RUUM_REQUIRE_IMPLEMENTED=1`. An operation that is not planned but answers
 //! `501` makes the case `pending`.
 //!
@@ -72,9 +77,26 @@ use std::time::Duration;
 pub const CASES_ENV: &str = "RUUM_PRIVACY_CASES";
 
 /// The card that brings a SQLite engine into `Services`. While it is `Some`, every SQLite case
-/// is planned with this card in its reason. Card E-3 sets it to `None` (and Q-3 makes the
-/// SQLite lens cases pass).
+/// is planned with this card in its reason. Card E-3 sets it to `None`. The SQLite cases that
+/// need the privacy filter then still wait for Q-3 ([`FILTER_WAITS_FOR`]).
 pub const SQLITE_WAITS_FOR: Option<&str> = Some("E-3");
+
+/// The cards that build the privacy filter of each engine (review-T-2 R-2): the lens views,
+/// the role kind per caller and grant, the markers from result column classes,
+/// `class_read_required` and the sanitized errors for agents. Q-1 builds `queryDatabase` for
+/// people only ("Out of scope: agents (Q-2, Q-3)"), and Q-2 and Q-3 remove no planned mark.
+/// So every case with [`Filter::Needed`] waits here for the card of its engine, on both
+/// backends. Q-2 removes the Postgres entry when it lands, and Q-3 the SQLite entry.
+pub const FILTER_WAITS_FOR: &[(Engine, &str)] =
+    &[(Engine::Postgres, "Q-2"), (Engine::Sqlite, "Q-3")];
+
+/// The card in [`FILTER_WAITS_FOR`] for `engine`, while it has one.
+pub fn filter_waits_for(engine: Engine) -> Option<&'static str> {
+    FILTER_WAITS_FOR
+        .iter()
+        .find(|(e, _)| *e == engine)
+        .map(|(_, card)| *card)
+}
 
 /// The operations every case uses to build its fixture.
 pub const FIXTURE_OPERATIONS: &[&str] = &[
@@ -169,10 +191,31 @@ pub enum Memory {
 
 /// The lens of the memory engine reads real values (review-E-1 N-1, review-E-2 N-3).
 pub const MEMORY_LENS: Memory = Memory::Planned("the memory lens is not masked (Q-2)");
+/// The memory engine is SQLite in memory, also for an `@postgres` run: the Postgres fixture
+/// (the `public` schema, `::jsonb`) does not run there, and the engine reads real values
+/// (review-T-2 R-1). Its own doc says that no privacy test may run on it.
+pub const MEMORY_ENGINE: Memory = Memory::Planned(
+    "the memory engine is SQLite in memory: the Postgres fixture does not run there, and no \
+     privacy test may run on it (E-1)",
+);
 /// The memory engine has no roles, files or catalog identity.
 pub const MEMORY_FAKE: Memory = Memory::Planned(
     "the memory engine is a fake: no roles, files, statistics or catalog identity (E-1)",
 );
+
+/// Whether a case needs the privacy filter of its engine ([`FILTER_WAITS_FOR`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// The case sends a statement as an agent, or reads a masked value or a marker: it waits
+    /// for the filter card of its engine. Every [`MEMORY_LENS`] case needs the filter.
+    Needed,
+    /// The case reads only the schema, the status, the migration list or the engine's own
+    /// refusals (files), so it runs as soon as its operations and engine exist.
+    NotNeeded,
+}
+
+const FILTER: Filter = Filter::Needed;
+const NO_FILTER: Filter = Filter::NotNeeded;
 
 /// A card a case waits for, beyond the planned marks of its operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +265,7 @@ pub struct Case {
     pub operations: &'static [&'static str],
     pub engines: &'static [Engine],
     pub memory: Memory,
+    pub filter: Filter,
     pub waits: &'static [Wait],
     pub run: Runner,
 }
@@ -251,6 +295,15 @@ impl Case {
         }
         for w in self.waits {
             why.push(format!("waits for {}: {}", w.card, w.reason));
+        }
+        if self.filter == Filter::Needed
+            && let Some(card) = filter_waits_for(engine)
+        {
+            why.push(format!(
+                "waits for {card}: the privacy filter of {} (lens views, role kind per caller, \
+                 markers, sanitized agent errors)",
+                engine.name()
+            ));
         }
         if engine == Engine::Sqlite
             && let Some(card) = SQLITE_WAITS_FOR
@@ -294,6 +347,7 @@ fn case(
     operations: &'static [&'static str],
     engines: &'static [Engine],
     memory: Memory,
+    filter: Filter,
     waits: &'static [Wait],
     run: Runner,
 ) -> Case {
@@ -304,6 +358,7 @@ fn case(
         operations,
         engines,
         memory,
+        filter,
         waits,
         run,
     }
@@ -322,6 +377,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_plain_column,
         ),
@@ -332,6 +388,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_expression,
         ),
@@ -342,6 +399,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_join,
         ),
@@ -352,6 +410,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_aggregate,
         ),
@@ -362,6 +421,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_jsonb_ruum,
         ),
@@ -372,6 +432,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_same_value,
         ),
@@ -382,6 +443,7 @@ pub fn cases() -> Vec<Case> {
             &["getDatabaseSchema", "listDatabaseColumns"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_unconfirmed,
         ),
@@ -392,6 +454,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_secret_without_manage,
         ),
@@ -402,6 +465,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseAccessGrant"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::query_read_personal,
         ),
@@ -411,7 +475,8 @@ pub fn cases() -> Vec<Case> {
             "getDatabaseSchema: names, types and classes, never a value",
             &["getDatabaseSchema"],
             BOTH,
-            Memory::Runs,
+            MEMORY_ENGINE,
+            NO_FILTER,
             &[],
             cases::schema_names_only,
         ),
@@ -421,7 +486,8 @@ pub fn cases() -> Vec<Case> {
             "listDatabaseQueries: an agent sees its own entries, with hidden parameters",
             &["listDatabaseQueries"],
             BOTH,
-            Memory::Runs,
+            MEMORY_LENS,
+            FILTER,
             &[],
             cases::queries_agent_log,
         ),
@@ -432,6 +498,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseAccessGrant", "getDatabaseApproval"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::approval_params_hidden,
         ),
@@ -442,6 +509,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseBranch"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::branch_masked,
         ),
@@ -452,6 +520,7 @@ pub fn cases() -> Vec<Case> {
             &["copyNode"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[WAIT_COPY],
             cases::copy_agent,
         ),
@@ -463,6 +532,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_like_count,
         ),
@@ -473,6 +543,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_eq_param,
         ),
@@ -483,6 +554,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_order_by,
         ),
@@ -493,6 +565,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_group_by,
         ),
@@ -503,6 +576,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_min,
         ),
@@ -513,6 +587,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_length,
         ),
@@ -523,6 +598,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_join_personal_normal,
         ),
@@ -533,6 +609,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::oracle_join_secret_normal,
         ),
@@ -544,6 +621,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseAccessGrant", "createDatabaseBranch"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::write_update_set,
         ),
@@ -554,6 +632,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseAccessGrant", "createDatabaseBranch"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::write_insert_select,
         ),
@@ -564,6 +643,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseAccessGrant", "createDatabaseBranch"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::write_returning,
         ),
@@ -575,6 +655,7 @@ pub fn cases() -> Vec<Case> {
             &["listDatabaseColumns"],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::rename_onto_dropped_normal,
         ),
@@ -585,6 +666,7 @@ pub fn cases() -> Vec<Case> {
             &["listDatabaseColumns"],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::rename_table_onto_dropped,
         ),
@@ -595,6 +677,7 @@ pub fn cases() -> Vec<Case> {
             &["listDatabaseColumns"],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::rename_retype,
         ),
@@ -605,6 +688,7 @@ pub fn cases() -> Vec<Case> {
             &["listDatabaseColumns"],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::rename_drop_add,
         ),
@@ -616,6 +700,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::role_reset_role,
         ),
@@ -626,6 +711,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::role_set_role_owner,
         ),
@@ -636,6 +722,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::role_set_role_dbhost,
         ),
@@ -646,6 +733,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::role_set_config,
         ),
@@ -656,6 +744,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::role_do_block,
         ),
@@ -667,6 +756,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             SQ,
             MEMORY_FAKE,
+            NO_FILTER,
             &[],
             cases::file_attach_other_tenant,
         ),
@@ -677,6 +767,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             SQ,
             MEMORY_FAKE,
+            NO_FILTER,
             &[],
             cases::file_vacuum_into,
         ),
@@ -687,6 +778,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             SQ,
             MEMORY_FAKE,
+            NO_FILTER,
             &[],
             cases::file_load_extension,
         ),
@@ -697,6 +789,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             SQ,
             MEMORY_FAKE,
+            NO_FILTER,
             &[],
             cases::file_pragma,
         ),
@@ -708,6 +801,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::pseudonym_direct_call,
         ),
@@ -718,6 +812,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::pseudonym_constant,
         ),
@@ -728,6 +823,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::pseudonym_key_unreadable,
         ),
@@ -738,7 +834,8 @@ pub fn cases() -> Vec<Case> {
             "a unique violation from an agent and from a person without manage shows no value",
             &["createDatabaseAccessGrant"],
             BOTH,
-            Memory::Runs,
+            MEMORY_ENGINE,
+            FILTER,
             &[],
             cases::leak_unique_violation,
         ),
@@ -748,7 +845,8 @@ pub fn cases() -> Vec<Case> {
             "a check violation from an agent and from a person without manage shows no value",
             &["createDatabaseAccessGrant"],
             BOTH,
-            Memory::Runs,
+            MEMORY_ENGINE,
+            FILTER,
             &[],
             cases::leak_check_violation,
         ),
@@ -758,7 +856,8 @@ pub fn cases() -> Vec<Case> {
             "a failed migration in listDatabaseMigrations shows no value to a viewer or an agent",
             &["listDatabaseMigrations"],
             BOTH,
-            Memory::Runs,
+            MEMORY_ENGINE,
+            NO_FILTER,
             &[],
             cases::leak_failed_migration,
         ),
@@ -768,7 +867,8 @@ pub fn cases() -> Vec<Case> {
             "the status message holds no row value, for anyone",
             &[],
             BOTH,
-            Memory::Runs,
+            MEMORY_ENGINE,
+            NO_FILTER,
             &[],
             cases::leak_status_message,
         ),
@@ -778,7 +878,8 @@ pub fn cases() -> Vec<Case> {
             "a person's literals are not in listDatabaseQueries; an agent with manage sees only its own entries",
             &["listDatabaseQueries"],
             BOTH,
-            Memory::Runs,
+            MEMORY_ENGINE,
+            FILTER,
             &[],
             cases::leak_log_literals,
         ),
@@ -790,6 +891,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::side_pg_stats,
         ),
@@ -800,6 +902,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             PG,
             MEMORY_FAKE,
+            FILTER,
             &[],
             cases::side_explain,
         ),
@@ -811,6 +914,7 @@ pub fn cases() -> Vec<Case> {
             &["listDatabaseQueries"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::poracle_log_param,
         ),
@@ -821,6 +925,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseAccessGrant", "getDatabaseApproval"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::poracle_approval_param,
         ),
@@ -831,6 +936,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseBranch"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::poracle_masked_branch,
         ),
@@ -841,6 +947,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseBranch"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[],
             cases::poracle_schema_only_branch,
         ),
@@ -851,6 +958,7 @@ pub fn cases() -> Vec<Case> {
             &["createDatabaseBranch", "copyNode"],
             BOTH,
             MEMORY_LENS,
+            FILTER,
             &[WAIT_COPY],
             cases::poracle_copy_keeps_key,
         ),
@@ -862,6 +970,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_FAKE,
+            NO_FILTER,
             &[WAIT_EXPORT],
             cases::export_person_full,
         ),
@@ -872,6 +981,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[WAIT_EXPORT],
             cases::export_person_masked,
         ),
@@ -882,6 +992,7 @@ pub fn cases() -> Vec<Case> {
             &[],
             BOTH,
             MEMORY_FAKE,
+            FILTER,
             &[WAIT_EXPORT],
             cases::export_agent,
         ),
@@ -1368,7 +1479,8 @@ impl Ctx {
         Ok(f)
     }
 
-    /// A JSON parameter: cast to `jsonb` on Postgres.
+    /// A JSON parameter: cast to `jsonb` on Postgres. The fixture runs on real engines only:
+    /// no case runs on the memory backend ([`MEMORY_ENGINE`]).
     fn json_param(&self, n: usize) -> String {
         match self.engine {
             Engine::Postgres => format!("{}::jsonb", self.engine.ph(n)),
@@ -2241,8 +2353,9 @@ mod cases {
         })
     }
 
-    /// The approval of an agent's `UPDATE` without `WHERE` with a parameter.
-    async fn approval_of(c: &mut Ctx, f: &Fixture, value: &str) -> Step<Value> {
+    /// The approval of an agent's `UPDATE` without `WHERE` with a parameter: its ID and its one
+    /// parameter as the agent reads it.
+    async fn approval_of(c: &mut Ctx, f: &Fixture, value: &str) -> Step<(String, Value)> {
         c.grant(&f.db, "write_live").await?;
         let sql = format!("update orders set label = {}", c.engine.ph(1));
         let res = c.query(A, &f.db, &sql, vec![json!(value)], true).await?;
@@ -2251,24 +2364,46 @@ mod cases {
             .json()
             .and_then(|v| v["approval"]["id"].as_str().map(str::to_string))
             .ok_or_else(|| Stop::Failed("the 202 has no approval ID".into()))?;
+        let param = approval_param_as(c, f, &id, A, value).await?;
+        Ok((id, param))
+    }
+
+    /// Reads approval `id` as `who` and checks that its one parameter is the hidden marker
+    /// (decision 0004-24: for every reader) and that the answer does not hold `value`. The
+    /// explicit check is needed: `value` may have no marker (for example `handle`).
+    async fn approval_param_as(
+        c: &mut Ctx,
+        f: &Fixture,
+        id: &str,
+        who: Who,
+        value: &str,
+    ) -> Step<Value> {
         let spec = RequestSpec::get(c.path(&f.db, &format!("/approvals/{id}")));
-        let res = c.send(A, &f.db, spec).await?;
-        want(&res, 200, None, "getDatabaseApproval as the agent")?;
+        let res = c.send(who, &f.db, spec).await?;
+        want(
+            &res,
+            200,
+            None,
+            &format!("getDatabaseApproval as {}", who.name()),
+        )?;
         let a = res.json().unwrap_or_default();
         let params = a["params"].as_array().cloned().unwrap_or_default();
         ensure!(
             params.len() == 1,
-            "the approval has one parameter, got {}",
+            "the approval has one parameter for {}, got {}",
+            who.name(),
             a["params"]
         );
         ensure!(
             is_hidden(&params[0], "personal"),
-            "an approval parameter is a hidden marker, got {}",
+            "an approval parameter is a hidden marker for {}, got {}",
+            who.name(),
             params[0]
         );
         ensure!(
             !res.text().contains(value),
-            "the approval holds the parameter's value"
+            "the approval holds the parameter's value for {}",
+            who.name()
         );
         Ok(params[0].clone())
     }
@@ -2277,8 +2412,12 @@ mod cases {
         Box::pin(async move {
             let f = c.fixture().await?;
             let value = f.people[1].handle.clone();
-            approval_of(c, &f, &value).await?;
-            // The manager's view of the same approval holds no value either.
+            let (id, _) = approval_of(c, &f, &value).await?;
+            // The same approval holds no value for its manager (manage) and for a person with
+            // view only either: the stored parameter is a marker for every reader.
+            for who in [M, V] {
+                approval_param_as(c, &f, &id, who, &value).await?;
+            }
             Ok(())
         })
     }
@@ -2806,7 +2945,20 @@ mod cases {
         for sql in sqls {
             for write in [false, true] {
                 let res = c.query(A, &f.db, sql, vec![], write).await?;
-                if res.status.as_u16() != 200 {
+                if res.status.as_u16() == 200 {
+                    // The role change and its effect can be in the same statement
+                    // (review-T-2 N-3): the answer itself must name no other role and hold
+                    // no value without a marker.
+                    let r = Rows::parse(&res)?;
+                    if let Some(role) = other_role_in(&r, &before) {
+                        fail!("{sql}: the answer names the role {role}, not {before}");
+                    }
+                    let text = res.text();
+                    ensure!(
+                        !text.contains("known-pin-") && !text.contains("known-handle-"),
+                        "{sql}: the answer holds a value"
+                    );
+                } else {
                     want_any(&res, REFUSED, sql)?;
                 }
                 let now = current_user(c, &f.db).await?;
@@ -2844,6 +2996,18 @@ mod cases {
             }
         }
         Ok(())
+    }
+
+    /// A cell of `r` that names a role other than `before`: `ruum_dbhost` or a login role
+    /// (`r_` + hex).
+    pub(super) fn other_role_in(r: &Rows, before: &Value) -> Option<String> {
+        r.rows().into_iter().flatten().find_map(|cell| {
+            let s = cell.as_str()?;
+            let login = s
+                .strip_prefix("r_")
+                .is_some_and(|h| !h.is_empty() && h.chars().all(|ch| ch.is_ascii_hexdigit()));
+            ((s == "ruum_dbhost" || login) && before.as_str() != Some(s)).then(|| s.to_string())
+        })
     }
 
     /// The other login roles of the database (`r_` + hex), as the agent can list them.
@@ -2892,6 +3056,10 @@ mod cases {
                 "select set_config('role', 'ruum_dbhost', false)".to_string(),
                 "select set_config('role', 'ruum_dbhost', true), current_user".to_string(),
                 "select set_config('session_authorization', 'ruum_dbhost', false)".to_string(),
+                // The role change and a read of the base table in one statement (N-3).
+                "select set_config('role', 'ruum_dbhost', true), \
+                 query_to_xml('select * from people', true, false, '')::text"
+                    .to_string(),
             ];
             for r in other_roles(c).await? {
                 sqls.push(format!("select set_config('role', '{r}', false)"));
@@ -3469,7 +3637,7 @@ mod cases {
             let lens = c
                 .lens_pseudonym(&f.db, "people", "email", shared.id)
                 .await?;
-            let p = approval_of(c, &f, &shared.email).await?;
+            let (_, p) = approval_of(c, &f, &shared.email).await?;
             ensure!(
                 !p.to_string().contains(&lens),
                 "the approval parameter equals the lens pseudonym"
@@ -3879,6 +4047,58 @@ mod tests {
         ));
         assert!(is_masked(&json!("p_0123456789ab")));
         assert!(!is_masked(&json!("guess")));
+    }
+
+    #[test]
+    fn a_role_name_in_an_answer_is_found() {
+        let rows = |v: Value| Rows {
+            value: json!({ "columns": [], "rows": v, "content_trust": "untrusted" }),
+        };
+        let before = json!("r_00aa11bb");
+        assert_eq!(
+            cases::other_role_in(&rows(json!([["r_00aa11bb"]])), &before),
+            None
+        );
+        assert_eq!(
+            cases::other_role_in(&rows(json!([["x", "ruum_dbhost"]])), &before),
+            Some("ruum_dbhost".to_string())
+        );
+        assert_eq!(
+            cases::other_role_in(&rows(json!([[1], ["r_ff09"]])), &before),
+            Some("r_ff09".to_string())
+        );
+        assert_eq!(
+            cases::other_role_in(&rows(json!([["r_owner", "nick-1"]])), &before),
+            None
+        );
+    }
+
+    #[test]
+    fn the_filter_cases_wait_for_their_engine_card() {
+        let by_id: BTreeMap<&str, Case> = cases().into_iter().map(|c| (c.id, c)).collect();
+        // A lens case waits for Q-2 on Postgres and Q-3 on SQLite, on both backends, also when
+        // its operations exist; a case without the filter does not.
+        // Q-2 and Q-3 remove their entries; the check holds while an entry is there.
+        let lens = by_id["query.plain_column"];
+        for engine in [Engine::Postgres, Engine::Sqlite] {
+            if let Some(card) = filter_waits_for(engine) {
+                let why = lens
+                    .planned_reason(engine, Kind::Postgres)
+                    .unwrap_or_default();
+                assert!(why.contains(&format!("waits for {card}")), "{why}");
+            }
+        }
+        let schema = by_id["schema.names_only"];
+        let pg = schema
+            .planned_reason(Engine::Postgres, Kind::Postgres)
+            .unwrap_or_default();
+        assert!(!pg.contains("privacy filter"), "{pg}");
+        // Every memory-lens case needs the filter.
+        for c in by_id.values() {
+            if c.memory == MEMORY_LENS {
+                assert_eq!(c.filter, Filter::Needed, "{}", c.id);
+            }
+        }
     }
 
     #[test]
