@@ -1,0 +1,14 @@
+[package]
+name = "s1-pseudonym"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike S-1: the Rust side of the pseudonym function (canonical_text and HMAC-SHA-256)."
+
+# Its own workspace: the spike is not a member of the Ruum workspace.
+[workspace]
+
+[dependencies]
+sha2 = "0.11.1"
+hex = "0.4.3"
+time = { version = "0.3.55", features = ["parsing"] }

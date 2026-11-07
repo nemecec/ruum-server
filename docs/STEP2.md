@@ -2,8 +2,9 @@
 
 Status: DRAFT, revised three times after panel reviews (design section 18.9): once for
 reviewer 1, again for every item of reviewer 2 and the UX contract needs C-15 to C-19, and a
-third time for the re-review of both reviewers (decisions 0004-24 to 0004-33). The decisions are
-in `docs/decisions/0004-step2-spec.md` (`provisional`). Nothing here is final until the panel
+third time for the re-review of both reviewers (decisions 0004-24 to 0004-33). Spike S-1 passed
+and its result is applied (decision 0004-34): the role kinds are frozen. The decisions are in
+`docs/decisions/0004-step2-spec.md` (`provisional`). Nothing here is final until the panel
 accepts the revision.
 
 This page splits step 2 of `docs/DESIGN.md` (section 16) into work areas and task cards for the
@@ -141,20 +142,43 @@ layer (`sqlparser`) are a first line only; each rule below holds in the engine i
    its options with `SET LOCAL` only (`statement_timeout`, read-only); `SET`, `RESET` and
    `set_config(..., false)` of session options are refused (`statement_not_allowed`); a
    connection goes back to the pool only after `DISCARD ALL`, and one whose transaction did not
-   end cleanly is closed. The same login-role path serves step 3 apps (decision 15), with kinds
-   of their own per binding (see the table below).
+   end cleanly is closed. Transaction-control statements (`BEGIN`, `START TRANSACTION`, `COMMIT`,
+   `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`) are refused too, in queries
+   and in each statement of a migration's `up` (`statement_not_allowed`), because they end the
+   transaction that holds the `SET LOCAL` options and the rollback of a migration; after each
+   untrusted statement the engine checks that its transaction is still open, else it fails the
+   request and closes the connection (decision 0004-34 d). A role can change its own session
+   defaults and password (`ALTER ROLE CURRENT_USER ...`, also from a `DO` block), so before it
+   opens connections for a role, `ruum_dbhost` runs `ALTER ROLE <role> RESET ALL`, sets the
+   fixed settings (`search_path`) and a new password with `VALID UNTIL`; after login the engine
+   checks that `pg_db_role_setting` holds only those settings (decision 0004-34 c). The same
+   login-role path serves step 3 apps (decision 15), with kinds of their own per binding (see
+   the table below).
 2. **The admin role.** `ruum_dbhost` (`CREATEDB`, `CREATEROLE`, no superuser) runs only platform
    DDL: create and drop databases and roles, set passwords, build the lens views, grant. It
    never runs untrusted SQL. On PostgreSQL 17 a `CREATEROLE` role gets ADMIN on the roles it
-   makes but no `SET` or `INHERIT` membership (`createrole_self_grant` stays empty).
+   makes but no `SET` or `INHERIT` membership (`createrole_self_grant` stays empty). To make
+   objects owned by `mask` (PostgreSQL 16 and later need `SET` membership for `OWNER TO` and
+   `SET ROLE`), `ruum_dbhost` grants itself `mask` `WITH INHERIT FALSE, SET TRUE` and builds the
+   key, the functions and the lens views under `SET ROLE mask`. It holds no membership in a LOGIN
+   kind; the LOGIN kinds are members of nothing, so no untrusted session reaches `mask` or
+   `ruum_dbhost` (decision 0004-34 a).
 3. **Lenses.** Each role kind reads through one lens: `base` (the tables), `nosecret` (views in
    the schema `ruum_nosecret`, every `secret` column masked) or `masked` (views in the schema
    `ruum_masked`, `personal` columns as pseudonyms and `secret` columns masked). A role has
-   `USAGE` only on its lens schema and `pg_catalog`, and `search_path` is its lens schema; it
-   has no right on the base tables and no `USAGE` on `public` or any other schema. So every
-   read, in any clause, sees the masked value, and functions outside the lens are out of reach.
-   The views are owned by the `mask` role (`NOLOGIN`, `SELECT` on the base tables, no session
-   ever runs as it). The kinds:
+   `USAGE` only on its lens schema, `extensions` and `pg_catalog`, and `search_path` is its lens
+   schema and `extensions`; it has no right on the base tables and no `USAGE` on `public` or any
+   other schema. So every read, in any clause, sees the masked value, and functions outside the
+   lens are out of reach. The views are owned by the `mask` role (`NOLOGIN`; `SELECT`,
+   `INSERT`, `UPDATE` and `DELETE` on the base tables, because an auto-updatable view needs the
+   view owner's rights; no untrusted session ever runs as it). `ruum_dbhost` owns the schemas
+   (`public`, `ruum_mask`, `ruum_masked`, `ruum_nosecret`, `extensions`); the `owner` kind has
+   `USAGE` and `CREATE` on `public` only and owns the tables, not the schema, so a migration
+   cannot give a lens kind `USAGE` on `public`; it has no `CREATE` on the database (no schema,
+   no extension). The base-table rights of `mask` and `secret_read` come from `ALTER DEFAULT
+   PRIVILEGES` that the platform runs once in an `owner` session; a migration that revokes them
+   breaks the lens closed (decision 0004-34 b). Extensions of the manifest are created by
+   `ruum_dbhost` in the schema `extensions` (decision 0004-34 g). The kinds:
 
    | Kind | Who | Lens | Writes |
    |---|---|---|---|
@@ -169,7 +193,8 @@ layer (`sqlparser`) are a first line only; each rule below holds in the engine i
 
    Hiding `secret` values from PEOPLE without `manage` is done by the engine (the `nosecret`
    lens), as reviewer 1 asked; an app binding never uses the people's kinds, so step 3 does not
-   need to change the people's rule (decision 0004-14). The kinds are frozen after spike S-1.
+   need to change the people's rule (decision 0004-14). Spike S-1 confirmed the kinds; they are
+   frozen (decision 0004-34).
 
    A masked `secret` column is `text`: `NULL` when the value is `NULL`, else a fixed constant;
    the query layer shows the hidden-value marker. A masked `personal` column is `text` holding
@@ -177,14 +202,22 @@ layer (`sqlparser`) are a first line only; each rule below holds in the engine i
    in one transaction with the catalog sync) after each migration and each confirmation.
 4. **One pseudonym function for both engines.** `pseudonym(v) = 'p_' || first 12 hex characters
    of HMAC-SHA-256(tenant_key, canonical_text(v))`. `canonical_text` is the text form of the
-   value with a fixed format that no session setting changes (text as is; numbers in their
-   shortest exact form; times as RFC 3339 in UTC; `bytea` and BLOB as lowercase hex). In
-   Postgres the function `ruum_mask.pseudonym(text)` is `SECURITY DEFINER`, owned by `mask`,
-   with `search_path` set to `pg_catalog, pg_temp`, and computes the HMAC with the built-in `sha256()` from the
-   padded keys in the table `ruum_mask.key` (owner `mask`, no grant to anyone; no extension
-   needed, so it never clashes with a `pgcrypto` of the manifest). The lens views call it;
-   the agent roles have `EXECUTE` on it but no `USAGE` on the schema `ruum_mask`, so they cannot
-   call it by name, and they can never read the key (spike S-1 proves this before the freeze).
+   value with a fixed format that no session setting changes: text as is; integers in decimal;
+   `numeric` without trailing fraction zeros; floats in the shortest form that reads back
+   exactly, in the layout of PostgreSQL `float8out` (fixed notation for a decimal exponent in
+   [-4, 15), else `d.ddde+XX`; `NaN`, `Infinity`, `-0`); `timestamptz` and `timestamp` as
+   `YYYY-MM-DDTHH:MM:SS[.ffffff without trailing zeros]Z` in UTC; `date` as `YYYY-MM-DD`;
+   `bytea` and BLOB as lowercase hex without `\x`; `boolean` as `true` / `false`; `uuid` in
+   lowercase (decision 0004-34 e). In Postgres the canonical text is made INSIDE the function,
+   never by a `::text` cast in the view (a cast follows the session's `TimeZone`, `DateStyle`,
+   `extra_float_digits` and `bytea_output`): there is one overload `ruum_mask.pseudonym(<type>)`
+   per type, each `SECURITY DEFINER`, owned by `mask`, with `search_path` set to `pg_catalog,
+   pg_temp` and fixed output settings, and it computes the HMAC with the built-in `sha256()` from
+   the padded keys in the table `ruum_mask.key` (owner `mask`, no grant to anyone; no extension
+   needed, so it never clashes with a `pgcrypto` of the manifest). The lens views call it; the
+   agent roles have `EXECUTE` on `pseudonym` (not on its helpers) but no `USAGE` on the schema
+   `ruum_mask`, so they cannot call it by name, and they can never read the key (spike S-1
+   showed both).
    The key is the pseudonym key of the database (decision 0004-25): the tenant's key
    (`tenant_keys`, card Q-4) for a live database and a `full` branch, and a key derived for the
    database, HMAC-SHA-256(tenant key, `db:` || node ID), for a branch with `masked` or
@@ -222,6 +255,15 @@ layer (`sqlparser`) are a first line only; each rule below holds in the engine i
    (`most_common_vals`, histograms) shows them nothing; `EXPLAIN` shows plans of the views;
    `pg_stat_statements` is not installed; `pg_stat_activity` shows other sessions' queries only
    to their own role (default). Timing differences of a query over masked values are accepted.
+   PostgreSQL leaves row values out of the `DETAIL` of a constraint error for a role without
+   `SELECT` on the base table (spike S-1); the sanitizing of errors stays as a second line.
+10. **Migrations and the lens views** (decision 0004-34 f). A lens view depends on the columns it
+   reads: `ALTER COLUMN ... TYPE` and `DROP COLUMN` fail while it exists, and `DROP TABLE ...
+   CASCADE` drops it. So before a migration `ruum_dbhost` drops the lens views of the database;
+   the migration runs in an `owner` session; then the catalog sync and the rebuild of the lens
+   views run in one `ruum_dbhost` transaction. While the views are gone, the lens kinds fail
+   closed (the database is `updating`; requests wait, then get the retryable
+   `database_not_ready`). A failed migration rebuilds the views from the unchanged catalog.
 
 ### SQLite
 
@@ -373,10 +415,13 @@ the key or an offline dictionary attack (decision 0004-4; relates to open questi
    also on the laptop). Laptop: a new compose service `postgres-data` (image
    `ruum-dev/postgres-data:17`, built from `deploy/dev/postgres-data/Dockerfile`: Postgres 17
    with PostGIS and pgvector; no PostgreSQL Anonymizer, decision 0004-4), port 5435 on
-   127.0.0.1, a volume, WAL archiving on, `pg_stat_statements` not installed.
+   127.0.0.1, a volume, WAL archiving on, `pg_stat_statements` not installed,
+   `max_prepared_transactions = 0`. `template1` holds no extension (the platform image puts
+   PostGIS there; the data cluster must not), and the control files of `postgis` and `vector`
+   say `trusted = true`, so `ruum_dbhost` can create them (decision 0004-34 g).
 2. **Per-database roles.** An init script creates the admin role `ruum_dbhost` with `CREATEDB`
-   and `CREATEROLE` (no superuser), `REVOKE CONNECT ... FROM PUBLIC` and `REVOKE ALL ON SCHEMA
-   public FROM PUBLIC` in `template1`, and `pg_hba.conf` lines that allow the per-database
+   and `CREATEROLE` (no superuser), `REVOKE CONNECT, TEMPORARY ON DATABASE ... FROM PUBLIC` for
+   `postgres` and `template1`, `REVOKE ALL ON SCHEMA public FROM PUBLIC` in `template1`, and `pg_hba.conf` lines that allow the per-database
    roles only with SCRAM from the platform's address. The engine creates, per database, the
    roles of `database_roles` (LOGIN, `NOINHERIT`, member of no role, `CONNECT` on their own
    database only; `mask` NOLOGIN), and runs `REVOKE TEMPORARY ON DATABASE ... FROM PUBLIC` on
@@ -445,7 +490,10 @@ Done when:   the architect panel accepts (two reviewers); redocly, zed validate,
              standard request and isolation and permission cases; cargo test --workspace and
              RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit (memory and postgres) pass;
              the provisional decision record 0004 lists what changed; spike S-1 is done and its
-             result is in 0004 before the database_roles kinds are frozen.
+             result is in 0004 before the database_roles kinds are frozen (done: 0004-34; the
+             kinds do not change); the description of queryDatabase and applyDatabaseMigration
+             lists the transaction-control statements under "Statements that never run"
+             (0004-34 d).
 After:       S-1 (for the freeze only; the review can start before)
 Out of scope: journal event schemas (C-2).
 ```
@@ -470,6 +518,8 @@ Out of scope: provider webhooks over HTTP (step 6).
 
 ```markdown
 ID:          S-1
+Status:      DONE (2026-11-07, branch s2/spike): 225 checks passed on PostgreSQL 17.11; the
+             kinds stand; the fixes are decision 0004-34 (a) to (g).
 Goal:        Spike: prove the Postgres engine security model before the role kinds freeze.
 Contracts:   docs/STEP2.md "The engine security model"; database_roles in 0004.
 May change:  spikes/step2-roles/ (new, scripts and a short README), docs/decisions/0004 (result).
@@ -591,7 +641,10 @@ May change:  crates/ruum-core/src/privacy/mod.rs, empty privacy/{keys,postgres,s
 Must not:    databases/, engines, contracts.
 Done when:   the marker types serialize exactly as the contract schemas; the Rust pseudonym
              matches fixed test vectors (text, numbers, times, bytea; canonical_text); the
-             derived key HMAC-SHA-256(tenant key, `db:` || node ID) matches a test vector; an
+             derived key HMAC-SHA-256(tenant key, `db:` || node ID) matches a test vector; the
+             canonical_text rules of decision 0004-34 (e) hold, with the values of
+             spikes/step2-roles/values.tsv and the SQL output of the spike as test vectors, and
+             the card lists the types that use the generic overload; an
              in-memory MaskingRules records calls, so K-1 can call the hook and Q-2 and Q-3
              implement it without touching each other's files.
 After:       C-1
@@ -635,7 +688,10 @@ Done when:   dev.sh up/status shows postgres-data healthy; dbhost_check.sh shows
              set_config('role', '<other role>', false)` and the same in a DO block cannot reach
              another role (current_user stays the same or the statement fails), each tested from
              a session that LOGS IN as the per-database role (not from ruum_dbhost with SET
-             ROLE); nothing listens outside 127.0.0.1.
+             ROLE); nothing listens outside 127.0.0.1; template1 holds no extension; ruum_dbhost
+             can create every extension of the manifest allow-list (postgis and vector marked
+             trusted); max_prepared_transactions is 0 (decision 0004-34 g, d). The checks of
+             spikes/step2-roles/spike.sh sections 1, 7 and 8 are a starting point.
 After:       -
 Out of scope: backups (I-2).
 ```
@@ -763,7 +819,16 @@ Done when:   the engine conformance suite passes against postgres-data; a role o
              `ruum_masked` or `ruum_nosecret` object, no role and no grant, and a restore of it
              into a new database installs the key handed in; the pseudonym function has
              `search_path` `pg_catalog, pg_temp`, and no per-database role has TEMPORARY.
-After:       E-1, I-1, S-1, Q-0
+             From S-1 (decision 0004-34): ruum_dbhost holds SET-only membership in `mask` and
+             none in a LOGIN kind; ruum_dbhost owns every schema and the owner kind owns only
+             tables; one `ruum_mask.pseudonym(<type>)` overload per type with fixed settings
+             (the Rust and SQL pseudonyms agree under hostile session settings); before opening
+             connections for a role, ruum_dbhost resets its settings and password, and a
+             connection whose role has other settings is closed; after each untrusted statement
+             the transaction is still open, else the connection is closed; the lens views are
+             dropped before a migration and rebuilt with the catalog sync after it (also after a
+             failed one); extensions live in the schema `extensions`, reachable by every kind.
+After:       E-1, I-1, S-1 (done), Q-0
 Out of scope: point-in-time restore (E-4).
 ```
 
@@ -839,7 +904,10 @@ Done when:   a failing migration leaves the database as before (422 migration_fa
              decision in the same transaction (entries for columns that do not exist afterwards
              are ignored); an agent's dry run on live or a full branch is 403 user_required
              before anything runs or is locked, and no approval is made; on a masked or
-             schema_only branch it runs (decision 0004-26).
+             schema_only branch it runs (decision 0004-26); an `up` with a transaction-control
+             statement is 422 statement_not_allowed; a migration that retypes or drops a column
+             read by a lens view works (the views are dropped first and rebuilt after, also
+             after a failure; decision 0004-34 f).
 After:       D-1, K-1, A-2, C-2
 ```
 
@@ -894,7 +962,8 @@ May change:  crates/ruum-core/src/databases/query/ except postgres_mask.rs and s
              crates/ruum-api/src/routes/database_query.rs.
 Done when:   T-1 cases pass; two statements are 422; a write in read mode is read_only_query; the
              statements of statement_not_allowed are 422 (also SET, RESET and set_config of
-             session options); the log never holds a raw parameter, a pseudonym of a parameter
+             session options, and transaction-control statements, decision 0004-34 d); the log
+             never holds a raw parameter, a pseudonym of a parameter
              or a literal (normalized statement; parameters as hidden markers, decision
              0004-24); an agent lists only its own log entries; a person with view lists own
              entries and those of their own agents, a person with manage all; error messages are
@@ -1020,8 +1089,8 @@ After:       all D, Q, K, A cards
 
 ## Order
 
-1. **Specify** (now): C-1 and C-2 review (one branch); I-1, then S-1 before the freeze; in
-   parallel T-1, T-2, U-1, I-3.
+1. **Specify** (now): C-1 and C-2 review (one branch); S-1 is done (it ran on the build
+   server's Postgres 17 before I-1, decision 0004-34); in parallel T-1, T-2, U-1, I-1, I-3.
 2. **Foundations** in parallel: P-1, E-1, Q-0; then P-2, Q-4, E-2 (after I-1, S-1), E-3 (after
    I-3), I-2.
 3. **Control plane**: D-1 (memory first), then K-1, Q-1, A-1 in parallel; P-3.

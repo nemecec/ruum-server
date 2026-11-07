@@ -1,0 +1,29 @@
+text	alice@example.com
+text	Ünïcode ✓ 中文
+text	
+int8	-42
+int8	9223372036854775807
+numeric	1.50
+numeric	-0.000100
+numeric	100
+numeric	123456789012345678901234567890.123400
+float8	0.1
+float8	1e21
+float8	1.5e-5
+float8	0.0001
+float8	-0
+float8	3.141592653589793
+float8	123456789012345.6
+float8	1234567890123456
+float8	1e-320
+float8	Infinity
+float8	NaN
+timestamptz	2026-11-07T12:34:56.789+02:00
+timestamptz	2026-01-01T00:00:00Z
+timestamptz	1999-12-31T23:59:59.000001-08:00
+date	2026-11-07
+bytea	\xDEADbeef00
+bytea	\x
+bool	true
+bool	false
+uuid	0190F0E2-7C4A-7B3E-9F00-0123456789AB

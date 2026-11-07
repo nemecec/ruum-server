@@ -642,9 +642,107 @@ permission table, card E-1.
 - Branch of a branch: refused with `409 conflict` (open question 10 decided for step 2; D-3, T-1,
   provider `Source`).
 
+## 34. Spike S-1: the result (card S-1)
+
+**Result.** The spike passed. `spikes/step2-roles/spike.sh` ran on PostgreSQL 17.11 (the build
+server, 2026-11-07): 225 checks passed, 0 failed. All six points of card S-1 hold: (1) no LOGIN
+kind reaches another role, also in a `DO` block or a function; (2) the masked kinds read
+pseudonyms in every clause and cannot read the base tables, `ruum_mask.key` or `pg_stats`
+values; (3) `ruum_mask.pseudonym` runs from a view but not by name; (4) `masked_write` writes
+plain columns only, and a `WHERE` on a masked column compares the pseudonym; (5) `SET LOCAL` and
+`DISCARD ALL` leave no session option; (6) the SQL and the Rust pseudonym agree on 29 values
+under hostile session settings. **The role kinds of `database_roles` do not change and are now
+frozen** (no contract change). The spike also found six gaps in how the model is built. Each
+one is fixed below, and the safer option is taken where there was a choice. The output is in
+`ruum-server-wt/panel/step2-spike-s1.md`.
+
+- **(a) Objects owned by `mask`.** Since PostgreSQL 16, `ALTER ... OWNER TO mask` and `SET ROLE
+  mask` need `SET` membership in `mask`; the `ADMIN` that `CREATEROLE` gives is not enough.
+  Decision: `ruum_dbhost` grants itself `mask` `WITH INHERIT FALSE, SET TRUE` when it makes a
+  database, and builds the key, the functions and the lens views under `SET ROLE mask`. It holds
+  no membership in any LOGIN kind. The direction is safe: the LOGIN kinds are members of nothing,
+  so no untrusted session reaches `mask` or `ruum_dbhost`. Item 1's "never granted to
+  `ruum_dbhost`" now means the LOGIN kinds.
+- **(b) Schema ownership.** `ruum_dbhost` (the database owner) owns `public` and the `ruum_*`
+  schemas. The `owner` kind gets `USAGE` and `CREATE` on `public` only and owns the tables, not
+  the schema, so an untrusted migration cannot grant `USAGE` on `public` to a lens kind (the
+  spike shows that this grant gives nothing). The `owner` kind gets no `CREATE` on the database,
+  so it makes no schema and no extension. The base-table rights of `mask` (`SELECT`, `INSERT`,
+  `UPDATE`, `DELETE`: an auto-updatable view needs the view owner's rights on the table) and of
+  `secret_read` (`SELECT`) come from `ALTER DEFAULT PRIVILEGES` that the platform runs once in an
+  `owner` session. A migration that revokes them breaks the lens closed (queries fail).
+- **(c) A role can change its own settings and password.** Any LOGIN role can run `ALTER ROLE
+  CURRENT_USER SET <option>` (the value reaches every new connection of that kind, and `DISCARD
+  ALL` does not reset it) and `ALTER ROLE CURRENT_USER PASSWORD`. The query layer already refuses
+  `ALTER ROLE`, but a `DO` block gets around the parser. Decision: before it opens connections for
+  a role, `ruum_dbhost` runs `ALTER ROLE <role> RESET ALL`, sets the fixed settings again
+  (`search_path`) and a new password with `VALID UNTIL`; after login the engine checks that
+  `pg_db_role_setting` holds only the fixed settings, else it closes the connection and repeats
+  the reset. A password the role chose itself stops working at the next reset, and `pg_hba.conf`
+  allows these roles only from the platform's address.
+- **(d) Transaction control ends the platform's transaction.** A `COMMIT` (also `END`,
+  `ROLLBACK`, `BEGIN`, `START TRANSACTION`, `SAVEPOINT`, `RELEASE`, `PREPARE TRANSACTION`)
+  ends the transaction that holds the `SET LOCAL` options: the next statement runs without the
+  timeout. In a migration's `up`, a `COMMIT` breaks the one-transaction rollback of decision 19
+  (the spike leaves a table behind after a failed migration). Decision: transaction-control
+  statements are added to "Statements that never run" (`422 statement_not_allowed`) for queries
+  and for each statement of a migration's `up`; as the engine line, after each untrusted
+  statement the engine checks that its transaction is still open (else it fails the request and
+  closes the connection). A `COMMIT` inside a `DO` block already fails inside the platform's
+  transaction, and `max_prepared_transactions` stays 0 on the data cluster. This changes the
+  text of `queryDatabase` and `applyDatabaseMigration`: card C-1 takes it (additive).
+- **(e) The canonical text is made inside the function.** With `ruum_mask.pseudonym(text)` and a
+  `::text` cast in the view, the pseudonym of a `timestamptz` changes with the session's
+  `TimeZone` (also `DateStyle`, `extra_float_digits`, `bytea_output`). Decision: one overload
+  `ruum_mask.pseudonym(<type>)` per type, each `SECURITY DEFINER` and computing
+  `ruum_mask.canonical(<type>)` with fixed function settings (`search_path`, `timezone = UTC`,
+  `extra_float_digits = 1`). The rules, which the Rust side must follow exactly: text as is;
+  integers in decimal; `numeric` without trailing fraction zeros (`trim_scale`); floats in the
+  shortest form that reads back exactly, in the layout of PostgreSQL `float8out` (fixed notation
+  for a decimal exponent in [-4, 15), else `d.ddde+XX`; `NaN`, `Infinity`, `-0`); `timestamptz`
+  and `timestamp` as `YYYY-MM-DDTHH:MM:SS[.ffffff without trailing zeros]Z` in UTC; `date` as
+  `YYYY-MM-DD`; `bytea` as lowercase hex without `\x`; `boolean` as `true` / `false`; `uuid`
+  in lowercase. A `personal` column of another type uses a generic overload over `::text` with
+  every output setting fixed (`DateStyle`, `IntervalStyle`, `TimeZone`, `extra_float_digits`,
+  `bytea_output`); card Q-0 lists those types. Only the agent kinds get `EXECUTE`, on
+  `pseudonym` only (not on the HMAC helper).
+- **(f) Lens views and migrations.** A lens view depends on the columns it reads, so `ALTER
+  COLUMN ... TYPE` and `DROP COLUMN` fail while it exists, and `DROP TABLE ... CASCADE` by the
+  `owner` kind drops it. A rename works (the view follows the column). Decision: before a
+  migration, `ruum_dbhost` drops the lens views of the database (`SET ROLE mask`); the migration
+  runs in an `owner` session; then the catalog sync and the rebuild of the lens views run in one
+  `ruum_dbhost` transaction (item 1 already says "after each migration"). These are three
+  transactions, because the migration runs as another role on another connection. While the
+  views are gone, the lens kinds fail closed (the database is `updating`; requests wait, then get
+  the retryable `database_not_ready`). A failed migration rebuilds the views from the unchanged
+  catalog.
+- **(g) Extensions.** `ruum_dbhost` (no superuser) can create seven of the nine extensions of
+  the manifest allow-list; `postgis` and `vector` are not trusted extensions, so it cannot. A lens
+  kind reaches extension functions only with `USAGE` on their schema. The stack's Postgres image
+  also installs PostGIS in `template1`, so every new database gets `public.spatial_ref_sys`.
+  Decision: extensions are created by `ruum_dbhost` in the schema `extensions` (owner
+  `ruum_dbhost`), with `USAGE` for every kind and `search_path` `<lens schema>, extensions`; the
+  data cluster image (card I-1) marks `postgis` and `vector` as trusted (`trusted = true` in their
+  control files), which is safe here because only `ruum_dbhost` has `CREATE` on a database, and
+  keeps `template1` free of extensions.
+- **(h) Confirmed as specified.** PostgreSQL itself leaves row values out of the `DETAIL` of a
+  `CHECK` or `UNIQUE` violation for a role without `SELECT` on the base table (all lens kinds);
+  the `owner` kind sees them. The sanitizing of item 8 stays (defence in depth). `pg_stats`
+  shows the lens kinds nothing of the base tables. `createrole_self_grant` is empty on
+  PostgreSQL 17, and `ruum_dbhost` holds only `ADMIN` (no `INHERIT`, no `SET`) on the LOGIN kinds.
+- **Not covered by the spike:** `pg_hba.conf` (card I-1), SQLite (E-3), performance, the
+  statement text of another session of the same kind in `pg_stat_activity` (visible to the
+  same role by default; every session of a kind has the same data rights, so it shows nothing
+  that kind may not read; recorded here, not tested).
+
+**Changes.** STEP2 "The engine security model" (Postgres items 1 to 4, a new item 10),
+"Infrastructure work" items 1 and 2, cards C-1, S-1, I-1, E-2, Q-0, Q-1 and D-2;
+`spikes/step2-roles/`.
+
 ## Open
 
 - Design 8.5 names PostgreSQL Anonymizer; item 4 replaces it. A person confirms, and the design
   text follows in a design change.
-- Spike S-1 is not run yet; C-1's freeze of the role kinds waits for it (item 15).
+- Spike S-1 passed (item 34). The role kinds are frozen. C-1 still takes the text change of item
+  34 (d) (transaction control in "Statements that never run").
 - UX contract needs C-20 to C-23 are not in the contract yet.
