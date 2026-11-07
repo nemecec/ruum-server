@@ -1523,6 +1523,45 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
+  /v1/nodes/move:
+    post:
+      tags: [nodes]
+      operationId: moveNodes
+      summary: Move many nodes
+      description: |
+        Moves 1 to 100 nodes, each to its own new parent (decision 0003-7). Each item is one
+        `moveNode`: it needs `manage` on the node and `edit` on the new parent, takes `name` and
+        `on_conflict` as `moveNode` does, and writes its own `node.moved`.
+
+        Not atomic. The items run in order, each on its own, and one item's error does not stop
+        the others. The answer is `200` with one result per item, in the order of the request:
+        `status` is the status that `moveNode` would answer for that item (`200`, `403`, `404`,
+        `409`, `422`), with `node` and `change` on success or `error` on failure. The
+        `Idempotency-Key` covers the whole call. A request with 0 or more than 100 items is
+        `422 validation_failed`.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveNodesRequest'
+      responses:
+        '200':
+          description: One result per item, in the order of the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResult'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
   /v1/nodes/by-path/{path}:
     get:
       tags: [nodes]
@@ -2625,6 +2664,42 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/NotFound'
+    post:
+      tags: [tags]
+      operationId: attachTagToNodes
+      summary: Attach a tag to many nodes
+      description: |
+        Attaches the tag to 1 to 100 nodes (decision 0003-7). Each item is one `attachTag`: it
+        needs `edit` on the node, attaching twice is a no-op, and each attach writes its own
+        `tag.attached`.
+
+        Not atomic. The items run in order, each on its own, and one item's error does not stop
+        the others. The answer is `200` with one result per node, in the order of the request:
+        `status` is the status that `attachTag` would answer for that node (`200`, `403`,
+        `404`), with `change` on success or `error` on failure. Who cannot see the tag gets
+        `404` in every item. The `Idempotency-Key` covers the whole call. A request with 0 or
+        more than 100 nodes is `422 validation_failed`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttachTagToNodesRequest'
+      responses:
+        '200':
+          description: One result per node, in the order of the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResult'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
 
   /v1/nodes/{node_id}/tags:
     parameters:
@@ -3087,6 +3162,10 @@ paths:
         marker in `resync`: the client lists that subtree again (`access: gained`) or drops it
         (`access: lost`), at the position `seq` of the marker. Clients order and dedupe entries
         by `seq`, and per node by `revision`.
+
+        IDs in `data` may name nodes that the caller cannot see, also nodes that are gone (for
+        example `old_parent_id` of a move); resolve them with `getNode`, which answers `404`.
+        Names, paths and every other attribute of such a node never appear (decision 0003-8).
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - name: cursor
@@ -3162,13 +3241,19 @@ paths:
     get:
       tags: [search]
       operationId: searchNodes
-      summary: Search by name
-      description: Live nodes whose name contains `q` (case-insensitive) that the caller can see. Best match first.
+      summary: Search by name and type
+      description: |
+        Live nodes that the caller can see and that match every filter given. `q` matches names
+        that contain it (case-insensitive), best match first. `type` matches `Node.type`
+        (decision 0003-7). `q` may be left out when `type`, `tag` or `within` is given; the
+        results are then ordered by name. With none of the four the answer is
+        `422 validation_failed`.
       parameters:
         - $ref: '#/components/parameters/TenantHeader'
         - name: q
           in: query
-          required: true
+          required: false
+          description: Part of a node name. Required unless `type`, `tag` or `within` is given.
           schema:
             type: string
             minLength: 1
@@ -3177,6 +3262,18 @@ paths:
           in: query
           schema:
             $ref: '#/components/schemas/NodeKind'
+        - name: type
+          in: query
+          description: |
+            Matches `Node.type`, ignoring case: a whole type (`application/pdf`), or a prefix
+            that ends in `/` (`image/` matches `image/png` and `image/jpeg`). `Node.type` is the
+            MIME type of a file, and the type of a folder or a typed node (for example
+            `database`), so the filter also finds typed nodes. To find "all PDFs", use
+            `type=application/pdf`, not `q`: a name can lie.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
         - name: tag
           in: query
           schema:
@@ -5766,6 +5863,75 @@ components:
           description: A new name at the same time. Default is the current name.
         on_conflict:
           $ref: '#/components/schemas/OnConflict'
+    MoveNodesRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/MoveNodesItem'
+    MoveNodesItem:
+      description: One move of `moveNodes`; the fields of `MoveRequest` and the node.
+      type: object
+      required: [node_id, parent_id]
+      properties:
+        node_id:
+          $ref: '#/components/schemas/Uuid'
+        parent_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/NodeName'
+          description: A new name at the same time. Default is the current name.
+        on_conflict:
+          $ref: '#/components/schemas/OnConflict'
+    AttachTagToNodesRequest:
+      type: object
+      required: [node_ids]
+      properties:
+        node_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Uuid'
+    BatchResult:
+      description: The answer of a batch call (`moveNodes`, `attachTagToNodes`).
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchItemResult'
+    BatchItemResult:
+      description: |
+        The result of one item of a batch call. `status` is the HTTP status that the single
+        operation would answer for this item. A success (`200`) carries the body of the single
+        operation (`node` and `change` for `moveNodes`, `change` for `attachTagToNodes`); a
+        failure carries `error`, the value of the `error` key of the standard error body.
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: integer
+          example: 404
+        node:
+          $ref: '#/components/schemas/Node'
+        change:
+          $ref: '#/components/schemas/Change'
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+            hint:
+              type: string
     CopyRequest:
       type: object
       required: [parent_id]

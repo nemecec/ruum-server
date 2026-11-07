@@ -103,7 +103,8 @@
       "$ref": "common.schema.json#/$defs/timestamp"
     },
     "data": {
-      "type": "object"
+      "type": "object",
+      "description": "The data of the change; its shape depends on `type`. IDs in `data` may name nodes that the reader cannot see, also nodes that are gone (for example `old_parent_id` of a move); resolve them with getNode, which answers 404. Names, paths and every other attribute of such a node never appear (decision 0003-8)."
     }
   },
   "allOf": [

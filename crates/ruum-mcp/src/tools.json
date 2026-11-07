@@ -1,13 +1,13 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "845a82ccad4d994c3446f24474a6641eeef3d684273c7e5b8bbb9ea1471dd7d6",
- "tools_sha256": "e89147c563f5bf24617a7e853776f009e824be46ace5c2384019bf50f5b7e3c8",
+ "openapi_sha256": "972bceb8115fc4270cf16b7e868605800ac1d270f70b55ccf843d2abbf1450c4",
+ "tools_sha256": "ca25a3fa883413e0ef404370f39fb1cebfc9243202d82703bdfdd8bc4f94e294",
  "tools": [
   {
    "name": "get_me",
    "operation": "getMe",
    "planned": false,
-   "description": "Show who you are: your agent identity, the user you act for, and your scope (subtree, max_role, expiry).",
+   "description": "Show who you are: your agent identity, the user you act for, and your scope (subtree, max_role, expiry). Agents cannot create agents, API keys, app passwords or invitations, and cannot undo another agent; the user does that in the Ruum web UI (a user_required error names the page).",
    "notes": null,
    "method": "GET",
    "path": "/v1/me",
@@ -168,7 +168,7 @@
    "name": "create_node",
    "operation": "createNode",
    "planned": false,
-   "description": "Create a folder, an empty file or a link inside a folder. Use write_file afterwards to give a file content.",
+   "description": "Create a folder, an empty file or a link inside a folder. Use write_file afterwards to give a file content. If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds \" (2)\").",
    "notes": null,
    "method": "POST",
    "path": "/v1/nodes",
@@ -424,7 +424,7 @@
    "name": "rename_node",
    "operation": "renameNode",
    "planned": false,
-   "description": "Rename a file or folder in place.",
+   "description": "Rename a file or folder in place. If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds \" (2)\").",
    "notes": null,
    "method": "POST",
    "path": "/v1/nodes/{node_id}/rename",
@@ -488,7 +488,7 @@
    "name": "move_node",
    "operation": "moveNode",
    "planned": false,
-   "description": "Move a file or folder to another folder (needs manage on it and edit on the target).",
+   "description": "Move a file or folder to another folder (needs manage on it and edit on the target). If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds \" (2)\"). To move many nodes, use move_nodes.",
    "notes": null,
    "method": "POST",
    "path": "/v1/nodes/{node_id}/move",
@@ -554,10 +554,78 @@
    }
   },
   {
+   "name": "move_nodes",
+   "operation": "moveNodes",
+   "planned": false,
+   "description": "Move up to 100 files or folders in one call, each with its own target folder, name and on_conflict (the rules of move_node). Not atomic: each item gets its own result with status 200 and the node, or an error; one failed item does not stop the others.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/nodes/move",
+   "params": [],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "body": {
+      "type": "object",
+      "required": [
+       "items"
+      ],
+      "properties": {
+       "items": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 100,
+        "items": {
+         "description": "One move of `moveNodes`; the fields of `MoveRequest` and the node.",
+         "type": "object",
+         "required": [
+          "node_id",
+          "parent_id"
+         ],
+         "properties": {
+          "node_id": {
+           "type": "string",
+           "format": "uuid",
+           "description": "A UUIDv7."
+          },
+          "parent_id": {
+           "type": "string",
+           "format": "uuid",
+           "description": "A UUIDv7."
+          },
+          "name": {
+           "type": "string",
+           "minLength": 1,
+           "maxLength": 255,
+           "description": "A new name at the same time. Default is the current name."
+          },
+          "on_conflict": {
+           "type": "string",
+           "description": "What to do when the name is taken. `rename` adds \" (2)\", \" (3)\", ... before the extension.",
+           "enum": [
+            "fail",
+            "rename"
+           ],
+           "default": "fail"
+          }
+         }
+        }
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "body"
+    ]
+   }
+  },
+  {
    "name": "copy_node",
    "operation": "copyNode",
    "planned": false,
-   "description": "Copy a file or folder into a folder. The copy shares content, so it is cheap.",
+   "description": "Copy a file or folder into a folder. The copy shares content, so it is cheap. If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds \" (2)\").",
    "notes": null,
    "method": "POST",
    "path": "/v1/nodes/{node_id}/copy",
@@ -1538,7 +1606,7 @@
    "name": "attach_tag",
    "operation": "attachTag",
    "planned": false,
-   "description": "Put a tag on a file or folder.",
+   "description": "Put a tag on a file or folder. To tag many nodes, use attach_tag_to_nodes.",
    "notes": null,
    "method": "PUT",
    "path": "/v1/nodes/{node_id}/tags/{tag_id}",
@@ -1573,6 +1641,56 @@
     "required": [
      "node_id",
      "tag_id"
+    ]
+   }
+  },
+  {
+   "name": "attach_tag_to_nodes",
+   "operation": "attachTagToNodes",
+   "planned": false,
+   "description": "Put one tag on up to 100 files or folders in one call (needs edit on each). Not atomic: each node gets its own result with status 200, or an error; one failed node does not stop the others.",
+   "notes": null,
+   "method": "POST",
+   "path": "/v1/tags/{tag_id}/nodes",
+   "params": [
+    {
+     "name": "tag_id",
+     "in": "path",
+     "prop": "tag_id"
+    }
+   ],
+   "body": "json",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "tag_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A UUIDv7."
+     },
+     "body": {
+      "type": "object",
+      "required": [
+       "node_ids"
+      ],
+      "properties": {
+       "node_ids": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 100,
+        "items": {
+         "type": "string",
+         "format": "uuid",
+         "description": "A UUIDv7."
+        }
+       }
+      }
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "tag_id",
+     "body"
     ]
    }
   },
@@ -2248,7 +2366,7 @@
    "name": "search_nodes",
    "operation": "searchNodes",
    "planned": false,
-   "description": "Search files and folders by name, optionally by kind, tag or inside a folder.",
+   "description": "Search files and folders by name (q), type, kind, tag or inside a folder (within). q matches names only; to find files by type use type, which matches the MIME type (type: application/pdf for all PDFs, type: image/ for all images), not kind. q may be left out when type, tag or within is given, so within alone lists a whole subtree.",
    "notes": null,
    "method": "GET",
    "path": "/v1/search",
@@ -2262,6 +2380,11 @@
      "name": "kind",
      "in": "query",
      "prop": "kind"
+    },
+    {
+     "name": "type",
+     "in": "query",
+     "prop": "type"
     },
     {
      "name": "tag",
@@ -2291,7 +2414,8 @@
      "q": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 255
+      "maxLength": 255,
+      "description": "Part of a node name. Required unless `type`, `tag` or `within` is given."
      },
      "kind": {
       "type": "string",
@@ -2301,6 +2425,12 @@
        "link",
        "typed"
       ]
+     },
+     "type": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "Matches `Node.type`, ignoring case: a whole type (`application/pdf`), or a prefix\nthat ends in `/` (`image/` matches `image/png` and `image/jpeg`). `Node.type` is the\nMIME type of a file, and the type of a folder or a typed node (for example\n`database`), so the filter also finds typed nodes. To find \"all PDFs\", use\n`type=application/pdf`, not `q`: a name can lie."
      },
      "tag": {
       "type": "string",
@@ -2323,10 +2453,7 @@
       "default": 100
      }
     },
-    "additionalProperties": false,
-    "required": [
-     "q"
-    ]
+    "additionalProperties": false
    }
   },
   {

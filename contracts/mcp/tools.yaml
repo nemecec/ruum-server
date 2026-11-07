@@ -33,7 +33,7 @@ openapi: ../openapi.yaml
 tools:
   - name: get_me
     operation: getMe
-    description: 'Show who you are: your agent identity, the user you act for, and your scope (subtree, max_role, expiry).'
+    description: 'Show who you are: your agent identity, the user you act for, and your scope (subtree, max_role, expiry). Agents cannot create agents, API keys, app passwords or invitations, and cannot undo another agent; the user does that in the Ruum web UI (a user_required error names the page).'
     input: '#/paths/~1v1~1me/get'
   - name: list_tenants
     operation: listTenants
@@ -57,7 +57,7 @@ tools:
     input: '#/paths/~1v1~1nodes~1root/get'
   - name: create_node
     operation: createNode
-    description: 'Create a folder, an empty file or a link inside a folder. Use write_file afterwards to give a file content.'
+    description: 'Create a folder, an empty file or a link inside a folder. Use write_file afterwards to give a file content. If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds " (2)").'
     input: '#/paths/~1v1~1nodes/post'
   - name: get_node_by_path
     operation: getNodeByPath
@@ -77,15 +77,19 @@ tools:
     input: '#/paths/~1v1~1nodes~1{node_id}~1children/get'
   - name: rename_node
     operation: renameNode
-    description: 'Rename a file or folder in place.'
+    description: 'Rename a file or folder in place. If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds " (2)").'
     input: '#/paths/~1v1~1nodes~1{node_id}~1rename/post'
   - name: move_node
     operation: moveNode
-    description: 'Move a file or folder to another folder (needs manage on it and edit on the target).'
+    description: 'Move a file or folder to another folder (needs manage on it and edit on the target). If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds " (2)"). To move many nodes, use move_nodes.'
     input: '#/paths/~1v1~1nodes~1{node_id}~1move/post'
+  - name: move_nodes
+    operation: moveNodes
+    description: 'Move up to 100 files or folders in one call, each with its own target folder, name and on_conflict (the rules of move_node). Not atomic: each item gets its own result with status 200 and the node, or an error; one failed item does not stop the others.'
+    input: '#/paths/~1v1~1nodes~1move/post'
   - name: copy_node
     operation: copyNode
-    description: 'Copy a file or folder into a folder. The copy shares content, so it is cheap.'
+    description: 'Copy a file or folder into a folder. The copy shares content, so it is cheap. If the folder already has a node with that name, the call fails with name_taken; send on_conflict: rename to keep both (adds " (2)").'
     input: '#/paths/~1v1~1nodes~1{node_id}~1copy/post'
   - name: trash_node
     operation: trashNode
@@ -171,8 +175,12 @@ tools:
     input: '#/paths/~1v1~1nodes~1{node_id}~1tags/get'
   - name: attach_tag
     operation: attachTag
-    description: 'Put a tag on a file or folder.'
+    description: 'Put a tag on a file or folder. To tag many nodes, use attach_tag_to_nodes.'
     input: '#/paths/~1v1~1nodes~1{node_id}~1tags~1{tag_id}/put'
+  - name: attach_tag_to_nodes
+    operation: attachTagToNodes
+    description: 'Put one tag on up to 100 files or folders in one call (needs edit on each). Not atomic: each node gets its own result with status 200, or an error; one failed node does not stop the others.'
+    input: '#/paths/~1v1~1tags~1{tag_id}~1nodes/post'
   - name: detach_tag
     operation: detachTag
     description: 'Remove a tag from a file or folder.'
@@ -223,7 +231,7 @@ tools:
     input: '#/paths/~1v1~1changes~1latest/get'
   - name: search_nodes
     operation: searchNodes
-    description: 'Search files and folders by name, optionally by kind, tag or inside a folder.'
+    description: 'Search files and folders by name (q), type, kind, tag or inside a folder (within). q matches names only; to find files by type use type, which matches the MIME type (type: application/pdf for all PDFs, type: image/ for all images), not kind. q may be left out when type, tag or within is given, so within alone lists a whole subtree.'
     input: '#/paths/~1v1~1search/get'
 
   - name: create_database

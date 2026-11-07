@@ -975,6 +975,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/nodes/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move many nodes
+         * @description Moves 1 to 100 nodes, each to its own new parent (decision 0003-7). Each item is one
+         *     `moveNode`: it needs `manage` on the node and `edit` on the new parent, takes `name` and
+         *     `on_conflict` as `moveNode` does, and writes its own `node.moved`.
+         *
+         *     Not atomic. The items run in order, each on its own, and one item's error does not stop
+         *     the others. The answer is `200` with one result per item, in the order of the request:
+         *     `status` is the status that `moveNode` would answer for that item (`200`, `403`, `404`,
+         *     `409`, `422`), with `node` and `change` on success or `error` on failure. The
+         *     `Idempotency-Key` covers the whole call. A request with 0 or more than 100 items is
+         *     `422 validation_failed`.
+         */
+        post: operations["moveNodes"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/nodes/by-path/{path}": {
         parameters: {
             query?: never;
@@ -1765,7 +1794,20 @@ export interface paths {
          */
         get: operations["listNodesByTag"];
         put?: never;
-        post?: never;
+        /**
+         * Attach a tag to many nodes
+         * @description Attaches the tag to 1 to 100 nodes (decision 0003-7). Each item is one `attachTag`: it
+         *     needs `edit` on the node, attaching twice is a no-op, and each attach writes its own
+         *     `tag.attached`.
+         *
+         *     Not atomic. The items run in order, each on its own, and one item's error does not stop
+         *     the others. The answer is `200` with one result per node, in the order of the request:
+         *     `status` is the status that `attachTag` would answer for that node (`200`, `403`,
+         *     `404`), with `change` on success or `error` on failure. Who cannot see the tag gets
+         *     `404` in every item. The `Idempotency-Key` covers the whole call. A request with 0 or
+         *     more than 100 nodes is `422 validation_failed`.
+         */
+        post: operations["attachTagToNodes"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2125,6 +2167,10 @@ export interface paths {
          *     marker in `resync`: the client lists that subtree again (`access: gained`) or drops it
          *     (`access: lost`), at the position `seq` of the marker. Clients order and dedupe entries
          *     by `seq`, and per node by `revision`.
+         *
+         *     IDs in `data` may name nodes that the caller cannot see, also nodes that are gone (for
+         *     example `old_parent_id` of a move); resolve them with `getNode`, which answers `404`.
+         *     Names, paths and every other attribute of such a node never appear (decision 0003-8).
          */
         get: operations["listChanges"];
         put?: never;
@@ -2163,8 +2209,12 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Search by name
-         * @description Live nodes whose name contains `q` (case-insensitive) that the caller can see. Best match first.
+         * Search by name and type
+         * @description Live nodes that the caller can see and that match every filter given. `q` matches names
+         *     that contain it (case-insensitive), best match first. `type` matches `Node.type`
+         *     (decision 0003-7). `q` may be left out when `type`, `tag` or `within` is given; the
+         *     results are then ordered by name. With none of the four the answer is
+         *     `422 validation_failed`.
          */
         get: operations["searchNodes"];
         put?: never;
@@ -3723,6 +3773,41 @@ export interface components {
             /** @description A new name at the same time. Default is the current name. */
             name?: components["schemas"]["NodeName"];
             on_conflict?: components["schemas"]["OnConflict"];
+        };
+        MoveNodesRequest: {
+            items: components["schemas"]["MoveNodesItem"][];
+        };
+        /** @description One move of `moveNodes`; the fields of `MoveRequest` and the node. */
+        MoveNodesItem: {
+            node_id: components["schemas"]["Uuid"];
+            parent_id: components["schemas"]["Uuid"];
+            /** @description A new name at the same time. Default is the current name. */
+            name?: components["schemas"]["NodeName"];
+            on_conflict?: components["schemas"]["OnConflict"];
+        };
+        AttachTagToNodesRequest: {
+            node_ids: components["schemas"]["Uuid"][];
+        };
+        /** @description The answer of a batch call (`moveNodes`, `attachTagToNodes`). */
+        BatchResult: {
+            items: components["schemas"]["BatchItemResult"][];
+        };
+        /**
+         * @description The result of one item of a batch call. `status` is the HTTP status that the single
+         *     operation would answer for this item. A success (`200`) carries the body of the single
+         *     operation (`node` and `change` for `moveNodes`, `change` for `attachTagToNodes`); a
+         *     failure carries `error`, the value of the `error` key of the standard error body.
+         */
+        BatchItemResult: {
+            /** @example 404 */
+            status: number;
+            node?: components["schemas"]["Node"];
+            change?: components["schemas"]["Change"];
+            error?: {
+                code: components["schemas"]["ErrorCode"];
+                message: string;
+                hint?: string;
+            };
         };
         CopyRequest: {
             parent_id: components["schemas"]["Uuid"];
@@ -6336,6 +6421,44 @@ export interface operations {
             422: components["responses"]["ValidationFailed"];
         };
     };
+    moveNodes: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MoveNodesRequest"];
+            };
+        };
+        responses: {
+            /** @description One result per item, in the order of the request. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResult"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
     getNodeByPath: {
         parameters: {
             query?: never;
@@ -7540,6 +7663,46 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    attachTagToNodes: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
+                 *     agent and share-link tokens, which are bound to one tenant; if sent, it must match.
+                 */
+                "Ruum-Tenant"?: components["parameters"]["TenantHeader"];
+                /**
+                 * @description A client-chosen unique key (for example a UUID) that makes the write safe to retry. The
+                 *     server keeps the first response for 24 hours per tenant, actor and key.
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                tag_id: components["parameters"]["TagId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachTagToNodesRequest"];
+            };
+        };
+        responses: {
+            /** @description One result per node, in the order of the request. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResult"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["PermissionDenied"];
+            422: components["responses"]["ValidationFailed"];
+        };
+    };
     listNodeTags: {
         parameters: {
             query?: never;
@@ -8086,9 +8249,18 @@ export interface operations {
     };
     searchNodes: {
         parameters: {
-            query: {
-                q: string;
+            query?: {
+                /** @description Part of a node name. Required unless `type`, `tag` or `within` is given. */
+                q?: string;
                 kind?: components["schemas"]["NodeKind"];
+                /**
+                 * @description Matches `Node.type`, ignoring case: a whole type (`application/pdf`), or a prefix
+                 *     that ends in `/` (`image/` matches `image/png` and `image/jpeg`). `Node.type` is the
+                 *     MIME type of a file, and the type of a folder or a typed node (for example
+                 *     `database`), so the filter also finds typed nodes. To find "all PDFs", use
+                 *     `type=application/pdf`, not `q`: a name can lie.
+                 */
+                type?: string;
                 tag?: components["schemas"]["Uuid"];
                 /** @description Only nodes inside this folder (at any depth). */
                 within?: components["schemas"]["Uuid"];
