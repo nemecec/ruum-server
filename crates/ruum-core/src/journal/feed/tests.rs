@@ -1192,7 +1192,7 @@ async fn a_move_out_of_a_gone_folder_shows_its_id_and_never_its_name() {
         EventType::NodeCreated,
         json!({ "parent_id": w.secret, "name": "Hidden plans", "kind": "folder" }),
     );
-    w.created(f, x);
+    let made = w.created(f, x);
     fake.node(f, Some(w.open), true);
     let mv = w.add(
         Some(f),
@@ -1213,8 +1213,10 @@ async fn a_move_out_of_a_gone_folder_shows_its_id_and_never_its_name() {
         json!({ "name": "Hidden plans", "subtree_count": 1, "reason": "by_request" }),
     );
     let page = w.feed(&fake, ChangesQuery::default()).await;
-    assert_eq!(seqs(&page), vec![mv]);
-    assert_eq!(page.items[0].data["old_parent_id"], json!(x));
+    // The file is seen now: its creation (with `parent_id` X) and the move reach the subject.
+    assert_eq!(seqs(&page), vec![made, mv]);
+    assert_eq!(page.items[0].data["parent_id"], json!(x));
+    assert_eq!(page.items[1].data["old_parent_id"], json!(x));
     let text = serde_json::to_string(&page).unwrap();
     assert!(!text.contains("Hidden plans"), "{text}");
 }
