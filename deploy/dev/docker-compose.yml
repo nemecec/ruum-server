@@ -128,6 +128,9 @@ services:
     user: "0"
     volumes:
       - ./.state/zitadel:/bootstrap
+    networks:
+      - default
+      - sso # the mock OIDC provider (profile sso-mock)
     ports:
       - "127.0.0.1:8180:8080"
     depends_on:
@@ -259,6 +262,33 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # A mock OIDC provider for automated sign-in tests through an external identity provider
+  # (design 13: "a mock OIDC provider for SSO tests"). Not started by default:
+  # scripts/dev.sh up --sso-mock. scripts/zitadel_idps.sh adds it to Zitadel as "Mock SSO".
+  # The issuer is http://oidc-mock.localhost:8190/ruum. Browsers send *.localhost to the loopback
+  # address (the host port); in the network `sso` the alias reaches the container. The issuer
+  # comes from the Host header, so both sides see the same issuer.
+  oidc-mock:
+    profiles: ["sso-mock"]
+    image: ghcr.io/navikt/mock-oauth2-server:6.1.2
+    environment:
+      SERVER_PORT: "8190"
+      JSON_CONFIG: '{"interactiveLogin":true,"httpServer":"NettyWrapper"}'
+    ports:
+      - "127.0.0.1:8190:8190"
+    networks:
+      sso:
+        aliases:
+          - oidc-mock.localhost
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8190/isalive"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+
   # Step 4 (repos and builds). Not started by default: scripts/dev.sh up --step4
   forgejo:
     profiles: ["step4"]
@@ -291,6 +321,13 @@ services:
 
 networks:
   data:
+  # Zitadel and the mock OIDC provider. Zitadel's HTTP client refuses private addresses (its
+  # SSRF deny list: 10/8, 172.16/12, 192.168/16, loopback), so this network uses TEST-NET-3
+  # (RFC 5737), a range that is never routed on the internet. The deny list stays as it is.
+  sso:
+    ipam:
+      config:
+        - subnet: 203.0.113.0/24
 
 volumes:
   postgres:

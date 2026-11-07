@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The Ruum laptop stack (docs/DESIGN.md section 12.2, docs/DEVSTACK.md).
 #
-#   scripts/dev.sh up [--step4]   create .env on the first run, start, wait until healthy, init
+#   scripts/dev.sh up [--step4] [--sso-mock]
+#                                 create .env on the first run, start, wait until healthy, init
+#                                 (--sso-mock: also the mock OIDC provider for sign-in tests)
 #   scripts/dev.sh down           stop the stack (keeps the data)
 #   scripts/dev.sh clean          stop the stack and delete all its data (the local KEK file too)
 #   scripts/dev.sh logs [svc]     follow the logs
@@ -10,6 +12,7 @@
 #   scripts/dev.sh seed           create missing databases and roles; later also tenants, users and files
 #   scripts/dev.sh env            print the settings for the Ruum server (eval "$(scripts/dev.sh env)")
 #   scripts/dev.sh ca             copy Caddy's local root certificate to deploy/dev/.state/caddy-root.crt
+#   scripts/dev.sh idps [check]   configure the sign-in providers of Zitadel again; check: test each flow
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -215,13 +218,25 @@ init_zitadel() {
   } >"$out"
 }
 
+# Google, Microsoft and the mock OIDC provider in Zitadel (docs/DEVSTACK.md "Sign-in providers").
+# Each is added only when its keys are present (or the mock runs); without them nothing changes.
+init_idps() {
+  RUUM_DEV_ROOT="$ROOT" ZITADEL_URL="$ZITADEL_URL" "$ROOT/scripts/zitadel_idps.sh" "$@"
+}
+
 cmd_up() {
   need docker
   ensure_env
   ensure_kek
   mkdir -p "$STATE/zitadel"
-  local profile=()
-  [[ "${1:-}" == "--step4" ]] && profile=(--profile step4)
+  local profile=() arg
+  for arg in "$@"; do
+    case "$arg" in
+      --step4) profile+=(--profile step4) ;;
+      --sso-mock) profile+=(--profile sso-mock) ;;
+      *) die "unknown option $arg (use --step4 or --sso-mock)" ;;
+    esac
+  done
   log "building and starting postgres and postgres-data"
   compose up -d --build postgres postgres-data
   wait_healthy 120
@@ -232,6 +247,7 @@ cmd_up() {
   wait_healthy 300
   init_garage
   init_zitadel
+  init_idps
   init_openbao
   log "all services are healthy"
   compose ${profile[@]+"${profile[@]}"} ps --format 'table {{.Service}}\t{{.Status}}'
@@ -299,15 +315,15 @@ main() {
   shift || true
   case "$cmd" in
     up) cmd_up "$@" ;;
-    down) ensure_env; compose --profile step4 down ;;
+    down) ensure_env; compose --profile step4 --profile sso-mock down ;;
     clean)
       ensure_env
-      compose --profile step4 down -v --remove-orphans
+      compose --profile step4 --profile sso-mock down -v --remove-orphans
       rm -rf "$STATE"
       log "volumes and deploy/dev/.state (with the local KEK file) deleted (deploy/dev/.env is kept)"
       ;;
     logs) compose logs -f --tail=200 "$@" ;;
-    status) compose --profile step4 ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
+    status) compose --profile step4 --profile sso-mock ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
     psql)
       load_env
       local tty=()
@@ -317,7 +333,8 @@ main() {
     seed) cmd_seed ;;
     env) cmd_env ;;
     ca) cmd_ca ;;
-    *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$cmd" ]] || exit 1 ;;
+    idps) init_idps "$@" ;;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$cmd" ]] || exit 1 ;;
   esac
 }
 
