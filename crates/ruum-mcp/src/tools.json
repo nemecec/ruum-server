@@ -1,7 +1,7 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "bbc4d6fec74995066639c6c8a9d554a7e12e13ac5001518923ce70a1c1aef612",
- "tools_sha256": "d476802ee37806096ca6c9384a4116ab7d59ce141f9e779ae5d61902db718373",
+ "openapi_sha256": "dc55eec7b199ff0ad1483f77e43c775aadc39c3fc6862ab226ee6fa79edbbae9",
+ "tools_sha256": "42eb75bd98096312a2c5a7545bc45021a871cbed74393fad6f4aee34b3818d57",
  "tools": [
   {
    "name": "get_me",
@@ -906,7 +906,7 @@
    "name": "write_file",
    "operation": "putContent",
    "planned": false,
-   "description": "Replace the content of a file with new content. Makes a new version; older versions stay in the history.",
+   "description": "Replace the content of a file with new content. Older versions stay in the history. Your saves within 10 minutes join one version (the last content wins); send coalesce: false to always make a new version, for example before a big rewrite.",
    "notes": "Input `body` is replaced by `content` (string) and `encoding` (`utf8` or `base64`). For large files use the REST upload operations or the ruum CLI.",
    "method": "PUT",
    "path": "/v1/nodes/{node_id}/content",
@@ -925,6 +925,11 @@
      "name": "Content-Type",
      "in": "header",
      "prop": "content_type"
+    },
+    {
+     "name": "coalesce",
+     "in": "query",
+     "prop": "coalesce"
     }
    ],
    "body": "content",
@@ -942,6 +947,11 @@
      },
      "content_type": {
       "type": "string"
+     },
+     "coalesce": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether the save may join the head version (C-8, decision 0003-6). With the default `true`, a save by the same actor within the coalescing window of the version policy (10 minutes) replaces the content of the head version, as for automatic saves. With `false` the save always makes a new version, so the content before it stays in the history; send it for an explicit \"upload a new version\"."
      },
      "content": {
       "type": "string",

@@ -114,7 +114,7 @@ tools:
     notes: 'Returns text for text files and base64 for binary files. Large files: use get_content_url instead.'
   - name: write_file
     operation: putContent
-    description: 'Replace the content of a file with new content. Makes a new version; older versions stay in the history.'
+    description: 'Replace the content of a file with new content. Older versions stay in the history. Your saves within 10 minutes join one version (the last content wins); send coalesce: false to always make a new version, for example before a big rewrite.'
     input: '#/paths/~1v1~1nodes~1{node_id}~1content/put'
     notes: 'Input `body` is replaced by `content` (string) and `encoding` (`utf8` or `base64`). For large files use the REST upload operations or the ruum CLI.'
   - name: get_content_url
@@ -454,6 +454,9 @@ not_exposed:
   - operation: resolveShareLink
     reason: not_for_agents
     note: 'plumbing: opens a share link for an anonymous visitor'
+  - operation: previewInvitation
+    reason: not_for_agents
+    note: 'plumbing: the accept page of an invitation shows it before sign-in'
   - operation: confirmColumnClasses
     reason: user_only
     note: 'a person confirms data classes; agents suggest them'

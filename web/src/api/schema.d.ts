@@ -511,6 +511,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/invitations/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * What an invitation is for, before it is accepted
+         * @description No sign-in needed (C-9, decision 0003-6). The accept page shows it before the person
+         *     signs in or joins: the space, who invited them, the role and the end date. The token is
+         *     in the body, not the URL, so it does not reach logs, as with `resolveShareLink`. Limited
+         *     per client IP (30 per minute; `429`). Nothing changes: the invitation stays pending.
+         *
+         *     `state` says whether the token still works. A pending or expired invitation also shows
+         *     the space, the inviter, the roles, the end date and the email it was sent to, masked
+         *     (for example `k***@e***.ee`), so the person can sign in with the right address. A
+         *     revoked or accepted invitation shows only its `state`. An unknown token is `404`, and
+         *     so is a token whose invitation ended more than 7 days ago (decision 0003-3: the server
+         *     keeps ended tokens for a week, then deletes them).
+         */
+        post: operations["previewInvitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tenants/{tenant_id}/limits": {
         parameters: {
             query?: never;
@@ -804,7 +834,7 @@ export interface paths {
          *     | `node.sharing_updated` | set the old `editors_can_share` |
          *
          *     An entry whose node another actor changed later is skipped with reason
-         *     `changed_later`, and an entry whose inverse the caller may not do is skipped with reason
+         *     `changed_later` (`changed_by` names the first such change), and an entry whose inverse the caller may not do is skipped with reason
          *     `permission_denied`.
          */
         post: operations["undoAgent"];
@@ -1509,6 +1539,7 @@ export interface paths {
          * @description For small files (at most 32 MiB): the body is the whole new content, and the server chunks
          *     it. Needs `edit`. Use `If-Match` with the version ID (`"<version_id>"`) to avoid lost
          *     updates. Larger files use `POST /v1/uploads`. Writes `version.created`.
+         *     `coalesce=false` always makes a new version (see the parameter).
          *
          *     A typed node (step 2: a database) fails with `409 conflict`, also for an `edit` share
          *     link: the manifest of a typed node changes only through the type's own operations
@@ -3433,6 +3464,30 @@ export interface components {
             items: components["schemas"]["Invitation"][];
             next_cursor: components["schemas"]["NextCursor"];
         };
+        PreviewInvitationRequest: {
+            /** @description The secret token from the invitation email (the link's `#token=`). */
+            token: string;
+        };
+        /**
+         * @description `pending`: the token works. `accepted`: someone accepted it. `expired`: it was not accepted before `expires_at`. `revoked`: an admin revoked it.
+         * @enum {string}
+         */
+        InvitationState: "pending" | "accepted" | "expired" | "revoked";
+        /** @description What an invitation is for (`previewInvitation`). Every property but `state` is present only while the invitation is `pending` or `expired`. */
+        InvitationPreview: {
+            state: components["schemas"]["InvitationState"];
+            /** @description The name of the space the invitation is for. */
+            tenant_name?: string;
+            tenant_kind?: components["schemas"]["TenantKind"];
+            /** @description The name of the person who invited, as the space knows it (C-7). Absent when no name is known. */
+            inviter_display_name?: string;
+            role?: components["schemas"]["MemberRole"];
+            /** @description The content role the person gets as a member (decision 0003-1); `null` for other roles. */
+            content_role?: components["schemas"]["ContentRole"] | null;
+            expires_at?: components["schemas"]["Timestamp"];
+            /** @description The email the invitation was sent to, masked: the first character of the name and of the domain, and the last part of the domain (for example `k***@e***.ee`). Never the email in clear. */
+            email_masked?: string;
+        };
         /** @description The limits of the plan (design section 4.3). `null` means no limit. */
         Limits: {
             /** Format: int64 */
@@ -3702,6 +3757,8 @@ export interface components {
              * @enum {string|null}
              */
             reason: "changed_later" | "irreversible" | "permission_denied" | null;
+            /** @description Who changed the node later (C-11, decision 0003-6): the first later change by another actor that blocked the undo, with names (C-7). Only for reason `changed_later`; absent when the inverse conflicted with the current state and no other actor changed the node. */
+            changed_by?: components["schemas"]["ActorPair"];
         };
         UndoReport: {
             dry_run: boolean;
@@ -3886,6 +3943,11 @@ export interface components {
             node_id: components["schemas"]["Uuid"];
             /** @description Fail with `version_mismatch` at completion if the head is no longer this version. */
             base_version?: components["schemas"]["Uuid"] | null;
+            /**
+             * @description Whether the new version may join the head version (C-8, decision 0003-6). With the default `true`, an upload by the same actor within the coalescing window of the version policy (10 minutes) replaces the content of the head version. With `false` the upload always makes a new version, so the content before it stays in the history; the web UI sends it for "Upload new version".
+             * @default true
+             */
+            coalesce: boolean;
         };
         /** @description A new file in a folder. */
         UploadTargetNewFile: {
@@ -4195,6 +4257,8 @@ export interface components {
         };
         SharedItem: {
             node: components["schemas"]["Node"];
+            /** @description The name of the space (tenant) that holds the item, `node.tenant_id` (C-10, decision 0003-6), also when the caller is only a guest there and the space is not in `listTenants`. Only the spaces of the caller's own shared items are named. */
+            tenant_name: string;
             role: components["schemas"]["Role"];
             shared_by: components["schemas"]["ActorPair"];
             shared_at: components["schemas"]["Timestamp"];
@@ -5784,6 +5848,32 @@ export interface operations {
             409: components["responses"]["Conflict"];
         };
     };
+    previewInvitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PreviewInvitationRequest"];
+            };
+        };
+        responses: {
+            /** @description The state of the invitation, and what it is for. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvitationPreview"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+        };
+    };
     getLimits: {
         parameters: {
             query?: never;
@@ -7229,7 +7319,10 @@ export interface operations {
     };
     putContent: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Whether the save may join the head version (C-8, decision 0003-6). With the default `true`, a save by the same actor within the coalescing window of the version policy (10 minutes) replaces the content of the head version, as for automatic saves. With `false` the save always makes a new version, so the content before it stays in the history; send it for an explicit "upload a new version". */
+                coalesce?: boolean;
+            };
             header?: {
                 /**
                  * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
