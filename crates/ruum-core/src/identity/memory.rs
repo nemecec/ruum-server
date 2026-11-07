@@ -62,6 +62,7 @@ impl Default for MemoryDeps {
 
 pub(crate) struct UserRow {
     pub user: User,
+    pub preferences: UserPreferences,
 }
 
 pub(crate) struct SessionRow {
@@ -470,7 +471,13 @@ impl IdentityStore for MemoryIdentityStore {
                         avatar_url: None,
                         created_at: now,
                     };
-                    st.users.insert(uid, UserRow { user: user.clone() });
+                    st.users.insert(
+                        uid,
+                        UserRow {
+                            user: user.clone(),
+                            preferences: UserPreferences::default(),
+                        },
+                    );
                     (user, tuples, Some(tenant))
                 }
             };
@@ -512,6 +519,22 @@ impl IdentityStore for MemoryIdentityStore {
             .get(&id)
             .map(|r| r.user.clone())
             .ok_or_else(not_found_user)
+    }
+
+    async fn preferences_of(&self, user: UserId) -> Result<UserPreferences> {
+        self.area
+            .lock()
+            .users
+            .get(&user)
+            .map(|r| r.preferences.clone())
+            .ok_or_else(not_found_user)
+    }
+
+    async fn set_locale(&self, user: UserId, locale: Option<String>) -> Result<UserPreferences> {
+        let mut st = self.area.lock();
+        let row = st.users.get_mut(&user).ok_or_else(not_found_user)?;
+        row.preferences.locale = locale;
+        Ok(row.preferences.clone())
     }
 
     async fn find_verified_email(&self, email: &str) -> Result<Option<User>> {

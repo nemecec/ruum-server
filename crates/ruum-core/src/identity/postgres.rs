@@ -472,6 +472,33 @@ impl IdentityStore for PgIdentityStore {
         user_from(&r)
     }
 
+    async fn preferences_of(&self, user: UserId) -> Result<UserPreferences> {
+        let mut tx = self.area.system().await?;
+        let locale: Option<Option<String>> =
+            sqlx::query_scalar("select locale from users where id = $1 and deleted_at is null")
+                .bind(user)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        let locale = locale.ok_or_else(|| Error::not_found("user"))?;
+        Ok(UserPreferences { locale })
+    }
+
+    async fn set_locale(&self, user: UserId, locale: Option<String>) -> Result<UserPreferences> {
+        let mut tx = self.area.system().await?;
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "update users set locale = $2, updated_at = now() \
+             where id = $1 and deleted_at is null returning locale",
+        )
+        .bind(user)
+        .bind(&locale)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let locale = stored.ok_or_else(|| Error::not_found("user"))?;
+        Ok(UserPreferences { locale })
+    }
+
     async fn find_verified_email(&self, email: &str) -> Result<Option<User>> {
         let mut tx = self.area.system().await?;
         let r = sqlx::query(crate::sql!(

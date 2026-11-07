@@ -548,12 +548,107 @@ async fn the_token_issuer_signs_what_it_verifies(a: Area) {
     assert_eq!(c.typ, TokenType::User);
 }
 
+async fn preferences_belong_to_one_user(a: Area) {
+    let mari = user(&a, "mari").await;
+    let jaan = user(&a, "jaan").await;
+    assert_eq!(
+        a.identity.preferences_of(mari.id).await.unwrap(),
+        UserPreferences::default()
+    );
+    let p = a
+        .identity
+        .set_locale(mari.id, Some("et".into()))
+        .await
+        .unwrap();
+    assert_eq!(p.locale.as_deref(), Some("et"));
+    assert_eq!(
+        a.identity
+            .preferences_of(mari.id)
+            .await
+            .unwrap()
+            .locale
+            .as_deref(),
+        Some("et")
+    );
+    // Another user keeps their own preferences.
+    assert_eq!(
+        a.identity.preferences_of(jaan.id).await.unwrap().locale,
+        None
+    );
+    // A new sign-in keeps the preference.
+    let again = a
+        .identity
+        .upsert_from_login(&login(&mari.email))
+        .await
+        .unwrap();
+    assert_eq!(again.id, mari.id);
+    assert_eq!(
+        a.identity
+            .preferences_of(mari.id)
+            .await
+            .unwrap()
+            .locale
+            .as_deref(),
+        Some("et")
+    );
+    // `None` clears it.
+    let cleared = a.identity.set_locale(mari.id, None).await.unwrap();
+    assert_eq!(cleared.locale, None);
+    // An unknown user is not found.
+    assert_eq!(
+        code(a.identity.preferences_of(UserId::new()).await),
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        code(
+            a.identity
+                .set_locale(UserId::new(), Some("et".into()))
+                .await
+        ),
+        ErrorCode::NotFound
+    );
+}
+
+#[test]
+fn locale_tags() {
+    for ok in [
+        "en",
+        "et",
+        "fil",
+        "en-GB",
+        "es-419",
+        "sr-Latn",
+        "sr-Latn-RS",
+        "en-XA",
+    ] {
+        assert!(valid_locale(ok), "{ok}");
+        assert!(check_locale(Some(ok)).is_ok());
+    }
+    for bad in [
+        "",
+        "e",
+        "EN",
+        "en_GB",
+        "en-gb",
+        "english",
+        "en-GB-x",
+        "et-",
+        "-et",
+        "en-Latn-gb",
+    ] {
+        assert!(!valid_locale(bad), "{bad}");
+        assert_eq!(code(check_locale(Some(bad))), ErrorCode::ValidationFailed);
+    }
+    assert!(check_locale(None).is_ok());
+}
+
 crate::conformance!(
     login_makes_a_user_with_a_personal_tenant,
     only_a_verified_email_links_identities,
     sessions_start_find_and_end,
     app_passwords_are_the_user_in_one_tenant,
     the_token_issuer_signs_what_it_verifies,
+    preferences_belong_to_one_user,
 );
 
 mod idempotency_tests {

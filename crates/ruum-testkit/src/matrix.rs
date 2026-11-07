@@ -9,6 +9,7 @@
 pub const USER_ONLY_OPERATIONS: &[&str] = &[
     "listMyIdentities",
     "listMySessions",
+    "updateMyPreferences",
     "endSession",
     "listAppPasswords",
     "createAppPassword",

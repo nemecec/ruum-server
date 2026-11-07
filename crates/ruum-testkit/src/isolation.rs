@@ -231,6 +231,21 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
                 vec![Probe::new("B's owner", o, std_req(op, b), NoLeak)],
             )
         }
+        "updateMyPreferences" => plain(
+            "the caller's own preferences: B's owner sets its language, also with A's tenant \
+             header (not a tenant operation); what A's users read does not change",
+            vec![
+                Probe::new("B's owner", o, std_req(op, b), NoLeak)
+                    .unchanged(Who::Member, std_req("getMe", a)),
+                Probe::new(
+                    "B's owner names tenant A",
+                    o,
+                    std_req(op, b).tenant(a.id),
+                    NoLeak,
+                )
+                .unchanged(Who::Owner, std_req("getMe", a)),
+            ],
+        ),
         "endSession" => addressed_case(NotFound, Some(("listMySessions", Who::Member))),
         "listAppPasswords" => plain(
             "the caller's app passwords in its own tenant",

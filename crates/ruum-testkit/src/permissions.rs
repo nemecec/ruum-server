@@ -356,6 +356,10 @@ fn operation_rule(op: &str) -> Option<Rule> {
             Agents::Allow,
         ),
         "getMe" => signed_in("every signed-in principal, agents too", Agents::Allow),
+        "updateMyPreferences" => signed_in(
+            "users only; the caller's own preferences (agents and share links: 403 user_required)",
+            Agents::Forbidden,
+        ),
         "listMyIdentities" | "listMySessions" => signed_in(
             "users only (agents and share links: 403 user_required)",
             Agents::Forbidden,

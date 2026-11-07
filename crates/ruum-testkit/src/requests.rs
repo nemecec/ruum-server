@@ -54,6 +54,8 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         "getMe" => RequestSpec::get("/v1/me"),
         "listMyIdentities" => RequestSpec::get("/v1/me/identities"),
         "listMySessions" => RequestSpec::get("/v1/me/sessions"),
+        "updateMyPreferences" => RequestSpec::new(Method::PATCH, "/v1/me/preferences")
+            .json(json!({ "locale": "et" })),
         "endSession" => RequestSpec::new(Method::DELETE, format!("/v1/me/sessions/{}", t.session)),
         "listAppPasswords" => RequestSpec::get("/v1/me/app-passwords").tenant(tid),
         "createAppPassword" => RequestSpec::post("/v1/me/app-passwords")

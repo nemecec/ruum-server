@@ -13,7 +13,7 @@ use axum::extract::{Path, State};
 use axum::http::header::{LOCATION, SET_COOKIE, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use ruum_core::audit::events;
 use ruum_core::identity::{
     CSRF_COOKIE, LOGIN_COOKIE, LoginStart, SESSION_COOKIE, SESSION_DAYS, secret,
@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/auth/callback", get(login_callback))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(get_me))
+        .route("/v1/me/preferences", patch(update_my_preferences))
         .route("/v1/me/identities", get(list_my_identities))
         .route("/v1/me/sessions", get(list_my_sessions))
         .route("/v1/me/sessions/{session_id}", delete(end_session))
@@ -352,13 +353,53 @@ pub async fn get_me(
         ),
         _ => None,
     };
-    Ok(Json(json!({
+    let mut me = json!({
         "actor": who.actor.actor,
         "on_behalf_of": who.actor.on_behalf_of,
         "user": user,
         "agent": agent,
         "bound_tenant_id": who.bound_tenant,
-    })))
+    });
+    // The preferences are the user's own: an agent does not get them.
+    if let Ok(uid) = require_user(&who) {
+        me["preferences"] = json!(state.services.identity.preferences_of(uid).await?);
+    }
+    Ok(Json(me))
+}
+
+/// A field that may be absent (`None`), `null` (`Some(None)`) or a value.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePreferences {
+    #[serde(default, deserialize_with = "present")]
+    locale: Option<Option<String>>,
+}
+
+/// Change the preferences of the signed-in user. `PATCH /v1/me/preferences` (operationId
+/// `updateMyPreferences`). Users only.
+pub async fn update_my_preferences(
+    State(state): State<AppState>,
+    Principal(who): Principal,
+    JsonBody(body): JsonBody<UpdatePreferences>,
+) -> ApiResult<Json<Value>> {
+    let user = require_user(&who)?;
+    let identity = &state.services.identity;
+    let prefs = match body.locale {
+        Some(locale) => {
+            ruum_core::identity::check_locale(locale.as_deref())?;
+            identity.set_locale(user, locale).await?
+        }
+        None => identity.preferences_of(user).await?,
+    };
+    Ok(Json(json!(prefs)))
 }
 
 /// Linked identities of the signed-in user. `GET /v1/me/identities` (operationId `listMyIdentities`).
@@ -674,6 +715,85 @@ pub(crate) mod tests {
         assert_eq!(after.status, StatusCode::UNAUTHORIZED);
     }
 
+    /// The language preference (design 12.4): `getMe` returns it, `updateMyPreferences` sets
+    /// it, for the caller only.
+    #[tokio::test]
+    async fn preferences_are_the_users_own() {
+        let (app, oidc, _) = app();
+        let (session, csrf) = sign_in(&app, &oidc, "mari@example.test").await;
+        let cookie = format!("ruum_session={session}; ruum_csrf={csrf}");
+        let mine: &[(&str, &str)] = &[("cookie", &cookie), ("ruum-csrf", &csrf)];
+        let me = call(&app, Method::GET, "/v1/me", &[("cookie", &cookie)], None).await;
+        assert_eq!(me.body["preferences"], json!({ "locale": null }));
+        // A write without the CSRF header is refused.
+        let no_csrf = call(
+            &app,
+            Method::PATCH,
+            "/v1/me/preferences",
+            &[("cookie", &cookie)],
+            Some(json!({ "locale": "et" })),
+        )
+        .await;
+        assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+        let set = call(
+            &app,
+            Method::PATCH,
+            "/v1/me/preferences",
+            mine,
+            Some(json!({ "locale": "et" })),
+        )
+        .await;
+        assert_eq!(set.status, StatusCode::OK, "{}", set.body);
+        assert_eq!(set.body, json!({ "locale": "et" }));
+        let me = call(&app, Method::GET, "/v1/me", &[("cookie", &cookie)], None).await;
+        assert_eq!(me.body["preferences"]["locale"], "et");
+        // Left out, it stays.
+        let keep = call(
+            &app,
+            Method::PATCH,
+            "/v1/me/preferences",
+            mine,
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(keep.body["locale"], "et");
+        // A tag that is not BCP 47, or an unknown field, is refused and changes nothing.
+        for bad in [
+            json!({ "locale": "Estonian" }),
+            json!({ "locale": "et_EE" }),
+        ] {
+            let r = call(&app, Method::PATCH, "/v1/me/preferences", mine, Some(bad)).await;
+            assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.body);
+            assert_eq!(r.body["error"]["code"], "validation_failed");
+        }
+        let unknown = call(
+            &app,
+            Method::PATCH,
+            "/v1/me/preferences",
+            mine,
+            Some(json!({ "theme": "dark" })),
+        )
+        .await;
+        assert!(unknown.status.is_client_error(), "{}", unknown.status);
+        // Another user does not see or change Mari's preference.
+        let (s2, c2) = sign_in(&app, &oidc, "jaan@example.test").await;
+        let cookie2 = format!("ruum_session={s2}; ruum_csrf={c2}");
+        let other = call(&app, Method::GET, "/v1/me", &[("cookie", &cookie2)], None).await;
+        assert_eq!(other.body["preferences"]["locale"], Value::Null);
+        let me = call(&app, Method::GET, "/v1/me", &[("cookie", &cookie)], None).await;
+        assert_eq!(me.body["preferences"]["locale"], "et");
+        // `null` clears it.
+        let clear = call(
+            &app,
+            Method::PATCH,
+            "/v1/me/preferences",
+            mine,
+            Some(json!({ "locale": null })),
+        )
+        .await;
+        assert_eq!(clear.body, json!({ "locale": null }));
+    }
+
     /// The CSRF value is bound to the session (decision 0002-3): a header and cookie pair that
     /// match each other but were not issued for this session fail, as after cookie tossing from
     /// a sibling host.
@@ -971,6 +1091,18 @@ pub(crate) mod tests {
         .await;
         assert_eq!(me.body["actor"]["kind"], "agent");
         assert_eq!(me.body["bound_tenant_id"], tid.as_str());
+        // The user's preferences are not the agent's to read or set.
+        assert!(me.body.get("preferences").is_none(), "{}", me.body);
+        let prefs = call(
+            &app,
+            Method::PATCH,
+            "/v1/me/preferences",
+            &[("authorization", &bearer)],
+            Some(json!({ "locale": "et" })),
+        )
+        .await;
+        assert_eq!(prefs.status, StatusCode::FORBIDDEN);
+        assert_eq!(prefs.body["error"]["code"], "user_required");
         let mint = call(
             &app,
             Method::POST,

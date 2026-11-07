@@ -85,6 +85,61 @@ pub struct User {
     pub created_at: OffsetDateTime,
 }
 
+/// The preferences of a user's account (design 12.4). They hold in every tenant, and only the
+/// user reads or changes them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserPreferences {
+    /// The language of the user interface as a BCP 47 tag, or `None` to follow the browser.
+    pub locale: Option<String>,
+}
+
+/// The longest language tag that a preference keeps.
+pub const LOCALE_MAX_LEN: usize = 35;
+
+/// Whether `tag` is a language tag the preferences accept: a language of 2 or 3 lower-case
+/// letters, an optional script (`Latn`) and an optional region (`GB` or `419`). The pattern of
+/// `LocaleTag` in the contract.
+pub fn valid_locale(tag: &str) -> bool {
+    if tag.len() > LOCALE_MAX_LEN {
+        return false;
+    }
+    let mut parts = tag.split('-');
+    let lang = parts.next().unwrap_or_default();
+    if !(2..=3).contains(&lang.len()) || !lang.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    let rest: Vec<&str> = parts.collect();
+    let script = |p: &str| {
+        p.len() == 4
+            && p.as_bytes()[0].is_ascii_uppercase()
+            && p.bytes().skip(1).all(|b| b.is_ascii_lowercase())
+    };
+    let region = |p: &str| {
+        (p.len() == 2 && p.bytes().all(|b| b.is_ascii_uppercase()))
+            || (p.len() == 3 && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    match rest.as_slice() {
+        [] => true,
+        [a] => script(a) || region(a),
+        [a, b] => script(a) && region(b),
+        _ => false,
+    }
+}
+
+/// Checks a new language preference. A tag that is not valid is `validation_failed`.
+pub fn check_locale(locale: Option<&str>) -> Result<()> {
+    match locale {
+        Some(tag) if !valid_locale(tag) => Err(Error::Api(
+            crate::error::ApiError::new(
+                ErrorCode::ValidationFailed,
+                "locale must be a BCP 47 language tag such as en, et or en-GB",
+            )
+            .with_hint("send a tag such as \"et\", or null to follow the browser"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// One linked identity of a user at an identity provider.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
@@ -298,6 +353,11 @@ pub trait IdentityStore: Send + Sync {
     /// The user with this verified email, if any.
     async fn find_verified_email(&self, email: &str) -> Result<Option<User>>;
     async fn identities_of(&self, user: UserId) -> Result<Vec<Identity>>;
+    /// The preferences of `user`. An unknown user is `not_found`.
+    async fn preferences_of(&self, user: UserId) -> Result<UserPreferences>;
+    /// Sets the language preference of `user` (`None` clears it) and returns the preferences.
+    /// The caller checks the tag with [`check_locale`]. An unknown user is `not_found`.
+    async fn set_locale(&self, user: UserId, locale: Option<String>) -> Result<UserPreferences>;
     /// Starts a web session. Returns it and the secret for the cookie (stored as SHA-256).
     async fn create_session(
         &self,

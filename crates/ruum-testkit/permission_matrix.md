@@ -24,6 +24,7 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `loginCallback` | any | any | any | any | any | any | any | any | any | any | any | any | any | any | any | any | public (security: []) |
 | `logout` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | ends the caller's web session; a bearer token (agents too) has none: 200, ends nothing (decided 0002-5) |
 | `getMe` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | every signed-in principal, agents too |
+| `updateMyPreferences` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only; the caller's own preferences (agents and share links: 403 user_required) |
 | `listMyIdentities` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only (agents and share links: 403 user_required) |
 | `listMySessions` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | users only (agents and share links: 403 user_required) |
 | `endSession` | 401 | 404 | 404 | ok | 404 | 404 | 404 | 404 | 404 | 404 | 404 | 404 | 403 | 403 | 403 | 403 | users only; only the user of the session (member), others do not see it |
