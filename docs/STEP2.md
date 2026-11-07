@@ -3,9 +3,10 @@
 Status: DRAFT, revised three times after panel reviews (design section 18.9): once for
 reviewer 1, again for every item of reviewer 2 and the UX contract needs C-15 to C-19, and a
 third time for the re-review of both reviewers (decisions 0004-24 to 0004-33). Spike S-1 passed
-and its result is applied (decision 0004-34): the role kinds are frozen. The decisions are in
-`docs/decisions/0004-step2-spec.md` (`provisional`). Nothing here is final until the panel
-accepts the revision.
+and its result is applied (decision 0004-34): the role kinds are frozen. The architect panel
+accepted card C-1 on 2026-11-07 with the changes of decision 0004-35, which are applied: the step
+2 contracts are frozen (a later change is additive, in a `contract:` commit).
+The decisions are in `docs/decisions/0004-step2-spec.md` (`provisional`).
 
 This page splits step 2 of `docs/DESIGN.md` (section 16) into work areas and task cards for the
 swarm (section 18.3). It follows the decisions of section 17.3:
@@ -243,7 +244,7 @@ layer (`sqlparser`) are a first line only; each rule below holds in the engine i
    waits up to 5 seconds for running statements, then cancels them and ends the remaining
    sessions; it takes the copy; it allows connections again and reopens the pools (the
    reconciler does the same after a crash in the middle). New requests wait up to 10 seconds,
-   then fail with the retryable `database_not_ready` (hint `retry`). Branches are for small
+   then fail with the retryable `503 database_not_ready` (hint `retry`). Branches are for small
    databases (decision 18, the plan's branch limit), so the pause is a few seconds; this cost is
    accepted. A masked copy then masks with the source's key and installs the key of the new
    database in `ruum_mask.key` before it is `ready`.
@@ -263,7 +264,11 @@ layer (`sqlparser`) are a first line only; each rule below holds in the engine i
    the migration runs in an `owner` session; then the catalog sync and the rebuild of the lens
    views run in one `ruum_dbhost` transaction. While the views are gone, the lens kinds fail
    closed (the database is `updating`; requests wait, then get the retryable
-   `database_not_ready`). A failed migration rebuilds the views from the unchanged catalog.
+   `503 database_not_ready`). A failed migration rebuilds the views from the unchanged catalog.
+   Before each statement of `up`, the engine sets its own `statement_timeout` and
+   `lock_timeout` again, and it enforces a wall-clock limit for the whole migration with a
+   protocol cancel request, then closes the connection (decision 0004-35), so a `SET LOCAL` or a
+   `set_config` in a `DO` block cannot lift the limits.
 
 ### SQLite
 
@@ -494,6 +499,10 @@ Done when:   the architect panel accepts (two reviewers); redocly, zed validate,
              kinds do not change); the description of queryDatabase and applyDatabaseMigration
              lists the transaction-control statements under "Statements that never run"
              (0004-34 d).
+Status:      ACCEPTED (2026-11-07, branch c/c1-acceptance): both reviewers accepted with
+             changes (c1-acceptance-review-1.md, c1-acceptance-review-2.md); the changes are
+             applied (decision 0004-35: transaction control and the rules of `up`, unqualified
+             table names, names next to principal IDs, `503 DatabaseNotReady`).
 After:       S-1 (for the freeze only; the review can start before)
 Out of scope: journal event schemas (C-2).
 ```
@@ -575,7 +584,14 @@ Done when:   the acceptance tests exist and are planned or pending until built; 
              (`dry_run: true`) on live and on a full branch (403 user_required, also with
              write_live; nothing ran, no approval made, no lock taken) and on a masked branch
              (200); a branch of a branch (409 conflict); restoreDatabase of a branch to a time
-             before it was ready (422).
+             before it was ready (422). From decision 0004-35: `public.t` (Postgres) and `main.t`
+             (SQLite) in queryDatabase and in `up` are 422 statement_not_allowed with hint
+             `unqualified_names`, for a person with manage, a viewer and an agent; an `up` with
+             `BEGIN` or `COMMIT` is 422 with hint `remove_transaction_control` and writes no
+             restore point, migration row or journal entry; `SET LOCAL statement_timeout` in a
+             query and in `up` is 422; database_not_ready is always `503` with `Retry-After`
+             (queryDatabase, getDatabaseSchema, applyDatabaseMigration, createDatabaseBranch,
+             createDatabaseRestorePoint, restoreDatabase).
 After:       C-1
 Out of scope: the privacy suite (T-2).
 ```
@@ -828,6 +844,14 @@ Done when:   the engine conformance suite passes against postgres-data; a role o
              the transaction is still open, else the connection is closed; the lens views are
              dropped before a migration and rebuilt with the catalog sync after it (also after a
              failed one); extensions live in the schema `extensions`, reachable by every kind.
+             From the C-1 acceptance (decision 0004-35): before each statement of a migration's
+             `up`, the engine sets statement_timeout and lock_timeout again (a `SET LOCAL
+             statement_timeout = 0` or a `set_config('statement_timeout', '0', true)` in a DO
+             block in one statement does not lift the timeout of the next), and a wall-clock
+             limit for the whole migration ends it with a protocol cancel request and closes the
+             connection; the one-time ALTER DEFAULT PRIVILEGES also grants USAGE on sequences to
+             the write and masked_write kinds (a conformance case inserts through both write
+             lenses into a `serial` table and a `generated always as identity` table).
 After:       E-1, I-1, S-1 (done), Q-0
 Out of scope: point-in-time restore (E-4).
 ```
@@ -847,7 +871,9 @@ Done when:   the engine conformance suite passes; one writer at a time; a read n
              (the denial of reads of restricted main columns outside a lens view is Q-3's);
              SQLITE_LIMIT_ATTACHED is 0, SQLITE_DBCONFIG_DEFENSIVE is on, trusted_schema is
              OFF; an isolation case: an agent of tenant A attaches tenant B's file (refused,
-             nothing read).
+             nothing read); the engine sets `PRAGMA defer_foreign_keys = ON` itself in every
+             migration transaction, so a table rebuild works without `PRAGMA foreign_keys`
+             (decision 0004-35).
 After:       E-1, I-3, Q-0
 Out of scope: the TEMP lens views and the restricted-column rules (Q-3).
 ```
@@ -887,7 +913,9 @@ Done when:   every handler of the `databases` area exists, the ones of later car
              classes, query, access), so K-1, Q-1 and A-1 never edit it; createDatabase loads
              the tenant key through Q-4 and the engine installs it (decision 0004-30): two
              databases of one tenant give the same pseudonym for the same value, two tenants
-             do not.
+             do not. No card of step 2 reads the manifest's `migrations` path: do not build a
+             folder reader (step 4 adds a new property for migrations in a repo, decision
+             0004-35).
 After:       P-2, E-1 (memory first), E-2 for the Postgres run, Q-4, C-2
 ```
 
@@ -905,7 +933,11 @@ Done when:   a failing migration leaves the database as before (422 migration_fa
              are ignored); an agent's dry run on live or a full branch is 403 user_required
              before anything runs or is locked, and no approval is made; on a masked or
              schema_only branch it runs (decision 0004-26); an `up` with a transaction-control
-             statement is 422 statement_not_allowed; a migration that retypes or drops a column
+             statement is 422 statement_not_allowed (hint remove_transaction_control, the
+             statement number in `message`; no restore point, migration row or journal entry),
+             and so is an `up` with `SET`, `SET LOCAL`, `RESET` or `set_config`; `CREATE
+             SCHEMA` and `CREATE EXTENSION` in `up` fail on the engine rights (422
+             migration_failed, the database as before; decision 0004-35); a migration that retypes or drops a column
              read by a lens view works (the views are dropped first and rebuilt after, also
              after a failure; decision 0004-34 f).
 After:       D-1, K-1, A-2, C-2
@@ -961,8 +993,11 @@ May change:  crates/ruum-core/src/databases/query/ except postgres_mask.rs and s
              (Q-1 declares them empty in query/mod.rs; Q-2 and Q-3 fill them),
              crates/ruum-api/src/routes/database_query.rs.
 Done when:   T-1 cases pass; two statements are 422; a write in read mode is read_only_query; the
-             statements of statement_not_allowed are 422 (also SET, RESET and set_config of
-             session options, and transaction-control statements, decision 0004-34 d); the log
+             statements of statement_not_allowed are 422 (also SET, SET LOCAL, RESET and
+             set_config of any option, and transaction-control statements with hint
+             remove_transaction_control, decision 0004-34 d); `public.t` and `main.t` are 422
+             with hint `unqualified_names`, for people and agents, and the server never
+             rewrites a name (decision 0004-35); database_not_ready is 503 with Retry-After; the log
              never holds a raw parameter, a pseudonym of a parameter
              or a literal (normalized statement; parameters as hidden markers, decision
              0004-24); an agent lists only its own log entries; a person with view lists own
@@ -1011,7 +1046,12 @@ Done when:   T-1 cases pass; unconfirmed = personal; only a person confirms; con
              identity and resets renamed, retyped, swapped and re-added columns (T-2 rename
              cases); a reset writes a new manifest version without the key; every change of
              classes calls MaskingRules::classes_changed (Q-0; an in-memory implementation
-             records the calls in the tests; the lens views themselves are Q-2 and Q-3).
+             records the calls in the tests; the lens views themselves are Q-2 and Q-3);
+             database_columns, getDatabaseSchema and the lens views cover the schema `public`
+             (SQLite `main`) only, never the Ruum schemas or `extensions`; the sync transaction
+             overwrites or deletes a dropped column's row when a column of the same name comes
+             back (drop and add, rename onto the name), so the primary key does not collide
+             (decision 0004-35).
 After:       D-1, Q-0, C-2
 ```
 
@@ -1045,7 +1085,9 @@ Done when:   DROP, TRUNCATE, DELETE/UPDATE without WHERE from an agent never run
              is spent; params of an approval are hidden markers, never pseudonyms (decision
              0004-24); every request has a review_url (IDs only); listPendingDatabaseApprovals
              lists what the caller may decide (agents: their own) and leaves out databases the
-             caller cannot see.
+             caller cannot see; two racing grant requests of one agent for one database and kind
+             make one row (a row lock until 0004 gets the partial unique index, decision
+             0004-35).
 Precondition: the sqlparser dependency is approved (open question 9).
 After:       Q-1, A-1, K-1, C-2
 ```

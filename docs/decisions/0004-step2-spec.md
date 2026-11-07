@@ -27,6 +27,9 @@ required changes; reviewer 2: six required changes and notes): items 24 to 33. E
 these change say so in place. `ruum-server-wt/panel/step2-spec-v2-changes.md` maps each review
 item to its change.
 
+Item 34 records spike S-1. Item 35 records the acceptance of card C-1 (two architect reviewers,
+2026-11-07) and the changes it applied.
+
 ## 1. Postgres sessions: untrusted SQL never runs as the admin role
 
 **Decision.** Untrusted SQL (every statement of the query API and every migration) runs only in
@@ -739,10 +742,133 @@ one is fixed below, and the safer option is taken where there was a choice. The 
 "Infrastructure work" items 1 and 2, cards C-1, S-1, I-1, E-2, Q-0, Q-1 and D-2;
 `spikes/step2-roles/`.
 
+## 35. Card C-1 accepted: the acceptance reviews (card C-1)
+
+**Outcome.** Status `provisional`, decided by the agent panel on 2026-11-07 (design 18.9). Two
+architect reviewers read the step 2 contracts on `main` (`1b344d6`):
+`ruum-server-wt/panel/c1-acceptance-review-1.md` (contract consistency, tenant isolation, the
+8.5 privacy filter, the spike) **accepted with two required changes**, and
+`ruum-server-wt/panel/c1-acceptance-review-2.md` (buildability for the next cards and later
+steps) **requested four changes and accepts when they land**. Neither asked for a re-review.
+Branch `c/c1-acceptance` applies every required change in one `contract:` commit; all of them
+are additive (description text, new optional properties, a new shared response and new `503`
+responses on planned operations): `oasdiff breaking` has 0 errors, and the regenerated
+`web/src/api/schema.d.ts` and `crates/ruum-mcp/src/tools.json` change only by these. With this
+commit card C-1 is accepted and the step 2 contracts are frozen; a later change is additive.
+No change to migration 0004, `schema.zed`, the manifest schema or the event schemas.
+
+Where the two reviews differ, the safer option is taken:
+
+- **Options inside a migration.** Reviewer 1 refuses `SET LOCAL` and `set_config` of every
+  option and has the platform set its options again before each statement of `up`. Reviewer 2
+  keeps `SET LOCAL` (so a migration can lower `lock_timeout`) and asks for a wall-clock limit
+  in the engine. Decision: both lines of reviewer 1, and the wall-clock limit of reviewer 2 as
+  a third line. A migration cannot change a limit; a later additive request field can lower
+  `lock_timeout` if people need it.
+- **The hint of a refusal.** Reviewer 1 puts the statement number in `hint`, reviewer 2 a fixed
+  hint code. Decision: the codes `remove_transaction_control` and `unqualified_names` in `hint`
+  (agents can act on a fixed code), and the statement number in `message`.
+- **`database_not_ready`.** Reviewer 1 keeps it in the text of `queryDatabase`; reviewer 2 makes
+  it a `503` with `Retry-After` on every operation that reaches the engine. Decision: the `503`
+  (a `400` tells clients not to retry).
+- **Qualified table names.** Both refuse `public.x` and `main.x` rather than rewrite them (a
+  rewrite is a second place where a name can resolve to a base table).
+
+**The changes.**
+
+- **(a) Transaction control and the rules of `up`** (reviewer 1 R1, reviewer 2 R1; completes
+  item 34 d, b and g). `queryDatabase` "Statements that never run" (on both engines) adds
+  transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`,
+  `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`, `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK
+  PREPARED`; hint `remove_transaction_control`), and "`SET`, `RESET` or `set_config(...,
+  false)` of any session option" becomes "`SET` (also `SET LOCAL`), `RESET` and `set_config` of
+  any option". `applyDatabaseMigration` gets "Statements that never run in `up`" (the same
+  rules, transaction control included; `422 statement_not_allowed`, the statement number in
+  `message`; nothing ran, and no restore point, migration row or journal entry is written; the
+  platform sets `statement_timeout` and `lock_timeout` again before each statement) and "What
+  `up` may create" (tables, views, functions and types in `public`; no schema and no
+  extension; extensions from the manifest in the schema `extensions`). `DatabaseState` and
+  `ProviderState`: `updating` also covers a migration. `queryDatabase` "Not ready": during a
+  migration, every kind except the owner's waits up to 10 seconds, then gets `503
+  database_not_ready` (item 34 f). MCP: `apply_database_migration` says "no BEGIN/COMMIT, no
+  SET, no CREATE SCHEMA or CREATE EXTENSION"; `query_database` says "no BEGIN, COMMIT or SET".
+- **(b) Unqualified table names** (reviewer 1 R2, reviewer 2 R2; decision 0004-3: the same
+  semantics in both engines). After item 34 b the lens kinds have no `USAGE` on `public`, so
+  `public.plants` failed with a bare `42501` for agents and viewers and worked for managers;
+  SQLite `main.plants` passed the TEMP lens views. `queryDatabase` gets "Table names": write
+  names without a schema; `public.` (Postgres) and `main.` (SQLite) are refused for every
+  caller (`422 statement_not_allowed`, hint `unqualified_names`); the server never rewrites a
+  name; `pg_catalog`, `information_schema` and `extensions` may be named. `getDatabaseSchema`
+  and the tool texts of `get_database_schema` and `query_database` say so.
+  `ResultColumn.source.schema` keeps `public`, so it matches the `data_classes` keys. Q-1 owns
+  the parser rule; T-1 and T-2 add the cases.
+- **(c) Names next to principal IDs** (reviewer 2 R3; decision 0003-5, UX C-22). Optional
+  `type: string` properties, absent when no name is known (the pattern of
+  `on_behalf_of_display_name`): `DatabaseAccessGrant.agent_display_name` and
+  `granted_by_display_name`, `DatabaseApproval.decided_by_display_name`,
+  `DatabaseColumn.confirmed_by_display_name`. The resolver of decision 0003-5 fills them; A-1,
+  A-2 and K-1 build them.
+- **(d) `503 DatabaseNotReady`** (reviewer 2 R4). A new shared response: `503`, header
+  `Retry-After`, body `Error` with `database_not_ready` and hint `retry`. It is on
+  `queryDatabase`, `getDatabaseSchema`, `applyDatabaseMigration`, `createDatabaseBranch`,
+  `createDatabaseRestorePoint` and `restoreDatabase`. `QueryFailed` no longer names
+  `database_not_ready`; `createDatabaseBranch` names the `503`. All six operations are planned,
+  so nothing built changes.
+
+**Notes recorded for the named cards** (non-blocking; STEP2 carries the card rules):
+
+- E-2: the platform's options set again before each statement of `up`, a wall-clock limit with
+  a protocol cancel request, and `USAGE` on sequences for the write kinds (an `INSERT` through a
+  write lens into a `serial` table needs `nextval`). E-3: the engine sets `PRAGMA
+  defer_foreign_keys = ON` in every migration transaction (a SQLite table rebuild cannot turn
+  foreign keys off inside a transaction).
+- K-1: the catalog covers `public` (SQLite `main`) only, so PostGIS's
+  `extensions.spatial_ref_sys` never shows up as unconfirmed `personal` columns; a dropped
+  column's row is overwritten or deleted when the name comes back.
+- A-2: one pending grant request per agent, database and kind; a row lock until 0004 next
+  changes in place and gets `unique (tenant_id, node_id, requested_by, grant_kind) where status
+  = 'pending' and subject = 'grant'`.
+- Q-2: decide whether the lens also wraps user views and how triggers that name other tables
+  behave through the write lens (a conformance case: an `updated_at` trigger). If the lens does
+  not wrap views, `getDatabaseSchema` marks objects the caller cannot query.
+- Q-2 and D-3: make the copy and the lens agree on empty `secret` values (suggested: every
+  non-`NULL` value hidden in the lens, `''` becomes `NULL` in a masked copy); the design change
+  of "Open" says so.
+- D-2: a migration's `updating` writes no `typed_node.status_changed` (recommended;
+  `database.migration_*` covers it). D-1: no folder reader for the manifest's `migrations`
+  (step 4 adds a property for migrations in a repo; never widen the string to a `oneOf`).
+- UX C-20 becomes its own operation later (for example `checkDatabaseStatement`), never `check:
+  true` on `queryDatabase`; C-21 adds optional `databases` objects to `Limits` and `Usage` before
+  D-1 starts, with the branch quota apart from the database count; C-23 is its own card after
+  A-1 (optional `Database.access_summary`); an optional `DatabaseApproval.database_name` comes
+  with C-21 or A-2.
+- Text fixes for the next change of each file: the `Pseudonym` example with 12 hex characters
+  and "a keyed hash of the value's canonical text"; the `schema.zed` comment on `manage`; the
+  shared `ValidationFailed` text naming the step 2 codes.
+- Later steps (additive then): step 3 a hook kind `binding_changed`, a gallery source kind, a
+  manifest list `schemas` for frameworks that need their own schema or extension; step 4 the
+  branch quota and a migrations source in a repo; step 5 nullable `agent_id` and `session_id`
+  for workspace grants; 14 (cells) the provider `Source` kind `import` and the hook
+  `tenant_imported` before the first tenant moves between cells.
+
+**Changes.** `contracts/openapi.yaml` (`getDatabaseSchema`, `queryDatabase`,
+`applyDatabaseMigration`, `createDatabaseBranch`, `createDatabaseRestorePoint`,
+`restoreDatabase`, `QueryFailed`, `DatabaseNotReady`, `DatabaseState`, `DatabaseAccessGrant`,
+`DatabaseApproval`, `DatabaseColumn`), `contracts/providers/provider.openapi.yaml`
+(`ProviderState`), `contracts/mcp/tools.yaml`, the regenerated `crates/ruum-mcp/src/tools.json`
+and `web/src/api/schema.d.ts`; STEP2 status, "The engine security model" (Postgres items 7 and
+10), cards C-1, T-1, E-2, E-3, D-1, D-2, Q-1, K-1 and A-2.
+
 ## Open
 
 - Design 8.5 names PostgreSQL Anonymizer; item 4 replaces it. A person confirms, and the design
-  text follows in a design change.
-- Spike S-1 passed (item 34). The role kinds are frozen. C-1 still takes the text change of item
-  34 (d) (transaction control in "Statements that never run").
-- UX contract needs C-20 to C-23 are not in the contract yet.
+  text follows in a design change (with the empty `secret` values of item 35).
+- Spike S-1 passed (item 34). The role kinds are frozen. C-1 took the text change of item 34 (d)
+  (item 35 a); card C-1 is accepted.
+- The `database_roles` comment of migration 0004 predates item 34 (owner of the schemas,
+  `ruum_dbhost` membership in `mask`, `USAGE` on `extensions`, items 34 c and d), and one line
+  holds both `key_node_id` and `extensions`. STEP2 "The engine security model" wins. Fix the
+  file in the same in-place change as the next SQL change of 0004 (an edit alone changes the
+  sqlx checksum and forces a fresh database on every stack).
+- UX contract needs C-20 to C-23 are not in the contract yet (item 35 records the form each
+  takes).
