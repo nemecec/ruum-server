@@ -1,0 +1,608 @@
+{
+  "$description": "Ruum base tokens: the same in every theme.",
+  "font": {
+    "family": {
+      "$type": "fontFamily",
+      "sans": {
+        "$value": [
+          "system-ui",
+          "-apple-system",
+          "Segoe UI",
+          "Roboto",
+          "Noto Sans",
+          "sans-serif"
+        ],
+        "$description": "The system stack: no font download"
+      },
+      "mono": {
+        "$value": [
+          "ui-monospace",
+          "SF Mono",
+          "Cascadia Mono",
+          "Menlo",
+          "Consolas",
+          "monospace"
+        ]
+      }
+    },
+    "weight": {
+      "$type": "fontWeight",
+      "regular": {
+        "$value": 400
+      },
+      "medium": {
+        "$value": 500
+      },
+      "strong": {
+        "$value": 600
+      },
+      "brand": {
+        "$value": 700,
+        "$description": "The wordmark only"
+      }
+    },
+    "size": {
+      "$type": "dimension",
+      "xs": {
+        "$value": {
+          "value": 12,
+          "unit": "px"
+        }
+      },
+      "sm": {
+        "$value": {
+          "value": 14,
+          "unit": "px"
+        }
+      },
+      "md": {
+        "$value": {
+          "value": 16,
+          "unit": "px"
+        }
+      },
+      "lg": {
+        "$value": {
+          "value": 18,
+          "unit": "px"
+        }
+      },
+      "xl": {
+        "$value": {
+          "value": 22,
+          "unit": "px"
+        }
+      },
+      "2xl": {
+        "$value": {
+          "value": 26,
+          "unit": "px"
+        }
+      }
+    },
+    "line": {
+      "$type": "dimension",
+      "xs": {
+        "$value": {
+          "value": 16,
+          "unit": "px"
+        }
+      },
+      "sm": {
+        "$value": {
+          "value": 20,
+          "unit": "px"
+        }
+      },
+      "md": {
+        "$value": {
+          "value": 24,
+          "unit": "px"
+        }
+      },
+      "lg": {
+        "$value": {
+          "value": 26,
+          "unit": "px"
+        }
+      },
+      "xl": {
+        "$value": {
+          "value": 30,
+          "unit": "px"
+        }
+      },
+      "2xl": {
+        "$value": {
+          "value": 34,
+          "unit": "px"
+        }
+      }
+    }
+  },
+  "text": {
+    "$type": "typography",
+    "xs": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": "{font.size.xs}",
+        "fontWeight": "{font.weight.regular}",
+        "lineHeight": "{font.line.xs}",
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Badges only"
+    },
+    "sm": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": "{font.size.sm}",
+        "fontWeight": "{font.weight.regular}",
+        "lineHeight": "{font.line.sm}",
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Metadata, helper text"
+    },
+    "md": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": "{font.size.md}",
+        "fontWeight": "{font.weight.regular}",
+        "lineHeight": "{font.line.md}",
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Body, inputs, buttons (the base)"
+    },
+    "lg": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": "{font.size.lg}",
+        "fontWeight": "{font.weight.strong}",
+        "lineHeight": "{font.line.lg}",
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Panel and dialog titles (h2)"
+    },
+    "xl": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": "{font.size.xl}",
+        "fontWeight": "{font.weight.strong}",
+        "lineHeight": "{font.line.xl}",
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Page titles (h1) on phone"
+    },
+    "2xl": {
+      "$value": {
+        "fontFamily": "{font.family.sans}",
+        "fontSize": "{font.size.2xl}",
+        "fontWeight": "{font.weight.strong}",
+        "lineHeight": "{font.line.2xl}",
+        "letterSpacing": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Page titles (h1) on desktop"
+    }
+  },
+  "space": {
+    "1": {
+      "$value": {
+        "value": 4,
+        "unit": "px"
+      }
+    },
+    "2": {
+      "$value": {
+        "value": 8,
+        "unit": "px"
+      }
+    },
+    "3": {
+      "$value": {
+        "value": 12,
+        "unit": "px"
+      }
+    },
+    "4": {
+      "$value": {
+        "value": 16,
+        "unit": "px"
+      }
+    },
+    "5": {
+      "$value": {
+        "value": 24,
+        "unit": "px"
+      }
+    },
+    "6": {
+      "$value": {
+        "value": 32,
+        "unit": "px"
+      }
+    },
+    "7": {
+      "$value": {
+        "value": 48,
+        "unit": "px"
+      }
+    },
+    "$type": "dimension",
+    "$description": "A 4 px base. Use only these steps."
+  },
+  "radius": {
+    "$type": "dimension",
+    "sm": {
+      "$value": {
+        "value": 4,
+        "unit": "px"
+      }
+    },
+    "md": {
+      "$value": {
+        "value": 8,
+        "unit": "px"
+      }
+    },
+    "lg": {
+      "$value": {
+        "value": 12,
+        "unit": "px"
+      }
+    },
+    "full": {
+      "$value": {
+        "value": 999,
+        "unit": "px"
+      }
+    }
+  },
+  "border": {
+    "width": {
+      "$type": "dimension",
+      "thin": {
+        "$value": {
+          "value": 1,
+          "unit": "px"
+        }
+      },
+      "thick": {
+        "$value": {
+          "value": 2,
+          "unit": "px"
+        },
+        "$description": "Focus ring, drop zone, write mode frame"
+      },
+      "edge": {
+        "$value": {
+          "value": 3,
+          "unit": "px"
+        },
+        "$description": "The left edge of notes, nav items and tags"
+      }
+    }
+  },
+  "size": {
+    "$type": "dimension",
+    "control": {
+      "$value": {
+        "value": 36,
+        "unit": "px"
+      },
+      "$description": "Height of buttons and fields on desktop"
+    },
+    "control-sm": {
+      "$value": {
+        "value": 28,
+        "unit": "px"
+      },
+      "$description": "Compact buttons in rows"
+    },
+    "touch": {
+      "$value": {
+        "value": 44,
+        "unit": "px"
+      },
+      "$description": "Touch target"
+    },
+    "icon": {
+      "$value": {
+        "value": 20,
+        "unit": "px"
+      }
+    },
+    "icon-sm": {
+      "$value": {
+        "value": 16,
+        "unit": "px"
+      }
+    },
+    "icon-lg": {
+      "$value": {
+        "value": 48,
+        "unit": "px"
+      },
+      "$description": "Empty state illustration"
+    },
+    "check": {
+      "$value": {
+        "value": 18,
+        "unit": "px"
+      },
+      "$description": "Checkbox and radio"
+    },
+    "topbar": {
+      "$value": {
+        "value": 56,
+        "unit": "px"
+      }
+    },
+    "rail": {
+      "$value": {
+        "value": 224,
+        "unit": "px"
+      }
+    },
+    "content": {
+      "$value": {
+        "value": 1200,
+        "unit": "px"
+      },
+      "$description": "Content max width"
+    },
+    "panel": {
+      "$value": {
+        "value": 360,
+        "unit": "px"
+      },
+      "$description": "Details panel and upload panel"
+    },
+    "dialog-sm": {
+      "$value": {
+        "value": 480,
+        "unit": "px"
+      }
+    },
+    "dialog-md": {
+      "$value": {
+        "value": 720,
+        "unit": "px"
+      }
+    },
+    "dialog-lg": {
+      "$value": {
+        "value": 1024,
+        "unit": "px"
+      }
+    },
+    "dialog-full-height": {
+      "$value": {
+        "value": 768,
+        "unit": "px"
+      }
+    },
+    "measure": {
+      "$value": {
+        "value": 40,
+        "unit": "rem"
+      },
+      "$description": "Line length of running text (about 72 characters)"
+    },
+    "narrow": {
+      "$value": {
+        "value": 30,
+        "unit": "rem"
+      },
+      "$description": "Sign-in and other single-column pages"
+    },
+    "empty-max": {
+      "$value": {
+        "value": 420,
+        "unit": "px"
+      }
+    },
+    "card-min": {
+      "$value": {
+        "value": 288,
+        "unit": "px"
+      },
+      "$description": "Smallest column of a card grid"
+    },
+    "picker-max": {
+      "$value": {
+        "value": 256,
+        "unit": "px"
+      }
+    },
+    "field-sm": {
+      "$value": {
+        "value": 256,
+        "unit": "px"
+      },
+      "$description": "Short fields (a space switcher, a date)"
+    },
+    "field-md": {
+      "$value": {
+        "value": 448,
+        "unit": "px"
+      },
+      "$description": "Search field"
+    },
+    "toast": {
+      "$value": {
+        "value": 512,
+        "unit": "px"
+      }
+    },
+    "progress": {
+      "$value": {
+        "value": 8,
+        "unit": "px"
+      }
+    },
+    "meter": {
+      "$value": {
+        "value": 12,
+        "unit": "px"
+      }
+    },
+    "dot": {
+      "$value": {
+        "value": 8,
+        "unit": "px"
+      }
+    }
+  },
+  "duration": {
+    "$type": "duration",
+    "instant": {
+      "$value": {
+        "value": 0,
+        "unit": "ms"
+      },
+      "$description": "Reduced motion: no transition"
+    },
+    "fast": {
+      "$value": {
+        "value": 120,
+        "unit": "ms"
+      }
+    },
+    "base": {
+      "$value": {
+        "value": 200,
+        "unit": "ms"
+      }
+    },
+    "exit": {
+      "$value": {
+        "value": 150,
+        "unit": "ms"
+      }
+    },
+    "highlight": {
+      "$value": {
+        "value": 2000,
+        "unit": "ms"
+      }
+    }
+  },
+  "easing": {
+    "$type": "cubicBezier",
+    "standard": {
+      "$value": [
+        0.2,
+        0,
+        0,
+        1
+      ]
+    },
+    "exit": {
+      "$value": [
+        0.4,
+        0,
+        1,
+        1
+      ]
+    }
+  },
+  "motion": {
+    "$type": "transition",
+    "fast": {
+      "$value": {
+        "duration": "{duration.fast}",
+        "delay": {
+          "value": 0,
+          "unit": "ms"
+        },
+        "timingFunction": "{easing.standard}"
+      },
+      "$description": "Hover, press, focus"
+    },
+    "base": {
+      "$value": {
+        "duration": "{duration.base}",
+        "delay": {
+          "value": 0,
+          "unit": "ms"
+        },
+        "timingFunction": "{easing.standard}"
+      },
+      "$description": "Panels, dialogs, toasts in"
+    },
+    "exit": {
+      "$value": {
+        "duration": "{duration.exit}",
+        "delay": {
+          "value": 0,
+          "unit": "ms"
+        },
+        "timingFunction": "{easing.exit}"
+      },
+      "$description": "Things that leave"
+    }
+  },
+  "opacity": {
+    "$type": "number",
+    "disabled": {
+      "$value": 0.5
+    }
+  },
+  "z": {
+    "$type": "number",
+    "raised": {
+      "$value": 1
+    },
+    "sticky": {
+      "$value": 5
+    },
+    "sheet": {
+      "$value": 15
+    },
+    "upload": {
+      "$value": 20
+    },
+    "toast": {
+      "$value": 30
+    },
+    "banner": {
+      "$value": 40
+    },
+    "skip": {
+      "$value": 50
+    }
+  },
+  "breakpoint": {
+    "$type": "dimension",
+    "$description": "CSS cannot read custom properties in media queries: the CSS repeats these values (stylelint allows px only there).",
+    "narrow": {
+      "$value": {
+        "value": 640,
+        "unit": "px"
+      }
+    },
+    "wide": {
+      "$value": {
+        "value": 900,
+        "unit": "px"
+      }
+    }
+  }
+}

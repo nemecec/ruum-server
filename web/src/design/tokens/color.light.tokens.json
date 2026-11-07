@@ -1,0 +1,483 @@
+{
+  "$description": "Ruum colour set: light. Same names in every set; a new theme is another file.",
+  "color": {
+    "$type": "color",
+    "canvas": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.980392,
+          0.972549,
+          0.956863
+        ],
+        "hex": "#faf8f4"
+      },
+      "$description": "Page background (warm paper)"
+    },
+    "surface": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1,
+          1,
+          1
+        ],
+        "hex": "#ffffff"
+      },
+      "$description": "Cards, panels, dialogs, the list"
+    },
+    "sunken": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.94902,
+          0.937255,
+          0.913725
+        ],
+        "hex": "#f2efe9"
+      },
+      "$description": "Top bar, rail, code, table header, compare background"
+    },
+    "border": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.878431,
+          0.858824,
+          0.823529
+        ],
+        "hex": "#e0dbd2"
+      },
+      "$description": "Dividers and card edges (decorative)"
+    },
+    "border-control": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.541176,
+          0.513725,
+          0.466667
+        ],
+        "hex": "#8a8377"
+      },
+      "$description": "Borders of inputs, selects, checkboxes (3:1)"
+    },
+    "text": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.141176,
+          0.129412,
+          0.109804
+        ],
+        "hex": "#24211c"
+      },
+      "$description": "Body text, headings"
+    },
+    "text-muted": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.360784,
+          0.337255,
+          0.298039
+        ],
+        "hex": "#5c564c"
+      },
+      "$description": "Secondary text, metadata"
+    },
+    "text-faint": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.45098,
+          0.423529,
+          0.380392
+        ],
+        "hex": "#736c61"
+      },
+      "$description": "Placeholders, timestamps (still 4.5:1 on surface)"
+    },
+    "primary": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.113725,
+          0.360784,
+          0.341176
+        ],
+        "hex": "#1d5c57"
+      },
+      "$description": "Primary buttons, selected nav (spruce)"
+    },
+    "primary-hover": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.086275,
+          0.282353,
+          0.266667
+        ],
+        "hex": "#164844"
+      },
+      "$description": "Hover and pressed primary"
+    },
+    "on-primary": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1,
+          1,
+          1
+        ],
+        "hex": "#ffffff"
+      },
+      "$description": "Text on primary"
+    },
+    "primary-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.886275,
+          0.933333,
+          0.921569
+        ],
+        "hex": "#e2eeeb"
+      },
+      "$description": "Info notes, selected rows, drop zone"
+    },
+    "link": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.113725,
+          0.360784,
+          0.341176
+        ],
+        "hex": "#1d5c57"
+      },
+      "$description": "Links (underlined in running text)"
+    },
+    "focus": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.113725,
+          0.360784,
+          0.341176
+        ],
+        "hex": "#1d5c57"
+      },
+      "$description": "Focus ring"
+    },
+    "selected": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.886275,
+          0.933333,
+          0.921569
+        ],
+        "hex": "#e2eeeb"
+      },
+      "$description": "Selected row background"
+    },
+    "danger": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.639216,
+          0.188235,
+          0.109804
+        ],
+        "hex": "#a3301c"
+      },
+      "$description": "Errors, destructive buttons (brick)"
+    },
+    "danger-hover": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.52549,
+          0.152941,
+          0.101961
+        ],
+        "hex": "#86271a"
+      },
+      "$description": "Hover of danger buttons"
+    },
+    "on-danger": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1,
+          1,
+          1
+        ],
+        "hex": "#ffffff"
+      },
+      "$description": "Text on danger buttons"
+    },
+    "danger-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.968627,
+          0.901961,
+          0.882353
+        ],
+        "hex": "#f7e6e1"
+      },
+      "$description": "Error note background"
+    },
+    "success": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.168627,
+          0.392157,
+          0.223529
+        ],
+        "hex": "#2b6439"
+      },
+      "$description": "Success text and icons (moss)"
+    },
+    "success-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.894118,
+          0.937255,
+          0.898039
+        ],
+        "hex": "#e4efe5"
+      },
+      "$description": "Success note background"
+    },
+    "warning": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.498039,
+          0.32549,
+          0
+        ],
+        "hex": "#7f5300"
+      },
+      "$description": "Warnings"
+    },
+    "warning-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.980392,
+          0.937255,
+          0.847059
+        ],
+        "hex": "#faefd8"
+      },
+      "$description": "Warning note background"
+    },
+    "agent": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.541176,
+          0.278431,
+          0.094118
+        ],
+        "hex": "#8a4718"
+      },
+      "$description": "The agent mark and agent names (clay)"
+    },
+    "agent-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.960784,
+          0.905882,
+          0.854902
+        ],
+        "hex": "#f5e7da"
+      },
+      "$description": "Agent badge background"
+    },
+    "tag": {
+      "$description": "The 8 tag colours: a 3 px edge and a dot, never text colour.",
+      "spruce": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.113725,
+            0.360784,
+            0.341176
+          ],
+          "hex": "#1d5c57"
+        }
+      },
+      "moss": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.168627,
+            0.392157,
+            0.223529
+          ],
+          "hex": "#2b6439"
+        }
+      },
+      "clay": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.541176,
+            0.278431,
+            0.094118
+          ],
+          "hex": "#8a4718"
+        }
+      },
+      "brick": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.639216,
+            0.188235,
+            0.109804
+          ],
+          "hex": "#a3301c"
+        }
+      },
+      "ochre": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.498039,
+            0.32549,
+            0
+          ],
+          "hex": "#7f5300"
+        }
+      },
+      "slate": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.290196,
+            0.345098,
+            0.407843
+          ],
+          "hex": "#4a5868"
+        }
+      },
+      "plum": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.431373,
+            0.231373,
+            0.368627
+          ],
+          "hex": "#6e3b5e"
+        }
+      },
+      "sand": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.541176,
+            0.478431,
+            0.333333
+          ],
+          "hex": "#8a7a55"
+        }
+      }
+    },
+    "backdrop": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.141176,
+          0.129412,
+          0.109804
+        ],
+        "hex": "#24211c",
+        "alpha": 0.4
+      },
+      "$description": "Behind modal dialogs"
+    },
+    "shadow-1": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.141176,
+          0.129412,
+          0.109804
+        ],
+        "hex": "#24211c",
+        "alpha": 0.08
+      },
+      "$description": "Colour of shadow 1 (none in dark: cards use a border)"
+    },
+    "shadow-2": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.141176,
+          0.129412,
+          0.109804
+        ],
+        "hex": "#24211c",
+        "alpha": 0.14
+      },
+      "$description": "Colour of shadow 2"
+    }
+  },
+  "shadow": {
+    "1": {
+      "$value": {
+        "color": "{color.shadow-1}",
+        "offsetX": {
+          "value": 0,
+          "unit": "px"
+        },
+        "offsetY": {
+          "value": 1,
+          "unit": "px"
+        },
+        "blur": {
+          "value": 2,
+          "unit": "px"
+        },
+        "spread": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Cards"
+    },
+    "2": {
+      "$value": {
+        "color": "{color.shadow-2}",
+        "offsetX": {
+          "value": 0,
+          "unit": "px"
+        },
+        "offsetY": {
+          "value": 8,
+          "unit": "px"
+        },
+        "blur": {
+          "value": 24,
+          "unit": "px"
+        },
+        "spread": {
+          "value": 0,
+          "unit": "px"
+        }
+      },
+      "$description": "Dialogs, menus, toasts, the upload panel"
+    },
+    "$type": "shadow"
+  }
+}
