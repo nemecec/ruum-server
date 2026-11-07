@@ -746,8 +746,9 @@ components:
     ProviderState:
       type: string
       description: |
-        `provisioning`: being made. `ready`: serves. `updating`: serves while a manifest change or
-        restore runs. `degraded`: serves with a problem (`reason`). `suspended`: in the trash or
+        `provisioning`: being made. `ready`: serves. `updating`: a manifest change, a migration or
+        a restore runs; it serves, or for a short time answers "not ready" (a database while a
+        migration rebuilds its lens views or an in-place restore runs). `degraded`: serves with a problem (`reason`). `suspended`: in the trash or
         over a hard limit; keeps the content, serves nothing. `failed`: does not serve (`reason`).
         `deleted`: the content is gone (after `purged`).
       enum: [provisioning, ready, updating, degraded, suspended, failed, deleted]

@@ -2404,7 +2404,8 @@ export interface paths {
          * @description The catalog of the database: schemas, tables and views, columns with their SQL type,
          *     nullability and data class (effective and confirmed), primary and foreign keys. Needs
          *     `view`. This is the context an agent reads before it writes a query. Names and types
-         *     only, never values.
+         *     only, never values. Use the names without the schema in `queryDatabase` (`plants`, not
+         *     `public.plants`; see "Table names" there).
          */
         get: operations["getDatabaseSchema"];
         put?: never;
@@ -2483,14 +2484,30 @@ export interface paths {
          *     and the estimated number of rows; a person decides it (`decideDatabaseApproval`), and
          *     the agent sends the same statement again with `approval_id`.
          *
-         *     **Statements that never run** (`422 statement_not_allowed`, for people and agents):
-         *     role and session statements (`SET ROLE`, `RESET ROLE`, `SET SESSION AUTHORIZATION`,
-         *     `set_config` of `role` or `session_authorization`, `CREATE`/`ALTER`/`DROP ROLE`,
-         *     `GRANT`/`REVOKE` of roles, and `SET`, `RESET` or `set_config(..., false)` of any session
-         *     option, because connections are pooled; options of one statement go in the request), references to the platform's schemas (`ruum_*`), and on
-         *     SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension` and every `PRAGMA` outside the
-         *     read-only allow-list. These checks are a first line only: the engine sessions are built
-         *     so that such a statement cannot reach another role, file or database even if it runs.
+         *     **Table names.** Write the names of the database's own tables and views without a schema
+         *     (`plants`, not `public.plants`; SQLite: not `main.plants`). The statement runs against
+         *     the caller's own view of the database (for agents and people without `manage`, masking
+         *     views with the same names), which the server finds through the search path. A name
+         *     qualified with `public` (Postgres) or `main` (SQLite) is refused for every caller with
+         *     `422 statement_not_allowed` (hint `unqualified_names`: leave out the schema), so a
+         *     statement works the same for every role and in both engines. The server never rewrites
+         *     a name. `pg_catalog`, `information_schema` and `extensions` may be named.
+         *
+         *     **Statements that never run** (`422 statement_not_allowed`, for people and agents, on
+         *     both engines): role and session statements (`SET ROLE`, `RESET ROLE`, `SET SESSION
+         *     AUTHORIZATION`, `set_config` of `role` or `session_authorization`,
+         *     `CREATE`/`ALTER`/`DROP ROLE`, `GRANT`/`REVOKE` of roles, and `SET` (also `SET LOCAL`),
+         *     `RESET` and `set_config` of any option, because connections are pooled and the
+         *     platform's options hold the limits; options of one statement go in the request);
+         *     transaction control (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`,
+         *     `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`, `PREPARE TRANSACTION`, `COMMIT PREPARED`,
+         *     `ROLLBACK PREPARED`; hint `remove_transaction_control`), because each request runs in a
+         *     transaction of the platform that holds the options of the request (decision 0004-34 d);
+         *     references to the platform's schemas (`ruum_*`); `public.` or `main.` before a table
+         *     name (see "Table names"); and on SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension`
+         *     and every `PRAGMA` outside the read-only allow-list. These checks are a first line only:
+         *     the engine sessions are built so that such a statement cannot reach another role, file
+         *     or database even if it runs.
          *
          *     **People** see `normal` and `personal` values as they are. `secret` values need `manage`
          *     (others read them masked, with the same rules as agents), so a viewer never reads a
@@ -2501,6 +2518,11 @@ export interface paths {
          *     of the constraint, table or column; the engine's `DETAIL`, `HINT` and `CONTEXT` (which
          *     can hold row values, for example `Key (email)=(...)`) are never returned. People with
          *     `manage` get the engine message.
+         *
+         *     **Not ready.** While a migration runs, the lens views are rebuilt and the database is
+         *     `updating`: a query of every role kind except the owner's waits up to 10 seconds, then
+         *     fails with the retryable `503 database_not_ready` (hint `retry`, header `Retry-After`).
+         *     The drain before a branch copy and an in-place restore answer the same way.
          *
          *     **Links for the agent's user.** When an agent gets `403 write_grant_required` (here, on
          *     `applyDatabaseMigration`) or `403 class_read_required`, the error `hint` is the web URL
@@ -2693,6 +2715,25 @@ export interface paths {
          *     once: the same name with the same checksum answers the stored result, with another
          *     checksum `409 conflict`.
          *
+         *     **Statements that never run in `up`.** Each statement of `up` is checked before anything
+         *     runs. The statements that `queryDatabase` never runs are refused here too (role and
+         *     session statements, `SET`, `SET LOCAL`, `RESET` and `set_config` of any option, the
+         *     platform's schemas, `public.` or `main.` before a table name, the SQLite statements),
+         *     transaction control included: the platform runs `up` in one transaction that it opens
+         *     and ends, and rolls it back on failure, so write `up` without `BEGIN` and `COMMIT` (hint
+         *     `remove_transaction_control`). A refused migration answers `422 statement_not_allowed`,
+         *     and `message` names the statement by its number in `up`; nothing ran, and no restore
+         *     point, migration row or journal entry is written. Before each statement of `up`, the
+         *     platform sets its own options (`statement_timeout`, `lock_timeout`) again, so a
+         *     statement cannot change the limits of the next.
+         *
+         *     **What `up` may create.** A migration runs as the owner of the tables in the schema
+         *     `public` (Postgres): tables, views, functions and types go there. It cannot create a
+         *     schema or an extension; extensions come from the manifest (`extensions`,
+         *     `updateDatabaseManifest`), in the schema `extensions`, which every statement can use.
+         *     While the migration runs, the database is `updating`, and queries of other callers wait
+         *     or get `503 database_not_ready` (see `queryDatabase`).
+         *
          *     Who: on a branch with `masked` or `schema_only` data, `edit`. On a live database and on
          *     a branch with `full` data, `manage`; an agent also needs a `write_live` grant, and its
          *     migration always waits for a person: the first call answers `202` with a pending
@@ -2766,7 +2807,8 @@ export interface paths {
          *     remaining sessions; it takes the copy; then it allows connections again and reopens
          *     the pools (the reconciler also does this after a crash in the middle). During the pause,
          *     a new request on the source waits up to 10 seconds, then fails with the retryable error
-         *     `database_not_ready` (hint `retry`); a cancelled statement fails the same way and
+         *     `503 database_not_ready` (hint `retry`, header `Retry-After`; a branch request on a
+         *     source that is draining or `updating` answers the same); a cancelled statement fails the same way and
          *     commits nothing. Branches are for small databases only (decision 18, the plan's branch
          *     limit), so the pause is a few seconds. `copyNode` of a database and `createDatabase`
          *     with `source.kind: template` take their copy the same way. SQLite copies the file with
@@ -4426,7 +4468,7 @@ export interface components {
         /**
          * @description The status of section 8.1, from the provider contract (`ProviderState` in
          *     `contracts/providers/provider.openapi.yaml`). `provisioning`: being made. `ready`:
-         *     answers queries. `updating`: a manifest change or restore runs. `degraded`: answers with
+         *     answers queries. `updating`: a manifest change, a migration or a restore runs. `degraded`: answers with
          *     a problem (`reason`). `suspended`: in the trash or over a hard limit, answers no query.
          *     `failed`: see `reason`. `deleted`: purged.
          * @enum {string}
@@ -4712,6 +4754,8 @@ export interface components {
             data_class: components["schemas"]["DataClass"];
             confirmed_class: components["schemas"]["DataClass"] | null;
             confirmed_by: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `confirmed_by` user, filled in responses by the resolver of decision 0003-5. Absent when `confirmed_by` is `null` or the name is not known. */
+            confirmed_by_display_name?: string;
             confirmed_at: components["schemas"]["Timestamp"] | null;
             suggestion: components["schemas"]["ClassSuggestion"] | null;
         };
@@ -4823,8 +4867,12 @@ export interface components {
             node_id: components["schemas"]["Uuid"];
             kind: components["schemas"]["DatabaseAccessGrantKind"];
             agent_id: components["schemas"]["Uuid"];
+            /** @description The current name of the agent `agent_id`, filled in responses by the resolver of decision 0003-5. Absent when the name is not known. */
+            agent_display_name?: string;
             /** @description The user who gave the grant (the agent acts for this user). */
             granted_by: components["schemas"]["Uuid"];
+            /** @description The current name of the `granted_by` user, filled in responses by the resolver of decision 0003-5. Absent when the name is not known. */
+            granted_by_display_name?: string;
             reason: string | null;
             starts_at: components["schemas"]["Timestamp"];
             expires_at: components["schemas"]["Timestamp"];
@@ -4907,6 +4955,8 @@ export interface components {
             estimated_rows: number | null;
             requested_by: components["schemas"]["ActorPair"];
             decided_by: components["schemas"]["Uuid"] | null;
+            /** @description The current name of the `decided_by` user, filled in responses by the resolver of decision 0003-5. Absent when `decided_by` is `null` or the name is not known. */
+            decided_by_display_name?: string;
             decided_at: components["schemas"]["Timestamp"] | null;
             comment: string | null;
             /** @description A pending request expires after 24 hours; an approved one after 15 minutes if unused. */
@@ -5040,14 +5090,29 @@ export interface components {
             };
         };
         /**
-         * @description The engine refused the statement (`query_failed`, with the SQLSTATE in `sqlstate`), a
-         *     write in a read-only query (`read_only_query`), or the database is not ready
-         *     (`database_not_ready`). For agents and for people without `manage` on the database,
+         * @description The engine refused the statement (`query_failed`, with the SQLSTATE in `sqlstate`), or a
+         *     write in a read-only query (`read_only_query`). A database that is not ready answers
+         *     `503 database_not_ready` (see `DatabaseNotReady`). For agents and for people without `manage` on the database,
          *     `message` is sanitized: a fixed text per SQLSTATE and object names, never the engine's
          *     `DETAIL`, `HINT` or `CONTEXT`, which can hold row values.
          */
         QueryFailed: {
             headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description The database is not ready for this request for a short time (`database_not_ready`, hint
+         *     `retry`): a migration rebuilds its lens views, the source of a branch copy is drained,
+         *     or an in-place restore runs (decisions 0004-27 and 0004-34 f). The request waited up to
+         *     10 seconds and nothing ran. Send it again after `Retry-After` seconds.
+         */
+        DatabaseNotReady: {
+            headers: {
+                "Retry-After"?: number;
                 [name: string]: unknown;
             };
             content: {
@@ -8599,6 +8664,7 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            503: components["responses"]["DatabaseNotReady"];
         };
     };
     queryDatabase: {
@@ -8652,6 +8718,7 @@ export interface operations {
             409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
             429: components["responses"]["RateLimited"];
+            503: components["responses"]["DatabaseNotReady"];
             504: components["responses"]["StatementTimeout"];
         };
     };
@@ -8895,6 +8962,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["DatabaseNotReady"];
             504: components["responses"]["StatementTimeout"];
         };
     };
@@ -8972,6 +9040,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["DatabaseNotReady"];
         };
     };
     listDatabaseRestorePoints: {
@@ -9047,6 +9116,7 @@ export interface operations {
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            503: components["responses"]["DatabaseNotReady"];
         };
     };
     restoreDatabase: {
@@ -9089,6 +9159,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
+            503: components["responses"]["DatabaseNotReady"];
         };
     };
     listDatabaseAccessGrants: {
