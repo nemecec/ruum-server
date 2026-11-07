@@ -9,15 +9,15 @@ You need Docker with Compose, `openssl`, `curl` and `jq`.
 
 | Command | What it does |
 |---|---|
-| `scripts/dev.sh up` | On the first run, copies `deploy/dev/.env.example` to `deploy/dev/.env` with new random secrets. Later runs add the settings that `.env.example` has and `.env` lacks (for example the passwords of `postgres-data`). Starts the stack, waits until all services are healthy, and runs the init steps (Garage bucket and key, Zitadel project and OIDC apps). You can run it again at any time. |
+| `scripts/dev.sh up` | On the first run, copies `deploy/dev/.env.example` to `deploy/dev/.env` with new random secrets. Later runs add the settings that `.env.example` has and `.env` lacks (for example the passwords of `postgres-data`). Makes the local KEK file `deploy/dev/.state/tenant-keys.kek` if it is missing (see "Tenant keys"). Starts the stack, waits until all services are healthy, and runs the init steps (Garage bucket and key, Zitadel project and OIDC apps, the OpenBao transit engine and key). You can run it again at any time. |
 | `scripts/dev.sh up --step4` | The same, and also starts Forgejo (compose profile `step4`). |
 | `scripts/dev.sh down` | Stops the stack. The data stays. |
-| `scripts/dev.sh clean` | Stops the stack and deletes all volumes and `deploy/dev/.state/`. It keeps `.env`. |
+| `scripts/dev.sh clean` | Stops the stack and deletes all volumes and `deploy/dev/.state/`, with the local KEK file. It keeps `.env`. |
 | `scripts/dev.sh logs [service]` | Follows the logs. |
 | `scripts/dev.sh status` | Shows the services and their health. |
 | `scripts/dev.sh psql [db]` | Opens `psql` as the `ruum` role. The default database is `ruum`. |
 | `scripts/dev.sh seed` | Creates the missing roles, databases and extensions, and runs the set-up of the data cluster again. The seed of tenants, users, an agent key and sample files comes with the core service. |
-| `scripts/dev.sh env` | Prints the settings for the Ruum server. Use `eval "$(scripts/dev.sh env)"`. `RUUM_DBHOST_URL` is the data cluster as `ruum_dbhost`. |
+| `scripts/dev.sh env` | Prints the settings for the Ruum server. Use `eval "$(scripts/dev.sh env)"`. `RUUM_DBHOST_URL` is the data cluster as `ruum_dbhost`. `RUUM_LOCAL_KEK_FILE` is the local KEK file. |
 | `scripts/dev.sh ca` | Copies the root certificate of Caddy's local CA to `deploy/dev/.state/caddy-root.crt`. |
 
 ## Ports
@@ -98,7 +98,11 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
   `SPICEDB_PRESHARED_KEY` in `.env`.
 - **NATS**: JetStream with at most 64 MB memory store and 2 GB file store.
 - **OpenBao**: dev mode. It is unsealed, keeps its data in memory and loses it on a restart.
-  The root token is `BAO_DEV_ROOT_TOKEN` in `.env`.
+  The root token is `BAO_DEV_ROOT_TOKEN` in `.env`. `dev.sh up` enables the transit engine
+  (`transit/`) and the key `ruum-tenant-keys` (type `aes256-gcm96`) at each start, because a
+  restart loses them. The laptop server does not use them (see "Tenant keys"); the OpenBao test
+  of `crates/ruum-core/src/privacy/keys.rs` does (`BAO_ADDR` and `BAO_TOKEN`, or
+  `RUUM_OPENBAO_ADDR` and `RUUM_OPENBAO_TOKEN`; it is skipped without them).
 - **Mailpit**: catches all mail. Open `http://localhost:8025`.
 - **Caddy**: the HTTPS front. It uses its own local CA for `ruum.localhost`,
   `dav.ruum.localhost` and `*.ruumapps.localhost`. `https://ruum.localhost/caddy-health`
@@ -117,6 +121,23 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 
 Memory limits: Postgres 1 GB, postgres-data and Zitadel 768 MB each, SpiceDB, Garage, NATS and OpenBao 256 MB each,
 Mailpit and Caddy 128 MB each, Forgejo 512 MB. When idle, the stack uses about 350 MB.
+
+## Tenant keys
+
+Each tenant has a pseudonym key in the platform table `tenant_keys`, stored only wrapped by a
+key-encryption key (KEK; decision 0004-16, `crates/ruum-core/src/privacy/keys.rs`). Production
+wraps with OpenBao transit (`ruum-tenant-keys`). Dev OpenBao loses its keys on a restart, so the
+laptop uses a local KEK file instead:
+
+- `deploy/dev/.state/tenant-keys.kek`: 32 random bytes, mode 0600. `dev.sh up` makes it when it
+  is missing and never overwrites it. `dev.sh env` prints its path as `RUUM_LOCAL_KEK_FILE`.
+- `dev.sh down` and `up` keep it, so a restart of the stack keeps the tenant keys and the
+  pseudonyms. `dev.sh clean` deletes it together with the platform database volume.
+- If the file is lost while the volume stays, the stored tenant keys cannot be unwrapped. `dev.sh
+  up` warns about it. Run `dev.sh clean` to start over.
+- `wrapper_from_env` of `keys.rs` (card D-1 wires it into the server) picks OpenBao transit
+  only when `RUUM_OPENBAO_ADDR` is set, else the file of `RUUM_LOCAL_KEK_FILE`. `dev.sh env` does
+  not set `RUUM_OPENBAO_ADDR`.
 
 ## Trust the local CA
 

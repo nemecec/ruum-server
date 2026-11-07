@@ -298,7 +298,7 @@ impl<'de> Deserialize<'de> for LiteralValue {
 ///
 /// `Debug` never prints the key, and the bytes are overwritten when the key is dropped (best
 /// effort: a moved or cloned copy may stay in memory).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PseudonymKey([u8; 32]);
 
 impl PseudonymKey {

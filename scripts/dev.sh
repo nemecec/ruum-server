@@ -3,7 +3,7 @@
 #
 #   scripts/dev.sh up [--step4]   create .env on the first run, start, wait until healthy, init
 #   scripts/dev.sh down           stop the stack (keeps the data)
-#   scripts/dev.sh clean          stop the stack and delete all its data
+#   scripts/dev.sh clean          stop the stack and delete all its data (the local KEK file too)
 #   scripts/dev.sh logs [svc]     follow the logs
 #   scripts/dev.sh status         show the services and their health
 #   scripts/dev.sh psql [db]      open psql as the ruum role (default database: ruum)
@@ -16,6 +16,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEV="$ROOT/deploy/dev"
 ENV_FILE="$DEV/.env"
 STATE="$DEV/.state"
+# The local key-encryption key of the tenant pseudonym keys (decision 0004-16, docs/DEVSTACK.md).
+# It lives and dies with the platform database volume: `up` makes it, `clean` deletes it.
+KEK_FILE="$STATE/tenant-keys.kek"
 ZITADEL_URL="http://localhost:8180"
 
 # No provenance attestation: it carries a build time, so every `up --build` would give the postgres
@@ -107,6 +110,40 @@ ensure_data_cluster() {
   pg_exec_retry postgres-data /docker-entrypoint-initdb.d/10-ruum-data.sh
 }
 
+# The local KEK: 32 random bytes, made once. Never overwritten: the wrapped tenant keys in the
+# platform database are useless without it.
+ensure_kek() {
+  need openssl
+  mkdir -p "$STATE"
+  if [[ -e "$KEK_FILE" ]]; then
+    [[ "$(wc -c <"$KEK_FILE" | tr -d ' ')" == 32 ]] || die "$KEK_FILE must hold exactly 32 bytes; it is kept as it is (run scripts/dev.sh clean to start over)"
+    return
+  fi
+  if docker volume inspect ruum_postgres >/dev/null 2>&1; then
+    log "warning: the platform database volume exists but $KEK_FILE does not; tenant keys made before cannot be unwrapped (scripts/dev.sh clean starts over)"
+  fi
+  log "creating the local key-encryption key deploy/dev/.state/tenant-keys.kek"
+  local tmp
+  tmp="$(umask 077 && mktemp "$STATE/.tenant-keys.kek.XXXXXX")"
+  openssl rand 32 >"$tmp"
+  chmod 600 "$tmp"
+  # `ln` fails when the file appeared in the meantime, so an existing KEK is never replaced.
+  ln "$tmp" "$KEK_FILE" 2>/dev/null || log "keeping the existing $KEK_FILE"
+  rm -f "$tmp"
+}
+
+# OpenBao transit with the key that wraps tenant keys in production (`ruum-tenant-keys`). Dev
+# OpenBao is in memory, so this runs at every `up`; the laptop server uses the KEK file instead.
+init_openbao() {
+  load_env
+  log "openbao: transit engine and the key ruum-tenant-keys"
+  local bao="http://127.0.0.1:8200" auth=(-H "X-Vault-Token: $BAO_DEV_ROOT_TOKEN")
+  if ! curl -fsS "${auth[@]}" "$bao/v1/sys/mounts/transit" >/dev/null 2>&1; then
+    curl -fsS "${auth[@]}" -X POST -d '{"type":"transit"}' "$bao/v1/sys/mounts/transit" >/dev/null
+  fi
+  curl -fsS "${auth[@]}" -X POST -d '{"type":"aes256-gcm96"}' "$bao/v1/transit/keys/ruum-tenant-keys" >/dev/null
+}
+
 garage() { compose exec -T -e RUST_LOG=warn garage /garage "$@"; }
 
 init_garage() {
@@ -181,6 +218,7 @@ init_zitadel() {
 cmd_up() {
   need docker
   ensure_env
+  ensure_kek
   mkdir -p "$STATE/zitadel"
   local profile=()
   [[ "${1:-}" == "--step4" ]] && profile=(--profile step4)
@@ -194,6 +232,7 @@ cmd_up() {
   wait_healthy 300
   init_garage
   init_zitadel
+  init_openbao
   log "all services are healthy"
   compose ${profile[@]+"${profile[@]}"} ps --format 'table {{.Service}}\t{{.Status}}'
 }
@@ -233,6 +272,7 @@ export ZITADEL_SERVICE_PAT_FILE=$STATE/zitadel/bootstrap.pat
 export NATS_URL=nats://127.0.0.1:4222
 export BAO_ADDR=http://127.0.0.1:8200
 export BAO_TOKEN=$BAO_DEV_ROOT_TOKEN
+export RUUM_LOCAL_KEK_FILE=$KEK_FILE
 export SMTP_URL=smtp://127.0.0.1:1025
 export RUUM_PUBLIC_URL=https://ruum.localhost
 export RUUM_APPS_DOMAIN=ruumapps.localhost
@@ -264,7 +304,7 @@ main() {
       ensure_env
       compose --profile step4 down -v --remove-orphans
       rm -rf "$STATE"
-      log "volumes and deploy/dev/.state deleted (deploy/dev/.env is kept)"
+      log "volumes and deploy/dev/.state (with the local KEK file) deleted (deploy/dev/.env is kept)"
       ;;
     logs) compose logs -f --tail=200 "$@" ;;
     status) compose --profile step4 ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;

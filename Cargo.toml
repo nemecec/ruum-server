@@ -90,6 +90,10 @@ argon2 = "0.6.0"
 rand = "0.10.3"
 base64 = "0.23.1"
 hex = "0.4.3"
+# AES-256-GCM: the local key-encryption key that wraps the tenant pseudonym keys (decision 0004-16,
+# card Q-4; production wraps with OpenBao transit). RustCrypto, Apache-2.0 OR MIT. Without the
+# default `getrandom` feature: the nonces come from `rand`.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 
 # Faces: CLI, MCP, WebDAV
 clap = { version = "4.6.7", features = ["derive", "env"] }
