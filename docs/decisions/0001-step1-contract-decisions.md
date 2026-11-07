@@ -52,6 +52,13 @@ gets `manage` through `node:<root>#team@tenant:<id>`; members share there while
 `tenant:<id>#members_can_share@user:*` exists (the policy `members_can_share`, default true). No
 tuple names the creator of a node.
 
+**Amended by decision 0003-1 (content roles).** A member gets its *content role* from the team
+root, not always `manage`: `team_manager`, `team_editor`, `team_commenter` or `team_viewer` of
+`schema.zed`. The default content role is `manage`, so a member without a `tenant#content_*`
+tuple manages, as above. Members with `edit` share as editors (while `members_can_share` is
+true and the effective `editors_can_share` is true); members with `view` or `comment` never
+share from the team root.
+
 ## 5. Cross-tenant links, member-link listing, known gaps
 
 - Cross-tenant links are refused in step 1 (database trigger). Accepted.

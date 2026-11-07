@@ -12,13 +12,16 @@ The panel files are in `ruum-server-wt/panel/` (outside the repository).
 
 ## Implementation status
 
-The proposal's order of work is item 5, then 1, 2, 3, then 4, 6, 7 and 8. This change
-implements **item 5** in full. Items 1, 2, 3, 4, 6, 7 and 8 are decided here and not built yet;
-each is a separate change, in that order. No item is half built.
+The proposal's order of work is item 5, then 1, 2, 3, then 4, 6, 7 and 8. Item 5 is built
+(branch `f/followups`), and item 1 is built (branch `f/content-role`), each in full. Items 2, 3,
+4, 6, 7 and 8 are decided here and not built yet; each is a separate change, in that order. No
+item is half built. The web UI part of item 1 (Members page, invite form, share dialog copy) is
+a card in `ruum-server-wt/panel/ui-followups.md`: the web UI is being rebuilt on the design
+system, and the card is built there.
 
 | Item | Decision | Built |
 |---|---|---|
-| 1. A content role for members | below | no |
+| 1. A content role for members | below | **yes**, server, contract and tests (branch `f/content-role`); the UI is a card |
 | 2. C-12: email grants bind | below | no |
 | 3. C-13: share and invitation emails | below | no |
 | 4. C-14: sign-ins in the audit log | below | no |
@@ -29,7 +32,8 @@ each is a separate change, in that order. No item is half built.
 
 Migrations are numbered in the order they are made, not by the numbers of the proposal (which
 assumed item 1 first): item 5 made `0002_principal_names.sql` and
-`0003_agent_names_unique.sql`. The next items take the next free numbers.
+`0003_agent_names_unique.sql`, decision 0004 took `0004_databases.sql`, and item 1 made
+`0005_member_content_role.sql`. The next items take the next free numbers.
 
 ## 1. A content role for team members
 
@@ -56,6 +60,69 @@ view members included (v2 1.6), and the UI says so.
   is limited. This record, the Members page and the invite form say so ("Can view: sees
   everything in *Space*, changes nothing. To show only some folders, make them a guest."). The
   S2 hint that sends people to Guest stays.
+
+**Choices made while building (each the safer or the non-breaking option):**
+
+- `Member.content_role` and `Invitation.content_role` are `ContentRole` or `null`, and the
+  server always sends them, but they are **not** in `required`. v2 1.3 said "required in
+  responses". The web UI builds `Member` and `Invitation` objects in its mock API, and the web
+  UI may not change in this change (it is being rebuilt); a required property would break its
+  build. The property can become required later without a breaking change.
+- A content role for a role other than `member` (in `updateMember` or `createInvitation`) is
+  `422 validation_failed`, the code the server uses for invalid fields (v2 said
+  `invalid_request`, which is not an `ErrorCode`).
+- The schema writes `team_manager = member - (content_viewer + content_commenter +
+  content_editor)`: the same set as the chained `-` of v2 1.4, with one parenthesis, so the
+  in-memory reader (operators left to right) and SpiceDB read it the same way.
+- `node#edit`, `comment` and `view` get `team->team_editor`, `team_commenter` and `team_viewer`
+  (v2 1.4). `sharing_member` (the team root's `share`) is now `team_manager &
+  members_can_share`; edit members share through `sharing_team_editor` inside
+  `sharing_editor`, so `editors_can_share` applies to them.
+- Rule (b) of 0002-6 does not "use `manage` through the authz check as today" (v2 1.5 assumed
+  so; the feed reads the membership date, not the graph). The feed now asks
+  `TenantStore::manager_since`: `memberships.updated_at` only for owners, admins and members
+  with `content_role = manage`. Rule (a) still uses `member_since` (any content role).
+- An accepted invitation always moves `memberships.updated_at`, as before (also when the role
+  and the content role stay): the date is never too early.
+- The audit entry `member.role_changed` gets `old_content_role` and `new_content_role`;
+  `invitation.created` and `invitation.accepted` get `content_role`. A change of the content
+  role alone is a `member.role_changed` entry.
+- `TenantStore` gets `update_member` (role and content role), `invite_as` (with a content
+  role), `manager_since` and `access_of` (role and content role, for the tag rules).
+  `set_member_role` and `invite` stay and keep the content role, or use the default.
+
+**Changes (item 1).** Contract (additive; `oasdiff breaking` against `main`: nothing): the
+schema `ContentRole`, the optional `content_role` of `Member`, `Invitation`,
+`CreateInvitationRequest` and the `updateMember` body, `422` on `updateMember` and
+`createInvitation`, the wording of `addGrant`, `GranteeTenantMembers` and
+`TenantPolicy.members_can_share`. `contracts/authz/schema.zed` (relations `content_viewer`,
+`content_commenter`, `content_editor`; permissions `team_manager`, `team_editor`,
+`team_commenter`, `team_viewer`, `sharing_team_editor`; the rebuild mapping in the header) and
+`schema.test.yaml` (tenants `gamma`, `delta`). Migration `0005_member_content_role.sql`. Code:
+`tenants::relations` (the content tuple), `tenants::rules` (`content_role_after`,
+`invitation_content_role`, `accepted_content_role`, `edits_team_content`), the memory and
+Postgres tenant stores (`update_member`, `invite_as`, `accept_invitation`, `remove_member`,
+`manager_since`, `access_of`), `journal::feed` (rule (b)), `tags::rules` (create, update and
+the creator's delete need content role `edit` or more), `ruum-api` `routes/tenants.rs`. The
+test kit has three new principals, `member_view`, `member_comment` and `member_edit`
+(`fixtures.rs`, the matrix columns of `permissions.rs`, `permission_matrix.md`).
+
+**Tests (item 1).** `schema.test.yaml` (authz conformance on memory and SpiceDB: each content
+role, an edit grant for a view member, a `tenant#member` grant for view and comment members,
+edit members without `members_can_share` and where `editors_can_share` is false); tenant
+conformance on memory and Postgres: `content_roles_keep_the_invariant` (member(view), admin,
+member (default), guest, member(edit), removed: the content role and the tuples after each
+step, the CHECK constraints in SQL), `accepting_an_invitation_sets_the_content_role` (a new
+person, a guest, a member keeps the higher role, an admin stays at `null`) and
+`member_since_dates_the_membership` (a content role change moves the date; `manager_since`);
+`relations::tests::content_roles_map_to_one_tuple`, `rules::tests` (content roles);
+`journal::feed::tests::content_roles_count_for_rule_a_and_only_manage_for_rule_b`;
+`tags::rules::tests::tag_writes_need_an_edit_content_role`;
+`agents::undo::tests::a_view_member_cannot_undo_into_a_write`; the permission matrix with the
+three new columns (memory, Postgres, SpiceDB): `member_view` and `member_comment` get `403` on
+every write, `member_edit` writes content, cannot move, trash, restore or purge, and shares only
+outside `Archive`. Mutations `team-viewer-gets-manage`, `content-role-not-cleared`,
+`content-role-keeps-member-since`, `accept-ignores-content-role`.
 
 ## 2. C-12: email grants bind
 

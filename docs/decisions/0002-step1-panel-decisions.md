@@ -267,6 +267,19 @@ while the node is still in the trash could restore it, and (b) holds: the member
 in the trash list and gets its entries. A member who joins after the purge learns nothing. An
 agent of such a member gets the entries only when its scope allows `manage`.
 
+**Members with content roles (decision 0003-1, this wording replaces the paragraph above where
+they differ).** A membership counts from `memberships.updated_at` (the join, or the last change
+of `role` or `content_role`).
+
+- For rule (a), a membership with **any** content role counts: a view, comment or edit member
+  who could see the node just before the trash satisfies (a), like a manager.
+- For rule (b), a membership counts only while the member could restore the node:
+  `content_role = manage`, or role admin or owner (`TenantStore::manager_since`). An agent of
+  the member also needs a scope with `manage`.
+- Any change of `content_role` moves `memberships.updated_at`, as a change of `role` does. So
+  the date is never too early. The feed may then hold back an entry from a member who had the
+  right before the change; it sends less, never more.
+
 **Dates.** The feed uses the dates that the records already have:
 
 - grants: the journal (`grant.added`, `grant.updated`, `grant.removed` and their `seq`);

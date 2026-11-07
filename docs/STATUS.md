@@ -65,6 +65,17 @@ Fixes made during the night integration:
   rebased commit (both branches changed `openapi.yaml` and `tools.yaml`; the YAML merged without
   conflicts).
 
+Content role of team members (decision 0003-1, branch `f/content-role`): members get a
+content role `view | comment | edit | manage` (default `manage`) on the team tree.
+Migration `0005_member_content_role.sql` (`memberships.content_role`, `invitations.content_role`,
+CHECK: set if and only if `role = member`); `schema.zed` relations `content_viewer`,
+`content_commenter`, `content_editor` and permissions `team_manager`, `team_editor`,
+`team_commenter`, `team_viewer`; optional `content_role` in `updateMember`, `createInvitation`,
+`Member` and `Invitation`; accepting an invitation never lowers a content role; rule (b) of
+0002-6 counts only managers (`TenantStore::manager_since`); tag writes need content role `edit`.
+The permission matrix has three new columns (`member_view`, `member_comment`, `member_edit`).
+The web UI part is a card in `ruum-server-wt/panel/ui-followups.md` (not built).
+
 The digest for the person is `docs/digests/2026-11-06-night.md` (earlier:
 `docs/digests/2026-11-06.md`, `docs/digests/2026-11-06-evening.md`). The worktrees of
 `q/browser`, `q/decisions`, `q/synthfix`, `f/followups` and `f/step2spec` are removed; the
@@ -285,7 +296,8 @@ rebased once more without a change to code). The smoke test and the mutation che
 ## Known gaps
 
 - **Step 1 follow-ups** (decision 0003, `provisional`): item 5 (C-7, names of actors) is built
-  and merged. Items 1 (content role), 2 (C-12), 3 (C-13), 4 (C-14), 6 (C-8 to C-11), 7
+  and merged; item 1 (content role) is built on `f/content-role` without its web UI (a card).
+  Items 2 (C-12), 3 (C-13), 4 (C-14), 6 (C-8 to C-11), 7
   (search `type`, batch, hints, `safe_stop`) and 8 (IDs of gone nodes) are decided and not built.
 
 - **Step 2** (decision 0004, `provisional`): only the specification is merged. The 24 database

@@ -175,6 +175,13 @@ One small set of roles applies to all nodes. Each node type says what a role mea
 Since decision 0001-1 (`docs/decisions/`), `share` is a permission, not a role: `manage` always
 has it, and `edit` has it while the node setting `editors_can_share` is true (as in Google Drive).
 
+In a team tenant, a member gets a *content role* on the whole team tree (decision 0003-1, the
+roles of a Google shared drive): `view`, `comment`, `edit` or `manage` (the default). Owners and
+admins always manage the team tree; guests have only grants. A "Can view" member still sees
+everything in the team tree and changes nothing; to show a person only some folders, make them
+a guest. Grants still only add rights: an `edit` grant on a folder lets a `view` member edit
+there, and a grant to everyone in the tenant reaches every member.
+
 Roles are inherited from parent folders. A grant on a child can add rights, but it cannot remove an
 inherited right (this is the Google Drive rule; it is simple to explain). A folder can be marked
 "restricted" to stop inheritance from above, for confidential sub-folders.
