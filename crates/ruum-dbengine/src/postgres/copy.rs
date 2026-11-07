@@ -343,6 +343,15 @@ enum Data<'a> {
 /// code, such as checks, policies and index expressions); then `ruum_dbhost` installs the key and
 /// builds the lens. No tenant code runs on a `ruum_dbhost` connection, so none runs with its
 /// `CREATEROLE` and its `ADMIN` on the roles of other databases.
+///
+/// Steps 1 and 3 run no tenant code (re-review of E-2): they change ownership, rights and
+/// `ruum_*` objects, and create views, which fires no trigger, rule or policy (event triggers
+/// need a superuser); they write only tables of `ruum_*`, which no tenant role owns; and their
+/// queries resolve names in `pg_catalog` only, since every `ruum_dbhost` session has the
+/// `search_path` [`super::DBHOST_SEARCH_PATH`]. Before that fix, the `= 0` of
+/// `revoke_old_rights` (step 1) and the `!~` of the catalog (step 3) picked a tenant's
+/// operators in `public`. Step 1 also holds `INHERIT` in the old and the new owner, which
+/// `REASSIGN OWNED` needs; the rights of the owners reach no other database.
 async fn hand_over(
     engine: &PostgresEngine,
     name: &str,

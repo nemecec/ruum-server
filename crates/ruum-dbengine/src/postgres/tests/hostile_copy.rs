@@ -49,6 +49,25 @@ async fn tenant_code_state(conn: &mut PgConnection) -> String {
     .unwrap()
 }
 
+/// The PL/pgSQL statements of hostile tenant code: each one tries to give a role of `other` to
+/// a role of `own` or to `ruum_dbhost`, and ignores its own failure. Only a session with
+/// `ruum_dbhost`'s `ADMIN` on the roles of `other` can make one succeed.
+fn escalation(other: &CreatedDatabase, own: &CreatedDatabase) -> String {
+    let grant = |role: RoleKind, to: String| {
+        format!(
+            "BEGIN EXECUTE 'GRANT {} TO {}'; EXCEPTION WHEN OTHERS THEN NULL; END;",
+            lens::ident(&role_name(other, role)),
+            lens::ident(&to)
+        )
+    };
+    [
+        grant(RoleKind::Write, role_name(own, RoleKind::Owner)),
+        grant(RoleKind::Owner, role_name(own, RoleKind::Read)),
+        grant(RoleKind::SecretRead, "ruum_dbhost".to_string()),
+    ]
+    .join("\n")
+}
+
 /// A source database armed with hostile tenant code against the roles of `other`.
 async fn hostile_source<'e>(engine: &'e PostgresEngine, other: &CreatedDatabase) -> Fixture<'e> {
     let f = Fixture::new(engine).await;
@@ -68,19 +87,10 @@ async fn hostile_source<'e>(engine: &'e PostgresEngine, other: &CreatedDatabase)
             .await
             .expect("rows");
     }
-    let grant = |role: RoleKind, to: String| {
-        format!(
-            "BEGIN EXECUTE 'GRANT {} TO {}'; EXCEPTION WHEN OTHERS THEN NULL; END;",
-            lens::ident(&role_name(other, role)),
-            lens::ident(&to)
-        )
-    };
     let up = format!(
         "CREATE FUNCTION public.evil() RETURNS integer LANGUAGE plpgsql AS $f$
          BEGIN
-           {g1}
-           {g2}
-           {g3}
+           {grants}
            RETURN 1;
          END $f$;
          CREATE FUNCTION public.evil_trigger() RETURNS trigger LANGUAGE plpgsql AS $f$
@@ -100,9 +110,7 @@ async fn hostile_source<'e>(engine: &'e PostgresEngine, other: &CreatedDatabase)
          ALTER TABLE locked ENABLE ROW LEVEL SECURITY;
          ALTER TABLE locked FORCE ROW LEVEL SECURITY;
          CREATE POLICY locked_none ON locked USING (public.evil() < 0);",
-        g1 = grant(RoleKind::Write, role_name(&f.created, RoleKind::Owner)),
-        g2 = grant(RoleKind::Owner, role_name(&f.created, RoleKind::Read)),
-        g3 = grant(RoleKind::SecretRead, "ruum_dbhost".to_string()),
+        grants = escalation(other, &f.created),
     );
     f.migrate(&up).await.expect("hostile tenant code");
     f
@@ -318,4 +326,222 @@ async fn a_masked_copy_builds_foreign_keys_again_or_leaves_them_out() {
         "true|p_|bob@example.com"
     );
     close(owner_session).await;
+}
+
+/// The memberships that a hostile tenant could have taken: those of the LOGIN roles of
+/// `databases`, and those of `ruum_dbhost` in the LOGIN roles of `other` (it holds `SET` in
+/// every `mask` by design). Empty when nothing was taken.
+async fn taken(
+    engine: &PostgresEngine,
+    databases: &[&CreatedDatabase],
+    other: &CreatedDatabase,
+) -> String {
+    let logins = |c: &CreatedDatabase| -> Vec<String> {
+        c.roles
+            .iter()
+            .filter(|r| r.kind != RoleKind::Mask)
+            .map(|r| r.role_name.clone())
+            .collect()
+    };
+    let roles: Vec<String> = databases.iter().flat_map(|c| logins(c)).collect();
+    let mut host = dbhost(engine, &other.database).await;
+    let mut out = memberships(&mut host, &roles).await;
+    let list = logins(other)
+        .iter()
+        .map(|r| lens::literal(r))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dbhost_in = psql(
+        &mut host,
+        &format!(
+            "select coalesce(string_agg('ruum_dbhost in ' || g.rolname, ', ' order by 1), '') \
+               from pg_auth_members m join pg_roles g on g.oid = m.roleid \
+              where m.member = 'ruum_dbhost'::regrole and g.rolname in ({list}) \
+                and (m.inherit_option or m.set_option)"
+        ),
+    )
+    .await
+    .unwrap();
+    close(host).await;
+    if !dbhost_in.is_empty() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(&dbhost_in);
+    }
+    out
+}
+
+/// A tenant puts operators into `public` that a catalog query of the platform would pick when
+/// `public` is on its `search_path` (`oid = integer`, `name !~ name`; the CVE-2018-1058 kind),
+/// and tries to grant other roles from them. Steps 1 and 3 of every hand-over (review E-2,
+/// re-review), the lens rebuild after a migration, `sync_lens` and a restore run on
+/// `ruum_dbhost` connections; none of them may resolve a name in a tenant schema, so the
+/// operators never run with `ruum_dbhost`'s rights and nothing is granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_steps_run_no_tenant_operator() {
+    let Some(engine) = engine().await else { return };
+    let other = Fixture::new(&engine).await;
+    let f = Fixture::new(&engine).await;
+    f.migrate("CREATE TABLE t (id integer PRIMARY KEY, secret text, personal text)")
+        .await
+        .expect("table");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO t VALUES (1, 'tok_t', 'alice@example.com')",
+        vec![],
+    )
+    .await
+    .expect("row");
+    let grants = escalation(&other.created, &f.created);
+    let up = format!(
+        "CREATE FUNCTION public.evil_oid_eq(oid, integer) RETURNS boolean LANGUAGE plpgsql AS $f$
+         BEGIN
+           PERFORM pg_catalog.set_config('ruum_test.hit', 'yes', false);
+           {grants}
+           RETURN $1 OPERATOR(pg_catalog.=) $2::pg_catalog.oid;
+         END $f$;
+         CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = integer,
+           FUNCTION = public.evil_oid_eq);
+         CREATE FUNCTION public.evil_name_nomatch(name, name) RETURNS boolean LANGUAGE plpgsql AS $f$
+         BEGIN
+           PERFORM pg_catalog.set_config('ruum_test.hit', 'yes', false);
+           {grants}
+           RETURN $1::pg_catalog.text OPERATOR(pg_catalog.!~) $2::pg_catalog.text;
+         END $f$;
+         CREATE OPERATOR public.!~ (LEFTARG = name, RIGHTARG = name,
+           FUNCTION = public.evil_name_nomatch);"
+    );
+    f.migrate(&up).await.expect("hostile operators");
+    // The control: where `public` is on the search_path (here the owner's), the queries of the
+    // platform pick the tenant's operators.
+    let mut owner = session(&engine, f.db(), RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select pg_catalog.set_config('ruum_test.hit', 'no', false);
+             select count(*) from pg_catalog.pg_namespace n where n.oid = 0;
+             select pg_catalog.set_config('ruum_test.eq', pg_catalog.current_setting('ruum_test.hit'), false),
+                    pg_catalog.set_config('ruum_test.hit', 'no', false);
+             select count(*) from pg_catalog.pg_namespace n where n.nspname !~ '^pg_';
+             select pg_catalog.current_setting('ruum_test.eq') || '|' ||
+                    pg_catalog.current_setting('ruum_test.hit')",
+        )
+        .await
+        .unwrap(),
+        "yes|yes",
+        "the tenant's operators are picked where public is on the search_path"
+    );
+    close(owner).await;
+    assert_eq!(
+        taken(&engine, &[&f.created, &other.created], &other.created).await,
+        "",
+        "the lens rebuild after the migration ran no tenant operator as ruum_dbhost"
+    );
+    let sync = ClassSync {
+        personal: vec!["personal"],
+        secret: vec!["secret"],
+    };
+    engine
+        .sync_lens(f.db(), &f.key, &sync)
+        .await
+        .expect("sync_lens");
+    assert_eq!(
+        taken(&engine, &[&f.created, &other.created], &other.created).await,
+        "",
+        "sync_lens ran no tenant operator as ruum_dbhost"
+    );
+    let col = |c: &str| ColumnRef {
+        schema: "public".into(),
+        table: "t".into(),
+        column: c.into(),
+    };
+    let masked = MaskPlan {
+        columns: vec![
+            (col("secret"), MaskAs::Null),
+            (col("personal"), MaskAs::Pseudonym),
+        ],
+    };
+    for data in [
+        CopyData::Full,
+        CopyData::SchemaOnly,
+        CopyData::Masked(masked),
+    ] {
+        let (key, _) = conformance::test_key();
+        let copy = engine
+            .copy_database(
+                f.db(),
+                &f.key,
+                &conformance::new_database(f.db().tenant_id),
+                &data,
+                &key,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{data:?}: the copy succeeds: {e:?}"));
+        assert_eq!(
+            taken(
+                &engine,
+                &[&f.created, &other.created, &copy],
+                &other.created
+            )
+            .await,
+            "",
+            "{data:?}: the hand-over ran no tenant operator as ruum_dbhost"
+        );
+        f.run_on(
+            &copy.database,
+            RoleKind::Owner,
+            StatementMode::Read,
+            "SELECT count(*) FROM t",
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{data:?}: the copy works: {e:?}"));
+    }
+    let point = engine
+        .create_restore_point(f.db())
+        .await
+        .expect("restore point");
+    let (key, _) = conformance::test_key();
+    let restored = engine
+        .restore_into_new(
+            f.db(),
+            &point,
+            &conformance::new_database(f.db().tenant_id),
+            &key,
+        )
+        .await
+        .expect("restore into a new database");
+    assert_eq!(
+        taken(
+            &engine,
+            &[&f.created, &other.created, &restored],
+            &other.created
+        )
+        .await,
+        "",
+        "the restore ran no tenant operator as ruum_dbhost"
+    );
+}
+
+/// Every `ruum_dbhost` session, to a database and to the admin database, resolves names in
+/// `pg_catalog` (and its own `pg_temp`) only, whatever the database or the role defaults say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dbhost_sessions_search_pg_catalog_only() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let mut host = dbhost(&engine, f.db()).await;
+    assert_eq!(
+        psql(&mut host, "show search_path").await.unwrap(),
+        "pg_catalog, pg_temp",
+        "a ruum_dbhost session to a database"
+    );
+    close(host).await;
+    let mut admin = engine.admin().await.expect("admin");
+    assert_eq!(
+        psql(&mut admin, "show search_path").await.unwrap(),
+        "pg_catalog, pg_temp",
+        "a ruum_dbhost session to the admin database"
+    );
 }

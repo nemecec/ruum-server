@@ -32,12 +32,26 @@ jobs:
           --health-cmd "pg_isready -U ruum" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       DATABASE_URL: postgres://ruum:ruum@localhost:5432/ruum
+      # The mutations of ruum-dbengine run against the data cluster (see ci.yml).
+      RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+      # The data cluster of step 2, as in ci.yml (a service container cannot be built).
+      - name: Start the data cluster (postgres-data)
+        run: |
+          docker build -t ruum-dev/postgres-data:17 deploy/dev/postgres-data
+          docker run -d --name postgres-data -p 127.0.0.1:5435:5432 --shm-size 256m \
+            -e POSTGRES_PASSWORD=ci-data-superuser -e RUUM_DBHOST_PASSWORD=ci-dbhost \
+            ruum-dev/postgres-data:17
+          for _ in $(seq 1 90); do
+            docker exec postgres-data pg_isready -q -h 127.0.0.1 -U postgres -d postgres && break
+            sleep 1
+          done
+          docker exec postgres-data pg_isready -h 127.0.0.1 -U postgres -d postgres
       # Strict: step 1 is built, so a survived or skipped mutation fails the run. Set the
       # repository variable MUTATION_STRICT=0 to make them warnings again.
       - name: Break each security rule in a copy; the suites must fail

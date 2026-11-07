@@ -131,7 +131,23 @@ impl PostgresConfig {
             .application_name("ruum-dbengine")
             .disable_statement_logging()
     }
+
+    /// The connection options of a `ruum_dbhost` session. Its `search_path` is `pg_catalog,
+    /// pg_temp`, set at log-in, so it wins over a default of the database or the role. A
+    /// tenant may create objects in `public`, and with `public` on the path a platform query
+    /// would pick a tenant's operator or function over the one of `pg_catalog` when its argument
+    /// types match better (`oid = integer`, `name !~ name`; the CVE-2018-1058 kind). That
+    /// code would run with `ruum_dbhost`'s `CREATEROLE` and its `ADMIN` on the roles of every
+    /// database (re-review of E-2). The sessions of the per-database roles keep the path of
+    /// their kind ([`pool::search_path`]).
+    pub(crate) fn dbhost_options(&self) -> PgConnectOptions {
+        self.connect_options()
+            .options([("search_path", DBHOST_SEARCH_PATH)])
+    }
 }
+
+/// The `search_path` of every `ruum_dbhost` session: no schema a tenant can write to.
+pub(crate) const DBHOST_SEARCH_PATH: &str = "pg_catalog, pg_temp";
 
 /// The meta data of a database in `ruum_meta`.
 #[derive(Debug, Clone)]
@@ -240,7 +256,7 @@ impl PostgresEngine {
             .max_connections(4)
             .min_connections(0)
             .idle_timeout(Duration::from_secs(60))
-            .connect_with(config.connect_options())
+            .connect_with(config.dbhost_options())
             .await
             .map_err(|e| internal("connect to the data cluster as ruum_dbhost", e))?;
         Ok(PostgresEngine {
@@ -281,7 +297,7 @@ impl PostgresEngine {
     /// closes it.
     pub(crate) async fn dbhost(&self, name: &str) -> Result<PgConnection, EngineError> {
         self.config
-            .connect_options()
+            .dbhost_options()
             .database(name)
             .connect()
             .await
