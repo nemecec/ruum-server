@@ -3,8 +3,9 @@
 This page says what works on `main` after the wave B merge, the security fixes of 2026-11-06,
 the panel decisions of `docs/decisions/0002-step1-panel-decisions.md`, the quality wave (wave
 C), the UX fixes of the web UI (`q/uxfix`), the synthetic-user fixes (`q/synthfix`), the
-names of actors (decision 0003, `f/followups`) and the step 2 specification (decision 0004,
-`f/step2spec`), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+names of actors (decision 0003, `f/followups`), the step 2 specification (decision 0004,
+`f/step2spec`) and the morning integration of 2026-11-07 (decision 0003 items 1 to 4 and 7, spike
+S-1, the first step 2 cards, the design system and localisation of the web UI), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -74,11 +75,50 @@ CHECK: set if and only if `role = member`); `schema.zed` relations `content_view
 `Member` and `Invitation`; accepting an invitation never lowers a content role; rule (b) of
 0002-6 counts only managers (`TenantStore::manager_since`); tag writes need content role `edit`.
 The permission matrix has three new columns (`member_view`, `member_comment`, `member_edit`).
-The web UI part is a card in `ruum-server-wt/panel/ui-followups.md` (not built).
+The web UI part is built on the design system (`w/design-system`, see below).
 
-The digest for the person is `docs/digests/2026-11-06-night.md` (earlier:
-`docs/digests/2026-11-06.md`, `docs/digests/2026-11-06-evening.md`). The worktrees of
-`q/browser`, `q/decisions`, `q/synthfix`, `f/followups` and `f/step2spec` are removed; the
+Morning integration (2026-11-07, each branch rebased onto `main`, checked on the build server,
+pushed and green in GitHub CI, then fast-forwarded, in this order; linear history, no merge
+commit, no co-author line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `f/content-role` | Decision 0003-1: a content role for team members (above). | accepted (`review-f1.md`) |
+| `f/email-grants` | Decision 0003-2 and 0003-3: an email grant binds at sign-in to the verified email; share and invitation emails through the mail outbox (`0006_email_grants_and_mail.sql`, worker, rate counters); `addGrant` answers `notified`. | accepted (`review-f23.md`) |
+| `f/audit-mcp` | Decision 0003-4 (C-14: `auth.login` and credential use in the audit log, `0007_session_tenants.sql`), 0003-7 (`searchNodes` `type`, `moveNodes`, `attachTagToNodes`, tool texts, `user_required` hints, the benchmark outcome `safe_stop` and harm checks, `0008_nodes_type_index.sql`), 0003-8 recorded. | accepted (`review-f47.md`) |
+| `s2/spike` | Spike S-1 (`spikes/step2-roles/`): the Postgres engine security model holds, 225 checks, 0 failed; the role kinds of `database_roles` are frozen; decision 0004-34 (a) to (g) fixes six gaps in how the model is built; `docs/STEP2.md` follows. | spike result (`step2-spike-s1.md`) |
+| `s2/q-0` | Card Q-0: `ruum_core::privacy` (marker types, `Pseudonymizer`, `MaskingRules` hook, canonical text with the spike's test vectors), plus the doc fix of review note 1 (`int2`/`int4` resolve to the `double precision` overload). | accepted (`review-Q-0.md`) |
+| `s2/p-1` | Card P-1: `ruum_core::providers` (the `Provider` trait, the registry, the in-memory provider, the conformance suite); the flaky export case of the review counts per tenant now. | rejected for one flaky test, fixed on the branch (`review-P-1.md`) |
+| `s2/e-1` | Card E-1: the new crate `ruum-dbengine` (the `DatabaseEngine` trait, the SQLite memory engine, the engine conformance suite); a failed `COMMIT` rolls back (case `deferred_constraint`). New dependency: `rusqlite` (`bundled`, `hooks`). | changes requested (B-1), fixed on the branch (`review-E-1.md`) |
+| `s2/i-1` | Card I-1: the data cluster `postgres-data` (Postgres 17.11, PostGIS, pgvector, no Anonymizer) with per-database LOGIN roles, `scripts/dbhost_check.sh`, `dev.sh` env and status. | accepted (`review-I-1.md`) |
+| `w/design-system` | Design 12.5 and 12.4: tokens (W3C format, Style Dictionary), the component library `web/src/ui` with Ladle and lint rules, every screen on it; FormatJS localisation (English, machine-translated Estonian, pseudo-locale), `updateMyPreferences` and `Me.preferences` (`0009_user_locale.sql`); the UX panel fixes; the web UI of decision 0003 items 1 to 4 and 7; the invitation token in the URL fragment. New web dependencies: `react-intl`, `@formatjs/icu-messageformat-parser`, Style Dictionary, stylelint, Ladle. | UX panel accepted with changes, fixed on the branch (`ux-heuristics.md`, `ux-accessibility.md`, `ux-consistency.md`) |
+
+The review files are in `ruum-server-wt/panel/`. Every decision is `provisional` (design 18.9).
+
+Fixes made during the morning integration:
+
+- Migrations renumbered at the rebase (the SQL did not change): `f/email-grants` 0005 to
+  `0006_email_grants_and_mail.sql`, `f/audit-mcp` 0005 and 0006 to `0007_session_tenants.sql`
+  and `0008_nodes_type_index.sql`, `w/design-system` 0005 to `0009_user_locale.sql`.
+- `f/email-grants` was taken in the form that `w/design-system` had already rebased onto
+  `f/content-role` (the same four commits, adapted to the content role); `w/design-system` was
+  rebased without its copies of those commits.
+- `f/audit-mcp`: the sign-in audit row comes first (it fails closed), then the email grants
+  bind; the identity test area keeps both the audit log and the in-memory authz engine.
+  `permission_matrix.md` was regenerated for `moveNodes` and `attachTagToNodes` with the
+  content-role columns.
+- `tools.json` and `web/src/api/schema.d.ts` were regenerated where the contract commits met.
+- `s2/p-1` and `s2/q-0` both add a `pub mod` line to `ruum-core/src/lib.rs`: both kept.
+- The CI job `browser end-to-end` failed once on `integ/audit-mcp` and `integ/s2-e-1` on
+  `versions.e2e.ts` "a name conflict on upload ..." (the known upload race of the design system
+  report); the re-run passed. `w/design-system` changes that test's flow.
+- The rebased branches are on GitHub as `integ/email-grants`, `integ/audit-mcp`,
+  `integ/s2-spike`, `integ/s2-q-0`, `integ/s2-p-1`, `integ/s2-e-1`, `integ/s2-i-1` and
+  `integ/design-system` (the old branch names keep the pre-rebase commits; no force push).
+
+The digest for the person is `docs/digests/2026-11-07.md` (earlier:
+`docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
+`docs/digests/2026-11-06-evening.md`). The worktrees of the merged branches are removed; the
 branches stay.
 
 Fixes made during the `q/uxfix` integration:
@@ -209,7 +249,7 @@ scripts/e2e_smoke.sh              # the stack must be up; RUUM_E2E_PORT (default
                                   # RUUM_E2E_DAV_PORT (default 8493), RUUM_DEV_SH (for worktrees)
 ```
 
-It builds and starts the server against the stack, seeds, and checks 52 steps: CLI login,
+It builds and starts the server against the stack, seeds, and checks 59 steps: CLI login,
 folders, a 3 MB upload in 73 chunks and a download with the same SHA-256, a named version and a
 second version, a copy, a share to Bob and his access, Shared with me, the changes feed, MCP
 (`initialize`, `tools/list`, `tools/call list_children`), WebDAV on its own host (PROPFIND, PUT,
@@ -261,68 +301,66 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-07, `main` after the night integration of `f/followups` and `f/step2spec`, `DATABASE_URL` and SpiceDB from `dev.sh env`)
+## Checks (2026-11-07, `main` after the morning integration, on the build server)
 
-The Rust, suite and web checks ran on the rebased `f/step2spec` tip; `main` has the same tree
-plus four commits to `docs/setup/ACCOUNTS.md` (made while the checks ran, so `f/step2spec` was
-rebased once more without a change to code). The smoke test and the mutation check ran on `main`.
+Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and SpiceDB).
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 355 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
-  ruum-core 210 + 15 (properties), ruum-api 39, ruum-cli 4 + 12 (mock server) + 3 (real
-  server), ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5, ruum-testkit 10 + 2
-  (contract) + 1 (isolation) + 1 (names) + 3 (permissions), ruum-webdav 5 + 20.
-- `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` on every backend: tenant isolation
-  328 checks (251 passed, 77 planned), permission matrix 1521 checks (1209 passed, 312
-  planned), trashed file suite 78/78; 0 pending, 0 failed, with `RUUM_SUITE_BACKEND=memory`,
-  `postgres` (memory authz) and `postgres` with `RUUM_SUITE_AUTHZ=spicedb`. The runs were one
-  after another, not in parallel.
-- `MUTATION_STRICT=1 MUTATION_TARGET_DIR=$PWD/target crates/ruum-testkit/scripts/mutation_check.sh`:
-  31 of 31 mutations killed, none survived or skipped (the 27 rules of 2026-11-06 and the 4
-  `names-*` rules of decision 0003-5).
-- `scripts/e2e_smoke.sh`: `PASSED: 52 checks`.
-- `web/`: `npm run lint` (0 warnings), `npm run build`, `npx vitest run` (16 files, 159 tests),
-  `npx tsc -p e2e/tsconfig.json`: pass.
-- `oasdiff breaking --fail-on ERR` (`tufin/oasdiff:v1.11.4`, as in CI) from the old `main`
-  (`9c86f0d`) to the new contract: 0 errors, 2438 warnings, all
-  `response-property-enum-value-added` (new `ErrorCode` values in the shared error schema).
-- On `f/followups` alone (before the step 2 merge): the same checks passed (workspace 348 passed,
-  1 ignored, suites memory and Postgres 251/1209/78, web 150 tests), except three
-  SpiceDB tests that could not write their schema to the shared SpiceDB (see "One SpiceDB for all
-  worktrees" below).
-- Not run at this integration: `scripts/e2e_browser.sh` (the Linux snapshots of 0003-5 come from
-  CI), `redocly`, `zed validate`, `crates/ruum-webdav/scripts/smoke.sh`, `cargo deny check`.
+- `cargo test --workspace`: 467 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
+  ruum-api 45, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-core 281 + 15
+  (properties), ruum-dbengine 33, ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5,
+  ruum-testkit 11 + 1 (batch) + 2 (contract) + 1 (isolation) + 1 (names) + 3 (permissions),
+  ruum-webdav 5 + 20.
+- `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` with `RUUM_SUITE_BACKEND=memory` and
+  `postgres`: tenant isolation 339 checks (262 passed, 77 planned), permission matrix 1920
+  checks (1536 passed, 384 planned), trashed file suite 96/96; 0 pending, 0 failed. The SpiceDB
+  variant (`RUUM_SUITE_AUTHZ=spicedb`) was not run at this integration; CI runs memory authz.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 45 of 45 mutations
+  killed, none survived or skipped.
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`, against the agent's own Postgres and SpiceDB.
+  Against the shared stack Postgres of the build server it fails at start ("migration 5 was
+  previously applied but has been modified"): that database had an old branch's 0005. Its
+  `ruum` database must be dropped and made again once no agent uses it.
+- `web/` (on the `w/design-system` tip): `npm run lint`, `npm run build`, `npx vitest run`
+  (21 files, 280 tests), `npm run e2e:typecheck`: pass.
+- `oasdiff breaking --fail-on ERR` (`tufin/oasdiff:v1.11.4`) from `e4ae45b`: 0 changes reported.
+- GitHub CI: green on `integ/email-grants`, `integ/audit-mcp`, `integ/s2-spike`,
+  `integ/s2-q-0`, `integ/s2-p-1`, `integ/s2-e-1`, `integ/s2-i-1` and `f/content-role`. On
+  `integ/design-system` only the 47 Linux visual references fail (see "Known gaps").
+- Not run at this integration: `scripts/e2e_browser.sh` locally (CI runs it),
+  `scripts/dbhost_check.sh` (needs `postgres-data`), `cargo deny check` (CI runs it).
 
 ## Known gaps
 
-- **Step 1 follow-ups** (decision 0003, `provisional`): item 5 (C-7, names of actors) is built
-  and merged; item 1 (content role) is built (`f/content-role`). Items 2 (C-12, email grants
-  bind) and 3 (C-13, share and invitation emails) are built on the server (`f/email-grants`,
-  migration `0006_email_grants_and_mail.sql`, the mail outbox worker, `addGrant` answers
-  `notified`). Their web UI parts are cards in `ruum-server-wt/panel/ui-followups.md`, built on
-  the design system (`w/design-system`). Branch `f/audit-mcp` builds item 4 (C-14: `auth.login`
-  in the home tenant at sign-in and at the first use of a session in each other tenant for
-  members and up, never for guests; key, token, app password and sign-out rows), item 7 (tool
-  descriptions, `searchNodes` `type`, `moveNodes` and `attachTagToNodes`, the `user_required`
-  hint with the page, the benchmark outcome `safe_stop` and harm checks) and records item 8 (IDs
-  of gone nodes may appear in entry data, names never); migrations `0007_session_tenants.sql`
-  and `0008_nodes_type_index.sql`. Item 6 (C-8 to C-11) is decided and not built. Not built of
-  4, 7 and 8: the metric `ruum_auth_login_failed_total` (no metrics registry), the IP of WebDAV
-  app password rows, the property test and mutation of item 8. The benchmark was not run with
-  the new tools.
+- **Step 1 follow-ups** (decision 0003, `provisional`): items 1 (content role), 2 (C-12), 3
+  (C-13), 4 (C-14), 5 (C-7) and 7 are built and merged, server and web UI; item 8 is recorded.
+  Item 6 (C-8 to C-11) is decided and not built. Not built of 4, 7 and 8: the metric
+  `ruum_auth_login_failed_total` (no metrics registry), the IP of WebDAV app password rows, the
+  property test and mutation of item 8. The benchmark was not run with the new tools.
 - **Mail.** Mail goes only to the relay of `SMTP_URL` (Mailpit on the laptop). Production
   sending stays with a person (design 18.9). There is no GDPR deletion job yet; it must delete
   a user's `mail_outbox` rows (and `principal_names`).
 
-- **Step 2** (decision 0004, `provisional`): only the specification is merged. The 24 database
-  operations have no route yet and count as planned in the suites (77 isolation and 312 matrix
-  checks). `migrations/0004_databases.sql` is a draft, but it is applied like any migration (by
+- **Step 2** (decision 0004, `provisional`): the specification, spike S-1 (passed; the role
+  kinds are frozen) and the foundation cards Q-0, P-1, E-1 and I-1 are merged. No database
+  operation has a route yet; the 24 operations count as planned in the suites.
+  `migrations/0004_databases.sql` is a draft, but it is applied like any migration (by
   `sqlx::test`, the suites, and the server at start while `RUUM_MIGRATE` is on, the default), so
-  a change to it before step 2 is built needs a fresh database. Open: spike S-1 before the role kinds freeze, the PostgreSQL Anonymizer change of
-  design 8.5 (a person confirms), UX contract needs C-20 to C-23.
-- **Linux visual snapshots.** Decision 0003-5 changed `versions-desktop-light` and
-  `versions-desktop-dark`; the darwin references are updated, the Linux references
-  (`web/e2e/visual.e2e.ts-snapshots/*-visual-linux.png`) must be refreshed by CI.
+  a change to it before step 2 is built needs a fresh database. Open: card C-1 takes the text
+  change of 0004-34 (d) (transaction control in "Statements that never run"); the PostgreSQL
+  Anonymizer change of design 8.5 (a person confirms); UX contract needs C-20 to C-23; the
+  notes of the card reviews for later cards (Q-2: `int2`/`int4`, `real`, BC dates; P-2: agent
+  copies, delivery keys per tenant; I-2 and later: review-I-1 findings 1 and 2).
+  `scripts/dbhost_check.sh` needs the `postgres-data` service and was not run at this
+  integration.
+- **Linux visual snapshots.** The CI job `browser end-to-end` fails only on 47 Linux references
+  of `web/e2e/visual.e2e.ts-snapshots/` (`<screen>-<variant>-visual-linux.png`), changed by the
+  web UI of decision 0003 and the UX panel fixes; CI must refresh them (take the
+  `*-actual.png` files of the `e2e-browser-report` artifact): phone-light and phone-dark of
+  account, activity-log, details, files, folder, invitations, members, not-found, share,
+  share-link, shared, trash and versions; desktop-light and desktop-dark of activity-log, agent,
+  details, members, share and versions; pseudo-locale of activity-log, agent, details, files,
+  members, not-found, share, trash and versions. The darwin references are up to date.
 - **One SpiceDB for all worktrees.** The SpiceDB of the laptop stack holds one schema. After a
   branch with new relations (here `f/step2spec`) wrote its schema and relationships, a branch
   without those relations cannot write its schema (`cannot delete relation ...`), and its SpiceDB
