@@ -4,6 +4,7 @@ import { Row, Stack } from '../layout/Layout'
 import { Text } from '../text/Text'
 import { AgentMark, FileIcon, FolderIcon, Icon, KindIcon } from './Icon'
 import { iconNames } from './paths'
+import { sample } from '../story'
 
 export default { title: 'Icon' }
 
@@ -41,6 +42,6 @@ export const Kinds: Story = () => (
 export const TheAgentMark: Story = () => (
   <Stack>
     <AgentMark />
-    <AgentName srText=", an agent for Liis Tamm">Claude Desktop for Liis</AgentName>
+    <AgentName srText=", an agent for Liis Tamm">{sample('Claude Desktop (agent of Liis Tamm)')}</AgentName>
   </Stack>
 )

@@ -18,6 +18,7 @@ import {
   Field,
   List,
   ListRow,
+  Menu,
   Loaded,
   Loading,
   LoadMore,
@@ -128,27 +129,6 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                         </Text>
                       )}
                       <Actions align="start">
-                        <Button
-                          size="sm"
-                          aria-label={t('versions.download.label', { when })}
-                          onClick={() => downloadNode(node, v.id).catch(setError)}
-                        >
-                          {t('common.download')}
-                        </Button>
-                        {page.items.length > 1 && (
-                          <Button size="sm" aria-label={t('versions.compare.label', { when })} onClick={() => setCompare(v)}>
-                            {t('versions.compare')}
-                          </Button>
-                        )}
-                        {canEdit && (
-                          <Button
-                            size="sm"
-                            aria-label={v.label ? t('versions.rename.label', { when }) : t('versions.keep.label', { when })}
-                            onClick={() => setNaming(v)}
-                          >
-                            {v.label ? t('details.rename') : t('versions.keep')}
-                          </Button>
-                        )}
                         {canEdit && !current && (
                           <ConfirmButton
                             size="sm"
@@ -160,6 +140,20 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                             onConfirm={() => restore(v)}
                           />
                         )}
+                        {page.items.length > 1 && (
+                          <Button size="sm" aria-label={t('versions.compare.label', { when })} onClick={() => setCompare(v)}>
+                            {t('versions.compare')}
+                          </Button>
+                        )}
+                        <Menu
+                          label={t('details.more')}
+                          context={t('versions.more.of', { when })}
+                          size="sm"
+                          items={[
+                            { label: t('common.download'), onSelect: () => void downloadNode(node, v.id).catch(setError) },
+                            ...(canEdit ? [{ label: v.label ? t('versions.rename') : t('versions.name'), onSelect: () => setNaming(v) }] : []),
+                          ]}
+                        />
                       </Actions>
                     </ListRow>
                   )
@@ -208,7 +202,7 @@ function changeCount(s: { inserted: number; deleted: number; modified: number; m
 }
 
 /** Plain names of the diff plugins (ia.md: "Compare as" text, data, image, file). */
-function pluginLabel(id: string): string {
+function pluginLabel(id: string, inline = false): string {
   const name = id.split('@')[0]
   const labels: Record<string, MessageKey> = {
     text: 'diff.plugin.text',
@@ -217,7 +211,15 @@ function pluginLabel(id: string): string {
     image: 'diff.plugin.image',
     binary: 'diff.plugin.binary',
   }
-  return labels[name] ? t(labels[name]) : name[0].toUpperCase() + name.slice(1)
+  const inlineLabels: Record<string, MessageKey> = {
+    text: 'diff.plugin.text.inline',
+    json: 'diff.plugin.json.inline',
+    xml: 'diff.plugin.xml.inline',
+    image: 'diff.plugin.image.inline',
+    binary: 'diff.plugin.binary.inline',
+  }
+  // A plugin the UI does not know: its ID as the server sends it.
+  return (inline ? inlineLabels : labels)[name] ? t((inline ? inlineLabels : labels)[name]) : name
 }
 
 /** A change path in plain words: `lines/2` is "Line 2". */
@@ -332,7 +334,7 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
                   )}
                   {d.truncated && <Text tone="muted">{t('compare.truncated')}</Text>}
                   <Text tone="muted" size="sm">
-                    {t('compare.comparedAs', { plugin: pluginLabel(d.plugin).toLowerCase() })}
+                    {t('compare.comparedAs', { plugin: pluginLabel(d.plugin, true) })}
                   </Text>
                 </DiffView>
               )

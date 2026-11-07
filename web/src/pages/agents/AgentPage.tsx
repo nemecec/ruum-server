@@ -5,7 +5,7 @@ import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useNames } from '../../app/useNames'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { formatDate, formatWhen } from '../../components/format'
+import { formatDate, formatWhen, formatWhenInline } from '../../components/format'
 import { ScopeFields } from './ScopeFields'
 import { accessSummary, agentStatus } from './status'
 import {
@@ -193,7 +193,8 @@ export function AgentPage() {
               )}
             </Toolbar>
             <Text tone="muted">
-              {t('agent.for', { name: a.name, person: names.person(a.owner_id)?.name ?? t('agent.someone') })} <Badge>{agentStatus(a)}</Badge>
+              {names.person(a.owner_id)?.name ? t('agent.for', { name: a.name, person: names.person(a.owner_id)!.name }) : a.name}{' '}
+              <Badge>{agentStatus(a)}</Badge>
               {a.description ? ` ${a.description}` : ''}
             </Text>
             {a.disabled_at && <Note>{t('agent.pausedNote')}</Note>}
@@ -324,7 +325,7 @@ function KeysSection({ agent }: { agent: Schemas['Agent'] }) {
                     {k.name || t('agent.key')} <code>{k.prefix}...</code>
                     <Text as="span" tone="muted" size="sm" block>
                       {k.last_used_at
-                        ? t('agent.key.facts', { ends: formatDate(k.expires_at), used: formatWhen(k.last_used_at).toLowerCase() })
+                        ? t('agent.key.facts', { ends: formatDate(k.expires_at), used: formatWhenInline(k.last_used_at) })
                         : t('agent.key.facts.unused', { ends: formatDate(k.expires_at) })}
                     </Text>
                   </Grow>
@@ -387,6 +388,24 @@ const reasons: Record<NonNullable<Schemas['UndoItem']['reason']>, MessageKey> = 
   permission_denied: 'undo.reason.permission',
 }
 
+/** How far apart two changes may be and still count as one run of the agent (journey J5). */
+const RUN_GAP_MS = 15 * 60 * 1000
+
+/**
+ * The entries in runs: changes of the agent that follow each other with less than 15 minutes
+ * between them. The entries come newest first; each run too.
+ */
+function runsOf<T extends { at: string }>(entries: T[]): T[][] {
+  const runs: T[][] = []
+  for (const e of entries) {
+    const run = runs[runs.length - 1]
+    const prev = run?.[run.length - 1]
+    if (prev && new Date(prev.at).getTime() - new Date(e.at).getTime() < RUN_GAP_MS) run.push(e)
+    else runs.push([e])
+  }
+  return runs
+}
+
 function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
   const agentId = agent.id
   const { toast } = useToast()
@@ -413,11 +432,12 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
     return unwrap(client.POST('/v1/agents/{agent_id}/undo', { params: { path: { agent_id: agentId } }, body }))
   }
 
-  /** The dry run: the selected entries, or everything since the agent was created up to now. */
-  async function dryRun() {
+  /** The dry run: `seqs` (one run), the selected entries, or everything since the agent was created up to now. */
+  async function dryRun(seqs?: number[]) {
     setError(undefined)
-    const request: UndoBody = selected.length
-      ? { dry_run: true, seqs: selected }
+    const pick = seqs ?? selected
+    const request: UndoBody = pick.length
+      ? { dry_run: true, seqs: pick }
       : { dry_run: true, since: agent.created_at, until: new Date().toISOString() }
     try {
       setReport({ result: await send(request), request })
@@ -449,12 +469,17 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
     activity.reload()
   }
 
+  // The confirm lists the changes in the order and with the words of the activity list.
+  const bySeq = new Map(entries.map((e) => [e.seq, e]))
+  const asListed = <T extends { seq: number }>(r: T) => (bySeq.get(r.seq) ?? r) as T
+  const inListOrder = <T extends { seq: number }>(list: T[]) => [...list].sort((x, y) => y.seq - x.seq)
+
   const n = report?.result.reverted.length ?? 0
   return (
     <Card aria-labelledby="activity-title">
       <Toolbar>
         <h2 id="activity-title">{t('activity.title')}</h2>
-        <Button onClick={dryRun} disabled={selected.length === 0 && open.length === 0}>
+        <Button onClick={() => dryRun()} disabled={selected.length === 0 && open.length === 0}>
           {selected.length ? t('undo.selected', { n: selected.length }) : t('undo.all')}
         </Button>
       </Toolbar>
@@ -464,28 +489,51 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
           items.length === 0 ? (
             <EmptyState title={t('activity.none.title', { name: agent.name })} text={t('activity.none.text')} />
           ) : (
-            <List>
-              {items.map((e) => {
-                const isUndone = undone.includes(e.seq)
+            <Stack gap={4}>
+              <Text tone="muted" size="sm">
+                {t('activity.help')}
+              </Text>
+              {runsOf(items).map((run) => {
+                const openSeqs = run.filter((e) => !undone.includes(e.seq)).map((e) => e.seq)
+                const last = run[0]
                 return (
-                  <ListRow key={e.seq} undone={isUndone}>
-                    <BareCheckbox
-                      aria-label={t('activity.select', { what: describePlain(e, info.data ?? {}) })}
-                      disabled={isUndone}
-                      checked={selected.includes(e.seq)}
-                      onChange={(ev) => setSelected((s) => (ev.target.checked ? [...s, e.seq] : s.filter((x) => x !== e.seq)))}
-                    />
-                    <ListRowMain>
-                      <DescribeText e={e} info={info.data ?? {}} />
-                      {isUndone && <Badge>{t('activity.undone')}</Badge>}
-                    </ListRowMain>
-                    <Text as="span" tone="muted" size="sm" title={formatDate(e.at)}>
-                      {formatWhen(e.at)}
-                    </Text>
-                  </ListRow>
+                  <Stack as="section" key={last.seq} gap={2} aria-label={t('activity.run', { when: formatWhen(run[run.length - 1].at), n: run.length })}>
+                    <Toolbar>
+                      <Text as="h3" size="sm" tone="muted">
+                        {t('activity.run', { when: formatWhen(run[run.length - 1].at), n: run.length })}
+                      </Text>
+                      {openSeqs.length > 0 && (
+                        <Button size="sm" onClick={() => dryRun(openSeqs)}>
+                          {t('activity.run.undo')}
+                        </Button>
+                      )}
+                    </Toolbar>
+                    <List>
+                      {run.map((e) => {
+                        const isUndone = undone.includes(e.seq)
+                        return (
+                          <ListRow key={e.seq} undone={isUndone}>
+                            <BareCheckbox
+                              aria-label={t('activity.select', { what: describePlain(e, info.data ?? {}) })}
+                              disabled={isUndone}
+                              checked={selected.includes(e.seq)}
+                              onChange={(ev) => setSelected((s) => (ev.target.checked ? [...s, e.seq] : s.filter((x) => x !== e.seq)))}
+                            />
+                            <ListRowMain>
+                              <DescribeText e={e} info={info.data ?? {}} />
+                              {isUndone && <Badge>{t('activity.undone')}</Badge>}
+                            </ListRowMain>
+                            <Text as="span" tone="muted" size="sm" title={formatDate(e.at)}>
+                              {formatWhen(e.at)}
+                            </Text>
+                          </ListRow>
+                        )
+                      })}
+                    </List>
+                  </Stack>
                 )
               })}
-            </List>
+            </Stack>
           )
         }
       </Loaded>
@@ -503,9 +551,9 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
                 <>
                   <p>{t('undo.list.reverted')}</p>
                   <ul>
-                    {report.result.reverted.map((r) => (
+                    {inListOrder(report.result.reverted).map((r) => (
                       <li key={r.seq}>
-                        <DescribeText e={r} info={info.data ?? {}} />
+                        <DescribeText e={asListed(r)} info={info.data ?? {}} />
                       </li>
                     ))}
                   </ul>
@@ -515,9 +563,9 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
                 <>
                   <p>{t('undo.list.skipped')}</p>
                   <ul>
-                    {report.result.skipped.map((s) => (
+                    {inListOrder(report.result.skipped).map((s) => (
                       <li key={s.seq}>
-                        <DescribeText e={s} info={info.data ?? {}} />: {s.reason ? t(reasons[s.reason]) : t('undo.reason.skipped')}
+                        <DescribeText e={asListed(s)} info={info.data ?? {}} />: {s.reason ? t(reasons[s.reason]) : t('undo.reason.skipped')}
                       </li>
                     ))}
                   </ul>

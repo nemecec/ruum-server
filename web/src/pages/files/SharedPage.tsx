@@ -62,15 +62,21 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
         <THead>
           <Tr>
             <Th scope="col">{t('common.name')}</Th>
-            {showSpace && <Th scope="col">{t('shell.space')}</Th>}
-            <Th scope="col">{t('shared.access')}</Th>
+            {showSpace && (
+              <Th scope="col" hideNarrow>
+                {t('shell.space')}
+              </Th>
+            )}
+            <Th scope="col" hideNarrow>
+              {t('shared.access')}
+            </Th>
             <Th scope="col" hideNarrow>
               {t('shared.by')}
             </Th>
             <Th scope="col" hideNarrow>
               {t('shared.when')}
             </Th>
-            <Th scope="col">
+            <Th scope="col" hideNarrow>
               <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
             </Th>
           </Tr>
@@ -82,17 +88,25 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
             return (
               <Tr key={node.id}>
                 <Th scope="row">
-                  <NameCell icon={<KindIcon kind={node.kind} type={node.type} name={node.name} />}>
+                  <NameCell
+                    icon={<KindIcon kind={node.kind} type={node.type} name={node.name} />}
+                    meta={
+                      // On the phone the other columns are hidden; the row opens the item, which has Download.
+                      showSpace
+                        ? t('shared.meta.space', { space: spaceName(node.tenant_id), access: roleLabels[role], who: sharer })
+                        : t('shared.meta', { access: roleLabels[role], who: sharer })
+                    }
+                  >
                     <Link to={sharedItemPath(node)}>{node.name}</Link>
                   </NameCell>
                 </Th>
-                {showSpace && <Td>{spaceName(node.tenant_id)}</Td>}
-                <Td>{roleLabels[role]}</Td>
+                {showSpace && <Td hideNarrow>{spaceName(node.tenant_id)}</Td>}
+                <Td hideNarrow>{roleLabels[role]}</Td>
                 <Td hideNarrow>{sharer}</Td>
                 <Td hideNarrow>
                   <span title={formatDate(shared_at)}>{formatWhen(shared_at)}</span>
                 </Td>
-                <Td actions>
+                <Td actions hideNarrow>
                   {node.kind === 'file' && (
                     <Button
                       size="sm"

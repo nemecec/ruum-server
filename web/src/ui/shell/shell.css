@@ -27,6 +27,10 @@
 }
 
 .ui-brand {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--size-control);
+  padding: 0 var(--space-1);
   color: var(--color-text);
   font: var(--text-lg);
   font-weight: var(--font-weight-brand);
@@ -275,6 +279,14 @@
     padding: var(--space-4);
   }
 
+  .ui-split-modal::before {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-sheet);
+    background: var(--color-backdrop);
+    content: '';
+  }
+
   .ui-split-aside {
     position: fixed;
     inset: auto 0 0;
@@ -290,5 +302,12 @@
     bottom: var(--space-2);
     left: var(--space-2);
     width: auto;
+  }
+}
+
+@media (pointer: coarse) {
+  .ui-brand,
+  .ui-search-input {
+    min-height: var(--size-touch);
   }
 }

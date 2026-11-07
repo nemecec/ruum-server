@@ -17,7 +17,7 @@ describe('account page', () => {
 
   it('ends another session', async () => {
     const { user } = renderApp(`${personal}/account`)
-    await user.click(await screen.findByRole('button', { name: 'Sign out Safari on iPhone' }))
+    await user.click(await screen.findByRole('button', { name: 'Sign out device Safari on iPhone' }))
     await user.click(within(await dialog('End this session?')).getByRole('button', { name: 'End session' }))
     expect(await screen.findByText('Session ended.')).toBeInTheDocument()
     expect(db.sessions).toHaveLength(1)

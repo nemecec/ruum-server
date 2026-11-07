@@ -2,8 +2,9 @@ import { Link, Navigate, useNavigate, useParams } from 'react-router'
 import { client, RuumApiError, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { EmptyState, Loaded, PageBody, useToast } from '../../ui'
+import { Loaded, PageBody, useToast } from '../../ui'
 import { trashNodes } from './api'
+import { EmailShareCheck } from './EmailShareCheck'
 import { NodeDetails } from './NodeDetails'
 import { VersionsPanel } from './VersionsPanel'
 import { useState } from 'react'
@@ -15,13 +16,15 @@ import { t } from '../../i18n'
  */
 export function ItemPage() {
   const { nodeId = '' } = useParams()
-  const { tenant, listed } = useTenant()
+  const { tenant } = useTenant()
   const { toast } = useToast()
   const navigate = useNavigate()
   const [versions, setVersions] = useState(false)
   const node = useApi(() => unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: nodeId } } })), [nodeId])
 
-  if (node.error instanceof RuumApiError && node.error.status === 404 && listed === false) return <NotInSpaceYet />
+  // A share email links here; a share to the person's email may need a bind check first.
+  if (node.error instanceof RuumApiError && node.error.status === 404)
+    return <EmailShareCheck nodeId={nodeId} tenantId={tenant.id} onRetry={node.reload} loading={node.loading} />
   return (
     <PageBody narrow>
       <p>
@@ -56,23 +59,6 @@ export function ItemPage() {
           )
         }
       </Loaded>
-    </PageBody>
-  )
-}
-
-/**
- * An item of a space that is not in the person's list answers `404`: the share reached the
- * person, but the server has not made them a guest of that space (docs/TESTING.md, known gaps).
- */
-export function NotInSpaceYet() {
-  return (
-    <PageBody>
-      <EmptyState
-        title={t('item.notInSpace.title')}
-        text={t('item.notInSpace.text')}
-      >
-        <Link to="/">{t('common.goToFiles')}</Link>
-      </EmptyState>
     </PageBody>
   )
 }

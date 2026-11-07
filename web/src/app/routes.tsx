@@ -17,7 +17,7 @@ import { OAuthConsentPage } from '../pages/OAuthConsent'
 import { ShareLinkPage } from '../pages/share/ShareLinkPage'
 import { SignInPage } from '../pages/SignIn'
 import { RequireSession } from './session'
-import { AccountRedirect, HomeRedirect, TenantLayout } from './Shell'
+import { AccountRedirect, HomeRedirect, SectionRedirect, TenantLayout } from './Shell'
 
 /** All routes of the UI. `createBrowserRouter` uses them in the app, `createMemoryRouter` in tests. */
 export const routes: RouteObject[] = [
@@ -41,6 +41,11 @@ export const routes: RouteObject[] = [
         children: [
           { index: true, element: <HomeRedirect /> },
           { path: 'account', element: <AccountRedirect /> },
+          // The page links in the hints of `403 user_required` (decision 0003-7).
+          { path: 'agents', element: <SectionRedirect to={['agents']} /> },
+          { path: 'members', element: <SectionRedirect to={['admin', 'members']} /> },
+          { path: 'audit', element: <SectionRedirect to={['admin', 'audit']} /> },
+          { path: 'settings', element: <SectionRedirect to={['admin', 'policy']} /> },
           { path: 'oauth/consent', element: <OAuthConsentPage /> },
           { path: 'invitations/accept', element: <AcceptInvitationPage /> },
           {
@@ -70,7 +75,7 @@ export const routes: RouteObject[] = [
                   { path: 'audit', element: <AuditPage /> },
                 ],
               },
-              { path: '*', element: <NotFoundPage /> },
+              { path: '*', element: <NotFoundPage inShell /> },
             ],
           },
         ],

@@ -41,7 +41,8 @@ import {
 } from '../../ui'
 import { listChildren, listSharedWithMe, loadFolder, moveNodes, trashNodes, type Node } from './api'
 import { MoveDialog, NameDialog } from './dialogs'
-import { NotInSpaceYet } from './ItemPage'
+import { focusPageHeading } from '../../components/dom'
+import { EmailShareCheck } from './EmailShareCheck'
 import { NodeDetails } from './NodeDetails'
 import { SharedTable } from './SharedPage'
 import { nameHeadVersion, replacesOwnSave } from './coalesce'
@@ -196,6 +197,7 @@ export function FilesPage() {
       setChecked(new Set())
       if (nodes.some((n) => n.id === selectedId)) select(null)
       reload()
+      focusPageHeading()
       toast(done.length === 1 ? t('files.trashed.one', { name: done[0].name }) : t('files.trashed', { n: done.length }), {
         undo: async () => {
           await undo()
@@ -214,6 +216,7 @@ export function FilesPage() {
     setChecked(new Set())
     if (nodes.some((n) => n.id === selectedId)) select(null)
     reload()
+    focusPageHeading()
     const folder = folderLabel(target)
     toast(done.length === 1 ? t('files.moved.one', { name: done[0].name, folder }) : t('files.moved', { n: done.length, folder }), {
       undo: async () => {
@@ -236,6 +239,7 @@ export function FilesPage() {
   return (
     <SplitView
       asideLabel={t('files.details')}
+      onCloseAside={() => select(null)}
       aside={
         selected && !stale ? (
           panel === 'versions' && selected.kind === 'file' ? (
@@ -256,8 +260,9 @@ export function FilesPage() {
     >
       {stale ? (
         <Loading label={t('files.loadingItems')} />
-      ) : state.error instanceof RuumApiError && state.error.status === 404 && listed === false ? (
-        <NotInSpaceYet />
+      ) : state.error instanceof RuumApiError && state.error.status === 404 && (folderId || listed === false) ? (
+        // A folder of a share email: a share to the person's email may need a bind check first.
+        <EmailShareCheck nodeId={folderId ?? tenant.id} tenantId={tenant.id} onRetry={state.reload} loading={state.loading} />
       ) : (
         <Loaded state={state}>
           {({ folder, ancestors }) => {
@@ -602,7 +607,16 @@ function FileTable(props: {
                 />
               </Td>
               <Th scope="row">
-                <NameCell icon={<KindIcon kind={n.kind} type={n.type} name={n.name} />}>
+                <NameCell
+                  icon={<KindIcon kind={n.kind} type={n.type} name={n.name} />}
+                  meta={
+                    // On the phone the Changed column is hidden: when and who (an agent with its
+                    // mark) go under the name, so the agent is visible in one look (journey J5).
+                    <>
+                      <span title={formatDate(n.updated_at)}>{formatWhen(n.updated_at)}</span> · <Actor pair={n.updated_by} />
+                    </>
+                  }
+                >
                   {n.kind === 'folder' ? (
                     <Link to={tenantPath(props.tenantId, 'files', n.id)}>{n.name}</Link>
                   ) : (

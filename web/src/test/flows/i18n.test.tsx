@@ -46,11 +46,19 @@ describe('localisation', () => {
   it('changes the language on the Account page and stores it with the account', async () => {
     const { user } = renderApp(`${personal}/account`)
     const select = await screen.findByRole('combobox', { name: 'Language of Ruum' })
+    // The choice applies with Save, not on input (WCAG 3.2.2).
     await user.selectOptions(select, 'et')
+    expect(db.preferences.locale).toBeNull()
+    await user.click(within(select.closest('form')!).getByRole('button', { name: 'Save' }))
     expect(await screen.findByRole('heading', { name: 'Konto', level: 1 })).toBeInTheDocument()
     expect(db.preferences.locale).toBe('et')
+    // The focus comes back to the picker of the new page, which says what changed (A1).
+    const picker = await screen.findByRole('combobox', { name: 'Kasutajaliidese keel' })
+    await waitFor(() => expect(picker).toHaveFocus())
+    expect(screen.getByText('Keel on nüüd Eesti.')).toBeInTheDocument()
     // "Same as the browser" clears the preference; jsdom's browser speaks English.
-    await user.selectOptions(await screen.findByRole('combobox', { name: 'Ruumi keel' }), '')
+    await user.selectOptions(picker, '')
+    await user.click(within(picker.closest('form')!).getByRole('button', { name: 'Salvesta' }))
     expect(await screen.findByRole('heading', { name: 'Account', level: 1 })).toBeInTheDocument()
     expect(db.preferences.locale).toBeNull()
   })

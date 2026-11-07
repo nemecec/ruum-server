@@ -1,5 +1,5 @@
 import type { Schemas } from '../../api/client'
-import { formatDay, formatWhen, roleLabels } from '../../components/format'
+import { formatDay, formatWhenInline, roleLabels } from '../../components/format'
 import { t } from '../../i18n'
 
 /** The status of an agent in plain words (copy.md 3.5). */
@@ -12,16 +12,18 @@ export function agentStatus(a: Schemas['Agent']): string {
         : t('agent.status.paused')
   if (a.scope.expires_at && a.scope.expires_at < new Date().toISOString()) return t('agent.status.ended')
   if (!a.last_used_at) return t('agent.status.unused')
-  return t('agent.status.active', { when: formatWhen(a.last_used_at).toLowerCase() })
+  return t('agent.status.active', { when: formatWhenInline(a.last_used_at) })
 }
 
 /** "Can edit in folder Clients, until 4 Feb 2027" (copy.md 3.5, access summary). */
-export function accessSummary(scope: Schemas['AgentScope'], folderName: string | null, spaceName: string): string {
+export function accessSummary(scope: Schemas['AgentScope'], folderName: string | null, spaceName: string | null): string {
+  // One message with a select per case: a fallback noun phrase in a slot that needs a case form
+  // breaks Estonian (i18n.md).
   return t('agent.summary', {
     role: roleLabels[scope.max_role],
-    where: scope.subtree ? 'folder' : 'everywhere',
-    folder: folderName ?? t('agent.aFolder'),
-    space: spaceName,
+    where: scope.subtree ? (folderName ? 'folder' : 'someFolder') : spaceName ? 'everywhere' : 'everywhereHere',
+    folder: folderName ?? '',
+    space: spaceName ?? '',
     hasEnd: scope.expires_at ? 'yes' : 'no',
     date: scope.expires_at ? formatDay(scope.expires_at) : '',
     hasBudget: scope.budget?.max_writes_per_hour ? 'yes' : 'no',

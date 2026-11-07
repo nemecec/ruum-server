@@ -10,7 +10,7 @@ for (const key of ['ann', 'ben'] as const) {
     await signIn(page, user)
     await expect(page).toHaveURL(/\/t\/[0-9a-f-]{36}\/files$/)
     await expect(page.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()
-    await expect(page.getByRole('combobox', { name: 'Space' })).toContainText(`${user.displayName}'s space (personal)`)
+    await expect(page.getByRole('button', { name: `${user.displayName}'s space (change space)` })).toBeVisible()
 
     // The session is a cookie with a CSRF partner; /v1/me answers for this user.
     const me = await api<{ user: { email: string; email_verified: boolean } }>(page, 'GET', '/v1/me')

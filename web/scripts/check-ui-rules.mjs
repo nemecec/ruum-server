@@ -13,6 +13,10 @@
 //    as a text property of an object (`{ label: '...' }`) or as the text of `toast()` and
 //    `setNotice()`. A string without letters (" ", "-", "/") or that is a catalogue key is fine;
 //    `// i18n-ignore: <reason>` on the line before skips one literal that people never see.
+// 6. No case change of text in code (`toLowerCase`, `toUpperCase` and the locale forms) in the same
+//    folders: the case belongs to the message. A use on data that people never read as a sentence
+//    (an email address to compare, a file extension) carries `// i18n-ignore: <reason>` on its line
+//    or the line before.
 //
 // Run: node scripts/check-ui-rules.mjs (part of `npm run lint`). Exit code 1 lists each break.
 import fs from 'node:fs'
@@ -147,6 +151,8 @@ function literalText(node) {
   return null
 }
 
+const caseCalls = new Set(['toLowerCase', 'toUpperCase', 'toLocaleLowerCase', 'toLocaleUpperCase'])
+
 for (const f of files.filter((f) => /\.tsx?$/.test(f) && !/\.(stories|test)\.tsx?$/.test(f) && !f.endsWith('.d.ts'))) {
   if (!inside(f, textDirs)) continue
   const text = fs.readFileSync(f, 'utf8')
@@ -174,6 +180,14 @@ for (const f of files.filter((f) => /\.tsx?$/.test(f) && !/\.(stories|test)\.tsx
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && textCalls.has(node.expression.text)) {
       const lit = literalText(node.arguments[0])
       if (lit) report(lit, `in ${node.expression.text}()`)
+    }
+    // 6. No case change in code: a translated text keeps the case the catalogue gives it.
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && caseCalls.has(node.expression.name.text)) {
+      const line = sf.getLineAndCharacterOfPosition(node.getStart()).line
+      if (!/i18n-ignore/.test(lines[line] ?? '') && !/i18n-ignore/.test(lines[line - 1] ?? ''))
+        problems.push(
+          `${at(node)}: ${node.expression.name.text}() changes the case of text; put the case in the catalogue (a message for the middle of a sentence), or mark a non-UI use with // i18n-ignore`,
+        )
     }
     ts.forEachChild(node, visit)
   }

@@ -4,7 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { errorText } from '../../api/errors'
-import { formatBytes, formatWhen } from '../../components/format'
+import { formatBytes, formatWhenInline } from '../../components/format'
 import {
   Actions,
   Button,
@@ -166,7 +166,7 @@ function summary(r: { nodes: Node[]; failed: number; folders: Set<string>; repla
   else text = folder ? t('uploads.toast.toFolder', { n, folder }) : t('uploads.toast.many', { n })
   if (r.replaced.length === 1) {
     const it = r.replaced[0]
-    text += ` ${t('uploads.toast.replaced.one', { when: formatWhen(it.replaced!).toLowerCase() })}`
+    text += ` ${t('uploads.toast.replaced.one', { when: formatWhenInline(it.replaced!) })}`
   } else if (r.replaced.length > 1) {
     text += ` ${t('uploads.toast.replaced', { n: r.replaced.length })}`
   }
@@ -317,7 +317,7 @@ export function ConflictDialog(props: {
   const [busy, setBusy] = useState(false)
   const title = names.length === 1 ? t('conflict.title.one', { name: names[0] }) : t('conflict.title', { n: names.length })
   const one = names.length === 1
-  const when = recent.length === 1 ? formatWhen(recent[0].updated_at).toLowerCase() : null
+  const when = recent.length === 1 ? formatWhenInline(recent[0].updated_at) : null
   return (
     <Dialog title={title} open onClose={props.onClose}>
       <Stack

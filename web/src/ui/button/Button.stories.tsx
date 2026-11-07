@@ -2,6 +2,7 @@ import type { Story } from '@ladle/react'
 import { Row, Stack } from '../layout/Layout'
 import { Text } from '../text/Text'
 import { Button, ButtonAnchor, ButtonLink, IconButton } from './Button'
+import { sample } from '../story'
 
 export default { title: 'Button' }
 
@@ -15,51 +16,51 @@ export const AllStates: Story = () => (
         <Text as="span" tone="muted" size="sm">
           {v}
         </Text>
-        <Button variant={v}>Save</Button>
+        <Button variant={v}>{sample('Save')}</Button>
         <Button variant={v} disabled>
-          Disabled
+          {sample('Disabled')}
         </Button>
         <Button variant={v} busy disabled>
-          Saving...
+          {sample('Saving...')}
         </Button>
         <Button variant={v} size="sm">
-          Small
+          {sample('Small')}
         </Button>
         <Button variant={v} icon="upload">
-          Upload files
+          {sample('Upload files')}
         </Button>
       </Row>
     ))}
   </Stack>
 )
 
-export const Primary: Story = () => <Button variant="primary">Upload files</Button>
-export const Secondary: Story = () => <Button>New folder</Button>
-export const Quiet: Story = () => <Button variant="quiet">End now</Button>
-export const Danger: Story = () => <Button variant="danger">Delete 12 items for good</Button>
-export const Link: Story = () => <Button variant="link">Clear selection</Button>
+export const Primary: Story = () => <Button variant="primary">{sample('Upload files')}</Button>
+export const Secondary: Story = () => <Button>{sample('New folder')}</Button>
+export const Quiet: Story = () => <Button variant="quiet">{sample('End now')}</Button>
+export const Danger: Story = () => <Button variant="danger">{sample('Delete 12 items for good')}</Button>
+export const Link: Story = () => <Button variant="link">{sample('Clear selection')}</Button>
 export const Busy: Story = () => (
   <Button variant="primary" busy disabled>
-    Deleting...
+    {sample('Deleting...')}
   </Button>
 )
-export const Disabled: Story = () => <Button disabled>Move</Button>
+export const Disabled: Story = () => <Button disabled>{sample('Move')}</Button>
 export const Wide: Story = () => (
   <Stack>
     <ButtonAnchor wide variant="primary" href="#signin">
-      Sign in with email
+      {sample('Sign in with email')}
     </ButtonAnchor>
     <ButtonLink wide to="/">
-      Not now
+      {sample('Not now')}
     </ButtonLink>
   </Stack>
 )
 export const Icons: Story = () => (
   <Row>
-    <IconButton icon="close" label="Close" />
-    <IconButton icon="more" label="More actions for plan.txt" />
-    <IconButton icon="copy" label="Copy the address" />
-    <IconButton icon="close" label="Remove tag" size="sm" />
-    <IconButton icon="close" label="Close (disabled)" disabled />
+    <IconButton icon="close" label={sample('Close')} />
+    <IconButton icon="more" label={sample('More actions for plan.txt')} />
+    <IconButton icon="copy" label={sample('Copy the address')} />
+    <IconButton icon="close" label={sample('Remove tag')} size="sm" />
+    <IconButton icon="close" label={sample('Close (disabled)')} disabled />
   </Row>
 )

@@ -56,10 +56,11 @@ export {
   SelectionBar,
   SkipLink,
   SplitView,
+  useNarrow,
   TopBar,
   TopBarItem,
 } from './shell/Shell'
-export { NameCell, SortHeader, Table, TBody, Td, Th, THead, Tr } from './table/Table'
+export { NameCell, NarrowMeta, SortHeader, Table, TBody, Td, Th, THead, Tr } from './table/Table'
 export { Code, ProseList, Text, VisuallyHidden, type Tone } from './text/Text'
 export { ToastProvider, ToastRegion, ToastView } from './toast/Toast'
 export { useToast, type ToastApi, type ToastOptions } from './toast/useToast'

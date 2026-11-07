@@ -46,7 +46,10 @@ test.describe('language preference', () => {
     await page.goto('/account')
     await expect(page.getByRole('heading', { name: 'Account', level: 1 })).toBeVisible()
     await page.getByRole('combobox', { name: 'Language of Ruum' }).selectOption('et')
+    await page.locator('form').filter({ has: page.getByRole('combobox', { name: 'Language of Ruum' }) }).getByRole('button', { name: 'Save' }).click()
     await expect(page.getByRole('heading', { name: 'Konto', level: 1 })).toBeVisible()
+    // The focus is back on the picker after the page changed its language.
+    await expect(page.getByRole('combobox', { name: 'Kasutajaliidese keel' })).toBeFocused()
     expect((await api<Me>(page, 'GET', '/v1/me')).body.preferences?.locale).toBe('et')
 
     // A new browser (no local choice) gets the language from the server.
@@ -56,7 +59,8 @@ test.describe('language preference', () => {
 
     // "Same as the browser" clears it.
     await page.goto('/account')
-    await page.getByRole('combobox', { name: 'Ruumi keel' }).selectOption('')
+    await page.getByRole('combobox', { name: 'Kasutajaliidese keel' }).selectOption('')
+    await page.locator('form').filter({ has: page.getByRole('combobox', { name: 'Kasutajaliidese keel' }) }).getByRole('button', { name: 'Salvesta' }).click()
     await expect(page.getByRole('heading', { name: 'Account', level: 1 })).toBeVisible()
     expect((await api<Me>(page, 'GET', '/v1/me')).body.preferences?.locale).toBeNull()
   })

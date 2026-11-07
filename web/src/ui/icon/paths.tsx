@@ -67,6 +67,7 @@ export const iconPaths = {
     </>
   ),
   upload: <path d="M10 13V4M6 7.5L10 3.5l4 4M4 16.5h12" />,
+  refresh: <path d="M15.5 6.5A6 6 0 1 0 16 11M15.5 3.5v3h-3" />,
   database: (
     <>
       <ellipse cx="10" cy="5" rx="6" ry="2.25" />

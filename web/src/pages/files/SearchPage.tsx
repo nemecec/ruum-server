@@ -9,6 +9,7 @@ import {
   EmptyState,
   Field,
   Grow,
+  KindIcon,
   List,
   ListRow,
   ListRowMain,
@@ -51,6 +52,7 @@ export function SearchPage() {
         as="form"
         align="end"
         role="search"
+        aria-label={t('search.filter')}
         onSubmit={(e) => {
           e.preventDefault()
           update('q', String(new FormData(e.currentTarget as HTMLFormElement).get('q') ?? '').trim())
@@ -62,7 +64,7 @@ export function SearchPage() {
           </Field>
         </Grow>
         <Field label={t('search.tag')}>
-          <Select value={tag} onChange={(e) => update('tag', e.target.value)}>
+          <Select width="auto" value={tag} onChange={(e) => update('tag', e.target.value)}>
             <option value="">{t('search.anyTag')}</option>
             {tags.data?.items.map((tag) => (
               <option key={tag.id} value={tag.id}>
@@ -88,6 +90,7 @@ export function SearchPage() {
                 <List>
                   {items.map(({ node, path }) => (
                     <ListRow key={node.id}>
+                      <KindIcon kind={node.kind} type={node.type} name={node.name} />
                       <ListRowMain>
                         <Link
                           to={
@@ -98,9 +101,8 @@ export function SearchPage() {
                         >
                           {node.name}
                         </Link>
-                        <Text as="span" tone="muted" size="sm">
-                          {' '}
-                          {path}
+                        <Text as="span" tone="muted" size="sm" block>
+                          {t('search.in', { path: path.split('/').slice(1, -1).join(' / ') || t('shell.nav.files') })}
                         </Text>
                       </ListRowMain>
                       <Text as="span" tone="muted" size="sm" hideNarrow>

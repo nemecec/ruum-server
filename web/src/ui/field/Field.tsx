@@ -105,7 +105,12 @@ export const BareCheckbox = forwardRef<
   HTMLInputElement,
   Omit<InputHTMLAttributes<HTMLInputElement>, 'className' | 'style' | 'type'> & { 'aria-label': string }
 >(function BareCheckbox(props, ref) {
-  return <input ref={ref} type="checkbox" className="ui-check-input" {...props} />
+  // The label around the box fills the check cell, so a tap beside the box counts (44 px on touch).
+  return (
+    <label className="ui-check-cell-label">
+      <input ref={ref} type="checkbox" className="ui-check-input" {...props} />
+    </label>
+  )
 })
 
 /** A radio with its label on the right. Group radios in a Fieldset. */
@@ -156,16 +161,23 @@ export function Switch(props: { label: ReactNode; checked: boolean; onChange: (o
   )
 }
 
-/** A value with a copy button (a link, an address or a command). */
-export function CopyField({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
+/**
+ * A value with a copy button (a link, an address or a command). `wrap`: a long value (a command)
+ * wraps onto more lines instead of being cut, so the person can read what they copy.
+ */
+export function CopyField({ label, value, mono = true, wrap }: { label: string; value: string; mono?: boolean; wrap?: boolean }) {
   const [copied, setCopied] = useState(false)
   return (
     <div className="ui-copy-field">
       <Field label={label} grow>
-        <TextInput readOnly value={value} mono={mono} onFocus={(e) => e.currentTarget.select()} />
+        {wrap ? (
+          <TextArea readOnly value={value} mono={mono} rows={Math.min(4, Math.ceil(value.length / 48))} onFocus={(e) => e.currentTarget.select()} />
+        ) : (
+          <TextInput readOnly value={value} mono={mono} onFocus={(e) => e.currentTarget.select()} />
+        )}
       </Field>
       <Button
-        aria-label={t('ui.copy.label', { label: label.toLowerCase() })}
+        aria-label={t('ui.copy.label', { label })}
         icon={copied ? 'check' : 'copy'}
         onClick={async () => {
           try {

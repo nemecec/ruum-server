@@ -2,7 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { browser } from '../../app/browser'
 import { db } from '../../mocks/db'
-import { dialog, ids, personal, renderApp } from '../render'
+import { dialog, ids, personal, renderApp, choose } from '../render'
 import { recordRequests } from '../requests'
 
 async function openDetails(user: ReturnType<typeof renderApp>['user'], name: string) {
@@ -15,7 +15,7 @@ describe('file browser', () => {
     const { user } = renderApp(`${personal}/files`)
     const table = await screen.findByRole('table', { name: 'Contents of this folder' })
     const rows = within(table).getAllByRole('row').slice(1)
-    expect(rows.map((r) => within(r).getByRole('rowheader').textContent)).toEqual(['Documents', 'Photos', 'notes.md'])
+    expect(rows.map((r) => (within(r).getByRole('rowheader').querySelector('a, button')?.textContent))).toEqual(['Documents', 'Photos', 'notes.md'])
 
     await user.click(screen.getByRole('link', { name: 'Documents' }))
     expect(await screen.findByRole('heading', { name: 'Documents', level: 1 })).toBeInTheDocument()
@@ -30,7 +30,7 @@ describe('file browser', () => {
   it('sorts by name, size and change, folders first, with aria-sort', async () => {
     const { user } = renderApp(`${personal}/files/${ids.documents}`)
     const table = await screen.findByRole('table', { name: 'Contents of this folder' })
-    const names = () => within(table).getAllByRole('row').slice(1).map((r) => within(r).getByRole('rowheader').textContent)
+    const names = () => within(table).getAllByRole('row').slice(1).map((r) => (within(r).getByRole('rowheader').querySelector('a, button')?.textContent))
     expect(names()).toEqual(['plan.txt', 'report.txt'])
     await user.click(within(table).getByRole('button', { name: 'Name' }))
     expect(names()).toEqual(['report.txt', 'plan.txt'])
@@ -177,7 +177,7 @@ describe('file browser', () => {
   it('renames a file', async () => {
     const { user } = renderApp(`${personal}/files`)
     const details = await openDetails(user, 'notes.md')
-    await user.click(within(details).getByRole('button', { name: 'Rename' }))
+    await choose(user, 'More actions for notes.md', 'Rename', details)
     const d = await dialog('Rename notes.md')
     const input = within(d).getByRole<HTMLInputElement>('textbox', { name: 'Name' })
     // The name without its extension is selected when the dialog opens: typing keeps ".md".
@@ -192,7 +192,7 @@ describe('file browser', () => {
   it('moves a file into another folder', async () => {
     const { user } = renderApp(`${personal}/files`)
     const details = await openDetails(user, 'notes.md')
-    await user.click(within(details).getByRole('button', { name: 'Move' }))
+    await choose(user, /^More actions for/, 'Move', details)
     const d = await dialog('Move notes.md')
     // The current folder is not a target.
     expect(await within(d).findByText("It's already here.")).toBeInTheDocument()
@@ -211,9 +211,9 @@ describe('file browser', () => {
     const { user } = renderApp(`${personal}/files`)
     const details = await openDetails(user, 'notes.md')
     // The trash can be undone, so there is no confirmation; the toast offers Undo.
-    await user.click(within(details).getByRole('button', { name: 'Move to trash' }))
+    await choose(user, 'More actions for notes.md', 'Move to trash', details)
     await waitFor(() => expect(screen.queryByRole('button', { name: 'notes.md' })).not.toBeInTheDocument())
-    expect(await screen.findByText('Moved notes.md to the trash.')).toBeInTheDocument()
+    expect(await screen.findByText('Moved notes.md to trash.')).toBeInTheDocument()
 
     await user.click(screen.getByRole('link', { name: 'Trash' }))
     await user.click(await screen.findByRole('button', { name: 'Restore notes.md' }))
@@ -223,7 +223,7 @@ describe('file browser', () => {
 
   it('deletes from the trash for good after a confirmation', async () => {
     const { user } = renderApp(`${personal}/trash`)
-    await user.click(await screen.findByRole('button', { name: 'Delete for good: old-draft.txt' }))
+    await choose(user, 'More actions for old-draft.txt', 'Delete for good')
     const d = await dialog('Delete old-draft.txt for good?')
     await user.click(within(d).getByRole('button', { name: 'Delete for good' }))
     expect(await screen.findByText('The trash is empty')).toBeInTheDocument()
@@ -251,7 +251,7 @@ describe('file browser', () => {
 
   it('lists what others shared with me', async () => {
     renderApp(`${personal}/shared`)
-    const row = (await screen.findByRole('rowheader', { name: 'Difference engine.txt' })).closest('tr')!
+    const row = (await screen.findByRole('rowheader', { name: /^Difference engine\.txt/ })).closest('tr')!
     expect(within(row).getByText('Can comment')).toBeInTheDocument()
     expect(within(row).getByText('Charles Babbage')).toBeInTheDocument()
   })
@@ -260,7 +260,7 @@ describe('file browser', () => {
     const seen = recordRequests()
     const { user, router, download } = renderApp(`${personal}/shared`)
     // An item of another tenant (Ada is a guest there) is listed on the page of her personal tenant.
-    const row = (await screen.findByRole('rowheader', { name: 'Engine drawings' })).closest('tr')!
+    const row = (await screen.findByRole('rowheader', { name: /^Engine drawings/ })).closest('tr')!
     expect(within(row).getByText('Babbage & Co')).toBeInTheDocument()
     expect(seen.find((r) => r.path === '/v1/shared-with-me')?.headers.has('Ruum-Tenant')).toBe(false)
 
@@ -299,7 +299,7 @@ describe('file browser', () => {
   it('moves a file of a guest: the picker goes up to the shared folders, not the hidden root', async () => {
     const { user } = renderApp(`/t/${ids.guest}/files/${ids.guestDrawings}`)
     const details = await openDetails(user, 'gears.txt')
-    await user.click(within(details).getByRole('button', { name: 'Move' }))
+    await choose(user, /^More actions for/, 'Move', details)
     const d = await dialog('Move gears.txt')
     expect(await within(d).findByRole('button', { name: 'Sketches' })).toBeInTheDocument()
     await user.click(within(d).getByRole('button', { name: 'Folders shared with you' }))

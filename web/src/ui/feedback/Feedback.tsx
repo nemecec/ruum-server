@@ -1,7 +1,9 @@
-import type { ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { errorDetails, errorText, type ErrorContext } from '../../api/errors'
+import { Button } from '../button/Button'
 import { cx } from '../cx'
 import { Icon, type IconName } from '../icon/Icon'
+import '../text/text.css'
 import './feedback.css'
 import { t } from '../../i18n'
 
@@ -29,15 +31,27 @@ export function Note(props: { tone?: NoteTone; role?: 'alert' | 'status' | 'note
   )
 }
 
-/** An error note in plain words, with the code and the API's message under "Details". */
-export function ErrorNote({ error, context }: { error: unknown; context?: ErrorContext }) {
+/**
+ * An error note in plain words: what happened and what to do (journeys, common states). With
+ * `onRetry` it offers "Try again" when a new try can help (network, server errors). The code and
+ * the API's message are under "Details".
+ */
+export function ErrorNote({ error, context, onRetry }: { error: unknown; context?: ErrorContext; onRetry?: () => void }) {
   if (!error) return null
   const details = errorDetails(error)
+  const retry = onRetry && retryable(error)
   return (
     <div className="ui-note ui-note-danger ui-error-note" role="alert">
       <Icon name="error" />
       <div className="ui-note-body">
         <p className="ui-error-text">{errorText(error, context)}</p>
+        {retry && (
+          <div className="ui-error-retry">
+            <Button size="sm" icon="refresh" onClick={onRetry}>
+              {t('ui.error.retry')}
+            </Button>
+          </div>
+        )}
         {details && (
           <details className="ui-error-details">
             <summary>{t('ui.error.details')}</summary>
@@ -59,15 +73,51 @@ export function Loading({ label }: { label?: string }) {
   )
 }
 
-/** Shows loading and error states of `useApi` and renders `children` with the data. */
+/** A new try can help: no answer (offline), a timeout, a limit or a server error. */
+function retryable(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status
+  if (typeof status !== 'number') return true
+  return status === 0 || status === 408 || status === 429 || status >= 500
+}
+
+/** How long a load may take before the page shows that it loads (journeys, common states). */
+export const LOADING_DELAY_MS = 300
+
+/** True once `active` has been true for `ms`; false again at once when it ends. */
+function useDelayed(active: boolean, ms: number): boolean {
+  const [shown, setShown] = useState(false)
+  useEffect(() => {
+    if (!active) {
+      setShown(false)
+      return
+    }
+    const id = setTimeout(() => setShown(true), ms)
+    return () => clearTimeout(id)
+  }, [active, ms])
+  return active && shown
+}
+
+/**
+ * Shows loading and error states of `useApi` and renders `children` with the data. Nothing shows
+ * for the first 300 ms; then a skeleton in the shape of the content (`skeleton` lines), or
+ * "Loading..." for a small region. An error offers "Try again" with the state's `reload`.
+ */
 export function Loaded<T>(props: {
-  state: { data: T | undefined; error: unknown; loading: boolean }
+  state: { data: T | undefined; error: unknown; loading: boolean; reload?: () => void }
   children: (data: T) => ReactNode
   context?: ErrorContext
+  /** The lines of the skeleton while it loads; without it a "Loading..." line. */
+  skeleton?: number
+  label?: string
 }) {
-  const { data, error, loading } = props.state
-  if (error) return <ErrorNote error={error} context={props.context} />
-  if (data === undefined) return loading ? <Loading /> : null
+  const { data, error, loading, reload } = props.state
+  const waiting = data === undefined && !error && loading
+  const show = useDelayed(waiting, LOADING_DELAY_MS)
+  if (error) return <ErrorNote error={error} context={props.context} onRetry={reload} />
+  if (data === undefined) {
+    if (!show) return null
+    return props.skeleton ? <Skeleton lines={props.skeleton} label={props.label} /> : <Loading label={props.label} />
+  }
   return <>{props.children(data)}</>
 }
 
@@ -80,12 +130,15 @@ export function Notice({ text }: { text: string | null }) {
   )
 }
 
-/** Grey bars in the shape of the content that loads. Decorative. */
-export function Skeleton({ lines = 3 }: { lines?: number }) {
+/** Grey bars in the shape of the content that loads. The bars are decorative; a hidden status says "Loading...". */
+export function Skeleton({ lines = 3, label }: { lines?: number; label?: string }) {
   return (
-    <div className="ui-skeleton" aria-hidden="true">
+    <div className="ui-skeleton">
+      <span className="ui-visually-hidden" role="status">
+        {t('ui.loading', { label: label ?? t('ui.loading.default') })}
+      </span>
       {Array.from({ length: lines }, (_, i) => (
-        <span key={i} className="ui-skeleton-line" />
+        <span key={i} className="ui-skeleton-line" aria-hidden="true" />
       ))}
     </div>
   )

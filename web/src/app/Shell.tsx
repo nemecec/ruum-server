@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Navigate, Outlet, useLocation, useNavigate, useParams } from 'react-router'
 import { client, RuumApiError, setSigningOut, setTenant, unwrap, type Schemas } from '../api/client'
 import { memberRoleLabels } from '../components/format'
@@ -11,6 +11,7 @@ import {
   Dialog,
   ErrorNote,
   Field,
+  Menu,
   MenuToggle,
   NavButton,
   NavItem,
@@ -18,7 +19,6 @@ import {
   NavRail,
   Note,
   SearchForm,
-  Select,
   SkipLink,
   Stack,
   TextInput,
@@ -40,12 +40,23 @@ export function HomeRedirect() {
   return <Navigate to={tenantPath(id, 'files')} replace />
 }
 
-/** `/account` without a space goes to the account page of the last or personal space. */
-export function AccountRedirect() {
+/**
+ * A page without a space (`/account`, `/agents`, `/members`, `/audit`, `/settings`) goes to that
+ * page of the last used space, or of the personal space. Agents pass these links to their users
+ * (the hint of `403 user_required`, decision 0003-7). A person who is not an admin of the space
+ * lands on the page and sees its usual "only admins" state.
+ */
+export function SectionRedirect({ to }: { to: string[] }) {
   const { me, tenants } = useSession()
+  const location = useLocation()
   const last = lastTenant()
   const id = tenants.some((m) => m.tenant.id === last) ? last! : me.user.home_tenant_id
-  return <Navigate to={tenantPath(id, 'account')} replace />
+  return <Navigate to={tenantPath(id, ...to) + location.search} replace />
+}
+
+/** `/account` without a space goes to the account page of the last or personal space. */
+export function AccountRedirect() {
+  return <SectionRedirect to={['account']} />
 }
 
 /**
@@ -75,6 +86,45 @@ function sharedSpace(id: string): Schemas['TenantMembership'] {
   }
 }
 
+/**
+ * The title of the page and the focus on a change of page (WCAG 2.4.2, 2.4.3; design-system 4.1):
+ * `document.title` is "*Page* - *Space* - Ruum" from the page's h1, and a new page (not the first
+ * one) moves the focus to its h1, so a screen reader hears where the person is.
+ */
+function PageTitle({ space }: { space: string }) {
+  const location = useLocation()
+  const first = useRef(true)
+  useEffect(() => {
+    const main = document.getElementById('main')
+    if (!main) return
+    const update = () => {
+      const h1 = main.querySelector('h1')?.textContent?.trim()
+      document.title = h1 ? t('shell.title', { page: h1, space }) : t('shell.title.space', { space })
+    }
+    update()
+    const observer = new MutationObserver(update)
+    observer.observe(main, { subtree: true, childList: true, characterData: true })
+    return () => observer.disconnect()
+  }, [space])
+  useEffect(() => {
+    if (first.current) {
+      first.current = false
+      return
+    }
+    // After the new page rendered its heading.
+    const id = requestAnimationFrame(() => {
+      const main = document.getElementById('main')
+      const h1 = main?.querySelector<HTMLElement>('h1')
+      const target = h1 ?? main
+      if (!target) return
+      if (target === h1 && !h1.hasAttribute('tabindex')) h1.setAttribute('tabindex', '-1')
+      target.focus({ preventScroll: true })
+    })
+    return () => cancelAnimationFrame(id)
+  }, [location.pathname])
+  return null
+}
+
 /** The layout of every page inside a space: the header, the navigation and the page. */
 export function TenantLayout() {
   const { tenantId = '' } = useParams()
@@ -95,6 +145,7 @@ export function TenantLayout() {
         me={{ id: me.user.id, name: me.user.display_name, email: me.user.email }}
       >
         <SkipLink />
+        <PageTitle space={membership.tenant.name} />
         <Header tenantId={tenantId} isAdmin={isAdmin} unlisted={listed ? null : membership}>
           {/* Only for a guest of the space. A space that is not in the person's list is not theirs at
               all yet: the pages say so (NotInSpaceYet), and a banner that says "guest" would contradict them. */}
@@ -106,13 +157,11 @@ export function TenantLayout() {
   )
 }
 
-/** The words after a space's name in the switcher: its kind and the person's role. */
-function spaceLabel(m: Schemas['TenantMembership']): string {
-  if (m.tenant.kind === 'personal' && m.role === 'owner') return t('shell.space.personal', { name: m.tenant.name })
-  return t('shell.space.role', { name: m.tenant.name, role: memberRoleLabels[m.role].toLowerCase() })
+/** The second line of a space in the switcher: its kind and the person's role. */
+function spaceHint(m: Schemas['TenantMembership']): string {
+  if (m.tenant.kind === 'personal' && m.role === 'owner') return t('shell.space.personalHint')
+  return t('shell.space.roleHint', { role: memberRoleLabels[m.role] })
 }
-
-const NEW_TEAM = '__new_team'
 
 /** The top bar, the navigation rail and the main region with the page (`children`). */
 function Header({
@@ -137,10 +186,6 @@ function Header({
   const shownQuery = onSearch ? (new URLSearchParams(location.search).get('q') ?? '') : ''
 
   function switchTenant(id: string) {
-    if (id === NEW_TEAM) {
-      setStartTeam(true)
-      return
-    }
     // Keep the same section (files, agents, account) when it exists in the other space.
     const section = location.pathname.split('/')[3] ?? 'files'
     const keep = ['files', 'shared', 'trash', 'agents', 'account', 'search'].includes(section) ? section : 'files'
@@ -175,22 +220,34 @@ function Header({
   )
 
   const options = unlisted ? [...tenants, unlisted] : tenants
+  const current = options.find((m) => m.tenant.id === tenantId) ?? options[0]
 
   return (
     <>
       <TopBar>
-        <Brand to={tenantPath(tenantId, 'files')}>{t('app.name')}</Brand>
+        <Brand to={tenantPath(tenantId, 'files')} label={t('shell.brand.label')}>
+          {t('app.name')}
+        </Brand>
         <TopBarItem grow>
-          <Field label={t('shell.space')} labelHidden>
-            <Select value={tenantId} onChange={(e) => switchTenant(e.target.value)}>
-              {options.map((m) => (
-                <option key={m.tenant.id} value={m.tenant.id}>
-                  {m === unlisted ? t('shell.space.shared', { name: m.tenant.name }) : spaceLabel(m)}
-                </option>
-              ))}
-              <option value={NEW_TEAM}>{t('shell.space.startTeam')}</option>
-            </Select>
-          </Field>
+          {/* The space switcher (design-system 4.2): a menu button that cuts a long name with an
+              ellipsis and shows it whole in its tooltip; each space has its role on a second line. */}
+          <Menu
+            wide
+            label={current.tenant.name}
+            title={current.tenant.name}
+            context={t('shell.space.switch')}
+            items={[
+              ...options.map((m) => ({
+                label: m === unlisted ? t('shell.space.shared', { name: m.tenant.name }) : m.tenant.name,
+                hint: m === unlisted ? undefined : spaceHint(m),
+                checked: m.tenant.id === tenantId,
+                onSelect: () => {
+                  if (m.tenant.id !== tenantId) switchTenant(m.tenant.id)
+                },
+              })),
+              { label: t('shell.space.startTeam'), onSelect: () => setStartTeam(true) },
+            ]}
+          />
         </TopBarItem>
         <SearchForm id="global-search" label={t('shell.search')} name="q" defaultValue={shownQuery} onSubmit={search} />
         <MenuToggle open={menuOpen} controls="main-nav" onToggle={() => setMenuOpen((o) => !o)} />

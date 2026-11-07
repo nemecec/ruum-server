@@ -1,5 +1,5 @@
 import { Fragment, useState, type FormEvent } from 'react'
-import { Link, Outlet } from 'react-router'
+import { Link, Outlet, useLocation } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
@@ -8,8 +8,19 @@ import { tenantPath, useTenant } from '../../app/tenant'
 import { Actor } from '../../app/names'
 import { useNames } from '../../app/useNames'
 import { StartTeamDialog } from '../../app/Shell'
-import { formatBytes, formatDate, formatDay, formatNumber, formatWhen, memberRoleLabels, memberRoleMeanings } from '../../components/format'
-import { auditDetail, auditText } from './audit'
+import {
+  formatBytes,
+  formatDate,
+  formatDay,
+  formatNumber,
+  formatWhen,
+  memberRoleInline,
+  memberRoleLabels,
+  memberRoleMeanings,
+  roleInline,
+  roleLabels,
+} from '../../components/format'
+import { auditClient, auditDetail, auditText } from './audit'
 import {
   Meter,
   Actions,
@@ -25,12 +36,16 @@ import {
   Field,
   Fieldset,
   Grow,
+  Indent,
   List,
   ListRow,
   Loaded,
   LoadMore,
+  Menu,
+  NarrowMeta,
   Note,
   PageBody,
+  Radio,
   Row,
   Select,
   Stack,
@@ -46,13 +61,19 @@ import {
   Tr,
   useToast,
   VisuallyHidden,
+  type MenuItem,
 } from '../../ui'
 import { t, tr, type MessageKey } from '../../i18n'
 
-/** The tenant admin layout: a sub-navigation and one admin page. */
+/**
+ * The tenant admin layout: a sub-navigation and one admin page. Members (not guests) who are not
+ * admins see only the people of the space, read-only (members may list members).
+ */
 export function AdminLayout() {
-  const { tenant, isAdmin } = useTenant()
-  if (!isAdmin) {
+  const { tenant, isAdmin, role } = useTenant()
+  const location = useLocation()
+  const membersPage = location.pathname.endsWith('/admin/members')
+  if (!isAdmin && (role !== 'member' || !membersPage)) {
     return (
       <PageBody>
         <h1>{t('shell.nav.admin')}</h1>
@@ -60,26 +81,35 @@ export function AdminLayout() {
       </PageBody>
     )
   }
-  const tabs: [string, MessageKey][] = [
-    ['members', 'admin.members'],
-    ['invitations', 'admin.invitations'],
-    ['policy', 'admin.policy'],
-    ['limits', 'admin.plan'],
-    ['audit', 'admin.audit'],
-  ]
+  const tabs: [string, MessageKey][] = isAdmin
+    ? [
+        ['members', 'admin.members'],
+        ['invitations', 'admin.invitations'],
+        ['policy', 'admin.policy'],
+        ['limits', 'admin.plan'],
+        ['audit', 'admin.audit'],
+      ]
+    : [['members', 'admin.members']]
   return (
     <PageBody>
       <h1>{t('admin.title', { space: tenant.name })}</h1>
-      <Tabs label={t('admin.tabs')} items={tabs.map(([to, label]) => ({ to, label: t(label) }))} />
-      <Outlet />
+      {isAdmin ? <Tabs label={t('admin.tabs')} items={tabs.map(([to, label]) => ({ to, label: t(label) }))} /> : <Outlet />}
+      {isAdmin && <Outlet />}
     </PageBody>
   )
 }
 
+/** The member roles in the order of the role menu, with Owner last. */
 const assignable: Schemas['MemberRole'][] = ['guest', 'member', 'admin', 'owner']
+const contentRoles: Schemas['ContentRole'][] = ['view', 'comment', 'edit', 'manage']
+
+/** The help line of a content role (ui-followups item 1). */
+export function contentRoleHelp(role: Schemas['ContentRole'], space: string): string {
+  return t('contentRole.help', { role, space })
+}
 
 export function MembersPage() {
-  const { tenant, role: myRole } = useTenant()
+  const { tenant, role: myRole, isAdmin } = useTenant()
   const { me } = useSession()
   const { toast } = useToast()
   const [error, setError] = useState<unknown>()
@@ -94,26 +124,36 @@ export function MembersPage() {
   // A change to Guest takes away everything that is not shared with the person directly, so it
   // asks first and says so (the role select alone gave no hint).
   const [toGuest, setToGuest] = useState<Schemas['Member'] | null>(null)
+  // A change to Member asks for the content role in the same step (default Can manage).
+  const [toMember, setToMember] = useState<Schemas['Member'] | null>(null)
+  const [removing, setRemoving] = useState<Schemas['Member'] | null>(null)
 
-  async function changeRole(m: Schemas['Member'], role: Schemas['MemberRole']) {
+  async function update(m: Schemas['Member'], body: { role: Schemas['MemberRole']; content_role?: Schemas['ContentRole'] }, done: string) {
     setError(undefined)
     try {
       await unwrap(
         client.PATCH('/v1/tenants/{tenant_id}/members/{user_id}', {
           params: { path: { tenant_id: tenant.id, user_id: m.user_id } },
-          body: { role },
+          body,
         }),
       )
-      toast(t('members.changed', { name: m.display_name, role: memberRoleLabels[role].toLowerCase() }))
+      toast(done)
     } catch (e) {
       setError(e)
     }
     members.reload()
   }
 
+  const changeRole = (m: Schemas['Member'], role: Schemas['MemberRole']) =>
+    update(m, { role }, t('members.changed', { name: m.display_name, role: memberRoleInline[role] }))
+
+  const changeContent = (m: Schemas['Member'], content_role: Schemas['ContentRole']) =>
+    update(m, { role: 'member', content_role }, t('members.content.changed', { name: m.display_name, role: roleInline[content_role], space: tenant.name }))
+
   return (
     <section aria-labelledby="members-title">
       <h2 id="members-title">{t('admin.members')}</h2>
+      {!isAdmin && <Text tone="muted">{t('members.readOnly', { space: tenant.name })}</Text>}
       <ErrorNote error={error} />
       {toGuest && (
         <ConfirmDialog
@@ -123,7 +163,7 @@ export function MembersPage() {
               {t('members.toGuest.message', {
                 name: toGuest.display_name,
                 space: tenant.name,
-                role: memberRoleLabels[toGuest.role].toLowerCase(),
+                role: memberRoleInline[toGuest.role],
               })}
             </p>
           }
@@ -132,88 +172,196 @@ export function MembersPage() {
           onClose={() => setToGuest(null)}
         />
       )}
-      <Loaded state={members}>
-        {({ items }) => (
-          <Table caption={t('admin.members')}>
-            <THead>
-              <Tr>
-                <Th scope="col">{t('common.name')}</Th>
-                <Th hideNarrow scope="col">
-                  {t('account.email')}
-                </Th>
-                <Th scope="col">{t('members.role')}</Th>
-                <Th scope="col">
-                  <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
-                </Th>
-              </Tr>
-            </THead>
-            <TBody>
-              {items.map((m) => {
-                const self = m.user_id === me.user.id
-                // Only owners can make or change owners.
-                const locked = self || (m.role === 'owner' && myRole !== 'owner')
-                return (
-                  <Tr key={m.user_id}>
-                    <Th scope="row">
-                      {m.display_name}
-                      {self && (
-                        <Text as="span" tone="muted">
-                          {' '}
-                          {t('share.you')}
-                        </Text>
-                      )}
+      {toMember && (
+        <MakeMemberDialog
+          member={toMember}
+          space={tenant.name}
+          onClose={() => setToMember(null)}
+          onConfirm={(content_role) =>
+            update(toMember, { role: 'member', content_role }, t('members.changed', { name: toMember.display_name, role: memberRoleInline.member }))
+          }
+        />
+      )}
+      {removing && (
+        <ConfirmDialog
+          title={t('members.remove.title', { name: removing.display_name, space: tenant.name })}
+          message={t('members.remove.message')}
+          confirmLabel={t('members.remove.label', { name: removing.display_name })}
+          danger
+          onClose={() => setRemoving(null)}
+          onConfirm={async () => {
+            await unwrap(
+              client.DELETE('/v1/tenants/{tenant_id}/members/{user_id}', {
+                params: { path: { tenant_id: tenant.id, user_id: removing.user_id } },
+              }),
+            )
+            toast(t('members.removed', { name: removing.display_name, space: tenant.name }))
+            members.reload()
+          }}
+        />
+      )}
+      <Loaded state={members} skeleton={4} label={t('admin.members')}>
+        {({ items }) => {
+          const owners = items.filter((m) => m.role === 'owner').length
+          return (
+            <Table caption={t('admin.members')}>
+              <THead>
+                <Tr>
+                  <Th scope="col">{t('common.name')}</Th>
+                  <Th hideNarrow scope="col">
+                    {t('account.email')}
+                  </Th>
+                  <Th scope="col">{t('members.role')}</Th>
+                  {isAdmin && (
+                    <Th scope="col">
+                      <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
                     </Th>
-                    <Td hideNarrow>{m.email}</Td>
-                    <Td>
-                      <Select
-                        aria-label={t('members.role.of', { name: m.display_name })}
-                        value={m.role}
-                        disabled={locked}
-                        onChange={(e) => {
-                          const role = e.target.value as Schemas['MemberRole']
-                          if (role === 'guest' && m.role !== 'guest') setToGuest(m)
-                          else void changeRole(m, role)
-                        }}
-                      >
-                        {assignable
-                          .filter((r) => r !== 'owner' || myRole === 'owner' || m.role === 'owner')
-                          .map((r) => (
-                            <option key={r} value={r}>
-                              {memberRoleLabels[r]}
-                            </option>
-                          ))}
-                      </Select>
-                    </Td>
-                    <Td actions>
-                      {!locked && (
-                        <ConfirmButton
-                          label={t('share.remove')}
-                          ariaLabel={t('members.remove.label', { name: m.display_name })}
-                          title={t('members.remove.title', { name: m.display_name, space: tenant.name })}
-                          message={t('members.remove.message')}
-                          confirmLabel={t('members.remove.label', { name: m.display_name })}
-                          danger
-                          onConfirm={async () => {
-                            await unwrap(
-                              client.DELETE('/v1/tenants/{tenant_id}/members/{user_id}', {
-                                params: { path: { tenant_id: tenant.id, user_id: m.user_id } },
-                              }),
-                            )
-                            toast(t('members.removed', { name: m.display_name, space: tenant.name }))
-                            members.reload()
-                          }}
-                        />
+                  )}
+                </Tr>
+              </THead>
+              <TBody>
+                {items.map((m) => {
+                  const self = m.user_id === me.user.id
+                  // Why a role can't change here, said next to it (journeys J6).
+                  const why: string | null = !isAdmin
+                    ? null
+                    : self
+                      ? m.role === 'owner' && owners === 1
+                        ? t('members.locked.lastOwner')
+                        : t('members.locked.self')
+                      : m.role === 'owner' && myRole !== 'owner'
+                        ? t('members.locked.owner')
+                        : null
+                  const locked = !isAdmin || why !== null
+                  const hintId = `member-${m.user_id}-why`
+                  const roleItems: MenuItem[] = assignable
+                    .filter((r) => r !== 'owner' || myRole === 'owner' || m.role === 'owner')
+                    .map((r) => ({
+                      label: memberRoleLabels[r],
+                      hint: memberRoleMeanings[r],
+                      checked: m.role === r,
+                      onSelect: () => {
+                        if (r === m.role) return
+                        if (r === 'guest') setToGuest(m)
+                        else if (r === 'member') setToMember(m)
+                        else void changeRole(m, r)
+                      },
+                    }))
+                  const content = m.role === 'member' ? (m.content_role ?? 'manage') : null
+                  return (
+                    <Tr key={m.user_id}>
+                      <Th scope="row">
+                        {m.display_name}
+                        {self && (
+                          <Text as="span" tone="muted">
+                            {' '}
+                            {t('share.you')}
+                          </Text>
+                        )}
+                        <NarrowMeta>{m.email}</NarrowMeta>
+                      </Th>
+                      <Td hideNarrow>{m.email}</Td>
+                      <Td>
+                        <Stack gap={1}>
+                          <Row gap={2}>
+                            {locked ? (
+                              <Text as="span" aria-describedby={why ? hintId : undefined}>
+                                {memberRoleLabels[m.role]}
+                              </Text>
+                            ) : (
+                              <Menu label={memberRoleLabels[m.role]} context={t('members.role.of', { name: m.display_name })} items={roleItems} size="sm" />
+                            )}
+                            {content &&
+                              (isAdmin ? (
+                                <Menu
+                                  label={roleLabels[content]}
+                                  context={t('members.content.of', { name: m.display_name })}
+                                  size="sm"
+                                  items={contentRoles.map((r) => ({
+                                    label: roleLabels[r],
+                                    hint: contentRoleHelp(r, tenant.name),
+                                    checked: content === r,
+                                    onSelect: () => {
+                                      if (r !== content) void changeContent(m, r)
+                                    },
+                                  }))}
+                                />
+                              ) : (
+                                <Text as="span" tone="muted">
+                                  {roleLabels[content]}
+                                </Text>
+                              ))}
+                          </Row>
+                          {why && (
+                            <Text as="span" tone="muted" size="sm" id={hintId}>
+                              {why}
+                            </Text>
+                          )}
+                          {content && (content === 'view' || content === 'comment') && (
+                            <Text as="span" tone="muted" size="sm">
+                              {t('members.content.everyone')}
+                            </Text>
+                          )}
+                        </Stack>
+                      </Td>
+                      {isAdmin && (
+                        <Td actions>
+                          {!locked && (
+                            <Menu
+                              icon="more"
+                              ariaLabel={t('members.more', { name: m.display_name })}
+                              quiet
+                              align="end"
+                              items={[{ label: t('members.remove.item', { space: tenant.name }), danger: true, onSelect: () => setRemoving(m) }]}
+                            />
+                          )}
+                        </Td>
                       )}
-                    </Td>
-                  </Tr>
-                )
-              })}
-            </TBody>
-          </Table>
-        )}
+                    </Tr>
+                  )
+                })}
+              </TBody>
+            </Table>
+          )
+        }}
       </Loaded>
       <LoadMore state={members} />
     </section>
+  )
+}
+
+/** "Make *name* a member?": the content role in the same step (default Can manage). */
+function MakeMemberDialog(props: {
+  member: Schemas['Member']
+  space: string
+  onClose: () => void
+  onConfirm: (content: Schemas['ContentRole']) => Promise<void>
+}) {
+  const [content, setContent] = useState<Schemas['ContentRole']>('manage')
+  return (
+    <ConfirmDialog
+      title={t('members.toMember.title', { name: props.member.display_name })}
+      message={
+        <Stack>
+          <p>{t('members.toMember.message', { name: props.member.display_name, space: props.space })}</p>
+          <Fieldset legend={t('members.content.label')} plain>
+            {contentRoles.map((r) => (
+              <Stack key={r} gap={1}>
+                <Radio name="content-role" checked={content === r} onChange={() => setContent(r)} label={roleLabels[r]} />
+                <Indent>
+                  <Text tone="muted" size="sm">
+                    {contentRoleHelp(r, props.space)}
+                  </Text>
+                </Indent>
+              </Stack>
+            ))}
+          </Fieldset>
+        </Stack>
+      }
+      confirmLabel={t('members.toMember.confirm')}
+      onConfirm={() => props.onConfirm(content)}
+      onClose={props.onClose}
+    />
   )
 }
 
@@ -233,6 +381,7 @@ export function InvitationsPage() {
   const membersAllowed = tenant.kind !== 'personal' && room.data !== false
   const [emails, setEmails] = useState('')
   const [role, setRole] = useState<Schemas['CreateInvitationRequest']['role']>(tenant.kind === 'personal' ? 'guest' : 'member')
+  const [content, setContent] = useState<Schemas['ContentRole']>('manage')
   const [message, setMessage] = useState('')
   const [error, setError] = useState<unknown>()
   const [startTeam, setStartTeam] = useState(false)
@@ -258,7 +407,13 @@ export function InvitationsPage() {
         await unwrap(
           client.POST('/v1/tenants/{tenant_id}/invitations', {
             params: { path: { tenant_id: tenant.id } },
-            body: { email, role: effectiveRole, ...(message.trim() ? { message: message.trim() } : {}) },
+            body: {
+              email,
+              role: effectiveRole,
+              // Only a member has a content role; for a guest or an admin it is left out.
+              ...(effectiveRole === 'member' ? { content_role: content } : {}),
+              ...(message.trim() ? { message: message.trim() } : {}),
+            },
           }),
         )
         sent.push(email)
@@ -289,12 +444,23 @@ export function InvitationsPage() {
             />
           </Field>
           <Field label={t('members.role')}>
-            <Select value={effectiveRole} onChange={(e) => setRole(e.target.value as typeof role)} aria-describedby="inv-role-help">
+            <Select width="auto" value={effectiveRole} onChange={(e) => setRole(e.target.value as typeof role)} aria-describedby="inv-role-help">
               <option value="guest">{memberRoleLabels.guest}</option>
               {membersAllowed && <option value="member">{memberRoleLabels.member}</option>}
               {membersAllowed && <option value="admin">{memberRoleLabels.admin}</option>}
             </Select>
           </Field>
+          {effectiveRole === 'member' && (
+            <Field label={t('members.content.label')}>
+              <Select width="auto" value={content} onChange={(e) => setContent(e.target.value as Schemas['ContentRole'])} aria-describedby="inv-content-help">
+                {contentRoles.map((r) => (
+                  <option key={r} value={r}>
+                    {roleLabels[r]}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          )}
         </Row>
         <Text tone="muted" size="sm" id="inv-emails-help">
           {t('invitations.emails.help')}
@@ -302,6 +468,11 @@ export function InvitationsPage() {
         <Text tone="muted" size="sm" id="inv-role-help">
           {t('share.roleMeaning', { role: memberRoleLabels[effectiveRole], meaning: memberRoleMeanings[effectiveRole] })}
         </Text>
+        {effectiveRole === 'member' && (
+          <Text tone="muted" size="sm" id="inv-content-help">
+            {t('share.roleMeaning', { role: roleLabels[content], meaning: contentRoleHelp(content, tenant.name) })}
+          </Text>
+        )}
         {!membersAllowed && (
           <Note>
             <p>
@@ -337,6 +508,7 @@ export function InvitationsPage() {
               <ListRow key={i.id}>
                 <Grow>
                   {i.email} <Badge>{memberRoleLabels[i.role]}</Badge>
+                  {i.role === 'member' && i.content_role && <Badge>{roleLabels[i.content_role]}</Badge>}
                   <Text as="span" tone="muted" size="sm" block>
                     {t('invitations.waiting', { date: formatDay(i.expires_at) })}
                   </Text>
@@ -502,7 +674,6 @@ export function LimitsPage() {
 
 export function AuditPage() {
   const { tenant } = useTenant()
-  const [action, setAction] = useState('')
   const [filter, setFilter] = useState('')
   // The activity log also comes as NDJSON (for export); the UI asks for JSON pages.
   const audit = usePagedApi(
@@ -536,16 +707,8 @@ export function AuditPage() {
   return (
     <section aria-labelledby="audit-title">
       <h2 id="audit-title">{t('admin.audit')}</h2>
-      <Row
-        as="form"
-        align="end"
-        onSubmit={(e) => {
-          e.preventDefault()
-          setFilter(action)
-        }}
-      >
-        <Field label={t('audit.show')} grow>
-          <Select value={action} onChange={(e) => setAction(e.target.value)}>
+      <Field label={t('audit.show')} hint={filter === 'auth.' ? t('audit.signIns.help') : undefined} hintId="audit-filter-help">
+        <Select width="auto" value={filter} onChange={(e) => setFilter(e.target.value)} aria-describedby={filter === 'auth.' ? 'audit-filter-help' : undefined}>
             <option value="">{t('audit.filter.all')}</option>
             <option value="auth.">{t('audit.filter.auth')}</option>
             <option value="member.">{t('admin.members')}</option>
@@ -555,11 +718,9 @@ export function AuditPage() {
             <option value="agent.">{t('shell.nav.agents')}</option>
             <option value="node.">{t('limits.items')}</option>
             <option value="version.">{t('details.versions')}</option>
-          </Select>
-        </Field>
-        <Button type="submit">{t('audit.show')}</Button>
-      </Row>
-      <Loaded state={audit}>
+        </Select>
+      </Field>
+      <Loaded state={audit} skeleton={6} label={t('admin.audit')}>
         {({ items }) => (
           <>
             {items.length === 0 ? (
@@ -570,6 +731,17 @@ export function AuditPage() {
                   <ListRow key={a.id}>
                     <Grow>
                       <Actor pair={a} /> <AuditWhat entry={a} items={items_.data ?? {}} />
+                      {a.action === 'agent.key_refused' && (
+                        <>
+                          {' '}
+                          <Badge tone="warning">{t('audit.refused')}</Badge>
+                        </>
+                      )}
+                      {auditClient(a) && (
+                        <Text as="span" tone="muted" size="sm" block>
+                          {auditClient(a)}
+                        </Text>
+                      )}
                     </Grow>
                     <Text as="span" tone="muted" size="sm" title={formatDate(a.at)}>
                       {formatWhen(a.at)}
@@ -592,7 +764,15 @@ type AuditItem = { name: string; folder: boolean }
 function AuditWhat({ entry, items }: { entry: Schemas['AuditEntry']; items: Record<string, AuditItem> }) {
   const { tenant } = useTenant()
   const names = useNames()
-  const detail = auditDetail(entry, { person: (id) => names.person(id)?.name, spaceName: tenant.name })
+  const { data: passwords } = useApi(
+    () => (entry.action === 'auth.app_password_used' ? unwrap(client.GET('/v1/me/app-passwords')) : Promise.resolve(null)),
+    [entry.action],
+  )
+  const detail = auditDetail(entry, {
+    person: (id) => names.person(id)?.name,
+    spaceName: tenant.name,
+    appPassword: (id) => passwords?.items.find((p) => p.id === id)?.name,
+  })
   if (!detail) return <>{auditText(entry)}</>
   const it = detail.item ? items[detail.item] : undefined
   const item = !detail.item ? (

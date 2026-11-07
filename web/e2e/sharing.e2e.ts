@@ -92,7 +92,7 @@ test('Ann shares a folder with Ben, who joins as a guest by invitation and sees 
   // the share dialog sent, which also binds the email grant to him.
   const mail = await waitForMail(users.ben.email)
   expect(mail.text).toContain(`I shared "${folder}" with you.`)
-  const link = /https?:\/\/\S+\/invitations\/accept\?token=\S+/.exec(mail.text)?.[0]
+  const link = /https?:\/\/\S+\/invitations\/accept[?#]token=\S+/.exec(mail.text)?.[0]
   expect(link, mail.text).toBeTruthy()
   const benContext = await browser.newContext({ storageState: storageStatePath('ben') })
   const ben = await benContext.newPage()
@@ -100,7 +100,9 @@ test('Ann shares a folder with Ben, who joins as a guest by invitation and sees 
   await acceptInvitation(ben, link!)
   await ben.reload()
   // Ann's space is now in Ben's space list, with his role there.
-  await expect(ben.getByRole('combobox', { name: 'Space' }).getByRole('option', { name: `${users.ann.displayName}'s space (guest)` })).toHaveCount(1)
+  await ben.getByRole('button', { name: /\(change space\)$/ }).click()
+  await expect(ben.getByRole('menuitemradio', { name: `${users.ann.displayName}'s space Your role: Guest` })).toHaveCount(1)
+  await ben.keyboard.press('Escape')
   await seesFolderReadOnly(ben, users.ann, folder, note, info.outputPath('ben-note.txt'))
 
   // Ann removes Ben's access; his next look at the folder fails.

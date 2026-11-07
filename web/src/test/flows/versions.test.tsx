@@ -1,14 +1,14 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { db } from '../../mocks/db'
-import { dialog, ids, personal, renderApp } from '../render'
+import { dialog, ids, personal, renderApp, choose } from '../render'
 import { recordRequests } from '../requests'
 
 describe('versions panel', () => {
   async function openVersions() {
     const app = renderApp(`${personal}/files`)
     await app.user.click(await screen.findByRole('button', { name: 'Details of notes.md' }))
-    await app.user.click(within(await screen.findByRole('region', { name: 'notes.md' })).getByRole('button', { name: 'Versions' }))
+    await choose(app.user, 'More actions for notes.md', 'Versions', await screen.findByRole('region', { name: 'notes.md' }))
     return { ...app, panel: await screen.findByRole('region', { name: 'Versions of notes.md' }) }
   }
 
@@ -100,10 +100,10 @@ describe('versions panel', () => {
 
   it('names a version, and says that named versions are kept forever', async () => {
     const { user, panel } = await openVersions()
-    // The button says what naming is for.
-    const label = await within(panel).findAllByRole('button', { name: /^Keep forever: name the version of / })
-    expect(label[0]).toHaveTextContent('Keep forever…')
-    await user.click(label[0])
+    // Naming is one action with one name everywhere (journey J4: "Name this version").
+    const more = await within(panel).findAllByRole('button', { name: /^More actions for the version of / })
+    await user.click(more[0])
+    await user.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Name this version' }))
     const d = await dialog('Name this version')
     expect(within(d).getByText(/Named versions are kept forever/)).toBeInTheDocument()
     expect(within(d).getByRole('textbox')).toHaveFocus()

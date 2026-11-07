@@ -26,7 +26,9 @@
 
 .ui-tabs ul {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: thin;
   gap: 0 var(--space-5);
   margin: 0;
   padding: 0;
@@ -52,4 +54,12 @@
   border-bottom-color: var(--color-primary);
   color: var(--color-text);
   font-weight: var(--font-weight-strong);
+}
+
+.ui-tabs li {
+  flex: none;
+}
+
+.ui-tabs a {
+  white-space: nowrap;
 }

@@ -2,6 +2,7 @@ import type { Story } from '@ladle/react'
 import { Row, Stack } from '../layout/Layout'
 import { Badge, Chip, Tag, TagList, type BadgeTone } from './Badge'
 import { tagColors } from './tagColor'
+import { sample } from '../story'
 
 export default { title: 'Badge, tag and chip' }
 
@@ -14,10 +15,10 @@ export const Badges: Story = () => (
         {t}
       </Badge>
     ))}
-    <Badge tone="primary">Current</Badge>
-    <Badge tone="success">Active</Badge>
-    <Badge tone="warning">Paused</Badge>
-    <Badge tone="danger">Access ended</Badge>
+    <Badge tone="primary">{sample('Current')}</Badge>
+    <Badge tone="success">{sample('Active')}</Badge>
+    <Badge tone="warning">{sample('Paused')}</Badge>
+    <Badge tone="danger">{sample('Access ended')}</Badge>
   </Row>
 )
 
@@ -34,12 +35,12 @@ const tagHex: Record<string, string> = {
 
 export const Tags: Story = () => (
   <Stack>
-    <TagList label="Tags">
+    <TagList label={sample('Tags')}>
       {tagColors.map((c) => (
         <Tag key={c} name={c} color={tagHex[c]} />
       ))}
     </TagList>
-    <TagList label="Removable tags">
+    <TagList label={sample('Removable tags')}>
       <Tag name="Invoices" color="#33aa77" onRemove={() => {}} />
       <Tag name="No colour" onRemove={() => {}} />
       <Tag name="Free colour #f0f" color="#f0f" />
@@ -49,15 +50,15 @@ export const Tags: Story = () => (
 
 export const Chips: Story = () => (
   <Row>
-    <Chip kind="hidden" srText="Hidden secret value" title="Hidden. Only people who can manage garden see secret values.">
-      hidden: secret
+    <Chip kind="hidden" srText="Hidden secret value" title={sample('Hidden. Only people who can manage garden see secret values.')}>
+      {sample('hidden: secret')}
     </Chip>
     <Chip kind="hidden" srText="Hidden personal value">
-      hidden: personal
+      {sample('hidden: personal')}
     </Chip>
     <Chip kind="standin" srText="Stand-in for a personal value, person 8 f 3 a 9 1">
-      person 8f3a91
+      {sample('person 8f3a91')}
     </Chip>
-    <Chip kind="value">value 1</Chip>
+    <Chip kind="value">{sample('value 1')}</Chip>
   </Row>
 )

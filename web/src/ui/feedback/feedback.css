@@ -183,3 +183,7 @@
   width: 100%;
   height: var(--size-meter);
 }
+
+.ui-error-retry {
+  margin-top: var(--space-2);
+}

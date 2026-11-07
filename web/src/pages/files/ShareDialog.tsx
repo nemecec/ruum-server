@@ -6,7 +6,7 @@ import { usePagedApi } from '../../api/usePagedApi'
 import { useActorText, useNames, type Names } from '../../app/useNames'
 import { useSession } from '../../app/useSession'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { formatDay, memberRoleLabels, roleLabels, roleMeanings } from '../../components/format'
+import { formatDay, memberRoleInline, roleInline, roleLabels, roleMeanings } from '../../components/format'
 import type { Node } from './api'
 import {
   Button,
@@ -20,6 +20,7 @@ import {
   ListRow,
   Loaded,
   LoadMore,
+  Menu,
   Note,
   Notice,
   Row,
@@ -27,6 +28,7 @@ import {
   Select,
   Stack,
   Text,
+  TextArea,
   TextInput,
 } from '../../ui'
 import { t, tr } from '../../i18n'
@@ -99,7 +101,7 @@ async function loadSpacePeople(tenantId: string): Promise<SpacePeople> {
     )
     for (const m of page.items) {
       byId.set(m.user_id, m)
-      if (m.email) byEmail.set(m.email.toLowerCase(), m)
+      if (m.email) byEmail.set(m.email.toLowerCase(), m) // i18n-ignore: an email address as a key
     }
     if (!page.next_cursor) break
     cursor = page.next_cursor
@@ -114,8 +116,37 @@ async function loadSpacePeople(tenantId: string): Promise<SpacePeople> {
  */
 export type EmailMatch = { kind: 'me' } | { kind: 'person'; member: Schemas['Member'] } | { kind: 'outside' } | { kind: 'unknown' }
 
-/** True for the space roles that manage everything in a team space (decision 0001-4, team root). */
-const managesEverything = (role: Schemas['MemberRole']) => role !== 'guest'
+/**
+ * The access a person of a team space has everywhere in it through the team root: owners and admins
+ * manage, a member has their content role (decision 0003-1, default manage), a guest nothing.
+ */
+export function teamAccess(m: { role: Schemas['MemberRole']; content_role?: Schemas['ContentRole'] | null }): Schemas['Role'] | null {
+  if (m.role === 'owner' || m.role === 'admin') return 'manage'
+  if (m.role === 'member') return m.content_role ?? 'manage'
+  return null
+}
+
+/** True when `role` gives nothing more than `base` (roles are ordered view < comment < edit < manage). */
+const covers = (base: Schemas['Role'] | null, role: Schemas['Role']) => base !== null && roles.indexOf(base) >= roles.indexOf(role)
+
+/** The rows of the access from the space: one per access, with the people in it (S2, decision 0003-1). */
+type TeamRow = { access: Schemas['Role']; admins: number; members: number }
+
+function teamRows(people: Schemas['Member'][]): TeamRow[] {
+  const by = new Map<Schemas['Role'], TeamRow>()
+  for (const m of people) {
+    const access = teamAccess(m)
+    if (!access) continue
+    const row = by.get(access) ?? { access, admins: 0, members: 0 }
+    if (m.role === 'member') row.members++
+    else row.admins++
+    by.set(access, row)
+  }
+  return roles
+    .filter((r) => by.has(r))
+    .reverse()
+    .map((r) => by.get(r)!)
+}
 
 /** The share dialog: people with access, the link, and who may share further (copy.md 3.3). */
 export function ShareDialog(props: { node: Node; open: boolean; onClose: () => void; onChanged: () => void }) {
@@ -146,17 +177,21 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   const canInviteGuests = isAdmin && policy.allow_guests
   const team = tenant.kind === 'team'
   const match = (email: string): EmailMatch => {
+    // i18n-ignore: email addresses compared without case
     const e = email.trim().toLowerCase()
+    // i18n-ignore: email addresses compared without case
     if (e === me.user.email.toLowerCase()) return { kind: 'me' }
     const known = people.data
     if (!known) return { kind: 'unknown' }
     const member = known.byEmail.get(e)
     return member ? { kind: 'person', member } : { kind: 'outside' }
   }
-  // Members, admins and owners of a team space manage everything in it through the team root,
-  // and share there while the policy `members_can_share` is on. A share or a sharing rule can't
-  // give them less, so the dialog shows that access too.
-  const roleCount = people.data ? [...people.data.byId.values()].filter((m) => managesEverything(m.role)).length : null
+  // Owners and admins of a team space manage everything in it through the team root; members have
+  // their content role there (decision 0003-1). A share or a sharing rule can't give them less, so
+  // the dialog shows that access too, one row per access.
+  const spacePeople = people.data ? [...people.data.byId.values()] : null
+  const rows = spacePeople ? teamRows(spacePeople) : null
+  const myAccess = team ? teamAccess({ role: myTenantRole, content_role: spacePeople?.find((m) => m.user_id === me.user.id)?.content_role }) : null
 
   // The folders that inherited grants come from, by name (ia.md: "from folder Name").
   const fromIds = [...new Set((grants.data?.items ?? []).map((g) => g.inherited_from).filter((x): x is string => Boolean(x)))]
@@ -219,7 +254,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   return (
     <Dialog title={t('share.title', { name: node.name })} open={props.open} onClose={props.onClose} size="md">
       <Stack>
-        <ErrorNote error={error} />
+        <ErrorNote error={error} context={{ share: true, space: tenant.name }} />
         <Notice text={notice} />
         {canShare ? (
           <AddPersonForm
@@ -229,7 +264,8 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
             membersCanShare={policy.members_can_share}
             itemName={node.name}
             match={match}
-            canInvite={canInviteGuests}
+            allowGuests={policy.allow_guests}
+            guestCaller={myTenantRole === 'guest'}
             isAdmin={isAdmin}
             tenantId={tenant.id}
             onUseLink={
@@ -241,58 +277,43 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     select?.focus()
                   }
             }
-            onAdd={async (target, role, inviteGuest) => {
+            onAdd={async (target, role, notify, message) => {
               setError(undefined)
+              setNotice(null)
               // A person of the space gets the share by user ID: it reaches their account at once
-              // (decision 0002-1). An email grant would wait for an invitation that never comes.
-              const body: Schemas['AddGrantRequest'] =
+              // (decision 0002-1). Anyone else gets an email grant; it binds when they sign in with
+              // that address (decision 0003-2). Ruum emails them when "Notify people" is on (0003-3).
+              const grantee: Schemas['Grantee'] =
                 target.kind === 'person'
-                  ? { grantee: { type: 'user', id: target.member.user_id }, role, notify: false }
-                  : { grantee: { type: 'email', email: target.email }, role, notify: false }
-              const who = target.kind === 'person' ? target.member.display_name || target.member.email : target.email
+                  ? { type: 'user', id: target.member.user_id }
+                  : target.kind === 'everyone'
+                    ? { type: 'tenant_members' }
+                    : { type: 'email', email: target.email }
+              const body: Schemas['AddGrantRequest'] = { grantee, role, notify, ...(notify && message ? { message } : {}) }
+              const who =
+                target.kind === 'person'
+                  ? target.member.display_name || target.member.email
+                  : target.kind === 'everyone'
+                    ? t('share.everyone', { space: tenant.name })
+                    : target.email
+              let res: Schemas['GrantWrite']
               try {
-                const res = await unwrap(client.POST('/v1/nodes/{node_id}/grants', { params: { path: { node_id: node.id } }, body }))
+                res = await unwrap(client.POST('/v1/nodes/{node_id}/grants', { params: { path: { node_id: node.id } }, body }))
                 if (target.kind === 'person') names.learn(target.member.user_id, { name: who, email: target.member.email })
-                else rememberGrantEmail(res.grant.id, target.email)
+                else if (target.kind === 'email') rememberGrantEmail(res.grant.id, target.email)
               } catch (e) {
                 setError(e)
-                return
+                return false
               }
               grants.reload()
-              if (target.kind === 'person') {
-                setNotice(
-                  team && managesEverything(target.member.role)
-                    ? t('share.done.role', {
-                        name: node.name,
-                        who,
-                        role: memberRoleLabels[target.member.role].toLowerCase(),
-                        space: tenant.name,
-                      })
-                    : t('share.done.person', { name: node.name, who }),
-                )
-                return
-              }
-              if (!inviteGuest) {
-                setNotice(t('share.done.noInvite', { name: node.name, who }))
-                return
-              }
-              // The person must join before they can open the item: Ruum emails them an invitation.
-              try {
-                await unwrap(
-                  client.POST('/v1/tenants/{tenant_id}/invitations', {
-                    params: { path: { tenant_id: tenant.id } },
-                    body: {
-                      email: target.email,
-                      role: 'guest',
-                      message: t('share.invitation.message', { name: node.name }),
-                    },
-                  }),
-                )
-                setNotice(t('share.done.invited', { name: node.name, who }))
-              } catch (e) {
-                setNotice(t('share.done.inviteFailed', { name: node.name, who }))
-                setError(e)
-              }
+              const access = target.kind === 'person' && team ? teamAccess(target.member) : null
+              const base =
+                access && covers(access, role)
+                  ? t('share.done.role', { name: node.name, who, role: roleLabels[access], space: tenant.name })
+                  : t('share.done', { name: node.name, who })
+              const mail = !notify || target.kind === 'everyone' ? '' : res.notified ? t('share.done.mailed') : t('share.done.notMailed')
+              setNotice(mail ? `${base} ${mail}` : base)
+              return true
             }}
           />
         ) : (
@@ -317,21 +338,39 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     {t('memberRole.owner')}
                   </Text>
                 </ListRow>
-                {team && (
+                {team &&
+                  (rows && rows.length > 1 ? rows : [{ access: 'manage' as const, admins: 0, members: 0 }]).map((r, _i, all) => (
+                    <ListRow key={r.access}>
+                      <Grow>
+                        {all.length === 1
+                          ? t('share.roleRow', { space: tenant.name })
+                          : t('share.roleRow.access', { space: tenant.name, admins: r.admins, members: r.members, both: r.admins && r.members ? 'yes' : 'no' })}
+                        {all.length === 1 && (
+                          <Text as="span" tone="muted" size="sm" block>
+                            {t('share.roleRow.detail', {
+                              hasCount: rows ? 'yes' : 'no',
+                              n: rows?.[0] ? rows[0].admins + rows[0].members : 0,
+                              space: tenant.name,
+                              share: policy.members_can_share ? 'yes' : 'no',
+                            })}
+                          </Text>
+                        )}
+                      </Grow>
+                      <Text as="span" tone="muted">
+                        {roleLabels[r.access]}
+                      </Text>
+                    </ListRow>
+                  ))}
+                {team && myAccess && (
                   <ListRow>
                     <Grow>
-                      {t('share.roleRow', { space: tenant.name })}
+                      {t('share.yourAccess')}
                       <Text as="span" tone="muted" size="sm" block>
-                        {t('share.roleRow.detail', {
-                          hasCount: roleCount !== null ? 'yes' : 'no',
-                          n: roleCount ?? 0,
-                          space: tenant.name,
-                          share: policy.members_can_share ? 'yes' : 'no',
-                        })}
+                        {t('share.yourAccess.detail', { space: tenant.name, role: memberRoleInline[myTenantRole] })}
                       </Text>
                     </Grow>
                     <Text as="span" tone="muted">
-                      {roleLabels.manage}
+                      {roleLabels[myAccess]}
                     </Text>
                   </ListRow>
                 )}
@@ -347,8 +386,9 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                   const member = g.grantee.type === 'user' ? people.data?.byId.get(g.grantee.id) : undefined
                   // A person outside the space can't open the item until they join it.
                   const notInSpace = g.grantee.type === 'user' && people.data && !mine && !member
-                  // A share weaker than the space role changes nothing for that person.
-                  const roleWins = team && member && managesEverything(member.role) && !mine
+                  // A share no stronger than the person's access from the space changes nothing for them.
+                  const memberAccess = team && member ? teamAccess(member) : null
+                  const roleWins = Boolean(memberAccess && covers(memberAccess, g.role) && !mine)
                   const addedBy = !g.inherited_from && g.created_by.actor.id !== node.owner_id ? actorText(g.created_by) : null
                   return (
                     <ListRow key={g.id}>
@@ -367,7 +407,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                         )}
                         {roleWins && (
                           <Text as="span" size="sm" block>
-                            {t('share.roleWins', { role: memberRoleLabels[member.role], space: tenant.name })}
+                            {t('share.roleWins.access', { role: roleLabels[memberAccess!], space: tenant.name })}
                           </Text>
                         )}
                         {notInSpace && (
@@ -391,48 +431,48 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                         )}
                       </Grow>
                       {canShare && !mine && !g.inherited_from && grantable.includes(g.role) ? (
-                        <>
-                          <Select
-                            aria-label={t('share.accessOf', { name })}
-                            value={g.role}
-                            onChange={(e) =>
-                              run(
-                                () =>
-                                  unwrap(
-                                    client.PATCH('/v1/nodes/{node_id}/grants/{grant_id}', {
-                                      params: { path: { node_id: node.id, grant_id: g.id } },
-                                      body: { role: e.target.value as Schemas['Role'] },
-                                    }),
-                                  ),
-                                t('share.changed', { name, role: roleLabels[e.target.value as Schemas['Role']].toLowerCase() }),
-                                grants.reload,
-                              )
-                            }
-                          >
-                            {grantable.map((r) => (
-                              <option key={r} value={r}>
-                                {roleLabels[r]}
-                              </option>
-                            ))}
-                          </Select>
-                          <Button
-                            aria-label={t('share.remove.label', { name })}
-                            onClick={() =>
-                              run(
-                                () =>
-                                  unwrap(
-                                    client.DELETE('/v1/nodes/{node_id}/grants/{grant_id}', {
-                                      params: { path: { node_id: node.id, grant_id: g.id } },
-                                    }),
-                                  ),
-                                t('share.removed', { name }),
-                                grants.reload,
-                              )
-                            }
-                          >
-                            {t('share.remove')}
-                          </Button>
-                        </>
+                        <Menu
+                          label={roleLabels[g.role]}
+                          context={t('share.accessOf', { name })}
+                          align="end"
+                          size="sm"
+                          items={[
+                            ...grantable.map((r) => ({
+                              label: roleLabels[r],
+                              hint: roleMeanings[r],
+                              checked: g.role === r,
+                              onSelect: () => {
+                                if (r === g.role) return
+                                void run(
+                                  () =>
+                                    unwrap(
+                                      client.PATCH('/v1/nodes/{node_id}/grants/{grant_id}', {
+                                        params: { path: { node_id: node.id, grant_id: g.id } },
+                                        body: { role: r },
+                                      }),
+                                    ),
+                                  t('share.changed', { name, role: roleInline[r] }),
+                                  grants.reload,
+                                )
+                              },
+                            })),
+                            {
+                              label: t('share.removeAccess'),
+                              danger: true,
+                              onSelect: () =>
+                                void run(
+                                  () =>
+                                    unwrap(
+                                      client.DELETE('/v1/nodes/{node_id}/grants/{grant_id}', {
+                                        params: { path: { node_id: node.id, grant_id: g.id } },
+                                      }),
+                                    ),
+                                  t('share.removed', { name }),
+                                  grants.reload,
+                                ),
+                            },
+                          ]}
+                        />
                       ) : (
                         <Text as="span" tone="muted">
                           {roleLabels[g.role]}
@@ -467,7 +507,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                       {live.map((l) => (
                         <ListRow key={l.id}>
                           <Grow>
-                            {t('share.link.role', { role: roleLabels[l.role].toLowerCase() })}
+                            {t('share.link.role', { role: roleInline[l.role] })}
                             <Text as="span" tone="muted" size="sm" block>
                               {t('share.link.ends', {
                                 hasEnd: l.expires_at ? 'yes' : 'no',
@@ -479,7 +519,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                           {canShare && (
                             <ConfirmButton
                               label={t('account.appPassword.off')}
-                              ariaLabel={t('share.link.turnOff.label', { role: roleLabels[l.role].toLowerCase() })}
+                              ariaLabel={t('share.link.turnOff.label', { role: roleInline[l.role] })}
                               title={t('share.link.turnOff.title')}
                               message={t('share.link.turnOff.message')}
                               confirmLabel={t('share.link.turnOff.confirm')}
@@ -570,11 +610,14 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   )
 }
 
-/** Whom the add form shares with: a person of the space (by user ID) or an email. */
-type AddTarget = { kind: 'person'; member: Schemas['Member'] } | { kind: 'email'; email: string }
+/** Whom the add form shares with: a person of the space (by user ID), an email, or everyone in the space. */
+type AddTarget = { kind: 'person'; member: Schemas['Member'] } | { kind: 'email'; email: string } | { kind: 'everyone' }
+
+/** The longest personal message of a share email (contract, `AddGrantRequest.message`). */
+const MESSAGE_MAX = 1000
 
 function AddPersonForm(props: {
-  onAdd: (target: AddTarget, role: Schemas['Role'], inviteGuest: boolean) => Promise<void>
+  onAdd: (target: AddTarget, role: Schemas['Role'], notify: boolean, message: string) => Promise<boolean>
   onUseLink?: () => void
   roles: Schemas['Role'][]
   spaceName: string
@@ -582,30 +625,38 @@ function AddPersonForm(props: {
   membersCanShare: boolean
   itemName: string
   match: (email: string) => EmailMatch
-  canInvite: boolean
+  allowGuests: boolean
+  guestCaller: boolean
   isAdmin: boolean
   tenantId: string
 }) {
   const { roles, spaceName } = props
   const [email, setEmail] = useState('')
+  const [everyone, setEveryone] = useState(false)
   const [role, setRole] = useState<Schemas['Role']>('view')
-  const [invite, setInvite] = useState(true)
+  const [notify, setNotify] = useState(true)
+  const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-  const found: EmailMatch | null = valid ? props.match(email) : null
+  const found: EmailMatch | null = !everyone && valid ? props.match(email) : null
   const person = found?.kind === 'person' ? found.member : null
   const outside = found?.kind === 'outside'
-  const roleWins = props.team && person !== null && managesEverything(person.role)
+  // A guest who shares sees every email as an email grant (decision 0003-2, rule a').
+  const emailGrant = !everyone && valid && !person && found?.kind !== 'me'
+  const access = props.team && person ? teamAccess(person) : null
+  const roleWins = access !== null && covers(access, role)
 
   async function submit(e: FormEvent) {
     e.preventDefault()
     setBusy(true)
     try {
-      // `notify: false`: the server sends no share email yet (crates/ruum-api/src/routes/sharing.rs).
-      // A person outside the space gets the invitation email instead (the box below).
-      const target: AddTarget = person ? { kind: 'person', member: person } : { kind: 'email', email: email.trim() }
-      await props.onAdd(target, role, outside && props.canInvite && invite)
-      setEmail('')
+      const target: AddTarget = everyone ? { kind: 'everyone' } : person ? { kind: 'person', member: person } : { kind: 'email', email: email.trim() }
+      const ok = await props.onAdd(target, role, notify && !everyone, message.trim())
+      if (ok) {
+        setEmail('')
+        setMessage('')
+        setEveryone(false)
+      }
     } finally {
       setBusy(false)
     }
@@ -614,17 +665,24 @@ function AddPersonForm(props: {
   return (
     <Stack as="form" onSubmit={submit} aria-label={t('share.add')}>
       <Row align="end">
-        <Field label={t('account.email')} grow>
-          <TextInput
-            type="email"
-            required
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder={t('share.email.placeholder')}
-          />
-        </Field>
+        {everyone ? (
+          <Grow>
+            <Text>{t('share.everyone', { space: spaceName })}</Text>
+          </Grow>
+        ) : (
+          <Field label={t('account.email')} grow>
+            <TextInput
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder={t('share.email.placeholder')}
+              aria-describedby={emailGrant ? 'add-email-help' : undefined}
+            />
+          </Field>
+        )}
         <Field label={t('share.access')}>
-          <Select value={role} onChange={(e) => setRole(e.target.value as Schemas['Role'])} aria-describedby="add-role-meaning">
+          <Select width="auto" value={role} onChange={(e) => setRole(e.target.value as Schemas['Role'])} aria-describedby="add-role-meaning">
             {roles.map((r) => (
               <option key={r} value={r}>
                 {roleLabels[r]}
@@ -632,13 +690,23 @@ function AddPersonForm(props: {
             ))}
           </Select>
         </Field>
-        <Button variant="primary" type="submit" disabled={busy || found?.kind === 'me'}>
+        <Button variant="primary" type="submit" disabled={busy || found?.kind === 'me'} busy={busy}>
           {t('details.share')}
         </Button>
       </Row>
       <Text tone="muted" size="sm" id="add-role-meaning">
         {t('share.roleMeaning', { role: roleLabels[role], meaning: roleMeanings[role] })}
       </Text>
+      {props.team && !props.guestCaller && (
+        <Text tone="muted" size="sm">
+          <Button variant="link" onClick={() => setEveryone((x) => !x)}>
+            {everyone ? t('share.everyone.back') : t('share.everyone.pick', { space: spaceName })}
+          </Button>
+        </Text>
+      )}
+      {everyone && (
+        <Note role="note">{t('share.everyone.note', { space: spaceName, role: roleLabels[role] })}</Note>
+      )}
       {found?.kind === 'me' && (
         <Text tone="muted" size="sm">
           {t('share.ownEmail')}
@@ -647,11 +715,10 @@ function AddPersonForm(props: {
       {person &&
         (roleWins ? (
           <Note tone="warning" role="note">
-            {tr('share.add.roleWins', {
+            {tr('share.add.roleWins.access', {
               name: person.display_name || person.email,
-              role: person.role,
+              access: roleLabels[access!],
               space: spaceName,
-              share: props.membersCanShare || person.role !== 'member' ? 'yes' : 'no',
               admin: props.isAdmin ? 'yes' : 'no',
               link: (chunks) => <Link to={tenantPath(props.tenantId, 'admin', 'members')}>{chunks}</Link>,
             })}
@@ -661,25 +728,41 @@ function AddPersonForm(props: {
             {t('share.add.inSpace', { name: person.display_name || person.email, space: spaceName, item: props.itemName })}
           </Text>
         ))}
+      {emailGrant && (
+        <Text tone="muted" size="sm" id="add-email-help">
+          {t('share.add.emailHelp')}
+        </Text>
+      )}
       {outside &&
-        (props.canInvite ? (
-          <Stack>
-            <Checkbox
-              checked={invite}
-              onChange={(e) => setInvite(e.target.checked)}
-              aria-describedby="add-outside"
-              label={t('share.add.invite')}
-            />
-            <Text tone="muted" size="sm" id="add-outside">
-              {t('share.add.new', { email: email.trim(), item: props.itemName })}
-              {invite ? '' : ` ${t('share.add.new.without')}`}
-            </Text>
-          </Stack>
+        (props.allowGuests ? (
+          <Text tone="muted" size="sm">
+            {t('share.add.outside', { email: email.trim(), item: props.itemName, space: spaceName })}
+          </Text>
         ) : (
           <Note tone="warning" role="note">
-            {t('share.add.new.admin', { email: email.trim(), item: props.itemName, space: spaceName })}
+            {t('share.add.guestsOff', { email: email.trim(), space: spaceName })}
           </Note>
         ))}
+      {!everyone && (
+        <Stack gap={2}>
+          <Checkbox checked={notify} onChange={(e) => setNotify(e.target.checked)} label={t('share.notify')} />
+          {notify && (
+            <Field
+              label={t('share.message')}
+              hint={message.length > MESSAGE_MAX - 100 ? t('share.message.count', { n: message.length, max: MESSAGE_MAX }) : undefined}
+              hintId="share-message-count"
+            >
+              <TextArea
+                rows={2}
+                maxLength={MESSAGE_MAX}
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                aria-describedby={message.length > MESSAGE_MAX - 100 ? 'share-message-count' : undefined}
+              />
+            </Field>
+          )}
+        </Stack>
+      )}
       {outside && props.onUseLink && (
         <Text tone="muted" size="sm">
           {tr('share.add.useLink', {

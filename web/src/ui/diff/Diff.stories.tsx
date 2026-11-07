@@ -1,11 +1,12 @@
 import type { Story } from '@ladle/react'
 import { DiffChange, DiffList, DiffView } from './Diff'
+import { sample } from '../story'
 
 export default { title: 'Diff' }
 
 export const Changes: Story = () => (
   <DiffView>
-    <p>3 changes</p>
+    <p>{sample('3 changes')}</p>
     <DiffList>
       <DiffChange kind="Changed" where="Line 2" old="Rosa canina" new="Rosa rugosa" />
       <DiffChange kind="Added" where="Line 7" new="A new line" />
@@ -21,12 +22,12 @@ export const Changes: Story = () => (
 
 export const Same: Story = () => (
   <DiffView>
-    <p>These versions are the same.</p>
+    <p>{sample('These versions are the same.')}</p>
   </DiffView>
 )
 
 export const Busy: Story = () => (
   <DiffView busy>
-    <p>Comparing...</p>
+    <p>{sample('Comparing...')}</p>
   </DiffView>
 )

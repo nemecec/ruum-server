@@ -35,3 +35,12 @@ export function renderApp(path: string, { locale }: { locale?: string | null } =
 export function dialog(name: string | RegExp) {
   return screen.findByRole('dialog', { name })
 }
+
+/** Opens the menu button `button` and chooses `item` in it (design-system 4.2 menus). */
+export async function choose(user: { click: (el: Element) => Promise<void> }, button: string | RegExp, item: string | RegExp, scope?: HTMLElement) {
+  const { screen, within } = await import('@testing-library/react')
+  const root = scope ? within(scope) : screen
+  await user.click(await root.findByRole('button', { name: button }))
+  const menu = await screen.findByRole('menu')
+  await user.click(within(menu).queryByRole('menuitem', { name: item }) ?? within(menu).getByRole('menuitemradio', { name: item }))
+}

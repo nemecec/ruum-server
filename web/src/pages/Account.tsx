@@ -1,10 +1,10 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { client, unwrap } from '../api/client'
 import { useApi } from '../api/useApi'
 import { useSession } from '../app/useSession'
 import { StartTeamDialog } from '../app/Shell'
 import { useTenant } from '../app/tenant'
-import { formatDate } from '../components/format'
+import { formatDate, formatDay } from '../components/format'
 import {
   Actions,
   Badge,
@@ -24,6 +24,7 @@ import {
   Loaded,
   Notice,
   PageBody,
+  Row,
   Select,
   SecretBox,
   Stack,
@@ -59,7 +60,7 @@ export function AccountPage() {
               <Badge tone="warning">{t('account.notVerified')}</Badge>
             )}
           </Fact>
-          <Fact label={t('account.memberSince')}>{formatDate(me.user.created_at)}</Fact>
+          <Fact label={t('account.memberSince')}>{formatDay(me.user.created_at)}</Fact>
         </Facts>
       </Card>
 
@@ -82,7 +83,7 @@ export function AccountPage() {
                     )}
                   </ListRowMain>
                   <Text as="span" tone="muted" size="sm">
-                    {t('account.identity.linked', { when: formatDate(i.linked_at) })}
+                    {t('account.identity.linked', { when: formatDay(i.linked_at) })}
                   </Text>
                 </ListRow>
               ))}
@@ -115,6 +116,7 @@ export function AccountPage() {
                       title={t('account.session.end.title')}
                       message={t('account.session.end.message')}
                       confirmLabel={t('account.session.end.confirm')}
+                      danger
                       onConfirm={async () => {
                         await unwrap(client.DELETE('/v1/me/sessions/{session_id}', { params: { path: { session_id: s.id } } }))
                         setNotice(t('account.session.ended'))
@@ -241,24 +243,44 @@ function AppPasswords() {
 /** The value of "Same as the browser" in the language picker. */
 const BROWSER = ''
 
+// The page mounts again in the new language after a change. This tells the new page to put the
+// focus back on the language picker and to say that the language changed (WCAG 2.4.3, 4.1.3).
+let justChanged: string | null = null
+
 /**
  * The language of the UI (design 12.4): stored with the account (`updateMyPreferences`), so it
- * holds on every device; "Same as the browser" clears it.
+ * holds on every device; "Same as the browser" clears it. The choice applies with "Save", not on
+ * input: an arrow key on a closed select fires `change` on some systems (WCAG 3.2.2).
  */
 function LanguageCard() {
   const { preference, setPreference } = useLocale()
+  const [choice, setChoice] = useState(preference ?? BROWSER)
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
+  const [announce, setAnnounce] = useState<string | null>(null)
+  const select = useRef<HTMLSelectElement>(null)
   const choices = import.meta.env.PROD ? LANGUAGES : [...LANGUAGES, { tag: PSEUDO_LOCALE, name: t('account.language.pseudo') }]
   const browserName = LANGUAGES.find((l) => l.tag === catalogueFor(browserLanguages()[0] ?? ''))?.name ?? LANGUAGES[0].name
+  const nameOf = (tag: string) => (tag === BROWSER ? t('account.language.browser', { language: browserName }) : (choices.find((l) => l.tag === tag)?.name ?? tag))
 
-  async function change(value: string) {
+  useEffect(() => {
+    if (justChanged === null) return
+    const name = justChanged
+    justChanged = null
+    select.current?.focus()
+    setAnnounce(t('account.language.changed', { language: name }))
+  }, [])
+
+  async function save(e: FormEvent) {
+    e.preventDefault()
     setBusy(true)
     setError(undefined)
     try {
-      const saved = await unwrap(client.PATCH('/v1/me/preferences', { body: { locale: value === BROWSER ? null : value } }))
+      const saved = await unwrap(client.PATCH('/v1/me/preferences', { body: { locale: choice === BROWSER ? null : choice } }))
+      justChanged = nameOf(saved.locale ?? BROWSER)
       // The page renders again in the new language.
       setPreference(saved.locale)
+      setBusy(false)
     } catch (err) {
       setError(err)
       setBusy(false)
@@ -268,17 +290,25 @@ function LanguageCard() {
   return (
     <Card aria-labelledby="language-title">
       <h2 id="language-title">{t('account.language')}</h2>
-      <Field label={t('account.language.label')} hint={t('account.language.hint')}>
-        <Select value={preference ?? BROWSER} disabled={busy} onChange={(e) => void change(e.target.value)}>
-          <option value={BROWSER}>{t('account.language.browser', { language: browserName })}</option>
-          {choices.map((l) => (
-            <option key={l.tag} value={l.tag} lang={l.tag === PSEUDO_LOCALE ? undefined : l.tag}>
-              {l.name}
-            </option>
-          ))}
-        </Select>
-      </Field>
-      <ErrorNote error={error} />
+      <Stack as="form" gap={3} onSubmit={save}>
+        <Row align="end">
+          <Field label={t('account.language.label')} hint={t('account.language.hint')} hintId="language-hint">
+            <Select ref={select} id="language-select" width="auto" value={choice} aria-describedby="language-hint" onChange={(e) => setChoice(e.target.value)}>
+              <option value={BROWSER}>{t('account.language.browser', { language: browserName })}</option>
+              {choices.map((l) => (
+                <option key={l.tag} value={l.tag} lang={l.tag === PSEUDO_LOCALE ? undefined : l.tag}>
+                  {l.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Button type="submit" busy={busy} disabled={choice === (preference ?? BROWSER)}>
+            {t('common.save')}
+          </Button>
+        </Row>
+        <Notice text={announce} />
+        <ErrorNote error={error} />
+      </Stack>
     </Card>
   )
 }

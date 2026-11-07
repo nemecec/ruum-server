@@ -1,16 +1,19 @@
 import { useState } from 'react'
 import { client, unwrap } from '../../api/client'
+import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useTenant } from '../../app/tenant'
 import { formatDate, formatWhen } from '../../components/format'
 import {
   Button,
   ConfirmButton,
+  ConfirmDialog,
   EmptyState,
   ErrorNote,
   KindIcon,
   Loaded,
   LoadMore,
+  Menu,
   NameCell,
   PageBody,
   Table,
@@ -39,7 +42,7 @@ export function TrashPage() {
       const res = await unwrap(
         client.POST('/v1/nodes/{node_id}/restore', { params: { path: { node_id: id } }, body: { on_conflict: 'rename' } }),
       )
-      let folder = t('trash.itsFolder')
+      let folder: string | null = null
       if (res.node.parent_id) {
         try {
           const parent = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: res.node.parent_id } } }))
@@ -48,10 +51,11 @@ export function TrashPage() {
           // The folder name is only for the toast.
         }
       }
+      const hasFolder = folder ? 'yes' : 'no'
       toast(
         res.node.name === name
-          ? t('trash.restored', { name, folder })
-          : t('trash.restored.renamed', { name, folder, newName: res.node.name }),
+          ? t('trash.restored', { name, folder: folder ?? '', hasFolder })
+          : t('trash.restored.renamed', { name, folder: folder ?? '', hasFolder, newName: res.node.name }),
       )
       trash.reload()
     } catch (e) {
@@ -60,6 +64,13 @@ export function TrashPage() {
   }
 
   const n = trash.data?.items.length ?? 0
+  // The days of the plan, when the person may read the limits (guests may not).
+  const limits = useApi(
+    () => unwrap(client.GET('/v1/tenants/{tenant_id}/limits', { params: { path: { tenant_id: tenant.id } } })).catch(() => null),
+    [tenant.id],
+  )
+  const days = limits.data?.limits.trash_days ?? null
+  const [purging, setPurging] = useState<{ id: string; name: string } | null>(null)
   return (
     <PageBody>
       <Toolbar>
@@ -80,7 +91,7 @@ export function TrashPage() {
         )}
       </Toolbar>
       <Text tone="muted">
-        {t('trash.intro', { space: tenant.name })}
+        {t('trash.intro', { hasDays: days ? 'yes' : 'no', days: days ?? 0 })}
         {isAdmin ? ` ${t('trash.intro.admin')}` : ''}
       </Text>
       <ErrorNote error={error} />
@@ -105,7 +116,12 @@ export function TrashPage() {
                 {items.map((node) => (
                   <Tr key={node.id}>
                     <Th scope="row">
-                      <NameCell icon={<KindIcon kind={node.kind} type={node.type} name={node.name} />}>{node.name}</NameCell>
+                      <NameCell
+                        icon={<KindIcon kind={node.kind} type={node.type} name={node.name} />}
+                        meta={<span title={formatDate(node.trashed_at)}>{formatWhen(node.trashed_at)}</span>}
+                      >
+                        {node.name}
+                      </NameCell>
                     </Th>
                     <Td hideNarrow>
                       <span title={formatDate(node.trashed_at)}>{formatWhen(node.trashed_at)}</span>
@@ -114,19 +130,12 @@ export function TrashPage() {
                       <Button size="sm" aria-label={t('trash.restore.named', { name: node.name })} onClick={() => restore(node.id, node.name)}>
                         {t('trash.restore')}
                       </Button>
-                      <ConfirmButton
-                        size="sm"
-                        label={t('trash.purge')}
-                        ariaLabel={t('trash.purge.named', { name: node.name })}
-                        title={t('trash.purge.title', { name: node.name })}
-                        message={t('trash.purge.message')}
-                        confirmLabel={t('trash.purge')}
-                        danger
-                        onConfirm={async () => {
-                          await unwrap(client.DELETE('/v1/nodes/{node_id}', { params: { path: { node_id: node.id } } }))
-                          toast(t('trash.purged', { name: node.name }))
-                          trash.reload()
-                        }}
+                      <Menu
+                        icon="more"
+                        ariaLabel={t('trash.more', { name: node.name })}
+                        quiet
+                        align="end"
+                        items={[{ label: t('trash.purge'), danger: true, onSelect: () => setPurging({ id: node.id, name: node.name }) }]}
                       />
                     </Td>
                   </Tr>
@@ -137,6 +146,20 @@ export function TrashPage() {
         }
       </Loaded>
       <LoadMore state={trash} />
+      {purging && (
+        <ConfirmDialog
+          title={t('trash.purge.title', { name: purging.name })}
+          message={t('trash.purge.message')}
+          confirmLabel={t('trash.purge')}
+          danger
+          onClose={() => setPurging(null)}
+          onConfirm={async () => {
+            await unwrap(client.DELETE('/v1/nodes/{node_id}', { params: { path: { node_id: purging.id } } }))
+            toast(t('trash.purged', { name: purging.name }))
+            trash.reload()
+          }}
+        />
+      )}
     </PageBody>
   )
 }

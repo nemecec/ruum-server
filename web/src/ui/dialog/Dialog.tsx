@@ -95,7 +95,8 @@ export function ConfirmDialog(props: {
   const [error, setError] = useState<unknown>()
   const messageId = useId()
   return (
-    <Dialog title={props.title} open onClose={props.onClose} describedBy={messageId}>
+    // Escape closes the dialog only while nothing is in flight (design-system 4.12).
+    <Dialog title={props.title} open onClose={() => !busy && props.onClose()} describedBy={messageId}>
       <Stack gap={4}>
         <div id={messageId}>{props.message}</div>
         <ErrorNote error={error} />

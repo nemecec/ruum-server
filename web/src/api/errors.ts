@@ -11,6 +11,8 @@ export type ErrorContext = {
   name?: string
   /** The space, for `permission_denied` and `quota_exceeded`. */
   space?: string
+  /** The person shared an item (`addGrant`): `rate_limited` then has the sharing copy. */
+  share?: boolean
 }
 
 type Code = ApiError['code']
@@ -62,7 +64,7 @@ export const errorCopy: Record<Code, (e: { message: string }, ctx: ErrorContext)
     const what = limitInMessage(e.message)
     return t('error.plan_limit_reached', { limit: what && knownLimits.has(what) ? what : 'other' })
   },
-  rate_limited: simple('error.rate_limited'),
+  rate_limited: (e, ctx) => (ctx.share ? t('share.rateLimited') : simple('error.rate_limited')(e, ctx)),
   agent_disabled: simple('error.agent_disabled'),
   chunk_missing: simple('error.upload_incomplete'),
   hash_mismatch: simple('error.upload_incomplete'),

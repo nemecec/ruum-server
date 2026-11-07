@@ -15,7 +15,7 @@ describe('accept an invitation (/invitations/accept)', () => {
     expect(await screen.findByText("You've joined Lovelace Lab.")).toBeInTheDocument()
     await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/t\/[0-9a-f-]{36}\/files$/))
     // React Router commits the new location in a transition: router.state changes first.
-    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Space' })).toHaveDisplayValue('Lovelace Lab (member)'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Lovelace Lab (change space)' })).toBeInTheDocument())
   })
 
   it('says so when the invitation was used or ended', async () => {

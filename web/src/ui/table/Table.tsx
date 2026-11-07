@@ -1,12 +1,35 @@
-import type { DragEventHandler, ReactNode, ThHTMLAttributes, TdHTMLAttributes } from 'react'
+import { useLayoutEffect, useRef, useState, type DragEventHandler, type ReactNode, type ThHTMLAttributes, type TdHTMLAttributes } from 'react'
 import { cx } from '../cx'
 import { VisuallyHidden } from '../text/Text'
 import './table.css'
 
-/** A data table with a caption (visually hidden unless `showCaption`). */
+/**
+ * A data table with a caption (visually hidden unless `showCaption`). When the table is wider than
+ * its place (a narrow screen, long words), its wrapper scrolls sideways and becomes a focusable,
+ * named region, so keyboard users can scroll it too (WCAG 1.4.10, 2.1.1).
+ */
 export function Table({ caption, showCaption, children }: { caption: string; showCaption?: boolean; children: ReactNode }) {
+  const wrap = useRef<HTMLDivElement>(null)
+  const [scrolls, setScrolls] = useState(false)
+  useLayoutEffect(() => {
+    const el = wrap.current
+    if (!el) return
+    const check = () => setScrolls(el.scrollWidth > el.clientWidth + 1)
+    check()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(check)
+    ro.observe(el)
+    if (el.firstElementChild) ro.observe(el.firstElementChild)
+    return () => ro.disconnect()
+  }, [])
   return (
-    <div className="ui-table-wrap">
+    <div
+      ref={wrap}
+      className="ui-table-wrap"
+      tabIndex={scrolls ? 0 : undefined}
+      role={scrolls ? 'region' : undefined}
+      aria-label={scrolls ? caption : undefined}
+    >
       <table className="ui-table">
         {showCaption ? (
           <caption className="ui-table-caption">{caption}</caption>
@@ -99,12 +122,23 @@ export function SortHeader(props: {
   )
 }
 
-/** The name cell of a file row: the kind icon and the name (a link or a button). */
-export function NameCell({ icon, children }: { icon: ReactNode; children: ReactNode }) {
+/**
+ * The name cell of a file row: the kind icon and the name (a link or a button). `meta` is a second
+ * line that shows only on the phone, where the other columns are hidden (who changed it, when).
+ */
+export function NameCell({ icon, children, meta }: { icon: ReactNode; children: ReactNode; meta?: ReactNode }) {
   return (
     <span className="ui-name-cell">
       {icon}
-      {children}
+      <span className="ui-name-cell-text">
+        {children}
+        {meta && <span className="ui-cell-meta">{meta}</span>}
+      </span>
     </span>
   )
+}
+
+/** A line under the main text of a cell that shows only on the phone (the hidden columns' facts). */
+export function NarrowMeta({ children }: { children: ReactNode }) {
+  return <span className="ui-cell-meta">{children}</span>
 }

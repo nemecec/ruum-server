@@ -3,7 +3,7 @@ import { client, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { Actor } from '../../app/names'
 import { useSession } from '../../app/useSession'
-import { fileTypeLabel, formatBytes, formatDate, formatWhen, roleLabels } from '../../components/format'
+import { fileTypeLabel, formatBytes, formatDate, formatWhen, formatWhenInline, roleLabels } from '../../components/format'
 import {
   Actions,
   Button,
@@ -16,6 +16,7 @@ import {
   IconButton,
   ListEmpty,
   Loaded,
+  Menu,
   Select,
   Stack,
   Tag,
@@ -23,6 +24,7 @@ import {
   TextInput,
   Toolbar,
   useToast,
+  type MenuItem,
 } from '../../ui'
 import { downloadNode, previewNode, type Node } from './api'
 import { NameDialog } from './dialogs'
@@ -77,6 +79,18 @@ export function NodeDetails(props: {
     uploadVersion(file)
   }
 
+  const more: MenuItem[] = [
+    ...(node.kind === 'file' ? [{ label: t('details.versions'), onSelect: props.onShowVersions }] : []),
+    ...(node.kind === 'file' && canEdit ? [{ label: t('details.uploadVersion'), onSelect: () => versionInput.current?.click() }] : []),
+    ...(canEdit
+      ? [
+          { label: t('details.rename'), onSelect: () => setDialog('rename') },
+          { label: t('files.move'), onSelect: props.onMove },
+          { label: t('files.toTrash'), onSelect: props.onTrash, danger: true },
+        ]
+      : []),
+  ]
+
   return (
     <Stack as="section" gap={4} aria-labelledby="details-title">
       <Toolbar>
@@ -103,6 +117,7 @@ export function NodeDetails(props: {
         {node.my_role && <Fact label={t('shared.access')}>{roleLabels[node.my_role]}</Fact>}
       </Facts>
       <ErrorNote error={error} context={{ name: node.name }} />
+      {/* The main actions as buttons, the rest in the row menu (design-system 4.4, 4.7). */}
       <Actions align="start">
         {node.kind === 'file' && (
           <Button variant="primary" onClick={() => downloadNode(node).catch(setError)}>
@@ -110,26 +125,20 @@ export function NodeDetails(props: {
           </Button>
         )}
         {node.kind === 'file' && <Button onClick={() => previewNode(node).catch(setError)}>{t('details.preview')}</Button>}
-        {node.kind === 'file' && <Button onClick={props.onShowVersions}>{t('details.versions')}</Button>}
-        {node.kind === 'file' && canEdit && (
-          <>
-            <Button onClick={() => versionInput.current?.click()}>{t('details.uploadVersion')}</Button>
-            <FileInput
-              ref={versionInput}
-              label={t('details.uploadVersion.label', { name: node.name })}
-              onChange={(e) => {
-                const file = e.target.files?.[0]
-                e.target.value = ''
-                if (file) void chooseVersion(file)
-              }}
-            />
-          </>
-        )}
         <Button onClick={() => setDialog('share')}>{t('details.share')}</Button>
-        {canEdit && <Button onClick={() => setDialog('rename')}>{t('details.rename')}</Button>}
-        {canEdit && <Button onClick={props.onMove}>{t('files.move')}</Button>}
-        {canEdit && <Button onClick={props.onTrash}>{t('files.toTrash')}</Button>}
+        {more.length > 0 && <Menu label={t('details.more')} context={t('details.more.of', { name: node.name })} items={more} align="end" />}
       </Actions>
+      {node.kind === 'file' && canEdit && (
+        <FileInput
+          ref={versionInput}
+          label={t('details.uploadVersion.label', { name: node.name })}
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            e.target.value = ''
+            if (file) void chooseVersion(file)
+          }}
+        />
+      )}
       <NodeTags node={node} canEdit={canEdit} />
 
       {dialog === 'rename' && (
@@ -190,7 +199,7 @@ function KeepVersionDialog(props: { node: Node; previousAt: string; onClose: () 
           }
         }}
       >
-        <p>{t('keepVersion.body', { name: props.node.name, when: formatWhen(props.previousAt).toLowerCase() })}</p>
+        <p>{t('keepVersion.body', { name: props.node.name, when: formatWhenInline(props.previousAt) })}</p>
         <Field label={t('keepVersion.name')}>
           <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder={t('keepVersion.placeholder')} />
         </Field>

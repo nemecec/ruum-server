@@ -59,6 +59,7 @@ const str = (v: unknown) => (typeof v === 'string' && v ? v : null)
 
 /** The actions whose words take the object right after them ("moved Plan.pdf"); the others take a colon. */
 const joined = new Set([
+  'invitation.created',
   'node.created',
   'node.copied',
   'node.moved',
@@ -93,10 +94,12 @@ export type AuditContext = {
   person: (id: string) => string | undefined
   /** The name of the space (for a grant to everyone in it). */
   spaceName: string
+  /** The name of one of the caller's own app passwords, or `undefined`. */
+  appPassword?: (id: string) => string | undefined
 }
 
 /** A detailed entry: a message of the catalogue, whose `{item}` the row fills with a link to the item. */
-export type AuditDetail = { key: MessageKey; values: Record<string, string>; item: string | null }
+export type AuditDetail = { key: MessageKey; values: Record<string, string | number>; item: string | null }
 
 const roleWords: Record<string, MessageKey> = {
   view: 'audit.role.view',
@@ -134,9 +137,37 @@ export function auditDetail(a: Schemas['AuditEntry'], ctx: AuditContext): AuditD
   const memberRole = (v: unknown) =>
     typeof v === 'string' ? ((memberRoleLabels as Record<string, string>)[v] ?? v) : null
   switch (a.action) {
+    case 'auth.login':
+      // The first use of a session in a team space (decision 0003-4), or a sign-in at home.
+      return d.via === 'session_first_use'
+        ? { key: 'audit.auth.firstUse', values: { space: ctx.spaceName }, item: null }
+        : { key: 'audit.auth.login', values: {}, item: null }
+    case 'auth.logout':
+      return { key: 'audit.auth.logout', values: {}, item: null }
+    case 'agent.token_issued':
+      return { key: 'audit.agent.token', values: {}, item: null }
+    case 'agent.key_used':
+      return { key: 'audit.agent.keyUsed', values: {}, item: null }
+    case 'agent.key_refused':
+      return { key: 'audit.agent.keyRefused', values: { reason: str(d.reason) ?? 'other' }, item: null }
+    case 'auth.app_password_used': {
+      const name = (a.target_id && ctx.appPassword?.(a.target_id)) || null
+      return name
+        ? { key: 'audit.appPassword.used', values: { name }, item: null }
+        : { key: 'audit.appPassword.used.unknown', values: {}, item: null }
+    }
+    case 'member.added': {
+      if (d.via !== 'email_grant') return null
+      const by = Array.isArray(d.granted_by) ? d.granted_by : []
+      const first = by[0] as Record<string, unknown> | undefined
+      const who =
+        (first && typeof first.id === 'string' ? ctx.person(first.id) : undefined) ?? str(first?.display_name) ?? t('audit.aPerson')
+      return { key: 'audit.member.viaEmailGrant', values: { who, more: Math.max(0, by.length - 1) }, item: null }
+    }
     case 'grant.added': {
       const who = granteeText(d.grantee, ctx)
       if (!who || a.target_type !== 'node') return null
+      if (d.may_add_guest === true) return { key: 'audit.grant.added.mayJoin', values: { who, role: role(d.role) }, item }
       return { key: 'audit.grant.added', values: { who, role: role(d.role) }, item }
     }
     case 'grant.updated': {
@@ -175,4 +206,42 @@ export function auditDetail(a: Schemas['AuditEntry'], ctx: AuditContext): AuditD
     default:
       return null
   }
+}
+
+/**
+ * A short name of a browser and system from a user agent ("Firefox on macOS"), or `null`. Only for
+ * the activity log; an unknown agent is shown as it is, cut to 60 characters.
+ */
+export function shortUserAgent(ua: string | null | undefined): string | null {
+  if (!ua) return null
+  const browser = /Edg\//.test(ua)
+    ? 'Edge'
+    : /Firefox\//.test(ua)
+      ? 'Firefox'
+      : /Chrome\//.test(ua)
+        ? 'Chrome'
+        : /Safari\//.test(ua)
+          ? 'Safari'
+          : null
+  const system = /iPhone|iPad/.test(ua)
+    ? 'iOS'
+    : /Android/.test(ua)
+      ? 'Android'
+      : /Mac OS X|Macintosh/.test(ua)
+        ? 'macOS'
+        : /Windows/.test(ua)
+          ? 'Windows'
+          : /Linux/.test(ua)
+            ? 'Linux'
+            : null
+  if (browser && system) return t('audit.client.browserOn', { browser, system })
+  if (browser) return browser
+  return ua.length > 60 ? `${ua.slice(0, 57)}...` : ua
+}
+
+/** The second line of an entry: where it came from ("192.0.2.1 · Firefox on macOS"); nothing without an IP or agent. */
+export function auditClient(a: Schemas['AuditEntry']): string | null {
+  const ua = shortUserAgent(a.user_agent)
+  if (a.ip && ua) return t('audit.client', { ip: a.ip, agent: ua })
+  return a.ip ?? ua ?? null
 }

@@ -5,6 +5,8 @@ export type ToastOptions = {
   undo?: () => Promise<string | void>
   /** One more action, for example "Invite people". */
   action?: { label: string; run: () => void }
+  /** A failure: an alert for screen readers, and the toast stays until it is closed. */
+  error?: boolean
 }
 
 export type ToastApi = { toast: (text: string, options?: ToastOptions) => void }

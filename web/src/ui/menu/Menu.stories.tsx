@@ -1,29 +1,31 @@
 import type { Story } from '@ladle/react'
 import { Row } from '../layout/Layout'
 import { Menu } from './Menu'
+import { sample } from '../story'
 
 export default { title: 'Menu' }
 
 const roles = [
-  { label: 'Can view', hint: 'See and download', onSelect: () => {} },
-  { label: 'Can comment', hint: 'See and comment', onSelect: () => {} },
-  { label: 'Can edit', hint: 'Change, upload and rename', onSelect: () => {}, checked: true },
-  { label: 'Can manage', hint: 'Also move, delete and share', onSelect: () => {}, disabled: true },
+  { label: sample('Can view'), hint: sample('See and download'), onSelect: () => {} },
+  { label: sample('Can comment'), hint: sample('See and comment'), onSelect: () => {} },
+  { label: sample('Can edit'), hint: sample('Change, upload and rename'), onSelect: () => {}, checked: true },
+  { label: sample('Can manage'), hint: sample('Also move, delete and share'), onSelect: () => {}, disabled: true },
 ]
 
-export const RoleMenu: Story = () => <Menu label="Can edit" ariaLabel="Access of Liis Tamm" items={roles} />
+// The name starts with the visible label (WCAG 2.5.3): "Can edit Access of Liis Tamm".
+export const RoleMenu: Story = () => <Menu label={sample('Can edit')} context={sample('Access of Liis Tamm')} items={roles} />
 
 export const RowMenu: Story = () => (
   <Row justify="end">
     <Menu
-      label="More"
-      ariaLabel="More actions for plan.txt"
+      icon="more"
+      ariaLabel={sample('More actions for plan.txt')}
       quiet
       align="end"
       items={[
-        { label: 'Rename', onSelect: () => {} },
-        { label: 'Move', onSelect: () => {} },
-        { label: 'Move to trash', onSelect: () => {}, danger: true },
+        { label: sample('Rename'), onSelect: () => {} },
+        { label: sample('Move'), onSelect: () => {} },
+        { label: sample('Move to trash'), onSelect: () => {}, danger: true },
       ]}
     />
   </Row>

@@ -478,6 +478,10 @@ export const handlers: HttpHandler[] = [
       const owners = db.members.filter((x) => x.tenant_id === params.tenant_id && x.role === 'owner')
       if (owners.length === 1) throw new Fail(409, 'conflict', 'A tenant needs at least one owner.')
     }
+    // The content role applies only to members (decision 0003-1): another role clears it, a member
+    // who stays a member keeps it when it is left out, and it is refused with another role.
+    if (body.content_role && body.role !== 'member') throw new Fail(422, 'validation_failed', 'content_role needs role member.')
+    m.content_role = body.role === 'member' ? (body.content_role ?? (m.role === 'member' ? (m.content_role ?? 'manage') : 'manage')) : null
     m.role = body.role
     return m
   }),
@@ -503,6 +507,7 @@ export const handlers: HttpHandler[] = [
         tenant_id: params.tenant_id,
         email: body.email,
         role: body.role,
+        content_role: body.role === 'member' ? (body.content_role ?? 'manage') : null,
         invited_by: byUser(),
         created_at: now(),
         expires_at: new Date(Date.now() + 14 * 86400_000).toISOString(),
@@ -1049,9 +1054,24 @@ export const handlers: HttpHandler[] = [
         if (!m) throw notFound('User')
         grantee = { type: 'user', id: m.user_id }
       }
+      // Decision 0003-2 (a): a member, admin or owner who shares with the email of a person of the
+      // space gets a grant to that user; (a') a guest always gets an email grant.
+      const caller = db.tenants.find((x) => x.tenant.id === tenant)?.role
+      if (body.grantee.type === 'email' && caller && caller !== 'guest') {
+        const email = body.grantee.email.toLowerCase()
+        const m = db.members.find((x) => x.tenant_id === tenant && x.email.toLowerCase() === email)
+        if (m) grantee = { type: 'user', id: m.user_id, display_name: m.display_name, email: m.email }
+      }
+      if (body.message && body.message.length > 1000) throw new Fail(422, 'validation_failed', 'The message is too long.')
       const grant: Schemas['Grant'] = { id: newId(), node_id: n.id, grantee, role: body.role, inherited_from: null, created_by: byUser(), created_at: now() }
       db.grants.push(grant)
-      return { grant, change: record('grant.added', n.id, tenant, { grant_id: grant.id, grantee, role: body.role }) }
+      // A share email goes out with `notify` (the default), except for everyone in the space or the
+      // caller's own address, and at most once per recipient and item in 10 minutes.
+      const to = grantee.type === 'email' ? grantee.email : grantee.type === 'user' ? (db.members.find((x) => x.user_id === grantee.id)?.email ?? null) : null
+      const key = `${n.id}/${to}`
+      const notified = body.notify !== false && to !== null && to !== db.user.email && !db.mailed.has(key)
+      if (notified) db.mailed.add(key)
+      return { grant, change: record('grant.added', n.id, tenant, { grant_id: grant.id, grantee, role: body.role }), notified }
     },
     { status: 201 },
   ),

@@ -249,8 +249,10 @@ not text.
 ### 4.4 File list and grid
 
 **Anatomy (list).** A table: checkbox, kind icon (folder, file type, shortcut), name (with a
-"Shared" mark icon and the tag dots), Changed (relative time and who: "2 h ago, Claude for Liis"
-with the agent mark), Size (files only), a row menu button ("More actions for *name*"). Folders
+"Shared" mark icon and the tag dots), Changed (relative time and who: "2 hours ago, Claude Desktop (agent of Liis Tamm)"
+with the agent mark), Size (files only), a "Details" button ("Details of *name*") that opens the
+details panel, where the actions are (the main ones as buttons, the rest in its "More" menu). On
+the phone the Changed column moves under the name as a second line, with the agent mark. Folders
 first. Column headers are sort buttons. Above the list: the selection bar when something is
 selected ("3 selected", Move, Download, Move to trash, Clear), and filter chips ("Changed by
 agents").
@@ -364,7 +366,7 @@ reverse); "Turn off" a link asks for confirmation (it cannot be reversed).
 
 **Version panel anatomy.** In the details panel tab "Versions". Groups by day ("Today",
 "Yesterday", "5 Nov 2026"). A row: time ("14:00", absolute date in a tooltip), who ("Liis Tamm",
-or the agent mark and "Claude for Liis"), size change ("+2 KB"), the version name as a badge if
+or the agent mark and "Claude Desktop (agent of Liis Tamm)"), size change ("+2 KB"), the version name as a badge if
 any, "Restored from 5 Nov, 14:00" if so, "Current" badge on the current version. Row actions:
 "Compare" (not on the current), and a "More" menu with "Download", "Name this version", "Restore
 this version" (not on the current). Filter chip at the top: "Only named versions". At the end:

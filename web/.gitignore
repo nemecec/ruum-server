@@ -23,3 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 build-ladle
+
+# The built catalogue (npm run ladle:build)
+build-ladle

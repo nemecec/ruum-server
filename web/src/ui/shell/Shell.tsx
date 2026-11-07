@@ -1,4 +1,4 @@
-import type { DragEventHandler, FormEventHandler, ReactNode } from 'react'
+import { useEffect, useRef, useSyncExternalStore, type DragEventHandler, type FormEventHandler, type ReactNode } from 'react'
 import { NavLink } from 'react-router'
 import { Button } from '../button/Button'
 import { cx } from '../cx'
@@ -28,11 +28,15 @@ export function TopBar({ children }: { children: ReactNode }) {
   )
 }
 
-/** The wordmark "Ruum": a link to Files, or plain text where there is no Files (a share link). */
-export function Brand({ to, children }: { to?: string; children: ReactNode }) {
+/**
+ * The wordmark "Ruum": a link to Files, or plain text where there is no Files (a share link). The
+ * brand is not translated. `label` names the link by where it goes ("Ruum, files"), so it is never
+ * read as the same word as a label next to it.
+ */
+export function Brand({ to, label, children }: { to?: string; label?: string; children: ReactNode }) {
   if (!to) return <span className="ui-brand">{children}</span>
   return (
-    <NavLink to={to} className="ui-brand">
+    <NavLink to={to} className="ui-brand" aria-label={label}>
       {children}
     </NavLink>
   )
@@ -52,7 +56,7 @@ export function SearchForm(props: {
   onSubmit: FormEventHandler<HTMLFormElement>
 }) {
   return (
-    <form role="search" className="ui-search" onSubmit={props.onSubmit}>
+    <form role="search" aria-label={props.label} className="ui-search" onSubmit={props.onSubmit}>
       <label htmlFor={props.id}>
         <VisuallyHidden>{props.label}</VisuallyHidden>
       </label>
@@ -130,16 +134,78 @@ export function AppMain({ id = 'main', children }: { id?: string; children: Reac
   )
 }
 
+/** The width under which the layout is the phone layout (the CSS uses the same 640 px). */
+export const NARROW_QUERY = '(max-width: 640px)'
+
+function subscribeNarrow(onChange: () => void) {
+  if (typeof window === 'undefined' || !window.matchMedia) return () => {}
+  const q = window.matchMedia(NARROW_QUERY)
+  q.addEventListener?.('change', onChange)
+  return () => q.removeEventListener?.('change', onChange)
+}
+
+/** True on the phone layout. */
+export function useNarrow(): boolean {
+  return useSyncExternalStore(
+    subscribeNarrow,
+    () => (typeof window !== 'undefined' && window.matchMedia ? window.matchMedia(NARROW_QUERY).matches : false),
+    () => false,
+  )
+}
+
 /**
  * A list and the details of one item beside it (design-system 4.7). On the phone the details
- * panel is a sheet over the list, so it is always in view.
+ * panel is a modal sheet over the list: the list is `inert` while the sheet is open, so the focus
+ * never goes under the sheet (WCAG 2.4.11), and Escape closes it (`onCloseAside`). When the panel
+ * closes, the focus goes back to where it was when the panel opened (the row).
  */
-export function SplitView({ children, aside, asideLabel }: { children: ReactNode; aside?: ReactNode; asideLabel: string }) {
+export function SplitView({
+  children,
+  aside,
+  asideLabel,
+  onCloseAside,
+}: {
+  children: ReactNode
+  aside?: ReactNode
+  asideLabel: string
+  onCloseAside?: () => void
+}) {
+  const narrow = useNarrow()
+  const open = Boolean(aside)
+  const opener = useRef<HTMLElement | null>(null)
+  const asideRef = useRef<HTMLElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const before = document.activeElement
+    opener.current = before instanceof HTMLElement && !asideRef.current?.contains(before) ? before : null
+    return () => {
+      const back = opener.current
+      // Only when the focus was in the panel or got lost with it.
+      const active = document.activeElement
+      if (back && back.isConnected && (!active || active === document.body || !active.isConnected)) back.focus()
+    }
+  }, [open])
+
   return (
-    <div className={cx('ui-split', aside ? 'ui-split-with-aside' : undefined)}>
-      <div className="ui-split-main">{children}</div>
+    <div className={cx('ui-split', open && 'ui-split-with-aside', open && narrow && 'ui-split-modal')}>
+      <div className="ui-split-main" inert={open && narrow ? true : undefined}>
+        {children}
+      </div>
       {aside && (
-        <aside className="ui-split-aside" aria-label={asideLabel}>
+        <aside
+          ref={asideRef}
+          className="ui-split-aside"
+          aria-label={asideLabel}
+          role={narrow ? 'dialog' : undefined}
+          aria-modal={narrow ? true : undefined}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape' && onCloseAside) {
+              e.stopPropagation()
+              onCloseAside()
+            }
+          }}
+        >
           {aside}
         </aside>
       )}

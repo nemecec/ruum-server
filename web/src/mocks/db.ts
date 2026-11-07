@@ -387,7 +387,7 @@ function seed() {
   const members: Schemas['Member'][] = [
     { tenant_id: ids.team, user_id: ids.charles, email: 'charles@example.com', display_name: 'Charles Babbage', role: 'owner', joined_at: t0 },
     { tenant_id: ids.team, user_id: ids.ada, email: 'ada@example.com', display_name: 'Ada Lovelace', role: 'admin', joined_at: t0 },
-    { tenant_id: ids.team, user_id: ids.grace, email: 'grace@example.com', display_name: 'Grace Hopper', role: 'member', joined_at: '2026-10-10T12:00:00Z' },
+    { tenant_id: ids.team, user_id: ids.grace, email: 'grace@example.com', display_name: 'Grace Hopper', role: 'member', content_role: 'edit', joined_at: '2026-10-10T12:00:00Z' },
     { tenant_id: ids.personal, user_id: ids.ada, email: 'ada@example.com', display_name: 'Ada Lovelace', role: 'owner', joined_at: t0 },
   ]
   const invitations: Schemas['Invitation'][] = [
@@ -410,6 +410,14 @@ function seed() {
     { id: '0190a000-0000-7000-8000-000000000b05', tenant_id: ids.team, action: 'member.role_changed', actor: userRef(), on_behalf_of: null, target_type: 'member', target_id: ids.grace, ip: '127.0.0.1', at: '2026-11-02T10:00:00Z', data: { old_role: 'guest', new_role: 'member' } },
     { id: '0190a000-0000-7000-8000-000000000b06', tenant_id: ids.team, action: 'node.sharing_updated', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'node', target_id: ids.teamSpecs, ip: null, at: '2026-11-02T09:00:00Z', data: { old_editors_can_share: null, new_editors_can_share: false } },
     { id: '0190a000-0000-7000-8000-000000000b03', action: 'tenant.updated', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'tenant', target_id: ids.team, ip: '127.0.0.1', at: '2026-10-05T09:00:00Z', data: { allow_edit_links: true } },
+    // Sign-ins and credential use (decision 0003-4) and a share to an email that bound (0003-2).
+    { id: '0190a000-0000-7000-8000-000000000b07', tenant_id: ids.team, action: 'auth.login', actor: userRef(), on_behalf_of: null, target_type: 'user', target_id: ids.ada, ip: '192.0.2.10', user_agent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) Gecko/20100101 Firefox/131.0', at: '2026-10-04T08:00:00Z', data: { method: 'oidc' } },
+    { id: '0190a000-0000-7000-8000-000000000b08', tenant_id: ids.team, action: 'auth.login', actor: userRef(ids.charles), on_behalf_of: null, target_type: 'user', target_id: ids.charles, ip: null, at: '2026-10-04T07:00:00Z', data: { via: 'session_first_use' } },
+    { id: '0190a000-0000-7000-8000-000000000b09', tenant_id: ids.team, action: 'auth.logout', actor: userRef(), on_behalf_of: null, target_type: 'user', target_id: ids.ada, ip: '192.0.2.10', at: '2026-10-04T06:00:00Z', data: {} },
+    { id: '0190a000-0000-7000-8000-000000000b0a', tenant_id: ids.team, action: 'agent.token_issued', actor: claudeRef, on_behalf_of: ids.ada, target_type: 'agent', target_id: ids.agentClaude, ip: '192.0.2.11', at: '2026-10-03T08:00:00Z', data: { grant: 'refresh_token' } },
+    { id: '0190a000-0000-7000-8000-000000000b0b', tenant_id: ids.team, action: 'agent.key_refused', actor: claudeRef, on_behalf_of: ids.ada, target_type: 'agent_key', target_id: '0190a000-0000-7000-8000-00000000ce01', ip: '192.0.2.11', at: '2026-10-03T07:00:00Z', data: { agent_id: ids.agentClaude, reason: 'revoked' } },
+    { id: '0190a000-0000-7000-8000-000000000b0c', tenant_id: ids.team, action: 'member.added', actor: userRef(ids.grace), on_behalf_of: null, target_type: 'member', target_id: ids.grace, ip: null, at: '2026-10-02T08:00:00Z', data: { role: 'guest', via: 'email_grant', granted_by: [userRef()] } },
+    { id: '0190a000-0000-7000-8000-000000000b0d', tenant_id: ids.team, action: 'grant.added', actor: userRef(), on_behalf_of: null, target_type: 'node', target_id: ids.teamSpecs, ip: null, at: '2026-10-02T07:00:00Z', data: { grantee: { type: 'email', email: 'kathleen@example.com' }, role: 'view', may_add_guest: true } },
   ]
   const limits: Record<string, Schemas['LimitsAndUsage']> = {
     [ids.personal]: {
@@ -467,6 +475,8 @@ function seed() {
     shareLinks,
     linkSecrets,
     invitationTokens,
+    /** Share emails sent, by `<node>/<email>` (one per recipient and item in 10 minutes, decision 0003-3). */
+    mailed: new Set<string>(),
     shared,
     agents,
     agentKeys,

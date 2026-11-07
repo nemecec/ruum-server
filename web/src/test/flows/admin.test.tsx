@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { db } from '../../mocks/db'
-import { dialog, ids, renderApp, team } from '../render'
+import { choose, dialog, ids, renderApp, team } from '../render'
 import { recordRequests } from '../requests'
 
 describe('tenant admin', () => {
@@ -9,17 +9,23 @@ describe('tenant admin', () => {
     const { user, router } = renderApp(`${team}/admin`)
     expect(await screen.findByRole('heading', { name: 'Members' })).toBeInTheDocument()
     expect(router.state.location.pathname).toBe(`${team}/admin/members`)
-    // An admin cannot change the owner or themselves.
-    expect(await screen.findByRole('combobox', { name: 'Role of Charles Babbage' })).toBeDisabled()
-    expect(screen.getByRole('combobox', { name: 'Role of Ada Lovelace' })).toBeDisabled()
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Role of Grace Hopper' }), 'admin')
+    // An admin cannot change the owner or themselves, and the page says why (journey J6).
+    const owner = (await screen.findByRole('rowheader', { name: /^Charles Babbage/ })).closest('tr')!
+    expect(within(owner).queryByRole('button', { name: /Role of/ })).not.toBeInTheDocument()
+    expect(within(owner).getByText('Only an owner can change the role of an owner.')).toBeInTheDocument()
+    const self = screen.getByRole('rowheader', { name: /^Ada Lovelace/ }).closest('tr')!
+    expect(within(self).getByText("You can't change your own role. Another admin or owner can.")).toBeInTheDocument()
+    // The role menu says what each role means.
+    await user.click(screen.getByRole('button', { name: 'Member Role of Grace Hopper' }))
+    expect(within(screen.getByRole('menu')).getByRole('menuitemradio', { name: /^Admin/ })).toHaveTextContent(/Admin.+/)
+    await user.click(within(screen.getByRole('menu')).getByRole('menuitemradio', { name: /^Admin/ }))
     expect(await screen.findByText('Grace Hopper is now admin.')).toBeInTheDocument()
     expect(db.members.find((m) => m.user_id === ids.grace && m.tenant_id === ids.team)?.role).toBe('admin')
   })
 
   it('asks before a member becomes a guest, and says what they lose', async () => {
     const { user } = renderApp(`${team}/admin/members`)
-    await user.selectOptions(await screen.findByRole('combobox', { name: 'Role of Grace Hopper' }), 'guest')
+    await choose(user, 'Member Role of Grace Hopper', /^Guest/)
     const d = await dialog('Make Grace Hopper a guest?')
     expect(d).toHaveTextContent('Grace Hopper then sees only the items that are shared with them directly, and loses access to everything else in Analytical Engines at once.')
     // Nothing changed before the confirmation.
@@ -31,11 +37,11 @@ describe('tenant admin', () => {
 
   it('removes a member after a confirmation', async () => {
     const { user } = renderApp(`${team}/admin/members`)
-    await user.click(await screen.findByRole('button', { name: 'Remove Grace Hopper' }))
+    await choose(user, 'More actions for Grace Hopper', 'Remove from Analytical Engines')
     const d = await dialog('Remove Grace Hopper from Analytical Engines?')
     expect(within(d).getByText(/Their files stay\./)).toBeInTheDocument()
     await user.click(within(d).getByRole('button', { name: 'Remove Grace Hopper' }))
-    await waitFor(() => expect(screen.queryByRole('rowheader', { name: 'Grace Hopper' })).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('rowheader', { name: /^Grace Hopper/ })).not.toBeInTheDocument())
   })
 
   it('invites someone and revokes an invitation', async () => {
@@ -80,6 +86,75 @@ describe('tenant admin', () => {
     expect(patch?.body).toMatchObject({ name: 'Analytical Engines', policy: { allow_share_links: false } })
   })
 
+  it('gives a member a content role, and a guest who becomes a member one in the same step (0003-1)', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${team}/admin/members`)
+    // The content role menu says what each one means.
+    await user.click(await screen.findByRole('button', { name: 'Can edit what Grace Hopper can do' }))
+    const menu = screen.getByRole('menu')
+    expect(within(menu).getByRole('menuitemradio', { name: /^Can view/ })).toHaveTextContent(
+      'Sees everything in Analytical Engines, changes nothing. To show only some folders, make them a guest.',
+    )
+    await user.click(within(menu).getByRole('menuitemradio', { name: /^Can view/ }))
+    expect(await screen.findByText('Grace Hopper: can view in Analytical Engines now.')).toBeInTheDocument()
+    expect(seen.find((r) => r.method === 'PATCH' && r.path.endsWith(`/members/${ids.grace}`))?.body).toEqual({ role: 'member', content_role: 'view' })
+    expect(await screen.findByText('Shares to everyone in the space still apply.')).toBeInTheDocument()
+
+    // Guest to member asks for the content role (default Can manage).
+    await choose(user, /Role of Grace Hopper/, /^Guest/)
+    await user.click(within(await dialog('Make Grace Hopper a guest?')).getByRole('button', { name: 'Make guest' }))
+    await screen.findByText('Grace Hopper is now guest.')
+    await choose(user, 'Guest Role of Grace Hopper', /^Member/)
+    const d = await dialog('Make Grace Hopper a member?')
+    expect(within(d).getByRole('radio', { name: 'Can manage' })).toBeChecked()
+    await user.click(within(d).getByRole('radio', { name: 'Can comment' }))
+    await user.click(within(d).getByRole('button', { name: 'Make member' }))
+    await screen.findByText('Grace Hopper is now member.')
+    expect(seen.filter((r) => r.method === 'PATCH').at(-1)?.body).toEqual({ role: 'member', content_role: 'comment' })
+  })
+
+  it('invites a member with a content role, and leaves it out for other roles (0003-1)', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${team}/admin/invitations`)
+    const form = await screen.findByRole('form', { name: 'Invite people' })
+    const what = within(form).getByRole('combobox', { name: 'What they can do' })
+    expect(what).toHaveValue('manage')
+    await user.selectOptions(what, 'edit')
+    expect(within(form).getByText(/Can edit: Changes files and folders in Analytical Engines/)).toBeInTheDocument()
+    await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'kathleen@example.com')
+    await user.click(within(form).getByRole('button', { name: 'Send invitations' }))
+    await screen.findByText(/Invitation sent|kathleen@example.com/)
+    await user.selectOptions(within(form).getByRole('combobox', { name: 'Role' }), 'admin')
+    expect(within(form).queryByRole('combobox', { name: 'What they can do' })).not.toBeInTheDocument()
+    await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'alan.t@example.com')
+    await user.click(within(form).getByRole('button', { name: 'Send invitations' }))
+    await waitFor(() => expect(seen.filter((r) => r.method === 'POST' && r.path.endsWith('/invitations'))).toHaveLength(2))
+    expect(seen.filter((r) => r.method === 'POST' && r.path.endsWith('/invitations')).map((r) => r.body)).toEqual([
+      { email: 'kathleen@example.com', role: 'member', content_role: 'edit' },
+      { email: 'alan.t@example.com', role: 'admin' },
+    ])
+  })
+
+  it('shows sign-ins in the activity log, with where they came from (0003-4)', async () => {
+    const { user } = renderApp(`${team}/admin/audit`)
+    await user.selectOptions(await screen.findByRole('combobox', { name: 'Show' }), 'auth.')
+    expect(await screen.findByText("Sign-ins of members. Guests' sign-ins are not shown.")).toBeInTheDocument()
+    const login = (await screen.findByText('signed in')).closest('li')!
+    expect(login).toHaveTextContent('192.0.2.10 · Firefox on macOS')
+    expect(screen.getByText('opened Analytical Engines (new session)')).toBeInTheDocument()
+    expect(screen.getByText('signed out')).toBeInTheDocument()
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Show' }), 'agent.')
+    const refused = (await screen.findByText('was refused (key revoked)')).closest('li')!
+    expect(within(refused).getByText('Refused')).toBeInTheDocument()
+    expect(screen.getByText('got a token')).toBeInTheDocument()
+  })
+
+  it('says how a person joined through a share to their email (0003-2)', async () => {
+    renderApp(`${team}/admin/audit`)
+    expect(await screen.findByText(/joined as a guest through a share by Ada Lovelace/)).toBeInTheDocument()
+    expect(screen.getByText(/\(view; may join as a guest\)/)).toBeInTheDocument()
+  })
+
   it('shows the plan, limits and usage', async () => {
     renderApp(`${team}/admin/limits`)
     expect(await screen.findByText('Team')).toBeInTheDocument()
@@ -89,12 +164,12 @@ describe('tenant admin', () => {
 
   it('lists and filters the activity log in plain words', async () => {
     const { user } = renderApp(`${team}/admin/audit`)
-    expect(await screen.findByText(/invited someone: alan@example\.com/)).toBeInTheDocument()
+    expect(await screen.findByText(/invited alan@example\.com/)).toBeInTheDocument()
     expect(screen.getByText(/created an agent: Claude Desktop/)).toBeInTheDocument()
     expect(screen.queryByText('agent.registered')).not.toBeInTheDocument()
+    // The filter applies on change.
     await user.selectOptions(screen.getByRole('combobox', { name: 'Show' }), 'agent.')
-    await user.click(screen.getByRole('button', { name: 'Show' }))
-    await waitFor(() => expect(screen.queryByText(/invited someone/)).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByText(/invited alan/)).not.toBeInTheDocument())
     expect(screen.getByText(/created an agent: Claude Desktop/)).toBeInTheDocument()
   })
 
@@ -113,7 +188,23 @@ describe('tenant admin', () => {
 
   it('keeps non-admins out', async () => {
     db.tenants[1].role = 'member'
+    renderApp(`${team}/admin/audit`)
+    expect(await screen.findByText('Only admins and owners of Analytical Engines can open these pages.')).toBeInTheDocument()
+  })
+
+  it('keeps guests out of the members page', async () => {
+    db.tenants[1].role = 'guest'
     renderApp(`${team}/admin/members`)
     expect(await screen.findByText('Only admins and owners of Analytical Engines can open these pages.')).toBeInTheDocument()
+  })
+
+  it('shows members the people of the space read-only, with their content roles (0003-1)', async () => {
+    db.tenants[1].role = 'member'
+    renderApp(`${team}/admin/members`)
+    expect(await screen.findByText('The people of Analytical Engines. Only admins can change roles.')).toBeInTheDocument()
+    const row = (await screen.findByRole('rowheader', { name: /^Grace Hopper/ })).closest('tr')!
+    expect(within(row).getByText('Can edit')).toBeInTheDocument()
+    expect(within(row).queryByRole('button')).not.toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: 'Space settings' })).not.toBeInTheDocument()
   })
 })

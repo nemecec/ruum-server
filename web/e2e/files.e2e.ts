@@ -92,7 +92,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   // Trash (it can be undone, so no confirmation), then restore from the trash page.
   await openDetails(page, 'renamed.bin')
   await page.getByRole('button', { name: 'Move to trash' }).click()
-  await expect(toast(page, 'Moved renamed.bin to the trash.')).toBeVisible()
+  await expect(toast(page, 'Moved renamed.bin to trash.')).toBeVisible()
   await expect(page.getByText('This folder is empty', { exact: true })).toBeVisible()
   const archiveUrl = page.url()
 

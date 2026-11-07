@@ -43,7 +43,7 @@ export function ConnectAgentPage() {
           </ProseList>
           <h3>{t('connect.claudeCode')}</h3>
           <p>{t('connect.claudeCode.intro')}</p>
-          <CopyField label={t('connect.claudeCode.command')} value={`claude mcp add --transport http ruum ${address}`} />
+          <CopyField wrap label={t('connect.claudeCode.command')} value={`claude mcp add --transport http ruum ${address}`} />
           <h3>{t('connect.chatgpt')}</h3>
           <ProseList ordered>
             <li>{t('connect.chatgpt.1')}</li>

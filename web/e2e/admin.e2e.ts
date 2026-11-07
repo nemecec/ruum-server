@@ -18,14 +18,14 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   await expect(form.getByLabel('Role').locator('option')).toHaveText(['Guest'])
   await expect(form).toContainText('is a personal space, just for you')
   // "Start a team space" in the space switcher (journeys J6 step 1).
-  await ann.getByRole('combobox', { name: 'Space' }).selectOption({ label: 'Start a team space...' })
+  await ann.getByRole('button', { name: /\(change space\)$/ }).click()
+  await ann.getByRole('menuitem', { name: 'Start a team space...' }).click()
   const start = ann.getByRole('dialog', { name: 'Start a team space' })
   await start.getByLabel('Team name').fill(team)
   await start.getByRole('button', { name: 'Create team space' }).click()
   await expect(toast(ann, `${team} is ready. Invite the people you work with.`)).toBeVisible()
   await expect(ann.getByRole('heading', { name: `Space settings: ${team}`, level: 1 })).toBeVisible()
-  await expect(ann.getByRole('combobox', { name: 'Space' })).toHaveValue(/[0-9a-f-]{36}/)
-  await expect(ann.getByRole('combobox', { name: 'Space' }).locator('option:checked')).toHaveText(`${team} (owner)`)
+  await expect(ann.getByRole('button', { name: `${team} (change space)` })).toBeVisible()
   await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Members' }).click()
 
   // Members: Ann alone, as the owner; she cannot change her own role.
@@ -49,7 +49,7 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   await cara.getByRole('button', { name: 'Join the space' }).click()
   await expect(toast(cara, `You've joined ${team}.`)).toBeVisible()
   await expect(cara.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()
-  await expect(cara.getByRole('combobox', { name: 'Space' }).locator('option:checked')).toHaveText(`${team} (member)`)
+  await expect(cara.getByRole('button', { name: `${team} (change space)` })).toBeVisible()
   await expect(cara.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Space settings' })).toHaveCount(0)
 
   // Ann sees Cara among the members, and no open invitation; she makes Cara an admin.
@@ -70,7 +70,7 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   // The activity log records the invitation and the role change, in plain words.
   await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Activity log' }).click()
   const log = ann.getByRole('region', { name: 'Activity log' })
-  await expect(log).toContainText(/invited someone|accepted an invitation/)
+  await expect(log).toContainText(/invited |accepted an invitation/)
   await expect(log).not.toContainText('invitation.created')
 
   await annContext.close()

@@ -5,7 +5,7 @@ import { useApi } from '../api/useApi'
 import { browser } from '../app/browser'
 import { clientIdOfRequest, redirectUriOfRequest } from '../app/oauth'
 import { useSession } from '../app/useSession'
-import { roleLabels } from '../components/format'
+import { roleInline } from '../components/format'
 import { accessSummary } from './agents/status'
 import { ScopeFields } from './agents/ScopeFields'
 import { Actions, Button, ErrorNote, Field, Fieldset, Indent, Loaded, Note, Page, Radio, Select, Stack, Text, TextInput } from '../ui'
@@ -70,7 +70,7 @@ export function OAuthConsentPage() {
   }
 
   const appName = oauthClient.data?.client_name ?? t('actor.app')
-  const spaceName = tenants.find((m) => m.tenant.id === tenantId)?.tenant.name ?? t('consent.yourSpace')
+  const spaceName = tenants.find((m) => m.tenant.id === tenantId)?.tenant.name ?? null
   const folderMissing = mode === 'new' && scope.subtree === ''
 
   async function answer(approve: boolean) {
@@ -124,7 +124,9 @@ export function OAuthConsentPage() {
           const href = c.client_uri ? safeHref(c.client_uri) : undefined
           // The redirect of this request when the UI can read it; otherwise the registered ones.
           const back = requestRedirect ? [hostOf(requestRedirect)] : c.redirect_uris.map((u) => hostOf(u))
-          const backText = currentIntl().formatList(back.map((h) => h ?? t('consent.badAddress')), { type: 'unit' })
+          const good = back.filter((h): h is string => Boolean(h))
+          const bad = good.length < back.length ? 'yes' : 'no'
+          const backText = currentIntl().formatList(good, { type: 'unit' })
           return (
             <Stack>
               <Note tone="warning" role="note">
@@ -145,8 +147,8 @@ export function OAuthConsentPage() {
                   </>
                 ) : null}
                 {requestRedirect
-                  ? t('consent.back.will', { back: backText })
-                  : t('consent.back.can', { back: backText, many: back.length > 1 ? 'yes' : 'no' })}
+                  ? t('consent.back.will', { back: backText, hasGood: good.length ? 'yes' : 'no', bad })
+                  : t('consent.back.can', { back: backText, many: good.length > 1 ? 'yes' : 'no', hasGood: good.length ? 'yes' : 'no', bad })}
               </Text>
             </Stack>
           )
@@ -178,7 +180,7 @@ export function OAuthConsentPage() {
               <Field label={t('consent.agent.name')}>
                 <TextInput value={agentName} placeholder={appName} onChange={(e) => setAgentName(e.target.value)} />
               </Field>
-              <ScopeFields tenantId={tenantId} spaceName={spaceName} scope={scope} onChange={setScope} idPrefix="consent" />
+              <ScopeFields tenantId={tenantId} spaceName={spaceName ?? undefined} scope={scope} onChange={setScope} idPrefix="consent" />
               {!folderMissing && <Note>{t('consent.summary', { summary: accessSummary(scope, null, spaceName) })}</Note>}
             </Indent>
           )}
@@ -198,7 +200,7 @@ export function OAuthConsentPage() {
                     .filter((a) => !a.disabled_at)
                     .map((a) => (
                       <option key={a.id} value={a.id}>
-                        {t('consent.agent.option', { name: a.name, role: roleLabels[a.scope.max_role].toLowerCase() })}
+                        {t('consent.agent.option', { name: a.name, role: roleInline[a.scope.max_role] })}
                       </option>
                     ))}
                 </Select>

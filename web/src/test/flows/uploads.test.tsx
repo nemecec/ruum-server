@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { db } from '../../mocks/db'
-import { dialog, ids, personal, renderApp } from '../render'
+import { dialog, ids, personal, renderApp, choose } from '../render'
 import { recordRequests } from '../requests'
 
 describe('uploads, conflicts and the file list', () => {
@@ -135,7 +135,7 @@ describe('uploads, conflicts and the file list', () => {
     const bar = screen.getByRole('region', { name: 'Selection' })
     expect(within(bar).getByText('2 items selected')).toBeInTheDocument()
     await user.click(within(bar).getByRole('button', { name: 'Move to trash' }))
-    expect(await screen.findByText('Moved 2 items to the trash.')).toBeInTheDocument()
+    expect(await screen.findByText('Moved 2 items to trash.')).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByRole('button', { name: 'plan.txt' })).not.toBeInTheDocument())
     await user.click(screen.getByRole('button', { name: 'Undo' }))
     expect(await screen.findByText('Restored 2 items.')).toBeInTheDocument()
@@ -160,7 +160,7 @@ describe('uploads, conflicts and the file list', () => {
   it('makes a folder inside the move picker', async () => {
     const { user } = renderApp(`${personal}/files`)
     await user.click(await screen.findByRole('button', { name: 'Details of notes.md' }))
-    await user.click(within(await screen.findByRole('region', { name: 'notes.md' })).getByRole('button', { name: 'Move' }))
+    await choose(user, 'More actions for notes.md', 'Move', await screen.findByRole('region', { name: 'notes.md' }))
     const d = await dialog('Move notes.md')
     await user.click(await within(d).findByRole('button', { name: 'New folder' }))
     const nf = await dialog('New folder')
