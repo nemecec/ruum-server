@@ -72,6 +72,10 @@ pub trait DatabaseEngine: Send + Sync {
     /// for [`StatementMode::Read`] and for the kinds that cannot write, cancelled after
     /// `timeout`, at most `max_rows` rows. `key` is the pseudonym key of the database (SQLite
     /// registers it on the connection it opens; Postgres has it installed).
+    ///
+    /// A failure at COMMIT (for example a deferred constraint) fails the request like a failed
+    /// statement ([`EngineError::Sql`] with the engine's code). The transaction is rolled back,
+    /// nothing of the statement stays, and the next request works.
     async fn execute(
         &self,
         role: &RoleRef,
@@ -82,7 +86,13 @@ pub trait DatabaseEngine: Send + Sync {
     /// Applies a migration: drops the lens views, runs `up` in an `owner` session in one
     /// transaction (rolled back on any failure, and always for a dry run), then reads the
     /// catalog, calls `sync` and rebuilds the lens views from its answer, also after a failed
-    /// `up` (decision 0004-34 f). A failed `up` gives [`EngineError::MigrationFailed`].
+    /// `up` (decision 0004-34 f). A failed `up` gives [`EngineError::MigrationFailed`]; a
+    /// failure at the COMMIT of `up` (for example a deferred constraint) is a failed `up`.
+    ///
+    /// [`EngineError::CatalogSync`] from this method means that `up` is committed, but the lens
+    /// is not rebuilt (it stays dropped, so the lens kinds fail closed) and the database stays
+    /// `updating`. The caller records the migration as applied and runs
+    /// [`DatabaseEngine::sync_lens`] again later.
     async fn apply_migration(
         &self,
         db: &DatabaseRef,
@@ -106,6 +116,11 @@ pub trait DatabaseEngine: Send + Sync {
     /// `source_key`; the new database gets `key` installed before it is returned (decision
     /// 0004-25). The source keeps working afterwards (Postgres drains it first, decision
     /// 0004-27).
+    ///
+    /// The engine does not compare `new.tenant_id` with `source.tenant_id`. A copy into another
+    /// tenant (for example a template of the Ruum gallery, design 2.7) is the platform's decision, made before
+    /// this call; the new database belongs to `new.tenant_id` only. The same holds for
+    /// [`DatabaseEngine::restore_into_new`].
     async fn copy_database(
         &self,
         source: &DatabaseRef,

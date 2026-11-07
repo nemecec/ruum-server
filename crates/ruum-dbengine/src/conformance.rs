@@ -223,6 +223,7 @@ pub async fn run_all(engine: &dyn DatabaseEngine) {
     timeout(engine).await;
     row_cap(engine).await;
     transaction_control(engine).await;
+    deferred_constraint(engine).await;
     migration(engine).await;
     branch(engine).await;
     restore_point(engine).await;
@@ -297,10 +298,13 @@ pub async fn drop_database(engine: &dyn DatabaseEngine) {
     ));
 }
 
-/// A reference with another tenant's (or node's) IDs finds nothing.
+/// A reference with another tenant's (or node's) IDs finds nothing, for every method that
+/// names an existing database.
 pub async fn isolation(engine: &dyn DatabaseEngine) {
     let f = Fixture::new(engine).await;
     f.seed_users().await;
+    let point = engine.create_restore_point(f.db()).await.unwrap();
+    let before = engine.catalog(f.db()).await.unwrap();
     for other in [
         DatabaseRef {
             tenant_id: Uuid::now_v7(),
@@ -331,10 +335,59 @@ pub async fn isolation(engine: &dyn DatabaseEngine) {
             Err(EngineError::NotFound)
         ));
         assert!(matches!(
+            engine.size_bytes(&other).await,
+            Err(EngineError::NotFound)
+        ));
+        let request = MigrationRequest {
+            up: "DROP TABLE users;".to_string(),
+            timeout: Duration::from_secs(10),
+            dry_run: false,
+        };
+        let sync = RecordingSync::new();
+        let migrated = engine
+            .apply_migration(&other, &f.key, &request, &sync)
+            .await;
+        assert!(
+            matches!(migrated, Err(EngineError::NotFound)),
+            "{migrated:?}"
+        );
+        assert!(matches!(
+            engine.sync_lens(&other, &f.key, &sync).await,
+            Err(EngineError::NotFound)
+        ));
+        assert!(sync.calls().is_empty(), "no sync for another tenant");
+        let (key, _) = test_key();
+        let copied = engine
+            .copy_database(
+                &other,
+                &f.key,
+                &new_database(other.tenant_id),
+                &CopyData::Full,
+                &key,
+            )
+            .await;
+        assert!(matches!(copied, Err(EngineError::NotFound)), "{copied:?}");
+        assert!(matches!(
+            engine.create_restore_point(&other).await,
+            Err(EngineError::NotFound)
+        ));
+        let restored = engine
+            .restore_into_new(&other, &point, &new_database(other.tenant_id), &key)
+            .await;
+        assert!(
+            matches!(restored, Err(EngineError::NotFound)),
+            "{restored:?}"
+        );
+        assert!(matches!(
+            engine.restore_in_place(&other, &point, &f.key).await,
+            Err(EngineError::NotFound)
+        ));
+        assert!(matches!(
             engine.drop_database(&other).await,
             Err(EngineError::NotFound)
         ));
     }
+    assert_eq!(engine.catalog(f.db()).await.unwrap(), before);
     assert_eq!(f.user_names(f.db()).await, ["Ann", "Bob", "Cid"]);
 }
 
@@ -558,6 +611,11 @@ pub async fn write(engine: &dyn DatabaseEngine) {
         .await
         .unwrap();
     assert!(out.rows.is_empty());
+    assert!(
+        matches!(out.rows_affected, None | Some(0)),
+        "DDL changes no rows, not the count of an earlier statement: {:?}",
+        out.rows_affected
+    );
     let catalog = engine.catalog(f.db()).await.unwrap();
     assert!(catalog.table(f.schema(), "notes").is_some());
     assert!(catalog.table(f.schema(), "t").is_none());
@@ -706,6 +764,175 @@ pub async fn transaction_control(engine: &dyn DatabaseEngine) {
     assert_times_out(&f, Duration::from_millis(150)).await;
 }
 
+/// A write or a migration's `up` that fails only at COMMIT (a deferred foreign key) fails like a
+/// failed statement and leaves nothing behind: the catalog and the rows are unchanged, the
+/// export holds no trace, and the database works afterwards, with the timeout. (This also
+/// checks the rule "a connection whose transaction failed is closed" of the engines with
+/// connection pools.)
+pub async fn deferred_constraint(engine: &dyn DatabaseEngine) {
+    let f = Fixture::new(engine).await;
+    f.migrate(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE child (id integer PRIMARY KEY, \
+            pid integer REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED);",
+    )
+    .await
+    .expect("migration");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO parent (id) VALUES (1)",
+        vec![],
+    )
+    .await
+    .expect("insert parent");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO child (id, pid) VALUES (1, 1)",
+        vec![],
+    )
+    .await
+    .expect("insert child");
+    let before = engine.catalog(f.db()).await.unwrap();
+
+    // A write of every kind that may write: the statement runs, the COMMIT fails.
+    for (i, kind) in [RoleKind::Write, RoleKind::MaskedWrite, RoleKind::Owner]
+        .into_iter()
+        .enumerate()
+    {
+        let id = 7701 + i as i64;
+        let err = f
+            .run(
+                kind,
+                StatementMode::Write,
+                "INSERT INTO child (id, pid) VALUES ($1, 9901)",
+                vec![Value::Int(id)],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Sql { .. }),
+            "{}: a constraint error, not {err:?}",
+            kind.as_str()
+        );
+        assert_eq!(
+            child_rows(&f).await,
+            [vec![Value::Int(1), Value::Int(1)]],
+            "{}: the failed row is not visible",
+            kind.as_str()
+        );
+    }
+
+    // A migration whose `up` fails at its COMMIT.
+    let sync = RecordingSync::new();
+    let err = f
+        .migrate_with(
+            "CREATE TABLE extra_deferred (x integer);
+             INSERT INTO child (id, pid) VALUES (7799, 9902);",
+            false,
+            &sync,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::MigrationFailed(ref e) if matches!(**e, EngineError::Sql { .. })),
+        "{err:?}"
+    );
+    assert_eq!(
+        sync.calls(),
+        std::slice::from_ref(&before),
+        "the sync runs on the unchanged catalog"
+    );
+    assert_eq!(engine.catalog(f.db()).await.unwrap(), before);
+    assert_eq!(child_rows(&f).await, [vec![Value::Int(1), Value::Int(1)]]);
+
+    // No trace in the export, a restore point or a copy.
+    let text = String::from_utf8(
+        engine
+            .export(f.db(), ExportFormat::Sql)
+            .await
+            .unwrap()
+            .into_bytes()
+            .await
+            .unwrap(),
+    )
+    .expect("a SQL export is text");
+    for trace in [
+        "7701",
+        "7702",
+        "7703",
+        "7799",
+        "9901",
+        "9902",
+        "extra_deferred",
+    ] {
+        assert!(!text.contains(trace), "the export holds {trace:?}");
+    }
+    let point = engine.create_restore_point(f.db()).await.unwrap();
+    let (key, _) = test_key();
+    let restored = engine
+        .restore_into_new(f.db(), &point, &new_database(f.db().tenant_id), &key)
+        .await
+        .unwrap();
+    assert_eq!(
+        shape(&engine.catalog(&restored.database).await.unwrap()),
+        shape(&before)
+    );
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &new_database(f.db().tenant_id),
+            &CopyData::Full,
+            &key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        shape(&engine.catalog(&copy.database).await.unwrap()),
+        shape(&before)
+    );
+
+    // The database works afterwards: statements (with their timeout), migrations, the lens.
+    assert_times_out(&f, Duration::from_millis(150)).await;
+    let out = f
+        .run(
+            RoleKind::Write,
+            StatementMode::Write,
+            "INSERT INTO child (id, pid) VALUES (2, 1)",
+            vec![],
+        )
+        .await
+        .expect("a valid write after the failures");
+    assert_eq!(out.rows_affected, Some(1));
+    f.migrate("CREATE TABLE after_deferred (x integer);")
+        .await
+        .expect("a migration after the failures");
+    let sync = RecordingSync::new();
+    let catalog = engine.sync_lens(f.db(), &f.key, &sync).await.unwrap();
+    assert!(catalog.table(f.schema(), "after_deferred").is_some());
+    assert_eq!(
+        child_rows(&f).await,
+        [
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(2), Value::Int(1)]
+        ]
+    );
+}
+
+async fn child_rows(f: &Fixture<'_>) -> Vec<Vec<Value>> {
+    f.run(
+        RoleKind::Read,
+        StatementMode::Read,
+        "SELECT id, pid FROM child ORDER BY id",
+        vec![],
+    )
+    .await
+    .expect("select child")
+    .rows
+}
+
 /// A migration runs `up` in one transaction and syncs the catalog once, also after a failure.
 pub async fn migration(engine: &dyn DatabaseEngine) {
     let f = Fixture::new(engine).await;
@@ -841,6 +1068,24 @@ pub async fn branch(engine: &dyn DatabaseEngine) {
         f.user_names(&schema_only.database).await.is_empty(),
         "no rows"
     );
+
+    // A copy into another tenant (the platform decided it) belongs to the new tenant only.
+    let other_tenant = new_database(Uuid::now_v7());
+    let moved = engine
+        .copy_database(f.db(), &f.key, &other_tenant, &CopyData::Full, &branch_key)
+        .await
+        .unwrap();
+    assert_eq!(moved.database.tenant_id, other_tenant.tenant_id);
+    assert_eq!(moved.database.node_id, other_tenant.node_id);
+    assert_eq!(f.user_names(&moved.database).await, ["Ann", "Bob", "Cid"]);
+    let under_source = DatabaseRef {
+        tenant_id: tenant,
+        ..moved.database.clone()
+    };
+    assert!(matches!(
+        engine.catalog(&under_source).await,
+        Err(EngineError::NotFound)
+    ));
 
     // The source keeps working after the copies.
     f.run(

@@ -25,6 +25,7 @@ conformance_cases!(
     timeout,
     row_cap,
     transaction_control,
+    deferred_constraint,
     migration,
     branch,
     restore_point,
@@ -345,4 +346,76 @@ async fn a_dropped_database_waits_for_its_running_statement() {
         engine.catalog(&db).await,
         Err(EngineError::NotFound)
     ));
+}
+
+/// A call that got the database before a drop, and waited on its lock, finds it gone.
+#[tokio::test]
+async fn a_call_waiting_on_a_dropped_database_finds_it_gone() {
+    let engine = std::sync::Arc::new(MemoryEngine::new());
+    let f = Fixture::new(engine.as_ref()).await;
+    f.seed_users().await;
+    let db = f.db().clone();
+    let key = f.key.clone();
+    let runner = {
+        let engine = engine.clone();
+        let db = db.clone();
+        tokio::spawn(async move {
+            let request = StatementRequest {
+                sql: "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) \
+                      SELECT count(*) FROM r"
+                    .into(),
+                params: vec![],
+                mode: StatementMode::Read,
+                timeout: Duration::from_millis(400),
+                max_rows: 1,
+            };
+            let role = RoleRef::new(db, RoleKind::Read).unwrap();
+            engine.execute(&role, &key, &request).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The drop waits on the lock first, then a reader that already holds the handle.
+    let dropper = {
+        let engine = engine.clone();
+        let db = db.clone();
+        tokio::spawn(async move { engine.drop_database(&db).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let reader = {
+        let engine = engine.clone();
+        let db = db.clone();
+        tokio::spawn(async move { engine.catalog(&db).await })
+    };
+    assert!(matches!(runner.await.unwrap(), Err(EngineError::Timeout)));
+    dropper.await.unwrap().unwrap();
+    let read = reader.await.unwrap();
+    assert!(matches!(read, Err(EngineError::NotFound)), "{read:?}");
+}
+
+/// DDL reports no changed rows (not the count of an earlier write).
+#[tokio::test]
+async fn ddl_reports_no_changed_rows() {
+    let engine = MemoryEngine::new();
+    let f = Fixture::new(&engine).await;
+    f.seed_users().await;
+    let out = f
+        .run(
+            RoleKind::Owner,
+            StatementMode::Write,
+            "ALTER TABLE users ADD COLUMN phone text",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.rows_affected, Some(0));
+    let out = f
+        .run(
+            RoleKind::Owner,
+            StatementMode::Write,
+            "DELETE FROM users WHERE id = 1",
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.rows_affected, Some(1));
 }

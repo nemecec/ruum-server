@@ -4,8 +4,13 @@
 //! that refuses transaction control, `ATTACH`, unsafe `PRAGMA`s and DDL of the kinds other than
 //! `owner`, and a progress handler for the timeout. The roles are names in a `ruum_roles`
 //! table (the stand-in of the Ruum objects); the kinds differ only in their rights (read-only,
-//! writes, schema changes). Masking is not here: the lens is empty until card Q-3, and a
-//! masked copy is [`EngineError::Unsupported`]. Restore points are SQL dumps in memory.
+//! writes, schema changes). Restore points are SQL dumps in memory.
+//!
+//! Masking is not here. The memory engine has no lens: a `masked_read` or `masked_write`
+//! session reads the real values, and a masked copy is [`EngineError::Unsupported`]. No card of
+//! step 2 owns a memory lens yet (card Q-3 fills the lens of the SQLite engine, `sqlite/lens.rs`,
+//! not this one). So a privacy or masking test must not run on the memory engine: it would pass
+//! without masking.
 
 mod conn;
 mod dump;
@@ -56,6 +61,9 @@ struct MemDb {
     connection_key: Option<PseudonymKey>,
     points: Vec<(RestorePointMark, String)>,
     lens: Vec<LensEvent>,
+    /// Set by `drop_database` under the lock. A call that got the handle before the drop and
+    /// waited on the lock finds the database gone.
+    dropped: bool,
 }
 
 struct Entry {
@@ -121,7 +129,11 @@ impl MemoryEngine {
     }
 
     async fn lock(&self, db: &DatabaseRef) -> Result<OwnedMutexGuard<MemDb>, EngineError> {
-        Ok(self.handle(db)?.lock_owned().await)
+        let guard = self.handle(db)?.lock_owned().await;
+        if guard.dropped {
+            return Err(EngineError::NotFound);
+        }
+        Ok(guard)
     }
 
     async fn run<T, F>(&self, db: &DatabaseRef, f: F) -> Result<T, EngineError>
@@ -158,6 +170,7 @@ impl MemoryEngine {
                 connection_key: None,
                 points: Vec::new(),
                 lens: Vec::new(),
+                dropped: false,
             })
         })
         .await
@@ -240,7 +253,10 @@ impl MemoryEngine {
             };
             // The memory lens has no views until card Q-3; the rebuild is recorded only.
             db.lens.push(LensEvent::Rebuilt(spec));
-            db.conn.execute_batch("COMMIT").map_err(conn::internal)
+            db.conn.execute_batch("COMMIT").map_err(|e| {
+                conn::rollback_if_open(&db.conn);
+                conn::internal(e)
+            })
         })
         .await?;
         done?;
@@ -264,8 +280,8 @@ impl DatabaseEngine for MemoryEngine {
 
     async fn drop_database(&self, db: &DatabaseRef) -> Result<(), EngineError> {
         // Take the lock first, so a running statement ends before the database goes.
-        let handle = self.handle(db)?;
-        let _held = handle.lock().await;
+        let mut held = self.lock(db).await?;
+        held.dropped = true;
         self.dbs.lock().remove(&db.engine_name);
         Ok(())
     }

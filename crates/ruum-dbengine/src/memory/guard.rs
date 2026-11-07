@@ -68,6 +68,8 @@ pub(crate) struct Guard {
     denied: Mutex<Option<Denial>>,
     deadline: Mutex<Option<Instant>>,
     timed_out: AtomicBool,
+    /// Whether the authorizer allowed DDL in the current untrusted statement.
+    changed_schema: AtomicBool,
     /// Tests only: let transaction control through the authorizer, to show that the check after
     /// each statement (the second line) catches it.
     allow_transaction_control: AtomicBool,
@@ -81,6 +83,7 @@ impl Guard {
     /// Enters untrusted mode for a statement of a kind with (`owner`) or without schema rights.
     pub(crate) fn enter_untrusted(&self, schema_rights: bool) {
         *self.denied.lock() = None;
+        self.changed_schema.store(false, Ordering::SeqCst);
         let mode = if schema_rights {
             UNTRUSTED_OWNER
         } else {
@@ -91,6 +94,12 @@ impl Guard {
 
     pub(crate) fn leave_untrusted(&self) {
         self.mode.store(TRUSTED, Ordering::SeqCst);
+    }
+
+    /// Whether the latest untrusted statement changed the schema (DDL that the authorizer let
+    /// through).
+    pub(crate) fn changed_schema(&self) -> bool {
+        self.changed_schema.load(Ordering::SeqCst)
     }
 
     pub(crate) fn take_denial(&self) -> Option<Denial> {
@@ -145,6 +154,18 @@ impl Guard {
         }
     }
 
+    /// The rule for DDL; records DDL that it allows.
+    fn ddl(&self, schema_rights: bool, reserved: bool) -> Option<Denial> {
+        if !schema_rights {
+            Some(Denial::Ddl)
+        } else if reserved {
+            Some(Denial::ReservedName)
+        } else {
+            self.changed_schema.store(true, Ordering::SeqCst);
+            None
+        }
+    }
+
     fn check(&self, action: &AuthAction<'_>, schema_rights: bool) -> Option<Denial> {
         use AuthAction as A;
         let reserved = |name: &str| name.to_ascii_lowercase().starts_with("ruum_");
@@ -180,7 +201,7 @@ impl Guard {
             | A::AlterTable { table_name, .. }
             | A::Analyze { table_name }
             | A::CreateVtable { table_name, .. }
-            | A::DropVtable { table_name, .. } => ddl(schema_rights, reserved(table_name)),
+            | A::DropVtable { table_name, .. } => self.ddl(schema_rights, reserved(table_name)),
             A::CreateIndex {
                 index_name,
                 table_name,
@@ -188,7 +209,7 @@ impl Guard {
             | A::DropIndex {
                 index_name,
                 table_name,
-            } => ddl(schema_rights, reserved(index_name) || reserved(table_name)),
+            } => self.ddl(schema_rights, reserved(index_name) || reserved(table_name)),
             A::CreateTrigger {
                 trigger_name,
                 table_name,
@@ -196,29 +217,19 @@ impl Guard {
             | A::DropTrigger {
                 trigger_name,
                 table_name,
-            } => ddl(
+            } => self.ddl(
                 schema_rights,
                 reserved(trigger_name) || reserved(table_name),
             ),
             A::CreateView { view_name } | A::DropView { view_name } => {
-                ddl(schema_rights, reserved(view_name))
+                self.ddl(schema_rights, reserved(view_name))
             }
-            A::Reindex { index_name } => ddl(schema_rights, reserved(index_name)),
+            A::Reindex { index_name } => self.ddl(schema_rights, reserved(index_name)),
             A::Read { table_name, .. }
             | A::Insert { table_name }
             | A::Update { table_name, .. }
             | A::Delete { table_name } => reserved(table_name).then_some(Denial::ReservedName),
             _ => None,
         }
-    }
-}
-
-fn ddl(schema_rights: bool, reserved: bool) -> Option<Denial> {
-    if !schema_rights {
-        Some(Denial::Ddl)
-    } else if reserved {
-        Some(Denial::ReservedName)
-    } else {
-        None
     }
 }

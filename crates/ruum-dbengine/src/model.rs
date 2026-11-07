@@ -310,7 +310,8 @@ pub struct MaskPlan {
 pub enum MaskAs {
     /// The pseudonym of the value under the source's key, as `text`.
     Pseudonym,
-    /// `NULL` (the `NOT NULL` constraint is dropped).
+    /// `NULL` for a non-empty value; an empty value (`NULL` or the empty string) is kept as it
+    /// is (`DataCopy` of the contract, design 8.5). The `NOT NULL` constraint is dropped.
     Null,
 }
 

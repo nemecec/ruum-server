@@ -75,14 +75,19 @@ fn untrusted_error(e: rusqlite::Error, guard: &Guard) -> EngineError {
     match e.sqlite_error_code() {
         Some(ErrorCode::OperationInterrupted) if guard.timed_out() => EngineError::Timeout,
         Some(ErrorCode::ReadOnly) => EngineError::ReadOnly,
-        Some(code) => EngineError::Sql {
-            code: format!("{code:?}"),
-            message: e.to_string(),
-        },
-        None => EngineError::Sql {
-            code: "error".to_string(),
-            message: e.to_string(),
-        },
+        _ => sql_error(e),
+    }
+}
+
+/// An engine error for the statement, with its code (`Sql`).
+fn sql_error(e: rusqlite::Error) -> EngineError {
+    let code = match e.sqlite_error_code() {
+        Some(code) => format!("{code:?}"),
+        None => "error".to_string(),
+    };
+    EngineError::Sql {
+        code,
+        message: e.to_string(),
     }
 }
 
@@ -139,10 +144,21 @@ fn transaction_state(conn: &Connection) -> TransactionState {
     }
 }
 
-fn rollback_if_open(conn: &Connection) {
+pub(crate) fn rollback_if_open(conn: &Connection) {
     if !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
     }
+}
+
+/// Commits the transaction of an untrusted statement or a migration's `up`. SQLite keeps the
+/// transaction open when a COMMIT fails (for example on a deferred foreign key), so a failed
+/// COMMIT rolls back here: the failed write never stays visible, and the next request can begin.
+/// The error is the statement's (`Sql` with its code), as if the statement itself had failed.
+fn commit(conn: &Connection) -> Result<(), EngineError> {
+    conn.execute_batch("COMMIT").map_err(|e| {
+        rollback_if_open(conn);
+        sql_error(e)
+    })
 }
 
 /// Runs one untrusted statement of the query API in its own transaction.
@@ -167,9 +183,7 @@ pub(crate) fn execute(
     guard.stop_timer();
 
     let finished = match (&result, state) {
-        (Ok(_), TransactionState::Open) if !read_only => {
-            conn.execute_batch("COMMIT").map_err(internal)
-        }
+        (Ok(_), TransactionState::Open) if !read_only => commit(conn),
         _ => {
             rollback_if_open(conn);
             Ok(())
@@ -274,7 +288,15 @@ fn run_statement(
             }
         })
         .collect();
-    let rows_affected = writes.then(|| conn.changes());
+    // `changes()` counts rows of the latest INSERT, UPDATE or DELETE only; for DDL it would be
+    // the count of an earlier statement.
+    let rows_affected = writes.then(|| {
+        if guard.changed_schema() {
+            0
+        } else {
+            conn.changes()
+        }
+    });
     Ok(StatementOutcome {
         columns,
         rows: rows_out,
@@ -296,7 +318,7 @@ pub(crate) fn run_up(
     guard.stop_timer();
     let result = result.and_then(|()| catalog(conn));
     match &result {
-        Ok(_) if !request.dry_run => conn.execute_batch("COMMIT").map_err(internal)?,
+        Ok(_) if !request.dry_run => commit(conn)?,
         _ => rollback_if_open(conn),
     }
     result
