@@ -1,0 +1,16 @@
+# The read_personal lens selects secret columns as they are.
+# Security rule: A read_personal grant never shows a secret to an agent (design 8.5).
+#
+# Planned: the cases it needs are planned and PERL is a placeholder that matches nothing,
+# so the mutation check would report SKIP. This file lives in mutations/planned/, which
+# mutation_check.sh does not read. Moves up to mutations/ with card Q-2: that card writes
+# the real FILE and PERL, checks that the mutation is KILLED under MUTATION_STRICT=1, sets
+# PLACEHOLDER=0 and moves the file.
+CARD="Q-2"
+CASES="query.read_personal_grant"
+DESCRIPTION="the read_personal lens selects secret columns as they are"
+FILE="crates/ruum-dbengine/src/postgres/lens.rs"
+PERL='s/RUUM_PLANNED_MUTATION_READ_PERSONAL_SHOWS_SECRET/broken/'
+TESTS="-p ruum-testkit --test privacy privacy_suite"
+ENV="RUUM_SUITE_BACKEND=postgres RUUM_REQUIRE_IMPLEMENTED=1 RUUM_PRIVACY_CASES=query.read_personal_grant"
+PLACEHOLDER=1

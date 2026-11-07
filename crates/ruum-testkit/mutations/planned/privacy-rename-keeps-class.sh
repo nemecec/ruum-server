@@ -1,0 +1,16 @@
+# The catalog sync keeps a confirmation by column name instead of column identity.
+# Security rule: A rename, a retype, a table swap and a drop and add of the same name clear the confirmation (decision 0004-5 b).
+#
+# Planned: the cases it needs are planned and PERL is a placeholder that matches nothing,
+# so the mutation check would report SKIP. This file lives in mutations/planned/, which
+# mutation_check.sh does not read. Moves up to mutations/ with card K-1: that card writes
+# the real FILE and PERL, checks that the mutation is KILLED under MUTATION_STRICT=1, sets
+# PLACEHOLDER=0 and moves the file.
+CARD="K-1"
+CASES="rename."
+DESCRIPTION="the catalog sync keeps a confirmation by column name instead of column identity"
+FILE="crates/ruum-core/src/databases/classes/mod.rs"
+PERL='s/RUUM_PLANNED_MUTATION_RENAME_KEEPS_CLASS/broken/'
+TESTS="-p ruum-testkit --test privacy privacy_suite"
+ENV="RUUM_SUITE_BACKEND=postgres RUUM_REQUIRE_IMPLEMENTED=1 RUUM_PRIVACY_CASES=rename."
+PLACEHOLDER=1

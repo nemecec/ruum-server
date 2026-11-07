@@ -10,6 +10,7 @@
 //! - [`client`]: an HTTP test client that sends a request as any principal through the router of
 //!   `ruum-api`, in memory.
 //! - [`contract`]: the list of operations, read from `contracts/openapi.yaml`.
+//! - [`privacy`]: the privacy suite (design 8.5): no raw secret or personal value reaches an agent.
 //!
 //! Both suites report each check as passed, pending (the handler answers `501`) or failed. Set
 //! `RUUM_REQUIRE_IMPLEMENTED=1` to count pending checks as failures. See `docs/TESTING.md`.
@@ -21,6 +22,7 @@ pub mod fixtures;
 pub mod isolation;
 pub mod matrix;
 pub mod permissions;
+pub mod privacy;
 pub mod report;
 pub mod requests;
 

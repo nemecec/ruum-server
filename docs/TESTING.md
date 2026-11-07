@@ -169,6 +169,83 @@ handler that checks the token answers `401`, and the suites report that as a fai
    probes for IDs of the other tenant in the body).
 4. Add the rule in `permissions::rule`, then regenerate `permission_matrix.md`.
 
+## The privacy suite
+
+`crates/ruum-testkit/src/privacy.rs` (card T-2) checks design 8.5: an agent never sees a raw
+`secret` value, and never a raw `personal` value without a `read_personal` grant. People without
+`manage` never see a raw `secret` value. The query log, approvals and the status never store a
+raw value. Run it with:
+
+```sh
+cargo test -p ruum-testkit --test privacy                       # memory
+RUUM_SUITE_BACKEND=postgres cargo test -p ruum-testkit --test privacy
+RUUM_PRIVACY_CASES=oracle.,write. cargo test -p ruum-testkit --test privacy   # some cases
+```
+
+**Cases.** Each case names its operations, its engines and what the memory backend does with
+it. A case runs once per engine, in a world of its own. The groups: one case per data path
+(`query.*`, `schema.*`, `queries.*`, `approval.*`, `branch.*`, `copy.*`), the oracles
+(`oracle.*`: `LIKE`, `= $1`, `ORDER BY`, `GROUP BY`, `min`, `length`, joins), writes that copy
+a value (`write.*`), migrations that move a confirmation (`rename.*`), role statements
+(`role.*`, Postgres), files (`file.*`, SQLite), the pseudonym function and its key
+(`pseudonym.*`), error texts and the log (`leak.*`), `pg_stats` and `EXPLAIN` (`side.*`),
+pseudonyms of chosen values (`poracle.*`, decisions 0004-24 and 0004-25) and exports
+(`export.*`, decision 0004-29).
+
+**Fixture.** The suite builds its own state through the API on the `fixtures.rs` world. `member`
+creates a database in `Private`, applies one migration (tables `people` and `orders`), confirms
+every class but `people.note` (unconfirmed, so `personal`), and inserts seven people and six
+orders. `agent_out` is the agent; `member_view` and `member_edit` are the people without
+`manage`.
+
+**Markers.** Every `personal` value holds `ruum-raw-<tag>-p<n>` and every `secret` value
+`ruum-raw-<tag>-s<n>`, with a new tag per case run. One helper (`privacy::leaks`) checks every
+answer: the body, each decoded JSON string (the error `message` and `hint`, cells, marker
+JSON) and each header. A marker that the caller may not see fails the case. On Postgres, at the
+end of each case, no marker may be in the stored rows of `database_queries`, the parameters of
+`database_approvals` or the status of `typed_nodes`. Failure reports replace markers with
+`<marker>`.
+
+**Oracles.** A missing marker is not enough, because a count or an order can leak a value. The
+fixture has values without markers that people can see (`handle`, `pin` and their normal
+copies in `orders`). Each oracle runs as a person first (the control finds the rows), then as
+the agent (it must find nothing, or order by the pseudonym).
+
+**Pseudonyms.** The suite never uses the tenant key. It checks the shape of a pseudonym (`p_`
+and 12 hex characters) against `ruum_core::privacy` with a fixed test key. "Same value, same
+pseudonym" and "a branch differs from its source" compare two answers.
+
+**Planned.** A case runs only when all of these are true. If not, it reports `planned` with
+all its reasons, also with `RUUM_REQUIRE_IMPLEMENTED=1`:
+
+- none of its operations is `x-ruum-status: planned`;
+- it waits for no card (`Case::waits`: copies wait for P-3; exports wait for a public export
+  operation, a contract gap for the panel);
+- its engine is in `Services` (SQLite: `SQLITE_WAITS_FOR`, card E-3 sets it to `None`);
+- on the memory backend, it does not need the masked lens ("the memory lens is not masked
+  (Q-2)") or a real engine.
+
+An operation that is not planned but answers `501` makes the case `pending`. The report lists
+the planned case runs by reason. Today all 99 case runs (55 cases) are planned.
+
+**Mutation rules.** The rules guard code that does not exist yet, so they are placeholders in
+`crates/ruum-testkit/mutations/planned/privacy-*.sh`. `mutation_check.sh` does not read that
+directory. Each file names its `CARD` and its `CASES`. The card writes the real `FILE` and
+`PERL`, checks that the mutation is `KILLED` under `MUTATION_STRICT=1`, sets `PLACEHOLDER=0`
+and moves the file up to `mutations/`. A test (`every_rule_has_a_planned_mutation`) keeps every
+case under at least one mutation.
+
+**When a card lands.** The card removes its planned marks (or its `waits` entry, or sets
+`SQLITE_WAITS_FOR` to `None`). The cases then run without a change to the suite. If a case
+fails and the case looks wrong, stop and say so; do not change the case to make it pass.
+
+Gaps found while writing the suite (for the panel):
+
+- No public operation starts a database export (`exportTypedNode` is a provider operation).
+  The export cases wait for one.
+- `WorldDb` has no accessor for its pool, so the stored-row check finds the world's database
+  by the tenant ID.
+
 ## Property tests
 
 `crates/ruum-core/tests/properties/` holds the property tests of design section 18.2, written
