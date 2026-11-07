@@ -70,7 +70,9 @@ test('version history: label, new version, diff and restore', async ({ page }, i
   const restored = panel.getByRole('listitem').filter({ hasText: 'Current' })
   await expect(restored).toContainText(/Restored from /)
 
-  const [dl] = await Promise.all([page.waitForEvent('download'), restored.getByRole('button', { name: /^Download version of/ }).click()])
+  // Download is in the row's More menu (the main actions of a version are Restore and Compare).
+  await restored.getByRole('button', { name: /^More actions for the version of/ }).click()
+  const [dl] = await Promise.all([page.waitForEvent('download'), page.getByRole('menu').getByRole('menuitem', { name: 'Download', exact: true }).click()])
   const file = info.outputPath('restored.txt')
   await dl.saveAs(file)
   expect(fs.readFileSync(file, 'utf8')).toBe(v1)
