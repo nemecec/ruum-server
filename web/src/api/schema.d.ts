@@ -401,6 +401,13 @@ export interface paths {
         /**
          * Change the role of a member
          * @description Users only (agents get `user_required`). Needs `admin`. Only an `owner` can make or remove owners. A tenant keeps at least one owner. A member made `guest` loses `tenant#member` and keeps only direct grants.
+         *
+         *     `content_role` (decision 0003-1) is allowed only when the new `role` is `member`;
+         *     otherwise the call fails with `422 validation_failed`. A member who stays a member keeps
+         *     their content role when `content_role` is left out. A guest, admin or owner who becomes a
+         *     member gets the given content role, else `manage`. A member who becomes an admin, owner
+         *     or guest loses the content role (`null`). Every change of `role` or `content_role` is
+         *     one `member.role_changed` audit entry.
          */
         patch: operations["updateMember"];
         trace?: never;
@@ -422,7 +429,7 @@ export interface paths {
         put?: never;
         /**
          * Invite a person
-         * @description Users only (agents get `user_required`). Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit, and with `permission_denied` for role `guest` when the tenant policy has `allow_guests: false`.
+         * @description Users only (agents get `user_required`). Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit, and with `permission_denied` for role `guest` when the tenant policy has `allow_guests: false`. `content_role` is allowed only with role `member` (else `422 validation_failed`) and defaults to `manage` (decision 0003-1). On acceptance a new person, or a guest, becomes a member with the invitation's content role; a person who is already a member keeps the higher of the two content roles (acceptance never lowers rights); an admin or owner keeps their role and has no content role.
          */
         post: operations["createInvitation"];
         delete?: never;
@@ -1860,6 +1867,10 @@ export interface paths {
          *     trusted provider (`email_verified`). An unverified email never claims an email grant.
          *     When the tenant policy has `allow_guests: false`, a grant to a guest, or to an email that
          *     is not the verified email of a member, fails with `permission_denied`.
+         *
+         *     A grant to `tenant_members` (everyone in the tenant) gives its role to every member,
+         *     whatever their content role (decision 0003-1): a `view` member gets `edit` from an `edit`
+         *     grant to everyone. Grants only add rights.
          */
         post: operations["addGrant"];
         delete?: never;
@@ -3072,6 +3083,25 @@ export interface components {
          * @enum {string}
          */
         Role: "view" | "comment" | "edit" | "manage";
+        /**
+         * @description The content role of a team member (decision 0003-1): what the member may do in the team
+         *     tree through the team root. It applies only to the tenant role `member`; owners and
+         *     admins always manage the team tree, and guests have only grants.
+         *     - `view`: sees everything in the team tree, changes nothing. A "Can view" member still
+         *       sees the whole team tree; to show a person only some folders, make them a guest and
+         *       share those folders.
+         *     - `comment`: as `view`, and comments (comments come after step 1).
+         *     - `edit`: changes content and uploads versions, creates and renames; does not move,
+         *       trash, restore or purge outside its grants. Shares as an editor: only while the tenant
+         *       policy `members_can_share` is true and the node's effective `editors_can_share` is
+         *       true.
+         *     - `manage`: the default; as today, manages the team tree, and shares there while
+         *       `members_can_share` is true.
+         *     Grants still only add rights: an `edit` grant on a folder lets a `view` member edit
+         *     there. A grant to everyone in the tenant (`tenant_members`) reaches every member, view
+         *     and comment members included.
+         */
+        ContentRole: components["schemas"]["Role"];
         LogoutResult: {
             /**
              * Format: uri
@@ -3196,8 +3226,10 @@ export interface components {
              */
             allow_guests: boolean;
             /**
-             * @description Team tenants: members manage the team tree through the team root, and while this is
-             *     true they also have the `share` permission there (the tuple
+             * @description Team tenants: members have their content role on the team tree through the team root
+             *     (`Member.content_role`, default `manage`), and while this is true members with
+             *     `manage` also have the `share` permission there, and members with `edit` share where
+             *     the effective `editors_can_share` is true (the tuple
              *     `tenant:<id>#members_can_share@user:*`). When false, members share only where a grant
              *     gives them `manage`, or `edit` with `editors_can_share`; owners and admins always share.
              * @default true
@@ -3241,6 +3273,8 @@ export interface components {
             email: string;
             display_name: string;
             role: components["schemas"]["MemberRole"];
+            /** @description The content role (decision 0003-1). Not `null` if and only if `role` is `member` (default `manage`); `null` for owners and admins (they always manage the team tree) and for guests (they have only grants). The server always sends it; it is not in `required` so that clients that build `Member` objects themselves stay valid. */
+            content_role?: components["schemas"]["ContentRole"] | null;
             joined_at: components["schemas"]["Timestamp"];
         };
         MemberPage: {
@@ -3252,6 +3286,8 @@ export interface components {
             email: string;
             /** @enum {string} */
             role: "guest" | "member" | "admin";
+            /** @description Only with role `member` (else `422 validation_failed`); default `manage` (decision 0003-1). */
+            content_role?: components["schemas"]["ContentRole"];
             message?: string;
         };
         Invitation: {
@@ -3259,6 +3295,8 @@ export interface components {
             tenant_id: components["schemas"]["Uuid"];
             email: string;
             role: components["schemas"]["MemberRole"];
+            /** @description The content role the person gets as a member (decision 0003-1). Not `null` if and only if `role` is `member`. The server always sends it (not in `required`, as `Member.content_role`). */
+            content_role?: components["schemas"]["ContentRole"] | null;
             invited_by: components["schemas"]["ActorPair"];
             created_at: components["schemas"]["Timestamp"];
             expires_at: components["schemas"]["Timestamp"];
@@ -3902,7 +3940,7 @@ export interface components {
             /** Format: email */
             email: string;
         };
-        /** @description Everybody in the tenant of the node (`tenant#member`). */
+        /** @description Everybody in the tenant of the node (`tenant#member`): owners, admins and members, with any content role (decision 0003-1). Not guests. */
         GranteeTenantMembers: {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -5395,6 +5433,7 @@ export interface operations {
             content: {
                 "application/json": {
                     role: components["schemas"]["MemberRole"];
+                    content_role?: components["schemas"]["ContentRole"];
                 };
             };
         };
@@ -5412,6 +5451,7 @@ export interface operations {
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["ValidationFailed"];
         };
     };
     listInvitations: {

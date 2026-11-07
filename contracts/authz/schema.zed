@@ -10,8 +10,10 @@
 // - `edit` has it while the effective node setting `editors_can_share` is true (the default);
 //   a manager sets it per node, and children inherit it until a child sets its own value
 //   (Drive: "Editors can change permissions and share");
-// - in a team tenant, members get `manage` from the team root, but `share` from it only while
-//   the tenant policy `members_can_share` is true;
+// - in a team tenant, members get their content role from the team root (decision 0003-1:
+//   `manage` by default, or `edit`, `comment`, `view`); members with `manage` get `share` from
+//   it only while the tenant policy `members_can_share` is true, members with `edit` only while
+//   `members_can_share` is true and the effective `editors_can_share` is true;
 // - share links never have it.
 //
 // The right of an agent or an app that acts for a user is the user's right intersected with the
@@ -21,6 +23,19 @@
 // Object IDs are the UUIDs of the platform tables. Every relationship that the core writes is
 // also implied by a row in Postgres (nodes.parent_id, nodes.editors_can_share, grants,
 // share_links, memberships, tenants.settings), so the graph can be rebuilt from the database.
+//
+// The rebuild mapping of a `memberships` row of tenant T and user U (decision 0003-1; the
+// invariant "content_role is not null if and only if role = member" is a CHECK constraint):
+//
+//   role = owner                          tenant:T#owner@user:U    tenant:T#member@user:U
+//   role = admin                          tenant:T#admin@user:U    tenant:T#member@user:U
+//   role = member, content_role = manage  tenant:T#member@user:U
+//   role = member, content_role = edit    tenant:T#member@user:U   tenant:T#content_editor@user:U
+//   role = member, content_role = comment tenant:T#member@user:U   tenant:T#content_commenter@user:U
+//   role = member, content_role = view    tenant:T#member@user:U   tenant:T#content_viewer@user:U
+//   role = guest                          tenant:T#guest@user:U
+//
+// Owners, admins and guests never hold a content_* tuple.
 
 // A person.
 definition user {}
@@ -43,14 +58,31 @@ definition tenant {
     // tenants). The core writes or deletes this one tuple when the policy changes.
     relation members_can_share: user:*
 
+    // The content role of a member (decision 0003-1): what the member may do in the team tree.
+    // At most one of these per member, written only for `role = member`. A member without one
+    // manages the team tree (the default `content_role = manage`).
+    relation content_viewer: user
+    relation content_commenter: user
+    relation content_editor: user
+
     // Change tenant settings, members, invitations; read the audit log.
     permission administer = owner + admin
 
-    // Every member: the people who manage the team tree through the team root.
-    permission team_member = member
+    // The members who manage the team tree through the team root: every member without a
+    // lower content role. Owners and admins hold `member` and never hold a content_* tuple.
+    permission team_manager = member - (content_viewer + content_commenter + content_editor)
 
-    // The members who get `share` from the team root: every member while the policy is on.
-    permission sharing_member = member & members_can_share
+    // The members who edit, comment on or view the team tree through the team root. A higher
+    // content role includes the lower ones. A "Can view" member still sees the whole team tree.
+    permission team_editor = team_manager + (member & content_editor)
+    permission team_commenter = team_editor + (member & content_commenter)
+    permission team_viewer = team_commenter + (member & content_viewer)
+
+    // The members who get `share` from the team root while the policy is on: managers always,
+    // edit members as editors (the node setting `editors_can_share` applies, see
+    // `node#sharing_editor`). View and comment members never share from the team root.
+    permission sharing_member = team_manager & members_can_share
+    permission sharing_team_editor = (member & content_editor) & members_can_share
 }
 
 // A deployed web app with its own identity (step 3). Kept here so node relations can name it.
@@ -92,7 +124,8 @@ definition node {
     relation owner: user
 
     // The team of a team tenant. Written ONLY on the root of a team tenant. Every member gets
-    // `manage` on the team tree; `share` only while the policy `members_can_share` is true.
+    // its content role on the team tree (`manage` by default; decision 0003-1); `share` only
+    // while the policy `members_can_share` is true.
     relation team: tenant
 
     // Grants to people (and apps). One relation per role.
@@ -119,23 +152,24 @@ definition node {
     permission editors_cannot_share = editors_share_off + (parent->editors_cannot_share - editors_share_on)
 
     // Move, trash, restore; change node settings such as `editors_can_share`.
-    permission manage = owner + manager + team->team_member + parent->manage
+    permission manage = owner + manager + team->team_manager + parent->manage
 
     // Change content, upload versions, rename, create children.
-    permission edit = manage + editor + link_editor + parent->edit
+    permission edit = manage + editor + link_editor + team->team_editor + parent->edit
 
     // Comment (comments come after step 1; the role exists now).
-    permission comment = edit + commenter + link_commenter + parent->comment
+    permission comment = edit + commenter + link_commenter + team->team_commenter + parent->comment
 
     // Read, download, list.
-    permission view = comment + viewer + link_viewer + parent->view + collection->view
+    permission view = comment + viewer + link_viewer + team->team_viewer + parent->view + collection->view
 
-    // The `manage` that always shares: ownership, manager grants, and team members while the
-    // policy `members_can_share` is true.
+    // The `manage` that always shares: ownership, manager grants, and team members with
+    // `manage` while the policy `members_can_share` is true.
     permission sharing_manager = owner + manager + team->sharing_member + parent->sharing_manager
 
-    // The `edit` grants to people (never share links), inherited down the tree.
-    permission sharing_editor = editor + parent->sharing_editor
+    // The `edit` grants to people (never share links), and edit members of the team while the
+    // policy `members_can_share` is true, inherited down the tree.
+    permission sharing_editor = editor + team->sharing_team_editor + parent->sharing_editor
 
     // Change grants and share links (a permission, not a role).
     permission share = sharing_manager + (sharing_editor - editors_cannot_share)
@@ -214,8 +248,9 @@ definition app_role {
 //     node:R#tenant@tenant:T
 //     node:R#manager@tenant:T#administer  (owners and admins manage, and so share, everything
 //                                          in the team tree)
-//     node:R#team@tenant:T                (every member manages the team tree: edit, move,
-//                                          trash and restore, also what others made)
+//     node:R#team@tenant:T                (every member has its content role on the team
+//                                          tree; `manage` by default: edit, move, trash and
+//                                          restore, also what others made)
 //     tenant:T#members_can_share@user:*   (only while the policy `members_can_share` is true;
 //                                          the core writes or deletes it when the policy changes)
 //

@@ -1,6 +1,6 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "a742bbd05196cf4b34a7375526f3c2a8016cbea3a4c147cf5e62bc1a778ef39e",
+ "openapi_sha256": "0dc022aefd7025b425955b4d256fe67abc6f31847012bbdeaeea11a2d4ead09f",
  "tools_sha256": "823453686716ecfe5259ff96effc4316e6bc0315a1ab4bfb7970273cd0c23567",
  "tools": [
   {
@@ -1750,7 +1750,7 @@
          },
          {
           "type": "object",
-          "description": "Everybody in the tenant of the node (`tenant#member`).",
+          "description": "Everybody in the tenant of the node (`tenant#member`): owners, admins and members, with any content role (decision 0003-1). Not guests.",
           "required": [
            "type"
           ],

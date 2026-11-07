@@ -53,6 +53,36 @@ relationships: |-
   node:garden_db#live_writer@agent:jaan_bot
   node:garden_db#personal_reader@agent:jaan_bot
   node:garden_db#live_writer@agent:writer_only_bot
+  tenant:gamma#owner@user:helle
+  tenant:gamma#member@user:helle
+  tenant:gamma#admin@user:indrek
+  tenant:gamma#member@user:indrek
+  tenant:gamma#member@user:kadri
+  tenant:gamma#content_viewer@user:kadri
+  tenant:gamma#member@user:kaarel
+  tenant:gamma#content_commenter@user:kaarel
+  tenant:gamma#member@user:eve
+  tenant:gamma#content_editor@user:eve
+  tenant:gamma#member@user:mart
+  tenant:gamma#members_can_share@user:*
+  node:gamma_root#tenant@tenant:gamma
+  node:gamma_root#manager@tenant:gamma#administer
+  node:gamma_root#team@tenant:gamma
+  node:gamma_docs#parent@node:gamma_root
+  node:gamma_locked#parent@node:gamma_root
+  node:gamma_locked#editors_share_off@user:*
+  node:gamma_kadri#parent@node:gamma_root
+  node:gamma_kadri#editor@user:kadri
+  node:gamma_all#parent@node:gamma_root
+  node:gamma_all#editor@tenant:gamma#member
+  tenant:delta#owner@user:helle
+  tenant:delta#member@user:helle
+  tenant:delta#member@user:toomas
+  tenant:delta#content_editor@user:toomas
+  node:delta_root#tenant@tenant:delta
+  node:delta_root#manager@tenant:delta#administer
+  node:delta_root#team@tenant:delta
+  node:delta_docs#parent@node:delta_root
 assertions:
   assertTrue:
     - node:plan#share@user:mari
@@ -100,6 +130,32 @@ assertions:
     - node:garden_db_preview#agent_write_live@agent:any_bot
     - node:garden_db#agent_write_live@agent:jaan_bot
     - node:garden_db#agent_read_personal@agent:jaan_bot
+    # Content roles of members (decision 0003-1). A member without a content_* tuple manages
+    # the team tree (content role `manage`, the default); owners and admins manage it through
+    # tenant#administer.
+    - tenant:gamma#team_manager@user:mart
+    - tenant:gamma#team_manager@user:helle
+    - tenant:gamma#team_manager@user:indrek
+    - node:gamma_docs#manage@user:mart
+    - node:gamma_docs#share@user:mart
+    - node:gamma_docs#manage@user:helle
+    - node:gamma_docs#manage@user:indrek
+    - node:gamma_docs#share@user:indrek
+    # A "Can view" member sees the whole team tree; a "Can comment" member comments.
+    - node:gamma_docs#view@user:kadri
+    - node:gamma_locked#view@user:kadri
+    - node:gamma_docs#view@user:kaarel
+    - node:gamma_docs#comment@user:kaarel
+    # A "Can edit" member edits, and shares as an editor while members_can_share is on.
+    - node:gamma_docs#edit@user:eve
+    - node:gamma_docs#share@user:eve
+    - node:gamma_locked#edit@user:eve
+    # Grants only add rights: an edit grant works for a view member.
+    - node:gamma_kadri#edit@user:kadri
+    # A grant to tenant#member gives its role to every member, view members too.
+    - node:gamma_all#edit@user:kadri
+    - node:gamma_all#edit@user:kaarel
+    - node:delta_docs#edit@user:toomas
   assertFalse:
     - node:projects#view@user:jaan
     - node:plan#manage@user:jaan
@@ -143,3 +199,24 @@ assertions:
     - node:plan#agent_write_live@agent:jaan_bot
     # The draft mark of a branch never reaches the live database above it.
     - node:garden#agent_write_live@agent:any_bot
+    # Content roles of members (decision 0003-1): a lower content role takes away the higher
+    # rights of the team root.
+    - tenant:gamma#team_manager@user:kadri
+    - tenant:gamma#team_manager@user:kaarel
+    - tenant:gamma#team_manager@user:eve
+    - node:gamma_docs#comment@user:kadri
+    - node:gamma_docs#edit@user:kadri
+    - node:gamma_docs#manage@user:kadri
+    - node:gamma_docs#share@user:kadri
+    - node:gamma_docs#edit@user:kaarel
+    - node:gamma_docs#share@user:kaarel
+    - node:gamma_docs#manage@user:eve
+    # An edit member does not share where editors_can_share is false.
+    - node:gamma_locked#share@user:eve
+    # An edit grant does not make a view member a manager there.
+    - node:gamma_kadri#manage@user:kadri
+    - node:gamma_kadri#edit@user:kaarel
+    - node:gamma_all#manage@user:kadri
+    # Without members_can_share an edit member edits but does not share.
+    - node:delta_docs#share@user:toomas
+    - node:delta_docs#manage@user:toomas
