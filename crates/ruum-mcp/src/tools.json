@@ -1,6 +1,6 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "395861e413b56fc4b001bd345bf0dda6db7546dc53b902cc0adabdd4dada909a",
+ "openapi_sha256": "415e7f2acd486549ea3ce5ab23935ad20ae28ba54875fdf89755c9c82a3a9849",
  "tools_sha256": "67359190912f4acacb5f0df03f03a9d06caecf3d084837f0755d2378905b50ce",
  "tools": [
   {
@@ -2469,7 +2469,7 @@
   {
    "name": "create_database",
    "operation": "createDatabase",
-   "planned": true,
+   "planned": false,
    "description": "Create a Postgres or SQLite database node in a folder from a manifest (engine, version, plan shared-small). Poll get_database until status is ready.",
    "notes": null,
    "method": "POST",
@@ -2688,7 +2688,7 @@
   {
    "name": "get_database",
    "operation": "getDatabase",
-   "planned": true,
+   "planned": false,
    "description": "Read a database node: manifest, status (provisioning, ready, failed), size, limits, backup window and what you may do on it.",
    "notes": null,
    "method": "GET",
@@ -2719,7 +2719,7 @@
   {
    "name": "update_database_manifest",
    "operation": "updateDatabaseManifest",
-   "planned": true,
+   "planned": false,
    "description": "Change the settings (manifest) of a database, for example its extensions. Needs manage. You cannot change data_classes; use suggest_column_classes.",
    "notes": null,
    "method": "PUT",

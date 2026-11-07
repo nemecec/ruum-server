@@ -2374,7 +2374,10 @@ export interface paths {
          *     (`validation_failed`). Only a person changes `data_classes`: when the caller is an agent
          *     and `data_classes` differs from the current manifest, the call fails with
          *     `validation_failed` (hint: `suggestColumnClasses`). Restoring an older manifest version
-         *     (`restoreVersion`) applies the same rules. Writes `version.created`.
+         *     (`restoreVersion`) applies the same rules. Writes `version.created`. A database in the
+         *     trash cannot change (`409 conflict`; restore it first), so a suspended database never
+         *     falls behind its manifest. In step 2 the extensions are fixed when the database is
+         *     made (`validation_failed`, hint `/extensions`).
          */
         put: operations["updateDatabaseManifest"];
         post?: never;
@@ -8676,6 +8679,7 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             412: components["responses"]["PreconditionFailed"];
             422: components["responses"]["ValidationFailed"];
         };

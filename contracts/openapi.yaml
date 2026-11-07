@@ -3388,7 +3388,6 @@ paths:
       tags: [databases]
       operationId: createDatabase
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: Create a database node
       description: |
         Creates a typed node of type `database` (design sections 7.1 and 8.1) under `parent_id`,
@@ -3448,7 +3447,6 @@ paths:
       tags: [databases]
       operationId: getDatabase
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: Get a database node with its status
       description: |
         The node, the current manifest, the status (`provisioning`, `ready`, `failed` with a
@@ -3478,7 +3476,6 @@ paths:
       tags: [databases]
       operationId: updateDatabaseManifest
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: Change the manifest (settings) of a database
       description: |
         Writes a new manifest version and applies it (the control loop of section 8.1). Needs
@@ -3486,7 +3483,10 @@ paths:
         (`validation_failed`). Only a person changes `data_classes`: when the caller is an agent
         and `data_classes` differs from the current manifest, the call fails with
         `validation_failed` (hint: `suggestColumnClasses`). Restoring an older manifest version
-        (`restoreVersion`) applies the same rules. Writes `version.created`.
+        (`restoreVersion`) applies the same rules. Writes `version.created`. A database in the
+        trash cannot change (`409 conflict`; restore it first), so a suspended database never
+        falls behind its manifest. In step 2 the extensions are fixed when the database is
+        made (`validation_failed`, hint `/extensions`).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/IfMatch'
@@ -3509,6 +3509,8 @@ paths:
           $ref: '#/components/responses/PermissionDenied'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '412':
           $ref: '#/components/responses/PreconditionFailed'
         '422':
