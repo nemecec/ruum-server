@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react'
 import type { Schemas } from '../api/client'
+import { t } from '../i18n'
 
 export type Person = { name: string; email?: string }
 export type AgentInfo = { name: string; ownerId: string }
@@ -32,17 +33,17 @@ export function actorLabel(
   switch (actor.kind) {
     case 'agent': {
       const info = names.agent(actor.id)
-      const name = actor.display_name ?? info?.name ?? 'An agent'
+      const name = actor.display_name ?? info?.name ?? t('actor.anAgent')
       const forId = onBehalfOf ?? info?.ownerId
       const person = onBehalfOfName ?? names.person(forId)?.name
-      return { text: person ? `${name} (agent of ${person})` : name, agent: true }
+      return { text: person ? t('actor.agentOf', { name, person }) : name, agent: true }
     }
     case 'share_link':
-      return { text: 'Anyone with the link', agent: false }
+      return { text: t('actor.link'), agent: false }
     case 'user':
-      return { text: actor.display_name ?? names.person(actor.id)?.name ?? 'Someone', agent: false }
+      return { text: actor.display_name ?? names.person(actor.id)?.name ?? t('actor.someone'), agent: false }
     default:
-      return { text: actor.display_name ?? 'An app', agent: false }
+      return { text: actor.display_name ?? t('actor.app'), agent: false }
   }
 }
 

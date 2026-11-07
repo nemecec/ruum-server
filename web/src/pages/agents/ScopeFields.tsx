@@ -4,6 +4,7 @@ import { useApi } from '../../api/useApi'
 import { roleLabels } from '../../components/format'
 import { FolderPicker } from '../files/dialogs'
 import { Button, Dialog, Field, Fieldset, Grow, Indent, Radio, Row, Select, Text, TextInput } from '../../ui'
+import { t } from '../../i18n'
 
 const roles: Schemas['Role'][] = ['view', 'comment', 'edit', 'manage']
 
@@ -32,22 +33,28 @@ export function ScopeFields(props: {
   const expires = scope.expires_at ? scope.expires_at.slice(0, 10) : ''
 
   return (
-    <Fieldset legend="What the agent may do">
+    <Fieldset legend={t('scope.legend')}>
       <Text tone="muted" size="sm">
-        An agent never gets more access than you have.
+        {t('scope.never')}
       </Text>
-      <Fieldset legend="Where">
+      <Fieldset legend={t('scope.where')}>
         <Radio
           name={`${idPrefix}-where`}
           checked={typeof scope.subtree === 'string'}
           onChange={() => onChange({ ...scope, subtree: scope.subtree ?? '' })}
-          label="Only in a folder"
+          label={t('scope.folder')}
         />
         {typeof scope.subtree === 'string' && (
           <Indent>
             <Row>
-              <Grow>{scope.subtree ? (subtree.data ? `Folder ${subtree.data.name}` : 'A folder') : 'No folder chosen yet'}</Grow>
-              <Button onClick={() => setPicking(true)}>Choose folder</Button>
+              <Grow>
+                {scope.subtree
+                  ? subtree.data
+                    ? t('scope.folder.named', { name: subtree.data.name })
+                    : t('scope.folder.unknown')
+                  : t('scope.folder.none')}
+              </Grow>
+              <Button onClick={() => setPicking(true)}>{t('scope.folder.choose')}</Button>
             </Row>
           </Indent>
         )}
@@ -55,10 +62,10 @@ export function ScopeFields(props: {
           name={`${idPrefix}-where`}
           checked={typeof scope.subtree !== 'string'}
           onChange={() => onChange({ ...scope, subtree: null })}
-          label={<>Everywhere you have access in {props.spaceName ?? 'this space'}</>}
+          label={props.spaceName ? t('scope.everywhere', { space: props.spaceName }) : t('scope.everywhere.here')}
         />
       </Fieldset>
-      <Field label="Highest role">
+      <Field label={t('scope.role')}>
         <Select value={scope.max_role} onChange={(e) => onChange({ ...scope, max_role: e.target.value as Schemas['Role'] })}>
           {roles.map((r) => (
             <option key={r} value={r}>
@@ -67,7 +74,7 @@ export function ScopeFields(props: {
           ))}
         </Select>
       </Field>
-      <Field label="Ends on (optional)">
+      <Field label={t('scope.ends')}>
         <TextInput
           type="date"
           value={expires}
@@ -76,7 +83,7 @@ export function ScopeFields(props: {
           }
         />
       </Field>
-      <Field label="Changes per hour, at most (optional)">
+      <Field label={t('scope.budget')}>
         <TextInput
           type="number"
           min={1}
@@ -90,11 +97,11 @@ export function ScopeFields(props: {
         />
       </Field>
       {picking && (
-        <Dialog title="Choose a folder for the agent" open onClose={() => setPicking(false)}>
+        <Dialog title={t('scope.picker.title')} open onClose={() => setPicking(false)}>
           <FolderPicker
             tenantId={tenantId}
             startId={scope.subtree || undefined}
-            pickLabel="Use this folder"
+            pickLabel={t('scope.picker.use')}
             onPick={(folder) => {
               onChange({ ...scope, subtree: folder.parent_id ? folder.id : null })
               setPicking(false)

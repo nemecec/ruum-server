@@ -1,7 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { client, RuumApiError, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
-import { count } from '../../components/format'
 import {
   Actions,
   Breadcrumbs,
@@ -21,6 +20,7 @@ import {
   TextInput,
 } from '../../ui'
 import { isNoAccess, listSharedWithMe, loadAncestors, type Node } from './api'
+import { t } from '../../i18n'
 
 /** A dialog with one name field, for "New folder", "Rename" and version names. */
 export function NameDialog(props: {
@@ -70,7 +70,7 @@ export function NameDialog(props: {
         </Field>
         <ErrorNote error={error} context={{ name: name.trim() }} />
         <Actions>
-          <Button onClick={props.onClose}>Cancel</Button>
+          <Button onClick={props.onClose}>{t('common.cancel')}</Button>
           <Button type="submit" variant="primary" disabled={busy || (!props.allowEmpty && !name.trim())} busy={busy}>
             {props.submitLabel}
           </Button>
@@ -105,6 +105,7 @@ export function FolderPicker(props: {
   const state = useApi(async (): Promise<{ folder: Node | null; ancestors: Node[]; folders: Node[] }> => {
     let folder: Node
     try {
+      // i18n-ignore: an internal signal, never shown
       if (folderId === null) throw new RuumApiError(404, { code: 'not_found', message: 'the shared folders' })
       folder = folderId
         ? await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: folderId }, header } }))
@@ -142,21 +143,21 @@ export function FolderPicker(props: {
       {({ folder, ancestors, folders }) => {
         const inside = folder && (disabled.has(folder.id) || ancestors.some((a) => disabled.has(a.id)))
         const here = folder?.id === props.currentId
-        const reason = inside ? "A folder can't go inside itself." : here ? "It's already here." : null
+        const reason = inside ? t('picker.inside') : here ? t('picker.here') : null
         const canCreate = folder && (folder.my_role === 'edit' || folder.my_role === 'manage')
         return (
           <Stack>
-            <Breadcrumbs label="Folder path">
+            <Breadcrumbs label={t('picker.path')}>
               {folder && ancestors[0]?.parent_id && (
                 <Crumb>
                   <Button variant="link" onClick={() => setFolderId(null)}>
-                    Folders shared with you
+                    {t('picker.shared')}
                   </Button>
                 </Crumb>
               )}
               {folder ? (
                 ancestors.map((a, i) => {
-                  const label = a.parent_id ? a.name : 'Files'
+                  const label = a.parent_id ? a.name : t('shell.nav.files')
                   return i === ancestors.length - 1 ? (
                     <CurrentCrumb key={a.id} current="location">
                       {label}
@@ -170,16 +171,16 @@ export function FolderPicker(props: {
                   )
                 })
               ) : (
-                <CurrentCrumb current="location">Folders shared with you</CurrentCrumb>
+                <CurrentCrumb current="location">{t('picker.shared')}</CurrentCrumb>
               )}
             </Breadcrumbs>
-            <Picker label="Folders">
+            <Picker label={t('picker.folders')}>
               {folders.map((f) => (
                 <PickerItem key={f.id} icon={<FolderIcon />} disabled={disabled.has(f.id)} onClick={() => setFolderId(f.id)}>
                   {f.name}
                 </PickerItem>
               ))}
-              {folders.length === 0 && <PickerEmpty>No folders here.</PickerEmpty>}
+              {folders.length === 0 && <PickerEmpty>{t('picker.empty')}</PickerEmpty>}
             </Picker>
             {reason && (
               <Text tone="muted" size="sm">
@@ -188,7 +189,7 @@ export function FolderPicker(props: {
             )}
             {folder && (
               <Actions>
-                {canCreate && <Button onClick={() => setCreating(true)}>New folder</Button>}
+                {canCreate && <Button onClick={() => setCreating(true)}>{t('files.newFolder')}</Button>}
                 <Button
                   variant="primary"
                   busy={busy}
@@ -209,10 +210,10 @@ export function FolderPicker(props: {
             {creating && folder && (
               <NameDialog
                 open
-                title="New folder"
-                label="Folder name"
+                title={t('files.newFolder')}
+                label={t('files.newFolder.name')}
                 initial=""
-                submitLabel="Create"
+                submitLabel={t('common.create')}
                 onClose={() => setCreating(false)}
                 onSubmit={async (name) => {
                   const res = await unwrap(
@@ -234,7 +235,7 @@ export function MoveDialog(props: { nodes: Node[]; open: boolean; onClose: () =>
   const [error, setError] = useState<unknown>()
   const { nodes } = props
   const first = nodes[0]
-  const title = nodes.length === 1 ? `Move ${first.name}` : `Move ${count(nodes.length, 'item')}`
+  const title = nodes.length === 1 ? t('move.title.one', { name: first.name }) : t('move.title', { n: nodes.length })
   const sameParent = nodes.every((n) => n.parent_id === first.parent_id)
   return (
     <Dialog title={title} open={props.open} onClose={props.onClose}>
@@ -245,7 +246,7 @@ export function MoveDialog(props: { nodes: Node[]; open: boolean; onClose: () =>
           startId={first.parent_id ?? undefined}
           disabledIds={nodes.filter((n) => n.kind === 'folder').map((n) => n.id)}
           currentId={sameParent ? (first.parent_id ?? undefined) : undefined}
-          pickLabel="Move here"
+          pickLabel={t('move.here')}
           onPick={async (folder) => {
             setError(undefined)
             try {

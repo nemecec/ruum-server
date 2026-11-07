@@ -4,7 +4,7 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { errorText } from '../../api/errors'
-import { count, formatBytes, formatWhen } from '../../components/format'
+import { formatBytes, formatWhen } from '../../components/format'
 import {
   Actions,
   Button,
@@ -30,6 +30,7 @@ import {
 import { uploadBlob, type UploadProgress } from '../../upload/upload'
 import type { Node } from './api'
 import { UploadsContext, type DoneListener, type UploadItem, type UploadPlan } from './useUploads'
+import { currentIntl, t, type MessageKey } from '../../i18n'
 
 type Job = UploadPlan & { item: UploadItem; tenantId: string; controller: AbortController; folderName?: string }
 
@@ -133,7 +134,7 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
   )
 
   const cancel = useCallback((id: string) => {
-    controllers.current.get(id)?.abort(new DOMException('The upload was cancelled.', 'AbortError'))
+    controllers.current.get(id)?.abort(new DOMException(t('uploads.cancelled.reason'), 'AbortError'))
     setItems((list) => list.map((i) => (i.id === id && i.status === 'waiting' ? { ...i, status: 'canceled' } : i)))
   }, [])
 
@@ -159,43 +160,43 @@ function summary(r: { nodes: Node[]; failed: number; folders: Set<string>; repla
   const n = r.nodes.length
   const folder = r.folders.size === 1 ? [...r.folders][0] : null
   let text: string
-  if (n === 0) text = `${count(r.failed, 'file')} didn't upload.`
-  else if (n === 1 && !r.failed) text = `Uploaded ${r.nodes[0].name}.`
-  else if (r.failed) text = `Uploaded ${count(n, 'file')}. ${r.failed} didn't upload.`
-  else text = folder ? `Uploaded ${count(n, 'file')} to ${folder}.` : `Uploaded ${count(n, 'file')}.`
+  if (n === 0) text = t('uploads.toast.failed', { n: r.failed })
+  else if (n === 1 && !r.failed) text = t('uploads.toast.one', { name: r.nodes[0].name })
+  else if (r.failed) text = t('uploads.toast.someFailed', { n, failed: r.failed })
+  else text = folder ? t('uploads.toast.toFolder', { n, folder }) : t('uploads.toast.many', { n })
   if (r.replaced.length === 1) {
     const it = r.replaced[0]
-    text += ` It replaced your version from ${formatWhen(it.replaced!).toLowerCase()}, because Ruum keeps one version for changes made within 10 minutes.`
+    text += ` ${t('uploads.toast.replaced.one', { when: formatWhen(it.replaced!).toLowerCase() })}`
   } else if (r.replaced.length > 1) {
-    text += ` ${r.replaced.length} of them replaced your versions from the last 10 minutes.`
+    text += ` ${t('uploads.toast.replaced', { n: r.replaced.length })}`
   }
   return text
 }
 
-const phaseLabels: Record<UploadProgress['phase'], string> = {
-  hashing: 'Checking',
-  uploading: 'Uploading',
-  completing: 'Finishing',
+const phaseLabels: Record<UploadProgress['phase'], MessageKey> = {
+  hashing: 'uploads.phase.hashing',
+  uploading: 'uploads.phase.uploading',
+  completing: 'uploads.phase.completing',
 }
 
 function statusText(item: UploadItem): string {
   switch (item.status) {
     case 'waiting':
-      return 'Waiting'
+      return t('uploads.status.waiting')
     case 'done': {
-      if (item.replaced) return 'Done, joined into the version from the last 10 minutes'
-      if (item.node && item.node.name !== item.name) return `Done, saved as ${item.node.name}`
-      return 'Done'
+      if (item.replaced) return t('uploads.status.joined')
+      if (item.node && item.node.name !== item.name) return t('uploads.status.savedAs', { name: item.node.name })
+      return t('uploads.status.done')
     }
     case 'canceled':
-      return 'Cancelled'
+      return t('uploads.status.cancelled')
     case 'failed':
-      return `Didn't upload: ${errorText(item.error, { name: item.name })}`
+      return t('uploads.status.failed', { error: errorText(item.error, { name: item.name }) })
     case 'active': {
       const { phase, done, total } = item.progress
-      if (phase !== 'uploading') return phaseLabels[phase]
+      if (phase !== 'uploading') return t(phaseLabels[phase])
       const pct = total ? Math.floor((done / total) * 100) : 0
-      return `${phaseLabels[phase]} ${pct}%`
+      return t('uploads.status.progress', { phase: t(phaseLabels[phase]), pct: currentIntl().formatNumber(pct / 100, { style: 'percent' }) })
     }
   }
 }
@@ -203,9 +204,9 @@ function statusText(item: UploadItem): string {
 function header(items: UploadItem[]): string {
   const open = items.filter((i) => i.status === 'active' || i.status === 'waiting').length
   const failed = items.filter((i) => i.status === 'failed').length
-  if (open) return `Uploading ${items.length - open + 1} of ${items.length}`
-  if (failed) return failed === 1 ? '1 upload needs you' : `${failed} uploads need you`
-  return items.length === 1 ? '1 upload done' : `${items.length} uploads done`
+  if (open) return t('uploads.header.running', { n: items.length - open + 1, total: items.length })
+  if (failed) return t('uploads.header.failed', { n: failed })
+  return t('uploads.header.done', { n: items.length })
 }
 
 /** The upload panel at the bottom right, on every page of the session. */
@@ -220,22 +221,22 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
   const [manual, setManual] = useState<{ key: string | null; open: boolean } | null>(null)
   useEffect(() => {
     if (!doneKey) return
-    const t = setTimeout(() => setFoldedFor(doneKey), 4000)
-    return () => clearTimeout(t)
+    const timer = setTimeout(() => setFoldedFor(doneKey), 4000)
+    return () => clearTimeout(timer)
   }, [doneKey])
   const open = manual && manual.key === doneKey ? manual.open : !(doneKey && foldedFor === doneKey)
   if (items.length === 0) return null
   const finished = items.some((i) => i.status !== 'active' && i.status !== 'waiting')
   return (
     <FloatingPanel
-      label="Uploads"
+      label={t('uploads.label')}
       title={header(items)}
       open={open}
       actions={
         <IconButton
           icon={open ? 'minus' : 'plus'}
           aria-expanded={open}
-          label={open ? 'Hide uploads' : 'Show uploads'}
+          label={open ? t('uploads.hide') : t('uploads.show')}
           onClick={() => setManual({ key: doneKey, open: !open })}
         />
       }
@@ -255,7 +256,7 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
                 </Text>
               </Row>
               {i.status === 'active' && i.progress.phase === 'uploading' && (
-                <ProgressBar max={total || 1} value={done} label={`Progress of ${i.name}`} />
+                <ProgressBar max={total || 1} value={done} label={t('uploads.progress.label', { name: i.name })} />
               )}
               <Row justify="between" nowrap>
                 <Text
@@ -267,8 +268,8 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
                   {statusText(i)}
                 </Text>
                 {(i.status === 'active' || i.status === 'waiting') && (
-                  <Button size="sm" aria-label={`Cancel upload of ${i.name}`} onClick={() => props.onCancel(i.id)}>
-                    Cancel
+                  <Button size="sm" aria-label={t('uploads.cancel.label', { name: i.name })} onClick={() => props.onCancel(i.id)}>
+                    {t('common.cancel')}
                   </Button>
                 )}
               </Row>
@@ -279,7 +280,7 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
       {finished && (
         <Actions align="start">
           <Button variant="link" onClick={props.onClear}>
-            Clear finished uploads
+            {t('uploads.clear')}
           </Button>
         </Actions>
       )}
@@ -291,7 +292,7 @@ export type ConflictChoice = 'version' | 'keep' | 'skip'
 
 /** "Before the upload of 15:13": the default name that keeps a recent version (24-hour clock, local time). */
 function keepLabel(now = new Date()): string {
-  return `Before the upload of ${now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })}`
+  return t('uploads.keepLabel', { time: currentIntl().formatTime(now, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) })
 }
 
 /**
@@ -314,7 +315,7 @@ export function ConflictDialog(props: {
   const [label, setLabel] = useState(() => (recent.length ? keepLabel() : ''))
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
-  const title = names.length === 1 ? `${names[0]} is already here` : `${names.length} items are already here`
+  const title = names.length === 1 ? t('conflict.title.one', { name: names[0] }) : t('conflict.title', { n: names.length })
   const one = names.length === 1
   const when = recent.length === 1 ? formatWhen(recent[0].updated_at).toLowerCase() : null
   return (
@@ -339,36 +340,36 @@ export function ConflictDialog(props: {
             {names.slice(0, 8).map((n) => (
               <li key={n}>{n}</li>
             ))}
-            {names.length > 8 && <li>and {names.length - 8} more</li>}
+            {names.length > 8 && <li>{t('conflict.more', { n: names.length - 8 })}</li>}
           </ProseList>
         )}
-        <Fieldset legend={one ? 'What should Ruum do?' : `What should Ruum do with all ${names.length}?`}>
+        <Fieldset legend={one ? t('conflict.question.one') : t('conflict.question', { n: names.length })}>
           <Radio
             name="conflict"
             checked={choice === 'version'}
             onChange={() => setChoice('version')}
             aria-describedby="conflict-version"
-            label="Save as a new version"
+            label={t('conflict.version')}
           />
           {choice === 'version' && (
             <Indent>
               <Text id="conflict-version" tone="muted" size="sm">
-                {one
-                  ? 'The file keeps its name. The earlier version stays in Versions.'
-                  : 'The files keep their names. The earlier versions stay in Versions.'}
+                {one ? t('conflict.version.help.one') : t('conflict.version.help')}
               </Text>
               {recent.length > 0 && (
                 <>
-                  <Field label={recent.length === 1 ? 'Name of the earlier version' : 'Name of the earlier versions'}>
+                  <Field label={recent.length === 1 ? t('conflict.keepName.one') : t('conflict.keepName')}>
                     <TextInput value={label} onChange={(e) => setLabel(e.target.value)} aria-describedby="conflict-keep" />
                   </Field>
                   {label.trim() ? (
                     <Text id="conflict-keep" tone="muted" size="sm">
-                      {`${recent.length === 1 ? `You changed ${recent[0].name} ${when}` : `You changed ${recent.length} of these files in the last 10 minutes`}. Ruum keeps that version under this name, so nothing is lost.`}
+                      {recent.length === 1
+                        ? t('conflict.kept.one', { name: recent[0].name, when: when ?? '' })
+                        : t('conflict.kept', { n: recent.length })}
                     </Text>
                   ) : (
                     <Note id="conflict-keep" tone="warning" role="note">
-                      {`Without a name, the new upload replaces ${recent.length === 1 ? `your version from ${when}` : 'your versions from the last 10 minutes'}: Ruum joins the changes you make within 10 minutes into one version.`}
+                      {recent.length === 1 ? t('conflict.replaces.one', { when: when ?? '' }) : t('conflict.replaces')}
                     </Note>
                   )}
                 </>
@@ -379,15 +380,15 @@ export function ConflictDialog(props: {
             name="conflict"
             checked={choice === 'keep'}
             onChange={() => setChoice('keep')}
-            label={one ? 'Keep both, as two separate files' : 'Keep both, as separate files'}
+            label={one ? t('conflict.keep.one') : t('conflict.keep')}
           />
-          <Radio name="conflict" checked={choice === 'skip'} onChange={() => setChoice('skip')} label="Skip" />
+          <Radio name="conflict" checked={choice === 'skip'} onChange={() => setChoice('skip')} label={t('conflict.skip')} />
         </Fieldset>
         <ErrorNote error={error} />
         <Actions>
-          <Button onClick={props.onClose}>Cancel</Button>
+          <Button onClick={props.onClose}>{t('common.cancel')}</Button>
           <Button type="submit" variant="primary" disabled={busy} busy={busy}>
-            Continue
+            {t('common.continue')}
           </Button>
         </Actions>
       </Stack>

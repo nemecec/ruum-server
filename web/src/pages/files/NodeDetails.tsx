@@ -29,6 +29,7 @@ import { NameDialog } from './dialogs'
 import { ShareDialog } from './ShareDialog'
 import { nameHeadVersion, replacesOwnSave } from './coalesce'
 import { useUploads } from './useUploads'
+import { t, tr } from '../../i18n'
 
 /** The details of an item and its actions, shown beside the file list. */
 export function NodeDetails(props: {
@@ -82,34 +83,40 @@ export function NodeDetails(props: {
         <h2 id="details-title" ref={heading} tabIndex={-1}>
           {node.name}
         </h2>
-        {props.onClose && <IconButton icon="close" label="Close details" onClick={props.onClose} />}
+        {props.onClose && <IconButton icon="close" label={t('details.close')} onClick={props.onClose} />}
       </Toolbar>
       <Facts>
-        <Fact label="Type">{fileTypeLabel(node)}</Fact>
-        {node.kind === 'file' && <Fact label="Size">{formatBytes(node.size_bytes)}</Fact>}
-        <Fact label="Changed">
-          <span title={formatDate(node.updated_at)}>{formatWhen(node.updated_at)}</span> by <Actor pair={node.updated_by} />
+        <Fact label={t('details.type')}>{fileTypeLabel(node)}</Fact>
+        {node.kind === 'file' && <Fact label={t('files.size')}>{formatBytes(node.size_bytes)}</Fact>}
+        <Fact label={t('files.changed')}>
+          {tr('details.when.by', {
+            when: <span title={formatDate(node.updated_at)}>{formatWhen(node.updated_at)}</span>,
+            who: <Actor pair={node.updated_by} />,
+          })}
         </Fact>
-        <Fact label="Created">
-          <span title={formatDate(node.created_at)}>{formatWhen(node.created_at)}</span> by <Actor pair={node.created_by} />
+        <Fact label={t('details.created')}>
+          {tr('details.when.by', {
+            when: <span title={formatDate(node.created_at)}>{formatWhen(node.created_at)}</span>,
+            who: <Actor pair={node.created_by} />,
+          })}
         </Fact>
-        {node.my_role && <Fact label="Your access">{roleLabels[node.my_role]}</Fact>}
+        {node.my_role && <Fact label={t('shared.access')}>{roleLabels[node.my_role]}</Fact>}
       </Facts>
       <ErrorNote error={error} context={{ name: node.name }} />
       <Actions align="start">
         {node.kind === 'file' && (
           <Button variant="primary" onClick={() => downloadNode(node).catch(setError)}>
-            Download
+            {t('common.download')}
           </Button>
         )}
-        {node.kind === 'file' && <Button onClick={() => previewNode(node).catch(setError)}>Preview</Button>}
-        {node.kind === 'file' && <Button onClick={props.onShowVersions}>Versions</Button>}
+        {node.kind === 'file' && <Button onClick={() => previewNode(node).catch(setError)}>{t('details.preview')}</Button>}
+        {node.kind === 'file' && <Button onClick={props.onShowVersions}>{t('details.versions')}</Button>}
         {node.kind === 'file' && canEdit && (
           <>
-            <Button onClick={() => versionInput.current?.click()}>Upload new version</Button>
+            <Button onClick={() => versionInput.current?.click()}>{t('details.uploadVersion')}</Button>
             <FileInput
               ref={versionInput}
-              label={`New version of ${node.name}`}
+              label={t('details.uploadVersion.label', { name: node.name })}
               onChange={(e) => {
                 const file = e.target.files?.[0]
                 e.target.value = ''
@@ -118,25 +125,25 @@ export function NodeDetails(props: {
             />
           </>
         )}
-        <Button onClick={() => setDialog('share')}>Share</Button>
-        {canEdit && <Button onClick={() => setDialog('rename')}>Rename</Button>}
-        {canEdit && <Button onClick={props.onMove}>Move</Button>}
-        {canEdit && <Button onClick={props.onTrash}>Move to trash</Button>}
+        <Button onClick={() => setDialog('share')}>{t('details.share')}</Button>
+        {canEdit && <Button onClick={() => setDialog('rename')}>{t('details.rename')}</Button>}
+        {canEdit && <Button onClick={props.onMove}>{t('files.move')}</Button>}
+        {canEdit && <Button onClick={props.onTrash}>{t('files.toTrash')}</Button>}
       </Actions>
       <NodeTags node={node} canEdit={canEdit} />
 
       {dialog === 'rename' && (
         <NameDialog
           open
-          title={`Rename ${node.name}`}
-          label="Name"
+          title={t('details.rename.title', { name: node.name })}
+          label={t('common.name')}
           initial={node.name}
           selectBase={node.kind === 'file'}
-          submitLabel="Rename"
+          submitLabel={t('details.rename')}
           onClose={() => setDialog(null)}
           onSubmit={async (name) => {
             await unwrap(client.POST('/v1/nodes/{node_id}/rename', { params: { path: { node_id: node.id } }, body: { name } }))
-            toast(`Renamed to ${name}.`)
+            toast(t('details.renamed', { name }))
             props.onChanged()
           }}
         />
@@ -167,7 +174,7 @@ function KeepVersionDialog(props: { node: Node; previousAt: string; onClose: () 
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
   return (
-    <Dialog title="Keep your last change as its own version?" open onClose={props.onClose}>
+    <Dialog title={t('keepVersion.title')} open onClose={props.onClose}>
       <Stack
         as="form"
         gap={4}
@@ -183,18 +190,15 @@ function KeepVersionDialog(props: { node: Node; previousAt: string; onClose: () 
           }
         }}
       >
-        <p>
-          You changed {props.node.name} {formatWhen(props.previousAt).toLowerCase()}. Ruum keeps one version for the changes you make within
-          10 minutes, so this upload replaces that version.
-        </p>
-        <Field label="Name the current version to keep it (optional)">
-          <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder="Before the new upload" />
+        <p>{t('keepVersion.body', { name: props.node.name, when: formatWhen(props.previousAt).toLowerCase() })}</p>
+        <Field label={t('keepVersion.name')}>
+          <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder={t('keepVersion.placeholder')} />
         </Field>
         <ErrorNote error={error} />
         <Actions>
-          <Button onClick={props.onClose}>Cancel</Button>
+          <Button onClick={props.onClose}>{t('common.cancel')}</Button>
           <Button type="submit" variant="primary" disabled={busy} busy={busy}>
-            {name.trim() ? 'Keep it and upload' : 'Replace it'}
+            {name.trim() ? t('keepVersion.keep') : t('keepVersion.replace')}
           </Button>
         </Actions>
       </Stack>
@@ -218,8 +222,8 @@ function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
         return
       }
       await unwrap(client.PUT('/v1/nodes/{node_id}/tags/{tag_id}', { params: { path: { node_id: node.id, tag_id: tagId } } }))
-      const name = tagName ?? allTags.data?.items.find((t) => t.id === tagId)?.name
-      if (name) toast(`Added the tag ${name}.`)
+      const name = tagName ?? allTags.data?.items.find((tag) => tag.id === tagId)?.name
+      if (name) toast(t('tags.added', { name }))
       nodeTags.reload()
     } catch (e) {
       setError(e)
@@ -240,41 +244,41 @@ function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
 
   return (
     <Stack as="section" aria-labelledby="tags-title">
-      <h3 id="tags-title">Tags</h3>
+      <h3 id="tags-title">{t('tags.title')}</h3>
       <ErrorNote error={error} />
       <Loaded state={nodeTags}>
         {({ items }) => (
           <TagList>
-            {items.length === 0 && <ListEmpty>No tags</ListEmpty>}
-            {items.map((t) => (
-              <Tag key={t.id} name={t.name} color={t.color} onRemove={canEdit ? () => detach(t.id) : undefined} />
+            {items.length === 0 && <ListEmpty>{t('tags.none')}</ListEmpty>}
+            {items.map((tag) => (
+              <Tag key={tag.id} name={tag.name} color={tag.color} onRemove={canEdit ? () => detach(tag.id) : undefined} />
             ))}
           </TagList>
         )}
       </Loaded>
       {canEdit && allTags.data && (
-        <Field label="Add a tag">
+        <Field label={t('tags.add')}>
           <Select value={pick} onChange={(e) => attach(e.target.value)}>
-            <option value="">Choose a tag</option>
+            <option value="">{t('tags.choose')}</option>
             {allTags.data.items
-              .filter((t) => !nodeTags.data?.items.some((x) => x.id === t.id))
-              .map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
+              .filter((tag) => !nodeTags.data?.items.some((x) => x.id === tag.id))
+              .map((tag) => (
+                <option key={tag.id} value={tag.id}>
+                  {tag.name}
                 </option>
               ))}
-            <option value="__new">New tag...</option>
+            <option value="__new">{t('tags.newOption')}</option>
           </Select>
         </Field>
       )}
       {creating && (
         <NameDialog
           open
-          title="New tag"
-          label="Tag name"
+          title={t('tags.new')}
+          label={t('tags.name')}
           initial=""
-          placeholder="Invoices"
-          submitLabel="Create and add"
+          placeholder={t('tags.placeholder')}
+          submitLabel={t('tags.createAdd')}
           onClose={() => setCreating(false)}
           onSubmit={async (name) => {
             const res = await unwrap(client.POST('/v1/tags', { body: { name } }))

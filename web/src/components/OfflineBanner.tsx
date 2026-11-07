@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import { Banner } from '../ui'
+import { t } from '../i18n'
 
 function subscribe(onChange: () => void) {
   window.addEventListener('online', onChange)
@@ -18,5 +19,5 @@ export function OfflineBanner() {
     () => true,
   )
   if (online) return null
-  return <Banner role="alert">You're offline. Changes wait until you're back.</Banner>
+  return <Banner role="alert">{t('shell.offline')}</Banner>
 }

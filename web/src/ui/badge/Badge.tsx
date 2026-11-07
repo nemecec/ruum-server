@@ -5,6 +5,7 @@ import { Icon, type IconName } from '../icon/Icon'
 import { VisuallyHidden } from '../text/Text'
 import { nearestTagColor } from './tagColor'
 import './badge.css'
+import { t } from '../../i18n'
 
 export type BadgeTone = 'neutral' | 'success' | 'warning' | 'danger' | 'agent' | 'primary'
 
@@ -21,7 +22,7 @@ export function Tag(props: { name: string; color?: string | null; onRemove?: () 
     <As className={cx('ui-tag', color && `ui-tag-${color}`)}>
       <span className="ui-tag-dot" aria-hidden="true" />
       {props.name}
-      {props.onRemove && <IconButton icon="close" size="sm" label={`Remove tag ${props.name}`} onClick={props.onRemove} />}
+      {props.onRemove && <IconButton icon="close" size="sm" label={t('ui.tag.remove', { name: props.name })} onClick={props.onRemove} />}
     </As>
   )
 }

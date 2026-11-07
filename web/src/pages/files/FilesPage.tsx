@@ -6,7 +6,7 @@ import { usePagedApi } from '../../api/usePagedApi'
 import { Actor } from '../../app/names'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { useSession } from '../../app/useSession'
-import { count, formatBytes, formatDate, formatWhen } from '../../components/format'
+import { formatBytes, formatDate, formatWhen } from '../../components/format'
 import {
   Actions,
   BareCheckbox,
@@ -48,6 +48,7 @@ import { nameHeadVersion, replacesOwnSave } from './coalesce'
 import { ConflictDialog, type ConflictChoice } from './uploads'
 import { useUploads, useUploadsDone, type UploadPlan } from './useUploads'
 import { VersionsPanel } from './VersionsPanel'
+import { currentIntl, t } from '../../i18n'
 
 /** Files whose names are taken, and the folder they go to, while the conflict dialog is open. */
 type Pending = { files: File[]; folder: Node; existing: Map<string, Node>; recent: Node[] }
@@ -141,7 +142,7 @@ export function FilesPage() {
   }
 
   function folderLabel(folder: Node): string {
-    return folder.parent_id ? folder.name : 'Files'
+    return folder.parent_id ? folder.name : t('shell.nav.files')
   }
 
   function onUpload(e: ChangeEvent<HTMLInputElement>) {
@@ -195,12 +196,11 @@ export function FilesPage() {
       setChecked(new Set())
       if (nodes.some((n) => n.id === selectedId)) select(null)
       reload()
-      const what = done.length === 1 ? done[0].name : count(done.length, 'item')
-      toast(`Moved ${what} to the trash.`, {
+      toast(done.length === 1 ? t('files.trashed.one', { name: done[0].name }) : t('files.trashed', { n: done.length }), {
         undo: async () => {
           await undo()
           reload()
-          return done.length === 1 ? `Restored ${done[0].name}.` : `Restored ${count(done.length, 'item')}.`
+          return done.length === 1 ? t('files.restored.one', { name: done[0].name }) : t('files.restored', { n: done.length })
         },
       })
     } catch (err) {
@@ -214,12 +214,12 @@ export function FilesPage() {
     setChecked(new Set())
     if (nodes.some((n) => n.id === selectedId)) select(null)
     reload()
-    const what = done.length === 1 ? done[0].name : count(done.length, 'item')
-    toast(`Moved ${what} to ${folderLabel(target)}.`, {
+    const folder = folderLabel(target)
+    toast(done.length === 1 ? t('files.moved.one', { name: done[0].name, folder }) : t('files.moved', { n: done.length, folder }), {
       undo: async () => {
         await undo()
         reload()
-        return done.length === 1 ? `Moved ${done[0].name} back.` : `Moved ${count(done.length, 'item')} back.`
+        return done.length === 1 ? t('files.movedBack.one', { name: done[0].name }) : t('files.movedBack', { n: done.length })
       },
     })
   }
@@ -235,7 +235,7 @@ export function FilesPage() {
 
   return (
     <SplitView
-      asideLabel="Details"
+      asideLabel={t('files.details')}
       aside={
         selected && !stale ? (
           panel === 'versions' && selected.kind === 'file' ? (
@@ -255,7 +255,7 @@ export function FilesPage() {
       }
     >
       {stale ? (
-        <Loading label="Loading items" />
+        <Loading label={t('files.loadingItems')} />
       ) : state.error instanceof RuumApiError && state.error.status === 404 && listed === false ? (
         <NotInSpaceYet />
       ) : (
@@ -278,10 +278,10 @@ export function FilesPage() {
                 }
               : {}
             return (
-              <DropZone active={dropTarget === folder.id} hint={`Drop to upload to ${folderLabel(folder)}`} {...dropProps}>
+              <DropZone active={dropTarget === folder.id} hint={t('files.dropHint', { folder: folderLabel(folder) })} {...dropProps}>
                 <Breadcrumbs hidden={ancestors.length < 2}>
                   {ancestors.map((a, i) => {
-                    const label = a.parent_id ? a.name : 'Files'
+                    const label = a.parent_id ? a.name : t('shell.nav.files')
                     return i === ancestors.length - 1 ? (
                       <CurrentCrumb key={a.id}>{label}</CurrentCrumb>
                     ) : (
@@ -292,14 +292,14 @@ export function FilesPage() {
                   })}
                 </Breadcrumbs>
                 <Toolbar>
-                  <h1>{isRoot ? 'Files' : folder.name}</h1>
+                  <h1>{isRoot ? t('shell.nav.files') : folder.name}</h1>
                   {canEdit && (
                     <Actions>
-                      <Button onClick={() => setNewFolder(true)}>New folder</Button>
+                      <Button onClick={() => setNewFolder(true)}>{t('files.newFolder')}</Button>
                       <Button variant="primary" icon="upload" onClick={() => fileInput.current?.click()}>
-                        Upload files
+                        {t('files.upload')}
                       </Button>
-                      <FileInput ref={fileInput} multiple label="Upload files" onChange={onUpload} />
+                      <FileInput ref={fileInput} multiple label={t('files.upload')} onChange={onUpload} />
                     </Actions>
                   )}
                 </Toolbar>
@@ -312,20 +312,20 @@ export function FilesPage() {
                 )}
                 <ErrorNote error={error} />
                 {checkedNodes.length > 0 && (
-                  <SelectionBar label="Selection">
-                    <span>{count(checkedNodes.length, 'item')} selected</span>
+                  <SelectionBar label={t('files.selection')}>
+                    <span>{t('files.selected', { n: checkedNodes.length })}</span>
                     {canEdit && (
                       <>
                         <Button size="sm" onClick={() => setMoving(checkedNodes)}>
-                          Move
+                          {t('files.move')}
                         </Button>
                         <Button size="sm" onClick={() => trash(checkedNodes)}>
-                          Move to trash
+                          {t('files.toTrash')}
                         </Button>
                       </>
                     )}
                     <Button variant="link" onClick={() => setChecked(new Set())}>
-                      Clear selection
+                      {t('files.clearSelection')}
                     </Button>
                   </SelectionBar>
                 )}
@@ -359,15 +359,15 @@ export function FilesPage() {
                 {newFolder && (
                   <NameDialog
                     open
-                    title="New folder"
-                    label="Folder name"
+                    title={t('files.newFolder')}
+                    label={t('files.newFolder.name')}
                     initial=""
-                    placeholder="Site photos"
-                    submitLabel="Create"
+                    placeholder={t('files.newFolder.placeholder')}
+                    submitLabel={t('common.create')}
                     onClose={() => setNewFolder(false)}
                     onSubmit={async (name) => {
                       await unwrap(client.POST('/v1/nodes', { body: { parent_id: folder.id, name, kind: 'folder' } }))
-                      toast(`Folder ${name} created.`)
+                      toast(t('files.newFolder.done', { name }))
                       reload()
                     }}
                   />
@@ -444,39 +444,39 @@ function WelcomeCard(props: { empty: boolean | undefined; onUpload: () => void; 
   }
   return (
     <Card aria-labelledby="welcome-title">
-      <h2 id="welcome-title">Welcome to Ruum, {first}</h2>
+      <h2 id="welcome-title">{t('files.welcome.title', { name: first })}</h2>
       <ProseList>
-        <li>Upload files from any device; drop them on a folder to put them there.</li>
-        <li>Every change is kept as a version, so you can go back.</li>
-        <li>Connect an AI agent that works for you, only in the folders you choose.</li>
+        <li>{t('files.welcome.upload')}</li>
+        <li>{t('files.welcome.versions')}</li>
+        <li>{t('files.welcome.agent')}</li>
       </ProseList>
       <Actions align="start">
         <Button variant="primary" onClick={props.onUpload}>
-          Upload files
+          {t('files.upload')}
         </Button>
-        <Button onClick={props.onConnect}>Connect an agent</Button>
-        <Button onClick={close}>Close</Button>
+        <Button onClick={props.onConnect}>{t('files.welcome.connect')}</Button>
+        <Button onClick={close}>{t('ui.close')}</Button>
       </Actions>
     </Card>
   )
 }
 
 function EmptyFolder(props: { isRoot: boolean; canEdit: boolean; onUpload: () => void; onNewFolder: () => void }) {
-  if (!props.canEdit) return <EmptyState icon="info" title="This folder is empty" />
+  if (!props.canEdit) return <EmptyState icon="info" title={t('files.empty.title')} />
   const actions = (
     <>
       <Button variant="primary" onClick={props.onUpload}>
-        Upload files
+        {t('files.upload')}
       </Button>
-      <Button onClick={props.onNewFolder}>New folder</Button>
+      <Button onClick={props.onNewFolder}>{t('files.newFolder')}</Button>
     </>
   )
   return props.isRoot ? (
-    <EmptyState title="Your files go here" text="Upload files or make folders. Every change is kept as a version.">
+    <EmptyState title={t('files.emptyRoot.title')} text={t('files.emptyRoot.text')}>
       {actions}
     </EmptyState>
   ) : (
-    <EmptyState title="This folder is empty" text="Drop files here, or upload them.">
+    <EmptyState title={t('files.empty.title')} text={t('files.empty.text')}>
       {actions}
     </EmptyState>
   )
@@ -490,15 +490,15 @@ function GuestHome({ tenantId, spaceName }: { tenantId: string; spaceName: strin
   const shared = usePagedApi(listSharedWithMe, [])
   return (
     <>
-      <h1>Shared with you in {spaceName}</h1>
+      <h1>{t('files.guest.title', { space: spaceName })}</h1>
       <Loaded state={shared}>
         {({ items }) => {
           const here = items.filter((s) => s.node.tenant_id === tenantId)
           return here.length === 0 ? (
-            <EmptyState title="Nothing yet" text={`You see only what people in ${spaceName} shared with you.`} />
+            <EmptyState title={t('files.guest.none')} text={t('files.guest.text', { space: spaceName })} />
           ) : (
             <>
-              <Text tone="muted">You see only what people in {spaceName} shared with you.</Text>
+              <Text tone="muted">{t('files.guest.text', { space: spaceName })}</Text>
               <SharedTable items={here} />
             </>
           )
@@ -511,10 +511,9 @@ function GuestHome({ tenantId, spaceName }: { tenantId: string; spaceName: strin
 
 type SortKey = 'name' | 'size' | 'changed'
 
-const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
-
-/** Folders first, then by the key; names in natural order ("photo 2" before "photo 10"). */
+/** Folders first, then by the key; names in natural order ("photo 2" before "photo 10"), in the UI's locale. */
 function sortNodes(nodes: Node[], key: SortKey, dir: 1 | -1): Node[] {
+  const collator = new Intl.Collator(currentIntl().locale, { numeric: true, sensitivity: 'base' })
   return [...nodes].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === 'folder' ? -1 : 1
     const by =
@@ -553,12 +552,12 @@ function FileTable(props: {
     />
   )
   return (
-    <Table caption="Contents of this folder">
+    <Table caption={t('files.table.caption')}>
       <THead>
         <Tr>
           <Th scope="col" check>
             <BareCheckbox
-              aria-label="Select all"
+              aria-label={t('files.selectAll')}
               checked={all}
               ref={(el) => {
                 if (el) el.indeterminate = some && !all
@@ -566,11 +565,11 @@ function FileTable(props: {
               onChange={(e) => props.onToggleAll(e.target.checked)}
             />
           </Th>
-          {header('name', 'Name')}
-          {header('size', 'Size', true)}
-          {header('changed', 'Changed', true)}
+          {header('name', t('common.name'))}
+          {header('size', t('files.size'), true)}
+          {header('changed', t('files.changed'), true)}
           <Th scope="col">
-            <VisuallyHidden>Actions</VisuallyHidden>
+            <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
           </Th>
         </Tr>
       </THead>
@@ -597,7 +596,7 @@ function FileTable(props: {
             >
               <Td check>
                 <BareCheckbox
-                  aria-label={`Select ${n.name}`}
+                  aria-label={t('files.select.named', { name: n.name })}
                   checked={props.checked.has(n.id)}
                   onChange={(e) => props.onToggle(n.id, e.target.checked)}
                 />
@@ -623,8 +622,8 @@ function FileTable(props: {
                 </Text>
               </Td>
               <Td actions>
-                <Button size="sm" aria-label={`Details of ${n.name}`} onClick={() => props.onSelect(n)}>
-                  Details
+                <Button size="sm" aria-label={t('files.details.named', { name: n.name })} onClick={() => props.onSelect(n)}>
+                  {t('files.details')}
                 </Button>
               </Td>
             </Tr>

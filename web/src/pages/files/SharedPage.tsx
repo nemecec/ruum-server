@@ -23,6 +23,7 @@ import {
   VisuallyHidden,
 } from '../../ui'
 import { downloadNode, listSharedWithMe, sharedItemPath } from './api'
+import { t } from '../../i18n'
 
 /**
  * "Shared with me": the items that other people shared with the person, across all spaces where
@@ -33,11 +34,11 @@ export function SharedPage() {
   const shared = usePagedApi(listSharedWithMe, [])
   return (
     <PageBody>
-      <h1>Shared with me</h1>
+      <h1>{t('shell.nav.shared')}</h1>
       <Loaded state={shared}>
         {({ items }) =>
           items.length === 0 ? (
-            <EmptyState title="Nothing shared with you yet" text="When someone shares a file or folder with you, it shows up here." />
+            <EmptyState title={t('shared.empty.title')} text={t('shared.empty.text')} />
           ) : (
             <SharedTable items={items} showSpace />
           )
@@ -53,31 +54,31 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
   const { tenants } = useSession()
   const names = useNames()
   const [error, setError] = useState<unknown>()
-  const spaceName = (id: string) => tenants.find((t) => t.tenant.id === id)?.tenant.name ?? 'A shared space'
+  const spaceName = (id: string) => tenants.find((m) => m.tenant.id === id)?.tenant.name ?? t('shell.sharedSpace')
   return (
     <>
       <ErrorNote error={error} />
-      <Table caption="Shared items">
+      <Table caption={t('shared.caption')}>
         <THead>
           <Tr>
-            <Th scope="col">Name</Th>
-            {showSpace && <Th scope="col">Space</Th>}
-            <Th scope="col">Your access</Th>
+            <Th scope="col">{t('common.name')}</Th>
+            {showSpace && <Th scope="col">{t('shell.space')}</Th>}
+            <Th scope="col">{t('shared.access')}</Th>
             <Th scope="col" hideNarrow>
-              Shared by
+              {t('shared.by')}
             </Th>
             <Th scope="col" hideNarrow>
-              Shared
+              {t('shared.when')}
             </Th>
             <Th scope="col">
-              <VisuallyHidden>Actions</VisuallyHidden>
+              <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
             </Th>
           </Tr>
         </THead>
         <TBody>
           {items.map(({ node, role, shared_by, shared_at }) => {
             const by = actorLabel(names, shared_by.actor, shared_by.on_behalf_of, shared_by.on_behalf_of_display_name)
-            const sharer = by.text === 'Someone' ? `Someone in ${spaceName(node.tenant_id)}` : by.text
+            const sharer = by.text === t('actor.someone') ? t('shared.someoneIn', { space: spaceName(node.tenant_id) }) : by.text
             return (
               <Tr key={node.id}>
                 <Th scope="row">
@@ -95,13 +96,13 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
                   {node.kind === 'file' && (
                     <Button
                       size="sm"
-                      aria-label={`Download ${node.name}`}
+                      aria-label={t('common.download.named', { name: node.name })}
                       onClick={() => {
                         setError(undefined)
                         downloadNode(node).catch(setError)
                       }}
                     >
-                      Download
+                      {t('common.download')}
                     </Button>
                   )}
                 </Td>

@@ -13,6 +13,7 @@ import { cx } from '../cx'
 import { Icon } from '../icon/Icon'
 import '../text/text.css'
 import './field.css'
+import { t } from '../../i18n'
 
 /**
  * A labelled field (design-system 4.15): the label above the control, helper text and the error
@@ -164,7 +165,7 @@ export function CopyField({ label, value, mono = true }: { label: string; value:
         <TextInput readOnly value={value} mono={mono} onFocus={(e) => e.currentTarget.select()} />
       </Field>
       <Button
-        aria-label={`Copy ${label.toLowerCase()}`}
+        aria-label={t('ui.copy.label', { label: label.toLowerCase() })}
         icon={copied ? 'check' : 'copy'}
         onClick={async () => {
           try {
@@ -175,7 +176,7 @@ export function CopyField({ label, value, mono = true }: { label: string; value:
           }
         }}
       >
-        {copied ? 'Copied' : 'Copy'}
+        {copied ? t('ui.copy.done') : t('ui.copy')}
       </Button>
     </div>
   )
@@ -186,7 +187,7 @@ export function SecretBox({ label, secret, note }: { label: string; secret: stri
   return (
     <div className="ui-secret">
       <CopyField label={label} value={secret} />
-      <p className="ui-field-hint">{note ?? 'Copy it now. Ruum shows it only once.'}</p>
+      <p className="ui-field-hint">{note ?? t('ui.secret.note')}</p>
     </div>
   )
 }

@@ -4,6 +4,7 @@ import { cx } from '../cx'
 import { ErrorNote } from '../feedback/Feedback'
 import { Text } from '../text/Text'
 import './list.css'
+import { t } from '../../i18n'
 
 type ItemProps = Omit<LiHTMLAttributes<HTMLLIElement>, 'className' | 'style'>
 
@@ -112,10 +113,10 @@ export function LoadMore({
       <ErrorNote error={state.moreError} />
       <div className="ui-load-more-row">
         <Text as="span" tone="muted" size="sm">
-          There are more items.
+          {t('ui.loadMore.more')}
         </Text>
         <Button disabled={state.loadingMore} busy={state.loadingMore} onClick={state.loadMore}>
-          {state.loadingMore ? 'Loading...' : 'Load more'}
+          {state.loadingMore ? t('ui.loadMore.loading') : t('ui.loadMore')}
         </Button>
       </div>
     </div>

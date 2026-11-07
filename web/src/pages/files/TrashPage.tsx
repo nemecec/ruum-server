@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { client, unwrap } from '../../api/client'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useTenant } from '../../app/tenant'
-import { count, formatDate, formatWhen } from '../../components/format'
+import { formatDate, formatWhen } from '../../components/format'
 import {
   Button,
   ConfirmButton,
@@ -24,6 +24,7 @@ import {
   useToast,
   VisuallyHidden,
 } from '../../ui'
+import { t } from '../../i18n'
 
 /** The trash: restore items, delete them for good, or empty the trash (copy.md 3.7). */
 export function TrashPage() {
@@ -38,16 +39,20 @@ export function TrashPage() {
       const res = await unwrap(
         client.POST('/v1/nodes/{node_id}/restore', { params: { path: { node_id: id } }, body: { on_conflict: 'rename' } }),
       )
-      let folder = 'its folder'
+      let folder = t('trash.itsFolder')
       if (res.node.parent_id) {
         try {
           const parent = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: res.node.parent_id } } }))
-          folder = parent.parent_id ? parent.name : 'Files'
+          folder = parent.parent_id ? parent.name : t('shell.nav.files')
         } catch {
           // The folder name is only for the toast.
         }
       }
-      toast(res.node.name === name ? `Restored ${name} to ${folder}.` : `Restored ${name} to ${folder} as ${res.node.name}.`)
+      toast(
+        res.node.name === name
+          ? t('trash.restored', { name, folder })
+          : t('trash.restored.renamed', { name, folder, newName: res.node.name }),
+      )
       trash.reload()
     } catch (e) {
       setError(e)
@@ -58,41 +63,41 @@ export function TrashPage() {
   return (
     <PageBody>
       <Toolbar>
-        <h1>Trash</h1>
+        <h1>{t('shell.nav.trash')}</h1>
         {n > 0 && (
           <ConfirmButton
-            label="Empty trash"
-            title={trash.data?.nextCursor ? 'Delete everything in the trash for good?' : `Delete ${count(n, 'item')} for good?`}
-            message="Everything in the trash is deleted, with its versions. You can't undo this."
-            confirmLabel={trash.data?.nextCursor ? 'Delete everything for good' : `Delete ${count(n, 'item')} for good`}
+            label={t('trash.empty')}
+            title={trash.data?.nextCursor ? t('trash.empty.titleAll') : t('trash.empty.title', { n })}
+            message={t('trash.empty.message')}
+            confirmLabel={trash.data?.nextCursor ? t('trash.empty.confirmAll') : t('trash.empty.confirm', { n })}
             danger
             onConfirm={async () => {
               const res = await unwrap(client.POST('/v1/trash/empty'))
-              toast(`Deleted ${count(res.purged, 'item')} for good.`)
+              toast(t('trash.emptied', { n: res.purged }))
               trash.reload()
             }}
           />
         )}
       </Toolbar>
       <Text tone="muted">
-        Items stay in the trash for the time the plan of {tenant.name} allows. Then Ruum deletes them for good.
-        {isAdmin ? ' Admins can restore items for longer.' : ''}
+        {t('trash.intro', { space: tenant.name })}
+        {isAdmin ? ` ${t('trash.intro.admin')}` : ''}
       </Text>
       <ErrorNote error={error} />
       <Loaded state={trash}>
         {({ items }) =>
           items.length === 0 ? (
-            <EmptyState title="The trash is empty" text="Items you move to the trash stay here for a while, so you can bring them back." />
+            <EmptyState title={t('trash.none.title')} text={t('trash.none.text')} />
           ) : (
-            <Table caption="Items in the trash">
+            <Table caption={t('trash.caption')}>
               <THead>
                 <Tr>
-                  <Th scope="col">Name</Th>
+                  <Th scope="col">{t('common.name')}</Th>
                   <Th scope="col" hideNarrow>
-                    Moved to the trash
+                    {t('trash.when')}
                   </Th>
                   <Th scope="col">
-                    <VisuallyHidden>Actions</VisuallyHidden>
+                    <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
                   </Th>
                 </Tr>
               </THead>
@@ -106,20 +111,20 @@ export function TrashPage() {
                       <span title={formatDate(node.trashed_at)}>{formatWhen(node.trashed_at)}</span>
                     </Td>
                     <Td actions>
-                      <Button size="sm" aria-label={`Restore ${node.name}`} onClick={() => restore(node.id, node.name)}>
-                        Restore
+                      <Button size="sm" aria-label={t('trash.restore.named', { name: node.name })} onClick={() => restore(node.id, node.name)}>
+                        {t('trash.restore')}
                       </Button>
                       <ConfirmButton
                         size="sm"
-                        label="Delete for good"
-                        ariaLabel={`Delete for good: ${node.name}`}
-                        title={`Delete ${node.name} for good?`}
-                        message="You can't undo this. Its versions are deleted too."
-                        confirmLabel="Delete for good"
+                        label={t('trash.purge')}
+                        ariaLabel={t('trash.purge.named', { name: node.name })}
+                        title={t('trash.purge.title', { name: node.name })}
+                        message={t('trash.purge.message')}
+                        confirmLabel={t('trash.purge')}
                         danger
                         onConfirm={async () => {
                           await unwrap(client.DELETE('/v1/nodes/{node_id}', { params: { path: { node_id: node.id } } }))
-                          toast(`Deleted ${node.name} for good.`)
+                          toast(t('trash.purged', { name: node.name }))
                           trash.reload()
                         }}
                       />

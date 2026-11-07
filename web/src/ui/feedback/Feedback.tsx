@@ -3,6 +3,7 @@ import { errorDetails, errorText, type ErrorContext } from '../../api/errors'
 import { cx } from '../cx'
 import { Icon, type IconName } from '../icon/Icon'
 import './feedback.css'
+import { t } from '../../i18n'
 
 /** A small turning circle while something works. Decorative; the text beside it says what. */
 export function Spinner() {
@@ -39,7 +40,7 @@ export function ErrorNote({ error, context }: { error: unknown; context?: ErrorC
         <p className="ui-error-text">{errorText(error, context)}</p>
         {details && (
           <details className="ui-error-details">
-            <summary>Details</summary>
+            <summary>{t('ui.error.details')}</summary>
             <pre>{details}</pre>
           </details>
         )}
@@ -49,11 +50,11 @@ export function ErrorNote({ error, context }: { error: unknown; context?: ErrorC
 }
 
 /** "Loading..." while a region loads. */
-export function Loading({ label = 'Loading' }: { label?: string }) {
+export function Loading({ label }: { label?: string }) {
   return (
     <p className="ui-loading" role="status">
       <Spinner />
-      {label}...
+      {t('ui.loading', { label: label ?? t('ui.loading.default') })}
     </p>
   )
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Navigate, useLocation, useNavigate } from 'react-router'
 import { client, onUnauthenticated, RuumApiError, unwrap, type Schemas } from '../api/client'
 import { useApi } from '../api/useApi'
@@ -6,6 +6,7 @@ import { ErrorNote, Loading, Page } from '../ui'
 import { UploadsProvider } from '../pages/files/uploads'
 import { signInPath } from './auth'
 import { SessionContext } from './useSession'
+import { t, useLocale } from '../i18n'
 
 async function loadSession() {
   const [me, tenants] = await Promise.all([unwrap(client.GET('/v1/me')), unwrap(client.GET('/v1/tenants'))])
@@ -31,6 +32,17 @@ export function RequireSession({ children }: { children: ReactNode }) {
     [navigate],
   )
 
+  // The language stored with the account wins over the one of this browser (design 12.4).
+  // Only a new answer of getMe decides; a change on the Account page sets both.
+  const { preference, setPreference } = useLocale()
+  const stored = state.data ? (state.data.me.preferences?.locale ?? null) : undefined
+  const applied = useRef<string | null | undefined>(undefined)
+  useEffect(() => {
+    if (stored === undefined || applied.current === stored) return
+    applied.current = stored
+    if (stored !== preference) setPreference(stored)
+  }, [stored, preference, setPreference])
+
   const reloadTenants = useCallback(async () => {
     const res = await unwrap(client.GET('/v1/tenants'))
     setTenants(res.items)
@@ -49,7 +61,7 @@ export function RequireSession({ children }: { children: ReactNode }) {
   if (!state.data)
     return (
       <Page>
-        <Loading label="Signing in" />
+        <Loading label={t('session.signingIn')} />
       </Page>
     )
   return (

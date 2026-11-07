@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { RegisterAgentDialog } from './AgentsPage'
 import { Actions, Button, Card, Columns, CopyField, PageBody, ProseList, Text } from '../../ui'
+import { t } from '../../i18n'
 
 /** The address of the MCP server: the public URL of Ruum and `/mcp` (STATUS.md, "MCP"). */
 function mcpAddress(): string {
@@ -22,43 +23,41 @@ export function ConnectAgentPage() {
   return (
     <PageBody>
       <p>
-        <Link to={tenantPath(tenant.id, 'agents')}>Agents</Link>
+        <Link to={tenantPath(tenant.id, 'agents')}>{t('shell.nav.agents')}</Link>
       </p>
-      <h1>Connect an agent</h1>
-      <Text tone="muted">
-        Agents work in Ruum for you, with the access you give them. Every change they make shows their name and yours.
-      </Text>
+      <h1>{t('files.welcome.connect')}</h1>
+      <Text tone="muted">{t('agents.intro')}</Text>
       <Columns>
         <Card aria-labelledby="connect-app">
-          <h2 id="connect-app">Connect an AI app</h2>
-          <p>Claude, ChatGPT and other apps that use MCP. Add this server address in the app:</p>
-          <CopyField label="Server address" value={address} />
+          <h2 id="connect-app">{t('connect.app.title')}</h2>
+          <p>{t('connect.app.intro')}</p>
+          <CopyField label={t('account.appPassword.server')} value={address} />
           <Text tone="muted" size="sm">
-            The app opens Ruum in your browser. You choose where the agent may work and how long, then go back to the app.
+            {t('connect.app.flow')}
           </Text>
-          <h3>Claude Desktop</h3>
+          <h3>{t('connect.claudeDesktop')}</h3>
           <ProseList ordered>
-            <li>Open Settings, then Connectors.</li>
-            <li>Choose Add custom connector, and paste the server address.</li>
-            <li>Choose Connect and allow the access in Ruum.</li>
+            <li>{t('connect.claudeDesktop.1')}</li>
+            <li>{t('connect.claudeDesktop.2')}</li>
+            <li>{t('connect.claudeDesktop.3')}</li>
           </ProseList>
-          <h3>Claude Code</h3>
-          <p>Run this in a terminal, then type /mcp in Claude Code and choose ruum to sign in:</p>
-          <CopyField label="Command for Claude Code" value={`claude mcp add --transport http ruum ${address}`} />
-          <h3>ChatGPT</h3>
+          <h3>{t('connect.claudeCode')}</h3>
+          <p>{t('connect.claudeCode.intro')}</p>
+          <CopyField label={t('connect.claudeCode.command')} value={`claude mcp add --transport http ruum ${address}`} />
+          <h3>{t('connect.chatgpt')}</h3>
           <ProseList ordered>
-            <li>Open Settings, then Connectors (developer mode must be on).</li>
-            <li>Create a connector with the server address and OAuth.</li>
-            <li>Allow the access in Ruum.</li>
+            <li>{t('connect.chatgpt.1')}</li>
+            <li>{t('connect.chatgpt.2')}</li>
+            <li>{t('connect.chatgpt.3')}</li>
           </ProseList>
         </Card>
         <Card aria-labelledby="connect-key">
-          <h2 id="connect-key">Use a key in a script or the CLI</h2>
-          <p>Create an agent with its own key. Give the key only to the program that needs it.</p>
-          <CopyField label="Ruum address for the CLI" value={window.location.origin} />
+          <h2 id="connect-key">{t('connect.key.title')}</h2>
+          <p>{t('connect.key.intro')}</p>
+          <CopyField label={t('connect.key.address')} value={window.location.origin} />
           <Actions align="start">
             <Button variant="primary" onClick={() => setRegistering(true)}>
-              Create an agent with a key
+              {t('agents.register.title')}
             </Button>
           </Actions>
         </Card>

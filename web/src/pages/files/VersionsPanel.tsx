@@ -3,7 +3,7 @@ import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { Actor } from '../../app/names'
-import { formatBytes, formatDate, formatShortDate, formatWhen } from '../../components/format'
+import { formatBytes, formatDate, formatShortDate, formatTime, whenParts } from '../../components/format'
 import {
   Actions,
   Badge,
@@ -30,6 +30,7 @@ import {
 } from '../../ui'
 import { downloadNode, type Node } from './api'
 import { NameDialog } from './dialogs'
+import { t, type MessageKey } from '../../i18n'
 
 /** Version history of a file: download, name, compare, restore (journeys J4). */
 export function VersionsPanel(props: { node: Node; onClose: () => void; onRestored: () => void }) {
@@ -52,7 +53,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
         body: { label: label || null },
       }),
     )
-    toast(label ? `Named the version ${label}.` : 'Removed the version name.')
+    toast(label ? t('versions.named', { label }) : t('versions.unnamed'))
     versions.reload()
   }
 
@@ -63,7 +64,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
     )
     setCompare(null)
     props.onRestored()
-    toast(`Restored. The version of ${formatShortDate(v.created_at)} is current again.`, {
+    toast(t('versions.restored', { when: formatShortDate(v.created_at) }), {
       undo: before
         ? async () => {
             await unwrap(
@@ -72,7 +73,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
               }),
             )
             props.onRestored()
-            return 'The version you had before is current again.'
+            return t('versions.restored.undone')
           }
         : undefined,
     })
@@ -81,21 +82,21 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
   return (
     <Stack as="section" gap={4} aria-labelledby="versions-title">
       <Toolbar>
-        <h2 id="versions-title">Versions of {node.name}</h2>
+        <h2 id="versions-title">{t('versions.title', { name: node.name })}</h2>
         <Button size="sm" onClick={props.onClose}>
-          Back to details
+          {t('versions.back')}
         </Button>
       </Toolbar>
       <ErrorNote error={error} />
       {naming && (
         <NameDialog
           open
-          title="Name this version"
-          help="Named versions are kept forever, also when old versions are removed."
-          label="Version name"
-          placeholder="Sent to client"
+          title={t('versions.name.title')}
+          help={t('versions.name.help')}
+          label={t('versions.name.label')}
+          placeholder={t('versions.name.placeholder')}
           initial={naming.label ?? ''}
-          submitLabel={naming.label ? 'Save name' : 'Save name'}
+          submitLabel={t('versions.name.save')}
           allowEmpty
           onClose={() => setNaming(null)}
           onSubmit={(label) => saveName(naming, label)}
@@ -115,47 +116,47 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                     <ListRow key={v.id} block current={current}>
                       <Row gap={2}>
                         <strong>{versionWhen(v.created_at)}</strong>
-                        {current && <Badge tone="primary">Current</Badge>}
+                        {current && <Badge tone="primary">{t('versions.current')}</Badge>}
                         {v.label && <Badge>{v.label}</Badge>}
                       </Row>
                       <Text as="div" tone="muted" size="sm">
-                        <Actor pair={v} /> - {formatBytes(v.size_bytes)}
+                        <Actor pair={v} /> {t('versions.size', { size: formatBytes(v.size_bytes) })}
                       </Text>
                       {v.restored_from && (
                         <Text as="div" tone="muted" size="sm">
-                          {source ? `Restored from ${formatShortDate(source.created_at)}` : 'Restored from an older version'}
+                          {source ? t('versions.restoredFrom', { when: formatShortDate(source.created_at) }) : t('versions.restoredFrom.older')}
                         </Text>
                       )}
                       <Actions align="start">
                         <Button
                           size="sm"
-                          aria-label={`Download version of ${when}`}
+                          aria-label={t('versions.download.label', { when })}
                           onClick={() => downloadNode(node, v.id).catch(setError)}
                         >
-                          Download
+                          {t('common.download')}
                         </Button>
                         {page.items.length > 1 && (
-                          <Button size="sm" aria-label={`Compare version of ${when}`} onClick={() => setCompare(v)}>
-                            Compare
+                          <Button size="sm" aria-label={t('versions.compare.label', { when })} onClick={() => setCompare(v)}>
+                            {t('versions.compare')}
                           </Button>
                         )}
                         {canEdit && (
                           <Button
                             size="sm"
-                            aria-label={v.label ? `Rename version of ${when}` : `Keep forever: name the version of ${when}`}
+                            aria-label={v.label ? t('versions.rename.label', { when }) : t('versions.keep.label', { when })}
                             onClick={() => setNaming(v)}
                           >
-                            {v.label ? 'Rename' : 'Keep forever…'}
+                            {v.label ? t('details.rename') : t('versions.keep')}
                           </Button>
                         )}
                         {canEdit && !current && (
                           <ConfirmButton
                             size="sm"
-                            label="Restore"
-                            ariaLabel={`Restore version of ${when}`}
-                            title={`Restore the version of ${formatShortDate(v.created_at)}?`}
-                            message="It becomes the current version. The version you have now stays in Versions."
-                            confirmLabel="Restore"
+                            label={t('trash.restore')}
+                            ariaLabel={t('versions.restore.label', { when })}
+                            title={t('versions.restore.title', { when: formatShortDate(v.created_at) })}
+                            message={t('versions.restore.message')}
+                            confirmLabel={t('trash.restore')}
                             onConfirm={() => restore(v)}
                           />
                         )}
@@ -165,10 +166,10 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
                 })}
               </List>
               {page.items.length === 1 && !page.nextCursor && (
-                <EmptyState title="This is the only version" text="Ruum keeps a new version each time the file changes." />
+                <EmptyState title={t('versions.only.title')} text={t('versions.only.text')} />
               )}
               <Text tone="muted" size="sm">
-                Named versions are kept forever. Older versions are removed after the time your plan allows.
+                {t('versions.retention')}
               </Text>
               {compare && <CompareDialog node={node} from={compare} versions={page.items} onClose={() => setCompare(null)} />}
             </>
@@ -180,13 +181,13 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
   )
 }
 
-const kindLabels: Record<Schemas['DiffChangeKind'], string> = {
-  insert: 'Added',
-  delete: 'Removed',
-  modify: 'Changed',
-  move: 'Moved',
-  format: 'Format',
-  replace: 'Replaced',
+const kindLabels: Record<Schemas['DiffChangeKind'], MessageKey> = {
+  insert: 'diff.kind.insert',
+  delete: 'diff.kind.delete',
+  modify: 'diff.kind.modify',
+  move: 'diff.kind.move',
+  format: 'diff.kind.format',
+  replace: 'diff.kind.replace',
 }
 
 /**
@@ -194,23 +195,29 @@ const kindLabels: Record<Schemas['DiffChangeKind'], string> = {
  * "13 minutes ago (15:13)", "Yesterday at 18:20", "20 Oct 2026, 14:00".
  */
 function versionWhen(iso: string): string {
-  const rel = formatWhen(iso)
-  if (/ago$|^Just now$/.test(rel)) return `${rel} (${new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })})`
-  if (rel.includes(' at ')) return rel
+  const { text, kind } = whenParts(iso)
+  if (kind === 'recent') return t('versions.when.recent', { when: text, time: formatTime(iso) })
+  if (kind === 'day') return text
   return formatDate(iso)
 }
 
 /** "1 change", "3 changes": the plain summary of a comparison (the counts by kind confused people). */
 function changeCount(s: { inserted: number; deleted: number; modified: number; moved?: number | null }): string {
   const n = s.inserted + s.deleted + s.modified + (s.moved ?? 0)
-  return n === 1 ? '1 change' : `${n} changes`
+  return t('diff.count', { n })
 }
 
 /** Plain names of the diff plugins (ia.md: "Compare as" text, data, image, file). */
 function pluginLabel(id: string): string {
   const name = id.split('@')[0]
-  const labels: Record<string, string> = { text: 'Text', json: 'Data (JSON)', xml: 'Data (XML)', image: 'Picture', binary: 'File' }
-  return labels[name] ?? name[0].toUpperCase() + name.slice(1)
+  const labels: Record<string, MessageKey> = {
+    text: 'diff.plugin.text',
+    json: 'diff.plugin.json',
+    xml: 'diff.plugin.xml',
+    image: 'diff.plugin.image',
+    binary: 'diff.plugin.binary',
+  }
+  return labels[name] ? t(labels[name]) : name[0].toUpperCase() + name.slice(1)
 }
 
 /** A change path in plain words: `lines/2` is "Line 2". */
@@ -218,7 +225,7 @@ function pathLabel(c: Schemas['DiffChange']): string | null {
   if (c.label) return c.label
   if (!c.path) return null
   const line = /^lines?\/(\d+)$/.exec(c.path)
-  if (line) return `Line ${line[1]}`
+  if (line) return t('diff.line', { n: line[1] })
   return c.path.replace(/\//g, ' > ')
 }
 
@@ -254,21 +261,26 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
   )
   const pluginItems = plugins.data?.items ?? []
   const label = (v: Schemas['Version']) =>
-    `${formatShortDate(v.created_at)}${v.id === node.head_version ? ' (current)' : ''}${v.label ? `, ${v.label}` : ''}`
+    t('compare.version', {
+      when: formatShortDate(v.created_at),
+      current: v.id === node.head_version ? 'yes' : 'no',
+      label: v.label ?? '',
+      named: v.label ? 'yes' : 'no',
+    })
 
   return (
-    <Dialog title="Compare versions" open onClose={props.onClose} size="full">
+    <Dialog title={t('compare.title')} open onClose={props.onClose} size="full">
       <Stack gap={4}>
         <Row gap={4} align="end">
           <Text>
             <Text as="span" tone="muted">
-              {swap ? 'To' : 'From'}
+              {swap ? t('compare.to') : t('compare.from')}
             </Text>{' '}
             <strong>{label(from)}</strong>
           </Text>
-          <Field label={swap ? 'From' : 'To'}>
+          <Field label={swap ? t('compare.from') : t('compare.to')}>
             <Select value={to} onChange={(e) => setTo(e.target.value)}>
-              {!swap && <option value="">Current version</option>}
+              {!swap && <option value="">{t('compare.current')}</option>}
               {others
                 .filter((v) => swap || v.id !== node.head_version)
                 .map((v) => (
@@ -280,13 +292,13 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
           </Field>
           {pluginItems.length > 1 && !advanced && (
             <Button variant="link" onClick={() => setAdvanced(true)}>
-              More options
+              {t('compare.more')}
             </Button>
           )}
           {pluginItems.length > 1 && advanced && (
-            <Field label="Compare as">
+            <Field label={t('compare.as')}>
               <Select value={plugin} onChange={(e) => setPlugin(e.target.value)}>
-                <option value="">Best match ({pluginLabel(pluginItems[0].name)})</option>
+                <option value="">{t('compare.best', { plugin: pluginLabel(pluginItems[0].name) })}</option>
                 {pluginItems.map((p) => (
                   <option key={p.name} value={p.name}>
                     {pluginLabel(p.name)}
@@ -297,14 +309,14 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
           )}
         </Row>
         {diff.loading && !diff.data ? (
-          <Loading label="Comparing" />
+          <Loading label={t('compare.loading')} />
         ) : (
           <Loaded state={diff}>
             {(d) =>
               !d ? null : (
                 <DiffView busy={diff.loading}>
                   {d.changes.length === 0 ? (
-                    <p>These versions are the same.</p>
+                    <p>{t('compare.same')}</p>
                   ) : (
                     <>
                       <p>{changeCount(d.summary)}</p>
@@ -314,13 +326,13 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
                   {d.render?.html && (
                     <p>
                       <a href={d.render.html} target="_blank" rel="noopener noreferrer">
-                        Open the full view of the changes
+                        {t('compare.fullView')}
                       </a>
                     </p>
                   )}
-                  {d.truncated && <Text tone="muted">Only the first changes are shown. Download both versions to see all.</Text>}
+                  {d.truncated && <Text tone="muted">{t('compare.truncated')}</Text>}
                   <Text tone="muted" size="sm">
-                    Compared as {pluginLabel(d.plugin).toLowerCase()}.
+                    {t('compare.comparedAs', { plugin: pluginLabel(d.plugin).toLowerCase() })}
                   </Text>
                 </DiffView>
               )
@@ -328,7 +340,7 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
           </Loaded>
         )}
         <Actions>
-          <Button onClick={props.onClose}>Close</Button>
+          <Button onClick={props.onClose}>{t('ui.close')}</Button>
         </Actions>
       </Stack>
     </Dialog>
@@ -339,7 +351,7 @@ function ChangeList({ changes }: { changes: Schemas['DiffChange'][] }) {
   return (
     <DiffList>
       {changes.map((c, i) => (
-        <DiffChange key={`${c.path ?? ''}-${i}`} kind={kindLabels[c.kind]} where={pathLabel(c)} old={c.old} new={c.new} format={c.change}>
+        <DiffChange key={`${c.path ?? ''}-${i}`} kind={t(kindLabels[c.kind])} where={pathLabel(c)} old={c.old} new={c.new} format={c.change}>
           {c.detail && c.detail.length > 0 && <ChangeList changes={c.detail} />}
         </DiffChange>
       ))}

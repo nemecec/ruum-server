@@ -1,31 +1,49 @@
+// Dates, times, numbers, sizes and labels in the locale of the UI (design 12.4). The numbers and
+// dates come from `Intl` with the current locale; the words come from the catalogue.
 import type { Schemas } from '../api/client'
+import { currentIntl, labels, t, type MessageKey } from '../i18n'
 
+const sizeUnits = ['format.size.kb', 'format.size.mb', 'format.size.gb', 'format.size.tb'] as const
+
+/** "512 B", "1.5 MB", "12 GB" (one decimal under 10). */
 export function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
+  const intl = currentIntl()
+  if (n < 1024) return t('format.size.b', { n: intl.formatNumber(n) })
   let v = n / 1024
   let i = 0
-  while (v >= 1024 && i < units.length - 1) {
+  while (v >= 1024 && i < sizeUnits.length - 1) {
     v /= 1024
     i++
   }
-  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`
+  const digits = v < 10 ? 1 : 0
+  const value = intl.formatNumber(digits ? v : Math.round(v), { minimumFractionDigits: digits, maximumFractionDigits: digits })
+  return t(sizeUnits[i], { n: value })
+}
+
+/** A number in the locale ("1,234" or "1 234"). */
+export function formatNumber(n: number): string {
+  return currentIntl().formatNumber(n)
 }
 
 /** "5 Nov 2026, 14:00" in the person's locale (24 h where the locale uses it). */
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return '-'
-  const d = new Date(iso)
-  return d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return currentIntl().formatDate(new Date(iso), { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
+/** "5 Nov 2026": a date without the time. */
+export function formatDay(iso: string | Date): string {
+  return currentIntl().formatDate(new Date(iso), { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
 /** "5 Nov, 14:00": a short date and time, for versions. */
 export function formatShortDate(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return currentIntl().formatDate(new Date(iso), { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-function time(d: Date): string {
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+/** "14:00" (or "2:00 PM"). */
+export function formatTime(d: Date | string): string {
+  return currentIntl().formatTime(new Date(d), { hour: '2-digit', minute: '2-digit' })
 }
 
 /**
@@ -34,80 +52,96 @@ function time(d: Date): string {
  */
 export function formatWhen(iso: string | null | undefined, now = new Date()): string {
   if (!iso) return '-'
+  return whenParts(iso, now).text
+}
+
+/**
+ * `formatWhen` and the kind of its text: `recent` ("5 minutes ago", today), `day` ("Yesterday at
+ * 14:00", a weekday with the time) or `date` (no time of day).
+ */
+export function whenParts(iso: string, now = new Date()): { text: string; kind: 'recent' | 'day' | 'date' } {
+  const kind = whenKind(iso, now)
+  return { text: whenText(iso, now), kind }
+}
+
+function whenKind(iso: string, now: Date): 'recent' | 'day' | 'date' {
+  const d = new Date(iso)
+  const s = Math.round((now.getTime() - d.getTime()) / 1000)
+  if (s < 0) return 'date'
+  if (s < 3600 || d.toDateString() === now.toDateString()) return 'recent'
+  return s < 7 * 86400 ? 'day' : 'date'
+}
+
+function whenText(iso: string, now: Date): string {
   const d = new Date(iso)
   const s = Math.round((now.getTime() - d.getTime()) / 1000)
   if (s < 0) return formatDate(iso)
-  if (s < 60) return 'Just now'
+  if (s < 60) return t('format.when.now')
   const m = Math.floor(s / 60)
-  if (m < 60) return m === 1 ? '1 minute ago' : `${m} minutes ago`
+  if (m < 60) return t('format.when.minutes', { n: m })
   const h = Math.floor(m / 60)
   const sameDay = d.toDateString() === now.toDateString()
-  if (sameDay) return h === 1 ? '1 hour ago' : `${h} hours ago`
+  if (sameDay) return t('format.when.hours', { n: h })
   const yesterday = new Date(now)
   yesterday.setDate(now.getDate() - 1)
-  if (d.toDateString() === yesterday.toDateString()) return `Yesterday at ${time(d)}`
-  if (s < 7 * 86400) return `${d.toLocaleDateString(undefined, { weekday: 'long' })} at ${time(d)}`
-  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+  if (d.toDateString() === yesterday.toDateString()) return t('format.when.yesterday', { time: formatTime(d) })
+  if (s < 7 * 86400) return t('format.when.weekday', { day: currentIntl().formatDate(d, { weekday: 'long' }), time: formatTime(d) })
+  return formatDay(d)
 }
 
-/** "1 item", "3 items". */
-export function count(n: number, one: string, many = `${one}s`): string {
-  return `${n} ${n === 1 ? one : many}`
-}
-
-export const roleLabels: Record<Schemas['Role'], string> = {
-  view: 'Can view',
-  comment: 'Can comment',
-  edit: 'Can edit',
-  manage: 'Can manage',
-}
+export const roleLabels: Record<Schemas['Role'], string> = labels({
+  view: 'role.view',
+  comment: 'role.comment',
+  edit: 'role.edit',
+  manage: 'role.manage',
+})
 
 /** The one-line meaning of each role (copy.md 3.3). */
-export const roleMeanings: Record<Schemas['Role'], string> = {
-  view: 'see and download',
-  comment: 'see and comment',
-  edit: 'change, upload and rename',
-  manage: 'also move, delete and share',
-}
+export const roleMeanings: Record<Schemas['Role'], string> = labels({
+  view: 'role.view.meaning',
+  comment: 'role.comment.meaning',
+  edit: 'role.edit.meaning',
+  manage: 'role.manage.meaning',
+})
 
-export const memberRoleLabels: Record<Schemas['MemberRole'], string> = {
-  guest: 'Guest',
-  member: 'Member',
-  admin: 'Admin',
-  owner: 'Owner',
-}
+export const memberRoleLabels: Record<Schemas['MemberRole'], string> = labels({
+  guest: 'memberRole.guest',
+  member: 'memberRole.member',
+  admin: 'memberRole.admin',
+  owner: 'memberRole.owner',
+})
 
 /** The one-line meaning of each member role (copy.md 3.6). */
-export const memberRoleMeanings: Record<Schemas['MemberRole'], string> = {
-  owner: 'everything, including billing and deleting the space',
-  admin: 'manage members, sharing rules and all agents',
-  member: 'can see, change, delete and share everything in the team space',
-  guest: 'sees only what is shared with them; the role for limiting someone to some folders',
-}
+export const memberRoleMeanings: Record<Schemas['MemberRole'], string> = labels({
+  owner: 'memberRole.owner.meaning',
+  admin: 'memberRole.admin.meaning',
+  member: 'memberRole.member.meaning',
+  guest: 'memberRole.guest.meaning',
+})
 
-const typeNames: [RegExp, string][] = [
-  [/^text\/plain/, 'Text file'],
-  [/^text\/markdown/, 'Markdown file'],
-  [/^text\/csv/, 'Spreadsheet (CSV)'],
-  [/^text\/html/, 'Web page'],
-  [/^text\//, 'Text file'],
-  [/^image\//, 'Picture'],
-  [/^video\//, 'Video'],
-  [/^audio\//, 'Audio'],
-  [/^application\/pdf/, 'PDF document'],
-  [/^application\/json/, 'Data file (JSON)'],
-  [/xml/, 'Data file (XML)'],
-  [/zip|tar|gzip|compressed/, 'Archive'],
-  [/spreadsheet|excel/, 'Spreadsheet'],
-  [/wordprocessing|msword|opendocument\.text/, 'Document'],
-  [/presentation|powerpoint/, 'Presentation'],
+const typeNames: [RegExp, MessageKey][] = [
+  [/^text\/plain/, 'fileType.text'],
+  [/^text\/markdown/, 'fileType.markdown'],
+  [/^text\/csv/, 'fileType.csv'],
+  [/^text\/html/, 'fileType.html'],
+  [/^text\//, 'fileType.text'],
+  [/^image\//, 'fileType.image'],
+  [/^video\//, 'fileType.video'],
+  [/^audio\//, 'fileType.audio'],
+  [/^application\/pdf/, 'fileType.pdf'],
+  [/^application\/json/, 'fileType.json'],
+  [/xml/, 'fileType.xml'],
+  [/zip|tar|gzip|compressed/, 'fileType.archive'],
+  [/spreadsheet|excel/, 'fileType.spreadsheet'],
+  [/wordprocessing|msword|opendocument\.text/, 'fileType.document'],
+  [/presentation|powerpoint/, 'fileType.presentation'],
 ]
 
 /** A plain name of a file type ("Text file", "Picture"), never a MIME type. */
 export function fileTypeLabel(node: { kind: string; type?: string | null; name: string }): string {
-  if (node.kind === 'folder') return 'Folder'
-  const t = node.type ?? ''
-  for (const [re, label] of typeNames) if (re.test(t)) return label
+  if (node.kind === 'folder') return t('fileType.folder')
+  const type = node.type ?? ''
+  for (const [re, key] of typeNames) if (re.test(type)) return t(key)
   const ext = /\.([a-z0-9]{1,8})$/i.exec(node.name)?.[1]
-  return ext ? `${ext.toUpperCase()} file` : 'File'
+  return ext ? t('fileType.extension', { ext: ext.toUpperCase() }) : t('fileType.file')
 }

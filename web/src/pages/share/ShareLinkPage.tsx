@@ -3,7 +3,7 @@ import { useLocation } from 'react-router'
 import { client, linkClient, RuumApiError, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { browser } from '../../app/browser'
-import { fileTypeLabel, formatBytes, formatDate, formatWhen, roleLabels } from '../../components/format'
+import { fileTypeLabel, formatBytes, formatDate, formatWhen } from '../../components/format'
 import {
   TopBar,
   Table,
@@ -33,6 +33,7 @@ import {
   Tr,
   VisuallyHidden,
 } from '../../ui'
+import { t } from '../../i18n'
 
 type Node = Schemas['Node']
 type Resolved = Schemas['ResolvedShareLink']
@@ -82,26 +83,26 @@ export function ShareLinkPage() {
   return (
     <>
       <TopBar>
-        <Brand>Ruum</Brand>
+        <Brand>{t('app.name')}</Brand>
         {state.step === 'ready' && (
           <Text as="span" tone="muted" size="sm">
-            You're viewing as anyone with the link. You can {roleLabels[state.link.role].replace('Can ', '')}.
+            {t('link.viewing', { role: state.link.role })}
           </Text>
         )}
       </TopBar>
       <AppMain>
-        {state.step === 'resolving' && <Loading label="Opening the link" />}
+        {state.step === 'resolving' && <Loading label={t('link.opening')} />}
         {state.step === 'ended' && (
           <Page narrow as="div">
-            <h1>This link doesn't work any more</h1>
-            <p>Ask the person who sent it for a new one.</p>
+            <h1>{t('link.ended.title')}</h1>
+            <p>{t('link.ended.text')}</p>
           </Page>
         )}
         {state.step === 'failed' && (
           <Page narrow as="div">
-            <h1>Ruum couldn't open this link</h1>
+            <h1>{t('link.failed.title')}</h1>
             <ErrorNote error={state.error} />
-            <Button onClick={() => resolve()}>Try again</Button>
+            <Button onClick={() => resolve()}>{t('common.tryAgain')}</Button>
           </Page>
         )}
         {state.step === 'password' && <PasswordForm wrong={state.wrong} onSubmit={(p) => resolve(p)} />}
@@ -119,8 +120,8 @@ function PasswordForm({ wrong, onSubmit }: { wrong: boolean; onSubmit: (password
   }
   return (
     <Page narrow as="form" onSubmit={submit}>
-      <h1>This link has a password</h1>
-      <Field label="Password">
+      <h1>{t('link.password.title')}</h1>
+      <Field label={t('link.password')}>
         <TextInput
           type="password"
           required
@@ -132,12 +133,12 @@ function PasswordForm({ wrong, onSubmit }: { wrong: boolean; onSubmit: (password
       </Field>
       {wrong && (
         <Text tone="danger" role="alert">
-          That password isn't right. Try again.
+          {t('link.password.wrong')}
         </Text>
       )}
       <Actions align="start">
         <Button variant="primary" type="submit">
-          Open
+          {t('link.open')}
         </Button>
       </Actions>
     </Page>
@@ -189,19 +190,19 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
       <Page narrow as="div">
         <h1>{current.name}</h1>
         <Facts>
-          <dt>Type</dt>
+          <dt>{t('details.type')}</dt>
           <dd>{fileTypeLabel(current)}</dd>
-          <dt>Size</dt>
+          <dt>{t('files.size')}</dt>
           <dd>{formatBytes(current.size_bytes)}</dd>
-          <dt>Changed</dt>
+          <dt>{t('files.changed')}</dt>
           <dd title={formatDate(current.updated_at)}>{formatWhen(current.updated_at)}</dd>
         </Facts>
         <ErrorNote error={error} />
         <Actions align="start">
           <Button variant="primary" onClick={() => open(current, 'attachment')}>
-            Download
+            {t('common.download')}
           </Button>
-          <Button onClick={() => open(current, 'inline')}>Preview</Button>
+          <Button onClick={() => open(current, 'inline')}>{t('details.preview')}</Button>
         </Actions>
       </Page>
     )
@@ -227,20 +228,20 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
       <Loaded state={children}>
         {(items) =>
           items.length === 0 ? (
-            <EmptyState title="This folder is empty" />
+            <EmptyState title={t('files.empty.title')} />
           ) : (
-            <Table caption="Contents of this folder">
+            <Table caption={t('files.table.caption')}>
               <THead>
                 <Tr>
-                  <Th scope="col">Name</Th>
+                  <Th scope="col">{t('common.name')}</Th>
                   <Th hideNarrow scope="col">
-                    Size
+                    {t('files.size')}
                   </Th>
                   <Th hideNarrow scope="col">
-                    Changed
+                    {t('files.changed')}
                   </Th>
                   <Th scope="col">
-                    <VisuallyHidden>Actions</VisuallyHidden>
+                    <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
                   </Th>
                 </Tr>
               </THead>
@@ -262,8 +263,8 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
                     </Td>
                     <Td actions>
                       {n.kind === 'file' && (
-                        <Button aria-label={`Download ${n.name}`} onClick={() => open(n, 'attachment')}>
-                          Download
+                        <Button aria-label={t('common.download.named', { name: n.name })} onClick={() => open(n, 'attachment')}>
+                          {t('common.download')}
                         </Button>
                       )}
                     </Td>

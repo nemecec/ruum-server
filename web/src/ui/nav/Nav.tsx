@@ -1,14 +1,15 @@
 import type { ReactNode } from 'react'
 import { NavLink } from 'react-router'
 import './nav.css'
+import { t } from '../../i18n'
 
 /**
  * Breadcrumbs (design-system 4.3): a `nav` with an ordered list; the separators are CSS, not text.
  * The last crumb is the current place, with `aria-current`.
  */
-export function Breadcrumbs({ label = 'Breadcrumbs', hidden, children }: { label?: string; hidden?: boolean; children: ReactNode }) {
+export function Breadcrumbs({ label, hidden, children }: { label?: string; hidden?: boolean; children: ReactNode }) {
   return (
-    <nav aria-label={label} className="ui-breadcrumbs" hidden={hidden}>
+    <nav aria-label={label ?? t('ui.breadcrumbs')} className="ui-breadcrumbs" hidden={hidden}>
       <ol>{children}</ol>
     </nav>
   )

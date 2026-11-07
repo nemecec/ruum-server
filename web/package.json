@@ -19,10 +19,12 @@
     "e2e:typecheck": "tsc -p e2e/tsconfig.json"
   },
   "dependencies": {
+    "@formatjs/icu-messageformat-parser": "3.5.22",
     "@noble/hashes": "2.0.1",
     "openapi-fetch": "^0.17.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
+    "react-intl": "12.1.5",
     "react-router": "^7.18.5"
   },
   "devDependencies": {

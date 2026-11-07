@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { client, unwrap } from '../api/client'
 import { actorLabel, NamesContext, useNames, type ActorLike, type AgentInfo, type Names, type Person } from './useNames'
 import { AgentName } from '../ui'
+import { t } from '../i18n'
 
 /** Loads the names of a space: members (if the person may list them) and agents. */
 export function NamesProvider(props: {
@@ -95,5 +96,5 @@ export function Actor({ pair }: { pair: ActorLike }) {
   const names = useNames()
   const { text, agent } = actorLabel(names, pair.actor, pair.on_behalf_of, pair.on_behalf_of_display_name)
   if (!agent) return <span>{text}</span>
-  return <AgentName srText=" (an agent)">{text}</AgentName>
+  return <AgentName srText={t('actor.agentSr')}>{text}</AgentName>
 }

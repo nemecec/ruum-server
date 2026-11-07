@@ -30,12 +30,13 @@ import { browser } from './browser'
 import { NamesProvider } from './names'
 import { useSession } from './useSession'
 import { lastTenant, rememberTenant, TenantContext, tenantPath } from './tenant'
+import { t } from '../i18n'
 
 /** `/`: goes to the files of the last space, or of the personal space. */
 export function HomeRedirect() {
   const { me, tenants } = useSession()
   const last = lastTenant()
-  const id = tenants.some((t) => t.tenant.id === last) ? last! : me.user.home_tenant_id
+  const id = tenants.some((m) => m.tenant.id === last) ? last! : me.user.home_tenant_id
   return <Navigate to={tenantPath(id, 'files')} replace />
 }
 
@@ -43,7 +44,7 @@ export function HomeRedirect() {
 export function AccountRedirect() {
   const { me, tenants } = useSession()
   const last = lastTenant()
-  const id = tenants.some((t) => t.tenant.id === last) ? last! : me.user.home_tenant_id
+  const id = tenants.some((m) => m.tenant.id === last) ? last! : me.user.home_tenant_id
   return <Navigate to={tenantPath(id, 'account')} replace />
 }
 
@@ -57,7 +58,7 @@ function sharedSpace(id: string): Schemas['TenantMembership'] {
     role: 'guest',
     tenant: {
       id,
-      name: 'A shared space',
+      name: t('shell.sharedSpace'),
       kind: 'team',
       plan: 'free',
       region: '',
@@ -78,7 +79,7 @@ function sharedSpace(id: string): Schemas['TenantMembership'] {
 export function TenantLayout() {
   const { tenantId = '' } = useParams()
   const { tenants, me } = useSession()
-  const listed = tenants.find((t) => t.tenant.id === tenantId)
+  const listed = tenants.find((m) => m.tenant.id === tenantId)
   const membership = listed ?? sharedSpace(tenantId)
 
   // Set the tenant header before the pages below load their data (their effects run first).
@@ -97,7 +98,7 @@ export function TenantLayout() {
         <Header tenantId={tenantId} isAdmin={isAdmin} unlisted={listed ? null : membership}>
           {/* Only for a guest of the space. A space that is not in the person's list is not theirs at
               all yet: the pages say so (NotInSpaceYet), and a banner that says "guest" would contradict them. */}
-          {listed?.role === 'guest' && <Note role="note">You're a guest here. You see only what people shared with you.</Note>}
+          {listed?.role === 'guest' && <Note role="note">{t('shell.guestBanner')}</Note>}
           <Outlet key={tenantId} />
         </Header>
       </NamesProvider>
@@ -106,9 +107,9 @@ export function TenantLayout() {
 }
 
 /** The words after a space's name in the switcher: its kind and the person's role. */
-function spaceLabel(t: Schemas['TenantMembership']): string {
-  if (t.tenant.kind === 'personal' && t.role === 'owner') return `${t.tenant.name} (personal)`
-  return `${t.tenant.name} (${memberRoleLabels[t.role].toLowerCase()})`
+function spaceLabel(m: Schemas['TenantMembership']): string {
+  if (m.tenant.kind === 'personal' && m.role === 'owner') return t('shell.space.personal', { name: m.tenant.name })
+  return t('shell.space.role', { name: m.tenant.name, role: memberRoleLabels[m.role].toLowerCase() })
 }
 
 const NEW_TEAM = '__new_team'
@@ -178,34 +179,34 @@ function Header({
   return (
     <>
       <TopBar>
-        <Brand to={tenantPath(tenantId, 'files')}>Ruum</Brand>
+        <Brand to={tenantPath(tenantId, 'files')}>{t('app.name')}</Brand>
         <TopBarItem grow>
-          <Field label="Space" labelHidden>
+          <Field label={t('shell.space')} labelHidden>
             <Select value={tenantId} onChange={(e) => switchTenant(e.target.value)}>
-              {options.map((t) => (
-                <option key={t.tenant.id} value={t.tenant.id}>
-                  {t === unlisted ? `${t.tenant.name} (shared with you)` : spaceLabel(t)}
+              {options.map((m) => (
+                <option key={m.tenant.id} value={m.tenant.id}>
+                  {m === unlisted ? t('shell.space.shared', { name: m.tenant.name }) : spaceLabel(m)}
                 </option>
               ))}
-              <option value={NEW_TEAM}>Start a team space...</option>
+              <option value={NEW_TEAM}>{t('shell.space.startTeam')}</option>
             </Select>
           </Field>
         </TopBarItem>
-        <SearchForm id="global-search" label="Search by name" name="q" defaultValue={shownQuery} onSubmit={search} />
+        <SearchForm id="global-search" label={t('shell.search')} name="q" defaultValue={shownQuery} onSubmit={search} />
         <MenuToggle open={menuOpen} controls="main-nav" onToggle={() => setMenuOpen((o) => !o)} />
       </TopBar>
       <AppBody>
-        <NavRail id="main-nav" label="Main" open={menuOpen}>
+        <NavRail id="main-nav" label={t('shell.nav')} open={menuOpen}>
           <NavList>
-            {link('files', 'Files')}
-            {link('shared', 'Shared with me')}
-            {link('trash', 'Trash')}
-            {link('agents', 'Agents')}
-            {isAdmin && link('admin', 'Space settings')}
+            {link('files', t('shell.nav.files'))}
+            {link('shared', t('shell.nav.shared'))}
+            {link('trash', t('shell.nav.trash'))}
+            {link('agents', t('shell.nav.agents'))}
+            {isAdmin && link('admin', t('shell.nav.admin'))}
           </NavList>
           <NavList end>
             {link('account', me.user.display_name)}
-            <NavButton onClick={signOut}>Sign out</NavButton>
+            <NavButton onClick={signOut}>{t('shell.signOut')}</NavButton>
           </NavList>
           <ErrorNote error={signOutError} />
         </NavRail>
@@ -230,11 +231,11 @@ export function StartTeamDialog({ onClose }: { onClose: () => void }) {
     setBusy(true)
     setError(undefined)
     try {
-      const t = await unwrap(client.POST('/v1/tenants', { body: { name: name.trim() } }))
+      const created = await unwrap(client.POST('/v1/tenants', { body: { name: name.trim() } }))
       await reloadTenants()
       onClose()
-      navigate(tenantPath(t.id, 'admin', 'invitations'))
-      toast(`${t.name} is ready. Invite the people you work with.`)
+      navigate(tenantPath(created.id, 'admin', 'invitations'))
+      toast(t('shell.startTeam.done', { name: created.name }))
     } catch (err) {
       setError(err)
       setBusy(false)
@@ -242,16 +243,16 @@ export function StartTeamDialog({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <Dialog title="Start a team space" open onClose={onClose}>
+    <Dialog title={t('shell.startTeam.title')} open onClose={onClose}>
       <Stack as="form" gap={4} onSubmit={submit}>
-        <Field label="Team name" hint="You'll be the owner. You can invite people next.">
-          <TextInput required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} placeholder="Pärn Studio" />
+        <Field label={t('shell.startTeam.name')} hint={t('shell.startTeam.hint')}>
+          <TextInput required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} placeholder={t('shell.startTeam.placeholder')} />
         </Field>
         <ErrorNote error={error} />
         <Actions>
-          <Button onClick={onClose}>Cancel</Button>
+          <Button onClick={onClose}>{t('common.cancel')}</Button>
           <Button type="submit" variant="primary" disabled={busy || !name.trim()} busy={busy}>
-            Create team space
+            {t('shell.startTeam.submit')}
           </Button>
         </Actions>
       </Stack>

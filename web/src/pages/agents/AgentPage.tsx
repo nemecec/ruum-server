@@ -5,7 +5,7 @@ import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useNames } from '../../app/useNames'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { count, formatDate, formatWhen } from '../../components/format'
+import { formatDate, formatWhen } from '../../components/format'
 import { ScopeFields } from './ScopeFields'
 import { accessSummary, agentStatus } from './status'
 import {
@@ -37,6 +37,7 @@ import {
   Toolbar,
   useToast,
 } from '../../ui'
+import { t, tr, type MessageKey } from '../../i18n'
 
 type Entry = Schemas['JournalEntry']
 type NodeInfo = { name: string; kind: string; parentId: string | null; tenantId: string }
@@ -49,7 +50,7 @@ function useNodeInfo(ids: string[]) {
       ids.slice(0, 60).map(async (id) => {
         try {
           const n = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: id } } }))
-          out[id] = { name: n.parent_id ? n.name : 'Files', kind: n.kind, parentId: n.parent_id, tenantId: n.tenant_id }
+          out[id] = { name: n.parent_id ? n.name : t('shell.nav.files'), kind: n.kind, parentId: n.parent_id, tenantId: n.tenant_id }
         } catch {
           // Purged, or out of the person's view: the entry keeps the name from its own data.
         }
@@ -61,50 +62,55 @@ function useNodeInfo(ids: string[]) {
 
 const str = (v: unknown) => (typeof v === 'string' ? v : null)
 
-/** "Created notes.md in Pärna 12" (copy.md 3.5, activity verbs). */
-function describe(
-  e: Entry | Schemas['UndoItem'],
-  info: Record<string, NodeInfo>,
-): { verb: string; name: string | null; where: string | null } {
+type Described = { key: MessageKey; name: string | null; values: Record<string, string> }
+
+/** "Created notes.md in Pärna 12" (copy.md 3.5, activity verbs): a message with `{name}` for the item. */
+function describe(e: Entry | Schemas['UndoItem'], info: Record<string, NodeInfo>): Described {
   const data = 'data' in e ? e.data : {}
   const node = e.node_id ? info[e.node_id] : undefined
   const name = node?.name ?? str(data.name) ?? str(data.new_name) ?? null
   const parent = (id: unknown) => (typeof id === 'string' ? (info[id]?.name ?? null) : null)
+  const where = (id: unknown) => {
+    const w = parent(id)
+    return { hasWhere: w ? 'yes' : 'no', where: w ?? '' }
+  }
   switch (e.type) {
     case 'node.created':
-      return { verb: 'Created', name, where: parent(data.parent_id) }
+      return { key: 'activity.created', name, values: where(data.parent_id) }
     case 'node.renamed':
-      return { verb: `Renamed ${str(data.old_name) ?? ''} to`, name: str(data.new_name) ?? name, where: null }
+      return { key: 'activity.renamed', name: str(data.new_name) ?? name, values: { old: str(data.old_name) ?? '' } }
     case 'node.moved':
-      return { verb: 'Moved', name, where: parent(data.new_parent_id) }
+      return { key: 'activity.moved', name, values: where(data.new_parent_id) }
     case 'node.copied':
-      return { verb: 'Copied', name, where: null }
+      return { key: 'activity.copied', name, values: {} }
     case 'node.trashed':
-      return { verb: 'Moved to the trash:', name, where: null }
+      return { key: 'activity.trashed', name, values: {} }
     case 'node.restored':
-      return { verb: 'Restored from the trash:', name, where: null }
+      return { key: 'activity.restored', name, values: {} }
     case 'node.purged':
-      return { verb: 'Deleted for good:', name, where: null }
+      return { key: 'activity.purged', name, values: {} }
     case 'version.created':
-      return { verb: 'Changed (new version)', name, where: null }
+      return { key: 'activity.versionCreated', name, values: {} }
     case 'version.restored':
-      return { verb: 'Restored a version of', name, where: null }
+      return { key: 'activity.versionRestored', name, values: {} }
     case 'tag.attached':
-      return { verb: `Added the tag ${str(data.tag_name) ?? ''} to`, name, where: null }
+      return { key: 'activity.tagAttached', name, values: { tag: str(data.tag_name) ?? '' } }
     case 'tag.detached':
-      return { verb: `Removed the tag ${str(data.tag_name) ?? ''} from`, name, where: null }
+      return { key: 'activity.tagDetached', name, values: { tag: str(data.tag_name) ?? '' } }
     case 'grant.added':
-      return { verb: 'Gave access to', name, where: null }
+      return { key: 'activity.grantAdded', name, values: {} }
     case 'grant.removed':
-      return { verb: 'Removed access to', name, where: null }
+      return { key: 'activity.grantRemoved', name, values: {} }
     default:
-      return { verb: 'Changed', name, where: null }
+      return { key: 'activity.changed', name, values: {} }
   }
 }
 
 function describePlain(e: Entry, info: Record<string, NodeInfo>): string {
   const d = describe(e, info)
-  return [d.verb, d.name, d.where ? `in ${d.where}` : null].filter(Boolean).join(' ')
+  return t(d.key, { ...d.values, name: d.name ?? '' })
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function DescribeText({ e, info }: { e: Entry | Schemas['UndoItem']; info: Record<string, NodeInfo> }) {
@@ -117,12 +123,8 @@ function DescribeText({ e, info }: { e: Entry | Schemas['UndoItem']; info: Recor
         ? tenantPath(node.tenantId, 'files', e.node_id)
         : tenantPath(tenant.id, 'item', e.node_id)
       : null
-  return (
-    <>
-      {d.verb} {d.name && (target ? <Link to={target}>{d.name}</Link> : <strong>{d.name}</strong>)}
-      {d.where && <> in {d.where}</>}
-    </>
-  )
+  const name = d.name ? target ? <Link to={target}>{d.name}</Link> : <strong>{d.name}</strong> : ''
+  return <>{tr(d.key, { ...d.values, name })}</>
 }
 
 // Entries that this browser undid. The activity list keeps them (the journal is append-only), so
@@ -163,7 +165,7 @@ export function AgentPage() {
     setError(undefined)
     try {
       await unwrap(client.POST('/v1/agents/{agent_id}/enable', { params: { path: { agent_id: a.id } } }))
-      toast(`Resumed ${a.name}.`)
+      toast(t('agent.resumed', { name: a.name }))
       agent.reload()
     } catch (e) {
       setError(e)
@@ -173,7 +175,7 @@ export function AgentPage() {
   return (
     <PageBody>
       <p>
-        <Link to={tenantPath(tenant.id, 'agents')}>Agents</Link>
+        <Link to={tenantPath(tenant.id, 'agents')}>{t('shell.nav.agents')}</Link>
       </p>
       <Loaded state={agent}>
         {(a) => (
@@ -184,18 +186,18 @@ export function AgentPage() {
               </h1>
               {a.disabled_at ? (
                 <Button variant="primary" onClick={() => resume(a)}>
-                  Resume
+                  {t('agent.resume')}
                 </Button>
               ) : (
-                <Button onClick={() => setPausing(true)}>Pause</Button>
+                <Button onClick={() => setPausing(true)}>{t('agent.pause')}</Button>
               )}
             </Toolbar>
             <Text tone="muted">
-              {a.name} for {names.person(a.owner_id)?.name ?? 'someone'} <Badge>{agentStatus(a)}</Badge>
+              {t('agent.for', { name: a.name, person: names.person(a.owner_id)?.name ?? t('agent.someone') })} <Badge>{agentStatus(a)}</Badge>
               {a.description ? ` ${a.description}` : ''}
             </Text>
-            {a.disabled_at && <Note>Paused. Its keys and connections don't work until you resume it.</Note>}
-            {justCreated && <Note>Agent created. Create a key for it below.</Note>}
+            {a.disabled_at && <Note>{t('agent.pausedNote')}</Note>}
+            {justCreated && <Note>{t('agent.created')}</Note>}
             <ErrorNote error={error} />
             <Columns>
               <AccessSection agent={a} onSaved={agent.reload} />
@@ -204,13 +206,13 @@ export function AgentPage() {
             <ActivitySection agent={a} />
             {pausing && (
               <ConfirmDialog
-                title={`Pause ${a.name}?`}
-                message="It can't read or change anything until you resume it. Its history stays."
-                confirmLabel="Pause"
+                title={t('agent.pause.title', { name: a.name })}
+                message={t('agent.pause.message')}
+                confirmLabel={t('agent.pause')}
                 onClose={() => setPausing(false)}
                 onConfirm={async () => {
                   await unwrap(client.POST('/v1/agents/{agent_id}/disable', { params: { path: { agent_id: a.id } } }))
-                  toast(`Paused ${a.name}.`)
+                  toast(t('agent.paused', { name: a.name }))
                   agent.reload()
                 }}
               />
@@ -240,7 +242,7 @@ function AccessSection({ agent, onSaved }: { agent: Schemas['Agent']; onSaved: (
     setError(undefined)
     try {
       await unwrap(client.PATCH('/v1/agents/{agent_id}', { params: { path: { agent_id: agent.id } }, body: { scope } }))
-      toast('Saved the access.')
+      toast(t('agent.access.saved'))
       setEditing(false)
       onSaved()
     } catch (err) {
@@ -250,21 +252,21 @@ function AccessSection({ agent, onSaved }: { agent: Schemas['Agent']; onSaved: (
   return (
     <Card aria-labelledby="scope-title">
       <Toolbar>
-        <h2 id="scope-title">Access</h2>
-        {!editing && <Button onClick={() => (setScope(agent.scope), setEditing(true))}>Change access</Button>}
+        <h2 id="scope-title">{t('share.access')}</h2>
+        {!editing && <Button onClick={() => (setScope(agent.scope), setEditing(true))}>{t('agent.access.change')}</Button>}
       </Toolbar>
-      <p>{accessSummary(agent.scope, folder.data?.name ?? null, tenant.name)}.</p>
+      <p>{t('consent.summary', { summary: accessSummary(agent.scope, folder.data?.name ?? null, tenant.name) })}</p>
       <Text tone="muted" size="sm">
-        An agent never gets more access than its person has.
+        {t('agent.access.never')}
       </Text>
       {editing && (
         <Stack as="form" onSubmit={submit}>
           <ScopeFields tenantId={tenant.id} spaceName={tenant.name} scope={scope} onChange={setScope} idPrefix="edit" />
           <ErrorNote error={error} />
           <Actions>
-            <Button onClick={() => setEditing(false)}>Cancel</Button>
+            <Button onClick={() => setEditing(false)}>{t('common.cancel')}</Button>
             <Button variant="primary" type="submit" disabled={scope.subtree === ''}>
-              Save access
+              {t('agent.access.save')}
             </Button>
           </Actions>
         </Stack>
@@ -303,8 +305,8 @@ function KeysSection({ agent }: { agent: Schemas['Agent'] }) {
   return (
     <Card aria-labelledby="keys-title">
       <Toolbar>
-        <h2 id="keys-title">Keys</h2>
-        <Button onClick={() => (setSecret(null), setCreating(true))}>New key</Button>
+        <h2 id="keys-title">{t('agent.keys')}</h2>
+        <Button onClick={() => (setSecret(null), setCreating(true))}>{t('agent.keys.new')}</Button>
       </Toolbar>
       <Loaded state={keys}>
         {({ items }) => {
@@ -313,23 +315,25 @@ function KeysSection({ agent }: { agent: Schemas['Agent'] }) {
             <List>
               {live.length === 0 && (
                 <Text as="li" tone="muted">
-                  No keys. Apps that connect with sign-in (OAuth) don't need a key.
+                  {t('agent.keys.none')}
                 </Text>
               )}
               {live.map((k) => (
                 <ListRow key={k.id}>
                   <Grow>
-                    {k.name || 'Key'} <code>{k.prefix}...</code>
+                    {k.name || t('agent.key')} <code>{k.prefix}...</code>
                     <Text as="span" tone="muted" size="sm" block>
-                      Ends {formatDate(k.expires_at)}, last used {k.last_used_at ? formatWhen(k.last_used_at).toLowerCase() : 'never'}
+                      {k.last_used_at
+                        ? t('agent.key.facts', { ends: formatDate(k.expires_at), used: formatWhen(k.last_used_at).toLowerCase() })
+                        : t('agent.key.facts.unused', { ends: formatDate(k.expires_at) })}
                     </Text>
                   </Grow>
                   <ConfirmButton
-                    label="Turn off"
-                    ariaLabel={`Turn off key ${k.prefix}`}
-                    title="Turn off this key?"
-                    message="Programs that use it stop working at once."
-                    confirmLabel="Turn off key"
+                    label={t('account.appPassword.off')}
+                    ariaLabel={t('agent.key.off.label', { prefix: k.prefix })}
+                    title={t('agent.key.off.title')}
+                    message={t('agent.key.off.message')}
+                    confirmLabel={t('agent.key.off.confirm')}
                     danger
                     onConfirm={async () => {
                       await unwrap(
@@ -345,26 +349,26 @@ function KeysSection({ agent }: { agent: Schemas['Agent'] }) {
         }}
       </Loaded>
       {creating && (
-        <Dialog title={`New key for ${agent.name}`} open onClose={() => setCreating(false)}>
+        <Dialog title={t('agent.key.new.title', { name: agent.name })} open onClose={() => setCreating(false)}>
           {secret ? (
             <Stack>
-              <SecretBox label="Key" secret={secret} note="Copy the key now. Ruum shows it only once." />
+              <SecretBox label={t('agent.key')} secret={secret} note={t('agent.key.note')} />
               <Actions>
                 <Button variant="primary" onClick={() => setCreating(false)}>
-                  Done
+                  {t('common.done')}
                 </Button>
               </Actions>
             </Stack>
           ) : (
             <Stack as="form" onSubmit={create}>
-              <Field label="Key name (optional)">
-                <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder="laptop" />
+              <Field label={t('agent.key.name')}>
+                <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder={t('agent.key.placeholder')} />
               </Field>
               <ErrorNote error={error} />
               <Actions>
-                <Button onClick={() => setCreating(false)}>Cancel</Button>
+                <Button onClick={() => setCreating(false)}>{t('common.cancel')}</Button>
                 <Button variant="primary" type="submit">
-                  Create key
+                  {t('agent.key.create')}
                 </Button>
               </Actions>
             </Stack>
@@ -377,10 +381,10 @@ function KeysSection({ agent }: { agent: Schemas['Agent'] }) {
 
 type UndoBody = Schemas['UndoRequest']
 
-const reasons: Record<NonNullable<Schemas['UndoItem']['reason']>, string> = {
-  changed_later: 'it was changed again later',
-  irreversible: "this can't be undone",
-  permission_denied: 'you no longer have access',
+const reasons: Record<NonNullable<Schemas['UndoItem']['reason']>, MessageKey> = {
+  changed_later: 'undo.reason.changedLater',
+  irreversible: 'undo.reason.irreversible',
+  permission_denied: 'undo.reason.permission',
 }
 
 function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
@@ -438,7 +442,9 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
     setReport(null)
     setSelected([])
     toast(
-      `Undid ${count(res.reverted.length, 'change')}.${res.skipped.length ? ` ${res.skipped.length} stayed as ${res.skipped.length === 1 ? 'it was' : 'they were'}.` : ''}`,
+      res.skipped.length
+        ? `${t('undo.done', { n: res.reverted.length })} ${t('undo.done.skipped', { n: res.skipped.length })}`
+        : t('undo.done', { n: res.reverted.length }),
     )
     activity.reload()
   }
@@ -447,16 +453,16 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
   return (
     <Card aria-labelledby="activity-title">
       <Toolbar>
-        <h2 id="activity-title">Activity</h2>
+        <h2 id="activity-title">{t('activity.title')}</h2>
         <Button onClick={dryRun} disabled={selected.length === 0 && open.length === 0}>
-          {selected.length ? `Undo ${count(selected.length, 'selected change')}...` : 'Undo all...'}
+          {selected.length ? t('undo.selected', { n: selected.length }) : t('undo.all')}
         </Button>
       </Toolbar>
       <ErrorNote error={error} />
       <Loaded state={activity}>
         {({ items }) =>
           items.length === 0 ? (
-            <EmptyState title={`${agent.name} hasn't changed anything yet`} text="Its changes show up here." />
+            <EmptyState title={t('activity.none.title', { name: agent.name })} text={t('activity.none.text')} />
           ) : (
             <List>
               {items.map((e) => {
@@ -464,14 +470,14 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
                 return (
                   <ListRow key={e.seq} undone={isUndone}>
                     <BareCheckbox
-                      aria-label={`Select: ${describePlain(e, info.data ?? {})}`}
+                      aria-label={t('activity.select', { what: describePlain(e, info.data ?? {}) })}
                       disabled={isUndone}
                       checked={selected.includes(e.seq)}
                       onChange={(ev) => setSelected((s) => (ev.target.checked ? [...s, e.seq] : s.filter((x) => x !== e.seq)))}
                     />
                     <ListRowMain>
                       <DescribeText e={e} info={info.data ?? {}} />
-                      {isUndone && <Badge>Undone</Badge>}
+                      {isUndone && <Badge>{t('activity.undone')}</Badge>}
                     </ListRowMain>
                     <Text as="span" tone="muted" size="sm" title={formatDate(e.at)}>
                       {formatWhen(e.at)}
@@ -486,8 +492,8 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
       <LoadMore state={activity} />
       {report && (
         <ConfirmDialog
-          title={n ? `Undo ${count(n, 'change')} by ${agent.name}?` : 'Nothing to undo'}
-          confirmLabel={n ? `Undo ${count(n, 'change')}` : 'Close'}
+          title={n ? t('undo.confirm.title', { n, name: agent.name }) : t('undo.nothing')}
+          confirmLabel={n ? t('undo.confirm', { n }) : t('ui.close')}
           danger={n > 0}
           onClose={() => setReport(null)}
           onConfirm={n ? confirm : () => setReport(null)}
@@ -495,7 +501,7 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
             <Stack>
               {n > 0 && (
                 <>
-                  <p>These changes will be undone:</p>
+                  <p>{t('undo.list.reverted')}</p>
                   <ul>
                     {report.result.reverted.map((r) => (
                       <li key={r.seq}>
@@ -507,11 +513,11 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
               )}
               {report.result.skipped.length > 0 && (
                 <>
-                  <p>These stay as they are:</p>
+                  <p>{t('undo.list.skipped')}</p>
                   <ul>
                     {report.result.skipped.map((s) => (
                       <li key={s.seq}>
-                        <DescribeText e={s} info={info.data ?? {}} />: {s.reason ? reasons[s.reason] : 'skipped'}
+                        <DescribeText e={s} info={info.data ?? {}} />: {s.reason ? t(reasons[s.reason]) : t('undo.reason.skipped')}
                       </li>
                     ))}
                   </ul>

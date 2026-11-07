@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { Fragment, useState, type FormEvent } from 'react'
 import { Link, Outlet } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
@@ -8,7 +8,7 @@ import { tenantPath, useTenant } from '../../app/tenant'
 import { Actor } from '../../app/names'
 import { useNames } from '../../app/useNames'
 import { StartTeamDialog } from '../../app/Shell'
-import { formatBytes, formatDate, formatWhen, memberRoleLabels, memberRoleMeanings } from '../../components/format'
+import { formatBytes, formatDate, formatDay, formatNumber, formatWhen, memberRoleLabels, memberRoleMeanings } from '../../components/format'
 import { auditDetail, auditText } from './audit'
 import {
   Meter,
@@ -47,6 +47,7 @@ import {
   useToast,
   VisuallyHidden,
 } from '../../ui'
+import { t, tr, type MessageKey } from '../../i18n'
 
 /** The tenant admin layout: a sub-navigation and one admin page. */
 export function AdminLayout() {
@@ -54,22 +55,22 @@ export function AdminLayout() {
   if (!isAdmin) {
     return (
       <PageBody>
-        <h1>Space settings</h1>
-        <p>Only admins and owners of {tenant.name} can open these pages.</p>
+        <h1>{t('shell.nav.admin')}</h1>
+        <p>{t('admin.only', { space: tenant.name })}</p>
       </PageBody>
     )
   }
-  const tabs: [string, string][] = [
-    ['members', 'Members'],
-    ['invitations', 'Invitations'],
-    ['policy', 'Sharing rules'],
-    ['limits', 'Plan'],
-    ['audit', 'Activity log'],
+  const tabs: [string, MessageKey][] = [
+    ['members', 'admin.members'],
+    ['invitations', 'admin.invitations'],
+    ['policy', 'admin.policy'],
+    ['limits', 'admin.plan'],
+    ['audit', 'admin.audit'],
   ]
   return (
     <PageBody>
-      <h1>Space settings: {tenant.name}</h1>
-      <Tabs label="Admin" items={tabs.map(([to, label]) => ({ to, label }))} />
+      <h1>{t('admin.title', { space: tenant.name })}</h1>
+      <Tabs label={t('admin.tabs')} items={tabs.map(([to, label]) => ({ to, label: t(label) }))} />
       <Outlet />
     </PageBody>
   )
@@ -103,7 +104,7 @@ export function MembersPage() {
           body: { role },
         }),
       )
-      toast(`${m.display_name} is now ${memberRoleLabels[role].toLowerCase()}.`)
+      toast(t('members.changed', { name: m.display_name, role: memberRoleLabels[role].toLowerCase() }))
     } catch (e) {
       setError(e)
     }
@@ -112,34 +113,37 @@ export function MembersPage() {
 
   return (
     <section aria-labelledby="members-title">
-      <h2 id="members-title">Members</h2>
+      <h2 id="members-title">{t('admin.members')}</h2>
       <ErrorNote error={error} />
       {toGuest && (
         <ConfirmDialog
-          title={`Make ${toGuest.display_name} a guest?`}
+          title={t('members.toGuest.title', { name: toGuest.display_name })}
           message={
             <p>
-              {toGuest.display_name} then sees only the items that are shared with them directly, and loses access to everything else in{' '}
-              {tenant.name} at once. You can make them a {memberRoleLabels[toGuest.role].toLowerCase()} again later.
+              {t('members.toGuest.message', {
+                name: toGuest.display_name,
+                space: tenant.name,
+                role: memberRoleLabels[toGuest.role].toLowerCase(),
+              })}
             </p>
           }
-          confirmLabel="Make guest"
+          confirmLabel={t('members.toGuest.confirm')}
           onConfirm={() => changeRole(toGuest, 'guest')}
           onClose={() => setToGuest(null)}
         />
       )}
       <Loaded state={members}>
         {({ items }) => (
-          <Table caption="Members">
+          <Table caption={t('admin.members')}>
             <THead>
               <Tr>
-                <Th scope="col">Name</Th>
+                <Th scope="col">{t('common.name')}</Th>
                 <Th hideNarrow scope="col">
-                  Email
+                  {t('account.email')}
                 </Th>
-                <Th scope="col">Role</Th>
+                <Th scope="col">{t('members.role')}</Th>
                 <Th scope="col">
-                  <VisuallyHidden>Actions</VisuallyHidden>
+                  <VisuallyHidden>{t('common.actions')}</VisuallyHidden>
                 </Th>
               </Tr>
             </THead>
@@ -155,14 +159,14 @@ export function MembersPage() {
                       {self && (
                         <Text as="span" tone="muted">
                           {' '}
-                          (you)
+                          {t('share.you')}
                         </Text>
                       )}
                     </Th>
                     <Td hideNarrow>{m.email}</Td>
                     <Td>
                       <Select
-                        aria-label={`Role of ${m.display_name}`}
+                        aria-label={t('members.role.of', { name: m.display_name })}
                         value={m.role}
                         disabled={locked}
                         onChange={(e) => {
@@ -183,11 +187,11 @@ export function MembersPage() {
                     <Td actions>
                       {!locked && (
                         <ConfirmButton
-                          label="Remove"
-                          ariaLabel={`Remove ${m.display_name}`}
-                          title={`Remove ${m.display_name} from ${tenant.name}?`}
-                          message="They lose access to everything in this space at once. Their agents are paused, their links are turned off, and their app passwords stop working. Their files stay."
-                          confirmLabel={`Remove ${m.display_name}`}
+                          label={t('share.remove')}
+                          ariaLabel={t('members.remove.label', { name: m.display_name })}
+                          title={t('members.remove.title', { name: m.display_name, space: tenant.name })}
+                          message={t('members.remove.message')}
+                          confirmLabel={t('members.remove.label', { name: m.display_name })}
                           danger
                           onConfirm={async () => {
                             await unwrap(
@@ -195,7 +199,7 @@ export function MembersPage() {
                                 params: { path: { tenant_id: tenant.id, user_id: m.user_id } },
                               }),
                             )
-                            toast(`Removed ${m.display_name} from ${tenant.name}.`)
+                            toast(t('members.removed', { name: m.display_name, space: tenant.name }))
                             members.reload()
                           }}
                         />
@@ -263,7 +267,7 @@ export function InvitationsPage() {
       setError(err)
     }
     if (sent.length) {
-      toast(sent.length === 1 ? `Invitation sent to ${sent[0]}.` : `${sent.length} invitations sent.`)
+      toast(sent.length === 1 ? t('invitations.sent.one', { email: sent[0] }) : t('invitations.sent', { n: sent.length }))
       setEmails(list.filter((x) => !sent.includes(x)).join(', '))
       if (sent.length === list.length) setMessage('')
       invitations.reload()
@@ -272,52 +276,52 @@ export function InvitationsPage() {
 
   return (
     <section aria-labelledby="inv-title">
-      <h2 id="inv-title">Invitations</h2>
-      <Card as="form" onSubmit={invite} aria-label="Invite people">
+      <h2 id="inv-title">{t('admin.invitations')}</h2>
+      <Card as="form" onSubmit={invite} aria-label={t('invitations.form')}>
         <Row align="end">
-          <Field label="Emails" grow>
+          <Field label={t('invitations.emails')} grow>
             <TextInput
               required
               value={emails}
               onChange={(e) => setEmails(e.target.value)}
-              placeholder="name@example.com"
+              placeholder={t('share.email.placeholder')}
               aria-describedby="inv-emails-help"
             />
           </Field>
-          <Field label="Role">
+          <Field label={t('members.role')}>
             <Select value={effectiveRole} onChange={(e) => setRole(e.target.value as typeof role)} aria-describedby="inv-role-help">
-              <option value="guest">Guest</option>
-              {membersAllowed && <option value="member">Member</option>}
-              {membersAllowed && <option value="admin">Admin</option>}
+              <option value="guest">{memberRoleLabels.guest}</option>
+              {membersAllowed && <option value="member">{memberRoleLabels.member}</option>}
+              {membersAllowed && <option value="admin">{memberRoleLabels.admin}</option>}
             </Select>
           </Field>
         </Row>
         <Text tone="muted" size="sm" id="inv-emails-help">
-          One or more, separated by commas
+          {t('invitations.emails.help')}
         </Text>
         <Text tone="muted" size="sm" id="inv-role-help">
-          {memberRoleLabels[effectiveRole]}: {memberRoleMeanings[effectiveRole]}
+          {t('share.roleMeaning', { role: memberRoleLabels[effectiveRole], meaning: memberRoleMeanings[effectiveRole] })}
         </Text>
         {!membersAllowed && (
           <Note>
             <p>
               {tenant.kind === 'personal'
-                ? `${tenant.name} is a personal space, just for you. Invite people as guests to share items with them, or start a team space to work together.`
-                : `${tenant.name} has reached the member limit of its plan. Invite people as guests, or change the plan.`}
+                ? t('invitations.personal', { space: tenant.name })
+                : t('invitations.full', { space: tenant.name })}
             </p>
-            {tenant.kind === 'personal' && <Button onClick={() => setStartTeam(true)}>Start a team space</Button>}
+            {tenant.kind === 'personal' && <Button onClick={() => setStartTeam(true)}>{t('shell.startTeam.title')}</Button>}
           </Note>
         )}
-        <Field label="Message (optional)">
+        <Field label={t('invitations.message')}>
           <TextArea rows={2} value={message} onChange={(e) => setMessage(e.target.value)} />
         </Field>
         {!tenant.policy.allow_guests && effectiveRole === 'guest' && (
-          <Text tone="danger">Guests are turned off in the sharing rules of this space.</Text>
+          <Text tone="danger">{t('invitations.guestsOff')}</Text>
         )}
         <ErrorNote error={error} context={{ space: tenant.name }} />
         <Actions>
           <Button variant="primary" type="submit">
-            Send invitations
+            {t('invitations.send')}
           </Button>
         </Actions>
       </Card>
@@ -326,7 +330,7 @@ export function InvitationsPage() {
           <List>
             {items.length === 0 && (
               <Text as="li" tone="muted">
-                No open invitations.
+                {t('invitations.none')}
               </Text>
             )}
             {items.map((i) => (
@@ -334,16 +338,15 @@ export function InvitationsPage() {
                 <Grow>
                   {i.email} <Badge>{memberRoleLabels[i.role]}</Badge>
                   <Text as="span" tone="muted" size="sm" block>
-                    Invited, waiting. Ends{' '}
-                    {new Date(i.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}.
+                    {t('invitations.waiting', { date: formatDay(i.expires_at) })}
                   </Text>
                 </Grow>
                 <ConfirmButton
-                  label="Cancel invitation"
-                  ariaLabel={`Cancel invitation: ${i.email}`}
-                  title="Cancel this invitation?"
-                  message={`${i.email} can no longer join with it.`}
-                  confirmLabel="Cancel invitation"
+                  label={t('invitations.cancel')}
+                  ariaLabel={t('invitations.cancel.label', { email: i.email })}
+                  title={t('invitations.cancel.title')}
+                  message={t('invitations.cancel.message', { email: i.email })}
+                  confirmLabel={t('invitations.cancel')}
                   danger
                   onConfirm={async () => {
                     await unwrap(
@@ -380,35 +383,35 @@ export function PolicyPage() {
       await unwrap(
         client.PATCH('/v1/tenants/{tenant_id}', { params: { path: { tenant_id: tenant.id } }, body: { name: name.trim(), policy } }),
       )
-      toast('Saved the sharing rules.')
+      toast(t('policy.saved'))
       await reloadTenants()
     } catch (err) {
       setError(err)
     }
   }
 
-  const check = (key: keyof Omit<Schemas['TenantPolicy'], 'share_link_max_days'>, label: string, disabled = false) => (
+  const check = (key: keyof Omit<Schemas['TenantPolicy'], 'share_link_max_days'>, label: MessageKey, disabled = false) => (
     <Checkbox
       checked={policy[key]}
       disabled={disabled}
       onChange={(e) => setPolicy({ ...policy, [key]: e.target.checked })}
-      label={<>{label}</>}
+      label={<>{t(label)}</>}
     />
   )
 
   return (
     <section aria-labelledby="policy-title">
-      <h2 id="policy-title">Sharing rules</h2>
+      <h2 id="policy-title">{t('admin.policy')}</h2>
       <Card as="form" onSubmit={save}>
-        <Field label="Space name">
+        <Field label={t('policy.name')}>
           <TextInput required value={name} onChange={(e) => setName(e.target.value)} />
         </Field>
-        <Fieldset legend="Sharing">
-          {check('members_can_share', 'Members can share')}
-          {check('allow_guests', 'Allow guests (people outside this space)')}
-          {check('allow_share_links', 'Allow links')}
-          {check('allow_edit_links', 'Allow links that can edit', !policy.allow_share_links)}
-          <Field label="Links end after at most (days, empty for no limit)">
+        <Fieldset legend={t('policy.sharing')}>
+          {check('members_can_share', 'policy.membersCanShare')}
+          {check('allow_guests', 'policy.allowGuests')}
+          {check('allow_share_links', 'policy.allowLinks')}
+          {check('allow_edit_links', 'policy.allowEditLinks', !policy.allow_share_links)}
+          <Field label={t('policy.linkDays')}>
             <TextInput
               type="number"
               min={1}
@@ -421,7 +424,7 @@ export function PolicyPage() {
         <ErrorNote error={error} />
         <Actions>
           <Button variant="primary" type="submit">
-            Save
+            {t('common.save')}
           </Button>
         </Actions>
       </Card>
@@ -433,7 +436,7 @@ function UsageMeter({
   label,
   used,
   limit,
-  format = String,
+  format = formatNumber,
 }: {
   label: string
   used: number
@@ -445,7 +448,7 @@ function UsageMeter({
       <Row>
         <Grow>{label}</Grow>
         <span>
-          {format(used)} of {limit === null ? 'no limit' : format(limit)}
+          {limit === null ? t('limits.usage.unlimited', { used: format(used) }) : t('limits.usage', { used: format(used), limit: format(limit) })}
         </span>
       </Row>
       {limit !== null && <Meter max={limit} value={used} high={limit * 0.9} label={label} />}
@@ -461,30 +464,34 @@ export function LimitsPage() {
   )
   return (
     <section aria-labelledby="limits-title">
-      <h2 id="limits-title">Plan</h2>
+      <h2 id="limits-title">{t('admin.plan')}</h2>
       <Loaded state={limits}>
         {({ plan, limits: l, usage: u }) => (
           <Card as="div">
             <p>
-              Plan: <strong>{plan[0].toUpperCase() + plan.slice(1)}</strong>
+              {tr('limits.plan', { plan: t('limits.plan.name', { plan }), b: (chunks) => <strong>{chunks}</strong> })}
             </p>
-            <UsageMeter label="Storage" used={u.storage_bytes} limit={l.storage_bytes} format={formatBytes} />
-            <UsageMeter label="Agents" used={u.agents} limit={l.agents} />
-            <UsageMeter label="Members" used={u.members} limit={l.members} />
+            <UsageMeter label={t('limits.storage')} used={u.storage_bytes} limit={l.storage_bytes} format={formatBytes} />
+            <UsageMeter label={t('shell.nav.agents')} used={u.agents} limit={l.agents} />
+            <UsageMeter label={t('admin.members')} used={u.members} limit={l.members} />
             <Facts>
-              <dt>Largest file</dt>
+              <dt>{t('limits.largestFile')}</dt>
               <dd>{formatBytes(l.max_file_bytes)}</dd>
-              <dt>Versions kept</dt>
+              <dt>{t('limits.versions')}</dt>
               <dd>
-                {l.version_days === null ? 'Forever' : `${l.version_days} days`}
-                {l.version_count !== null && `, at most ${l.version_count} per file`}. Named versions are kept forever.
+                {t('limits.versions.value', {
+                  forever: l.version_days === null ? 'yes' : 'no',
+                  days: l.version_days ?? 0,
+                  capped: l.version_count !== null ? 'yes' : 'no',
+                  count: l.version_count ?? 0,
+                })}
               </dd>
-              <dt>Trash kept</dt>
-              <dd>{l.trash_days} days</dd>
-              <dt>Admin restore</dt>
-              <dd>{l.admin_restore_days ? `${l.admin_restore_days} days` : 'Not in this plan'}</dd>
-              <dt>Items</dt>
-              <dd>{u.nodes}</dd>
+              <dt>{t('limits.trash')}</dt>
+              <dd>{t('limits.days', { n: l.trash_days })}</dd>
+              <dt>{t('limits.adminRestore')}</dt>
+              <dd>{l.admin_restore_days ? t('limits.days', { n: l.admin_restore_days }) : t('limits.notInPlan')}</dd>
+              <dt>{t('limits.items')}</dt>
+              <dd>{formatNumber(u.nodes)}</dd>
             </Facts>
           </Card>
         )}
@@ -518,7 +525,7 @@ export function AuditPage() {
       nodeIds.map(async (id) => {
         try {
           const n = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: id } } }))
-          out[id] = { name: n.parent_id ? n.name : 'Files', folder: n.kind === 'folder' }
+          out[id] = { name: n.parent_id ? n.name : t('shell.nav.files'), folder: n.kind === 'folder' }
         } catch {
           // Not readable: the row says "an item".
         }
@@ -528,7 +535,7 @@ export function AuditPage() {
   }, [nodeIds.join(',')])
   return (
     <section aria-labelledby="audit-title">
-      <h2 id="audit-title">Activity log</h2>
+      <h2 id="audit-title">{t('admin.audit')}</h2>
       <Row
         as="form"
         align="end"
@@ -537,26 +544,26 @@ export function AuditPage() {
           setFilter(action)
         }}
       >
-        <Field label="Show" grow>
+        <Field label={t('audit.show')} grow>
           <Select value={action} onChange={(e) => setAction(e.target.value)}>
-            <option value="">Everything</option>
-            <option value="auth.">Sign-ins</option>
-            <option value="member.">Members</option>
-            <option value="invitation.">Invitations</option>
-            <option value="grant.">Access</option>
-            <option value="share_link.">Links</option>
-            <option value="agent.">Agents</option>
-            <option value="node.">Items</option>
-            <option value="version.">Versions</option>
+            <option value="">{t('audit.filter.all')}</option>
+            <option value="auth.">{t('audit.filter.auth')}</option>
+            <option value="member.">{t('admin.members')}</option>
+            <option value="invitation.">{t('admin.invitations')}</option>
+            <option value="grant.">{t('share.access')}</option>
+            <option value="share_link.">{t('audit.filter.links')}</option>
+            <option value="agent.">{t('shell.nav.agents')}</option>
+            <option value="node.">{t('limits.items')}</option>
+            <option value="version.">{t('details.versions')}</option>
           </Select>
         </Field>
-        <Button type="submit">Show</Button>
+        <Button type="submit">{t('audit.show')}</Button>
       </Row>
       <Loaded state={audit}>
         {({ items }) => (
           <>
             {items.length === 0 ? (
-              <EmptyState title="No activity yet" text={`Changes in ${tenant.name} show up here.`} />
+              <EmptyState title={t('audit.none.title')} text={t('audit.none.text', { space: tenant.name })} />
             ) : (
               <List>
                 {items.map((a) => (
@@ -585,20 +592,18 @@ type AuditItem = { name: string; folder: boolean }
 function AuditWhat({ entry, items }: { entry: Schemas['AuditEntry']; items: Record<string, AuditItem> }) {
   const { tenant } = useTenant()
   const names = useNames()
-  const parts = auditDetail(entry, { person: (id) => names.person(id)?.name, spaceName: tenant.name })
-  if (!parts) return <>{auditText(entry)}</>
-  return (
-    <>
-      {parts.map((p, i) => {
-        if (typeof p === 'string') return <span key={i}>{p}</span>
-        const it = items[p.item]
-        if (!it) return <span key={i}>an item</span>
-        return (
-          <Link key={i} to={it.folder ? tenantPath(tenant.id, 'files', p.item) : tenantPath(tenant.id, 'item', p.item)}>
-            {it.name}
-          </Link>
-        )
-      })}
-    </>
+  const detail = auditDetail(entry, { person: (id) => names.person(id)?.name, spaceName: tenant.name })
+  if (!detail) return <>{auditText(entry)}</>
+  const it = detail.item ? items[detail.item] : undefined
+  const item = !detail.item ? (
+    ''
+  ) : it ? (
+    <Link to={it.folder ? tenantPath(tenant.id, 'files', detail.item) : tenantPath(tenant.id, 'item', detail.item)}>{it.name}</Link>
+  ) : (
+    <span>{t('audit.anItem')}</span>
   )
+  // The words are spans of their own, beside the link (the tests and screen readers find them).
+  const out = tr(detail.key, { ...detail.values, item })
+  const parts = Array.isArray(out) ? out : [out]
+  return <>{parts.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <Fragment key={i}>{p}</Fragment>))}</>
 }

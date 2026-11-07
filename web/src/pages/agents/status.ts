@@ -1,21 +1,30 @@
 import type { Schemas } from '../../api/client'
-import { formatWhen } from '../../components/format'
+import { formatDay, formatWhen, roleLabels } from '../../components/format'
+import { t } from '../../i18n'
 
 /** The status of an agent in plain words (copy.md 3.5). */
 export function agentStatus(a: Schemas['Agent']): string {
-  if (a.disabled_at) return a.disabled_reason === 'by_admin' ? 'Paused by an admin' : a.disabled_reason === 'owner_left' ? 'Paused (its person left)' : 'Paused'
-  if (a.scope.expires_at && a.scope.expires_at < new Date().toISOString()) return 'Access ended'
-  if (!a.last_used_at) return 'Not used yet'
-  return `Active, last used ${formatWhen(a.last_used_at).toLowerCase()}`
+  if (a.disabled_at)
+    return a.disabled_reason === 'by_admin'
+      ? t('agent.status.pausedByAdmin')
+      : a.disabled_reason === 'owner_left'
+        ? t('agent.status.ownerLeft')
+        : t('agent.status.paused')
+  if (a.scope.expires_at && a.scope.expires_at < new Date().toISOString()) return t('agent.status.ended')
+  if (!a.last_used_at) return t('agent.status.unused')
+  return t('agent.status.active', { when: formatWhen(a.last_used_at).toLowerCase() })
 }
 
 /** "Can edit in folder Clients, until 4 Feb 2027" (copy.md 3.5, access summary). */
 export function accessSummary(scope: Schemas['AgentScope'], folderName: string | null, spaceName: string): string {
-  const role = { view: 'Can view', comment: 'Can comment', edit: 'Can edit', manage: 'Can manage' }[scope.max_role]
-  const where = scope.subtree ? `in folder ${folderName ?? 'a folder'}` : `everywhere you have access in ${spaceName}`
-  const until = scope.expires_at
-    ? `until ${new Date(scope.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
-    : 'no end date'
-  const budget = scope.budget?.max_writes_per_hour ? `, at most ${scope.budget.max_writes_per_hour} changes per hour` : ''
-  return `${role} ${where}, ${until}${budget}`
+  return t('agent.summary', {
+    role: roleLabels[scope.max_role],
+    where: scope.subtree ? 'folder' : 'everywhere',
+    folder: folderName ?? t('agent.aFolder'),
+    space: spaceName,
+    hasEnd: scope.expires_at ? 'yes' : 'no',
+    date: scope.expires_at ? formatDay(scope.expires_at) : '',
+    hasBudget: scope.budget?.max_writes_per_hour ? 'yes' : 'no',
+    budget: scope.budget?.max_writes_per_hour ?? 0,
+  })
 }

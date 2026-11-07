@@ -7,6 +7,7 @@ import { trashNodes } from './api'
 import { NodeDetails } from './NodeDetails'
 import { VersionsPanel } from './VersionsPanel'
 import { useState } from 'react'
+import { t } from '../../i18n'
 
 /**
  * One item by its ID (`/t/<space>/item/<id>`): the page for a file that was shared alone, whose
@@ -24,7 +25,7 @@ export function ItemPage() {
   return (
     <PageBody narrow>
       <p>
-        <Link to={tenantPath(tenant.id, 'shared')}>Shared with me</Link>
+        <Link to={tenantPath(tenant.id, 'shared')}>{t('shell.nav.shared')}</Link>
       </p>
       <Loaded state={node}>
         {(n) =>
@@ -42,11 +43,11 @@ export function ItemPage() {
               }
               onTrash={async () => {
                 const { undo } = await trashNodes([n])
-                toast(`Moved ${n.name} to the trash.`, {
+                toast(t('files.trashed.one', { name: n.name }), {
                   undo: async () => {
                     await undo()
                     node.reload()
-                    return `Restored ${n.name}.`
+                    return t('files.restored.one', { name: n.name })
                   },
                 })
                 navigate(tenantPath(n.tenant_id, 'shared'))
@@ -67,10 +68,10 @@ export function NotInSpaceYet() {
   return (
     <PageBody>
       <EmptyState
-        title="Ruum can't open this for you yet"
-        text="Someone shared it with you, but you are not in their space yet. Ask them to invite you as a guest."
+        title={t('item.notInSpace.title')}
+        text={t('item.notInSpace.text')}
       >
-        <Link to="/">Go to your files</Link>
+        <Link to="/">{t('common.goToFiles')}</Link>
       </EmptyState>
     </PageBody>
   )

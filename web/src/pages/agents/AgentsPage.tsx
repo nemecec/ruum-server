@@ -29,6 +29,7 @@ import {
   Toolbar,
   Tr,
 } from '../../ui'
+import { t } from '../../i18n'
 
 /** The agents of the person (all agents of the space for admins). */
 export function AgentsPage() {
@@ -41,35 +42,35 @@ export function AgentsPage() {
   return (
     <PageBody>
       <Toolbar>
-        <h1>Agents</h1>
+        <h1>{t('shell.nav.agents')}</h1>
         <Button variant="primary" onClick={connect}>
-          Connect an agent
+          {t('files.welcome.connect')}
         </Button>
       </Toolbar>
       <Text tone="muted">
-        Agents work in Ruum for you, with the access you give them. Every change they make shows their name and yours.
-        {isAdmin && ` As an admin, you see every agent in ${tenant.name}.`}
+        {t('agents.intro')}
+        {isAdmin && ` ${t('agents.intro.admin', { space: tenant.name })}`}
       </Text>
       <Loaded state={agents}>
         {({ items }) =>
           items.length === 0 ? (
-            <EmptyState title="No agents yet" text="Connect Claude, ChatGPT or another AI app, or create an agent with a key for a script.">
+            <EmptyState title={t('agents.none.title')} text={t('agents.none.text')}>
               <Button variant="primary" onClick={connect}>
-                Connect an agent
+                {t('files.welcome.connect')}
               </Button>
             </EmptyState>
           ) : (
-            <Table caption="Agents">
+            <Table caption={t('shell.nav.agents')}>
               <THead>
                 <Tr>
-                  <Th scope="col">Name</Th>
-                  <Th scope="col">Status</Th>
+                  <Th scope="col">{t('common.name')}</Th>
+                  <Th scope="col">{t('agents.status')}</Th>
                   <Th hideNarrow scope="col">
-                    Highest role
+                    {t('scope.role')}
                   </Th>
                   {isAdmin && (
                     <Th hideNarrow scope="col">
-                      Works for
+                      {t('agents.worksFor')}
                     </Th>
                   )}
                 </Tr>
@@ -84,7 +85,7 @@ export function AgentsPage() {
                     </Th>
                     <Td>{agentStatus(a)}</Td>
                     <Td hideNarrow>{roleLabels[a.scope.max_role]}</Td>
-                    {isAdmin && <Td hideNarrow>{names.person(a.owner_id)?.name ?? 'Someone'}</Td>}
+                    {isAdmin && <Td hideNarrow>{names.person(a.owner_id)?.name ?? t('actor.someone')}</Td>}
                   </Tr>
                 ))}
               </TBody>
@@ -125,20 +126,20 @@ export function RegisterAgentDialog(props: { onClose: () => void; onCreated: (a:
   }
 
   return (
-    <Dialog title="Create an agent with a key" open onClose={props.onClose} size="md">
+    <Dialog title={t('agents.register.title')} open onClose={props.onClose} size="md">
       <Stack as="form" onSubmit={submit}>
-        <Field label="Name">
-          <TextInput required value={name} onChange={(e) => setName(e.target.value)} placeholder="Backup script" />
+        <Field label={t('common.name')}>
+          <TextInput required value={name} onChange={(e) => setName(e.target.value)} placeholder={t('agents.register.placeholder')} />
         </Field>
-        <Field label="Description (optional)">
+        <Field label={t('agents.register.description')}>
           <TextInput value={description} onChange={(e) => setDescription(e.target.value)} />
         </Field>
         <ScopeFields tenantId={tenant.id} spaceName={tenant.name} scope={scope} onChange={setScope} idPrefix="register" />
         <ErrorNote error={error} />
         <Actions>
-          <Button onClick={props.onClose}>Cancel</Button>
+          <Button onClick={props.onClose}>{t('common.cancel')}</Button>
           <Button variant="primary" type="submit" disabled={busy || !name.trim() || scope.subtree === ''}>
-            Create agent
+            {t('agents.register.submit')}
           </Button>
         </Actions>
       </Stack>

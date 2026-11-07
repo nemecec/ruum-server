@@ -7,6 +7,7 @@
 import { blake3 } from '@noble/hashes/blake3.js'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { FastCdc, type ChunkSizes } from './fastcdc'
+import { t } from '../i18n'
 
 /** One chunk of a file: where it is, how long it is, and its BLAKE3 hash. */
 export type FileChunk = { offset: number; size: number; hash: string }
@@ -23,7 +24,7 @@ export async function readBytes(blob: Blob, start: number, end: number): Promise
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer))
-    reader.onerror = () => reject(reader.error ?? new Error('The file cannot be read.'))
+    reader.onerror = () => reject(reader.error ?? new Error(t('uploads.unreadable')))
     reader.readAsArrayBuffer(part)
   })
 }

@@ -9,6 +9,7 @@ import { roleLabels } from '../components/format'
 import { accessSummary } from './agents/status'
 import { ScopeFields } from './agents/ScopeFields'
 import { Actions, Button, ErrorNote, Field, Fieldset, Indent, Loaded, Note, Page, Radio, Select, Stack, Text, TextInput } from '../ui'
+import { currentIntl, t, tr } from '../i18n'
 
 /** The host of a URL, or `null` for a malformed value (client metadata is not trusted). */
 function hostOf(url: string | null | undefined): string | null {
@@ -62,14 +63,14 @@ export function OAuthConsentPage() {
   if (!request) {
     return (
       <Page narrow id="main">
-        <h1>This connection request has ended</h1>
-        <p>Start the connection again from the app.</p>
+        <h1>{t('consent.ended.title')}</h1>
+        <p>{t('consent.ended.text')}</p>
       </Page>
     )
   }
 
-  const appName = oauthClient.data?.client_name ?? 'An app'
-  const spaceName = tenants.find((t) => t.tenant.id === tenantId)?.tenant.name ?? 'your space'
+  const appName = oauthClient.data?.client_name ?? t('actor.app')
+  const spaceName = tenants.find((m) => m.tenant.id === tenantId)?.tenant.name ?? t('consent.yourSpace')
   const folderMissing = mode === 'new' && scope.subtree === ''
 
   async function answer(approve: boolean) {
@@ -96,8 +97,8 @@ export function OAuthConsentPage() {
   if (done) {
     return (
       <Page narrow id="main">
-        <h1>Connected</h1>
-        <p>You can go back to {appName}.</p>
+        <h1>{t('consent.done.title')}</h1>
+        <p>{t('consent.done.text', { app: appName })}</p>
       </Page>
     )
   }
@@ -109,13 +110,13 @@ export function OAuthConsentPage() {
 
   return (
     <Page narrow id="main">
-      <h1>{appName} wants to connect to Ruum</h1>
+      <h1>{t('consent.title', { app: appName })}</h1>
       <Loaded state={oauthClient}>
         {(c) => {
           if (!c) {
             return (
               <Note tone="warning" role="note">
-                Ruum can't show the name of this app. Continue only if you started this.
+                {t('consent.noName')}
               </Note>
             )
           }
@@ -123,38 +124,37 @@ export function OAuthConsentPage() {
           const href = c.client_uri ? safeHref(c.client_uri) : undefined
           // The redirect of this request when the UI can read it; otherwise the registered ones.
           const back = requestRedirect ? [hostOf(requestRedirect)] : c.redirect_uris.map((u) => hostOf(u))
-          const backText = back.map((h) => h ?? 'an address that is not valid').join(', ')
+          const backText = currentIntl().formatList(back.map((h) => h ?? t('consent.badAddress')), { type: 'unit' })
           return (
             <Stack>
               <Note tone="warning" role="note">
-                Ruum can't check the name or address of this app. Continue only if you started this.
+                {t('consent.unchecked')}
               </Note>
               <Text tone="muted">
                 {from ? (
                   <>
-                    It says it is from{' '}
-                    {href ? (
-                      <a href={href} rel="noreferrer noopener">
-                        {from}
-                      </a>
-                    ) : (
-                      from
-                    )}
-                    .{' '}
+                    {tr('consent.from', {
+                      from: href ? (
+                        <a href={href} rel="noreferrer noopener">
+                          {from}
+                        </a>
+                      ) : (
+                        from
+                      ),
+                    })}{' '}
                   </>
                 ) : null}
-                {requestRedirect ? `It will go back to ${backText}.` : `It can go back to ${back.length > 1 ? 'one of ' : ''}${backText}.`}
+                {requestRedirect
+                  ? t('consent.back.will', { back: backText })
+                  : t('consent.back.can', { back: backText, many: back.length > 1 ? 'yes' : 'no' })}
               </Text>
             </Stack>
           )
         }}
       </Loaded>
-      <p>
-        It will act as an agent for you, <strong>{me.user.display_name}</strong>. It gets only the access you choose here, and never more
-        than you have. You can pause it at any time on the Agents page.
-      </p>
+      <p>{tr('consent.acts', { name: me.user.display_name, b: (chunks) => <strong>{chunks}</strong> })}</p>
       <Stack as="form" onSubmit={submit}>
-        <Field label="Space">
+        <Field label={t('shell.space')}>
           <Select
             value={tenantId}
             onChange={(e) => {
@@ -164,22 +164,22 @@ export function OAuthConsentPage() {
               setScope((s) => ({ ...s, subtree: typeof s.subtree === 'string' ? '' : null }))
             }}
           >
-            {tenants.map((t) => (
-              <option key={t.tenant.id} value={t.tenant.id}>
-                {t.tenant.name}
+            {tenants.map((m) => (
+              <option key={m.tenant.id} value={m.tenant.id}>
+                {m.tenant.name}
               </option>
             ))}
           </Select>
         </Field>
-        <Fieldset legend="Agent">
-          <Radio name="mode" checked={mode === 'new'} onChange={() => setMode('new')} label="Create a new agent" />
+        <Fieldset legend={t('consent.agent')}>
+          <Radio name="mode" checked={mode === 'new'} onChange={() => setMode('new')} label={t('consent.agent.new')} />
           {mode === 'new' && (
             <Indent>
-              <Field label="Agent name">
+              <Field label={t('consent.agent.name')}>
                 <TextInput value={agentName} placeholder={appName} onChange={(e) => setAgentName(e.target.value)} />
               </Field>
               <ScopeFields tenantId={tenantId} spaceName={spaceName} scope={scope} onChange={setScope} idPrefix="consent" />
-              {!folderMissing && <Note>{accessSummary(scope, null, spaceName)}.</Note>}
+              {!folderMissing && <Note>{t('consent.summary', { summary: accessSummary(scope, null, spaceName) })}</Note>}
             </Indent>
           )}
           <Radio
@@ -187,18 +187,18 @@ export function OAuthConsentPage() {
             checked={mode === 'existing'}
             disabled={!agents.data?.items.length}
             onChange={() => setMode('existing')}
-            label="Use an existing agent"
+            label={t('consent.agent.existing')}
           />
           {mode === 'existing' && agents.data && (
             <Indent>
-              <Field label="Existing agent">
+              <Field label={t('consent.agent.existing.label')}>
                 <Select required value={agentId} onChange={(e) => setAgentId(e.target.value)}>
-                  <option value="">Choose an agent</option>
+                  <option value="">{t('consent.agent.choose')}</option>
                   {agents.data.items
                     .filter((a) => !a.disabled_at)
                     .map((a) => (
                       <option key={a.id} value={a.id}>
-                        {a.name} ({roleLabels[a.scope.max_role].toLowerCase()})
+                        {t('consent.agent.option', { name: a.name, role: roleLabels[a.scope.max_role].toLowerCase() })}
                       </option>
                     ))}
                 </Select>
@@ -209,15 +209,15 @@ export function OAuthConsentPage() {
         <ErrorNote error={error} />
         <Actions>
           <Button disabled={busy} onClick={() => answer(false)}>
-            Don't allow
+            {t('consent.deny')}
           </Button>
           <Button variant="primary" type="submit" disabled={busy || (mode === 'existing' && !agentId) || folderMissing}>
-            Allow
+            {t('consent.allow')}
           </Button>
         </Actions>
         {folderMissing && (
           <Text tone="muted" size="sm">
-            Choose a folder first, or choose Everywhere.
+            {t('consent.folderFirst')}
           </Text>
         )}
       </Stack>

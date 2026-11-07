@@ -6,7 +6,7 @@ import { usePagedApi } from '../../api/usePagedApi'
 import { useActorText, useNames, type Names } from '../../app/useNames'
 import { useSession } from '../../app/useSession'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { count, memberRoleLabels, roleLabels, roleMeanings } from '../../components/format'
+import { formatDay, memberRoleLabels, roleLabels, roleMeanings } from '../../components/format'
 import type { Node } from './api'
 import {
   Button,
@@ -29,6 +29,7 @@ import {
   Text,
   TextInput,
 } from '../../ui'
+import { t, tr } from '../../i18n'
 
 const roles: Schemas['Role'][] = ['view', 'comment', 'edit', 'manage']
 const linkRoles: Schemas['ShareLinkRole'][] = ['view', 'comment', 'edit']
@@ -65,18 +66,18 @@ function granteeName(g: Schemas['Grantee'], names: Names, spaceName: string, gra
   switch (g.type) {
     case 'user': {
       const person = names.person(g.id)
-      return g.display_name ?? person?.name ?? g.email ?? (grantId ? grantEmails()[grantId] : undefined) ?? 'A person outside this space'
+      return g.display_name ?? person?.name ?? g.email ?? (grantId ? grantEmails()[grantId] : undefined) ?? t('share.outsider')
     }
     case 'email':
       return g.email
     case 'tenant_members':
-      return `Everyone in ${spaceName}`
+      return t('share.everyone', { space: spaceName })
   }
 }
 
 /** The second line of a grantee: the email under a name, or "Invited, not joined yet". */
 function granteeDetail(g: Schemas['Grantee'], names: Names, grantId: string): string | null {
-  if (g.type === 'email') return 'Invited, not joined yet'
+  if (g.type === 'email') return t('share.invitedNotJoined')
   if (g.type === 'user') {
     const email = g.email ?? names.person(g.id)?.email ?? grantEmails()[grantId]
     const name = g.display_name ?? names.person(g.id)?.name
@@ -164,7 +165,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
     for (const id of fromIds) {
       try {
         const n = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: id } } }))
-        out[id] = n.parent_id ? n.name : 'Files'
+        out[id] = n.parent_id ? n.name : t('shell.nav.files')
       } catch {
         // A folder the person cannot see: the row says "from a folder above".
       }
@@ -216,7 +217,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   }
 
   return (
-    <Dialog title={`Share ${node.name}`} open={props.open} onClose={props.onClose} size="md">
+    <Dialog title={t('share.title', { name: node.name })} open={props.open} onClose={props.onClose} size="md">
       <Stack>
         <ErrorNote error={error} />
         <Notice text={notice} />
@@ -261,13 +262,18 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
               if (target.kind === 'person') {
                 setNotice(
                   team && managesEverything(target.member.role)
-                    ? `Shared ${node.name} with ${who}. As ${memberRoleLabels[target.member.role].toLowerCase()} of ${tenant.name}, they could already manage it.`
-                    : `Shared ${node.name} with ${who}. They find it under Shared with me.`,
+                    ? t('share.done.role', {
+                        name: node.name,
+                        who,
+                        role: memberRoleLabels[target.member.role].toLowerCase(),
+                        space: tenant.name,
+                      })
+                    : t('share.done.person', { name: node.name, who }),
                 )
                 return
               }
               if (!inviteGuest) {
-                setNotice(`Shared ${node.name} with ${who}. They can open it only after they join; nobody emailed them.`)
+                setNotice(t('share.done.noInvite', { name: node.name, who }))
                 return
               }
               // The person must join before they can open the item: Ruum emails them an invitation.
@@ -278,31 +284,29 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     body: {
                       email: target.email,
                       role: 'guest',
-                      message: `I shared "${node.name}" with you. Accept this invitation and make a free Ruum account to open it.`,
+                      message: t('share.invitation.message', { name: node.name }),
                     },
                   }),
                 )
-                setNotice(
-                  `Shared ${node.name} with ${who}. Ruum emailed them an invitation: they make a free account, then they can open it.`,
-                )
+                setNotice(t('share.done.invited', { name: node.name, who }))
               } catch (e) {
-                setNotice(`Shared ${node.name} with ${who}, but the invitation email was not sent.`)
+                setNotice(t('share.done.inviteFailed', { name: node.name, who }))
                 setError(e)
               }
             }}
           />
         ) : (
-          <Text tone="muted">You can see who has access, but you can't share this. Ask {owner?.name ?? 'the owner'}.</Text>
+          <Text tone="muted">{owner?.name ? t('share.cannot', { owner: owner.name }) : t('share.cannot.owner')}</Text>
         )}
 
         <section aria-labelledby="share-people">
-          <h3 id="share-people">People with access</h3>
+          <h3 id="share-people">{t('share.people')}</h3>
           <Loaded state={grants}>
             {(page) => (
               <List>
                 <ListRow>
                   <Grow>
-                    {owner?.name ?? 'The owner'}
+                    {owner?.name ?? t('share.theOwner')}
                     {owner?.email && (
                       <Text as="span" tone="muted" size="sm" block>
                         {owner.email}
@@ -310,18 +314,20 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     )}
                   </Grow>
                   <Text as="span" tone="muted">
-                    Owner
+                    {t('memberRole.owner')}
                   </Text>
                 </ListRow>
                 {team && (
                   <ListRow>
                     <Grow>
-                      Everyone in {tenant.name} except guests
+                      {t('share.roleRow', { space: tenant.name })}
                       <Text as="span" tone="muted" size="sm" block>
-                        {roleCount !== null ? `${count(roleCount, 'person', 'people')}. ` : ''}Owners, admins and members manage everything
-                        in {tenant.name}
-                        {policy.members_can_share ? ', and share it' : ''}. This comes from their role in the space; a share here can't give
-                        them less.
+                        {t('share.roleRow.detail', {
+                          hasCount: roleCount !== null ? 'yes' : 'no',
+                          n: roleCount ?? 0,
+                          space: tenant.name,
+                          share: policy.members_can_share ? 'yes' : 'no',
+                        })}
                       </Text>
                     </Grow>
                     <Text as="span" tone="muted">
@@ -331,7 +337,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                 )}
                 {!team && page.items.length === 0 && (
                   <Text as="li" tone="muted">
-                    Only you can see this.
+                    {t('share.onlyYou')}
                   </Text>
                 )}
                 {page.items.map((g) => {
@@ -348,7 +354,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     <ListRow key={g.id}>
                       <Grow>
                         {name}
-                        {mine && ' (you)'}
+                        {mine && ` ${t('share.you')}`}
                         {detail && (
                           <Text as="span" tone="muted" size="sm" block>
                             {detail}
@@ -356,39 +362,38 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                         )}
                         {addedBy && (
                           <Text as="span" tone="muted" size="sm" block>
-                            added by {g.created_by.actor.id === me.user.id ? 'you' : addedBy}
+                            {g.created_by.actor.id === me.user.id ? t('share.addedBy.you') : t('share.addedBy', { who: addedBy })}
                           </Text>
                         )}
                         {roleWins && (
                           <Text as="span" size="sm" block>
-                            {memberRoleLabels[member.role]} of {tenant.name}: can manage everything here, whatever this share says.
+                            {t('share.roleWins', { role: memberRoleLabels[member.role], space: tenant.name })}
                           </Text>
                         )}
                         {notInSpace && (
                           <Text as="span" size="sm" block>
-                            Can't open it yet: they haven't joined
-                            {canInviteGuests ? '. Invite them under Space settings, Invitations.' : '. Ask an admin to invite them.'}
+                            {canInviteGuests ? t('share.notJoined.invite') : t('share.notJoined.ask')}
                           </Text>
                         )}
                         {g.inherited_from && (
                           <Text as="span" tone="muted" size="sm" block>
-                            {folders.data?.[g.inherited_from] ? (
-                              <>
-                                from folder{' '}
-                                <Link to={tenantPath(node.tenant_id, 'files', g.inherited_from)} onClick={props.onClose}>
-                                  {folders.data[g.inherited_from]}
-                                </Link>
-                              </>
-                            ) : (
-                              'from a folder above'
-                            )}
+                            {folders.data?.[g.inherited_from]
+                              ? tr('share.fromFolder', {
+                                  folder: folders.data[g.inherited_from],
+                                  link: (chunks) => (
+                                    <Link to={tenantPath(node.tenant_id, 'files', g.inherited_from!)} onClick={props.onClose}>
+                                      {chunks}
+                                    </Link>
+                                  ),
+                                })
+                              : t('share.fromAbove')}
                           </Text>
                         )}
                       </Grow>
                       {canShare && !mine && !g.inherited_from && grantable.includes(g.role) ? (
                         <>
                           <Select
-                            aria-label={`Access of ${name}`}
+                            aria-label={t('share.accessOf', { name })}
                             value={g.role}
                             onChange={(e) =>
                               run(
@@ -399,7 +404,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                                       body: { role: e.target.value as Schemas['Role'] },
                                     }),
                                   ),
-                                `Changed ${name} to ${roleLabels[e.target.value as Schemas['Role']].toLowerCase()}.`,
+                                t('share.changed', { name, role: roleLabels[e.target.value as Schemas['Role']].toLowerCase() }),
                                 grants.reload,
                               )
                             }
@@ -411,7 +416,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                             ))}
                           </Select>
                           <Button
-                            aria-label={`Remove access for ${name}`}
+                            aria-label={t('share.remove.label', { name })}
                             onClick={() =>
                               run(
                                 () =>
@@ -420,12 +425,12 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                                       params: { path: { node_id: node.id, grant_id: g.id } },
                                     }),
                                   ),
-                                `Removed access for ${name}.`,
+                                t('share.removed', { name }),
                                 grants.reload,
                               )
                             }
                           >
-                            Remove
+                            {t('share.remove')}
                           </Button>
                         </>
                       ) : (
@@ -443,9 +448,9 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
         </section>
 
         <section aria-labelledby="share-links">
-          <h3 id="share-links">Link</h3>
+          <h3 id="share-links">{t('share.link')}</h3>
           {!policy.allow_share_links ? (
-            <Text tone="muted">Links are turned off in this space.</Text>
+            <Text tone="muted">{t('share.link.off')}</Text>
           ) : (
             <>
               <Loaded state={links}>
@@ -456,32 +461,33 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     <List>
                       {live.length === 0 && (
                         <Text as="li" tone="muted">
-                          Anyone with the link: off
+                          {t('share.link.none')}
                         </Text>
                       )}
                       {live.map((l) => (
                         <ListRow key={l.id}>
                           <Grow>
-                            Anyone with the link: {roleLabels[l.role].toLowerCase()}
+                            {t('share.link.role', { role: roleLabels[l.role].toLowerCase() })}
                             <Text as="span" tone="muted" size="sm" block>
-                              {l.expires_at
-                                ? `Ends ${new Date(l.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
-                                : 'No end date'}
-                              {l.has_password ? ', with password' : ''}
+                              {t('share.link.ends', {
+                                hasEnd: l.expires_at ? 'yes' : 'no',
+                                date: l.expires_at ? formatDay(l.expires_at) : '',
+                                password: l.has_password ? 'yes' : 'no',
+                              })}
                             </Text>
                           </Grow>
                           {canShare && (
                             <ConfirmButton
-                              label="Turn off"
-                              ariaLabel={`Turn off the ${roleLabels[l.role].toLowerCase()} link`}
-                              title="Turn off this link?"
-                              message="People who use it lose access at once. You can make a new link later."
-                              confirmLabel="Turn off link"
+                              label={t('account.appPassword.off')}
+                              ariaLabel={t('share.link.turnOff.label', { role: roleLabels[l.role].toLowerCase() })}
+                              title={t('share.link.turnOff.title')}
+                              message={t('share.link.turnOff.message')}
+                              confirmLabel={t('share.link.turnOff.confirm')}
                               danger
                               onConfirm={() =>
                                 run(
                                   () => unwrap(client.DELETE('/v1/share-links/{link_id}', { params: { path: { link_id: l.id } } })),
-                                  'Link turned off.',
+                                  t('share.link.turnedOff'),
                                   links.reload,
                                 )
                               }
@@ -514,12 +520,16 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
 
         {canManage && node.kind === 'folder' && (
           <section aria-labelledby="share-settings">
-            <h3 id="share-settings">Sharing rule</h3>
+            <h3 id="share-settings">{t('share.rule')}</h3>
             <Text tone="muted" size="sm" id="share-rule-help">
-              Can people who got <strong>Can edit</strong> on this folder share it with others too? This applies to shares and links, not to{' '}
-              {team ? `the owners, admins and members of ${tenant.name}: they manage everything, whatever this rule says` : 'you'}.
+              {tr('share.rule.help', {
+                role: roleLabels.edit,
+                team: team ? 'yes' : 'no',
+                space: tenant.name,
+                b: (chunks) => <strong>{chunks}</strong>,
+              })}
             </Text>
-            <Field label="People who can edit can also share">
+            <Field label={t('share.rule.label')}>
               <Select
                 aria-describedby="share-rule-help"
                 onFocus={() => setRuleSaved(false)}
@@ -533,21 +543,24 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                           body: { editors_can_share: e.target.value === 'inherit' ? null : e.target.value === 'true' },
                         }),
                       ),
-                    'Saved the sharing rule.',
+                    t('share.rule.saved'),
                     props.onChanged,
                   ).then(setRuleSaved)
                 }
               >
                 <option value="inherit">
-                  {parentRule.data?.top ? 'Standard' : 'Same as the folder above'} (now: {(parentRule.data?.value ?? true) ? 'yes' : 'no'})
+                  {t('share.rule.inherit', {
+                    top: parentRule.data?.top ? 'yes' : 'no',
+                    value: (parentRule.data?.value ?? true) ? 'yes' : 'no',
+                  })}
                 </option>
-                <option value="true">Yes</option>
-                <option value="false">No</option>
+                <option value="true">{t('common.yes')}</option>
+                <option value="false">{t('common.no')}</option>
               </Select>
             </Field>
             {ruleSaved && (
               <Text tone="muted" size="sm" role="status">
-                Saved.
+                {t('common.saved')}
               </Text>
             )}
           </section>
@@ -599,12 +612,18 @@ function AddPersonForm(props: {
   }
 
   return (
-    <Stack as="form" onSubmit={submit} aria-label="Add people">
+    <Stack as="form" onSubmit={submit} aria-label={t('share.add')}>
       <Row align="end">
-        <Field label="Email" grow>
-          <TextInput type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" />
+        <Field label={t('account.email')} grow>
+          <TextInput
+            type="email"
+            required
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder={t('share.email.placeholder')}
+          />
         </Field>
-        <Field label="Access">
+        <Field label={t('share.access')}>
           <Select value={role} onChange={(e) => setRole(e.target.value as Schemas['Role'])} aria-describedby="add-role-meaning">
             {roles.map((r) => (
               <option key={r} value={r}>
@@ -614,38 +633,32 @@ function AddPersonForm(props: {
           </Select>
         </Field>
         <Button variant="primary" type="submit" disabled={busy || found?.kind === 'me'}>
-          Share
+          {t('details.share')}
         </Button>
       </Row>
       <Text tone="muted" size="sm" id="add-role-meaning">
-        {roleLabels[role]}: {roleMeanings[role]}
+        {t('share.roleMeaning', { role: roleLabels[role], meaning: roleMeanings[role] })}
       </Text>
       {found?.kind === 'me' && (
         <Text tone="muted" size="sm">
-          That's your own email: you have access already.
+          {t('share.ownEmail')}
         </Text>
       )}
       {person &&
         (roleWins ? (
           <Note tone="warning" role="note">
-            {person.display_name || person.email} is {person.role === 'admin' ? 'an' : 'a'} {memberRoleLabels[person.role].toLowerCase()} of{' '}
-            {spaceName}, so they can already manage everything here
-            {props.membersCanShare || person.role !== 'member' ? ' and share it' : ''}. A share can't give them less. To let them see only
-            some folders, make them a guest
-            {props.isAdmin ? (
-              <>
-                {' '}
-                under <Link to={tenantPath(props.tenantId, 'admin', 'members')}>Members</Link>
-              </>
-            ) : (
-              ' (ask an admin)'
-            )}
-            .
+            {tr('share.add.roleWins', {
+              name: person.display_name || person.email,
+              role: person.role,
+              space: spaceName,
+              share: props.membersCanShare || person.role !== 'member' ? 'yes' : 'no',
+              admin: props.isAdmin ? 'yes' : 'no',
+              link: (chunks) => <Link to={tenantPath(props.tenantId, 'admin', 'members')}>{chunks}</Link>,
+            })}
           </Note>
         ) : (
           <Text tone="muted" size="sm">
-            {person.display_name || person.email} is in {spaceName}. They find {props.itemName} under Shared with me; Ruum sends no email
-            for this.
+            {t('share.add.inSpace', { name: person.display_name || person.email, space: spaceName, item: props.itemName })}
           </Text>
         ))}
       {outside &&
@@ -655,25 +668,28 @@ function AddPersonForm(props: {
               checked={invite}
               onChange={(e) => setInvite(e.target.checked)}
               aria-describedby="add-outside"
-              label="Email them an invitation"
+              label={t('share.add.invite')}
             />
             <Text tone="muted" size="sm" id="add-outside">
-              {email.trim()} is new here. With the invitation they make a free Ruum account, then they can open {props.itemName}.
-              {invite ? '' : ' Without it they cannot open it.'}
+              {t('share.add.new', { email: email.trim(), item: props.itemName })}
+              {invite ? '' : ` ${t('share.add.new.without')}`}
             </Text>
           </Stack>
         ) : (
           <Note tone="warning" role="note">
-            {email.trim()} is new here. They can open {props.itemName} only after an admin of {spaceName} invites them.
+            {t('share.add.new.admin', { email: email.trim(), item: props.itemName, space: spaceName })}
           </Note>
         ))}
       {outside && props.onUseLink && (
         <Text tone="muted" size="sm">
-          No account wanted?{' '}
-          <Button variant="link" onClick={props.onUseLink}>
-            Use a link instead
-          </Button>{' '}
-          and send it to them yourself: anyone with the link can open {props.itemName} without signing in.
+          {tr('share.add.useLink', {
+            item: props.itemName,
+            button: (chunks) => (
+              <Button variant="link" onClick={props.onUseLink}>
+                {chunks}
+              </Button>
+            ),
+          })}
         </Text>
       )}
     </Stack>
@@ -710,9 +726,9 @@ function CreateLinkForm(props: {
   }
 
   return (
-    <Stack as="form" onSubmit={submit} aria-label="Create a link">
+    <Stack as="form" onSubmit={submit} aria-label={t('share.link.create.label')}>
       <Row align="end">
-        <Field label="Access">
+        <Field label={t('share.access')}>
           <Select id="link-role" value={role} onChange={(e) => setRole(e.target.value as Schemas['ShareLinkRole'])}>
             {props.roles
               .filter((r) => r !== 'edit' || props.allowEdit)
@@ -723,7 +739,7 @@ function CreateLinkForm(props: {
               ))}
           </Select>
         </Field>
-        <Field label="Ends after (days)">
+        <Field label={t('share.link.days')}>
           <TextInput
             type="number"
             min={1}
@@ -733,16 +749,16 @@ function CreateLinkForm(props: {
             onChange={(e) => setDays(e.target.value)}
           />
         </Field>
-        <Field label="Password (optional)">
+        <Field label={t('share.link.password')}>
           <TextInput type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} />
         </Field>
-        <Button type="submit">Create link</Button>
+        <Button type="submit">{t('share.link.create')}</Button>
       </Row>
       <Text tone="muted" size="sm">
-        For safety, Ruum shows a new link only once. Copy it when it appears; you can make a new one at any time.
+        {t('share.link.once')}
       </Text>
       <ErrorNote error={error} />
-      {created?.url && <SecretBox label="New link" secret={created.url} note="Copy the link now. For safety, Ruum shows it only once." />}
+      {created?.url && <SecretBox label={t('share.link.new')} secret={created.url} note={t('share.link.new.note')} />}
     </Stack>
   )
 }

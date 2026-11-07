@@ -4,6 +4,7 @@ import { Button } from '../button/Button'
 import { cx } from '../cx'
 import { VisuallyHidden } from '../text/Text'
 import './shell.css'
+import { t } from '../../i18n'
 
 // The app shell (design-system 4.1): the top bar, the rail (a menu on the phone), the main region,
 // and the layout parts of pages: the split view with the details panel, the selection bar, the drop
@@ -13,7 +14,7 @@ import './shell.css'
 export function SkipLink({ target = 'main' }: { target?: string }) {
   return (
     <a className="ui-skip" href={`#${target}`}>
-      Skip to content
+      {t('ui.skip')}
     </a>
   )
 }
@@ -73,7 +74,7 @@ export function MenuToggle({ open, controls, onToggle }: { open: boolean; contro
   return (
     <span className="ui-menu-toggle">
       <Button icon="menu" aria-expanded={open} aria-controls={controls} onClick={onToggle}>
-        Menu
+        {t('ui.menu')}
       </Button>
     </span>
   )

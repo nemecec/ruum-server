@@ -5,6 +5,7 @@ import { cx } from '../cx'
 import { ErrorNote } from '../feedback/Feedback'
 import { Actions, Stack } from '../layout/Layout'
 import './dialog.css'
+import { t } from '../../i18n'
 
 /**
  * Where the focus goes when a dialog opens: an element marked `data-autofocus`, else the first
@@ -74,7 +75,7 @@ export function Dialog(props: {
     >
       <header className="ui-dialog-head">
         <h2 id={titleId}>{props.title}</h2>
-        <IconButton icon="close" label="Close" onClick={props.onClose} />
+        <IconButton icon="close" label={t('ui.close')} onClick={props.onClose} />
       </header>
       <div className="ui-dialog-body">{props.children}</div>
     </dialog>
@@ -99,7 +100,7 @@ export function ConfirmDialog(props: {
         <div id={messageId}>{props.message}</div>
         <ErrorNote error={error} />
         <Actions>
-          <Button onClick={props.onClose}>Cancel</Button>
+          <Button onClick={props.onClose}>{t('ui.cancel')}</Button>
           <Button
             variant={props.danger ? 'danger' : 'primary'}
             disabled={busy}

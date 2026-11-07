@@ -5,6 +5,7 @@ import { cx } from '../cx'
 import { Icon } from '../icon/Icon'
 import { ToastContext, type ToastOptions } from './useToast'
 import './toast.css'
+import { t } from '../../i18n'
 
 type ToastData = { id: number; text: string; options: ToastOptions; error?: boolean }
 
@@ -40,7 +41,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 /** The fixed region of the toasts. */
 export function ToastRegion({ children }: { children: ReactNode }) {
   return (
-    <section className="ui-toasts" aria-label="Notifications">
+    <section className="ui-toasts" aria-label={t('ui.toasts')}>
       {children}
     </section>
   )
@@ -59,7 +60,7 @@ export function ToastView(
       <Icon name={error ? 'error' : 'success'} />
       <p role="status">{text}</p>
       {children}
-      <IconButton icon="close" size="sm" label="Dismiss" onClick={onDismiss} />
+      <IconButton icon="close" size="sm" label={t('ui.toast.dismiss')} onClick={onDismiss} />
     </div>
   )
 }
@@ -96,13 +97,13 @@ function ToastItem({ toast, onDone, onUpdate }: { toast: ToastData; onDone: () =
             setBusy(true)
             try {
               const text = await toast.options.undo!()
-              onUpdate({ text: text || 'Undone.', options: {} })
+              onUpdate({ text: text || t('ui.toast.undone'), options: {} })
             } catch (e) {
               onUpdate({ text: errorText(e), options: {}, error: true })
             }
           }}
         >
-          Undo
+          {t('ui.toast.undo')}
         </Button>
       )}
       {toast.options.action && (

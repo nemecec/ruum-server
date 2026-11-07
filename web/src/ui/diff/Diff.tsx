@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { VisuallyHidden } from '../text/Text'
 import './diff.css'
+import { t } from '../../i18n'
 
 /**
  * The changes between two versions (design-system 4.9). Insertions and deletions use `<ins>` and
@@ -8,7 +9,7 @@ import './diff.css'
  */
 export function DiffView({ busy, children }: { busy?: boolean; children: ReactNode }) {
   return (
-    <div className="ui-diff" aria-label="Changes" role="group" aria-busy={busy}>
+    <div className="ui-diff" aria-label={t('ui.diff.label')} role="group" aria-busy={busy}>
       {children}
     </div>
   )
@@ -36,13 +37,13 @@ export function DiffChange(props: {
         <div className="ui-diff-values">
           {props.old !== undefined && (
             <del>
-              <VisuallyHidden>Removed: </VisuallyHidden>
+              <VisuallyHidden>{t('ui.diff.removed')} </VisuallyHidden>
               {props.old}
             </del>
           )}
           {props.new !== undefined && (
             <ins>
-              <VisuallyHidden>Added: </VisuallyHidden>
+              <VisuallyHidden>{t('ui.diff.added')} </VisuallyHidden>
               {props.new}
             </ins>
           )}

@@ -379,7 +379,18 @@ export const handlers: HttpHandler[] = [
     if (typeof document !== 'undefined') document.cookie = 'ruum_mock_session=; Max-Age=0; Path=/'
     return { logout_url: '/signin?signed_out=1' }
   }),
-  route('get', '/v1/me', () => ({ actor: userRef(), on_behalf_of: null, user: db.user, agent: null, bound_tenant_id: null })),
+  route('get', '/v1/me', () => ({
+    actor: userRef(),
+    on_behalf_of: null,
+    user: db.user,
+    agent: null,
+    bound_tenant_id: null,
+    preferences: { ...db.preferences },
+  })),
+  route('patch', '/v1/me/preferences', ({ body }) => {
+    if (body.locale !== undefined) db.preferences = { locale: body.locale }
+    return { ...db.preferences }
+  }),
   route('get', '/v1/me/identities', () => ({ items: db.identities })),
   route('get', '/v1/me/sessions', () => ({ items: db.sessions })),
   route('delete', '/v1/me/sessions/{session_id}', ({ params }) => {

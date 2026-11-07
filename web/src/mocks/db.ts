@@ -478,6 +478,8 @@ function seed() {
     audit,
     limits,
     identities,
+    /** The signed-in user's preferences (`getMe`, `updateMyPreferences`). */
+    preferences: { locale: null } as Schemas['UserPreferences'],
     sessions,
     appPasswords,
     oauthClients,

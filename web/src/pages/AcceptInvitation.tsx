@@ -4,6 +4,7 @@ import { client, RuumApiError, unwrap } from '../api/client'
 import { tenantPath } from '../app/tenant'
 import { useSession } from '../app/useSession'
 import { Actions, Button, ButtonLink, ErrorNote, Page, useToast } from '../ui'
+import { t, tr } from '../i18n'
 
 /**
  * `/invitations/accept?token=...` (card UX-02): the link of an invitation email. The person signs
@@ -26,9 +27,9 @@ export function AcceptInvitationPage() {
     try {
       const member = await unwrap(client.POST('/v1/invitations/accept', { body: { token } }))
       const tenants = await reloadTenants()
-      const space = tenants.find((t) => t.tenant.id === member.tenant_id)?.tenant.name ?? 'the space'
+      const space = tenants.find((m) => m.tenant.id === member.tenant_id)?.tenant.name
       navigate(tenantPath(member.tenant_id, 'files'), { replace: true })
-      toast(`You've joined ${space}.`)
+      toast(space ? t('invitation.joined', { space }) : t('invitation.joined.unnamed'))
     } catch (e) {
       if (e instanceof RuumApiError && e.status === 404) setEnded(true)
       else setError(e)
@@ -39,10 +40,10 @@ export function AcceptInvitationPage() {
   if (ended) {
     return (
       <Page narrow id="main">
-        <h1>This invitation doesn't work any more</h1>
-        <p>It was used already, or it ended. Ask the person who invited you for a new one.</p>
+        <h1>{t('invitation.ended.title')}</h1>
+        <p>{t('invitation.ended.body')}</p>
         <p>
-          <Link to="/">Go to your files</Link>
+          <Link to="/">{t('common.goToFiles')}</Link>
         </p>
       </Page>
     )
@@ -50,18 +51,16 @@ export function AcceptInvitationPage() {
 
   return (
     <Page narrow id="main">
-      <h1>You're invited to a space in Ruum</h1>
+      <h1>{t('invitation.title')}</h1>
       <p>
-        You join as <strong>{me.user.display_name}</strong> ({me.user.email}). The invitation email names the space, the person who invited
-        you and your role; Ruum can't show them here yet. After you join, the space and what was shared with you show up in your space
-        switcher.
+        {tr('invitation.body', { name: me.user.display_name, email: me.user.email, b: (c) => <strong>{c}</strong> })}
       </p>
       <ErrorNote error={error} />
       <Actions align="start">
         <Button variant="primary" disabled={busy} busy={busy} onClick={join}>
-          Join the space
+          {t('invitation.join')}
         </Button>
-        <ButtonLink to="/">Not now</ButtonLink>
+        <ButtonLink to="/">{t('common.notNow')}</ButtonLink>
       </Actions>
     </Page>
   )

@@ -29,4 +29,25 @@ describe('error copy (copy.md section 4)', () => {
     const e = new RuumApiError(403, { code: 'plan_limit_reached', message: 'the tenant has reached its limit of 1 members', hint: 'invite the person as a guest, or move to a team plan' })
     expect(errorText(e)).toBe("You've reached the limit of your plan for members. Remove one you don't use, or change the plan.")
   })
+
+  it('falls back to the server message for a code the UI does not know', () => {
+    const e = new RuumApiError(409, { code: 'branch_locked' as never, message: 'the branch is locked by a migration', hint: 'wait' })
+    expect(errorText(e)).toBe('The branch is locked by a migration.')
+  })
+
+  it('shows the copy in the language of the UI', async () => {
+    const { currentIntl, setCurrentIntl, makeIntl } = await import('../i18n/intl')
+    const { loadMessages } = await import('../i18n/catalogue')
+    const before = currentIntl()
+    setCurrentIntl(makeIntl('et', await loadMessages('et')))
+    try {
+      const e = new RuumApiError(409, { code: 'name_taken', message: 'the folder already has a node named "Plaan"', hint: '' })
+      expect(errorText(e)).toBe('Siin on juba üksus nimega Plaan. Vali teine nimi.')
+      expect(errorText(new RuumApiError(403, { code: 'permission_denied', message: 'no', hint: '' }), { space: 'Pärn' })).toBe(
+        'Sul pole selleks ligipääsu. Küsi ruumi Pärn omanikult või administraatorilt.',
+      )
+    } finally {
+      setCurrentIntl(before)
+    }
+  })
 })

@@ -20,6 +20,7 @@ import {
   Text,
   TextInput,
 } from '../../ui'
+import { t } from '../../i18n'
 
 /** Search by name, optionally narrowed to one tag. */
 export function SearchPage() {
@@ -45,7 +46,7 @@ export function SearchPage() {
 
   return (
     <PageBody>
-      <h1>Search</h1>
+      <h1>{t('search.title')}</h1>
       <Row
         as="form"
         align="end"
@@ -56,33 +57,33 @@ export function SearchPage() {
         }}
       >
         <Grow as="div">
-          <Field label="Name contains">
+          <Field label={t('search.name')}>
             <TextInput name="q" type="search" defaultValue={q} key={q} />
           </Field>
         </Grow>
-        <Field label="Tag">
+        <Field label={t('search.tag')}>
           <Select value={tag} onChange={(e) => update('tag', e.target.value)}>
-            <option value="">Any tag</option>
-            {tags.data?.items.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
+            <option value="">{t('search.anyTag')}</option>
+            {tags.data?.items.map((tag) => (
+              <option key={tag.id} value={tag.id}>
+                {tag.name}
               </option>
             ))}
           </Select>
         </Field>
         <Button type="submit" icon="search">
-          Search
+          {t('search.submit')}
         </Button>
       </Row>
       {q && (
         <Loaded state={results}>
           {({ items }) =>
             items.length === 0 ? (
-              <EmptyState icon="search" title={`Nothing matches "${q}".`} />
+              <EmptyState icon="search" title={t('search.none', { q })} />
             ) : (
               <>
                 <Text role="status" tone="muted">
-                  {items.length} {items.length === 1 ? 'match' : 'matches'}
+                  {t('search.count', { n: items.length })}
                 </Text>
                 <List>
                   {items.map(({ node, path }) => (
