@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { Link, NavLink, Outlet } from 'react-router'
+import { Link, Outlet } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
@@ -9,19 +9,54 @@ import { Actor } from '../../app/names'
 import { useNames } from '../../app/useNames'
 import { StartTeamDialog } from '../../app/Shell'
 import { formatBytes, formatDate, formatWhen, memberRoleLabels, memberRoleMeanings } from '../../components/format'
-import { useToast } from '../../components/useToast'
-import { ConfirmButton, ConfirmDialog, EmptyState, ErrorNote, Loaded, LoadMore } from '../../components/ui'
 import { auditDetail, auditText } from './audit'
+import {
+  Meter,
+  Actions,
+  Badge,
+  Button,
+  Card,
+  Checkbox,
+  ConfirmButton,
+  ConfirmDialog,
+  EmptyState,
+  ErrorNote,
+  Facts,
+  Field,
+  Fieldset,
+  Grow,
+  List,
+  ListRow,
+  Loaded,
+  LoadMore,
+  Note,
+  PageBody,
+  Row,
+  Select,
+  Stack,
+  Table,
+  Tabs,
+  TBody,
+  Td,
+  Text,
+  TextArea,
+  TextInput,
+  Th,
+  THead,
+  Tr,
+  useToast,
+  VisuallyHidden,
+} from '../../ui'
 
 /** The tenant admin layout: a sub-navigation and one admin page. */
 export function AdminLayout() {
   const { tenant, isAdmin } = useTenant()
   if (!isAdmin) {
     return (
-      <div className="page-body">
+      <PageBody>
         <h1>Space settings</h1>
         <p>Only admins and owners of {tenant.name} can open these pages.</p>
-      </div>
+      </PageBody>
     )
   }
   const tabs: [string, string][] = [
@@ -32,19 +67,11 @@ export function AdminLayout() {
     ['audit', 'Activity log'],
   ]
   return (
-    <div className="page-body">
+    <PageBody>
       <h1>Space settings: {tenant.name}</h1>
-      <nav aria-label="Admin" className="tabs">
-        <ul>
-          {tabs.map(([to, label]) => (
-            <li key={to}>
-              <NavLink to={to}>{label}</NavLink>
-            </li>
-          ))}
-        </ul>
-      </nav>
+      <Tabs label="Admin" items={tabs.map(([to, label]) => ({ to, label }))} />
       <Outlet />
-    </div>
+    </PageBody>
   )
 }
 
@@ -56,7 +83,10 @@ export function MembersPage() {
   const { toast } = useToast()
   const [error, setError] = useState<unknown>()
   const members = usePagedApi(
-    (cursor) => unwrap(client.GET('/v1/tenants/{tenant_id}/members', { params: { path: { tenant_id: tenant.id }, query: cursor ? { cursor } : {} } })),
+    (cursor) =>
+      unwrap(
+        client.GET('/v1/tenants/{tenant_id}/members', { params: { path: { tenant_id: tenant.id }, query: cursor ? { cursor } : {} } }),
+      ),
     [tenant.id],
   )
 
@@ -100,37 +130,39 @@ export function MembersPage() {
       )}
       <Loaded state={members}>
         {({ items }) => (
-          <table className="table">
-            <thead>
-              <tr>
-                <th scope="col">Name</th>
-                <th scope="col" className="hide-narrow">
+          <Table caption="Members">
+            <THead>
+              <Tr>
+                <Th scope="col">Name</Th>
+                <Th hideNarrow scope="col">
                   Email
-                </th>
-                <th scope="col">Role</th>
-                <th scope="col">
-                  <span className="sr-only">Actions</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
+                </Th>
+                <Th scope="col">Role</Th>
+                <Th scope="col">
+                  <VisuallyHidden>Actions</VisuallyHidden>
+                </Th>
+              </Tr>
+            </THead>
+            <TBody>
               {items.map((m) => {
                 const self = m.user_id === me.user.id
                 // Only owners can make or change owners.
                 const locked = self || (m.role === 'owner' && myRole !== 'owner')
                 return (
-                  <tr key={m.user_id}>
-                    <th scope="row">
+                  <Tr key={m.user_id}>
+                    <Th scope="row">
                       {m.display_name}
-                      {self && <span className="muted"> (you)</span>}
-                    </th>
-                    <td className="hide-narrow">{m.email}</td>
-                    <td>
-                      <label className="sr-only" htmlFor={`member-role-${m.user_id}`}>
-                        Role of {m.display_name}
-                      </label>
-                      <select
-                        id={`member-role-${m.user_id}`}
+                      {self && (
+                        <Text as="span" tone="muted">
+                          {' '}
+                          (you)
+                        </Text>
+                      )}
+                    </Th>
+                    <Td hideNarrow>{m.email}</Td>
+                    <Td>
+                      <Select
+                        aria-label={`Role of ${m.display_name}`}
                         value={m.role}
                         disabled={locked}
                         onChange={(e) => {
@@ -146,9 +178,9 @@ export function MembersPage() {
                               {memberRoleLabels[r]}
                             </option>
                           ))}
-                      </select>
-                    </td>
-                    <td className="row-actions">
+                      </Select>
+                    </Td>
+                    <Td actions>
                       {!locked && (
                         <ConfirmButton
                           label="Remove"
@@ -168,12 +200,12 @@ export function MembersPage() {
                           }}
                         />
                       )}
-                    </td>
-                  </tr>
+                    </Td>
+                  </Tr>
                 )
               })}
-            </tbody>
-          </table>
+            </TBody>
+          </Table>
         )}
       </Loaded>
       <LoadMore state={members} />
@@ -183,13 +215,10 @@ export function MembersPage() {
 
 /** The member roles a space can still take, from its plan: a personal space has room only for its owner. */
 function useRoomForMembers(tenantId: string) {
-  return useApi(
-    async () => {
-      const res = await unwrap(client.GET('/v1/tenants/{tenant_id}/limits', { params: { path: { tenant_id: tenantId } } }))
-      return res.limits.members === null || res.usage.members < res.limits.members
-    },
-    [tenantId],
-  )
+  return useApi(async () => {
+    const res = await unwrap(client.GET('/v1/tenants/{tenant_id}/limits', { params: { path: { tenant_id: tenantId } } }))
+    return res.limits.members === null || res.usage.members < res.limits.members
+  }, [tenantId])
 }
 
 export function InvitationsPage() {
@@ -204,7 +233,10 @@ export function InvitationsPage() {
   const [error, setError] = useState<unknown>()
   const [startTeam, setStartTeam] = useState(false)
   const invitations = usePagedApi(
-    (cursor) => unwrap(client.GET('/v1/tenants/{tenant_id}/invitations', { params: { path: { tenant_id: tenant.id }, query: cursor ? { cursor } : {} } })),
+    (cursor) =>
+      unwrap(
+        client.GET('/v1/tenants/{tenant_id}/invitations', { params: { path: { tenant_id: tenant.id }, query: cursor ? { cursor } : {} } }),
+      ),
     [tenant.id],
   )
   const effectiveRole = membersAllowed ? role : 'guest'
@@ -241,67 +273,71 @@ export function InvitationsPage() {
   return (
     <section aria-labelledby="inv-title">
       <h2 id="inv-title">Invitations</h2>
-      <form className="stack card" onSubmit={invite} aria-label="Invite people">
-        <div className="inline-form">
-          <label className="grow">
-            Emails
-            <input required value={emails} onChange={(e) => setEmails(e.target.value)} placeholder="name@example.com" aria-describedby="inv-emails-help" />
-          </label>
-          <label>
-            Role
-            <select value={effectiveRole} onChange={(e) => setRole(e.target.value as typeof role)} aria-describedby="inv-role-help">
+      <Card as="form" onSubmit={invite} aria-label="Invite people">
+        <Row align="end">
+          <Field label="Emails" grow>
+            <TextInput
+              required
+              value={emails}
+              onChange={(e) => setEmails(e.target.value)}
+              placeholder="name@example.com"
+              aria-describedby="inv-emails-help"
+            />
+          </Field>
+          <Field label="Role">
+            <Select value={effectiveRole} onChange={(e) => setRole(e.target.value as typeof role)} aria-describedby="inv-role-help">
               <option value="guest">Guest</option>
               {membersAllowed && <option value="member">Member</option>}
               {membersAllowed && <option value="admin">Admin</option>}
-            </select>
-          </label>
-        </div>
-        <p id="inv-emails-help" className="muted small">
+            </Select>
+          </Field>
+        </Row>
+        <Text tone="muted" size="sm" id="inv-emails-help">
           One or more, separated by commas
-        </p>
-        <p id="inv-role-help" className="muted small">
+        </Text>
+        <Text tone="muted" size="sm" id="inv-role-help">
           {memberRoleLabels[effectiveRole]}: {memberRoleMeanings[effectiveRole]}
-        </p>
+        </Text>
         {!membersAllowed && (
-          <div className="note">
+          <Note>
             <p>
               {tenant.kind === 'personal'
                 ? `${tenant.name} is a personal space, just for you. Invite people as guests to share items with them, or start a team space to work together.`
                 : `${tenant.name} has reached the member limit of its plan. Invite people as guests, or change the plan.`}
             </p>
-            {tenant.kind === 'personal' && (
-              <button type="button" onClick={() => setStartTeam(true)}>
-                Start a team space
-              </button>
-            )}
-          </div>
+            {tenant.kind === 'personal' && <Button onClick={() => setStartTeam(true)}>Start a team space</Button>}
+          </Note>
         )}
-        <label>
-          Message (optional)
-          <textarea rows={2} value={message} onChange={(e) => setMessage(e.target.value)} />
-        </label>
+        <Field label="Message (optional)">
+          <TextArea rows={2} value={message} onChange={(e) => setMessage(e.target.value)} />
+        </Field>
         {!tenant.policy.allow_guests && effectiveRole === 'guest' && (
-          <p className="error">Guests are turned off in the sharing rules of this space.</p>
+          <Text tone="danger">Guests are turned off in the sharing rules of this space.</Text>
         )}
         <ErrorNote error={error} context={{ space: tenant.name }} />
-        <div className="actions">
-          <button type="submit" className="primary">
+        <Actions>
+          <Button variant="primary" type="submit">
             Send invitations
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Card>
       <Loaded state={invitations}>
         {({ items }) => (
-          <ul className="rows">
-            {items.length === 0 && <li className="muted">No open invitations.</li>}
+          <List>
+            {items.length === 0 && (
+              <Text as="li" tone="muted">
+                No open invitations.
+              </Text>
+            )}
             {items.map((i) => (
-              <li key={i.id} className="row">
-                <span className="grow">
-                  {i.email} <span className="badge">{memberRoleLabels[i.role]}</span>
-                  <span className="muted small block">
-                    Invited, waiting. Ends {new Date(i.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}.
-                  </span>
-                </span>
+              <ListRow key={i.id}>
+                <Grow>
+                  {i.email} <Badge>{memberRoleLabels[i.role]}</Badge>
+                  <Text as="span" tone="muted" size="sm" block>
+                    Invited, waiting. Ends{' '}
+                    {new Date(i.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}.
+                  </Text>
+                </Grow>
                 <ConfirmButton
                   label="Cancel invitation"
                   ariaLabel={`Cancel invitation: ${i.email}`}
@@ -318,9 +354,9 @@ export function InvitationsPage() {
                     invitations.reload()
                   }}
                 />
-              </li>
+              </ListRow>
             ))}
-          </ul>
+          </List>
         )}
       </Loaded>
       <LoadMore state={invitations} />
@@ -341,7 +377,9 @@ export function PolicyPage() {
     e.preventDefault()
     setError(undefined)
     try {
-      await unwrap(client.PATCH('/v1/tenants/{tenant_id}', { params: { path: { tenant_id: tenant.id } }, body: { name: name.trim(), policy } }))
+      await unwrap(
+        client.PATCH('/v1/tenants/{tenant_id}', { params: { path: { tenant_id: tenant.id } }, body: { name: name.trim(), policy } }),
+      )
       toast('Saved the sharing rules.')
       await reloadTenants()
     } catch (err) {
@@ -350,59 +388,68 @@ export function PolicyPage() {
   }
 
   const check = (key: keyof Omit<Schemas['TenantPolicy'], 'share_link_max_days'>, label: string, disabled = false) => (
-    <label className="check">
-      <input type="checkbox" checked={policy[key]} disabled={disabled} onChange={(e) => setPolicy({ ...policy, [key]: e.target.checked })} />
-      {label}
-    </label>
+    <Checkbox
+      checked={policy[key]}
+      disabled={disabled}
+      onChange={(e) => setPolicy({ ...policy, [key]: e.target.checked })}
+      label={<>{label}</>}
+    />
   )
 
   return (
     <section aria-labelledby="policy-title">
       <h2 id="policy-title">Sharing rules</h2>
-      <form className="stack card" onSubmit={save}>
-        <label>
-          Space name
-          <input required value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
-        <fieldset className="stack">
-          <legend>Sharing</legend>
+      <Card as="form" onSubmit={save}>
+        <Field label="Space name">
+          <TextInput required value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <Fieldset legend="Sharing">
           {check('members_can_share', 'Members can share')}
           {check('allow_guests', 'Allow guests (people outside this space)')}
           {check('allow_share_links', 'Allow links')}
           {check('allow_edit_links', 'Allow links that can edit', !policy.allow_share_links)}
-          <label>
-            Links end after at most (days, empty for no limit)
-            <input
+          <Field label="Links end after at most (days, empty for no limit)">
+            <TextInput
               type="number"
               min={1}
               value={policy.share_link_max_days ?? ''}
               disabled={!policy.allow_share_links}
               onChange={(e) => setPolicy({ ...policy, share_link_max_days: e.target.value ? Number(e.target.value) : null })}
             />
-          </label>
-        </fieldset>
+          </Field>
+        </Fieldset>
         <ErrorNote error={error} />
-        <div className="actions">
-          <button type="submit" className="primary">
+        <Actions>
+          <Button variant="primary" type="submit">
             Save
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Card>
     </section>
   )
 }
 
-function Meter({ label, used, limit, format = String }: { label: string; used: number; limit: number | null; format?: (n: number) => string }) {
+function UsageMeter({
+  label,
+  used,
+  limit,
+  format = String,
+}: {
+  label: string
+  used: number
+  limit: number | null
+  format?: (n: number) => string
+}) {
   return (
-    <div className="meter-row">
-      <div className="row">
-        <span className="grow">{label}</span>
+    <Stack gap={1}>
+      <Row>
+        <Grow>{label}</Grow>
         <span>
           {format(used)} of {limit === null ? 'no limit' : format(limit)}
         </span>
-      </div>
-      {limit !== null && <meter min={0} max={limit} value={used} high={limit * 0.9} aria-label={label} />}
-    </div>
+      </Row>
+      {limit !== null && <Meter max={limit} value={used} high={limit * 0.9} label={label} />}
+    </Stack>
   )
 }
 
@@ -417,14 +464,14 @@ export function LimitsPage() {
       <h2 id="limits-title">Plan</h2>
       <Loaded state={limits}>
         {({ plan, limits: l, usage: u }) => (
-          <div className="stack card">
+          <Card as="div">
             <p>
               Plan: <strong>{plan[0].toUpperCase() + plan.slice(1)}</strong>
             </p>
-            <Meter label="Storage" used={u.storage_bytes} limit={l.storage_bytes} format={formatBytes} />
-            <Meter label="Agents" used={u.agents} limit={l.agents} />
-            <Meter label="Members" used={u.members} limit={l.members} />
-            <dl className="facts">
+            <UsageMeter label="Storage" used={u.storage_bytes} limit={l.storage_bytes} format={formatBytes} />
+            <UsageMeter label="Agents" used={u.agents} limit={l.agents} />
+            <UsageMeter label="Members" used={u.members} limit={l.members} />
+            <Facts>
               <dt>Largest file</dt>
               <dd>{formatBytes(l.max_file_bytes)}</dd>
               <dt>Versions kept</dt>
@@ -438,8 +485,8 @@ export function LimitsPage() {
               <dd>{l.admin_restore_days ? `${l.admin_restore_days} days` : 'Not in this plan'}</dd>
               <dt>Items</dt>
               <dd>{u.nodes}</dd>
-            </dl>
-          </div>
+            </Facts>
+          </Card>
         )}
       </Loaded>
     </section>
@@ -482,16 +529,16 @@ export function AuditPage() {
   return (
     <section aria-labelledby="audit-title">
       <h2 id="audit-title">Activity log</h2>
-      <form
-        className="inline-form"
+      <Row
+        as="form"
+        align="end"
         onSubmit={(e) => {
           e.preventDefault()
           setFilter(action)
         }}
       >
-        <label className="grow">
-          Show
-          <select value={action} onChange={(e) => setAction(e.target.value)}>
+        <Field label="Show" grow>
+          <Select value={action} onChange={(e) => setAction(e.target.value)}>
             <option value="">Everything</option>
             <option value="auth.">Sign-ins</option>
             <option value="member.">Members</option>
@@ -501,28 +548,28 @@ export function AuditPage() {
             <option value="agent.">Agents</option>
             <option value="node.">Items</option>
             <option value="version.">Versions</option>
-          </select>
-        </label>
-        <button type="submit">Show</button>
-      </form>
+          </Select>
+        </Field>
+        <Button type="submit">Show</Button>
+      </Row>
       <Loaded state={audit}>
         {({ items }) => (
           <>
             {items.length === 0 ? (
               <EmptyState title="No activity yet" text={`Changes in ${tenant.name} show up here.`} />
             ) : (
-              <ul className="rows audit">
+              <List>
                 {items.map((a) => (
-                  <li key={a.id} className="row">
-                    <span className="grow">
+                  <ListRow key={a.id}>
+                    <Grow>
                       <Actor pair={a} /> <AuditWhat entry={a} items={items_.data ?? {}} />
-                    </span>
-                    <span className="muted small" title={formatDate(a.at)}>
+                    </Grow>
+                    <Text as="span" tone="muted" size="sm" title={formatDate(a.at)}>
                       {formatWhen(a.at)}
-                    </span>
-                  </li>
+                    </Text>
+                  </ListRow>
                 ))}
-              </ul>
+              </List>
             )}
           </>
         )}

@@ -4,7 +4,35 @@ import { client, linkClient, RuumApiError, unwrap, type Schemas } from '../../ap
 import { useApi } from '../../api/useApi'
 import { browser } from '../../app/browser'
 import { fileTypeLabel, formatBytes, formatDate, formatWhen, roleLabels } from '../../components/format'
-import { EmptyState, ErrorNote, FileIcon, FolderIcon, Loaded, Loading } from '../../components/ui'
+import {
+  TopBar,
+  Table,
+  NameCell,
+  KindIcon,
+  CurrentCrumb,
+  Crumb,
+  Breadcrumbs,
+  Brand,
+  AppMain,
+  Actions,
+  Button,
+  EmptyState,
+  ErrorNote,
+  Facts,
+  Field,
+  Loaded,
+  Loading,
+  Page,
+  PageBody,
+  TBody,
+  Td,
+  Text,
+  TextInput,
+  Th,
+  THead,
+  Tr,
+  VisuallyHidden,
+} from '../../ui'
 
 type Node = Schemas['Node']
 type Resolved = Schemas['ResolvedShareLink']
@@ -15,7 +43,6 @@ type State =
   | { step: 'ended' }
   | { step: 'failed'; error: unknown }
   | { step: 'ready'; link: Resolved }
-
 
 /** Opens a link: `resolveShareLink` with the token (and password) in the body. */
 async function resolveLink(token: string, password?: string): Promise<State> {
@@ -54,49 +81,32 @@ export function ShareLinkPage() {
 
   return (
     <>
-      <header className="topbar">
-        <div className="topbar-row">
-          <span className="brand">Ruum</span>
-          {state.step === 'ready' && (
-            <span className="muted small">
-              You're viewing as anyone with the link. You can {roleLabels[state.link.role].replace('Can ', '')}.
-            </span>
-          )}
-        </div>
-      </header>
-      <main id="main" className="main">
+      <TopBar>
+        <Brand>Ruum</Brand>
+        {state.step === 'ready' && (
+          <Text as="span" tone="muted" size="sm">
+            You're viewing as anyone with the link. You can {roleLabels[state.link.role].replace('Can ', '')}.
+          </Text>
+        )}
+      </TopBar>
+      <AppMain>
         {state.step === 'resolving' && <Loading label="Opening the link" />}
         {state.step === 'ended' && (
-          <div className="page narrow">
+          <Page narrow as="div">
             <h1>This link doesn't work any more</h1>
             <p>Ask the person who sent it for a new one.</p>
-          </div>
+          </Page>
         )}
         {state.step === 'failed' && (
-          <div className="page narrow">
+          <Page narrow as="div">
             <h1>Ruum couldn't open this link</h1>
             <ErrorNote error={state.error} />
-            <button
-              type="button"
-              onClick={() => resolve()}
-            >
-              Try again
-            </button>
-          </div>
+            <Button onClick={() => resolve()}>Try again</Button>
+          </Page>
         )}
-        {state.step === 'password' && (
-          <PasswordForm
-            wrong={state.wrong}
-            onSubmit={(p) => resolve(p)}
-          />
-        )}
-        {state.step === 'ready' && (
-          <SharedView
-            link={state.link}
-            onExpired={() => resolve()}
-          />
-        )}
-      </main>
+        {state.step === 'password' && <PasswordForm wrong={state.wrong} onSubmit={(p) => resolve(p)} />}
+        {state.step === 'ready' && <SharedView link={state.link} onExpired={() => resolve()} />}
+      </AppMain>
     </>
   )
 }
@@ -108,23 +118,29 @@ function PasswordForm({ wrong, onSubmit }: { wrong: boolean; onSubmit: (password
     onSubmit(password)
   }
   return (
-    <form className="page narrow stack" onSubmit={submit}>
+    <Page narrow as="form" onSubmit={submit}>
       <h1>This link has a password</h1>
-      <label>
-        Password
-        <input type="password" required autoFocus autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
-      </label>
+      <Field label="Password">
+        <TextInput
+          type="password"
+          required
+          autoFocus
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+      </Field>
       {wrong && (
-        <p className="error" role="alert">
+        <Text tone="danger" role="alert">
           That password isn't right. Try again.
-        </p>
+        </Text>
       )}
-      <div className="actions left">
-        <button type="submit" className="primary">
+      <Actions align="start">
+        <Button variant="primary" type="submit">
           Open
-        </button>
-      </div>
-    </form>
+        </Button>
+      </Actions>
+    </Page>
   )
 }
 
@@ -134,23 +150,20 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
   const [trail, setTrail] = useState<Node[]>([link.node])
   const [error, setError] = useState<unknown>()
   const current = trail[trail.length - 1]
-  const children = useApi(
-    async () => {
-      if (current.kind !== 'folder') return []
-      const all: Node[] = []
-      let cursor: string | undefined
-      for (let i = 0; i < 20; i++) {
-        const page = await unwrap(
-          api.GET('/v1/nodes/{node_id}/children', { params: { path: { node_id: current.id }, query: cursor ? { cursor } : {} } }),
-        )
-        all.push(...page.items)
-        if (!page.next_cursor) break
-        cursor = page.next_cursor
-      }
-      return all
-    },
-    [current.id, api],
-  )
+  const children = useApi(async () => {
+    if (current.kind !== 'folder') return []
+    const all: Node[] = []
+    let cursor: string | undefined
+    for (let i = 0; i < 20; i++) {
+      const page = await unwrap(
+        api.GET('/v1/nodes/{node_id}/children', { params: { path: { node_id: current.id }, query: cursor ? { cursor } : {} } }),
+      )
+      all.push(...page.items)
+      if (!page.next_cursor) break
+      cursor = page.next_cursor
+    }
+    return all
+  }, [current.id, api])
 
   useEffect(() => {
     if (children.error instanceof RuumApiError && children.error.status === 401) onExpired()
@@ -173,46 +186,42 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
 
   if (current.kind === 'file') {
     return (
-      <div className="page narrow stack">
+      <Page narrow as="div">
         <h1>{current.name}</h1>
-        <dl className="facts">
+        <Facts>
           <dt>Type</dt>
           <dd>{fileTypeLabel(current)}</dd>
           <dt>Size</dt>
           <dd>{formatBytes(current.size_bytes)}</dd>
           <dt>Changed</dt>
           <dd title={formatDate(current.updated_at)}>{formatWhen(current.updated_at)}</dd>
-        </dl>
+        </Facts>
         <ErrorNote error={error} />
-        <div className="actions left">
-          <button type="button" className="primary" onClick={() => open(current, 'attachment')}>
+        <Actions align="start">
+          <Button variant="primary" onClick={() => open(current, 'attachment')}>
             Download
-          </button>
-          <button type="button" onClick={() => open(current, 'inline')}>
-            Preview
-          </button>
-        </div>
-      </div>
+          </Button>
+          <Button onClick={() => open(current, 'inline')}>Preview</Button>
+        </Actions>
+      </Page>
     )
   }
 
   return (
-    <div className="page-body">
-      <nav aria-label="Breadcrumbs" className="breadcrumbs" hidden={trail.length < 2}>
-        <ol>
-          {trail.map((n, i) => (
-            <li key={n.id}>
-              {i === trail.length - 1 ? (
-                <span aria-current="page">{n.name}</span>
-              ) : (
-                <button type="button" className="link" onClick={() => setTrail(trail.slice(0, i + 1))}>
-                  {n.name}
-                </button>
-              )}
-            </li>
-          ))}
-        </ol>
-      </nav>
+    <PageBody>
+      <Breadcrumbs hidden={trail.length < 2}>
+        {trail.map((n, i) =>
+          i === trail.length - 1 ? (
+            <CurrentCrumb key={n.id}>{n.name}</CurrentCrumb>
+          ) : (
+            <Crumb key={n.id}>
+              <Button variant="link" onClick={() => setTrail(trail.slice(0, i + 1))}>
+                {n.name}
+              </Button>
+            </Crumb>
+          ),
+        )}
+      </Breadcrumbs>
       <h1>{current.name}</h1>
       <ErrorNote error={error} />
       <Loaded state={children}>
@@ -220,51 +229,51 @@ function SharedView({ link, onExpired }: { link: Resolved; onExpired: () => void
           items.length === 0 ? (
             <EmptyState title="This folder is empty" />
           ) : (
-            <table className="table files">
-              <caption className="sr-only">Contents of this folder</caption>
-              <thead>
-                <tr>
-                  <th scope="col">Name</th>
-                  <th scope="col" className="hide-narrow">
+            <Table caption="Contents of this folder">
+              <THead>
+                <Tr>
+                  <Th scope="col">Name</Th>
+                  <Th hideNarrow scope="col">
                     Size
-                  </th>
-                  <th scope="col" className="hide-narrow">
+                  </Th>
+                  <Th hideNarrow scope="col">
                     Changed
-                  </th>
-                  <th scope="col">
-                    <span className="sr-only">Actions</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
+                  </Th>
+                  <Th scope="col">
+                    <VisuallyHidden>Actions</VisuallyHidden>
+                  </Th>
+                </Tr>
+              </THead>
+              <TBody>
                 {items.map((n) => (
-                  <tr key={n.id}>
-                    <th scope="row">
-                      <span className="name-cell">
-                        <span className={`kind kind-${n.kind}`}>{n.kind === 'folder' ? <FolderIcon /> : <FileIcon type={n.type} name={n.name} />}</span>
-                        <button type="button" className="link" onClick={() => setTrail([...trail, n])}>
+                  <Tr key={n.id}>
+                    <Th scope="row">
+                      <NameCell icon={<KindIcon kind={n.kind} type={n.type} name={n.name} />}>
+                        <Button variant="link" onClick={() => setTrail([...trail, n])}>
                           {n.name}
-                        </button>
-                      </span>
-                    </th>
-                    <td className="hide-narrow num">{n.kind === 'folder' ? '-' : formatBytes(n.size_bytes)}</td>
-                    <td className="hide-narrow">
+                        </Button>
+                      </NameCell>
+                    </Th>
+                    <Td hideNarrow numeric>
+                      {n.kind === 'folder' ? '-' : formatBytes(n.size_bytes)}
+                    </Td>
+                    <Td hideNarrow>
                       <span title={formatDate(n.updated_at)}>{formatWhen(n.updated_at)}</span>
-                    </td>
-                    <td className="row-actions">
+                    </Td>
+                    <Td actions>
                       {n.kind === 'file' && (
-                        <button type="button" aria-label={`Download ${n.name}`} onClick={() => open(n, 'attachment')}>
+                        <Button aria-label={`Download ${n.name}`} onClick={() => open(n, 'attachment')}>
                           Download
-                        </button>
+                        </Button>
                       )}
-                    </td>
-                  </tr>
+                    </Td>
+                  </Tr>
                 ))}
-              </tbody>
-            </table>
+              </TBody>
+            </Table>
           )
         }
       </Loaded>
-    </div>
+    </PageBody>
   )
 }

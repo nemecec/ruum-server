@@ -7,8 +7,28 @@ import { useActorText, useNames, type Names } from '../../app/useNames'
 import { useSession } from '../../app/useSession'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { count, memberRoleLabels, roleLabels, roleMeanings } from '../../components/format'
-import { ConfirmButton, Dialog, ErrorNote, Loaded, LoadMore, Notice, SecretBox } from '../../components/ui'
 import type { Node } from './api'
+import {
+  Button,
+  Checkbox,
+  ConfirmButton,
+  Dialog,
+  ErrorNote,
+  Field,
+  Grow,
+  List,
+  ListRow,
+  Loaded,
+  LoadMore,
+  Note,
+  Notice,
+  Row,
+  SecretBox,
+  Select,
+  Stack,
+  Text,
+  TextInput,
+} from '../../ui'
 
 const roles: Schemas['Role'][] = ['view', 'comment', 'edit', 'manage']
 const linkRoles: Schemas['ShareLinkRole'][] = ['view', 'comment', 'edit']
@@ -91,11 +111,7 @@ async function loadSpacePeople(tenantId: string): Promise<SpacePeople> {
  * their account by user ID, so it reaches them at once), a person outside it, or `unknown` when
  * the caller may not list the space's people.
  */
-export type EmailMatch =
-  | { kind: 'me' }
-  | { kind: 'person'; member: Schemas['Member'] }
-  | { kind: 'outside' }
-  | { kind: 'unknown' }
+export type EmailMatch = { kind: 'me' } | { kind: 'person'; member: Schemas['Member'] } | { kind: 'outside' } | { kind: 'unknown' }
 
 /** True for the space roles that manage everything in a team space (decision 0001-4, team root). */
 const managesEverything = (role: Schemas['MemberRole']) => role !== 'guest'
@@ -143,21 +159,18 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
 
   // The folders that inherited grants come from, by name (ia.md: "from folder Name").
   const fromIds = [...new Set((grants.data?.items ?? []).map((g) => g.inherited_from).filter((x): x is string => Boolean(x)))]
-  const folders = useApi(
-    async () => {
-      const out: Record<string, string> = {}
-      for (const id of fromIds) {
-        try {
-          const n = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: id } } }))
-          out[id] = n.parent_id ? n.name : 'Files'
-        } catch {
-          // A folder the person cannot see: the row says "from a folder above".
-        }
+  const folders = useApi(async () => {
+    const out: Record<string, string> = {}
+    for (const id of fromIds) {
+      try {
+        const n = await unwrap(client.GET('/v1/nodes/{node_id}', { params: { path: { node_id: id } } }))
+        out[id] = n.parent_id ? n.name : 'Files'
+      } catch {
+        // A folder the person cannot see: the row says "from a folder above".
       }
-      return out
-    },
-    [fromIds.join(',')],
-  )
+    }
+    return out
+  }, [fromIds.join(',')])
 
   // Grantees with a name or email teach the name directory.
   useEffect(() => {
@@ -203,8 +216,8 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
   }
 
   return (
-    <Dialog title={`Share ${node.name}`} open={props.open} onClose={props.onClose} wide>
-      <div className="stack">
+    <Dialog title={`Share ${node.name}`} open={props.open} onClose={props.onClose} size="md">
+      <Stack>
         <ErrorNote error={error} />
         <Notice text={notice} />
         {canShare ? (
@@ -222,10 +235,10 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
               !policy.allow_share_links || linkGrantable.length === 0
                 ? undefined
                 : () => {
-              const select = document.getElementById('link-role')
-              select?.scrollIntoView?.({ block: 'center' })
-              select?.focus()
-            }
+                    const select = document.getElementById('link-role')
+                    select?.scrollIntoView?.({ block: 'center' })
+                    select?.focus()
+                  }
             }
             onAdd={async (target, role, inviteGuest) => {
               setError(undefined)
@@ -269,7 +282,9 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     },
                   }),
                 )
-                setNotice(`Shared ${node.name} with ${who}. Ruum emailed them an invitation: they make a free account, then they can open it.`)
+                setNotice(
+                  `Shared ${node.name} with ${who}. Ruum emailed them an invitation: they make a free account, then they can open it.`,
+                )
               } catch (e) {
                 setNotice(`Shared ${node.name} with ${who}, but the invitation email was not sent.`)
                 setError(e)
@@ -277,36 +292,48 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
             }}
           />
         ) : (
-          <p className="muted">You can see who has access, but you can't share this. Ask {owner?.name ?? 'the owner'}.</p>
+          <Text tone="muted">You can see who has access, but you can't share this. Ask {owner?.name ?? 'the owner'}.</Text>
         )}
 
         <section aria-labelledby="share-people">
           <h3 id="share-people">People with access</h3>
           <Loaded state={grants}>
             {(page) => (
-              <ul className="rows">
-                <li className="row">
-                  <span className="grow">
+              <List>
+                <ListRow>
+                  <Grow>
                     {owner?.name ?? 'The owner'}
-                    {owner?.email && <span className="muted small block">{owner.email}</span>}
-                  </span>
-                  <span className="muted">Owner</span>
-                </li>
+                    {owner?.email && (
+                      <Text as="span" tone="muted" size="sm" block>
+                        {owner.email}
+                      </Text>
+                    )}
+                  </Grow>
+                  <Text as="span" tone="muted">
+                    Owner
+                  </Text>
+                </ListRow>
                 {team && (
-                  <li className="row">
-                    <span className="grow">
+                  <ListRow>
+                    <Grow>
                       Everyone in {tenant.name} except guests
-                      <span className="muted small block">
-                        {roleCount !== null ? `${count(roleCount, 'person', 'people')}. ` : ''}Owners, admins and members manage everything in{' '}
-                        {tenant.name}
-                        {policy.members_can_share ? ', and share it' : ''}. This comes from their role in the space; a share here can't
-                        give them less.
-                      </span>
-                    </span>
-                    <span className="muted">{roleLabels.manage}</span>
-                  </li>
+                      <Text as="span" tone="muted" size="sm" block>
+                        {roleCount !== null ? `${count(roleCount, 'person', 'people')}. ` : ''}Owners, admins and members manage everything
+                        in {tenant.name}
+                        {policy.members_can_share ? ', and share it' : ''}. This comes from their role in the space; a share here can't give
+                        them less.
+                      </Text>
+                    </Grow>
+                    <Text as="span" tone="muted">
+                      {roleLabels.manage}
+                    </Text>
+                  </ListRow>
                 )}
-                {!team && page.items.length === 0 && <li className="muted">Only you can see this.</li>}
+                {!team && page.items.length === 0 && (
+                  <Text as="li" tone="muted">
+                    Only you can see this.
+                  </Text>
+                )}
                 {page.items.map((g) => {
                   const name = nameOf(g)
                   const detail = granteeDetail(g.grantee, names, g.id)
@@ -318,25 +345,33 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                   const roleWins = team && member && managesEverything(member.role) && !mine
                   const addedBy = !g.inherited_from && g.created_by.actor.id !== node.owner_id ? actorText(g.created_by) : null
                   return (
-                    <li key={g.id} className="row">
-                      <span className="grow">
+                    <ListRow key={g.id}>
+                      <Grow>
                         {name}
                         {mine && ' (you)'}
-                        {detail && <span className="muted small block">{detail}</span>}
-                        {addedBy && <span className="muted small block">added by {g.created_by.actor.id === me.user.id ? 'you' : addedBy}</span>}
+                        {detail && (
+                          <Text as="span" tone="muted" size="sm" block>
+                            {detail}
+                          </Text>
+                        )}
+                        {addedBy && (
+                          <Text as="span" tone="muted" size="sm" block>
+                            added by {g.created_by.actor.id === me.user.id ? 'you' : addedBy}
+                          </Text>
+                        )}
                         {roleWins && (
-                          <span className="small block">
+                          <Text as="span" size="sm" block>
                             {memberRoleLabels[member.role]} of {tenant.name}: can manage everything here, whatever this share says.
-                          </span>
+                          </Text>
                         )}
                         {notInSpace && (
-                          <span className="small block">
+                          <Text as="span" size="sm" block>
                             Can't open it yet: they haven't joined
                             {canInviteGuests ? '. Invite them under Space settings, Invitations.' : '. Ask an admin to invite them.'}
-                          </span>
+                          </Text>
                         )}
                         {g.inherited_from && (
-                          <span className="muted small block">
+                          <Text as="span" tone="muted" size="sm" block>
                             {folders.data?.[g.inherited_from] ? (
                               <>
                                 from folder{' '}
@@ -347,16 +382,13 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                             ) : (
                               'from a folder above'
                             )}
-                          </span>
+                          </Text>
                         )}
-                      </span>
+                      </Grow>
                       {canShare && !mine && !g.inherited_from && grantable.includes(g.role) ? (
                         <>
-                          <label className="sr-only" htmlFor={`role-${g.id}`}>
-                            Access of {name}
-                          </label>
-                          <select
-                            id={`role-${g.id}`}
+                          <Select
+                            aria-label={`Access of ${name}`}
                             value={g.role}
                             onChange={(e) =>
                               run(
@@ -377,9 +409,8 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                                 {roleLabels[r]}
                               </option>
                             ))}
-                          </select>
-                          <button
-                            type="button"
+                          </Select>
+                          <Button
                             aria-label={`Remove access for ${name}`}
                             onClick={() =>
                               run(
@@ -395,15 +426,17 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                             }
                           >
                             Remove
-                          </button>
+                          </Button>
                         </>
                       ) : (
-                        <span className="muted">{roleLabels[g.role]}</span>
+                        <Text as="span" tone="muted">
+                          {roleLabels[g.role]}
+                        </Text>
                       )}
-                    </li>
+                    </ListRow>
                   )
                 })}
-              </ul>
+              </List>
             )}
           </Loaded>
           <LoadMore state={grants} />
@@ -412,7 +445,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
         <section aria-labelledby="share-links">
           <h3 id="share-links">Link</h3>
           {!policy.allow_share_links ? (
-            <p className="muted">Links are turned off in this space.</p>
+            <Text tone="muted">Links are turned off in this space.</Text>
           ) : (
             <>
               <Loaded state={links}>
@@ -420,17 +453,23 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                   // The list has turned-off links too; only live ones are shown.
                   const live = page.items.filter((l) => !l.revoked_at)
                   return (
-                    <ul className="rows">
-                      {live.length === 0 && <li className="muted">Anyone with the link: off</li>}
+                    <List>
+                      {live.length === 0 && (
+                        <Text as="li" tone="muted">
+                          Anyone with the link: off
+                        </Text>
+                      )}
                       {live.map((l) => (
-                        <li key={l.id} className="row">
-                          <span className="grow">
+                        <ListRow key={l.id}>
+                          <Grow>
                             Anyone with the link: {roleLabels[l.role].toLowerCase()}
-                            <span className="muted small block">
-                              {l.expires_at ? `Ends ${new Date(l.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}` : 'No end date'}
+                            <Text as="span" tone="muted" size="sm" block>
+                              {l.expires_at
+                                ? `Ends ${new Date(l.expires_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
+                                : 'No end date'}
                               {l.has_password ? ', with password' : ''}
-                            </span>
-                          </span>
+                            </Text>
+                          </Grow>
                           {canShare && (
                             <ConfirmButton
                               label="Turn off"
@@ -448,9 +487,9 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                               }
                             />
                           )}
-                        </li>
+                        </ListRow>
                       ))}
-                    </ul>
+                    </List>
                   )
                 }}
               </Loaded>
@@ -476,13 +515,12 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
         {canManage && node.kind === 'folder' && (
           <section aria-labelledby="share-settings">
             <h3 id="share-settings">Sharing rule</h3>
-            <p className="muted small" id="share-rule-help">
-              Can people who got <strong>Can edit</strong> on this folder share it with others too? This applies to shares and links, not
-              to {team ? `the owners, admins and members of ${tenant.name}: they manage everything, whatever this rule says` : 'you'}.
-            </p>
-            <label>
-              People who can edit can also share
-              <select
+            <Text tone="muted" size="sm" id="share-rule-help">
+              Can people who got <strong>Can edit</strong> on this folder share it with others too? This applies to shares and links, not to{' '}
+              {team ? `the owners, admins and members of ${tenant.name}: they manage everything, whatever this rule says` : 'you'}.
+            </Text>
+            <Field label="People who can edit can also share">
+              <Select
                 aria-describedby="share-rule-help"
                 onFocus={() => setRuleSaved(false)}
                 value={node.editors_can_share === null || node.editors_can_share === undefined ? 'inherit' : String(node.editors_can_share)}
@@ -505,16 +543,16 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                 </option>
                 <option value="true">Yes</option>
                 <option value="false">No</option>
-              </select>
-            </label>
+              </Select>
+            </Field>
             {ruleSaved && (
-              <p className="muted small" role="status">
+              <Text tone="muted" size="sm" role="status">
                 Saved.
-              </p>
+              </Text>
             )}
           </section>
         )}
-      </div>
+      </Stack>
     </Dialog>
   )
 }
@@ -561,33 +599,35 @@ function AddPersonForm(props: {
   }
 
   return (
-    <form className="stack" onSubmit={submit} aria-label="Add people">
-      <div className="inline-form">
-        <label className="grow">
-          Email
-          <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" />
-        </label>
-        <label>
-          Access
-          <select value={role} onChange={(e) => setRole(e.target.value as Schemas['Role'])} aria-describedby="add-role-meaning">
+    <Stack as="form" onSubmit={submit} aria-label="Add people">
+      <Row align="end">
+        <Field label="Email" grow>
+          <TextInput type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" />
+        </Field>
+        <Field label="Access">
+          <Select value={role} onChange={(e) => setRole(e.target.value as Schemas['Role'])} aria-describedby="add-role-meaning">
             {roles.map((r) => (
               <option key={r} value={r}>
                 {roleLabels[r]}
               </option>
             ))}
-          </select>
-        </label>
-        <button type="submit" className="primary" disabled={busy || found?.kind === 'me'}>
+          </Select>
+        </Field>
+        <Button variant="primary" type="submit" disabled={busy || found?.kind === 'me'}>
           Share
-        </button>
-      </div>
-      <p id="add-role-meaning" className="muted small">
+        </Button>
+      </Row>
+      <Text tone="muted" size="sm" id="add-role-meaning">
         {roleLabels[role]}: {roleMeanings[role]}
-      </p>
-      {found?.kind === 'me' && <p className="muted small">That's your own email: you have access already.</p>}
+      </Text>
+      {found?.kind === 'me' && (
+        <Text tone="muted" size="sm">
+          That's your own email: you have access already.
+        </Text>
+      )}
       {person &&
         (roleWins ? (
-          <p className="warning" role="note">
+          <Note tone="warning" role="note">
             {person.display_name || person.email} is {person.role === 'admin' ? 'an' : 'a'} {memberRoleLabels[person.role].toLowerCase()} of{' '}
             {spaceName}, so they can already manage everything here
             {props.membersCanShare || person.role !== 'member' ? ' and share it' : ''}. A share can't give them less. To let them see only
@@ -601,40 +641,42 @@ function AddPersonForm(props: {
               ' (ask an admin)'
             )}
             .
-          </p>
+          </Note>
         ) : (
-          <p className="muted small">
+          <Text tone="muted" size="sm">
             {person.display_name || person.email} is in {spaceName}. They find {props.itemName} under Shared with me; Ruum sends no email
             for this.
-          </p>
+          </Text>
         ))}
       {outside &&
         (props.canInvite ? (
-          <div className="stack">
-            <label className="check">
-              <input type="checkbox" checked={invite} onChange={(e) => setInvite(e.target.checked)} aria-describedby="add-outside" />
-              Email them an invitation
-            </label>
-            <p id="add-outside" className="muted small">
+          <Stack>
+            <Checkbox
+              checked={invite}
+              onChange={(e) => setInvite(e.target.checked)}
+              aria-describedby="add-outside"
+              label="Email them an invitation"
+            />
+            <Text tone="muted" size="sm" id="add-outside">
               {email.trim()} is new here. With the invitation they make a free Ruum account, then they can open {props.itemName}.
               {invite ? '' : ' Without it they cannot open it.'}
-            </p>
-          </div>
+            </Text>
+          </Stack>
         ) : (
-          <p className="warning" role="note">
+          <Note tone="warning" role="note">
             {email.trim()} is new here. They can open {props.itemName} only after an admin of {spaceName} invites them.
-          </p>
+          </Note>
         ))}
       {outside && props.onUseLink && (
-        <p className="muted small">
+        <Text tone="muted" size="sm">
           No account wanted?{' '}
-          <button type="button" className="link" onClick={props.onUseLink}>
+          <Button variant="link" onClick={props.onUseLink}>
             Use a link instead
-          </button>{' '}
+          </Button>{' '}
           and send it to them yourself: anyone with the link can open {props.itemName} without signing in.
-        </p>
+        </Text>
       )}
-    </form>
+    </Stack>
   )
 }
 
@@ -668,11 +710,10 @@ function CreateLinkForm(props: {
   }
 
   return (
-    <form className="stack" onSubmit={submit} aria-label="Create a link">
-      <div className="inline-form">
-        <label>
-          Access
-          <select id="link-role" value={role} onChange={(e) => setRole(e.target.value as Schemas['ShareLinkRole'])}>
+    <Stack as="form" onSubmit={submit} aria-label="Create a link">
+      <Row align="end">
+        <Field label="Access">
+          <Select id="link-role" value={role} onChange={(e) => setRole(e.target.value as Schemas['ShareLinkRole'])}>
             {props.roles
               .filter((r) => r !== 'edit' || props.allowEdit)
               .map((r) => (
@@ -680,11 +721,10 @@ function CreateLinkForm(props: {
                   {roleLabels[r]}
                 </option>
               ))}
-          </select>
-        </label>
-        <label>
-          Ends after (days)
-          <input
+          </Select>
+        </Field>
+        <Field label="Ends after (days)">
+          <TextInput
             type="number"
             min={1}
             max={props.maxDays ?? undefined}
@@ -692,16 +732,17 @@ function CreateLinkForm(props: {
             value={days}
             onChange={(e) => setDays(e.target.value)}
           />
-        </label>
-        <label>
-          Password (optional)
-          <input type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} />
-        </label>
-        <button type="submit">Create link</button>
-      </div>
-      <p className="muted small">For safety, Ruum shows a new link only once. Copy it when it appears; you can make a new one at any time.</p>
+        </Field>
+        <Field label="Password (optional)">
+          <TextInput type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </Field>
+        <Button type="submit">Create link</Button>
+      </Row>
+      <Text tone="muted" size="sm">
+        For safety, Ruum shows a new link only once. Copy it when it appears; you can make a new one at any time.
+      </Text>
       <ErrorNote error={error} />
       {created?.url && <SecretBox label="New link" secret={created.url} note="Copy the link now. For safety, Ruum shows it only once." />}
-    </form>
+    </Stack>
   )
 }

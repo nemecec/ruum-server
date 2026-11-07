@@ -5,7 +5,31 @@ import { useSession } from '../app/useSession'
 import { StartTeamDialog } from '../app/Shell'
 import { useTenant } from '../app/tenant'
 import { formatDate } from '../components/format'
-import { ConfirmButton, Dialog, ErrorNote, Loaded, Notice, SecretBox } from '../components/ui'
+import {
+  Actions,
+  Badge,
+  Button,
+  Card,
+  Code,
+  ConfirmButton,
+  Dialog,
+  ErrorNote,
+  Fact,
+  Facts,
+  Field,
+  List,
+  ListEmpty,
+  ListRow,
+  ListRowMain,
+  Loaded,
+  Notice,
+  PageBody,
+  SecretBox,
+  Stack,
+  Text,
+  TextInput,
+  Toolbar,
+} from '../ui'
 
 const providerNames: Record<string, string> = { google: 'Google', microsoft: 'Microsoft', passkey: 'Passkey' }
 
@@ -17,54 +41,63 @@ export function AccountPage() {
   const [notice, setNotice] = useState<string | null>(null)
 
   return (
-    <div className="page-body">
+    <PageBody>
       <h1>Account</h1>
       <Notice text={notice} />
-      <section className="card" aria-labelledby="profile-title">
+      <Card aria-labelledby="profile-title">
         <h2 id="profile-title">Profile</h2>
-        <dl className="facts">
-          <dt>Name</dt>
-          <dd>{me.user.display_name}</dd>
-          <dt>Email</dt>
-          <dd>
-            {me.user.email} {me.user.email_verified ? <span className="badge">Verified</span> : <span className="badge warn">Not verified</span>}
-          </dd>
-          <dt>Member since</dt>
-          <dd>{formatDate(me.user.created_at)}</dd>
-        </dl>
-      </section>
+        <Facts>
+          <Fact label="Name">{me.user.display_name}</Fact>
+          <Fact label="Email">
+            {me.user.email} {me.user.email_verified ? <Badge tone="success">Verified</Badge> : <Badge tone="warning">Not verified</Badge>}
+          </Fact>
+          <Fact label="Member since">{formatDate(me.user.created_at)}</Fact>
+        </Facts>
+      </Card>
 
-      <section className="card" aria-labelledby="identities-title">
+      <Card aria-labelledby="identities-title">
         <h2 id="identities-title">Sign-in methods</h2>
         <Loaded state={identities}>
           {({ items }) => (
-            <ul className="rows">
+            <List>
               {items.map((i) => (
-                <li key={i.id} className="row">
-                  <span className="grow">
+                <ListRow key={i.id}>
+                  <ListRowMain>
                     {providerNames[i.provider ?? ''] ?? i.provider ?? i.issuer}
-                    {i.email && <span className="muted"> - {i.email}</span>}
-                  </span>
-                  <span className="muted small">Linked {formatDate(i.linked_at)}</span>
-                </li>
+                    {i.email && (
+                      <Text as="span" tone="muted">
+                        {' '}
+                        - {i.email}
+                      </Text>
+                    )}
+                  </ListRowMain>
+                  <Text as="span" tone="muted" size="sm">
+                    Linked {formatDate(i.linked_at)}
+                  </Text>
+                </ListRow>
               ))}
-            </ul>
+            </List>
           )}
         </Loaded>
-        <p className="muted small">Passkeys and linked accounts are managed by the identity provider at sign-in.</p>
-      </section>
+        <Text tone="muted" size="sm">
+          Passkeys and linked accounts are managed by the identity provider at sign-in.
+        </Text>
+      </Card>
 
-      <section className="card" aria-labelledby="sessions-title">
+      <Card aria-labelledby="sessions-title">
         <h2 id="sessions-title">Signed-in devices</h2>
         <Loaded state={sessions}>
           {({ items }) => (
-            <ul className="rows">
+            <List>
               {items.map((s) => (
-                <li key={s.id} className="row">
-                  <span className="grow">
-                    {s.user_agent ?? 'Unknown device'} {s.current && <span className="badge">This device</span>}
-                    <span className="muted small"> - last seen {formatDate(s.last_seen_at)}</span>
-                  </span>
+                <ListRow key={s.id}>
+                  <ListRowMain>
+                    {s.user_agent ?? 'Unknown device'} {s.current && <Badge tone="primary">This device</Badge>}
+                    <Text as="span" tone="muted" size="sm">
+                      {' '}
+                      - last seen {formatDate(s.last_seen_at)}
+                    </Text>
+                  </ListRowMain>
                   {!s.current && (
                     <ConfirmButton
                       label="Sign out"
@@ -79,16 +112,16 @@ export function AccountPage() {
                       }}
                     />
                   )}
-                </li>
+                </ListRow>
               ))}
-            </ul>
+            </List>
           )}
         </Loaded>
-      </section>
+      </Card>
 
       <AppPasswords />
       <NewTeam />
-    </div>
+    </PageBody>
   )
 }
 
@@ -116,26 +149,27 @@ function AppPasswords() {
   }
 
   return (
-    <section className="card" aria-labelledby="apppw-title">
-      <div className="panel-head">
+    <Card aria-labelledby="apppw-title">
+      <Toolbar>
         <h2 id="apppw-title">App passwords</h2>
-        <button type="button" onClick={() => (setSecret(null), setCreating(true))}>
-          New app password
-        </button>
-      </div>
-      <p className="muted small">
+        <Button onClick={() => (setSecret(null), setCreating(true))}>New app password</Button>
+      </Toolbar>
+      <Text tone="muted" size="sm">
         For WebDAV clients (Finder, Explorer) in {tenant.name}. Sign in with your email and the app password.
-      </p>
+      </Text>
       <Loaded state={passwords}>
         {({ items }) => (
-          <ul className="rows">
-            {items.length === 0 && <li className="muted">No app passwords.</li>}
+          <List>
+            {items.length === 0 && <ListEmpty>No app passwords.</ListEmpty>}
             {items.map((p) => (
-              <li key={p.id} className="row">
-                <span className="grow">
-                  {p.name} <code>{p.prefix}...</code>
-                  <span className="muted small"> - last used {p.last_used_at ? formatDate(p.last_used_at) : 'never'}</span>
-                </span>
+              <ListRow key={p.id}>
+                <ListRowMain>
+                  {p.name} <Code>{p.prefix}...</Code>
+                  <Text as="span" tone="muted" size="sm">
+                    {' '}
+                    - last used {p.last_used_at ? formatDate(p.last_used_at) : 'never'}
+                  </Text>
+                </ListRowMain>
                 <ConfirmButton
                   label="Turn off"
                   ariaLabel={`Turn off app password ${p.name}`}
@@ -148,60 +182,56 @@ function AppPasswords() {
                     passwords.reload()
                   }}
                 />
-              </li>
+              </ListRow>
             ))}
-          </ul>
+          </List>
         )}
       </Loaded>
       {creating && (
         <Dialog title="New app password" open onClose={() => setCreating(false)}>
           {secret ? (
-            <div className="stack">
+            <Stack gap={4}>
               <SecretBox label="App password" secret={secret} />
               {davUrl && <SecretBox label="Server address" secret={davUrl} />}
-              <p className="muted small">
-                Connect your WebDAV client to the server address, with your email as the user name. The password is shown only
-                once.
-              </p>
-              <div className="actions">
-                <button type="button" className="primary" onClick={() => setCreating(false)}>
+              <Text tone="muted" size="sm">
+                Connect your WebDAV client to the server address, with your email as the user name. The password is shown only once.
+              </Text>
+              <Actions>
+                <Button variant="primary" onClick={() => setCreating(false)}>
                   Done
-                </button>
-              </div>
-            </div>
+                </Button>
+              </Actions>
+            </Stack>
           ) : (
-            <form className="stack" onSubmit={create}>
-              <label>
-                Name
-                <input required autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Finder on my laptop" />
-              </label>
+            <Stack as="form" gap={4} onSubmit={create}>
+              <Field label="Name">
+                <TextInput required autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Finder on my laptop" />
+              </Field>
               <ErrorNote error={error} />
-              <div className="actions">
-                <button type="button" onClick={() => setCreating(false)}>
-                  Cancel
-                </button>
-                <button type="submit" className="primary" disabled={!name.trim()}>
+              <Actions>
+                <Button onClick={() => setCreating(false)}>Cancel</Button>
+                <Button type="submit" variant="primary" disabled={!name.trim()}>
                   Create
-                </button>
-              </div>
-            </form>
+                </Button>
+              </Actions>
+            </Stack>
           )}
         </Dialog>
       )}
-    </section>
+    </Card>
   )
 }
 
 function NewTeam() {
   const [open, setOpen] = useState(false)
   return (
-    <section className="card" aria-labelledby="team-title">
+    <Card aria-labelledby="team-title">
       <h2 id="team-title">Team spaces</h2>
-      <p className="muted">A team space is shared by the people you invite. You'll be its owner.</p>
-      <button type="button" onClick={() => setOpen(true)}>
-        Start a team space
-      </button>
+      <Text tone="muted">A team space is shared by the people you invite. You'll be its owner.</Text>
+      <Actions align="start">
+        <Button onClick={() => setOpen(true)}>Start a team space</Button>
+      </Actions>
       {open && <StartTeamDialog onClose={() => setOpen(false)} />}
-    </section>
+    </Card>
   )
 }

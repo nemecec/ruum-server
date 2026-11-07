@@ -2,8 +2,7 @@ import { Link, Navigate, useNavigate, useParams } from 'react-router'
 import { client, RuumApiError, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { tenantPath, useTenant } from '../../app/tenant'
-import { useToast } from '../../components/useToast'
-import { EmptyState, Loaded } from '../../components/ui'
+import { EmptyState, Loaded, PageBody, useToast } from '../../ui'
 import { trashNodes } from './api'
 import { NodeDetails } from './NodeDetails'
 import { VersionsPanel } from './VersionsPanel'
@@ -23,7 +22,7 @@ export function ItemPage() {
 
   if (node.error instanceof RuumApiError && node.error.status === 404 && listed === false) return <NotInSpaceYet />
   return (
-    <div className="page-body narrow-body">
+    <PageBody narrow>
       <p>
         <Link to={tenantPath(tenant.id, 'shared')}>Shared with me</Link>
       </p>
@@ -38,7 +37,9 @@ export function ItemPage() {
               node={n}
               onChanged={node.reload}
               onShowVersions={() => setVersions(true)}
-              onMove={() => navigate(n.parent_id ? `${tenantPath(n.tenant_id, 'files', n.parent_id)}?node=${n.id}` : tenantPath(n.tenant_id, 'files'))}
+              onMove={() =>
+                navigate(n.parent_id ? `${tenantPath(n.tenant_id, 'files', n.parent_id)}?node=${n.id}` : tenantPath(n.tenant_id, 'files'))
+              }
               onTrash={async () => {
                 const { undo } = await trashNodes([n])
                 toast(`Moved ${n.name} to the trash.`, {
@@ -54,7 +55,7 @@ export function ItemPage() {
           )
         }
       </Loaded>
-    </div>
+    </PageBody>
   )
 }
 
@@ -64,13 +65,13 @@ export function ItemPage() {
  */
 export function NotInSpaceYet() {
   return (
-    <div className="page-body">
+    <PageBody>
       <EmptyState
         title="Ruum can't open this for you yet"
         text="Someone shared it with you, but you are not in their space yet. Ask them to invite you as a guest."
       >
         <Link to="/">Go to your files</Link>
       </EmptyState>
-    </div>
+    </PageBody>
   )
 }

@@ -3,8 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router'
 import { client, RuumApiError, unwrap } from '../api/client'
 import { tenantPath } from '../app/tenant'
 import { useSession } from '../app/useSession'
-import { useToast } from '../components/useToast'
-import { ErrorNote } from '../components/ui'
+import { Actions, Button, ButtonLink, ErrorNote, Page, useToast } from '../ui'
 
 /**
  * `/invitations/accept?token=...` (card UX-02): the link of an invitation email. The person signs
@@ -39,33 +38,31 @@ export function AcceptInvitationPage() {
 
   if (ended) {
     return (
-      <main className="page narrow" id="main">
+      <Page narrow id="main">
         <h1>This invitation doesn't work any more</h1>
         <p>It was used already, or it ended. Ask the person who invited you for a new one.</p>
         <p>
           <Link to="/">Go to your files</Link>
         </p>
-      </main>
+      </Page>
     )
   }
 
   return (
-    <main className="page narrow" id="main">
+    <Page narrow id="main">
       <h1>You're invited to a space in Ruum</h1>
       <p>
-        You join as <strong>{me.user.display_name}</strong> ({me.user.email}). The invitation email names the space, the person who
-        invited you and your role; Ruum can't show them here yet. After you join, the space and what was shared with you show up in
-        your space switcher.
+        You join as <strong>{me.user.display_name}</strong> ({me.user.email}). The invitation email names the space, the person who invited
+        you and your role; Ruum can't show them here yet. After you join, the space and what was shared with you show up in your space
+        switcher.
       </p>
       <ErrorNote error={error} />
-      <div className="actions left">
-        <button type="button" className="primary" disabled={busy} onClick={join}>
+      <Actions align="start">
+        <Button variant="primary" disabled={busy} busy={busy} onClick={join}>
           Join the space
-        </button>
-        <Link className="button" to="/">
-          Not now
-        </Link>
-      </div>
-    </main>
+        </Button>
+        <ButtonLink to="/">Not now</ButtonLink>
+      </Actions>
+    </Page>
   )
 }

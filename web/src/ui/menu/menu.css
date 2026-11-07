@@ -1,0 +1,88 @@
+.ui-menu {
+  position: relative;
+  display: inline-block;
+}
+
+.ui-menu-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--size-control);
+  padding: 0 var(--space-3);
+  border: var(--border-width-thin) solid var(--color-border-control);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  cursor: pointer;
+}
+
+.ui-menu-button-quiet {
+  border-color: transparent;
+  background: transparent;
+}
+
+.ui-menu-button:hover {
+  background: var(--color-sunken);
+}
+
+.ui-menu-list {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  z-index: var(--z-toast);
+  min-width: var(--size-field-sm);
+  margin: 0;
+  padding: var(--space-1);
+  border: var(--border-width-thin) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-2);
+  list-style: none;
+}
+
+.ui-menu-end {
+  right: 0;
+  left: auto;
+}
+
+.ui-menu-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--size-control);
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: none;
+  text-align: start;
+  cursor: pointer;
+}
+
+.ui-menu-item:hover:not(:disabled),
+.ui-menu-item:focus-visible {
+  background: var(--color-sunken);
+}
+
+.ui-menu-item:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.ui-menu-item-danger {
+  color: var(--color-danger);
+}
+
+.ui-menu-check {
+  flex: none;
+  width: var(--size-icon-sm);
+}
+
+.ui-menu-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.ui-menu-hint {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}

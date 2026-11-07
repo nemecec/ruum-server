@@ -3,8 +3,27 @@ import { client, unwrap } from '../../api/client'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useTenant } from '../../app/tenant'
 import { count, formatDate, formatWhen } from '../../components/format'
-import { useToast } from '../../components/useToast'
-import { ConfirmButton, EmptyState, ErrorNote, FileIcon, FolderIcon, Loaded, LoadMore } from '../../components/ui'
+import {
+  Button,
+  ConfirmButton,
+  EmptyState,
+  ErrorNote,
+  KindIcon,
+  Loaded,
+  LoadMore,
+  NameCell,
+  PageBody,
+  Table,
+  TBody,
+  Td,
+  Text,
+  Th,
+  THead,
+  Toolbar,
+  Tr,
+  useToast,
+  VisuallyHidden,
+} from '../../ui'
 
 /** The trash: restore items, delete them for good, or empty the trash (copy.md 3.7). */
 export function TrashPage() {
@@ -16,7 +35,9 @@ export function TrashPage() {
   async function restore(id: string, name: string) {
     setError(undefined)
     try {
-      const res = await unwrap(client.POST('/v1/nodes/{node_id}/restore', { params: { path: { node_id: id } }, body: { on_conflict: 'rename' } }))
+      const res = await unwrap(
+        client.POST('/v1/nodes/{node_id}/restore', { params: { path: { node_id: id } }, body: { on_conflict: 'rename' } }),
+      )
       let folder = 'its folder'
       if (res.node.parent_id) {
         try {
@@ -35,8 +56,8 @@ export function TrashPage() {
 
   const n = trash.data?.items.length ?? 0
   return (
-    <div className="page-body">
-      <div className="toolbar">
+    <PageBody>
+      <Toolbar>
         <h1>Trash</h1>
         {n > 0 && (
           <ConfirmButton
@@ -52,46 +73,44 @@ export function TrashPage() {
             }}
           />
         )}
-      </div>
-      <p className="muted">
+      </Toolbar>
+      <Text tone="muted">
         Items stay in the trash for the time the plan of {tenant.name} allows. Then Ruum deletes them for good.
         {isAdmin ? ' Admins can restore items for longer.' : ''}
-      </p>
+      </Text>
       <ErrorNote error={error} />
       <Loaded state={trash}>
         {({ items }) =>
           items.length === 0 ? (
             <EmptyState title="The trash is empty" text="Items you move to the trash stay here for a while, so you can bring them back." />
           ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th scope="col">Name</th>
-                  <th scope="col" className="hide-narrow">
+            <Table caption="Items in the trash">
+              <THead>
+                <Tr>
+                  <Th scope="col">Name</Th>
+                  <Th scope="col" hideNarrow>
                     Moved to the trash
-                  </th>
-                  <th scope="col">
-                    <span className="sr-only">Actions</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
+                  </Th>
+                  <Th scope="col">
+                    <VisuallyHidden>Actions</VisuallyHidden>
+                  </Th>
+                </Tr>
+              </THead>
+              <TBody>
                 {items.map((node) => (
-                  <tr key={node.id}>
-                    <th scope="row">
-                      <span className="name-cell">
-                        <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon type={node.type} name={node.name} />}</span>
-                        {node.name}
-                      </span>
-                    </th>
-                    <td className="hide-narrow">
+                  <Tr key={node.id}>
+                    <Th scope="row">
+                      <NameCell icon={<KindIcon kind={node.kind} type={node.type} name={node.name} />}>{node.name}</NameCell>
+                    </Th>
+                    <Td hideNarrow>
                       <span title={formatDate(node.trashed_at)}>{formatWhen(node.trashed_at)}</span>
-                    </td>
-                    <td className="row-actions">
-                      <button type="button" aria-label={`Restore ${node.name}`} onClick={() => restore(node.id, node.name)}>
+                    </Td>
+                    <Td actions>
+                      <Button size="sm" aria-label={`Restore ${node.name}`} onClick={() => restore(node.id, node.name)}>
                         Restore
-                      </button>
+                      </Button>
                       <ConfirmButton
+                        size="sm"
                         label="Delete for good"
                         ariaLabel={`Delete for good: ${node.name}`}
                         title={`Delete ${node.name} for good?`}
@@ -104,15 +123,15 @@ export function TrashPage() {
                           trash.reload()
                         }}
                       />
-                    </td>
-                  </tr>
+                    </Td>
+                  </Tr>
                 ))}
-              </tbody>
-            </table>
+              </TBody>
+            </Table>
           )
         }
       </Loaded>
       <LoadMore state={trash} />
-    </div>
+    </PageBody>
   )
 }

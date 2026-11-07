@@ -1,0 +1,155 @@
+.ui-stack {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+ul.ui-stack,
+ol.ui-stack {
+  list-style: none;
+}
+
+.ui-row,
+.ui-actions,
+.ui-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.ui-nowrap {
+  flex-wrap: nowrap;
+}
+
+.ui-gap-0 {
+  gap: 0;
+}
+.ui-gap-1 {
+  gap: var(--space-1);
+}
+.ui-gap-2 {
+  gap: var(--space-2);
+}
+.ui-gap-3 {
+  gap: var(--space-3);
+}
+.ui-gap-4 {
+  gap: var(--space-4);
+}
+.ui-gap-5 {
+  gap: var(--space-5);
+}
+.ui-gap-6 {
+  gap: var(--space-6);
+}
+.ui-gap-7 {
+  gap: var(--space-7);
+}
+
+.ui-align-start {
+  align-items: flex-start;
+}
+.ui-align-center {
+  align-items: center;
+}
+.ui-align-end {
+  align-items: flex-end;
+}
+.ui-align-baseline {
+  align-items: baseline;
+}
+.ui-align-stretch {
+  align-items: stretch;
+}
+
+.ui-justify-start {
+  justify-content: flex-start;
+}
+.ui-justify-end {
+  justify-content: flex-end;
+}
+.ui-justify-center {
+  justify-content: center;
+}
+.ui-justify-between {
+  justify-content: space-between;
+}
+
+.ui-grow {
+  flex: 1 1 var(--size-field-sm);
+  min-width: 0;
+}
+
+.ui-actions {
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ui-toolbar {
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+
+.ui-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(var(--size-card-min), 100%), 1fr));
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ui-indent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-inline-start: var(--space-6);
+}
+
+.ui-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: var(--size-content);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-4);
+}
+
+.ui-page-narrow {
+  max-width: var(--size-narrow);
+  padding-top: var(--space-7);
+}
+
+.ui-page-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.ui-page-body-narrow {
+  max-width: var(--size-measure);
+}
+
+.ui-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4);
+  border: var(--border-width-thin) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-1);
+}
+
+@media (min-width: 900px) {
+  .ui-card {
+    padding: var(--space-5);
+  }
+}

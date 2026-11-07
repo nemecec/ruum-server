@@ -1,0 +1,93 @@
+/* The base of every page: the tokens and the element defaults. Components style themselves. */
+@import url('../design/generated/tokens.css');
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: var(--text-md);
+  color: var(--color-text);
+  background: var(--color-canvas);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  color: var(--color-text);
+  overflow-wrap: break-word;
+}
+
+h1 {
+  font: var(--text-xl);
+}
+
+h2 {
+  font: var(--text-lg);
+}
+
+h3 {
+  font: var(--text-md);
+  font-weight: var(--font-weight-strong);
+}
+
+@media (min-width: 900px) {
+  h1 {
+    font: var(--text-2xl);
+  }
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--color-link);
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: var(--border-width-thick) solid var(--color-focus);
+  outline-offset: var(--border-width-thick);
+}
+
+/* stylelint-disable declaration-no-important -- the hidden attribute must win over components. */
+[hidden] {
+  display: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: var(--duration-instant) !important;
+    animation-duration: var(--duration-instant) !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+/* stylelint-enable declaration-no-important */
+
+/* A heading that receives the focus when a page or panel opens (for screen readers) shows no ring. */
+[tabindex='-1']:focus:not(:focus-visible),
+h1[tabindex='-1']:focus,
+h2[tabindex='-1']:focus {
+  outline: none;
+}

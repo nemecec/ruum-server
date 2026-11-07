@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { createBrowserRouter, RouterProvider } from 'react-router'
 import { routes } from './app/routes'
-import './index.css'
+import './ui/global.css'
 
 async function main() {
   // `npm run dev` runs with the mock API (mode `mock`); `npm run dev:server` and builds use the server.

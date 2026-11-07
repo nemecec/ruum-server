@@ -1,5 +1,6 @@
 import { useSearchParams } from 'react-router'
 import { loginUrl, safeReturnTo, type Idp } from '../app/auth'
+import { ButtonAnchor, Note, Page, Stack, Text } from '../ui'
 
 const providers: { idp: Idp; label: string }[] = [
   { idp: 'passkey', label: 'Sign in with email' },
@@ -22,35 +23,35 @@ export function SignInPage() {
   const invited = returnTo.startsWith('/invitations/accept')
 
   return (
-    <main className="page narrow" id="main">
+    <Page narrow id="main">
       <h1>Sign in to Ruum</h1>
       {invited ? (
         <p>Sign in, or make a free account, to join the space you were invited to. Ruum brings you back to the invitation.</p>
       ) : (
-        <p className="muted">Files, databases and apps in one tree, for you and your agents.</p>
+        <Text tone="muted">Files, databases and apps in one tree, for you and your agents.</Text>
       )}
       {signedOut && (
-        <p className="notice" role="status">
+        <Note tone="success" role="status">
           You are signed out.
-        </p>
+        </Note>
       )}
       {error && (
-        <p className="error" role="alert">
+        <Note tone="danger" role="alert">
           {errorTexts[error] ?? `Sign-in failed (${error}). Try again.`}
-        </p>
+        </Note>
       )}
-      <ul className="providers">
-        {providers.map((p) => (
+      <Stack as="ul" gap={2}>
+        {providers.map((p, i) => (
           <li key={p.idp}>
-            <a className="button wide" href={loginUrl(returnTo, p.idp)}>
+            <ButtonAnchor wide variant={i === 0 ? 'primary' : 'secondary'} href={loginUrl(returnTo, p.idp)}>
               {p.label}
-            </a>
+            </ButtonAnchor>
           </li>
         ))}
-      </ul>
-      <p className="muted small">
+      </Stack>
+      <Text tone="muted" size="sm">
         New here? Signing in makes your account and a personal space.
-      </p>
-    </main>
+      </Text>
+    </Page>
   )
 }

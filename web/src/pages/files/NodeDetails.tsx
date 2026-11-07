@@ -4,8 +4,26 @@ import { useApi } from '../../api/useApi'
 import { Actor } from '../../app/names'
 import { useSession } from '../../app/useSession'
 import { fileTypeLabel, formatBytes, formatDate, formatWhen, roleLabels } from '../../components/format'
-import { useToast } from '../../components/useToast'
-import { Dialog, ErrorNote, Loaded } from '../../components/ui'
+import {
+  Actions,
+  Button,
+  Dialog,
+  ErrorNote,
+  Fact,
+  Facts,
+  Field,
+  FileInput,
+  IconButton,
+  ListEmpty,
+  Loaded,
+  Select,
+  Stack,
+  Tag,
+  TagList,
+  TextInput,
+  Toolbar,
+  useToast,
+} from '../../ui'
 import { downloadNode, previewNode, type Node } from './api'
 import { NameDialog } from './dialogs'
 import { ShareDialog } from './ShareDialog'
@@ -59,68 +77,39 @@ export function NodeDetails(props: {
   }
 
   return (
-    <section className="panel" aria-labelledby="details-title">
-      <div className="panel-head">
+    <Stack as="section" gap={4} aria-labelledby="details-title">
+      <Toolbar>
         <h2 id="details-title" ref={heading} tabIndex={-1}>
           {node.name}
         </h2>
-        {props.onClose && (
-          <button type="button" className="icon" aria-label="Close details" onClick={props.onClose}>
-            ×
-          </button>
-        )}
-      </div>
-      <dl className="facts">
-        <dt>Type</dt>
-        <dd>{fileTypeLabel(node)}</dd>
-        {node.kind === 'file' && (
-          <>
-            <dt>Size</dt>
-            <dd>{formatBytes(node.size_bytes)}</dd>
-          </>
-        )}
-        <dt>Changed</dt>
-        <dd>
+        {props.onClose && <IconButton icon="close" label="Close details" onClick={props.onClose} />}
+      </Toolbar>
+      <Facts>
+        <Fact label="Type">{fileTypeLabel(node)}</Fact>
+        {node.kind === 'file' && <Fact label="Size">{formatBytes(node.size_bytes)}</Fact>}
+        <Fact label="Changed">
           <span title={formatDate(node.updated_at)}>{formatWhen(node.updated_at)}</span> by <Actor pair={node.updated_by} />
-        </dd>
-        <dt>Created</dt>
-        <dd>
+        </Fact>
+        <Fact label="Created">
           <span title={formatDate(node.created_at)}>{formatWhen(node.created_at)}</span> by <Actor pair={node.created_by} />
-        </dd>
-        {node.my_role && (
-          <>
-            <dt>Your access</dt>
-            <dd>{roleLabels[node.my_role]}</dd>
-          </>
-        )}
-      </dl>
+        </Fact>
+        {node.my_role && <Fact label="Your access">{roleLabels[node.my_role]}</Fact>}
+      </Facts>
       <ErrorNote error={error} context={{ name: node.name }} />
-      <div className="actions left wrap">
+      <Actions align="start">
         {node.kind === 'file' && (
-          <button type="button" className="primary" onClick={() => downloadNode(node).catch(setError)}>
+          <Button variant="primary" onClick={() => downloadNode(node).catch(setError)}>
             Download
-          </button>
+          </Button>
         )}
-        {node.kind === 'file' && (
-          <button type="button" onClick={() => previewNode(node).catch(setError)}>
-            Preview
-          </button>
-        )}
-        {node.kind === 'file' && (
-          <button type="button" onClick={props.onShowVersions}>
-            Versions
-          </button>
-        )}
+        {node.kind === 'file' && <Button onClick={() => previewNode(node).catch(setError)}>Preview</Button>}
+        {node.kind === 'file' && <Button onClick={props.onShowVersions}>Versions</Button>}
         {node.kind === 'file' && canEdit && (
           <>
-            <button type="button" onClick={() => versionInput.current?.click()}>
-              Upload new version
-            </button>
-            <input
+            <Button onClick={() => versionInput.current?.click()}>Upload new version</Button>
+            <FileInput
               ref={versionInput}
-              type="file"
-              hidden
-              aria-label={`New version of ${node.name}`}
+              label={`New version of ${node.name}`}
               onChange={(e) => {
                 const file = e.target.files?.[0]
                 e.target.value = ''
@@ -129,25 +118,11 @@ export function NodeDetails(props: {
             />
           </>
         )}
-        <button type="button" onClick={() => setDialog('share')}>
-          Share
-        </button>
-        {canEdit && (
-          <button type="button" onClick={() => setDialog('rename')}>
-            Rename
-          </button>
-        )}
-        {canEdit && (
-          <button type="button" onClick={props.onMove}>
-            Move
-          </button>
-        )}
-        {canEdit && (
-          <button type="button" className="danger" onClick={props.onTrash}>
-            Move to trash
-          </button>
-        )}
-      </div>
+        <Button onClick={() => setDialog('share')}>Share</Button>
+        {canEdit && <Button onClick={() => setDialog('rename')}>Rename</Button>}
+        {canEdit && <Button onClick={props.onMove}>Move</Button>}
+        {canEdit && <Button onClick={props.onTrash}>Move to trash</Button>}
+      </Actions>
       <NodeTags node={node} canEdit={canEdit} />
 
       {dialog === 'rename' && (
@@ -179,7 +154,7 @@ export function NodeDetails(props: {
           }}
         />
       )}
-    </section>
+    </Stack>
   )
 }
 
@@ -193,8 +168,9 @@ function KeepVersionDialog(props: { node: Node; previousAt: string; onClose: () 
   const [busy, setBusy] = useState(false)
   return (
     <Dialog title="Keep your last change as its own version?" open onClose={props.onClose}>
-      <form
-        className="stack"
+      <Stack
+        as="form"
+        gap={4}
         onSubmit={async (e) => {
           e.preventDefault()
           setBusy(true)
@@ -208,23 +184,20 @@ function KeepVersionDialog(props: { node: Node; previousAt: string; onClose: () 
         }}
       >
         <p>
-          You changed {props.node.name} {formatWhen(props.previousAt).toLowerCase()}. Ruum keeps one version for the changes you make
-          within 10 minutes, so this upload replaces that version.
+          You changed {props.node.name} {formatWhen(props.previousAt).toLowerCase()}. Ruum keeps one version for the changes you make within
+          10 minutes, so this upload replaces that version.
         </p>
-        <label>
-          Name the current version to keep it (optional)
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Before the new upload" />
-        </label>
+        <Field label="Name the current version to keep it (optional)">
+          <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder="Before the new upload" />
+        </Field>
         <ErrorNote error={error} />
-        <div className="actions">
-          <button type="button" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary" disabled={busy}>
+        <Actions>
+          <Button onClick={props.onClose}>Cancel</Button>
+          <Button type="submit" variant="primary" disabled={busy} busy={busy}>
             {name.trim() ? 'Keep it and upload' : 'Replace it'}
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Stack>
     </Dialog>
   )
 }
@@ -234,10 +207,7 @@ function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
   const [error, setError] = useState<unknown>()
   const [pick, setPick] = useState('')
   const [creating, setCreating] = useState(false)
-  const nodeTags = useApi(
-    () => unwrap(client.GET('/v1/nodes/{node_id}/tags', { params: { path: { node_id: node.id } } })),
-    [node.id],
-  )
+  const nodeTags = useApi(() => unwrap(client.GET('/v1/nodes/{node_id}/tags', { params: { path: { node_id: node.id } } })), [node.id])
   const allTags = useApi(() => unwrap(client.GET('/v1/tags')), [])
 
   async function attach(tagId: string, tagName?: string) {
@@ -269,30 +239,22 @@ function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
   }
 
   return (
-    <section aria-labelledby="tags-title">
+    <Stack as="section" aria-labelledby="tags-title">
       <h3 id="tags-title">Tags</h3>
       <ErrorNote error={error} />
       <Loaded state={nodeTags}>
         {({ items }) => (
-          <ul className="tags">
-            {items.length === 0 && <li className="muted">No tags</li>}
+          <TagList>
+            {items.length === 0 && <ListEmpty>No tags</ListEmpty>}
             {items.map((t) => (
-              <li key={t.id} className="tag" style={t.color ? { borderLeftColor: t.color } : undefined}>
-                {t.name}
-                {canEdit && (
-                  <button type="button" className="icon" aria-label={`Remove tag ${t.name}`} onClick={() => detach(t.id)}>
-                    ×
-                  </button>
-                )}
-              </li>
+              <Tag key={t.id} name={t.name} color={t.color} onRemove={canEdit ? () => detach(t.id) : undefined} />
             ))}
-          </ul>
+          </TagList>
         )}
       </Loaded>
       {canEdit && allTags.data && (
-        <label>
-          Add a tag
-          <select value={pick} onChange={(e) => attach(e.target.value)}>
+        <Field label="Add a tag">
+          <Select value={pick} onChange={(e) => attach(e.target.value)}>
             <option value="">Choose a tag</option>
             {allTags.data.items
               .filter((t) => !nodeTags.data?.items.some((x) => x.id === t.id))
@@ -302,8 +264,8 @@ function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
                 </option>
               ))}
             <option value="__new">New tag...</option>
-          </select>
-        </label>
+          </Select>
+        </Field>
       )}
       {creating && (
         <NameDialog
@@ -321,6 +283,6 @@ function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
           }}
         />
       )}
-    </section>
+    </Stack>
   )
 }

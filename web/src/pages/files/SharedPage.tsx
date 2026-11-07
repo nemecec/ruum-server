@@ -5,7 +5,23 @@ import { usePagedApi } from '../../api/usePagedApi'
 import { actorLabel, useNames } from '../../app/useNames'
 import { useSession } from '../../app/useSession'
 import { formatDate, formatWhen, roleLabels } from '../../components/format'
-import { EmptyState, ErrorNote, FileIcon, FolderIcon, Loaded, LoadMore } from '../../components/ui'
+import {
+  Button,
+  EmptyState,
+  ErrorNote,
+  KindIcon,
+  Loaded,
+  LoadMore,
+  NameCell,
+  PageBody,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
+  Tr,
+  VisuallyHidden,
+} from '../../ui'
 import { downloadNode, listSharedWithMe, sharedItemPath } from './api'
 
 /**
@@ -16,7 +32,7 @@ import { downloadNode, listSharedWithMe, sharedItemPath } from './api'
 export function SharedPage() {
   const shared = usePagedApi(listSharedWithMe, [])
   return (
-    <div className="page-body">
+    <PageBody>
       <h1>Shared with me</h1>
       <Loaded state={shared}>
         {({ items }) =>
@@ -28,7 +44,7 @@ export function SharedPage() {
         }
       </Loaded>
       <LoadMore state={shared} />
-    </div>
+    </PageBody>
   )
 }
 
@@ -41,46 +57,44 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
   return (
     <>
       <ErrorNote error={error} />
-      <table className="table">
-        <caption className="sr-only">Shared items</caption>
-        <thead>
-          <tr>
-            <th scope="col">Name</th>
-            {showSpace && <th scope="col">Space</th>}
-            <th scope="col">Your access</th>
-            <th scope="col" className="hide-narrow">
+      <Table caption="Shared items">
+        <THead>
+          <Tr>
+            <Th scope="col">Name</Th>
+            {showSpace && <Th scope="col">Space</Th>}
+            <Th scope="col">Your access</Th>
+            <Th scope="col" hideNarrow>
               Shared by
-            </th>
-            <th scope="col" className="hide-narrow">
+            </Th>
+            <Th scope="col" hideNarrow>
               Shared
-            </th>
-            <th scope="col">
-              <span className="sr-only">Actions</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>
+            </Th>
+            <Th scope="col">
+              <VisuallyHidden>Actions</VisuallyHidden>
+            </Th>
+          </Tr>
+        </THead>
+        <TBody>
           {items.map(({ node, role, shared_by, shared_at }) => {
             const by = actorLabel(names, shared_by.actor, shared_by.on_behalf_of, shared_by.on_behalf_of_display_name)
             const sharer = by.text === 'Someone' ? `Someone in ${spaceName(node.tenant_id)}` : by.text
             return (
-              <tr key={node.id}>
-                <th scope="row">
-                  <span className="name-cell">
-                    <span className={`kind kind-${node.kind}`}>{node.kind === 'folder' ? <FolderIcon /> : <FileIcon type={node.type} name={node.name} />}</span>
+              <Tr key={node.id}>
+                <Th scope="row">
+                  <NameCell icon={<KindIcon kind={node.kind} type={node.type} name={node.name} />}>
                     <Link to={sharedItemPath(node)}>{node.name}</Link>
-                  </span>
-                </th>
-                {showSpace && <td>{spaceName(node.tenant_id)}</td>}
-                <td>{roleLabels[role]}</td>
-                <td className="hide-narrow">{sharer}</td>
-                <td className="hide-narrow">
+                  </NameCell>
+                </Th>
+                {showSpace && <Td>{spaceName(node.tenant_id)}</Td>}
+                <Td>{roleLabels[role]}</Td>
+                <Td hideNarrow>{sharer}</Td>
+                <Td hideNarrow>
                   <span title={formatDate(shared_at)}>{formatWhen(shared_at)}</span>
-                </td>
-                <td className="row-actions">
+                </Td>
+                <Td actions>
                   {node.kind === 'file' && (
-                    <button
-                      type="button"
+                    <Button
+                      size="sm"
                       aria-label={`Download ${node.name}`}
                       onClick={() => {
                         setError(undefined)
@@ -88,14 +102,14 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
                       }}
                     >
                       Download
-                    </button>
+                    </Button>
                   )}
-                </td>
-              </tr>
+                </Td>
+              </Tr>
             )
           })}
-        </tbody>
-      </table>
+        </TBody>
+      </Table>
     </>
   )
 }

@@ -5,8 +5,28 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { errorText } from '../../api/errors'
 import { count, formatBytes, formatWhen } from '../../components/format'
-import { useToast } from '../../components/useToast'
-import { Dialog, ErrorNote } from '../../components/ui'
+import {
+  Actions,
+  Button,
+  Dialog,
+  ErrorNote,
+  Field,
+  Fieldset,
+  FloatingPanel,
+  IconButton,
+  Indent,
+  List,
+  ListRow,
+  Note,
+  ProgressBar,
+  ProseList,
+  Radio,
+  Row,
+  Stack,
+  Text,
+  TextInput,
+  useToast,
+} from '../../ui'
 import { uploadBlob, type UploadProgress } from '../../upload/upload'
 import type { Node } from './api'
 import { UploadsContext, type DoneListener, type UploadItem, type UploadPlan } from './useUploads'
@@ -207,50 +227,63 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
   if (items.length === 0) return null
   const finished = items.some((i) => i.status !== 'active' && i.status !== 'waiting')
   return (
-    <section className="upload-panel" aria-label="Uploads">
-      <div className="upload-panel-head">
-        <h2 aria-live="polite">{header(items)}</h2>
-        <button type="button" className="icon" aria-expanded={open} aria-label={open ? 'Hide uploads' : 'Show uploads'} onClick={() => setManual({ key: doneKey, open: !open })}>
-          {open ? '−' : '+'}
-        </button>
-      </div>
-      <div hidden={!open}>
-        <>
-          <ul>
-            {items.map((i) => {
-              const { done, total } = i.progress
-              const saved = i.node && i.node.name !== i.name ? i.node.name : i.name
-              return (
-                <li key={i.id} className={`upload upload-${i.status}`}>
-                  <div className="upload-head">
-                    <span className="upload-name">{saved}</span>
-                    <span className="muted small">{formatBytes(i.size)}</span>
-                  </div>
-                  {i.status === 'active' && i.progress.phase === 'uploading' && (
-                    <progress max={total || 1} value={done} aria-label={`Progress of ${i.name}`} />
-                  )}
-                  <div className="upload-head">
-                    <span className={i.status === 'failed' ? 'error small' : 'muted small'} role={i.status === 'failed' ? 'alert' : undefined}>
-                      {statusText(i)}
-                    </span>
-                    {(i.status === 'active' || i.status === 'waiting') && (
-                      <button type="button" aria-label={`Cancel upload of ${i.name}`} onClick={() => props.onCancel(i.id)}>
-                        Cancel
-                      </button>
-                    )}
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
-          {finished && (
-            <button type="button" className="link small" onClick={props.onClear}>
-              Clear finished uploads
-            </button>
-          )}
-        </>
-      </div>
-    </section>
+    <FloatingPanel
+      label="Uploads"
+      title={header(items)}
+      open={open}
+      actions={
+        <IconButton
+          icon={open ? 'minus' : 'plus'}
+          aria-expanded={open}
+          label={open ? 'Hide uploads' : 'Show uploads'}
+          onClick={() => setManual({ key: doneKey, open: !open })}
+        />
+      }
+    >
+      <List>
+        {items.map((i) => {
+          const { done, total } = i.progress
+          const saved = i.node && i.node.name !== i.name ? i.node.name : i.name
+          return (
+            <ListRow key={i.id} block>
+              <Row justify="between" nowrap>
+                <Text as="span" truncate>
+                  {saved}
+                </Text>
+                <Text as="span" tone="muted" size="sm" numeric>
+                  {formatBytes(i.size)}
+                </Text>
+              </Row>
+              {i.status === 'active' && i.progress.phase === 'uploading' && (
+                <ProgressBar max={total || 1} value={done} label={`Progress of ${i.name}`} />
+              )}
+              <Row justify="between" nowrap>
+                <Text
+                  as="span"
+                  tone={i.status === 'failed' ? 'danger' : 'muted'}
+                  size="sm"
+                  role={i.status === 'failed' ? 'alert' : undefined}
+                >
+                  {statusText(i)}
+                </Text>
+                {(i.status === 'active' || i.status === 'waiting') && (
+                  <Button size="sm" aria-label={`Cancel upload of ${i.name}`} onClick={() => props.onCancel(i.id)}>
+                    Cancel
+                  </Button>
+                )}
+              </Row>
+            </ListRow>
+          )
+        })}
+      </List>
+      {finished && (
+        <Actions align="start">
+          <Button variant="link" onClick={props.onClear}>
+            Clear finished uploads
+          </Button>
+        </Actions>
+      )}
+    </FloatingPanel>
   )
 }
 
@@ -286,8 +319,9 @@ export function ConflictDialog(props: {
   const when = recent.length === 1 ? formatWhen(recent[0].updated_at).toLowerCase() : null
   return (
     <Dialog title={title} open onClose={props.onClose}>
-      <form
-        className="stack"
+      <Stack
+        as="form"
+        gap={4}
         onSubmit={async (e) => {
           e.preventDefault()
           setBusy(true)
@@ -301,58 +335,62 @@ export function ConflictDialog(props: {
         }}
       >
         {names.length > 1 && (
-          <ul className="small">
+          <ProseList size="sm">
             {names.slice(0, 8).map((n) => (
               <li key={n}>{n}</li>
             ))}
             {names.length > 8 && <li>and {names.length - 8} more</li>}
-          </ul>
+          </ProseList>
         )}
-        <fieldset className="stack">
-          <legend>{one ? 'What should Ruum do?' : `What should Ruum do with all ${names.length}?`}</legend>
-          <label className="check">
-            <input type="radio" name="conflict" checked={choice === 'version'} onChange={() => setChoice('version')} aria-describedby="conflict-version" />
-            Save as a new version
-          </label>
+        <Fieldset legend={one ? 'What should Ruum do?' : `What should Ruum do with all ${names.length}?`}>
+          <Radio
+            name="conflict"
+            checked={choice === 'version'}
+            onChange={() => setChoice('version')}
+            aria-describedby="conflict-version"
+            label="Save as a new version"
+          />
           {choice === 'version' && (
-            <div className="indent stack">
-              <p id="conflict-version" className="muted small">
-                {one ? 'The file keeps its name. The earlier version stays in Versions.' : 'The files keep their names. The earlier versions stay in Versions.'}
-              </p>
+            <Indent>
+              <Text id="conflict-version" tone="muted" size="sm">
+                {one
+                  ? 'The file keeps its name. The earlier version stays in Versions.'
+                  : 'The files keep their names. The earlier versions stay in Versions.'}
+              </Text>
               {recent.length > 0 && (
                 <>
-                  <label>
-                    {recent.length === 1 ? 'Name of the earlier version' : 'Name of the earlier versions'}
-                    <input value={label} onChange={(e) => setLabel(e.target.value)} aria-describedby="conflict-keep" />
-                  </label>
-                  <p id="conflict-keep" className={label.trim() ? 'muted small' : 'warning'} role={label.trim() ? undefined : 'note'}>
-                    {label.trim()
-                      ? `${recent.length === 1 ? `You changed ${recent[0].name} ${when}` : `You changed ${recent.length} of these files in the last 10 minutes`}. Ruum keeps that version under this name, so nothing is lost.`
-                      : `Without a name, the new upload replaces ${recent.length === 1 ? `your version from ${when}` : 'your versions from the last 10 minutes'}: Ruum joins the changes you make within 10 minutes into one version.`}
-                  </p>
+                  <Field label={recent.length === 1 ? 'Name of the earlier version' : 'Name of the earlier versions'}>
+                    <TextInput value={label} onChange={(e) => setLabel(e.target.value)} aria-describedby="conflict-keep" />
+                  </Field>
+                  {label.trim() ? (
+                    <Text id="conflict-keep" tone="muted" size="sm">
+                      {`${recent.length === 1 ? `You changed ${recent[0].name} ${when}` : `You changed ${recent.length} of these files in the last 10 minutes`}. Ruum keeps that version under this name, so nothing is lost.`}
+                    </Text>
+                  ) : (
+                    <Note id="conflict-keep" tone="warning" role="note">
+                      {`Without a name, the new upload replaces ${recent.length === 1 ? `your version from ${when}` : 'your versions from the last 10 minutes'}: Ruum joins the changes you make within 10 minutes into one version.`}
+                    </Note>
+                  )}
                 </>
               )}
-            </div>
+            </Indent>
           )}
-          <label className="check">
-            <input type="radio" name="conflict" checked={choice === 'keep'} onChange={() => setChoice('keep')} />
-            {one ? 'Keep both, as two separate files' : 'Keep both, as separate files'}
-          </label>
-          <label className="check">
-            <input type="radio" name="conflict" checked={choice === 'skip'} onChange={() => setChoice('skip')} />
-            Skip
-          </label>
-        </fieldset>
+          <Radio
+            name="conflict"
+            checked={choice === 'keep'}
+            onChange={() => setChoice('keep')}
+            label={one ? 'Keep both, as two separate files' : 'Keep both, as separate files'}
+          />
+          <Radio name="conflict" checked={choice === 'skip'} onChange={() => setChoice('skip')} label="Skip" />
+        </Fieldset>
         <ErrorNote error={error} />
-        <div className="actions">
-          <button type="button" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary" disabled={busy}>
+        <Actions>
+          <Button onClick={props.onClose}>Cancel</Button>
+          <Button type="submit" variant="primary" disabled={busy} busy={busy}>
             Continue
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Stack>
     </Dialog>
   )
 }

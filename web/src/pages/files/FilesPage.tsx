@@ -7,8 +7,38 @@ import { Actor } from '../../app/names'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { useSession } from '../../app/useSession'
 import { count, formatBytes, formatDate, formatWhen } from '../../components/format'
-import { useToast } from '../../components/useToast'
-import { EmptyState, ErrorNote, FileIcon, FolderIcon, Loaded, Loading, LoadMore } from '../../components/ui'
+import {
+  Actions,
+  BareCheckbox,
+  Breadcrumbs,
+  Button,
+  Card,
+  Crumb,
+  CurrentCrumb,
+  DropZone,
+  EmptyState,
+  ErrorNote,
+  FileInput,
+  KindIcon,
+  Loaded,
+  Loading,
+  LoadMore,
+  NameCell,
+  ProseList,
+  SelectionBar,
+  SortHeader,
+  SplitView,
+  Table,
+  TBody,
+  Td,
+  Text,
+  Th,
+  THead,
+  Toolbar,
+  Tr,
+  useToast,
+  VisuallyHidden,
+} from '../../ui'
 import { listChildren, listSharedWithMe, loadFolder, moveNodes, trashNodes, type Node } from './api'
 import { MoveDialog, NameDialog } from './dialogs'
 import { NotInSpaceYet } from './ItemPage'
@@ -85,7 +115,13 @@ export function FilesPage() {
     uploads.add(plansFor(files, folder, existing, 'keep'), folder.tenant_id, folderLabel(folder))
   }
 
-  function plansFor(files: File[], folder: Node, existing: Map<string, Node>, choice: ConflictChoice, named = new Set<string>()): UploadPlan[] {
+  function plansFor(
+    files: File[],
+    folder: Node,
+    existing: Map<string, Node>,
+    choice: ConflictChoice,
+    named = new Set<string>(),
+  ): UploadPlan[] {
     const plans: UploadPlan[] = []
     for (const file of files) {
       const old = existing.get(file.name)
@@ -198,171 +234,11 @@ export function FilesPage() {
   }
 
   return (
-    <div className="files-layout">
-      <div className="files-main">
-        {stale ? (
-          <Loading label="Loading items" />
-        ) : state.error instanceof RuumApiError && state.error.status === 404 && listed === false ? (
-          <NotInSpaceYet />
-        ) : (
-          <Loaded state={state}>
-            {({ folder, ancestors }) => {
-              if (!folder) return <GuestHome tenantId={tenant.id} spaceName={tenant.name} />
-              const canEdit = folder.my_role === 'edit' || folder.my_role === 'manage'
-              const isRoot = !folder.parent_id
-              const dropProps = canEdit
-                ? {
-                    onDragOver: (e: DragEvent) => {
-                      if (!e.dataTransfer.types.includes('Files')) return
-                      e.preventDefault()
-                      setDropTarget(folder.id)
-                    },
-                    onDragLeave: (e: DragEvent) => {
-                      if (!e.currentTarget.contains(e.relatedTarget as globalThis.Node | null)) setDropTarget(null)
-                    },
-                    onDrop: (e: DragEvent) => void onDropInto(e, folder),
-                  }
-                : {}
-              return (
-                <div className={dropTarget === folder.id ? 'drop-zone active' : 'drop-zone'} {...dropProps}>
-                  <nav aria-label="Breadcrumbs" className="breadcrumbs" hidden={ancestors.length < 2}>
-                    <ol>
-                      {ancestors.map((a, i) => {
-                        const label = a.parent_id ? a.name : 'Files'
-                        const last = i === ancestors.length - 1
-                        return (
-                          <li key={a.id}>
-                            {last ? (
-                              <span aria-current="page">{label}</span>
-                            ) : (
-                              <Link to={a.parent_id ? tenantPath(tenant.id, 'files', a.id) : tenantPath(tenant.id, 'files')}>{label}</Link>
-                            )}
-                          </li>
-                        )
-                      })}
-                    </ol>
-                  </nav>
-                  <div className="toolbar">
-                    <h1>{isRoot ? 'Files' : folder.name}</h1>
-                    {canEdit && (
-                      <div className="actions">
-                        <button type="button" onClick={() => setNewFolder(true)}>
-                          New folder
-                        </button>
-                        <button type="button" className="primary" onClick={() => fileInput.current?.click()}>
-                          Upload files
-                        </button>
-                        <input ref={fileInput} type="file" multiple hidden aria-label="Upload files" onChange={onUpload} />
-                      </div>
-                    )}
-                  </div>
-                  {dropTarget === folder.id && <p className="drop-hint" aria-hidden="true">Drop to upload to {folderLabel(folder)}</p>}
-                  {isRoot && tenant.kind === 'personal' && (
-                    <WelcomeCard
-                      empty={children.data?.items.length === 0}
-                      onUpload={() => fileInput.current?.click()}
-                      onConnect={() => navigate(tenantPath(tenant.id, 'agents', 'connect'))}
-                    />
-                  )}
-                  <ErrorNote error={error} />
-                  {checkedNodes.length > 0 && (
-                    <div className="selection-bar" role="region" aria-label="Selection">
-                      <span>{count(checkedNodes.length, 'item')} selected</span>
-                      {canEdit && (
-                        <>
-                          <button type="button" onClick={() => setMoving(checkedNodes)}>
-                            Move
-                          </button>
-                          <button type="button" onClick={() => trash(checkedNodes)}>
-                            Move to trash
-                          </button>
-                        </>
-                      )}
-                      <button type="button" className="link" onClick={() => setChecked(new Set())}>
-                        Clear selection
-                      </button>
-                    </div>
-                  )}
-                  <Loaded state={children}>
-                    {({ items }) =>
-                      items.length === 0 ? (
-                        <EmptyFolder
-                          isRoot={isRoot}
-                          canEdit={canEdit}
-                          onUpload={() => fileInput.current?.click()}
-                          onNewFolder={() => setNewFolder(true)}
-                        />
-                      ) : (
-                        <FileTable
-                          nodes={items}
-                          tenantId={tenant.id}
-                          selectedId={selectedId}
-                          checked={checked}
-                          canEdit={canEdit}
-                          dropTarget={dropTarget}
-                          onToggle={toggle}
-                          onToggleAll={(on) => setChecked(on ? new Set(items.map((n) => n.id)) : new Set())}
-                          onSelect={(n) => select(n)}
-                          onDragOverFolder={(id) => setDropTarget(id)}
-                          onDropFolder={(e, n) => void onDropInto(e, n)}
-                        />
-                      )
-                    }
-                  </Loaded>
-                  <LoadMore state={children} />
-                  {newFolder && (
-                    <NameDialog
-                      open
-                      title="New folder"
-                      label="Folder name"
-                      initial=""
-                      placeholder="Site photos"
-                      submitLabel="Create"
-                      onClose={() => setNewFolder(false)}
-                      onSubmit={async (name) => {
-                        await unwrap(client.POST('/v1/nodes', { body: { parent_id: folder.id, name, kind: 'folder' } }))
-                        toast(`Folder ${name} created.`)
-                        reload()
-                      }}
-                    />
-                  )}
-                  {pending && (
-                    <ConflictDialog
-                      names={pending.files.filter((f) => pending.existing.has(f.name)).map((f) => f.name)}
-                      recent={pending.recent}
-                      onClose={() => setPending(null)}
-                      onChoose={async (choice, label) => {
-                        // A name keeps the person's save of the last minutes as its own version.
-                        const named = new Set<string>()
-                        if (choice === 'version' && label) {
-                          for (const n of pending.recent) {
-                            await nameHeadVersion(n, label)
-                            named.add(n.id)
-                          }
-                        }
-                        const plans = plansFor(pending.files, pending.folder, pending.existing, choice, named)
-                        setPending(null)
-                        if (plans.length) uploads.add(plans, pending.folder.tenant_id, folderLabel(pending.folder))
-                      }}
-                    />
-                  )}
-                  {moving && (
-                    <MoveDialog
-                      nodes={moving}
-                      open
-                      onClose={() => setMoving(null)}
-                      onMove={(target) => move(moving, target)}
-                    />
-                  )}
-                </div>
-              )
-            }}
-          </Loaded>
-        )}
-      </div>
-      {selected && !stale && (
-        <aside className="files-aside" aria-label="Details">
-          {panel === 'versions' && selected.kind === 'file' ? (
+    <SplitView
+      asideLabel="Details"
+      aside={
+        selected && !stale ? (
+          panel === 'versions' && selected.kind === 'file' ? (
             <VersionsPanel node={selected} onClose={() => select(selected)} onRestored={reload} />
           ) : (
             <NodeDetails
@@ -374,10 +250,155 @@ export function FilesPage() {
               onShowVersions={() => select(selected, 'versions')}
               onClose={() => select(null)}
             />
-          )}
-        </aside>
+          )
+        ) : undefined
+      }
+    >
+      {stale ? (
+        <Loading label="Loading items" />
+      ) : state.error instanceof RuumApiError && state.error.status === 404 && listed === false ? (
+        <NotInSpaceYet />
+      ) : (
+        <Loaded state={state}>
+          {({ folder, ancestors }) => {
+            if (!folder) return <GuestHome tenantId={tenant.id} spaceName={tenant.name} />
+            const canEdit = folder.my_role === 'edit' || folder.my_role === 'manage'
+            const isRoot = !folder.parent_id
+            const dropProps = canEdit
+              ? {
+                  onDragOver: (e: DragEvent) => {
+                    if (!e.dataTransfer.types.includes('Files')) return
+                    e.preventDefault()
+                    setDropTarget(folder.id)
+                  },
+                  onDragLeave: (e: DragEvent) => {
+                    if (!e.currentTarget.contains(e.relatedTarget as globalThis.Node | null)) setDropTarget(null)
+                  },
+                  onDrop: (e: DragEvent) => void onDropInto(e, folder),
+                }
+              : {}
+            return (
+              <DropZone active={dropTarget === folder.id} hint={`Drop to upload to ${folderLabel(folder)}`} {...dropProps}>
+                <Breadcrumbs hidden={ancestors.length < 2}>
+                  {ancestors.map((a, i) => {
+                    const label = a.parent_id ? a.name : 'Files'
+                    return i === ancestors.length - 1 ? (
+                      <CurrentCrumb key={a.id}>{label}</CurrentCrumb>
+                    ) : (
+                      <Crumb key={a.id}>
+                        <Link to={a.parent_id ? tenantPath(tenant.id, 'files', a.id) : tenantPath(tenant.id, 'files')}>{label}</Link>
+                      </Crumb>
+                    )
+                  })}
+                </Breadcrumbs>
+                <Toolbar>
+                  <h1>{isRoot ? 'Files' : folder.name}</h1>
+                  {canEdit && (
+                    <Actions>
+                      <Button onClick={() => setNewFolder(true)}>New folder</Button>
+                      <Button variant="primary" icon="upload" onClick={() => fileInput.current?.click()}>
+                        Upload files
+                      </Button>
+                      <FileInput ref={fileInput} multiple label="Upload files" onChange={onUpload} />
+                    </Actions>
+                  )}
+                </Toolbar>
+                {isRoot && tenant.kind === 'personal' && (
+                  <WelcomeCard
+                    empty={children.data?.items.length === 0}
+                    onUpload={() => fileInput.current?.click()}
+                    onConnect={() => navigate(tenantPath(tenant.id, 'agents', 'connect'))}
+                  />
+                )}
+                <ErrorNote error={error} />
+                {checkedNodes.length > 0 && (
+                  <SelectionBar label="Selection">
+                    <span>{count(checkedNodes.length, 'item')} selected</span>
+                    {canEdit && (
+                      <>
+                        <Button size="sm" onClick={() => setMoving(checkedNodes)}>
+                          Move
+                        </Button>
+                        <Button size="sm" onClick={() => trash(checkedNodes)}>
+                          Move to trash
+                        </Button>
+                      </>
+                    )}
+                    <Button variant="link" onClick={() => setChecked(new Set())}>
+                      Clear selection
+                    </Button>
+                  </SelectionBar>
+                )}
+                <Loaded state={children}>
+                  {({ items }) =>
+                    items.length === 0 ? (
+                      <EmptyFolder
+                        isRoot={isRoot}
+                        canEdit={canEdit}
+                        onUpload={() => fileInput.current?.click()}
+                        onNewFolder={() => setNewFolder(true)}
+                      />
+                    ) : (
+                      <FileTable
+                        nodes={items}
+                        tenantId={tenant.id}
+                        selectedId={selectedId}
+                        checked={checked}
+                        canEdit={canEdit}
+                        dropTarget={dropTarget}
+                        onToggle={toggle}
+                        onToggleAll={(on) => setChecked(on ? new Set(items.map((n) => n.id)) : new Set())}
+                        onSelect={(n) => select(n)}
+                        onDragOverFolder={(id) => setDropTarget(id)}
+                        onDropFolder={(e, n) => void onDropInto(e, n)}
+                      />
+                    )
+                  }
+                </Loaded>
+                <LoadMore state={children} />
+                {newFolder && (
+                  <NameDialog
+                    open
+                    title="New folder"
+                    label="Folder name"
+                    initial=""
+                    placeholder="Site photos"
+                    submitLabel="Create"
+                    onClose={() => setNewFolder(false)}
+                    onSubmit={async (name) => {
+                      await unwrap(client.POST('/v1/nodes', { body: { parent_id: folder.id, name, kind: 'folder' } }))
+                      toast(`Folder ${name} created.`)
+                      reload()
+                    }}
+                  />
+                )}
+                {pending && (
+                  <ConflictDialog
+                    names={pending.files.filter((f) => pending.existing.has(f.name)).map((f) => f.name)}
+                    recent={pending.recent}
+                    onClose={() => setPending(null)}
+                    onChoose={async (choice, label) => {
+                      // A name keeps the person's save of the last minutes as its own version.
+                      const named = new Set<string>()
+                      if (choice === 'version' && label) {
+                        for (const n of pending.recent) {
+                          await nameHeadVersion(n, label)
+                          named.add(n.id)
+                        }
+                      }
+                      const plans = plansFor(pending.files, pending.folder, pending.existing, choice, named)
+                      setPending(null)
+                      if (plans.length) uploads.add(plans, pending.folder.tenant_id, folderLabel(pending.folder))
+                    }}
+                  />
+                )}
+                {moving && <MoveDialog nodes={moving} open onClose={() => setMoving(null)} onMove={(target) => move(moving, target)} />}
+              </DropZone>
+            )
+          }}
+        </Loaded>
       )}
-    </div>
+    </SplitView>
   )
 }
 
@@ -422,38 +443,32 @@ function WelcomeCard(props: { empty: boolean | undefined; onUpload: () => void; 
     setClosed(true)
   }
   return (
-    <section className="welcome card" aria-labelledby="welcome-title">
+    <Card aria-labelledby="welcome-title">
       <h2 id="welcome-title">Welcome to Ruum, {first}</h2>
-      <ul>
+      <ProseList>
         <li>Upload files from any device; drop them on a folder to put them there.</li>
         <li>Every change is kept as a version, so you can go back.</li>
         <li>Connect an AI agent that works for you, only in the folders you choose.</li>
-      </ul>
-      <div className="actions left">
-        <button type="button" className="primary" onClick={props.onUpload}>
+      </ProseList>
+      <Actions align="start">
+        <Button variant="primary" onClick={props.onUpload}>
           Upload files
-        </button>
-        <button type="button" onClick={props.onConnect}>
-          Connect an agent
-        </button>
-        <button type="button" onClick={close}>
-          Close
-        </button>
-      </div>
-    </section>
+        </Button>
+        <Button onClick={props.onConnect}>Connect an agent</Button>
+        <Button onClick={close}>Close</Button>
+      </Actions>
+    </Card>
   )
 }
 
 function EmptyFolder(props: { isRoot: boolean; canEdit: boolean; onUpload: () => void; onNewFolder: () => void }) {
-  if (!props.canEdit) return <EmptyState title="This folder is empty" />
+  if (!props.canEdit) return <EmptyState icon="info" title="This folder is empty" />
   const actions = (
     <>
-      <button type="button" className="primary" onClick={props.onUpload}>
+      <Button variant="primary" onClick={props.onUpload}>
         Upload files
-      </button>
-      <button type="button" onClick={props.onNewFolder}>
-        New folder
-      </button>
+      </Button>
+      <Button onClick={props.onNewFolder}>New folder</Button>
     </>
   )
   return props.isRoot ? (
@@ -483,7 +498,7 @@ function GuestHome({ tenantId, spaceName }: { tenantId: string; spaceName: strin
             <EmptyState title="Nothing yet" text={`You see only what people in ${spaceName} shared with you.`} />
           ) : (
             <>
-              <p className="muted">You see only what people in {spaceName} shared with you.</p>
+              <Text tone="muted">You see only what people in {spaceName} shared with you.</Text>
               <SharedTable items={here} />
             </>
           )
@@ -503,7 +518,11 @@ function sortNodes(nodes: Node[], key: SortKey, dir: 1 | -1): Node[] {
   return [...nodes].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === 'folder' ? -1 : 1
     const by =
-      key === 'size' ? a.size_bytes - b.size_bytes : key === 'changed' ? a.updated_at.localeCompare(b.updated_at) : collator.compare(a.name, b.name)
+      key === 'size'
+        ? a.size_bytes - b.size_bytes
+        : key === 'changed'
+          ? a.updated_at.localeCompare(b.updated_at)
+          : collator.compare(a.name, b.name)
     return (by || collator.compare(a.name, b.name)) * dir
   })
 }
@@ -525,26 +544,20 @@ function FileTable(props: {
   const nodes = sortNodes(props.nodes, sort.key, sort.dir)
   const all = props.nodes.length > 0 && props.nodes.every((n) => props.checked.has(n.id))
   const some = props.nodes.some((n) => props.checked.has(n.id))
-  const header = (key: SortKey, label: string, className?: string) => (
-    <th scope="col" className={className} aria-sort={sort.key === key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}>
-      <button
-        type="button"
-        className="sort"
-        onClick={() => setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === 'name' ? 1 : -1 }))}
-      >
-        {label}
-        <span aria-hidden="true">{sort.key === key ? (sort.dir === 1 ? ' ↑' : ' ↓') : ''}</span>
-      </button>
-    </th>
+  const header = (key: SortKey, label: string, hideNarrow?: boolean) => (
+    <SortHeader
+      label={label}
+      hideNarrow={hideNarrow}
+      sort={sort.key === key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}
+      onSort={() => setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === 'name' ? 1 : -1 }))}
+    />
   )
   return (
-    <table className="table files">
-      <caption className="sr-only">Contents of this folder</caption>
-      <thead>
-        <tr>
-          <th scope="col" className="check-cell">
-            <input
-              type="checkbox"
+    <Table caption="Contents of this folder">
+      <THead>
+        <Tr>
+          <Th scope="col" check>
+            <BareCheckbox
               aria-label="Select all"
               checked={all}
               ref={(el) => {
@@ -552,18 +565,17 @@ function FileTable(props: {
               }}
               onChange={(e) => props.onToggleAll(e.target.checked)}
             />
-          </th>
+          </Th>
           {header('name', 'Name')}
-          {header('size', 'Size', 'hide-narrow')}
-          {header('changed', 'Changed', 'hide-narrow')}
-          <th scope="col">
-            <span className="sr-only">Actions</span>
-          </th>
-        </tr>
-      </thead>
-      <tbody>
+          {header('size', 'Size', true)}
+          {header('changed', 'Changed', true)}
+          <Th scope="col">
+            <VisuallyHidden>Actions</VisuallyHidden>
+          </Th>
+        </Tr>
+      </THead>
+      <TBody>
         {nodes.map((n) => {
-          const isDrop = props.dropTarget === n.id
           const folderDrop =
             n.kind === 'folder' && props.canEdit
               ? {
@@ -576,45 +588,49 @@ function FileTable(props: {
                   onDrop: (e: DragEvent) => props.onDropFolder(e, n),
                 }
               : {}
-          const cls = [n.id === props.selectedId || props.checked.has(n.id) ? 'selected' : '', isDrop ? 'drop' : ''].filter(Boolean).join(' ')
           return (
-            <tr key={n.id} className={cls || undefined} {...folderDrop}>
-              <td className="check-cell">
-                <input
-                  type="checkbox"
+            <Tr
+              key={n.id}
+              selected={n.id === props.selectedId || props.checked.has(n.id)}
+              dropTarget={props.dropTarget === n.id}
+              {...folderDrop}
+            >
+              <Td check>
+                <BareCheckbox
                   aria-label={`Select ${n.name}`}
                   checked={props.checked.has(n.id)}
                   onChange={(e) => props.onToggle(n.id, e.target.checked)}
                 />
-              </td>
-              <th scope="row">
-                <span className="name-cell">
-                  <span className={`kind kind-${n.kind}`}>{n.kind === 'folder' ? <FolderIcon /> : <FileIcon type={n.type} name={n.name} />}</span>
+              </Td>
+              <Th scope="row">
+                <NameCell icon={<KindIcon kind={n.kind} type={n.type} name={n.name} />}>
                   {n.kind === 'folder' ? (
                     <Link to={tenantPath(props.tenantId, 'files', n.id)}>{n.name}</Link>
                   ) : (
-                    <button type="button" className="link" onClick={() => props.onSelect(n)}>
+                    <Button variant="link" onClick={() => props.onSelect(n)}>
                       {n.name}
-                    </button>
+                    </Button>
                   )}
-                </span>
-              </th>
-              <td className="hide-narrow num">{n.kind === 'folder' ? '-' : formatBytes(n.size_bytes)}</td>
-              <td className="hide-narrow changed">
+                </NameCell>
+              </Th>
+              <Td hideNarrow numeric>
+                {n.kind === 'folder' ? '-' : formatBytes(n.size_bytes)}
+              </Td>
+              <Td hideNarrow>
                 <span title={formatDate(n.updated_at)}>{formatWhen(n.updated_at)}</span>
-                <span className="muted small changed-by">
+                <Text as="span" tone="muted" size="sm" block>
                   <Actor pair={n.updated_by} />
-                </span>
-              </td>
-              <td className="row-actions">
-                <button type="button" aria-label={`Details of ${n.name}`} onClick={() => props.onSelect(n)}>
+                </Text>
+              </Td>
+              <Td actions>
+                <Button size="sm" aria-label={`Details of ${n.name}`} onClick={() => props.onSelect(n)}>
                   Details
-                </button>
-              </td>
-            </tr>
+                </Button>
+              </Td>
+            </Tr>
           )
         })}
-      </tbody>
-    </table>
+      </TBody>
+    </Table>
   )
 }

@@ -1,0 +1,11 @@
+.ui-agent-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-agent);
+  overflow-wrap: break-word;
+}
+
+.ui-agent-name a {
+  color: inherit;
+}

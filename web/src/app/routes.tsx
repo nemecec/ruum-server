@@ -1,6 +1,6 @@
 import { Navigate, Outlet, type RouteObject } from 'react-router'
 import { OfflineBanner } from '../components/OfflineBanner'
-import { ToastProvider } from '../components/toast'
+import { ToastProvider } from '../ui'
 import { AcceptInvitationPage } from '../pages/AcceptInvitation'
 import { AccountPage } from '../pages/Account'
 import { AdminLayout, AuditPage, InvitationsPage, LimitsPage, MembersPage, PolicyPage } from '../pages/admin/AdminPages'

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { Navigate, useLocation, useNavigate } from 'react-router'
 import { client, onUnauthenticated, RuumApiError, unwrap, type Schemas } from '../api/client'
 import { useApi } from '../api/useApi'
-import { ErrorNote, Loading } from '../components/ui'
+import { ErrorNote, Loading, Page } from '../ui'
 import { UploadsProvider } from '../pages/files/uploads'
 import { signInPath } from './auth'
 import { SessionContext } from './useSession'
@@ -40,8 +40,18 @@ export function RequireSession({ children }: { children: ReactNode }) {
   if (state.error instanceof RuumApiError && state.error.status === 401) {
     return <Navigate to={signInPath(location)} replace />
   }
-  if (state.error) return <main className="page"><ErrorNote error={state.error} /></main>
-  if (!state.data) return <main className="page"><Loading label="Signing in" /></main>
+  if (state.error)
+    return (
+      <Page>
+        <ErrorNote error={state.error} />
+      </Page>
+    )
+  if (!state.data)
+    return (
+      <Page>
+        <Loading label="Signing in" />
+      </Page>
+    )
   return (
     <SessionContext.Provider value={{ me: state.data.me, tenants: tenants ?? state.data.tenants, reloadTenants }}>
       <UploadsProvider>{children}</UploadsProvider>

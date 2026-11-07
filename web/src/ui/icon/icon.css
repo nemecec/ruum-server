@@ -1,0 +1,28 @@
+.ui-icon {
+  flex: none;
+  display: block;
+  width: var(--size-icon);
+  height: var(--size-icon);
+}
+
+.ui-icon-sm {
+  width: var(--size-icon-sm);
+  height: var(--size-icon-sm);
+}
+
+.ui-kind-folder {
+  color: var(--color-primary);
+}
+
+.ui-kind-file {
+  color: var(--color-text-muted);
+}
+
+.ui-agent-mark {
+  flex: none;
+  display: inline-block;
+  width: var(--size-icon-sm);
+  height: var(--size-icon-sm);
+  color: var(--color-agent);
+  vertical-align: text-bottom;
+}

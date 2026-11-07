@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { Banner } from '../ui'
 
 function subscribe(onChange: () => void) {
   window.addEventListener('online', onChange)
@@ -11,11 +12,11 @@ function subscribe(onChange: () => void) {
 
 /** The offline banner (journeys "Common states", copy.md section 4): the UI tells the truth. */
 export function OfflineBanner() {
-  const online = useSyncExternalStore(subscribe, () => navigator.onLine, () => true)
-  if (online) return null
-  return (
-    <p className="offline" role="alert">
-      You're offline. Changes wait until you're back.
-    </p>
+  const online = useSyncExternalStore(
+    subscribe,
+    () => navigator.onLine,
+    () => true,
   )
+  if (online) return null
+  return <Banner role="alert">You're offline. Changes wait until you're back.</Banner>
 }

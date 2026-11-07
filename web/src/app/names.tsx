@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { client, unwrap } from '../api/client'
 import { actorLabel, NamesContext, useNames, type ActorLike, type AgentInfo, type Names, type Person } from './useNames'
-import { AgentGlyph } from '../components/ui'
+import { AgentName } from '../ui'
 
 /** Loads the names of a space: members (if the person may list them) and agents. */
 export function NamesProvider(props: {
@@ -35,10 +35,13 @@ export function NamesProvider(props: {
     const header = { 'Ruum-Tenant': tenantId }
     if (canListMembers) {
       void collect((cursor) =>
-        unwrap(client.GET('/v1/tenants/{tenant_id}/members', { params: { path: { tenant_id: tenantId }, query: cursor ? { cursor } : {} } })),
+        unwrap(
+          client.GET('/v1/tenants/{tenant_id}/members', { params: { path: { tenant_id: tenantId }, query: cursor ? { cursor } : {} } }),
+        ),
       )
         .then((items) => {
-          if (active) setPeople((p) => ({ ...p, ...Object.fromEntries(items.map((m) => [m.user_id, { name: m.display_name, email: m.email }])) }))
+          if (active)
+            setPeople((p) => ({ ...p, ...Object.fromEntries(items.map((m) => [m.user_id, { name: m.display_name, email: m.email }])) }))
         })
         .catch(() => {})
     }
@@ -92,12 +95,5 @@ export function Actor({ pair }: { pair: ActorLike }) {
   const names = useNames()
   const { text, agent } = actorLabel(names, pair.actor, pair.on_behalf_of, pair.on_behalf_of_display_name)
   if (!agent) return <span>{text}</span>
-  return (
-    <span className="agent-name">
-      <AgentGlyph />
-      {text}
-      <span className="sr-only"> (an agent)</span>
-    </span>
-  )
+  return <AgentName srText=" (an agent)">{text}</AgentName>
 }
-

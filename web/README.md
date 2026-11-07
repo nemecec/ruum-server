@@ -8,9 +8,27 @@ npm run dev         # http://localhost:5173 with the mock API (src/mocks); no se
 npm run dev:server  # http://localhost:5173, proxies the API to the Ruum server (see below)
 npm run gen:api     # regenerate src/api/schema.d.ts from ../contracts/openapi.yaml
 npm run build       # type check and build to dist/
-npm run lint
+npm run lint        # oxlint, stylelint, the design system rules, generated tokens up to date
 npm test            # component tests (Vitest, Testing Library, jsdom) against the mock API
+npm run tokens      # regenerate src/design/generated/ from the design tokens
+npm run ladle       # the component catalogue (Ladle) on http://localhost:61000
 ```
+
+## Design system
+
+The look is defined once (design 12.5, `docs/ux/design-system.md` section 6):
+
+- **Tokens** in the W3C Design Tokens format: `src/design/tokens/` (`base`, `color.light`,
+  `color.dark`). Style Dictionary (`scripts/build-tokens.mjs`) writes `src/design/generated/`
+  (`tokens.css`, `tokens.ts`). The output is committed; `npm run lint` fails when it is stale.
+- **Components** in `src/ui/`, exported by `src/ui/index.ts`, each with its CSS and Ladle stories.
+  Screens (`src/app`, `src/pages`, `src/components`) use only these components: no `className`,
+  no `style`, no CSS files, no raw controls (`scripts/check-ui-rules.mjs`).
+- **stylelint** (`stylelint.config.mjs`) refuses colour, length, font, shadow, layer and timing
+  values outside the token files.
+- **Catalogue:** `npm run ladle` / `npm run ladle:build` (to `build-ladle/`). Light and dark with
+  the theme button; phone and desktop width; the a11y panel. `src/ui/catalogue.test.tsx` renders
+  every story and runs axe in Vitest.
 
 ## Against the real server
 
@@ -81,7 +99,10 @@ Downloads and previews use `getContentUrl` (the content domain), never the API-o
 | `src/app/` | Routes, the session (`getMe`, `listTenants`), the tenant layout with the tenant switcher, sign-in URLs. |
 | `src/pages/` | The pages: files, shared with me, trash, search, agents, OAuth consent, account, tenant admin. |
 | `src/upload/` | Chunked uploads: FastCDC (`fastcdc.ts`, `gear.ts`), chunking and hashing (`chunker.ts`), the upload flow (`upload.ts`). |
-| `src/components/` | Dialog (native `<dialog>`), confirm button, status and error messages, formatting. |
+| `src/components/` | Formatting helpers and the offline banner. |
+| `src/ui/` | The component library (design system): layout, text, buttons, fields, dialogs, notes, tables, lists, navigation, menus, toasts, icons, the app shell. |
+| `src/design/` | The design tokens (`tokens/`) and their generated CSS and TypeScript (`generated/`). |
+| `.ladle/` | The Ladle configuration of the component catalogue. |
 | `src/mocks/` | The mock API: seed data (`db.ts`) and MSW handlers (`handlers.ts`), both typed by the schema. |
 | `mock-auth.ts` | Vite plugin for `npm run dev`: plays `loginStart` and `loginCallback` (full page redirects). |
 | `src/test/` | Test setup, helpers and the flow tests. |

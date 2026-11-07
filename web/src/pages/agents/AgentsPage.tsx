@@ -5,9 +5,30 @@ import { usePagedApi } from '../../api/usePagedApi'
 import { useNames } from '../../app/useNames'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { roleLabels } from '../../components/format'
-import { AgentGlyph, Dialog, EmptyState, ErrorNote, Loaded, LoadMore } from '../../components/ui'
 import { ScopeFields } from './ScopeFields'
 import { agentStatus } from './status'
+import {
+  Actions,
+  AgentName,
+  Button,
+  Dialog,
+  EmptyState,
+  ErrorNote,
+  Field,
+  Loaded,
+  LoadMore,
+  PageBody,
+  Stack,
+  Table,
+  TBody,
+  Td,
+  Text,
+  TextInput,
+  Th,
+  THead,
+  Toolbar,
+  Tr,
+} from '../../ui'
 
 /** The agents of the person (all agents of the space for admins). */
 export function AgentsPage() {
@@ -18,62 +39,61 @@ export function AgentsPage() {
   const connect = () => navigate(tenantPath(tenant.id, 'agents', 'connect'))
 
   return (
-    <div className="page-body">
-      <div className="toolbar">
+    <PageBody>
+      <Toolbar>
         <h1>Agents</h1>
-        <button type="button" className="primary" onClick={connect}>
+        <Button variant="primary" onClick={connect}>
           Connect an agent
-        </button>
-      </div>
-      <p className="muted">
+        </Button>
+      </Toolbar>
+      <Text tone="muted">
         Agents work in Ruum for you, with the access you give them. Every change they make shows their name and yours.
         {isAdmin && ` As an admin, you see every agent in ${tenant.name}.`}
-      </p>
+      </Text>
       <Loaded state={agents}>
         {({ items }) =>
           items.length === 0 ? (
             <EmptyState title="No agents yet" text="Connect Claude, ChatGPT or another AI app, or create an agent with a key for a script.">
-              <button type="button" className="primary" onClick={connect}>
+              <Button variant="primary" onClick={connect}>
                 Connect an agent
-              </button>
+              </Button>
             </EmptyState>
           ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th scope="col">Name</th>
-                  <th scope="col">Status</th>
-                  <th scope="col" className="hide-narrow">
+            <Table caption="Agents">
+              <THead>
+                <Tr>
+                  <Th scope="col">Name</Th>
+                  <Th scope="col">Status</Th>
+                  <Th hideNarrow scope="col">
                     Highest role
-                  </th>
+                  </Th>
                   {isAdmin && (
-                    <th scope="col" className="hide-narrow">
+                    <Th hideNarrow scope="col">
                       Works for
-                    </th>
+                    </Th>
                   )}
-                </tr>
-              </thead>
-              <tbody>
+                </Tr>
+              </THead>
+              <TBody>
                 {items.map((a) => (
-                  <tr key={a.id}>
-                    <th scope="row">
-                      <span className="agent-name">
-                        <AgentGlyph />
+                  <Tr key={a.id}>
+                    <Th scope="row">
+                      <AgentName>
                         <Link to={tenantPath(tenant.id, 'agents', a.id)}>{a.name}</Link>
-                      </span>
-                    </th>
-                    <td>{agentStatus(a)}</td>
-                    <td className="hide-narrow">{roleLabels[a.scope.max_role]}</td>
-                    {isAdmin && <td className="hide-narrow">{names.person(a.owner_id)?.name ?? 'Someone'}</td>}
-                  </tr>
+                      </AgentName>
+                    </Th>
+                    <Td>{agentStatus(a)}</Td>
+                    <Td hideNarrow>{roleLabels[a.scope.max_role]}</Td>
+                    {isAdmin && <Td hideNarrow>{names.person(a.owner_id)?.name ?? 'Someone'}</Td>}
+                  </Tr>
                 ))}
-              </tbody>
-            </table>
+              </TBody>
+            </Table>
           )
         }
       </Loaded>
       <LoadMore state={agents} />
-    </div>
+    </PageBody>
   )
 }
 
@@ -92,7 +112,9 @@ export function RegisterAgentDialog(props: { onClose: () => void; onCreated: (a:
     setError(undefined)
     try {
       const agent = await unwrap(
-        client.POST('/v1/agents', { body: { name: name.trim(), ...(description.trim() ? { description: description.trim() } : {}), scope } }),
+        client.POST('/v1/agents', {
+          body: { name: name.trim(), ...(description.trim() ? { description: description.trim() } : {}), scope },
+        }),
       )
       props.onCreated(agent)
     } catch (err) {
@@ -103,27 +125,23 @@ export function RegisterAgentDialog(props: { onClose: () => void; onCreated: (a:
   }
 
   return (
-    <Dialog title="Create an agent with a key" open onClose={props.onClose} wide>
-      <form className="stack" onSubmit={submit}>
-        <label>
-          Name
-          <input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Backup script" />
-        </label>
-        <label>
-          Description (optional)
-          <input value={description} onChange={(e) => setDescription(e.target.value)} />
-        </label>
+    <Dialog title="Create an agent with a key" open onClose={props.onClose} size="md">
+      <Stack as="form" onSubmit={submit}>
+        <Field label="Name">
+          <TextInput required value={name} onChange={(e) => setName(e.target.value)} placeholder="Backup script" />
+        </Field>
+        <Field label="Description (optional)">
+          <TextInput value={description} onChange={(e) => setDescription(e.target.value)} />
+        </Field>
         <ScopeFields tenantId={tenant.id} spaceName={tenant.name} scope={scope} onChange={setScope} idPrefix="register" />
         <ErrorNote error={error} />
-        <div className="actions">
-          <button type="button" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary" disabled={busy || !name.trim() || scope.subtree === ''}>
+        <Actions>
+          <Button onClick={props.onClose}>Cancel</Button>
+          <Button variant="primary" type="submit" disabled={busy || !name.trim() || scope.subtree === ''}>
             Create agent
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Stack>
     </Dialog>
   )
 }

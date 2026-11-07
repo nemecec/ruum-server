@@ -4,7 +4,22 @@ import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { formatDate } from '../../components/format'
-import { Loaded, LoadMore } from '../../components/ui'
+import {
+  Button,
+  EmptyState,
+  Field,
+  Grow,
+  List,
+  ListRow,
+  ListRowMain,
+  Loaded,
+  LoadMore,
+  PageBody,
+  Row,
+  Select,
+  Text,
+  TextInput,
+} from '../../ui'
 
 /** Search by name, optionally narrowed to one tag. */
 export function SearchPage() {
@@ -29,47 +44,50 @@ export function SearchPage() {
   }
 
   return (
-    <div className="page-body">
+    <PageBody>
       <h1>Search</h1>
-      <form
-        className="inline-form"
+      <Row
+        as="form"
+        align="end"
         role="search"
         onSubmit={(e) => {
           e.preventDefault()
-          update('q', String(new FormData(e.currentTarget).get('q') ?? '').trim())
+          update('q', String(new FormData(e.currentTarget as HTMLFormElement).get('q') ?? '').trim())
         }}
       >
-        <label className="grow">
-          Name contains
-          <input name="q" type="search" defaultValue={q} key={q} />
-        </label>
-        <label>
-          Tag
-          <select value={tag} onChange={(e) => update('tag', e.target.value)}>
+        <Grow as="div">
+          <Field label="Name contains">
+            <TextInput name="q" type="search" defaultValue={q} key={q} />
+          </Field>
+        </Grow>
+        <Field label="Tag">
+          <Select value={tag} onChange={(e) => update('tag', e.target.value)}>
             <option value="">Any tag</option>
             {tags.data?.items.map((t) => (
               <option key={t.id} value={t.id}>
                 {t.name}
               </option>
             ))}
-          </select>
-        </label>
-        <button type="submit">Search</button>
-      </form>
+          </Select>
+        </Field>
+        <Button type="submit" icon="search">
+          Search
+        </Button>
+      </Row>
       {q && (
         <Loaded state={results}>
           {({ items }) =>
             items.length === 0 ? (
-              <p className="empty">Nothing matches "{q}".</p>
+              <EmptyState icon="search" title={`Nothing matches "${q}".`} />
             ) : (
               <>
-                <p role="status" className="muted">
+                <Text role="status" tone="muted">
                   {items.length} {items.length === 1 ? 'match' : 'matches'}
-                </p>
-                <ul className="rows">
+                </Text>
+                <List>
                   {items.map(({ node, path }) => (
-                    <li key={node.id} className="row">
-                      <span className="grow">
+                    <ListRow key={node.id}>
+                      <ListRowMain>
                         <Link
                           to={
                             node.kind === 'folder'
@@ -79,18 +97,23 @@ export function SearchPage() {
                         >
                           {node.name}
                         </Link>
-                        <span className="muted small"> {path}</span>
-                      </span>
-                      <span className="muted small hide-narrow">{formatDate(node.updated_at)}</span>
-                    </li>
+                        <Text as="span" tone="muted" size="sm">
+                          {' '}
+                          {path}
+                        </Text>
+                      </ListRowMain>
+                      <Text as="span" tone="muted" size="sm" hideNarrow>
+                        {formatDate(node.updated_at)}
+                      </Text>
+                    </ListRow>
                   ))}
-                </ul>
+                </List>
               </>
             )
           }
         </Loaded>
       )}
       {q && <LoadMore state={results} />}
-    </div>
+    </PageBody>
   )
 }

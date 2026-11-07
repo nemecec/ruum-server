@@ -1,0 +1,112 @@
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  border: var(--border-width-thin) solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-sunken);
+  color: var(--color-text-muted);
+  font: var(--text-xs);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.ui-badge-success {
+  border-color: transparent;
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+.ui-badge-warning {
+  border-color: transparent;
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+.ui-badge-danger {
+  border-color: transparent;
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+.ui-badge-agent {
+  border-color: transparent;
+  background: var(--color-agent-soft);
+  color: var(--color-agent);
+}
+.ui-badge-primary {
+  border-color: transparent;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.ui-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ui-tag {
+  --tag-color: var(--color-border-control);
+
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--size-control-sm);
+  padding: 0 var(--space-1) 0 var(--space-3);
+  border: var(--border-width-thin) solid var(--color-border);
+  border-inline-start: var(--border-width-edge) solid var(--tag-color);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.ui-tag:not(:has(button)) {
+  padding-inline-end: var(--space-3);
+}
+
+.ui-tag-dot {
+  width: var(--size-dot);
+  height: var(--size-dot);
+  border-radius: var(--radius-full);
+  background: var(--tag-color);
+}
+
+.ui-tag-spruce {
+  --tag-color: var(--color-tag-spruce);
+}
+.ui-tag-moss {
+  --tag-color: var(--color-tag-moss);
+}
+.ui-tag-clay {
+  --tag-color: var(--color-tag-clay);
+}
+.ui-tag-brick {
+  --tag-color: var(--color-tag-brick);
+}
+.ui-tag-ochre {
+  --tag-color: var(--color-tag-ochre);
+}
+.ui-tag-slate {
+  --tag-color: var(--color-tag-slate);
+}
+.ui-tag-plum {
+  --tag-color: var(--color-tag-plum);
+}
+.ui-tag-sand {
+  --tag-color: var(--color-tag-sand);
+}
+
+.ui-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: var(--space-5);
+  padding: 0 var(--space-2);
+  border: var(--border-width-thin) dashed var(--color-border-control);
+  border-radius: var(--radius-sm);
+  background: var(--color-sunken);
+  color: var(--color-text-muted);
+  font: var(--text-sm);
+  white-space: nowrap;
+}

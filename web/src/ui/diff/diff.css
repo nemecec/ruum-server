@@ -1,0 +1,60 @@
+.ui-diff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--color-sunken);
+  font-size: var(--font-size-sm);
+}
+
+.ui-diff-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding-inline-start: var(--space-4);
+}
+
+.ui-diff-list .ui-diff-list {
+  font-size: var(--font-size-xs);
+}
+
+.ui-diff-kind {
+  font-weight: var(--font-weight-strong);
+}
+
+.ui-diff-where {
+  color: var(--color-text-muted);
+}
+
+.ui-diff-values {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 var(--space-2);
+}
+
+.ui-diff-values del,
+.ui-diff-values ins {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-family-mono);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.ui-diff-values del {
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+.ui-diff-values ins {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+  text-decoration: none;
+}
+
+.ui-diff-format {
+  font-style: italic;
+}

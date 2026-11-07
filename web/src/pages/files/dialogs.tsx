@@ -2,7 +2,24 @@ import { useState, type FormEvent } from 'react'
 import { client, RuumApiError, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { count } from '../../components/format'
-import { Dialog, ErrorNote, FolderIcon, Loaded } from '../../components/ui'
+import {
+  Actions,
+  Breadcrumbs,
+  Button,
+  Crumb,
+  CurrentCrumb,
+  Dialog,
+  ErrorNote,
+  Field,
+  FolderIcon,
+  Loaded,
+  Picker,
+  PickerEmpty,
+  PickerItem,
+  Stack,
+  Text,
+  TextInput,
+} from '../../ui'
 import { isNoAccess, listSharedWithMe, loadAncestors, type Node } from './api'
 
 /** A dialog with one name field, for "New folder", "Rename" and version names. */
@@ -40,28 +57,25 @@ export function NameDialog(props: {
 
   return (
     <Dialog title={props.title} open={props.open} onClose={props.onClose}>
-      <form className="stack" onSubmit={submit}>
-        {props.help && <p className="muted">{props.help}</p>}
-        <label>
-          {props.label}
-          <input
+      <Stack as="form" gap={4} onSubmit={submit}>
+        {props.help && <Text tone="muted">{props.help}</Text>}
+        <Field label={props.label}>
+          <TextInput
             required={!props.allowEmpty}
             value={name}
             placeholder={props.placeholder}
             data-select-base={props.selectBase ? '' : undefined}
             onChange={(e) => setName(e.target.value)}
           />
-        </label>
+        </Field>
         <ErrorNote error={error} context={{ name: name.trim() }} />
-        <div className="actions">
-          <button type="button" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary" disabled={busy || (!props.allowEmpty && !name.trim())}>
+        <Actions>
+          <Button onClick={props.onClose}>Cancel</Button>
+          <Button type="submit" variant="primary" disabled={busy || (!props.allowEmpty && !name.trim())} busy={busy}>
             {props.submitLabel}
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Stack>
     </Dialog>
   )
 }
@@ -131,60 +145,53 @@ export function FolderPicker(props: {
         const reason = inside ? "A folder can't go inside itself." : here ? "It's already here." : null
         const canCreate = folder && (folder.my_role === 'edit' || folder.my_role === 'manage')
         return (
-          <div className="stack">
-            <nav aria-label="Folder path" className="breadcrumbs">
-              <ol>
-                {folder && ancestors[0]?.parent_id && (
-                  <li>
-                    <button type="button" className="link" onClick={() => setFolderId(null)}>
-                      Folders shared with you
-                    </button>
-                  </li>
-                )}
-                {folder ? (
-                  ancestors.map((a, i) => {
-                    const label = a.parent_id ? a.name : 'Files'
-                    return (
-                      <li key={a.id}>
-                        {i === ancestors.length - 1 ? (
-                          <span aria-current="location">{label}</span>
-                        ) : (
-                          <button type="button" className="link" onClick={() => setFolderId(a.id)}>
-                            {label}
-                          </button>
-                        )}
-                      </li>
-                    )
-                  })
-                ) : (
-                  <li>
-                    <span aria-current="location">Folders shared with you</span>
-                  </li>
-                )}
-              </ol>
-            </nav>
-            <ul className="picker" aria-label="Folders">
+          <Stack>
+            <Breadcrumbs label="Folder path">
+              {folder && ancestors[0]?.parent_id && (
+                <Crumb>
+                  <Button variant="link" onClick={() => setFolderId(null)}>
+                    Folders shared with you
+                  </Button>
+                </Crumb>
+              )}
+              {folder ? (
+                ancestors.map((a, i) => {
+                  const label = a.parent_id ? a.name : 'Files'
+                  return i === ancestors.length - 1 ? (
+                    <CurrentCrumb key={a.id} current="location">
+                      {label}
+                    </CurrentCrumb>
+                  ) : (
+                    <Crumb key={a.id}>
+                      <Button variant="link" onClick={() => setFolderId(a.id)}>
+                        {label}
+                      </Button>
+                    </Crumb>
+                  )
+                })
+              ) : (
+                <CurrentCrumb current="location">Folders shared with you</CurrentCrumb>
+              )}
+            </Breadcrumbs>
+            <Picker label="Folders">
               {folders.map((f) => (
-                <li key={f.id}>
-                  <button type="button" className="picker-item" disabled={disabled.has(f.id)} onClick={() => setFolderId(f.id)}>
-                    <FolderIcon />
-                    {f.name}
-                  </button>
-                </li>
+                <PickerItem key={f.id} icon={<FolderIcon />} disabled={disabled.has(f.id)} onClick={() => setFolderId(f.id)}>
+                  {f.name}
+                </PickerItem>
               ))}
-              {folders.length === 0 && <li className="muted">No folders here.</li>}
-            </ul>
-            {reason && <p className="muted small">{reason}</p>}
+              {folders.length === 0 && <PickerEmpty>No folders here.</PickerEmpty>}
+            </Picker>
+            {reason && (
+              <Text tone="muted" size="sm">
+                {reason}
+              </Text>
+            )}
             {folder && (
-              <div className="actions">
-                {canCreate && (
-                  <button type="button" onClick={() => setCreating(true)}>
-                    New folder
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="primary"
+              <Actions>
+                {canCreate && <Button onClick={() => setCreating(true)}>New folder</Button>}
+                <Button
+                  variant="primary"
+                  busy={busy}
                   disabled={busy || Boolean(reason)}
                   onClick={async () => {
                     setBusy(true)
@@ -196,8 +203,8 @@ export function FolderPicker(props: {
                   }}
                 >
                   {props.pickLabel}
-                </button>
-              </div>
+                </Button>
+              </Actions>
             )}
             {creating && folder && (
               <NameDialog
@@ -208,12 +215,14 @@ export function FolderPicker(props: {
                 submitLabel="Create"
                 onClose={() => setCreating(false)}
                 onSubmit={async (name) => {
-                  const res = await unwrap(client.POST('/v1/nodes', { params: { header }, body: { parent_id: folder.id, name, kind: 'folder' } }))
+                  const res = await unwrap(
+                    client.POST('/v1/nodes', { params: { header }, body: { parent_id: folder.id, name, kind: 'folder' } }),
+                  )
                   setFolderId(res.node.id)
                 }}
               />
             )}
-          </div>
+          </Stack>
         )
       }}
     </Loaded>
@@ -229,23 +238,25 @@ export function MoveDialog(props: { nodes: Node[]; open: boolean; onClose: () =>
   const sameParent = nodes.every((n) => n.parent_id === first.parent_id)
   return (
     <Dialog title={title} open={props.open} onClose={props.onClose}>
-      <ErrorNote error={error} context={{ name: nodes.length === 1 ? first.name : undefined }} />
-      <FolderPicker
-        tenantId={first.tenant_id}
-        startId={first.parent_id ?? undefined}
-        disabledIds={nodes.filter((n) => n.kind === 'folder').map((n) => n.id)}
-        currentId={sameParent ? (first.parent_id ?? undefined) : undefined}
-        pickLabel="Move here"
-        onPick={async (folder) => {
-          setError(undefined)
-          try {
-            await props.onMove(folder)
-            props.onClose()
-          } catch (e) {
-            setError(e)
-          }
-        }}
-      />
+      <Stack gap={4}>
+        <ErrorNote error={error} context={{ name: nodes.length === 1 ? first.name : undefined }} />
+        <FolderPicker
+          tenantId={first.tenant_id}
+          startId={first.parent_id ?? undefined}
+          disabledIds={nodes.filter((n) => n.kind === 'folder').map((n) => n.id)}
+          currentId={sameParent ? (first.parent_id ?? undefined) : undefined}
+          pickLabel="Move here"
+          onPick={async (folder) => {
+            setError(undefined)
+            try {
+              await props.onMove(folder)
+              props.onClose()
+            } catch (e) {
+              setError(e)
+            }
+          }}
+        />
+      </Stack>
     </Dialog>
   )
 }

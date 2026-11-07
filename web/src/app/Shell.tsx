@@ -1,9 +1,31 @@
-import { useState, type FormEvent } from 'react'
-import { Navigate, NavLink, Outlet, useLocation, useNavigate, useParams } from 'react-router'
+import { useState, type FormEvent, type ReactNode } from 'react'
+import { Navigate, Outlet, useLocation, useNavigate, useParams } from 'react-router'
 import { client, RuumApiError, setSigningOut, setTenant, unwrap, type Schemas } from '../api/client'
 import { memberRoleLabels } from '../components/format'
-import { useToast } from '../components/useToast'
-import { Dialog, ErrorNote } from '../components/ui'
+import {
+  Actions,
+  AppBody,
+  AppMain,
+  Brand,
+  Button,
+  Dialog,
+  ErrorNote,
+  Field,
+  MenuToggle,
+  NavButton,
+  NavItem,
+  NavList,
+  NavRail,
+  Note,
+  SearchForm,
+  Select,
+  SkipLink,
+  Stack,
+  TextInput,
+  TopBar,
+  TopBarItem,
+  useToast,
+} from '../ui'
 import { browser } from './browser'
 import { NamesProvider } from './names'
 import { useSession } from './useSession'
@@ -71,20 +93,13 @@ export function TenantLayout() {
         canListMembers={membership.role !== 'guest'}
         me={{ id: me.user.id, name: me.user.display_name, email: me.user.email }}
       >
-        <a className="skip" href="#main">
-          Skip to content
-        </a>
-        <Header tenantId={tenantId} isAdmin={isAdmin} unlisted={listed ? null : membership} />
-        <main id="main" className="main" tabIndex={-1}>
+        <SkipLink />
+        <Header tenantId={tenantId} isAdmin={isAdmin} unlisted={listed ? null : membership}>
           {/* Only for a guest of the space. A space that is not in the person's list is not theirs at
               all yet: the pages say so (NotInSpaceYet), and a banner that says "guest" would contradict them. */}
-          {listed?.role === 'guest' && (
-            <p className="note" role="note">
-              You're a guest here. You see only what people shared with you.
-            </p>
-          )}
+          {listed?.role === 'guest' && <Note role="note">You're a guest here. You see only what people shared with you.</Note>}
           <Outlet key={tenantId} />
-        </main>
+        </Header>
       </NamesProvider>
     </TenantContext.Provider>
   )
@@ -98,7 +113,18 @@ function spaceLabel(t: Schemas['TenantMembership']): string {
 
 const NEW_TEAM = '__new_team'
 
-function Header({ tenantId, isAdmin, unlisted }: { tenantId: string; isAdmin: boolean; unlisted: Schemas['TenantMembership'] | null }) {
+/** The top bar, the navigation rail and the main region with the page (`children`). */
+function Header({
+  tenantId,
+  isAdmin,
+  unlisted,
+  children,
+}: {
+  tenantId: string
+  isAdmin: boolean
+  unlisted: Schemas['TenantMembership'] | null
+  children: ReactNode
+}) {
   const { me, tenants } = useSession()
   const navigate = useNavigate()
   const location = useLocation()
@@ -142,68 +168,51 @@ function Header({ tenantId, isAdmin, unlisted }: { tenantId: string; isAdmin: bo
   }
 
   const link = (to: string, label: string) => (
-    <li>
-      <NavLink to={tenantPath(tenantId, to)} onClick={() => setMenuOpen(false)}>
-        {label}
-      </NavLink>
-    </li>
+    <NavItem to={tenantPath(tenantId, to)} onClick={() => setMenuOpen(false)}>
+      {label}
+    </NavItem>
   )
 
   const options = unlisted ? [...tenants, unlisted] : tenants
 
   return (
-    <header className="topbar">
-      <div className="topbar-row">
-        <NavLink to={tenantPath(tenantId, 'files')} className="brand">
-          Ruum
-        </NavLink>
-        <label className="tenant-switcher">
-          <span className="sr-only">Space</span>
-          <select value={tenantId} onChange={(e) => switchTenant(e.target.value)}>
-            {options.map((t) => (
-              <option key={t.tenant.id} value={t.tenant.id}>
-                {t === unlisted ? `${t.tenant.name} (shared with you)` : spaceLabel(t)}
-              </option>
-            ))}
-            <option value={NEW_TEAM}>Start a team space...</option>
-          </select>
-        </label>
-        <form role="search" className="search" onSubmit={search}>
-          <label className="sr-only" htmlFor="global-search">
-            Search by name
-          </label>
-          <input key={shownQuery} id="global-search" name="q" type="search" placeholder="Search by name" defaultValue={shownQuery} />
-        </form>
-        <button
-          type="button"
-          className="menu-toggle"
-          aria-expanded={menuOpen}
-          aria-controls="main-nav"
-          onClick={() => setMenuOpen((o) => !o)}
-        >
-          Menu
-        </button>
-      </div>
-      <nav id="main-nav" aria-label="Main" className={menuOpen ? 'nav open' : 'nav'}>
-        <ul>
-          {link('files', 'Files')}
-          {link('shared', 'Shared with me')}
-          {link('trash', 'Trash')}
-          {link('agents', 'Agents')}
-          {isAdmin && link('admin', 'Space settings')}
-        </ul>
-        <ul className="nav-end">
-          {link('account', me.user.display_name)}
-          <li>
-            <button type="button" className="link" onClick={signOut}>
-              Sign out
-            </button>
-          </li>
-        </ul>
-        <ErrorNote error={signOutError} />
-      </nav>
+    <>
+      <TopBar>
+        <Brand to={tenantPath(tenantId, 'files')}>Ruum</Brand>
+        <TopBarItem grow>
+          <Field label="Space" labelHidden>
+            <Select value={tenantId} onChange={(e) => switchTenant(e.target.value)}>
+              {options.map((t) => (
+                <option key={t.tenant.id} value={t.tenant.id}>
+                  {t === unlisted ? `${t.tenant.name} (shared with you)` : spaceLabel(t)}
+                </option>
+              ))}
+              <option value={NEW_TEAM}>Start a team space...</option>
+            </Select>
+          </Field>
+        </TopBarItem>
+        <SearchForm id="global-search" label="Search by name" name="q" defaultValue={shownQuery} onSubmit={search} />
+        <MenuToggle open={menuOpen} controls="main-nav" onToggle={() => setMenuOpen((o) => !o)} />
+      </TopBar>
+      <AppBody>
+        <NavRail id="main-nav" label="Main" open={menuOpen}>
+          <NavList>
+            {link('files', 'Files')}
+            {link('shared', 'Shared with me')}
+            {link('trash', 'Trash')}
+            {link('agents', 'Agents')}
+            {isAdmin && link('admin', 'Space settings')}
+          </NavList>
+          <NavList end>
+            {link('account', me.user.display_name)}
+            <NavButton onClick={signOut}>Sign out</NavButton>
+          </NavList>
+          <ErrorNote error={signOutError} />
+        </NavRail>
+        <AppMain>{children}</AppMain>
+      </AppBody>
       {startTeam && <StartTeamDialog onClose={() => setStartTeam(false)} />}
-    </header>
+    </>
   )
 }
 
@@ -234,22 +243,18 @@ export function StartTeamDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <Dialog title="Start a team space" open onClose={onClose}>
-      <form className="stack" onSubmit={submit}>
-        <label>
-          Team name
-          <input required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} placeholder="Pärn Studio" />
-        </label>
-        <p className="muted small">You'll be the owner. You can invite people next.</p>
+      <Stack as="form" gap={4} onSubmit={submit}>
+        <Field label="Team name" hint="You'll be the owner. You can invite people next.">
+          <TextInput required maxLength={100} value={name} onChange={(e) => setName(e.target.value)} placeholder="Pärn Studio" />
+        </Field>
         <ErrorNote error={error} />
-        <div className="actions">
-          <button type="button" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary" disabled={busy || !name.trim()}>
+        <Actions>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button type="submit" variant="primary" disabled={busy || !name.trim()} busy={busy}>
             Create team space
-          </button>
-        </div>
-      </form>
+          </Button>
+        </Actions>
+      </Stack>
     </Dialog>
   )
 }

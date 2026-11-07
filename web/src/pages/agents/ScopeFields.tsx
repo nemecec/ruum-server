@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { roleLabels } from '../../components/format'
-import { Dialog } from '../../components/ui'
 import { FolderPicker } from '../files/dialogs'
+import { Button, Dialog, Field, Fieldset, Grow, Indent, Radio, Row, Select, Text, TextInput } from '../../ui'
 
 const roles: Schemas['Role'][] = ['view', 'comment', 'edit', 'manage']
 
@@ -32,56 +32,52 @@ export function ScopeFields(props: {
   const expires = scope.expires_at ? scope.expires_at.slice(0, 10) : ''
 
   return (
-    <fieldset className="stack">
-      <legend>What the agent may do</legend>
-      <p className="muted small">An agent never gets more access than you have.</p>
-      <fieldset className="stack plain">
-        <legend>Where</legend>
-        <label className="check">
-          <input
-            type="radio"
-            name={`${idPrefix}-where`}
-            checked={typeof scope.subtree === 'string'}
-            onChange={() => onChange({ ...scope, subtree: scope.subtree ?? '' })}
-          />
-          Only in a folder
-        </label>
+    <Fieldset legend="What the agent may do">
+      <Text tone="muted" size="sm">
+        An agent never gets more access than you have.
+      </Text>
+      <Fieldset legend="Where">
+        <Radio
+          name={`${idPrefix}-where`}
+          checked={typeof scope.subtree === 'string'}
+          onChange={() => onChange({ ...scope, subtree: scope.subtree ?? '' })}
+          label="Only in a folder"
+        />
         {typeof scope.subtree === 'string' && (
-          <div className="row indent">
-            <span className="grow">{scope.subtree ? (subtree.data ? `Folder ${subtree.data.name}` : 'A folder') : 'No folder chosen yet'}</span>
-            <button type="button" onClick={() => setPicking(true)}>
-              Choose folder
-            </button>
-          </div>
+          <Indent>
+            <Row>
+              <Grow>{scope.subtree ? (subtree.data ? `Folder ${subtree.data.name}` : 'A folder') : 'No folder chosen yet'}</Grow>
+              <Button onClick={() => setPicking(true)}>Choose folder</Button>
+            </Row>
+          </Indent>
         )}
-        <label className="check">
-          <input type="radio" name={`${idPrefix}-where`} checked={typeof scope.subtree !== 'string'} onChange={() => onChange({ ...scope, subtree: null })} />
-          Everywhere you have access in {props.spaceName ?? 'this space'}
-        </label>
-      </fieldset>
-      <label>
-        Highest role
-        <select value={scope.max_role} onChange={(e) => onChange({ ...scope, max_role: e.target.value as Schemas['Role'] })}>
+        <Radio
+          name={`${idPrefix}-where`}
+          checked={typeof scope.subtree !== 'string'}
+          onChange={() => onChange({ ...scope, subtree: null })}
+          label={<>Everywhere you have access in {props.spaceName ?? 'this space'}</>}
+        />
+      </Fieldset>
+      <Field label="Highest role">
+        <Select value={scope.max_role} onChange={(e) => onChange({ ...scope, max_role: e.target.value as Schemas['Role'] })}>
           {roles.map((r) => (
             <option key={r} value={r}>
               {roleLabels[r]}
             </option>
           ))}
-        </select>
-      </label>
-      <label>
-        Ends on (optional)
-        <input
+        </Select>
+      </Field>
+      <Field label="Ends on (optional)">
+        <TextInput
           type="date"
           value={expires}
           onChange={(e) =>
             onChange({ ...scope, expires_at: e.target.value ? new Date(`${e.target.value}T23:59:59Z`).toISOString() : null })
           }
         />
-      </label>
-      <label>
-        Changes per hour, at most (optional)
-        <input
+      </Field>
+      <Field label="Changes per hour, at most (optional)">
+        <TextInput
           type="number"
           min={1}
           value={scope.budget?.max_writes_per_hour ?? ''}
@@ -92,7 +88,7 @@ export function ScopeFields(props: {
             })
           }
         />
-      </label>
+      </Field>
       {picking && (
         <Dialog title="Choose a folder for the agent" open onClose={() => setPicking(false)}>
           <FolderPicker
@@ -106,6 +102,6 @@ export function ScopeFields(props: {
           />
         </Dialog>
       )}
-    </fieldset>
+    </Fieldset>
   )
 }
