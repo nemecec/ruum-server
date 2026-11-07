@@ -1,31 +1,32 @@
-// Checks the colour pairs of docs/ux/design-system.md against WCAG 2.2 AA.
+// Checks the colour pairs of the design tokens (docs/ux/design-system.md) against WCAG 2.2 AA.
 // Text pairs need 4.5:1; large text, icons, borders of controls and the focus ring need 3:1.
 // Run: node contrast.mjs   (exit code 1 when a pair fails)
 
-const themes = {
-  light: {
-    canvas: '#FAF8F4', surface: '#FFFFFF', sunken: '#F2EFE9',
-    border: '#E0DBD2', 'border-control': '#8A8377',
-    text: '#24211C', 'text-muted': '#5C564C', 'text-faint': '#736C61',
-    primary: '#1D5C57', 'primary-hover': '#164844', 'on-primary': '#FFFFFF',
-    'primary-soft': '#E2EEEB', link: '#1D5C57', focus: '#1D5C57', selected: '#E2EEEB',
-    danger: '#A3301C', 'danger-soft': '#F7E6E1', 'on-danger': '#FFFFFF',
-    success: '#2B6439', 'success-soft': '#E4EFE5',
-    warning: '#7F5300', 'warning-soft': '#FAEFD8',
-    agent: '#8A4718', 'agent-soft': '#F5E7DA',
-  },
-  dark: {
-    canvas: '#161513', surface: '#1E1C19', sunken: '#121110',
-    border: '#37332D', 'border-control': '#7D766A',
-    text: '#EDE9E2', 'text-muted': '#ABA497', 'text-faint': '#948D81',
-    primary: '#72C2B9', 'primary-hover': '#8FD1C9', 'on-primary': '#0E1D1C',
-    'primary-soft': '#1E3431', link: '#82CBC2', focus: '#72C2B9', selected: '#1E3431',
-    danger: '#F08B74', 'danger-soft': '#3B201A', 'on-danger': '#1A0C08',
-    success: '#82C291', 'success-soft': '#1D2E21',
-    warning: '#E2B455', 'warning-soft': '#33280F',
-    agent: '#E9A672', 'agent-soft': '#3A2A1D',
-  },
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// The colours come from the token files of the web UI (W3C Design Tokens format), the single
+// source of the design system (design 12.5): web/src/design/tokens/color.<theme>.tokens.json.
+const tokens = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../../web/src/design/tokens')
+
+/** The flat colour map of one theme file: `text-muted`, `tag-spruce`, ... -> `#rrggbb`. */
+function load(theme) {
+  const json = JSON.parse(fs.readFileSync(path.join(tokens, `color.${theme}.tokens.json`), 'utf8'))
+  const out = {}
+  const walk = (node, prefix) => {
+    for (const [k, v] of Object.entries(node)) {
+      if (k.startsWith('$') || typeof v !== 'object') continue
+      if ('$value' in v) {
+        if (v.$value.hex && v.$value.alpha === undefined) out[prefix + k] = v.$value.hex
+      } else walk(v, `${prefix}${k}-`)
+    }
+  }
+  walk(json.color, '')
+  return out
 }
+
+const themes = { light: load('light'), dark: load('dark') }
 
 // [foreground, background, minimum ratio, what]
 const pairs = [
@@ -44,6 +45,7 @@ const pairs = [
   ['on-primary', 'primary-hover', 4.5, 'primary button label, hover'],
   ['primary', 'primary-soft', 4.5, 'text on primary-soft (info note)'],
   ['on-danger', 'danger', 4.5, 'danger button label'],
+  ['on-danger', 'danger-hover', 4.5, 'danger button label, hover'],
   ['danger', 'surface', 4.5, 'error text'],
   ['danger', 'danger-soft', 4.5, 'error note'],
   ['success', 'success-soft', 4.5, 'success note'],
@@ -56,6 +58,9 @@ const pairs = [
   ['focus', 'canvas', 3, 'focus ring'],
   ['focus', 'surface', 3, 'focus ring on cards'],
   ['primary', 'canvas', 3, 'primary button edge, icons'],
+  ['primary', 'selected', 3, 'selected nav edge and text'],
+  ['text-faint', 'canvas', 3, 'empty state illustration'],
+  ...['spruce', 'moss', 'clay', 'brick', 'ochre', 'slate', 'plum', 'sand'].map((t) => [`tag-${t}`, 'surface', 3, `tag colour ${t} (edge and dot)`]),
 ]
 
 function lum(hex) {

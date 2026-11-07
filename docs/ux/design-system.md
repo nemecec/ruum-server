@@ -21,15 +21,17 @@ agents, no glass blur, no glowing borders, no dark-mode-first neon, no emoji in 
 "AI-powered" badges. An agent is a worker with a name, not magic: its mark is a small solid
 key glyph in clay, the same everywhere.
 
-**Not a copy of another product.** The current UI uses the GitHub Primer palette
-(`web/src/index.css`). Replace it with the tokens below.
+**Not a copy of another product.** The tokens below replaced the GitHub Primer palette of the
+first UI. Section 6 says where they live in code.
 
 ## 2. Tokens
 
-Tokens are CSS custom properties on `:root`. Components use only tokens, never raw values. Dark
-mode follows `prefers-color-scheme`; a person can force light or dark on the Account page
-(`data-theme` on `<html>`). Every text pair below is checked by `docs/ux/tools/contrast.mjs`
-(WCAG 2.2: 4.5:1 for text, 3:1 for control borders, icons and the focus ring). All pairs pass.
+The tokens are defined once, in the W3C Design Tokens format, in `web/src/design/tokens/`
+(section 6). Style Dictionary makes them CSS custom properties on `:root`. Components use only
+tokens, never raw values. Dark mode follows `prefers-color-scheme`; a person can force light or
+dark on the Account page (`data-theme` on `<html>`). Every text pair below is checked by
+`docs/ux/tools/contrast.mjs`, which reads the token files (WCAG 2.2: 4.5:1 for text, 3:1 for
+control borders, icons, tag colours and the focus ring). All 76 pairs pass.
 
 ### 2.1 Colour
 
@@ -51,6 +53,7 @@ mode follows `prefers-color-scheme`; a person can force light or dark on the Acc
 | `--color-focus` | `#1D5C57` | `#72C2B9` | Focus ring |
 | `--color-selected` | `#E2EEEB` | `#1E3431` | Selected row background |
 | `--color-danger` | `#A3301C` | `#F08B74` | Errors, destructive buttons (brick) |
+| `--color-danger-hover` | `#86271A` | `#F4A693` | Hover of danger buttons |
 | `--color-on-danger` | `#FFFFFF` | `#1A0C08` | Text on danger buttons |
 | `--color-danger-soft` | `#F7E6E1` | `#3B201A` | Error note background |
 | `--color-success` | `#2B6439` | `#82C291` | Success text and icons (moss) |
@@ -65,12 +68,26 @@ Rules:
 - **Colour never carries meaning alone.** Errors have an icon and words; diff insertions have a
   `+` and the word "Added" for screen readers; the agent mark is a glyph and a name.
 - **Tag colours** come from a fixed set of 8 (spruce, moss, clay, brick, ochre, slate, plum, sand)
-  with a light and a dark value each, used as a 3 px left edge and a dot, never as text colour.
-  The API's free `color` value maps to the nearest of the 8.
+  with a light and a dark value each (`--color-tag-*`), used as a 3 px left edge and a dot, never
+  as text colour. The API's free `color` value maps to the nearest of the 8 (`nearestTagColor`).
+
+  | Tag | Light | Dark |
+  |---|---|---|
+  | spruce | `#1D5C57` | `#72C2B9` |
+  | moss | `#2B6439` | `#82C291` |
+  | clay | `#8A4718` | `#E9A672` |
+  | brick | `#A3301C` | `#F08B74` |
+  | ochre | `#7F5300` | `#E2B455` |
+  | slate | `#4A5868` | `#9AA8B8` |
+  | plum | `#6E3B5E` | `#C99BBC` |
+  | sand | `#8A7A55` | `#C8B78E` |
 - **Diff colours**: insertions on `--color-success-soft` with `--color-success` text, deletions
   on `--color-danger-soft` with `--color-danger` text and a strike-through.
 
 ### 2.2 Type
+
+In code the type scale is `--font-size-*` and `--font-line-*`, and `--text-*` is the `font`
+shorthand of each step (weight, size, line height, family).
 
 The system font stack: no font download (fast on slow links, nothing sent to a font host, which
 matters for EU customers), and it reads well in every language. Warmth comes from colour, space
@@ -131,6 +148,12 @@ Layout: rail 224 px, content max 1200 px, details panel 360 px (min 1024 px wind
 | `--motion-fast` | 120 ms `cubic-bezier(0.2, 0, 0, 1)` | Hover, press, focus |
 | `--motion-base` | 200 ms `cubic-bezier(0.2, 0, 0, 1)` | Panels, dialogs, toasts in |
 | `--motion-exit` | 150 ms `cubic-bezier(0.4, 0, 1, 1)` | Things that leave |
+
+Sizes, layers and other values that components need are tokens too: `--size-*` (control 36 px,
+touch 44 px, rail 224 px, content 1200 px, panel 360 px, dialog widths, icons), `--border-width-*`
+(1, 2 and 3 px), `--z-*` (sticky, sheet, upload, toast, banner, skip), `--opacity-disabled` and
+`--breakpoint-*` (640 and 900 px; CSS repeats these in media queries, because a custom property
+cannot be read there).
 
 Rules: motion only as feedback (something opened, moved, finished). No looping animation except
 progress. With `prefers-reduced-motion: reduce`, all transitions become opacity fades of 0 ms to
@@ -521,8 +544,8 @@ active: 1 px down shift is not used (calm), the colour darkens one more step; fo
 disabled: 50% opacity with the reason nearby; busy: a spinner replaces the icon, the label stays,
 `aria-busy="true"`.
 
-"Move to trash" is a secondary button (it can be undone), not a danger button. The current CSS
-rule `.actions button.danger:last-child` fills every last danger button red; remove it.
+"Move to trash" is a secondary button (it can be undone), not a danger button. Only the confirm
+button of an irreversible action is `danger`.
 
 ### 4.17 Badges and tags
 
@@ -810,3 +833,85 @@ A UI task card is done only when its screenshots at 1280 px and 390 px, light an
 - the copy of `copy.md` word for word;
 - no axe violations, and the keyboard path of the journey works;
 - the agent mark wherever an agent did something.
+
+## 6. The design system in code
+
+Design 12.5 (decided 2026-11-07, provisional). The look of Ruum is defined in one place, so it
+can change without touching screens. Built on the branch `w/design-system`.
+
+### 6.1 Tokens
+
+- **Source:** `web/src/design/tokens/`, in the W3C Design Tokens format (2025.10: colours as
+  `{colorSpace, components, hex}`, dimensions and durations as `{value, unit}`).
+  - `base.tokens.json`: type, spacing, radius, border widths, sizes, motion, opacity, layers,
+    breakpoints. The same in every theme.
+  - `color.light.tokens.json` and `color.dark.tokens.json`: the colour sets and the shadows. Both
+    files have the same names. A new theme or brand is one more colour file, with no change to
+    components.
+- **Build:** `npm run tokens` runs Style Dictionary (`web/scripts/build-tokens.mjs`) and writes
+  `web/src/design/generated/tokens.css` (light on `:root`; dark under `prefers-color-scheme`
+  unless `data-theme="light"`, and under `data-theme="dark"`) and `tokens.ts` (the values for
+  code, and `cssVar()`).
+- **Committed, not built:** the generated files are committed, like `src/api/schema.d.ts`, so
+  Vitest, the type check, Vite and Ladle need no build step. `npm run lint` runs
+  `build-tokens.mjs --check` and fails when they are out of date (CI runs `npm run lint`).
+
+### 6.2 Components
+
+One library in `web/src/ui/`, exported from `web/src/ui/index.ts`. Each folder has the
+component, its CSS (only tokens) and its Ladle stories. Every state and the accessibility rules of
+sections 3 and 4 are inside the component, so screens cannot forget them.
+
+| Folder | Components |
+|---|---|
+| `layout` | `Stack`, `Row`, `Grow`, `Actions`, `Toolbar`, `Columns`, `Indent`, `Page`, `PageBody`, `Card` |
+| `text` | `Text` (tone, size, weight, mono, truncate, numeric), `VisuallyHidden`, `Code`, `ProseList` |
+| `button` | `Button` (primary, secondary, quiet, danger, link; small; busy), `ButtonLink`, `ButtonAnchor`, `IconButton` |
+| `field` | `Field` (label, hint, error), `TextInput`, `Select`, `TextArea`, `Checkbox`, `BareCheckbox`, `Radio`, `Fieldset`, `Switch`, `FileInput`, `CopyField`, `SecretBox` |
+| `dialog` | `Dialog` (sm, md, full; sheet on the phone), `ConfirmDialog`, `ConfirmButton` |
+| `feedback` | `Note`, `ErrorNote`, `Notice`, `Loading`, `Loaded`, `Spinner`, `Skeleton`, `EmptyState`, `Banner`, `ProgressBar`, `Meter` |
+| `badge` | `Badge`, `Tag`, `TagList`, `Chip` (hidden, stand-in, value markers of 4b), `nearestTagColor` |
+| `list` | `List`, `ListRow`, `ListRowMain`, `ListEmpty`, `Facts`, `Fact`, `Picker`, `PickerItem`, `LoadMore` |
+| `table` | `Table`, `THead`, `TBody`, `Tr` (selected, drop target), `Th`, `Td`, `SortHeader`, `NameCell` |
+| `nav` | `Breadcrumbs`, `Crumb`, `CurrentCrumb`, `Tabs` |
+| `menu` | `Menu` (menu button with arrow keys, Home, End, type-ahead, Escape) |
+| `toast` | `ToastProvider`, `useToast`, `ToastRegion`, `ToastView` |
+| `icon` | `Icon` (20 outline icons), `FolderIcon`, `FileIcon`, `KindIcon`, `AgentMark` (the key mark of 2.6) |
+| `agent` | `AgentName` (mark, name, screen-reader text) |
+| `shell` | `SkipLink`, `TopBar`, `Brand`, `TopBarItem`, `SearchForm`, `MenuToggle`, `AppBody`, `NavRail`, `NavList`, `NavItem`, `NavButton`, `AppMain`, `SplitView`, `SelectionBar`, `DropZone`, `FloatingPanel` |
+| `diff` | `DiffView`, `DiffList`, `DiffChange` |
+
+`web/src/ui/global.css` imports the tokens and sets the element defaults (body, headings, links,
+focus ring, reduced motion). Screens (`src/app`, `src/pages`, `src/components`) compose these
+components and hold no styling of their own.
+
+### 6.3 Lint
+
+`npm run lint` (CI job "web build and generated client") runs:
+
+- **oxlint**, as before.
+- **stylelint** (`web/stylelint.config.mjs`) on every CSS file outside the generated tokens: no
+  hex, named or functional colour (`rgb()`, `hsl()`, ...); no length or time unit (`px`, `rem`,
+  `em`, `ch`, `ms`, `s`, ...), except `px` in media queries (the breakpoints); colour, `font*`,
+  `line-height`, `box-shadow`, `z-index`, `opacity`, `border-radius`, `transition` and animation
+  times only through a token (`declaration-strict-value`); no `!important`; no ID selectors.
+- **`web/scripts/check-ui-rules.mjs`** (TypeScript AST): style files only in `src/ui/` and
+  `src/design/`; no `style` attribute anywhere; no `className` and no raw `button`, `input`,
+  `select`, `textarea`, table elements, `dialog`, `progress`, `meter`, `label`, `fieldset` or
+  `legend` in screens; a Ladle story file in every `src/ui/` folder.
+- **`build-tokens.mjs --check`**: the generated token files are up to date.
+
+Literal UI text (design 12.4) is the next step: the lint rule comes with the message catalogue.
+
+### 6.4 Catalogue
+
+**Ladle** shows every component in every state: `npm run ladle` (serve) and `npm run ladle:build`
+(to `web/build-ladle/`, not committed). The theme button (key `d`) switches light and dark through
+`data-theme`, the same switch as the Account page; the width addon has phone (390 px) and desktop
+(1280 px); the a11y panel runs axe. Stories are `web/src/ui/<folder>/*.stories.tsx`.
+
+`web/src/ui/catalogue.test.tsx` (Vitest) renders every story and runs axe (WCAG 2.2 A and AA,
+without colour contrast, which jsdom cannot compute: `contrast.mjs` checks the token pairs and the
+visual tests check the screens). The pseudo-locale and per-component visual snapshots come with
+localisation (12.4).
+
