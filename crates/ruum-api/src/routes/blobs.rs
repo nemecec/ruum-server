@@ -387,13 +387,26 @@ fn if_match_version(headers: &HeaderMap) -> Result<Option<VersionId>, Error> {
     })
 }
 
-/// The work of `putContent`, for a known context.
+/// The query of `putContent`.
+#[derive(Debug, Deserialize)]
+pub struct PutContentQuery {
+    /// `false` always makes a new version (C-8, decision 0003-6).
+    #[serde(default = "yes")]
+    pub coalesce: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// The work of `putContent`, for a known context. `coalesce` is the query parameter.
 pub async fn put_content_for(
     state: &AppState,
     ctx: &Context,
     headers: &HeaderMap,
     node: NodeId,
     data: Bytes,
+    coalesce: bool,
 ) -> Result<Value, Error> {
     let if_version = if_match_version(headers)?;
     let content_type = headers
@@ -404,7 +417,7 @@ pub async fn put_content_for(
     let w = state
         .services
         .transfers
-        .put_content(ctx, node, data, content_type, if_version)
+        .put_content_with(ctx, node, data, content_type, if_version, coalesce)
         .await?;
     content_write(w)
 }
@@ -415,13 +428,14 @@ pub async fn put_content(
     RequestContext(ctx): RequestContext,
     headers: HeaderMap,
     node: Result<Path<Uuid>, PathRejection>,
+    QueryParams(q): QueryParams<PutContentQuery>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<axum::Json<Value>> {
     let node = NodeId(path(node)?);
     check_link_may_write(&ctx)?;
     let data = raw_body(body, MAX_PUT_CONTENT_BYTES)?;
     Ok(axum::Json(
-        put_content_for(&state, &ctx, &headers, node, data).await?,
+        put_content_for(&state, &ctx, &headers, node, data, q.coalesce).await?,
     ))
 }
 
@@ -739,7 +753,7 @@ pub(crate) mod tests {
         let (node, v1) = file(&w, "p.txt", b"one").await;
         let other = w.user_with(ruum_core::authz::Role::Edit, w.docs).await;
         let stale = headers(&[("if-match", &format!("\"{}\"", VersionId::new()))]);
-        let e = put_content_for(&st, &other, &stale, node, Bytes::from_static(b"x"))
+        let e = put_content_for(&st, &other, &stale, node, Bytes::from_static(b"x"), true)
             .await
             .unwrap_err();
         assert_eq!(e.http_status(), 412);
@@ -747,7 +761,7 @@ pub(crate) mod tests {
             ("if-match", &format!("\"{v1}\"")),
             ("content-type", "text/markdown"),
         ]);
-        let v = put_content_for(&st, &other, &ok, node, Bytes::from_static(b"two"))
+        let v = put_content_for(&st, &other, &ok, node, Bytes::from_static(b"two"), true)
             .await
             .unwrap();
         for key in ["node", "version", "change"] {
@@ -756,6 +770,29 @@ pub(crate) mod tests {
         assert_eq!(v["version"]["content_type"], "text/markdown");
         assert_eq!(v["node"]["head_version"], v["version"]["id"]);
         assert!(v["change"]["seq"].is_i64());
+        assert_journal_valid(&w);
+    }
+
+    /// C-8: the same actor's next save joins the head by default; `coalesce=false` always
+    /// makes a new version.
+    #[tokio::test]
+    async fn put_content_without_coalesce_makes_a_new_version() {
+        let w = World::new().await;
+        let st = state(&w);
+        let (node, _) = file(&w, "c.txt", b"one").await;
+        let other = w.user_with(ruum_core::authz::Role::Edit, w.docs).await;
+        let none = HeaderMap::new();
+        let a = put_content_for(&st, &other, &none, node, Bytes::from_static(b"a"), true)
+            .await
+            .unwrap();
+        let b = put_content_for(&st, &other, &none, node, Bytes::from_static(b"b"), true)
+            .await
+            .unwrap();
+        assert_eq!(a["version"]["id"], b["version"]["id"], "the default joins");
+        let c = put_content_for(&st, &other, &none, node, Bytes::from_static(b"c"), false)
+            .await
+            .unwrap();
+        assert_ne!(b["version"]["id"], c["version"]["id"], "false never joins");
         assert_journal_valid(&w);
     }
 
@@ -840,6 +877,18 @@ pub(crate) mod tests {
             req.target,
             UploadTarget::NewVersion {
                 base_version: None,
+                coalesce: true,
+                ..
+            }
+        ));
+        // C-8: `coalesce: false` reaches the target.
+        let v = json!({ "target": "new_version", "node_id": parent, "coalesce": false,
+            "size": 0, "content_hash": Hash::of(b"").to_hex(), "chunking": "x", "chunks": [] });
+        let req: NewUpload = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            req.target,
+            UploadTarget::NewVersion {
+                coalesce: false,
                 ..
             }
         ));

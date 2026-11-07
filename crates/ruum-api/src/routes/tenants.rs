@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
             delete(revoke_invitation),
         )
         .route("/v1/invitations/accept", post(accept_invitation))
+        .route("/v1/invitations/preview", post(preview_invitation))
         .route("/v1/tenants/{tenant_id}/limits", get(get_limits))
 }
 
@@ -272,6 +273,24 @@ pub async fn accept_invitation(
         .accept_invitation(&who.actor, &body.token)
         .await?;
     Ok(Json(json!(m)))
+}
+
+/// What an invitation is for. `POST /v1/invitations/preview` (operationId
+/// `previewInvitation`, C-9, decision 0003-6). No sign-in: the token in the body is the
+/// credential. Limited per client IP (`limits.rs`). Nothing changes.
+pub async fn preview_invitation(
+    State(state): State<AppState>,
+    JsonBody(body): JsonBody<AcceptInvitation>,
+) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], Json<Value>)> {
+    let p = state
+        .services
+        .tenants
+        .preview_invitation(&body.token)
+        .await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(json!(p)),
+    ))
 }
 
 /// Plan limits and usage. `GET /v1/tenants/{tenant_id}/limits` (operationId `getLimits`).

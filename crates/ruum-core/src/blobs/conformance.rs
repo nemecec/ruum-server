@@ -478,6 +478,68 @@ async fn content_suite(h: &dyn Harness) {
         ),
         ErrorCode::NotFound
     );
+
+    // C-8 (decision 0003-6): `coalesce: false` always makes a new version, for an upload and
+    // for putContent; the default still joins the same actor's save inside the window.
+    let (c8, c1) = upload(
+        &*t,
+        &owner,
+        new_file(h.docs(), "c8.txt", OnConflict::Fail),
+        b"one",
+    )
+    .await
+    .unwrap();
+    let versions = |n: NodeId| {
+        let vs = vs.clone();
+        let owner = owner.clone();
+        async move {
+            vs.list(&owner, n, PageRequest::default())
+                .await
+                .unwrap()
+                .items
+                .len()
+        }
+    };
+    let joined = t
+        .put_content(&owner, c8.id, Bytes::from_static(b"two"), None, None)
+        .await
+        .unwrap()
+        .value
+        .1;
+    assert_eq!(joined.id, c1.id, "the default joins the head");
+    let kept = |c| UploadTarget::NewVersion {
+        node_id: c8.id,
+        base_version: None,
+        coalesce: c,
+    };
+    let (_, c2) = upload(&*t, &owner, kept(false), b"three").await.unwrap();
+    assert_ne!(
+        c2.id, c1.id,
+        "an upload with coalesce false makes a version"
+    );
+    let c3 = t
+        .put_content_with(
+            &owner,
+            c8.id,
+            Bytes::from_static(b"four"),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .value
+        .1;
+    assert_ne!(
+        c3.id, c2.id,
+        "putContent with coalesce false makes a version"
+    );
+    assert_eq!(versions(c8.id).await, 3);
+    assert_eq!(h.head_of(c8.id).await, (Some(c3.id), 4));
+    let (_, c4) = upload(&*t, &owner, kept(true), b"five").await.unwrap();
+    assert_eq!(c4.id, c3.id, "an upload with the default joins the head");
+    assert_eq!(read_all(&*t, &owner, c8.id, None).await, b"five");
+    assert_eq!(versions(c8.id).await, 3);
 }
 
 struct MemoryHarness(World);

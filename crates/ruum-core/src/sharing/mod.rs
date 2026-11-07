@@ -145,6 +145,9 @@ pub struct GrantAdded {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SharedItem {
     pub node: Node,
+    /// The name of the tenant that holds the node (C-10, decision 0003-6), also when the
+    /// caller is only a guest there.
+    pub tenant_name: String,
     pub role: Role,
     pub shared_by: Actor,
     #[serde(with = "time::serde::rfc3339")]

@@ -1104,6 +1104,20 @@ impl SharingStore for PgSharingStore {
         .bind(i64::from(page.limit()) + 1)
         .fetch_all(&mut *tx)
         .await?;
+        // The names of the tenants of these items (C-10), still in system mode: only the
+        // tenants that hold the user's own shared items.
+        let mut tenant_ids: Vec<uuid::Uuid> = rows.iter().chain(&members).map(|r| r.0).collect();
+        tenant_ids.sort_unstable();
+        tenant_ids.dedup();
+        let tenant_names: std::collections::HashMap<uuid::Uuid, String> =
+            sqlx::query_as::<_, (uuid::Uuid, String)>(
+                "select id, name from tenants where id = any($1)",
+            )
+            .bind(&tenant_ids)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect();
         tx.commit().await?;
         let mut rows = rows;
         rows.extend(members);
@@ -1131,6 +1145,7 @@ impl SharingStore for PgSharingStore {
             match self.nodes.get(&tctx, NodeId(node)).await {
                 Ok(n) if n.trashed_at.is_none() => items.push(SharedItem {
                     node: n,
+                    tenant_name: tenant_names.get(&tenant).cloned().unwrap_or_default(),
                     role: role_of_text(&role)?,
                     shared_by: actor_of(kind, by, obo),
                     shared_at: at,

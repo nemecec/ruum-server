@@ -231,6 +231,80 @@ pub fn edits_team_content(role: Option<MemberRole>, content: Option<Role>) -> bo
     }
 }
 
+/// The state of an invitation at `now` (C-9, decision 0003-6).
+pub fn invitation_state(
+    revoked_at: Option<time::OffsetDateTime>,
+    accepted_at: Option<time::OffsetDateTime>,
+    expires_at: time::OffsetDateTime,
+    now: time::OffsetDateTime,
+) -> super::InvitationState {
+    use super::InvitationState::*;
+    if revoked_at.is_some() {
+        Revoked
+    } else if accepted_at.is_some() {
+        Accepted
+    } else if expires_at <= now {
+        Expired
+    } else {
+        Pending
+    }
+}
+
+/// When an ended invitation ended: the revoke, the acceptance, or the expiry. `None` while it
+/// is pending.
+pub fn invitation_ended_at(
+    revoked_at: Option<time::OffsetDateTime>,
+    accepted_at: Option<time::OffsetDateTime>,
+    expires_at: time::OffsetDateTime,
+    now: time::OffsetDateTime,
+) -> Option<time::OffsetDateTime> {
+    revoked_at
+        .or(accepted_at)
+        .or((expires_at <= now).then_some(expires_at))
+}
+
+/// Whether `previewInvitation` still answers for an invitation that ended at `ended_at`: for
+/// [`crate::mailing::outbox::KEEP_DAYS`] days, as long as the server keeps its tokens
+/// (decision 0003-3). The stores check it themselves, so the answer does not depend on when the
+/// clean-up ran.
+pub fn preview_still_answers(
+    ended_at: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> bool {
+    ended_at
+        .is_none_or(|t| now - t < time::Duration::days(crate::mailing::outbox::KEEP_DAYS.into()))
+}
+
+/// Whether the preview shows what the invitation is for: only while it is pending or expired.
+/// A revoked invitation was taken back on purpose, and an accepted one has done its work, so
+/// their tokens tell nothing more (decision 0003-6).
+pub fn preview_shows_details(state: super::InvitationState) -> bool {
+    matches!(
+        state,
+        super::InvitationState::Pending | super::InvitationState::Expired
+    )
+}
+
+/// Masks an email for `previewInvitation`: the first character of the name and of the domain,
+/// and the last part of the domain: `kadri@example.ee` is `k***@e***.ee`. Never the address
+/// in clear; a value without `@` is `***`.
+pub fn mask_email(email: &str) -> String {
+    fn first(s: &str) -> String {
+        match s.chars().next() {
+            Some(c) => format!("{c}***"),
+            None => "***".into(),
+        }
+    }
+    let Some((name, domain)) = email.trim().rsplit_once('@') else {
+        return "***".into();
+    };
+    let domain = match domain.rsplit_once('.') {
+        Some((host, tld)) if !tld.is_empty() => format!("{}.{tld}", first(host)),
+        _ => first(domain),
+    };
+    format!("{}@{domain}", first(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +416,47 @@ mod tests {
         assert_eq!(accepted_role(Some(Admin), Member), Admin);
         assert_eq!(accepted_role(Some(Guest), Member), Member);
         assert_eq!(accepted_role(None, Guest), Guest);
+    }
+
+    #[test]
+    fn emails_are_masked() {
+        assert_eq!(mask_email("kadri@example.ee"), "k***@e***.ee");
+        assert_eq!(mask_email("Jaan.Tamm@mail.example.co.uk"), "J***@m***.uk");
+        assert_eq!(mask_email("x@localhost"), "x***@l***");
+        assert_eq!(mask_email("ülle@näide.ee"), "ü***@n***.ee");
+        assert_eq!(mask_email("@example.ee"), "***@e***.ee");
+        assert_eq!(mask_email("no-at-sign"), "***");
+        for e in ["kadri@example.ee", "jaan.tamm@mail.example.co.uk"] {
+            let m = mask_email(e);
+            assert!(
+                !m.contains("adri") && !m.contains("example") && !m.contains("tamm"),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn invitation_states_and_the_preview_window() {
+        use super::super::InvitationState::*;
+        let now = time::OffsetDateTime::now_utc();
+        let later = now + time::Duration::days(3);
+        let before = now - time::Duration::days(1);
+        assert_eq!(invitation_state(None, None, later, now), Pending);
+        assert_eq!(invitation_state(None, None, before, now), Expired);
+        assert_eq!(invitation_state(None, Some(before), later, now), Accepted);
+        assert_eq!(invitation_state(Some(before), None, later, now), Revoked);
+        assert!(preview_shows_details(Pending) && preview_shows_details(Expired));
+        assert!(!preview_shows_details(Accepted) && !preview_shows_details(Revoked));
+        assert_eq!(invitation_ended_at(None, None, later, now), None);
+        assert_eq!(invitation_ended_at(None, None, before, now), Some(before));
+        assert!(preview_still_answers(None, now));
+        assert!(preview_still_answers(
+            Some(now - time::Duration::days(6)),
+            now
+        ));
+        assert!(!preview_still_answers(
+            Some(now - time::Duration::days(8)),
+            now
+        ));
     }
 }

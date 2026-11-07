@@ -345,6 +345,7 @@ async fn an_empty_file_and_a_new_version_with_base() {
     let target = |base| UploadTarget::NewVersion {
         node_id: node.id,
         base_version: base,
+        coalesce: true,
     };
     let (_, v2) = upload(&*w.store, &other, target(Some(v1.id)), b"two")
         .await
@@ -425,6 +426,7 @@ async fn retention_and_thinning_keep_named_versions_and_the_head() {
             Some(n) => UploadTarget::NewVersion {
                 node_id: n,
                 base_version: None,
+                coalesce: true,
             },
         };
         let (n, v) = upload(&*w.store, &c, target, &[b'a' + i])

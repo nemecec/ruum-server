@@ -387,6 +387,13 @@ async fn run(w: &World, b: &dyn Backend) {
     assert_eq!(mine.items[0].node.id, w.projects);
     assert_eq!(mine.items[0].role, Role::Comment);
     assert_eq!(mine.items[0].shared_by, Actor::user(w.owner));
+    // C-10 (decision 0003-6): the name of the item's tenant, where guest_view is only a guest.
+    // Both test stores name every tenant "test".
+    assert_eq!(mine.items[0].tenant_name, "test");
+    assert_eq!(
+        serde_json::to_value(&mine.items[0]).unwrap()["tenant_name"],
+        "test"
+    );
     // An agent of guest_view sees only items inside its scope.
     let agent = w.agent(w.guest_view, Some(w.private), Role::Manage);
     assert!(
@@ -929,7 +936,7 @@ async fn seed_pg(pool: &PgPool, w: &World) {
     for (t, root, owner) in [(w.a, w.root, w.owner), (w.b, w.root_b, w.owner_b)] {
         sqlx::query(
             "insert into tenants (id, name, kind, plan, root_node_id, created_kind, created_by) \
-             values ($1, 'team', 'team', 'team', $2, 'user', $3)",
+             values ($1, 'test', 'team', 'team', $2, 'user', $3)",
         )
         .bind(t.0)
         .bind(root.0)

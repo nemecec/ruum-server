@@ -1,8 +1,10 @@
 //! Rate limits per client IP for the operations that need no sign-in and write or check a
 //! secret: `registerOAuthClient` (`POST /v1/oauth/register`, one stored row per call),
-//! `exchangeToken` (`POST /v1/oauth/token`) and `resolveShareLink`
-//! (`POST /v1/share-links/resolve`, link passwords). The contract gives these three a `429`
-//! answer (`RateLimited`).
+//! `exchangeToken` (`POST /v1/oauth/token`), `resolveShareLink`
+//! (`POST /v1/share-links/resolve`, link passwords) and `previewInvitation`
+//! (`POST /v1/invitations/preview`, invitation tokens; C-9, decision 0003-6). The contract gives
+//! these four a `429` answer (`RateLimited`). The counters are per process; the tokens have 256
+//! bits, so the limits only cut noise (moving them to the shared counters is a later card).
 //!
 //! Each operation has a fixed window of one minute per client IP. The client IP is the peer
 //! address of the connection (`ConnectInfo<SocketAddr>`, which `ruum-server` sets). When the peer
@@ -29,6 +31,7 @@ pub const LIMITS: &[(&str, u32)] = &[
     ("/v1/oauth/register", 10),
     ("/v1/oauth/token", 60),
     ("/v1/share-links/resolve", 30),
+    ("/v1/invitations/preview", 30),
 ];
 
 /// When the table holds this many windows, the ended ones are dropped.
@@ -223,6 +226,37 @@ mod tests {
                 Some("198.51.100.10")
             )
             .await,
+            StatusCode::OK
+        );
+    }
+
+    /// C-9: `previewInvitation` is limited per client IP, 30 per minute, like `resolveShareLink`.
+    #[tokio::test]
+    async fn invitation_previews_are_limited_per_client_ip() {
+        let app = Router::new()
+            .route("/v1/invitations/preview", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                RateLimiter::new(),
+                rate_limit,
+            ));
+        let limit = LIMITS
+            .iter()
+            .find(|(p, _)| *p == "/v1/invitations/preview")
+            .unwrap()
+            .1;
+        assert_eq!(limit, 30);
+        for _ in 0..limit {
+            assert_eq!(
+                send(&app, "/v1/invitations/preview", "203.0.113.20:1", None).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            send(&app, "/v1/invitations/preview", "203.0.113.20:2", None).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            send(&app, "/v1/invitations/preview", "203.0.113.21:1", None).await,
             StatusCode::OK
         );
     }

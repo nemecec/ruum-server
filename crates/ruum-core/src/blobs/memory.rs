@@ -238,7 +238,8 @@ impl MemoryContentStore {
         }
     }
 
-    /// Makes a new head version (or merges the save into the head) and writes the entry.
+    /// Makes a new head version (or merges the save into the head, when `coalesce` and the
+    /// version policy allow it) and writes the entry.
     async fn commit(
         &self,
         ctx: &Context,
@@ -246,6 +247,7 @@ impl MemoryContentStore {
         manifest: Manifest,
         content_type: Option<String>,
         restored_from: Option<VersionId>,
+        coalesce: bool,
     ) -> Result<ContentWritten> {
         let policy = self.policy(ctx.tenant).await;
         let now = crate::now();
@@ -253,7 +255,8 @@ impl MemoryContentStore {
             let mut st = self.lock();
             let ids = st.by_node.get(&node.id).cloned().unwrap_or_default();
             let head = ids.last().and_then(|id| st.versions.get(id)).cloned();
-            let merge = restored_from.is_none()
+            let merge = coalesce
+                && restored_from.is_none()
                 && head.as_ref().is_some_and(|h| {
                     policy::may_coalesce(
                         &HeadInfo {
@@ -395,7 +398,7 @@ impl MemoryContentStore {
             return Ok(None);
         };
         let w = self
-            .commit(ctx, to, s.manifest, s.version.content_type, None)
+            .commit(ctx, to, s.manifest, s.version.content_type, None, true)
             .await?;
         Ok(Some(w.value.1))
     }
@@ -647,13 +650,14 @@ impl Transfers for MemoryContentStore {
             UploadTarget::NewVersion {
                 node_id,
                 base_version,
+                coalesce,
             } => {
                 let node = self.file(ctx, *node_id, Role::Edit).await?;
                 let head = self.lock().head(*node_id).map(|h| h.version.id);
                 if base_version.is_some() && *base_version != head {
                     return Err(logic::version_mismatch());
                 }
-                self.commit(ctx, node, manifest, u.content_type.clone(), None)
+                self.commit(ctx, node, manifest, u.content_type.clone(), None, *coalesce)
                     .await?
             }
             UploadTarget::NewFile {
@@ -677,7 +681,7 @@ impl Transfers for MemoryContentStore {
                     )
                     .await?
                     .value;
-                self.commit(ctx, node, manifest, u.content_type.clone(), None)
+                self.commit(ctx, node, manifest, u.content_type.clone(), None, true)
                     .await?
             }
         };
@@ -725,13 +729,14 @@ impl Transfers for MemoryContentStore {
         })
     }
 
-    async fn put_content(
+    async fn put_content_with(
         &self,
         ctx: &Context,
         node: NodeId,
         data: Bytes,
         content_type: Option<String>,
         if_version: Option<VersionId>,
+        coalesce: bool,
     ) -> Result<ContentWritten> {
         check_link_may_write(ctx)?;
         let n = self.file(ctx, node, Role::Edit).await?;
@@ -762,7 +767,8 @@ impl Transfers for MemoryContentStore {
         )
         .await?;
         self.record_chunks(ctx.tenant, &stored);
-        self.commit(ctx, n, manifest, content_type, None).await
+        self.commit(ctx, n, manifest, content_type, None, coalesce)
+            .await
     }
 
     async fn content_grant(
@@ -875,7 +881,14 @@ impl VersionStore for MemoryContentStore {
         let n = self.file(ctx, node, Role::Edit).await?;
         let s = self.stored(ctx.tenant, node, Some(version))?;
         let w = self
-            .commit(ctx, n, s.manifest, s.version.content_type, Some(version))
+            .commit(
+                ctx,
+                n,
+                s.manifest,
+                s.version.content_type,
+                Some(version),
+                true,
+            )
             .await?;
         Ok(Written {
             value: w.value.1,

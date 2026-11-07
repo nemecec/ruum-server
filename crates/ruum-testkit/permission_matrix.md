@@ -42,6 +42,7 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `createInvitation` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin |
 | `revokeInvitation` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin |
 | `acceptInvitation` | 401 | any | any | any | any | any | any | any | any | any | any | any | 403 | 403 | 403 | 403 | users only, with the token (the answer depends on membership) |
+| `previewInvitation` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public; the invitation token in the body is the credential, nothing changes |
 | `getLimits` | 401 | ok | ok | ok | ok | ok | ok | 403 | 403 | 403 | 403 | 403 | ok | ok | 403 | 403 | any member can read them; guests get 403 |
 | `listAudit` | 401 | ok | ok | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs admin |
 | `listAgents` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | the caller's agents (admins: all); an agent sees only itself (decided 0002-5) |

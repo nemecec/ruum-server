@@ -247,6 +247,16 @@ async fn answers_name_their_actors() {
         item["shared_by"]["actor"]["display_name"].is_string(),
         "{item}"
     );
+    // C-10 (decision 0003-6): the item names its space, where guest_view is only a guest.
+    assert_eq!(item["tenant_name"], json!(a.name), "{item}");
+    assert!(
+        shared["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["tenant_name"].is_string()),
+        "{shared}"
+    );
 
     // The audit log names its actors.
     let audit = ok(
@@ -350,4 +360,41 @@ async fn answers_name_their_actors() {
         db.finish().await;
     }
     backend.finish().await;
+}
+
+/// C-9 (decision 0003-6) through the router, without sign-in: `previewInvitation` names the
+/// space and the inviter (C-7), masks the email and never sends it in clear; tenant B's
+/// token names only tenant B.
+#[tokio::test]
+async fn invitation_previews_name_the_space_and_the_inviter() {
+    let backend = Backend::start().await;
+    let (state, _db) = backend.world().await;
+    let w = fixtures::seed(&state).await;
+    assert!(w.seeded, "the fixture world must seed");
+    let app = client::app(state.clone());
+    // The fixture names each user "<prefix> <who>".
+    let owner_name = |t: &fixtures::TenantFixture| format!("{} {}", t.prefix, Who::Owner.name());
+    for t in [&w.a, &w.b] {
+        let p = ok(
+            &client::send(
+                &app,
+                &RequestSpec::post("/v1/invitations/preview")
+                    .json(json!({ "token": t.invitation_token })),
+                t.principal(Who::Anonymous),
+            )
+            .await,
+            "previewInvitation",
+        );
+        assert_eq!(p["state"], "pending", "{p}");
+        assert_eq!(p["tenant_name"], json!(t.name), "{p}");
+        assert_eq!(p["tenant_kind"], "team", "{p}");
+        assert_eq!(p["role"], "member", "{p}");
+        assert_eq!(p["content_role"], "manage", "{p}");
+        assert_eq!(p["inviter_display_name"], json!(owner_name(t)), "{p}");
+        let text = p.to_string();
+        assert!(!text.contains(&t.invitation_email), "{p}");
+        assert!(p["email_masked"].as_str().unwrap().contains("***"), "{p}");
+        let other = if t.id == w.a.id { &w.b } else { &w.a };
+        assert!(!text.contains(&other.name), "{p}");
+    }
 }

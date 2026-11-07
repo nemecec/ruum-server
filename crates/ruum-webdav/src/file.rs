@@ -377,6 +377,7 @@ impl Writer {
             Target::Existing(n) => UploadTarget::NewVersion {
                 node_id: n.id,
                 base_version: None,
+                coalesce: true,
             },
             Target::New { parent, name } => UploadTarget::NewFile {
                 parent_id: parent.id,

@@ -1060,7 +1060,136 @@ async fn principal_names_follow_the_tenant(a: Area) {
     assert!(names.is_empty(), "{names:?}");
 }
 
+/// C-9 (decision 0003-6): `previewInvitation` shows what a pending invitation is for, with a
+/// masked email and never the email in clear; accepted and revoked invitations show only their
+/// state; unknown tokens are `not_found`; nothing changes.
+async fn previewing_an_invitation_shows_what_it_is_for(a: Area) {
+    let t = team(&a).await;
+    let oc = ctx(t.tenant.id, t.owner.id);
+    let email = "preview.person@example.test";
+    let (inv, token) = a
+        .tenants
+        .invite_as(
+            &oc,
+            email.into(),
+            MemberRole::Member,
+            Some(Role::Edit),
+            None,
+        )
+        .await
+        .unwrap();
+    let p = a.tenants.preview_invitation(&token).await.unwrap();
+    assert_eq!(p.state, InvitationState::Pending);
+    let d = p
+        .details
+        .clone()
+        .expect("a pending invitation shows its details");
+    assert_eq!(d.tenant_name, "Acme");
+    assert_eq!(d.tenant_kind, TenantKind::Team);
+    assert_eq!(
+        d.inviter_display_name.as_deref(),
+        Some(t.owner.display_name.as_str())
+    );
+    assert_eq!(d.role, MemberRole::Member);
+    assert_eq!(d.content_role, Some(Role::Edit));
+    assert_eq!(d.expires_at, inv.expires_at);
+    assert_eq!(d.email_masked, "p***@e***.test");
+    let json = serde_json::to_value(&p).unwrap();
+    assert!(!json.to_string().contains(email), "{json}");
+    assert!(!json.to_string().contains("preview.person"), "{json}");
+    assert_eq!(json["state"], "pending");
+    assert_eq!(json["content_role"], "edit");
+    // The mailed token (Postgres: minted by the worker) shows the same.
+    a.deliver().await;
+    let mailed = mailed_token(&a.mailer.sent().last().unwrap().body);
+    assert_eq!(
+        a.tenants.preview_invitation(&mailed).await.unwrap().state,
+        InvitationState::Pending
+    );
+    // Previews change nothing: the invitation is still open.
+    assert_eq!(
+        a.tenants
+            .list_invitations(&oc, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert_eq!(
+        code(a.tenants.preview_invitation("ruum_inv_unknown").await),
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        code(a.tenants.preview_invitation("").await),
+        ErrorCode::NotFound
+    );
+    // Accepted: only the state, also through the other token.
+    let newcomer = user(&a, "previewed").await;
+    a.tenants
+        .accept_invitation(&Actor::user(newcomer.id), &token)
+        .await
+        .unwrap();
+    for tok in [&token, &mailed] {
+        let p = a.tenants.preview_invitation(tok).await.unwrap();
+        assert_eq!(p.state, InvitationState::Accepted);
+        assert!(p.details.is_none());
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::json!({ "state": "accepted" })
+        );
+    }
+    // Revoked: only the state.
+    let (inv2, token2) = a
+        .tenants
+        .invite(&oc, "revoked@example.test".into(), MemberRole::Guest, None)
+        .await
+        .unwrap();
+    a.tenants.revoke_invitation(&oc, inv2.id).await.unwrap();
+    let p = a.tenants.preview_invitation(&token2).await.unwrap();
+    assert_eq!(p.state, InvitationState::Revoked);
+    assert_eq!(
+        serde_json::to_value(&p).unwrap(),
+        serde_json::json!({ "state": "revoked" })
+    );
+    // Expired, and ended more than 7 days ago (Postgres: the times are set in SQL).
+    if let Some(pool) = &a.pool {
+        let (inv3, token3) = a
+            .tenants
+            .invite(&oc, "late@example.test".into(), MemberRole::Guest, None)
+            .await
+            .unwrap();
+        let set = |days: i32| async move {
+            let mut c = system(pool).await;
+            let n = sqlx::query(
+                "update invitations set expires_at = now() - make_interval(days => $2) \
+                 where id = $1",
+            )
+            .bind(inv3.id)
+            .bind(days)
+            .execute(&mut *c)
+            .await
+            .unwrap()
+            .rows_affected();
+            assert_eq!(n, 1);
+        };
+        set(1).await;
+        let p = a.tenants.preview_invitation(&token3).await.unwrap();
+        assert_eq!(p.state, InvitationState::Expired);
+        let d = p.details.expect("an expired invitation shows its details");
+        assert_eq!(d.role, MemberRole::Guest);
+        assert_eq!(d.content_role, None);
+        assert_eq!(d.email_masked, "l***@e***.test");
+        set(8).await;
+        assert_eq!(
+            code(a.tenants.preview_invitation(&token3).await),
+            ErrorCode::NotFound
+        );
+    }
+}
+
 crate::conformance!(
+    previewing_an_invitation_shows_what_it_is_for,
     principal_names_follow_the_tenant,
     a_team_tenant_has_its_owner_and_root,
     members_and_roles_follow_the_rules,

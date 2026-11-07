@@ -331,6 +331,10 @@ fn operation_rule(op: &str) -> Option<Rule> {
             "public; the share link token in the body is the credential",
             |_| Access::Allow,
         ),
+        "previewInvitation" => Rule::new(
+            "public; the invitation token in the body is the credential, nothing changes",
+            |_| Access::Allow,
+        ),
         "registerOAuthClient" => Rule::new(
             "public; a registration gives no access (consent does)",
             |_| Access::Allow,

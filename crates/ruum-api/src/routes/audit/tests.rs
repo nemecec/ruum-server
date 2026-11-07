@@ -13,7 +13,8 @@ use ruum_core::authz::{Role, Scope};
 use ruum_core::journal::memory::MemoryJournal;
 use ruum_core::journal::{EventType, NewEntry};
 use ruum_core::tenants::{
-    Invitation, Member, MemberRole, Tenant, TenantPolicyChange, TenantStore, Usage,
+    Invitation, InvitationPreview, Member, MemberRole, Tenant, TenantPolicyChange, TenantStore,
+    Usage,
 };
 use ruum_core::{AgentId, AgentKeyId, InvitationId, NodeId, PrincipalId, Result, Services, UserId};
 use serde_json::{Value, json};
@@ -80,6 +81,9 @@ impl TenantStore for Roles {
         unimplemented!()
     }
     async fn accept_invitation(&self, _: &Actor, _: &str) -> Result<Member> {
+        unimplemented!()
+    }
+    async fn preview_invitation(&self, _: &str) -> Result<InvitationPreview> {
         unimplemented!()
     }
     async fn usage(&self, _: &Context) -> Result<Usage> {

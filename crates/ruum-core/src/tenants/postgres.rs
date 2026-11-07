@@ -1323,6 +1323,55 @@ impl TenantStore for PgTenantStore {
         Ok(m)
     }
 
+    async fn preview_invitation(&self, token: &str) -> Result<InvitationPreview> {
+        // A system lookup, as at `accept_invitation` (the tenant is not known yet). It reads one
+        // invitation and its tenant, and writes nothing.
+        let mut tx = self.area.system().await?;
+        let r = sqlx::query(crate::sql!(
+            "select {INVITATION_COLS}, revoked_at, now() as now from invitations where id = \
+             (select invitation_id from invitation_tokens where token_hash = $1)"
+        ))
+        .bind(&secret::sha256(token.trim())[..])
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::not_found("invitation"))?;
+        let inv = invitation_from(&r)?;
+        let revoked_at: Option<OffsetDateTime> = r.try_get("revoked_at")?;
+        let now: OffsetDateTime = r.try_get("now")?;
+        let ended = rules::invitation_ended_at(revoked_at, inv.accepted_at, inv.expires_at, now);
+        if !rules::preview_still_answers(ended, now) {
+            return Err(Error::not_found("invitation"));
+        }
+        let state = rules::invitation_state(revoked_at, inv.accepted_at, inv.expires_at, now);
+        if !rules::preview_shows_details(state) {
+            return Ok(InvitationPreview {
+                state,
+                details: None,
+            });
+        }
+        let tenant = tenant_row(&mut tx, inv.tenant_id).await?;
+        tx.commit().await?;
+        // The name as the tenant knows it, under the tenant's row-level security (C-7).
+        let inviter = inv.invited_by.actor.id.0;
+        let inviter_display_name = self
+            .principal_names(inv.tenant_id, &[inviter])
+            .await?
+            .remove(&inviter)
+            .map(|n| n.display_name);
+        Ok(InvitationPreview {
+            state,
+            details: Some(InvitationDetails {
+                tenant_name: tenant.name,
+                tenant_kind: tenant.kind,
+                inviter_display_name,
+                role: inv.role,
+                content_role: inv.content_role,
+                expires_at: inv.expires_at,
+                email_masked: rules::mask_email(&inv.email),
+            }),
+        })
+    }
+
     async fn usage(&self, ctx: &Context) -> Result<Usage> {
         let user = caller_user(ctx)?;
         let mut tx = self.area.ctx(ctx).await?;

@@ -303,6 +303,27 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             );
             plain("addressed resource of tenant A", p)
         }
+        "previewInvitation" => plain(
+            "invitation tokens are bearer secrets by design (sent by email); the probe checks \
+             that an unknown token is 404 and that B's own token, also without sign-in, leaks \
+             nothing of A",
+            vec![
+                Probe::new(
+                    "anonymous, unknown token",
+                    Who::Anonymous,
+                    RequestSpec::post("/v1/invitations/preview")
+                        .json(json!({ "token": "no-such-invitation-token" })),
+                    NotFound,
+                ),
+                Probe::new("B's owner, B's token", o, std_req(op, b), NoLeak),
+                Probe::new(
+                    "anonymous, B's token",
+                    Who::Anonymous,
+                    std_req(op, b),
+                    NoLeak,
+                ),
+            ],
+        ),
         "acceptInvitation" => plain(
             "invitation tokens are bearer secrets by design (sent by email); the probe checks \
              that an unknown token is 404 and that B's own token leaks nothing of A",

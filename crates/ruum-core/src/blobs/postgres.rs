@@ -54,7 +54,7 @@ const VERSION_COLUMNS: &str = "id, tenant_id, node_id, manifest, encoding, size_
 /// The columns of an upload row that [`upload_of`] reads.
 const UPLOAD_COLUMNS: &str = "id, tenant_id, node_id, base_version, parent_id, name, \
      on_conflict, content_type, size_bytes, content_hash, manifest, chunking, status::text \
-     as status, actor_kind, actor, on_behalf_of, expires_at";
+     as status, actor_kind, actor, on_behalf_of, expires_at, may_coalesce";
 
 /// What the store reads of a `nodes` row.
 #[derive(Clone, Debug)]
@@ -138,6 +138,7 @@ fn upload_of(row: &PgRow) -> Result<Upload> {
             base_version: row
                 .try_get::<Option<Uuid>, _>("base_version")?
                 .map(VersionId),
+            coalesce: row.try_get("may_coalesce")?,
         },
         None => UploadTarget::NewFile {
             parent_id: NodeId(
@@ -358,9 +359,12 @@ impl PgContentStore {
         logic::require_trashed_read(&*self.authz, &*self.nodes, ctx, n.id, n.trashed).await
     }
 
-    /// Makes the new head version (or merges the save into the head), sets the file's head,
-    /// writes the entry, and applies thinning and retention to the file. In `conn`'s
-    /// transaction. Returns the version and the change.
+    /// Makes the new head version (or merges the save into the head, when `coalesce` and the
+    /// version policy allow it), sets the file's head, writes the entry, and applies thinning
+    /// and retention to the file. In `conn`'s transaction. Returns the version and the change.
+    // The connection, the context, the file, the content and the version policy, and how the
+    // version is made (`restored_from`, `coalesce`).
+    #[allow(clippy::too_many_arguments)]
     async fn commit_version(
         conn: &mut PgConnection,
         ctx: &Context,
@@ -368,6 +372,7 @@ impl PgContentStore {
         manifest: &Manifest,
         content_type: Option<String>,
         restored_from: Option<VersionId>,
+        coalesce: bool,
         policy: &VersionPolicy,
     ) -> Result<(Version, ChangeInfo)> {
         let now = crate::now();
@@ -375,7 +380,8 @@ impl PgContentStore {
             Some(h) => Some(version_row(conn, ctx.tenant, n.id, h, true).await?),
             None => None,
         };
-        let merge = restored_from.is_none()
+        let merge = coalesce
+            && restored_from.is_none()
             && head.as_ref().is_some_and(|h| {
                 policy::may_coalesce(
                     &HeadInfo {
@@ -856,6 +862,7 @@ pub async fn copy_head(
         &v.manifest,
         v.version.content_type,
         None,
+        true,
         &policy,
     )
     .await?;
@@ -910,16 +917,18 @@ impl Transfers for PgContentStore {
         };
         let id = UploadId::new();
         let expires_at = crate::now() + Duration::hours(UPLOAD_HOURS);
-        let (node_id, base, parent, name, on_conflict) = match &req.target {
+        let (node_id, base, parent, name, on_conflict, coalesce) = match &req.target {
             UploadTarget::NewVersion {
                 node_id,
                 base_version,
+                coalesce,
             } => (
                 Some(node_id.0),
                 base_version.map(|v| v.0),
                 None,
                 None,
                 "fail",
+                *coalesce,
             ),
             UploadTarget::NewFile {
                 parent_id,
@@ -934,13 +943,14 @@ impl Transfers for PgContentStore {
                     crate::nodes::OnConflict::Fail => "fail",
                     crate::nodes::OnConflict::Rename => "rename",
                 },
+                true,
             ),
         };
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "insert into uploads (id, tenant_id, node_id, base_version, parent_id, name, on_conflict, \
              content_type, size_bytes, content_hash, manifest, chunking, actor_kind, actor, \
-             on_behalf_of, expires_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+             on_behalf_of, expires_at, may_coalesce) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
              returning {UPLOAD_COLUMNS}"
         )))
         .bind(id.0)
@@ -959,6 +969,7 @@ impl Transfers for PgContentStore {
         .bind(ctx.actor.actor.id.0)
         .bind(ctx.actor.on_behalf_of.map(|u| u.0))
         .bind(expires_at)
+        .bind(coalesce)
         .fetch_one(&mut *tx)
         .await?;
         let mut up = upload_of(&row)?;
@@ -1043,6 +1054,7 @@ impl Transfers for PgContentStore {
             UploadTarget::NewVersion {
                 node_id,
                 base_version,
+                ..
             } => {
                 let n = node_row(&mut tx, ctx.tenant, *node_id, true).await?;
                 check_file(&n, true)?;
@@ -1080,6 +1092,13 @@ impl Transfers for PgContentStore {
             &manifest,
             up.content_type.clone(),
             None,
+            !matches!(
+                up.target,
+                UploadTarget::NewVersion {
+                    coalesce: false,
+                    ..
+                }
+            ),
             &policy,
         )
         .await?;
@@ -1136,13 +1155,14 @@ impl Transfers for PgContentStore {
         Ok(self.content(ctx.tenant, n.name, v, range))
     }
 
-    async fn put_content(
+    async fn put_content_with(
         &self,
         ctx: &Context,
         node: NodeId,
         data: Bytes,
         content_type: Option<String>,
         if_version: Option<VersionId>,
+        coalesce: bool,
     ) -> Result<ContentWritten> {
         check_link_may_write(ctx)?;
         self.require(ctx, node, Role::Edit).await?;
@@ -1179,8 +1199,17 @@ impl Transfers for PgContentStore {
         if if_version.is_some() && if_version != n.head_version {
             return Err(logic::precondition_failed());
         }
-        let (version, change) =
-            Self::commit_version(&mut tx, ctx, &n, &manifest, content_type, None, &policy).await?;
+        let (version, change) = Self::commit_version(
+            &mut tx,
+            ctx,
+            &n,
+            &manifest,
+            content_type,
+            None,
+            coalesce,
+            &policy,
+        )
+        .await?;
         tx.commit().await?;
         let node = self.node_response(ctx, node).await?;
         Ok(Written {
@@ -1310,6 +1339,7 @@ impl VersionStore for PgContentStore {
             &src.manifest,
             src.version.content_type.clone(),
             Some(version),
+            true,
             &policy,
         )
         .await?;

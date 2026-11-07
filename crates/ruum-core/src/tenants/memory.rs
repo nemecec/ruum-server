@@ -775,6 +775,56 @@ impl TenantStore for MemoryTenantStore {
             .ok_or_else(|| Error::not_found("member"))
     }
 
+    async fn preview_invitation(&self, token: &str) -> Result<InvitationPreview> {
+        let hash = secret::sha256(token.trim());
+        let now = crate::now();
+        let (inv, state, tenant) = {
+            let st = self.area.lock();
+            let r = st
+                .invitations
+                .values()
+                .find(|r| secret::constant_time_eq(&r.token_hash, &hash))
+                .ok_or_else(|| Error::not_found("invitation"))?;
+            let ended =
+                rules::invitation_ended_at(r.revoked_at, r.inv.accepted_at, r.inv.expires_at, now);
+            if !rules::preview_still_answers(ended, now) {
+                return Err(Error::not_found("invitation"));
+            }
+            let state =
+                rules::invitation_state(r.revoked_at, r.inv.accepted_at, r.inv.expires_at, now);
+            let tenant = st
+                .tenants
+                .get(&r.inv.tenant_id)
+                .cloned()
+                .ok_or_else(|| Error::not_found("invitation"))?;
+            (r.inv.clone(), state, tenant)
+        };
+        if !rules::preview_shows_details(state) {
+            return Ok(InvitationPreview {
+                state,
+                details: None,
+            });
+        }
+        let inviter = inv.invited_by.actor.id.0;
+        let inviter_display_name = self
+            .principal_names(inv.tenant_id, &[inviter])
+            .await?
+            .remove(&inviter)
+            .map(|n| n.display_name);
+        Ok(InvitationPreview {
+            state,
+            details: Some(InvitationDetails {
+                tenant_name: tenant.name,
+                tenant_kind: tenant.kind,
+                inviter_display_name,
+                role: inv.role,
+                content_role: inv.content_role,
+                expires_at: inv.expires_at,
+                email_masked: rules::mask_email(&inv.email),
+            }),
+        })
+    }
+
     async fn usage(&self, ctx: &Context) -> Result<Usage> {
         let user = caller_user(ctx)?;
         let st = self.area.lock();

@@ -374,6 +374,10 @@ pub enum UploadTarget {
         node_id: NodeId,
         /// Fail with `version_mismatch` if the head version is not this one.
         base_version: Option<VersionId>,
+        /// Whether the new version may join the head version (the version policy's
+        /// coalescing). `false` always makes a new version (C-8, decision 0003-6).
+        #[serde(default = "default_coalesce")]
+        coalesce: bool,
     },
     NewFile {
         parent_id: NodeId,
@@ -381,6 +385,10 @@ pub enum UploadTarget {
         #[serde(default)]
         on_conflict: OnConflict,
     },
+}
+
+fn default_coalesce() -> bool {
+    true
 }
 
 /// A request to start an upload.
@@ -485,6 +493,20 @@ pub trait Transfers: Send + Sync {
         data: Bytes,
         content_type: Option<String>,
         if_version: Option<VersionId>,
+    ) -> Result<crate::journal::Written<(Node, Version)>> {
+        self.put_content_with(ctx, node, data, content_type, if_version, true)
+            .await
+    }
+    /// [`Transfers::put_content`] with the `coalesce` flag of `putContent` (C-8, decision
+    /// 0003-6): with `false` the save never joins the head version.
+    async fn put_content_with(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        data: Bytes,
+        content_type: Option<String>,
+        if_version: Option<VersionId>,
+        coalesce: bool,
     ) -> Result<crate::journal::Written<(Node, Version)>>;
     /// A signed grant to read one version on the content domain for
     /// [`CONTENT_URL_SECONDS`] (`getContentUrl`). Needs `view`.

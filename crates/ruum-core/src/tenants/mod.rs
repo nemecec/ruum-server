@@ -168,6 +168,45 @@ pub struct Invitation {
     pub accepted_at: Option<OffsetDateTime>,
 }
 
+/// The state of an invitation (`InvitationState` in `openapi.yaml`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationState {
+    /// The token works.
+    Pending,
+    /// Someone accepted it.
+    Accepted,
+    /// It was not accepted before `expires_at`.
+    Expired,
+    /// An admin revoked it.
+    Revoked,
+}
+
+/// What an invitation is for, before it is accepted (`previewInvitation`, C-9, decision 0003-6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvitationPreview {
+    pub state: InvitationState,
+    /// Present only while the invitation is pending or expired ([`rules::preview_shows_details`]).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub details: Option<InvitationDetails>,
+}
+
+/// The part of [`InvitationPreview`] that only pending and expired invitations show.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvitationDetails {
+    pub tenant_name: String,
+    pub tenant_kind: TenantKind,
+    /// The inviter's name as the tenant knows it (C-7); `None` when no name is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inviter_display_name: Option<String>,
+    pub role: MemberRole,
+    pub content_role: Option<Role>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    /// The invitation's email, masked ([`rules::mask_email`]).
+    pub email_masked: String,
+}
+
 /// The current usage of a tenant.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -390,6 +429,11 @@ pub trait TenantStore: Send + Sync {
     /// (acceptance never lowers rights; [`rules::accepted_content_role`]). The content role and
     /// its tuple are written in the same transaction as the role.
     async fn accept_invitation(&self, actor: &Actor, token: &str) -> Result<Member>;
+    /// What the invitation of a token is for (`previewInvitation`, C-9, decision 0003-6). No
+    /// caller: the token is the credential, and nothing changes. A revoked or accepted
+    /// invitation shows only its state. An unknown token, or one whose invitation ended more
+    /// than [`crate::mailing::outbox::KEEP_DAYS`] days ago, is `not_found`.
+    async fn preview_invitation(&self, token: &str) -> Result<InvitationPreview>;
     /// The current usage. Needs the tenant role `member`.
     async fn usage(&self, ctx: &Context) -> Result<Usage>;
 }

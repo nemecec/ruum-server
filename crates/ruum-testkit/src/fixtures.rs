@@ -923,6 +923,7 @@ mod seed {
                 UploadTarget::NewVersion {
                     node_id: node,
                     base_version: Some(v1),
+                    coalesce: true,
                 },
                 format!("{} plan, second draft\n", t.prefix).into_bytes(),
             );

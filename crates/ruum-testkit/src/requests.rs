@@ -94,6 +94,8 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         ),
         "acceptInvitation" => RequestSpec::post("/v1/invitations/accept")
             .json(json!({ "token": t.invitation_token })),
+        "previewInvitation" => RequestSpec::post("/v1/invitations/preview")
+            .json(json!({ "token": t.invitation_token })),
         "getLimits" => RequestSpec::get(format!("/v1/tenants/{tid}/limits")),
         "listAudit" => RequestSpec::get(format!("/v1/tenants/{tid}/audit")),
 

@@ -205,6 +205,10 @@ pub struct UndoItem {
     pub event: crate::journal::EventType,
     /// Why the change was skipped; `None` for a reverted change.
     pub reason: Option<UndoSkipReason>,
+    /// For `changed_later`: the first later change of the node by another actor, the one that
+    /// blocked the undo (C-11, decision 0003-6). `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_by: Option<crate::actor::Actor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

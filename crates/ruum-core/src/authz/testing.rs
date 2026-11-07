@@ -282,6 +282,9 @@ impl TenantStore for TestTenants {
     async fn accept_invitation(&self, _: &Actor, _: &str) -> Result<Member> {
         unimplemented!()
     }
+    async fn preview_invitation(&self, _: &str) -> Result<InvitationPreview> {
+        unimplemented!()
+    }
     async fn usage(&self, _: &Context) -> Result<Usage> {
         unimplemented!()
     }

@@ -740,6 +740,7 @@ impl SharingStore for MemorySharingStore {
             match self.nodes.get(&tctx, r.node).await {
                 Ok(node) if node.trashed_at.is_none() => items.push(SharedItem {
                     node,
+                    tenant_name: self.tenants.find(r.tenant).await?.name,
                     role: r.role,
                     shared_by: r.shared_by,
                     shared_at: r.shared_at,

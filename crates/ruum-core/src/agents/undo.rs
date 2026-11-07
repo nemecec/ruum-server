@@ -26,7 +26,7 @@
 //! 4. Add a case to the tests of this module.
 
 use super::{AgentId, UndoItem, UndoReport, UndoRequest, UndoSkipReason, undo_action};
-use crate::actor::{Context, require_user_actor};
+use crate::actor::{Actor, Context, require_user_actor};
 use crate::authz::Role;
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{GrantId, NodeId, ShareLinkId, TagId, VersionId};
@@ -167,16 +167,23 @@ pub async fn undo(
     entries.sort_by_key(|e| std::cmp::Reverse(e.seq));
     entries.truncate(MAX_UNDO_ENTRIES);
 
-    // For `changed_later`: the newest seq of another actor per node.
-    let mut last_other: HashMap<NodeId, i64> = HashMap::new();
+    // For `changed_later`: the entries of other actors per node, oldest first (`all` is in
+    // `seq` order).
+    let mut others: HashMap<NodeId, Vec<(i64, Actor)>> = HashMap::new();
     for e in &all {
         if let Some(n) = e.node_id
             && e.actor.actor.id.0 != agent.id.0
         {
-            let v = last_other.entry(n).or_insert(e.seq);
-            *v = (*v).max(e.seq);
+            others.entry(n).or_default().push((e.seq, e.actor));
         }
     }
+    others.values_mut().for_each(|v| v.sort_by_key(|x| x.0));
+    // The first change of the node by another actor after `seq` (C-11).
+    let first_later = |node: Option<NodeId>, seq: i64| -> Option<Actor> {
+        let v = others.get(&node?)?;
+        let i = v.partition_point(|x| x.0 <= seq);
+        v.get(i).map(|x| x.1)
+    };
 
     let mut report = UndoReport {
         dry_run: req.dry_run,
@@ -185,11 +192,17 @@ pub async fn undo(
         change: None,
     };
     for e in entries {
-        let item = |reason| UndoItem {
+        let blocked_by = first_later(e.node_id, e.seq);
+        let item = |reason: Option<UndoSkipReason>| UndoItem {
             seq: e.seq,
             node_id: e.node_id,
             event: e.event,
             reason,
+            changed_by: if reason == Some(UndoSkipReason::ChangedLater) {
+                blocked_by
+            } else {
+                None
+            },
         };
         if undo_action(e.event).is_none() {
             report
@@ -197,10 +210,7 @@ pub async fn undo(
                 .push(item(Some(UndoSkipReason::Irreversible)));
             continue;
         }
-        if e.node_id
-            .and_then(|n| last_other.get(&n))
-            .is_some_and(|seq| *seq > e.seq)
-        {
+        if blocked_by.is_some() {
             report
                 .skipped
                 .push(item(Some(UndoSkipReason::ChangedLater)));
@@ -709,6 +719,90 @@ mod tests {
             .unwrap();
         let err = invert(&s, &ctx, &renamed).await.unwrap_err();
         assert_eq!(err.to_api().code, ErrorCode::NameTaken);
+    }
+
+    /// C-11 (decision 0003-6): an entry that another actor's later change blocks is skipped
+    /// with `changed_later` and names the first such change in `changed_by`; reverted and
+    /// other skipped entries carry no `changed_by`.
+    #[tokio::test]
+    async fn changed_later_names_the_first_later_change() {
+        use super::super::{AgentScope, NewAgent};
+        let (s, ctx, root) = personal().await;
+        let user = ctx.actor.effective_user().unwrap();
+        let agent = s
+            .agents
+            .register(
+                &ctx,
+                NewAgent {
+                    name: "Helper".into(),
+                    description: None,
+                    scope: AgentScope {
+                        subtree: None,
+                        max_role: Role::Manage,
+                        expires_at: None,
+                        budget: Default::default(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let actx = Context {
+            tenant: ctx.tenant,
+            actor: Actor {
+                actor: crate::actor::PrincipalRef {
+                    kind: crate::actor::PrincipalKind::Agent,
+                    id: agent.id.into(),
+                },
+                on_behalf_of: Some(user),
+            },
+            scope: Some(agent.scope.as_scope()),
+            idempotency_key: None,
+        };
+        let since = crate::now() - time::Duration::seconds(1);
+        let n = &s.nodes;
+        let a = n
+            .create(&actx, new_node(root, "a.txt", NodeKind::File))
+            .await
+            .unwrap()
+            .value;
+        let b = n
+            .create(&actx, new_node(root, "b.txt", NodeKind::File))
+            .await
+            .unwrap()
+            .value;
+        // The user renames `a.txt` twice: the first rename is the one that blocks the undo.
+        n.rename(&ctx, a.id, "a2.txt".into(), Oc::Fail, None)
+            .await
+            .unwrap();
+        let first = last(&s, &ctx).await;
+        n.rename(&ctx, a.id, "a3.txt".into(), Oc::Fail, None)
+            .await
+            .unwrap();
+        let report = undo(
+            &s,
+            &ctx,
+            agent.id,
+            UndoRequest {
+                since: Some(since),
+                until: None,
+                seqs: None,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        let skipped = &report.skipped[0];
+        assert_eq!(skipped.node_id, Some(a.id));
+        assert_eq!(skipped.reason, Some(UndoSkipReason::ChangedLater));
+        assert_eq!(skipped.changed_by, Some(first.actor));
+        assert_eq!(skipped.changed_by, Some(Actor::user(user)));
+        assert_eq!(report.reverted.len(), 1);
+        assert_eq!(report.reverted[0].node_id, Some(b.id));
+        assert_eq!(report.reverted[0].changed_by, None);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["skipped"][0]["changed_by"]["actor"]["kind"], "user");
+        assert!(json["reverted"][0].get("changed_by").is_none());
     }
 
     /// Decision 0003-1: each inverse runs the store's check for the caller, so a member whose
