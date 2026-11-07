@@ -302,7 +302,12 @@ paths:
       tags: [auth]
       operationId: getMe
       summary: The signed-in principal
-      description: Who the caller is. For an agent token, the agent, its user and its scope.
+      description: |
+        Who the caller is. For an agent token, the agent, its user and its scope.
+
+        With the session cookie of the web UI, the call also binds the pending email grants of
+        the user's verified email (see `addGrant`), at most once per session per 60 seconds.
+        No other credential binds.
       responses:
         '200':
           description: The principal.
@@ -717,7 +722,7 @@ paths:
       x-ruum-user-only: true
       summary: Invite a person
       description: >-
-        Users only (agents get `user_required`). Needs `admin`. Sends an email with the accept link. Fails with `plan_limit_reached` at the member limit, and with `permission_denied` for role `guest` when the tenant policy has `allow_guests: false`. `content_role` is allowed only with role `member` (else `422 validation_failed`) and defaults to `manage` (decision 0003-1). On acceptance a new person, or a guest, becomes a member with the invitation's content role; a person who is already a member keeps the higher of the two content roles (acceptance never lowers rights); an admin or owner keeps their role and has no content role.
+        Users only (agents get `user_required`). Needs `admin`. Queues an email with the accept link in the same transaction (decision 0003-3); it names the space, the inviter, the role and the end date (`expires_at`). The server mints the token in the link when it sends the mail, so no token is stored in the outbox; a token works only while the invitation is pending. Fails with `plan_limit_reached` at the member limit, and with `permission_denied` for role `guest` when the tenant policy has `allow_guests: false`. `content_role` is allowed only with role `member` (else `422 validation_failed`) and defaults to `manage` (decision 0003-1). On acceptance a new person, or a guest, becomes a member with the invitation's content role; a person who is already a member keeps the higher of the two content roles (acceptance never lowers rights); an admin or owner keeps their role and has no content role.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -2731,13 +2736,47 @@ paths:
         A grant to a user by ID reaches only members and guests of this tenant. Any other user
         ID, unknown or a user of another tenant, fails with `404 not_found`. The answer is the
         same for both, so the call tells nothing about other tenants' users, and it never makes
-        anyone a guest. To share with a person outside the tenant, grant to their email. It stays
-        an email grant (no user) and sends an invitation with a secret token. It becomes a grant
-        to a user, and the person a guest of this tenant, only when (a) a signed-in user accepts
-        that invitation token, or (b) a user signs in with that email as a verified email of a
-        trusted provider (`email_verified`). An unverified email never claims an email grant.
-        When the tenant policy has `allow_guests: false`, a grant to a guest, or to an email that
-        is not the verified email of a member, fails with `permission_denied`.
+        anyone a guest. To share with a person outside the tenant, grant to their email.
+
+        A grant to an email (decision 0003-2):
+
+        - (a) When the caller's user is a member, admin or owner (or the caller is an agent of
+          one), and the email is the verified email of a member, admin, owner or guest of this
+          tenant, the server stores a grant to that user and answers with a `GranteeUser`.
+          These callers can list the members' emails anyway.
+        - (a') When the caller's user is a guest (or the caller is an agent of a guest), the
+          grant is always an email grant (`GranteeEmail`), whoever owns the email, so a guest
+          cannot test whether an email belongs to the tenant.
+        - (b) Any other email grant stays an email grant in storage and in every answer. It
+          binds to a user, and the person becomes a guest of this tenant, when the person signs
+          in with that email as a verified email of a trusted provider (`email_verified`), or
+          calls `getMe` or `listSharedWithMe` with the session cookie of the web UI. Agent
+          tokens, app passwords, share link tokens and bearer tokens never bind. An unverified
+          email never claims an email grant. An admin invitation to that email
+          (`createInvitation`) also binds it when it is accepted.
+        - (c) A bind makes the person a guest only while the tenant policy has
+          `allow_guests: true`; otherwise the grant stays an email grant.
+
+        Anyone who may share the node may add an email grant, and so may cause a guest
+        membership while `allow_guests` is true. The `grant.added` entry of an email grant has
+        `may_add_guest: true`. When the tenant policy has `allow_guests: false`, a grant to a
+        guest, or to an email that is not the verified email of a member, fails with
+        `permission_denied`; a guest caller then gets `permission_denied` for every email.
+
+        With `notify` (default `true`) the server queues a share email in the same transaction
+        as the grant (decision 0003-3): `<Sharer> shared "<item>" with you`, the role in words,
+        the optional `message` as plain text, and a link to the item in the web UI
+        (`/t/<tenant_id>/files/<node_id>` for a folder, `/t/<tenant_id>/item/<node_id>`
+        otherwise). The mail carries no token: the recipient opens the item by signing in with
+        the address it was sent to. `notified` in the answer says whether a mail was queued
+        (not whether it was delivered). No mail is queued for a grant to `tenant_members`, for
+        a user without a verified email, to the caller's own email, when the same recipient got
+        a mail for the node in the last 10 minutes, or over the mail limits (50 share mails per
+        hour per sharing user and tenant, 500 per tenant). The grant is made in every case.
+
+        Limits: 60 calls per 10 minutes per caller user (an agent counts against its user) and
+        tenant, and 600 per tenant. Refused calls count too. Over the limit the call fails with
+        `429 rate_limited`.
 
         A grant to `tenant_members` (everyone in the tenant) gives its role to every member,
         whatever their content role (decision 0003-1): a `view` member gets `edit` from an `edit`
@@ -2767,6 +2806,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
 
   /v1/nodes/{node_id}/grants/{grant_id}:
     parameters:
@@ -2995,9 +3036,22 @@ paths:
         The roots of grants to the caller's user (directly, or through `tenant#member`), across all
         tenants where the user is a member or guest. Newest first. No `Ruum-Tenant` header. For an
         agent, only items inside its scope.
+
+        With the session cookie of the web UI, the call first binds the pending email grants of
+        the user's verified email (see `addGrant`), at most once per session per 60 seconds;
+        `check_email_grants=true` checks now. No other credential binds.
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
+        - name: check_email_grants
+          in: query
+          description: >-
+            Check for email grants to bind now, also within 60 seconds of the last check. The
+            item page of a share email sends it when the item answers `404`. Web sessions only;
+            other credentials ignore it.
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: One page of shared items.
@@ -6133,8 +6187,9 @@ components:
     GranteeEmail:
       type: object
       description: >-
-        A person by email. A person who is not a member becomes a guest only when the invitation
-        is accepted or the verified email claims it (see `addGrant`).
+        A person by email. A grant stays an email grant until the person proves the address: a
+        sign-in or a web session with that verified email binds it, and a person who is not in
+        the tenant then becomes a guest while the tenant allows guests (see `addGrant`).
       required: [type, email]
       properties:
         type:
@@ -6195,10 +6250,13 @@ components:
         notify:
           type: boolean
           default: true
-          description: Send an email to the grantee.
+          description: Queue a share email to the grantee (see `addGrant`).
         message:
           type: string
           maxLength: 1000
+          description: >-
+            A personal message for the share email. It goes out as plain text: no Markdown, no
+            HTML, no links are made from it.
     GrantWrite:
       type: object
       required: [grant, change]
@@ -6207,6 +6265,13 @@ components:
           $ref: '#/components/schemas/Grant'
         change:
           $ref: '#/components/schemas/Change'
+        notified:
+          type: boolean
+          description: >-
+            Only in the answer of `addGrant`: true when a share email was queued in the same
+            transaction as the grant. It says nothing about delivery. False without `notify`,
+            for a grant to `tenant_members`, over the mail limits, or when the same recipient
+            got a mail for the node in the last 10 minutes.
     UpdateNodeSharingRequest:
       type: object
       required: [editors_can_share]

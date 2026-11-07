@@ -183,7 +183,7 @@ tools:
     input: '#/paths/~1v1~1nodes~1{node_id}~1grants/get'
   - name: add_grant
     operation: addGrant
-    description: 'Give a person access to a file or folder with a role (view, comment, edit or manage). Needs the share permission; you can give at most your own role.'
+    description: 'Give a person access to a file or folder with a role (view, comment, edit or manage). Needs the share permission; you can give at most your own role. By default Ruum emails the person (notify: true); pass notify: false when your user did not ask to tell them. The answer says notified: true only when an email was queued. A grant to an email that belongs to nobody in the space stays an email grant until that person signs in with the address.'
     input: '#/paths/~1v1~1nodes~1{node_id}~1grants/post'
   - name: remove_grant
     operation: removeGrant

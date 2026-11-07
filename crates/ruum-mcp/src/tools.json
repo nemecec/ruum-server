@@ -1,7 +1,7 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "0dc022aefd7025b425955b4d256fe67abc6f31847012bbdeaeea11a2d4ead09f",
- "tools_sha256": "823453686716ecfe5259ff96effc4316e6bc0315a1ab4bfb7970273cd0c23567",
+ "openapi_sha256": "845a82ccad4d994c3446f24474a6641eeef3d684273c7e5b8bbb9ea1471dd7d6",
+ "tools_sha256": "e89147c563f5bf24617a7e853776f009e824be46ace5c2384019bf50f5b7e3c8",
  "tools": [
   {
    "name": "get_me",
@@ -1673,7 +1673,7 @@
    "name": "add_grant",
    "operation": "addGrant",
    "planned": false,
-   "description": "Give a person access to a file or folder with a role (view, comment, edit or manage). Needs the share permission; you can give at most your own role.",
+   "description": "Give a person access to a file or folder with a role (view, comment, edit or manage). Needs the share permission; you can give at most your own role. By default Ruum emails the person (notify: true); pass notify: false when your user did not ask to tell them. The answer says notified: true only when an email was queued. A grant to an email that belongs to nobody in the space stays an email grant until that person signs in with the address.",
    "notes": null,
    "method": "POST",
    "path": "/v1/nodes/{node_id}/grants",
@@ -1732,7 +1732,7 @@
          },
          {
           "type": "object",
-          "description": "A person by email. A person who is not a member becomes a guest only when the invitation is accepted or the verified email claims it (see `addGrant`).",
+          "description": "A person by email. A grant stays an email grant until the person proves the address: a sign-in or a web session with that verified email binds it, and a person who is not in the tenant then becomes a guest while the tenant allows guests (see `addGrant`).",
           "required": [
            "type",
            "email"
@@ -1784,11 +1784,12 @@
        "notify": {
         "type": "boolean",
         "default": true,
-        "description": "Send an email to the grantee."
+        "description": "Queue a share email to the grantee (see `addGrant`)."
        },
        "message": {
         "type": "string",
-        "maxLength": 1000
+        "maxLength": 1000,
+        "description": "A personal message for the share email. It goes out as plain text: no Markdown, no HTML, no links are made from it."
        }
       }
      }
@@ -2118,6 +2119,11 @@
      "name": "limit",
      "in": "query",
      "prop": "limit"
+    },
+    {
+     "name": "check_email_grants",
+     "in": "query",
+     "prop": "check_email_grants"
     }
    ],
    "body": null,
@@ -2133,6 +2139,11 @@
       "minimum": 1,
       "maximum": 1000,
       "default": 100
+     },
+     "check_email_grants": {
+      "type": "boolean",
+      "default": false,
+      "description": "Check for email grants to bind now, also within 60 seconds of the last check. The item page of a share email sends it when the item answers `404`. Web sessions only; other credentials ignore it."
      }
     },
     "additionalProperties": false
