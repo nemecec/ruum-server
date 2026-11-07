@@ -246,9 +246,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # The laptop stack: Postgres, Garage, Zitadel, SpiceDB, Mailpit, ... (deploy/dev).
+      # The laptop stack: Postgres, Garage, Zitadel, SpiceDB, Mailpit, ... (deploy/dev), with the
+      # mock OIDC provider that web/e2e/sso.e2e.ts signs in through. CI has no Google or Microsoft
+      # keys, so dev.sh adds only the mock provider to Zitadel.
       - name: Start the stack
-        run: scripts/dev.sh up
+        run: scripts/dev.sh up --sso-mock
       - name: Web dependencies and Chromium
         working-directory: web
         run: |
@@ -259,6 +261,8 @@ jobs:
         env:
           # The work folder (report, traces, logs) goes here, for the artifact below.
           TMPDIR: ${{ runner.temp }}
+          # The sign-in test through the mock provider must run, not skip.
+          RUUM_E2E_SSO_MOCK: required
         run: scripts/e2e_browser.sh
       - name: Keep the report and traces
         if: always()

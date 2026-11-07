@@ -68,3 +68,20 @@ export async function createUser(u: { email: string; password: string; givenName
   })
   return res.userId
 }
+
+/** The ID of the instance identity provider with this name on the login page, or undefined. */
+export async function loginPolicyIdp(name: string): Promise<string | undefined> {
+  const res = await zapi<{ result?: { idpId: string; idpName: string }[] }>('POST', '/admin/v1/policies/login/idps/_search', {})
+  return res.result?.find((p) => p.idpName === name)?.idpId
+}
+
+/** The Zitadel user with this email and the identity providers linked to it. */
+export async function userWithLinks(email: string): Promise<{ userId: string; emailVerified: boolean; links: { idpId: string; userId: string }[] } | undefined> {
+  const users = await zapi<{ result?: { userId: string; human?: { email?: { email: string; isVerified?: boolean } } }[] }>('POST', '/v2/users', {
+    queries: [{ emailQuery: { emailAddress: email } }],
+  })
+  const u = users.result?.[0]
+  if (!u) return undefined
+  const links = await zapi<{ result?: { idpId: string; userId: string }[] }>('POST', `/v2/users/${u.userId}/links/_search`, {})
+  return { userId: u.userId, emailVerified: Boolean(u.human?.email?.isVerified), links: links.result ?? [] }
+}
