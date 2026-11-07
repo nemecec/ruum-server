@@ -309,6 +309,14 @@ How the run is set up:
   `setup` project signs in Ann and Ben and keeps their browser state for the other specs.
 - `ruum-server seed-dev` runs too, as a check that the stack and the token key work; the browser
   specs use their own users, because the seed users have no Zitadel login.
+- `sso.e2e.ts` signs in through an external identity provider: the mock OIDC provider of the
+  compose profile `sso-mock` (`scripts/dev.sh up --sso-mock`, `docs/DEVSTACK.md` "Sign-in
+  providers"). A new person chooses "Mock SSO" on the Zitadel login page, enters a subject and
+  claims on the mock's page, and lands on the files of a new personal space. The test checks
+  `/v1/me` (the provider's verified email and name), the link of the Zitadel user to the
+  provider's subject, and that a second sign-in with the same subject gives the same user.
+  Without the mock provider the test is skipped; with `RUUM_E2E_SSO_MOCK=required` (the CI job)
+  it fails instead.
 
 | Spec | What it checks |
 |---|---|
@@ -363,10 +371,10 @@ Passkey (WebAuthn works on `localhost` without TLS):
 
 Google:
 
-1. In Google Cloud, make an OAuth client (web application) with the redirect URI
-   `http://localhost:8180/ui/login/login/externalidp/callback`.
-2. In the Zitadel console, add a Google identity provider with that client ID and secret, and
-   allow it in the login policy.
+1. Make the Google OAuth client of `docs/setup/ACCOUNTS.md` step 4. Put its keys in
+   `~/.config/ruum/secrets.env`.
+2. Run `scripts/dev.sh idps` (or `up`), then `scripts/dev.sh idps check`. Zitadel then has a
+   Google provider on its login page (`docs/DEVSTACK.md`, "Sign-in providers").
 3. Sign out of Ruum. Click "Continue with Google", choose Google on the Zitadel page, sign in.
 4. Check: a new account gets a personal space; an email that Google verified links to an existing
    Ruum user with the same verified email (no second account); an email grant to that address
@@ -374,13 +382,14 @@ Google:
 
 Microsoft (Entra ID):
 
-1. In Entra ID, register an application with the redirect URI
-   `http://localhost:8180/ui/login/login/externalidp/callback` and make a client secret.
-2. In the Zitadel console, add a Microsoft identity provider (tenant type as needed) and allow it
-   in the login policy.
+1. Make the Entra app of `docs/setup/ACCOUNTS.md` step 5. Put its keys in
+   `~/.config/ruum/secrets.env`.
+2. Run `scripts/dev.sh idps` (or `up`), then `scripts/dev.sh idps check`. Zitadel then has a
+   Microsoft provider for the `common` endpoint on its login page.
 3. Sign out of Ruum. Click "Continue with Microsoft", choose Microsoft on the Zitadel page, sign
    in with a work or school account and with a personal account.
 4. Check the same points as for Google. Also check that an account whose email Microsoft does not
    mark as verified does not claim email grants or invitations.
 
-Remove the identity providers from Zitadel when you are done, if the laptop stack is shared.
+The flow through an external provider itself is tested automatically with the mock OIDC
+provider (`web/e2e/sso.e2e.ts`, below). Only the real accounts need a person.

@@ -11,6 +11,9 @@ You need Docker with Compose, `openssl`, `curl` and `jq`.
 |---|---|
 | `scripts/dev.sh up` | On the first run, copies `deploy/dev/.env.example` to `deploy/dev/.env` with new random secrets. Later runs add the settings that `.env.example` has and `.env` lacks (for example the passwords of `postgres-data`). Makes the local KEK file `deploy/dev/.state/tenant-keys.kek` if it is missing (see "Tenant keys"). Starts the stack, waits until all services are healthy, and runs the init steps (Garage bucket and key, Zitadel project and OIDC apps, the OpenBao transit engine and key). You can run it again at any time. |
 | `scripts/dev.sh up --step4` | The same, and also starts Forgejo (compose profile `step4`). |
+| `scripts/dev.sh up --sso-mock` | The same, and also starts the mock OIDC provider (compose profile `sso-mock`) and adds it to Zitadel as "Mock SSO". The flags can go together. See "Sign-in providers". |
+| `scripts/dev.sh idps` | Configures the sign-in providers of Zitadel again (`scripts/zitadel_idps.sh`). `up` does this too. |
+| `scripts/dev.sh idps check` | Starts the flow of each provider on the Zitadel login page without a password and stops at the provider. See "Sign-in providers". |
 | `scripts/dev.sh down` | Stops the stack. The data stays. |
 | `scripts/dev.sh clean` | Stops the stack and deletes all volumes and `deploy/dev/.state/`, with the local KEK file. It keeps `.env`. |
 | `scripts/dev.sh logs [service]` | Follows the logs. |
@@ -41,6 +44,7 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 | 8025 | Mailpit web UI and API |
 | 1025 | Mailpit SMTP |
 | 3001, 2222 | Forgejo web and SSH (profile `step4` only) |
+| 8190 | The mock OIDC provider, issuer `http://oidc-mock.localhost:8190/ruum` (profile `sso-mock` only) |
 | 8490 | Reserved for the Ruum server on the host (`RUUM_BIND`, the server default). Caddy proxies `https://ruum.localhost` to it. |
 
 ## Services
@@ -118,9 +122,11 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
   the Host header kept. If an upstream does not run, Caddy answers 502 with a short message. The
   other `*.ruumapps.localhost` hosts answer 503 until the app gateway exists (step 3).
 - **Forgejo**: only with `--step4`. It uses SQLite for now; step 4 decides the database.
+- **oidc-mock**: only with `--sso-mock`. `mock-oauth2-server` of NAV, for automated tests of
+  sign-in through an external provider. See "Sign-in providers".
 
 Memory limits: Postgres 1 GB, postgres-data and Zitadel 768 MB each, SpiceDB, Garage, NATS and OpenBao 256 MB each,
-Mailpit and Caddy 128 MB each, Forgejo 512 MB. When idle, the stack uses about 350 MB.
+Mailpit and Caddy 128 MB each, Forgejo 512 MB, oidc-mock 256 MB. When idle, the stack uses about 350 MB.
 
 ## Tenant keys
 
@@ -158,11 +164,104 @@ Without this step, browsers show a certificate warning for `https://ruum.localho
 
 `scripts/dev.sh clean` deletes the CA. After a clean, trust the new root certificate again.
 
+## Sign-in providers
+
+Ruum does not talk to Google or Microsoft. Zitadel does: they are upstream identity providers
+of the platform issuer (design 4.2). `scripts/zitadel_idps.sh` sets them up through the Zitadel
+API, as the bootstrap service account. `dev.sh up` runs it after the Zitadel init step, and
+`dev.sh idps` runs it alone. You can run it again at any time.
+
+| Provider | Added when | Zitadel type |
+|---|---|---|
+| Google | `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` are set | Google, scopes `openid email profile` |
+| Microsoft | `MS_OAUTH_CLIENT_ID` and `MS_OAUTH_CLIENT_SECRET` are set | Microsoft (Azure AD), tenant `common`: work, school and personal accounts; scopes `openid email profile User.Read` |
+| Mock SSO | the mock OIDC provider answers (`dev.sh up --sso-mock`) | generic OIDC, issuer `http://oidc-mock.localhost:8190/ruum` |
+
+How it works:
+
+- The keys come from the environment, else from `deploy/dev/.env`, else from
+  `~/.config/ruum/secrets.env` (`RUUM_SECRETS_FILE` changes the path). The script reads only
+  these four names from that file. It never sources the file, and it never prints, logs or
+  writes the values. They go to Zitadel on the standard input of `curl`. You do not have to copy
+  them into `deploy/dev/.env`; if you do, that file wins. The keys are made in
+  `docs/setup/ACCOUNTS.md` steps 4 and 5.
+- Each provider is an instance provider, on the default login policy of the instance. The
+  Zitadel login page then shows a button for it. The script also makes sure that the login
+  policy allows external providers.
+- It is idempotent. It finds a provider by its name and updates it, so a new secret takes effect
+  at the next run. Without the keys it changes nothing: the stack starts as before, and a
+  provider that was added earlier stays. Remove one in the console
+  (`http://localhost:8180/ui/console`, Default settings > Identity providers).
+- Provider options (design 4.2): the first sign-in makes a Zitadel account. For Google and
+  Microsoft, the person first confirms the name and email on a Zitadel page, where they can also
+  link the provider to an existing account by signing in to it. Zitadel never links accounts by
+  email on its own, because that allows account takeover. Zitadel updates the name and email
+  from the provider at each sign-in.
+- Microsoft does not prove that a work account owns the email address in its profile. So the
+  Microsoft provider has `emailVerified: false`, and Zitadel asks the person to verify the
+  address once (the code goes to Mailpit on the laptop). Google sends `email_verified`.
+- The redirect URIs that the Google and Microsoft apps must accept are
+  `http://localhost:8180/ui/login/login/externalidp/callback` (the login UI of the stack) and
+  `http://localhost:8180/idps/callback` (login v2). `docs/setup/ACCOUNTS.md` lists them with the
+  staging and production ones.
+- The sign-in buttons of the Ruum web UI all open the Zitadel login page, because the server
+  does not send the `idp` hint to Zitadel yet. Choose the provider there.
+
+`scripts/dev.sh idps check` checks the set-up without a password. For each provider on the login
+policy, it starts a login of the `ruum-web` client like a browser, follows the redirects of
+Zitadel with `curl`, and stops at the provider. It prints the status codes, the provider's host
+and path, whether `client_id` is the configured one, and `redirect_uri`. Then it makes one
+request to the provider: Google must answer `302` to its sign-in page (an unknown client goes to
+`/signin/oauth/error`), and Microsoft must show its sign-in page for the app (an unknown client
+gives error code 50059 or 700016). It never prints a secret.
+
+### The mock OIDC provider
+
+`dev.sh up --sso-mock` starts `mock-oauth2-server` (`ghcr.io/navikt/mock-oauth2-server`) on
+port 8190, and the script adds it to Zitadel as "Mock SSO". The browser test
+`web/e2e/sso.e2e.ts` signs in through it from start to end (see `docs/TESTING.md`). The CI job
+`e2e-browser` starts the stack with `--sso-mock`.
+
+- Its sign-in page asks for any user name (the subject) and optional claims as JSON, for
+  example `{"email": "sam@example.test", "email_verified": true, "given_name": "Sam",
+  "family_name": "Test"}`. Zitadel takes the claims from the ID token and makes the account
+  without the confirm page.
+- The issuer is `http://oidc-mock.localhost:8190/ruum`. The mock takes the issuer from the Host
+  header. Browsers and `curl` send `*.localhost` to the loopback address, so they reach the host
+  port. Zitadel reaches the container through the same name, an alias in the compose network
+  `sso`. So both sides see the same issuer.
+- Zitadel's HTTP client refuses private addresses (its SSRF deny list: `10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, loopback and others). The network `sso` therefore uses
+  `203.0.113.0/24` (TEST-NET-3 of RFC 5737, never routed on the internet). Zitadel is on the
+  networks `default` and `sso`. The deny list stays as it is. A stack made before this network
+  existed gets it at the next `dev.sh up`, which recreates the Zitadel container once.
+- The mock accepts any client ID and secret. The values in the script are test values.
+- When the mock is stopped, the "Mock SSO" button stays on the login page and fails. Run
+  `dev.sh up --sso-mock` again, or remove the provider in the console.
+
+### What a person must still check by hand
+
+The automated checks stop at the provider's sign-in page. Only a person with real accounts can
+finish a Google or Microsoft sign-in. Do this once on the laptop stack, and again when a key
+changes (the Microsoft secret expires after 24 months):
+
+1. `scripts/dev.sh idps check` passes.
+2. Start the web UI and the server (`web/README.md`), open the sign-in page, choose "Sign in with
+   Google", then "Google" on the Zitadel page, and sign in with your own Google account. Check:
+   Zitadel shows the confirm page with your name and email; after it, you land on your files in a
+   new personal space; Account shows your Google address as verified.
+3. The same with "Microsoft", once with a personal Microsoft account and once with a work or
+   school account, if you have one. Check: Zitadel asks you to verify the email (the code is in
+   Mailpit, `http://localhost:8025`), then you land on your files.
+4. The other points of the manual checklist in `docs/TESTING.md` (an existing user with the same
+   verified email, email grants).
+
 ## Manual steps
 
 - Trust the Caddy root certificate (see above).
-- Passkeys, Google and Microsoft sign-in are not set up in Zitadel yet. Do this in the console
-  as `admin@ruum.localhost` when the sign-in work starts, or add it to the init step.
+- Passkeys are not set up in Zitadel. A person adds one in the console (`docs/TESTING.md`,
+  manual checklist).
+- A real Google and Microsoft sign-in (see "What a person must still check by hand").
 
 ## Check the stack
 

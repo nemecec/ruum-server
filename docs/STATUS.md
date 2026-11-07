@@ -471,7 +471,10 @@ touch {} +` on the server.
 - **Request timeout.** `RUUM_REQUEST_TIMEOUT_SECONDS` (default 120) also covers the body of a
   large WebDAV `PUT` or `putContent` on a slow link. Chunked uploads are not affected.
 - In-memory `TenantStore::usage` reports 0 bytes and 0 nodes (Postgres reports real usage).
-- Passkeys, Google and Microsoft sign-in are only in the manual checklist of `docs/TESTING.md`.
+- Passkeys are only in the manual checklist of `docs/TESTING.md`. Google and Microsoft are set up in
+  the laptop Zitadel by `scripts/dev.sh` when their keys are present, and the flow through an external
+  provider is tested with the mock OIDC provider (`web/e2e/sso.e2e.ts`); a real Google and Microsoft
+  sign-in still needs a person (`docs/DEVSTACK.md`, "Sign-in providers").
 - The WebDAV example `dav_fake_server` keeps its name but now runs on `Services::in_memory`.
 - CI (`.github/workflows/`) runs on the pushed branches; `main` itself is not pushed.
 - Older gaps of `docs/FOUNDATION.md` still apply (`node.sharing_updated` is not undone, the

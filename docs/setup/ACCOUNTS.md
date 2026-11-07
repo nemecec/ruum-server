@@ -106,6 +106,13 @@ French, so the data stays in the EU. One account for two needs means fewer keys.
 Nothing to do for backups beyond the key; the agents create the bucket in `nl-ams`, with object
 lock (write once) where available.
 
+Status of the sending domain (read through the Scaleway API on 2026-11-07, no email sent):
+`notify.staging.ruum.space` exists in region `fr-par` of the project, with status `checked`
+(Scaleway's verified state), reputation `excellent`, last valid check 2026-11-07 04:55 UTC, next
+check 2026-11-08 05:43 UTC, and 0 emails sent. Public DNS has its SPF, DKIM, DMARC (`p=none`)
+and MX records. The field `last_error` still holds "record not found" for all four records, from
+a check before the records existed.
+
 ## 4. Google sign-in, about 10 minutes
 
 Goal: "Sign in with Google" for Ruum, through Zitadel.
