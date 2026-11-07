@@ -561,7 +561,12 @@ pub(crate) async fn status(f: &dyn Fixture) {
         let text = serde_json::to_string(&r).unwrap();
         assert!(holds_none(&text, &m), "{text}");
     }
-    assert_eq!(f.platform().refused(), 0, "a report went backwards");
+    // Count only this tenant's refusals: other cases may share the platform.
+    assert_eq!(
+        f.platform().refused_for(tenant),
+        0,
+        "a report went backwards"
+    );
 }
 
 /// `deliverHook`: every hook kind, unknown nodes, idempotency and tenant isolation.
@@ -1069,13 +1074,14 @@ pub(crate) async fn export(f: &dyn Fixture) {
         }
         assert!(reported, "a report with the export file");
 
-        // The same delivery again writes nothing more.
-        let uploads = platform.upload_count();
+        // The same delivery again writes nothing more. Count only this tenant's uploads:
+        // other cases may share the platform and export at the same time.
+        let uploads = platform.upload_count_for(tenant);
         assert_eq!(
             p.export_typed_node(delivery, node, r).await.unwrap(),
             started
         );
-        assert_eq!(platform.upload_count(), uploads);
+        assert_eq!(platform.upload_count_for(tenant), uploads);
     }
 
     // An agent never gets full data.

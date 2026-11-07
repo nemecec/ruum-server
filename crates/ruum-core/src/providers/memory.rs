@@ -1046,9 +1046,9 @@ pub struct MemoryPlatform {
 struct PlatformInner {
     statuses: HashMap<(TenantId, NodeId), ProviderStatus>,
     reports: Vec<StatusReport>,
-    refused: usize,
+    refused: HashMap<TenantId, usize>,
     grants: HashMap<UploadId, (TenantId, String)>,
-    uploads: HashMap<UploadId, (NodeId, Vec<u8>)>,
+    uploads: HashMap<UploadId, (TenantId, NodeId, Vec<u8>)>,
     access: HashMap<(TenantId, NodeId, Uuid, String), CheckRole>,
     checks: Vec<CheckRequest>,
 }
@@ -1072,9 +1072,15 @@ impl MemoryPlatform {
         self.lock().reports.clone()
     }
 
-    /// The number of refused (older) reports.
+    /// The number of refused (older) reports, in all tenants.
     pub fn refused(&self) -> usize {
-        self.lock().refused
+        self.lock().refused.values().sum()
+    }
+
+    /// The number of refused (older) reports of one tenant. Tests that share one platform
+    /// with other tests use this count, not [`MemoryPlatform::refused`].
+    pub fn refused_for(&self, tenant: TenantId) -> usize {
+        self.lock().refused.get(&tenant).copied().unwrap_or(0)
     }
 
     /// Grants a one-upload token for an export into `tenant`.
@@ -1091,12 +1097,25 @@ impl MemoryPlatform {
 
     /// The bytes written to an upload and the file node that holds them.
     pub fn upload(&self, id: UploadId) -> Option<(NodeId, Vec<u8>)> {
-        self.lock().uploads.get(&id).cloned()
+        self.lock()
+            .uploads
+            .get(&id)
+            .map(|(_, file, bytes)| (*file, bytes.clone()))
     }
 
-    /// The number of finished uploads.
+    /// The number of finished uploads, in all tenants.
     pub fn upload_count(&self) -> usize {
         self.lock().uploads.len()
+    }
+
+    /// The number of finished uploads of one tenant. Tests that share one platform with
+    /// other tests use this count, not [`MemoryPlatform::upload_count`].
+    pub fn upload_count_for(&self, tenant: TenantId) -> usize {
+        self.lock()
+            .uploads
+            .values()
+            .filter(|(t, _, _)| *t == tenant)
+            .count()
     }
 
     /// Lets `principal` (the actor's ID) have `permission` on a node with `role`.
@@ -1134,7 +1153,7 @@ impl PlatformApi for MemoryPlatform {
         if let Some(stored) = inner.statuses.get(&key).map(|s| s.generation)
             && stored >= report.status.generation
         {
-            inner.refused += 1;
+            *inner.refused.entry(report.tenant_id).or_default() += 1;
             return Err(conflict(format!(
                 "generation {} is not newer than the stored generation {stored}",
                 report.status.generation
@@ -1179,7 +1198,9 @@ impl PlatformApi for MemoryPlatform {
             return Err(conflict("the upload is already written"));
         }
         let file = NodeId::new();
-        inner.uploads.insert(upload.upload_id, (file, bytes));
+        inner
+            .uploads
+            .insert(upload.upload_id, (tenant, file, bytes));
         Ok(file)
     }
 }
