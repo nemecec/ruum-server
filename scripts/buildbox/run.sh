@@ -14,12 +14,18 @@
 #     reused, in DATABASE_URL and TEST_DATABASE_URL;
 #   - its own SpiceDB: the container spicedb-<name> (memory datastore, its own ports), started or
 #     reused, in SPICEDB_ENDPOINT, RUUM_SPICEDB_ENDPOINT and RUUM_SPICEDB_HTTP_URL;
-#   - free ports in RUUM_E2E_PORT and RUUM_E2E_DAV_PORT, and RUUM_DEV_SH for scripts/e2e_smoke.sh.
+#   - a dev root of its own, ~/w/.<name>.dev, in RUUM_DEV_ROOT (scripts/e2e_browser.sh) and its
+#     scripts/dev.sh in RUUM_DEV_SH (scripts/e2e_smoke.sh): a wrapper of the base copy's dev.sh
+#     whose `env` prints the agent's Postgres and SpiceDB instead of the stack's, next to a link to
+#     the stack's deploy/dev/.env. So the e2e scripts use the agent's databases too;
+#   - free ports for the e2e scripts: RUUM_E2E_PORT and RUUM_E2E_DAV_PORT (e2e_smoke.sh),
+#     RUUM_E2E_BROWSER_PORT, RUUM_E2E_BROWSER_DAV_PORT, RUUM_E2E_WEB_PORT and RUUM_E2E_MOCK_PORT
+#     (e2e_browser.sh). Node.js, npm and Playwright's Chromium come from setup.sh.
 # The output streams here; the exit status is the command's. The command gets no stdin. Ctrl-C or
 # SIGTERM stops the command on the server too.
 #
 # --stop stops a running command of <name> and deletes its Postgres and SpiceDB (with their data),
-# ~/targets/<name> and ~/w/<name>.
+# ~/targets/<name>, ~/w/<name> and its dev root ~/w/.<name>.dev.
 #
 # Settings: BUILDBOX_HOST (default 2.31.194.2), BUILDBOX_USER (ruum),
 # BUILDBOX_KEY (~/.config/ruum/buildbox_ed25519).
@@ -40,7 +46,7 @@ set -euo pipefail
 action=$1 name=$2
 shift 2
 W=$HOME/w/$name T=$HOME/targets/$name C=spicedb-$name BASE=$HOME/ruum-server
-P=pg-$name
+P=pg-$name D=$HOME/w/.$name.dev
 PIDFILE=$HOME/w/.$name.pid
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
@@ -112,18 +118,42 @@ case $action in
     pg=$(docker port "$P" 5432/tcp | head -1 | awk -F: '{print $NF}')
     export DATABASE_URL=postgres://ruum:$ruum_pw@127.0.0.1:$pg/ruum
     export TEST_DATABASE_URL=postgres://ruum:$ruum_pw@127.0.0.1:$pg/ruum_test
-    export CARGO_TARGET_DIR=$T CARGO_INCREMENTAL=0 RUUM_DEV_SH=$BASE/scripts/dev.sh BUILDBOX_NAME=$name
-    if [[ -z ${RUUM_E2E_PORT:-} ]]; then
-      read -r RUUM_E2E_PORT RUUM_E2E_DAV_PORT < <(python3 -c '
+    export CARGO_TARGET_DIR=$T CARGO_INCREMENTAL=0 BUILDBOX_NAME=$name
+    # The agent's dev root: the e2e scripts read `dev.sh env` from it, so they get the agent's
+    # Postgres and SpiceDB (the BUILDBOX_* settings), and the rest of the shared stack.
+    export BUILDBOX_DATABASE_URL=$DATABASE_URL BUILDBOX_TEST_DATABASE_URL=$TEST_DATABASE_URL
+    export BUILDBOX_SPICEDB_ENDPOINT=$SPICEDB_ENDPOINT BUILDBOX_SPICEDB_HTTP_URL=$RUUM_SPICEDB_HTTP_URL
+    mkdir -p "$D/scripts" "$D/deploy/dev"
+    ln -sfn "$BASE/deploy/dev/.env" "$D/deploy/dev/.env"
+    cat >"$D/scripts/dev.sh" <<'WRAPPER'
+#!/usr/bin/env bash
+# scripts/dev.sh of the build server's stack, but `env` prints this agent's Postgres and SpiceDB
+# (made by scripts/buildbox/run.sh, which sets the BUILDBOX_* settings).
+set -euo pipefail
+base=$HOME/ruum-server/scripts/dev.sh
+[[ ${1:-} == env ]] || exec "$base" "$@"
+"$base" env
+for v in DATABASE_URL TEST_DATABASE_URL; do
+  b=BUILDBOX_$v
+  printf 'export %s=%q\n' "$v" "${!b:?run this through scripts/buildbox/run.sh}"
+done
+printf 'export %s=%q\n' SPICEDB_ENDPOINT "$BUILDBOX_SPICEDB_ENDPOINT" \
+  RUUM_SPICEDB_ENDPOINT "$BUILDBOX_SPICEDB_ENDPOINT" RUUM_SPICEDB_HTTP_URL "$BUILDBOX_SPICEDB_HTTP_URL"
+WRAPPER
+    chmod +x "$D/scripts/dev.sh"
+    export RUUM_DEV_ROOT=$D RUUM_DEV_SH=$D/scripts/dev.sh
+    # Free ports for the e2e scripts; a setting given with `env` wins.
+    read -r p1 p2 p3 p4 p5 p6 < <(python3 -c '
 import socket
-s = [socket.socket() for _ in range(2)]
+s = [socket.socket() for _ in range(6)]
 for x in s: x.bind(("127.0.0.1", 0))
 print(*[x.getsockname()[1] for x in s])')
-      export RUUM_E2E_PORT RUUM_E2E_DAV_PORT
-    fi
+    export RUUM_E2E_PORT=${RUUM_E2E_PORT:-$p1} RUUM_E2E_DAV_PORT=${RUUM_E2E_DAV_PORT:-$p2}
+    export RUUM_E2E_BROWSER_PORT=${RUUM_E2E_BROWSER_PORT:-$p3} RUUM_E2E_BROWSER_DAV_PORT=${RUUM_E2E_BROWSER_DAV_PORT:-$p4}
+    export RUUM_E2E_WEB_PORT=${RUUM_E2E_WEB_PORT:-$p5} RUUM_E2E_MOCK_PORT=${RUUM_E2E_MOCK_PORT:-$p6}
     mkdir -p "$T"
     cd "$W"
-    echo "postgres $P on :$pg; spicedb $C on grpc :$grpc http :$http; target $T; e2e ports $RUUM_E2E_PORT $RUUM_E2E_DAV_PORT" >&2
+    echo "postgres $P on :$pg; spicedb $C on grpc :$grpc http :$http; target $T; e2e ports: smoke $RUUM_E2E_PORT $RUUM_E2E_DAV_PORT, browser $RUUM_E2E_BROWSER_PORT $RUUM_E2E_BROWSER_DAV_PORT web $RUUM_E2E_WEB_PORT mock $RUUM_E2E_MOCK_PORT" >&2
     # A session of its own, so an interrupt can stop the whole process group.
     status=0
     setsid -w bash -c 'echo $$ >"$0"; exec "$@"' "$PIDFILE" "$@" || status=$?
@@ -134,8 +164,8 @@ print(*[x.getsockname()[1] for x in s])')
   stop)
     kill_running
     docker rm -f -v "$C" "$P" >/dev/null 2>&1 || true
-    rm -rf "$T" "$W"
-    echo "removed $C, $P, $T and $W"
+    rm -rf "$T" "$W" "$D"
+    echo "removed $C, $P, $T, $W and $D"
     ;;
   *) echo "unknown action $action" >&2; exit 2 ;;
 esac
