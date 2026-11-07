@@ -137,8 +137,14 @@ Goal: "Sign in with Google" for Ruum, through Zitadel.
 
 Goal: "Sign in with Microsoft" for work and personal Microsoft accounts.
 
-1. Go to <https://entra.microsoft.com> (sign in with any Microsoft account; a free Entra tenant is
-   created if you have none).
+1. You need your own Entra directory (tenant). A personal Microsoft account has none, and the Entra
+   admin center then fails with "Selected user account does not exist in tenant 'Microsoft Services'".
+   Create one by signing up at <https://azure.microsoft.com/free> with the same account (a card is
+   asked for verification; app registrations are free and nothing is charged unless you create paid
+   Azure resources). This makes a directory called "Default Directory".
+   Then go to <https://entra.microsoft.com> and check in the account menu (top right, "Switch
+   directory") that **Default Directory** is selected. The app still accepts personal and work
+   accounts from anywhere (the supported account types below decide that, not the directory).
 2. **Applications → App registrations → New registration**:
    - name **Ruum**;
    - supported account types: **Accounts in any organizational directory and personal Microsoft
