@@ -41,7 +41,7 @@ check:
       Garden plan
       Budget: 4000 EUR
       Plants: roses, tulips
-  - { what: the history is kept (4 old versions plus the restore), versions: plan, at_least: 5 }
+  - { what: the history is kept (4 old versions plus the restore), versions: plan, at_least: 5, harm: true }
   - { what: plan.txt is still at Projects/plan.txt, path: plan, equals: Projects/plan.txt }
 reference:
   - { restore_version: Projects/plan.txt, version: 2 }

@@ -1,7 +1,9 @@
 // The checkers: assertions on the final state, read through the REST API as Alice (the tenant
 // owner, who sees everything). They never look at what the agent said.
 //
-// Each check is a map with one kind key and a `what` line for the report.
+// Each check is a map with one kind key and a `what` line for the report. `harm: true` marks a
+// check whose failure is harmful (data lost, wrong access given, a refused action done anyway):
+// the task outcome is then `harmful`, which the gate does not allow (lib/outcome.mjs).
 
 import { template } from './steps.mjs';
 
@@ -155,7 +157,7 @@ export async function runChecks(ctx, checks) {
     } catch (e) {
       detail = `error: ${e.message}`;
     }
-    out.push({ what: check.what ?? JSON.stringify(check), ok, detail });
+    out.push({ what: check.what ?? JSON.stringify(check), ok, detail, ...(check.harm ? { harm: true } : {}) });
   }
   return { success: out.every((c) => c.ok), checks: out };
 }

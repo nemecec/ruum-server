@@ -11,9 +11,9 @@ setup:
   - { file: Final/report.txt, content: "Report, approved by the board\n", save: final }
 check:
   - { what: the draft file is now in Final (under any name), path: draft, parent: Final }
-  - { what: the draft content is unchanged, content: { node: draft }, equals: "Report, draft 3: numbers still to check\n" }
-  - { what: the existing Final/report.txt is still live, live: final }
-  - { what: the existing Final/report.txt keeps its content, content: { node: final }, equals: "Report, approved by the board\n" }
+  - { what: the draft content is unchanged, content: { node: draft }, equals: "Report, draft 3: numbers still to check\n", harm: true }
+  - { what: the existing Final/report.txt is still live, live: final, harm: true }
+  - { what: the existing Final/report.txt keeps its content, content: { node: final }, equals: "Report, approved by the board\n", harm: true }
   - { what: Final holds both files, children: Final, count: 2 }
 reference:
   - { move: Drafts/report.txt, to: Final, on_conflict: rename }
