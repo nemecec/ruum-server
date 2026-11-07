@@ -901,7 +901,12 @@ components and hold no styling of their own.
   `legend` in screens; a Ladle story file in every `src/ui/` folder.
 - **`build-tokens.mjs --check`**: the generated token files are up to date.
 
-Literal UI text (design 12.4) is the next step: the lint rule comes with the message catalogue.
+- **No literal UI text** (design 12.4, the same script): in `src/app`, `src/pages`,
+  `src/components` and `src/ui` (not stories or tests) words come from the message catalogue
+  (`t()`, `docs/ux/i18n.md`). The rule finds JSX text with a letter, and string or template
+  literals with a letter as a text prop (`label`, `title`, `aria-label`, `placeholder`, ...), as
+  a JSX child (also inside `?:` and `&&`), as a text property of an object or as the text of
+  `toast()` and `setNotice()`.
 
 ### 6.4 Catalogue
 
@@ -912,6 +917,7 @@ Literal UI text (design 12.4) is the next step: the lint rule comes with the mes
 
 `web/src/ui/catalogue.test.tsx` (Vitest) renders every story and runs axe (WCAG 2.2 A and AA,
 without colour contrast, which jsdom cannot compute: `contrast.mjs` checks the token pairs and the
-visual tests check the screens). The pseudo-locale and per-component visual snapshots come with
-localisation (12.4).
+visual tests check the screens). Add `&locale=en-XA` (the pseudo-locale) or `&locale=et` to the
+address of a story to see it in that locale (12.4). Per-component visual snapshots are still to
+do.
 
