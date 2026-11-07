@@ -6,8 +6,13 @@
 //
 // Update the snapshots after an intended change:
 //   RUUM_E2E_MOCK_ONLY=1 npx playwright test --project visual --update-snapshots
+//
+// One more pass runs the main screens in the pseudo-locale (design 12.4: accented, about 40%
+// longer text), at desktop width in light: it catches layouts that break with longer text, and
+// text that does not come from the message catalogue.
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type Page } from '@playwright/test'
+import { english, pseudoWords, untranslated, type Words } from './support/pseudo.ts'
 
 const NOW = new Date('2026-11-06T10:00:00Z')
 
@@ -27,9 +32,9 @@ const claude = '0190a000-0000-7000-8000-000000000301'
 
 /** Waits until no region says "Loading..." and the mock API's latency has passed. */
 async function settle(page: Page) {
-  await expect(page.getByRole('status').filter({ hasText: /\.\.\.$/ })).toHaveCount(0)
+  await expect(page.getByRole('status').filter({ hasText: /\.\.\.\]?$/ })).toHaveCount(0)
   await page.waitForTimeout(400)
-  await expect(page.getByRole('status').filter({ hasText: /\.\.\.$/ })).toHaveCount(0)
+  await expect(page.getByRole('status').filter({ hasText: /\.\.\.\]?$/ })).toHaveCount(0)
 }
 
 /** No serious or critical axe violations (WCAG 2.2 A and AA rules). */
@@ -41,7 +46,7 @@ async function axe(page: Page, screen: string) {
   expect(bad, `axe on ${screen}`).toEqual([])
 }
 
-type Screen = { name: string; open: (page: Page) => Promise<void> }
+type Screen = { name: string; open: (page: Page, words: Words) => Promise<void> }
 
 /** A consent request in the shape the server seals (ruum-core identity::tokens::Sealed): the claims are inside `v`. */
 const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url')
@@ -73,20 +78,22 @@ const screens: Screen[] = [
   },
   {
     name: 'compare',
-    open: async (page) => {
+    open: async (page, w) => {
       await page.goto(`${personal}/files?node=0190a000-0000-7000-8000-000000000203&panel=versions`)
       await settle(page)
-      await page.getByRole('button', { name: /^Compare version of/ }).last().click()
-      await expect(page.getByRole('dialog', { name: 'Compare versions' }).getByRole('group', { name: 'Changes' })).toBeVisible()
+      await page.getByRole('button', { name: w.prefix('Compare version of') }).last().click()
+      await expect(
+        page.getByRole('dialog', { name: w.exact('Compare versions') }).getByRole('group', { name: w.exact('Changes') }),
+      ).toBeVisible()
     },
   },
   {
     name: 'share',
-    open: async (page) => {
+    open: async (page, w) => {
       await page.goto(`${personal}/files?node=0190a000-0000-7000-8000-000000000203`)
       await settle(page)
-      await page.getByRole('button', { name: 'Share', exact: true }).click()
-      await expect(page.getByRole('dialog', { name: 'Share notes.md' })).toBeVisible()
+      await page.getByRole('button', { name: w.exact('Share'), exact: true }).click()
+      await expect(page.getByRole('dialog', { name: w.prefix('Share ') })).toBeVisible()
     },
   },
   { name: 'empty-folder', open: go(`${personal}/files/${photos}`) },
@@ -130,7 +137,7 @@ for (const v of variants) {
           { name: 'ruum_mock_session', value: '1', domain: 'localhost', path: '/' },
           { name: 'ruum_csrf', value: 'visual-test', domain: 'localhost', path: '/' },
         ])
-        await s.open(page)
+        await s.open(page, english)
         await settle(page)
         await axe(page, s.name)
         await expect(page).toHaveScreenshot(`${s.name}-${v.name}.png`)
@@ -138,3 +145,33 @@ for (const v of variants) {
     }
   })
 }
+
+test.describe('pseudo-locale', () => {
+  test.use({ viewport: { width: 1280, height: 800 }, colorScheme: 'light', locale: 'en-XA' })
+
+  test.beforeEach(async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+  })
+
+  test('sign-in', async ({ page }) => {
+    await page.goto('/signin')
+    await expect(page.getByRole('heading', { name: pseudoWords.exact('Sign in to Ruum') })).toBeVisible()
+    expect(await untranslated(page)).toEqual([])
+    await expect(page).toHaveScreenshot('sign-in-pseudo.png')
+  })
+
+  for (const s of screens) {
+    test(s.name, async ({ page, context }) => {
+      await context.addCookies([
+        { name: 'ruum_mock_session', value: '1', domain: 'localhost', path: '/' },
+        { name: 'ruum_csrf', value: 'visual-test', domain: 'localhost', path: '/' },
+      ])
+      await s.open(page, pseudoWords)
+      await settle(page)
+      await expect(page.locator('html')).toHaveAttribute('lang', 'en-XA')
+      expect(await untranslated(page), `untranslated text on ${s.name}`).toEqual([])
+      await axe(page, `${s.name} (pseudo-locale)`)
+      await expect(page).toHaveScreenshot(`${s.name}-pseudo.png`)
+    })
+  }
+})
