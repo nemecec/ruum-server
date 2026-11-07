@@ -39,6 +39,34 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # The data cluster: customer databases only, never the platform metadata (docs/STEP2.md
+  # "Infrastructure work" 1 and 2). Its own network, so the only address it accepts logins from is
+  # the network gateway (the host, where the Ruum server runs). See docs/DEVSTACK.md.
+  postgres-data:
+    build: ./postgres-data
+    image: ruum-dev/postgres-data:17
+    environment:
+      POSTGRES_USER: postgres
+      # Empty in a .env older than this service: the first start then fails. `dev.sh up` adds them.
+      POSTGRES_PASSWORD: ${POSTGRES_DATA_PASSWORD:-}
+      RUUM_DBHOST_PASSWORD: ${RUUM_DBHOST_PASSWORD:-}
+      RUUM_DATA_PLATFORM_CIDR: ${RUUM_DATA_PLATFORM_CIDR:-}
+    ports:
+      - "127.0.0.1:${POSTGRES_DATA_PORT:-5435}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - data
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -h /var/run/postgresql -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 768m
+    restart: unless-stopped
+    logging: *logging
+
   garage:
     image: dxflrs/garage:v2.5.0
     environment:
@@ -261,8 +289,12 @@ services:
     restart: unless-stopped
     logging: *logging
 
+networks:
+  data:
+
 volumes:
   postgres:
+  postgres-data:
   garage-meta:
   garage-data:
   nats:

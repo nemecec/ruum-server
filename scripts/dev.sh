@@ -7,7 +7,7 @@
 #   scripts/dev.sh logs [svc]     follow the logs
 #   scripts/dev.sh status         show the services and their health
 #   scripts/dev.sh psql [db]      open psql as the ruum role (default database: ruum)
-#   scripts/dev.sh seed           create missing databases; later also tenants, users and files
+#   scripts/dev.sh seed           create missing databases and roles; later also tenants, users and files
 #   scripts/dev.sh env            print the settings for the Ruum server (eval "$(scripts/dev.sh env)")
 #   scripts/dev.sh ca             copy Caddy's local root certificate to deploy/dev/.state/caddy-root.crt
 set -euo pipefail
@@ -26,22 +26,39 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 
-# Copy .env.example to .env and replace each @random-hexN@ marker with N random hex characters.
+# Replace each @random-hexN@ marker of a line with N random hex characters.
+fill_random() {
+  local line=$1 n
+  while [[ "$line" =~ @random-hex([0-9]+)@ ]]; do
+    n="${BASH_REMATCH[1]}"
+    line="${line/"${BASH_REMATCH[0]}"/$(openssl rand -hex $(((n + 1) / 2)) | cut -c1-"$n")}"
+  done
+  printf '%s\n' "$line"
+}
+
+# Copy .env.example to .env with new random values. An existing .env gets the settings that
+# .env.example has and it lacks (for example the passwords of a service added later).
 ensure_env() {
-  [[ -f "$ENV_FILE" ]] && return
   need openssl
-  log "creating deploy/dev/.env with new random secrets"
-  local tmp line n
-  tmp="$(mktemp)"
+  local tmp line key added=()
+  if [[ ! -f "$ENV_FILE" ]]; then
+    log "creating deploy/dev/.env with new random secrets"
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      fill_random "$line" >>"$tmp"
+    done <"$DEV/.env.example"
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    return
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
-    while [[ "$line" =~ @random-hex([0-9]+)@ ]]; do
-      n="${BASH_REMATCH[1]}"
-      line="${line/"${BASH_REMATCH[0]}"/$(openssl rand -hex $(((n + 1) / 2)) | cut -c1-"$n")}"
-    done
-    printf '%s\n' "$line" >>"$tmp"
+    [[ "$line" =~ ^([A-Z0-9_]+)= ]] || continue
+    key="${BASH_REMATCH[1]}"
+    grep -q "^$key=" "$ENV_FILE" && continue
+    fill_random "$line" >>"$ENV_FILE"
+    added+=("$key")
   done <"$DEV/.env.example"
-  mv "$tmp" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
+  ((${#added[@]} == 0)) || log "added to deploy/dev/.env: ${added[*]}"
 }
 
 load_env() {
@@ -69,6 +86,12 @@ wait_healthy() {
 ensure_databases() {
   log "creating missing roles, databases and extensions"
   compose exec -T -e PGOPTIONS="-c client_min_messages=warning" postgres bash /docker-entrypoint-initdb.d/10-ruum.sh >/dev/null
+}
+
+# The data cluster: the role ruum_dbhost (password from .env) and the closed shared databases.
+ensure_data_cluster() {
+  log "data cluster: ruum_dbhost and the closed template1"
+  compose exec -T -e PGOPTIONS="-c client_min_messages=warning" postgres-data bash /docker-entrypoint-initdb.d/10-ruum-data.sh >/dev/null
 }
 
 garage() { compose exec -T -e RUST_LOG=warn garage /garage "$@"; }
@@ -148,10 +171,11 @@ cmd_up() {
   mkdir -p "$STATE/zitadel"
   local profile=()
   [[ "${1:-}" == "--step4" ]] && profile=(--profile step4)
-  log "building and starting postgres"
-  compose up -d --build postgres
+  log "building and starting postgres and postgres-data"
+  compose up -d --build postgres postgres-data
   wait_healthy 120
   ensure_databases
+  ensure_data_cluster
   log "starting the stack"
   compose ${profile[@]+"${profile[@]}"} up -d
   wait_healthy 300
@@ -163,6 +187,7 @@ cmd_up() {
 
 cmd_seed() {
   ensure_databases
+  ensure_data_cluster
   # Later (section 12.2): two tenants, three users, an agent key and sample files,
   # created through the Ruum API (`ruum` CLI) once the core service exists.
   log "seed: databases are ready; tenant and user seed comes with the core service"
@@ -177,6 +202,7 @@ cmd_env() {
   cat <<EOF
 export DATABASE_URL=postgres://ruum:$RUUM_DB_PASSWORD@127.0.0.1:5434/ruum
 export TEST_DATABASE_URL=postgres://ruum:$RUUM_DB_PASSWORD@127.0.0.1:5434/ruum_test
+export RUUM_DBHOST_URL=postgres://ruum_dbhost:${RUUM_DBHOST_PASSWORD:-}@127.0.0.1:${POSTGRES_DATA_PORT:-5435}/postgres
 export S3_ENDPOINT=http://127.0.0.1:3900
 export S3_REGION=garage
 export S3_BUCKET=$S3_BUCKET
@@ -228,7 +254,7 @@ main() {
       log "volumes and deploy/dev/.state deleted (deploy/dev/.env is kept)"
       ;;
     logs) compose logs -f --tail=200 "$@" ;;
-    status) compose --profile step4 ps ;;
+    status) compose --profile step4 ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
     psql)
       load_env
       local tty=()

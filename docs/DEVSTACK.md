@@ -9,15 +9,15 @@ You need Docker with Compose, `openssl`, `curl` and `jq`.
 
 | Command | What it does |
 |---|---|
-| `scripts/dev.sh up` | On the first run, copies `deploy/dev/.env.example` to `deploy/dev/.env` with new random secrets. Starts the stack, waits until all services are healthy, and runs the init steps (Garage bucket and key, Zitadel project and OIDC apps). You can run it again at any time. |
+| `scripts/dev.sh up` | On the first run, copies `deploy/dev/.env.example` to `deploy/dev/.env` with new random secrets. Later runs add the settings that `.env.example` has and `.env` lacks (for example the passwords of `postgres-data`). Starts the stack, waits until all services are healthy, and runs the init steps (Garage bucket and key, Zitadel project and OIDC apps). You can run it again at any time. |
 | `scripts/dev.sh up --step4` | The same, and also starts Forgejo (compose profile `step4`). |
 | `scripts/dev.sh down` | Stops the stack. The data stays. |
 | `scripts/dev.sh clean` | Stops the stack and deletes all volumes and `deploy/dev/.state/`. It keeps `.env`. |
 | `scripts/dev.sh logs [service]` | Follows the logs. |
 | `scripts/dev.sh status` | Shows the services and their health. |
 | `scripts/dev.sh psql [db]` | Opens `psql` as the `ruum` role. The default database is `ruum`. |
-| `scripts/dev.sh seed` | Creates the missing roles, databases and extensions. The seed of tenants, users, an agent key and sample files comes with the core service. |
-| `scripts/dev.sh env` | Prints the settings for the Ruum server. Use `eval "$(scripts/dev.sh env)"`. |
+| `scripts/dev.sh seed` | Creates the missing roles, databases and extensions, and runs the set-up of the data cluster again. The seed of tenants, users, an agent key and sample files comes with the core service. |
+| `scripts/dev.sh env` | Prints the settings for the Ruum server. Use `eval "$(scripts/dev.sh env)"`. `RUUM_DBHOST_URL` is the data cluster as `ruum_dbhost`. |
 | `scripts/dev.sh ca` | Copies the root certificate of Caddy's local CA to `deploy/dev/.state/caddy-root.crt`. |
 
 ## Ports
@@ -28,7 +28,8 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 | Port | Service |
 |---|---|
 | 80, 443 | Caddy: `https://ruum.localhost`, `https://*.ruumapps.localhost` (80 redirects to 443) |
-| 5434 | Postgres 17 with PostGIS and pgvector |
+| 5434 | Postgres 17 with PostGIS and pgvector (the platform database) |
+| 5435 | `postgres-data`: the data cluster for customer databases (`POSTGRES_DATA_PORT` in `.env` changes it) |
 | 3900 | Garage S3 API (region `garage`, path-style URLs) |
 | 3903 | Garage admin API (token `GARAGE_ADMIN_TOKEN`) |
 | 8180 | Zitadel (issuer `http://localhost:8180`, console `http://localhost:8180/ui/console`) |
@@ -50,6 +51,28 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
   not a superuser. Thus the script creates the extensions `postgis` and `vector` in `ruum`,
   `ruum_test` and `template1`. The databases that `#[sqlx::test]` creates come from `template1`,
   so they have the extensions too. Use `TEST_DATABASE_URL` or `DATABASE_URL` from `dev.sh env`.
+- **postgres-data** (`deploy/dev/postgres-data/`): the data cluster (`docs/STEP2.md`
+  "Infrastructure work" 1 and 2). Customer databases live here, never in the platform database.
+  The image `ruum-dev/postgres-data:17` is Postgres 17.11 with PostGIS and pgvector, without
+  PostgreSQL Anonymizer (decision 0004-4).
+  - `template1` holds no extension. `postgis` and `vector` are marked trusted in their control
+    files, so `ruum_dbhost` creates them (in the schema `extensions` of a database) without being
+    a superuser (decision 0004-34 g).
+  - `max_prepared_transactions = 0` (decision 0004-34 d). `pg_stat_statements` is not loaded.
+    WAL archiving is on (`archive_mode = on`); until card I-2 adds pgBackRest, the archive
+    command keeps nothing.
+  - The init script (`initdb/10-ruum-data.sh`, run again by `dev.sh up` and `seed`) makes the
+    role `ruum_dbhost` with `CREATEDB` and `CREATEROLE`, no superuser, password
+    `RUUM_DBHOST_PASSWORD` in `.env`. It revokes `CONNECT` and `TEMPORARY` on `postgres` and
+    `template1` from `PUBLIC`, and every right on the schema `public` of `template1`.
+  - `pg_hba.conf` is written at each container start. `ruum_dbhost` and the per-database roles
+    (`r_` and 16 hex) log in only with SCRAM and only from the platform's address: the gateway of
+    the container's own network `data`, where connections to the host port come from. Set
+    `RUUM_DATA_PLATFORM_CIDR` in `.env` to change it. The superuser (`POSTGRES_DATA_PASSWORD`)
+    logs in only on the local socket: `docker compose -p ruum exec postgres-data psql -U postgres`.
+    No other login works.
+  - The engine (card E-2), not the stack, creates the databases and their roles.
+  - `scripts/dbhost_check.sh` checks all of this on the running cluster (see "Check the stack").
 - **Garage**: one node with a 2 GB layout. `dev.sh up` imports the access key from `.env` and
   creates the bucket `ruum-dev`.
 - **Zitadel**: uses its own database in the same Postgres. The first start creates the instance
@@ -92,7 +115,7 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
   other `*.ruumapps.localhost` hosts answer 503 until the app gateway exists (step 3).
 - **Forgejo**: only with `--step4`. It uses SQLite for now; step 4 decides the database.
 
-Memory limits: Postgres 1 GB, Zitadel 768 MB, SpiceDB, Garage, NATS and OpenBao 256 MB each,
+Memory limits: Postgres 1 GB, postgres-data and Zitadel 768 MB each, SpiceDB, Garage, NATS and OpenBao 256 MB each,
 Mailpit and Caddy 128 MB each, Forgejo 512 MB. When idle, the stack uses about 350 MB.
 
 ## Trust the local CA
@@ -122,9 +145,17 @@ Without this step, browsers show a certificate warning for `https://ruum.localho
 
 ## Check the stack
 
+`scripts/dbhost_check.sh` checks the data cluster as the platform uses it. As `ruum_dbhost` it
+creates two databases with the roles of every kind, and from sessions that log in as each role it
+shows that no role reaches another role or another database, that logins come only from the
+platform's address, and that `ruum_dbhost` creates every extension of the manifest allow-list. It
+prints `PASS` or `FAIL` per check, drops what it made and exits non-zero on a failure. It needs
+`psql` and `jq`.
+
 ```sh
 eval "$(scripts/dev.sh env)"
 echo 'select 1; select extname from pg_extension' | scripts/dev.sh psql
+scripts/dbhost_check.sh
 curl --aws-sigv4 "aws:amz:garage:s3" --user "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" -T CLAUDE.md "$S3_ENDPOINT/$S3_BUCKET/check.txt"
 curl --aws-sigv4 "aws:amz:garage:s3" --user "$S3_ACCESS_KEY_ID:$S3_SECRET_ACCESS_KEY" "$S3_ENDPOINT/$S3_BUCKET/check.txt"
 docker compose -p ruum exec spicedb grpc_health_probe -addr=localhost:50051
