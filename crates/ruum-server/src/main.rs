@@ -18,6 +18,8 @@ use tracing_subscriber::EnvFilter;
 
 /// How often the sweeper runs.
 const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// How often the mail outbox worker looks for due mails when nothing wakes it.
+const MAIL_EVERY: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,6 +74,15 @@ async fn main() -> anyhow::Result<()> {
     // and sessions.
     if let Some(pool) = &sweep_pool {
         tokio::spawn(ruum_core::identity::sweep::run(pool.clone(), SWEEP_EVERY));
+        // The mail outbox worker: share and invitation emails (decision 0003-3).
+        let settings = ruum_core::identity::setup::IdentitySettings::from_env(&config.public_url);
+        let mailer = ruum_core::identity::setup::mailer(&settings)?;
+        tokio::spawn(ruum_core::mailing::outbox::run_worker(
+            pool.clone(),
+            mailer,
+            settings.public_url.clone(),
+            MAIL_EVERY,
+        ));
     }
 
     let platform = app::platform(state.clone(), config.request_timeout);

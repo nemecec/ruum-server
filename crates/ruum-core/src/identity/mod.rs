@@ -310,6 +310,19 @@ pub trait IdentityStore: Send + Sync {
     async fn sessions_of(&self, user: UserId) -> Result<Vec<Session>>;
     /// Ends a session of `user`. A session of another user is `not_found`.
     async fn end_session(&self, user: UserId, id: Uuid) -> Result<()>;
+    /// Binds the email grants of the user's verified email in every tenant (decision 0003-2
+    /// (b)), for the live web session `session` of the user: only an interactive user session
+    /// binds, never an agent token, app password, share-link token or bearer token, so the
+    /// caller passes the session of the request (the cookie) or of a new sign-in. Without
+    /// `force` it checks at most once per session per [`BIND_CHECK_SECONDS`] (a timestamp on
+    /// the session row, shared by every server process); `force` (a sign-in, or the item page
+    /// of a share email) skips that throttle. An unverified email binds nothing. A bind makes
+    /// the user a guest of a tenant only while the tenant allows guests. Returns the number of
+    /// email grants bound. The default binds nothing.
+    async fn bind_email_grants(&self, user: UserId, session: Uuid, force: bool) -> Result<usize> {
+        let _ = (user, session, force);
+        Ok(0)
+    }
 
     /// The app passwords of the caller in `ctx.tenant`, also revoked and expired ones, newest
     /// first. Users only.
@@ -329,6 +342,10 @@ pub trait IdentityStore: Send + Sync {
     /// guest of the tenant. The result is the user (actor = the user) bound to that tenant.
     async fn authenticate_app_password(&self, email: &str, secret: &str) -> Result<Authenticated>;
 }
+
+/// A web session checks for email grants to bind at most once in this many seconds
+/// ([`IdentityStore::bind_email_grants`] without `force`).
+pub const BIND_CHECK_SECONDS: i64 = 60;
 
 /// The `unauthenticated` error with a hint.
 pub fn unauthenticated(message: &str, hint: &str) -> Error {

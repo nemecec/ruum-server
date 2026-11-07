@@ -207,6 +207,68 @@ impl TenantStore for MemoryTenantStore {
         }))
     }
 
+    async fn verified_person(&self, tenant: TenantId, email: &str) -> Result<Option<UserId>> {
+        let st = self.area.lock();
+        Ok(st
+            .memberships
+            .keys()
+            .filter(|(t, _)| *t == tenant)
+            .map(|(_, u)| *u)
+            .find(|u| {
+                st.users.get(u).is_some_and(|r| {
+                    r.user.email_verified && r.user.email.eq_ignore_ascii_case(email.trim())
+                })
+            }))
+    }
+
+    async fn add_guest_from_email_grant(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+        data: serde_json::Value,
+    ) -> Result<()> {
+        let now = crate::now();
+        let added = {
+            let mut st = self.area.lock();
+            if st.memberships.contains_key(&(tenant, user)) || !st.users.contains_key(&user) {
+                false
+            } else {
+                let order = st.next_order();
+                st.memberships.insert(
+                    (tenant, user),
+                    MembershipRow {
+                        role: MemberRole::Guest,
+                        content_role: None,
+                        joined_at: now,
+                        role_since: now,
+                        order,
+                    },
+                );
+                true
+            }
+        };
+        if added {
+            self.area
+                .relate(relations::membership(
+                    tenant,
+                    user,
+                    None,
+                    Some((MemberRole::Guest, None)),
+                ))
+                .await?;
+            let ctx = Context {
+                tenant,
+                actor: Actor::user(user),
+                scope: None,
+                idempotency_key: None,
+            };
+            self.area
+                .audit(&ctx, "member.added", "member", user, data)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn principal_names(
         &self,
         tenant: TenantId,
@@ -523,8 +585,15 @@ impl TenantStore for MemoryTenantStore {
             )
             .await?;
         let url = accept_url(&self.area.deps.public_url, &token);
-        let mail =
-            mail::invitation_mail(&inv.email, &tenant_name, &inviter, &url, message.as_deref());
+        // The in-memory store sends at once (no outbox in memory).
+        let mail = crate::mailing::InvitationFields {
+            space: tenant_name,
+            inviter,
+            role: inv.role,
+            expires_at: inv.expires_at,
+            message: message.clone(),
+        }
+        .render(&inv.email, &url);
         if let Err(e) = self.area.deps.mailer.send(mail).await {
             tracing::warn!(error = %e, "the invitation email was not sent");
         }

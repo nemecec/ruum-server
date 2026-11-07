@@ -381,11 +381,16 @@ impl TokenIssuer for MemoryTokenIssuer {
 #[derive(Clone, Default)]
 pub struct MemoryIdentityStore {
     area: Arc<MemoryArea>,
+    /// The last bind check of each session ([`IdentityStore::bind_email_grants`]).
+    bind_checked: Arc<Mutex<HashMap<Uuid, OffsetDateTime>>>,
 }
 
 impl MemoryIdentityStore {
     pub fn new(area: Arc<MemoryArea>) -> Self {
-        Self { area }
+        Self {
+            area,
+            bind_checked: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -590,6 +595,41 @@ impl IdentityStore for MemoryIdentityStore {
             }
             _ => Err(Error::not_found("session")),
         }
+    }
+
+    async fn bind_email_grants(&self, user: UserId, session: Uuid, force: bool) -> Result<usize> {
+        let now = crate::now();
+        let email = {
+            let st = self.area.lock();
+            let live = st.sessions.values().any(|r| {
+                r.session.id == session
+                    && r.session.user_id == user
+                    && r.ended_at.is_none()
+                    && r.session.expires_at > now
+            });
+            if !live {
+                return Ok(0);
+            }
+            match st.users.get(&user) {
+                Some(r) if r.user.email_verified => r.user.email.clone(),
+                _ => return Ok(0),
+            }
+        };
+        {
+            let mut checked = self.bind_checked.lock().unwrap_or_else(|e| e.into_inner());
+            let due = force
+                || checked
+                    .get(&session)
+                    .is_none_or(|t| now - *t >= time::Duration::seconds(super::BIND_CHECK_SECONDS));
+            if !due {
+                return Ok(0);
+            }
+            checked.insert(session, now);
+        }
+        if let Some(c) = self.area.cleanup_hook() {
+            c.verified_email_signed_in(&email, user).await?;
+        }
+        Ok(0)
     }
 
     async fn list_app_passwords(&self, ctx: &Context) -> Result<Vec<AppPassword>> {

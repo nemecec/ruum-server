@@ -22,6 +22,7 @@ use crate::authz::{self, Authz, ObjectRef, RelationshipUpdate, Scope, SubjectRef
 use crate::error::{Error, ErrorCode};
 use crate::ids::PrincipalId;
 use crate::journal::memory::MemoryJournal;
+use crate::tenants::mail::MemoryMailer;
 use crate::tenants::{MemberRole, TenantPolicy};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -176,6 +177,8 @@ impl World {
 trait Backend: Send + Sync {
     fn store(&self) -> &dyn SharingStore;
     async fn set_policy(&self, w: &World, policy: TenantPolicy);
+    /// The share emails sent so far (Postgres: after one round of the mail worker).
+    async fn deliver(&self) -> Vec<crate::tenants::mail::Mail>;
 }
 
 fn code<T>(r: Result<T>) -> &'static str {
@@ -196,6 +199,9 @@ fn code<T>(r: Result<T>) -> &'static str {
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
+
+/// The public URL of the mail links.
+const URL: &str = "https://ruum.localhost";
 
 /// The verified email of a user of the world.
 fn email_of(u: UserId) -> String {
@@ -794,6 +800,25 @@ async fn share_links(w: &World, b: &dyn Backend) {
 struct Memory {
     store: memory::MemorySharingStore,
     tenants: Arc<TestTenants>,
+    mailer: Arc<MemoryMailer>,
+}
+
+impl Memory {
+    fn new(w: &World) -> Self {
+        let store = memory::MemorySharingStore::new(
+            w.authz.clone(),
+            w.nodes.clone(),
+            w.tenants.clone(),
+            Arc::new(MemoryJournal::default()),
+        );
+        let mailer = Arc::new(MemoryMailer::default());
+        store.set_mail(mailer.clone(), URL.into());
+        Self {
+            store,
+            tenants: w.tenants.clone(),
+            mailer,
+        }
+    }
 }
 
 #[async_trait]
@@ -804,22 +829,44 @@ impl Backend for Memory {
     async fn set_policy(&self, w: &World, policy: TenantPolicy) {
         self.tenants.policies.write().unwrap().insert(w.a, policy);
     }
+    async fn deliver(&self) -> Vec<crate::tenants::mail::Mail> {
+        self.mailer.sent()
+    }
 }
 
 #[tokio::test]
 async fn memory_sharing_conforms() {
     let w = World::new();
     w.seed().await;
-    let b = Memory {
-        store: memory::MemorySharingStore::new(
-            w.authz.clone(),
-            w.nodes.clone(),
-            w.tenants.clone(),
-            Arc::new(MemoryJournal::default()),
-        ),
-        tenants: w.tenants.clone(),
-    };
-    run(&w, &b).await;
+    run(&w, &Memory::new(&w)).await;
+}
+
+#[tokio::test]
+async fn memory_email_grants_conform() {
+    let w = World::new();
+    w.seed().await;
+    email_grants(&w, &Memory::new(&w)).await;
+}
+
+#[tokio::test]
+async fn memory_share_emails_conform() {
+    let w = World::new();
+    w.seed().await;
+    share_emails(&w, &Memory::new(&w)).await;
+}
+
+#[tokio::test]
+async fn memory_add_grant_limits_conform() {
+    let w = World::new();
+    w.seed().await;
+    add_grant_limits(&w, &Memory::new(&w), None).await;
+}
+
+#[tokio::test]
+async fn memory_share_mail_limits_conform() {
+    let w = World::new();
+    w.seed().await;
+    share_mail_limits(&w, &Memory::new(&w)).await;
 }
 
 // ------------------------------------------------------------------ postgres
@@ -827,12 +874,30 @@ async fn memory_sharing_conforms() {
 struct Pg {
     store: postgres::PgSharingStore,
     pool: PgPool,
+    mailer: Arc<MemoryMailer>,
+}
+
+impl Pg {
+    async fn new(pool: &PgPool, w: &World) -> Self {
+        seed_pg(pool, w).await;
+        Self {
+            store: postgres::PgSharingStore::new(pool.clone(), w.authz.clone(), w.nodes.clone()),
+            pool: pool.clone(),
+            mailer: Arc::new(MemoryMailer::default()),
+        }
+    }
 }
 
 #[async_trait]
 impl Backend for Pg {
     fn store(&self) -> &dyn SharingStore {
         &self.store
+    }
+    async fn deliver(&self) -> Vec<crate::tenants::mail::Mail> {
+        crate::mailing::outbox::run_once(&self.pool, self.mailer.as_ref(), URL)
+            .await
+            .unwrap();
+        self.mailer.sent()
     }
     async fn set_policy(&self, w: &World, policy: TenantPolicy) {
         let mut tx = self.pool.begin().await.unwrap();
@@ -940,11 +1005,7 @@ async fn seed_pg(pool: &PgPool, w: &World) {
 async fn postgres_sharing_conforms(pool: PgPool) {
     let w = World::new();
     w.seed().await;
-    seed_pg(&pool, &w).await;
-    let b = Pg {
-        store: postgres::PgSharingStore::new(pool.clone(), w.authz.clone(), w.nodes.clone()),
-        pool: pool.clone(),
-    };
+    let b = Pg::new(&pool, &w).await;
     run(&w, &b).await;
     // Every outbox row was applied after its commit.
     assert_eq!(authz::outbox::pending_count(&pool).await.unwrap(), 0);
@@ -1022,4 +1083,597 @@ async fn postgres_sharing_conforms(pool: PgPool) {
             .iter()
             .all(|g| g.grantee != user_grantee(w.guest_edit))
     );
+}
+
+// ------------------------------------------------------------------ email grants (decision 0003-2)
+
+fn email(e: impl Into<String>) -> Grantee {
+    Grantee::Email { email: e.into() }
+}
+
+/// A grant request with a share email.
+fn notify(grantee: Grantee, role: Role, message: Option<&str>) -> NewGrant {
+    NewGrant {
+        grantee,
+        role,
+        notify: true,
+        message: message.map(str::to_string),
+    }
+}
+
+/// The grantee of an answer, as JSON without the email (to compare shapes).
+fn shape(g: &Grantee) -> Vec<String> {
+    let mut keys: Vec<String> = serde_json::to_value(g)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+async fn email_grants(w: &World, b: &dyn Backend) {
+    let s = b.store();
+    grant_fixture(w, s).await;
+    let m = w.user(w.member);
+    let gm = w.user(w.guest_manage);
+
+    // (a) A member sharing with the verified email of a person of the tenant gets a user grant:
+    // a member (the owner), and a guest.
+    let g = s
+        .add_grant(
+            &m,
+            w.private,
+            email(email_of(w.owner).to_uppercase()),
+            Role::View,
+        )
+        .await
+        .unwrap();
+    assert_eq!(g.value.grantee, user_grantee(w.owner));
+    assert!(w.sees(w.owner, w.private, "view").await);
+    let g = s
+        .add_grant(&m, w.private, email(email_of(w.guest_view)), Role::View)
+        .await
+        .unwrap();
+    assert_eq!(g.value.grantee, user_grantee(w.guest_view));
+    assert!(w.sees(w.guest_view, w.private, "view").await);
+    // An unknown email and the email of an account outside the tenant give the same answer.
+    let unknown = s
+        .add_grant(&m, w.plan, email("nobody@example.test"), Role::View)
+        .await
+        .unwrap();
+    let outside = s
+        .add_grant(&m, w.plan, email(email_of(w.outsider)), Role::View)
+        .await
+        .unwrap();
+    assert!(matches!(unknown.value.grantee, Grantee::Email { .. }));
+    assert!(matches!(outside.value.grantee, Grantee::Email { .. }));
+    assert_eq!(shape(&unknown.value.grantee), shape(&outside.value.grantee));
+    assert!(!w.sees(w.outsider, w.plan, "view").await);
+
+    // (a') A guest (who may share Projects) always gets an email grant, also for a member's
+    // email, the same as for an unknown email.
+    let to_member = s
+        .add_grant(&gm, w.plan, email(email_of(w.member)), Role::Edit)
+        .await
+        .unwrap();
+    let to_unknown = s
+        .add_grant(&gm, w.plan, email("someone@example.test"), Role::Edit)
+        .await
+        .unwrap();
+    assert_eq!(
+        to_member.value.grantee,
+        email(email_of(w.member)),
+        "a guest's share never resolves an email"
+    );
+    assert_eq!(
+        shape(&to_member.value.grantee),
+        shape(&to_unknown.value.grantee)
+    );
+    // An agent of a guest: the same.
+    let agent = w.agent(w.guest_manage, None, Role::Manage);
+    let by_agent = s
+        .add_grant(&agent, w.projects, email(email_of(w.owner)), Role::View)
+        .await
+        .unwrap();
+    assert_eq!(by_agent.value.grantee, email(email_of(w.owner)));
+    // An agent of a member resolves, as its user does.
+    let agent_m = w.agent(w.member, None, Role::Manage);
+    let by_agent_m = s
+        .add_grant(
+            &agent_m,
+            w.archive,
+            email(email_of(w.guest_edit)),
+            Role::View,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_agent_m.value.grantee, user_grantee(w.guest_edit));
+
+    // While guests are off, a guest (and its agent) gets the same refusal for every email:
+    // a member's email cannot be told from any other (reviewer 1 #1).
+    b.set_policy(
+        w,
+        TenantPolicy {
+            allow_guests: false,
+            ..TenantPolicy::default()
+        },
+    )
+    .await;
+    for (caller, to) in [
+        (&gm, email_of(w.member)),
+        (&gm, "fresh@example.test".to_string()),
+        (&agent, email_of(w.owner).to_uppercase()),
+        (&agent, "fresh2@example.test".to_string()),
+    ] {
+        assert_eq!(
+            code(
+                s.add_grant(caller, w.projects, email(to.clone()), Role::View)
+                    .await
+            ),
+            "403",
+            "{to}"
+        );
+    }
+    // A member still reaches a member by email (a user grant), and no outsider.
+    let g = s
+        .add_grant(&m, w.archive, email(email_of(w.owner)), Role::View)
+        .await
+        .unwrap();
+    assert_eq!(g.value.grantee, user_grantee(w.owner));
+    assert_eq!(
+        code(
+            s.add_grant(&m, w.archive, email("out@example.test"), Role::View)
+                .await
+        ),
+        "403"
+    );
+    b.set_policy(w, TenantPolicy::default()).await;
+}
+
+// ------------------------------------------------------------------ share emails (decision 0003-3)
+
+async fn share_emails(w: &World, b: &dyn Backend) {
+    let s = b.store();
+    let o = w.user(w.owner);
+    // A user grant with notify: one mail with the item link, the role and the message, and no
+    // token.
+    let r = s
+        .share(
+            &o,
+            w.plan,
+            notify(
+                user_grantee(w.member),
+                Role::Edit,
+                Some("Have a look\r\nat <b>this</b>"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(r.notified);
+    let mails = b.deliver().await;
+    assert_eq!(mails.len(), 1);
+    let mail = &mails[0];
+    assert_eq!(mail.to, email_of(w.member));
+    assert!(mail.subject.contains("\"plan\""), "{}", mail.subject);
+    let link = format!("{URL}/t/{}/files/{}", w.a.0, w.plan.0);
+    assert!(mail.body.contains(&link), "{}", mail.body);
+    assert!(mail.body.contains("You can edit it."));
+    assert!(mail.body.contains("Have a look\nat <b>this</b>"));
+    assert!(!mail.body.to_lowercase().contains("token"));
+    assert!(!mail.html.as_deref().unwrap().contains("<b>this"));
+    // The member is a person of the tenant: no "sign in with this address" text.
+    assert!(
+        !mail
+            .body
+            .contains("Sign in to Ruum with this email address")
+    );
+    assert_eq!(mail.reply_to.as_deref(), Some(email_of(w.owner).as_str()));
+
+    // Without notify: no mail.
+    let r = s
+        .share(
+            &o,
+            w.private,
+            NewGrant {
+                grantee: user_grantee(w.member),
+                role: Role::View,
+                notify: false,
+                message: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!r.notified);
+    assert_eq!(b.deliver().await.len(), 1);
+
+    // An email grant: the same mail with the item link and how to open it; no token.
+    let r = s
+        .share(
+            &o,
+            w.private,
+            notify(email("New.Person@example.test"), Role::View, None),
+        )
+        .await
+        .unwrap();
+    assert!(r.notified);
+    let mails = b.deliver().await;
+    assert_eq!(mails.len(), 2);
+    let mail = &mails[1];
+    assert_eq!(mail.to, "New.Person@example.test");
+    assert!(
+        mail.body
+            .contains(&format!("{URL}/t/{}/files/{}", w.a.0, w.private.0))
+    );
+    assert!(
+        mail.body
+            .contains("Sign in to Ruum with this email address")
+    );
+    assert!(!mail.body.to_lowercase().contains("token"));
+
+    // A grant to everyone in the space sends no mail.
+    let r = s
+        .share(
+            &o,
+            w.projects,
+            notify(Grantee::TenantMembers, Role::View, None),
+        )
+        .await
+        .unwrap();
+    assert!(!r.notified);
+
+    // A second grant to the same recipient and node within 10 minutes: no second mail.
+    s.remove_grant(
+        &o,
+        w.private,
+        email_grant_id(s, w, w.private, "new.person@example.test").await,
+    )
+    .await
+    .unwrap();
+    let again = s
+        .share(
+            &o,
+            w.private,
+            notify(email("new.person@example.test"), Role::Edit, None),
+        )
+        .await
+        .unwrap();
+    assert!(!again.notified);
+    assert_eq!(b.deliver().await.len(), 2);
+}
+
+/// The ID of the direct email grant of `to` on `node`.
+async fn email_grant_id(s: &dyn SharingStore, w: &World, node: NodeId, to: &str) -> GrantId {
+    s.list_grants(&w.user(w.owner), node, PageRequest::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|g| matches!(&g.grantee, Grantee::Email { email } if email.eq_ignore_ascii_case(to)))
+        .map(|g| g.id)
+        .expect("the email grant")
+}
+
+/// The `addGrant` limit: 60 calls per 10 minutes per user and tenant, refused calls counted,
+/// agents counted against their user, another user not limited (decision 0003-2).
+async fn add_grant_limits(w: &World, b: &dyn Backend, second: Option<&dyn SharingStore>) {
+    let s = b.store();
+    let o = w.user(w.owner);
+    for _ in 0..crate::mailing::ADD_GRANT_PER_USER {
+        // Refused calls count too.
+        assert_eq!(
+            code(
+                s.add_grant(&o, w.plan, email("not an email"), Role::View)
+                    .await
+            ),
+            "422"
+        );
+    }
+    assert_eq!(
+        code(
+            s.add_grant(&o, w.plan, user_grantee(w.member), Role::View)
+                .await
+        ),
+        "429"
+    );
+    let agent = w.agent(w.owner, None, Role::Manage);
+    assert_eq!(
+        code(
+            s.add_grant(&agent, w.plan, user_grantee(w.member), Role::View)
+                .await
+        ),
+        "429"
+    );
+    // Another user of the tenant is not limited.
+    s.add_grant(
+        &w.user(w.member),
+        w.private,
+        user_grantee(w.guest_view),
+        Role::View,
+    )
+    .await
+    .unwrap();
+    // A second server process on the same database shares the counter.
+    if let Some(s2) = second {
+        assert_eq!(
+            code(
+                s2.add_grant(&o, w.plan, user_grantee(w.member), Role::View)
+                    .await
+            ),
+            "429"
+        );
+    }
+}
+
+/// 50 share mails per hour per sharing user and tenant; the 51st grant is made without a mail.
+async fn share_mail_limits(w: &World, b: &dyn Backend) {
+    let s = b.store();
+    let o = w.user(w.owner);
+    for i in 0..crate::mailing::SHARE_MAIL_PER_USER {
+        let r = s
+            .share(
+                &o,
+                w.plan,
+                notify(email(format!("p{i}@example.test")), Role::View, None),
+            )
+            .await
+            .unwrap();
+        assert!(r.notified, "mail {i}");
+    }
+    let r = s
+        .share(
+            &o,
+            w.plan,
+            notify(email("p-last@example.test"), Role::View, None),
+        )
+        .await
+        .unwrap();
+    assert!(!r.notified, "the 51st mail in an hour is not sent");
+    assert!(matches!(r.written.value.grantee, Grantee::Email { .. }));
+    assert_eq!(
+        b.deliver().await.len(),
+        crate::mailing::SHARE_MAIL_PER_USER as usize
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn postgres_email_grants_conform(pool: PgPool) {
+    let w = World::new();
+    w.seed().await;
+    let b = Pg::new(&pool, &w).await;
+    email_grants(&w, &b).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn postgres_share_emails_conform(pool: PgPool) {
+    let w = World::new();
+    w.seed().await;
+    let b = Pg::new(&pool, &w).await;
+    share_emails(&w, &b).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn postgres_add_grant_limits_conform(pool: PgPool) {
+    let w = World::new();
+    w.seed().await;
+    let b = Pg::new(&pool, &w).await;
+    let second = postgres::PgSharingStore::new(pool.clone(), w.authz.clone(), w.nodes.clone());
+    add_grant_limits(&w, &b, Some(&second)).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn postgres_share_mail_limits_conform(pool: PgPool) {
+    let w = World::new();
+    w.seed().await;
+    let b = Pg::new(&pool, &w).await;
+    share_mail_limits(&w, &b).await;
+}
+
+/// A mailer that fails while `fail` is set.
+#[derive(Default)]
+struct FlakyMailer {
+    fail: std::sync::atomic::AtomicBool,
+    inner: MemoryMailer,
+}
+
+#[async_trait]
+impl crate::tenants::mail::Mailer for FlakyMailer {
+    async fn send(&self, mail: crate::tenants::mail::Mail) -> Result<()> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Internal("the relay is down".into()));
+        }
+        self.inner.send(mail).await
+    }
+}
+
+async fn system_tx(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("set local ruum.system = 'on'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx
+}
+
+/// The outbox worker (decision 0003-3): the row is written in the grant's transaction and
+/// holds no token; a failed send is retried and the grant stays; after 24 hours the worker
+/// gives up and clears the payload; a removed grant drops the mail; a grant bound to the user
+/// before the send still sends.
+#[sqlx::test(migrations = "../../migrations")]
+async fn postgres_mail_outbox_worker(pool: PgPool) {
+    use crate::mailing::outbox::{Round, run_once};
+    let w = World::new();
+    w.seed().await;
+    let b = Pg::new(&pool, &w).await;
+    let s = &b.store;
+    let o = w.user(w.owner);
+    let flaky = FlakyMailer::default();
+    flaky.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // A failed send is retried later; the grant stays.
+    let r = s
+        .share(
+            &o,
+            w.plan,
+            notify(user_grantee(w.member), Role::View, Some("hi")),
+        )
+        .await
+        .unwrap();
+    assert!(r.notified);
+    let round = run_once(&pool, &flaky, URL).await.unwrap();
+    assert_eq!(
+        round,
+        Round {
+            retried: 1,
+            ..Round::default()
+        }
+    );
+    assert!(w.sees(w.member, w.plan, "view").await);
+    // Not due yet: nothing happens.
+    assert_eq!(
+        run_once(&pool, &flaky, URL).await.unwrap(),
+        Round::default()
+    );
+    let mut tx = system_tx(&pool).await;
+    let (attempts, error): (i32, Option<String>) =
+        sqlx::query_as("select attempts, last_error from mail_outbox")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(attempts, 1);
+    assert!(error.unwrap().contains("relay is down"));
+    sqlx::query("update mail_outbox set next_attempt_at = now()")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    flaky.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(run_once(&pool, &flaky, URL).await.unwrap().sent, 1);
+    assert_eq!(flaky.inner.sent().len(), 1);
+    let mut tx = system_tx(&pool).await;
+    let payload: Option<serde_json::Value> = sqlx::query_scalar("select payload from mail_outbox")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(payload.is_none(), "the payload is cleared after the send");
+    drop(tx);
+
+    // Giving up after 24 hours clears the payload.
+    flaky.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    s.share(
+        &o,
+        w.private,
+        notify(user_grantee(w.member), Role::View, Some("secret note")),
+    )
+    .await
+    .unwrap();
+    let mut tx = system_tx(&pool).await;
+    sqlx::query(
+        "update mail_outbox set created_at = now() - interval '25 hours' where sent_at is null",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(run_once(&pool, &flaky, URL).await.unwrap().given_up, 1);
+    let mut tx = system_tx(&pool).await;
+    let left: i64 = sqlx::query_scalar(
+        "select count(*) from mail_outbox where payload is not null or \
+         (sent_at is null and given_up_at is null and dropped_at is null)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+    drop(tx);
+    flaky.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // A removed grant drops the mail.
+    let r = s
+        .share(
+            &o,
+            w.archive,
+            notify(email("gone@example.test"), Role::View, None),
+        )
+        .await
+        .unwrap();
+    assert!(r.notified);
+    s.remove_grant(&o, w.archive, r.written.value.id)
+        .await
+        .unwrap();
+    assert_eq!(run_once(&pool, &flaky, URL).await.unwrap().dropped, 1);
+    assert_eq!(flaky.inner.sent().len(), 1);
+
+    // A grant bound to the user before the send still sends: the outsider's verified email.
+    let r = s
+        .share(
+            &o,
+            w.archive,
+            notify(email(email_of(w.outsider)), Role::View, None),
+        )
+        .await
+        .unwrap();
+    assert!(r.notified);
+    let mut tx = postgres::begin(&pool, &o).await.unwrap();
+    postgres::bind_email_grants(&mut tx, w.a, &email_of(w.outsider), w.outsider)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(run_once(&pool, &flaky, URL).await.unwrap().sent, 1);
+    let sent = flaky.inner.sent();
+    assert_eq!(sent.last().unwrap().to, email_of(w.outsider));
+
+    // No row holds a token, and the rows are kept 7 days, then deleted.
+    let mut tx = system_tx(&pool).await;
+    let rows: Vec<Option<serde_json::Value>> =
+        sqlx::query_scalar("select payload from mail_outbox")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        rows.iter()
+            .flatten()
+            .all(|p| !p.to_string().contains("ruum_"))
+    );
+    sqlx::query(
+        "update mail_outbox set sent_at = sent_at - interval '8 days', \
+         given_up_at = given_up_at - interval '8 days', dropped_at = dropped_at - interval '8 days'",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    // An old counter window goes too.
+    sqlx::query(
+        "insert into rate_counters (tenant_id, key, window_start, count) \
+         values ($1, 'old', now() - interval '2 days', 3)",
+    )
+    .bind(w.a.0)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let cleaned = crate::mailing::outbox::clean(&pool).await.unwrap();
+    assert_eq!(cleaned.mails, 4);
+    assert_eq!(cleaned.rate_counters, 1);
+    let mut tx = system_tx(&pool).await;
+    let n: i64 = sqlx::query_scalar("select count(*) from mail_outbox")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    let current: i64 = sqlx::query_scalar("select count(*) from rate_counters")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(current > 0, "the current windows stay");
+}
+
+#[test]
+fn email_grants_carry_may_add_guest() {
+    let d = rules::grant_added_data(GrantId::new(), &email("a@example.test"), Role::View);
+    assert_eq!(d["may_add_guest"], true);
+    let d = rules::grant_added_data(GrantId::new(), &user_grantee(UserId::new()), Role::View);
+    assert!(d.get("may_add_guest").is_none());
 }

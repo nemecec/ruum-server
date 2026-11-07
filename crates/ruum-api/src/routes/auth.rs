@@ -195,11 +195,21 @@ pub async fn login_callback(
         .get(USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (_session, session_secret) = state
+    let (session, session_secret) = state
         .services
         .identity
         .create_session(user.id, user_agent)
         .await?;
+    // Every sign-in binds the email grants of the user's verified email (decision 0003-2
+    // (b)). A failure does not fail the sign-in; the grants stay email grants.
+    if let Err(e) = state
+        .services
+        .identity
+        .bind_email_grants(user.id, session.id, true)
+        .await
+    {
+        tracing::warn!(error = %e, user = %user.id, "could not bind email grants");
+    }
     // Bound to the session (decision 0002-3): the check recomputes it from the session cookie.
     let csrf = ruum_core::identity::csrf_token(&session_secret);
     let max_age = SESSION_DAYS * 24 * 3600;
@@ -240,6 +250,31 @@ pub async fn logout(
     Ok(res)
 }
 
+/// Binds the pending email grants of a web session's user (decision 0003-2 (b)): only for a
+/// user signed in with the session cookie, never for agent tokens, app passwords, share-link
+/// tokens or bearer tokens. `force` skips the 60-second throttle. A failure is logged; the
+/// request goes on (the grants stay email grants).
+pub(crate) async fn bind_for_session(
+    state: &AppState,
+    who: &ruum_core::identity::Authenticated,
+    force: bool,
+) {
+    let (Some(session), PrincipalKind::User, None) =
+        (who.session_id, who.actor.actor.kind, who.bound_tenant)
+    else {
+        return;
+    };
+    let user = ruum_core::UserId(who.actor.actor.id.0);
+    if let Err(e) = state
+        .services
+        .identity
+        .bind_email_grants(user, session, force)
+        .await
+    {
+        tracing::warn!(error = %e, %user, "could not bind email grants");
+    }
+}
+
 /// The signed-in principal. `GET /v1/me` (operationId `getMe`).
 pub async fn get_me(
     State(state): State<AppState>,
@@ -247,6 +282,7 @@ pub async fn get_me(
 ) -> ApiResult<Json<Value>> {
     refuse_share_link(&who)?;
     let user_id = who.user().ok_or_else(Error::user_required)?;
+    bind_for_session(&state, &who, false).await;
     let user = state.services.identity.get_user(user_id).await?;
     let agent = match (who.actor.actor.kind, who.bound_tenant) {
         (PrincipalKind::Agent, Some(t)) => Some(

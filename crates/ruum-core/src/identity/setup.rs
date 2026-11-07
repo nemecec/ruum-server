@@ -67,6 +67,26 @@ impl IdentitySettings {
     }
 }
 
+/// The mailer of the settings: SMTP to `SMTP_URL` (Mailpit on the laptop), else in memory.
+/// The server's mail outbox worker (`mailing::outbox::run_worker`) sends with it too.
+pub fn mailer(settings: &IdentitySettings) -> Result<Arc<dyn Mailer>> {
+    let origin = settings.public_url.as_str();
+    Ok(match &settings.smtp_url {
+        Some(url) => {
+            let host = url::Url::parse(origin)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "ruum.localhost".into());
+            let from = settings
+                .mail_from
+                .clone()
+                .unwrap_or_else(|| format!("no-reply@{host}"));
+            Arc::new(SmtpMailer::from_url(url, &from)?)
+        }
+        None => Arc::new(MemoryMailer::default()),
+    })
+}
+
 /// Puts the area into `services`: the OIDC client, and with `pool` the token issuer of the
 /// configured key and the Postgres stores (they write relationships through `services.authz`,
 /// so call this after it is set). Without `pool` the in-memory stores of `Services::in_memory`
@@ -91,20 +111,7 @@ pub fn install(
             Arc::new(JwtTokenIssuer::generate(origin, origin))
         }
     };
-    let mailer: Arc<dyn Mailer> = match &settings.smtp_url {
-        Some(url) => {
-            let host = url::Url::parse(origin)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .unwrap_or_else(|| "ruum.localhost".into());
-            let from = settings
-                .mail_from
-                .clone()
-                .unwrap_or_else(|| format!("no-reply@{host}"));
-            Arc::new(SmtpMailer::from_url(url, &from)?)
-        }
-        None => Arc::new(MemoryMailer::default()),
-    };
+    let mailer = mailer(settings)?;
     services.oidc = match &settings.oidc {
         Some(o) => Arc::new(HttpOidcClient::new(o.clone(), Some(format!("{origin}/")))?),
         None => Arc::new(MemoryOidcClient::default()),

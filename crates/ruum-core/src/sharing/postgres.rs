@@ -370,6 +370,90 @@ async fn node_revision(conn: &mut PgConnection, tenant: TenantId, node: NodeId) 
     )
 }
 
+/// Queues the share email of a new grant in the grant's transaction (decision 0003-3).
+/// Returns whether a row was queued: not for `tenant_members`, not for a user without a
+/// verified email, not to the caller themselves, not when the recipient got a mail for the
+/// node in the last 10 minutes, and not over the mail limits (50 per hour per sharing user
+/// and tenant, 500 per tenant). The grant is made in every case.
+async fn queue_share_mail(
+    conn: &mut PgConnection,
+    ctx: &Context,
+    node: NodeId,
+    grantee: &Grantee,
+    role: Role,
+    message: Option<&str>,
+) -> Result<bool> {
+    use crate::mailing::{self as m, ShareFields, outbox, rate};
+    let Some(sender) = ctx.actor.effective_user() else {
+        return Ok(false);
+    };
+    let (to, email_grant) = match grantee {
+        Grantee::Email { email } => (email.clone(), true),
+        Grantee::User { id } => {
+            let to: Option<String> = sqlx::query_scalar(
+                "select email from users where id = $1 and email_verified and deleted_at is null",
+            )
+            .bind(id.0)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match to {
+                Some(to) if !to.is_empty() => (to, false),
+                _ => return Ok(false),
+            }
+        }
+        Grantee::TenantMembers => return Ok(false),
+    };
+    let me: Option<(String, String, bool)> =
+        sqlx::query_as("select display_name, email, email_verified from users where id = $1")
+            .bind(sender.0)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let (sharer, sender_email, verified) = me.unwrap_or_default();
+    if to.eq_ignore_ascii_case(&sender_email) {
+        return Ok(false);
+    }
+    if outbox::recent_share(conn, ctx.tenant, &to, node.0, m::SHARE_MAIL_REPEAT_SECONDS).await? {
+        return Ok(false);
+    }
+    let user_key = m::share_mail_user_key(sender.0);
+    let w = m::SHARE_MAIL_WINDOW_SECONDS;
+    if rate::peek(conn, ctx.tenant, &user_key, w).await? >= m::SHARE_MAIL_PER_USER
+        || rate::peek(conn, ctx.tenant, m::SHARE_MAIL_TENANT_KEY, w).await?
+            >= m::SHARE_MAIL_PER_TENANT
+    {
+        return Ok(false);
+    }
+    rate::hit(conn, ctx.tenant, &user_key, w).await?;
+    rate::hit(conn, ctx.tenant, m::SHARE_MAIL_TENANT_KEY, w).await?;
+    let (item, kind): (String, String) =
+        sqlx::query_as("select name, kind::text from nodes where tenant_id = $1 AND id = $2")
+            .bind(ctx.tenant.0)
+            .bind(node.0)
+            .fetch_one(&mut *conn)
+            .await?;
+    let fields = ShareFields {
+        sharer,
+        item,
+        folder: kind == "folder",
+        role,
+        message: message.map(str::to_string),
+        email_grant,
+        reply_to: verified.then_some(sender_email),
+    };
+    outbox::queue(
+        conn,
+        ctx.tenant,
+        &to,
+        Some(sender.0),
+        &outbox::Queued::Share {
+            node_id: node.0,
+            fields,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
 impl PgSharingStore {
     pub fn new(pool: PgPool, authz: Arc<dyn Authz>, nodes: Arc<dyn NodeStore>) -> Self {
         Self { pool, authz, nodes }
@@ -377,6 +461,37 @@ impl PgSharingStore {
 
     async fn after_commit(&self, tenant: TenantId, ids: &[i64]) {
         outbox::apply_after_commit(&self.pool, &*self.authz, tenant, ids).await;
+    }
+
+    /// Counts one `addGrant` call against the limits, in its own committed transaction, and
+    /// refuses it over the limit (decision 0003-2).
+    async fn count_add_grant(&self, ctx: &Context) -> Result<()> {
+        use crate::mailing::{self as m, rate};
+        let user = ctx
+            .actor
+            .effective_user()
+            .map(|u| u.0)
+            .unwrap_or(ctx.actor.actor.id.0);
+        let mut tx = begin(&self.pool, ctx).await?;
+        let mine = rate::hit(
+            &mut tx,
+            ctx.tenant,
+            &m::add_grant_user_key(user),
+            m::ADD_GRANT_WINDOW_SECONDS,
+        )
+        .await?;
+        let all = rate::hit(
+            &mut tx,
+            ctx.tenant,
+            m::ADD_GRANT_TENANT_KEY,
+            m::ADD_GRANT_WINDOW_SECONDS,
+        )
+        .await?;
+        tx.commit().await?;
+        if mine > m::ADD_GRANT_PER_USER || all > m::ADD_GRANT_PER_TENANT {
+            return Err(m::add_grant_rate_limited());
+        }
+        Ok(())
     }
 
     /// Loads a grant and locks its row until the commit (`for update`), so two concurrent
@@ -453,13 +568,16 @@ impl SharingStore for PgSharingStore {
         Ok(super::memory::page_of(items, page.limit(), |g| g.id.0))
     }
 
-    async fn add_grant(
-        &self,
-        ctx: &Context,
-        node: NodeId,
-        grantee: Grantee,
-        role: Role,
-    ) -> Result<Written<Grant>> {
+    async fn share(&self, ctx: &Context, node: NodeId, req: NewGrant) -> Result<GrantAdded> {
+        let NewGrant {
+            grantee,
+            role,
+            notify,
+            message,
+        } = req;
+        // The limits count every call, also refused ones, in their own committed transaction
+        // (decision 0003-2), so probing with refused calls is limited too.
+        self.count_add_grant(ctx).await?;
         rules::check_grant(&*self.authz, &*self.nodes, ctx, node, role).await?;
         let email = rules::check_grantee(&grantee)?;
         let grantee = match email {
@@ -469,6 +587,39 @@ impl SharingStore for PgSharingStore {
         let mut tx = begin(&self.pool, ctx).await?;
         let (revision, _) = lock_node(&mut tx, ctx.tenant, node).await?;
         let policy = policy_of(&mut tx, ctx.tenant).await?;
+        let caller_role = match ctx.actor.effective_user() {
+            Some(u) => member_role(&mut tx, ctx.tenant, u).await?,
+            None => None,
+        };
+        let grantee = match grantee {
+            Grantee::Email { email } if is_inside(caller_role) => {
+                // (a) A caller who may list the members gets a user grant for the verified
+                // email of a person of the tenant; the answer tells them nothing new.
+                let person: Option<uuid::Uuid> = sqlx::query_scalar(
+                    "select m.user_id from memberships m join users u on u.id = m.user_id \
+                     where m.tenant_id = $1 AND u.email_verified and u.deleted_at is null \
+                     and lower(u.email) = lower($2) limit 1",
+                )
+                .bind(ctx.tenant.0)
+                .bind(&email)
+                .fetch_optional(&mut *tx)
+                .await?;
+                match person {
+                    Some(u) => Grantee::User { id: UserId(u) },
+                    None => Grantee::Email { email },
+                }
+            }
+            Grantee::Email { email } => {
+                // (a') A guest caller (or an agent of a guest) always gets an email grant, and
+                // while guests are off the same refusal for every email, so a guest cannot
+                // tell the email of a member from any other.
+                if !policy.allow_guests {
+                    return Err(rules::guests_refused());
+                }
+                Grantee::Email { email }
+            }
+            other => other,
+        };
         let mut updates = Vec::new();
         match &grantee {
             Grantee::User { id } => {
@@ -574,21 +725,32 @@ impl SharingStore for PgSharingStore {
             node,
             revision,
             EventType::GrantAdded,
-            json!({ "grant_id": grant.id, "grantee": grantee, "role": role }),
+            rules::grant_added_data(grant.id, &grantee, role),
         )
         .await?;
+        let notified = if notify {
+            queue_share_mail(&mut tx, ctx, node, &grantee, role, message.as_deref()).await?
+        } else {
+            false
+        };
         let ob = if updates.is_empty() {
             None
         } else {
             Some(outbox::enqueue(&mut tx, ctx.tenant, &updates).await?)
         };
         tx.commit().await?;
+        if notified {
+            crate::mailing::outbox::wake();
+        }
         if let Some(id) = ob {
             self.after_commit(ctx.tenant, &[id]).await;
         }
-        Ok(Written {
-            value: grant,
-            change,
+        Ok(GrantAdded {
+            written: Written {
+                value: grant,
+                change,
+            },
+            notified,
         })
     }
 

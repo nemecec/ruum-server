@@ -48,6 +48,16 @@ async fn team(a: &Area) -> Team {
     }
 }
 
+/// The invitation token of an invitation mail's accept link.
+fn mailed_token(body: &str) -> String {
+    let at = body.find("token=").expect("an accept link") + "token=".len();
+    body[at..]
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn agent_actor(owner: UserId) -> Actor {
     Actor {
         actor: PrincipalRef {
@@ -312,11 +322,25 @@ async fn invitations_bind_by_token(a: Area) {
         .unwrap();
     assert!(token.starts_with(INVITATION_PREFIX));
     assert_eq!(inv.invited_by, Actor::user(t.owner.id));
+    a.deliver().await;
     let mails = a.mailer.sent();
     let mail = mails.last().unwrap();
     assert_eq!(mail.to, "new@example.test");
-    assert!(mail.body.contains(&token));
     assert!(mail.body.contains("Welcome"));
+    // The mail names the role and the end date (decision 0003-3).
+    assert!(mail.body.contains("as a member"), "{}", mail.body);
+    assert!(
+        mail.body
+            .contains(&crate::tenants::mail::date_words(inv.expires_at))
+    );
+    // The mail's token: the in-memory store mails the returned token; the Postgres worker
+    // mints its own at the send, and both work until the invitation is accepted.
+    let mailed = mailed_token(&mail.body);
+    if a.pool.is_none() {
+        assert_eq!(mailed, token);
+    } else {
+        assert_ne!(mailed, token);
+    }
     assert_eq!(
         code(
             a.tenants
@@ -390,6 +414,15 @@ async fn invitations_bind_by_token(a: Area) {
                 .await
         ),
         ErrorCode::NotFound
+    );
+    // The accept ended every token of the invitation, also the mailed one.
+    assert_eq!(
+        code(
+            a.tenants
+                .accept_invitation(&Actor::user(t.guest.id), &mailed)
+                .await
+        ),
+        ErrorCode::Conflict
     );
     assert!(
         a.tenants
@@ -1039,3 +1072,266 @@ crate::conformance!(
     content_roles_keep_the_invariant,
     accepting_an_invitation_sets_the_content_role,
 );
+
+/// Email grants that bind (decision 0003-2) and invitation mails through the outbox (decision
+/// 0003-3), on the Postgres stores. The in-memory flow runs through the API tests
+/// (`ruum-api`, `routes::auth::tests`).
+mod email_grants {
+    use super::*;
+    use crate::identity::tests::{login, postgres};
+
+    async fn system(pool: &sqlx::PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx
+    }
+
+    /// An email grant on the team root, as `addGrant` stores it for an outsider.
+    async fn email_grant(pool: &sqlx::PgPool, t: &Team, email: &str, role: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        let mut tx = system(pool).await;
+        sqlx::query(
+            "insert into grants (id, tenant_id, node_id, grantee_kind, grantee_email, role, \
+             created_kind, created_by) values ($1, $2, $3, 'email', $4, $5::grant_role, 'user', $6)",
+        )
+        .bind(id)
+        .bind(t.tenant.id)
+        .bind(t.tenant.root_node_id)
+        .bind(email)
+        .bind(role)
+        .bind(t.owner.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        id
+    }
+
+    async fn grantee_kind(pool: &sqlx::PgPool, grant: Uuid) -> Option<String> {
+        let mut tx = system(pool).await;
+        sqlx::query_scalar("select grantee_kind::text from grants where id = $1")
+            .bind(grant)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap()
+    }
+
+    /// A web session binds the email grants of the user's verified email and makes the user a
+    /// guest (`member.added` with `via: email_grant`); the check runs at most once a minute
+    /// unless forced; another user's session binds nothing.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_web_session_binds_email_grants_and_makes_a_guest(pool: sqlx::PgPool) {
+        let a = postgres(pool.clone());
+        let t = team(&a).await;
+        let stranger = user(&a, "stranger").await;
+        let grant = email_grant(&pool, &t, &stranger.email.to_uppercase(), "view").await;
+        let (session, _) = a.identity.create_session(stranger.id, None).await.unwrap();
+        // Another user's session, or no session of this user, binds nothing.
+        let (other, _) = a.identity.create_session(t.member.id, None).await.unwrap();
+        assert_eq!(
+            a.identity
+                .bind_email_grants(stranger.id, other.id, true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            a.identity
+                .bind_email_grants(stranger.id, session.id, false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(grantee_kind(&pool, grant).await.as_deref(), Some("user"));
+        assert_eq!(
+            a.tenants.role_of(t.tenant.id, stranger.id).await.unwrap(),
+            Some(MemberRole::Guest)
+        );
+        let mut tx = system(&pool).await;
+        let data: serde_json::Value = sqlx::query_scalar(
+            "select data from audit where tenant_id = $1 and action = 'member.added' \
+             and target_id = $2",
+        )
+        .bind(t.tenant.id)
+        .bind(stranger.id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(data["via"], "email_grant");
+        assert_eq!(data["role"], "guest");
+        assert_eq!(data["grant_ids"][0], grant.to_string());
+        assert_eq!(data["granted_by"][0]["id"], t.owner.id.to_string());
+
+        // Within the minute a new grant waits, unless the check is forced.
+        let second = email_grant(&pool, &t, &stranger.email, "edit").await;
+        assert_eq!(
+            a.identity
+                .bind_email_grants(stranger.id, session.id, false)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(grantee_kind(&pool, second).await.as_deref(), Some("email"));
+        assert_eq!(
+            a.identity
+                .bind_email_grants(stranger.id, session.id, true)
+                .await
+                .unwrap(),
+            1
+        );
+        // The user already had a grant on the node: it is raised to edit, the email grant goes.
+        assert_eq!(grantee_kind(&pool, second).await, None);
+        // An ended session binds nothing.
+        a.identity
+            .end_session(stranger.id, session.id)
+            .await
+            .unwrap();
+        email_grant(&pool, &t, &stranger.email, "manage").await;
+        assert_eq!(
+            a.identity
+                .bind_email_grants(stranger.id, session.id, true)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// An unverified email never binds; a tenant that does not allow guests keeps its email
+    /// grants and makes no guest (rule (c)).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unverified_emails_and_closed_tenants_bind_nothing(pool: sqlx::PgPool) {
+        let a = postgres(pool.clone());
+        let t = team(&a).await;
+        let mut l = login(&format!(
+            "unverified-{}@example.test",
+            Uuid::now_v7().simple()
+        ));
+        l.email_verified = false;
+        let unverified = a.identity.upsert_from_login(&l).await.unwrap();
+        assert!(!unverified.email_verified);
+        let grant = email_grant(&pool, &t, &unverified.email, "view").await;
+        let (session, _) = a
+            .identity
+            .create_session(unverified.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.identity
+                .bind_email_grants(unverified.id, session.id, true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(grantee_kind(&pool, grant).await.as_deref(), Some("email"));
+
+        let stranger = user(&a, "closed").await;
+        let grant = email_grant(&pool, &t, &stranger.email, "view").await;
+        a.tenants
+            .update(
+                &ctx(t.tenant.id, t.owner.id),
+                None,
+                Some(TenantPolicyChange {
+                    allow_guests: Some(false),
+                    ..TenantPolicyChange::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let (session, _) = a.identity.create_session(stranger.id, None).await.unwrap();
+        assert_eq!(
+            a.identity
+                .bind_email_grants(stranger.id, session.id, true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(grantee_kind(&pool, grant).await.as_deref(), Some("email"));
+        assert_eq!(
+            a.tenants.role_of(t.tenant.id, stranger.id).await.unwrap(),
+            None
+        );
+    }
+
+    /// The outbox row of an invitation holds no token; a revoke before the send means no mail
+    /// and no new token (reviewer 1 #3 (b)).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_revoked_invitation_sends_no_mail_and_mints_no_token(pool: sqlx::PgPool) {
+        let a = postgres(pool.clone());
+        let t = team(&a).await;
+        let oc = ctx(t.tenant.id, t.owner.id);
+        a.deliver().await;
+        let before = a.mailer.sent().len();
+        let (inv, token) = a
+            .tenants
+            .invite(&oc, "late@example.test".into(), MemberRole::Member, None)
+            .await
+            .unwrap();
+        let mut tx = system(&pool).await;
+        let payload: serde_json::Value =
+            sqlx::query_scalar("select payload from mail_outbox where invitation_id = $1")
+                .bind(inv.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        drop(tx);
+        assert!(!payload.to_string().contains(INVITATION_PREFIX));
+        assert!(!payload.to_string().contains(&token));
+        a.tenants.revoke_invitation(&oc, inv.id).await.unwrap();
+        let round = a.deliver().await;
+        assert_eq!(round.dropped, 1);
+        assert_eq!(round.sent, 0);
+        assert_eq!(a.mailer.sent().len(), before);
+        let mut tx = system(&pool).await;
+        let tokens: i64 =
+            sqlx::query_scalar("select count(*) from invitation_tokens where invitation_id = $1")
+                .bind(inv.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(tokens, 1, "only the token of the invitation itself");
+    }
+
+    /// The tokens of invitations that ended more than 7 days ago are deleted; the invitation
+    /// row keeps its state, and the tokens of a pending invitation stay.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn tokens_of_ended_invitations_are_cleaned(pool: sqlx::PgPool) {
+        let a = postgres(pool.clone());
+        let t = team(&a).await;
+        let oc = ctx(t.tenant.id, t.owner.id);
+        let (pending, _) = a
+            .tenants
+            .invite(&oc, "pending@example.test".into(), MemberRole::Member, None)
+            .await
+            .unwrap();
+        let mut tx = system(&pool).await;
+        sqlx::query(
+            "update invitations set accepted_at = accepted_at - interval '8 days' \
+             where tenant_id = $1 and accepted_at is not null",
+        )
+        .bind(t.tenant.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let cleaned = crate::mailing::outbox::clean(&pool).await.unwrap();
+        assert_eq!(cleaned.invitation_tokens, 2, "the member's and the guest's");
+        let mut tx = system(&pool).await;
+        let left: Vec<Uuid> = sqlx::query_scalar("select invitation_id from invitation_tokens")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![pending.id.0]);
+        let accepted: i64 = sqlx::query_scalar(
+            "select count(*) from invitations where tenant_id = $1 and accepted_at is not null",
+        )
+        .bind(t.tenant.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(accepted, 2);
+    }
+}

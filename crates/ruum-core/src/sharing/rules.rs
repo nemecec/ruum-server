@@ -5,7 +5,7 @@ use super::{Grantee, NewShareLink, ShareLink, ShareLinkRole};
 use crate::actor::{Context, PrincipalKind};
 use crate::authz::{self, Authz, Permission, Role};
 use crate::error::{ApiError, Error, ErrorCode, Result};
-use crate::ids::NodeId;
+use crate::ids::{GrantId, NodeId};
 use crate::nodes::NodeStore;
 use crate::paging::Cursor;
 use crate::tenants::TenantPolicy;
@@ -374,6 +374,20 @@ pub fn one_per_node<T>(
         }
     }
     out
+}
+
+/// The data of `grant.added`. An email grant carries `may_add_guest: true` (decision 0003-2):
+/// it binds to whoever proves the address, and that person may become a guest. Every stored
+/// email grant may do so (callers who may list the members get a user grant for the persons of
+/// the tenant, and while guests are off an email grant to an outsider is refused), so the flag
+/// tells a reader of the feed nothing about the address. Admins find "who invited outsiders"
+/// in the audit log by it.
+pub fn grant_added_data(grant: GrantId, grantee: &Grantee, role: Role) -> serde_json::Value {
+    let mut data = serde_json::json!({ "grant_id": grant, "grantee": grantee, "role": role });
+    if matches!(grantee, Grantee::Email { .. }) {
+        data["may_add_guest"] = serde_json::Value::Bool(true);
+    }
+    data
 }
 
 #[cfg(test)]

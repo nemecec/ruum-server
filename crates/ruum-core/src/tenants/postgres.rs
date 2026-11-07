@@ -195,27 +195,38 @@ pub(crate) async fn leave_system(conn: &mut PgConnection, t: TenantId, user: Use
 /// the user (`grant.added`, same grant ID, a `share_index` row and the tuple), or, when the user
 /// already has a direct grant on that node, the email grant is deleted and the user's grant is
 /// raised to the higher of the two roles (`grant.updated` when it changes). Returns the tuples
-/// to write and the number of email grants bound.
+/// to write and what was bound.
 pub(crate) async fn bind_email_grants(
     conn: &mut PgConnection,
     ctx: &Context,
     email: &str,
     user: UserId,
-) -> Result<(Vec<RelationshipUpdate>, usize)> {
+) -> Result<(Vec<RelationshipUpdate>, Bound)> {
     let t = ctx.tenant;
     let mut tuples = Vec::new();
     let rows = sqlx::query(
-        "select id, node_id, role::text as role from grants where tenant_id = $1 \
+        "select id, node_id, role::text as role, created_kind, created_by, created_obo \
+         from grants where tenant_id = $1 \
          and grantee_kind = 'email' and lower(grantee_email) = lower($2) order by id for update",
     )
     .bind(t)
     .bind(email)
     .fetch_all(&mut *conn)
     .await?;
+    let mut bound = Bound::default();
     for g in &rows {
         let id: Uuid = g.try_get("id")?;
         let node: Uuid = g.try_get("node_id")?;
         let role = role_from_text(&g.try_get::<String, _>("role")?)?;
+        bound.grant_ids.push(id);
+        let by = crate::actor::PrincipalRef {
+            kind: g.try_get("created_kind")?,
+            id: crate::ids::PrincipalId(g.try_get("created_by")?),
+        };
+        if !bound.granted_by.contains(&by) {
+            bound.granted_by.push(by);
+        }
+        let _: Option<Uuid> = g.try_get("created_obo")?;
         let revision = node_revision(conn, t, node).await?;
         let node_id = Some(crate::ids::NodeId(node));
         crate::journal::postgres::append(
@@ -349,20 +360,36 @@ pub(crate) async fn bind_email_grants(
             }
         }
     }
-    Ok((tuples, rows.len()))
+    Ok((tuples, bound))
 }
 
-/// Binds the email grants of `email` to `user` in every tenant, when the user signs in with
-/// that email as a verified email of a trusted provider (a new user, or a new identity linked by
-/// its verified email). One transaction per tenant, under its row-level security. A tenant where
-/// the user is not a member or guest and that does not allow guests keeps its email grants.
+/// What [`bind_email_grants`] bound: the email grants (their IDs) and who made them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Bound {
+    pub grant_ids: Vec<Uuid>,
+    pub granted_by: Vec<crate::actor::PrincipalRef>,
+}
+
+impl Bound {
+    pub fn count(&self) -> usize {
+        self.grant_ids.len()
+    }
+}
+
+/// Binds the email grants of `email` to `user` in every tenant (decision 0003-2 (b)): at every
+/// sign-in with that email as a verified email of a trusted provider, and at the bind check of
+/// a web session (`getMe`, `listSharedWithMe`). A system lookup finds the tenants that hold
+/// email grants for the address; then one transaction per tenant, under its row-level
+/// security. In a tenant where the user is not a member or guest, the bind makes them a guest
+/// (`member.added` with `via: email_grant`), only while the tenant allows guests; otherwise the
+/// tenant keeps its email grants (rule (c)). Returns the number of email grants bound.
 pub(crate) async fn bind_email_grants_on_sign_in(
     area: &PgArea,
     email: &str,
     user: UserId,
-) -> Result<()> {
+) -> Result<usize> {
     if email.trim().is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut tx = area.system().await?;
     let tenants: Vec<TenantId> = sqlx::query_scalar(
@@ -374,10 +401,12 @@ pub(crate) async fn bind_email_grants_on_sign_in(
     .await?;
     tx.commit().await?;
     let actor = Actor::user(user);
+    let mut total = 0;
     for t in tenants {
         let mut tx = area.tenant(t, Some(user)).await?;
         let tenant = tenant_row(&mut tx, t).await?;
-        if role_in(&mut tx, t, user).await?.is_none() && !tenant.policy.allow_guests {
+        let old = role_in(&mut tx, t, user).await?;
+        if old.is_none() && !tenant.policy.allow_guests {
             continue;
         }
         let ctx = Context {
@@ -386,7 +415,41 @@ pub(crate) async fn bind_email_grants_on_sign_in(
             scope: None,
             idempotency_key: None,
         };
-        let (tuples, bound) = bind_email_grants(&mut tx, &ctx, email, user).await?;
+        let (mut tuples, bound) = bind_email_grants(&mut tx, &ctx, email, user).await?;
+        if bound.count() == 0 {
+            continue;
+        }
+        if old.is_none() {
+            sqlx::query(
+                "insert into memberships (tenant_id, user_id, role, created_kind, created_by) \
+                 values ($1, $2, 'guest', 'user', $2) on conflict (tenant_id, user_id) do nothing",
+            )
+            .bind(t)
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+            tuples.extend(relations::membership(
+                t,
+                user,
+                None,
+                Some((MemberRole::Guest, None)),
+            ));
+            audit(
+                &mut tx,
+                t,
+                &actor,
+                "member.added",
+                "member",
+                user,
+                serde_json::json!({
+                    "role": MemberRole::Guest,
+                    "via": "email_grant",
+                    "grant_ids": bound.grant_ids,
+                    "granted_by": bound.granted_by,
+                }),
+            )
+            .await?;
+        }
         let outbox = enqueue(&mut tx, t, &tuples).await?;
         audit(
             &mut tx,
@@ -395,13 +458,14 @@ pub(crate) async fn bind_email_grants_on_sign_in(
             "email_grants.bound",
             "user",
             user,
-            serde_json::json!({ "email_grants_bound": bound }),
+            serde_json::json!({ "email_grants_bound": bound.count() }),
         )
         .await?;
         tx.commit().await?;
         area.apply(outbox).await?;
+        total += bound.count();
     }
-    Ok(())
+    Ok(total)
 }
 
 #[async_trait]
@@ -592,6 +656,21 @@ impl TenantStore for PgTenantStore {
         .await?;
         tx.commit().await?;
         Ok(inside)
+    }
+
+    async fn verified_person(&self, tenant: TenantId, email: &str) -> Result<Option<UserId>> {
+        let mut tx = self.area.tenant(tenant, None).await?;
+        let user: Option<UserId> = sqlx::query_scalar(
+            "select m.user_id from memberships m join users u on u.id = m.user_id \
+             where m.tenant_id = $1 and u.email_verified and u.deleted_at is null \
+             and lower(u.email) = lower($2) limit 1",
+        )
+        .bind(tenant)
+        .bind(email.trim())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(user)
     }
 
     async fn principal_names(
@@ -1000,16 +1079,18 @@ impl TenantStore for PgTenantStore {
         let token = secret::random_secret(INVITATION_PREFIX);
         let now = crate::now();
         let (kind, by, obo) = crate::identity::postgres::actor_cols(&ctx.actor);
+        // The token returned here is stored as a hash in `invitation_tokens` and goes into no
+        // mail (callers inside the server, such as the seed and the tests, use it). The mail
+        // worker mints its own token when it sends (decision 0003-3).
         let r = sqlx::query(crate::sql!(
-            "insert into invitations (id, tenant_id, email, role, token_hash, message, created_at, \
+            "insert into invitations (id, tenant_id, email, role, message, created_at, \
              created_kind, created_by, created_obo, expires_at, content_role) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {INVITATION_COLS}"
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning {INVITATION_COLS}"
         ))
         .bind(InvitationId::new())
         .bind(ctx.tenant)
         .bind(&email)
         .bind(role)
-        .bind(&secret::sha256(&token)[..])
         .bind(&message)
         .bind(now)
         .bind(kind)
@@ -1021,6 +1102,15 @@ impl TenantStore for PgTenantStore {
         .await
         .map_err(|e| unique_to_conflict(e.into(), "an open invitation for this email exists"))?;
         let inv = invitation_from(&r)?;
+        sqlx::query(
+            "insert into invitation_tokens (tenant_id, invitation_id, token_hash) \
+             values ($1, $2, $3)",
+        )
+        .bind(ctx.tenant)
+        .bind(inv.id)
+        .bind(&secret::sha256(&token)[..])
+        .execute(&mut *tx)
+        .await?;
         let inviter: String = sqlx::query_scalar("select display_name from users where id = $1")
             .bind(caller)
             .fetch_optional(&mut *tx)
@@ -1040,12 +1130,26 @@ impl TenantStore for PgTenantStore {
             }),
         )
         .await?;
+        // The mail goes through the outbox, in this transaction; the worker sends it.
+        crate::mailing::outbox::queue(
+            &mut tx,
+            ctx.tenant,
+            &inv.email,
+            Some(caller.0),
+            &crate::mailing::outbox::Queued::Invitation {
+                invitation_id: inv.id.0,
+                fields: crate::mailing::InvitationFields {
+                    space: t.name.clone(),
+                    inviter,
+                    role: inv.role,
+                    expires_at: inv.expires_at,
+                    message: message.clone(),
+                },
+            },
+        )
+        .await?;
         tx.commit().await?;
-        let url = memory::accept_url(&self.area.public_url, &token);
-        let mail = mail::invitation_mail(&inv.email, &t.name, &inviter, &url, message.as_deref());
-        if let Err(e) = self.area.mailer.send(mail).await {
-            tracing::warn!(error = %e, "the invitation email was not sent");
-        }
+        crate::mailing::outbox::wake();
         Ok((inv, token))
     }
 
@@ -1121,8 +1225,11 @@ impl TenantStore for PgTenantStore {
         // The token lookup is a system lookup (the tenant is not known yet); every write after
         // it runs under the row-level security of the invitation's tenant.
         let mut tx = self.area.system().await?;
+        // A token works only while its invitation is pending: revoked, expired (and accepted
+        // by someone else, below) invitations end all their tokens (decision 0003-3).
         let r = sqlx::query(crate::sql!(
-            "select {INVITATION_COLS}, accepted_by from invitations where token_hash = $1 \
+            "select {INVITATION_COLS}, accepted_by from invitations where id = \
+             (select invitation_id from invitation_tokens where token_hash = $1) \
              and revoked_at is null and expires_at > now() for update"
         ))
         .bind(&secret::sha256(token.trim())[..])
@@ -1193,6 +1300,7 @@ impl TenantStore for PgTenantStore {
             idempotency_key: None,
         };
         let (bound_tuples, bound) = bind_email_grants(&mut tx, &ctx, &inv.email, user).await?;
+        let bound = bound.count();
         tuples.extend(bound_tuples);
         let outbox = enqueue(&mut tx, t, &tuples).await?;
         audit(

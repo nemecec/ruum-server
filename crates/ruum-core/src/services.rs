@@ -98,6 +98,8 @@ impl Services {
             journal.clone(),
         ));
         area.set_member_cleanup(sharing.clone());
+        // Share emails go through the area's mailer (in memory: sent at once).
+        sharing.set_mail(area.deps.mailer.clone(), area.deps.public_url.clone());
         area.set_root_created(nodes.clone());
         nodes.set_tenants(tenants.clone());
         let tags = Arc::new(MemoryTagStore::new(

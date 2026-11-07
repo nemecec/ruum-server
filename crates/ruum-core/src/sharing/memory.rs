@@ -14,7 +14,9 @@ use crate::authz::{self, Authz, Permission, RelationshipUpdate, tuples};
 use crate::error::{Error, ErrorCode};
 use crate::journal::memory::MemoryJournal;
 use crate::journal::{ChangeInfo, EventType, NewEntry};
+use crate::mailing::rate::MemoryCounters;
 use crate::nodes::NodeStore;
+use crate::tenants::mail::Mailer;
 use crate::tenants::{MemberRole, TenantStore};
 use serde_json::json;
 use std::collections::HashMap;
@@ -63,6 +65,13 @@ pub struct MemorySharingStore {
     /// Held across a whole grant change (`update_grant`, `remove_grant`), so two concurrent
     /// changes of one grant never both act on the same old role.
     grant_writes: tokio::sync::Mutex<()>,
+    /// The mailer and the public URL of share emails ([`MemorySharingStore::set_mail`]).
+    /// Without them no share email is sent (`notified: false`).
+    mail: std::sync::OnceLock<(Arc<dyn Mailer>, String)>,
+    /// The `addGrant` and share mail limits.
+    counters: MemoryCounters,
+    /// The share mails sent: tenant, recipient (lower case), node and time.
+    recent_mails: Mutex<Vec<(TenantId, String, NodeId, OffsetDateTime)>>,
 }
 
 impl std::fmt::Debug for MemorySharingStore {
@@ -88,7 +97,91 @@ impl MemorySharingStore {
             journal,
             state: Mutex::new(State::default()),
             grant_writes: tokio::sync::Mutex::new(()),
+            mail: std::sync::OnceLock::new(),
+            counters: MemoryCounters::default(),
+            recent_mails: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Sends share emails with `mailer`, with links to `public_url`. The in-memory store sends
+    /// at once (there is no outbox in memory). Set once; later calls are ignored.
+    pub fn set_mail(&self, mailer: Arc<dyn Mailer>, public_url: String) {
+        let _ = self.mail.set((mailer, public_url));
+    }
+
+    /// Sends the share email of a new grant (see the Postgres store's `queue_share_mail` for
+    /// the rules). Returns whether a mail was sent.
+    async fn share_mail(
+        &self,
+        ctx: &Context,
+        node: &Node,
+        grantee: &Grantee,
+        role: Role,
+        message: Option<&str>,
+    ) -> Result<bool> {
+        use crate::mailing::{self as m, ShareFields};
+        let Some((mailer, public_url)) = self.mail.get() else {
+            return Ok(false);
+        };
+        let Some(sender) = ctx.actor.effective_user() else {
+            return Ok(false);
+        };
+        let names = self
+            .tenants
+            .principal_names(ctx.tenant, &[sender.0, grantee_user(grantee)])
+            .await?;
+        let (to, email_grant) = match grantee {
+            Grantee::Email { email } => (email.clone(), true),
+            Grantee::User { id } => match names.get(&id.0).and_then(|n| n.email.clone()) {
+                Some(to) if !to.is_empty() => (to, false),
+                _ => return Ok(false),
+            },
+            Grantee::TenantMembers => return Ok(false),
+        };
+        let me = names.get(&sender.0);
+        let sender_email = me.and_then(|n| n.email.clone()).unwrap_or_default();
+        if to.eq_ignore_ascii_case(&sender_email) {
+            return Ok(false);
+        }
+        let now = crate::now();
+        let key = to.to_lowercase();
+        {
+            let mut recent = self.recent_mails.lock().unwrap_or_else(|e| e.into_inner());
+            let since = now - time::Duration::seconds(m::SHARE_MAIL_REPEAT_SECONDS);
+            recent.retain(|r| r.3 > since);
+            if recent
+                .iter()
+                .any(|r| r.0 == ctx.tenant && r.1 == key && r.2 == node.id)
+            {
+                return Ok(false);
+            }
+            let user_key = m::share_mail_user_key(sender.0);
+            let w = m::SHARE_MAIL_WINDOW_SECONDS;
+            if self.counters.peek(ctx.tenant, &user_key, w) >= m::SHARE_MAIL_PER_USER
+                || self.counters.peek(ctx.tenant, m::SHARE_MAIL_TENANT_KEY, w)
+                    >= m::SHARE_MAIL_PER_TENANT
+            {
+                return Ok(false);
+            }
+            self.counters.hit(ctx.tenant, &user_key, w);
+            self.counters.hit(ctx.tenant, m::SHARE_MAIL_TENANT_KEY, w);
+            recent.push((ctx.tenant, key, node.id, now));
+        }
+        let fields = ShareFields {
+            sharer: me.map(|n| n.display_name.clone()).unwrap_or_default(),
+            item: node.name.clone(),
+            folder: node.kind == crate::nodes::NodeKind::Folder,
+            role,
+            message: message.map(str::to_string),
+            email_grant,
+            // The in-memory names carry no verified flag; members' emails are verified there.
+            reply_to: (!sender_email.is_empty()).then_some(sender_email),
+        };
+        let mail = fields.render(&to, public_url, ctx.tenant.0, node.id.0);
+        if let Err(e) = mailer.send(mail).await {
+            tracing::warn!(error = %e, "the share email was not sent");
+        }
+        Ok(true)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -136,14 +229,15 @@ impl MemorySharingStore {
     }
 
     /// Binds the email grants of `email` in `tenant` to `user` (invitation accepted, or a verified
-    /// email of a trusted provider). Returns how many grants were bound.
+    /// email of a trusted provider). Returns the bound grants.
     pub async fn bind_email_grants(
         &self,
         tenant: TenantId,
         email: &str,
         user: UserId,
-    ) -> Result<usize> {
+    ) -> Result<Vec<Grant>> {
         let mut updates = Vec::new();
+        let done;
         {
             let mut st = self.state();
             let taken: Vec<NodeId> = st
@@ -167,6 +261,7 @@ impl MemorySharingStore {
                     bound.push(g.grant.clone());
                 }
             }
+            done = bound.clone();
             for g in bound {
                 st.index.push(IndexRow {
                     tenant,
@@ -179,11 +274,10 @@ impl MemorySharingStore {
                 });
             }
         }
-        let n = updates.len();
-        if n > 0 {
+        if !updates.is_empty() {
             self.authz.write(updates).await?;
         }
-        Ok(n)
+        Ok(done)
     }
 }
 
@@ -221,13 +315,33 @@ impl SharingStore for MemorySharingStore {
         Ok(page_of(items, page.limit(), |g| g.id.0))
     }
 
-    async fn add_grant(
-        &self,
-        ctx: &Context,
-        node: NodeId,
-        grantee: Grantee,
-        role: Role,
-    ) -> Result<Written<Grant>> {
+    async fn share(&self, ctx: &Context, node: NodeId, req: NewGrant) -> Result<GrantAdded> {
+        use crate::mailing as m;
+        let NewGrant {
+            grantee,
+            role,
+            notify,
+            message,
+        } = req;
+        // The limits count every call, also refused ones (decision 0003-2).
+        let user = ctx
+            .actor
+            .effective_user()
+            .map(|u| u.0)
+            .unwrap_or(ctx.actor.actor.id.0);
+        let mine = self.counters.hit(
+            ctx.tenant,
+            &m::add_grant_user_key(user),
+            m::ADD_GRANT_WINDOW_SECONDS,
+        );
+        let all = self.counters.hit(
+            ctx.tenant,
+            m::ADD_GRANT_TENANT_KEY,
+            m::ADD_GRANT_WINDOW_SECONDS,
+        );
+        if mine > m::ADD_GRANT_PER_USER || all > m::ADD_GRANT_PER_TENANT {
+            return Err(m::add_grant_rate_limited());
+        }
         rules::check_grant(&*self.authz, &*self.nodes, ctx, node, role).await?;
         let n = self.nodes.get(ctx, node).await?;
         let email = rules::check_grantee(&grantee)?;
@@ -236,6 +350,26 @@ impl SharingStore for MemorySharingStore {
             None => grantee,
         };
         let policy = self.tenants.find(ctx.tenant).await?.policy;
+        let caller_role = match ctx.actor.effective_user() {
+            Some(u) => self.tenants.role_of(ctx.tenant, u).await?,
+            None => None,
+        };
+        // (a) and (a'), as in the Postgres store.
+        let grantee = match grantee {
+            Grantee::Email { email } if is_inside(caller_role) => {
+                match self.tenants.verified_person(ctx.tenant, &email).await? {
+                    Some(id) => Grantee::User { id },
+                    None => Grantee::Email { email },
+                }
+            }
+            Grantee::Email { email } => {
+                if !policy.allow_guests {
+                    return Err(rules::guests_refused());
+                }
+                Grantee::Email { email }
+            }
+            other => other,
+        };
         match &grantee {
             Grantee::User { id } => {
                 // Only people already in the tenant (see the Postgres store).
@@ -314,11 +448,20 @@ impl SharingStore for MemorySharingStore {
             ctx,
             &n,
             EventType::GrantAdded,
-            json!({ "grant_id": grant.id, "grantee": grant.grantee, "role": role }),
+            rules::grant_added_data(grant.id, &grant.grantee, role),
         )?;
-        Ok(Written {
-            value: grant,
-            change,
+        let notified = if notify {
+            self.share_mail(ctx, &n, &grant.grantee, role, message.as_deref())
+                .await?
+        } else {
+            false
+        };
+        Ok(GrantAdded {
+            written: Written {
+                value: grant,
+                change,
+            },
+            notified,
         })
     }
 
@@ -681,6 +824,14 @@ pub(crate) fn page_of<T>(mut items: Vec<T>, limit: u32, key: impl Fn(&T) -> uuid
     Page { items, next_cursor }
 }
 
+/// The user of a user grantee, or the nil UUID.
+fn grantee_user(g: &Grantee) -> uuid::Uuid {
+    match g {
+        Grantee::User { id } => id.0,
+        _ => uuid::Uuid::nil(),
+    }
+}
+
 /// The role of a user in a tenant counts as "inside the tenant" (not a guest).
 pub(crate) fn is_inside(role: Option<MemberRole>) -> bool {
     matches!(
@@ -762,6 +913,50 @@ impl crate::tenants::MemberCleanup for MemorySharingStore {
 
     async fn invitation_accepted(&self, ctx: &Context, email: &str, user: UserId) -> Result<()> {
         self.bind_email_grants(ctx.tenant, email, user).await?;
+        Ok(())
+    }
+
+    /// Binds the email grants of `email` in every tenant (decision 0003-2 (b) and (c)): a
+    /// tenant where the user is not a member or guest makes them a guest, only while it allows
+    /// guests; otherwise it keeps its email grants.
+    async fn verified_email_signed_in(&self, email: &str, user: UserId) -> Result<()> {
+        let mut tenants: Vec<TenantId> = self
+            .state()
+            .grants
+            .iter()
+            .filter(|g| matches!(&g.grant.grantee, Grantee::Email { email: e } if e.eq_ignore_ascii_case(email)))
+            .map(|g| g.tenant)
+            .collect();
+        tenants.sort();
+        tenants.dedup();
+        for t in tenants {
+            let old = self.tenants.role_of(t, user).await?;
+            if old.is_none() && !self.tenants.find(t).await?.policy.allow_guests {
+                continue;
+            }
+            let bound = self.bind_email_grants(t, email, user).await?;
+            if old.is_none() && !bound.is_empty() {
+                let mut granted_by: Vec<crate::actor::PrincipalRef> = Vec::new();
+                for g in &bound {
+                    if !granted_by.contains(&g.created_by.actor) {
+                        granted_by.push(g.created_by.actor);
+                    }
+                }
+                let ids: Vec<GrantId> = bound.iter().map(|g| g.id).collect();
+                self.tenants
+                    .add_guest_from_email_grant(
+                        t,
+                        user,
+                        json!({
+                            "role": MemberRole::Guest,
+                            "via": "email_grant",
+                            "grant_ids": ids,
+                            "granted_by": granted_by,
+                        }),
+                    )
+                    .await?;
+            }
+        }
         Ok(())
     }
 }

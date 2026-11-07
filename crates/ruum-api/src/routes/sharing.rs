@@ -16,7 +16,7 @@ use ruum_core::authz::Role;
 use ruum_core::identity::{AccessClaims, TokenType};
 use ruum_core::paging::{Cursor, PageRequest};
 use ruum_core::sharing::rules::{LINK_ACCESS_TOKEN_SECONDS, link_scope};
-use ruum_core::sharing::{Grantee, NewShareLink, ShareLinkRole};
+use ruum_core::sharing::{Grantee, NewGrant, NewShareLink, ShareLinkRole};
 use ruum_core::tenants::MemberRole;
 use ruum_core::{ApiError, Error, ErrorCode, GrantId, NodeId, ShareLinkId};
 use serde::Deserialize;
@@ -148,7 +148,7 @@ pub async fn list_grants(
 pub struct AddGrantBody {
     pub grantee: Grantee,
     pub role: Role,
-    /// Sending an email to the grantee comes with the invitations of the identity area.
+    /// Queue a share email to the grantee (decision 0003-3). Default `true`.
     #[serde(default)]
     pub notify: Option<bool>,
     #[serde(default)]
@@ -171,17 +171,31 @@ pub async fn add_grant(
         )
         .into());
     }
-    let w = state
+    let added = state
         .services
         .sharing
-        .add_grant(&ctx, node, b.grantee, b.role)
+        .share(
+            &ctx,
+            node,
+            NewGrant {
+                grantee: b.grantee,
+                role: b.role,
+                notify: b.notify.unwrap_or(true),
+                message: b.message,
+            },
+        )
         .await?;
     if may_see_grantee_emails(&state, &ctx, node).await? {
         crate::names::allow_grantee_emails();
     }
+    let w = added.written;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "grant": to_json(&w.value)?, "change": to_json(&w.change)? })),
+        Json(json!({
+            "grant": to_json(&w.value)?,
+            "change": to_json(&w.change)?,
+            "notified": added.notified,
+        })),
     ))
 }
 
@@ -393,12 +407,36 @@ pub async fn resolve_share_link(
     ))
 }
 
+/// The query of `listSharedWithMe`.
+#[derive(Debug, Default, Deserialize)]
+pub struct SharedParams {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+    /// Check for email grants to bind now, also within the 60 seconds after the last check
+    /// (the item page of a share email; decision 0003-2). Web sessions only.
+    #[serde(default)]
+    pub check_email_grants: bool,
+}
+
 /// Shared with me. `GET /v1/shared-with-me` (operationId `listSharedWithMe`).
 pub async fn list_shared_with_me(
     State(state): State<AppState>,
     crate::auth::Principal(who): crate::auth::Principal,
-    q: Result<Query<PageParams>, QueryRejection>,
+    q: Result<Query<SharedParams>, QueryRejection>,
 ) -> ApiResult<Json<Value>> {
+    let Query(params) = q.map_err(|e| {
+        Error::Api(
+            ApiError::new(ErrorCode::BadRequest, format!("bad query parameters: {e}"))
+                .with_hint("see the parameters of this operation in contracts/openapi.yaml"),
+        )
+    })?;
+    // A web session binds pending email grants first (decision 0003-2 (b)); agents, app
+    // passwords and tokens never do.
+    crate::routes::auth::bind_for_session(&state, &who, params.check_email_grants).await;
+    let page_req = PageRequest {
+        cursor: params.cursor.map(Cursor),
+        limit: params.limit,
+    };
     // No `Ruum-Tenant` header (the list spans every tenant of the user). Bound credentials
     // (agents) use their tenant; for a user the context tenant is not read (the user's
     // memberships decide), so the nil tenant stands in.
@@ -416,7 +454,7 @@ pub async fn list_shared_with_me(
     let p = state
         .services
         .sharing
-        .shared_with_me(&ctx, page(q)?)
+        .shared_with_me(&ctx, page_req)
         .await?;
     Ok(Json(to_json(&p)?))
 }
@@ -522,6 +560,200 @@ mod tests {
         let stored = String::from_utf8_lossy(rows[0].1.as_deref().unwrap_or_default());
         assert!(!stored.contains("ruum_link_"), "{stored}");
         assert!(!stored.contains(&token));
+    }
+
+    /// Email grants that bind (decision 0003-2) over HTTP, on the in-memory services: a share
+    /// by email answers `notified`; the next sign-in binds it and makes the person a guest; a
+    /// guest's share to a signed-in person waits for the 60-second throttle of `getMe`, which
+    /// `listSharedWithMe?check_email_grants=true` skips; a bearer token never binds.
+    #[tokio::test]
+    async fn email_grants_bind_in_web_sessions_only() {
+        use crate::routes::auth::tests::{call, sign_in};
+        use axum::http::Method;
+        use ruum_core::identity::memory::MemoryOidcClient;
+        use std::sync::Arc;
+
+        let mut s = ruum_core::Services::in_memory();
+        let oidc = Arc::new(MemoryOidcClient::default());
+        s.oidc = oidc.clone();
+        let tokens = s.tokens.clone();
+        let app = crate::router(AppState::new(s, crate::ApiConfig::default()));
+        let session = |sess: &str, csrf: &str| {
+            (
+                format!("ruum_session={sess}; ruum_csrf={csrf}"),
+                csrf.to_string(),
+            )
+        };
+
+        // Ann shares her root with Ben's email; Ben has no account yet.
+        let (sa, ca) = sign_in(&app, &oidc, "ann@example.test").await;
+        let (ann, ann_csrf) = session(&sa, &ca);
+        let tenants = call(&app, Method::GET, "/v1/tenants", &[("cookie", &ann)], None).await;
+        let tenant = &tenants.body["items"][0]["tenant"];
+        let tid = tenant["id"].as_str().unwrap().to_string();
+        let root = tenant["root_node_id"].as_str().unwrap().to_string();
+        let ann_h = [
+            ("cookie", ann.as_str()),
+            ("ruum-csrf", ann_csrf.as_str()),
+            ("ruum-tenant", tid.as_str()),
+        ];
+        let r = call(
+            &app,
+            Method::POST,
+            &format!("/v1/nodes/{root}/grants"),
+            &ann_h,
+            Some(json!({ "grantee": { "type": "email", "email": "ben@example.test" }, "role": "view" })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        assert_eq!(r.body["grant"]["grantee"]["type"], "email");
+        assert_eq!(r.body["notified"], true);
+        let r = call(
+            &app,
+            Method::POST,
+            &format!("/v1/nodes/{root}/grants"),
+            &ann_h,
+            Some(json!({ "grantee": { "type": "email", "email": "eve@example.test" }, "role": "view", "notify": false })),
+        )
+        .await;
+        assert_eq!(r.body["notified"], false);
+
+        // Ben signs in: the grant binds and Ben is a guest of Ann's space.
+        let (sb, cb) = sign_in(&app, &oidc, "ben@example.test").await;
+        let (ben, ben_csrf) = session(&sb, &cb);
+        let ben_h = [
+            ("cookie", ben.as_str()),
+            ("ruum-csrf", ben_csrf.as_str()),
+            ("ruum-tenant", tid.as_str()),
+        ];
+        let r = call(
+            &app,
+            Method::GET,
+            &format!("/v1/nodes/{root}"),
+            &ben_h,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+        // Ann makes a folder and gives Ben (a guest now) manage on it: by email, Ann gets a
+        // user grant, because Ben is a person of the space (rule (a)).
+        let r = call(
+            &app,
+            Method::POST,
+            "/v1/nodes",
+            &ann_h,
+            Some(json!({ "parent_id": root, "name": "Plans", "kind": "folder" })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        let folder = r.body["node"]["id"].as_str().unwrap().to_string();
+        let r = call(
+            &app,
+            Method::POST,
+            &format!("/v1/nodes/{folder}/grants"),
+            &ann_h,
+            Some(json!({ "grantee": { "type": "email", "email": "BEN@example.test" }, "role": "manage", "notify": false })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        assert_eq!(r.body["grant"]["grantee"]["type"], "user");
+
+        // Dan signs in (no grant yet). Then Ben, a guest, shares the folder with Dan's email:
+        // always an email grant (rule (a')).
+        let (sd, cd) = sign_in(&app, &oidc, "dan@example.test").await;
+        let (dan, dan_csrf) = session(&sd, &cd);
+        let r = call(
+            &app,
+            Method::POST,
+            &format!("/v1/nodes/{folder}/grants"),
+            &ben_h,
+            Some(json!({ "grantee": { "type": "email", "email": "dan@example.test" }, "role": "view" })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        assert_eq!(r.body["grant"]["grantee"]["type"], "email");
+        let dan_h = [
+            ("cookie", dan.as_str()),
+            ("ruum-csrf", dan_csrf.as_str()),
+            ("ruum-tenant", tid.as_str()),
+        ];
+        // getMe within 60 seconds of the sign-in does not check again.
+        let me = call(
+            &app,
+            Method::GET,
+            "/v1/me",
+            &[("cookie", dan.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(me.status, StatusCode::OK);
+        let dan_id = me.body["user"]["id"].as_str().unwrap().to_string();
+        let r = call(
+            &app,
+            Method::GET,
+            &format!("/v1/nodes/{folder}"),
+            &dan_h,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        // A bearer token never binds, also with the parameter.
+        let token = ruum_core::identity::issue_user_token(
+            tokens.as_ref(),
+            ruum_core::UserId(dan_id.parse().unwrap()),
+            600,
+        )
+        .unwrap();
+        let bearer = format!("Bearer {token}");
+        let r = call(
+            &app,
+            Method::GET,
+            "/v1/shared-with-me?check_email_grants=true",
+            &[("authorization", bearer.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body["items"].as_array().unwrap().len(), 0);
+        let r = call(
+            &app,
+            Method::GET,
+            "/v1/me",
+            &[("authorization", bearer.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let r = call(
+            &app,
+            Method::GET,
+            &format!("/v1/nodes/{folder}"),
+            &dan_h,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        // The item page of the share email forces the check: Dan gets the folder.
+        let r = call(
+            &app,
+            Method::GET,
+            "/v1/shared-with-me?check_email_grants=true",
+            &[("cookie", dan.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body["items"][0]["node"]["id"], folder.as_str());
+        let r = call(
+            &app,
+            Method::GET,
+            &format!("/v1/nodes/{folder}"),
+            &dan_h,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     }
 
     #[test]

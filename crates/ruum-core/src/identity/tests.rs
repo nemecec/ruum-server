@@ -81,6 +81,23 @@ impl Area {
     }
 }
 
+impl Area {
+    /// Sends the queued mails: the Postgres stores queue them in `mail_outbox` and the worker
+    /// sends them (one round here); the in-memory stores sent them already.
+    pub async fn deliver(&self) -> crate::mailing::outbox::Round {
+        match &self.pool {
+            Some(pool) => crate::mailing::outbox::run_once(
+                pool,
+                self.mailer.as_ref(),
+                "https://ruum.localhost",
+            )
+            .await
+            .unwrap(),
+            None => crate::mailing::outbox::Round::default(),
+        }
+    }
+}
+
 /// A node store that knows only tenant roots, for the scope subtree checks of the in-memory
 /// stores. Every other method is not used by the area.
 #[derive(Default)]

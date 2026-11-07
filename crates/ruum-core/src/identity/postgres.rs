@@ -600,6 +600,51 @@ impl IdentityStore for PgIdentityStore {
         Ok(())
     }
 
+    async fn bind_email_grants(&self, user: UserId, session: Uuid, force: bool) -> Result<usize> {
+        let mut tx = self.area.system().await?;
+        // The throttle: one check per session per minute, unless forced. A session of another
+        // user, or one that ended, binds nothing.
+        let due: Option<Uuid> = sqlx::query_scalar(
+            "update sessions set bind_checked_at = now() where id = $1 and user_id = $2 \
+             and ended_at is null and expires_at > now() \
+             and ($3 or bind_checked_at is null \
+                  or bind_checked_at < now() - make_interval(secs => $4)) returning id",
+        )
+        .bind(session)
+        .bind(user)
+        .bind(force)
+        .bind(BIND_CHECK_SECONDS as f64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if due.is_none() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "select email, email_verified from users where id = $1 and deleted_at is null",
+        )
+        .bind(user)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((email, true)) = row else {
+            tx.commit().await?;
+            return Ok(0);
+        };
+        // The cheap check on the index of email grants first.
+        let pending: bool = sqlx::query_scalar(
+            "select exists (select 1 from grants where grantee_kind = 'email' \
+             and lower(grantee_email) = lower($1))",
+        )
+        .bind(&email)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if !pending {
+            return Ok(0);
+        }
+        crate::tenants::postgres::bind_email_grants_on_sign_in(&self.area, &email, user).await
+    }
+
     async fn list_app_passwords(&self, ctx: &Context) -> Result<Vec<AppPassword>> {
         let user = require_user_actor(ctx)?;
         let mut tx = self.area.ctx(ctx).await?;

@@ -4,8 +4,9 @@
 # It builds ruum-server and the ruum CLI, starts the server on RUUM_E2E_PORT (default 8491)
 # and its WebDAV host on RUUM_E2E_DAV_PORT (default 8493) with the stack's Postgres, Garage and
 # SpiceDB, seeds a tenant, users and an agent key (`ruum-server seed-dev`), and then checks with
-# the CLI and curl: folders, chunked upload and download, versions, a copy, sharing, the changes
-# feed, MCP, WebDAV on its own host and tenant isolation.
+# the CLI and curl: folders, chunked upload and download, versions, a copy, sharing, a share email
+# in Mailpit (RUUM_E2E_MAILPIT_URL, default http://127.0.0.1:8025), the changes feed, MCP, WebDAV
+# on its own host and tenant isolation.
 #
 #   scripts/dev.sh up            # the stack must be healthy
 #   scripts/e2e_smoke.sh
@@ -192,6 +193,33 @@ expect 200 "$(api "$BOB_TOKEN" "" GET "/v1/shared-with-me")" "Bob lists Shared w
 [[ "$(body "[.items[] | select(.node.id == \"$FOLDER\" or .node_id == \"$FOLDER\")] | length")" -ge 1 ]] ||
   fail "Shared with me does not list the folder: $(cat "$WORK/body")"
 ok "Shared with me lists the folder"
+
+# ------------------------------------------------------------------ share email (Mailpit)
+say "share email to Mailpit (decision 0003-3)"
+MAILPIT="${RUUM_E2E_MAILPIT_URL:-http://127.0.0.1:8025}"
+SHARE_TO="e2e-share-$(openssl rand -hex 6)@example.test"
+REQ="$(jq -nc --arg e "$SHARE_TO" '{grantee: {type: "email", email: $e}, role: "view", message: "Hello from the smoke test"}')"
+expect 201 "$(api "$ALICE_TOKEN" "$TENANT_A" POST "/v1/nodes/$FOLDER/grants" "$REQ")" "Alice shares the folder with a new address"
+expect email "$(body '.grant.grantee.type')" "the grant stays an email grant"
+expect true "$(body '.notified')" "the answer says a share email was queued"
+MAIL_ID=""
+for _ in $(seq 1 40); do
+  curl -fsS -G "$MAILPIT/api/v1/search" --data-urlencode "query=to:\"$SHARE_TO\"" >"$WORK/mails.json" 2>/dev/null || true
+  MAIL_ID="$(jq -r '.messages[0].ID // empty' "$WORK/mails.json" 2>/dev/null || true)"
+  [[ -n "$MAIL_ID" ]] && break
+  sleep 0.5
+done
+[[ -n "$MAIL_ID" ]] || fail "no share email to $SHARE_TO in Mailpit ($MAILPIT)"
+ok "the share email reached Mailpit"
+curl -fsS "$MAILPIT/api/v1/message/$MAIL_ID" >"$WORK/mail.json"
+jq -r '.Subject' "$WORK/mail.json" | grep -q 'shared "Shared" with you' || fail "share email subject: $(jq -r '.Subject' "$WORK/mail.json")"
+ok "the subject names the folder: $(jq -r '.Subject' "$WORK/mail.json")"
+jq -r '.Text' "$WORK/mail.json" | grep -qF "$BASE/t/$TENANT_A/files/$FOLDER" || fail "share email has no item link: $(jq -r '.Text' "$WORK/mail.json")"
+ok "the mail links to the folder page"
+jq -r '.Text' "$WORK/mail.json" | grep -q "Hello from the smoke test" || fail "share email has no message"
+jq -r '.Text, .HTML' "$WORK/mail.json" | grep -qi "token" && fail "the share email carries a token"
+[[ -n "$(jq -r '.HTML // empty' "$WORK/mail.json")" ]] || fail "the share email has no HTML part"
+ok "the mail has the message, an HTML part and no token"
 
 # ------------------------------------------------------------------ changes
 say "changes feed"

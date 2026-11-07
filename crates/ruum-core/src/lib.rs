@@ -19,6 +19,7 @@ pub mod authz;
 pub mod blobs;
 pub mod identity;
 pub mod journal;
+pub mod mailing;
 pub mod nodes;
 pub mod search;
 pub mod sharing;

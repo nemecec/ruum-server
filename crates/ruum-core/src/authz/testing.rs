@@ -201,6 +201,40 @@ impl TenantStore for TestTenants {
                     .is_some_and(|r| *r != MemberRole::Guest)
         }))
     }
+    async fn verified_person(&self, tenant: TenantId, email: &str) -> Result<Option<UserId>> {
+        let roles = self.roles.read().unwrap();
+        Ok(self
+            .verified_emails
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(u, e)| {
+                e.eq_ignore_ascii_case(email.trim()) && roles.contains_key(&(tenant, **u))
+            })
+            .map(|(u, _)| *u))
+    }
+    async fn principal_names(
+        &self,
+        tenant: TenantId,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, crate::tenants::PrincipalName>> {
+        let roles = self.roles.read().unwrap();
+        let emails = self.verified_emails.read().unwrap();
+        Ok(ids
+            .iter()
+            .filter(|id| roles.contains_key(&(tenant, UserId(**id))))
+            .map(|id| {
+                (
+                    *id,
+                    crate::tenants::PrincipalName {
+                        display_name: format!("User {}", &id.to_string()[..8]),
+                        email: emails.get(&UserId(*id)).cloned(),
+                        owner: None,
+                    },
+                )
+            })
+            .collect())
+    }
     async fn list_members(&self, _: &Context, _: PageRequest) -> Result<Page<Member>> {
         unimplemented!()
     }

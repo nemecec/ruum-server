@@ -289,6 +289,29 @@ pub trait TenantStore: Send + Sync {
         let _ = (tenant, email);
         Ok(false)
     }
+    /// The person of the tenant (member, admin, owner or guest) whose verified email is
+    /// `email`, case-insensitive (decision 0003-2 (a)). A system lookup in this tenant only;
+    /// `addGrant` calls it only for callers who may list the members anyway. The default knows
+    /// nobody.
+    async fn verified_person(&self, tenant: TenantId, email: &str) -> Result<Option<UserId>> {
+        let _ = (tenant, email);
+        Ok(None)
+    }
+    /// Makes `user` a guest of the tenant because an email grant bound to them (decision
+    /// 0003-2 (c)): the membership, its tuples and the audit row `member.added` with
+    /// `data` (`via: email_grant`, the grant IDs and their creators). The caller has checked
+    /// that the user is not in the tenant and that the policy allows guests. Only the in-memory
+    /// store needs it (the Postgres store does it in the transaction of the bind); the default
+    /// does nothing.
+    async fn add_guest_from_email_grant(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+        data: serde_json::Value,
+    ) -> Result<()> {
+        let _ = (tenant, user, data);
+        Ok(())
+    }
     /// The names of `ids` in the tenant, for the names in answers (C-7, decision 0003-5). A
     /// lookup in this tenant only, with no access check: the API calls it only for principals
     /// that an answer it may send already names. In this order: current members and guests

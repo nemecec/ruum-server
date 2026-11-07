@@ -33,9 +33,12 @@ use time::OffsetDateTime;
 pub enum Grantee {
     /// A user by ID (a member or a guest).
     User { id: UserId },
-    /// A person by email. The grant stays an email grant and sends an invitation. It binds to a
-    /// user only through the invitation token, or a verified email of a trusted provider; an
-    /// unverified email never claims it.
+    /// A person by email (decision 0003-2). When the caller may list the members (a member,
+    /// admin or owner, or an agent of one) and the email is the verified email of a person of
+    /// the tenant, `addGrant` stores a user grant instead. Otherwise it stays an email grant,
+    /// which binds to a user only by a verified email in an interactive user session (sign-in,
+    /// or the bind check of `getMe` and `listSharedWithMe` with the session cookie), or through
+    /// an accepted admin invitation; an unverified email never claims it.
     Email { email: String },
     /// Everybody in the tenant of the node (`tenant#member`).
     TenantMembers,
@@ -117,6 +120,27 @@ pub struct NewShareLink {
     pub password: Option<String>,
 }
 
+/// A request of `addGrant`.
+#[derive(Clone, Debug)]
+pub struct NewGrant {
+    pub grantee: Grantee,
+    pub role: Role,
+    /// Queue a share email to the grantee (decision 0003-3). The default of the API is `true`.
+    pub notify: bool,
+    /// The personal message of the share email (at most 1000 characters).
+    pub message: Option<String>,
+}
+
+/// The answer of `addGrant`.
+#[derive(Clone, Debug)]
+pub struct GrantAdded {
+    pub written: Written<Grant>,
+    /// A share email was queued in the same transaction as the grant (it says nothing about
+    /// delivery). False without `notify`, for a grant to `tenant_members`, over the mail
+    /// limits, or when the same recipient got a mail for the node in the last 10 minutes.
+    pub notified: bool,
+}
+
 /// One row of "Shared with me".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SharedItem {
@@ -136,14 +160,28 @@ pub trait SharingStore: Send + Sync {
         node: NodeId,
         page: PageRequest,
     ) -> Result<Page<Grant>>;
-    /// Adds a grant. Needs the `share` permission on the node.
+    /// Adds a grant (`addGrant`). Needs the `share` permission on the node. Counts against the
+    /// `addGrant` limits first, also when the call is refused (decision 0003-2): 60 calls per
+    /// 10 minutes per caller user (agents count against their user) and tenant, 600 per
+    /// tenant; over the limit it fails with `rate_limited`. With `notify` it queues the share
+    /// email in the grant's transaction (decision 0003-3).
+    async fn share(&self, ctx: &Context, node: NodeId, req: NewGrant) -> Result<GrantAdded>;
+    /// [`SharingStore::share`] without a share email.
     async fn add_grant(
         &self,
         ctx: &Context,
         node: NodeId,
         grantee: Grantee,
         role: Role,
-    ) -> Result<Written<Grant>>;
+    ) -> Result<Written<Grant>> {
+        let req = NewGrant {
+            grantee,
+            role,
+            notify: false,
+            message: None,
+        };
+        Ok(self.share(ctx, node, req).await?.written)
+    }
     /// Changes the role of a grant in one step (`grant.updated`). Needs `share` on the node.
     async fn update_grant(
         &self,
