@@ -11,11 +11,19 @@
 //!
 //! **The hand-over of a copy.** A `TEMPLATE` copy holds the source's objects with the
 //! source's owners and grants. Before the copy is handed out, `ruum_dbhost` drops the objects of
-//! the source's `mask` (as that `mask`), reassigns the tables of the source's `owner` to the
+//! the source's `mask` (as that `mask`), reassigns the objects of the source's `owner` to the
 //! copy's `owner` (`REASSIGN OWNED`, which needs `ruum_dbhost` to hold `INHERIT` membership in
-//! both owners for the length of the hand-over; it is revoked right after, also on failure),
-//! revokes every right of the source's roles in the copy, and builds the copy's grants, key,
-//! functions and lens views. At rest `ruum_dbhost` holds membership in no LOGIN kind.
+//! the old owner and `INHERIT` and `SET` in the new one; both are revoked right after that
+//! step, also on failure), revokes every right of the source's roles in the copy, and builds the
+//! copy's grants and functions. At rest `ruum_dbhost` holds membership in no LOGIN kind.
+//!
+//! A schema-only or masked copy changes tenant tables, and that can run tenant code: triggers,
+//! rules, checks, policies. That step never runs on a `ruum_dbhost` connection (review E-2,
+//! B-1): the copy's own `owner` runs it in a session of its own, after it disables the enabled
+//! triggers and rules of its tables and lifts forced row-level security, and it puts each one
+//! back in its old state afterwards. So tenant code runs at most with the rights of the copy's
+//! `owner`, which a migration of the copy has anyway. Then `ruum_dbhost` installs the copy's key
+//! and builds the lens views.
 //!
 //! **Restore points.** Point-in-time restore is card E-4. A restore point here is
 //! `pg_create_restore_point` (or the current WAL position when `ruum_dbhost` may not call it)
@@ -188,21 +196,23 @@ pub(crate) async fn resume(engine: &PostgresEngine, name: &str) -> Result<(), En
     set_allow_connections(engine, name, true).await
 }
 
-/// Grants (or revokes) `ruum_dbhost` `INHERIT` membership in `roles` for a hand-over.
+/// Grants (or revokes) `ruum_dbhost` the memberships of a hand-over: `INHERIT` in the old
+/// owner, `INHERIT` and `SET` in the new owner (`REASSIGN OWNED` gives a function, a type or
+/// another object that is not a table to the new owner only with `SET` in it).
 async fn membership(
     engine: &PostgresEngine,
-    roles: &[&str],
+    old_owner: &str,
+    new_owner: &str,
     grant: bool,
 ) -> Result<(), EngineError> {
-    let list = roles
-        .iter()
-        .map(|r| ident(r))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let (old_owner, new_owner) = (ident(old_owner), ident(new_owner));
     let sql = if grant {
-        format!("grant {list} to ruum_dbhost with inherit true, set false")
+        format!(
+            "grant {old_owner} to ruum_dbhost with inherit true, set false;\n\
+             grant {new_owner} to ruum_dbhost with inherit true, set true"
+        )
     } else {
-        format!("revoke {list} from ruum_dbhost")
+        format!("revoke {old_owner}, {new_owner} from ruum_dbhost")
     };
     let mut admin = engine.admin().await?;
     run(&mut admin, "change the hand-over membership", sql).await
@@ -327,6 +337,12 @@ enum Data<'a> {
 
 /// Hands a fresh copy (made from a template whose objects belong to `old`) over to `new_roles`,
 /// masks or empties it, installs `key`, rebuilds the lens and opens it to its roles.
+///
+/// Three steps (review E-2, B-1): `ruum_dbhost` takes the objects over; then the copy's own
+/// `owner` empties or masks the tables in a session of its own (the only step that runs tenant
+/// code, such as checks, policies and index expressions); then `ruum_dbhost` installs the key and
+/// builds the lens. No tenant code runs on a `ruum_dbhost` connection, so none runs with its
+/// `CREATEROLE` and its `ADMIN` on the roles of other databases.
 async fn hand_over(
     engine: &PostgresEngine,
     name: &str,
@@ -346,13 +362,25 @@ async fn hand_over(
     let old_owner = role(old, RoleKind::Owner);
     let new_owner = role(new_roles, RoleKind::Owner);
     let old_mask = role(old, RoleKind::Mask);
+    let new_mask = role(new_roles, RoleKind::Mask);
+    let masked = matches!(data, Data::Masked(..));
+    // A masked copy is masked with the source's key; the copy's key comes in step 3
+    // (decision 0004-25).
+    let first_key = match &data {
+        Data::Masked(_, source_key) => *source_key,
+        _ => key,
+    };
     setup::create_roles(engine, new_roles).await?;
-    membership(engine, &[&old_owner, &new_owner], true).await?;
+    // 1. ruum_dbhost takes the objects over. The memberships last for this step only.
+    membership(engine, &old_owner, &new_owner, true).await?;
     // `ruum_dbhost` needs SET on the old mask: it has it (decision 0004-34 a).
     let mut conn = engine.dbhost(name).await?;
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
         drop_old_mask_objects(&mut conn, &old_mask).await?;
+        // The schema rights first: a function or a type goes to a new owner only when that
+        // owner may create in its schema.
+        run(&mut conn, "grant the schemas", setup::grants_sql(new_roles)).await?;
         run(
             &mut conn,
             "reassign the tables",
@@ -371,8 +399,7 @@ async fn hand_over(
             )));
         }
         setup::write_meta(&mut conn, new.tenant_id, new.node_id, new_roles).await?;
-        run(&mut conn, "grant the schemas", setup::grants_sql(new_roles)).await?;
-        let mask = ident(&role(new_roles, RoleKind::Mask));
+        let mask = ident(&new_mask);
         run(
             &mut conn,
             "grant the tables",
@@ -387,18 +414,34 @@ async fn hand_over(
             ),
         )
         .await?;
-        match data {
-            Data::Keep => setup::install_functions(&mut conn, new_roles, key).await?,
-            Data::SchemaOnly => {
-                setup::install_functions(&mut conn, new_roles, key).await?;
-                empty_tables(&mut conn).await?;
-            }
-            Data::Masked(plan, source_key) => {
-                // Mask with the source's key, then install the copy's key (decision 0004-25).
-                setup::install_functions(&mut conn, new_roles, source_key).await?;
-                mask_columns(&mut conn, new_roles, plan).await?;
-                setup::install_key(&mut conn, new_roles, key).await?;
-            }
+        setup::install_functions(&mut conn, new_roles, first_key).await?;
+        if masked {
+            pseudonyms_for_owner(&mut conn, &new_mask, &new_owner, true).await?;
+        }
+        run(&mut conn, "commit", "commit".to_string()).await
+    }
+    .await;
+    let _ = conn.close().await;
+    let revoked = membership(engine, &old_owner, &new_owner, false).await;
+    result?;
+    revoked?;
+    // 2. The copy's owner empties or masks its tables, in a session of its own.
+    if !matches!(data, Data::Keep) {
+        let owner = new_roles
+            .iter()
+            .find(|r| r.kind == RoleKind::Owner)
+            .cloned()
+            .expect("an owner role");
+        setup::grant_connect(engine, name, std::slice::from_ref(&owner)).await?;
+        change_data(engine, name, new, new_roles, &data).await?;
+    }
+    // 3. ruum_dbhost installs the copy's key and builds the lens.
+    let mut conn = engine.dbhost(name).await?;
+    let result = async {
+        run(&mut conn, "begin", "begin".to_string()).await?;
+        if masked {
+            pseudonyms_for_owner(&mut conn, &new_mask, &new_owner, false).await?;
+            setup::install_key(&mut conn, new_roles, key).await?;
         }
         let catalog = catalog::read(&mut conn).await?;
         let spec = setup::read_lens_spec(&mut conn).await?;
@@ -407,10 +450,141 @@ async fn hand_over(
     }
     .await;
     let _ = conn.close().await;
-    let revoked = membership(engine, &[&old_owner, &new_owner], false).await;
     result?;
-    revoked?;
     setup::grant_connect(engine, name, new_roles).await
+}
+
+/// Lets the copy's `owner` compute pseudonyms for the length of the masking (`USAGE` on
+/// `ruum_mask`, `EXECUTE` on `pseudonym` and `pseudonym_other` only), or takes that back.
+async fn pseudonyms_for_owner(
+    conn: &mut PgConnection,
+    mask: &str,
+    owner: &str,
+    grant: bool,
+) -> Result<(), EngineError> {
+    let owner = ident(owner);
+    let (verb, to) = if grant {
+        ("grant", "to")
+    } else {
+        ("revoke", "from")
+    };
+    run(
+        conn,
+        "change the owner's right on ruum_mask",
+        format!("{verb} usage on schema ruum_mask {to} {owner}"),
+    )
+    .await?;
+    run(
+        conn,
+        "become mask",
+        format!("set local role {}", ident(mask)),
+    )
+    .await?;
+    let rows = sqlx::query(
+        "select p.oid::pg_catalog.regprocedure::text from pg_catalog.pg_proc p
+          where p.pronamespace = 'ruum_mask'::pg_catalog.regnamespace
+            and p.proname in ('pseudonym', 'pseudonym_other')",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the pseudonym functions", e))?;
+    for row in rows {
+        let function: String = row.get(0);
+        run(
+            conn,
+            "change the owner's right on a pseudonym function",
+            format!("{verb} execute on function {function} {to} {owner}"),
+        )
+        .await?;
+    }
+    run(conn, "leave mask", "reset role".to_string()).await
+}
+
+/// Step 2 of a hand-over, in a session of the copy's `owner` (it owns every table and holds
+/// none of `ruum_dbhost`'s rights): parks the tenant's triggers, rules and forced row-level
+/// security, empties or masks the tables, and puts the tenant code back as it was.
+async fn change_data(
+    engine: &PostgresEngine,
+    name: &str,
+    new: &NewDatabase,
+    new_roles: &[EngineRole],
+    data: &Data<'_>,
+) -> Result<(), EngineError> {
+    let state = DbState::new(
+        name.to_string(),
+        Meta {
+            tenant_id: new.tenant_id,
+            node_id: new.node_id,
+            roles: new_roles.to_vec(),
+        },
+    );
+    let (mut conn, _) = engine.pool(&state, RoleKind::Owner).open(engine).await?;
+    let result = async {
+        run(&mut conn, "begin", "begin".to_string()).await?;
+        let parked = park_tenant_code(&mut conn).await?;
+        match data {
+            Data::Keep => {}
+            Data::SchemaOnly => empty_tables(&mut conn).await?,
+            Data::Masked(plan, _) => mask_columns(&mut conn, plan).await?,
+        }
+        for sql in parked {
+            run(&mut conn, "put the tenant code back", sql).await?;
+        }
+        run(&mut conn, "commit", "commit".to_string()).await
+    }
+    .await;
+    let _ = conn.close().await;
+    result
+}
+
+/// Disables every enabled trigger and rule of the current user's tables and lifts forced
+/// row-level security, so the owner's data change reaches every row and no `DO INSTEAD` rule or
+/// trigger skips one. Returns the statements that put each one back in its old state (`ENABLE`,
+/// `ENABLE REPLICA` or `ENABLE ALWAYS`): the triggers of partitioned tables before the clones
+/// on their partitions, so a clone keeps its own state.
+async fn park_tenant_code(conn: &mut PgConnection) -> Result<Vec<String>, EngineError> {
+    let rows = sqlx::query(
+        "with mine as (
+           select c.oid, c.relforcerowsecurity from pg_catalog.pg_class c
+            where c.relowner = (select oid from pg_catalog.pg_roles where rolname = current_user)
+              and c.relkind in ('r', 'p'))
+         select case when t.tgparentid = 0 then 0 else 1 end as ord,
+                pg_catalog.format('alter table %s disable trigger %I',
+                  t.tgrelid::pg_catalog.regclass, t.tgname) as park,
+                pg_catalog.format('alter table %s %s trigger %I', t.tgrelid::pg_catalog.regclass,
+                  case t.tgenabled when 'R' then 'enable replica' when 'A' then 'enable always'
+                    else 'enable' end, t.tgname) as back
+           from pg_catalog.pg_trigger t join mine m on m.oid = t.tgrelid
+          where not t.tgisinternal and t.tgenabled <> 'D'
+         union all
+         select 2,
+                pg_catalog.format('alter table %s disable rule %I',
+                  r.ev_class::pg_catalog.regclass, r.rulename),
+                pg_catalog.format('alter table %s %s rule %I', r.ev_class::pg_catalog.regclass,
+                  case r.ev_enabled when 'R' then 'enable replica' when 'A' then 'enable always'
+                    else 'enable' end, r.rulename)
+           from pg_catalog.pg_rewrite r join mine m on m.oid = r.ev_class
+          where r.ev_enabled <> 'D' and r.rulename <> '_RETURN'
+         union all
+         select 3,
+                pg_catalog.format('alter table %s no force row level security',
+                  m.oid::pg_catalog.regclass),
+                pg_catalog.format('alter table %s force row level security',
+                  m.oid::pg_catalog.regclass)
+           from mine m where m.relforcerowsecurity
+         order by 1",
+    )
+    .persistent(false)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the triggers and rules", e))?;
+    let mut back = Vec::with_capacity(rows.len());
+    for row in rows {
+        run(conn, "park the tenant code", row.get("park")).await?;
+        back.push(row.get("back"));
+    }
+    Ok(back)
 }
 
 /// Empties every table of `public` (a `schema_only` copy).
@@ -452,31 +626,13 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// becomes `text` holding its pseudonym under the key installed now (the source's), a `secret`
 /// column keeps its type and holds `NULL` for a non-empty value (its `NOT NULL` dropped).
 /// Checks that read a masked column are dropped; foreign keys on masked columns are dropped and
-/// built again, and one that fails (a pseudonym collision) is left out. Triggers are off while
-/// the values change.
-async fn mask_columns(
-    conn: &mut PgConnection,
-    roles: &[EngineRole],
-    plan: &MaskPlan,
-) -> Result<(), EngineError> {
+/// built again, and one that cannot be built again (its other side is not masked the same way)
+/// is left out. Runs in the `owner` session of [`change_data`], with the tenant's triggers and
+/// rules parked; a secret column is checked to hold no value afterwards.
+async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
     if plan.columns.is_empty() {
         return Ok(());
     }
-    let mask = roles
-        .iter()
-        .find(|r| r.kind == RoleKind::Mask)
-        .map(|r| ident(&r.role_name))
-        .expect("a mask role");
-    // `ruum_dbhost` computes the pseudonyms for the length of the masking only.
-    run(
-        conn,
-        "let ruum_dbhost compute pseudonyms",
-        format!(
-            "set local role {mask}; \
-             grant execute on all functions in schema ruum_mask to ruum_dbhost; reset role"
-        ),
-    )
-    .await?;
     let bases = lens::base_types(conn).await?;
     let mut fks: Vec<(String, String, String)> = Vec::new();
     for (column, how) in &plan.columns {
@@ -569,12 +725,25 @@ async fn mask_columns(
                     "mask a secret column",
                     format!(
                         "alter table {table} alter column {col} drop not null;\n\
-                         alter table {table} disable trigger user;\n\
-                         update {table} set {col} = null where {col} is not null and {col}::text <> '';\n\
-                         alter table {table} enable trigger user"
+                         update {table} set {col} = null where {col} is not null and {col}::text <> ''"
                     ),
                 )
                 .await?;
+                let left: bool = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "select exists (select 1 from {table} \
+                      where {col} is not null and {col}::text <> '')"
+                )))
+                .persistent(false)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| internal("check a secret column", e))?
+                .get(0);
+                if left {
+                    return Err(EngineError::Internal(format!(
+                        "the secret column {}.{} still holds values after the masking",
+                        column.table, column.column
+                    )));
+                }
             }
         }
     }
@@ -593,15 +762,7 @@ async fn mask_columns(
         };
         run(conn, "end the savepoint", end.to_string()).await?;
     }
-    run(
-        conn,
-        "take the pseudonyms back from ruum_dbhost",
-        format!(
-            "set local role {mask}; \
-             revoke execute on all functions in schema ruum_mask from ruum_dbhost; reset role"
-        ),
-    )
-    .await
+    Ok(())
 }
 
 /// `copy_database`: a `TEMPLATE` copy of `source` after its drain.
