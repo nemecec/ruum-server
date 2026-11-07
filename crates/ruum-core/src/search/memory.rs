@@ -34,7 +34,7 @@ impl MemorySearch {
 #[async_trait]
 impl Search for MemorySearch {
     async fn by_name(&self, ctx: &Context, query: SearchQuery) -> Result<Page<SearchHit>> {
-        let q = query_text(&query.q)?;
+        let Filters { q, node_type } = filters(&query)?;
         let offset = query
             .page
             .cursor
@@ -57,7 +57,11 @@ impl Search for MemorySearch {
         let mut candidates: Vec<Node> = Vec::new();
         for n in self.nodes.live_nodes(ctx.tenant) {
             if n.parent_id.is_none()
-                || !n.name.to_lowercase().contains(&q)
+                || q.as_ref()
+                    .is_some_and(|q| !n.name.to_lowercase().contains(q))
+                || node_type
+                    .as_ref()
+                    .is_some_and(|t| !t.matches(n.node_type.as_deref()))
                 || query.kind.is_some_and(|k| k != n.kind)
                 || tagged.as_ref().is_some_and(|t| !t.contains(&n.id))
             {
@@ -70,7 +74,10 @@ impl Search for MemorySearch {
             }
             candidates.push(n);
         }
-        candidates.sort_by_key(|a| (rank(&a.name, &q), a.id));
+        match &q {
+            Some(q) => candidates.sort_by_key(|a| (rank(&a.name, q), a.id)),
+            None => candidates.sort_by_key(|a| (a.name.to_lowercase(), a.id)),
+        }
         let mut pos = offset.min(candidates.len());
         let mut hits = Vec::new();
         for _ in 0..MAX_BATCHES {

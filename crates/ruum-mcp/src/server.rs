@@ -16,7 +16,10 @@ use std::sync::Arc;
 const INSTRUCTIONS: &str = "Ruum is a file tree with versions, tags and sharing. \
 Start with get_me (who you are and your scope) and get_root or get_node_by_path. \
 Every write makes a version or a journal entry, so it can be undone by your user. \
-Errors carry a code and a hint for the next step.";
+Errors carry a code and a hint for the next step. \
+Some actions are for the signed-in user only (agents, API keys, app passwords, members, \
+invitations, undo of an agent, the audit log): tell the user to do them in the Ruum web UI; \
+the user_required error names the page.";
 
 /// The MCP server of one Ruum instance.
 #[derive(Clone)]

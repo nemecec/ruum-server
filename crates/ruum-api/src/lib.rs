@@ -44,6 +44,10 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            error::user_required_hint,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::idempotency,
         ))
         .layer(axum::middleware::from_fn_with_state(

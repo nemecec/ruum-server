@@ -6,7 +6,10 @@
 //! best match first: an exact name, then names that start with `q`, then the rest (Postgres
 //! orders the rest by trigram similarity, memory by length). `within` limits the search to a
 //! folder that the caller can see; a folder the caller cannot see, or of another tenant, gives
-//! no results. The cursor is an offset into the candidates (before the permission filter).
+//! no results. `type` matches `Node.type` (`nodes.type`), ignoring case: an exact type, or a
+//! prefix that ends in `/` (decision 0003-7). `q` may be left out when `type`, `tag` or
+//! `within` is given; the results are then ordered by name. The cursor is an offset into the
+//! candidates (before the permission filter).
 
 pub mod memory;
 pub mod postgres;
@@ -29,9 +32,14 @@ pub const MAX_BATCHES: usize = 10;
 /// A search by name.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchQuery {
-    /// Matches names that contain the text, case-insensitive.
-    pub q: String,
+    /// Matches names that contain the text, case-insensitive. Optional when `node_type`, `tag`
+    /// or `within` is given.
+    pub q: Option<String>,
     pub kind: Option<NodeKind>,
+    /// Matches `Node.type`, ignoring case: an exact type (`application/pdf`), or a prefix that
+    /// ends in `/` (`image/`).
+    #[serde(rename = "type")]
+    pub node_type: Option<String>,
     /// Only nodes with this tag.
     pub tag: Option<TagId>,
     /// Only nodes inside this folder (at any depth).
@@ -51,6 +59,80 @@ pub struct SearchHit {
 #[async_trait]
 pub trait Search: Send + Sync {
     async fn by_name(&self, ctx: &Context, query: SearchQuery) -> Result<Page<SearchHit>>;
+}
+
+/// The longest `type` filter, in characters.
+pub const MAX_TYPE_CHARS: usize = 255;
+
+/// The checked filters of a query: the name text (`None`: no name filter) and the type filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filters {
+    pub q: Option<String>,
+    pub node_type: Option<TypeFilter>,
+}
+
+/// The `type` filter, lower case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeFilter {
+    /// The whole type, for example `application/pdf`.
+    Exact(String),
+    /// A prefix that ends in `/`, for example `image/`.
+    Prefix(String),
+}
+
+impl TypeFilter {
+    /// Whether a node type matches.
+    pub fn matches(&self, node_type: Option<&str>) -> bool {
+        let Some(t) = node_type.map(str::to_lowercase) else {
+            return false;
+        };
+        match self {
+            TypeFilter::Exact(e) => t == *e,
+            TypeFilter::Prefix(p) => t.starts_with(p.as_str()),
+        }
+    }
+}
+
+/// Checks the filters of a query: `q` is checked by [`query_text`] when given; without `q`,
+/// one of `type`, `tag` or `within` is needed (`validation_failed`).
+pub fn filters(query: &SearchQuery) -> Result<Filters> {
+    let q = query.q.as_deref().map(query_text).transpose()?;
+    let node_type = query
+        .node_type
+        .as_deref()
+        .map(|t| {
+            let t = t.trim().to_lowercase();
+            if t.is_empty()
+                || t.chars().count() > MAX_TYPE_CHARS
+                || t.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(Error::Api(
+                    ApiError::new(
+                        ErrorCode::ValidationFailed,
+                        format!("type is 1 to {MAX_TYPE_CHARS} characters without spaces"),
+                    )
+                    .with_hint(
+                        "send a MIME type such as application/pdf, or a prefix such as image/",
+                    ),
+                ));
+            }
+            Ok(if t.ends_with('/') {
+                TypeFilter::Prefix(t)
+            } else {
+                TypeFilter::Exact(t)
+            })
+        })
+        .transpose()?;
+    if q.is_none() && node_type.is_none() && query.tag.is_none() && query.within.is_none() {
+        return Err(Error::Api(
+            ApiError::new(
+                ErrorCode::ValidationFailed,
+                "send q, or at least one of type, tag and within",
+            )
+            .with_hint("q matches names; type matches the MIME type, for example application/pdf"),
+        ));
+    }
+    Ok(Filters { q, node_type })
 }
 
 /// The normalized query text (NFC, lower case) after the checks of the contract.

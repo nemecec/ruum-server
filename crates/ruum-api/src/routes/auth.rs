@@ -981,6 +981,11 @@ pub(crate) mod tests {
         .await;
         assert_eq!(mint.status, StatusCode::FORBIDDEN);
         assert_eq!(mint.body["error"]["code"], "user_required");
+        // The hint names the page of the web UI with the public URL (decision 0003-7, fix 6).
+        assert_eq!(
+            mint.body["error"]["hint"],
+            "ask the user to do this in the Ruum web UI at https://ruum.localhost/agents"
+        );
         // Disable: the token stops at once.
         let off = call(
             &app,

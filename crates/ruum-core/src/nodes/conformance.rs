@@ -776,7 +776,7 @@ async fn isolation(w: &World, b: &dyn Backend) {
         .by_name(
             &ob,
             SearchQuery {
-                q: "secret".into(),
+                q: Some("secret".into()),
                 ..SearchQuery::default()
             },
         )
@@ -965,7 +965,7 @@ async fn search(w: &World, b: &dyn Backend) {
     let _other = mk(b, &m, file(garden.id, "my garden notes.txt")).await;
     let _private = mk(b, &m, file(w.root, "garden secret.txt")).await;
     let q = |q: &str| SearchQuery {
-        q: q.into(),
+        q: Some(q.into()),
         ..SearchQuery::default()
     };
     let hits = s.by_name(&m, q("GARDEN")).await.unwrap();
@@ -1046,6 +1046,91 @@ async fn search(w: &World, b: &dyn Backend) {
     assert_eq!(code(s.by_name(&m, q("")).await), "422");
     // Special characters are literal.
     assert!(s.by_name(&m, q("%")).await.unwrap().items.is_empty());
+
+    // The `type` filter (decision 0003-7): `Node.type`, ignoring case, exact or a prefix that
+    // ends in `/`; `q` may be left out when `type`, `tag` or `within` is given.
+    let docs = mk(b, &m, folder(w.root, "Typed docs")).await;
+    let typed = |parent: NodeId, name: &str, t: &str| NewNode {
+        node_type: Some(t.into()),
+        ..file(parent, name)
+    };
+    let pdf = mk(b, &m, typed(docs.id, "REPORT.PDF", "application/pdf")).await;
+    let pdf2 = mk(b, &m, typed(docs.id, "a.pdf", "Application/PDF")).await;
+    let _tips = mk(b, &m, typed(docs.id, "pdf-tips.txt", "text/plain")).await;
+    let png = mk(b, &m, typed(docs.id, "b.png", "image/png")).await;
+    let jpg = mk(b, &m, typed(w.root, "c.jpg", "image/jpeg")).await;
+    let by_type = |t: &str| SearchQuery {
+        node_type: Some(t.into()),
+        ..SearchQuery::default()
+    };
+    let ids = |p: crate::paging::Page<crate::search::SearchHit>| {
+        p.items.into_iter().map(|h| h.node.id).collect::<Vec<_>>()
+    };
+    // Ordered by name without q.
+    assert_eq!(
+        ids(s.by_name(&m, by_type("application/pdf")).await.unwrap()),
+        vec![pdf2.id, pdf.id]
+    );
+    assert_eq!(
+        ids(s.by_name(&m, by_type("image/")).await.unwrap()),
+        vec![png.id, jpg.id]
+    );
+    assert_eq!(
+        ids(s
+            .by_name(
+                &m,
+                SearchQuery {
+                    within: Some(docs.id),
+                    ..by_type("IMAGE/")
+                }
+            )
+            .await
+            .unwrap()),
+        vec![png.id]
+    );
+    // `type` and `q` together; the prefix needs the slash.
+    assert_eq!(
+        ids(s
+            .by_name(
+                &m,
+                SearchQuery {
+                    q: Some("report".into()),
+                    ..by_type("application/pdf")
+                }
+            )
+            .await
+            .unwrap()),
+        vec![pdf.id]
+    );
+    assert!(
+        s.by_name(&m, by_type("image"))
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    // `within` alone lists the subtree.
+    let all_docs = s
+        .by_name(
+            &m,
+            SearchQuery {
+                within: Some(docs.id),
+                ..SearchQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(all_docs.items.len(), 4);
+    // No filter at all, or an empty type: 422. A guest finds no node it cannot see.
+    assert_eq!(code(s.by_name(&m, SearchQuery::default()).await), "422");
+    assert_eq!(code(s.by_name(&m, by_type(" ")).await), "422");
+    assert!(
+        s.by_name(&w.user(w.guest), by_type("application/pdf"))
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }
 
 // ------------------------------------------------------------------ memory

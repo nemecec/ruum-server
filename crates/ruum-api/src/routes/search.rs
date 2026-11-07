@@ -8,7 +8,7 @@ use axum::Router;
 use axum::extract::{Json, State};
 use axum::routing::get;
 use ruum_core::search::SearchQuery;
-use ruum_core::{ApiError, Error, ErrorCode, NodeId, TagId};
+use ruum_core::{NodeId, TagId};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -22,6 +22,9 @@ pub fn router() -> Router<AppState> {
 pub struct SearchParams {
     pub q: Option<String>,
     pub kind: Option<String>,
+    /// `Node.type`: a MIME type, or a prefix that ends in `/` (decision 0003-7).
+    #[serde(rename = "type")]
+    pub node_type: Option<String>,
     pub tag: Option<Uuid>,
     pub within: Option<Uuid>,
     // Not `#[serde(flatten)]`: a flattened query reads every value as a string, so a number
@@ -30,23 +33,18 @@ pub struct SearchParams {
     pub limit: Option<u32>,
 }
 
-/// Search by name. `GET /v1/search` (operationId `searchNodes`).
+/// Search by name and type. `GET /v1/search` (operationId `searchNodes`). `q` may be left out
+/// when `type`, `tag` or `within` is given.
 pub async fn search_nodes(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
     QueryParams(p): QueryParams<SearchParams>,
 ) -> ApiResult<Json<Value>> {
     refuse_share_link(&ctx)?;
-    let Some(q) = p.q else {
-        return Err(Error::Api(
-            ApiError::new(ErrorCode::ValidationFailed, "q is required")
-                .with_hint("send part of a node name in q"),
-        )
-        .into());
-    };
     let query = SearchQuery {
-        q,
+        q: p.q,
         kind: parse_kind(p.kind.as_deref())?,
+        node_type: p.node_type,
         tag: p.tag.map(TagId),
         within: p.within.map(NodeId),
         page: Paging {

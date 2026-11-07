@@ -201,7 +201,27 @@ pub fn build(spec: &RequestSpec, who: &Principal) -> Request<AxumBody> {
 }
 
 /// Sends `spec` as `who` through `app`.
+///
+/// A batch operation ([`crate::matrix::BATCH_OPERATIONS`]) answers `200` with one result per
+/// item, each with the status that the single operation would answer (decision 0003-7). The
+/// suites send batches of one item, so for them the answer counts with the status of its first
+/// item: `send` puts that status in [`Response::status`] (the body stays as it came).
 pub async fn send(app: &Router, spec: &RequestSpec, who: &Principal) -> Response {
+    let mut res = send_raw(app, spec, who).await;
+    if res.status == StatusCode::OK
+        && crate::matrix::is_batch(spec.method.as_str(), &spec.uri)
+        && let Some(first) = res
+            .json()
+            .and_then(|v| v["items"][0]["status"].as_u64())
+            .and_then(|s| StatusCode::from_u16(s as u16).ok())
+    {
+        res.status = first;
+    }
+    res
+}
+
+/// Sends `spec` as `who` through `app`, and keeps the status of the answer as it is.
+pub async fn send_raw(app: &Router, spec: &RequestSpec, who: &Principal) -> Response {
     let res = app
         .clone()
         .oneshot(build(spec, who))

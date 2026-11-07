@@ -39,6 +39,26 @@ pub const USER_ONLY_OPERATIONS: &[&str] = &[
     "decideDatabaseApproval",
 ];
 
+/// The batch operations (decision 0003-7): `200` with one result per item, each with the status
+/// that the single operation would answer. The suites send one item and judge its status
+/// ([`crate::client::send`]); the rules are those of `moveNode` and `attachTag`.
+pub const BATCH_OPERATIONS: &[&str] = &["moveNodes", "attachTagToNodes"];
+
+/// Whether `method` and `uri` are a call of a batch operation of the contract.
+pub fn is_batch(method: &str, uri: &str) -> bool {
+    use std::sync::OnceLock;
+    static BATCH: OnceLock<Vec<crate::contract::Operation>> = OnceLock::new();
+    BATCH
+        .get_or_init(|| {
+            crate::contract::operations()
+                .into_iter()
+                .filter(|o| BATCH_OPERATIONS.contains(&o.id.as_str()))
+                .collect()
+        })
+        .iter()
+        .any(|o| o.method == method && o.matches(uri))
+}
+
 /// The operations that are specified but not built (`x-ruum-status: planned` in
 /// `contracts/openapi.yaml`, decision 0004-21). The suites need a standard request and the
 /// isolation and permission cases for each of them, like for any operation; while its route is

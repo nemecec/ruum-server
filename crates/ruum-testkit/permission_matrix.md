@@ -61,6 +61,7 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `exchangeToken` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public; the agent key in the body is the credential |
 | `getRoot` | 401 | ok | ok | ok | ok | ok | ok | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | 403/404 | view on the root; the root is not secret (403) |
 | `createNode` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the parent |
+| `moveNodes` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | batch of moveNode (decision 0003-7): the status of the item; manage on the node and edit on the new parent |
 | `getNodeByPath` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | view on the target is enough, as for getNode (decided 0002-5) |
 | `getNode` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | ok | Needs view; 404 when the caller cannot see it |
 | `purgeNode` | 401 | ok | ok | 403 | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | Needs manage, and admin on a team plan (admin_restore_days > trash_days) |
@@ -93,6 +94,7 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `updateTag` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | 403 | 403 | 403 | 404 | 403 | 403 | members with content role edit or manage, admins, owners; not guests, view or comment members (decision 0003-1); agents need max_role edit (decided 0002-5) |
 | `deleteTag` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 404 | 403 | 403 | tenant admins or the creator (member, while it can edit: decision 0003-1); agents need max_role edit (decided 0002-5) |
 | `listNodesByTag` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 404 | ok | 403 | members, and principals who can see a node with the tag (decided 0002-5) |
+| `attachTagToNodes` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | batch of attachTag (decision 0003-7): the status of the item; edit on the node |
 | `listNodeTags` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the node |
 | `attachTag` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the node |
 | `detachTag` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the node |

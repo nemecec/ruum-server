@@ -1176,3 +1176,45 @@ async fn the_purge_of_an_ancestor_ends_the_trash_time() {
         .await;
     assert_eq!(seqs(&page), vec![g]);
 }
+
+/// Decision 0003-8: entry data may carry the ID of a node that the subject cannot see, also of a
+/// gone node, but never its name. A file moves out of the hidden folder `X` into a folder the
+/// subject sees; then `X` is trashed and purged. The subject gets the move with
+/// `data.old_parent_id = X`, and no entry or field names `X`.
+#[tokio::test]
+async fn a_move_out_of_a_gone_folder_shows_its_id_and_never_its_name() {
+    let fake = Fake::default();
+    let w = world(&fake);
+    let (x, f) = (NodeId::new(), NodeId::new());
+    fake.node(x, Some(w.secret), false);
+    w.add(
+        Some(x),
+        EventType::NodeCreated,
+        json!({ "parent_id": w.secret, "name": "Hidden plans", "kind": "folder" }),
+    );
+    w.created(f, x);
+    fake.node(f, Some(w.open), true);
+    let mv = w.add(
+        Some(f),
+        EventType::NodeMoved,
+        json!({ "old_parent_id": x, "new_parent_id": w.open, "old_name": "f.txt", "new_name": "f.txt" }),
+    );
+    w.add(
+        Some(x),
+        EventType::NodeTrashed,
+        json!({ "parent_id": w.secret, "name": "Hidden plans", "subtree_count": 1,
+                "purge_after": "2026-12-06T00:00:00Z" }),
+    );
+    // The purge: `X` is gone.
+    fake.parents.lock().unwrap().remove(&x);
+    w.add(
+        Some(x),
+        EventType::NodePurged,
+        json!({ "name": "Hidden plans", "subtree_count": 1, "reason": "by_request" }),
+    );
+    let page = w.feed(&fake, ChangesQuery::default()).await;
+    assert_eq!(seqs(&page), vec![mv]);
+    assert_eq!(page.items[0].data["old_parent_id"], json!(x));
+    let text = serde_json::to_string(&page).unwrap();
+    assert!(!text.contains("Hidden plans"), "{text}");
+}

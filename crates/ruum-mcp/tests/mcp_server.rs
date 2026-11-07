@@ -245,7 +245,7 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     // Tools of planned operations (decision 0004-22) are not offered.
     let expected: Vec<&str> = catalog.offered().map(|t| t.name.as_str()).collect();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 48);
+    assert_eq!(names.len(), 50);
     for t in catalog.tools.iter().filter(|t| t.planned) {
         assert!(!names.contains(&t.name.as_str()), "{} is planned", t.name);
     }

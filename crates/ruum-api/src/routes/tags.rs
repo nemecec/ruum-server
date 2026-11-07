@@ -1,6 +1,6 @@
 //! Routes of the `tags` area (`docs/STEP1.md`, area 1). The logic is in `ruum_core::tags`.
 
-use super::nodes::{change_only, path_id, refuse_share_link, to_json};
+use super::nodes::{batch_item, change_only, check_batch, path_id, refuse_share_link, to_json};
 use crate::auth::{JsonBody, Paging, QueryParams, RequestContext};
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -22,7 +22,10 @@ pub fn router() -> Router<AppState> {
             "/v1/tags/{tag_id}",
             get(get_tag).patch(update_tag).delete(delete_tag),
         )
-        .route("/v1/tags/{tag_id}/nodes", get(list_nodes_by_tag))
+        .route(
+            "/v1/tags/{tag_id}/nodes",
+            get(list_nodes_by_tag).post(attach_tag_to_nodes),
+        )
         .route("/v1/nodes/{node_id}/tags", get(list_node_tags))
         .route(
             "/v1/nodes/{node_id}/tags/{tag_id}",
@@ -164,6 +167,37 @@ pub async fn attach_tag(
     let (node, tag) = node_and_tag(ids)?;
     let w = state.services.tags.attach(&ctx, node, tag).await?;
     Ok(change_only(&w.change)?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AttachTagToNodesBody {
+    pub node_ids: Vec<ruum_core::NodeId>,
+}
+
+/// Attach a tag to many nodes. `POST /v1/tags/{tag_id}/nodes` (operationId `attachTagToNodes`,
+/// decision 0003-7).
+///
+/// Not atomic: each node is checked and journalled on its own, as `attachTag` (`edit` on the
+/// node), in order, and gets its own result (`ChangeOnly` on success). One item's error does
+/// not stop the others.
+pub async fn attach_tag_to_nodes(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    tag: Result<Path<Uuid>, PathRejection>,
+    JsonBody(b): JsonBody<AttachTagToNodesBody>,
+) -> ApiResult<Json<Value>> {
+    refuse_share_link(&ctx)?;
+    let tag = tag_id(tag)?;
+    check_batch(b.node_ids.len())?;
+    let mut items = Vec::with_capacity(b.node_ids.len());
+    for node in b.node_ids {
+        let r = match state.services.tags.attach(&ctx, node, tag).await {
+            Ok(w) => change_only(&w.change).map(|Json(v)| v),
+            Err(e) => Err(e),
+        };
+        items.push(batch_item(r));
+    }
+    Ok(Json(json!({ "items": items })))
 }
 
 /// Detach a tag. `DELETE /v1/nodes/{node_id}/tags/{tag_id}` (operationId `detachTag`).

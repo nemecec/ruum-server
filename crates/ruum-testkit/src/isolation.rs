@@ -486,6 +486,26 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             );
             plain("node or new parent in tenant A", p)
         }
+        "moveNodes" => {
+            let mut p = addressed(op, w, NotFound, Some(("getNode", o)));
+            p.push(
+                Probe::new(
+                    "B's owner, B's file into A's folder",
+                    o,
+                    RequestSpec::post("/v1/nodes/move")
+                        .tenant(b.id)
+                        .json(json!({
+                            "items": [{ "node_id": b.plan, "parent_id": a.archive }],
+                        })),
+                    NotFound,
+                )
+                .unchanged(o, node_get(a, a.archive, "/children")),
+            );
+            plain(
+                "batch (decision 0003-7): the item's status; node or new parent in tenant A",
+                p,
+            )
+        }
         "restoreNode" => {
             let mut p = addressed(op, w, NotFound, Some(("listTrash", o)));
             p.push(
@@ -595,6 +615,35 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
                 .unchanged(o, std_req("listNodeTags", a)),
             );
             plain("node or tag in tenant A", p)
+        }
+        "attachTagToNodes" => {
+            let mut p = addressed(op, w, NotFound, None);
+            for x in p.iter_mut() {
+                x.unchanged = Some((o, node_get(a, a.archive, "/tags")));
+            }
+            p.push(Probe::new(
+                "B's owner, B's node with A's tag",
+                o,
+                RequestSpec::post(format!("/v1/tags/{}/nodes", a.tag))
+                    .tenant(b.id)
+                    .json(json!({ "node_ids": [b.plan] })),
+                NotFound,
+            ));
+            p.push(
+                Probe::new(
+                    "B's owner, A's node with B's tag",
+                    o,
+                    RequestSpec::post(format!("/v1/tags/{}/nodes", b.tag))
+                        .tenant(b.id)
+                        .json(json!({ "node_ids": [a.plan] })),
+                    NotFound,
+                )
+                .unchanged(o, std_req("listNodeTags", a)),
+            );
+            plain(
+                "batch (decision 0003-7): the item's status; node or tag in tenant A",
+                p,
+            )
         }
 
         // ------------------------------------------------------------ sharing

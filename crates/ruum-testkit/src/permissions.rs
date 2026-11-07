@@ -482,6 +482,14 @@ fn operation_rule(op: &str) -> Option<Rule> {
         ),
         "listChildren" => node("view on the folder", Projects, Role::View),
         "renameNode" => node("Needs edit on the node", Plan, Role::Edit),
+        "moveNodes" => node2(
+            "batch of moveNode (decision 0003-7): the status of the item; manage on the node \
+             and edit on the new parent",
+            Plan,
+            Role::Manage,
+            Some((Archive, Role::Edit)),
+        )
+        .hide(Plan, Role::View),
         "moveNode" => node2(
             "Needs manage on the node and edit on the new parent",
             Plan,
@@ -583,6 +591,11 @@ fn operation_rule(op: &str) -> Option<Rule> {
         ),
         "listNodeTags" => node("Needs view on the node", Plan, Role::View),
         "attachTag" => node("Needs edit on the node", Archive, Role::Edit),
+        "attachTagToNodes" => node(
+            "batch of attachTag (decision 0003-7): the status of the item; edit on the node",
+            Archive,
+            Role::Edit,
+        ),
         "detachTag" => node("Needs edit on the node", Plan, Role::Edit),
 
         // ------------------------------------------------------------ sharing

@@ -165,6 +165,9 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         "moveNode" => RequestSpec::post(node(plan, "/move"))
             .tenant(tid)
             .json(json!({ "parent_id": t.archive })),
+        "moveNodes" => RequestSpec::post("/v1/nodes/move").tenant(tid).json(json!({
+            "items": [{ "node_id": plan, "parent_id": t.archive }],
+        })),
         "copyNode" => RequestSpec::post(node(plan, "/copy"))
             .tenant(tid)
             .json(json!({ "parent_id": t.archive })),
@@ -245,6 +248,9 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         "attachTag" => {
             RequestSpec::new(Method::PUT, node(t.archive, &format!("/tags/{}", t.tag))).tenant(tid)
         }
+        "attachTagToNodes" => RequestSpec::post(format!("/v1/tags/{}/nodes", t.tag))
+            .tenant(tid)
+            .json(json!({ "node_ids": [t.archive] })),
         "detachTag" => {
             RequestSpec::new(Method::DELETE, node(plan, &format!("/tags/{}", t.tag))).tenant(tid)
         }

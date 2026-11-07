@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/nodes/{node_id}", get(get_node).delete(purge_node))
         .route("/v1/nodes/{node_id}/children", get(list_children))
         .route("/v1/nodes/{node_id}/rename", post(rename_node))
+        .route("/v1/nodes/move", post(move_nodes))
         .route("/v1/nodes/{node_id}/move", post(move_node))
         .route("/v1/nodes/{node_id}/copy", post(copy_node))
         .route("/v1/nodes/{node_id}/trash", post(trash_node))
@@ -69,6 +70,43 @@ pub(crate) fn node_write(w: &Written<Node>) -> Result<Json<Value>, Error> {
     Ok(Json(
         json!({ "node": to_json(&w.value)?, "change": to_json(&w.change)? }),
     ))
+}
+
+/// The most items of one batch call (`moveNodes`, `attachTagToNodes`; decision 0003-7).
+pub const MAX_BATCH_ITEMS: usize = 100;
+
+/// Checks the number of items of a batch call: 1 to [`MAX_BATCH_ITEMS`].
+pub(crate) fn check_batch(n: usize) -> Result<(), Error> {
+    if n == 0 || n > MAX_BATCH_ITEMS {
+        return Err(Error::Api(
+            ApiError::new(
+                ErrorCode::ValidationFailed,
+                format!("a batch has 1 to {MAX_BATCH_ITEMS} items"),
+            )
+            .with_hint("split the work into calls of at most 100 items"),
+        ));
+    }
+    Ok(())
+}
+
+/// One result of a batch call (`BatchItemResult`): `status` is the HTTP status that the single
+/// operation would answer; a success carries its body, a failure `error` (the standard error
+/// body, without the outer `error` key).
+pub(crate) fn batch_item(r: Result<Value, Error>) -> Value {
+    match r {
+        Ok(Value::Object(mut body)) => {
+            body.insert("status".into(), json!(200));
+            Value::Object(body)
+        }
+        Ok(other) => json!({ "status": 200, "value": other }),
+        Err(e) => {
+            if !matches!(e, Error::Api(_)) {
+                tracing::error!(error = %e, "internal error in a batch item");
+            }
+            let api = e.to_api();
+            json!({ "status": api.code.http_status(), "error": api })
+        }
+    }
 }
 
 /// `{ "change": ... }` (`ChangeOnly`).
@@ -259,6 +297,53 @@ pub async fn move_node(
     };
     let w = state.services.nodes.move_node(&ctx, id, req).await?;
     Ok(node_write(&w)?)
+}
+
+/// One item of `moveNodes`: `MoveRequest` with the node.
+#[derive(Debug, Deserialize)]
+pub struct MoveItem {
+    pub node_id: NodeId,
+    #[serde(flatten)]
+    pub to: MoveBody,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoveNodesBody {
+    pub items: Vec<MoveItem>,
+}
+
+/// Move many nodes. `POST /v1/nodes/move` (operationId `moveNodes`, decision 0003-7).
+///
+/// Not atomic: each item is checked and journalled on its own, as `moveNode` (`manage` on the
+/// node, `edit` on the new parent), in order, and gets its own result. One item's error does
+/// not stop the others. The `Idempotency-Key` covers the whole call.
+pub async fn move_nodes(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    JsonBody(b): JsonBody<MoveNodesBody>,
+) -> ApiResult<Json<Value>> {
+    refuse_share_link(&ctx)?;
+    check_batch(b.items.len())?;
+    let mut items = Vec::with_capacity(b.items.len());
+    for item in b.items {
+        let req = MoveRequest {
+            parent_id: item.to.parent_id,
+            name: item.to.name,
+            on_conflict: item.to.on_conflict,
+            if_revision: None,
+        };
+        let r = match state
+            .services
+            .nodes
+            .move_node(&ctx, item.node_id, req)
+            .await
+        {
+            Ok(w) => node_write(&w).map(|Json(v)| v),
+            Err(e) => Err(e),
+        };
+        items.push(batch_item(r));
+    }
+    Ok(Json(json!({ "items": items })))
 }
 
 /// Copy a node. `POST /v1/nodes/{node_id}/copy` (operationId `copyNode`).
