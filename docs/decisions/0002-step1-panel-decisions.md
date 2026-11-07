@@ -296,8 +296,15 @@ in the trash shows now only to those who may restore it, so that is (b). Entries
 tree keep the old "before" rules (old place, grantee of a removed grant).
 
 **What does not count yet.** Member links: the journal does not date the access that they give,
-so they never satisfy (a) or (b). The feed sends less, never more. Entries that name a gone node
-only in their data (for example the `old_parent_id` of a move) are not covered.
+so they never satisfy (a) or (b). The feed sends less, never more.
+
+**IDs of gone nodes in entry data** (decision 0003-8, which replaces the open point that stood
+here). Entries may carry, in `data`, the IDs of nodes that the subject cannot see, also of gone
+nodes (for example `old_parent_id`, `new_parent_id`). IDs are exempt from rules (a) and (b).
+Names, paths, tag names, MIME types, sizes and every other attribute of a node that fails (a)
+and (b) for the subject never appear. Accepted costs: a UUIDv7 shows when the unseen node was
+made (to the millisecond), and the same ID in two entries shows that both concern the same
+unseen node.
 
 **Tests.** `journal::feed::tests` (a guest who gets `/a` after `/a/c` was trashed; members who
 join during the trash and after the purge; their agents), a journal conformance case for the

@@ -296,13 +296,20 @@ rebased once more without a change to code). The smoke test and the mutation che
 ## Known gaps
 
 - **Step 1 follow-ups** (decision 0003, `provisional`): item 5 (C-7, names of actors) is built
-  and merged; item 1 (content role) is built on `f/content-role`. Items 2 (C-12, email grants
-  bind) and 3 (C-13, share and invitation emails) are built on the server in `f/email-grants`,
-  stacked on `f/content-role` (migration `0006_email_grants_and_mail.sql`, the mail outbox
-  worker, `addGrant` answers `notified`). Their web UI parts are cards in
-  `ruum-server-wt/panel/ui-followups.md`, built on the design system (`w/design-system`).
-  Items 4 (C-14), 6 (C-8 to C-11), 7 (search `type`, batch, hints, `safe_stop`) and 8 (IDs of
-  gone nodes) are decided and not built here.
+  and merged; item 1 (content role) is built (`f/content-role`). Items 2 (C-12, email grants
+  bind) and 3 (C-13, share and invitation emails) are built on the server (`f/email-grants`,
+  migration `0006_email_grants_and_mail.sql`, the mail outbox worker, `addGrant` answers
+  `notified`). Their web UI parts are cards in `ruum-server-wt/panel/ui-followups.md`, built on
+  the design system (`w/design-system`). Branch `f/audit-mcp` builds item 4 (C-14: `auth.login`
+  in the home tenant at sign-in and at the first use of a session in each other tenant for
+  members and up, never for guests; key, token, app password and sign-out rows), item 7 (tool
+  descriptions, `searchNodes` `type`, `moveNodes` and `attachTagToNodes`, the `user_required`
+  hint with the page, the benchmark outcome `safe_stop` and harm checks) and records item 8 (IDs
+  of gone nodes may appear in entry data, names never); migrations `0007_session_tenants.sql`
+  and `0008_nodes_type_index.sql`. Item 6 (C-8 to C-11) is decided and not built. Not built of
+  4, 7 and 8: the metric `ruum_auth_login_failed_total` (no metrics registry), the IP of WebDAV
+  app password rows, the property test and mutation of item 8. The benchmark was not run with
+  the new tools.
 - **Mail.** Mail goes only to the relay of `SMTP_URL` (Mailpit on the laptop). Production
   sending stays with a person (design 18.9). There is no GDPR deletion job yet; it must delete
   a user's `mail_outbox` rows (and `principal_names`).
@@ -354,7 +361,8 @@ rebased once more without a change to code). The smoke test and the mutation che
   email and the invitation email names no role or end date (C-13); no code calls
   `audit::events::sign_in`, so no space logs sign-ins (C-14); the accept page can't name the
   space (C-9). A Member manages everything in a team space; a view-only member role is a
-  product question for the architect panel. No folder upload control.
+  product question for the architect panel. No folder upload control. (C-14 is built on
+  `f/audit-mcp`, decision 0003-4.)
 - **SpiceDB freshness inside a request.** A request reads at least as fresh as its tenant's
   newest token at its start and its own writes (decision 0002-4). Work that a handler spawns on
   another task (unless it uses `authz::in_current_request`), the outbox worker and `seed-dev`

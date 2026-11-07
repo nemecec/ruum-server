@@ -14,26 +14,28 @@ The panel files are in `ruum-server-wt/panel/` (outside the repository).
 
 The proposal's order of work is item 5, then 1, 2, 3, then 4, 6, 7 and 8. Item 5 is built
 (branch `f/followups`), and item 1 is built (branch `f/content-role`), each in full. Items 2
-and 3 are built on the server (branch `f/email-grants`, stacked on `f/content-role`). Items 4,
-6, 7 and 8 are decided here and not built yet; each is a separate change. The web UI parts of
-items 1, 2 and 3 are cards in `ruum-server-wt/panel/ui-followups.md`, built on the design
-system.
+and 3 are built on the server (branch `f/email-grants`, stacked on `f/content-role`). Items 4
+and 7 are built, and item 8 is recorded, on branch `f/audit-mcp`. Item 6 is decided here and
+not built yet. The web UI parts of items 1, 2 and 3 are cards in
+`ruum-server-wt/panel/ui-followups.md`, built on the design system.
 
 | Item | Decision | Built |
 |---|---|---|
 | 1. A content role for members | below | **yes**, server, contract and tests (branch `f/content-role`); the UI is a card |
 | 2. C-12: email grants bind | below | **yes**, server (branch `f/email-grants`) |
 | 3. C-13: share and invitation emails | below | **yes**, server (branch `f/email-grants`); web UI on the card |
-| 4. C-14: sign-ins in the audit log | below | no |
+| 4. C-14: sign-ins in the audit log | below | **yes** (branch `f/audit-mcp`) |
 | 5. C-7: names of actors | below | **yes** (branch `f/followups`) |
 | 6. C-8 to C-11 | below | no |
-| 7. MCP and benchmark fixes, safe stop | below | only the fixes 1 and 2 of BENCHMARK.md (item 5) and the `list_changes` tool text |
-| 8. IDs of gone nodes in entry data | below | no |
+| 7. MCP and benchmark fixes, safe stop | below | **yes** (branch `f/audit-mcp`; fixes 1 and 2 by item 5, fix 3 deferred on purpose) |
+| 8. IDs of gone nodes in entry data | below | **recorded** (branch `f/audit-mcp`: 0002-6, the contract text, a feed test) |
 
 Migrations are numbered in the order they are made, not by the numbers of the proposal (which
 assumed item 1 first): item 5 made `0002_principal_names.sql` and
 `0003_agent_names_unique.sql`, decision 0004 took `0004_databases.sql`, item 1 made
-`0005_member_content_role.sql`, and items 2 and 3 made `0006_email_grants_and_mail.sql`. The
+`0005_member_content_role.sql`, items 2 and 3 made `0006_email_grants_and_mail.sql`, and
+`f/audit-mcp` made `0007_session_tenants.sql` (item 4) and `0008_nodes_type_index.sql` (item
+7); it was written as 0005 and 0006 and renumbered at its rebase (the SQL did not change). The
 next items take the next free numbers.
 
 ## 1. A content role for team members
@@ -286,6 +288,42 @@ user; the unused audit helpers wired.
 `sessions.id` row ID, never derived from the cookie secret. Reviewer 2 #5: `session_tenants`
 rows are deleted when their session ends or expires (see item 3).
 
+**Built** (branch `f/audit-mcp`). Choices made while building, each the safer or the simpler
+option:
+
+- `loginCallback` writes `auth.login` (`data.method`, `data.session_id`, IP, user agent) in the
+  home tenant after the session row exists. When the write fails, the server ends that session
+  and answers `500` without cookies.
+- The first use is recorded by the `RequestContext` extractor and by `tenant_context` (the
+  `/v1/tenants/{tenant_id}` routes), so every tenant request with a session cookie passes it.
+  `AuditLog::record_first_use` writes the marker and the row in one transaction. A cache in the
+  process (`SessionsSeen`) keeps the pairs that are done; a guest is not kept, so a later
+  promotion to member is recorded.
+- The client IP comes from the connection (or the last `X-Forwarded-For` address that a local
+  proxy added, as `limits.rs`), for every audit entry of a request. WebDAV records only the user
+  agent: its listener does not pass the peer address to the auth code.
+- No path refuses a known user after the identity provider answered (a deleted user's identity
+  is not found, and the sign-in makes or links a user), so `auth.login_failed` stays unused in
+  step 1. Failures without a known user are a `tracing` event (`target: ruum::security`,
+  `event: auth.login_failed`, a reason code). There is no metrics registry yet, so the counter
+  `ruum_auth_login_failed_total` is a later card.
+- `endSession` also writes `auth.logout` (the helper says "ended a session").
+- `agent.key_used` is written in the transaction of the exchange; `agent.key_refused` (reasons
+  `revoked`, `expired`, `agent_disabled`, `scope_expired`) is committed before the error. An
+  unknown key writes nothing (it names no tenant). `agent.token_issued` is written in the
+  transaction that rotates the refresh token, so a failed write issues nothing.
+- `auth.app_password_used`: at most one row per password per hour, checked against the audit
+  table itself in the insert statement (`last_used_at` is still updated on every use, for the
+  web UI).
+- The sweeper (`identity::sweep`), not the mail outbox worker of item 3, deletes the markers of
+  sessions that ended, expired or are gone: it already sweeps sessions.
+
+Tests: the audit conformance case `the_first_use_of_a_session_is_recorded_once` (memory,
+Postgres); `routes::auth::tests::sign_ins_are_audited_in_the_home_tenant_and_at_first_use`,
+`a_failed_sign_in_audit_fails_the_sign_in`, `a_failed_first_use_audit_fails_the_request`; the
+key, token and app password rows in `agents::tests` and `identity::tests` (memory, Postgres);
+the sweeper test. Mutations `login-not-audited`, `guest-session-audited-in-host`.
+
 ## 5. C-7: names of actors (built)
 
 **Decision.**
@@ -384,6 +422,31 @@ the `searchNodes` text says that `type` matches `Node.type`, so the filter keeps
 typed nodes later. Reviewer 2 note: the `search_nodes` tool text says which of `kind` and `type`
 an agent uses for "all PDFs".
 
+**Built** (branch `f/audit-mcp`):
+
+- Tool descriptions (`move_node`, `copy_node`, `rename_node`, `create_node`: `name_taken` and
+  `on_conflict: rename`; `search_nodes`: `type`, not `kind`, for "all PDFs"; `get_me`: what
+  agents cannot do) and the user-only sentence in the MCP `INSTRUCTIONS`.
+- Fix 4: `searchNodes` takes `type` (exact, or a prefix that ends in `/`, ignoring case) and `q`
+  is optional when `type`, `tag` or `within` is given (then ordered by name); with none of the
+  four, `422 validation_failed`. Migration `0008_nodes_type_index.sql` (the index above).
+- Fix 5: `moveNodes` (`POST /v1/nodes/move`) and `attachTagToNodes` (`POST /v1/tags/{tag_id}/nodes`),
+  1 to 100 items, `200` with one `BatchItemResult` per item: `status` is what the single
+  operation would answer, then its body or `error`. Not atomic; the `Idempotency-Key` covers the
+  call. Tools `move_nodes` and `attach_tag_to_nodes`. The isolation and permission suites send
+  one-item batches and judge the item's status (`ruum_testkit::client::send`,
+  `matrix::BATCH_OPERATIONS`); `tests/batch.rs` checks mixed batches.
+- Fix 6: a middleware gives every `403 user_required` the hint "ask the user to do this in the
+  Ruum web UI at `<RUUM_PUBLIC_URL><page>`", the page by the path of the operation (`/agents`,
+  `/members`, `/audit`, `/settings`, `/account`). The web UI must route these top-level paths
+  to the page of the current space (card in `ruum-server-wt/panel/ui-followups.md`).
+- The safe stop: `bench/agent/lib/outcome.mjs` (outcomes `pass`, `safe_stop`, `fail`,
+  `harmful`; a tenant snapshot before and after the agent), `harm: true` on the checks of data
+  loss, wrong access and refused actions, the report's `gate` (pass rate, harmful = 0), and the
+  "Scoring" section of `docs/BENCHMARK.md`. The benchmark was not run again.
+- Per-item rate counting of batches (7.3) is not built: step 1 has no rate limit on these
+  writes, and the shared counters come with item 2.
+
 ## 8. IDs of gone nodes in entry data
 
 **Decision.** As v2 8: IDs are acceptable; names and every other attribute of a node that fails
@@ -393,11 +456,19 @@ recorded. The rule replaces the "What does not count yet" paragraph of 0002-6.
 **Review outcome.** No required change (reviewer 1: "Item 8's rule and its accepted costs are
 recorded").
 
+**Recorded** (branch `f/audit-mcp`): the rule replaces the open point of 0002-6 in
+`0002-step1-panel-decisions.md`; one sentence in `listChanges` and in the `data` of
+`contracts/events/journal-entry.schema.json`; the feed test
+`journal::feed::tests::a_move_out_of_a_gone_folder_shows_its_id_and_never_its_name`. Not done:
+the assertion in the feed property test that no name of a node that fails (a) and (b) appears,
+and the mutation `feed-leaks-gone-parent-name` (v2 8.6); they stay on the card of item 8.
+
 ## Later cards
 
 From v2 7.7 and the reviews: an agent-facing undo preview; the rate limits of `limits.rs` in
 the shared counters; an email match for admin invitations; a view link in the share email if
 real users ask; the GDPR deletion job (`principal_names`, `mail_outbox`); per-person caps for
-the production mail sender. From items 2 and 3: the web UI card (share dialog, item page
-states, accept link in the fragment), the clean-up of `session_tenants` with item 4, and the
-content role in the invitation mail with item 1.
+the production mail sender; the metric `ruum_auth_login_failed_total` (item 4, when a metrics
+registry exists); the property test and mutation of item 8. From items 2 and 3: the web UI card
+(share dialog, item page states, accept link in the fragment), the clean-up of
+`session_tenants` with item 4, and the content role in the invitation mail with item 1.
