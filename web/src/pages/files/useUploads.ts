@@ -11,15 +11,12 @@ export type UploadItem = {
   status: 'waiting' | 'active' | 'done' | 'failed' | 'canceled'
   error?: unknown
   node?: Node
-  /** For a new version that the server joined into the version before (coalescing). */
-  replaced?: string
 }
 
 /** Where one file goes, and what the UI knows to tell the person about it afterwards. */
 export type UploadPlan = {
   file: File
   target: UploadTarget
-  previousAt?: string
   /**
    * For a new file that the page thought had a free name (`on_conflict: fail`): the server
    * answered `name_taken`, because the name was taken after the page read its list. At the end of

@@ -21,7 +21,9 @@ describe('uploads, conflicts and the file list', () => {
     expect(db.nodes.filter((n) => n.parent_id === ids.personalRoot && n.name.startsWith('notes'))).toHaveLength(1)
   })
 
-  it('by default keeps the person\'s own version of the last minutes as a named version, then uploads', async () => {
+  it('saves a new version that never joins the person\'s own version of the last minutes (C-8)', async () => {
+    // The head is Ada's own unnamed save of a minute ago: the server would join an upload into it
+    // by default. The web UI sends `coalesce: false`, so it needs no name and no warning.
     const notes = db.nodes.find((n) => n.id === ids.notes)!
     const head = db.versions.find((v) => v.id === notes.head_version)!
     head.actor = { kind: 'user', id: ids.ada, display_name: 'Ada Lovelace' }
@@ -33,39 +35,19 @@ describe('uploads, conflicts and the file list', () => {
     await screen.findByRole('link', { name: 'Documents' })
     await user.upload(screen.getByLabelText('Upload files'), new File(['# v4'], 'notes.md', { type: 'text/markdown' }))
     const d = await dialog('notes.md is already here')
-    // "Save as a new version" is the default, and the earlier version gets a name, so nothing is lost.
     expect(within(d).getByRole('radio', { name: 'Save as a new version' })).toBeChecked()
-    const name = within(d).getByRole('textbox', { name: 'Name of the earlier version' })
-    expect((name as HTMLInputElement).value).toMatch(/^Before the upload of \d\d:\d\d$/)
-    expect(within(d).getByText(/You changed notes\.md 1 minute ago\. Ruum keeps that version under this name, so nothing is lost\./)).toBeInTheDocument()
-    await user.keyboard('{Enter}')
-    expect(await screen.findByText(/^Uploaded notes\.md\.$/)).toBeInTheDocument()
-    // The old version got its name first, so it stays a version of its own.
-    const labelled = seen.find((r) => r.method === 'PUT' && r.path.endsWith('/label'))?.body as { label: string } | undefined
-    expect(labelled?.label).toMatch(/^Before the upload of /)
-    expect(db.versions.find((v) => v.id === head.id)?.label).toMatch(/^Before the upload of /)
-    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_version', node_id: ids.notes })
-  })
-
-  it('says in plain words that a conflict upload without a name replaces the version of the last minutes', async () => {
-    const notes = db.nodes.find((n) => n.id === ids.notes)!
-    const head = db.versions.find((v) => v.id === notes.head_version)!
-    head.actor = { kind: 'user', id: ids.ada, display_name: 'Ada Lovelace' }
-    notes.updated_by = { actor: head.actor, on_behalf_of: null }
-    notes.updated_at = new Date(Date.now() - 60_000).toISOString()
-    const seen = recordRequests()
-    const { user } = renderApp(`${personal}/files`)
-    await screen.findByRole('link', { name: 'Documents' })
-    await user.upload(screen.getByLabelText('Upload files'), new File(['# v4'], 'notes.md', { type: 'text/markdown' }))
-    const d = await dialog('notes.md is already here')
-    await user.clear(within(d).getByRole('textbox', { name: 'Name of the earlier version' }))
-    expect(within(d).getByRole('note')).toHaveTextContent(
-      'Without a name, the new upload replaces your version from 1 minute ago: Ruum joins the changes you make within 10 minutes into one version.',
-    )
+    expect(within(d).getByText('The file keeps its name. The earlier version stays in Versions.')).toBeInTheDocument()
+    expect(within(d).queryByRole('textbox')).not.toBeInTheDocument()
     await user.click(within(d).getByRole('button', { name: 'Continue' }))
-    await waitFor(() => expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')).toBeTruthy())
+    expect(await screen.findByText(/^Uploaded notes\.md\.$/)).toBeInTheDocument()
+    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({
+      target: 'new_version',
+      node_id: ids.notes,
+      coalesce: false,
+    })
+    // No version is renamed to keep it: the earlier version stays as it is.
     expect(seen.some((r) => r.method === 'PUT' && r.path.endsWith('/label'))).toBe(false)
-    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({ target: 'new_version' })
+    expect(db.versions.find((v) => v.id === head.id)?.label ?? null).toBeNull()
   })
 
   it('asks when the server answers that a name is taken that the list on the screen did not show yet', async () => {
@@ -140,7 +122,7 @@ describe('uploads, conflicts and the file list', () => {
     expect(await within(panel).findByText('1 upload done')).toBeInTheDocument()
   })
 
-  it('warns before "Upload new version" replaces the person\'s own version of the last minutes', async () => {
+  it('"Upload new version" always makes a new version, without asking (C-8)', async () => {
     const notes = db.nodes.find((n) => n.id === ids.notes)!
     const head = db.versions.find((v) => v.id === notes.head_version)!
     head.actor = { kind: 'user', id: ids.ada, display_name: 'Ada Lovelace' }
@@ -152,14 +134,16 @@ describe('uploads, conflicts and the file list', () => {
     await user.click(await screen.findByRole('button', { name: 'Details of notes.md' }))
     const details = await screen.findByRole('region', { name: 'notes.md' })
     await user.upload(within(details).getByLabelText('New version of notes.md'), new File(['# v4'], 'notes.md'))
-    const d = await dialog('Keep your last change as its own version?')
-    expect(within(d).getByText(/You changed notes\.md 1 minute ago\./)).toBeInTheDocument()
-    await user.type(within(d).getByRole('textbox'), 'Before v4')
-    await user.click(within(d).getByRole('button', { name: 'Keep it and upload' }))
     expect(await screen.findByText(/^Uploaded notes\.md\.$/)).toBeInTheDocument()
-    // The old version got a name first, so it stays a version of its own.
-    expect(seen.find((r) => r.method === 'PUT' && r.path.endsWith('/label'))?.body).toEqual({ label: 'Before v4' })
-    expect(db.versions.find((v) => v.id === head.id)?.label).toBe('Before v4')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(seen.find((r) => r.method === 'POST' && r.path === '/v1/uploads')?.body).toMatchObject({
+      target: 'new_version',
+      node_id: ids.notes,
+      base_version: head.id,
+      coalesce: false,
+    })
+    expect(seen.some((r) => r.method === 'PUT' && r.path.endsWith('/label'))).toBe(false)
+    expect(db.nodes.find((n) => n.id === ids.notes)?.head_version).not.toBe(head.id)
   })
 
   it('selects several items and moves them to the trash with Undo', async () => {

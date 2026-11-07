@@ -63,7 +63,9 @@ describe('invitation link (decision 0003-3)', () => {
     const seen = recordRequests()
     window.history.replaceState(null, '', '/invitations/accept#token=demo-invite')
     const { user } = renderApp('/invitations/accept')
-    await user.click(await screen.findByRole('button', { name: 'Join the space' }))
+    await user.click(await screen.findByRole('button', { name: 'Join Lovelace Lab' }))
+    // The preview and the accept both send the fragment's token in the body, never in a URL.
+    expect(seen.find((r) => r.path === '/v1/invitations/preview')?.body).toEqual({ token: 'demo-invite' })
     await waitFor(() => expect(seen.find((r) => r.path === '/v1/invitations/accept')?.body).toEqual({ token: 'demo-invite' }))
     window.history.replaceState(null, '', '/')
   })

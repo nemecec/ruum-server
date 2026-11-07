@@ -28,6 +28,7 @@ import {
 } from '../ui'
 import { browser } from './browser'
 import { NamesProvider } from './names'
+import { findSpaceName, knownSpaceName } from './sharedSpaces'
 import { useSession } from './useSession'
 import { lastTenant, rememberTenant, TenantContext, tenantPath } from './tenant'
 import { t } from '../i18n'
@@ -61,15 +62,15 @@ export function AccountRedirect() {
 
 /**
  * A space that is not in the person's list: someone shared an item of it with them, but Ruum has
- * not listed the space for them (docs/ux/gap-analysis.md, contract need C-7). The pages work with
- * the person's grants; the name of the space is not known.
+ * not listed the space for them (docs/ux/gap-analysis.md). The pages work with the person's
+ * grants. The name comes from "Shared with me" (C-10, decision 0003-6), else "A shared space".
  */
-function sharedSpace(id: string): Schemas['TenantMembership'] {
+function sharedSpace(id: string, name: string | undefined): Schemas['TenantMembership'] {
   return {
     role: 'guest',
     tenant: {
       id,
-      name: t('shell.sharedSpace'),
+      name: name ?? t('shell.sharedSpace'),
       kind: 'team',
       plan: 'free',
       region: '',
@@ -130,7 +131,8 @@ export function TenantLayout() {
   const { tenantId = '' } = useParams()
   const { tenants, me } = useSession()
   const listed = tenants.find((m) => m.tenant.id === tenantId)
-  const membership = listed ?? sharedSpace(tenantId)
+  const unlistedName = useUnlistedSpaceName(tenantId, !listed)
+  const membership = listed ?? sharedSpace(tenantId, unlistedName)
 
   // Set the tenant header before the pages below load their data (their effects run first).
   setTenant(tenantId)
@@ -155,6 +157,26 @@ export function TenantLayout() {
       </NamesProvider>
     </TenantContext.Provider>
   )
+}
+
+/** The name of a space that is not in the person's list, from "Shared with me" (C-10). */
+function useUnlistedSpaceName(tenantId: string, unlisted: boolean): string | undefined {
+  const [found, setFound] = useState<{ id: string; name: string | undefined }>()
+  useEffect(() => {
+    if (!unlisted || knownSpaceName(tenantId)) return
+    let active = true
+    findSpaceName(tenantId)
+      .then((name) => {
+        if (active) setFound({ id: tenantId, name })
+      })
+      // Without the name the shell says "A shared space"; the page shows its own errors.
+      .catch(() => undefined)
+    return () => {
+      active = false
+    }
+  }, [tenantId, unlisted])
+  if (!unlisted) return undefined
+  return knownSpaceName(tenantId) ?? (found?.id === tenantId ? found.name : undefined)
 }
 
 /** The second line of a space in the switcher: its kind and the person's role. */

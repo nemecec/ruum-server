@@ -161,15 +161,16 @@ export async function invite(page: Page, email: string, role: 'Guest' | 'Member'
 
 /**
  * Accepts an invitation as the signed-in user of `page`: the link of the mail opens the accept page
- * of the web UI, and "Join the space" joins. Ends on the files of the space.
+ * of the web UI, which names the space (`previewInvitation`, C-9), and "Join *Space*" joins. Ends
+ * on the files of the space.
  */
 export async function acceptInvitation(page: Page, link: string): Promise<void> {
   const url = new URL(link)
   expect(url.origin).toBe(new URL(env.webUrl).origin)
   // The token is in the fragment (#token=); old mails had ?token=.
   await page.goto(url.pathname + url.search + url.hash)
-  await expect(page.getByRole('heading', { name: "You're invited to a space in Ruum" })).toBeVisible()
-  await page.getByRole('button', { name: 'Join the space' }).click()
+  await expect(page.getByRole('heading', { name: / invited you to /, level: 1 })).toBeVisible()
+  await page.getByRole('button', { name: /^Join / }).click()
   await expect(toast(page, /^You've joined /)).toBeVisible()
   await page.waitForURL(/\/t\/[0-9a-f-]{36}\/files$/)
 }

@@ -2,7 +2,7 @@
 // the API with that key, its activity with names, and undo.
 import { expect, test } from '@playwright/test'
 import { env, readRun, storageStatePath } from './support/env.ts'
-import { agentToken, toast, uniqueName } from './support/app.ts'
+import { agentToken, api, toast, uniqueName } from './support/app.ts'
 
 test.use({ storageState: storageStatePath('ann') })
 
@@ -57,6 +57,17 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
     body: JSON.stringify({ parent_id: root.id, name: folder, kind: 'folder' }),
   })
   expect(created.status).toBe(201)
+  // A second folder, which Ann renames afterwards: the undo leaves it and names her (C-11).
+  const kept = uniqueName('Kept', run)
+  const second = await fetch(`${env.serverUrl}/v1/nodes`, {
+    method: 'POST',
+    headers: { ...headers, 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ parent_id: root.id, name: kept, kind: 'folder' }),
+  })
+  expect(second.status).toBe(201)
+  const keptId = ((await second.json()) as { id: string }).id
+  const renamed = `${kept} (Ann's)`
+  expect((await api(page, 'POST', `/v1/nodes/${keptId}/rename`, { tenant, body: { name: renamed } })).status).toBe(200)
 
   // Ann sees the change in the agent's activity, with the item's name and a link.
   await page.reload()
@@ -78,6 +89,10 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
   await activity.getByRole('button', { name: 'Undo all...' }).click()
   const undo = page.getByRole('dialog', { name: `Undo 1 change by ${name}?` })
   await expect(undo).toContainText(`Created ${folder}`)
+  // The renamed folder stays as it is, and the dialog says who changed it later (C-11).
+  await expect(undo.getByRole('listitem').filter({ hasText: 'changed it again later' })).toContainText(
+    new RegExp(`${kept}.*: ${users.ann.displayName} changed it again later`),
+  )
   await undo.getByRole('button', { name: 'Undo 1 change' }).click()
   await expect(undo).toHaveCount(0)
   await expect(toast(page, 'Undid 1 change.')).toBeVisible()

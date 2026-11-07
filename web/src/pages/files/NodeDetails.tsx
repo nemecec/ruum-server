@@ -2,12 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { client, unwrap } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { Actor } from '../../app/names'
-import { useSession } from '../../app/useSession'
-import { fileTypeLabel, formatBytes, formatDate, formatWhen, formatWhenInline, roleLabels } from '../../components/format'
+import { fileTypeLabel, formatBytes, formatDate, formatWhen, roleLabels } from '../../components/format'
 import {
   Actions,
   Button,
-  Dialog,
   ErrorNote,
   Fact,
   Facts,
@@ -21,15 +19,13 @@ import {
   Stack,
   Tag,
   TagList,
-  TextInput,
   Toolbar,
   useToast,
   type MenuItem,
 } from '../../ui'
-import { downloadNode, previewNode, type Node } from './api'
+import { downloadNode, newVersionTarget, previewNode, type Node } from './api'
 import { NameDialog } from './dialogs'
 import { ShareDialog } from './ShareDialog'
-import { nameHeadVersion, replacesOwnSave } from './coalesce'
 import { useUploads } from './useUploads'
 import { t, tr } from '../../i18n'
 
@@ -43,12 +39,10 @@ export function NodeDetails(props: {
   onClose?: () => void
 }) {
   const { node } = props
-  const { me } = useSession()
   const { toast } = useToast()
   const uploads = useUploads()
   const [dialog, setDialog] = useState<'rename' | 'share' | null>(null)
   const [error, setError] = useState<unknown>()
-  const [versionFile, setVersionFile] = useState<{ file: File; previousAt: string } | null>(null)
   const canEdit = node.my_role === 'edit' || node.my_role === 'manage'
   const heading = useRef<HTMLHeadingElement>(null)
   const versionInput = useRef<HTMLInputElement>(null)
@@ -59,24 +53,13 @@ export function NodeDetails(props: {
     heading.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' })
   }, [node.id])
 
-  function uploadVersion(file: File, previousAt?: string) {
-    uploads.add(
-      [{ file, target: { target: 'new_version', node_id: node.id, base_version: node.head_version }, previousAt }],
-      node.tenant_id,
-    )
-  }
-
   /**
-   * "Upload new version": when the person's own last save is younger than the coalescing window,
-   * the server would join this upload into it and the old content would be gone. Ask first.
+   * "Upload new version" is an explicit save: it always makes a new version (`coalesce: false`,
+   * C-8, decision 0003-6), so the content before it stays in Versions.
    */
-  async function chooseVersion(file: File) {
+  function uploadVersion(file: File) {
     setError(undefined)
-    if (await replacesOwnSave(node, me.user.id)) {
-      setVersionFile({ file, previousAt: node.updated_at })
-      return
-    }
-    uploadVersion(file)
+    uploads.add([{ file, target: newVersionTarget(node) }], node.tenant_id)
   }
 
   const more: MenuItem[] = [
@@ -135,7 +118,7 @@ export function NodeDetails(props: {
           onChange={(e) => {
             const file = e.target.files?.[0]
             e.target.value = ''
-            if (file) void chooseVersion(file)
+            if (file) uploadVersion(file)
           }}
         />
       )}
@@ -158,62 +141,10 @@ export function NodeDetails(props: {
         />
       )}
       {dialog === 'share' && <ShareDialog node={node} open onClose={() => setDialog(null)} onChanged={props.onChanged} />}
-      {versionFile && (
-        <KeepVersionDialog
-          node={node}
-          previousAt={versionFile.previousAt}
-          onClose={() => setVersionFile(null)}
-          onUpload={async (name) => {
-            if (name) await nameHeadVersion(node, name)
-            uploadVersion(versionFile.file, name ? undefined : versionFile.previousAt)
-            setVersionFile(null)
-          }}
-        />
-      )}
     </Stack>
   )
 }
 
-/**
- * Asked before "Upload new version" would replace the person's own save of the last 10 minutes:
- * a name keeps that save as its own version (named versions never join, design 5.3).
- */
-function KeepVersionDialog(props: { node: Node; previousAt: string; onClose: () => void; onUpload: (name: string) => Promise<void> }) {
-  const [name, setName] = useState('')
-  const [error, setError] = useState<unknown>()
-  const [busy, setBusy] = useState(false)
-  return (
-    <Dialog title={t('keepVersion.title')} open onClose={props.onClose}>
-      <Stack
-        as="form"
-        gap={4}
-        onSubmit={async (e) => {
-          e.preventDefault()
-          setBusy(true)
-          setError(undefined)
-          try {
-            await props.onUpload(name.trim())
-          } catch (err) {
-            setError(err)
-            setBusy(false)
-          }
-        }}
-      >
-        <p>{t('keepVersion.body', { name: props.node.name, when: formatWhenInline(props.previousAt) })}</p>
-        <Field label={t('keepVersion.name')}>
-          <TextInput value={name} onChange={(e) => setName(e.target.value)} placeholder={t('keepVersion.placeholder')} />
-        </Field>
-        <ErrorNote error={error} />
-        <Actions>
-          <Button onClick={props.onClose}>{t('common.cancel')}</Button>
-          <Button type="submit" variant="primary" disabled={busy} busy={busy}>
-            {name.trim() ? t('keepVersion.keep') : t('keepVersion.replace')}
-          </Button>
-        </Actions>
-      </Stack>
-    </Dialog>
-  )
-}
 
 function NodeTags({ node, canEdit }: { node: Node; canEdit: boolean }) {
   const { toast } = useToast()

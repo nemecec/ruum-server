@@ -46,10 +46,16 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   const caraContext = await browser.newContext()
   const cara = await caraContext.newPage()
   const url = new URL(link)
-  // The token is in the fragment: it waits in the tab's session storage while Cara signs in.
+  // The token is in the fragment: it waits in the tab's session storage while Cara signs in. The
+  // sign-in page already names the space and the masked address (`previewInvitation`, C-9).
+  await cara.goto(url.pathname + url.search + url.hash)
+  await expect(cara.getByText(`Sign in, or make a free account, to join ${team}. The invitation was sent to `)).toBeVisible()
+  await expect(cara.getByText(users.cara.email)).toHaveCount(0)
   await signIn(cara, users.cara, url.pathname + url.search + url.hash, { shell: false })
-  await expect(cara.getByRole('heading', { name: "You're invited to a space in Ruum" })).toBeVisible()
-  await cara.getByRole('button', { name: 'Join the space' }).click()
+  // The accept page names the space, the inviter and the role (C-9).
+  await expect(cara.getByRole('heading', { name: `${users.ann.displayName} invited you to ${team}`, level: 1 })).toBeVisible()
+  await expect(cara.getByText(`As a member, you can do everything with the files in ${team}, also move, delete and restore them.`)).toBeVisible()
+  await cara.getByRole('button', { name: `Join ${team}` }).click()
   await expect(toast(cara, `You've joined ${team}.`)).toBeVisible()
   await expect(cara.getByRole('heading', { name: 'Files', level: 1 })).toBeVisible()
   await expect(cara.getByRole('button', { name: `${team} (change space)` })).toBeVisible()

@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import type { Schemas } from '../../api/client'
 import { usePagedApi } from '../../api/usePagedApi'
 import { actorLabel, useNames } from '../../app/useNames'
+import { rememberSpaceNames } from '../../app/sharedSpaces'
 import { useSession } from '../../app/useSession'
 import { formatDate, formatWhen, roleLabels } from '../../components/format'
 import {
@@ -32,6 +33,10 @@ import { t } from '../../i18n'
  */
 export function SharedPage() {
   const shared = usePagedApi(listSharedWithMe, [])
+  // The shell names a space that is not in the person's list from these (C-10).
+  useEffect(() => {
+    if (shared.data) rememberSpaceNames(shared.data.items)
+  }, [shared.data])
   return (
     <PageBody>
       <h1>{t('shell.nav.shared')}</h1>
@@ -54,7 +59,9 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
   const { tenants } = useSession()
   const names = useNames()
   const [error, setError] = useState<unknown>()
-  const spaceName = (id: string) => tenants.find((m) => m.tenant.id === id)?.tenant.name ?? t('shell.sharedSpace')
+  // Every item names its space (C-10, decision 0003-6), also a space the person is only a guest of.
+  const spaceName = (item: Schemas['SharedItem']) =>
+    item.tenant_name || (tenants.find((m) => m.tenant.id === item.node.tenant_id)?.tenant.name ?? t('shell.sharedSpace'))
   return (
     <>
       <ErrorNote error={error} />
@@ -82,9 +89,10 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
           </Tr>
         </THead>
         <TBody>
-          {items.map(({ node, role, shared_by, shared_at }) => {
+          {items.map((item) => {
+            const { node, role, shared_by, shared_at } = item
             const by = actorLabel(names, shared_by.actor, shared_by.on_behalf_of, shared_by.on_behalf_of_display_name)
-            const sharer = by.text === t('actor.someone') ? t('shared.someoneIn', { space: spaceName(node.tenant_id) }) : by.text
+            const sharer = by.text === t('actor.someone') ? t('shared.someoneIn', { space: spaceName(item) }) : by.text
             return (
               <Tr key={node.id}>
                 <Th scope="row">
@@ -93,14 +101,14 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
                     meta={
                       // On the phone the other columns are hidden; the row opens the item, which has Download.
                       showSpace
-                        ? t('shared.meta.space', { space: spaceName(node.tenant_id), access: roleLabels[role], who: sharer })
+                        ? t('shared.meta.space', { space: spaceName(item), access: roleLabels[role], who: sharer })
                         : t('shared.meta', { access: roleLabels[role], who: sharer })
                     }
                   >
                     <Link to={sharedItemPath(node)}>{node.name}</Link>
                   </NameCell>
                 </Th>
-                {showSpace && <Td hideNarrow>{spaceName(node.tenant_id)}</Td>}
+                {showSpace && <Td hideNarrow>{spaceName(item)}</Td>}
                 <Td hideNarrow>{roleLabels[role]}</Td>
                 <Td hideNarrow>{sharer}</Td>
                 <Td hideNarrow>

@@ -117,9 +117,13 @@ export function newFileTarget(folder: Node, file: File): UploadTarget {
   return { target: 'new_file', parent_id: folder.id, name: file.name, on_conflict: 'rename' }
 }
 
-/** A new version of a file. It fails with `version_mismatch` if someone else wrote one first. */
+/**
+ * A new version of a file. It fails with `version_mismatch` if someone else wrote one first. An
+ * upload from the web UI is an explicit save, so it never joins the version before
+ * (`coalesce: false`, C-8, decision 0003-6).
+ */
 export function newVersionTarget(node: Node): UploadTarget {
-  return { target: 'new_version', node_id: node.id, base_version: node.head_version }
+  return { target: 'new_version', node_id: node.id, base_version: node.head_version, coalesce: false }
 }
 
 /** Downloads from the content domain (`getContentUrl`), never from the API origin. */

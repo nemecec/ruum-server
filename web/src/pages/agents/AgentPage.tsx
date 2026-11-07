@@ -3,6 +3,7 @@ import { Link, useLocation, useParams } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
+import { Actor } from '../../app/names'
 import { useNames } from '../../app/useNames'
 import { tenantPath, useTenant } from '../../app/tenant'
 import { formatDate, formatWhen, formatWhenInline } from '../../components/format'
@@ -388,6 +389,14 @@ const reasons: Record<NonNullable<Schemas['UndoItem']['reason']>, MessageKey> = 
   permission_denied: 'undo.reason.permission',
 }
 
+/** Why an undo skips a change; a later change names who made it (C-11, decision 0003-6). */
+function SkipReason({ item }: { item: Schemas['UndoItem'] }) {
+  if (item.reason === 'changed_later' && item.changed_by) {
+    return <>{tr('undo.reason.changedLaterBy', { who: <Actor pair={item.changed_by} /> })}</>
+  }
+  return <>{item.reason ? t(reasons[item.reason]) : t('undo.reason.skipped')}</>
+}
+
 /** How far apart two changes may be and still count as one run of the agent (journey J5). */
 const RUN_GAP_MS = 15 * 60 * 1000
 
@@ -565,7 +574,7 @@ function ActivitySection({ agent }: { agent: Schemas['Agent'] }) {
                   <ul>
                     {inListOrder(report.result.skipped).map((s) => (
                       <li key={s.seq}>
-                        <DescribeText e={asListed(s)} info={info.data ?? {}} />: {s.reason ? t(reasons[s.reason]) : t('undo.reason.skipped')}
+                        <DescribeText e={asListed(s)} info={info.data ?? {}} />: <SkipReason item={s} />
                       </li>
                     ))}
                   </ul>

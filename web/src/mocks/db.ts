@@ -334,9 +334,66 @@ function seed() {
   ])
   // Invitation tokens of the mock: `/invitations/accept?token=demo-invite` joins a new team space.
   const invitationTokens = new Set<string>(['demo-invite'])
+  // What `previewInvitation` says of each token (C-9): `demo-invite` is pending until it is
+  // accepted; the others show the ended states.
+  const invitationPreviews = new Map<string, Schemas['InvitationPreview']>([
+    [
+      'demo-invite',
+      {
+        state: 'pending',
+        tenant_name: 'Lovelace Lab',
+        tenant_kind: 'team',
+        inviter_display_name: 'Charles Babbage',
+        role: 'member',
+        content_role: 'edit',
+        expires_at: '2026-11-20T10:00:00Z',
+        email_masked: 'a***@e***.com',
+      },
+    ],
+    [
+      'demo-other-address',
+      {
+        state: 'pending',
+        tenant_name: 'Lovelace Lab',
+        tenant_kind: 'team',
+        inviter_display_name: 'Charles Babbage',
+        role: 'guest',
+        content_role: null,
+        expires_at: '2026-11-20T10:00:00Z',
+        email_masked: 'l***@m***.org',
+      },
+    ],
+    [
+      'demo-expired',
+      {
+        state: 'expired',
+        tenant_name: 'Lovelace Lab',
+        tenant_kind: 'team',
+        inviter_display_name: 'Charles Babbage',
+        role: 'member',
+        content_role: 'view',
+        expires_at: '2026-10-20T10:00:00Z',
+        email_masked: 'a***@e***.com',
+      },
+    ],
+    ['demo-revoked', { state: 'revoked' }],
+    ['demo-used', { state: 'accepted' }],
+  ])
   const shared: Schemas['SharedItem'][] = [
-    { node: nodes.find((n) => n.id === ids.sharedDoc)!, role: 'comment', shared_by: byUser(ids.charles), shared_at: '2026-10-15T08:00:00Z' },
-    { node: nodes.find((n) => n.id === ids.guestDrawings)!, role: 'edit', shared_by: byUser(ids.charles), shared_at: '2026-10-20T08:00:00Z' },
+    {
+      node: nodes.find((n) => n.id === ids.sharedDoc)!,
+      tenant_name: 'Ada Lovelace',
+      role: 'comment',
+      shared_by: byUser(ids.charles),
+      shared_at: '2026-10-15T08:00:00Z',
+    },
+    {
+      node: nodes.find((n) => n.id === ids.guestDrawings)!,
+      tenant_name: 'Babbage & Co',
+      role: 'edit',
+      shared_by: byUser(ids.charles),
+      shared_at: '2026-10-20T08:00:00Z',
+    },
   ]
 
   const agents: Schemas['Agent'][] = [
@@ -475,6 +532,7 @@ function seed() {
     shareLinks,
     linkSecrets,
     invitationTokens,
+    invitationPreviews,
     /** Share emails sent, by `<node>/<email>` (one per recipient and item in 10 minutes, decision 0003-3). */
     mailed: new Set<string>(),
     shared,

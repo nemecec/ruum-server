@@ -144,6 +144,13 @@ test('Ann shares a folder with Ben, who gets a mail, opens its link and sees the
   await expect(people).not.toContainText('Invited, not joined yet')
   await expect.poll(async () => (await api(ben, 'GET', `/v1/nodes/${folderId}`, { tenant })).status, { timeout: 15_000 }).toBe(200)
 
+  // Shared with me names the space of the folder from the item itself (C-10).
+  const shared = (await api<{ items: { node: { id: string }; tenant_name: string }[] }>(ben, 'GET', '/v1/shared-with-me')).body
+  expect(shared.items.find((i) => i.node.id === folderId)?.tenant_name).toBe(`${users.ann.displayName}'s space`)
+  await ben.goto(`/t/${tenant}/shared`)
+  const row = ben.getByRole('row').filter({ has: ben.getByRole('link', { name: folder, exact: true }) })
+  await expect(row).toContainText(`${users.ann.displayName}'s space`)
+
   await context.close()
   await benContext.close()
 })

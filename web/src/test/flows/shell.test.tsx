@@ -39,6 +39,23 @@ describe('app shell', () => {
     expect(screen.getByRole('button', { name: 'A shared space (change space)' })).toBeInTheDocument()
   })
 
+  it('names a space that is not in the list from Shared with me (C-10)', async () => {
+    // Ada's guest space is not listed (for example the list was read before the share).
+    db.tenants.splice(2, 1)
+    renderApp(`/t/${ids.guest}/files`)
+    expect(await screen.findByRole('button', { name: 'Babbage & Co (change space)' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Shared with you in Babbage & Co', level: 1 })).toBeInTheDocument()
+    expect(screen.queryByText(/A shared space/)).not.toBeInTheDocument()
+  })
+
+  it('names the space of every shared item from the item, also an unlisted one (C-10)', async () => {
+    db.tenants.splice(2, 1)
+    renderApp(`${personal}/shared`)
+    const row = (await screen.findByRole('link', { name: 'Engine drawings' })).closest('tr')!
+    expect(within(row).getAllByText('Babbage & Co').length).toBeGreaterThan(0)
+    expect(screen.queryByText('A shared space')).not.toBeInTheDocument()
+  })
+
   it('tells a guest of a space that they see only what was shared', async () => {
     db.tenants[1].role = 'guest'
     renderApp(`${team}/files`)

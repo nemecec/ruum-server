@@ -39,13 +39,12 @@ import {
   useToast,
   VisuallyHidden,
 } from '../../ui'
-import { findFilesByName, listChildren, listSharedWithMe, loadFolder, moveNodes, nameKey, refreshNode, trashNodes, type Node } from './api'
+import { findFilesByName, listChildren, listSharedWithMe, loadFolder, moveNodes, nameKey, newVersionTarget, refreshNode, trashNodes, type Node } from './api'
 import { MoveDialog, NameDialog } from './dialogs'
 import { focusPageHeading } from '../../components/dom'
 import { EmailShareCheck } from './EmailShareCheck'
 import { NodeDetails } from './NodeDetails'
 import { SharedTable } from './SharedPage'
-import { nameHeadVersion, replacesOwnSave } from './coalesce'
 import { ConflictDialog, type ConflictChoice } from './uploads'
 import { useUploads, useUploadsDone, type UploadPlan } from './useUploads'
 import { VersionsPanel } from './VersionsPanel'
@@ -56,13 +55,12 @@ import { currentIntl, t } from '../../i18n'
  * `existing` maps `nameKey` to the file of that name. `again` is set when the server answered
  * `name_taken` for files of an earlier plan (see `askAgain`).
  */
-type Pending = { files: File[]; folder: Node; existing: Map<string, Node>; recent: Node[]; again: boolean }
+type Pending = { files: File[]; folder: Node; existing: Map<string, Node>; again: boolean }
 
 /** The file browser: one folder, its breadcrumbs, its children and the details of one child. */
 export function FilesPage() {
   const { folderId } = useParams()
   const { tenant, listed } = useTenant()
-  const { me } = useSession()
   const { toast } = useToast()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
@@ -129,13 +127,10 @@ export function FilesPage() {
       // The new version starts from the head the server has now, not from the list on the screen.
       const fresh = await Promise.all(taken.map(refreshNode))
       taken.forEach((old, i) => existing.set(nameKey(old.name), fresh[i]))
-      // A new version of the person's own unnamed save of the last 10 minutes replaces it
-      // (coalescing, design 5.3): the dialog says so before, as "Upload new version" does.
-      const checks = await Promise.all(fresh.map((n) => replacesOwnSave(n, me.user.id)))
-      setPending({ files, folder, existing, recent: fresh.filter((_, i) => checks[i]), again })
+      setPending({ files, folder, existing, again })
       return
     }
-    uploads.add(plansFor(files, folder, existing, 'keep', undefined, again), folder.tenant_id, folderLabel(folder))
+    uploads.add(plansFor(files, folder, existing, 'keep', again), folder.tenant_id, folderLabel(folder))
   }
 
   /**
@@ -162,7 +157,6 @@ export function FilesPage() {
     folder: Node,
     existing: Map<string, Node>,
     choice: ConflictChoice,
-    named = new Set<string>(),
     again = false,
   ): UploadPlan[] {
     const plans: UploadPlan[] = []
@@ -172,12 +166,8 @@ export function FilesPage() {
       const old = existing.get(nameKey(file.name))
       if (old && choice === 'skip') continue
       if (old && choice === 'version') {
-        const mine = old.updated_by.actor.kind === 'user' && old.updated_by.actor.id === me.user.id
-        plans.push({
-          file,
-          target: { target: 'new_version', node_id: old.id, base_version: old.head_version },
-          previousAt: mine && !named.has(old.id) ? old.updated_at : undefined,
-        })
+        // An explicit new version never joins the version before (C-8).
+        plans.push({ file, target: newVersionTarget(old) })
       } else if (old || again) {
         // "Keep both", or a name that is still taken by something that is not a file (a folder).
         plans.push({ file, target: { target: 'new_file', parent_id: folder.id, name: file.name, on_conflict: 'rename' } })
@@ -430,18 +420,9 @@ export function FilesPage() {
                 {pending && (
                   <ConflictDialog
                     names={pending.files.filter((f) => pending.existing.has(nameKey(f.name))).map((f) => f.name)}
-                    recent={pending.recent}
                     onClose={() => setPending(null)}
-                    onChoose={async (choice, label) => {
-                      // A name keeps the person's save of the last minutes as its own version.
-                      const named = new Set<string>()
-                      if (choice === 'version' && label) {
-                        for (const n of pending.recent) {
-                          await nameHeadVersion(n, label)
-                          named.add(n.id)
-                        }
-                      }
-                      const plans = plansFor(pending.files, pending.folder, pending.existing, choice, named, pending.again)
+                    onChoose={(choice) => {
+                      const plans = plansFor(pending.files, pending.folder, pending.existing, choice, pending.again)
                       setPending(null)
                       if (plans.length) uploads.add(plans, pending.folder.tenant_id, folderLabel(pending.folder))
                     }}

@@ -105,6 +105,28 @@ describe('agents', () => {
     expect(within(activity).getByRole('checkbox', { name: 'Select: Renamed todo.txt to plan.txt' })).toBeDisabled()
   })
 
+  it('names who changed an item later, when the undo skips it (C-11)', async () => {
+    // Charles renamed plan.txt after the agent did: the undo leaves it as it is and says who.
+    db.journal.push({
+      tenant_id: ids.personal,
+      seq: 50,
+      node_id: ids.plan,
+      revision: 2,
+      type: 'node.renamed',
+      actor: { kind: 'user', id: ids.charles, display_name: 'Charles Babbage' },
+      on_behalf_of: null,
+      at: '2026-11-05T17:00:00Z',
+      data: { old_name: 'plan.txt', new_name: 'plan-final.txt' },
+    })
+    const { user } = renderApp(`${personal}/agents/${ids.agentClaude}`)
+    const activity = await screen.findByRole('region', { name: 'Activity' })
+    await user.click(await within(activity).findByRole('checkbox', { name: 'Select: Renamed todo.txt to plan.txt' }))
+    await user.click(within(activity).getByRole('button', { name: 'Undo 1 selected change...' }))
+    const d = await dialog('Nothing to undo')
+    expect(within(d).getByText('These stay as they are:')).toBeInTheDocument()
+    expect(within(d).getByRole('listitem')).toHaveTextContent('Renamed todo.txt to plan.txt: Charles Babbage changed it again later')
+  })
+
   it('undoes all with a fixed range, and confirms exactly the entries of the dry run', async () => {
     const seen = recordRequests()
     const { user } = renderApp(`${personal}/agents/${ids.agentClaude}`)

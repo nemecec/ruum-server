@@ -527,9 +527,20 @@ export const handlers: HttpHandler[] = [
     requireAdmin(params.tenant_id)
     db.invitations = db.invitations.filter((i) => i.id !== params.invitation_id)
   }),
+  route(
+    'post',
+    '/v1/invitations/preview',
+    ({ body }) => {
+      const p = db.invitationPreviews.get(body.token)
+      if (!p) throw notFound('Invitation')
+      return p
+    },
+    { public: true },
+  ),
   route('post', '/v1/invitations/accept', ({ body }) => {
     if (!db.invitationTokens.has(body.token)) throw notFound('Invitation')
     db.invitationTokens.delete(body.token)
+    db.invitationPreviews.set(body.token, { state: 'accepted' })
     const id = newId()
     const root = newId()
     const tenant: Schemas['Tenant'] = {
@@ -669,20 +680,27 @@ export const handlers: HttpHandler[] = [
         (!body.since || j.at >= body.since) &&
         (!body.until || j.at <= body.until),
     )
-    const item = (j: Schemas['JournalEntry'], reason: Schemas['UndoItem']['reason']): Schemas['UndoItem'] => ({
+    const item = (j: Schemas['JournalEntry'], reason: Schemas['UndoItem']['reason'], changedBy?: Schemas['ActorPair']): Schemas['UndoItem'] => ({
       seq: j.seq,
       node_id: j.node_id,
       type: j.type,
       reason,
+      ...(changedBy ? { changed_by: changedBy } : {}),
     })
-    // The mock treats a purge as irreversible, an entry undone before as changed later (the undo
-    // was a later change), and everything else as revertible. Like the server, the journal keeps
-    // the entries: the activity still lists them.
-    const undone = (j: Schemas['JournalEntry']) => db.undoneSeqs.has(j.seq)
-    const reverted = entries.filter((j) => j.type !== 'node.purged' && !undone(j)).map((j) => item(j, null))
+    // Who changed the node first after the entry (C-11): a later journal entry of another actor,
+    // or the person whose undo reverted the entry before (the undo was a later change).
+    const changedBy = (j: Schemas['JournalEntry']): Schemas['ActorPair'] | undefined => {
+      const later = db.journal.find((x) => x.tenant_id === j.tenant_id && x.node_id === j.node_id && x.seq > j.seq && x.actor.id !== j.actor.id)
+      if (later) return { actor: later.actor, on_behalf_of: later.on_behalf_of }
+      return db.undoneSeqs.has(j.seq) ? byUser() : undefined
+    }
+    // The mock treats a purge as irreversible, an entry that someone changed later as changed
+    // later, and everything else as revertible. Like the server, the journal keeps the entries:
+    // the activity still lists them.
+    const reverted = entries.filter((j) => j.type !== 'node.purged' && !changedBy(j)).map((j) => item(j, null))
     const skipped = entries
-      .filter((j) => j.type === 'node.purged' || undone(j))
-      .map((j) => item(j, j.type === 'node.purged' ? 'irreversible' : 'changed_later'))
+      .filter((j) => j.type === 'node.purged' || changedBy(j))
+      .map((j) => (j.type === 'node.purged' ? item(j, 'irreversible') : item(j, 'changed_later', changedBy(j))))
     if (body.dry_run) return { dry_run: true, reverted, skipped, change: null }
     for (const r of reverted) db.undoneSeqs.add(r.seq)
     return { dry_run: false, reverted, skipped, change: change() }

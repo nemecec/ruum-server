@@ -5,27 +5,24 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { RuumApiError } from '../../api/client'
 import { errorText } from '../../api/errors'
-import { formatBytes, formatWhenInline } from '../../components/format'
+import { formatBytes } from '../../components/format'
 import {
   Actions,
   Button,
   Dialog,
   ErrorNote,
-  Field,
   Fieldset,
   FloatingPanel,
   IconButton,
   Indent,
   List,
   ListRow,
-  Note,
   ProgressBar,
   ProseList,
   Radio,
   Row,
   Stack,
   Text,
-  TextInput,
   useToast,
 } from '../../ui'
 import { uploadBlob, type UploadProgress } from '../../upload/upload'
@@ -77,15 +74,10 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
           signal: job.controller.signal,
           onProgress: (progress) => update(job.item.id, { progress }),
         })
-        // A new version by the same person within the coalescing window joins the version before
-        // (design 5.3): the head version stays the same. Say so instead of hiding it.
-        const base = job.target.target === 'new_version' ? job.target.base_version : null
-        const replaced = base && res.node.head_version === base ? (job.previousAt ?? res.node.updated_at) : undefined
-        const done: Partial<UploadItem> = { status: 'done', node: res.node, replaced, progress: { phase: 'completing', done: 1, total: 1 } }
-        update(job.item.id, done)
+        // A new version from the web UI never joins the version before (`coalesce: false`, C-8).
+        update(job.item.id, { status: 'done', node: res.node, progress: { phase: 'completing', done: 1, total: 1 } })
         round.current.nodes.push(res.node)
         if (job.folderName) round.current.folders.add(job.folderName)
-        if (replaced) round.current.replaced.push({ ...job.item, ...done })
       } catch (error) {
         if (job.onNameTaken && error instanceof RuumApiError && error.code === 'name_taken' && !job.controller.signal.aborted) {
           round.current.nameTaken.push({ job, error })
@@ -167,10 +159,10 @@ export function UploadsProvider({ children }: { children: ReactNode }) {
 }
 
 /** What one round of the queue did, for the toast at its end. */
-type Round = { nodes: Node[]; failed: number; folders: Set<string>; replaced: UploadItem[]; nameTaken: { job: Job; error: unknown }[] }
+type Round = { nodes: Node[]; failed: number; folders: Set<string>; nameTaken: { job: Job; error: unknown }[] }
 
 function newRound(): Round {
-  return { nodes: [], failed: 0, folders: new Set(), replaced: [], nameTaken: [] }
+  return { nodes: [], failed: 0, folders: new Set(), nameTaken: [] }
 }
 
 /** The toast at the end of a round (copy.md 3.2). */
@@ -182,12 +174,6 @@ function summary(r: Round): string {
   else if (n === 1 && !r.failed) text = t('uploads.toast.one', { name: r.nodes[0].name })
   else if (r.failed) text = t('uploads.toast.someFailed', { n, failed: r.failed })
   else text = folder ? t('uploads.toast.toFolder', { n, folder }) : t('uploads.toast.many', { n })
-  if (r.replaced.length === 1) {
-    const it = r.replaced[0]
-    text += ` ${t('uploads.toast.replaced.one', { when: formatWhenInline(it.replaced!) })}`
-  } else if (r.replaced.length > 1) {
-    text += ` ${t('uploads.toast.replaced', { n: r.replaced.length })}`
-  }
   return text
 }
 
@@ -202,7 +188,6 @@ function statusText(item: UploadItem): string {
     case 'waiting':
       return t('uploads.status.waiting')
     case 'done': {
-      if (item.replaced) return t('uploads.status.joined')
       if (item.node && item.node.name !== item.name) return t('uploads.status.savedAs', { name: item.node.name })
       return t('uploads.status.done')
     }
@@ -308,34 +293,20 @@ export function UploadPanel(props: { items: UploadItem[]; onCancel: (id: string)
 
 export type ConflictChoice = 'version' | 'keep' | 'skip'
 
-/** "Before the upload of 15:13": the default name that keeps a recent version (24-hour clock, local time). */
-function keepLabel(now = new Date()): string {
-  return t('uploads.keepLabel', { time: currentIntl().formatTime(now, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) })
-}
 
 /**
  * Asks once per batch what to do with files whose names are already in the folder (copy.md 3.2):
- * save as a new version (the default), keep both, or skip. `recent` are the items whose head
- * version is the person's own unnamed save of the last 10 minutes: the server joins a new version
- * into such a version (design 5.3). So that "every change is kept as a version" holds, the
- * default names that version first (named versions never join) and says so; clearing the name
- * says in plain words that the upload then replaces it (decisions.md, synthetic-user round).
+ * save as a new version (the default), keep both, or skip. A new version never joins the version
+ * before (`coalesce: false`, C-8, decision 0003-6), so the earlier content always stays in
+ * Versions.
  */
-export function ConflictDialog(props: {
-  names: string[]
-  recent?: Node[]
-  onChoose: (choice: ConflictChoice, label: string) => void | Promise<void>
-  onClose: () => void
-}) {
+export function ConflictDialog(props: { names: string[]; onChoose: (choice: ConflictChoice) => void | Promise<void>; onClose: () => void }) {
   const { names } = props
-  const recent = props.recent ?? []
   const [choice, setChoice] = useState<ConflictChoice>('version')
-  const [label, setLabel] = useState(() => (recent.length ? keepLabel() : ''))
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
   const title = names.length === 1 ? t('conflict.title.one', { name: names[0] }) : t('conflict.title', { n: names.length })
   const one = names.length === 1
-  const when = recent.length === 1 ? formatWhenInline(recent[0].updated_at) : null
   return (
     <Dialog title={title} open onClose={props.onClose}>
       <Stack
@@ -346,7 +317,7 @@ export function ConflictDialog(props: {
           setBusy(true)
           setError(undefined)
           try {
-            await props.onChoose(choice, choice === 'version' ? label.trim() : '')
+            await props.onChoose(choice)
           } catch (err) {
             setError(err)
             setBusy(false)
@@ -374,24 +345,6 @@ export function ConflictDialog(props: {
               <Text id="conflict-version" tone="muted" size="sm">
                 {one ? t('conflict.version.help.one') : t('conflict.version.help')}
               </Text>
-              {recent.length > 0 && (
-                <>
-                  <Field label={recent.length === 1 ? t('conflict.keepName.one') : t('conflict.keepName')}>
-                    <TextInput value={label} onChange={(e) => setLabel(e.target.value)} aria-describedby="conflict-keep" />
-                  </Field>
-                  {label.trim() ? (
-                    <Text id="conflict-keep" tone="muted" size="sm">
-                      {recent.length === 1
-                        ? t('conflict.kept.one', { name: recent[0].name, when: when ?? '' })
-                        : t('conflict.kept', { n: recent.length })}
-                    </Text>
-                  ) : (
-                    <Note id="conflict-keep" tone="warning" role="note">
-                      {recent.length === 1 ? t('conflict.replaces.one', { when: when ?? '' }) : t('conflict.replaces')}
-                    </Note>
-                  )}
-                </>
-              )}
             </Indent>
           )}
           <Radio
