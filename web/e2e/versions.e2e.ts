@@ -3,7 +3,7 @@
 import fs from 'node:fs'
 import { expect, test } from '@playwright/test'
 import { readRun, storageStatePath } from './support/env.ts'
-import { testFile, toast, uniqueName } from './support/app.ts'
+import { testFile, toast, uniqueName, menuAction } from './support/app.ts'
 
 test.use({ storageState: storageStatePath('ann') })
 
@@ -26,11 +26,12 @@ test('version history: label, new version, diff and restore', async ({ page }, i
 
   // Saves by the same person within 10 minutes merge into one version (design 5.3); a name keeps
   // the first version on its own.
-  await page.getByRole('button', { name: 'Versions', exact: true }).click()
+  await menuAction(page, 'More actions for plan.txt', 'Versions')
   const panel = page.getByRole('region', { name: 'Versions of plan.txt' })
   await expect(panel.getByRole('listitem')).toHaveCount(1)
   await expect(panel.getByText('This is the only version')).toBeVisible()
-  await panel.getByRole('button', { name: /^Keep forever: name the version of/ }).click()
+  await panel.getByRole('button', { name: /^More actions for the version of/ }).first().click()
+  await page.getByRole('menuitem', { name: 'Name this version' }).click()
   const nameDialog = page.getByRole('dialog', { name: 'Name this version' })
   await expect(nameDialog).toContainText('Named versions are kept forever')
   await nameDialog.getByLabel('Version name').fill('first')
@@ -42,7 +43,7 @@ test('version history: label, new version, diff and restore', async ({ page }, i
   // A new version through "Upload new version" (target new_version with the head as base).
   await page.getByLabel('New version of plan.txt').setInputFiles(testFile(info.outputPath('v2'), 'plan.txt', v2))
   await expect(toast(page, 'Uploaded plan.txt.')).toBeVisible()
-  await page.getByRole('button', { name: 'Versions', exact: true }).click()
+  await menuAction(page, 'More actions for plan.txt', 'Versions')
   await expect(panel.getByRole('listitem')).toHaveCount(2)
   const current = panel.getByRole('listitem').filter({ hasText: 'Current' })
   await expect(current).toHaveCount(1)
@@ -94,7 +95,7 @@ test('"Upload new version" warns before it replaces your own version of the last
   await keep.getByLabel('Name the current version to keep it (optional)').fill('before two')
   await keep.getByRole('button', { name: 'Keep it and upload' }).click()
   await expect(toast(page, 'Uploaded plan.txt.')).toBeVisible()
-  await page.getByRole('button', { name: 'Versions', exact: true }).click()
+  await menuAction(page, 'More actions for plan.txt', 'Versions')
   const panel = page.getByRole('region', { name: 'Versions of plan.txt' })
   // Both versions are there: the named one kept the old content.
   await expect(panel.getByRole('listitem')).toHaveCount(2)
@@ -133,7 +134,7 @@ test('a name conflict on upload does not silently replace your own version of th
   await page.keyboard.press('Enter')
   await expect(toast(page, /^Uploaded plan\.txt\.$/)).toBeVisible()
   await page.getByRole('button', { name: 'Details of plan.txt' }).click()
-  await page.getByRole('button', { name: 'Versions', exact: true }).click()
+  await menuAction(page, 'More actions for plan.txt', 'Versions')
   const panel = page.getByRole('region', { name: 'Versions of plan.txt' })
   await expect(panel.getByRole('listitem')).toHaveCount(2)
   await expect(panel.getByText(/^Before the upload of /)).toBeVisible()
@@ -146,6 +147,6 @@ test('a name conflict on upload does not silently replace your own version of th
   await expect(conflict.getByRole('note')).toContainText('Without a name, the new upload replaces your version from')
   await conflict.getByRole('button', { name: 'Continue' }).click()
   await expect(toast(page, /^Uploaded plan\.txt\. It replaced your version from /)).toBeVisible()
-  await page.getByRole('button', { name: 'Versions', exact: true }).click()
+  await menuAction(page, 'More actions for plan.txt', 'Versions')
   await expect(panel.getByRole('listitem')).toHaveCount(2)
 })

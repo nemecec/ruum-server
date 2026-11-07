@@ -175,3 +175,54 @@ test.describe('pseudo-locale', () => {
     })
   }
 })
+
+/** The page does not scroll sideways (WCAG 1.4.10 Reflow; design-system 3.10). */
+async function noSidewaysScroll(page: Page, screen: string) {
+  const { scroll, width } = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, width: window.innerWidth }))
+  expect(scroll, `${screen} scrolls sideways at ${width} px`).toBeLessThanOrEqual(width)
+}
+
+// The pseudo-locale at phone width (UX panel, consistency 13): longer text must not cut row
+// actions or push the page sideways. No snapshots: the checks are the point.
+test.describe('pseudo-locale phone', () => {
+  test.use({ viewport: { width: 390, height: 844 }, colorScheme: 'dark', locale: 'en-XA' })
+
+  test.beforeEach(async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+  })
+
+  for (const s of screens) {
+    test(s.name, async ({ page, context }) => {
+      await context.addCookies([
+        { name: 'ruum_mock_session', value: '1', domain: 'localhost', path: '/' },
+        { name: 'ruum_csrf', value: 'visual-test', domain: 'localhost', path: '/' },
+      ])
+      await s.open(page, pseudoWords)
+      await settle(page)
+      expect(await untranslated(page), `untranslated text on ${s.name}`).toEqual([])
+      await noSidewaysScroll(page, `${s.name} (pseudo-locale, phone)`)
+      await axe(page, `${s.name} (pseudo-locale, phone)`)
+    })
+  }
+})
+
+// Reflow at 320 px (UX panel, accessibility A5), in English: no sideways scroll.
+test.describe('reflow 320', () => {
+  test.use({ viewport: { width: 320, height: 640 }, colorScheme: 'light' })
+
+  test.beforeEach(async ({ page }) => {
+    await page.clock.setFixedTime(NOW)
+  })
+
+  for (const s of screens.filter((x) => ['files', 'shared', 'trash', 'members', 'connect', 'account', 'agent', 'activity-log'].includes(x.name))) {
+    test(s.name, async ({ page, context }) => {
+      await context.addCookies([
+        { name: 'ruum_mock_session', value: '1', domain: 'localhost', path: '/' },
+        { name: 'ruum_csrf', value: 'visual-test', domain: 'localhost', path: '/' },
+      ])
+      await s.open(page, english)
+      await settle(page)
+      await noSidewaysScroll(page, s.name)
+    })
+  }
+})

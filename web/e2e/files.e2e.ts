@@ -4,7 +4,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { expect, test, type Page } from '@playwright/test'
 import { readRun, storageStatePath } from './support/env.ts'
-import { sha256, testFile, toast, uniqueName } from './support/app.ts'
+import { sha256, testFile, toast, uniqueName, menuAction } from './support/app.ts'
 
 test.use({ storageState: storageStatePath('ann') })
 
@@ -64,7 +64,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   expect(sha256(back)).toBe(sha256(data))
 
   // Rename.
-  await page.getByRole('button', { name: 'Rename' }).click()
+  await menuAction(page, 'More actions for big.bin', 'Rename')
   const rename = page.getByRole('dialog', { name: 'Rename big.bin' })
   // The dialog puts the focus in the field and selects the name without its extension, as file
   // managers do: typing keeps ".bin".
@@ -78,7 +78,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
 
   // Move into Archive with the folder picker.
   await openDetails(page, 'renamed.bin')
-  await page.getByRole('button', { name: 'Move', exact: true }).click()
+  await menuAction(page, 'More actions for renamed.bin', 'Move')
   const move = page.getByRole('dialog', { name: 'Move renamed.bin' })
   await move.getByRole('button', { name: 'Archive', exact: true }).click()
   await expect(move.getByRole('navigation', { name: 'Folder path' })).toContainText('Archive')
@@ -91,7 +91,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
 
   // Trash (it can be undone, so no confirmation), then restore from the trash page.
   await openDetails(page, 'renamed.bin')
-  await page.getByRole('button', { name: 'Move to trash' }).click()
+  await menuAction(page, 'More actions for renamed.bin', 'Move to trash')
   await expect(toast(page, 'Moved renamed.bin to trash.')).toBeVisible()
   await expect(page.getByText('This folder is empty', { exact: true })).toBeVisible()
   const archiveUrl = page.url()

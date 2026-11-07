@@ -33,8 +33,10 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   const annRow = members.getByRole('row').filter({ hasText: '(you)' })
   await expect(annRow).toContainText(users.ann.displayName)
   await expect(annRow).toContainText(users.ann.email)
-  await expect(annRow.getByRole('combobox')).toHaveValue('owner')
-  await expect(annRow.getByRole('combobox')).toBeDisabled()
+  // The role is text with the reason next to it (journey J6): no menu for her own row.
+  await expect(annRow).toContainText('Owner')
+  await expect(annRow).toContainText('A space needs at least one owner.')
+  await expect(annRow.getByRole('button', { name: /Role of/ })).toHaveCount(0)
 
   // An invitation to Cara as a member; the mail reaches Mailpit with the accept link.
   const link = await invite(ann, users.cara.email, 'Member')
@@ -58,10 +60,13 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Members' }).click()
   const caraRow = members.getByRole('row').filter({ hasText: users.cara.email })
   await expect(caraRow).toContainText(users.cara.displayName)
-  await expect(caraRow.getByRole('combobox')).toHaveValue('member')
-  await caraRow.getByRole('combobox').selectOption('admin')
+  // A member has a content role, default Can manage (decision 0003-1).
+  await expect(caraRow.getByRole('button', { name: `Can manage what ${users.cara.displayName} can do` })).toBeVisible()
+  await caraRow.getByRole('button', { name: `Member Role of ${users.cara.displayName}` }).click()
+  await ann.getByRole('menu').getByRole('menuitemradio', { name: /^Admin/ }).click()
   await expect(toast(ann, `${users.cara.displayName} is now admin.`)).toBeVisible()
-  await expect(caraRow.getByRole('combobox')).toHaveValue('admin')
+  await expect(caraRow.getByRole('button', { name: `Admin Role of ${users.cara.displayName}` })).toBeVisible()
+  await expect(caraRow.getByRole('button', { name: /can do$/ })).toHaveCount(0)
 
   // Cara now has the admin pages of the team.
   await cara.reload()

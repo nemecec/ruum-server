@@ -1,9 +1,10 @@
-// Sharing: Ann shares a folder by email; the other person sees it, with view access only. A link
-// made in the share dialog opens for a visitor without an account.
+// Sharing: Ann shares a folder by email (decision 0003-2, 0003-3); Ruum emails the person, who
+// opens the link of the mail and sees the folder with view access only. A link made in the share
+// dialog opens for a visitor without an account.
 import fs from 'node:fs'
 import { expect, test, type Browser, type Page } from '@playwright/test'
 import { readRun, storageStatePath, type TestUser } from './support/env.ts'
-import { acceptInvitation, api, signIn, testFile, toast, uniqueName, waitForMail } from './support/app.ts'
+import { api, signIn, testFile, toast, uniqueName, waitForMail } from './support/app.ts'
 
 /** Ann makes a folder with note.txt and shares the folder with `email` as "Can view". */
 async function annSharesFolder(browser: Browser, email: string, outDir: string) {
@@ -29,18 +30,16 @@ async function annSharesFolder(browser: Browser, email: string, outDir: string) 
   const form = share.getByRole('form', { name: 'Add people' })
   await form.getByLabel('Email', { exact: true }).fill(email)
   await expect(form.getByLabel('Access')).toHaveValue('view')
-  // No out-of-date "can't send emails" text: the one box says what Ruum emails.
-  await expect(form).not.toContainText("can't send emails")
-  await expect(form.getByLabel('Send an email')).toHaveCount(0)
-  // The person is new here: a share alone would not let them open the folder, so the dialog says
-  // so in plain words and emails them an invitation (on by default). A link is the way without an account.
-  await expect(form).toContainText(`${email} is new here. With the invitation they make a free Ruum account, then they can open ${folder}.`)
-  await expect(form.getByRole('checkbox', { name: 'Email them an invitation' })).toBeChecked()
+  // The email grant binds when the person signs in with this address; "Notify people" is on by
+  // default, and the share dialog never creates an invitation (decision 0003-3).
+  await expect(form).toContainText('They sign in with this address to open it.')
+  await expect(form.getByRole('checkbox', { name: 'Notify people' })).toBeChecked()
+  await expect(form.getByRole('checkbox', { name: /invitation/ })).toHaveCount(0)
+  await expect(form).not.toContainText('make a free')
   await expect(form.getByRole('button', { name: 'Use a link instead' })).toBeVisible()
+  await form.getByLabel('Message (optional)').fill(`The plans, run ${run}.`)
   await form.getByRole('button', { name: 'Share' }).click()
-  await expect(
-    share.getByRole('status').filter({ hasText: `Shared ${folder} with ${email}. Ruum emailed them an invitation: they make a free account, then they can open it.` }),
-  ).toBeVisible()
+  await expect(share.getByRole('status').filter({ hasText: `Shared with ${email}. Ruum emailed them.` })).toBeVisible()
   const people = share.getByRole('region', { name: 'People with access' })
   await expect(people).toContainText(email)
   await expect(people).toContainText('Invited, not joined yet')
@@ -55,7 +54,7 @@ async function annSharesFolder(browser: Browser, email: string, outDir: string) 
 async function seesFolderReadOnly(page: Page, owner: TestUser, folder: string, note: string, outFile: string) {
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Shared with me' }).click()
   await expect(page.getByRole('heading', { name: 'Shared with me', level: 1 })).toBeVisible()
-  const row = page.getByRole('row').filter({ has: page.getByRole('rowheader', { name: folder }) })
+  const row = page.getByRole('row').filter({ has: page.getByRole('link', { name: folder, exact: true }) })
   await expect(row).toContainText('Can view')
   // The space by its name, never "Another tenant" or an ID.
   await expect(row).toContainText(owner.displayName)
@@ -70,8 +69,12 @@ async function seesFolderReadOnly(page: Page, owner: TestUser, folder: string, n
   await page.getByRole('button', { name: 'Details of note.txt' }).click()
   const details = page.getByRole('complementary', { name: 'Details' })
   await expect(details.getByRole('definition').filter({ hasText: 'Can view' })).toBeVisible()
-  await expect(details.getByRole('button', { name: 'Rename' })).toHaveCount(0)
-  await expect(details.getByRole('button', { name: 'Move to trash' })).toHaveCount(0)
+  // The More menu has no write actions for a viewer.
+  await details.getByRole('button', { name: 'More actions for note.txt' }).click()
+  await expect(page.getByRole('menuitem', { name: 'Versions' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Rename' })).toHaveCount(0)
+  await expect(page.getByRole('menuitem', { name: 'Move to trash' })).toHaveCount(0)
+  await page.keyboard.press('Escape')
   const [dl] = await Promise.all([page.waitForEvent('download'), details.getByRole('button', { name: 'Download', exact: true }).click()])
   await dl.saveAs(outFile)
   expect(fs.readFileSync(outFile, 'utf8')).toBe(note)
@@ -84,20 +87,26 @@ async function seesFolderReadOnly(page: Page, owner: TestUser, folder: string, n
   return { folderId, tenant }
 }
 
-test('Ann shares a folder with Ben, who joins as a guest by invitation and sees it read-only', async ({ browser }, info) => {
+/** The link of a share email: the item page of the web UI, never a token (decision 0003-3). */
+function shareLink(text: string): string {
+  const link = /https?:\/\/\S+\/t\/[0-9a-f-]{36}\/(?:files|item)\/[0-9a-f-]{36}/.exec(text)?.[0]
+  expect(link, text).toBeTruthy()
+  expect(link).not.toContain('token')
+  return link!
+}
+
+test('Ann shares a folder with Ben, who gets a mail, opens its link and sees the folder read-only', async ({ browser }, info) => {
   const { users } = readRun()
   const { context, ann, folder, folderId, tenant, note, share } = await annSharesFolder(browser, users.ben.email, info.outputPath())
 
-  // Ben is a person outside Ann's space: he joins it as a guest through the invitation mail that
-  // the share dialog sent, which also binds the email grant to him.
-  const mail = await waitForMail(users.ben.email)
-  expect(mail.text).toContain(`I shared "${folder}" with you.`)
-  const link = /https?:\/\/\S+\/invitations\/accept[?#]token=\S+/.exec(mail.text)?.[0]
-  expect(link, mail.text).toBeTruthy()
+  // Ben already has an account. The share mail names the item and Ann's message, and links to
+  // the folder; opening it with his session binds the email grant, and he joins as a guest.
+  const mail = await waitForMail(users.ben.email, 20_000, folder)
+  expect(mail.text).toContain('The plans, run')
   const benContext = await browser.newContext({ storageState: storageStatePath('ben') })
   const ben = await benContext.newPage()
-  await ben.goto('/')
-  await acceptInvitation(ben, link!)
+  await ben.goto(shareLink(mail.text))
+  await expect(ben.getByRole('heading', { name: folder, level: 1 })).toBeVisible()
   await ben.reload()
   // Ann's space is now in Ben's space list, with his role there.
   await ben.getByRole('button', { name: /\(change space\)$/ }).click()
@@ -109,28 +118,28 @@ test('Ann shares a folder with Ben, who joins as a guest by invitation and sees 
   await ann.goto(`/t/${tenant}/files`)
   await ann.getByRole('button', { name: `Details of ${folder}`, exact: true }).click()
   await ann.getByRole('button', { name: 'Share', exact: true }).click()
-  // The accepted invitation turned the email grant into a grant to Ben's user. (listGrants gives
-  // no name or email for a user grantee, so the dialog shows Ben's user ID; a small gap.)
-  // The row names Ben (a guest of the space now, so the members list has his name), never his ID.
+  // The bind turned the email grant into a grant to Ben's user: the row names him, never his ID.
   const benId = (await api<{ user: { id: string } }>(ben, 'GET', '/v1/me')).body.user.id
   const people = share.getByRole('region', { name: 'People with access' })
   await expect(people).toContainText(users.ben.displayName)
   await expect(people).not.toContainText(benId)
-  // Ben is a guest of the space now: no warning that he can't open it.
   await expect(people).not.toContainText("can't open it")
-  await share.getByRole('button', { name: `Remove access for ${users.ben.displayName}` }).click()
+  // The row's role menu ends with "Remove access" (design-system 4.8).
+  await share.getByRole('button', { name: `Can view Access of ${users.ben.displayName}` }).click()
+  await ann.getByRole('menuitem', { name: 'Remove access' }).click()
   await expect(share.getByRole('status').filter({ hasText: `Removed access for ${users.ben.displayName}.` })).toBeVisible()
   await expect.poll(async () => (await api(ben, 'GET', `/v1/nodes/${folderId}`, { tenant })).status, { timeout: 15_000 }).toBe(404)
 
   // Ben is a guest of the space now. A new share to his email goes to his account at once (by
-  // user ID): the row names him, never "Invited, not joined yet", and he can open the folder
-  // without a new invitation (the synthetic-user blocker).
+  // user ID, decision 0003-2 rule a): the row names him, never "Invited, not joined yet".
   const form = share.getByRole('form', { name: 'Add people' })
   await form.getByLabel('Email', { exact: true }).fill(users.ben.email)
   await expect(form).toContainText(`${users.ben.displayName} is in`)
-  await expect(form.getByRole('checkbox', { name: 'Email them an invitation' })).toHaveCount(0)
   await form.getByRole('button', { name: 'Share' }).click()
-  await expect(share.getByRole('status').filter({ hasText: `Shared ${folder} with ${users.ben.displayName}. They find it under Shared with me.` })).toBeVisible()
+  // A second mail for the same item within 10 minutes is not sent, and the dialog says so.
+  await expect(
+    share.getByRole('status').filter({ hasText: `Shared with ${users.ben.displayName}. Ruum did not email them this time; they find it under Shared with me.` }),
+  ).toBeVisible()
   await expect(people).toContainText(users.ben.displayName)
   await expect(people).not.toContainText('Invited, not joined yet')
   await expect.poll(async () => (await api(ben, 'GET', `/v1/nodes/${folderId}`, { tenant })).status, { timeout: 15_000 }).toBe(200)
@@ -189,10 +198,9 @@ test('a link made in the share dialog opens for a visitor without an account', a
   await context.close()
 })
 
-// Known gap: an email grant that binds at a first sign-in does not make the person a guest of the
-// tenant. "Shared with me" lists the folder ("Another tenant", not a link), but every read answers
-// 404, so the person cannot open what was shared. The test above goes through an invitation.
-test.fixme('a new person signs in after a share by email and opens the folder read-only', async ({ browser }, info) => {
+// The email grant binds at sign-in (decision 0003-2, rule b): Cara signs in with the address
+// the share went to and opens the folder read-only.
+test('a person signs in after a share by email and opens the folder read-only', async ({ browser }, info) => {
   const { users } = readRun()
   const { context, folder, note } = await annSharesFolder(browser, users.cara.email, info.outputPath())
   const caraContext = await browser.newContext()
@@ -203,20 +211,21 @@ test.fixme('a new person signs in after a share by email and opens the folder re
   await caraContext.close()
 })
 
-// Known server gap (crates/ruum-core/src/identity/postgres.rs, sharing/postgres.rs): an email grant
-// binds only when the user signs in for the first time (a known identity returns before the
-// binding), and addGrant sends no invitation mail with a token, although the contract of addGrant
-// says both. So a person who already has a Ruum account never gets a folder shared by email, and
-// the web UI has no other way to share with them (AddPersonForm sends only email grantees).
-test.fixme('Ann shares a folder with an existing user, who gets a mail and sees it read-only', async ({ browser }, info) => {
-  const { users } = readRun()
-  const { context, folder, note } = await annSharesFolder(browser, users.ben.email, info.outputPath())
-  const mail = await waitForMail(users.ben.email)
-  expect(mail.text).toContain(folder)
-  const benContext = await browser.newContext()
+// A person with another account opens the link of a share email: the page says so and names
+// neither the item nor the sharer (decision 0003-3, reviewer 2 #1).
+test('a person signed in with another address sees the "another address" state', async ({ browser }, info) => {
+  const { run, users } = readRun()
+  const elsewhere = `someone-else-${run}@example.com`
+  const { context, folder } = await annSharesFolder(browser, elsewhere, info.outputPath())
+  const mail = await waitForMail(elsewhere, 20_000, folder)
+  const benContext = await browser.newContext({ storageState: storageStatePath('ben') })
   const ben = await benContext.newPage()
-  await signIn(ben, users.ben)
-  await seesFolderReadOnly(ben, users.ann, folder, note, info.outputPath('ben-note.txt'))
+  await ben.goto(shareLink(mail.text))
+  await expect(ben.getByText("You can't open this with this account")).toBeVisible()
+  await expect(ben.getByText(/If this was shared with another email address, sign in with that address/)).toBeVisible()
+  await expect(ben.getByRole('main')).not.toContainText(folder)
+  await expect(ben.getByRole('main')).not.toContainText(users.ann.displayName)
+  await expect(ben.getByRole('button', { name: 'Sign in with another account' })).toBeVisible()
   await context.close()
   await benContext.close()
 })

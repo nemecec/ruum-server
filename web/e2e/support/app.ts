@@ -81,13 +81,14 @@ interface MailSummary {
 }
 
 /** Waits for a mail to `to` in Mailpit and returns its subject and plain text. */
-export async function waitForMail(to: string, timeoutMs = 20_000): Promise<{ subject: string; text: string }> {
+export async function waitForMail(to: string, timeoutMs = 20_000, subject?: string): Promise<{ subject: string; text: string }> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
     const res = await fetch(`${env.mailpitUrl}/api/v1/search?query=${encodeURIComponent(`to:"${to}"`)}`)
     if (res.ok) {
       const list = (await res.json()) as { messages: MailSummary[] }
-      const m = list.messages?.[0]
+      // The newest mail to `to`, or the newest whose subject has `subject` in it.
+      const m = list.messages?.find((x) => !subject || x.Subject.includes(subject))
       if (m) {
         const full = (await (await fetch(`${env.mailpitUrl}/api/v1/message/${m.ID}`)).json()) as { Text: string }
         return { subject: m.Subject, text: full.Text }
@@ -162,4 +163,11 @@ export async function acceptInvitation(page: Page, link: string): Promise<void> 
   await page.getByRole('button', { name: 'Join the space' }).click()
   await expect(toast(page, /^You've joined /)).toBeVisible()
   await page.waitForURL(/\/t\/[0-9a-f-]{36}\/files$/)
+}
+
+/** Opens the menu button `button` and chooses `item` (design-system 4.2 menus: row and "More" menus). */
+export async function menuAction(page: Page, button: string | RegExp, item: string | RegExp): Promise<void> {
+  await page.getByRole('button', { name: button }).click()
+  const menu = page.getByRole('menu')
+  await menu.getByRole('menuitem', { name: item }).or(menu.getByRole('menuitemradio', { name: item })).click()
 }

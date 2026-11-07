@@ -187,3 +187,37 @@ S6. **Smaller fixes of this round.** The sharing rule explains itself, its inher
 | C-13 | Share and invitation emails that lead with the item | Kati's client should read "Kati Tamm shared Garden Parna 12 with you", and should get a view link without an account if Kati wants that; the role and the end date belong in the invitation email | Implement `notify` of `addGrant` (the J3 email: item name, sharer, an "Open" button, HTML part); an invitation created from a share carries the item; the invitation email names the role and the end date |
 | C-14 | Sign-ins in each space's activity log (server gap, no contract change) | An admin asks "who signed in to Tamm Consulting"; the filter "Sign-ins" is always empty | Call `audit::events::sign_in` at `loginCallback` for every tenant of the person (or record the first use of a session per tenant) |
 | C-9 | (again, now a major) | The accept page can't name the space, the inviter or the role | As proposed above |
+
+# Round 3: the UX panel of the design system (`w/design-system`, 2026-11-07)
+
+Status: `provisional` (design 18.9). The panel files are `ruum-server-wt/panel/ux-heuristics.md`,
+`ux-accessibility.md` and `ux-consistency.md`. All blockers and majors are fixed on
+`w/design-system`, with the UI parts of decision 0003 items 1 to 4 and 7 (`panel/ui-followups.md`).
+
+## Decisions
+
+| ID | Decision | Why |
+|---|---|---|
+| D1 | Estonian keeps "ruum" for a space (i18n.md). The product name is not written in running Estonian text, and labels that could be read as "of the space" are renamed: the language picker is "Kasutajaliidese keel", the brand link is named "Ruum, failid", the space switcher is named by the space and "(vali ruum)", storage is "salvestusruum", and "Sind kutsutakse ühte ruumi". A person who speaks Estonian should confirm it; the catalogue stays `machine`. | H2, A4: "Ruum" (brand) and "ruum" (space) clashed in the top bar, on Account, in Trash and on the invitation page. A new word for space would change every screen and the decided term. |
+| D2 | Code never changes the case of text. A message that sits inside a sentence has its own key (`format.when.*.inline`, `role.*.inline`, `memberRole.*.inline`, `diff.plugin.*.inline`); `npm run lint` refuses `toLowerCase`/`toUpperCase` in screens and `src/ui` unless the line says `// i18n-ignore` (data, not text). | H3, M2: "last used thursday at 06:20 pm"; languages that capitalise nouns. |
+| D3 | Actions: two or three main buttons, the rest in the "More" menu (details panel, version rows); a role is chosen from a role menu with one meaning per role (members, content roles, share rows); row actions on the phone are a row menu ("More actions for *name*"); the space switcher is a menu button. | H4, H8, M6, consistency 1 and 3. |
+| D4 | Loading: nothing for 300 ms, then a skeleton or "Loading..."; an error that a new try can help offers "Try again". | H5 and the common states of journeys.md. |
+| D5 | Toasts are added into two live regions that exist from the start (polite, and assertive for errors). Errors stay until closed; a toast with an action stays 30 s; Alt+T focuses the newest toast. | A3. |
+| D6 | The language applies with "Save" on the Account page; the focus returns to the picker and a status says the new language. | A1 (WCAG 3.2.2, 2.4.3). |
+| D7 | The details panel on the phone is a modal sheet: the list is `inert`, Escape closes it, the focus goes back to the row. | A2 (WCAG 2.4.11). |
+| D8 | The catalogue's sample text goes through the pseudo-locale with `&locale=en-XA` (`sample()` in `src/ui/story.ts`); the catalogue and design-system.md use the screens' wording ("Claude Desktop (agent of Liis Tamm)", "2 hours ago"); the file list keeps its "Details" button. | M1, H9. |
+| D9 | Agent activity is shown in runs (changes less than 15 minutes apart) with "Undo these changes" on each run; the confirm lists the changes with the words and in the order of the list. | H7 (J5). |
+| D10 | Members (not guests) see the Members page read-only, with the content roles; the other admin pages stay admin-only. | ui-followups item 1. |
+| D11 | The invitation link carries its token in the fragment (`#token=`); the accept page keeps it in session storage over the sign-in and also reads `?token=` of old mails. | ui-followups items 2 and 3. |
+
+## Not done in this round
+
+- Decision 0003 item 6 (C-8 to C-11): no server branch has built them yet (`coalesce` on
+  `UploadTargetNewVersion`, `previewInvitation`, `SharedItem.tenant_name`, `UndoItem.changed_by`),
+  so their UI waits. The accept page still names nothing (C-9); a space that is not in the
+  person's list is still "A shared space" (C-10).
+- Optional cards of items 4 and 7: the search "Type" filter and bulk move and tag with
+  `moveNodes` / `attachTagToNodes` need `f/audit-mcp`, which this branch does not include.
+- Minors left as cards: versions grouped by day, the compare summary in lines, the consent form's
+  nested fieldsets and its native date field, the admin tab repeated as a heading, helper text
+  sizes, the toolbar order in the pseudo-locale, the contrast tool pairs (A10).
