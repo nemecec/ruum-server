@@ -1,9 +1,21 @@
+/*
+ * Inline, not a flex box: a long name wraps like the text around it, and its next lines start at
+ * the left edge under the mark. As an inline-flex box, the name wrapped inside its own box beside
+ * the mark, so on a phone every next line had an odd indent. The lead (the mark and a word
+ * joiner, AgentName.tsx) keeps the mark on the line of the first word.
+ */
 .ui-agent-name {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
+  display: inline;
   color: var(--color-agent);
   overflow-wrap: break-word;
+}
+
+.ui-agent-lead {
+  white-space: nowrap;
+}
+
+.ui-agent-lead .ui-agent-mark {
+  margin-inline-end: var(--space-1);
 }
 
 .ui-agent-name a {
