@@ -5461,6 +5461,8 @@ components:
           type: integer
         members:
           type: [integer, 'null']
+        databases:
+          $ref: '#/components/schemas/DatabasePlanLimits'
     Usage:
       type: object
       required: [storage_bytes, nodes, agents, members]
@@ -5475,6 +5477,63 @@ components:
           type: integer
         members:
           type: integer
+        databases:
+          $ref: '#/components/schemas/DatabaseUsage'
+    DatabasePlanLimits:
+      type: object
+      description: |
+        The database limits of the plan (design section 4.3; decision 0004-35, C-21), per
+        engine. `null` means no limit. Branches count apart from the databases of each engine:
+        `count` never includes a branch, and `branches` is the most branches of the tenant.
+        Team values are for the whole tenant (the plan's per-member values times the members).
+        `createDatabase` answers `plan_limit_reached` when the engine's `count` is reached.
+        Optional (step 1 servers do not send it).
+      required: [postgres, sqlite, branches]
+      properties:
+        postgres:
+          $ref: '#/components/schemas/EngineDatabaseLimits'
+        sqlite:
+          $ref: '#/components/schemas/EngineDatabaseLimits'
+        branches:
+          type: [integer, 'null']
+          description: The most database branches of the tenant, of both engines together.
+    EngineDatabaseLimits:
+      type: object
+      required: [count, size_bytes]
+      properties:
+        count:
+          type: [integer, 'null']
+          description: The most databases of this engine (branches not counted).
+        size_bytes:
+          type: [integer, 'null']
+          format: int64
+          description: The largest size of one database of this engine.
+    DatabaseUsage:
+      type: object
+      description: |
+        The databases of the tenant (decision 0004-35, C-21), per engine. Every database node
+        that is not purged counts, also one in the trash or still `provisioning`. Branches
+        count apart. Optional (step 1 servers do not send it).
+      required: [postgres, sqlite, branches]
+      properties:
+        postgres:
+          $ref: '#/components/schemas/EngineDatabaseUsage'
+        sqlite:
+          $ref: '#/components/schemas/EngineDatabaseUsage'
+        branches:
+          type: integer
+          description: The database branches of the tenant, of both engines together.
+    EngineDatabaseUsage:
+      type: object
+      required: [count, size_bytes]
+      properties:
+        count:
+          type: integer
+          description: The databases of this engine (branches not counted).
+        size_bytes:
+          type: integer
+          format: int64
+          description: The total size of these databases, as last measured.
     LimitsAndUsage:
       type: object
       required: [plan, limits, usage]

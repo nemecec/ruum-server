@@ -3544,6 +3544,7 @@ export interface components {
             admin_restore_days: number;
             agents: number;
             members: number | null;
+            databases?: components["schemas"]["DatabasePlanLimits"];
         };
         Usage: {
             /** Format: int64 */
@@ -3552,6 +3553,50 @@ export interface components {
             nodes: number;
             agents: number;
             members: number;
+            databases?: components["schemas"]["DatabaseUsage"];
+        };
+        /**
+         * @description The database limits of the plan (design section 4.3; decision 0004-35, C-21), per
+         *     engine. `null` means no limit. Branches count apart from the databases of each engine:
+         *     `count` never includes a branch, and `branches` is the most branches of the tenant.
+         *     Team values are for the whole tenant (the plan's per-member values times the members).
+         *     `createDatabase` answers `plan_limit_reached` when the engine's `count` is reached.
+         *     Optional (step 1 servers do not send it).
+         */
+        DatabasePlanLimits: {
+            postgres: components["schemas"]["EngineDatabaseLimits"];
+            sqlite: components["schemas"]["EngineDatabaseLimits"];
+            /** @description The most database branches of the tenant, of both engines together. */
+            branches: number | null;
+        };
+        EngineDatabaseLimits: {
+            /** @description The most databases of this engine (branches not counted). */
+            count: number | null;
+            /**
+             * Format: int64
+             * @description The largest size of one database of this engine.
+             */
+            size_bytes: number | null;
+        };
+        /**
+         * @description The databases of the tenant (decision 0004-35, C-21), per engine. Every database node
+         *     that is not purged counts, also one in the trash or still `provisioning`. Branches
+         *     count apart. Optional (step 1 servers do not send it).
+         */
+        DatabaseUsage: {
+            postgres: components["schemas"]["EngineDatabaseUsage"];
+            sqlite: components["schemas"]["EngineDatabaseUsage"];
+            /** @description The database branches of the tenant, of both engines together. */
+            branches: number;
+        };
+        EngineDatabaseUsage: {
+            /** @description The databases of this engine (branches not counted). */
+            count: number;
+            /**
+             * Format: int64
+             * @description The total size of these databases, as last measured.
+             */
+            size_bytes: number;
         };
         LimitsAndUsage: {
             plan: components["schemas"]["Plan"];

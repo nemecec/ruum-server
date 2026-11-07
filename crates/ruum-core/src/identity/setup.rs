@@ -11,7 +11,7 @@
 //! | `RUUM_OIDC_REDIRECT_URI` | The callback; default `<RUUM_PUBLIC_URL>/v1/auth/callback`. |
 //! | `SMTP_URL` | `smtp://host:port` of the mail relay (Mailpit on the laptop). Without it mails stay in memory. |
 //! | `RUUM_MAIL_FROM` | The sender address; default `no-reply@<host of RUUM_PUBLIC_URL>`. |
-//! | `RUUM_PLAN_LIMITS` | The plan table as JSON (`tenants::PlanTable`); default the numbers of design section 4.3. |
+//! | `RUUM_PLAN_LIMITS` | The plan table as JSON (`tenants::PlanTable`); default the numbers of design section 4.3. Each plan may hold `databases` (C-21): `{"postgres": {"count": 1, "size_bytes": 262144000}, "sqlite": {...}, "branches": null}`, where `null` is no limit; `count` and `branches` are per member on `team`. A plan without `databases` keeps the defaults of section 4.3. |
 
 use super::memory::MemoryOidcClient;
 use super::oidc::HttpOidcClient;

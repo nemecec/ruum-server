@@ -841,6 +841,7 @@ impl TenantStore for MemoryTenantStore {
                 .filter(|a| st.role_of(ctx.tenant, a.owner_id) != Some(MemberRole::Guest))
                 .count() as u32,
             members: st.member_count(ctx.tenant),
+            databases: None,
         })
     }
 }

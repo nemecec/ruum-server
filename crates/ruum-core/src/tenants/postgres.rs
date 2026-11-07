@@ -1398,6 +1398,7 @@ impl TenantStore for PgTenantStore {
             nodes: r.try_get("nodes")?,
             agents: r.try_get::<i64, _>("agents")? as u32,
             members,
+            databases: None,
         })
     }
 }

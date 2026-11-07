@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub use limits::{Limits, PlanTable, configure_plans, plan_limits, tenant_limits};
+pub use limits::{
+    DatabasePlanLimits, EngineDatabaseLimits, Limits, PlanTable, configure_plans, database_limits,
+    plan_limits, tenant_limits,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +217,27 @@ pub struct Usage {
     pub nodes: i64,
     pub agents: u32,
     pub members: u32,
+    /// The databases of the tenant (C-21). The tenant stores leave it `None`; `getLimits` fills
+    /// it from the databases area.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub databases: Option<DatabaseUsage>,
+}
+
+/// The databases of one engine (`EngineDatabaseUsage`, C-21).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineDatabaseUsage {
+    /// The databases of the engine that are not purged, branches not counted.
+    pub count: u32,
+    /// Their total size, as last measured.
+    pub size_bytes: i64,
+}
+
+/// The databases of a tenant (`DatabaseUsage`, C-21). Branches count apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseUsage {
+    pub postgres: EngineDatabaseUsage,
+    pub sqlite: EngineDatabaseUsage,
+    pub branches: u32,
 }
 
 /// What answers show of a principal (contract need C-7, decision 0003-5).
