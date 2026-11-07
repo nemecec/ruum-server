@@ -798,7 +798,7 @@ impl TenantStore for MemoryTenantStore {
 /// The link of the invitation email: the accept page of the web UI.
 pub fn accept_url(public_url: &str, token: &str) -> String {
     format!(
-        "{}/invitations/accept?token={}",
+        "{}/invitations/accept#token={}",
         public_url.trim_end_matches('/'),
         token
     )

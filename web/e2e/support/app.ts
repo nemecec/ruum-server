@@ -145,7 +145,7 @@ export async function invite(page: Page, email: string, role: 'Guest' | 'Member'
 
   const mail = await waitForMail(email)
   expect(mail.text).toContain('Welcome to the e2e run.')
-  const link = /https?:\/\/\S+\/invitations\/accept\?token=\S+/.exec(mail.text)?.[0]
+  const link = /https?:\/\/\S+\/invitations\/accept[?#]token=\S+/.exec(mail.text)?.[0]
   expect(link, mail.text).toBeTruthy()
   return link!
 }
