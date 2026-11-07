@@ -171,7 +171,15 @@ export function CopyField({ label, value, mono = true, wrap }: { label: string; 
     <div className="ui-copy-field">
       <Field label={label} grow>
         {wrap ? (
-          <TextArea readOnly value={value} mono={mono} rows={Math.min(4, Math.ceil(value.length / 48))} onFocus={(e) => e.currentTarget.select()} />
+          // The name is the label alone: a label's text would include the text of the textarea.
+          <TextArea
+            readOnly
+            aria-label={label}
+            value={value}
+            mono={mono}
+            rows={Math.min(4, Math.ceil(value.length / 48))}
+            onFocus={(e) => e.currentTarget.select()}
+          />
         ) : (
           <TextInput readOnly value={value} mono={mono} onFocus={(e) => e.currentTarget.select()} />
         )}

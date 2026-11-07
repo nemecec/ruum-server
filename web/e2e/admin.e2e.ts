@@ -46,7 +46,8 @@ test('a team: members, an invitation by mail, a new member and a role change', a
   const caraContext = await browser.newContext()
   const cara = await caraContext.newPage()
   const url = new URL(link)
-  await signIn(cara, users.cara, url.pathname + url.search, { shell: false })
+  // The token is in the fragment: it waits in the tab's session storage while Cara signs in.
+  await signIn(cara, users.cara, url.pathname + url.search + url.hash, { shell: false })
   await expect(cara.getByRole('heading', { name: "You're invited to a space in Ruum" })).toBeVisible()
   await cara.getByRole('button', { name: 'Join the space' }).click()
   await expect(toast(cara, `You've joined ${team}.`)).toBeVisible()

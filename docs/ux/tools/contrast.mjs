@@ -38,6 +38,9 @@ const pairs = [
   ['text-muted', 'surface', 4.5, 'secondary text on cards'],
   ['text-muted', 'sunken', 4.5, 'secondary text on sunken areas'],
   ['text-faint', 'surface', 4.5, 'placeholders and timestamps'],
+  // text-faint is only for surface, canvas and sunken: on selected and primary-soft it is under
+  // 4.5:1 (UX panel A10), so Text tone="faint" is not used there.
+  ['text-faint', 'canvas', 4.5, 'timestamps on the page'],
   ['link', 'canvas', 4.5, 'links'],
   ['link', 'surface', 4.5, 'links on cards'],
   ['link', 'selected', 4.5, 'links in a selected row'],
@@ -55,6 +58,7 @@ const pairs = [
   ['agent', 'surface', 4.5, 'agent name in text'],
   ['border-control', 'surface', 3, 'input and checkbox border'],
   ['border-control', 'canvas', 3, 'input border on canvas'],
+  ['border-control', 'sunken', 3, 'search field border in the top bar'],
   ['focus', 'canvas', 3, 'focus ring'],
   ['focus', 'surface', 3, 'focus ring on cards'],
   ['primary', 'canvas', 3, 'primary button edge, icons'],

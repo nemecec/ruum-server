@@ -36,9 +36,17 @@ export async function signIn(page: Page, user: TestUser, returnTo = '/', opts: {
   if (opts.shell !== false) await expect(page.getByRole('link', { name: user.displayName })).toBeVisible()
 }
 
-/** A toast (or a status message in a dialog) with this text; the newest one when there are several. */
+/**
+ * A toast (or a status message in a dialog) with this text; the newest one when there are several.
+ * Toasts sit in the live regions of the "Notifications" region (design-system 4.13); a status
+ * message of a dialog is its own `status`.
+ */
 export function toast(page: Page, text: string | RegExp) {
-  return page.getByRole('status').filter({ hasText: text }).last()
+  return page
+    .getByRole('region', { name: 'Notifications' })
+    .getByText(text)
+    .or(page.getByRole('dialog').getByRole('status').filter({ hasText: text }))
+    .last()
 }
 
 /** The tenant ID in the current URL (`/t/<tenant>/...`). */
@@ -158,7 +166,8 @@ export async function invite(page: Page, email: string, role: 'Guest' | 'Member'
 export async function acceptInvitation(page: Page, link: string): Promise<void> {
   const url = new URL(link)
   expect(url.origin).toBe(new URL(env.webUrl).origin)
-  await page.goto(url.pathname + url.search)
+  // The token is in the fragment (#token=); old mails had ?token=.
+  await page.goto(url.pathname + url.search + url.hash)
   await expect(page.getByRole('heading', { name: "You're invited to a space in Ruum" })).toBeVisible()
   await page.getByRole('button', { name: 'Join the space' }).click()
   await expect(toast(page, /^You've joined /)).toBeVisible()
@@ -169,5 +178,6 @@ export async function acceptInvitation(page: Page, link: string): Promise<void> 
 export async function menuAction(page: Page, button: string | RegExp, item: string | RegExp): Promise<void> {
   await page.getByRole('button', { name: button }).click()
   const menu = page.getByRole('menu')
-  await menu.getByRole('menuitem', { name: item }).or(menu.getByRole('menuitemradio', { name: item })).click()
+  const exact = typeof item === 'string'
+  await menu.getByRole('menuitem', { name: item, exact }).or(menu.getByRole('menuitemradio', { name: item, exact })).click()
 }

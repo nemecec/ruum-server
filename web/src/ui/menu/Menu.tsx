@@ -100,7 +100,11 @@ export function Menu(props: {
     else if (e.key === 'ArrowUp') setActive((a) => step(a, -1))
     else if (e.key === 'Home') setActive(step(-1, 1))
     else if (e.key === 'End') setActive(step(items.length, -1))
-    else if (e.key === 'Escape') close()
+    else if (e.key === 'Escape') {
+      // Only the menu closes, not the panel or dialog around it.
+      e.stopPropagation()
+      close()
+    }
     else if (e.key === 'Tab') {
       // The menu pattern: Tab leaves the menu and moves on from the button.
       close()
