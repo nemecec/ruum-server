@@ -83,15 +83,28 @@ wait_healthy() {
   done
 }
 
+# Run a setup script in a Postgres service. A fresh volume runs the image's first-time setup on a
+# temporary server and then restarts; a connection in that gap fails with "shutting down". Retry a
+# few times instead of failing the whole start (seen on CI, where every run starts from scratch).
+pg_exec_retry() {
+  service="$1"; script="$2"; tries=0
+  until compose exec -T -e PGOPTIONS="-c client_min_messages=warning" "$service" bash "$script" >/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 20 ] && die "$service: $script failed 20 times"
+    log "$service is not ready yet; retrying in 3 s"
+    sleep 3
+  done
+}
+
 ensure_databases() {
   log "creating missing roles, databases and extensions"
-  compose exec -T -e PGOPTIONS="-c client_min_messages=warning" postgres bash /docker-entrypoint-initdb.d/10-ruum.sh >/dev/null
+  pg_exec_retry postgres /docker-entrypoint-initdb.d/10-ruum.sh
 }
 
 # The data cluster: the role ruum_dbhost (password from .env) and the closed shared databases.
 ensure_data_cluster() {
   log "data cluster: ruum_dbhost and the closed template1"
-  compose exec -T -e PGOPTIONS="-c client_min_messages=warning" postgres-data bash /docker-entrypoint-initdb.d/10-ruum-data.sh >/dev/null
+  pg_exec_retry postgres-data /docker-entrypoint-initdb.d/10-ruum-data.sh
 }
 
 garage() { compose exec -T -e RUST_LOG=warn garage /garage "$@"; }
