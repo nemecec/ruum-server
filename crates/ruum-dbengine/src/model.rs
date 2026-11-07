@@ -202,6 +202,25 @@ pub enum Value {
     Array(Vec<Value>),
 }
 
+impl Value {
+    /// The size of the value for the size cap of a result (`StatementRequest::max_bytes`): the
+    /// bytes of a text, a byte string or a JSON text, 8 for a number or a time, 16 for a UUID,
+    /// the sum of the elements for an array.
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) | Value::Float(_) | Value::Timestamp(_) => 8,
+            Value::Date(_) => 4,
+            Value::Uuid(_) => 16,
+            Value::Numeric(s) | Value::Text(s) => s.len() as u64,
+            Value::Bytes(b) => b.len() as u64,
+            Value::Json(j) => j.to_string().len() as u64,
+            Value::Array(items) => items.iter().map(Value::size_bytes).sum(),
+        }
+    }
+}
+
 /// `read` runs in a read-only transaction; `write` may change data (`QueryMode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +240,10 @@ pub struct StatementRequest {
     pub timeout: Duration,
     /// The most rows the result holds; the engine reports `truncated` when there were more.
     pub max_rows: u64,
+    /// The most bytes of row values the result holds ([`Value::size_bytes`] of each cell; design
+    /// 8.5 "row and size caps"). The engine stops reading rows at the first row that would go
+    /// over it and reports `truncated`. `None`: only `max_rows` caps the result.
+    pub max_bytes: Option<u64>,
 }
 
 /// A column of a result (engine side of `ResultColumn`; the query layer adds the class and the
@@ -239,7 +262,8 @@ pub struct ResultColumn {
 pub struct StatementOutcome {
     pub columns: Vec<ResultColumn>,
     pub rows: Vec<Vec<Value>>,
-    /// More rows than `max_rows` existed; `rows` holds the first `max_rows`.
+    /// More rows than `max_rows` existed, or the rows went over `max_bytes`; `rows` holds the
+    /// rows before the cut.
     pub truncated: bool,
     /// The rows a write changed; `None` for a read.
     pub rows_affected: Option<u64>,

@@ -24,6 +24,7 @@ conformance_cases!(
     write,
     timeout,
     row_cap,
+    size_cap,
     transaction_control,
     deferred_constraint,
     migration,
@@ -334,6 +335,7 @@ async fn a_dropped_database_waits_for_its_running_statement() {
                 mode: StatementMode::Read,
                 timeout: Duration::from_millis(300),
                 max_rows: 1,
+                max_bytes: None,
             };
             let role = RoleRef::new(db, RoleKind::Read).unwrap();
             engine.execute(&role, &key, &request).await
@@ -368,6 +370,7 @@ async fn a_call_waiting_on_a_dropped_database_finds_it_gone() {
                 mode: StatementMode::Read,
                 timeout: Duration::from_millis(400),
                 max_rows: 1,
+                max_bytes: None,
             };
             let role = RoleRef::new(db, RoleKind::Read).unwrap();
             engine.execute(&role, &key, &request).await

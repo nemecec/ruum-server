@@ -71,10 +71,47 @@ jobs:
         run: |
           psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
           psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant create on database ruum to ruum_test"
+      # The data cluster of step 2 (STEP2 "Infrastructure work" 1, 2 and 7; card E-2): the image of
+      # deploy/dev/postgres-data with its init script, on 127.0.0.1:5435 as on the laptop. It is
+      # built here (a service container cannot be built). The Postgres engine tests of
+      # ruum-dbengine run against it; in CI they fail, never skip, when it is missing. pg_hba.conf
+      # allows the docker gateway (the runner's connections through the published port).
+      - name: Start the data cluster (postgres-data)
+        run: |
+          docker build -t ruum-dev/postgres-data:17 deploy/dev/postgres-data
+          docker run -d --name postgres-data -p 127.0.0.1:5435:5432 --shm-size 256m \
+            -e POSTGRES_PASSWORD=ci-data-superuser -e RUUM_DBHOST_PASSWORD=ci-dbhost \
+            ruum-dev/postgres-data:17
+          for _ in $(seq 1 90); do
+            docker exec postgres-data pg_isready -q -h 127.0.0.1 -U postgres -d postgres && break
+            sleep 1
+          done
+          docker exec postgres-data pg_isready -h 127.0.0.1 -U postgres -d postgres
+          docker logs postgres-data 2>&1 | grep 'ruum-data'
+      # pg_dump must be a PostgreSQL 17 client for the 17 server (the engine's export,
+      # RUUM_PG_DUMP); the runner has 16. The client comes from the PGDG repository.
+      - name: PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
+      # The isolation checks of the data cluster (card I-1; review-I-1 finding 2): sessions that
+      # log in as the per-database roles cannot reach another role or database.
+      - name: Data cluster checks (scripts/dbhost_check.sh)
+        env:
+          RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
+          DBHOST_CHECK_CONTAINER: postgres-data
+        run: scripts/dbhost_check.sh
       # Unit and conformance tests. `#[sqlx::test]` tests use DATABASE_URL (one database per test).
+      # RUUM_DBHOST_URL: the Postgres engine (ruum-dbengine) and its conformance suite.
       - name: Unit and conformance tests
         env:
           DATABASE_URL: postgres://ruum_test:ruum_test@localhost:5432/ruum
+          RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
+          RUUM_PG_DUMP: /usr/lib/postgresql/17/bin/pg_dump
         run: |
           cargo test --workspace --exclude ruum-testkit --locked
           cargo test -p ruum-testkit --lib --test contract --locked

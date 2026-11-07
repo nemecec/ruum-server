@@ -243,6 +243,7 @@ fn run_statement(
         .collect();
     let writes = !stmt.readonly();
     let mut rows_out: Vec<Vec<Value>> = Vec::new();
+    let mut bytes_out: u64 = 0;
     let mut truncated = false;
     {
         let mut rows = stmt.raw_query();
@@ -265,6 +266,18 @@ fn run_statement(
                     row.get_ref(i).map_err(|e| untrusted_error(e, guard))?,
                 ));
             }
+            let size: u64 = values.iter().map(Value::size_bytes).sum();
+            if request
+                .max_bytes
+                .is_some_and(|cap| bytes_out.saturating_add(size) > cap)
+            {
+                truncated = true;
+                if writes {
+                    continue;
+                }
+                break;
+            }
+            bytes_out += size;
             rows_out.push(values);
         }
     }

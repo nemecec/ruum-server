@@ -153,6 +153,7 @@ impl<'e> Fixture<'e> {
             mode,
             timeout: Duration::from_secs(10),
             max_rows: 1000,
+            max_bytes: None,
         };
         let role = RoleRef::new(db.clone(), kind).expect("session kind");
         self.engine.execute(&role, &self.key, &request).await
@@ -222,6 +223,7 @@ pub async fn run_all(engine: &dyn DatabaseEngine) {
     write(engine).await;
     timeout(engine).await;
     row_cap(engine).await;
+    size_cap(engine).await;
     transaction_control(engine).await;
     deferred_constraint(engine).await;
     migration(engine).await;
@@ -636,6 +638,7 @@ async fn assert_times_out(f: &Fixture<'_>, timeout: Duration) {
         mode: StatementMode::Read,
         timeout,
         max_rows: 10,
+        max_bytes: None,
     };
     let started = Instant::now();
     let err = f
@@ -665,6 +668,7 @@ pub async fn timeout(engine: &dyn DatabaseEngine) {
         mode: StatementMode::Write,
         timeout: Duration::from_millis(200),
         max_rows: 10,
+        max_bytes: None,
     };
     let err = engine
         .execute(&f.role(RoleKind::Owner), &f.key, &request)
@@ -684,6 +688,7 @@ pub async fn row_cap(engine: &dyn DatabaseEngine) {
         mode: StatementMode::Read,
         timeout: Duration::from_secs(10),
         max_rows: 2,
+        max_bytes: None,
     };
     let role = f.role(RoleKind::Read);
     let out = engine.execute(&role, &f.key, &request).await.unwrap();
@@ -701,6 +706,77 @@ pub async fn row_cap(engine: &dyn DatabaseEngine) {
         mode: StatementMode::Write,
         timeout: Duration::from_secs(10),
         max_rows: 1,
+        max_bytes: None,
+    };
+    let out = engine
+        .execute(&f.role(RoleKind::Write), &f.key, &request)
+        .await
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert!(out.truncated);
+    assert_eq!(out.rows_affected, Some(3));
+}
+
+/// A result holds at most `max_bytes` bytes of row values (design 8.5 "row and size caps"): the
+/// engine stops at the first row that would go over the cap, says that it cut, and a capped
+/// write still changes every row (review-E-1 N-6).
+pub async fn size_cap(engine: &dyn DatabaseEngine) {
+    let f = Fixture::new(engine).await;
+    f.seed_users().await;
+    let role = f.role(RoleKind::Read);
+    let request = |max_bytes: Option<u64>| StatementRequest {
+        sql: "SELECT name, email FROM users ORDER BY id".to_string(),
+        params: vec![],
+        mode: StatementMode::Read,
+        timeout: Duration::from_secs(10),
+        max_rows: 1000,
+        max_bytes,
+    };
+    let all = engine.execute(&role, &f.key, &request(None)).await.unwrap();
+    assert_eq!(all.rows.len(), 3);
+    assert!(!all.truncated);
+    let sizes: Vec<u64> = all
+        .rows
+        .iter()
+        .map(|r| r.iter().map(Value::size_bytes).sum())
+        .collect();
+    // "Ann" + "ann@example.com", "Bob" + NULL, "Cid" + "cid@example.com".
+    assert_eq!(sizes, [18, 3, 18]);
+
+    let total: u64 = sizes.iter().sum();
+    let out = engine
+        .execute(&role, &f.key, &request(Some(total)))
+        .await
+        .unwrap();
+    assert_eq!(out.rows, all.rows, "a cap of exactly the size cuts nothing");
+    assert!(!out.truncated);
+
+    let out = engine
+        .execute(&role, &f.key, &request(Some(sizes[0] + sizes[1] + 1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.rows,
+        all.rows[..2],
+        "the row that would go over the cap is left out"
+    );
+    assert!(out.truncated);
+
+    let out = engine
+        .execute(&role, &f.key, &request(Some(sizes[0] - 1)))
+        .await
+        .unwrap();
+    assert!(out.rows.is_empty(), "a first row over the cap gives no row");
+    assert!(out.truncated);
+
+    // A capped write still changes every row; only the result is cut.
+    let request = StatementRequest {
+        sql: "UPDATE users SET email = 'x' RETURNING name".to_string(),
+        params: vec![],
+        mode: StatementMode::Write,
+        timeout: Duration::from_secs(10),
+        max_rows: 1000,
+        max_bytes: Some(4),
     };
     let out = engine
         .execute(&f.role(RoleKind::Write), &f.key, &request)

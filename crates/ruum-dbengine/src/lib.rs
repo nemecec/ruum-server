@@ -70,7 +70,7 @@ pub trait DatabaseEngine: Send + Sync {
 
     /// Runs one untrusted statement in a session of `role`, in its own transaction: read-only
     /// for [`StatementMode::Read`] and for the kinds that cannot write, cancelled after
-    /// `timeout`, at most `max_rows` rows. `key` is the pseudonym key of the database (SQLite
+    /// `timeout`, at most `max_rows` rows and `max_bytes` bytes of row values. `key` is the pseudonym key of the database (SQLite
     /// registers it on the connection it opens; Postgres has it installed).
     ///
     /// A failure at COMMIT (for example a deferred constraint) fails the request like a failed

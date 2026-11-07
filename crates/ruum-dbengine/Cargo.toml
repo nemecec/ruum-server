@@ -17,9 +17,12 @@ futures.workspace = true
 hex.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
+# The Postgres engine (card E-2): runtime queries only, no `query!` macros (CLAUDE.md).
+sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true

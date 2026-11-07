@@ -208,7 +208,7 @@ for k in $LOGIN_KINDS; do
   me="ROLE_$key"
   ok "($k) session_user = current_user = the role itself" "$key" "$DBA" "select session_user = current_user and current_user = '${!me}'" t
   same "($k) RESET ROLE" "$key" "$DBA" "reset role; select current_user"
-  for target in "$other" B_owner A_mask dbhost; do
+  for target in "$other" B_owner A_mask dbhost $([[ $k == masked_* ]] && echo A_owner); do
     tname="ROLE_$target"
     t=${!tname}
     same "($k) SET ROLE <$target>" "$key" "$DBA" "set role $t; select current_user"
