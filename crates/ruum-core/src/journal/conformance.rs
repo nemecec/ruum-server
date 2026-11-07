@@ -380,6 +380,9 @@ async fn the_feed_sends_a_purge_only_to_who_saw_the_node(h: &dyn Harness) {
         async fn member_since(&self) -> Result<Option<time::OffsetDateTime>> {
             Ok(None)
         }
+        async fn manager_since(&self) -> Result<Option<time::OffsetDateTime>> {
+            self.member_since().await
+        }
     }
 
     let t = h.tenant().await;
@@ -466,6 +469,9 @@ async fn the_feed_keeps_a_trash_from_access_that_began_after_it(h: &dyn Harness)
         }
         async fn member_since(&self) -> Result<Option<time::OffsetDateTime>> {
             Ok(None)
+        }
+        async fn manager_since(&self) -> Result<Option<time::OffsetDateTime>> {
+            self.member_since().await
         }
     }
 

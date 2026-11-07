@@ -2,8 +2,8 @@
 //! and agent stores ([`MemoryArea`]).
 
 use super::rules::{
-    accepted_role, apply_policy, caller_user, check_member_limit, check_removal, check_role_change,
-    require_role,
+    accepted_content_role, accepted_role, apply_policy, caller_user, check_member_limit,
+    check_removal, check_role_change, content_role_after, invitation_content_role, require_role,
 };
 use super::*;
 use crate::actor::{PrincipalKind, require_user_actor};
@@ -36,6 +36,7 @@ impl MemoryTenantStore {
             email: user.user.email.clone(),
             display_name: user.user.display_name.clone(),
             role: m.role,
+            content_role: m.content_role,
             joined_at: m.joined_at,
         })
     }
@@ -166,6 +167,35 @@ impl TenantStore for MemoryTenantStore {
             .map(|m| m.role_since))
     }
 
+    async fn manager_since(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<OffsetDateTime>> {
+        let st = self.area.lock();
+        Ok(st
+            .memberships
+            .get(&(tenant, user))
+            .filter(|m| match m.role {
+                MemberRole::Owner | MemberRole::Admin => true,
+                MemberRole::Member => m.content_role == Some(crate::authz::Role::Manage),
+                MemberRole::Guest => false,
+            })
+            .map(|m| m.role_since))
+    }
+
+    async fn access_of(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<(MemberRole, Option<crate::authz::Role>)>> {
+        let st = self.area.lock();
+        Ok(st
+            .memberships
+            .get(&(tenant, user))
+            .map(|m| (m.role, m.content_role)))
+    }
+
     async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
         let st = self.area.lock();
         Ok(st.memberships.iter().any(|((t, u), m)| {
@@ -239,6 +269,7 @@ impl TenantStore for MemoryTenantStore {
                                 email: usr.user.email.clone(),
                                 display_name: usr.user.display_name.clone(),
                                 role: m.role,
+                                content_role: m.content_role,
                                 joined_at: m.joined_at,
                             },
                         )
@@ -251,20 +282,24 @@ impl TenantStore for MemoryTenantStore {
         page_of(items, &page)
     }
 
-    async fn set_member_role(
+    async fn update_member(
         &self,
         ctx: &Context,
         user: UserId,
         role: MemberRole,
+        content_role: Option<crate::authz::Role>,
     ) -> Result<Member> {
         let caller = require_user_actor(ctx)?;
-        let (old, tuples) = {
+        let (old, new, tuples) = {
             let mut st = self.area.lock();
             let caller_role = require_role(st.role_of(ctx.tenant, caller), MemberRole::Admin)?;
-            let old = st
-                .role_of(ctx.tenant, user)
+            let (old, old_content) = st
+                .memberships
+                .get(&(ctx.tenant, user))
+                .map(|m| (m.role, m.content_role))
                 .ok_or_else(|| Error::not_found("member"))?;
             check_role_change(caller_role, old, role, st.owner_count(ctx.tenant))?;
+            let content = content_role_after(old, old_content, role, content_role)?;
             if old == MemberRole::Guest && role != MemberRole::Guest {
                 let t = st
                     .tenants
@@ -273,16 +308,23 @@ impl TenantStore for MemoryTenantStore {
                 let members = st.member_count(ctx.tenant);
                 check_member_limit(tenant_limits(t.plan, members).members, members)?;
             }
-            if let Some(m) = st.memberships.get_mut(&(ctx.tenant, user)) {
+            let (old, new) = ((old, old_content), (role, content));
+            if old != new
+                && let Some(m) = st.memberships.get_mut(&(ctx.tenant, user))
+            {
                 m.role = role;
+                m.content_role = content;
+                // Every change of the role or the content role dates the membership anew
+                // (decision 0002-6 with 0003-1).
                 m.role_since = crate::now();
             }
             (
                 old,
-                relations::membership(ctx.tenant, user, Some(old), Some(role)),
+                new,
+                relations::membership(ctx.tenant, user, Some(old), Some(new)),
             )
         };
-        if old != role {
+        if old != new {
             self.area.relate(tuples).await?;
             self.area
                 .audit(
@@ -290,7 +332,12 @@ impl TenantStore for MemoryTenantStore {
                     "member.role_changed",
                     "member",
                     user,
-                    serde_json::json!({ "old_role": old, "new_role": role }),
+                    serde_json::json!({
+                        "old_role": old.0,
+                        "new_role": new.0,
+                        "old_content_role": old.1,
+                        "new_content_role": new.1,
+                    }),
                 )
                 .await?;
         }
@@ -300,7 +347,7 @@ impl TenantStore for MemoryTenantStore {
 
     async fn remove_member(&self, ctx: &Context, user: UserId) -> Result<()> {
         let caller = require_user_actor(ctx)?;
-        let old = {
+        let (old, old_content) = {
             let st = self.area.lock();
             let caller_role = st
                 .role_of(ctx.tenant, caller)
@@ -318,7 +365,11 @@ impl TenantStore for MemoryTenantStore {
                 target_role,
                 st.owner_count(ctx.tenant),
             )?;
-            target_role
+            let content = st
+                .memberships
+                .get(&(ctx.tenant, user))
+                .and_then(|m| m.content_role);
+            (target_role, content)
         };
         // The sharing side first: direct grants and the user's share links.
         if let Some(c) = self.area.cleanup_hook() {
@@ -354,7 +405,12 @@ impl TenantStore for MemoryTenantStore {
             ended
         };
         self.area
-            .relate(relations::membership(ctx.tenant, user, Some(old), None))
+            .relate(relations::membership(
+                ctx.tenant,
+                user,
+                Some((old, old_content)),
+                None,
+            ))
             .await?;
         self.area
             .audit(
@@ -367,11 +423,12 @@ impl TenantStore for MemoryTenantStore {
             .await
     }
 
-    async fn invite(
+    async fn invite_as(
         &self,
         ctx: &Context,
         email: String,
         role: MemberRole,
+        content_role: Option<crate::authz::Role>,
         message: Option<String>,
     ) -> Result<(Invitation, String)> {
         let caller = require_user_actor(ctx)?;
@@ -381,6 +438,7 @@ impl TenantStore for MemoryTenantStore {
                 "an invitation has the role guest, member or admin",
             ));
         }
+        let content_role = invitation_content_role(role, content_role)?;
         if message.as_ref().is_some_and(|m| m.chars().count() > 1000) {
             return Err(crate::identity::invalid(
                 "the message must have at most 1000 characters",
@@ -429,6 +487,7 @@ impl TenantStore for MemoryTenantStore {
                 tenant_id: ctx.tenant,
                 email: email.clone(),
                 role,
+                content_role,
                 invited_by: ctx.actor,
                 created_at: now,
                 expires_at: now + time::Duration::days(INVITATION_DAYS),
@@ -456,7 +515,11 @@ impl TenantStore for MemoryTenantStore {
                 "invitation.created",
                 "invitation",
                 inv.id,
-                serde_json::json!({ "email": inv.email, "role": inv.role }),
+                serde_json::json!({
+                    "email": inv.email,
+                    "role": inv.role,
+                    "content_role": inv.content_role,
+                }),
             )
             .await?;
         let url = accept_url(&self.area.deps.public_url, &token);
@@ -525,7 +588,7 @@ impl TenantStore for MemoryTenantStore {
         let user = UserId(actor.actor.id.0);
         let hash = secret::sha256(token.trim());
         let now = crate::now();
-        let (tenant, old, new, email, already) = {
+        let (tenant, old, new, new_content, email, already) = {
             let mut st = self.area.lock();
             let (id, inv, accepted_by) = st
                 .invitations
@@ -536,10 +599,19 @@ impl TenantStore for MemoryTenantStore {
                 .ok_or_else(|| Error::not_found("invitation"))?;
             if inv.accepted_at.is_some() {
                 if accepted_by == Some(user) {
-                    let role = st
-                        .role_of(inv.tenant_id, user)
+                    let (role, content) = st
+                        .memberships
+                        .get(&(inv.tenant_id, user))
+                        .map(|m| (m.role, m.content_role))
                         .ok_or_else(|| Error::not_found("invitation"))?;
-                    (inv.tenant_id, Some(role), role, inv.email, true)
+                    (
+                        inv.tenant_id,
+                        Some((role, content)),
+                        role,
+                        content,
+                        inv.email,
+                        true,
+                    )
                 } else {
                     return Err(Error::Api(
                         crate::error::ApiError::new(
@@ -553,8 +625,13 @@ impl TenantStore for MemoryTenantStore {
                 if !st.users.contains_key(&user) {
                     return Err(Error::not_found("user"));
                 }
-                let old = st.role_of(inv.tenant_id, user);
+                let current = st
+                    .memberships
+                    .get(&(inv.tenant_id, user))
+                    .map(|m| (m.role, m.content_role));
+                let old = current.map(|c| c.0);
                 let new = accepted_role(old, inv.role);
+                let new_content = accepted_content_role(current, new, inv.content_role);
                 let t = st
                     .tenants
                     .get(&inv.tenant_id)
@@ -581,9 +658,11 @@ impl TenantStore for MemoryTenantStore {
                     .and_modify(|m| {
                         m.role = new;
                         m.role_since = now;
+                        m.content_role = new_content;
                     })
                     .or_insert(MembershipRow {
                         role: new,
+                        content_role: new_content,
                         joined_at: now,
                         role_since: now,
                         order,
@@ -592,12 +671,17 @@ impl TenantStore for MemoryTenantStore {
                     r.inv.accepted_at = Some(now);
                     r.accepted_by = Some(user);
                 }
-                (inv.tenant_id, old, new, inv.email, false)
+                (inv.tenant_id, current, new, new_content, inv.email, false)
             }
         };
         if !already {
             self.area
-                .relate(relations::membership(tenant, user, old, Some(new)))
+                .relate(relations::membership(
+                    tenant,
+                    user,
+                    old,
+                    Some((new, new_content)),
+                ))
                 .await?;
             let ctx = Context {
                 tenant,
@@ -614,7 +698,7 @@ impl TenantStore for MemoryTenantStore {
                     "invitation.accepted",
                     "member",
                     user,
-                    serde_json::json!({ "role": new }),
+                    serde_json::json!({ "role": new, "content_role": new_content }),
                 )
                 .await?;
         }

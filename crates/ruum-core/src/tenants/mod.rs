@@ -15,6 +15,7 @@ pub mod rules;
 mod tests;
 
 use crate::actor::{Actor, Context};
+use crate::authz::Role;
 use crate::error::Result;
 use crate::ids::{InvitationId, NodeId, TenantId, UserId};
 use crate::paging::{Page, PageRequest};
@@ -141,6 +142,10 @@ pub struct Member {
     pub email: String,
     pub display_name: String,
     pub role: MemberRole,
+    /// What a member may do in the team tree (decision 0003-1). Set if and only if `role` is
+    /// `member` (default `manage`); `None` for owners and admins (they always manage) and for
+    /// guests (they have only grants).
+    pub content_role: Option<Role>,
     #[serde(with = "time::serde::rfc3339")]
     pub joined_at: OffsetDateTime,
 }
@@ -151,6 +156,9 @@ pub struct Invitation {
     pub tenant_id: TenantId,
     pub email: String,
     pub role: MemberRole,
+    /// The content role the person gets as a member (decision 0003-1). Set if and only if
+    /// `role` is `member`.
+    pub content_role: Option<Role>,
     pub invited_by: Actor,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -250,6 +258,30 @@ pub trait TenantStore: Send + Sync {
         let _ = (tenant, user);
         Ok(None)
     }
+    /// Since when the user manages the team tree through the membership: an owner or admin, or
+    /// a member with the content role `manage` (decision 0003-1). The time is
+    /// `memberships.updated_at`, which every change of `role` or `content_role` moves, so the
+    /// answer is never too early. `None` for a member with a lower content role, a guest or a
+    /// stranger. A system lookup for rule (b) of the changes feed (decision 0002-6: only a
+    /// member who could restore a node counts). The default answers `None`.
+    async fn manager_since(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<OffsetDateTime>> {
+        let _ = (tenant, user);
+        Ok(None)
+    }
+    /// The role and the content role of a user in the tenant, or `None`. A system lookup for the
+    /// rules of other areas (the tag rules). The default answers `None`.
+    async fn access_of(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<(MemberRole, Option<Role>)>> {
+        let _ = (tenant, user);
+        Ok(None)
+    }
     /// Whether `email` is the verified email of a member, admin or owner (not a guest) of the
     /// tenant, case-insensitive. A system lookup for the `allow_guests` policy of email grants
     /// (decision 0002-1). The default answers `false`, which refuses the grant.
@@ -274,13 +306,29 @@ pub trait TenantStore: Send + Sync {
     }
     /// Members and guests, in the order they joined. Needs the tenant role `member`.
     async fn list_members(&self, ctx: &Context, page: PageRequest) -> Result<Page<Member>>;
-    /// Changes the role of a member. Users only; needs `admin`; only an owner makes or removes
-    /// owners; a tenant keeps at least one owner (`conflict`).
+    /// Changes the role of a member, keeping the content role of a member who stays a member.
+    /// See [`TenantStore::update_member`].
     async fn set_member_role(
         &self,
         ctx: &Context,
         user: UserId,
         role: MemberRole,
+    ) -> Result<Member> {
+        self.update_member(ctx, user, role, None).await
+    }
+    /// Changes the role and the content role of a member (`updateMember`). Users only; needs
+    /// `admin`; only an owner makes or removes owners; a tenant keeps at least one owner
+    /// (`conflict`). The content role (decision 0003-1, [`rules::content_role_after`]): given
+    /// only when the new role is `member` (else `validation_failed`); a member who stays a
+    /// member keeps their content role when none is given; a person who becomes a member gets
+    /// the given one, else `manage`; any other role has none. Every change of the role or the
+    /// content role moves `memberships.updated_at` and writes the tuples of the change.
+    async fn update_member(
+        &self,
+        ctx: &Context,
+        user: UserId,
+        role: MemberRole,
+        content_role: Option<Role>,
     ) -> Result<Member>;
     /// Removes a member. Users only; needs `admin`, or the member removes themselves; the last
     /// owner cannot leave (`conflict`). In one transaction it also removes the user's direct
@@ -289,20 +337,35 @@ pub trait TenantStore: Send + Sync {
     /// app passwords for the tenant (section 3.4; `removeMember` in `openapi.yaml`). Grants and
     /// member links the user made for others stay.
     async fn remove_member(&self, ctx: &Context, user: UserId) -> Result<()>;
-    /// Invites a person by email and sends the email. Users only; needs `admin`. Returns the
-    /// invitation and its secret token (in the email only).
+    /// Invites a person by email with the default content role. See [`TenantStore::invite_as`].
     async fn invite(
         &self,
         ctx: &Context,
         email: String,
         role: MemberRole,
         message: Option<String>,
+    ) -> Result<(Invitation, String)> {
+        self.invite_as(ctx, email, role, None, message).await
+    }
+    /// Invites a person by email and sends the email (`createInvitation`). Users only; needs
+    /// `admin`. `content_role` is allowed only with the role `member` (else
+    /// `validation_failed`) and defaults to `manage` (decision 0003-1). Returns the invitation
+    /// and its secret token (in the email only).
+    async fn invite_as(
+        &self,
+        ctx: &Context,
+        email: String,
+        role: MemberRole,
+        content_role: Option<Role>,
+        message: Option<String>,
     ) -> Result<(Invitation, String)>;
     /// The open invitations, newest first. Users only; needs `admin`.
     async fn list_invitations(&self, ctx: &Context, page: PageRequest) -> Result<Page<Invitation>>;
     async fn revoke_invitation(&self, ctx: &Context, id: InvitationId) -> Result<()>;
     /// Accepts an invitation by its secret token, for the signed-in user. A user who is already a
-    /// member keeps the higher of the two roles.
+    /// member keeps the higher of the two roles, and the higher of the two content roles
+    /// (acceptance never lowers rights; [`rules::accepted_content_role`]). The content role and
+    /// its tuple are written in the same transaction as the role.
     async fn accept_invitation(&self, actor: &Actor, token: &str) -> Result<Member>;
     /// The current usage. Needs the tenant role `member`.
     async fn usage(&self, ctx: &Context) -> Result<Usage>;

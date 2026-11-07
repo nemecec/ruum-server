@@ -11,6 +11,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post};
+use ruum_core::authz::Role;
 use ruum_core::identity::Authenticated;
 use ruum_core::tenants::{MemberRole, TenantPolicyChange, tenant_limits};
 use ruum_core::{Context, Error, InvitationId, PrincipalKind, TenantId, UserId};
@@ -157,6 +158,8 @@ pub async fn list_members(
 #[derive(Deserialize)]
 pub struct UpdateMember {
     role: MemberRole,
+    /// Only with the role `member` (decision 0003-1).
+    content_role: Option<Role>,
 }
 
 /// Change the role of a member. `PATCH /v1/tenants/{tenant_id}/members/{user_id}` (operationId `updateMember`).
@@ -173,7 +176,7 @@ pub async fn update_member(
     let m = state
         .services
         .tenants
-        .set_member_role(&ctx, user, body.role)
+        .update_member(&ctx, user, body.role, body.content_role)
         .await?;
     Ok(Json(json!(m)))
 }
@@ -214,6 +217,8 @@ pub async fn list_invitations(
 pub struct CreateInvitation {
     email: String,
     role: MemberRole,
+    /// Only with the role `member` (decision 0003-1).
+    content_role: Option<Role>,
     message: Option<String>,
 }
 
@@ -230,7 +235,7 @@ pub async fn create_invitation(
     let (inv, _token) = state
         .services
         .tenants
-        .invite(&ctx, body.email, body.role, body.message)
+        .invite_as(&ctx, body.email, body.role, body.content_role, body.message)
         .await?;
     Ok((StatusCode::CREATED, Json(json!(inv))))
 }

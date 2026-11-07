@@ -2,6 +2,7 @@
 
 use super::{MemberRole, TenantPolicy, TenantPolicyChange};
 use crate::actor::{Context, PrincipalKind};
+use crate::authz::Role;
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::UserId;
 
@@ -148,10 +149,172 @@ pub fn accepted_role(current: Option<MemberRole>, invited: MemberRole) -> Member
     current.map_or(invited, |c| c.max(invited))
 }
 
+/// The content role is only for members (decision 0003-1).
+fn content_role_only_for_members() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::ValidationFailed,
+            "content_role applies only to the role member",
+        )
+        .with_hint("leave content_role out for guests, admins and owners"),
+    )
+}
+
+/// The content role after `updateMember` changes a person from `old` (with `old_content`) to
+/// `new`, with `requested` from the request (decision 0003-1):
+///
+/// - a new role other than `member` has no content role; a requested one is
+///   `validation_failed`;
+/// - a member who stays a member gets the requested content role, else keeps their own;
+/// - a guest, admin or owner who becomes a member gets the requested content role, else
+///   `manage`.
+pub fn content_role_after(
+    old: MemberRole,
+    old_content: Option<Role>,
+    new: MemberRole,
+    requested: Option<Role>,
+) -> Result<Option<Role>> {
+    if new != MemberRole::Member {
+        return match requested {
+            Some(_) => Err(content_role_only_for_members()),
+            None => Ok(None),
+        };
+    }
+    let kept = if old == MemberRole::Member {
+        old_content
+    } else {
+        None
+    };
+    Ok(Some(requested.or(kept).unwrap_or(Role::Manage)))
+}
+
+/// The content role of a new invitation for `role` (decision 0003-1): `requested`, else
+/// `manage`, for a member; none for the other roles (a requested one is `validation_failed`).
+pub fn invitation_content_role(role: MemberRole, requested: Option<Role>) -> Result<Option<Role>> {
+    content_role_after(MemberRole::Guest, None, role, requested)
+}
+
+/// The content role a user keeps when an invitation is accepted (decision 0003-1, review 1 #2).
+/// `current` is the user's role and content role before, `new` the role after
+/// ([`accepted_role`]), `invited` the content role of the invitation. Acceptance never lowers
+/// rights:
+///
+/// - an owner or admin (or a guest, when `new` is guest) has none;
+/// - a member who stays a member keeps the higher of their content role and the invitation's;
+/// - a new person, or a guest who becomes a member, gets the invitation's content role.
+pub fn accepted_content_role(
+    current: Option<(MemberRole, Option<Role>)>,
+    new: MemberRole,
+    invited: Option<Role>,
+) -> Option<Role> {
+    if new != MemberRole::Member {
+        return None;
+    }
+    let kept = match current {
+        Some((MemberRole::Member, c)) => c,
+        _ => None,
+    };
+    match (kept, invited) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => Some(a.or(b).unwrap_or(Role::Manage)),
+    }
+}
+
+/// Whether a user with this role and content role may change content of the team tree by the
+/// membership alone (`edit` or more): owners, admins, and members with `edit` or `manage`. Used
+/// by the rules that are not node checks (creating and changing tags).
+pub fn edits_team_content(role: Option<MemberRole>, content: Option<Role>) -> bool {
+    match role {
+        Some(MemberRole::Owner | MemberRole::Admin) => true,
+        Some(MemberRole::Member) => content.is_some_and(|c| c >= Role::Edit),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use MemberRole::*;
+
+    #[test]
+    fn content_roles_follow_the_role() {
+        // Only members have one.
+        assert_eq!(
+            content_role_after(Member, Some(Role::View), Admin, None).unwrap(),
+            None
+        );
+        assert!(content_role_after(Member, Some(Role::View), Admin, Some(Role::Edit)).is_err());
+        assert!(content_role_after(Guest, None, Guest, Some(Role::View)).is_err());
+        // A member keeps theirs unless the request changes it.
+        assert_eq!(
+            content_role_after(Member, Some(Role::View), Member, None).unwrap(),
+            Some(Role::View)
+        );
+        assert_eq!(
+            content_role_after(Member, Some(Role::View), Member, Some(Role::Edit)).unwrap(),
+            Some(Role::Edit)
+        );
+        // Who becomes a member gets the requested one, else manage.
+        assert_eq!(
+            content_role_after(Admin, None, Member, None).unwrap(),
+            Some(Role::Manage)
+        );
+        assert_eq!(
+            content_role_after(Guest, None, Member, Some(Role::Comment)).unwrap(),
+            Some(Role::Comment)
+        );
+        assert_eq!(
+            invitation_content_role(Member, None).unwrap(),
+            Some(Role::Manage)
+        );
+        assert!(invitation_content_role(Admin, Some(Role::View)).is_err());
+        assert_eq!(invitation_content_role(Guest, None).unwrap(), None);
+    }
+
+    #[test]
+    fn accepting_never_lowers_the_content_role() {
+        // A new person and a guest who becomes a member get the invitation's.
+        assert_eq!(
+            accepted_content_role(None, Member, Some(Role::View)),
+            Some(Role::View)
+        );
+        assert_eq!(
+            accepted_content_role(Some((Guest, None)), Member, Some(Role::Edit)),
+            Some(Role::Edit)
+        );
+        // A member keeps the higher of the two.
+        assert_eq!(
+            accepted_content_role(Some((Member, Some(Role::Manage))), Member, Some(Role::View)),
+            Some(Role::Manage)
+        );
+        assert_eq!(
+            accepted_content_role(Some((Member, Some(Role::View))), Member, Some(Role::Edit)),
+            Some(Role::Edit)
+        );
+        // A member who accepts a guest invitation keeps theirs.
+        assert_eq!(
+            accepted_content_role(Some((Member, Some(Role::Comment))), Member, None),
+            Some(Role::Comment)
+        );
+        // Admins and owners stay at none.
+        assert_eq!(
+            accepted_content_role(Some((Admin, None)), Admin, Some(Role::View)),
+            None
+        );
+    }
+
+    #[test]
+    fn only_edit_members_change_team_content() {
+        assert!(edits_team_content(Some(Owner), None));
+        assert!(edits_team_content(Some(Admin), None));
+        assert!(edits_team_content(Some(Member), Some(Role::Manage)));
+        assert!(edits_team_content(Some(Member), Some(Role::Edit)));
+        assert!(!edits_team_content(Some(Member), Some(Role::Comment)));
+        assert!(!edits_team_content(Some(Member), Some(Role::View)));
+        assert!(!edits_team_content(Some(Member), None));
+        assert!(!edits_team_content(Some(Guest), None));
+        assert!(!edits_team_content(None, None));
+    }
 
     #[test]
     fn only_owners_touch_owners() {

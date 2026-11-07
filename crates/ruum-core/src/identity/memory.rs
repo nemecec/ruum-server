@@ -78,6 +78,8 @@ pub(crate) struct AppPasswordRow {
 
 pub(crate) struct MembershipRow {
     pub role: MemberRole,
+    /// The content role of a member (decision 0003-1); `None` unless `role` is `member`.
+    pub content_role: Option<crate::authz::Role>,
     pub joined_at: OffsetDateTime,
     /// The join or the last change of the role (`memberships.updated_at` in Postgres).
     pub role_since: OffsetDateTime,
@@ -294,6 +296,7 @@ impl MemoryArea {
             (tenant.id, owner),
             MembershipRow {
                 role: MemberRole::Owner,
+                content_role: None,
                 joined_at: tenant.created_at,
                 role_since: tenant.created_at,
                 order,

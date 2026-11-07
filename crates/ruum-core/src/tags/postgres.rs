@@ -95,11 +95,12 @@ impl PgTagStore {
     }
 
     async fn caller(&self, ctx: &Context) -> Result<TagCaller> {
-        let role = match ctx.actor.effective_user() {
+        let access: Option<(MemberRole, Option<Role>)> = match ctx.actor.effective_user() {
             Some(u) => {
                 let mut c = begin_tenant(&self.pool, ctx.tenant).await?;
-                let r: Option<MemberRole> = sqlx::query_scalar(
-                    "select role from memberships where tenant_id = $1 and user_id = $2",
+                let r = sqlx::query_as(
+                    "select role, content_role from memberships \
+                     where tenant_id = $1 and user_id = $2",
                 )
                 .bind(ctx.tenant.0)
                 .bind(u.0)
@@ -110,7 +111,11 @@ impl PgTagStore {
             }
             None => None,
         };
-        Ok(TagCaller::new(ctx, role))
+        Ok(TagCaller::new(
+            ctx,
+            access.map(|a| a.0),
+            access.and_then(|a| a.1),
+        ))
     }
 
     async fn visible(&self, ctx: &Context, id: TagId) -> Result<(Tag, TagCaller)> {

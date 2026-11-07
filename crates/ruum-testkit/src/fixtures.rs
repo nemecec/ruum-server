@@ -16,7 +16,8 @@
 //!
 //! | Principal | What it is |
 //! |---|---|
-//! | `owner`, `admin`, `member` | tenant roles; owners and admins have `manage` (and so `share`) on the root; members have `manage` from the team root (`node:<root>#team@tenant`), and `share` while the tenant policy `members_can_share` is true (the default) |
+//! | `owner`, `admin`, `member` | tenant roles; owners and admins have `manage` (and so `share`) on the root; members have `manage` from the team root (`node:<root>#team@tenant`, content role `manage`, the default), and `share` while the tenant policy `members_can_share` is true (the default) |
+//! | `member_view`, `member_comment`, `member_edit` | members with the content role `view`, `comment` or `edit` (decision 0003-1): that role on the whole team tree from the team root; `member_edit` shares where `editors_can_share` is true (not in `Archive`) |
 //! | `guest` | a guest without grants |
 //! | `guest_view` ... `guest_manage` | guests with one grant on `Projects`; `guest_edit` shares where `editors_can_share` is true (not in `Archive`), `guest_manage` everywhere below `Projects` |
 //! | `agent` | the agent of `member`: scope `Projects`, `max_role: view` (the narrow agent) |
@@ -61,6 +62,9 @@ pub enum Who {
     Owner,
     Admin,
     Member,
+    MemberView,
+    MemberComment,
+    MemberEdit,
     Guest,
     GuestView,
     GuestComment,
@@ -79,6 +83,9 @@ impl Who {
         Who::Owner,
         Who::Admin,
         Who::Member,
+        Who::MemberView,
+        Who::MemberComment,
+        Who::MemberEdit,
         Who::Guest,
         Who::GuestView,
         Who::GuestComment,
@@ -96,6 +103,9 @@ impl Who {
             Who::Owner => "owner",
             Who::Admin => "admin",
             Who::Member => "member",
+            Who::MemberView => "member_view",
+            Who::MemberComment => "member_comment",
+            Who::MemberEdit => "member_edit",
             Who::Guest => "guest",
             Who::GuestView => "guest_view",
             Who::GuestComment => "guest_comment",
@@ -113,10 +123,25 @@ impl Who {
         match self {
             Who::Owner => Some(MemberRole::Owner),
             Who::Admin => Some(MemberRole::Admin),
-            Who::Member => Some(MemberRole::Member),
+            Who::Member | Who::MemberView | Who::MemberComment | Who::MemberEdit => {
+                Some(MemberRole::Member)
+            }
             Who::Guest | Who::GuestView | Who::GuestComment | Who::GuestEdit | Who::GuestManage => {
                 Some(MemberRole::Guest)
             }
+            _ => None,
+        }
+    }
+
+    /// The content role of a member (decision 0003-1): `manage` for `member` (the default),
+    /// the lower roles for `member_view`, `member_comment` and `member_edit`; none for the
+    /// other principals.
+    pub fn content_role(self) -> Option<Role> {
+        match self {
+            Who::Member => Some(Role::Manage),
+            Who::MemberView => Some(Role::View),
+            Who::MemberComment => Some(Role::Comment),
+            Who::MemberEdit => Some(Role::Edit),
             _ => None,
         }
     }
@@ -175,8 +200,12 @@ impl Who {
             return user.role_on(target).map(|r| r.min(max_role));
         }
         match self {
-            // Owners and admins: `manager@tenant#administer`; members: `team@tenant` on the root.
-            Who::Owner | Who::Admin | Who::Member => Some(Role::Manage),
+            // Owners and admins: `manager@tenant#administer`; members: their content role
+            // through `team@tenant` on the root (decision 0003-1).
+            Who::Owner | Who::Admin => Some(Role::Manage),
+            Who::Member | Who::MemberView | Who::MemberComment | Who::MemberEdit => {
+                self.content_role()
+            }
             // The `view` share link on `Projects`.
             Who::ShareLink if target.is_inside(Target::Projects) => Some(Role::View),
             Who::ShareLink => None,
@@ -190,7 +219,8 @@ impl Who {
     /// Whether this principal has the `share` permission on a node of the fixture tree
     /// (`schema.zed`, decision 0001-1): `manage` always shares; `edit` shares where the effective
     /// `editors_can_share` is true; members share from the team root by the default tenant policy
-    /// `members_can_share`; share links never. For agents: the user shares, and the scope has
+    /// `members_can_share` (edit members as editors, view and comment members never; decision
+    /// 0003-1); share links never. For agents: the user shares, and the scope has
     /// `max_role` `manage`, or `edit` where `editors_can_share` is true.
     pub fn can_share(self, target: Target) -> bool {
         if self.is_share_link() {
@@ -758,6 +788,7 @@ mod seed {
             .filter(|w| w.is_user() && *w != Who::Owner)
         {
             let role = who.tenant_role().expect("a user");
+            let content_role = who.content_role();
             let (s2, c, email) = (
                 s.clone(),
                 owner_ctx.clone(),
@@ -765,7 +796,10 @@ mod seed {
             );
             let user = t.user_id(who);
             let joined = step("member", async move {
-                let (_inv, token) = s2.tenants.invite(&c, email, role, None).await?;
+                let (_inv, token) = s2
+                    .tenants
+                    .invite_as(&c, email, role, content_role, None)
+                    .await?;
                 s2.tenants
                     .accept_invitation(&Actor::user(user), &token)
                     .await
@@ -1218,5 +1252,22 @@ mod tests {
         assert!(!Who::Agent.can_share(Target::Projects));
         // A wide scope never lifts the user's right.
         assert!(!Who::AgentOfGuestView.can_share(Target::Projects));
+    }
+
+    #[test]
+    fn content_roles_limit_members() {
+        // Decision 0003-1: a member's content role is its role on the whole team tree.
+        assert_eq!(Who::MemberView.role_on(Target::Private), Some(Role::View));
+        assert_eq!(
+            Who::MemberComment.role_on(Target::Plan),
+            Some(Role::Comment)
+        );
+        assert_eq!(Who::MemberEdit.role_on(Target::Root), Some(Role::Edit));
+        assert!(!Who::MemberView.can_share(Target::Projects));
+        assert!(!Who::MemberComment.can_share(Target::Projects));
+        // Edit members share as editors: not where editors_can_share is false.
+        assert!(Who::MemberEdit.can_share(Target::Projects));
+        assert!(!Who::MemberEdit.can_share(Target::Archive));
+        assert_eq!(Who::MemberEdit.tenant_role(), Some(MemberRole::Member));
     }
 }

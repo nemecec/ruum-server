@@ -577,6 +577,355 @@ async fn member_since_dates_the_membership(a: Area) {
         promoted >= before && promoted > member,
         "{promoted} vs {member}"
     );
+    // A change of the content role alone moves the date too (decision 0003-1), and only a
+    // member with `manage` manages the team tree (`manager_since`).
+    let oc = ctx(tid, t.owner.id);
+    assert_eq!(
+        a.tenants.manager_since(tid, t.member.id).await.unwrap(),
+        Some(member)
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    a.tenants
+        .update_member(&oc, t.member.id, MemberRole::Member, Some(Role::View))
+        .await
+        .unwrap();
+    let viewer = ms(t.member.id).await.expect("still a member");
+    assert!(viewer > member, "{viewer} vs {member}");
+    assert_eq!(
+        a.tenants.manager_since(tid, t.member.id).await.unwrap(),
+        None
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    a.tenants
+        .update_member(&oc, t.member.id, MemberRole::Member, Some(Role::Manage))
+        .await
+        .unwrap();
+    let manager = a
+        .tenants
+        .manager_since(tid, t.member.id)
+        .await
+        .unwrap()
+        .expect("manages again");
+    assert!(manager > viewer, "{manager} vs {viewer}");
+    assert_eq!(ms(t.member.id).await, Some(manager));
+    // Owners and admins manage; guests and strangers do not.
+    assert!(
+        a.tenants
+            .manager_since(tid, t.owner.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        a.tenants.manager_since(tid, UserId::new()).await.unwrap(),
+        None
+    );
+}
+
+/// The members of `tenant` with their content roles, as `(user, role, content_role)`.
+async fn content_roles(a: &Area, oc: &Context) -> Vec<(UserId, MemberRole, Option<Role>)> {
+    a.tenants
+        .list_members(oc, PageRequest::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|m| (m.user_id, m.role, m.content_role))
+        .collect()
+}
+
+/// The `tenant#...@user:<u>` relations of one user, sorted.
+async fn user_tuples(a: &Area, tenant: TenantId, u: UserId) -> Vec<String> {
+    let suffix = format!("@user:{u}");
+    a.tenant_tuples(tenant)
+        .await
+        .into_iter()
+        .filter(|t| t.ends_with(&suffix))
+        .map(|t| t.trim_end_matches(&suffix).to_string())
+        .collect()
+}
+
+/// Decision 0003-1, the storage invariant: `content_role` is set if and only if the role is
+/// `member`, and the tuples follow the rebuild mapping of `schema.zed` after every transition
+/// (member(view), admin, member (default), guest, member(edit), removed).
+async fn content_roles_keep_the_invariant(a: Area) {
+    let t = team(&a).await;
+    let tid = t.tenant.id;
+    let oc = ctx(tid, t.owner.id);
+    let u = t.member.id;
+    // The member who joined without a content role has the default.
+    let m = content_roles(&a, &oc).await;
+    assert!(
+        m.contains(&(u, MemberRole::Member, Some(Role::Manage))),
+        "{m:?}"
+    );
+    assert!(m.contains(&(t.owner.id, MemberRole::Owner, None)), "{m:?}");
+    assert!(m.contains(&(t.guest.id, MemberRole::Guest, None)), "{m:?}");
+    assert_eq!(user_tuples(&a, tid, u).await, vec!["member"]);
+
+    // (new role, requested content role, content role after, the user's tuples after)
+    type Step = (
+        MemberRole,
+        Option<Role>,
+        Option<Role>,
+        &'static [&'static str],
+    );
+    let steps: [Step; 5] = [
+        (
+            MemberRole::Member,
+            Some(Role::View),
+            Some(Role::View),
+            &["content_viewer", "member"],
+        ),
+        (MemberRole::Admin, None, None, &["admin", "member"]),
+        (MemberRole::Member, None, Some(Role::Manage), &["member"]),
+        (MemberRole::Guest, None, None, &["guest"]),
+        (
+            MemberRole::Member,
+            Some(Role::Edit),
+            Some(Role::Edit),
+            &["content_editor", "member"],
+        ),
+    ];
+    for (role, requested, want, tuples) in steps {
+        let m = a
+            .tenants
+            .update_member(&oc, u, role, requested)
+            .await
+            .unwrap();
+        assert_eq!(
+            (m.role, m.content_role),
+            (role, want),
+            "{role:?} {requested:?}"
+        );
+        assert_eq!(
+            user_tuples(&a, tid, u).await,
+            tuples.to_vec(),
+            "{role:?} {requested:?}"
+        );
+        assert_eq!(
+            a.tenants.access_of(tid, u).await.unwrap(),
+            Some((role, want))
+        );
+    }
+    // A member who stays a member keeps the content role when none is given.
+    let m = a
+        .tenants
+        .set_member_role(&oc, u, MemberRole::Member)
+        .await
+        .unwrap();
+    assert_eq!(m.content_role, Some(Role::Edit));
+    // A content role for another role is refused, and nothing changes.
+    for role in [MemberRole::Admin, MemberRole::Guest] {
+        assert_eq!(
+            code(
+                a.tenants
+                    .update_member(&oc, u, role, Some(Role::View))
+                    .await
+            ),
+            ErrorCode::ValidationFailed
+        );
+    }
+    assert_eq!(
+        a.tenants.access_of(tid, u).await.unwrap(),
+        Some((MemberRole::Member, Some(Role::Edit)))
+    );
+    // Removal deletes the membership and the content tuple.
+    a.tenants.remove_member(&oc, u).await.unwrap();
+    assert!(user_tuples(&a, tid, u).await.is_empty());
+    assert_eq!(a.tenants.access_of(tid, u).await.unwrap(), None);
+
+    // Invitations carry the content role of members only.
+    assert_eq!(
+        code(
+            a.tenants
+                .invite_as(
+                    &oc,
+                    "admin@example.test".into(),
+                    MemberRole::Admin,
+                    Some(Role::View),
+                    None,
+                )
+                .await
+        ),
+        ErrorCode::ValidationFailed
+    );
+    let (inv, _) = a
+        .tenants
+        .invite_as(
+            &oc,
+            "viewer@example.test".into(),
+            MemberRole::Member,
+            Some(Role::Comment),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(inv.content_role, Some(Role::Comment));
+    let (inv, _) = a
+        .tenants
+        .invite(&oc, "plain@example.test".into(), MemberRole::Member, None)
+        .await
+        .unwrap();
+    assert_eq!(inv.content_role, Some(Role::Manage));
+    let (inv, _) = a
+        .tenants
+        .invite(&oc, "guest2@example.test".into(), MemberRole::Guest, None)
+        .await
+        .unwrap();
+    assert_eq!(inv.content_role, None);
+    let listed = a
+        .tenants
+        .list_invitations(&oc, PageRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        listed
+            .items
+            .iter()
+            .any(|i| i.email == "viewer@example.test" && i.content_role == Some(Role::Comment))
+    );
+
+    // The database checks the invariant itself.
+    if let Some(pool) = &a.pool {
+        let mut c = system(pool).await;
+        let bad = sqlx::query(
+            "update memberships set content_role = 'manage' where tenant_id = $1 and user_id = $2",
+        )
+        .bind(tid)
+        .bind(t.guest.id)
+        .execute(&mut *c)
+        .await;
+        assert!(bad.is_err(), "a guest with a content role");
+        let bad = sqlx::query(
+            "update memberships set content_role = null where tenant_id = $1 and role = 'owner'",
+        )
+        .bind(tid)
+        .execute(&mut *c)
+        .await;
+        assert!(bad.is_ok(), "owners have none already");
+        let stranger = user(&a, "stranger").await;
+        let bad = sqlx::query(
+            "insert into memberships (tenant_id, user_id, role, created_kind, created_by) \
+             values ($1, $2, 'member', 'user', $2)",
+        )
+        .bind(tid)
+        .bind(stranger.id)
+        .execute(&mut *c)
+        .await;
+        assert!(bad.is_err(), "a member without a content role");
+        let bad = sqlx::query(
+            "update invitations set content_role = 'view' where tenant_id = $1 and role = 'guest'",
+        )
+        .bind(tid)
+        .execute(&mut *c)
+        .await;
+        assert!(bad.is_err(), "a guest invitation with a content role");
+    }
+}
+
+/// Decision 0003-1, review 1 #2: accepting an invitation writes the content role and its tuple.
+/// A new person, or a guest who becomes a member, gets the invitation's content role; a member
+/// keeps the higher of the two; an admin stays at none.
+async fn accepting_an_invitation_sets_the_content_role(a: Area) {
+    let t = team(&a).await;
+    let tid = t.tenant.id;
+    let oc = ctx(tid, t.owner.id);
+    let accept = |email: String, role: MemberRole, content: Option<Role>, who: UserId| {
+        let (a, oc) = (&a, oc.clone());
+        async move {
+            let (_inv, token) = a
+                .tenants
+                .invite_as(&oc, email, role, content, None)
+                .await
+                .unwrap();
+            a.tenants
+                .accept_invitation(&Actor::user(who), &token)
+                .await
+                .unwrap()
+        }
+    };
+    // A new person gets the invitation's content role and its tuple.
+    let newcomer = user(&a, "newcomer").await;
+    let m = accept(
+        newcomer.email.clone(),
+        MemberRole::Member,
+        Some(Role::View),
+        newcomer.id,
+    )
+    .await;
+    assert_eq!(
+        (m.role, m.content_role),
+        (MemberRole::Member, Some(Role::View))
+    );
+    assert_eq!(
+        user_tuples(&a, tid, newcomer.id).await,
+        vec!["content_viewer", "member"]
+    );
+    // A guest who becomes a member gets it too.
+    let m = accept(
+        t.guest.email.clone(),
+        MemberRole::Member,
+        Some(Role::Edit),
+        t.guest.id,
+    )
+    .await;
+    assert_eq!(
+        (m.role, m.content_role),
+        (MemberRole::Member, Some(Role::Edit))
+    );
+    assert_eq!(
+        user_tuples(&a, tid, t.guest.id).await,
+        vec!["content_editor", "member"]
+    );
+    // A member keeps the higher of the two: never lowered, raised by a higher invitation.
+    let m = accept(
+        t.member.email.clone(),
+        MemberRole::Member,
+        Some(Role::View),
+        t.member.id,
+    )
+    .await;
+    assert_eq!(
+        (m.role, m.content_role),
+        (MemberRole::Member, Some(Role::Manage))
+    );
+    assert_eq!(user_tuples(&a, tid, t.member.id).await, vec!["member"]);
+    let m = accept(
+        newcomer.email.clone(),
+        MemberRole::Member,
+        Some(Role::Comment),
+        newcomer.id,
+    )
+    .await;
+    assert_eq!(m.content_role, Some(Role::Comment));
+    assert_eq!(
+        user_tuples(&a, tid, newcomer.id).await,
+        vec!["content_commenter", "member"]
+    );
+    // A member who accepts a guest invitation keeps the content role.
+    let m = accept(newcomer.email.clone(), MemberRole::Guest, None, newcomer.id).await;
+    assert_eq!(
+        (m.role, m.content_role),
+        (MemberRole::Member, Some(Role::Comment))
+    );
+    // An admin stays an admin without a content role.
+    a.tenants
+        .update_member(&oc, t.member.id, MemberRole::Admin, None)
+        .await
+        .unwrap();
+    let m = accept(
+        t.member.email.clone(),
+        MemberRole::Member,
+        Some(Role::View),
+        t.member.id,
+    )
+    .await;
+    assert_eq!((m.role, m.content_role), (MemberRole::Admin, None));
+    assert_eq!(
+        user_tuples(&a, tid, t.member.id).await,
+        vec!["admin", "member"]
+    );
 }
 
 /// Names for answers (C-7, decision 0003-5): members, guests and agents of the tenant by their
@@ -687,4 +1036,6 @@ crate::conformance!(
     guests_follow_the_policy,
     usage_and_limits,
     member_since_dates_the_membership,
+    content_roles_keep_the_invariant,
+    accepting_an_invitation_sets_the_content_role,
 );

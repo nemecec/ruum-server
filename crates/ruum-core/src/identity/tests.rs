@@ -23,6 +23,62 @@ pub(crate) struct Area {
     pub tokens: Arc<dyn TokenIssuer>,
     pub mailer: Arc<MemoryMailer>,
     pub pool: Option<sqlx::PgPool>,
+    /// The in-memory engine that the in-memory stores write their tuples to (`None` for
+    /// Postgres, whose tuples go to `authz_outbox`).
+    pub authz: Option<Arc<crate::authz::memory::MemoryAuthz>>,
+}
+
+impl Area {
+    /// The relationships of the tenant now, as `relation@type:id` strings of `tenant:<t>`. For
+    /// the in-memory stores from the engine; for Postgres folded from the tenant's outbox (each
+    /// batch in order: a touch adds, a delete removes), the state SpiceDB gets.
+    pub async fn tenant_tuples(&self, tenant: TenantId) -> Vec<String> {
+        use crate::authz::{Relationship, RelationshipUpdate};
+        let object = format!("tenant:{tenant}");
+        let fmt = |r: &Relationship| {
+            format!(
+                "{}@{}:{}",
+                r.relation, r.subject.object.object_type, r.subject.object.object_id
+            )
+        };
+        let mut out: Vec<String> = Vec::new();
+        if let Some(authz) = &self.authz {
+            for r in authz.all() {
+                if r.object.to_string() == object {
+                    out.push(fmt(&r));
+                }
+            }
+        } else if let Some(pool) = &self.pool {
+            let mut c = system(pool).await;
+            let batches: Vec<serde_json::Value> = sqlx::query_scalar(
+                "select updates from authz_outbox where tenant_id = $1 order by id",
+            )
+            .bind(tenant)
+            .fetch_all(&mut *c)
+            .await
+            .unwrap();
+            for b in batches {
+                let ups: Vec<RelationshipUpdate> = serde_json::from_value(b).unwrap();
+                for u in ups {
+                    match u {
+                        RelationshipUpdate::Touch(r) if r.object.to_string() == object => {
+                            let k = fmt(&r);
+                            if !out.contains(&k) {
+                                out.push(k);
+                            }
+                        }
+                        RelationshipUpdate::Delete(r) if r.object.to_string() == object => {
+                            let k = fmt(&r);
+                            out.retain(|x| *x != k);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
 }
 
 /// A node store that knows only tenant roots, for the scope subtree checks of the in-memory
@@ -148,8 +204,12 @@ pub(crate) fn memory() -> Area {
     let roots = Arc::new(Roots::default());
     let mailer = Arc::new(MemoryMailer::default());
     let tokens: Arc<dyn TokenIssuer> = Arc::new(memory::MemoryTokenIssuer::default());
+    let authz = Arc::new(crate::authz::memory::MemoryAuthz::new(
+        crate::authz::schema::Schema::contract(),
+    ));
     let area = Arc::new(memory::MemoryArea::new(memory::MemoryDeps {
         tokens: tokens.clone(),
+        authz: Some(authz.clone()),
         nodes: Some(roots.clone()),
         root_created: Some(roots),
         mailer: mailer.clone(),
@@ -163,6 +223,7 @@ pub(crate) fn memory() -> Area {
         tokens,
         mailer,
         pool: None,
+        authz: Some(authz),
     }
 }
 
@@ -180,6 +241,7 @@ pub(crate) fn postgres(pool: sqlx::PgPool) -> Area {
         tokens,
         mailer,
         pool: Some(pool),
+        authz: None,
     }
 }
 

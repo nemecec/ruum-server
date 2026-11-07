@@ -1196,8 +1196,9 @@ async fn seed_pg(pool: &PgPool, w: &World) {
     let roles = w.tenants.roles.read().unwrap().clone();
     for ((t, u), role) in roles {
         sqlx::query(
-            "insert into memberships (tenant_id, user_id, role, created_kind, created_by) \
-             values ($1, $2, $3, 'user', $2)",
+            "insert into memberships (tenant_id, user_id, role, content_role, created_kind, \
+             created_by) values ($1, $2, $3, case when $3 = 'member'::member_role \
+             then 'manage'::grant_role end, 'user', $2)",
         )
         .bind(t.0)
         .bind(u.0)

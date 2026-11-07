@@ -710,4 +710,83 @@ mod tests {
         let err = invert(&s, &ctx, &renamed).await.unwrap_err();
         assert_eq!(err.to_api().code, ErrorCode::NameTaken);
     }
+
+    /// Decision 0003-1: each inverse runs the store's check for the caller, so a member whose
+    /// content role was lowered to `view` cannot undo into a write (the undo report says
+    /// `permission_denied`). The same member with `manage` can.
+    #[tokio::test]
+    async fn a_view_member_cannot_undo_into_a_write() {
+        use crate::tenants::MemberRole;
+        let (s, owner, _) = personal().await;
+        let owner_user = owner.actor.effective_user().unwrap();
+        let team = s
+            .tenants
+            .create_team(&Actor::user(owner_user), "Team".into())
+            .await
+            .unwrap();
+        let oc = Context {
+            tenant: team.id,
+            ..owner.clone()
+        };
+        let login = crate::identity::VerifiedLogin {
+            issuer: "https://idp.ruum.test".into(),
+            subject: format!("undo-m-{}", Uuid::now_v7()),
+            email: Some(format!("undo-m-{}@example.test", Uuid::now_v7())),
+            email_verified: true,
+            name: Some("Member".into()),
+            id_token: None,
+        };
+        let member = s.identity.upsert_from_login(&login).await.unwrap();
+        let (_, token) = s
+            .tenants
+            .invite(&oc, member.email.clone(), MemberRole::Member, None)
+            .await
+            .unwrap();
+        s.tenants
+            .accept_invitation(&Actor::user(member.id), &token)
+            .await
+            .unwrap();
+        let mc = Context {
+            tenant: team.id,
+            actor: Actor::user(member.id),
+            scope: None,
+            idempotency_key: None,
+        };
+        // The member (content role `manage`) makes a folder.
+        s.nodes
+            .create(&mc, new_node(team.root_node_id, "f", NodeKind::Folder))
+            .await
+            .unwrap();
+        let created = last(&s, &mc).await;
+        assert_eq!(created.event, EventType::NodeCreated);
+        // An admin lowers the member to `view`: the inverse (a trash) is refused.
+        s.tenants
+            .update_member(
+                &oc,
+                member.id,
+                MemberRole::Member,
+                Some(crate::authz::Role::View),
+            )
+            .await
+            .unwrap();
+        let err = invert(&s, &mc, &created).await.unwrap_err();
+        assert!(
+            matches!(
+                err.to_api().code,
+                ErrorCode::PermissionDenied | ErrorCode::NotFound
+            ),
+            "{err:?}"
+        );
+        // Back to `manage`: the inverse works.
+        s.tenants
+            .update_member(
+                &oc,
+                member.id,
+                MemberRole::Member,
+                Some(crate::authz::Role::Manage),
+            )
+            .await
+            .unwrap();
+        assert!(invert(&s, &mc, &created).await.unwrap().is_some());
+    }
 }

@@ -16,9 +16,11 @@
 //! that is in the trash or purged now, is sent only when the caller sees the node now (in the
 //! trash: only with `manage`), or could see it just before it went to the trash, or could restore
 //! it while it was in the trash. "Could" uses dated access only: grants from the journal, and a
-//! membership from `TenantStore::member_since` (members `manage` the team tree). `manage` is
-//! capped by an agent's scope, and for an agent the node must be inside its subtree. Seeing the
-//! old place now is not enough: access that began after the trash never reveals the node.
+//! membership from `TenantStore::member_since` (any content role: members see the team tree) or,
+//! for the restore, `TenantStore::manager_since` (owners, admins and members with the content
+//! role `manage`; decision 0003-1). `manage` is capped by an agent's scope, and for an agent the
+//! node must be inside its subtree. Seeing the old place now is not enough: access that began
+//! after the trash never reveals the node.
 //!
 //! When a change alters what the caller sees of a whole subtree, the page also carries a
 //! [`ResyncMarker`] for the caller: a grant to the caller (directly or through
@@ -121,8 +123,13 @@ pub trait FeedAccess: Send + Sync {
     async fn is_member(&self) -> Result<bool>;
     /// Since when the caller's user is a member, admin or owner (not a guest), or `None`
     /// (`TenantStore::member_since`). Members see the whole team tree through the team root
-    /// (`manage`); the feed counts that access only from this time (decision 0002-6).
+    /// (any content role); the feed counts that access only from this time (decision 0002-6).
     async fn member_since(&self) -> Result<Option<OffsetDateTime>>;
+    /// Since when the caller's user manages the team tree through the membership (an owner or
+    /// admin, or a member with the content role `manage`), or `None`
+    /// (`TenantStore::manager_since`, decision 0003-1). Only this counts for rule (b) of
+    /// decision 0002-6: a member with a lower content role could never restore a node.
+    async fn manager_since(&self) -> Result<Option<OffsetDateTime>>;
 }
 
 /// [`FeedAccess`] from the core services: `NodeStore::get` for visibility (with the scope and the
@@ -181,6 +188,16 @@ impl FeedAccess for ServicesAccess<'_> {
             .member_since(self.ctx.tenant, user)
             .await
     }
+
+    async fn manager_since(&self) -> Result<Option<OffsetDateTime>> {
+        let Some(user) = self.ctx.actor.effective_user() else {
+            return Ok(None);
+        };
+        self.services
+            .tenants
+            .manager_since(self.ctx.tenant, user)
+            .await
+    }
 }
 
 /// Share-link bearers cannot follow the feed (`user_required`, `contracts/openapi.yaml`, section
@@ -211,6 +228,7 @@ struct Memo<'a> {
     ancestors: HashMap<NodeId, Option<Vec<NodeId>>>,
     member: Option<bool>,
     member_since: Option<Option<OffsetDateTime>>,
+    manager_since: Option<Option<OffsetDateTime>>,
     gone: HashMap<NodeId, Option<Gone>>,
 }
 
@@ -246,6 +264,15 @@ impl Memo<'_> {
         }
         let m = self.access.member_since().await?;
         self.member_since = Some(m);
+        Ok(m)
+    }
+
+    async fn manager_since(&mut self) -> Result<Option<OffsetDateTime>> {
+        if let Some(m) = self.manager_since {
+            return Ok(m);
+        }
+        let m = self.access.manager_since().await?;
+        self.manager_since = Some(m);
         Ok(m)
     }
 
@@ -469,10 +496,11 @@ impl Memo<'_> {
     /// the trash. Access that began after the trash never counts.
     ///
     /// - Just before the trash: a grant to the caller's user (any role) on the node or on an
-    ///   ancestor at that moment, or a membership that began before the trash. For an agent the
-    ///   node must be inside its scope subtree then.
+    ///   ancestor at that moment, or a membership (any content role) that began before the
+    ///   trash. For an agent the node must be inside its scope subtree then.
     /// - In the trash: `manage` from a grant on the node or an ancestor, or from a membership
-    ///   (the team root), at some moment before the end of the trash time; for an agent only
+    ///   that manages the team tree (owner, admin, or content role `manage`; dated by
+    ///   `manager_since`), at some moment before the end of the trash time; for an agent only
     ///   when its scope allows `manage` and the node is inside its subtree.
     ///
     /// Member links do not count here: the journal does not date their access.
@@ -498,9 +526,12 @@ impl Memo<'_> {
         }
         let end = g.ended.as_ref().map_or(i64::MAX, |e| e.seq);
         let chain_end = self.gone_chain(node, end).await?;
-        // A member until the end (or now) manages the whole team tree; the scope must hold the
-        // node at the end. (At the trash itself, (a) above already answered.)
-        let member_in_time = match (member_since, &g.ended) {
+        // A manager of the team tree until the end (or now) could restore the node; the scope
+        // must hold the node at the end. (At the trash itself, (a) above already answered.) A
+        // member with a lower content role counts only for (a): every change of the content
+        // role moves the date, so a member who managed before a downgrade is held back.
+        let manager_since = self.manager_since().await?;
+        let member_in_time = match (manager_since, &g.ended) {
             (Some(m), Some(e)) => m <= e.at,
             (Some(_), None) => true,
             (None, _) => false,
@@ -740,6 +771,7 @@ pub async fn list_changes_filtered(
         ancestors: HashMap::new(),
         member: None,
         member_since: None,
+        manager_since: None,
         gone: HashMap::new(),
     };
     if let Some(folder) = query.node

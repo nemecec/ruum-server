@@ -66,11 +66,15 @@ impl MemoryTagStore {
     }
 
     async fn caller(&self, ctx: &Context) -> Result<TagCaller> {
-        let role = match ctx.actor.effective_user() {
-            Some(u) => self.tenants.role_of(ctx.tenant, u).await?,
+        let access = match ctx.actor.effective_user() {
+            Some(u) => self.tenants.access_of(ctx.tenant, u).await?,
             None => None,
         };
-        Ok(TagCaller::new(ctx, role))
+        Ok(TagCaller::new(
+            ctx,
+            access.map(|a| a.0),
+            access.and_then(|a| a.1),
+        ))
     }
 
     /// `(tag, node)` for every tag on a live node of the tenant.

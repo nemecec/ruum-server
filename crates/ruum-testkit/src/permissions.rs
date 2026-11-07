@@ -232,6 +232,16 @@ fn upload_creator(note: &'static str) -> Rule {
     })
 }
 
+/// Whether a user changes team content by its membership alone (decision 0003-1): owners,
+/// admins, and members with the content role `edit` or `manage`. Tag writes need it.
+fn edits_team_content(who: Who) -> bool {
+    match who.tenant_role() {
+        Some(MemberRole::Owner | MemberRole::Admin) => true,
+        Some(MemberRole::Member) => who.content_role().is_some_and(|r| r >= Role::Edit),
+        _ => false,
+    }
+}
+
 /// Who can see the tag T (it is on `plan`): every member, and others with `view` on `plan`.
 fn sees_tag(who: Who) -> bool {
     if who.is_agent() {
@@ -542,10 +552,17 @@ fn operation_rule(op: &str) -> Option<Rule> {
             "members see all tags; guests only tags on nodes they can see",
             Agents::Allow,
         ),
-        "createTag" => tenant_role(
-            "any member, not guests; agents need max_role edit (decided 0002-5)",
-            MemberRole::Member,
+        "createTag" => user_rule(
+            "members with content role edit or manage, admins, owners; not guests, view or \
+             comment members (decision 0003-1); agents need max_role edit (decided 0002-5)",
             Agents::FollowUserWrite,
+            |who| {
+                if edits_team_content(who) {
+                    Access::Allow
+                } else {
+                    Access::Forbidden
+                }
+            },
         ),
         "getTag" | "listNodesByTag" => tag_rule(
             "members, and principals who can see a node with the tag (decided 0002-5)",
@@ -553,12 +570,14 @@ fn operation_rule(op: &str) -> Option<Rule> {
             false,
         ),
         "updateTag" => tag_rule(
-            "any member, not guests; agents need max_role edit (decided 0002-5)",
-            |w| w.tenant_role().is_some_and(|r| r >= MemberRole::Member),
+            "members with content role edit or manage, admins, owners; not guests, view or \
+             comment members (decision 0003-1); agents need max_role edit (decided 0002-5)",
+            edits_team_content,
             true,
         ),
         "deleteTag" => tag_rule(
-            "tenant admins or the creator (member); agents need max_role edit (decided 0002-5)",
+            "tenant admins or the creator (member, while it can edit: decision 0003-1); agents \
+             need max_role edit (decided 0002-5)",
             |w| matches!(w, Who::Owner | Who::Admin | Who::Member),
             true,
         ),
@@ -1059,7 +1078,8 @@ pub fn render_matrix() -> String {
          bearer of a `view` share link on `Projects`. Roles are `view < comment < edit < manage`;\n\
          `share` is a permission: `manage` always, `edit` where `editors_can_share` is true (not\n\
          in `Archive`). Members manage the team tree and share there by the default tenant\n\
-         policy (`members_can_share`).\n"
+         policy (`members_can_share`). `member_view`, `member_comment` and `member_edit` are\n\
+         members with a lower content role (decision 0003-1): that role on the whole team tree.\n"
     );
     let _ = write!(s, "| operation |");
     for who in Who::ALL {

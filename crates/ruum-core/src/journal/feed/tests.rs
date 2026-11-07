@@ -18,8 +18,10 @@ struct Fake {
     /// Parent of each node; a node missing here does not exist.
     parents: Mutex<HashMap<NodeId, Option<NodeId>>>,
     member: bool,
-    /// When the member joined; `None` means long ago.
+    /// When the member joined (or last changed role or content role); `None` means long ago.
     joined: Option<OffsetDateTime>,
+    /// The member's content role (decision 0003-1); `None` is the default, `manage`.
+    content: Option<Role>,
 }
 
 impl Fake {
@@ -58,6 +60,14 @@ impl FeedAccess for Fake {
         Ok(self
             .member
             .then(|| self.joined.unwrap_or(OffsetDateTime::UNIX_EPOCH)))
+    }
+    async fn manager_since(&self) -> Result<Option<OffsetDateTime>> {
+        let manages = self.content.is_none_or(|c| c == Role::Manage);
+        Ok(if manages {
+            self.member_since().await?
+        } else {
+            None
+        })
     }
 }
 
@@ -990,6 +1000,86 @@ async fn a_member_who_joins_after_the_trash_learns_the_node_only_if_it_could_res
             want,
             "{max_role:?}"
         );
+    }
+}
+
+/// Decision 0002-6 with content roles (decision 0003-1). `/a/c` is renamed, trashed and purged.
+/// Rule (a) counts a membership with any content role that began before the trash; rule (b)
+/// counts only a membership that could restore the node (content role `manage`). Every change
+/// of the content role moves the membership date.
+#[tokio::test]
+async fn content_roles_count_for_rule_a_and_only_manage_for_rule_b() {
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
+    let mut fake = Fake {
+        member: true,
+        ..Default::default()
+    };
+    let w = world(&fake);
+    let (a, c) = (NodeId::new(), NodeId::new());
+    fake.node(a, Some(w.root), true);
+    let start = w.created(a, w.root);
+    w.created(c, a);
+    let rn = w.add(
+        Some(c),
+        EventType::NodeRenamed,
+        json!({ "parent_id": a, "old_name": "n", "new_name": "c" }),
+    );
+    let tr = w.add(Some(c), EventType::NodeTrashed, trashed(a));
+    pause().await;
+    let during = OffsetDateTime::now_utc();
+    pause().await;
+    let pu = w.add(Some(c), EventType::NodePurged, purged());
+    let query = ChangesQuery {
+        after: Some(start + 1),
+        ..Default::default()
+    };
+    let all = vec![rn, tr, pu];
+    for (joined, content, want, case) in [
+        // A view member who was a member before the trash: rule (a).
+        (
+            None,
+            Some(Role::View),
+            all.clone(),
+            "view member before the trash",
+        ),
+        (
+            None,
+            Some(Role::Comment),
+            all.clone(),
+            "comment member before",
+        ),
+        (None, Some(Role::Edit), all.clone(), "edit member before"),
+        // A view member who joins during the trash: neither (a) nor (b).
+        (
+            Some(during),
+            Some(Role::View),
+            vec![],
+            "view member joins during",
+        ),
+        (
+            Some(during),
+            Some(Role::Edit),
+            vec![],
+            "edit member joins during",
+        ),
+        // A manager downgraded to view during the trash: the date moved, held back by design.
+        (
+            Some(during),
+            Some(Role::View),
+            vec![],
+            "manager downgraded during",
+        ),
+        // A view member upgraded to manage during the trash could restore from then on: (b).
+        (
+            Some(during),
+            Some(Role::Manage),
+            all.clone(),
+            "view member upgraded during",
+        ),
+    ] {
+        fake.joined = joined;
+        fake.content = content;
+        assert_eq!(seqs(&w.feed(&fake, query.clone()).await), want, "{case}");
     }
 }
 

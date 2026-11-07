@@ -39,8 +39,11 @@ use time::OffsetDateTime;
 
 /// The roles of section 3.2 (the Google Drive model), from lowest to highest. A higher role
 /// includes all lower ones. There is no `share` role: see [`Permission::Share`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, sqlx::Type,
+)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "grant_role", rename_all = "snake_case")]
 pub enum Role {
     View,
     Comment,

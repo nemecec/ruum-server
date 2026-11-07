@@ -51,17 +51,24 @@ impl TenantStore for Roles {
     async fn list_members(&self, _: &Context, _: PageRequest) -> Result<Page<Member>> {
         unimplemented!()
     }
-    async fn set_member_role(&self, _: &Context, _: UserId, _: MemberRole) -> Result<Member> {
+    async fn update_member(
+        &self,
+        _: &Context,
+        _: UserId,
+        _: MemberRole,
+        _: Option<ruum_core::authz::Role>,
+    ) -> Result<Member> {
         unimplemented!()
     }
     async fn remove_member(&self, _: &Context, _: UserId) -> Result<()> {
         unimplemented!()
     }
-    async fn invite(
+    async fn invite_as(
         &self,
         _: &Context,
         _: String,
         _: MemberRole,
+        _: Option<ruum_core::authz::Role>,
         _: Option<String>,
     ) -> Result<(Invitation, String)> {
         unimplemented!()

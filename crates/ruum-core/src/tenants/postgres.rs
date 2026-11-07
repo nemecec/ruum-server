@@ -3,8 +3,8 @@
 //! `share_index`, `agents`, `agent_oauth_grants` and `app_passwords` in the same transaction).
 
 use super::rules::{
-    accepted_role, apply_policy, caller_user, check_member_limit, check_removal, check_role_change,
-    require_role,
+    accepted_content_role, accepted_role, apply_policy, caller_user, check_member_limit,
+    check_removal, check_role_change, content_role_after, invitation_content_role, require_role,
 };
 use super::*;
 use crate::actor::{PrincipalKind, require_user_actor};
@@ -39,12 +39,13 @@ fn member_from(r: &PgRow) -> Result<Member> {
         email: r.try_get("email")?,
         display_name: r.try_get("display_name")?,
         role: r.try_get("role")?,
+        content_role: r.try_get("content_role")?,
         joined_at: r.try_get("joined_at")?,
     })
 }
 
 const MEMBER_SELECT: &str = "select m.tenant_id, m.user_id, u.email, u.display_name, m.role, \
-     m.joined_at from memberships m join users u on u.id = m.user_id";
+     m.content_role, m.joined_at from memberships m join users u on u.id = m.user_id";
 
 fn invitation_from(r: &PgRow) -> Result<Invitation> {
     let kind: crate::actor::PrincipalKind = r.try_get("created_kind")?;
@@ -55,6 +56,7 @@ fn invitation_from(r: &PgRow) -> Result<Invitation> {
         tenant_id: r.try_get("tenant_id")?,
         email: r.try_get("email")?,
         role: r.try_get("role")?,
+        content_role: r.try_get("content_role")?,
         invited_by: Actor {
             actor: crate::actor::PrincipalRef {
                 kind,
@@ -68,8 +70,8 @@ fn invitation_from(r: &PgRow) -> Result<Invitation> {
     })
 }
 
-const INVITATION_COLS: &str = "id, tenant_id, email, role, created_kind, created_by, created_obo, \
-     created_at, expires_at, accepted_at";
+const INVITATION_COLS: &str = "id, tenant_id, email, role, content_role, created_kind, \
+     created_by, created_obo, created_at, expires_at, accepted_at";
 
 async fn role_in(conn: &mut PgConnection, t: TenantId, u: UserId) -> Result<Option<MemberRole>> {
     Ok(
@@ -79,6 +81,21 @@ async fn role_in(conn: &mut PgConnection, t: TenantId, u: UserId) -> Result<Opti
             .fetch_optional(&mut *conn)
             .await?,
     )
+}
+
+/// The role and the content role of a user in the tenant (decision 0003-1), or `None`.
+async fn access_in(
+    conn: &mut PgConnection,
+    t: TenantId,
+    u: UserId,
+) -> Result<Option<relations::Access>> {
+    Ok(sqlx::query_as(
+        "select role, content_role from memberships where tenant_id = $1 and user_id = $2",
+    )
+    .bind(t)
+    .bind(u)
+    .fetch_optional(&mut *conn)
+    .await?)
 }
 
 async fn tenant_row(conn: &mut PgConnection, t: TenantId) -> Result<Tenant> {
@@ -532,6 +549,35 @@ impl TenantStore for PgTenantStore {
         Ok(since)
     }
 
+    async fn manager_since(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<OffsetDateTime>> {
+        let mut tx = self.area.system().await?;
+        let since: Option<OffsetDateTime> = sqlx::query_scalar(
+            "select updated_at from memberships where tenant_id = $1 and user_id = $2 \
+             and (role in ('owner', 'admin') or (role = 'member' and content_role = 'manage'))",
+        )
+        .bind(tenant.0)
+        .bind(user.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(since)
+    }
+
+    async fn access_of(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<(MemberRole, Option<Role>)>> {
+        let mut tx = self.area.system().await?;
+        let access = access_in(&mut tx, tenant, user).await?;
+        tx.commit().await?;
+        Ok(access)
+    }
+
     async fn is_verified_member_email(&self, tenant: TenantId, email: &str) -> Result<bool> {
         let mut tx = self.area.system().await?;
         // The same query as the email grant of `sharing::postgres::add_grant`.
@@ -655,11 +701,12 @@ impl TenantStore for PgTenantStore {
         Ok(page(items, off, limit))
     }
 
-    async fn set_member_role(
+    async fn update_member(
         &self,
         ctx: &Context,
         user: UserId,
         role: MemberRole,
+        content_role: Option<Role>,
     ) -> Result<Member> {
         let caller = require_user_actor(ctx)?;
         let mut tx = self.area.ctx(ctx).await?;
@@ -667,7 +714,7 @@ impl TenantStore for PgTenantStore {
             role_in(&mut tx, ctx.tenant, caller).await?,
             MemberRole::Admin,
         )?;
-        let old = role_in(&mut tx, ctx.tenant, user)
+        let (old, old_content) = access_in(&mut tx, ctx.tenant, user)
             .await?
             .ok_or_else(|| Error::not_found("member"))?;
         check_role_change(
@@ -676,26 +723,31 @@ impl TenantStore for PgTenantStore {
             role,
             owner_count(&mut tx, ctx.tenant).await?,
         )?;
+        let content = content_role_after(old, old_content, role, content_role)?;
         if old == MemberRole::Guest && role != MemberRole::Guest {
             let t = tenant_row(&mut tx, ctx.tenant).await?;
             let members = member_count(&mut tx, ctx.tenant).await?;
             check_member_limit(tenant_limits(t.plan, members).members, members)?;
         }
         let mut outbox = None;
-        if old != role {
+        let (old, new) = ((old, old_content), (role, content));
+        if old != new {
+            // Every change of the role or the content role dates the membership anew
+            // (decision 0002-6 with 0003-1).
             sqlx::query(
-                "update memberships set role = $3, updated_at = now() \
+                "update memberships set role = $3, content_role = $4, updated_at = now() \
                  where tenant_id = $1 and user_id = $2",
             )
             .bind(ctx.tenant)
             .bind(user)
             .bind(role)
+            .bind(content)
             .execute(&mut *tx)
             .await?;
             outbox = enqueue(
                 &mut tx,
                 ctx.tenant,
-                &relations::membership(ctx.tenant, user, Some(old), Some(role)),
+                &relations::membership(ctx.tenant, user, Some(old), Some(new)),
             )
             .await?;
             audit(
@@ -705,7 +757,12 @@ impl TenantStore for PgTenantStore {
                 "member.role_changed",
                 "member",
                 user,
-                serde_json::json!({ "old_role": old, "new_role": role }),
+                serde_json::json!({
+                    "old_role": old.0,
+                    "new_role": new.0,
+                    "old_content_role": old.1,
+                    "new_content_role": new.1,
+                }),
             )
             .await?;
         }
@@ -725,7 +782,7 @@ impl TenantStore for PgTenantStore {
         if caller != user {
             require_role(Some(caller_role), MemberRole::Admin)?;
         }
-        let target_role = role_in(&mut tx, t, user)
+        let (target_role, target_content) = access_in(&mut tx, t, user)
             .await?
             .ok_or_else(|| Error::not_found("member"))?;
         check_removal(
@@ -736,7 +793,7 @@ impl TenantStore for PgTenantStore {
             owner_count(&mut tx, t).await?,
         )?;
 
-        let mut tuples = relations::membership(t, user, Some(target_role), None);
+        let mut tuples = relations::membership(t, user, Some((target_role, target_content)), None);
         // Keep the name for the activity log of this tenant (decision 0003-5). It must be read
         // before the membership goes: then the user is no longer visible here.
         sqlx::query(
@@ -890,11 +947,12 @@ impl TenantStore for PgTenantStore {
         self.area.apply(outbox).await
     }
 
-    async fn invite(
+    async fn invite_as(
         &self,
         ctx: &Context,
         email: String,
         role: MemberRole,
+        content_role: Option<Role>,
         message: Option<String>,
     ) -> Result<(Invitation, String)> {
         let caller = require_user_actor(ctx)?;
@@ -904,6 +962,7 @@ impl TenantStore for PgTenantStore {
                 "an invitation has the role guest, member or admin",
             ));
         }
+        let content_role = invitation_content_role(role, content_role)?;
         if message.as_ref().is_some_and(|m| m.chars().count() > 1000) {
             return Err(crate::identity::invalid(
                 "the message must have at most 1000 characters",
@@ -943,8 +1002,8 @@ impl TenantStore for PgTenantStore {
         let (kind, by, obo) = crate::identity::postgres::actor_cols(&ctx.actor);
         let r = sqlx::query(crate::sql!(
             "insert into invitations (id, tenant_id, email, role, token_hash, message, created_at, \
-             created_kind, created_by, created_obo, expires_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning {INVITATION_COLS}"
+             created_kind, created_by, created_obo, expires_at, content_role) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {INVITATION_COLS}"
         ))
         .bind(InvitationId::new())
         .bind(ctx.tenant)
@@ -957,6 +1016,7 @@ impl TenantStore for PgTenantStore {
         .bind(by)
         .bind(obo)
         .bind(now + time::Duration::days(INVITATION_DAYS))
+        .bind(content_role)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| unique_to_conflict(e.into(), "an open invitation for this email exists"))?;
@@ -973,7 +1033,11 @@ impl TenantStore for PgTenantStore {
             "invitation.created",
             "invitation",
             inv.id,
-            serde_json::json!({ "email": inv.email, "role": inv.role }),
+            serde_json::json!({
+                "email": inv.email,
+                "role": inv.role,
+                "content_role": inv.content_role,
+            }),
         )
         .await?;
         tx.commit().await?;
@@ -1082,8 +1146,10 @@ impl TenantStore for PgTenantStore {
             tx.commit().await?;
             return Ok(m);
         }
-        let old = role_in(&mut tx, t, user).await?;
+        let current = access_in(&mut tx, t, user).await?;
+        let old = current.map(|c| c.0);
         let new = accepted_role(old, inv.role);
+        let new_content = accepted_content_role(current, new, inv.content_role);
         let tenant = tenant_row(&mut tx, t).await?;
         // The policy may have changed since the invitation was sent.
         if new == MemberRole::Guest && !tenant.policy.allow_guests {
@@ -1102,13 +1168,15 @@ impl TenantStore for PgTenantStore {
             check_member_limit(tenant_limits(tenant.plan, members).members, members)?;
         }
         sqlx::query(
-            "insert into memberships (tenant_id, user_id, role, created_kind, created_by) \
-             values ($1, $2, $3, 'user', $2) on conflict (tenant_id, user_id) \
-             do update set role = excluded.role, updated_at = now()",
+            "insert into memberships (tenant_id, user_id, role, content_role, created_kind, \
+             created_by) values ($1, $2, $3, $4, 'user', $2) on conflict (tenant_id, user_id) \
+             do update set role = excluded.role, content_role = excluded.content_role, \
+             updated_at = now()",
         )
         .bind(t)
         .bind(user)
         .bind(new)
+        .bind(new_content)
         .execute(&mut *tx)
         .await?;
         sqlx::query("update invitations set accepted_at = now(), accepted_by = $2 where id = $1")
@@ -1116,7 +1184,7 @@ impl TenantStore for PgTenantStore {
             .bind(user)
             .execute(&mut *tx)
             .await?;
-        let mut tuples = relations::membership(t, user, old, Some(new));
+        let mut tuples = relations::membership(t, user, current, Some((new, new_content)));
         // Email grants to the invitation's email become grants to the user.
         let ctx = Context {
             tenant: t,
@@ -1134,7 +1202,11 @@ impl TenantStore for PgTenantStore {
             "invitation.accepted",
             "member",
             user,
-            serde_json::json!({ "role": new, "email_grants_bound": bound }),
+            serde_json::json!({
+                "role": new,
+                "content_role": new_content,
+                "email_grants_bound": bound,
+            }),
         )
         .await?;
         let m = member(&mut tx, t, user).await?;

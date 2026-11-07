@@ -204,17 +204,37 @@ impl TenantStore for TestTenants {
     async fn list_members(&self, _: &Context, _: PageRequest) -> Result<Page<Member>> {
         unimplemented!()
     }
-    async fn set_member_role(&self, _: &Context, _: UserId, _: MemberRole) -> Result<Member> {
+    async fn access_of(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> Result<Option<(MemberRole, Option<super::Role>)>> {
+        // The fake knows no content roles: its members have the default, `manage`.
+        Ok(self.roles.read().unwrap().get(&(tenant, user)).map(|r| {
+            (
+                *r,
+                (*r == MemberRole::Member).then_some(super::Role::Manage),
+            )
+        }))
+    }
+    async fn update_member(
+        &self,
+        _: &Context,
+        _: UserId,
+        _: MemberRole,
+        _: Option<super::Role>,
+    ) -> Result<Member> {
         unimplemented!()
     }
     async fn remove_member(&self, _: &Context, _: UserId) -> Result<()> {
         unimplemented!()
     }
-    async fn invite(
+    async fn invite_as(
         &self,
         _: &Context,
         _: String,
         _: MemberRole,
+        _: Option<super::Role>,
         _: Option<String>,
     ) -> Result<(Invitation, String)> {
         unimplemented!()
