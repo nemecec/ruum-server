@@ -65,7 +65,7 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
     body: JSON.stringify({ parent_id: root.id, name: kept, kind: 'folder' }),
   })
   expect(second.status).toBe(201)
-  const keptId = ((await second.json()) as { id: string }).id
+  const keptId = ((await second.json()) as { node: { id: string } }).node.id
   const renamed = `${kept} (Ann's)`
   expect((await api(page, 'POST', `/v1/nodes/${keptId}/rename`, { tenant, body: { name: renamed } })).status).toBe(200)
 
