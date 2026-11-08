@@ -1509,6 +1509,8 @@ Good translations need context, consistency and checking.
 The look of Ruum is defined in one place, so it can be changed later without touching screens
 (decided 2026-11-07, provisional). `docs/ux/design-system.md` describes it; the code enforces it:
 
+- **The visual designer agent (18.4) owns the token values and the visual quality; the UX designer owns
+  the components' behaviour and states.**
 - **Design tokens are the single source**: colours, type, spacing, radius, shadows and motion, in
   one token file in the W3C Design Tokens format (`web/src/design/tokens/`). Style Dictionary
   generates the CSS custom properties (and TypeScript constants where code needs a value). Light and
@@ -1761,6 +1763,7 @@ one migration task at a time.
 |---|---|---|
 | Architect | agent panel; a person is optional (section 18.9) | design, contracts, approval of contract PRs and of security-sensitive merges |
 | UX designer | agent, with a UX review panel; a person is optional (section 18.9) | user journeys, information architecture, the design system, wireframes and UI copy before the UI task cards; the "agent experience" of MCP tools, CLI output and error hints; approval of UI merges (section 18.4.1) |
+| Visual designer | agent, with the UX review panel | owns the visual identity (logo, palette, typography, icons, illustrations, motion) in the same informal, playful character as the voice; owns the visual layer of the design system (the token values in both themes, the visual quality of the catalogue); adds the visual-quality lens to the UX review panel; makes visual assets for docs and the website. The brand direction is a decision of the person: the agent prepares two or three directions to choose from |
 | Copywriter | agent, with the UX review panel | owns the voice (`docs/ux/copy.md`); writes and rewrites all source text (UI strings, errors, emails, empty states, onboarding, release notes, later the website); reviews every change that touches text; writes the description, tone and length budget of each message for translators (12.4.1) |
 | Planner | agent | breaks a step into task cards with dependencies (a task graph), in the issue tracker |
 | Test writer | agent | writes acceptance tests from the contracts, before the code |
