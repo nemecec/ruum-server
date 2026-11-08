@@ -7,7 +7,8 @@
 # It is idempotent. It waits for cloud-init, installs Node.js (pinned, official binaries) when it
 # is missing or another version, clones or updates the base copy ~/ruum-server from GitHub
 # (fast-forward only), starts the dev stack there (scripts/dev.sh up), installs sqlx-cli (for the
-# migration check of CI), the web dependencies of the base copy and Playwright's Chromium with its
+# migration check of CI), the PostgreSQL 17 client (pg_dump for the export of the Postgres
+# engine), the web dependencies of the base copy and Playwright's Chromium with its
 # OS packages (for scripts/e2e_browser.sh), makes ~/w and ~/targets, and prints a short status.
 #
 # --fresh-platform-db: before the start, give the shared stack a new, empty platform Postgres
@@ -81,6 +82,29 @@ fresh_platform_db() {
   log "kept: $backup (delete it when the new stack works)"
 }
 
+# The PostgreSQL 17 client from the PGDG repository, as in CI: the export of the Postgres engine
+# runs pg_dump against the 17 data cluster, and Ubuntu 24.04 has only the 16 client. The
+# pg_wrapper of /usr/bin/pg_dump takes the newest client, so a plain `pg_dump` (the default of
+# RUUM_PG_DUMP) is then the 17 one.
+PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+install_pg_client() {
+  [[ -x /usr/lib/postgresql/17/bin/pg_dump ]] && return
+  log "installing the PostgreSQL 17 client (PGDG)"
+  local key=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc tmp
+  tmp="$(mktemp)"
+  curl -fsSL -o "$tmp" https://www.postgresql.org/media/keys/ACCC4CF8.asc
+  [[ "$(gpg --show-keys --with-colons "$tmp" 2>/dev/null | awk -F: '/^fpr/ {print $10; exit}')" == "$PGDG_KEY_FINGERPRINT" ]] \
+    || { rm -f "$tmp"; die "the PGDG signing key has the wrong fingerprint"; }
+  sudo install -d /usr/share/postgresql-common/pgdg
+  sudo install -m 0644 "$tmp" "$key"
+  rm -f "$tmp"
+  echo "deb [signed-by=$key] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+  sudo apt-get update -qq >/dev/null
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends postgresql-client-17 >/dev/null
+  [[ "$(pg_dump --version)" == *" 17."* ]] || die "pg_dump is not the 17 client: $(pg_dump --version)"
+}
+
 # The web dependencies of the base copy and Playwright's Chromium (the version that web/ pins),
 # with the OS packages it needs. The browsers go to ~/.cache/ms-playwright, which all agents share;
 # each agent's scripts/e2e_browser.sh runs its own `npm ci` and finds the browser there.
@@ -137,6 +161,7 @@ main() {
     cargo install -q --locked sqlx-cli --no-default-features --features postgres,rustls
   fi
 
+  install_pg_client
   install_browser
 
   mkdir -p "$HOME/w" "$HOME/targets"
@@ -145,7 +170,7 @@ main() {
 
   echo
   echo "base copy:  $(git -C "$BASE" log -1 --format='%h %s')"
-  echo "toolchain:  $(rustc --version), $(sqlx --version)"
+  echo "toolchain:  $(rustc --version), $(sqlx --version), $(pg_dump --version)"
   echo "web:        node $(node --version), npm $(npm --version), $(cd "$BASE/web" && npx --no-install playwright --version)"
   echo "disk:       $(df -h --output=avail / | tail -1 | tr -d ' ') free of $(df -h --output=size / | tail -1 | tr -d ' ')"
   echo "stack:"

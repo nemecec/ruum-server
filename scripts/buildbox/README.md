@@ -11,7 +11,7 @@ the agent's own Postgres and SpiceDB.
 |---|---|
 | `hcloud.py` | Creates, shows or deletes the server, its SSH key and its firewall (SSH only from one IP). |
 | `cloud-init.yaml` | The first boot: Docker, build tools, Node.js 22, Rust for the user `ruum`. |
-| `setup.sh` | Run once after a create, and again at any time: Node.js, base copy `~/ruum-server` from GitHub, dev stack, `sqlx-cli`, Playwright's Chromium with its OS packages, status. |
+| `setup.sh` | Run once after a create, and again at any time: Node.js, base copy `~/ruum-server` from GitHub, dev stack, `sqlx-cli`, the PostgreSQL 17 client (`pg_dump` for the engine's export), Playwright's Chromium with its OS packages, status. |
 | `run.sh` | Runs a command for one agent on the server. |
 
 ## Cost

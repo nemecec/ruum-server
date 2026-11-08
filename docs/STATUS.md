@@ -193,6 +193,8 @@ Fixes made during the evening integration:
 - On the build server, the four `ruum-dbengine` export tests need a PostgreSQL 17 `pg_dump`
   (review-D-1 N-7: the server has 16). The checks set `RUUM_PG_DUMP` to a wrapper that runs the
   `pg_dump` of the `ruum-dev/postgres-data:17` image, as CI sets its own 17 client.
+  `f/followups-4`: `setup.sh` now installs the PostgreSQL 17 client (PGDG), and the server has
+  it, so a plain run passes without `RUUM_PG_DUMP`.
 - The rebased branches were pushed as `integ/f-sign-in-providers`, `integ/f-rr-fix-e2`,
   `integ/s2-d-1`, `integ/s2-t-1`, `integ/s2-t-2` and `integ/s2-t-2-r` (no force push) and
   deleted from GitHub after the fast-forward. `f/buildbox-browser` needed no rebase.
@@ -407,7 +409,7 @@ touch {} +` on the server. The build server's `pg_dump` is version 16, so the ch
 - `privacy::keys::tests::no_key_in_the_log_memory` (card Q-4) is flaky: it failed in 3 of 10
   full runs of the `ruum-core` lib tests on the build server ("the capture works": empty log,
   probably the global callsite cache of `tracing` with parallel tests). It passed in the final
-  run.
+  run. `f/followups-4`: the case runs in a child process of the test binary, alone.
 - `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 56 of 56 mutations
   killed, none survived or skipped (51 this afternoon; new: the four of D-1 and
   `dbengine-dbhost-search-path`).
@@ -452,7 +454,7 @@ touch {} +` on the server. The build server's `pg_dump` is version 16, so the ch
   `FILTER_WAITS_FOR` in `crates/ruum-testkit/src/privacy.rs`); re-review-p2 F-1 (an unreadable
   payload still ends a `purged` delivery in Postgres; asked for before D-1 starts the worker,
   and D-1 now starts it), F-2 (memory store: a provider panic holds a delivery for ever) and
-  F-3 (a mutation for `must_succeed`). OpenBao is not in CI: `openbao_transit_wrapper_round_trip` returns early and
+  F-3 (a mutation for `must_succeed`); all three are fixed on `f/followups-4`. OpenBao is not in CI: `openbao_transit_wrapper_round_trip` returns early and
   reports `ok` there (review-Q-4 note 2). `wrapper_from_env_needs_a_kek` asserts nothing where
   `dev.sh env` sets `RUUM_LOCAL_KEK_FILE` (review-Q-4 note 6). Notes for later cards:
   review-E-2 N-3 to N-6 (Q-2, I-2), review-Q-4 notes 3 to 5 (tenant export of design 14, D-1),
