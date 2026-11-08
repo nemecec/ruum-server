@@ -32,9 +32,9 @@
 //! `plants` as the database's owner kind through the engine (wave 4 gate G-1): `id integer
 //! primary key, latin_name text not null, common_name text`, with two rows of plant names (no
 //! personal data). The standard requests of `queryDatabase`, `suggestColumnClasses` and
-//! `confirmColumnClasses` address it. The write grant of `agent` on it and the pending
-//! request of `agent` on it are placeholder IDs until A-1 and A-2 seed them (they keep these
-//! field names).
+//! `confirmColumnClasses` address it. `member` gives `agent` a `read_personal` grant on it for 8
+//! hours (card A-1). The pending request of `agent` on it is a placeholder ID until A-2 seeds it
+//! (it keeps the field name).
 //!
 //! The tag T was made by `member`. The upload sessions were started by `member`. The web session
 //! and the WebDAV app password belong to `member`. The invitation is for a new email address with the role `member`. The
@@ -326,7 +326,8 @@ pub struct TenantFixture {
     /// card D-1), and its name.
     pub database: NodeId,
     pub database_name: String,
-    /// A `write_live` grant of `agent` on the database, given by `member` (placeholder until A-1).
+    /// A `read_personal` grant of `agent` on the database, given by `member` for 8 hours (card
+    /// A-1; `write_live` needs an agent scope of `edit`).
     pub database_grant: Uuid,
     /// A pending request of `agent` on the database: a `DELETE` without `WHERE` (placeholder
     /// until A-2).
@@ -1246,6 +1247,40 @@ mod seed {
                 t.agent_key = key.id;
                 t.agent_key_secret = secret;
             }
+        }
+
+        // The grant of `agent` on the database, given by `member` (card A-1): `read_personal`
+        // for the longest allowed time. Not `write_live`: that kind needs an agent scope of
+        // `edit`, and `agent` has `view`. The standard query is a read and the agents' query
+        // rules of Q-1 do not read grants, so it changes no other operation's result.
+        let (s2, c, db, agent) = (
+            s.clone(),
+            member_ctx.clone(),
+            t.database,
+            t.agent_id(Who::Agent),
+        );
+        if let Some(g) = step("database grant", async move {
+            s2.databases
+                .create_grant(
+                    &c,
+                    &*s2.agents,
+                    db,
+                    ruum_core::databases::access::grants::CreateGrant {
+                        kind: ruum_core::databases::access::grants::GrantKind::ReadPersonal,
+                        agent_id: agent,
+                        duration_minutes: i64::from(
+                            ruum_core::databases::access::grants::READ_PERSONAL_MAX_MINUTES,
+                        ),
+                        reason: Some("fixture grant".into()),
+                    },
+                )
+                .await
+        })
+        .await
+        {
+            t.database_grant = g.value.id;
+        } else {
+            agents_ok = false;
         }
 
         // ------------------------------------------------------------ OAuth

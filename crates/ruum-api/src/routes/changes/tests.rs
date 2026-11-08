@@ -160,6 +160,13 @@ fn sample(event: EventType, user: UserId) -> Value {
             "columns": [{ "schema": "main", "table": "plants", "column": "latin_name",
                           "class": "normal", "old_class": null }]
         }),
+        EventType::DatabaseGrantCreated => json!({
+            "grant_id": id(), "kind": "read_personal", "agent_id": id(),
+            "expires_at": "2026-11-08T12:00:00Z", "restore_point_id": null, "approval_id": null
+        }),
+        EventType::DatabaseGrantRevoked => json!({
+            "grant_id": id(), "kind": "read_personal", "agent_id": id(), "cause": "revoked"
+        }),
     }
 }
 

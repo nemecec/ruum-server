@@ -1,6 +1,6 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "688ee67ed4d074d6308a1374b0f247e2a17275e9891f2e62d3b697b47bed1fb1",
+ "openapi_sha256": "d839d9e4b2df05c2a2526d5a07d3d2003ee9b7b36b2dd0e43b057a46f91b61ad",
  "tools_sha256": "67359190912f4acacb5f0df03f03a9d06caecf3d084837f0755d2378905b50ce",
  "tools": [
   {
@@ -3591,7 +3591,7 @@
   {
    "name": "list_database_access_grants",
    "operation": "listDatabaseAccessGrants",
-   "planned": true,
+   "planned": false,
    "description": "List your time-limited grants on a database (live writes, real personal values) and when they end.",
    "notes": null,
    "method": "GET",
@@ -3710,7 +3710,7 @@
   {
    "name": "remove_database_access_grant",
    "operation": "revokeDatabaseAccessGrant",
-   "planned": true,
+   "planned": false,
    "description": "Give back a grant on a database before it ends.",
    "notes": null,
    "method": "DELETE",

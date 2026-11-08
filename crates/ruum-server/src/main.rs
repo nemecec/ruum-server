@@ -68,6 +68,9 @@ async fn main() -> anyhow::Result<()> {
         services.databases.clone(),
         ruum_core::databases::classes::SYNC_EVERY,
     ));
+    tokio::spawn(ruum_core::databases::access::grants::run_sweeper(
+        services.databases.clone(),
+    ));
     let state = AppState::new(
         services.clone(),
         ApiConfig {

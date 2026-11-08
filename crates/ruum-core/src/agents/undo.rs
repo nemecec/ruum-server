@@ -400,6 +400,14 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
         // trait yet. When it adds one (for example `update_node_sharing(ctx, node, Option<bool>)`),
         // this arm calls it with `old_editors_can_share`. Until then the entry is skipped.
         NodeSharingUpdated => return Ok(None),
+        DatabaseGrantCreated => {
+            s.databases
+                .revoke_grant(ctx, node()?, uuid_field(d, "grant_id")?)
+                .await?
+                .change
+        }
+        // `undo_action` gives `None`: skipped as irreversible before this point.
+        DatabaseGrantRevoked => return Ok(None),
     };
     Ok(Some(change))
 }

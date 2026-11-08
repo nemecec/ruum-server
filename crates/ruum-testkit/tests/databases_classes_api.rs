@@ -112,6 +112,7 @@ async fn databases_classes_api() {
             typed: d.typed.clone(),
             columns: d.columns.clone(),
             masking: rec.clone(),
+            grants: d.grants.clone(),
         },
     )
     .expect("install the database area");

@@ -546,6 +546,7 @@ async fn memory_world() -> (World, Arc<RecordingMaskingRules>, NodeId) {
             typed: d.typed.clone(),
             columns: d.columns.clone(),
             masking: rec.clone(),
+            grants: d.grants.clone(),
         },
     )
     .unwrap();
@@ -1210,6 +1211,7 @@ async fn postgres_engine_resets_by_identity() {
             typed: d.typed.clone(),
             columns: d.columns.clone(),
             masking: rec.clone(),
+            grants: d.grants.clone(),
         },
     )
     .unwrap();

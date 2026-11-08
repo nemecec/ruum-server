@@ -176,6 +176,11 @@ impl Services {
                 journal.clone(),
             )),
             masking: Arc::new(crate::privacy::RecordingMaskingRules::new()),
+            grants: Arc::new(crate::databases::access::grants::MemoryGrantStore::new(
+                nodes.clone(),
+                journal.clone(),
+                typed.clone(),
+            )),
         };
         let (providers, databases) =
             build_databases(nodes.clone(), authz.clone(), tenants.clone(), &parts)

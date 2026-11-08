@@ -144,9 +144,12 @@ pub async fn install_databases(
             )),
             store: Arc::new(PgDatabaseStore::new(pool.clone())),
             typed: Arc::new(PgTypedNodeStore::new(pool.clone())),
-            columns: Arc::new(databases::classes::postgres::PgColumnStore::new(pool)),
+            columns: Arc::new(databases::classes::postgres::PgColumnStore::new(
+                pool.clone(),
+            )),
             // The lens rules of Q-2 (Postgres) and Q-3 (SQLite) register here.
             masking: Arc::new(ruum_core::privacy::AllMaskingRules::new(vec![])),
+            grants: Arc::new(databases::access::grants::PgGrantStore::new(pool)),
         },
         None => DatabaseParts {
             engines,
@@ -161,6 +164,11 @@ pub async fn install_databases(
                 handles.journal.clone(),
             )),
             masking: Arc::new(ruum_core::privacy::AllMaskingRules::new(vec![])),
+            grants: Arc::new(databases::access::grants::MemoryGrantStore::new(
+                handles.nodes.clone(),
+                handles.journal.clone(),
+                handles.typed.clone(),
+            )),
         },
     };
     databases::install(services, parts).context("set up the database area")?;

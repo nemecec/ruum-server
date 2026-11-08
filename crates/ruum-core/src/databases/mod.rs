@@ -1094,6 +1094,7 @@ pub struct DatabaseDeps {
     pub settings: DatabaseSettings,
     pub columns: Arc<dyn classes::ColumnStore>,
     pub masking: Arc<dyn crate::privacy::MaskingRules>,
+    pub grants: Arc<dyn access::grants::GrantStore>,
 }
 
 /// `createDatabase`, `getDatabase`, `updateDatabaseManifest` and the usage of `getLimits`.
@@ -1460,6 +1461,7 @@ pub struct DatabaseParts {
     pub typed: Arc<dyn TypedNodeStore>,
     pub columns: Arc<dyn classes::ColumnStore>,
     pub masking: Arc<dyn crate::privacy::MaskingRules>,
+    pub grants: Arc<dyn access::grants::GrantStore>,
 }
 
 /// A key-encryption key that lives in memory only, for a process that makes no tenant key (no
@@ -1505,6 +1507,7 @@ pub fn build(
         settings: DatabaseSettings::default(),
         columns: parts.columns.clone(),
         masking: parts.masking.clone(),
+        grants: parts.grants.clone(),
     });
     Ok((Arc::new(registry), Arc::new(service)))
 }
@@ -2068,6 +2071,7 @@ mod tests {
             typed: w.handles.typed.clone(),
             columns: w.s.databases.deps().columns.clone(),
             masking: w.s.databases.deps().masking.clone(),
+            grants: w.s.databases.deps().grants.clone(),
         };
         install(&mut w.s, parts).unwrap();
         let a = ctx(w.team.id, w.alice);
@@ -2679,6 +2683,7 @@ mod tests {
             typed: w.handles.typed.clone(),
             columns: w.s.databases.deps().columns.clone(),
             masking: w.s.databases.deps().masking.clone(),
+            grants: w.s.databases.deps().grants.clone(),
         };
         install(&mut w.s, parts).unwrap();
         let a = ctx(w.team.id, w.alice);

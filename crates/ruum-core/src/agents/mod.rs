@@ -195,6 +195,11 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         // Only a person confirms classes (card K-1); an agent never wrote one.
         DatabaseColumnsConfirmed => None,
         NodeSharingUpdated => Some("set the old editors_can_share"),
+        // Only people give grants, so an agent never writes `database.grant_created`; its
+        // inverse would end the grant. A grant that ended (given back) cannot start again: a
+        // new grant needs the agent's user and a new restore point.
+        DatabaseGrantCreated => Some("end the grant"),
+        DatabaseGrantRevoked => None,
     }
 }
 

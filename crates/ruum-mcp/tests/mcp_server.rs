@@ -245,15 +245,18 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     // Tools of planned operations (decision 0004-22) are not offered.
     let expected: Vec<&str> = catalog.offered().map(|t| t.name.as_str()).collect();
     assert_eq!(names, expected);
-    // 50 step 1 tools, the three database tools of card D-1 and the two of card K-1
-    // (confirmColumnClasses is users only: no tool).
-    assert_eq!(names.len(), 55);
+    // 50 step 1 tools, the three database tools of card D-1, the two of card K-1
+    // (confirmColumnClasses is users only: no tool) and the two grant tools of card A-1
+    // (`createDatabaseAccessGrant` is users only, so it has no tool).
+    assert_eq!(names.len(), 57);
     for t in [
         "create_database",
         "get_database",
         "update_database_manifest",
         "list_database_columns",
         "suggest_column_classes",
+        "list_database_access_grants",
+        "remove_database_access_grant",
     ] {
         assert!(names.contains(&t), "{t} is offered");
     }
