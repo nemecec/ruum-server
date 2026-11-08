@@ -28,7 +28,9 @@
 //!   `revoked_*`, writes `database.grant_revoked`, and, when no other live grant of the same
 //!   agent and kind holds the tuple, deletes the tuple through the outbox and enqueues the
 //!   provider delivery `access_changed` for the database node. A grant that has ended already
-//!   is `409 conflict`.
+//!   is `404 not_found`, as a revoked link is for `revokeShareLink` (the contract lists no
+//!   `409`). On Postgres, the writes of one tuple `(tenant, node, agent, kind)` are serialized
+//!   (an advisory lock), so the tuple follows the rows also under concurrent writes.
 //!
 //! The check for later cards is [`active`] (and [`DatabaseService::active_grant`]): a grant
 //! counts only when its row is live (`starts_at <= now < expires_at`, `revoked_at` null) AND the
@@ -45,7 +47,7 @@
 //! [`grant_prompt_url`] builds the web link of the prefilled grant prompt, the `hint` of `403
 //! write_grant_required` (decision 0004-20, C-16; UX DB-8). Q-2 and D-2 use it.
 
-use super::super::{DatabaseService, in_trash, refuse_share_link};
+use super::super::{DatabaseRow, DatabaseService, in_trash, refuse_share_link};
 use crate::actor::{Actor, Context, PrincipalKind, PrincipalRef};
 use crate::agents::AgentStore;
 use crate::authz::{self, Authz, ObjectRef, Relationship, RelationshipUpdate, Role, SubjectRef};
@@ -249,6 +251,14 @@ pub struct SweepRound {
 
 /// Times in Postgres have microseconds; the stores keep the same precision everywhere, so a row
 /// reads back equal to what was written.
+/// Whether a grant still needs its tuple at `at`: it is not revoked and has not expired. Unlike
+/// [`DatabaseAccessGrant::is_live`] it does not ask `starts_at <= at`: a grant starts when it is
+/// created, so a grant that starts after `at` was created while the end at `at` waited for the
+/// lock of the tuple. It is live now, and its tuple must stay (review A-1 R-1).
+fn holds_tuple_at(g: &DatabaseAccessGrant, at: OffsetDateTime) -> bool {
+    g.revoked_at.is_none() && g.expires_at > at
+}
+
 fn micros(t: OffsetDateTime) -> OffsetDateTime {
     t.replace_nanosecond(t.nanosecond() / 1000 * 1000)
         .unwrap_or(t)
@@ -345,10 +355,15 @@ fn change_of(e: &crate::journal::JournalEntry) -> ChangeInfo {
     }
 }
 
+/// A grant that has ended already is `404`, as a revoked share link is for `revokeShareLink`:
+/// the contract of `revokeDatabaseAccessGrant` has no `409` (review A-1 R-2).
 fn grant_ended() -> Error {
     Error::Api(
-        ApiError::new(ErrorCode::Conflict, "the grant has ended already")
-            .with_hint("list the grants with active=true"),
+        ApiError::new(
+            ErrorCode::NotFound,
+            "no live database access grant with this ID; it has ended already",
+        )
+        .with_hint("list the grants with active=true"),
     )
 }
 
@@ -431,7 +446,7 @@ pub trait GrantStore: Send + Sync {
     /// Ends a live grant at `at`: sets `revoked_*` to `ctx`'s principals, writes
     /// `database.grant_revoked` with `cause`, and, when no other grant of the agent and kind is
     /// live, deletes the tuple and enqueues `access_changed`; all in one transaction. `404`
-    /// when the grant is not on that database of the tenant; `409` when it has ended.
+    /// when the grant is not on that database of the tenant, and also when it has ended.
     async fn revoke(
         &self,
         ctx: &Context,
@@ -550,6 +565,7 @@ impl MemoryGrantStore {
         })
     }
 
+    /// Another grant of the tuple that still needs it at `at`: see [`holds_tuple_at`].
     fn other_live(&self, g: &DatabaseAccessGrant, at: OffsetDateTime) -> bool {
         self.lock().grants.iter().any(|o| {
             o.tenant_id == g.tenant_id
@@ -557,7 +573,7 @@ impl MemoryGrantStore {
                 && o.agent_id == g.agent_id
                 && o.kind == g.kind
                 && o.id != g.id
-                && o.is_live(at)
+                && holds_tuple_at(o, at)
         })
     }
 
@@ -888,6 +904,34 @@ async fn node_revision(
     r.ok_or_else(|| Error::not_found("database"))
 }
 
+/// Serializes the grant writes of one tuple `(tenant, node, agent, kind)` until the end of the
+/// caller's transaction (`pg_advisory_xact_lock` on a hash of the key). `create`, `revoke` and
+/// `end_expired` take it first, so the "other live grant" check of one write always sees the
+/// committed result of the other: two revokes at the same time cannot both keep the tuple, and
+/// a create during a revoke cannot lose its tuple (review A-1 R-1). The outbox rows of the
+/// writes then get their IDs in commit order, and the outbox applies them in that order. A hash
+/// collision of two keys only serializes more.
+async fn lock_tuple(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    node: NodeId,
+    agent: AgentId,
+    kind: GrantKind,
+) -> Result<()> {
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "database_access_grant:{}:{}:{}:{}",
+            tenant.0,
+            node.0,
+            agent.0,
+            kind.as_str()
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Another grant of the tuple that still needs it at `at` (see [`holds_tuple_at`]).
 async fn other_live_pg(
     conn: &mut sqlx::PgConnection,
     g: &DatabaseAccessGrant,
@@ -896,7 +940,7 @@ async fn other_live_pg(
     Ok(sqlx::query_scalar(
         "select exists (select 1 from database_access_grants where tenant_id = $1 \
          and node_id = $2 and agent_id = $3 and kind = $4::database_grant_kind and id <> $5 \
-         and revoked_at is null and starts_at <= $6 and expires_at > $6)",
+         and revoked_at is null and expires_at > $6)",
     )
     .bind(g.tenant_id.0)
     .bind(g.node_id.0)
@@ -977,6 +1021,7 @@ impl GrantStore for PgGrantStore {
             .effective_user()
             .ok_or_else(Error::user_required)?;
         let mut tx = crate::sharing::postgres::begin(&self.pool, ctx).await?;
+        lock_tuple(&mut tx, ctx.tenant, new.node, new.agent, new.kind).await?;
         let revision = node_revision(&mut tx, ctx.tenant, new.node).await?;
         let point = match &new.restore_point {
             Some(m) => {
@@ -1141,6 +1186,26 @@ impl GrantStore for PgGrantStore {
     ) -> Result<Written<DatabaseAccessGrant>> {
         let at = micros(at);
         let mut tx = crate::sharing::postgres::begin(&self.pool, ctx).await?;
+        // The agent and the kind of a grant never change, so read them first, then take the
+        // lock of the tuple, then lock and read the row again.
+        let key: Option<(Uuid, String)> = sqlx::query_as(
+            "select agent_id, kind::text from database_access_grants \
+             where tenant_id = $1 and node_id = $2 and id = $3",
+        )
+        .bind(ctx.tenant.0)
+        .bind(node.0)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (agent, kind) = key.ok_or_else(grant_not_found)?;
+        lock_tuple(
+            &mut tx,
+            ctx.tenant,
+            node,
+            AgentId(agent),
+            GrantKind::parse(&kind)?,
+        )
+        .await?;
         let row = sqlx::query(concat!(
             "select ",
             grant_columns!(),
@@ -1217,6 +1282,14 @@ impl GrantStore for PgGrantStore {
     ) -> Result<Option<bool>> {
         let ctx = sweeper_ctx(grant);
         let mut tx = crate::sharing::postgres::begin(&self.pool, &ctx).await?;
+        lock_tuple(
+            &mut tx,
+            grant.tenant_id,
+            grant.node_id,
+            grant.agent_id,
+            grant.kind,
+        )
+        .await?;
         let row = sqlx::query(concat!(
             "select ",
             grant_columns!(),
@@ -1376,6 +1449,10 @@ impl DatabaseService {
                 .with_hint("widen the agent's scope to the database first"),
             ));
         }
+        // Both kinds need a ready database: the grant row refers to its `databases` row (a
+        // foreign key), so a database that is still provisioning, or whose create failed, gets
+        // the same `409` on both backends instead of a `500` on Postgres (review A-1 R-3).
+        self.ready_database(ctx.tenant, node).await?;
         let restore_point = match req.kind {
             GrantKind::ReadPersonal => None,
             GrantKind::WriteLive => {
@@ -1407,6 +1484,16 @@ impl DatabaseService {
         Ok(w)
     }
 
+    /// The `databases` row of a ready database, else `409` "not ready".
+    async fn ready_database(&self, tenant: TenantId, node: NodeId) -> Result<DatabaseRow> {
+        self.deps().store.get(tenant, node).await?.ok_or_else(|| {
+            Error::Api(
+                ApiError::new(ErrorCode::Conflict, "the database is not ready yet")
+                    .with_hint("retry when the database is ready"),
+            )
+        })
+    }
+
     /// The engine's restore point before a `write_live` grant. The database must be ready
     /// (its `databases` row exists).
     async fn restore_point_before_grant(
@@ -1415,12 +1502,7 @@ impl DatabaseService {
         node: NodeId,
     ) -> Result<RestorePointMark> {
         let d = self.deps();
-        let row = d.store.get(tenant, node).await?.ok_or_else(|| {
-            Error::Api(
-                ApiError::new(ErrorCode::Conflict, "the database is not ready yet")
-                    .with_hint("retry when the database is ready"),
-            )
-        })?;
+        let row = self.ready_database(tenant, node).await?;
         let engine = d
             .engines
             .get(row.engine)
@@ -1918,7 +2000,8 @@ mod tests {
                     .revoke(&c, authz, s.node, g1.id, EndCause::Revoked, crate::now())
                     .await
             ),
-            (409, "conflict".into())
+            (404, "not_found".into()),
+            "an ended grant is 404, as a revoked share link (review A-1 R-2)"
         );
         assert_eq!(
             code(
@@ -2176,6 +2259,42 @@ mod tests {
         assert_eq!(created, 3);
     }
 
+    /// Review A-1 R-3: a database that is not ready (no `databases` row: still provisioning,
+    /// or its create failed) refuses both kinds with `409`, before the store is called. On
+    /// Postgres the grant row's foreign key to `databases` would otherwise fail as a `500`.
+    #[tokio::test]
+    async fn a_database_that_is_not_ready_refuses_both_kinds() {
+        let w = world().await;
+        let node = database(&w, "garden").await;
+        let s = &w.s;
+        let alice = ctx(w.team.id, w.alice);
+        let a = agent_of(&w, w.alice, Role::Edit, None).await;
+        s.databases
+            .deps()
+            .store
+            .delete(w.team.id, node)
+            .await
+            .unwrap()
+            .expect("the databases row");
+        for kind in [GrantKind::ReadPersonal, GrantKind::WriteLive] {
+            assert_eq!(
+                code(
+                    s.databases
+                        .create_grant(&alice, &*s.agents, node, create_req(kind, a.id, 30))
+                        .await
+                ),
+                (409, "conflict".into()),
+                "{kind:?}"
+            );
+        }
+        let rows = s
+            .databases
+            .list_grants(&alice, node, false, PageRequest::default())
+            .await
+            .unwrap();
+        assert!(rows.items.is_empty(), "no grant row: {:?}", rows.items);
+    }
+
     /// The check, the sweeper and the revoke rules on the in-memory services.
     #[tokio::test]
     async fn expired_or_revoked_grants_give_nothing_before_the_sweeper() {
@@ -2300,8 +2419,8 @@ mod tests {
         let last = w.handles.journal.entries(t).pop().unwrap();
         assert_eq!(last.data["cause"], "given_back");
         assert_eq!(
-            code(s.databases.revoke_grant(&alice, node, g.id).await).0,
-            409
+            code(s.databases.revoke_grant(&alice, node, g.id).await),
+            (404, "not_found".into())
         );
         assert_eq!(
             code(s.databases.revoke_grant(&alice, node, Uuid::now_v7()).await).0,
@@ -2712,6 +2831,102 @@ mod tests {
         assert!(
             holds(&authz, agent, GrantKind::WriteLive, node).await,
             "applied after the commit"
+        );
+    }
+
+    /// Review A-1 R-1: two revokes at the same time of the two live grants of one tuple. Each
+    /// must see the other's commit, so the second one deletes the tuple. Without the lock of the
+    /// tuple, most rounds left the tuple with no live grant, for ever (the sweeper skips revoked
+    /// rows).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_concurrent_revokes_leave_no_tuple(pool: sqlx::PgPool) {
+        let store = PgGrantStore::new(pool.clone());
+        let authz = MemoryAuthz::default();
+        let (t, u, node, agent) = seed_pg(&pool).await;
+        let (rounds, mut leaks) = (20, 0);
+        for _ in 0..rounds {
+            let now = micros(crate::now());
+            let mk = || NewGrant {
+                node,
+                kind: GrantKind::ReadPersonal,
+                agent,
+                reason: None,
+                starts_at: now,
+                expires_at: now + time::Duration::minutes(60),
+                restore_point: None,
+            };
+            let c = ctx(t, u);
+            let g1 = store.create(&c, &authz, mk()).await.unwrap().value;
+            let g2 = store.create(&c, &authz, mk()).await.unwrap().value;
+            let (r1, r2) = tokio::join!(
+                store.revoke(&c, &authz, node, g1.id, EndCause::Revoked, crate::now()),
+                store.revoke(&c, &authz, node, g2.id, EndCause::Revoked, crate::now()),
+            );
+            r1.unwrap();
+            r2.unwrap();
+            if holds(&authz, agent, GrantKind::ReadPersonal, node).await {
+                leaks += 1;
+                authz
+                    .write(vec![RelationshipUpdate::Delete(tuple(
+                        node,
+                        GrantKind::ReadPersonal,
+                        agent,
+                    ))])
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            leaks, 0,
+            "{leaks} of {rounds} rounds left the tuple with no live grant"
+        );
+    }
+
+    /// Review A-1 R-1: a create during a revoke of the same tuple. The new grant is live, so
+    /// its tuple must stay, whichever write takes the lock first; and after the new grant is
+    /// revoked too, the tuple goes.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_create_during_revoke_keeps_the_tuple(pool: sqlx::PgPool) {
+        let store = PgGrantStore::new(pool.clone());
+        let authz = MemoryAuthz::default();
+        let (t, u, node, agent) = seed_pg(&pool).await;
+        let c = ctx(t, u);
+        let mk = || {
+            let now = micros(crate::now());
+            NewGrant {
+                node,
+                kind: GrantKind::ReadPersonal,
+                agent,
+                reason: None,
+                starts_at: now,
+                expires_at: now + time::Duration::minutes(60),
+                restore_point: None,
+            }
+        };
+        let (rounds, mut lost) = (20, 0);
+        for _ in 0..rounds {
+            let a = store.create(&c, &authz, mk()).await.unwrap().value;
+            let (r, b) = tokio::join!(
+                store.revoke(&c, &authz, node, a.id, EndCause::Revoked, crate::now()),
+                store.create(&c, &authz, mk()),
+            );
+            r.unwrap();
+            let b = b.unwrap().value;
+            if !holds(&authz, agent, GrantKind::ReadPersonal, node).await {
+                lost += 1;
+            }
+            store
+                .revoke(&c, &authz, node, b.id, EndCause::Revoked, crate::now())
+                .await
+                .unwrap();
+            assert!(
+                !holds(&authz, agent, GrantKind::ReadPersonal, node).await,
+                "no live grant is left, so the tuple goes"
+            );
+        }
+        assert_eq!(
+            lost, 0,
+            "{lost} of {rounds} rounds left the new live grant without its tuple"
         );
     }
 

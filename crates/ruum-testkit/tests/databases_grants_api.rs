@@ -357,7 +357,7 @@ fn cases() -> Vec<Case> {
                 );
                 check!(w["grant"]["revoked_at"].is_string(), "revoked_at: {w}");
                 check!(w["change"]["seq"].is_i64(), "a journal entry: {w}");
-                cx.refused(Who::Member, revoke_req(&cx, &fixture), 409, &["conflict"])
+                cx.refused(Who::Member, revoke_req(&cx, &fixture), 404, &["not_found"])
                     .await?;
                 // A manager who did not give it.
                 let g = give(&cx, "read_personal", Who::Agent, 60).await?;
