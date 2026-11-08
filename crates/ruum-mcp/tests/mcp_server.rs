@@ -246,9 +246,9 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     let expected: Vec<&str> = catalog.offered().map(|t| t.name.as_str()).collect();
     assert_eq!(names, expected);
     // 50 step 1 tools, the three database tools of card D-1, the two of card K-1
-    // (confirmColumnClasses is users only: no tool) and the two grant tools of card A-1
-    // (`createDatabaseAccessGrant` is users only, so it has no tool).
-    assert_eq!(names.len(), 57);
+    // (confirmColumnClasses is users only: no tool), the two grant tools of card A-1
+    // (`createDatabaseAccessGrant` is users only, so it has no tool) and the three of card Q-1.
+    assert_eq!(names.len(), 60);
     for t in [
         "create_database",
         "get_database",
@@ -257,6 +257,9 @@ async fn initialize_and_list_every_tool_of_the_contract() {
         "suggest_column_classes",
         "list_database_access_grants",
         "remove_database_access_grant",
+        "get_database_schema",
+        "query_database",
+        "list_database_queries",
     ] {
         assert!(names.contains(&t), "{t} is offered");
     }
