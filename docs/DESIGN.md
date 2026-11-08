@@ -1486,14 +1486,18 @@ Good translations need context, consistency and checking.
      in the visual tests, nothing left untranslated;
   4. a reviewer agent on another model checks a back-translation, rates fluency, and looks at the
      screen rendered in that language;
-  5. people: each string has a status `machine` → `agent-reviewed` → `human-verified`; a self-hosted
-     **Weblate** (open source; ICU, Git, glossary, memory, checks, screenshots) lets native speakers,
-     customers and open-source contributors suggest and verify translations; "suggest a better
-     translation" on any text, through the element selection of support (22.1);
-  6. a language is "beta" until every string is translated and the key journeys are human-verified.
-- **Scope**: the UI, emails, error texts and the documentation. Legal texts (terms of service,
-  privacy policy) are translated by professionals only, a decision of the person. MCP tool texts stay
-  in English.
+  5. people improve, they do not gate: each string has a status `machine` → `agent-reviewed`, and
+     there is no human verification step. A self-hosted **Weblate** (open source; ICU, Git, glossary,
+     memory, checks, screenshots) and "suggest a better translation" on any text (through the element
+     selection of support, 22.1) let native speakers, customers and open-source contributors suggest
+     improvements; the reviewer agent checks each suggestion against the glossary and the context and
+     accepts it;
+  6. a language is "beta" until every string is agent-reviewed and the key journeys have been checked
+     on rendered screens.
+- **Scope**: the UI, emails, error texts and the documentation. MCP tool texts stay in English.
+- **Legal texts** (terms of service, privacy policy, data processing agreement): a specialised
+  **lawyer agent** translates them, keeps the legal meaning, and flags terms that differ between legal
+  systems and any ambiguity; then a person reviews them before they apply (decided 2026-11-08).
 
 ### 12.5 The design system in code
 
