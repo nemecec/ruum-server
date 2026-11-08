@@ -484,3 +484,43 @@ async fn a_database_that_is_not_ready_answers_503() {
     t.ok(Who::MemberView, t.read("select count(*) from plants"))
         .await;
 }
+
+/// Review Q-1, R-3: SQLite reads a double-quoted word as a string when no column has that name
+/// (the DQS quirk). Whatever the engine does with it, the log keeps no such word.
+#[tokio::test]
+async fn sqlite_double_quoted_words_leave_no_value_in_the_log() {
+    let t = world().await;
+    let _ = t
+        .send(
+            Who::Member,
+            t.read(r#"select "Alice" from plants where latin_name <> "Bellis-dqs-55""#),
+        )
+        .await;
+    let all = t.log(Who::Member).await;
+    assert_eq!(all.len(), 1, "{all:#?}");
+    let text = serde_json::to_string(&all).unwrap();
+    for value in ["Alice", "Bellis-dqs-55"] {
+        assert!(!text.contains(value), "the log holds {value:?}: {text}");
+    }
+    assert_eq!(
+        all[0]["statement"],
+        "select $L1 from plants where latin_name <> $L2"
+    );
+}
+
+/// Review Q-1, R-3, engine part: with DQS off (`SQLITE_DBCONFIG_DQS_DML` and `_DDL` = 0) a
+/// double-quoted word is a name only, so a word that names no column fails. Planned: the SQLite
+/// connections belong to the engine cards (the memory engine now, E-3 for files; Q-3), which
+/// are outside card Q-1's files. The card that turns DQS off removes the `ignore`.
+#[tokio::test]
+#[ignore = "planned: DQS off on every SQLite connection (memory engine, E-3, Q-3)"]
+async fn sqlite_double_quoted_words_are_names_only() {
+    let t = world().await;
+    for sql in [
+        r#"select "Alice" from plants"#,
+        r#"select count(*) from plants where latin_name = "Rosa canina""#,
+    ] {
+        t.refused(Who::Member, t.read(sql), 400, "query_failed")
+            .await;
+    }
+}

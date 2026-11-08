@@ -15,7 +15,10 @@
 //!    hint `remove_transaction_control`.
 //! 4. `SET` (also `SET LOCAL`, `SET ROLE`, `SET SESSION AUTHORIZATION`), `RESET` and `DISCARD`
 //!    are refused; so is `set_config` anywhere in the statement.
-//! 5. Any name that starts with `ruum_` (the platform's schemas and objects) is refused.
+//! 5. Any name that starts with `ruum_` (the platform's schemas and objects) is refused. On
+//!    Postgres, a Unicode-escaped name (`U&"..."`, also with `UESCAPE`) is refused first: the
+//!    name rules compare the text of a word, and Postgres reads `U&"set\005fconfig"` as
+//!    `set_config` (review Q-1, R-1).
 //! 6. `public.` (Postgres) or `main.` (SQLite) before a name is refused with the hint
 //!    `unqualified_names`. The server never rewrites a name. `pg_catalog`, `information_schema`
 //!    and `extensions` may be named.
@@ -36,7 +39,7 @@
 //! recurse.
 
 use ruum_dbengine::EngineKind;
-use sqlparser::ast::{ObjectType, Statement};
+use sqlparser::ast::{ObjectType, Query, SetExpr, Statement};
 use sqlparser::dialect::{Dialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
@@ -158,7 +161,10 @@ fn dialect(engine: EngineKind) -> Box<dyn Dialect> {
 fn unparsed() -> Refusal {
     Refusal::not_allowed(
         "the server could not parse the statement, and it runs only statements that it can check",
-        Some("check the syntax for this database's engine; DO blocks do not run"),
+        Some(
+            "check the syntax for this database's engine; DO blocks do not run; on SQLite, quote \
+             the table name of a PRAGMA, as in pragma table_info('plants')",
+        ),
     )
 }
 
@@ -179,7 +185,7 @@ fn analyze_here(engine: EngineKind, sql: &str) -> Analysis {
     };
     let parsed = Parser::parse_sql(&*dialect, sql).ok();
     let normalized = match &parsed {
-        Some(_) => normalize_tokens(&tokens),
+        Some(_) => normalize_tokens(engine, &tokens),
         None => UNPARSED.to_string(),
     };
     let verdict = check(engine, &tokens, parsed.as_deref());
@@ -248,6 +254,9 @@ fn check(
         return Err(session_statement());
     }
     // 4 to 7. Names anywhere in the statement.
+    if engine == EngineKind::Postgres {
+        check_unicode_names(tokens)?;
+    }
     check_names(engine, &sig)?;
     // 8. The parse.
     let Some([statement]) = parsed else {
@@ -273,6 +282,33 @@ fn session_statement() -> Refusal {
             "leave the option out; the limits of one call go in the request (timeout_ms, max_rows)",
         ),
     )
+}
+
+/// Postgres reads `U&"..."` (optionally with `UESCAPE '<char>'`) as an identifier with Unicode
+/// escapes, so `U&"set\005fconfig"` is `set_config`. The parser keeps such a name as the word
+/// `U`, the operator `&` and a quoted word with the escapes still in it, so the word rules below
+/// would compare the escaped text. Refuse every such name (fail closed). The check runs on the
+/// full token list: with whitespace or a comment between `U`, `&` and the quoted word, Postgres
+/// reads a column `U` and the operator `&`, not an escaped name.
+fn check_unicode_names(tokens: &[Token]) -> Result<(), Refusal> {
+    for w in tokens.windows(3) {
+        let [Token::Word(u), Token::Ampersand, name] = w else {
+            continue;
+        };
+        let quoted = match name {
+            Token::Word(n) => n.quote_style == Some('"'),
+            Token::DoubleQuotedString(_) => true,
+            _ => false,
+        };
+        if u.quote_style.is_none() && u.value.eq_ignore_ascii_case("u") && quoted {
+            return Err(Refusal::not_allowed(
+                "names with Unicode escapes (U&\"...\") never run: the server checks names by \
+                 their text",
+                Some("write the name without Unicode escapes"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The rules on words: `set_config`, `ruum_*`, `public.` / `main.`, and the SQLite file
@@ -327,6 +363,8 @@ fn not_allowed_kind() -> Refusal {
 fn classify(engine: EngineKind, statement: &Statement) -> Result<StatementKind, Refusal> {
     use StatementKind::*;
     Ok(match statement {
+        // `SELECT ... INTO` makes a table: a schema change (review Q-1, N-2).
+        Statement::Query(q) if query_has_into(q) => SchemaChange,
         Statement::Query(_) => Read,
         Statement::Insert(_)
         | Statement::Update(_)
@@ -334,12 +372,24 @@ fn classify(engine: EngineKind, statement: &Statement) -> Result<StatementKind, 
         | Statement::Merge(_)
         | Statement::Truncate(_) => Write,
         Statement::Explain {
-            statement, analyze, ..
-        } => match classify(engine, statement)? {
-            // EXPLAIN without ANALYZE plans the statement but does not run it.
-            _ if !analyze => Read,
-            kind => kind,
-        },
+            statement,
+            analyze,
+            options,
+            ..
+        } => {
+            // `EXPLAIN (ANALYZE)` and `EXPLAIN (ANALYZE <any value>)` count as ANALYZE (fail
+            // closed; review Q-1, N-1).
+            let analyze = *analyze
+                || options.as_ref().is_some_and(|o| {
+                    o.iter()
+                        .any(|opt| opt.name.value.eq_ignore_ascii_case("analyze"))
+                });
+            match classify(engine, statement)? {
+                // EXPLAIN without ANALYZE plans the statement but does not run it.
+                _ if !analyze => Read,
+                kind => kind,
+            }
+        }
         Statement::CreateTable(_)
         | Statement::CreateView(_)
         | Statement::CreateIndex(_)
@@ -396,8 +446,31 @@ fn classify(engine: EngineKind, statement: &Statement) -> Result<StatementKind, 
     })
 }
 
+/// Whether a query (or one of its set operations) has `INTO`.
+fn query_has_into(q: &Query) -> bool {
+    fn set_has_into(s: &SetExpr) -> bool {
+        match s {
+            SetExpr::Select(select) => select.into.is_some(),
+            SetExpr::Query(q) => query_has_into(q),
+            SetExpr::SetOperation { left, right, .. } => set_has_into(left) || set_has_into(right),
+            _ => false,
+        }
+    }
+    set_has_into(&q.body)
+}
+
 /// Whether a token is a literal (a value written into the statement).
-fn is_literal(t: &Token) -> bool {
+///
+/// On SQLite a double-quoted word is a literal too: SQLite reads `"Alice"` as a string when no
+/// column has that name (the DQS quirk), so the log cannot keep it (review Q-1, R-3). The log
+/// then shows a double-quoted name as a marker as well; that loses a name, never a value.
+fn is_literal(engine: EngineKind, t: &Token) -> bool {
+    if engine == EngineKind::Sqlite
+        && let Token::Word(w) = t
+        && w.quote_style == Some('"')
+    {
+        return true;
+    }
     matches!(
         t,
         Token::Number(..)
@@ -425,11 +498,17 @@ fn is_literal(t: &Token) -> bool {
 
 /// The normalized statement: every literal token becomes `$L1`, `$L2`, ... in order; comments
 /// and runs of whitespace become one space.
-fn normalize_tokens(tokens: &[Token]) -> String {
+///
+/// A number directly followed by a word (no whitespace) is one literal: Postgres 16+ reads
+/// `0o17` and `0b101` as numbers, while the tokenizer splits them into the number `0` and the
+/// words `o17` and `b101` (review Q-1, R-2). Postgres refuses every other such case ("trailing
+/// junk after numeric literal"), so the merge hides no name.
+fn normalize_tokens(engine: EngineKind, tokens: &[Token]) -> String {
     let mut out = String::new();
     let mut n = 0usize;
     let mut space = false;
-    for t in tokens {
+    let mut iter = tokens.iter().peekable();
+    while let Some(t) = iter.next() {
         match t {
             Token::EOF => {}
             Token::Whitespace(_) => space = true,
@@ -438,9 +517,14 @@ fn normalize_tokens(tokens: &[Token]) -> String {
                     out.push(' ');
                 }
                 space = false;
-                if is_literal(t) {
+                if is_literal(engine, t) {
                     n += 1;
                     out.push_str(&format!("$L{n}"));
+                    if matches!(t, Token::Number(..)) {
+                        while matches!(iter.peek(), Some(Token::Word(_) | Token::Number(..))) {
+                            iter.next();
+                        }
+                    }
                 } else {
                     out.push_str(&t.to_string());
                 }
@@ -663,6 +747,62 @@ mod tests {
         }
     }
 
+    /// Review Q-1, R-1: Postgres reads `U&"set\005fconfig"` as `set_config`.
+    #[test]
+    fn unicode_escaped_names_never_run() {
+        for sql in [
+            r#"select U&"set\005fconfig"('statement_timeout', '0', false)"#,
+            r#"select u&"set\005fconfig"('work_mem', '7MB', true)"#,
+            r#"select U&"set!005fconfig" UESCAPE '!' ('work_mem', '7MB', true)"#,
+            r#"select * from U&"\0070ublic".plants"#,
+            r#"select * from U&"\0072uum_meta".databases"#,
+            r#"select * from U&"plants""#,
+            r#"select U&"name" from plants"#,
+        ] {
+            let r = not_allowed(PG, sql);
+            assert_eq!(
+                r.hint.as_deref(),
+                Some("write the name without Unicode escapes"),
+                "{sql}"
+            );
+        }
+        // A Unicode string literal is a value, not a name.
+        assert_eq!(kind(PG, r"select U&'d\0061t\+000061'"), StatementKind::Read);
+        // With whitespace, `u` is a column and `&` the bitwise and.
+        assert_eq!(
+            kind(PG, r#"select u & "id" from plants"#),
+            StatementKind::Read
+        );
+    }
+
+    /// Review Q-1, N-1 and N-2.
+    #[test]
+    fn explain_options_and_select_into_are_classified_by_what_they_do() {
+        assert_eq!(
+            kind(PG, "explain (analyze) delete from plants"),
+            StatementKind::Write
+        );
+        assert_eq!(
+            kind(PG, "explain (analyze true) delete from plants"),
+            StatementKind::Write
+        );
+        assert_eq!(
+            kind(PG, "explain (verbose) delete from plants"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            kind(PG, "select * into plants2 from plants"),
+            StatementKind::SchemaChange
+        );
+        assert_eq!(
+            kind(
+                PG,
+                "select id into plants3 from plants union select id from plants"
+            ),
+            StatementKind::SchemaChange
+        );
+    }
+
     #[test]
     fn qualified_names_are_refused_and_never_rewritten() {
         for sql in [
@@ -799,10 +939,23 @@ mod tests {
                 "select interval '3 days', date '2026-01-02', timestamptz '2026-01-02 03:04:05+00'",
                 "",
             ),
+            // Review Q-1, R-2: Postgres 16+ integer literals with a prefix.
+            (
+                PG,
+                "select 0o17, 0b101, 0x1F, 1_000_000",
+                "select $L1, $L2, $L3, $L4",
+            ),
+            // Review Q-1, R-3: SQLite reads a double-quoted word as a string (DQS).
+            (
+                LITE,
+                "select \"Alice\" from plants where latin_name = \"Alice\"",
+                "select $L1 from plants where latin_name = $L2",
+            ),
         ];
         let secrets = [
             "alice", "42", "secret", "deadbeef", "0101", "3.14159", "7", "1e10", ".5", "11", "12",
-            "13", "14", "99", "100", "3 days", "2026", "cafe",
+            "13", "14", "99", "100", "3 days", "2026", "cafe", "o17", "b101", "x1F", "000",
+            "Alice",
         ];
         for (engine, sql, expected) in cases {
             let a = analyze(*engine, sql);
@@ -822,6 +975,21 @@ mod tests {
                 "{sql:?} -> {:?}",
                 a.normalized
             );
+        }
+    }
+
+    /// A prefixed integer where the parser fails or reads an alias still leaves no digits.
+    #[test]
+    fn prefixed_integers_leave_no_digits() {
+        for sql in [
+            "select * from plants where pin = 0b1011",
+            "select 0o7531 as x",
+            "select * from plants where pin = 0o7531 and id = 0x2A",
+        ] {
+            let a = analyze(PG, sql);
+            for s in ["1011", "7531", "2A"] {
+                assert!(!a.normalized.contains(s), "{sql:?} -> {:?}", a.normalized);
+            }
         }
     }
 
