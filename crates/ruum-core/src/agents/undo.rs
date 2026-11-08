@@ -336,7 +336,8 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
                 .await?
                 .change
         }
-        NodePurged | ShareLinkRevoked => return Ok(None),
+        // A confirmation of classes is by a person only (card K-1), never an agent's change.
+        NodePurged | ShareLinkRevoked | DatabaseColumnsConfirmed => return Ok(None),
         VersionCreated | VersionRestored => match opt_uuid(d, "previous_version_id") {
             Some(prev) => {
                 s.versions

@@ -63,6 +63,11 @@ async fn main() -> anyhow::Result<()> {
     }
     // The delivery worker and the reconciler of typed nodes (card D-1).
     wiring::start_typed_node_tasks(&services);
+    // The scheduled catalog sync of the column classes (card K-1).
+    tokio::spawn(ruum_core::databases::classes::run_scheduled_sync(
+        services.databases.clone(),
+        ruum_core::databases::classes::SYNC_EVERY,
+    ));
     let state = AppState::new(
         services.clone(),
         ApiConfig {

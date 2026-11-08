@@ -171,6 +171,11 @@ impl Services {
             )),
             store: database_store.clone(),
             typed: typed.clone(),
+            columns: Arc::new(crate::databases::classes::MemoryColumnStore::new(
+                nodes.clone(),
+                journal.clone(),
+            )),
+            masking: Arc::new(crate::privacy::RecordingMaskingRules::new()),
         };
         let (providers, databases) =
             build_databases(nodes.clone(), authz.clone(), tenants.clone(), &parts)

@@ -155,6 +155,11 @@ fn sample(event: EventType, user: UserId) -> Value {
         EventType::NodeSharingUpdated => {
             json!({ "old_editors_can_share": null, "new_editors_can_share": false })
         }
+        EventType::DatabaseColumnsConfirmed => json!({
+            "version_id": id(), "approval_id": null,
+            "columns": [{ "schema": "main", "table": "plants", "column": "latin_name",
+                          "class": "normal", "old_class": null }]
+        }),
     }
 }
 

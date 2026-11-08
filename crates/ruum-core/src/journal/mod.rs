@@ -72,6 +72,8 @@ pub enum EventType {
     ShareLinkRevoked,
     #[serde(rename = "node.sharing_updated")]
     NodeSharingUpdated,
+    #[serde(rename = "database.columns_confirmed")]
+    DatabaseColumnsConfirmed,
 }
 
 impl EventType {
@@ -95,6 +97,7 @@ impl EventType {
         EventType::ShareLinkCreated,
         EventType::ShareLinkRevoked,
         EventType::NodeSharingUpdated,
+        EventType::DatabaseColumnsConfirmed,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -119,6 +122,7 @@ impl EventType {
             ShareLinkCreated => "share_link.created",
             ShareLinkRevoked => "share_link.revoked",
             NodeSharingUpdated => "node.sharing_updated",
+            DatabaseColumnsConfirmed => "database.columns_confirmed",
         }
     }
 
@@ -429,7 +433,10 @@ mod tests {
         for e in ALL_EVENTS {
             assert!(
                 crate::agents::undo_action(*e).is_some()
-                    || matches!(e, EventType::NodePurged | EventType::ShareLinkRevoked),
+                    || matches!(e, EventType::NodePurged | EventType::ShareLinkRevoked)
+                    // Only a person confirms classes (`confirmColumnClasses` is users only), so
+                    // `undoAgent` never meets this entry among an agent's changes.
+                    || *e == EventType::DatabaseColumnsConfirmed,
                 "{e:?} has no inverse"
             );
         }

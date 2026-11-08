@@ -1092,6 +1092,8 @@ pub struct DatabaseDeps {
     pub provider: Arc<provider::DatabaseProvider>,
     pub engines: Engines,
     pub settings: DatabaseSettings,
+    pub columns: Arc<dyn classes::ColumnStore>,
+    pub masking: Arc<dyn crate::privacy::MaskingRules>,
 }
 
 /// `createDatabase`, `getDatabase`, `updateDatabaseManifest` and the usage of `getLimits`.
@@ -1442,7 +1444,7 @@ impl DatabaseService {
             branch_of: db.as_ref().and_then(|r| r.branch_of),
             branch_data: db.as_ref().and_then(|r| r.branch_data),
             pitr_window: None,
-            unconfirmed_columns: 0,
+            unconfirmed_columns: self.unconfirmed_columns(ctx.tenant, node.id).await?,
             my_permissions,
             manifest,
             node,
@@ -1456,6 +1458,8 @@ pub struct DatabaseParts {
     pub keys: Arc<crate::privacy::keys::TenantKeys>,
     pub store: Arc<dyn DatabaseStore>,
     pub typed: Arc<dyn TypedNodeStore>,
+    pub columns: Arc<dyn classes::ColumnStore>,
+    pub masking: Arc<dyn crate::privacy::MaskingRules>,
 }
 
 /// A key-encryption key that lives in memory only, for a process that makes no tenant key (no
@@ -1499,6 +1503,8 @@ pub fn build(
         provider,
         engines: parts.engines.clone(),
         settings: DatabaseSettings::default(),
+        columns: parts.columns.clone(),
+        masking: parts.masking.clone(),
     });
     Ok((Arc::new(registry), Arc::new(service)))
 }
@@ -2060,6 +2066,8 @@ mod tests {
             keys: w.s.tenant_keys.clone(),
             store: w.handles.databases.clone(),
             typed: w.handles.typed.clone(),
+            columns: w.s.databases.deps().columns.clone(),
+            masking: w.s.databases.deps().masking.clone(),
         };
         install(&mut w.s, parts).unwrap();
         let a = ctx(w.team.id, w.alice);
@@ -2669,6 +2677,8 @@ mod tests {
             keys: w.s.tenant_keys.clone(),
             store: w.handles.databases.clone(),
             typed: w.handles.typed.clone(),
+            columns: w.s.databases.deps().columns.clone(),
+            masking: w.s.databases.deps().masking.clone(),
         };
         install(&mut w.s, parts).unwrap();
         let a = ctx(w.team.id, w.alice);

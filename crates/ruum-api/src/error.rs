@@ -72,7 +72,8 @@ pub fn user_page(path: &str) -> &'static str {
 /// Middleware: the hint of a `403 user_required` answer names the page of the web UI where the
 /// user does it, with the public URL (`ask the user to do this at https://.../agents`), so an
 /// agent can tell its user where to go (decision 0003-7, BENCHMARK fix 6). MCP tool calls run
-/// through the same router, so they get the same hint.
+/// through the same router, so they get the same hint. A hint that already is a web URL of a
+/// space page (`<public URL>/t/...`, decision 0004-20) stays as the handler wrote it.
 pub async fn user_required_hint(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
     req: axum::extract::Request,
@@ -95,6 +96,15 @@ pub async fn user_required_hint(
         Err(_) => return Response::from_parts(parts, axum::body::Body::from(bytes)),
     };
     if v["error"]["code"] != "user_required" {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    // A handler that names the exact page already (decision 0004-20, C-16: for example the
+    // Columns tab of a database for `confirmColumnClasses`) keeps its hint.
+    let origin = state.config.public_url.trim_end_matches('/');
+    if v["error"]["hint"]
+        .as_str()
+        .is_some_and(|h| h.starts_with(&format!("{origin}/t/")))
+    {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     }
     let url = format!(

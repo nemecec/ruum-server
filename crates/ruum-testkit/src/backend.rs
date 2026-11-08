@@ -427,6 +427,10 @@ impl Pg {
             )),
             store: Arc::new(PgDatabaseStore::new(pool.clone())),
             typed: Arc::new(PgTypedNodeStore::new(pool.clone())),
+            columns: Arc::new(databases::classes::postgres::PgColumnStore::new(
+                pool.clone(),
+            )),
+            masking: Arc::new(ruum_core::privacy::RecordingMaskingRules::new()),
         };
         databases::install(&mut s, parts).expect("install the database area");
         s
