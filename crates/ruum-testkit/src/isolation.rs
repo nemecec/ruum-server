@@ -1154,9 +1154,19 @@ pub async fn run_probe(
     }
     if let (Some(b), Some(a)) = (&before, &after) {
         if b.is_not_implemented() || a.is_not_implemented() {
-            // The read is not built yet; the write cannot be checked.
+            // The read is not built yet; the write cannot be checked. A read of a planned
+            // operation (its card has not landed) makes the probe planned, not pending.
+            let read_planned = probe.unchanged.as_ref().is_some_and(|(_, r)| {
+                crate::contract::operations()
+                    .iter()
+                    .any(|o| o.planned && o.method == r.method.as_str() && o.matches(&r.uri))
+            });
             if !pending && problems.is_empty() {
-                return Outcome::Pending;
+                return if read_planned {
+                    Outcome::Planned
+                } else {
+                    Outcome::Pending
+                };
             }
         } else if b.status != a.status || b.body != a.body {
             problems.push(format!(
