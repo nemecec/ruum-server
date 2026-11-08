@@ -7,7 +7,14 @@ for things follow `ia.md` (one word per concept). Agent-facing text (MCP, CLI, A
 
 ## 1. Voice
 
-Calm, plain, a little warm. We are a careful colleague who keeps your work safe.
+**Informal and playful, never official or corporate** (decided by the person, 2026-11-08; for every
+language). We are a friendly colleague with a sense of humour, who also keeps your work safe.
+
+- **Informal address in every language** (Estonian "sina", German "du", French "tu", and so on).
+- **Playful where nothing is at stake**: empty states, onboarding, success messages, small touches. A
+  light joke or a friendly word is welcome there.
+- **Calm and exact where something is at stake**: errors that can lose data, security, money and
+  billing, legal texts, deleting for good. No jokes there; say what happened and what to do.
 
 - **Plain English** (CLAUDE.md, "Writing"; ASD-STE100 in spirit): short sentences (at most 20
   words in instructions), active voice, present tense, common words.
@@ -16,7 +23,8 @@ Calm, plain, a little warm. We are a careful colleague who keeps your work safe.
 - **Talk to the person** ("you", "your"). Ruum speaks of itself as "Ruum", not "we", except in
   the welcome card.
 - **Contractions are fine** (don't, can't, you're): they read warmer and shorter.
-- **Sentence case** in every title, button and label. No exclamation marks. No emoji.
+- **Sentence case** in every title, button and label. An exclamation mark only for a real
+  success, at most one per screen. No emoji (they translate and read badly with screen readers).
 - **No blame, no drama.** Not "You failed to...", not "Oops!", not "Whoops, something went
   wrong!". Not "Invalid", "Illegal", "Fatal", "Error 403".
 - **No hype.** Not "magic", "smart", "AI-powered", "seamless", "effortless".

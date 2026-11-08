@@ -1473,6 +1473,9 @@ Good translations need context, consistency and checking.
   tone); a screenshot of the message in place, linked by message key from the visual tests and the
   component catalogue; a source written for translation (the copy rules of `docs/ux/copy.md`, ICU
   messages with named placeholders, no sentences built from pieces).
+- **One voice in every language**: informal and playful, never official or corporate; informal
+  address everywhere (Estonian "sina", German "du", ...); calm and exact, without jokes, where data,
+  security, money or legal matters are at stake (docs/ux/copy.md, section 1).
 - **Consistency**: a glossary per language (the approved terms for space, folder, share, version,
   trash, agent, ... and a do-not-translate list); a style guide per language (formality, punctuation,
   number and date conventions, gender-neutral wording; Estonian uses the informal "sina", decided by the
