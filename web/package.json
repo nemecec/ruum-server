@@ -8,7 +8,7 @@
     "dev:server": "vite",
     "gen:api": "openapi-typescript ../contracts/openapi.yaml -o src/api/schema.d.ts",
     "build": "tsc -b && vite build",
-    "lint": "oxlint && stylelint \"src/**/*.css\" && node scripts/check-ui-rules.mjs && node scripts/build-tokens.mjs --check",
+    "lint": "oxlint && stylelint \"src/**/*.css\" && node scripts/check-ui-rules.mjs && node scripts/check-translations.mjs && node scripts/build-tokens.mjs --check",
     "tokens": "node scripts/build-tokens.mjs",
     "ladle": "ladle serve",
     "ladle:build": "ladle build",

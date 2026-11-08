@@ -13,6 +13,14 @@ export type CatalogueMeta = {
   /** `source`, `machine` (translated by an agent) or `human` (checked by a person). */
   translation: 'source' | 'machine' | 'human'
   note?: string
+  /**
+   * The status of each message of a translation (design 12.4.1): `<state>:<hash>`, where the state
+   * is `machine` or `agent-reviewed` and the hash is the start of the SHA-256 of the English message
+   * it was made from. `scripts/check-translations.mjs` keeps and checks it.
+   */
+  status?: Record<string, string>
+  /** Keys whose translation is the same as the English text on purpose ("Video"). */
+  sameAsSource?: string[]
 }
 
 export type Catalogue = { '@metadata': CatalogueMeta; messages: Record<string, string> }
