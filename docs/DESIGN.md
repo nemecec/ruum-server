@@ -1465,6 +1465,36 @@ The UI is localisable from the start of the work on it (decided 2026-11-07, prov
 - **Translations** are made by a translator agent and checked by a second agent; until a person
   checks them they are marked "machine translated" in the catalogue metadata.
 
+#### 12.4.1 The translation pipeline
+
+Good translations need context, consistency and checking.
+
+- **Context for every message**: a description (where it is shown, what it means, maximum length,
+  tone); a screenshot of the message in place, linked by message key from the visual tests and the
+  component catalogue; a source written for translation (the copy rules of `docs/ux/copy.md`, ICU
+  messages with named placeholders, no sentences built from pieces).
+- **Consistency**: a glossary per language (the approved terms for space, folder, share, version,
+  trash, agent, ... and a do-not-translate list); a style guide per language (formality, punctuation,
+  number and date conventions, gender-neutral wording; for Estonian the choice of "sina" or "teie" is
+  a decision of the person); a translation memory, so approved translations are reused.
+- **The pipeline, on every change**:
+  1. extract new and changed message keys;
+  2. a translator agent translates with the full context (description, screenshot, glossary, memory,
+     style guide, neighbouring strings);
+  3. automatic checks: valid ICU, the same placeholders as the source, every plural category the
+     language needs (CLDR), glossary terms, length budgets checked by rendering the real translation
+     in the visual tests, nothing left untranslated;
+  4. a reviewer agent on another model checks a back-translation, rates fluency, and looks at the
+     screen rendered in that language;
+  5. people: each string has a status `machine` → `agent-reviewed` → `human-verified`; a self-hosted
+     **Weblate** (open source; ICU, Git, glossary, memory, checks, screenshots) lets native speakers,
+     customers and open-source contributors suggest and verify translations; "suggest a better
+     translation" on any text, through the element selection of support (22.1);
+  6. a language is "beta" until every string is translated and the key journeys are human-verified.
+- **Scope**: the UI, emails, error texts and the documentation. Legal texts (terms of service,
+  privacy policy) are translated by professionals only, a decision of the person. MCP tool texts stay
+  in English.
+
 ### 12.5 The design system in code
 
 The look of Ruum is defined in one place, so it can be changed later without touching screens
@@ -2036,3 +2066,58 @@ customer uses, plus a published markup that covers fixed costs.
   building it in agent tokens.
 - The capacity and cost agent looks for savings and reports cost per feature and per agent run in the
   weekly digest.
+
+## 22. Support
+
+Filing a ticket must be easy for people and agents, the context must come with it, and every ticket
+must lead somewhere visible.
+
+### 22.1 Filing, with the context
+
+- A **"Help & feedback" button on every screen**, and a keyboard shortcut, with three modes:
+  1. **Select UI elements**, one or several, each with an optional comment. Each selection captures
+     the design-system component, the message keys of the text shown (language-independent), the
+     route, the IDs of the items on screen, the app version, language, theme and screen size.
+  2. **Screenshot and draw**, with the drawing tools of preview annotations (11.1): shapes, arrows,
+     freehand, colours, and a comment on any shape. The screenshot carries a **map of the UI**: which
+     region is which component, text key and item, so the support agent reads "the arrow points at
+     the Share button of folder X", not only pixels.
+  3. **Just type**, in any language.
+- Attached after the person checks it, as in the report widget (9.7): recent errors, failed requests
+  and trace IDs; each item can be removed or blurred.
+- **Agents file through an MCP tool** and the CLI, with structured context: the operation, request ID,
+  error code, trace ID and an excerpt of their own tool calls.
+
+### 22.2 A short dialogue
+
+- A **support agent** answers within seconds, in the same panel and the person's language, and asks
+  at most one or two clarifying questions, only when something is unclear.
+- It may reproduce the problem with read-only diagnostics **only with the person's consent for this
+  ticket** (time-limited, through the privacy filter, and the person can see what it looked at).
+- It escalates by need: a stronger model for hard cases; engineering as a bug with evidence; the
+  product manager as a feature request (20); a person for the red cases (suspected account takeover,
+  legal matters, disputes).
+
+### 22.3 Every ticket gets an outcome
+
+| Outcome | What the reporter gets |
+|---|---|
+| Answered | the answer, and a documentation fix when the question shows the docs were unclear |
+| Fixed | a link to the change and the release: "your report led to this fix" |
+| Planned | where it is in the roadmap and a rough time; a notice when it ships |
+| Duplicate | a link to the main ticket and "you are one of 37 people who reported this"; a notice when it is resolved |
+| Declined | always a reason (the principle of the product direction, the cost, or the security concern) and an alternative where there is one |
+| Needs info | a clear question with a deadline, then a polite close |
+
+- Every ticket has a **status page** and a notice at each change.
+- **Encouragement without pressure**: one click to file, a thank-you that says what changed, a small
+  "your reports helped fix 5 things" on the profile; no required fields, no blaming language.
+
+### 22.4 An open ticket database, with limits
+
+- **Public**: title, a summary written by the support agent and approved by the reporter, status,
+  "+1" count, links between duplicates, decisions with their reasons.
+- **Private**: screenshots, logs, personal data, anything that identifies a space or customer, the full
+  dialogue; the reporter can also keep a whole ticket private.
+- **Never in the open tracker**: vulnerability reports (a separate security channel, `security.txt`, a
+  coordinated disclosure policy, later a bounty) and abuse reports.
