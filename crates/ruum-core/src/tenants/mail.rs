@@ -399,17 +399,17 @@ pub fn share_mail(m: &ShareMail<'_>) -> Mail {
     if m.email_grant {
         let to = header_text(m.to, 320);
         text.push_str(&format!(
-            "\nSign in to Ruum with this email address ({to}) to open it. If you have no Ruum \
-             account with this address yet, create one and verify the address first.\n"
+            "\nTo open it, sign in to Ruum with this email address ({to}). New to Ruum? \
+             Create an account with this address and verify it first.\n"
         ));
         html.push_str(&format!(
-            "<p>Sign in to Ruum with this email address ({}) to open it. If you have no Ruum \
-             account with this address yet, create one and verify the address first.</p>\n",
+            "<p>To open it, sign in to Ruum with this email address ({}). New to Ruum? \
+             Create an account with this address and verify it first.</p>\n",
             html_escape(&to)
         ));
     }
-    text.push_str("\nIf you did not expect this email, you can ignore it.\n");
-    html.push_str("<p>If you did not expect this email, you can ignore it.</p>\n");
+    text.push_str("\nIf you didn't expect this email, you can ignore it.\n");
+    html.push_str("<p>If you didn&rsquo;t expect this email, you can ignore it.</p>\n");
     Mail {
         to: m.to.to_string(),
         subject: format!("{sharer} shared \"{item}\" with you"),
@@ -431,8 +431,8 @@ pub struct InvitationMail<'a> {
     pub message: Option<&'a str>,
 }
 
-/// The invitation email: the space, the inviter, the role in words and the end date, with the
-/// accept link. (The content role of members comes with decision 0003-1.)
+/// The invitation email (docs/ux/copy.md, section 6): `<Inviter> invited you to <space> on Ruum`,
+/// the space, the inviter, the role in words and the end date, with the accept link. (The content role of members comes with decision 0003-1.)
 pub fn invitation_mail(m: &InvitationMail<'_>) -> Mail {
     let space = header_text(m.space, MAX_HEADER_NAME);
     let inviter = header_text(m.inviter, MAX_HEADER_NAME);
@@ -445,15 +445,15 @@ pub fn invitation_mail(m: &InvitationMail<'_>) -> Mail {
     let until = date_words(m.expires_at);
     let message = m.message.map(message_text).filter(|t| !t.is_empty());
     let mut text = format!(
-        "{inviter} invited you to the Ruum space \"{space}\" as {role}.\n\n\
-         Open this link to accept the invitation:\n{}\n\n\
-         The invitation ends on {until}.\n",
+        "{inviter} invited you to join the Ruum space \"{space}\" as {role}.\n\n\
+         Open this link to join:\n{}\n\n\
+         The link works until {until}.\n",
         m.accept_url
     );
     let mut html = format!(
-        "<p>{} invited you to the Ruum space &ldquo;{}&rdquo; as {}.</p>\n\
-         <p><a href=\"{}\">Accept the invitation</a></p>\n\
-         <p>The invitation ends on {until}.</p>\n",
+        "<p>{} invited you to join the Ruum space &ldquo;{}&rdquo; as {}.</p>\n\
+         <p><a href=\"{}\">Join the space</a></p>\n\
+         <p>The link works until {until}.</p>\n",
         html_escape(&inviter),
         html_escape(&space),
         html_escape(role),
@@ -467,11 +467,11 @@ pub fn invitation_mail(m: &InvitationMail<'_>) -> Mail {
             html_escape(msg)
         ));
     }
-    text.push_str("\nIf you did not expect this email, you can ignore it.\n");
-    html.push_str("<p>If you did not expect this email, you can ignore it.</p>\n");
+    text.push_str("\nIf you didn't expect this email, you can ignore it.\n");
+    html.push_str("<p>If you didn&rsquo;t expect this email, you can ignore it.</p>\n");
     Mail {
         to: m.to.to_string(),
-        subject: format!("Invitation to {space} on Ruum"),
+        subject: format!("{inviter} invited you to {space} on Ruum"),
         body: text,
         html: Some(html),
         reply_to: None,
@@ -498,7 +498,7 @@ mod tests {
     fn the_invitation_mail_names_the_space_inviter_role_and_end() {
         let m = invitation("https://x/invitations/accept?token=t", None);
         assert!(m.body.contains("https://x/invitations/accept?token=t"));
-        assert!(m.subject.contains("Acme"));
+        assert_eq!(m.subject, "Mari invited you to Acme on Ruum");
         assert!(m.body.contains("Mari invited you"));
         assert!(m.body.contains("as a member"));
         assert!(m.body.contains("21 November 2026"));
