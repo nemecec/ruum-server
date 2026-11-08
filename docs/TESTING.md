@@ -169,6 +169,29 @@ handler that checks the token answers `401`, and the suites report that as a fai
    probes for IDs of the other tenant in the body).
 4. Add the rule in `permissions::rule`, then regenerate `permission_matrix.md`.
 
+## The database acceptance cases
+
+`crates/ruum-testkit/tests/databases_*.rs` (card T-1) are the acceptance cases of the 24
+database operations of step 2, from the contract and decision 0004. Each binary is one group:
+`databases_d1` (create, status, manifest: card D-1), `databases_guests`, `databases_agents`,
+`databases_nodes` and `databases_statements`. `databases_meta` checks the cases themselves: each
+case names its operations, a case over a planned operation is reported as planned and never as
+passed, and each entry of `PENDING` (in `tests/common/mod.rs`) names its case and the card that
+unblocks it. A case fails when it calls an operation that its list does not name.
+
+```sh
+cargo test -p ruum-testkit --test databases_d1 -- --nocapture                    # memory
+RUUM_SUITE_BACKEND=postgres RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit \
+  --test databases_d1 --test databases_guests --test databases_agents \
+  --test databases_nodes --test databases_statements -- --nocapture
+cargo test -p ruum-testkit --test databases_meta                                 # no database
+```
+
+On Postgres, the engine of `postgres` manifests is the data cluster of `RUUM_DBHOST_URL` when it
+answers, else the memory engine. The CI suite jobs run the five groups on memory and on Postgres
+(without the data cluster); the unit job runs `databases_meta`. A card that builds an operation
+removes its `planned` mark, and its cases then run with no change to these files.
+
 ## The privacy suite
 
 `crates/ruum-testkit/src/privacy.rs` (card T-2) checks design 8.5: an agent never sees a raw
