@@ -4245,7 +4245,6 @@ paths:
       tags: [databases]
       operationId: listDatabaseAccessGrants
       x-ruum-area: access
-      x-ruum-status: planned
       summary: Time-limited grants of agents on a database
       description: |
         The live and recent `write_live` and `read_personal` grants (section 8.5). Needs `view`;
@@ -4273,7 +4272,6 @@ paths:
       tags: [databases]
       operationId: createDatabaseAccessGrant
       x-ruum-area: access
-      x-ruum-status: planned
       x-ruum-user-only: true
       summary: Give an agent live writes or real personal values, for a time
       description: |
@@ -4317,7 +4315,6 @@ paths:
       tags: [databases]
       operationId: revokeDatabaseAccessGrant
       x-ruum-area: access
-      x-ruum-status: planned
       summary: End a grant now
       description: |
         Ends the grant at once; the next query of the agent no longer has it. The user who gave

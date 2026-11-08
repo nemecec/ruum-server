@@ -671,8 +671,6 @@
         "database.restore_started",
         "database.restored",
         "database.restore_failed",
-        "database.grant_created",
-        "database.grant_revoked",
         "database.approval_decided"
       ]
     }
