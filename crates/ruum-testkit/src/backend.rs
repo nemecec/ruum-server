@@ -432,6 +432,7 @@ impl Pg {
             )),
             masking: Arc::new(ruum_core::privacy::RecordingMaskingRules::new()),
             grants: Arc::new(databases::access::grants::PgGrantStore::new(pool.clone())),
+            queries: Arc::new(databases::query::PgQueryLog::new(pool.clone())),
         };
         databases::install(&mut s, parts).expect("install the database area");
         s

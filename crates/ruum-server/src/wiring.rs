@@ -149,7 +149,8 @@ pub async fn install_databases(
             )),
             // The lens rules of Q-2 (Postgres) and Q-3 (SQLite) register here.
             masking: Arc::new(ruum_core::privacy::AllMaskingRules::new(vec![])),
-            grants: Arc::new(databases::access::grants::PgGrantStore::new(pool)),
+            grants: Arc::new(databases::access::grants::PgGrantStore::new(pool.clone())),
+            queries: Arc::new(databases::query::PgQueryLog::new(pool)),
         },
         None => DatabaseParts {
             engines,
@@ -169,6 +170,7 @@ pub async fn install_databases(
                 handles.journal.clone(),
                 handles.typed.clone(),
             )),
+            queries: Arc::new(databases::query::MemoryQueryLog::new()),
         },
     };
     databases::install(services, parts).context("set up the database area")?;

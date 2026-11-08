@@ -1,2 +1,1277 @@
-//! The query API (card Q-1): `queryDatabase`, `getDatabaseSchema`, `listDatabaseQueries`.
-//! Declared by card D-1; empty until Q-1 (which declares its masking submodules here).
+//! The query API (card Q-1): `queryDatabase`, `getDatabaseSchema`, `listDatabaseQueries`
+//! (`docs/STEP2.md` area 4; `contracts/openapi.yaml`, area `query`).
+//!
+//! # `queryDatabase`
+//!
+//! The checks run in this order (the contract's order for agents, "Agent writes"):
+//!
+//! 1. A share-link bearer gets `403 user_required`; a caller who cannot see the database gets
+//!    `404`; `view` is needed for every call.
+//! 2. `mode: write` needs `edit` (`403 permission_denied`, or `scope_exceeded` for an agent).
+//! 3. Agents: wave decision 1 (see [`agent_kind`]).
+//! 4. The request limits (`422`), then the statement rules of [`rules`] (`422
+//!    validation_failed` for no or two statements, `422 statement_not_allowed`).
+//! 5. `mode: read` with a statement that writes is `400 read_only_query`, also when only the
+//!    engine finds it.
+//! 6. The role kind of the caller ([`person_kind`]): `view` reads as `read`, `edit` writes as
+//!    `write`, `manage` reads as `secret_read` and writes as `owner`.
+//! 7. While the database is not ready, every kind but `owner` waits up to 10 seconds, then gets
+//!    `503 database_not_ready` (hint `retry`, `Retry-After`).
+//! 8. A schema change by a person with `manage` runs through the engine's migration path
+//!    ([`run_schema_change`], wave decision 3); every other statement runs through
+//!    `DatabaseEngine::execute` with the timeout and the caps.
+//!
+//! The limits come from the plan (`Database.limits`, [`super::DatabaseSettings`]); the request
+//! may only lower them. Each result cell is the engine's typed value as JSON; an object with the
+//! key `$ruum` comes back wrapped as a `LiteralValue`. A person without `manage` never sees a
+//! `secret` value: the `nosecret` lens of the engine masks it, and the result marks each cell of
+//! a column whose class (the head manifest's `data_classes`, wave decision 2) is `secret` as the
+//! hidden-value marker. Errors are `query_failed` with the SQLSTATE; for agents and people
+//! without `manage` the text is a fixed one per SQLSTATE plus object names, never the engine's
+//! text (decision 0004-8).
+//!
+//! Every call that reaches the rules (also a refused or failed one) writes one row of the query
+//! log ([`log`]): the normalized statement, the parameters as hidden-value markers, the outcome.
+//! A call that the database row does not exist for yet (still provisioning) writes no row: the
+//! log's foreign key needs the row. No call writes a journal entry.
+//!
+//! # `getDatabaseSchema`
+//!
+//! `view`; the engine catalog of the schema `public` (SQLite `main`) only, never the `ruum_*`
+//! schemas or `extensions`; names and types only. Classes by wave decision 2.
+//!
+//! # `listDatabaseQueries`
+//!
+//! `view`; a person with `manage` reads all rows, a person with `view` their own and those of
+//! their own agents, an agent only its own (also with `manage`). See [`log_visibility`].
+//!
+//! # Wave decisions (`provisional`, `ruum-server-wt/panel/step2-wave4.md`)
+//!
+//! 1. Agents fail closed until card Q-2: [`agent_kind`] and [`mark_agent_result`].
+//! 2. Classes come from the head manifest's `data_classes` ([`manifest_classes`]).
+//! 3. A person's schema change runs through `DatabaseEngine::apply_migration` with an interim
+//!    catalog sync ([`interim_catalog_sync`], called only by [`run_schema_change`]); the
+//!    integrator swaps it for card K-1's sync at that one call site.
+
+pub mod log;
+pub mod postgres_mask;
+pub mod rules;
+pub mod sqlite_mask;
+
+pub use log::{
+    LogFilter, LogVisibility, MemoryQueryLog, PgQueryLog, QueryLogEntry, QueryLogStore,
+    QueryOutcome,
+};
+
+use super::{DatabaseRow, DatabaseService, DatabaseStatus, in_trash, refuse_share_link};
+use crate::actor::{Actor, Context};
+use crate::authz::{self, Role};
+use crate::error::{ApiError, Error, ErrorCode, Result};
+use crate::ids::{NodeId, TenantId};
+use crate::paging::{Page, PageRequest};
+use crate::privacy::keys::TenantKeys;
+use crate::privacy::{HiddenValue, LiteralValue};
+use crate::providers::ProviderState;
+use async_trait::async_trait;
+use ruum_dbengine::{
+    Catalog, CatalogSync, DataClass, DatabaseEngine, DatabaseRef, EngineError, EngineKind,
+    LensSpec, MigrationRequest, PseudonymKey, RelationKind, RoleKind, RoleRef, StatementMode,
+    StatementOutcome, StatementRequest, Value,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// How long a call waits for a database that is not ready (decisions 0004-27, 0004-34 f).
+pub const NOT_READY_WAIT: Duration = Duration::from_secs(10);
+/// The `Retry-After` of `503 database_not_ready`, in seconds.
+pub const RETRY_AFTER_SECONDS: u64 = 2;
+/// The longest statement (`QueryRequest.sql`, characters).
+pub const MAX_SQL_CHARS: usize = 100_000;
+/// The most parameters (`QueryRequest.params`).
+pub const MAX_PARAMS: usize = 1000;
+/// The lowest timeout a request may ask for (`QueryRequest.timeout_ms`).
+pub const MIN_TIMEOUT_MS: u64 = 100;
+
+/// What the query API works with (the field `queries` of [`super::DatabaseDeps`]).
+#[derive(Clone)]
+pub struct QueryDeps {
+    pub log: Arc<dyn QueryLogStore>,
+    /// The pseudonym keys: the engine takes the key of the database on every statement.
+    pub keys: Arc<TenantKeys>,
+    /// How long a call waits for a database that is not ready ([`NOT_READY_WAIT`]).
+    pub not_ready_wait: Duration,
+}
+
+impl QueryDeps {
+    pub fn new(log: Arc<dyn QueryLogStore>, keys: Arc<TenantKeys>) -> Self {
+        Self {
+            log,
+            keys,
+            not_ready_wait: NOT_READY_WAIT,
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------ requests
+
+/// `QueryRequest`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct QueryRequest {
+    pub sql: String,
+    #[serde(default)]
+    pub params: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub mode: Option<StatementMode>,
+    #[serde(default)]
+    pub max_rows: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub approval_id: Option<Uuid>,
+}
+
+/// The filters of `listDatabaseQueries`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListQueries {
+    pub actor: Option<Uuid>,
+    pub mode: Option<StatementMode>,
+}
+
+// -------------------------------------------------------------------------------- errors
+
+/// An error answer of the query API that the step 1 [`ErrorCode`] list has no code for
+/// (`query_failed`, `read_only_query`, `statement_not_allowed`, `database_not_ready`,
+/// `statement_timeout`, `write_grant_required`; contract `ErrorCode`), with the optional
+/// `sqlstate` of the contract's `Error` and the `Retry-After` of `503`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+    pub hint: Option<String>,
+    pub sqlstate: Option<String>,
+    /// Seconds for the `Retry-After` header.
+    pub retry_after: Option<u64>,
+}
+
+impl Problem {
+    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Problem {
+        Problem {
+            status,
+            code,
+            message: message.into(),
+            hint: None,
+            sqlstate: None,
+            retry_after: None,
+        }
+    }
+
+    fn hint(mut self, hint: impl Into<String>) -> Problem {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// The `error` object of the answer.
+    pub fn body(&self) -> serde_json::Value {
+        let mut e = serde_json::json!({ "code": self.code, "message": self.message });
+        if let Some(h) = &self.hint {
+            e["hint"] = h.clone().into();
+        }
+        if let Some(s) = &self.sqlstate {
+            e["sqlstate"] = s.clone().into();
+        }
+        serde_json::json!({ "error": e })
+    }
+
+    /// `503 database_not_ready`, hint `retry`, `Retry-After` (decision 0004-35 d).
+    pub fn not_ready() -> Problem {
+        let mut p = Problem::new(
+            503,
+            "database_not_ready",
+            "the database is not ready for queries right now; nothing ran",
+        )
+        .hint("retry");
+        p.retry_after = Some(RETRY_AFTER_SECONDS);
+        p
+    }
+
+    fn read_only() -> Problem {
+        Problem::new(
+            400,
+            "read_only_query",
+            "a read-only query cannot change data",
+        )
+        .hint("send mode write for a statement that changes data (needs edit)")
+    }
+
+    fn timeout() -> Problem {
+        Problem::new(
+            504,
+            "statement_timeout",
+            "the statement ran longer than the timeout and was cancelled",
+        )
+        .hint("make the statement cheaper, or send a smaller result (max_rows)")
+    }
+
+    fn validation(message: impl Into<String>, hint: impl Into<String>) -> Problem {
+        Problem::new(422, "validation_failed", message).hint(hint)
+    }
+
+    fn refusal(r: rules::Refusal) -> Problem {
+        let mut p = Problem::new(422, r.code.as_str(), r.message);
+        p.hint = r.hint;
+        p
+    }
+
+    fn query_failed(sqlstate: String, message: String) -> Problem {
+        let mut p = Problem::new(400, "query_failed", message);
+        p.sqlstate = Some(sqlstate);
+        p
+    }
+}
+
+/// An error of the query API: a step 1 error, or a [`Problem`].
+#[derive(Debug)]
+pub enum QueryError {
+    Core(Error),
+    Problem(Problem),
+}
+
+impl From<Error> for QueryError {
+    fn from(e: Error) -> Self {
+        QueryError::Core(e)
+    }
+}
+
+impl From<Problem> for QueryError {
+    fn from(p: Problem) -> Self {
+        QueryError::Problem(p)
+    }
+}
+
+impl QueryError {
+    /// The error code of the answer, for the query log.
+    fn code(&self) -> String {
+        match self {
+            QueryError::Core(e) => e.to_api().code.as_str().to_string(),
+            QueryError::Problem(p) => p.code.to_string(),
+        }
+    }
+
+    fn outcome(&self) -> QueryOutcome {
+        match self {
+            QueryError::Problem(p) if p.code == "statement_timeout" => QueryOutcome::Timeout,
+            _ => QueryOutcome::Error,
+        }
+    }
+
+    fn sqlstate(&self) -> Option<String> {
+        match self {
+            QueryError::Problem(p) => p.sqlstate.clone(),
+            QueryError::Core(_) => None,
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- the answers
+
+/// `ResultColumn.source`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SourceColumn {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+}
+
+/// `ResultColumn.masking`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Masking {
+    None,
+    Pseudonym,
+    Hidden,
+}
+
+/// `ResultColumn`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueryColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub data_class: DataClass,
+    pub source: Option<SourceColumn>,
+    pub masking: Masking,
+}
+
+/// `QueryResult`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueryResult {
+    pub query_id: Uuid,
+    pub mode: StatementMode,
+    pub columns: Vec<QueryColumn>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub row_count: usize,
+    pub truncated: bool,
+    pub truncated_reason: Option<&'static str>,
+    pub rows_affected: Option<u64>,
+    pub elapsed_ms: u64,
+    pub content_trust: &'static str,
+    pub restore_point_id: Option<Uuid>,
+}
+
+/// One column of `DatabaseTable.columns`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SchemaColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub nullable: bool,
+    pub data_class: DataClass,
+    pub confirmed: bool,
+}
+
+/// `DatabaseTable.foreign_keys[]`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SchemaForeignKey {
+    pub columns: Vec<String>,
+    pub references_schema: String,
+    pub references_table: String,
+    pub references_columns: Vec<String>,
+}
+
+/// `DatabaseTable`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SchemaTable {
+    pub schema: String,
+    pub name: String,
+    pub kind: RelationKind,
+    pub columns: Vec<SchemaColumn>,
+    pub primary_key: Vec<String>,
+    pub foreign_keys: Vec<SchemaForeignKey>,
+}
+
+/// `DatabaseSchema`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DatabaseSchema {
+    pub engine: EngineKind,
+    pub tables: Vec<SchemaTable>,
+}
+
+// ------------------------------------------------------------------------------- classes
+
+/// The schema of the database's own tables: `public` (Postgres) or `main` (SQLite).
+pub fn own_schema(engine: EngineKind) -> &'static str {
+    match engine {
+        EngineKind::Postgres => "public",
+        EngineKind::Sqlite => "main",
+    }
+}
+
+/// One part of a `data_classes` key: quoted as in SQL when it holds a dot or a quote.
+fn key_part(s: &str) -> String {
+    if s.contains('.') || s.contains('"') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// The `data_classes` key of a column: `<schema>.<table>.<column>`.
+pub fn class_key(schema: &str, table: &str, column: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        key_part(schema),
+        key_part(table),
+        key_part(column)
+    )
+}
+
+/// The confirmed classes of the head manifest (`data_classes`; wave decision 2). A column that
+/// is not listed is `personal` and unconfirmed.
+pub fn manifest_classes(manifest: &serde_json::Value) -> HashMap<String, DataClass> {
+    manifest
+        .get("data_classes")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let class = match v.as_str()? {
+                        "normal" => DataClass::Normal,
+                        "personal" => DataClass::Personal,
+                        "secret" => DataClass::Secret,
+                        _ => return None,
+                    };
+                    Some((k.clone(), class))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The class of a column by the manifest: `(class, confirmed)`.
+fn class_of(
+    classes: &HashMap<String, DataClass>,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> (DataClass, bool) {
+    match classes.get(&class_key(schema, table, column)) {
+        Some(c) => (*c, true),
+        None => (DataClass::Personal, false),
+    }
+}
+
+// ------------------------------------------------------------------------- the role kinds
+
+/// The role kind of a person (`docs/STEP2.md`, the kinds table): `view` reads as `read`,
+/// `edit` writes as `write`, `manage` reads as `secret_read` and writes as `owner`. `None`
+/// when the role does not allow the mode.
+pub fn person_kind(role: Option<Role>, mode: StatementMode) -> Option<RoleKind> {
+    let manage = role >= Some(Role::Manage);
+    match mode {
+        StatementMode::Read if manage => Some(RoleKind::SecretRead),
+        StatementMode::Read if role >= Some(Role::View) => Some(RoleKind::Read),
+        StatementMode::Write if manage => Some(RoleKind::Owner),
+        StatementMode::Write if role >= Some(Role::Edit) => Some(RoleKind::Write),
+        _ => None,
+    }
+}
+
+/// The role kind of an agent (wave decision 1, `provisional`): agents fail closed until card
+/// Q-2. A read runs in the `masked_read` kind; a write answers `403 write_grant_required`,
+/// because no grant check exists before cards A-1 and Q-2.
+///
+/// Card Q-2 replaces this function (the grant check of A-1's `grants::active`,
+/// `class_read_required`, the `masked_write` kind and the hint URL of the grant prompt).
+pub fn agent_kind(mode: StatementMode) -> std::result::Result<RoleKind, Problem> {
+    match mode {
+        StatementMode::Read => Ok(RoleKind::MaskedRead),
+        StatementMode::Write => Err(Problem::new(
+            403,
+            "write_grant_required",
+            "an agent writes to a live database only with a write grant (write_live) from its user",
+        )
+        .hint("ask your user to give you a write grant on this database in the Ruum web UI")),
+    }
+}
+
+/// Marks an agent's result (wave decision 1, `provisional`): until card Q-2 builds the markers
+/// by class, every cell that is not `NULL` becomes the hidden-value marker `{"$ruum": "hidden",
+/// "class": "personal"}`, and every column has the class `personal` and the masking `hidden`.
+/// The memory engine has no lens, so this is the only line that keeps real values away from an
+/// agent there.
+///
+/// Card Q-2 replaces this function.
+pub fn mark_agent_result(columns: &mut [QueryColumn], rows: &mut [Vec<serde_json::Value>]) {
+    for c in columns.iter_mut() {
+        c.data_class = DataClass::Personal;
+        c.masking = Masking::Hidden;
+    }
+    let hidden = serde_json::to_value(HiddenValue::PERSONAL).expect("a marker serializes");
+    for row in rows.iter_mut() {
+        for cell in row.iter_mut() {
+            if !cell.is_null() {
+                *cell = hidden.clone();
+            }
+        }
+    }
+}
+
+/// Which rows of the query log a caller reads (`listDatabaseQueries`): an agent only its own
+/// (also with `manage`), a person with `manage` all, a person with `view` their own and those of
+/// their own agents.
+pub fn log_visibility(actor: &Actor, role: Option<Role>) -> Result<LogVisibility> {
+    if actor.is_agent() {
+        return Ok(LogVisibility::OwnOnly(actor.actor.id));
+    }
+    if role >= Some(Role::Manage) {
+        return Ok(LogVisibility::All);
+    }
+    let user = actor.effective_user().ok_or_else(Error::user_required)?;
+    Ok(LogVisibility::OwnAndAgentsOf(user))
+}
+
+// ------------------------------------------------------------------------------- values
+
+/// A JSON parameter as an engine value. Numbers that fit an `i64` are integers; others are
+/// floats, or decimal text when they do not fit a float either.
+pub fn param_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+            (Some(i), _) => Value::Int(i),
+            (None, Some(f)) if n.is_f64() => Value::Float(f),
+            _ => Value::Numeric(n.to_string()),
+        },
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Array(a) => Value::Array(a.iter().map(param_value).collect()),
+        serde_json::Value::Object(_) => Value::Json(v.clone()),
+    }
+}
+
+/// The largest integer that a JSON number (a double) holds exactly.
+const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+
+/// An engine value as a result cell (`QueryCell`): numbers beyond a double as strings, bytes as
+/// base64, times as RFC 3339; a JSON object with the key `$ruum` wrapped as a `LiteralValue`.
+pub fn cell_value(v: &Value) -> serde_json::Value {
+    use base64::Engine as _;
+    use serde_json::Value as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Int(i) if (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(i) => J::from(*i),
+        Value::Int(i) => J::String(i.to_string()),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(J::Number)
+            .unwrap_or_else(|| {
+                J::String(if f.is_nan() {
+                    "NaN".into()
+                } else if *f > 0.0 {
+                    "Infinity".into()
+                } else {
+                    "-Infinity".into()
+                })
+            }),
+        Value::Numeric(s) | Value::Text(s) => J::String(s.clone()),
+        Value::Bytes(b) => J::String(base64::engine::general_purpose::STANDARD.encode(b)),
+        Value::Json(j) => wrap_literals(j),
+        Value::Timestamp(t) => J::String(
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        ),
+        Value::Date(d) => J::String(d.to_string()),
+        Value::Uuid(u) => J::String(u.hyphenated().to_string()),
+        Value::Array(items) => J::Array(items.iter().map(cell_value).collect()),
+    }
+}
+
+/// A JSON value of the database as a cell: an object with the key `$ruum` is wrapped, also an
+/// element of an array (so no element is ever read as a marker).
+fn wrap_literals(j: &serde_json::Value) -> serde_json::Value {
+    match j {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(wrap_literals).collect())
+        }
+        other => LiteralValue::cell(other.clone()),
+    }
+}
+
+// --------------------------------------------------------------------- engine errors
+
+/// The fixed text of a SQLSTATE for agents and people without `manage` (decision 0004-8).
+fn fixed_text(sqlstate: &str) -> &'static str {
+    match sqlstate {
+        "23505" => "a unique constraint was violated",
+        "23503" => "a foreign key constraint was violated",
+        "23502" => "a not-null constraint was violated",
+        "23514" => "a check constraint was violated",
+        "42P01" => "the table or view does not exist",
+        "42703" => "the column does not exist",
+        "42883" => "the function or operator does not exist",
+        "42601" => "the statement has a syntax error",
+        "42501" => "permission denied",
+        "42P07" => "the table, view or index exists already",
+        "42701" => "the column exists already",
+        "42804" => "a value has the wrong type",
+        "22012" => "division by zero",
+        "25006" => "a read-only query cannot change data",
+        s if s.starts_with("23") => "an integrity constraint was violated",
+        s if s.starts_with("22") => "a value is not valid for its type",
+        s if s.starts_with("40") => "the transaction could not finish; retry",
+        s if s.starts_with("42") => "the statement is not valid for this database",
+        s if s.starts_with("53") || s.starts_with("54") => {
+            "the statement needs more resources than the database allows"
+        }
+        _ => "the statement failed",
+    }
+}
+
+/// The SQLSTATEs whose engine text names objects only (never values), so the names may be
+/// shown next to the fixed text.
+const NAMES_ALLOWED: &[&str] = &[
+    "23505", "23503", "23502", "23514", "23000", "42P01", "42703", "42883", "42P07", "42701",
+];
+
+/// A name taken from engine text: identifier characters only.
+fn is_plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+}
+
+/// The object names of an engine message, for the SQLSTATEs of [`NAMES_ALLOWED`]: the parts in
+/// double quotes (Postgres), or the names after the colon (SQLite).
+fn object_names(sqlstate: &str, message: &str) -> Vec<String> {
+    if !NAMES_ALLOWED.contains(&sqlstate) {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = message
+        .split('"')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s.to_string())
+        .collect();
+    if names.is_empty()
+        && let Some((_, rest)) = message.rsplit_once(": ")
+    {
+        names = rest.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    names.retain(|n| is_plain_name(n));
+    names.dedup();
+    names
+}
+
+/// The nearest SQLSTATE of a SQLite error (the result code name and the message).
+fn sqlite_sqlstate(code: &str, message: &str) -> &'static str {
+    let m = message.to_ascii_lowercase();
+    if m.contains("unique constraint failed") {
+        "23505"
+    } else if m.contains("not null constraint failed") {
+        "23502"
+    } else if m.contains("foreign key constraint failed") {
+        "23503"
+    } else if m.contains("check constraint failed") {
+        "23514"
+    } else if code == "ConstraintViolation" {
+        "23000"
+    } else if m.contains("no such table") {
+        "42P01"
+    } else if m.contains("no such column") {
+        "42703"
+    } else if m.contains("no such function") {
+        "42883"
+    } else if m.contains("syntax error") {
+        "42601"
+    } else if m.contains("already exists") {
+        "42P07"
+    } else if code == "TypeMismatch" || m.contains("datatype mismatch") {
+        "42804"
+    } else if code == "TooBig" {
+        "54000"
+    } else if code == "Unknown" {
+        "42000"
+    } else {
+        "XX000"
+    }
+}
+
+/// Whether a code is a SQLSTATE (`^[0-9A-Z]{5}$`).
+fn is_sqlstate(code: &str) -> bool {
+    code.len() == 5
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+}
+
+/// The answer of an engine error. `manage`: the caller may read the engine's text.
+fn engine_problem(e: EngineError, manage: bool) -> QueryError {
+    let failed = |sqlstate: String, engine_text: String| {
+        let message = if manage {
+            engine_text
+        } else {
+            let names = object_names(&sqlstate, &engine_text);
+            let fixed = fixed_text(&sqlstate);
+            if names.is_empty() {
+                fixed.to_string()
+            } else {
+                format!("{fixed}: {}", names.join(", "))
+            }
+        };
+        QueryError::Problem(Problem::query_failed(sqlstate, message))
+    };
+    match e {
+        EngineError::ReadOnly => Problem::read_only().into(),
+        EngineError::Timeout => Problem::timeout().into(),
+        EngineError::NotReady => Problem::not_ready().into(),
+        EngineError::MultipleStatements => Problem::validation(
+            "send one statement per call",
+            "/sql: send each statement in its own call",
+        )
+        .into(),
+        EngineError::StatementNotAllowed(rule) => Problem::new(
+            422,
+            "statement_not_allowed",
+            format!("the engine refused the statement: {rule}"),
+        )
+        .into(),
+        EngineError::TransactionEnded => Problem::new(
+            422,
+            "statement_not_allowed",
+            "the statement ended the transaction of the call",
+        )
+        .hint(rules::HINT_TRANSACTION_CONTROL)
+        .into(),
+        EngineError::PermissionDenied(text) => failed("42501".into(), text),
+        EngineError::Sql { code, message } => {
+            let sqlstate = if is_sqlstate(&code) {
+                code
+            } else {
+                sqlite_sqlstate(&code, &message).to_string()
+            };
+            failed(sqlstate, message)
+        }
+        EngineError::MigrationFailed(inner) => engine_problem(*inner, manage),
+        EngineError::Unsupported(_) => Problem::validation(
+            "this engine does not support a value or a feature of the statement",
+            "/params: send numbers, strings, booleans or null",
+        )
+        .into(),
+        other => QueryError::Core(Error::Internal(format!("engine: {other}"))),
+    }
+}
+
+// -------------------------------------------------------------------- schema changes
+
+/// The interim catalog sync of a person's schema change (wave decision 3, `provisional`): the
+/// lens takes each column's class from the head manifest's `data_classes`; every other column
+/// of the database's own schema is `personal`. It records nothing (card K-1's sync keeps
+/// `database_columns`).
+pub struct ManifestClassSync {
+    pub engine: EngineKind,
+    pub classes: HashMap<String, DataClass>,
+}
+
+#[async_trait]
+impl CatalogSync for ManifestClassSync {
+    async fn sync(&self, catalog: &Catalog) -> std::result::Result<LensSpec, EngineError> {
+        let schema = own_schema(self.engine);
+        let columns = catalog
+            .tables
+            .iter()
+            .filter(|t| t.schema == schema)
+            .flat_map(|t| {
+                t.columns.iter().map(move |c| {
+                    let (class, _) = class_of(&self.classes, &t.schema, &t.name, &c.name);
+                    (
+                        ruum_dbengine::ColumnRef {
+                            schema: t.schema.clone(),
+                            table: t.name.clone(),
+                            column: c.name.clone(),
+                        },
+                        class,
+                    )
+                })
+            })
+            .collect();
+        Ok(LensSpec { columns })
+    }
+}
+
+/// The catalog sync of [`run_schema_change`]. The integrator replaces this one function by
+/// card K-1's sync after both cards merge (wave decision 3).
+pub fn interim_catalog_sync(engine: EngineKind, manifest: &serde_json::Value) -> ManifestClassSync {
+    ManifestClassSync {
+        engine,
+        classes: manifest_classes(manifest),
+    }
+}
+
+/// A person's schema change through `queryDatabase` (wave decision 3): the engine's migration
+/// path (drop the lens views, run in an `owner` session, sync the catalog, rebuild the views),
+/// not `execute`. No `database_migrations` row and no restore point (cards D-2 and D-4).
+///
+/// This is the one call site of the interim catalog sync.
+pub async fn run_schema_change(
+    engine: &dyn DatabaseEngine,
+    db: &DatabaseRef,
+    key: &PseudonymKey,
+    kind: EngineKind,
+    manifest: &serde_json::Value,
+    sql: &str,
+    timeout: Duration,
+) -> std::result::Result<(), EngineError> {
+    let sync = interim_catalog_sync(kind, manifest);
+    let request = MigrationRequest {
+        up: sql.to_string(),
+        timeout,
+        dry_run: false,
+    };
+    match engine.apply_migration(db, key, &request, &sync).await {
+        Ok(_) => Ok(()),
+        // `up` is committed, but the lens is not rebuilt: try once more. The lens kinds fail
+        // closed until a rebuild works.
+        Err(EngineError::CatalogSync(first)) => {
+            if let Err(e) = engine.sync_lens(db, key, &sync).await {
+                tracing::warn!(
+                    tenant = %db.tenant_id,
+                    node = %db.node_id,
+                    first = %first,
+                    error = %e,
+                    "the lens was not rebuilt after a schema change"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// --------------------------------------------------------------------------- the calls
+
+/// What a call wrote into the query log.
+struct LogDraft {
+    mode: StatementMode,
+    statement: String,
+    statement_hash: [u8; 32],
+    params: Vec<serde_json::Value>,
+}
+
+/// The database row, its manifest and the caller's view of it, once the caller may see it.
+struct Target {
+    row: Option<DatabaseRow>,
+    manifest: serde_json::Value,
+    role: Option<Role>,
+    trashed: bool,
+}
+
+async fn target(svc: &DatabaseService, ctx: &Context, id: NodeId) -> Result<Target> {
+    refuse_share_link(ctx)?;
+    let d = svc.deps();
+    let node = svc.database_node(ctx, id).await?;
+    authz::require(&*d.authz, &*d.nodes, ctx, id, Role::View).await?;
+    let typed = svc.typed_row(ctx.tenant, id).await?;
+    let manifest = d
+        .store
+        .manifest(ctx.tenant, typed.desired_version)
+        .await?
+        .ok_or_else(|| Error::Internal(format!("database {id} has no manifest")))?;
+    let row = d.store.get(ctx.tenant, id).await?;
+    Ok(Target {
+        row,
+        manifest,
+        role: node.my_role,
+        trashed: node.trashed_at.is_some(),
+    })
+}
+
+/// The engine kind of a database: by its row, else by its manifest.
+fn engine_kind(t: &Target) -> EngineKind {
+    match &t.row {
+        Some(r) => r.engine,
+        None => match t.manifest.get("engine").and_then(|e| e.as_str()) {
+            Some("sqlite") => EngineKind::Sqlite,
+            _ => EngineKind::Postgres,
+        },
+    }
+}
+
+/// Waits until the database answers queries of `kind` (see the module docs, step 7), and
+/// returns its row.
+async fn wait_ready(
+    svc: &DatabaseService,
+    tenant: TenantId,
+    id: NodeId,
+    trashed: bool,
+    owner: bool,
+) -> std::result::Result<DatabaseRow, QueryError> {
+    if trashed {
+        return Err(in_trash().into());
+    }
+    let d = svc.deps();
+    let deadline = Instant::now() + d.queries.not_ready_wait;
+    loop {
+        let typed = svc.typed_row(tenant, id).await?;
+        let state = DatabaseStatus::of(&typed, false).state;
+        let serving = match state {
+            ProviderState::Ready | ProviderState::Degraded => true,
+            ProviderState::Updating => owner,
+            ProviderState::Provisioning => false,
+            ProviderState::Suspended | ProviderState::Failed | ProviderState::Deleted => {
+                return Err(Error::Api(
+                    ApiError::new(ErrorCode::Conflict, "the database does not answer queries")
+                        .with_hint("see the status of the database (getDatabase)"),
+                )
+                .into());
+            }
+        };
+        if serving && let Some(row) = d.store.get(tenant, id).await? {
+            return Ok(row);
+        }
+        if Instant::now() >= deadline {
+            return Err(Problem::not_ready().into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `queryDatabase`. See the module docs.
+pub async fn query(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+    req: QueryRequest,
+) -> std::result::Result<QueryResult, QueryError> {
+    let t = target(svc, ctx, id).await?;
+    let mode = req.mode.unwrap_or(StatementMode::Read);
+    let engine = engine_kind(&t);
+    let too_long = req.sql.chars().count() > MAX_SQL_CHARS;
+    let analysis = if too_long {
+        rules::Analysis {
+            verdict: Err(rules::Refusal {
+                code: rules::RefusalCode::ValidationFailed,
+                message: format!("the statement is longer than {MAX_SQL_CHARS} characters"),
+                hint: Some("/sql: send a shorter statement".into()),
+            }),
+            normalized: rules::UNPARSED.to_string(),
+        }
+    } else {
+        let sql = req.sql.clone();
+        tokio::task::spawn_blocking(move || rules::analyze(engine, &sql))
+            .await
+            .map_err(|e| Error::Internal(format!("the statement check stopped: {e}")))?
+    };
+    let draft = LogDraft {
+        mode,
+        statement: analysis.normalized.clone(),
+        statement_hash: *blake3::hash(req.sql.as_bytes()).as_bytes(),
+        params: QueryLogEntry::hide_params(&req.params),
+    };
+    let started = Instant::now();
+    let result = run(svc, ctx, id, &t, engine, mode, &req, analysis.verdict).await;
+    let elapsed = started.elapsed();
+    let query_id = Uuid::now_v7();
+    if t.row.is_some() {
+        write_log(svc, ctx, id, query_id, draft, &result, elapsed).await?;
+    }
+    let (columns, rows, truncated_reason, rows_affected) = result?;
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    Ok(QueryResult {
+        query_id,
+        mode,
+        row_count: rows.len(),
+        truncated: truncated_reason.is_some(),
+        truncated_reason,
+        rows_affected,
+        elapsed_ms,
+        content_trust: "untrusted",
+        restore_point_id: None,
+        columns,
+        rows,
+    })
+}
+
+type RunOutput = (
+    Vec<QueryColumn>,
+    Vec<Vec<serde_json::Value>>,
+    Option<&'static str>,
+    Option<u64>,
+);
+
+#[allow(clippy::too_many_arguments)]
+async fn run(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+    t: &Target,
+    engine: EngineKind,
+    mode: StatementMode,
+    req: &QueryRequest,
+    verdict: std::result::Result<rules::StatementKind, rules::Refusal>,
+) -> std::result::Result<RunOutput, QueryError> {
+    let d = svc.deps();
+    let is_agent = ctx.actor.is_agent();
+    let manage = !is_agent && t.role >= Some(Role::Manage);
+    // 2. The right for the mode.
+    if mode == StatementMode::Write {
+        authz::require(&*d.authz, &*d.nodes, ctx, id, Role::Edit).await?;
+    }
+    // 3. Agents (wave decision 1).
+    let kind = if is_agent {
+        agent_kind(mode)?
+    } else {
+        person_kind(t.role, mode).ok_or_else(Error::permission_denied)?
+    };
+    // 4. The request limits, then the statement rules.
+    if req.params.len() > MAX_PARAMS {
+        return Err(Problem::validation(
+            format!("at most {MAX_PARAMS} parameters"),
+            "/params: send fewer parameters",
+        )
+        .into());
+    }
+    if req.max_rows == Some(0) {
+        return Err(Problem::validation("max_rows is at least 1", "/max_rows").into());
+    }
+    if req.timeout_ms.is_some_and(|ms| ms < MIN_TIMEOUT_MS) {
+        return Err(Problem::validation(
+            format!("timeout_ms is at least {MIN_TIMEOUT_MS}"),
+            "/timeout_ms",
+        )
+        .into());
+    }
+    if req.approval_id.is_some() {
+        return Err(Problem::validation(
+            "approvals of statements are not available yet",
+            "/approval_id: leave it out",
+        )
+        .into());
+    }
+    if req.sql.trim().is_empty() {
+        return Err(Problem::validation("sql is empty", "/sql: send one SQL statement").into());
+    }
+    let statement = verdict.map_err(Problem::refusal)?;
+    // 5. Read mode.
+    if mode == StatementMode::Read && statement != rules::StatementKind::Read {
+        return Err(Problem::read_only().into());
+    }
+    // 7. Ready.
+    let row = wait_ready(svc, ctx.tenant, id, t.trashed, kind == RoleKind::Owner).await?;
+    let engine_impl = d
+        .engines
+        .get(row.engine)
+        .ok_or_else(|| Error::Internal("the engine of the database is gone".into()))?;
+    let key = d
+        .queries
+        .keys
+        .engine_key(ctx.tenant, row.key_node_id)
+        .await?;
+    let s = d.settings;
+    let timeout_ms = req
+        .timeout_ms
+        .map_or(s.statement_timeout_ms, |ms| ms.min(s.statement_timeout_ms));
+    let max_rows = req.max_rows.map_or(s.max_rows, |n| n.min(s.max_rows));
+    let timeout = Duration::from_millis(timeout_ms);
+    // 8. A schema change by a person with manage: the migration path.
+    if statement == rules::StatementKind::SchemaChange && kind == RoleKind::Owner {
+        if !req.params.is_empty() {
+            return Err(Problem::validation(
+                "a schema change takes no parameters",
+                "/params: leave them out",
+            )
+            .into());
+        }
+        run_schema_change(
+            &**engine_impl,
+            &row.database_ref(),
+            &key,
+            engine,
+            &t.manifest,
+            &req.sql,
+            timeout,
+        )
+        .await
+        .map_err(|e| engine_problem(e, manage))?;
+        return Ok((Vec::new(), Vec::new(), None, None));
+    }
+    let role = RoleRef::new(row.database_ref(), kind)
+        .map_err(|e| Error::Internal(format!("role: {e}")))?;
+    let request = StatementRequest {
+        sql: req.sql.clone(),
+        params: req.params.iter().map(param_value).collect(),
+        mode,
+        timeout,
+        max_rows,
+        max_bytes: u64::try_from(s.max_result_bytes).ok(),
+    };
+    let out = engine_impl
+        .execute(&role, &key, &request)
+        .await
+        .map_err(|e| engine_problem(e, manage))?;
+    Ok(shape(out, max_rows, &t.manifest, is_agent, manage))
+}
+
+/// The result of the engine as the answer: columns with class and masking, cells as JSON.
+fn shape(
+    out: StatementOutcome,
+    max_rows: u64,
+    manifest: &serde_json::Value,
+    is_agent: bool,
+    manage: bool,
+) -> RunOutput {
+    let classes = manifest_classes(manifest);
+    let mut columns: Vec<QueryColumn> = out
+        .columns
+        .iter()
+        .map(|c| {
+            let data_class = match &c.source {
+                Some(s) => class_of(&classes, &s.schema, &s.table, &s.column).0,
+                // The server cannot tell which columns an expression reads.
+                None => DataClass::Personal,
+            };
+            QueryColumn {
+                name: c.name.clone(),
+                type_name: c.type_name.clone(),
+                data_class,
+                source: c.source.as_ref().map(|s| SourceColumn {
+                    schema: s.schema.clone(),
+                    table: s.table.clone(),
+                    column: s.column.clone(),
+                }),
+                masking: Masking::None,
+            }
+        })
+        .collect();
+    let mut rows: Vec<Vec<serde_json::Value>> = out
+        .rows
+        .iter()
+        .map(|r| r.iter().map(cell_value).collect())
+        .collect();
+    if is_agent {
+        mark_agent_result(&mut columns, &mut rows);
+    } else if !manage {
+        // A person without manage never sees a secret value (the nosecret lens masks it in
+        // the engine; the result shows the marker).
+        let secret = serde_json::to_value(HiddenValue::SECRET).expect("a marker serializes");
+        for (i, c) in columns.iter_mut().enumerate() {
+            if c.data_class == DataClass::Secret {
+                c.masking = Masking::Hidden;
+                for row in rows.iter_mut() {
+                    if let Some(cell) = row.get_mut(i)
+                        && !cell.is_null()
+                    {
+                        *cell = secret.clone();
+                    }
+                }
+            }
+        }
+    }
+    let reason = if rows.len() as u64 >= max_rows {
+        "max_rows"
+    } else {
+        "max_result_bytes"
+    };
+    let truncated_reason = out.truncated.then_some(reason);
+    (columns, rows, truncated_reason, out.rows_affected)
+}
+
+async fn write_log(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+    query_id: Uuid,
+    draft: LogDraft,
+    result: &std::result::Result<RunOutput, QueryError>,
+    elapsed: Duration,
+) -> Result<()> {
+    let (outcome, error_code, sqlstate, row_count, rows_affected, truncated) = match result {
+        Ok((_, rows, reason, affected)) => (
+            QueryOutcome::Ok,
+            None,
+            None,
+            i32::try_from(rows.len()).ok(),
+            affected.and_then(|n| i64::try_from(n).ok()),
+            reason.is_some(),
+        ),
+        Err(e) => (e.outcome(), Some(e.code()), e.sqlstate(), None, None, false),
+    };
+    let entry = QueryLogEntry {
+        id: query_id,
+        tenant_id: ctx.tenant,
+        node_id: id,
+        mode: draft.mode,
+        statement: draft.statement,
+        statement_hash: draft.statement_hash,
+        params: draft.params,
+        outcome,
+        error_code,
+        sqlstate,
+        row_count,
+        rows_affected,
+        truncated,
+        elapsed_ms: i32::try_from(elapsed.as_millis()).ok(),
+        grant_id: None,
+        approval_id: None,
+        by: ctx.actor,
+        at: crate::now(),
+    };
+    svc.deps().queries.log.insert(&entry).await
+}
+
+/// `getDatabaseSchema`. See the module docs.
+pub async fn schema(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+) -> std::result::Result<DatabaseSchema, QueryError> {
+    let t = target(svc, ctx, id).await?;
+    let row = wait_ready(svc, ctx.tenant, id, t.trashed, false).await?;
+    let engine = svc
+        .deps()
+        .engines
+        .get(row.engine)
+        .ok_or_else(|| Error::Internal("the engine of the database is gone".into()))?;
+    let catalog = engine
+        .catalog(&row.database_ref())
+        .await
+        .map_err(|e| match e {
+            EngineError::NotReady => QueryError::Problem(Problem::not_ready()),
+            other => QueryError::Core(Error::Internal(format!("catalog: {other}"))),
+        })?;
+    Ok(schema_of(row.engine, &catalog, &t.manifest))
+}
+
+/// The catalog as `DatabaseSchema`: the database's own schema only, classes by the manifest.
+pub fn schema_of(
+    engine: EngineKind,
+    catalog: &Catalog,
+    manifest: &serde_json::Value,
+) -> DatabaseSchema {
+    let own = own_schema(engine);
+    let classes = manifest_classes(manifest);
+    let tables = catalog
+        .tables
+        .iter()
+        .filter(|t| t.schema == own && !t.name.to_ascii_lowercase().starts_with("ruum_"))
+        .map(|t| SchemaTable {
+            schema: t.schema.clone(),
+            name: t.name.clone(),
+            kind: t.kind,
+            columns: t
+                .columns
+                .iter()
+                .map(|c| {
+                    let (data_class, confirmed) = class_of(&classes, &t.schema, &t.name, &c.name);
+                    SchemaColumn {
+                        name: c.name.clone(),
+                        type_name: c.data_type.clone(),
+                        nullable: c.nullable,
+                        data_class,
+                        confirmed,
+                    }
+                })
+                .collect(),
+            primary_key: t.primary_key.clone(),
+            foreign_keys: t
+                .foreign_keys
+                .iter()
+                .map(|f| SchemaForeignKey {
+                    columns: f.columns.clone(),
+                    references_schema: f.references_schema.clone(),
+                    references_table: f.references_table.clone(),
+                    references_columns: f.references_columns.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    DatabaseSchema { engine, tables }
+}
+
+/// `listDatabaseQueries`. See the module docs.
+pub async fn list_queries(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+    filter: ListQueries,
+    page: PageRequest,
+) -> Result<Page<QueryLogEntry>> {
+    let t = target(svc, ctx, id).await?;
+    let filter = LogFilter {
+        visibility: log_visibility(&ctx.actor, t.role)?,
+        actor: filter.actor,
+        mode: filter.mode,
+    };
+    svc.deps()
+        .queries
+        .log
+        .list(ctx.tenant, id, &filter, page)
+        .await
+}
+
+#[cfg(test)]
+mod tests;

@@ -2853,6 +2853,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "similar",
+ "sqlparser",
  "sqlx",
  "thiserror",
  "time",
@@ -3285,6 +3286,15 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
+name = "sqlparser"
+version = "0.63.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3679862809bd1f92e563cf6fd820e28f39135303668001c10331d5027183e8b4"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "sqlx"

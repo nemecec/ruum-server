@@ -2966,6 +2966,7 @@ mod tests {
             columns: w.s.databases.deps().columns.clone(),
             masking: w.s.databases.deps().masking.clone(),
             grants: w.s.databases.deps().grants.clone(),
+            queries: Arc::new(crate::databases::query::MemoryQueryLog::new()),
         };
         install(&mut w.s, parts).unwrap();
         let a = ctx(w.team.id, w.alice);

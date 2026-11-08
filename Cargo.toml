@@ -77,6 +77,11 @@ blake3 = "1.8.7"
 # sqlx, never built) asks for libsqlite3-sys < 0.38, and Cargo allows one `sqlite3` only: see the patch below.
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "hooks", "functions", "limits", "backup", "column_metadata", "column_decltype"] }
 fastcdc = "5.0.0"
+# The SQL parser of the query API (cards Q-1 and A-2; decision 0004-36): one statement per call,
+# the statements that never run, the literals of the query log. Dialects PostgreSqlDialect and
+# SQLiteDialect. `std` only: no `recursive-protection` (the parser's own recursion limit bounds
+# the depth of an untrusted statement, and the query layer parses on a thread with a large stack).
+sqlparser = { version = "0.63.0", default-features = false, features = ["std"] }
 zstd = "0.14.3"
 
 # Diff plugins (section 5.4). The Wasm plugin runtime is wasmtime.

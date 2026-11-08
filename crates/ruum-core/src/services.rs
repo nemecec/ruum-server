@@ -181,6 +181,7 @@ impl Services {
                 journal.clone(),
                 typed.clone(),
             )),
+            queries: Arc::new(crate::databases::query::MemoryQueryLog::new()),
         };
         let (providers, databases) =
             build_databases(nodes.clone(), authz.clone(), tenants.clone(), &parts)
