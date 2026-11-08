@@ -14,6 +14,8 @@ are the input for UI task cards and the reference for the UX review panel.
 | [ia.md](ia.md) | Navigation, URLs and the names of things (one word per concept). |
 | [design-system.md](design-system.md) | Tokens (colour, type, spacing, radius, motion) and components with states and accessibility rules. |
 | [copy.md](copy.md) | UI copy rules and the exact copy of main messages, errors and empty states. |
+| [glossary.md](glossary.md) | The approved English terms and the do-not-translate list, for translators. |
+| [i18n.md](i18n.md) | How the UI is localised, and the context for translators (description, tone and length of every message). |
 | [agent-experience.md](agent-experience.md) | Rules for MCP tool names and descriptions, CLI output and error hints. |
 | [gap-analysis.md](gap-analysis.md) | Where the UI on `main` differs from this design, as prioritised task cards. |
 | [decisions.md](decisions.md) | What the UX fix round (`q/uxfix`) did per card, its decisions, and the new contract needs C-7 to C-11. |

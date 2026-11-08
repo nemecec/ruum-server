@@ -5,6 +5,13 @@ main messages, errors and empty states. UI task cards copy these strings word fo
 for things follow `ia.md` (one word per concept). Agent-facing text (MCP, CLI, API hints) is in
 `agent-experience.md`.
 
+Where the words live: the catalogue `web/src/locales/en.json` holds the English source of every
+UI string, and `web/src/locales/context/en.json` holds each message's description, tone and length
+budget for translators (`i18n.md`, "Context for translators"). The approved terms and the
+do-not-translate list are in `glossary.md`. When this page and the catalogue differ, fix the one
+that is wrong in the same change; the copywriter reviews every change that touches text (design
+18.4).
+
 ## 1. Voice
 
 **Informal and playful, never official or corporate** (decided by the person, 2026-11-08; for every
@@ -15,6 +22,20 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
   light joke or a friendly word is welcome there.
 - **Calm and exact where something is at stake**: errors that can lose data, security, money and
   billing, legal texts, deleting for good. No jokes there; say what happened and what to do.
+
+- **Which tone where.** Each message carries its tone in the context file: `playful` (empty
+  states, welcome, success toasts, small nudges), `neutral` (labels, buttons, headings, lists) or
+  `calm` (errors, security, sign-in, access, money and plans, deleting for good, legal). A playful
+  line still says the facts: "Plenty of room here. Drop files in, or upload them." A calm line has
+  no joke and no exclamation mark: "You can't undo this. Its versions are deleted too."
+
+| Playful (nothing at stake) | Calm (something at stake) |
+|---|---|
+| Folder Invoices is ready for your files. | Delete plan.pdf for good? You can't undo this. |
+| You're in! Welcome to Pärn Studio. | Copy the key now. Ruum shows it only once. |
+| Claude Desktop is back at work. | Paused Claude Desktop. |
+| Nothing to clean up. Items you move to the trash stay here for a while, so you can bring them back. | Items stay in the trash for 30 days. Then they are deleted for good. |
+| Changed your mind? Ruum keeps every change as a version, so you can always go back. | The migration failed. Nothing changed. |
 
 - **Plain English** (CLAUDE.md, "Writing"; ASD-STE100 in spirit): short sentences (at most 20
   words in instructions), active voice, present tense, common words.
@@ -63,19 +84,19 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Sign in, title | Sign in to Ruum |
 | Sign in, subtitle | Your files, with every version kept, and AI agents that work where you let them. |
 | Buttons | Continue with Google / Continue with Microsoft / Sign in with a passkey |
-| Under the buttons | New to Ruum? Signing in creates your personal space. |
-| Signed out | You're signed out. |
+| Under the buttons | New here? Signing in makes your account and a personal space, all in one go. |
+| Signed out | You're signed out. See you soon. |
 | Cancelled | Sign-in was cancelled. Try again or pick another way to sign in. |
-| Provider failed | Sign-in didn't work. Try again, or pick another way to sign in. |
+| Provider failed | Sign-in didn't work (*code*). Try again, or pick another way to sign in. |
 | Welcome card, title | Welcome to Ruum, *first name* |
-| Welcome card, points | Upload files and folders, from any device. / Every change is kept as a version, so you can go back. / Connect an AI agent that works for you, only in the folders you choose. |
+| Welcome card, points | Bring your files: upload them from any device, or drop them right on a folder. / Changed your mind? Ruum keeps every change as a version, so you can always go back. / Get a helper: connect an AI agent that works for you, only in the folders you choose. |
 | Welcome card, buttons | Upload files / Connect an agent / Close |
 
 ### 3.2 Files
 
 | Where | Copy |
 |---|---|
-| Toast, folder created | Folder *Name* created. |
+| Toast, folder created | Folder *Name* is ready for your files. |
 | Toast, uploaded | Uploaded *name*. / Uploaded 12 files to *Folder*. |
 | Toast, uploaded with failures | Uploaded 10 files. 2 didn't upload. [Show] |
 | Toast, renamed | Renamed to *New name*. |
@@ -130,7 +151,7 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Retention note | Versions older than 30 days are removed on your plan. Named versions are kept forever. |
 | Compare header | Compare versions / From / To / Compare as |
 | Summary | 3 added, 1 removed, 2 changed |
-| Same | These versions are the same. |
+| Same | Nothing changed between these versions. |
 | Cannot compare | These files can't be compared line by line. [Download both] |
 | Truncated | Only the first 500 changes are shown. Download both versions to see all. |
 | Restore, confirm | Title: Restore the version of 5 Nov, 14:00? Body: It becomes the current version. The version you have now stays in Versions. Button: Restore |
@@ -172,13 +193,13 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Where | Copy |
 |---|---|
 | Start a team | Title: Start a team space. Label: Team name. Body: You'll be the owner. You can invite people next. Button: Create team space |
-| Team ready | *Team* is ready. Invite the people you work with. [Invite people] |
+| Team ready | *Team* is ready! Now invite the people you work with. [Invite people] |
 | Invite form | Emails / One or more, separated by commas / Role / Message (optional) / Send invitations |
 | Member roles | Owner: everything, including billing and deleting the space / Admin: manage members, sharing rules and all agents / Member: work with everything in the team space / Guest: only what is shared with them |
-| Invite toast | Invitation sent to *email*. / 3 invitations sent. |
+| Invite toast | Invitation on its way to *email*. / 3 invitations are on their way. |
 | Invitation row | Invited, waiting. Ends 13 Nov 2026. [Cancel invitation] |
 | Accept page | *Person* invited you to *Space*. / Sign in to join. / [Join *Space*] |
-| Joined | You've joined *Space*. |
+| Joined | You're in! Welcome to *Space*. |
 | Remove member, confirm | Title: Remove *Name* from *Space*? Body: They lose access to everything in this space at once. Their 2 agents are paused, their 3 links are turned off, and their app passwords stop working. Their files stay. Button: Remove *Name* |
 | Last owner | A space needs at least one owner. |
 | Sharing rules | Allow links / Allow links that can edit / Links end after at most (days) / Allow guests / Members can share |
@@ -189,7 +210,7 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 |---|---|
 | Intro | Items stay in the trash for 30 days. Then Ruum deletes them for good. |
 | Intro, admin | Admins can restore items for 60 days. |
-| Restore toast | Restored *name* to *Folder*. [Show] |
+| Restore toast | *name* is back in *Folder*. [Show] |
 | Delete for good, confirm | Title: Delete *name* for good? Body: You can't undo this. Its versions are deleted too. Button: Delete for good |
 | Empty trash, confirm | Title: Delete 12 items for good? Body: Everything in the trash is deleted, with its versions. You can't undo this. Button: Delete 12 items for good |
 | Empty toast | Deleted 12 items for good. |
@@ -404,7 +425,7 @@ and the request ID.
 | `permission_denied` | You don't have access to do this. Ask *owner name* or an admin of *Space*. | Close |
 | `scope_exceeded` | (agents only; never shown to people) | |
 | `user_required` | (agents only; never shown to people) | |
-| `not_found` | This item is not here any more. It may have been moved or deleted. | Go to Files |
+| `not_found` | This item isn't here any more. Someone may have moved or deleted it. | Go to Files |
 | `conflict` | This changed while you were working on it. Refresh to see the newest version, then try again. | Refresh |
 | `name_taken` | There's already an item called *Name* here. Pick another name. | Under the field |
 | `version_mismatch`, `precondition_failed` | Someone else changed *name* a moment ago. Refresh to see their change. | Refresh |
@@ -438,24 +459,24 @@ Never show a stack trace, an HTTP status number or an internal path to people.
 
 | Place | Title | Text | Action |
 |---|---|---|---|
-| Files (top), can edit | Your files go here | Upload files or make folders. Every change is kept as a version. | Upload files / New folder |
-| Folder, can edit | This folder is empty | Drop files here, or upload them. | Upload files / New folder |
+| Files (top), can edit | Your files go here | Upload files or make a folder to get started. Ruum keeps every change as a version, so nothing gets lost. | Upload files / New folder |
+| Folder, can edit | This folder is empty | Plenty of room here. Drop files in, or upload them. | Upload files / New folder |
 | Folder, view only | This folder is empty | | |
 | Guest home | Shared with you in *Space* | You see only what people in *Space* shared with you. Nothing yet. | |
-| Shared with me | Nothing shared with you yet | When someone shares a file or folder with you, it shows up here. | |
-| Trash | The trash is empty | Items you move to the trash stay here for 30 days. | |
-| Search, no results | Nothing called "*q*" | Check the spelling, or search for part of the name. | Search all of *Space* (when inside a folder) |
-| Versions, one only | This is the only version | Ruum keeps a new version each time the file changes. | |
+| Shared with me | Nothing shared with you yet | When someone shares a file or folder with you, it lands here. | |
+| Trash | The trash is empty | Nothing to clean up. Items you move to the trash stay here for a while, so you can bring them back. | |
+| Search, no results | Nothing matches "*q*" | Check the spelling, or try part of the name. | Search all of *Space* (when inside a folder) |
+| Versions, one only | This is the only version | Ruum keeps a new version each time the file changes, so its history starts here. | |
 | Tags on an item | No tags | | Add a tag (can edit) |
 | People with access | Only you can see this | | (the add field is above) |
 | Links | Anyone with the link: off | | Turn on |
-| Agents | No agents yet | Agents work in Ruum for you, with the access you give them. Every change they make shows their name and yours. | Connect an agent |
-| Agent activity | *Agent* hasn't changed anything yet | Its changes show up here, grouped by run. | |
-| Agent keys | No keys | Apps that connect with sign-in (OAuth) don't need a key. | New key |
+| Agents | No agents yet | Bring in a helper: connect Claude, ChatGPT or another AI app, or create an agent with a key for a script. | Connect an agent |
+| Agent activity | *Agent* hasn't changed anything yet | When it gets to work, its changes show up here, grouped by run. | |
+| Agent keys | No keys yet | Apps that connect with sign-in (OAuth) don't need one. | New key |
 | Members (only owner) | It's just you here | Invite the people you work with. | Invite people |
 | Invitations | No open invitations | | Invite people |
 | Activity log | No activity yet | Changes in *Space* show up here. | |
-| App passwords | No app passwords | Make one to open your files in Finder or Explorer. | New app password |
+| App passwords | No app passwords yet | Make one to open your files in Finder or Explorer. | New app password |
 | Database tables (Query) | No tables yet | Tables come from migrations, or from a CREATE TABLE in Can change data. | |
 | Query result | No rows match | | |
 | Columns | All columns are confirmed | Agents see each column as you chose. | |
@@ -470,14 +491,16 @@ Never show a stack trace, an HTTP status number or an internal path to people.
 
 ## 6. Emails
 
-Emails use the same voice. Subject lines say who and what.
+Emails use the same voice, a little warmer than the UI, and calm about links and addresses
+(people check emails for phishing). Subject lines say who and what. The server writes them in
+`crates/ruum-core/src/tenants/mail.rs`; they are English until the server localises emails by the
+recipient's language (design 12.4).
 
 | Email | Subject | Body (plain text) |
 |---|---|---|
-| Invitation to a space | *Person* invited you to *Space* on Ruum | *Person* invited you to the Ruum space "*Space*". Open this link to join: *link* (The link works for *n* days.) Message from *Person*: *message* If you didn't expect this email, you can ignore it. |
-| Shared with you (email grant) | *Person* shared *Item* with you | *Person* shared "*Item*" with you. You can *comment*. Open it: *link* *Note* If you didn't expect this email, you can ignore it. |
+| Invitation to a space | *Person* invited you to *Space* on Ruum | *Person* invited you to join the Ruum space "*Space*" as *a member*. / Open this link to join: *link* / The link works until *21 November 2026*. / Message from *Person*: *message* / If you didn't expect this email, you can ignore it. |
+| Shared with you | *Person* shared "*Item*" with you | *Person* shared the *folder* "*Item*" with you on Ruum. You *can edit* it. / Message from *Person*: *message* / Open it: *link* / (email grant) To open it, sign in to Ruum with this email address (*address*). New to Ruum? Create an account with this address and verify it first. / If you didn't expect this email, you can ignore it. |
 
-The current invitation email (`crates/ruum-core/src/tenants/mail.rs`) matches this voice; only
-the subject changes ("Invitation to *Space* on Ruum" becomes "*Person* invited you to *Space* on
-Ruum") and the line about how long the link works is new (the server's invitation lifetime decides the
-number).
+The HTML part says the same, with the link as "Join the space" or "Open the *folder*". Role words
+in emails: "a guest (you see only what people share with you)", "a member", "an admin", "an
+owner"; "can view", "can comment on", "can edit", "can manage".
