@@ -1475,8 +1475,8 @@ Good translations need context, consistency and checking.
   messages with named placeholders, no sentences built from pieces).
 - **Consistency**: a glossary per language (the approved terms for space, folder, share, version,
   trash, agent, ... and a do-not-translate list); a style guide per language (formality, punctuation,
-  number and date conventions, gender-neutral wording; for Estonian the choice of "sina" or "teie" is
-  a decision of the person); a translation memory, so approved translations are reused.
+  number and date conventions, gender-neutral wording; Estonian uses the informal "sina", decided by the
+  person on 2026-11-08); a translation memory, so approved translations are reused.
 - **The pipeline, on every change**:
   1. extract new and changed message keys;
   2. a translator agent translates with the full context (description, screenshot, glossary, memory,
