@@ -409,7 +409,11 @@ touch {} +` on the server. The build server's `pg_dump` is version 16, so the ch
 - `privacy::keys::tests::no_key_in_the_log_memory` (card Q-4) is flaky: it failed in 3 of 10
   full runs of the `ruum-core` lib tests on the build server ("the capture works": empty log,
   probably the global callsite cache of `tracing` with parallel tests). It passed in the final
-  run. `f/followups-4`: the case runs in a child process of the test binary, alone.
+  run. `f/followups-4`: the case runs in a child process of the test binary, alone, and a
+  global test subscriber ("sometimes" for every callsite) keeps `no_key_in_the_log_postgres`
+  free of the same race; 30 of 30 full runs passed for both. In those runs
+  `sharing::conformance::postgres_add_grant_limits_conform` failed once (1 of 30): its 61 calls
+  can cross the boundary of the fixed 10-minute window of the rate counter.
 - `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 56 of 56 mutations
   killed, none survived or skipped (51 this afternoon; new: the four of D-1 and
   `dbengine-dbhost-search-path`).

@@ -1368,14 +1368,52 @@ mod tests {
             fn enter(&self, _: &Id) {}
             fn exit(&self, _: &Id) {}
         }
+
+        /// The global subscriber of the test binary: it takes no event, but it answers
+        /// "sometimes" for every callsite and allows every level. So no callsite caches "never"
+        /// and the global max level is never `OFF` while a test on another thread hits a
+        /// callsite first; each event asks the subscriber of its thread, which is the
+        /// [`Capture`] in a capturing case.
+        struct AskEachTime;
+
+        impl Subscriber for AskEachTime {
+            fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+                Interest::sometimes()
+            }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                false
+            }
+            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+                Some(tracing::level_filters::LevelFilter::TRACE)
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        /// Sets [`AskEachTime`] as the global subscriber, once per process (no other test of
+        /// this binary sets one).
+        pub fn ask_each_time() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(AskEachTime);
+            });
+        }
     }
 
     /// Runs wrap, unwrap, first use, the database key, export and import with every event
     /// captured, and checks that no key shows in the log.
     async fn exercise_and_check_the_log(store: Arc<dyn TenantKeyStore>, tenant: TenantId) {
+        capture::ask_each_time();
         let capture = capture::Capture::default();
         let guard = tracing::subscriber::set_default(capture.clone());
-        // Callsites that other tests hit first, without a subscriber, may have cached "never".
+        // Callsites that other tests hit first, before the global subscriber, may have cached
+        // "never".
         tracing::callsite::rebuild_interest_cache();
         let w = kek(30);
         let keys = TenantKeys::new(store.clone(), w.clone());
@@ -1439,7 +1477,9 @@ mod tests {
     /// `tracing` callsites is global to the process: a test on another thread that hits a
     /// callsite first, while no subscriber is set, can cache "never" for it after this case
     /// rebuilt the cache, and the capture then misses the event. In a process of its own no
-    /// other test runs.
+    /// other test runs. (The Postgres case does not run in a child: the child's `sqlx::test`
+    /// could clean up the test databases of the parent. It relies on
+    /// [`capture::ask_each_time`].)
     #[tokio::test]
     async fn no_key_in_the_log_memory() {
         if std::env::var_os(LOG_CHILD_ENV).is_some() {
