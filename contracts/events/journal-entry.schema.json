@@ -665,7 +665,6 @@
       "description": "Event types that are specified but not written yet (decision 0004-21). Not used for validation; the envelope test of ruum-core keeps `EventType` equal to the `type` enum minus this list.",
       "enum": [
         "typed_node.status_changed",
-        "database.columns_confirmed",
         "database.migration_applied",
         "database.migration_failed",
         "database.branch_created",

@@ -3761,7 +3761,6 @@ paths:
       tags: [databases]
       operationId: listDatabaseColumns
       x-ruum-area: classes
-      x-ruum-status: planned
       summary: The data class of every column
       description: |
         Every column of the database with its effective class, its confirmed class and the
@@ -3795,7 +3794,6 @@ paths:
       tags: [databases]
       operationId: suggestColumnClasses
       x-ruum-area: classes
-      x-ruum-status: planned
       summary: Suggest data classes for columns
       description: |
         An agent (or a person) proposes the class of columns, with a short reason, for example
@@ -3835,7 +3833,6 @@ paths:
       tags: [databases]
       operationId: confirmColumnClasses
       x-ruum-area: classes
-      x-ruum-status: planned
       x-ruum-user-only: true
       summary: Confirm the data classes of columns
       description: |

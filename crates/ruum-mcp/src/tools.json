@@ -1,6 +1,6 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "415e7f2acd486549ea3ce5ab23935ad20ae28ba54875fdf89755c9c82a3a9849",
+ "openapi_sha256": "688ee67ed4d074d6308a1374b0f247e2a17275e9891f2e62d3b697b47bed1fb1",
  "tools_sha256": "67359190912f4acacb5f0df03f03a9d06caecf3d084837f0755d2378905b50ce",
  "tools": [
   {
@@ -3104,7 +3104,7 @@
   {
    "name": "list_database_columns",
    "operation": "listDatabaseColumns",
-   "planned": true,
+   "planned": false,
    "description": "List the data class (normal, personal, secret) of every column, and which ones still wait for a person to confirm.",
    "notes": null,
    "method": "GET",
@@ -3163,7 +3163,7 @@
   {
    "name": "suggest_column_classes",
    "operation": "suggestColumnClasses",
-   "planned": true,
+   "planned": false,
    "description": "Suggest the data class of columns with a short reason. A person confirms; until then the column counts as personal.",
    "notes": null,
    "method": "POST",
