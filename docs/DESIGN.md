@@ -1985,6 +1985,21 @@ customer uses, plus a published markup that covers fixed costs.
 - **Every usage event carries tenant, user, node and app, and `actor` / `on_behalf_of`**, like the
   journal (2.5, 3.4). Costs trace back to a specific action (an upload, an agent session's build) and a
   specific user wherever one person uses the resource; shared resources are split by measured share.
+- **Tracking must cost less than what it tracks.** For each resource class, the cost of measuring it
+  stays below **5 % of that class's actual cost** (target 1-2 %); below that, finer tracking would not
+  change a price. Each class uses the coarsest level that keeps prices fair:
+
+  | Level | For | Examples |
+  |---|---|---|
+  | each event recorded | costly, countable actions | model calls, builds, agent sessions, emails, backups and restores |
+  | counters added up hourly per tenant, app or user | frequent small actions | API requests, traffic, CPU and memory time |
+  | periodic snapshots | cost by size over time | storage in GB-hours (sampled daily), database size |
+  | sampling | huge numbers of tiny events | 1 % of reads recorded and scaled, with a stated error margin |
+  | allocation by a proxy | shared or nearly free things | control plane, sign-in checks, small reads: split by active users or stored GB, as overhead |
+
+  Metering is its own resource pool in the ledger. The cost agent reports the ratio per class every
+  month; above 5 % the class moves one level coarser (and finer, when a class becomes costly and cheap
+  to measure). Estimated amounts are labelled "estimated" in the cost breakdowns.
 
 ### 21.3 From bills to unit costs
 
