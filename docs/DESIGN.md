@@ -1874,7 +1874,17 @@ no standing administrator rights. Each action has a risk class:
 | Amber | two independent agents (the guard included); logged | database failover, moving a tenant between cells, blocking an abusive app, revoking tokens, a production security patch |
 | Red | a person | deleting tenant data, a restore that loses data, changing security policy or access rights, spending above budget, legal and law-enforcement requests, telling customers about a breach, turning off a safety control |
 
-- **The policy is signed and owned by a person**; agents cannot change it.
+- **Who classifies: the policy, not the acting agent.** Each action type of the operations API has its
+  class in the policy file (versioned, signed). The policy engine evaluates it deterministically,
+  also from parameters and context that the engine computes itself: scaling within budget is green
+  and above budget red; a restore is amber without data loss and red when the engine computes a loss
+  window from the backup times; during an open security incident some green actions become amber.
+- **Unlisted means red**: a new or unknown action type needs a person until the policy names it.
+- **No splitting**: the engine also counts totals over time (for example more than N deletions in an
+  hour is red, even when each one is green), and the guard agent watches sequences of actions.
+- **The policy is signed and owned by a person**; agents cannot change it. They may propose a change
+  (a new runbook action with a suggested class) as a pull request; approving it is a red action. The
+  architect panel drafts the first policy from the runbooks, and a person approves and signs it once.
 - **Just-in-time credentials**: each action gets short-lived, narrow credentials from OpenBao.
   Production data reaches agents only through the privacy filter (8.5, 9.6), as pseudonyms.
 - **GitOps**: every infrastructure change is a pull request, reviewed by an agent panel and checked by
