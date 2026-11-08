@@ -54,7 +54,7 @@ describe('tenant admin', () => {
     await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'kathleen@example.com, alan.t@example.com')
     await user.selectOptions(within(form).getByRole('combobox', { name: 'Role' }), 'guest')
     await user.click(within(form).getByRole('button', { name: 'Send invitations' }))
-    expect(await screen.findByText('2 invitations sent.')).toBeInTheDocument()
+    expect(await screen.findByText('2 invitations are on their way.')).toBeInTheDocument()
     expect(seen.filter((r) => r.method === 'POST' && r.path.endsWith('/invitations')).map((r) => r.body)).toEqual([
       { email: 'kathleen@example.com', role: 'guest' },
       { email: 'alan.t@example.com', role: 'guest' },
@@ -123,7 +123,7 @@ describe('tenant admin', () => {
     expect(within(form).getByText(/Can edit: Changes files and folders in Analytical Engines/)).toBeInTheDocument()
     await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'kathleen@example.com')
     await user.click(within(form).getByRole('button', { name: 'Send invitations' }))
-    await screen.findByText(/Invitation sent|kathleen@example.com/)
+    await screen.findByText(/Invitation on its way|kathleen@example.com/)
     await user.selectOptions(within(form).getByRole('combobox', { name: 'Role' }), 'admin')
     expect(within(form).queryByRole('combobox', { name: 'What they can do' })).not.toBeInTheDocument()
     await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'alan.t@example.com')
@@ -138,7 +138,7 @@ describe('tenant admin', () => {
   it('shows sign-ins in the activity log, with where they came from (0003-4)', async () => {
     const { user } = renderApp(`${team}/admin/audit`)
     await user.selectOptions(await screen.findByRole('combobox', { name: 'Show' }), 'auth.')
-    expect(await screen.findByText("Sign-ins of members. Guests' sign-ins are not shown.")).toBeInTheDocument()
+    expect(await screen.findByText("Sign-ins of members. Guests' sign-ins aren't shown here.")).toBeInTheDocument()
     const login = (await screen.findByText('signed in')).closest('li')!
     expect(login).toHaveTextContent('192.0.2.10 · Firefox on macOS')
     expect(screen.getByText('opened Analytical Engines (new session)')).toBeInTheDocument()

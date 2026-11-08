@@ -31,7 +31,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   const dialog = page.getByRole('dialog', { name: 'New folder' })
   await dialog.getByLabel('Folder name').fill(top)
   await dialog.getByRole('button', { name: 'Create' }).click()
-  await expect(toast(page, `Folder ${top} created.`)).toBeVisible()
+  await expect(toast(page, `Folder ${top} is ready for your files.`)).toBeVisible()
   await page.getByRole('link', { name: top, exact: true }).click()
   await expect(page.getByRole('heading', { name: top, level: 1 })).toBeVisible()
   await expect(page.getByRole('navigation', { name: 'Breadcrumbs' })).toContainText(top)
@@ -92,7 +92,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   // Trash (it can be undone, so no confirmation), then restore from the trash page.
   await openDetails(page, 'renamed.bin')
   await menuAction(page, 'More actions for renamed.bin', 'Move to trash')
-  await expect(toast(page, 'Moved renamed.bin to trash.')).toBeVisible()
+  await expect(toast(page, 'Moved renamed.bin to the trash.')).toBeVisible()
   await expect(page.getByText('This folder is empty', { exact: true })).toBeVisible()
   const archiveUrl = page.url()
 
@@ -100,7 +100,7 @@ test('folders, chunked upload, download, rename, move, trash and restore', async
   await expect(page.getByRole('heading', { name: 'Trash', level: 1 })).toBeVisible()
   await expect(page.getByRole('rowheader', { name: 'renamed.bin' })).toBeVisible()
   await page.getByRole('button', { name: 'Restore renamed.bin' }).first().click()
-  await expect(toast(page, /^Restored renamed\.bin to Archive/)).toBeVisible()
+  await expect(toast(page, /^renamed\.bin is back in Archive/)).toBeVisible()
 
   await page.goto(archiveUrl)
   await expect(page.getByRole('button', { name: 'renamed.bin', exact: true })).toBeVisible()

@@ -245,8 +245,10 @@ const BROWSER = ''
 
 // The page mounts again in the new language after a change (maybe more than once while the
 // catalogue and the session load). This tells the new page, for a few seconds, to put the focus
-// back on the language picker and to say that the language changed (WCAG 2.4.3, 4.1.3).
-let justChanged: { name: string; until: number } | null = null
+// back on the language picker and to say that the language changed (WCAG 2.4.3, 4.1.3). It keeps
+// the tag, not a name: the new page names the language in the new language, and "Same as the
+// browser" is said as the language it gives ("Ruum now speaks English.").
+let justChanged: { tag: string; until: number } | null = null
 
 /**
  * The language of the UI (design 12.4): stored with the account (`updateMyPreferences`), so it
@@ -262,11 +264,12 @@ function LanguageCard() {
   const select = useRef<HTMLSelectElement>(null)
   const choices = import.meta.env.PROD ? LANGUAGES : [...LANGUAGES, { tag: PSEUDO_LOCALE, name: t('account.language.pseudo') }]
   const browserName = LANGUAGES.find((l) => l.tag === catalogueFor(browserLanguages()[0] ?? ''))?.name ?? LANGUAGES[0].name
-  const nameOf = (tag: string) => (tag === BROWSER ? t('account.language.browser', { language: browserName }) : (choices.find((l) => l.tag === tag)?.name ?? tag))
 
   useEffect(() => {
     if (justChanged === null || justChanged.until < Date.now()) return
-    const name = justChanged.name
+    const tag = justChanged.tag === BROWSER ? catalogueFor(browserLanguages()[0] ?? '') : justChanged.tag
+    const name =
+      tag === PSEUDO_LOCALE ? t('account.language.pseudo') : (LANGUAGES.find((l) => l.tag === tag)?.name ?? LANGUAGES[0].name)
     // After the paint, so nothing that mounts with the page takes the focus after it.
     const id = requestAnimationFrame(() => {
       select.current?.focus()
@@ -281,7 +284,7 @@ function LanguageCard() {
     setError(undefined)
     try {
       const saved = await unwrap(client.PATCH('/v1/me/preferences', { body: { locale: choice === BROWSER ? null : choice } }))
-      justChanged = { name: nameOf(saved.locale ?? BROWSER), until: Date.now() + 5000 }
+      justChanged = { tag: saved.locale ?? BROWSER, until: Date.now() + 5000 }
       // The page renders again in the new language.
       setPreference(saved.locale)
       setBusy(false)

@@ -60,7 +60,7 @@ describe('file browser', () => {
     expect(input).toHaveValue('')
     await user.keyboard('Invoices{Enter}')
     expect(await screen.findByRole('link', { name: 'Invoices' })).toBeInTheDocument()
-    expect(await screen.findByText('Folder Invoices created.')).toBeInTheDocument()
+    expect(await screen.findByText('Folder Invoices is ready for your files.')).toBeInTheDocument()
   })
 
   it('shows a name conflict in the dialog', async () => {
@@ -214,11 +214,11 @@ describe('file browser', () => {
     // The trash can be undone, so there is no confirmation; the toast offers Undo.
     await choose(user, 'More actions for notes.md', 'Move to trash', details)
     await waitFor(() => expect(screen.queryByRole('button', { name: 'notes.md' })).not.toBeInTheDocument())
-    expect(await screen.findByText('Moved notes.md to trash.')).toBeInTheDocument()
+    expect(await screen.findByText('Moved notes.md to the trash.')).toBeInTheDocument()
 
     await user.click(screen.getByRole('link', { name: 'Trash' }))
     await user.click(await screen.findByRole('button', { name: 'Restore notes.md' }))
-    expect(await screen.findByText('Restored notes.md to Files.')).toBeInTheDocument()
+    expect(await screen.findByText('notes.md is back in Files.')).toBeInTheDocument()
     expect(db.nodes.find((n) => n.id === ids.notes)?.trashed_at).toBeNull()
   })
 

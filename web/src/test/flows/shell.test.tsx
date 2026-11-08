@@ -69,7 +69,7 @@ describe('app shell', () => {
     const d = await screen.findByRole('dialog', { name: 'Start a team space' })
     expect(within(d).getByText("You'll be the owner. You can invite people next.")).toBeInTheDocument()
     await user.type(within(d).getByRole('textbox', { name: 'Team name' }), 'Pärn Studio{Enter}')
-    expect(await screen.findByText('Pärn Studio is ready. Invite the people you work with.')).toBeInTheDocument()
+    expect(await screen.findByText('Pärn Studio is ready! Now invite the people you work with.')).toBeInTheDocument()
     expect(router.state.location.pathname).toMatch(/\/admin\/invitations$/)
     // React Router commits the new location in a transition, after the toast: wait for it.
     await waitFor(() => expect(screen.getByRole('button', { name: 'Pärn Studio (change space)' })).toBeInTheDocument())

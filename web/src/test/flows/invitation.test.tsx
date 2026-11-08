@@ -19,7 +19,7 @@ describe('accept an invitation (/invitations/accept)', () => {
     expect(seen.find((r) => r.path === '/v1/invitations/preview')?.body).toEqual({ token: 'demo-invite' })
     expect(seen.some((r) => r.path === '/v1/invitations/accept')).toBe(false)
     await user.click(screen.getByRole('button', { name: 'Join Lovelace Lab' }))
-    expect(await screen.findByText("You've joined Lovelace Lab.")).toBeInTheDocument()
+    expect(await screen.findByText("You're in! Welcome to Lovelace Lab.")).toBeInTheDocument()
     await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/t\/[0-9a-f-]{36}\/files$/))
     // React Router commits the new location in a transition: router.state changes first.
     await waitFor(() => expect(screen.getByRole('button', { name: 'Lovelace Lab (change space)' })).toBeInTheDocument())

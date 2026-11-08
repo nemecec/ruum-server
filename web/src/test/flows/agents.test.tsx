@@ -36,7 +36,7 @@ describe('agents', () => {
 
     await user.click(within(d).getByRole('button', { name: 'Create agent' }))
     expect(await screen.findByRole('heading', { name: 'Researcher', level: 1 })).toBeInTheDocument()
-    expect(screen.getByText('Agent created. Create a key for it below.')).toBeInTheDocument()
+    expect(screen.getByText('Agent created. Now create a key for it below, so it can get to work.')).toBeInTheDocument()
     const post = seen.find((r) => r.method === 'POST' && r.path === '/v1/agents')
     expect(post?.body).toEqual({ name: 'Researcher', scope: { subtree: ids.documents, max_role: 'view', expires_at: null } })
     expect(router.state.location.pathname).toMatch(new RegExp(`^${personal}/agents/`))
@@ -80,7 +80,7 @@ describe('agents', () => {
     expect(await screen.findByText('Paused Claude Desktop.')).toBeInTheDocument()
     expect(screen.getByText("Paused. Its keys and connections don't work until you resume it.")).toBeInTheDocument()
     await user.click(await screen.findByRole('button', { name: 'Resume' }))
-    expect(await screen.findByText('Resumed Claude Desktop.')).toBeInTheDocument()
+    expect(await screen.findByText('Claude Desktop is back at work.')).toBeInTheDocument()
   })
 
   it('undoes selected changes of an agent after a dry run', async () => {

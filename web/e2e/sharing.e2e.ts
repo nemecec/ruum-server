@@ -140,7 +140,7 @@ test('Ann shares a folder with Ben, who gets a mail, opens its link and sees the
   await form.getByRole('button', { name: 'Share' }).click()
   // A second mail for the same item within 10 minutes is not sent, and the dialog says so.
   await expect(
-    share.getByRole('status').filter({ hasText: `Shared with ${users.ben.displayName}. Ruum did not email them this time; they find it under Shared with me.` }),
+    share.getByRole('status').filter({ hasText: `Shared with ${users.ben.displayName}. Ruum didn't email them this time. They'll find it under Shared with me.` }),
   ).toBeVisible()
   await expect(people).toContainText(users.ben.displayName)
   await expect(people).not.toContainText('Invited, not joined yet')

@@ -66,7 +66,7 @@ describe('OAuth consent screen', () => {
     db.oauthClients[0].client_uri = 'not a url'
     db.oauthClients[0].redirect_uris = ['::bad::']
     renderApp(`/oauth/consent?request=${bare}`)
-    expect(await screen.findByText(/an address that is not valid/)).toBeInTheDocument()
+    expect(await screen.findByText(/an address that isn't valid/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Allow' })).toBeInTheDocument()
   })
 

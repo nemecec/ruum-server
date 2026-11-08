@@ -149,7 +149,7 @@ export async function invite(page: Page, email: string, role: 'Guest' | 'Member'
   await form.getByLabel('Role').selectOption({ label: role })
   await form.getByLabel('Message (optional)').fill('Welcome to the e2e run.')
   await form.getByRole('button', { name: 'Send invitations' }).click()
-  await expect(toast(page, `Invitation sent to ${email}.`)).toBeVisible()
+  await expect(toast(page, `Invitation on its way to ${email}.`)).toBeVisible()
   await expect(page.getByRole('listitem').filter({ hasText: email })).toContainText(role)
 
   const mail = await waitForMail(email)
@@ -171,7 +171,7 @@ export async function acceptInvitation(page: Page, link: string): Promise<void> 
   await page.goto(url.pathname + url.search + url.hash)
   await expect(page.getByRole('heading', { name: / invited you to /, level: 1 })).toBeVisible()
   await page.getByRole('button', { name: /^Join / }).click()
-  await expect(toast(page, /^You've joined /)).toBeVisible()
+  await expect(toast(page, /^You're in! Welcome to /)).toBeVisible()
   await page.waitForURL(/\/t\/[0-9a-f-]{36}\/files$/)
 }
 

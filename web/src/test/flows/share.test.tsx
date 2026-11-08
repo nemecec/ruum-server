@@ -42,7 +42,7 @@ describe('share dialog', () => {
     await user.selectOptions(within(form).getByRole('combobox', { name: 'Access' }), 'view')
     await user.click(within(form).getByRole('button', { name: 'Share' }))
     expect(
-      await within(d).findByText('Shared with grace@example.com. Ruum did not email them this time; they find it under Shared with me.'),
+      await within(d).findByText("Shared with grace@example.com. Ruum didn't email them this time. They'll find it under Shared with me."),
     ).toBeInTheDocument()
   })
 
@@ -54,7 +54,7 @@ describe('share dialog', () => {
     await user.type(within(form).getByRole('textbox', { name: 'Email' }), 'cara@example.com')
     expect(
       within(form).getByText(
-        'cara@example.com is not in Ada Lovelace. They can open notes.md after they sign in with this address; they join Ada Lovelace as a guest.',
+        "cara@example.com isn't in Ada Lovelace. They can open notes.md after they sign in with this address, and they join Ada Lovelace as a guest.",
       ),
     ).toBeInTheDocument()
     // Never "make an account".

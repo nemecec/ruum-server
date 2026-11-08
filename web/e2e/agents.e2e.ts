@@ -28,7 +28,7 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
   await dialog.getByRole('button', { name: 'Create agent' }).click()
 
   await expect(page.getByRole('heading', { name, level: 1 })).toBeVisible()
-  await expect(page.getByText('Agent created. Create a key for it below.')).toBeVisible()
+  await expect(page.getByText('Agent created. Now create a key for it below, so it can get to work.')).toBeVisible()
   const activity = page.getByRole('region', { name: 'Activity' })
   await expect(activity).toContainText(`${name} hasn't changed anything yet`)
 

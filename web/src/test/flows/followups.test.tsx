@@ -109,9 +109,9 @@ describe('design system fixes (UX panel)', () => {
     const { user } = renderApp(`${personal}/files`)
     await user.click(await screen.findByRole('checkbox', { name: 'Select notes.md' }))
     await user.click(within(screen.getByRole('region', { name: 'Selection' })).getByRole('button', { name: 'Move to trash' }))
-    await screen.findByText('Moved notes.md to trash.')
+    await screen.findByText('Moved notes.md to the trash.')
     await user.keyboard('{Alt>}t{/Alt}')
-    expect(document.activeElement).toHaveTextContent('Moved notes.md to trash.')
+    expect(document.activeElement).toHaveTextContent('Moved notes.md to the trash.')
   })
 
   it('skips disabled items of a menu with the arrow keys, but lets them take the focus to be heard', async () => {
