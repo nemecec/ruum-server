@@ -1432,9 +1432,40 @@ mod tests {
         }
     }
 
+    /// Set in the child process of [`no_key_in_the_log_memory`].
+    const LOG_CHILD_ENV: &str = "RUUM_TEST_LOG_CHILD";
+
+    /// The case runs in a child process of the test binary, alone. The interest cache of
+    /// `tracing` callsites is global to the process: a test on another thread that hits a
+    /// callsite first, while no subscriber is set, can cache "never" for it after this case
+    /// rebuilt the cache, and the capture then misses the event. In a process of its own no
+    /// other test runs.
     #[tokio::test]
     async fn no_key_in_the_log_memory() {
-        exercise_and_check_the_log(Arc::new(MemoryTenantKeyStore::new()), TenantId::new()).await;
+        if std::env::var_os(LOG_CHILD_ENV).is_some() {
+            exercise_and_check_the_log(Arc::new(MemoryTenantKeyStore::new()), TenantId::new())
+                .await;
+            return;
+        }
+        let name = format!(
+            "{}::no_key_in_the_log_memory",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(LOG_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the child failed: {text}");
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "the child ran the case: {text}"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
