@@ -7,7 +7,8 @@ names of actors (decision 0003, `f/followups`), the step 2 specification (decisi
 `f/step2spec`) and the morning integration of 2026-11-07 (decision 0003 items 1 to 4 and 7, spike
 S-1, the first step 2 cards, the design system and localisation of the web UI), the afternoon
 integration of 2026-11-07 (decision 0003 item 6, the C-1 acceptance, cards E-2, Q-4 and P-2),
-how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+the evening integration (run on 2026-11-08: the browser tests on the build server, sign-in
+providers, the second E-2 fix, cards D-1, T-1 and T-2), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -156,8 +157,48 @@ Fixes made during the afternoon integration:
   after the fast-forward (each is part of `main`). The old branch names on GitHub keep the
   pre-rebase commits. `w/fixes` needed no rebase.
 
-The digest for the person is `docs/digests/2026-11-07-afternoon.md` (earlier:
-`docs/digests/2026-11-07.md`, `docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
+Evening integration (run on 2026-11-08, each branch rebased onto `main`, checked on the build
+server with `cargo test --workspace`, both suite backends with `RUUM_REQUIRE_IMPLEMENTED=1` and,
+after `f/buildbox-browser`, `scripts/e2e_browser.sh`, pushed and green in GitHub CI, then
+fast-forwarded, in this order; linear history, no merge commit, no co-author line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `f/buildbox-browser` | The build server gets Node.js 22 (pinned, SHA-256 checked) and Playwright's Chromium; `run.sh` gives each agent a dev root (`RUUM_DEV_ROOT`, `RUUM_DEV_SH`) with its own Postgres and SpiceDB and free ports for both e2e scripts; `setup.sh --fresh-platform-db`. | no panel review file (tooling) |
+| `f/sign-in-providers` | `scripts/zitadel_idps.sh` (`dev.sh idps [check]`, run by `dev.sh up`): Google and Microsoft (tenant `common`) in the laptop Zitadel when their keys are present, and a mock OIDC provider (`dev.sh up --sso-mock`, compose profile `sso-mock`); `web/e2e/sso.e2e.ts` signs in through the mock from start to end, and the CI browser job requires it; the status of the sending domain in `docs/setup/ACCOUNTS.md`. | no panel review file |
+| `f/rr-fix-e2` | Every `ruum_dbhost` session has `search_path = pg_catalog, pg_temp`: before, a tenant operator in `public` (`oid = integer`, `name !~ name`) ran as `ruum_dbhost` in hand-over steps 1 and 3 and in every lens rebuild (found by checking the question of `re-review-e2.md`). Hostile tests, mutation `dbengine-dbhost-search-path`; the nightly mutation job starts `postgres-data`. | no review of the fix yet (`re-review-e2.md` was not complete) |
+| `s2/d-1` | Card D-1: `createDatabase`, `getDatabase` and `updateDatabaseManifest` on the engines (the three `planned` marks removed); contract C-21 (`Limits.databases`, `Usage.databases`); `Services` wires the engines, the tenant keys, the delivery worker (each round in its own task) and the reconciler; the fixture database `<prefix>-garden`; `listVersions` of a database node lists its manifest versions; a stale manifest check is `409`; a database in the trash shows `suspended` (`in_trash`); four mutations. New dependencies in `ruum-core`: `jsonschema` (workspace) and the workspace crate `ruum-dbengine`. | changes requested (B-1 `listVersions`, B-2 a T-1 case), B-1 fixed, accepted by the second review once B-2 is fixed and the panel names the wave exception for `crates/ruum-api/src/routes/versions.rs` (`review-D-1.md`, `review-D-1-fix.md`, `review-D-1-2.md`) |
+| `s2/t-1` | Card T-1: 42 acceptance cases of the 24 database operations (`tests/databases_*.rs`), 12 isolation probes, the meta checks (`databases_meta`). The 11 D-1 cases pass on memory and Postgres; the other 31 stay planned or wait for a card. | accepted (`review-T-1.md`) |
+| `s2/t-2` | Card T-2: the privacy suite (`src/privacy.rs`, `tests/privacy.rs`, 56 cases, 99 runs, all planned until the operations and the privacy filters land; 24 planned mutations). | changes requested (R-1 to R-3), fixed, accepted by the second review (`review-T-2.md`, `review-T-2-fix.md`, `review-T-2-2.md`) |
+
+Fixes made during the evening integration:
+
+- `s2/t-1`, review-D-1 B-2: the case `guests_create_a_database_only_with_the_policy` gave
+  `guest_view` a second grant on Projects (it already has `view` there), and step 1 answers
+  `409`. The setup now makes a folder in Projects as the owner and grants `manage` there; the
+  databases go into that folder, and `createNode` is in the case's operation list. No assertion
+  changed. This is the fix that `review-D-1-2.md` proved in a scratch copy. D-1 was
+  fast-forwarded after the rebased T-1 passed the 11 d1 cases on memory and Postgres, in CI and
+  on the build server.
+- The wave exception of review D-1 B-1 (`crates/ruum-api/src/routes/versions.rs`, about 15
+  lines of dispatch, outside D-1's "May change") is taken as both D-1 reviews recommend. It is
+  `provisional`: no separate panel record names it.
+- CI (review-T-1 N-1, review-T-2 N-1): the memory and Postgres suite jobs also run
+  `databases_d1`, `_guests`, `_agents`, `_nodes`, `_statements` and `privacy`; the unit job runs
+  `databases_meta`. `docs/TESTING.md` has a section on the T-1 cases (review-T-2 N-6).
+- `main` got documentation commits from outside this run during the integration. `s2/t-2`
+  was rebased once more onto the first two (decision 0004-36, design 9.10); CI on the rebased
+  commit is green. The final checks ran on `b4a63e8`; the commits after it change only
+  `docs/DESIGN.md` and `docs/ux/copy.md`.
+- On the build server, the four `ruum-dbengine` export tests need a PostgreSQL 17 `pg_dump`
+  (review-D-1 N-7: the server has 16). The checks set `RUUM_PG_DUMP` to a wrapper that runs the
+  `pg_dump` of the `ruum-dev/postgres-data:17` image, as CI sets its own 17 client.
+- The rebased branches were pushed as `integ/f-sign-in-providers`, `integ/f-rr-fix-e2`,
+  `integ/s2-d-1`, `integ/s2-t-1`, `integ/s2-t-2` and `integ/s2-t-2-r` (no force push) and
+  deleted from GitHub after the fast-forward. `f/buildbox-browser` needed no rebase.
+
+The digest for the person is `docs/digests/2026-11-07-evening.md` (earlier:
+`docs/digests/2026-11-07-afternoon.md`, `docs/digests/2026-11-07.md`, `docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
 `docs/digests/2026-11-06-evening.md`). The worktrees of the merged branches are removed; the
 branches stay.
 
@@ -341,41 +382,47 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-07, `main` after the afternoon integration, on the build server)
+## Checks (2026-11-08, `main` after the evening integration, on the build server)
 
 Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and SpiceDB). `run.sh`
 keeps the file times of the worktree, so after a rebase cargo can reuse a stale test binary on a
 target it built before: the checks first run `find crates contracts migrations -type f -exec
-touch {} +` on the server.
+touch {} +` on the server. The build server's `pg_dump` is version 16, so the checks set
+`RUUM_PG_DUMP` to a wrapper around the `pg_dump` 17 of the `ruum-dev/postgres-data:17` image
+(review-D-1 N-7); without it, four `ruum-dbengine` export tests fail there.
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 565 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
-  ruum-api 47, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-core 326 + 15
-  (properties), ruum-dbengine 83, ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5,
-  ruum-testkit 11 + 1 (batch) + 2 (contract) + 1 (isolation) + 2 (names) + 3 (permissions),
-  ruum-webdav 5 + 20.
+- `cargo test --workspace`: 607 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
+  ruum-api 47, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-core 344 + 15
+  (properties), ruum-dbengine 85, ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5,
+  ruum-testkit 17 + 1 (batch) + 2 (contract) + 1 each (databases_agents, _d1, _guests, _nodes,
+  _statements) + 6 (databases_meta) + 1 (isolation) + 2 (names) + 3 (permissions) + 5
+  (privacy), ruum-webdav 5 + 20.
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` with `RUUM_SUITE_BACKEND=memory` and
-  `postgres`: tenant isolation 342 checks (265 passed, 77 planned), permission matrix 1936
-  checks (1552 passed, 384 planned), trashed file suite 96/96; 0 pending, 0 failed. The SpiceDB
-  variant (`RUUM_SUITE_AUTHZ=spicedb`) was not run at this integration; CI runs memory authz.
-- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 51 of 51 mutations
-  killed, none survived or skipped (45 this morning; new: the two `previewInvitation` rules of
-  C-9, the three provider rules of P-2 and the tenant key rule of Q-4).
+  `postgres` (the same numbers on both): tenant isolation 354 checks (284 passed, 70 planned),
+  permission matrix 1936 checks (1600 passed, 336 planned), trashed file suite 96/96; database
+  cases d1 11/11 passed, agents 13, guests 3 and statements 7 planned, nodes 5 planned and 3
+  pending (card P-3); privacy suite 99 planned; 0 pending (501), 0 failed. The SpiceDB variant
+  (`RUUM_SUITE_AUTHZ=spicedb`) was not run; CI runs memory authz.
+- `privacy::keys::tests::no_key_in_the_log_memory` (card Q-4) is flaky: it failed in 3 of 10
+  full runs of the `ruum-core` lib tests on the build server ("the capture works": empty log,
+  probably the global callsite cache of `tracing` with parallel tests). It passed in the final
+  run.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 56 of 56 mutations
+  killed, none survived or skipped (51 this afternoon; new: the four of D-1 and
+  `dbengine-dbhost-search-path`).
 - `scripts/e2e_smoke.sh`: `PASSED: 59 checks`, against the agent's own Postgres and SpiceDB
-  (`RUUM_DEV_SH` set to a wrapper that prints `dev.sh env` and then the agent's `DATABASE_URL`
-  and SpiceDB settings). Against the shared stack Postgres of the build server it still fails
-  at start ("migration 5 was previously applied but has been modified"): that database had an
-  old branch's 0005. Its `ruum` database must be dropped and made again once no agent uses it.
-- `web/` (on the `main` tree, in a web worktree): `npm run lint`, `npm run build`,
-  `npx vitest run` (21 files, 289 tests), `npm run e2e:typecheck`: pass.
-- `oasdiff breaking --fail-on ERR` (`tufin/oasdiff:v1.11.4`) from `1b344d6`: 0 changes reported.
-- GitHub CI: green on `w/fixes` (`4028a89`), `integ/f-ux-c8-c11`, `integ/c-c1-acceptance`,
-  `integ/s2-e-2`, `integ/s2-q-4` and `integ/s2-p-2` (`450e397`), some after a re-run of a
-  failed job (see the afternoon fixes). The last commit of `main` (the Q-4 mutation file) ran
-  only on the build server.
-- Not run at this integration: `scripts/e2e_browser.sh` locally (CI runs it),
-  `scripts/dbhost_check.sh` locally (CI's unit job runs it with `postgres-data`), `cargo deny
-  check` (CI runs it).
+  (`RUUM_DEV_SH` of `run.sh`).
+- `scripts/e2e_browser.sh` (on the build server, on each branch after `f/buildbox-browser`):
+  172 passed, 1 skipped (`sso.e2e.ts`: the shared stack runs no mock provider; CI starts it and
+  requires the test).
+- `web/` (laptop, on `main`): `npm run lint`, `npm run build`, `npx vitest run` (21 files, 289
+  tests), `npm run e2e:typecheck`: pass.
+- GitHub CI: green on `f/buildbox-browser` (`78a0c6e`), `integ/f-sign-in-providers`,
+  `integ/f-rr-fix-e2`, `integ/s2-d-1`, `integ/s2-t-1`, `integ/s2-t-2` and `integ/s2-t-2-r`
+  (`b4a63e8`, the tree of `main` before this documentation commit), each at the first run.
+- Not run at this integration: `scripts/dbhost_check.sh` (CI's unit job runs it), `cargo deny
+  check` and `oasdiff` (CI runs them; the only contract change is the additive C-21 of D-1).
 
 ## Known gaps
 
@@ -393,9 +440,19 @@ touch {} +` on the server.
   kinds are frozen), the foundation cards Q-0, P-1, E-1 and I-1, the C-1 acceptance (0004-35:
   the step 2 contracts are frozen, later changes are additive) and cards E-2 (Postgres engine),
   Q-4 (tenant pseudonym key) and P-2 (typed node store, delivery worker, reconciler) are
-  merged. No database operation has a route yet; the 24 operations count as planned in the
-  suites. Nothing wires the engine, the tenant keys or the delivery worker into `Services` yet
-  (card D-1). OpenBao is not in CI: `openbao_transit_wrapper_round_trip` returns early and
+  merged, and so are cards D-1 (`createDatabase`, `getDatabase`, `updateDatabaseManifest`;
+  `Services` wires the engines, the tenant keys, the delivery worker and the reconciler), T-1
+  (database acceptance cases) and T-2 (privacy suite). The other 21 database operations count
+  as planned in the suites; the privacy suite is all planned until the operations and the
+  filters of Q-2 and Q-3 land. The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) has had
+  no review. Open notes for later cards: review-D-1 N-2 to N-5, N-8, N-9 (plan check not
+  atomic, two server processes, `getVersion`/`restoreVersion` of a manifest version);
+  review-T-1 N-3 to N-7; review-T-2 N-5 (no public export operation: the panel decides) and
+  N-8 (E-3, Q-2 and Q-3 each remove their own entry of `SQLITE_WAITS_FOR` /
+  `FILTER_WAITS_FOR` in `crates/ruum-testkit/src/privacy.rs`); re-review-p2 F-1 (an unreadable
+  payload still ends a `purged` delivery in Postgres; asked for before D-1 starts the worker,
+  and D-1 now starts it), F-2 (memory store: a provider panic holds a delivery for ever) and
+  F-3 (a mutation for `must_succeed`). OpenBao is not in CI: `openbao_transit_wrapper_round_trip` returns early and
   reports `ok` there (review-Q-4 note 2). `wrapper_from_env_needs_a_kek` asserts nothing where
   `dev.sh env` sets `RUUM_LOCAL_KEK_FILE` (review-Q-4 note 6). Notes for later cards:
   review-E-2 N-3 to N-6 (Q-2, I-2), review-Q-4 notes 3 to 5 (tenant export of design 14, D-1),
@@ -411,8 +468,8 @@ touch {} +` on the server.
   integration.
 - **Linux visual snapshots.** The 47 Linux references of the morning were refreshed from CI
   (`1b344d6`); `w/fixes` and `f/ux-c8-c11` brought their own Linux references from CI. The
-  browser job is green on `integ/s2-p-2` (the tree of `main` without the last mutation
-  commit), so no Linux reference waits for a refresh. The visual `pseudo-locale › share`
+  browser job is green on `integ/s2-t-2-r` (the web tree of `main`), so no Linux reference
+  waits for a refresh. The visual `pseudo-locale › share`
   failed once (2 % of pixels) and passed on the re-run.
 - **Flaky browser tests.** `versions.e2e.ts` "a name conflict on upload ..." (morning) and the
   C-8 test of "Upload new version" (once this afternoon: the
@@ -480,11 +537,16 @@ touch {} +` on the server.
 - Older gaps of `docs/FOUNDATION.md` still apply (`node.sharing_updated` is not undone, the
   `idp` hint of `loginStart` is not sent, the in-memory `Arc` cycle).
 
+## Dependencies added in the evening integration (2026-11-08)
+
+- `ruum-core` now uses the workspace dependency `jsonschema` (the manifest check of card D-1)
+  and the workspace crate `ruum-dbengine`. No new crate from outside the workspace.
+
 ## Dependencies added on 2026-11-07 (afternoon)
 
 - `aes-gcm` 0.11.1 (workspace, ruum-core; Apache-2.0 OR MIT; `default-features = false`,
-  `aes` and `alloc`): the local key-encryption key of card Q-4 (decision 0004-16). It waits for
-  a person's approval. `ruum-dbengine` now also uses the workspace dependencies `sqlx` and
+  `aes` and `alloc`): the local key-encryption key of card Q-4 (decision 0004-16). The person
+  approved it (decision 0004-36), and `sqlparser` too. `ruum-dbengine` now also uses the workspace dependencies `sqlx` and
   `tracing` (card E-2).
 
 ## Dependencies added in wave B
