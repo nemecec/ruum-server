@@ -175,14 +175,26 @@ pub fn cases() -> Vec<Case> {
         ),
         case!(
             "guests_create_a_database_only_with_the_policy",
-            ["getDatabase", "createDatabase", "addGrant", "updateTenant"],
-            "decision 0004-10: guest_view raised to manage on Projects, and its agent \
+            [
+                "getDatabase",
+                "createDatabase",
+                "createNode",
+                "addGrant",
+                "updateTenant"
+            ],
+            "decision 0004-10: guest_view gets manage on a new folder in Projects (it already \
+             has view on Projects, and a second grant there is a conflict), and its agent \
              agent_of_guest_view (scope everything, manage): 403 permission_denied with hint \
              guests_create_resources while the policy is false (the default); 202 after the \
              owner sets guests_create_resources true",
             |cx| {
                 let e = engine(&cx).await?;
-                add_grant(&cx, cx.a().projects, Who::GuestView, "manage").await?;
+                let place = folder(&cx, Who::Owner, cx.a().projects, "guest place").await?;
+                add_grant(&cx, &place, Who::GuestView, "manage").await?;
+                let place: ruum_core::NodeId = match place.parse() {
+                    Ok(id) => id,
+                    Err(_) => fail!("createNode gave an ID that is not a UUID: {place}"),
+                };
                 for (who, name) in [
                     (Who::GuestView, "guest db"),
                     (Who::AgentOfGuestView, "agent db"),
@@ -190,7 +202,7 @@ pub fn cases() -> Vec<Case> {
                     let err = cx
                         .refused(
                             who,
-                            create_database(&cx, cx.a().projects, name, e),
+                            create_database(&cx, place, name, e),
                             403,
                             &["permission_denied"],
                         )
@@ -203,7 +215,7 @@ pub fn cases() -> Vec<Case> {
                     (Who::AgentOfGuestView, "agent db"),
                 ] {
                     let made = cx
-                        .ok(who, create_database(&cx, cx.a().projects, name, e), &[202])
+                        .ok(who, create_database(&cx, place, name, e), &[202])
                         .await?;
                     wait_ready(&cx, &written_id(&made)?).await?;
                 }
