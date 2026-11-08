@@ -15,12 +15,19 @@
 //! them until it gets a `2xx`, also after a `4xx` (a provider answers `200` for a node it does
 //! not know, so any `4xx` is a provider error). There is no last attempt. `last_error` holds
 //! the status and the code of the error only, never its message (a provider may quote values
-//! in it).
+//! in it). The rules go by the hook kind of the row ([`PendingDelivery::kind`], the `hook`
+//! column), so a delete hook whose payload does not read is retried too, not ended.
+//!
+//! A provider that panics gives `500 internal`, a retry with the backoff. A panic elsewhere in a
+//! round leaves the delivery due and unchanged (the transaction rolls back; the memory store
+//! releases it), and [`DeliveryWorker::run`] goes on with the next round (re-review-P-2 F-2).
 //!
 //! How the server starts the worker is the server's wiring ([`DeliveryWorker::run`] in a task).
 
 use super::store::{Deliver, DeliveryOutcome, PendingDelivery, TypedNodeStore, error_text};
 use super::*;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -116,19 +123,30 @@ impl Deliver for RegistryDeliver {
         };
         let call = tokio::time::timeout(
             self.timeout,
-            provider.deliver_hook(d.delivery_id, d.hook.clone()),
+            AssertUnwindSafe(provider.deliver_hook(d.delivery_id, d.hook.clone())).catch_unwind(),
         )
         .await
         .unwrap_or_else(|_| {
-            Err(Error::api(
+            Ok(Err(Error::api(
                 ErrorCode::Unavailable,
                 "the provider did not answer in time",
-            ))
+            )))
+        })
+        .unwrap_or_else(|_| {
+            // A panic is a provider error: retry with the backoff, and never end a delete.
+            tracing::error!(
+                tenant = %d.tenant_id,
+                delivery = %d.delivery_id,
+                provider = %d.provider,
+                hook = ?d.kind,
+                "a provider panicked on a hook delivery"
+            );
+            Err(Error::Internal("the provider panicked".into()))
         });
         match call {
             Ok(_) => DeliveryOutcome::Delivered,
             Err(e) => {
-                let kind = d.hook.hook;
+                let kind = d.kind;
                 let status = e.http_status();
                 if must_succeed(kind) && (400..500).contains(&status) {
                     // The provider breaks the contract: a delete must succeed. Retry anyway,
@@ -154,6 +172,10 @@ impl Deliver for RegistryDeliver {
                 outcome_of(&e, kind, d.attempts + 1, &self.backoff)
             }
         }
+    }
+
+    fn retry_after(&self, failed: i32) -> Duration {
+        self.backoff.after(failed)
     }
 }
 
@@ -215,10 +237,15 @@ impl DeliveryWorker {
         Ok(round)
     }
 
-    /// Runs rounds for ever: after each wake, and at least every `interval`.
+    /// Runs rounds for ever: after each wake, and at least every `interval`. A round that
+    /// panics is logged, and the next round runs after `interval`.
     pub async fn run(&self, interval: Duration) {
         loop {
-            match self.run_once(Self::ROUND_LIMIT).await {
+            let round = AssertUnwindSafe(self.run_once(Self::ROUND_LIMIT))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(Error::Internal("a delivery round panicked".into())));
+            match round {
                 Ok(round) if round.delivered + round.retried + round.refused > 0 => {
                     tracing::debug!(?round, "hook deliveries");
                     if round.delivered + round.retried + round.refused == Self::ROUND_LIMIT {

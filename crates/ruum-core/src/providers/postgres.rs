@@ -13,6 +13,7 @@
 //! the provider, and records the outcome in the same transaction. So two workers never deliver
 //! one row at the same time, and a delivery is either recorded with its outcome or still due.
 
+use super::deliveries::must_succeed;
 use super::store::{
     Deliver, DeliveryOutcome, DeliveryState, NewDelivery, NewTypedNode, PendingDelivery,
     ReconcileItem, ReportOutcome, TypedNodeRow, TypedNodeStore, check_status, hook_name,
@@ -311,7 +312,7 @@ impl TypedNodeStore for PgTypedNodeStore {
         let row = sqlx::query(concat!(
             "select ",
             delivery_columns!(),
-            " from provider_deliveries d \
+            ", hook::text as hook_column from provider_deliveries d \
               where d.delivered_at is null and d.next_attempt_at <= now() \
                 and not exists (select 1 from provider_deliveries e \
                     where e.tenant_id = d.tenant_id and e.delivered_at is null \
@@ -333,27 +334,41 @@ impl TypedNodeStore for PgTypedNodeStore {
         let attempts: i32 = row.try_get("attempts")?;
         let provider: String = row.try_get("provider")?;
         let payload: Value = row.try_get("payload")?;
+        // The rules go by the hook column, not by the payload: the column still reads when
+        // the payload does not (re-review-P-2 F-1). `None`: a kind this build does not know.
+        let column: String = row.try_get("hook_column")?;
+        let kind = serde_json::from_value::<HookKind>(Value::String(column)).ok();
         let hook = match serde_json::from_value::<HookDelivery>(payload) {
             Ok(hook) => hook,
             Err(e) => {
-                // A payload that does not read is refused for good, so its queue goes on.
                 // Log the category and the place of the error only: its text can quote a
                 // part of the payload, and a payload can hold an upload token.
                 tracing::error!(
                     %tenant,
                     %delivery,
+                    hook = ?kind,
                     category = ?e.classify(),
                     line = e.line(),
                     column = e.column(),
                     "a delivery payload does not read"
                 );
-                return self.refuse_unreadable(tx, tenant, delivery).await;
+                return self
+                    .unreadable(tx, tenant, delivery, kind, attempts, deliver)
+                    .await;
             }
+        };
+        // A kind this build does not know, with a payload that reads: retry, as for a payload
+        // that does not read (a later build knows it).
+        let Some(kind) = kind else {
+            return self
+                .unreadable(tx, tenant, delivery, None, attempts, deliver)
+                .await;
         };
         let pending = PendingDelivery {
             tenant_id: tenant,
             delivery_id: delivery,
             provider,
+            kind,
             hook,
             attempts,
         };
@@ -416,23 +431,47 @@ impl TypedNodeStore for PgTypedNodeStore {
 }
 
 impl PgTypedNodeStore {
-    async fn refuse_unreadable(
+    /// A row whose payload does not read, or whose hook kind this build does not know. A hook
+    /// that [`must_succeed`] (or an unknown kind, which may be one) is retried with the
+    /// backoff, so the data does not stay with the provider; its queue waits, and a build that
+    /// reads the payload delivers it. Any other hook is refused for good, so its queue goes
+    /// on. Both record `last_error = 'payload_unreadable'` and give an error to the worker.
+    async fn unreadable(
         &self,
         mut tx: Transaction<'static, Postgres>,
         tenant: TenantId,
         delivery: DeliveryId,
+        kind: Option<HookKind>,
+        attempts: i32,
+        deliver: &dyn Deliver,
     ) -> Result<Option<(PendingDelivery, DeliveryOutcome)>> {
-        sqlx::query(
-            "update provider_deliveries set delivered_at = now(), attempts = attempts + 1, \
-             last_error = 'payload_unreadable' where tenant_id = $1 and delivery_id = $2",
-        )
-        .bind(tenant)
-        .bind(delivery.0)
-        .execute(&mut *tx)
-        .await?;
+        let retry = kind.is_none_or(must_succeed);
+        if retry {
+            sqlx::query(
+                "update provider_deliveries set attempts = attempts + 1, \
+                 last_error = 'payload_unreadable', \
+                 next_attempt_at = now() + make_interval(secs => $3) \
+                 where tenant_id = $1 and delivery_id = $2",
+            )
+            .bind(tenant)
+            .bind(delivery.0)
+            .bind(deliver.retry_after(attempts + 1).as_secs_f64())
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "update provider_deliveries set delivered_at = now(), attempts = attempts + 1, \
+                 last_error = 'payload_unreadable' where tenant_id = $1 and delivery_id = $2",
+            )
+            .bind(tenant)
+            .bind(delivery.0)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Err(Error::Internal(format!(
-            "delivery {delivery} of tenant {tenant}: the payload does not read"
+            "delivery {delivery} of tenant {tenant}: the payload or the hook kind does not read ({})",
+            if retry { "retried" } else { "refused" }
         )))
     }
 }

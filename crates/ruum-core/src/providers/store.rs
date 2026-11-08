@@ -244,6 +244,11 @@ pub struct PendingDelivery {
     pub tenant_id: TenantId,
     pub delivery_id: DeliveryId,
     pub provider: String,
+    /// The hook kind of the row (the `hook` column on Postgres). The delivery rules
+    /// ([`super::deliveries::must_succeed`]) go by it, not by the payload's `hook.hook`: the
+    /// column is written by `enqueue` with the payload and still reads when the payload does
+    /// not (re-review-P-2 F-1).
+    pub kind: HookKind,
     pub hook: HookDelivery,
     /// The failed attempts before this one.
     pub attempts: i32,
@@ -287,6 +292,13 @@ pub struct DeliveryState {
 #[async_trait]
 pub trait Deliver: Send + Sync {
     async fn deliver(&self, d: &PendingDelivery) -> DeliveryOutcome;
+
+    /// The delay before the next attempt after `failed` failed attempts, for a delivery that
+    /// the store retries without a call to [`Deliver::deliver`] (a delete hook whose payload
+    /// does not read).
+    fn retry_after(&self, failed: i32) -> Duration {
+        super::deliveries::Backoff::default().after(failed)
+    }
 }
 
 /// What `last_error` holds for an error: the status and the code, never the message (a
@@ -634,14 +646,26 @@ impl TypedNodeStore for MemoryTypedNodeStore {
                 tenant_id: key.0,
                 delivery_id: key.1,
                 provider: d.provider,
+                kind: d.hook.hook,
                 hook: d.hook,
                 attempts: d.attempts,
             }
         };
+        let key = (pending.tenant_id, pending.delivery_id);
+        // Releases the delivery when the call panics or the future is dropped, as the row
+        // lock of Postgres goes with its transaction (re-review-P-2 F-2). The delivery stays
+        // due and unchanged.
+        struct Release<'a>(&'a MemoryTypedNodeStore, (TenantId, DeliveryId));
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.lock().held.remove(&self.1);
+            }
+        }
+        let release = Release(self, key);
         let outcome = deliver.deliver(&pending).await;
         let mut inner = self.lock();
-        let key = (pending.tenant_id, pending.delivery_id);
         inner.held.remove(&key);
+        std::mem::forget(release);
         if let Some(d) = inner.deliveries.get_mut(&key) {
             let now = crate::now();
             d.attempts += 1;
@@ -688,7 +712,7 @@ mod tests {
     use super::*;
     use crate::actor::Actor;
     use crate::ids::UserId;
-    use crate::providers::deliveries::{Backoff, DeliveryWorker, Round, outcome_of};
+    use crate::providers::deliveries::{Backoff, DeliveryWorker, Round, must_succeed, outcome_of};
     use crate::providers::memory::{MemoryPlatform, MemoryProvider};
     use crate::providers::postgres::{self as pg, PgTypedNodeStore};
     use crate::providers::reconciler::{Reconciler, apply_delivery_id, create_delivery_id};
@@ -2010,6 +2034,566 @@ mod tests {
         the_worker_delivers_through_the_registry,
         a_delete_hook_is_retried_after_a_4xx,
     );
+
+    // -------------------------------------------------------------- re-review-P-2 cases
+    // The hostile cases of the re-review of P-2 (H1 to H7 of `re-review-p2.md`) and the cases
+    // of its follow-ups F-1 and F-2.
+
+    #[derive(Clone)]
+    enum Step {
+        Fail(fn() -> Error),
+        Panic,
+    }
+
+    /// A provider whose deliver_hook follows a script; an empty script delegates to memory.
+    struct Scripted {
+        inner: MemoryProvider,
+        script: Mutex<std::collections::VecDeque<Step>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(inner: MemoryProvider, steps: Vec<Step>) -> Self {
+            Self {
+                inner,
+                script: Mutex::new(steps.into()),
+                calls: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Scripted {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.inner.descriptor()
+        }
+        async fn validate_manifest(
+            &self,
+            d: DeliveryId,
+            r: ValidateRequest,
+        ) -> Result<ValidationResult> {
+            self.inner.validate_manifest(d, r).await
+        }
+        async fn create_typed_node(
+            &self,
+            d: DeliveryId,
+            r: CreateTypedNodeRequest,
+        ) -> Result<Reply<ProviderStatus>> {
+            self.inner.create_typed_node(d, r).await
+        }
+        async fn apply_manifest(
+            &self,
+            d: DeliveryId,
+            n: NodeId,
+            r: ApplyManifestRequest,
+        ) -> Result<Reply<ProviderStatus>> {
+            self.inner.apply_manifest(d, n, r).await
+        }
+        async fn get_typed_node_status(&self, t: TenantId, n: NodeId) -> Result<ProviderStatus> {
+            self.inner.get_typed_node_status(t, n).await
+        }
+        async fn deliver_hook(&self, d: DeliveryId, h: HookDelivery) -> Result<Reply<HookResult>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let step = self.script.lock().unwrap().pop_front();
+            match step {
+                Some(Step::Fail(f)) => Err(f()),
+                Some(Step::Panic) => panic!("hostile provider panics"),
+                None => self.inner.deliver_hook(d, h).await,
+            }
+        }
+        async fn list_provider_versions(
+            &self,
+            t: TenantId,
+            n: NodeId,
+            p: PageRequest,
+        ) -> Result<ProviderVersionPage> {
+            self.inner.list_provider_versions(t, n, p).await
+        }
+        async fn restore_provider_version(
+            &self,
+            d: DeliveryId,
+            n: NodeId,
+            r: RestoreRequest,
+        ) -> Result<ProviderStatus> {
+            self.inner.restore_provider_version(d, n, r).await
+        }
+        async fn export_typed_node(
+            &self,
+            d: DeliveryId,
+            n: NodeId,
+            r: ExportRequest,
+        ) -> Result<ProviderStatus> {
+            self.inner.export_typed_node(d, n, r).await
+        }
+    }
+
+    fn scripted_worker(h: &dyn Harness, steps: Vec<Step>) -> (DeliveryWorker, Arc<Scripted>) {
+        let s = h.store();
+        let platform = Arc::new(StoreReports::new(
+            s.clone(),
+            Arc::new(MemoryPlatform::new()),
+        ));
+        let p = Arc::new(Scripted::new(MemoryProvider::new(platform), steps));
+        let mut registry = ProviderRegistry::new();
+        registry.register(p.clone()).unwrap();
+        (
+            DeliveryWorker::new(
+                s,
+                Arc::new(registry),
+                Backoff {
+                    first: HOUR,
+                    max: HOUR,
+                },
+            ),
+            p,
+        )
+    }
+
+    /// Every error the platform knows, as a provider error.
+    fn all_errors() -> Vec<fn() -> Error> {
+        macro_rules! e {
+            ($($c:ident),*) => { vec![$(|| Error::api(ErrorCode::$c, "hostile \"quoted\" value")),*] };
+        }
+        let mut v: Vec<fn() -> Error> = e!(
+            BadRequest,
+            ValidationFailed,
+            Unauthenticated,
+            TokenExpired,
+            PermissionDenied,
+            ScopeExceeded,
+            UserRequired,
+            NotFound,
+            Conflict,
+            NameTaken,
+            VersionMismatch,
+            IdempotencyKeyReused,
+            PreconditionFailed,
+            PayloadTooLarge,
+            RangeNotSatisfiable,
+            CursorExpired,
+            QuotaExceeded,
+            PlanLimitReached,
+            RateLimited,
+            AgentDisabled,
+            ChunkMissing,
+            HashMismatch,
+            NotImplemented,
+            Internal,
+            Unavailable
+        );
+        v.push(|| Error::Internal("boom".into()));
+        v.push(|| Error::Database(sqlx::Error::PoolTimedOut));
+        v
+    }
+
+    /// H1: a purged and a tenant_deleted get every error the platform knows, one after the
+    /// other, with "retry now" between rounds. They never end; the first 2xx ends them.
+    async fn rrp2_every_error_keeps_a_delete_due(h: &dyn Harness) {
+        assert_eq!(
+            all_errors().len(),
+            ErrorCode::ALL.len() + 2,
+            "the list covers ErrorCode::ALL"
+        );
+        let s = h.store();
+        let t = h.tenant().await;
+        let purged = delivery(HookKind::Purged, t, Some(NodeId::new()));
+        let gone = delivery(HookKind::TenantDeleted, t, None);
+        h.enqueue(purged.clone()).await;
+        h.enqueue(gone.clone()).await;
+        // Each error twice in a row (once per delivery), in order.
+        let steps: Vec<Step> = all_errors()
+            .into_iter()
+            .flat_map(|f| [Step::Fail(f), Step::Fail(f)])
+            .collect();
+        let n = all_errors().len();
+        let (w, p) = scripted_worker(h, steps);
+        for i in 0..n {
+            let round = w.run_once(100).await.unwrap();
+            assert_eq!(
+                (round.delivered, round.refused, round.retried),
+                (0, 0, 2),
+                "error {i}: {round:?}"
+            );
+            for d in [&purged, &gone] {
+                let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+                assert!(st.delivered_at.is_none(), "error {i}: {:?} ended", st.hook);
+                assert_eq!(st.attempts as usize, i + 1);
+                let le = st.last_error.clone().unwrap();
+                assert!(!le.contains("hostile") && !le.contains("boom"), "{le}");
+                assert!(s.retry_now(t, d.delivery_id).await.unwrap());
+            }
+        }
+        // Script empty: the memory provider answers 2xx.
+        let round = w.run_once(100).await.unwrap();
+        assert_eq!(
+            (round.delivered, round.refused, round.retried),
+            (2, 0, 0),
+            "{round:?}"
+        );
+        for d in [&purged, &gone] {
+            let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+            assert!(st.delivered_at.is_some());
+            assert_eq!(st.last_error, None);
+            assert_eq!(st.attempts as usize, n + 1);
+        }
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2 * n + 2);
+    }
+
+    /// H2: every non-delete hook IS refused on a final 4xx (the fix did not widen the retry).
+    async fn rrp2_other_hooks_still_refused(h: &dyn Harness) {
+        let s = h.store();
+        let t = h.tenant().await;
+        for kind in HookKind::ALL.iter().copied().filter(|k| !must_succeed(*k)) {
+            let node = if kind.is_tenant_hook() {
+                None
+            } else {
+                Some(NodeId::new())
+            };
+            let mut d = delivery(kind, t, node);
+            if kind == HookKind::Copied {
+                d.hook.target_node_id = Some(NodeId::new());
+            }
+            h.enqueue(d.clone()).await;
+            let (w, _) =
+                scripted_worker(h, vec![Step::Fail(|| Error::api(ErrorCode::NotFound, "x"))]);
+            let round = w.run_once(1).await.unwrap();
+            assert_eq!(round.refused, 1, "{kind:?}: {round:?}");
+            let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+            assert!(st.delivered_at.is_some(), "{kind:?}");
+        }
+    }
+
+    /// H3: a purged behind a refused moved of the same node: the queue goes on to purged, and
+    /// purged is not refused; a later hook of the node waits behind it.
+    async fn rrp2_purged_in_a_queue(h: &dyn Harness) {
+        let s = h.store();
+        let t = h.tenant().await;
+        let n = NodeId::new();
+        let moved = delivery(HookKind::Moved, t, Some(n));
+        let purged = delivery(HookKind::Purged, t, Some(n));
+        let after = delivery(HookKind::Renamed, t, Some(n));
+        for d in [&moved, &purged, &after] {
+            h.enqueue(d.clone()).await;
+        }
+        let f: fn() -> Error = || Error::api(ErrorCode::ValidationFailed, "x");
+        let (w, p) = scripted_worker(h, vec![Step::Fail(f), Step::Fail(f)]);
+        let round = w.run_once(100).await.unwrap();
+        assert_eq!(
+            (round.delivered, round.refused, round.retried),
+            (0, 1, 1),
+            "{round:?}"
+        );
+        assert!(
+            s.delivery(t, purged.delivery_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivered_at
+                .is_none()
+        );
+        let st = s.delivery(t, after.delivery_id).await.unwrap().unwrap();
+        assert_eq!(st.attempts, 0, "a later hook waits behind the purged");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// H4: an unregistered provider for a purged: retried, never ended.
+    async fn rrp2_unregistered_provider(h: &dyn Harness) {
+        let s = h.store();
+        let t = h.tenant().await;
+        let mut d = delivery(HookKind::Purged, t, Some(NodeId::new()));
+        d.provider = "gone-provider".into();
+        h.enqueue(d.clone()).await;
+        let (w, _) = scripted_worker(h, vec![]);
+        let round = w.run_once(1).await.unwrap();
+        assert_eq!(round.retried, 1, "{round:?}");
+        let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+        assert!(st.delivered_at.is_none());
+        assert_eq!(st.last_error.as_deref(), Some("provider_not_registered"));
+    }
+
+    /// H5 (F-2): a provider that panics on purged. The panic is a provider error (`500
+    /// internal`): a retry with the backoff, never an end; after "retry now" the purged is
+    /// delivered.
+    async fn rrp2_panic_keeps_purged(h: &dyn Harness) {
+        let s = h.store();
+        let t = h.tenant().await;
+        let d = delivery(HookKind::Purged, t, Some(NodeId::new()));
+        h.enqueue(d.clone()).await;
+        let (w, p) = scripted_worker(h, vec![Step::Panic]);
+        let round = w.run_once(1).await.unwrap();
+        assert_eq!(
+            (round.delivered, round.refused, round.retried),
+            (0, 0, 1),
+            "{round:?}"
+        );
+        let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+        assert!(st.delivered_at.is_none(), "a panic does not end the purged");
+        assert_eq!(st.attempts, 1);
+        assert_eq!(st.last_error.as_deref(), Some("500 internal"));
+        assert!(st.next_attempt_at > crate::now() + Duration::from_secs(1800));
+        assert!(s.retry_now(t, d.delivery_id).await.unwrap());
+        let round = w.run_once(1).await.unwrap();
+        assert_eq!(
+            round.delivered, 1,
+            "the purged is delivered after the panic: {round:?}"
+        );
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A [`Deliver`] that panics on its first `panics` calls, then delivers.
+    struct PanicsFirst {
+        panics: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PanicsFirst {
+        fn new(panics: usize) -> Arc<Self> {
+            Arc::new(Self {
+                panics,
+                calls: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Deliver for PanicsFirst {
+        async fn deliver(&self, _: &PendingDelivery) -> DeliveryOutcome {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.panics {
+                panic!("a hostile deliver panics");
+            }
+            DeliveryOutcome::Delivered
+        }
+    }
+
+    /// F-2: a panic in the round itself (not in the provider) leaves the delivery due and
+    /// unchanged; the memory store does not keep it held. The next round delivers it, without
+    /// "retry now".
+    async fn a_panic_in_a_round_leaves_the_delivery_due(h: &dyn Harness) {
+        let s = h.store();
+        let t = h.tenant().await;
+        let d = delivery(HookKind::Purged, t, Some(NodeId::new()));
+        h.enqueue(d.clone()).await;
+        let p = PanicsFirst::new(1);
+        let w = Arc::new(DeliveryWorker::with_deliver(s.clone(), p.clone()));
+        let w2 = w.clone();
+        let joined = tokio::spawn(async move { w2.run_once(1).await }).await;
+        assert!(joined.is_err(), "the round panicked");
+        let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+        assert!(st.delivered_at.is_none(), "a panic does not end the purged");
+        assert_eq!(st.attempts, 0, "nothing is recorded for a panic");
+        let round = w.run_once(1).await.unwrap();
+        assert_eq!(round.delivered, 1, "{round:?}");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// F-2: [`DeliveryWorker::run`] goes on after a round that panics, and delivers the
+    /// delivery in a later round.
+    async fn the_worker_loop_survives_a_panic(h: &dyn Harness) {
+        let s = h.store();
+        let t = h.tenant().await;
+        let d = delivery(HookKind::TenantDeleted, t, None);
+        h.enqueue(d.clone()).await;
+        let p = PanicsFirst::new(2);
+        let w = Arc::new(DeliveryWorker::with_deliver(s.clone(), p.clone()));
+        let w2 = w.clone();
+        let task = tokio::spawn(async move { w2.run(Duration::from_millis(20)).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+            if st.delivered_at.is_some() {
+                assert_eq!(st.attempts, 1, "the panics recorded nothing");
+                break;
+            }
+            assert!(!task.is_finished(), "the worker loop ended");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not delivered after two panics"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!task.is_finished(), "the worker loop ended");
+        task.abort();
+        assert_eq!(p.calls.load(Ordering::SeqCst), 3);
+    }
+
+    mod rrp2 {
+        use super::*;
+        suite!(
+            rrp2_every_error_keeps_a_delete_due,
+            rrp2_other_hooks_still_refused,
+            rrp2_purged_in_a_queue,
+            rrp2_unregistered_provider,
+            rrp2_panic_keeps_purged,
+            a_panic_in_a_round_leaves_the_delivery_due,
+            the_worker_loop_survives_a_panic,
+        );
+    }
+
+    async fn pg_rewrite(pool: &PgPool, t: TenantId, d: DeliveryId, q: &'static str) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("select set_config('ruum.system', 'on', true)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let r = sqlx::query(q)
+            .bind(t)
+            .bind(d.0)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(r.rows_affected(), 1);
+        tx.commit().await.unwrap();
+    }
+
+    /// The state of a row read by SQL (`delivery` does not read a row whose payload does
+    /// not read): delivered_at, last_error, attempts, next_attempt_at.
+    async fn pg_row(
+        pool: &PgPool,
+        t: TenantId,
+        d: DeliveryId,
+    ) -> (Option<OffsetDateTime>, Option<String>, i32, OffsetDateTime) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("select set_config('ruum.system', 'on', true)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let row = sqlx::query_as(
+            "select delivered_at, last_error, attempts, next_attempt_at from provider_deliveries \
+             where tenant_id = $1 and delivery_id = $2",
+        )
+        .bind(t)
+        .bind(d.0)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        row
+    }
+
+    /// H6 (F-1, Postgres): a purged and a tenant_deleted row whose payload no longer reads (a
+    /// version skew or a bad backfill). They go by the hook column: retried with the backoff
+    /// and `payload_unreadable`, never ended, and the provider is not called. A later hook of
+    /// the node waits behind the purged.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rrp2_pg_unreadable_purged_payload(pool: PgPool) {
+        let h = PgHarness::new(pool.clone()).await;
+        let t = h.tenant().await;
+        let node = NodeId::new();
+        let purged = delivery(HookKind::Purged, t, Some(node));
+        let after = delivery(HookKind::Renamed, t, Some(node));
+        let gone = delivery(HookKind::TenantDeleted, t, None);
+        for d in [&purged, &after, &gone] {
+            h.enqueue(d.clone()).await;
+        }
+        for d in [&purged, &gone] {
+            pg_rewrite(&pool, t, d.delivery_id, "update provider_deliveries set payload = payload - 'by' where tenant_id = $1 and delivery_id = $2").await;
+        }
+        let (w, p) = scripted_worker(&h, vec![]);
+        for _ in 0..2 {
+            assert!(
+                w.run_once(10).await.is_err(),
+                "an unreadable payload is an error"
+            );
+        }
+        assert!(
+            w.run_once(10).await.unwrap() == Round::default(),
+            "nothing is due"
+        );
+        for d in [&purged, &gone] {
+            let (delivered_at, last_error, attempts, next) = pg_row(&pool, t, d.delivery_id).await;
+            assert!(
+                delivered_at.is_none(),
+                "an unreadable delete hook ended without a 2xx"
+            );
+            assert_eq!(last_error.as_deref(), Some("payload_unreadable"));
+            assert_eq!(attempts, 1);
+            assert!(
+                next > crate::now() + Duration::from_secs(1800),
+                "the backoff"
+            );
+        }
+        let (_, _, attempts, _) = pg_row(&pool, t, after.delivery_id).await;
+        assert_eq!(attempts, 0, "a later hook waits behind the purged");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+
+        // A deploy that reads the payload delivers it.
+        for d in [&purged, &gone] {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query("select set_config('ruum.system', 'on', true)")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query(
+                "update provider_deliveries set payload = payload || jsonb_build_object('by', $3::jsonb), \
+                 next_attempt_at = now() where tenant_id = $1 and delivery_id = $2",
+            )
+            .bind(t)
+            .bind(d.delivery_id.0)
+            .bind(serde_json::to_value(d.hook.by).unwrap())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        // The renamed of a node the memory provider does not know is refused (404).
+        let round = w.run_once(10).await.unwrap();
+        assert_eq!((round.delivered, round.refused), (2, 1), "{round:?}");
+    }
+
+    /// F-1 (Postgres): another hook whose payload does not read is still refused for good, so
+    /// its queue goes on.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn pg_unreadable_moved_payload_is_refused(pool: PgPool) {
+        let h = PgHarness::new(pool.clone()).await;
+        let t = h.tenant().await;
+        let node = NodeId::new();
+        let moved = delivery(HookKind::Moved, t, Some(node));
+        let after = delivery(HookKind::Renamed, t, Some(node));
+        for d in [&moved, &after] {
+            h.enqueue(d.clone()).await;
+        }
+        pg_rewrite(&pool, t, moved.delivery_id, "update provider_deliveries set payload = payload - 'by' where tenant_id = $1 and delivery_id = $2").await;
+        let (w, p) = scripted_worker(&h, vec![]);
+        assert!(w.run_once(10).await.is_err());
+        let (delivered_at, last_error, attempts, _) = pg_row(&pool, t, moved.delivery_id).await;
+        assert!(delivered_at.is_some(), "refused for good");
+        assert_eq!(last_error.as_deref(), Some("payload_unreadable"));
+        assert_eq!(attempts, 1);
+        // The renamed reaches the provider (it does not know the node: 404, refused).
+        let round = w.run_once(10).await.unwrap();
+        assert_eq!(round.refused, 1, "the queue goes on: {round:?}");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// H7 (F-1, Postgres): hook column 'purged' but payload hook 'moved'; the provider answers
+    /// 422. The rules go by the column: retried, not refused.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rrp2_pg_column_payload_mismatch(pool: PgPool) {
+        let h = PgHarness::new(pool.clone()).await;
+        let s = h.store();
+        let t = h.tenant().await;
+        let d = delivery(HookKind::Purged, t, Some(NodeId::new()));
+        h.enqueue(d.clone()).await;
+        pg_rewrite(
+            &pool,
+            t,
+            d.delivery_id,
+            "update provider_deliveries set payload = jsonb_set(payload, '{hook}', '\"moved\"') where tenant_id = $1 and delivery_id = $2",
+        )
+        .await;
+        let (w, _) = scripted_worker(
+            &h,
+            vec![Step::Fail(|| Error::api(ErrorCode::ValidationFailed, "x"))],
+        );
+        let round = w.run_once(1).await.unwrap();
+        assert_eq!(round.retried, 1, "{round:?}");
+        let st = s.delivery(t, d.delivery_id).await.unwrap().unwrap();
+        assert!(
+            st.delivered_at.is_none(),
+            "H7: column purged, payload moved: refused on 422"
+        );
+        assert_eq!(st.last_error.as_deref(), Some("422 validation_failed"));
+    }
 
     /// Several workers on several threads (memory): the same rules as above.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
