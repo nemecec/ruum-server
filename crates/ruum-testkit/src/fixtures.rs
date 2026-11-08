@@ -9,7 +9,8 @@
 //! │   │                              guest_manage=manage
 //! │   ├── <prefix>-plan.txt (X)  two versions v1 and v2, tag T attached
 //! │   ├── Archive/          (S)  editors_can_share = false (editors keep edit, lose share)
-//! │   ├── <prefix>-garden   (D)  a database node (SQLite 3), made by `member` (card D-1)
+//! │   ├── <prefix>-garden   (D)  a database node (SQLite 3), made by `member` (card D-1), with
+//! │   │                          the table `plants` (id, latin_name, common_name; two rows)
 //! │   └── <prefix>-old.txt  (Y)  in the trash (its old parent is Projects)
 //! └── Private/             (G)  no grants
 //! ```
@@ -27,7 +28,11 @@
 //! | `anonymous` | no credentials |
 //!
 //! The database D is made by `member` through `createDatabase` (the database provider, card
-//! D-1), and `seed` waits until it is `ready`. The write grant of `agent` on it and the pending
+//! D-1), and `seed` waits until it is `ready`. Then the step "garden tables" makes the table
+//! `plants` as the database's owner kind through the engine (wave 4 gate G-1): `id integer
+//! primary key, latin_name text not null, common_name text`, with two rows of plant names (no
+//! personal data). The standard requests of `queryDatabase`, `suggestColumnClasses` and
+//! `confirmColumnClasses` address it. The write grant of `agent` on it and the pending
 //! request of `agent` on it are placeholder IDs until A-1 and A-2 seed them (they keep these
 //! field names).
 //!
@@ -932,6 +937,56 @@ mod seed {
                 Err(ruum_core::Error::Internal(
                     "the fixture database is not ready after 5 s".into(),
                 ))
+            })
+            .await;
+            // The table `plants` (wave 4 gate G-1): the standard requests of `queryDatabase`,
+            // `suggestColumnClasses` and `confirmColumnClasses` address it. Made as the
+            // database's owner kind through the engine of the services; no personal data.
+            let (s2, tenant, id) = (s.clone(), t.id, t.database);
+            step("garden tables", async move {
+                use ruum_core::databases::engine::{
+                    RoleKind, RoleRef, StatementMode, StatementRequest,
+                };
+                let row = s2
+                    .databases
+                    .deps()
+                    .store
+                    .get(tenant, id)
+                    .await?
+                    .ok_or_else(|| ruum_core::Error::Internal("no databases row".into()))?;
+                let engine = s2
+                    .database_engines
+                    .get(row.engine)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ruum_core::Error::Internal("no engine for the fixture database".into())
+                    })?;
+                let key = s2.tenant_keys.engine_key(tenant, row.key_node_id).await?;
+                let role = RoleRef::new(row.database_ref(), RoleKind::Owner)
+                    .map_err(|e| ruum_core::Error::Internal(e.to_string()))?;
+                for sql in [
+                    "create table plants (id integer primary key, latin_name text not null, \
+                     common_name text)",
+                    "insert into plants (id, latin_name, common_name) values \
+                     (1, 'Rosa canina', 'dog rose'), (2, 'Bellis perennis', 'daisy')",
+                ] {
+                    engine
+                        .execute(
+                            &role,
+                            &key,
+                            &StatementRequest {
+                                sql: sql.into(),
+                                params: vec![],
+                                mode: StatementMode::Write,
+                                timeout: std::time::Duration::from_secs(30),
+                                max_rows: 10,
+                                max_bytes: None,
+                            },
+                        )
+                        .await
+                        .map_err(|e| ruum_core::Error::Internal(e.to_string()))?;
+                }
+                Ok(())
             })
             .await;
         }
