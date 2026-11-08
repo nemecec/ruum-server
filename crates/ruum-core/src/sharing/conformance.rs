@@ -1275,7 +1275,7 @@ async fn share_emails(w: &World, b: &dyn Backend) {
     assert!(
         !mail
             .body
-            .contains("Sign in to Ruum with this email address")
+            .contains("To open it, sign in to Ruum with this email address")
     );
     assert_eq!(mail.reply_to.as_deref(), Some(email_of(w.owner).as_str()));
 
@@ -1316,7 +1316,7 @@ async fn share_emails(w: &World, b: &dyn Backend) {
     );
     assert!(
         mail.body
-            .contains("Sign in to Ruum with this email address")
+            .contains("To open it, sign in to Ruum with this email address")
     );
     assert!(!mail.body.to_lowercase().contains("token"));
 
