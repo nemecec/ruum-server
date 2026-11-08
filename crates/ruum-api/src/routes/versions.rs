@@ -48,6 +48,10 @@ pub struct ListQuery {
 }
 
 /// List versions. `GET /v1/nodes/{node_id}/versions` (operationId `listVersions`).
+///
+/// A file lists its content versions. A database node lists its manifest versions (read only,
+/// with the label and the actor of each; review-D-1 B-1), which `updateDatabaseManifest`
+/// writes.
 pub async fn list_versions(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
@@ -59,20 +63,21 @@ pub async fn list_versions(
         actor_kind: q.actor_kind,
         labeled: q.labeled,
     };
-    let page = state
-        .services
-        .versions
-        .list_filtered(
-            &ctx,
-            node,
-            filter,
-            Paging {
-                cursor: q.cursor,
-                limit: q.limit,
-            }
-            .page()?,
-        )
-        .await?;
+    let page = Paging {
+        cursor: q.cursor,
+        limit: q.limit,
+    }
+    .page()?;
+    let databases = &state.services.databases;
+    let page = if databases.is_database(ctx.tenant, node).await? {
+        databases.list_versions(&ctx, node, filter, page).await?
+    } else {
+        state
+            .services
+            .versions
+            .list_filtered(&ctx, node, filter, page)
+            .await?
+    };
     Ok(Json(to_json(&page)?))
 }
 

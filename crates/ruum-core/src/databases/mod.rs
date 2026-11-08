@@ -51,11 +51,13 @@ use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::{NodeId, TenantId, VersionId};
 use crate::journal::{ChangeInfo, EventType, NewEntry, Written};
 use crate::nodes::{NewTyped, Node, NodeKind, NodeStore, OnConflict};
+use crate::paging::{Page, PageRequest};
 use crate::providers::store::{ReportOutcome, TypedNodeRow, TypedNodeStore};
 use crate::providers::{
     ApplyManifestRequest, CreateTypedNodeRequest, DataCopy, ProviderState, ProviderStatus, Source,
 };
 use crate::tenants::{DatabaseUsage, MemberRole, TenantStore, database_limits};
+use crate::versions::{Version, VersionFilter};
 use async_trait::async_trait;
 use ruum_dbengine::{DatabaseEngine, DatabaseRef, EngineKind, EngineRole};
 use serde::{Deserialize, Serialize};
@@ -320,22 +322,38 @@ pub trait DatabaseStore: Send + Sync {
 
     /// Called after [`NodeStore::create_typed`] made a database node with its first manifest.
     /// The Postgres store has the version row already and does nothing.
-    fn created(&self, tenant: TenantId, node: NodeId, version: VersionId, manifest: &Value) {
-        let _ = (tenant, node, version, manifest);
+    fn created(&self, node: &Node, version: VersionId, manifest: &Value) {
+        let _ = (node, version, manifest);
     }
 
     /// Writes a new manifest version of a database node as its head (revision + 1), makes it
     /// the desired version of the `typed_nodes` row and writes `version.created`, in one
-    /// transaction. `if_revision` is the `If-Match` revision (`412`). A node in the trash is
-    /// `409 conflict`; a node that is not a database is `404`.
+    /// transaction. `checked` is the desired version that the caller checked the new manifest
+    /// against ([`manifest::check`]); when the desired version is another one under the row
+    /// lock, someone changed the manifest in between, and the call is `409 conflict` (so an
+    /// agent's write never reverts a person's change of `data_classes`). `if_revision` is the
+    /// `If-Match` revision (`412`). A node in the trash is `409 conflict`; a node that is not a
+    /// database is `404`.
     async fn put_manifest(
         &self,
         ctx: &Context,
         node: NodeId,
         manifest: &Value,
         label: Option<&str>,
+        checked: VersionId,
         if_revision: Option<i64>,
     ) -> Result<Written<VersionId>>;
+
+    /// The manifest versions of a database node, newest first (`listVersions` of a database
+    /// node): the label, the actor and the time of each. No permission check; the caller
+    /// checks `view`.
+    async fn list_versions(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>>;
 
     /// The `databases` row of a node.
     async fn get(&self, tenant: TenantId, node: NodeId) -> Result<Option<DatabaseRow>>;
@@ -369,6 +387,8 @@ pub struct MemoryDatabaseStore {
 #[derive(Default)]
 struct MemDbInner {
     manifests: HashMap<(TenantId, VersionId), Value>,
+    /// The manifest versions of each database node, oldest first.
+    versions: HashMap<(TenantId, NodeId), Vec<Version>>,
     /// The database nodes and their engine (until purged).
     nodes: HashMap<(TenantId, NodeId), EngineKind>,
     rows: HashMap<(TenantId, NodeId), (DatabaseRow, Vec<EngineRole>)>,
@@ -412,11 +432,24 @@ impl DatabaseStore for MemoryDatabaseStore {
         Ok(self.lock().manifests.get(&(tenant, version)).cloned())
     }
 
-    fn created(&self, tenant: TenantId, node: NodeId, version: VersionId, manifest: &Value) {
+    fn created(&self, node: &Node, version: VersionId, manifest: &Value) {
+        let tenant = node.tenant_id;
         let mut inner = self.lock();
         inner.manifests.insert((tenant, version), manifest.clone());
+        inner.versions.insert(
+            (tenant, node.id),
+            vec![manifest_version(
+                tenant,
+                node.id,
+                version,
+                manifest,
+                None,
+                node.created_by,
+                node.created_at,
+            )],
+        );
         if let Some(e) = engine_of(manifest) {
-            inner.nodes.insert((tenant, node), e);
+            inner.nodes.insert((tenant, node.id), e);
         }
     }
 
@@ -425,7 +458,8 @@ impl DatabaseStore for MemoryDatabaseStore {
         ctx: &Context,
         node: NodeId,
         manifest: &Value,
-        _label: Option<&str>,
+        label: Option<&str>,
+        checked: VersionId,
         if_revision: Option<i64>,
     ) -> Result<Written<VersionId>> {
         let current = self
@@ -440,6 +474,13 @@ impl DatabaseStore for MemoryDatabaseStore {
         if if_revision.is_some_and(|r| r != current.revision) {
             return Err(crate::nodes::rules::precondition_failed());
         }
+        let desired = TypedNodeStore::get(&*self.typed, ctx.tenant, node)
+            .await?
+            .ok_or_else(|| Error::not_found("database"))?
+            .desired_version;
+        if desired != checked {
+            return Err(manifest_changed());
+        }
         let (bytes, hash) = crate::nodes::typed_manifest_bytes(manifest);
         let version = VersionId::new();
         let previous = current.head_version;
@@ -451,9 +492,25 @@ impl DatabaseStore for MemoryDatabaseStore {
             ctx.actor.into(),
         )?;
         let updated = self.nodes.set_head(ctx, node, Some(version), 0)?;
-        self.lock()
-            .manifests
-            .insert((ctx.tenant, version), manifest.clone());
+        {
+            let mut inner = self.lock();
+            inner
+                .manifests
+                .insert((ctx.tenant, version), manifest.clone());
+            inner
+                .versions
+                .entry((ctx.tenant, node))
+                .or_default()
+                .push(manifest_version(
+                    ctx.tenant,
+                    node,
+                    version,
+                    manifest,
+                    label,
+                    ctx.actor,
+                    updated.updated_at,
+                ));
+        }
         let e = self.journal.append(
             ctx,
             NewEntry {
@@ -476,6 +533,39 @@ impl DatabaseStore for MemoryDatabaseStore {
                 at: e.at,
             },
         })
+    }
+
+    async fn list_versions(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>> {
+        let after = page
+            .cursor
+            .as_ref()
+            .map(crate::blobs::logic::decode_version_cursor)
+            .transpose()?;
+        let limit = page.limit() as usize;
+        let mut all: Vec<Version> = self
+            .lock()
+            .versions
+            .get(&(tenant, node))
+            .map(|vs| {
+                vs.iter()
+                    .filter(|v| v.tenant_id == tenant && filter.matches(v))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        let mut items: Vec<Version> = all
+            .into_iter()
+            .filter(|v| after.is_none_or(|(at, id)| (v.created_at, v.id) < (at, id)))
+            .take(limit + 1)
+            .collect();
+        Ok(page_of(&mut items, limit))
     }
 
     async fn get(&self, tenant: TenantId, node: NodeId) -> Result<Option<DatabaseRow>> {
@@ -538,6 +628,56 @@ impl DatabaseStore for MemoryDatabaseStore {
             e.size_bytes += row.map(|r| r.size_bytes).unwrap_or(0);
         }
         Ok(u)
+    }
+}
+
+/// `409 conflict` when the manifest changed while a new one was checked against it.
+pub fn manifest_changed() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::Conflict,
+            "the manifest changed while this change was checked",
+        )
+        .with_hint("read the database again (getDatabase) and send the change again"),
+    )
+}
+
+/// The `Version` of a manifest version of a typed node.
+fn manifest_version(
+    tenant: TenantId,
+    node: NodeId,
+    version: VersionId,
+    manifest: &Value,
+    label: Option<&str>,
+    actor: crate::actor::Actor,
+    at: OffsetDateTime,
+) -> Version {
+    let (bytes, hash) = crate::nodes::typed_manifest_bytes(manifest);
+    Version {
+        id: version,
+        tenant_id: tenant,
+        node_id: node,
+        size_bytes: bytes.len() as i64,
+        content_hash: crate::blobs::Hash(hash),
+        content_type: Some("application/json".into()),
+        restored_from: None,
+        label: label.map(str::to_owned),
+        actor,
+        created_at: at,
+    }
+}
+
+/// One page of `items` (at most `limit + 1` of them, newest first).
+fn page_of(items: &mut Vec<Version>, limit: usize) -> Page<Version> {
+    let next_cursor = if items.len() > limit {
+        items.truncate(limit);
+        items.last().map(crate::blobs::logic::version_cursor)
+    } else {
+        None
+    };
+    Page {
+        items: std::mem::take(items),
+        next_cursor,
     }
 }
 
@@ -640,6 +780,7 @@ impl DatabaseStore for PgDatabaseStore {
         node: NodeId,
         manifest: &Value,
         label: Option<&str>,
+        checked: VersionId,
         if_revision: Option<i64>,
     ) -> Result<Written<VersionId>> {
         use sqlx::Row;
@@ -667,6 +808,19 @@ impl DatabaseStore for PgDatabaseStore {
         let revision: i64 = row.try_get("revision")?;
         if if_revision.is_some_and(|r| r != revision) {
             return Err(crate::nodes::rules::precondition_failed());
+        }
+        // The `nodes` row lock above serializes every manifest write of the node, so the
+        // desired version read here stays until this transaction ends.
+        let desired: VersionId = sqlx::query_scalar(
+            "select desired_version from typed_nodes where tenant_id = $1 and node_id = $2",
+        )
+        .bind(ctx.tenant)
+        .bind(node)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::not_found("database"))?;
+        if desired != checked {
+            return Err(manifest_changed());
         }
         let previous: Option<VersionId> = row.try_get("head_version")?;
         let (bytes, hash) = crate::nodes::typed_manifest_bytes(manifest);
@@ -731,6 +885,72 @@ impl DatabaseStore for PgDatabaseStore {
                 at: e.at,
             },
         })
+    }
+
+    async fn list_versions(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>> {
+        use sqlx::Row;
+        let after = page
+            .cursor
+            .as_ref()
+            .map(crate::blobs::logic::decode_version_cursor)
+            .transpose()?;
+        let limit = page.limit() as usize;
+        let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(
+            "select id, size_bytes, content_hash, content_type, restored_from, label, \
+             actor_kind, actor, on_behalf_of, created_at from versions \
+             where tenant_id = $1 and node_id = $2 and encoding = 'typed_manifest_v1' \
+             and ($3::principal_kind is null or actor_kind = $3) \
+             and ($4::boolean is null or (label is not null) = $4) \
+             and ($5::timestamptz is null or (created_at, id) < ($5, $6)) \
+             order by created_at desc, id desc limit $7",
+        )
+        .bind(tenant)
+        .bind(node)
+        .bind(filter.actor_kind)
+        .bind(filter.labeled)
+        .bind(after.map(|(at, _)| at))
+        .bind(after.map(|(_, id)| id))
+        .bind(limit as i64 + 1)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut items = rows
+            .iter()
+            .map(|r| {
+                let hash: Vec<u8> = r.try_get("content_hash")?;
+                let hash: [u8; 32] = hash
+                    .try_into()
+                    .map_err(|_| Error::Internal("a stored hash is not 32 bytes".into()))?;
+                Ok(Version {
+                    id: r.try_get("id")?,
+                    tenant_id: tenant,
+                    node_id: node,
+                    size_bytes: r.try_get("size_bytes")?,
+                    content_hash: crate::blobs::Hash(hash),
+                    content_type: r.try_get("content_type")?,
+                    restored_from: r.try_get("restored_from")?,
+                    label: r.try_get("label")?,
+                    actor: crate::actor::Actor {
+                        actor: crate::actor::PrincipalRef {
+                            kind: r.try_get("actor_kind")?,
+                            id: crate::ids::PrincipalId(r.try_get("actor")?),
+                        },
+                        on_behalf_of: r
+                            .try_get::<Option<uuid::Uuid>, _>("on_behalf_of")?
+                            .map(crate::ids::UserId),
+                    },
+                    created_at: r.try_get("created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(page_of(&mut items, limit))
     }
 
     async fn get(&self, tenant: TenantId, node: NodeId) -> Result<Option<DatabaseRow>> {
@@ -961,7 +1181,7 @@ impl DatabaseService {
             .value
             .head_version
             .ok_or_else(|| Error::Internal("a new typed node has no version".into()))?;
-        d.store.created(ctx.tenant, node, version, &manifest);
+        d.store.created(&written.value, version, &manifest);
         // Start provisioning. A failure here leaves the row `provisioning`; the reconciler
         // sends `createTypedNode` again with the same delivery ID.
         let req = CreateTypedNodeRequest {
@@ -1031,7 +1251,14 @@ impl DatabaseService {
         let manifest = manifest::check(&req.manifest, Some(&current), ctx.actor.is_agent())?;
         let written = d
             .store
-            .put_manifest(ctx, id, &manifest, req.label.as_deref(), if_revision)
+            .put_manifest(
+                ctx,
+                id,
+                &manifest,
+                req.label.as_deref(),
+                row.desired_version,
+                if_revision,
+            )
             .await?;
         let version = written.value;
         let apply = ApplyManifestRequest {
@@ -1058,6 +1285,36 @@ impl DatabaseService {
             value: db,
             change: written.change,
         })
+    }
+
+    /// Whether a node of the tenant is a database node (its `typed_nodes` row names the
+    /// type `database`). No permission check: the API uses it to send `listVersions` of a
+    /// database node to [`Self::list_versions`], which checks `view`.
+    pub async fn is_database(&self, tenant: TenantId, id: NodeId) -> Result<bool> {
+        Ok(self
+            .deps
+            .typed
+            .get(tenant, id)
+            .await?
+            .is_some_and(|r| r.type_name == NODE_TYPE))
+    }
+
+    /// `listVersions` of a database node: its manifest versions, newest first, with the label
+    /// and the actor of each (read only). Needs `view`, as `getDatabase` does (a node in the
+    /// trash needs `manage`).
+    pub async fn list_versions(
+        &self,
+        ctx: &Context,
+        id: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>> {
+        refuse_share_link(ctx)?;
+        self.database_node(ctx, id).await?;
+        self.deps
+            .store
+            .list_versions(ctx.tenant, id, filter, page)
+            .await
     }
 
     /// The databases of the tenant (`Usage.databases`, C-21).
@@ -1535,6 +1792,78 @@ mod tests {
         let after = written.value;
         assert_ne!(after.manifest_version_id, db.manifest_version_id);
         assert_eq!(after.node.revision, db.node.revision + 1);
+        // `listVersions` of the database: the manifest versions with the label, newest first
+        // (review-D-1 B-1). Bob (edit on the folder) sees them too.
+        let versions =
+            w.s.databases
+                .list_versions(&a, id, VersionFilter::default(), PageRequest::default())
+                .await
+                .unwrap();
+        let listed: Vec<(VersionId, Option<&str>)> = versions
+            .items
+            .iter()
+            .map(|v| (v.id, v.label.as_deref()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (after.manifest_version_id, Some("classes")),
+                (db.manifest_version_id, None)
+            ]
+        );
+        assert!(
+            versions
+                .items
+                .iter()
+                .all(|v| v.actor.actor.id == w.alice.into())
+        );
+        let b = ctx(w.team.id, w.bob);
+        assert_eq!(
+            w.s.databases
+                .list_versions(&b, id, VersionFilter::default(), PageRequest::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        assert!(w.s.databases.is_database(w.team.id, id).await.unwrap());
+        assert!(
+            !w.s.databases
+                .is_database(w.team.id, w.folder)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            code(
+                w.s.databases
+                    .list_versions(
+                        &a,
+                        w.folder,
+                        VersionFilter::default(),
+                        PageRequest::default()
+                    )
+                    .await
+            )
+            .0,
+            404
+        );
+        // A manifest checked against the old version, written after the new one came, is
+        // refused (review-D-1 N-1): an agent without If-Match cannot revert a person's change.
+        assert_eq!(
+            code(
+                w.handles
+                    .databases
+                    .put_manifest(&a, id, &db.manifest, None, db.manifest_version_id, None)
+                    .await
+            )
+            .0,
+            409
+        );
+        assert_eq!(
+            w.s.databases.get(&a, id).await.unwrap().manifest_version_id,
+            after.manifest_version_id
+        );
         assert_eq!(after.manifest["data_classes"]["main.plants.name"], "normal");
         assert_eq!(after.status.state, ProviderState::Ready);
         assert_eq!(
@@ -1873,7 +2202,7 @@ mod tests {
                 .value;
         w.handles
             .databases
-            .created(w.team.id, node.id, node.head_version.unwrap(), &manifest);
+            .created(&node, node.head_version.unwrap(), &manifest);
         let rec = crate::providers::reconciler::Reconciler::new(
             w.s.typed_nodes.clone(),
             w.s.providers.clone(),
@@ -2109,24 +2438,95 @@ mod tests {
         let c = ctx(a, UserId(user));
         let m = manifest::check(&sqlite(), None, false).unwrap();
         assert_eq!(
-            code(store.put_manifest(&c, node, &m, None, Some(9)).await).0,
+            code(store.put_manifest(&c, node, &m, None, v1, Some(9)).await).0,
             412
         );
         assert_eq!(
             code(
                 store
-                    .put_manifest(&ctx(b, UserId(user)), node, &m, None, None)
+                    .put_manifest(&ctx(b, UserId(user)), node, &m, None, v1, None)
                     .await
             )
             .0,
             404
         );
         let w = store
-            .put_manifest(&c, node, &m, Some("same"), Some(1))
+            .put_manifest(&c, node, &m, Some("same"), v1, Some(1))
             .await
             .unwrap();
         let v2 = w.value;
         assert!(w.change.seq.is_some());
+        // A manifest checked against v1 after v2 came is refused, and writes nothing
+        // (review-D-1 N-1).
+        assert_eq!(
+            code(store.put_manifest(&c, node, &m, None, v1, None).await).0,
+            409
+        );
+        // `listVersions` of the node: both manifest versions, newest first, with the label;
+        // other tenants see none.
+        let page = store
+            .list_versions(a, node, VersionFilter::default(), PageRequest::default())
+            .await
+            .unwrap();
+        let listed: Vec<(VersionId, Option<&str>)> = page
+            .items
+            .iter()
+            .map(|v| (v.id, v.label.as_deref()))
+            .collect();
+        assert_eq!(listed, vec![(v2, Some("same")), (v1, None)]);
+        assert_eq!(page.items[0].actor.actor.id.0, user);
+        let labeled = store
+            .list_versions(
+                a,
+                node,
+                VersionFilter {
+                    actor_kind: None,
+                    labeled: Some(true),
+                },
+                PageRequest {
+                    cursor: None,
+                    limit: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(labeled.items.len(), 1);
+        assert_eq!(labeled.items[0].id, v2);
+        let first = store
+            .list_versions(
+                a,
+                node,
+                VersionFilter::default(),
+                PageRequest {
+                    cursor: None,
+                    limit: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.items[0].id, v2);
+        let second = store
+            .list_versions(
+                a,
+                node,
+                VersionFilter::default(),
+                PageRequest {
+                    cursor: first.next_cursor.clone(),
+                    limit: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.items[0].id, v1);
+        assert!(second.next_cursor.is_none());
+        assert!(
+            store
+                .list_versions(b, node, VersionFilter::default(), PageRequest::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
         let row = typed.get(a, node).await.unwrap().unwrap();
         assert_eq!(row.desired_version, v2);
         assert_eq!(store.manifest(a, v2).await.unwrap().unwrap(), m);
@@ -2165,7 +2565,7 @@ mod tests {
         assert_eq!(data["previous_version_id"], json!(v1));
         assert_eq!(data["version_id"], json!(v2));
         assert_eq!(
-            code(store.put_manifest(&c, node, &m, None, None).await).0,
+            code(store.put_manifest(&c, node, &m, None, v2, None).await).0,
             409
         );
     }
