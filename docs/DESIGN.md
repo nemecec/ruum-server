@@ -1495,7 +1495,9 @@ disks, and data in the EU. **Ruum starts in Helsinki** (`hel1`: cloud servers, d
   a database server dies at 3 a.m., somebody gets an alert and fixes it. For the first version:
   automatic failover (CloudNativePG promotes the replica by itself), alerts to a phone (Grafana
   OnCall or similar), a written runbook for each alert, and **no 24/7 promise** to customers
-  ("best effort" support until there is a team that can take turns on call).
+  ("best effort" support until there is a team that can take turns on call). Section 19 replaces
+  the phone alerts with agent operations: alerts go to the on-call agent, and only red actions and
+  security incidents reach a person.
 - Use **Cloud servers** for the control plane and spiky work, **dedicated servers** (AX for compute,
   SX for storage) for the database clusters and, later, Ceph. Connect them with vSwitch.
 - Hetzner Object Storage is young. Measure its throughput and limits for your workload, and keep the
@@ -1831,3 +1833,72 @@ hit, with a report.
 4. The tenant isolation and permission test harness, before the first endpoint.
 5. Then the parallel work: nodes, blobs and versions, sharing, agents and tokens, the MCP server,
    WebDAV, the web UI.
+
+## 19. Operating Ruum with agents
+
+Ruum must not need a large operations team. A swarm of agents runs it, a policy keeps them safe, and
+people decide only what needs human judgment. Section 18 is how agents build Ruum; this section is how
+they run it.
+
+### 19.1 Three layers
+
+1. **A self-healing platform, with no agent in the loop.** Routine work is deterministic: Kubernetes
+   controllers, database failover (CloudNativePG), autoscaling, certificate renewal, automatic
+   rollback on a rising error rate (9.6), scheduled backups with automatic restore tests, dependency
+   update bots behind the CI gates. Ruum stays up when every agent, or the AI provider, is down.
+2. **An agent swarm for the exceptions** (19.2).
+3. **People for decisions that need human judgment** (19.4).
+
+### 19.2 Agent roles
+
+| Role | Job |
+|---|---|
+| On-call | receives every alert, at any hour; correlates and diagnoses with logs, metrics and traces; runs runbook actions within policy; escalates |
+| Remediation | turns a diagnosis into a fix through the normal pipeline (branch, CI, review panel, staged rollout) |
+| Release | promotes builds from staging to a canary cell and then to all cells, after automatic canary analysis |
+| Security | vulnerability and image scans, patches, secret rotation, audit-log anomalies, abuse and phishing takedowns for public apps (13) |
+| Capacity and cost | forecasts, scaling, rightsizing, new cells (14) |
+| Support | answers customer tickets with the documentation and read-only diagnostics, only with the customer's consent |
+| Compliance | access reviews, proof of backups and restores, GDPR export and erasure requests, audit evidence |
+| Postmortem | writes incident reports and turns lessons into task cards |
+| Guard | a second, independent agent (another model where possible) that must agree before amber actions |
+
+### 19.3 Safety: the policy decides, not the agent
+
+All operations go through **one audited operations API with a policy engine**. Agents get no shell and
+no standing administrator rights. Each action has a risk class:
+
+| Class | Who decides | Examples |
+|---|---|---|
+| Green | the agent, within limits | restart, scale within budget, roll back, renew a certificate, retry a backup |
+| Amber | two independent agents (the guard included); logged | database failover, moving a tenant between cells, blocking an abusive app, revoking tokens, a production security patch |
+| Red | a person | deleting tenant data, a restore that loses data, changing security policy or access rights, spending above budget, legal and law-enforcement requests, telling customers about a breach, turning off a safety control |
+
+- **The policy is signed and owned by a person**; agents cannot change it.
+- **Just-in-time credentials**: each action gets short-lived, narrow credentials from OpenBao.
+  Production data reaches agents only through the privacy filter (8.5, 9.6), as pseudonyms.
+- **GitOps**: every infrastructure change is a pull request, reviewed by an agent panel and checked by
+  the policy, rolled out staging → canary cell → all cells. Cells limit the blast radius (14).
+- **Prompt injection**: alerts, logs, tickets and customer messages are untrusted data. Operations
+  agents never act on instructions inside them, and their tools are an allow-list.
+- **Limits and kill switches**: rate limits and token budgets for the operations agents; one switch
+  for a person to stop the whole swarm (layer 1 keeps running).
+- **No single AI provider**: a fallback model or provider for the operations agents.
+
+### 19.4 The person's part
+
+- **Red actions** arrive as a push notification with a short summary, the recommended choice and its
+  consequences: approve or reject.
+- **Any security incident with possible data loss pages a person.**
+- **A weekly operations digest**: incidents, SLOs, costs, security, and the agent decisions that a
+  person can veto.
+- **A monthly review** of the policy, the SLOs and the budgets (about 15 minutes).
+
+### 19.5 Proof before production
+
+- **Game days on staging**: injected failures (lost nodes, a corrupt backup, a simulated breach, an
+  abuse flood) that the agents must handle within policy.
+- **An operations benchmark**: a fixed set of incident scenarios; its pass rate is a release gate for
+  running production.
+
+This work is part of the staging step (section 16): there is nothing to operate before staging exists.
