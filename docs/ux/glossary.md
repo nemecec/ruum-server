@@ -4,8 +4,8 @@ Status: `provisional` (copywriter, 2026-11-08). The approved English terms of th
 emails and the error texts, and the words that stay as they are in every language. Translators
 use it with the context of each message (`web/src/locales/context/en.json`) and the voice
 (`copy.md`, section 1). The terms come from `ia.md` (one word per concept); this page adds what a
-translator needs. Each language adds its own column of approved translations here, or in
-Weblate's glossary once it runs (design 12.4.1).
+translator needs. Each language adds its own column of approved translations here (Estonian is
+the first), or in Weblate's glossary once it runs (design 12.4.1).
 
 ## How to use it
 
@@ -22,84 +22,91 @@ Weblate's glossary once it runs (design 12.4.1).
 
 ## Approved terms
 
+The column "Estonian" holds the approved Estonian translation (`style-guides/et.md`). The words in
+parentheses that end in "-" are the stems that every form of the term starts with, or contains
+(Estonian inflects and compounds: "kaust", "kausta", "kaustas", "alamkaust"). Where a row has
+stems, `web/scripts/check-translations.mjs` checks each message: when the English text uses the
+term (or its plural), the Estonian text must contain one of the stems. Alternatives in a cell are
+separated by " / " or "; " and pair by position; one Estonian entry stands for all of them.
+
 ### Spaces and people
 
-| Term | Meaning | Never |
-|---|---|---|
-| space | Where your files live: your **personal space**, or a **team space** you share | tenant, organisation, workspace, account |
-| personal space | The space every person gets at the first sign-in | |
-| team space | A space for a group of people | |
-| member | A person in a team space, with a member role | user (in running text) |
-| Owner / Admin / Member / Guest | The member roles of a space (`memberRole.*`) | Viewer, Editor (for member roles) |
-| guest | A person outside the space who sees only what is shared with them | external user |
-| invitation, invite | How people join a space | |
-| Space settings | The admin pages of a space | Admin console, preferences |
-| Sharing rules | The space-wide switches for links, guests and sharing | policy |
-| Plan | What the space pays for and its limits | quota, limits (alone), subscription |
-| Activity log | The record of events in a space (admins) | audit log, journal |
+| Term | Meaning | Never | Estonian |
+|---|---|---|---|
+| space | Where your files live: your **personal space**, or a **team space** you share | tenant, organisation, workspace, account | ruum (ruum-) |
+| personal space | The space every person gets at the first sign-in | | isiklik ruum (isikli-) |
+| team space | A space for a group of people | | meeskonnaruum (meeskonnaruum-) |
+| member | A person in a team space, with a member role | user (in running text) | liige (liige-, liikme-) |
+| Owner / Admin / Member / Guest | The member roles of a space (`memberRole.*`) | Viewer, Editor (for member roles) | Omanik (omanik-) / Administraator (administraator-) / Liige (liige-, liikme-) / Külaline (külali-) |
+| guest | A person outside the space who sees only what is shared with them | external user | külaline (külali-) |
+| invitation, invite | How people join a space | | kutse, kutsuma (kutse-, kutsu-) |
+| Space settings | The admin pages of a space | Admin console, preferences | Ruumi seaded |
+| Sharing rules | The space-wide switches for links, guests and sharing | policy | Jagamise reeglid (reegl-, reegel-) |
+| Plan | What the space pays for and its limits | quota, limits (alone), subscription | pakett (paket-) |
+| Activity log | The record of events in a space (admins) | audit log, journal | Tegevuslogi (tegevuslogi-) |
 
 ### Files
 
-| Term | Meaning | Never |
-|---|---|---|
-| item | A file or folder, when the kind does not matter | node, object, entry, resource |
-| file / folder | | document (for any file), directory |
-| Files | The top of the tree, and the page | root, home, drive |
-| tag | A word you attach to items | label, category |
-| version | One saved state of a file | revision, snapshot, commit |
-| current version | The newest version | head, latest |
-| version name; Name this version | A named version is kept forever | label, pin |
-| Restore | Bring back: a version, or an item from the trash | revert, roll back, undelete, recover |
-| Compare; Compare as | Show the changes between versions | diff |
-| Trash; Move to trash | Where deleted items wait | bin, recycle bin |
-| Delete for good; Empty trash | The only actions that delete. Calm, exact, never playful | purge, delete forever |
-| upload | | transfer |
-| Shared with me | The page of items others shared with you | |
+| Term | Meaning | Never | Estonian |
+|---|---|---|---|
+| item | A file or folder, when the kind does not matter | node, object, entry, resource | üksus (üksus-) |
+| file / folder | | document (for any file), directory | fail (fail-) / kaust (kaust-) |
+| Files | The top of the tree, and the page | root, home, drive | Failid (fail-) |
+| tag | A word you attach to items | label, category | silt (silt-, sildi-, silte-) |
+| version | One saved state of a file | revision, snapshot, commit | versioon (versioon-) |
+| current version | The newest version | head, latest | praegune versioon (praegu-) |
+| version name; Name this version | A named version is kept forever | label, pin | versiooni nimi; Anna versioonile nimi |
+| Restore | Bring back: a version, or an item from the trash | revert, roll back, undelete, recover | Taasta (taasta-, taaste-) |
+| Compare; Compare as | Show the changes between versions | diff | Võrdle, Võrdlusviis (võrdl-, võrrel-) |
+| Trash; Move to trash | Where deleted items wait | bin, recycle bin | Prügikast, Vii prügikasti (prügikast-) |
+| Delete for good; Empty trash | The only actions that delete. Calm, exact, never playful | purge, delete forever | Kustuta jäädavalt (jäädav-); Tühjenda prügikast (tühjenda-) |
+| upload | | transfer | laadi üles, üleslaadimine (laad-) |
+| Shared with me | The page of items others shared with you | | Minuga jagatud (minuga jagatud-) |
 
 ### Sharing and access
 
-| Term | Meaning | Never |
-|---|---|---|
-| access; People with access | What a person or agent may do with an item | permission, grant, ACL |
-| Give access / Remove access / Change access | | grant, revoke |
-| Can view / Can comment / Can edit / Can manage | The roles on an item (`role.*`) | Viewer, Editor, Owner (on items) |
-| share | Give people access to an item | |
-| link; Anyone with the link | A share link | URL token, secret URL |
-| Turn off (a link, a key, an app password) | Stop it working | revoke, invalidate, disable |
-| Everyone in *Space* | All members of a space | |
-| from folder *Name* | Access that comes from a folder above | inherited |
+| Term | Meaning | Never | Estonian |
+|---|---|---|---|
+| access; People with access | What a person or agent may do with an item | permission, grant, ACL | ligipääs, Kellel on ligipääs (ligipääs-) |
+| Give access / Remove access / Change access | | grant, revoke | Anna ligipääs / Eemalda ligipääs / Muuda ligipääsu |
+| Can view / Can comment / Can edit / Can manage | The roles on an item (`role.*`) | Viewer, Editor, Owner (on items) | Saab vaadata (vaada-, vaata-) / Saab kommenteerida (kommenteeri-) / Saab muuta (muut-, muud-) / Saab hallata (halla-, haldav-) |
+| share | Give people access to an item | | jagama (jaga-) |
+| link; Anyone with the link | A share link | URL token, secret URL | link, Kõik, kellel on link (link-, lingi-, linke-) |
+| Turn off (a link, a key, an app password) | Stop it working | revoke, invalidate, disable | Lülita välja (lülit-) |
+| Everyone in *Space* | All members of a space | | Kõik ruumis *Space* |
+| from folder *Name* | Access that comes from a folder above | inherited | kaustast *Name* |
 
 ### Agents
 
-| Term | Meaning | Never |
-|---|---|---|
-| agent | An AI or program that works in Ruum for a person | bot, assistant, AI (alone), integration |
-| *Agent* for *Person* | The by-line of every agent | |
-| app | A program that asks to connect (OAuth consent screen) | client |
-| Connect / Allow / Don't allow | The consent actions | authorize |
-| key | An agent key for scripts and the CLI | token, API key (alone) |
-| app password | A password for WebDAV clients (Finder, Explorer) | |
-| Pause / Resume | Stop and start an agent | disable, enable |
-| Undo changes | Undo an agent's run of changes | revert, rollback |
-| run | Changes an agent made close together | batch, session |
-| Where / Highest role / Ends on / Changes per hour | The parts of an agent's access | scope, max role, budget |
-| signed-in device | A session on the Account page | session (as a noun on screen) |
-| sign-in method | Google, Microsoft or a passkey | identity, IdP |
+| Term | Meaning | Never | Estonian |
+|---|---|---|---|
+| agent | An AI or program that works in Ruum for a person | bot, assistant, AI (alone), integration | agent (agent-, agend-) |
+| *Agent* for *Person* | The by-line of every agent | | *Agent* kasutajale *Person* |
+| app | A program that asks to connect (OAuth consent screen) | client | rakendus (rakendus-) |
+| Connect / Allow / Don't allow | The consent actions | authorize | Ühenda (ühend-) / Luba (luba-, lubat-, lubam-) / Ära luba |
+| key | An agent key for scripts and the CLI | token, API key (alone) | võti (võti-, võtme-, võtit-) |
+| app password | A password for WebDAV clients (Finder, Explorer) | | rakenduse parool (parool-) |
+| Pause / Resume | Stop and start an agent | disable, enable | Peata (peata-, peatu-) / Jätka (jätka-) |
+| Undo changes | Undo an agent's run of changes | revert, rollback | Võta muudatused tagasi |
+| run | Changes an agent made close together | batch, session | tööhoog (one go of work: "ühe hooga tehtud muudatused") |
+| Where / Highest role / Ends on / Changes per hour | The parts of an agent's access | scope, max role, budget | Kus / Kõrgeim roll / Lõpeb / Muudatusi tunnis |
+| signed-in device | A session on the Account page | session (as a noun on screen) | sisselogitud seade (seade-, seadme-) |
+| sign-in method | Google, Microsoft or a passkey | identity, IdP | sisselogimisviis (sisselogimisvii-) |
 
 ### Databases (step 2, `ia.md`)
 
-| Term | Meaning | Never |
-|---|---|---|
-| database | A database item in Files | db, instance |
-| query; Read only / Can change data | | statement, SQL console, write mode |
-| migration | A change to the tables | schema change (alone), DDL |
-| branch | A copy of a database to try changes | fork, clone, sandbox |
-| restore point | A moment you can go back to | snapshot, checkpoint |
-| privacy class: Normal / Personal / Secret | What agents see of a column | data class, sensitivity |
-| stand-in | The value agents see instead of personal data | pseudonym, hash, token |
-| hidden | A secret value agents never see | masked, redacted |
-| write access / personal data access | Short-time extra access for agents | write grant |
-| request; Waiting for you; Approve / Deny | An agent asks a person | ticket |
+| Term | Meaning | Never | Estonian |
+|---|---|---|---|
+| database | A database item in Files | db, instance | andmebaas (andmebaas-) |
+| query; Read only / Can change data | | statement, SQL console, write mode | päring (päring-); Ainult lugemiseks / Saab andmeid muuta |
+| migration | A change to the tables | schema change (alone), DDL | migratsioon (migratsioon-) |
+| branch | A copy of a database to try changes | fork, clone, sandbox | haru (haru-) |
+| restore point | A moment you can go back to | snapshot, checkpoint | taastepunkt (taastepunkt-) |
+| privacy class: Normal / Personal / Secret | What agents see of a column | data class, sensitivity | privaatsusklass: Tavaline / Isikuandmed / Salajane |
+| stand-in | The value agents see instead of personal data | pseudonym, hash, token | asendusväärtus (asendusväärtus-) |
+| hidden | A secret value agents never see | masked, redacted | peidetud |
+| write access / personal data access | Short-time extra access for agents | write grant | kirjutusligipääs (kirjutusligipääs-) / isikuandmete ligipääs (isikuandmete ligipääs-) |
+| request; Waiting for you; Approve / Deny | An agent asks a person | ticket | taotlus; Ootab sind; Kinnita / Keeldu |
 
 ## Do not translate
 
@@ -121,5 +128,5 @@ Translate the names of other products' screens and buttons (ChatGPT's "Settings"
 
 ## Style per language
 
-Each language gets its own section here (formality, punctuation, numbers and dates,
-gender-neutral wording). Estonian: `i18n.md`, "Estonian".
+Each language has a style guide (formality, punctuation, numbers and dates, gender-neutral
+wording) in `style-guides/<tag>.md`. Estonian: `style-guides/et.md`.
