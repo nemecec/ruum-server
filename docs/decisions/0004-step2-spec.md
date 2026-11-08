@@ -872,3 +872,14 @@ and `web/src/api/schema.d.ts`; STEP2 status, "The engine security model" (Postgr
   sqlx checksum and forces a fresh database on every stack).
 - UX contract needs C-20 to C-23 are not in the contract yet (item 35 records the form each
   takes).
+
+## 36. Dependencies approved by the person (2026-11-08)
+
+The person approved two new dependencies (design 18.4: a new dependency needs approval):
+
+- `sqlparser` (Apache-2.0), for the query path (cards Q-1 and A-2). This closes open question 9:
+  Q-1 may start once D-1 is merged.
+- `aes-gcm` 0.11.1 (Apache-2.0 OR MIT, RustCrypto), already used by card Q-4 for the tenant
+  pseudonym key.
+
+Status: decided (not provisional).
