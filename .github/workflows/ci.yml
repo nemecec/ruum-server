@@ -114,7 +114,7 @@ jobs:
           RUUM_PG_DUMP: /usr/lib/postgresql/17/bin/pg_dump
         run: |
           cargo test --workspace --exclude ruum-testkit --locked
-          cargo test -p ruum-testkit --lib --test contract --locked
+          cargo test -p ruum-testkit --lib --test contract --test databases_meta --locked
 
   security-suites:
     name: tenant isolation and permission suites
@@ -140,7 +140,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Tenant isolation and permission matrix (in-memory services)
-        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --locked -- --nocapture
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --locked -- --nocapture
       # The superuser of the service container bypasses row-level security. The suites connect
       # as a role without superuser (CREATEDB for the suite databases), as on the laptop stack.
       - name: Role for the suites
@@ -149,7 +149,7 @@ jobs:
         env:
           RUUM_SUITE_BACKEND: postgres
           DATABASE_URL: postgres://ruum_suite:ruum_suite@localhost:5432/ruum
-        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --locked -- --nocapture
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --locked -- --nocapture
 
   cargo-deny:
     name: cargo-deny
