@@ -1912,3 +1912,51 @@ no standing administrator rights. Each action has a risk class:
   running production.
 
 This work is part of the staging step (section 16): there is nothing to operate before staging exists.
+
+## 20. Improving Ruum: the product loop
+
+Agents do not only build and run Ruum; they also find what to improve. A product manager agent turns
+that into decisions, and a person makes the product decisions.
+
+### 20.1 Everyone files
+
+- **Every agent run ends with a short retro step**: what slowed me down, what was missing, what was
+  confusing. Build, operations, support, review and synthetic-user agents file **bugs**, **feature
+  requests** and **friction reports** ("the MCP tool for X is missing", "this error hint did not help").
+- They go into a **"Ruum" project inside Ruum**, as issue nodes from templates (9.7): Ruum's own
+  issues are the first users of the issue system.
+- Other inputs feed the same project: patterns in support tickets, user reports from the widget,
+  privacy-aware usage data (9.6), agent benchmark failures (18.7), postmortems (19.2), and, opt-in, a
+  "send feedback to Ruum" MCP tool for the agents of Ruum's users.
+
+### 20.2 Triage, review, decision
+
+1. A **triage agent** merges duplicates, links the evidence (how often, how many users or agents, logs
+   and traces, benchmark tasks) and scores each item: severity, reach, rough effort (from an
+   engineering agent) and fit with the product direction (20.4).
+2. **Engineering and operations agents** add notes to the top items: feasibility, cost, security and
+   privacy risk, operational effect.
+3. A **product manager agent** groups ideas into themes, keeps a proposed roadmap, and writes a short
+   **decision brief** for each real decision: problem, evidence, options, recommendation, cost in agent
+   tokens and time, risks.
+4. A **weekly product review page**: the person accepts, rejects or defers each brief. Each decision is
+   a decision record; accepted items enter the normal pipeline (spec, review, build).
+
+### 20.3 What needs a person
+
+- **Without a person** (straight into the build pipeline with its reviews and gates): bugs with clear
+  evidence, small agent-experience fixes (error hints, tool texts), performance and reliability fixes
+  within the current scope.
+- **A person decides**: new features, changes of product scope, UX direction, pricing and plans,
+  security and privacy rules, data retention, and anything costly.
+
+### 20.4 Guardrails
+
+- **A filing budget and a quality bar** per agent, with evidence required; duplicates are merged, not
+  counted twice.
+- **No self-approval**: an agent's own feature idea is not built without the product manager's brief
+  and the person's decision.
+- **A product direction document owned by the person**: vision, target users, and what Ruum is not.
+  The product manager scores ideas against it, so the loop does not just follow the most requests.
+  The architect panel drafts it from this design; the person approves it once and reviews it in the
+  monthly review (19.4).
