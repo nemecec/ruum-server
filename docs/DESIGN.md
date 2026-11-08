@@ -1329,6 +1329,7 @@ agents:
       - security     # only when auth, data access or secrets change
       - privacy      # classes for new columns and telemetry fields (sections 8.5, 9.6)
       - hygiene      # structured logging and parameterised SQL (below)
+      - copy         # optional: a copywriter agent reviews changed UI text against the project's voice
       - ux           # heuristics and accessibility on screenshots of changed screens
     on_publish:
       - journeys     # synthetic users run the key journeys of the project
@@ -1481,7 +1482,8 @@ Good translations need context, consistency and checking.
   number and date conventions, gender-neutral wording; Estonian uses the informal "sina", decided by the
   person on 2026-11-08); a translation memory, so approved translations are reused.
 - **The pipeline, on every change**:
-  1. extract new and changed message keys;
+  1. extract new and changed message keys; the copywriter agent (18.4) checks the source text against
+     the voice and writes each message's description, tone and length budget;
   2. a translator agent translates with the full context (description, screenshot, glossary, memory,
      style guide, neighbouring strings);
   3. automatic checks: valid ICU, the same placeholders as the source, every plural category the
@@ -1759,6 +1761,7 @@ one migration task at a time.
 |---|---|---|
 | Architect | agent panel; a person is optional (section 18.9) | design, contracts, approval of contract PRs and of security-sensitive merges |
 | UX designer | agent, with a UX review panel; a person is optional (section 18.9) | user journeys, information architecture, the design system, wireframes and UI copy before the UI task cards; the "agent experience" of MCP tools, CLI output and error hints; approval of UI merges (section 18.4.1) |
+| Copywriter | agent, with the UX review panel | owns the voice (`docs/ux/copy.md`); writes and rewrites all source text (UI strings, errors, emails, empty states, onboarding, release notes, later the website); reviews every change that touches text; writes the description, tone and length budget of each message for translators (12.4.1) |
 | Planner | agent | breaks a step into task cards with dependencies (a task graph), in the issue tracker |
 | Test writer | agent | writes acceptance tests from the contracts, before the code |
 | Implementer | many agents in parallel | one task card each, in its own git worktree, until CI is green |
