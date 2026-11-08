@@ -290,7 +290,8 @@ alternative, but thousands of realms are hard to run; its newer "organizations" 
 
 ### 4.3 Plans and limits
 
-A first proposal. The numbers are configuration, not code, so they can change at any time.
+A first proposal. The numbers are configuration, not code, so they can change at any time. They are
+placeholders: prices and limits will be built from measured costs (section 21).
 
 | | Free | Personal | Team (per member) |
 |---|---|---|---|
@@ -1960,3 +1961,63 @@ that into decisions, and a person makes the product decisions.
   The product manager scores ideas against it, so the loop does not just follow the most requests.
   The architect panel drafts it from this design; the person approves it once and reviews it in the
   monthly review (19.4).
+
+## 21. Costs and cost-based pricing
+
+Ruum aims to be affordable while covering its costs, not to take as much as the market allows. So
+every cost is recorded and attributed, and prices are built from costs: the marginal cost of what a
+customer uses, plus a published markup that covers fixed costs.
+
+### 21.1 Record every cost
+
+- **Sources**: infrastructure (servers, disks, load balancers, IP addresses, traffic), object storage
+  and backup copies (Hetzner, Scaleway), email (Scaleway), model tokens (the AI gateway, 11.1),
+  payment fees (Stripe), fixed services (domains, monitoring), and the agents: operations, support and
+  the product loop are running costs; the swarm that builds Ruum is development cost.
+- A **cost agent** (19.2) reads the billing APIs and invoices of the providers each month into the
+  **cost ledger**.
+
+### 21.2 Measure and attribute usage
+
+- **Meters**: storage by class (current files, versions, trash, backups), traffic, CPU and memory time
+  of app sandboxes and databases, database storage, requests, emails, model tokens by model, build
+  minutes.
+- **Every usage event carries tenant, user, node and app, and `actor` / `on_behalf_of`**, like the
+  journal (2.5, 3.4). Costs trace back to a specific action (an upload, an agent session's build) and a
+  specific user wherever one person uses the resource; shared resources are split by measured share.
+
+### 21.3 From bills to unit costs
+
+- Each month, the actual bill of each resource pool divided by its measured use gives a **unit cost**
+  (EUR per GB-month, per CPU-hour, per 1,000 emails, per million tokens of a model).
+- **Idle capacity and shared services** (control plane, sign-in, authz, monitoring, operations agents)
+  are recorded separately as **overhead**; the markup covers them.
+- The ledger is **append-only and explainable**: every number can be broken down ("why does this cost
+  X?").
+
+### 21.4 Pricing
+
+- **Price = marginal unit cost × (1 + markup).** The markup covers the overhead and fixed costs plus a
+  small reserve, and it is **published** ("our price is our cost plus X %").
+- Prices are recalculated **quarterly, with smoothing**, so they do not jump every month.
+- **Plans are bundles**: prepaid allowances priced from the unit prices, for a predictable bill; use
+  beyond the bundle is charged per unit at the same prices.
+- **The free tier is a deliberate cost**, funded from the markup, with hard limits.
+- The plans and limits of 4.3 are placeholders until the cost agent has real costs from staging; then
+  the product manager agent (20.2) brings a decision brief with the numbers. The markup, the free tier
+  and the rounding rules are decisions of the person.
+
+### 21.5 Transparency and budgets
+
+- Each space sees a **cost breakdown** (for example storage EUR 0.42, apps EUR 1.10, agents EUR 2.05),
+  with drill-down to projects, apps and agents.
+- **Budgets with alerts and hard caps**, especially for agents.
+- **Per-user costs inside a team** are visible only to the team's admins (they show what a person did),
+  and follow the data classes (8.5).
+
+### 21.6 Cost-conscious building
+
+- Every design review and decision brief includes a **cost estimate**: running cost, and the cost of
+  building it in agent tokens.
+- The capacity and cost agent looks for savings and reports cost per feature and per agent run in the
+  weekly digest.
