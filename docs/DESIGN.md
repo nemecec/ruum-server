@@ -1085,6 +1085,66 @@ checks the visitor's app role (section 9.3).
 **Remix** (backlog): a visitor copies a public project into their own Ruum: the code, the schema and
 masked sample data, never the secrets or the real data (built on project templates, section 2.7).
 
+### 9.10 Apps calling apps
+
+An app is a principal and a binding gives it rights to a node (9.2), so calling another app is one
+more kind of binding, with the same checks as a database binding.
+
+```yaml
+# the called app: app.yaml
+apis:
+  orders:
+    visibility: internal        # internal: only apps bound to it | external: users, agents, partners
+    protocol: http              # http (OpenAPI file) | events (AsyncAPI file)
+    spec: ./api/orders.openapi.yaml
+    scopes: [orders.read, orders.write]   # app-defined, like the app roles of 9.3
+
+# the calling app: app.yaml
+bindings:
+  shop: { node: ../shop-app, api: orders, scopes: [orders.read] }
+```
+
+**Security, the same as for databases:**
+
+- **No privilege escalation:** the person (or agent) who deploys the calling app must be allowed to
+  grant those scopes (`manage` on the called app, or an API role that may grant them). The grant
+  records `granted_by`.
+- **Default deny on the network:** app sandboxes reach each other only along a binding (Cilium
+  policies). Internal APIs are never reachable from the internet.
+- **Identity on every call:** the platform adds a signed header with the calling app and, when
+  delegated, the user it acts for: the same token format as for users (9.4), checked with the same
+  SDK.
+- **Delegation chains:** user → app A → app B. B sees actor = A and on_behalf_of = the user; the
+  effective right is the user's right ∩ A's binding ∩ B's API scopes. The chain length is capped;
+  every hop is in the audit log and the trace.
+- **Data classes travel with the data:** personal and secret fields of API payloads follow 8.5 and
+  9.6 in logs and traces.
+
+**Internal and external APIs:**
+
+- **Internal**: only bound apps of the same tenant, at an internal address
+  (`http://<binding>.<api>.ruum.internal`).
+- **External**: published through the app gateway (apps domain or custom domain), for signed-in Ruum
+  users with app roles, agents with OAuth or agent tokens (Ruum can publish an app's OpenAPI as MCP
+  tools, so any agent can use the app), partners with API keys managed by Ruum (per consumer, rate
+  limits, revocation), or the public.
+- Calls between tenants only through external APIs (or later federation, 7.5).
+
+**Synchronous and asynchronous:**
+
+- **Synchronous**: HTTP request and response, streaming and WebSockets, through the internal gateway
+  with timeouts, retries for safe methods, rate limits and circuit breaking; one OpenTelemetry trace
+  across the apps (9.6).
+- **Asynchronous**: events on the platform bus (NATS JetStream). An app declares the topics it
+  publishes; another app subscribes through a binding with a grant. Delivery is at least once, with
+  retries, a dead-letter queue and replay; events carry actor and on_behalf_of. Apps can also
+  subscribe to Ruum's own events for nodes in their scope ("a file was added to Invoices/").
+
+**Contracts between apps:** each API is described in OpenAPI (synchronous) or AsyncAPI
+(asynchronous) in the app's repo. Ruum generates a typed client for each bound app, and the app's
+development pipeline (11.2) runs a breaking-change check when other apps depend on the API, so an
+agent changing one app cannot silently break another.
+
 ## 10. Source code and builds
 
 Store code in **Git**, even if the user never sees Git. Do not invent a new version control system.
