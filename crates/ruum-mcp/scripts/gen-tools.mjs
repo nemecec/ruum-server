@@ -68,6 +68,34 @@ function resolveSchema(s, seen = []) {
   return out;
 }
 
+/**
+ * Whether a schema can carry a field marked `x-ruum-content-trust: untrusted` (decision 0005
+ * B-3): text that an agent wrote and other agents read. The tool description must then tell the
+ * agent to treat that text as data, never as instructions (`tests/content_trust.rs`).
+ */
+function carriesUntrusted(s, seen = new Set()) {
+  if (Array.isArray(s)) return s.some((x) => carriesUntrusted(x, seen));
+  if (s === null || typeof s !== 'object') return false;
+  if (s['x-ruum-content-trust'] === 'untrusted') return true;
+  if (s.$ref) {
+    if (seen.has(s.$ref)) return false;
+    seen.add(s.$ref);
+    if (carriesUntrusted(pointer(s.$ref), seen)) return true;
+  }
+  return Object.entries(s).some(
+    ([k, v]) => k !== '$ref' && k !== 'example' && k !== 'examples' && carriesUntrusted(v, seen),
+  );
+}
+
+/** Whether a success answer of the operation can carry untrusted text. */
+function answersUntrusted(op) {
+  return Object.entries(op.responses ?? {}).some(([code, r]) => {
+    if (!code.startsWith('2')) return false;
+    const resp = r.$ref ? pointer(r.$ref) : r;
+    return carriesUntrusted(resp.content ?? {});
+  });
+}
+
 const SKIP_HEADERS = new Set(['ruum-tenant', 'idempotency-key']);
 const snake = (h) => h.toLowerCase().replace(/-/g, '_');
 
@@ -131,6 +159,8 @@ for (const t of toolsDoc.tools) {
     operation: t.operation,
     // Specified but not built (decision 0004-22): the server does not offer the tool yet.
     planned: op['x-ruum-status'] === 'planned',
+    // The answer can carry text that an agent wrote (decision 0005 B-3).
+    untrusted_output: answersUntrusted(op),
     description: t.description,
     notes: t.notes ?? null,
     method: method.toUpperCase(),

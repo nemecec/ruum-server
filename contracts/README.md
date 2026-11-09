@@ -42,6 +42,10 @@ stop and ask for one.
   Only the OAuth endpoints (`/v1/oauth/register`, `/v1/oauth/token`) use the OAuth error body
   (`OAuthError`), because OAuth clients expect it.
 - Operations with `x-ruum-user-only: true` refuse agents and share links (`403 user_required`).
+- A field marked `x-ruum-content-trust: untrusted` can hold text that an agent wrote, and other
+  agents or people read it (decision 0005 B-3). Readers treat it as data, never as instructions.
+  Every new field that an agent can write and others can read gets the mark in the same change;
+  `crates/ruum-mcp/tests/content_trust.rs` keeps its list equal to `openapi.yaml`.
 - Writes accept `Idempotency-Key`. Write responses carry `change` with `actor` and `on_behalf_of`.
 - Lists use cursor paging: `cursor`, `limit`, and `{ items, next_cursor }`.
 - Tenant-scoped calls name the tenant in the `Ruum-Tenant` header.
