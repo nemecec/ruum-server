@@ -34,6 +34,13 @@
 //!   column name. The sync plans the whole new set of rows of a database ([`plan`]) and writes
 //!   it in one transaction; a dropped column's row is overwritten when a column of the same name
 //!   comes back (drop and add, rename onto the name; decision 0004-35).
+//! - **A name the store cannot hold gets no row** (review K-1, C-2; backlog 2026-11-08 P-2).
+//!   `database_columns` holds names of 1 to 63 characters (the Postgres identifier limit), and
+//!   Postgres text holds no NUL. SQLite names have no such limit: an unaliased expression
+//!   column of a view is named after the expression text. [`plan`] leaves such a column out
+//!   ([`fits_store`]), so it has no row and no confirmation, and its effective class is
+//!   `personal` (the lens takes a column that it does not name as `personal`). The sync logs a
+//!   line with the count. The sync of the other columns goes on.
 //!
 //! # When the sync runs
 //!
@@ -230,6 +237,20 @@ pub fn data_class_key(c: &ColumnRef) -> String {
     format!("{}.{}.{}", part(&c.schema), part(&c.table), part(&c.column))
 }
 
+/// The longest schema, table or column name that `database_columns` holds, in characters (the
+/// Postgres identifier limit, `NAMEDATALEN - 1`).
+pub const MAX_NAME_CHARS: usize = 63;
+
+/// Whether `database_columns` can hold the names of `c`: each name has 1 to
+/// [`MAX_NAME_CHARS`] characters and no NUL. A column that does not fit gets no row and counts
+/// as `personal` (see the module docs).
+pub fn fits_store(c: &ColumnRef) -> bool {
+    [&c.schema, &c.table, &c.column].iter().all(|n| {
+        let chars = n.chars().count();
+        (1..=MAX_NAME_CHARS).contains(&chars) && !n.contains('\0')
+    })
+}
+
 /// A column of the engine catalog, as the sync takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveColumn {
@@ -343,7 +364,15 @@ fn reset_reason(
 /// by name (also a dropped row). [`reset_reason`] decides whether the class stays. A row that
 /// no live column took is marked dropped; a dropped row whose name a live column took is
 /// overwritten. New and reset columns get the rule-based suggestion ([`rule_suggestion`]).
+/// A live column whose names the store cannot hold ([`fits_store`]) is left out: it gets no
+/// row, and a row that it took over by identity counts as dropped.
 pub fn plan(existing: &[ColumnRow], live: &[LiveColumn], now: OffsetDateTime) -> Plan {
+    let live: Vec<LiveColumn> = live
+        .iter()
+        .filter(|l| fits_store(&l.column))
+        .cloned()
+        .collect();
+    let live = live.as_slice();
     let mut consumed = vec![false; existing.len()];
     let mut matched: Vec<Option<(usize, bool)>> = vec![None; live.len()];
     for (i, l) in live.iter().enumerate() {
@@ -1019,6 +1048,16 @@ impl DatabaseService {
         catalog: &Catalog,
     ) -> Result<(LensSpec, SyncOutcome)> {
         let live = live_columns(catalog, schema);
+        let unfit = live.iter().filter(|l| !fits_store(&l.column)).count();
+        if unfit > 0 {
+            // The names stay out of the log: they are the tenant's.
+            tracing::warn!(
+                %tenant,
+                %node,
+                columns = unfit,
+                "columns with a name over 63 characters (or empty) get no class row; they count as personal"
+            );
+        }
         let (rows, outcome) = self
             .deps
             .columns

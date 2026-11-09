@@ -119,9 +119,11 @@ async fn read_rows(
     tenant: TenantId,
     node: NodeId,
 ) -> Result<Vec<ColumnRow>> {
+    // Byte order (`collate "C"`), as the memory store sorts: the database's collation puts
+    // `ä` before `e`, Rust after it (review K-1, C-2 conformance case).
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "select {COLUMNS} from database_columns where tenant_id = $1 and node_id = $2 \
-         order by schema_name, table_name, column_name"
+         order by schema_name collate \"C\", table_name collate \"C\", column_name collate \"C\""
     )))
     .bind(tenant)
     .bind(node)

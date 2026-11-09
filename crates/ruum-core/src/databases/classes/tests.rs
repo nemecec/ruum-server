@@ -291,6 +291,62 @@ fn only_the_user_schema_is_synced() {
     assert!(live_columns(&catalog, user_schema(EngineKind::Sqlite)).is_empty());
 }
 
+/// Review K-1, C-2: names the store cannot hold (over 63 characters, empty, a NUL) get no row.
+#[test]
+fn names_the_store_cannot_hold_get_no_row() {
+    let long = "x".repeat(MAX_NAME_CHARS + 1);
+    let edge = "y".repeat(MAX_NAME_CHARS);
+    // 63 characters of two bytes each: Postgres counts characters, so it fits.
+    let wide = "õ".repeat(MAX_NAME_CHARS);
+    let wide_long = "õ".repeat(MAX_NAME_CHARS + 1);
+    assert!(fits_store(&cref("public", "t", &edge)));
+    assert!(fits_store(&cref("public", "t", &wide)));
+    for bad in [
+        cref("public", "t", &long),
+        cref("public", &long, "a"),
+        cref(&long, "t", "a"),
+        cref("public", "t", &wide_long),
+        cref("public", "t", ""),
+        cref("main", "", "a"),
+        cref("public", "t", "a\0b"),
+    ] {
+        assert!(!fits_store(&bad), "{bad:?}");
+    }
+    let live = [
+        pg_col("t", "a", 10, 1, 25),
+        pg_col("t", &long, 10, 2, 25),
+        pg_col(&long, "b", 11, 1, 25),
+        pg_col("t", &edge, 10, 3, 25),
+        pg_col("t", &wide, 10, 4, 25),
+        lite_col("v", "", "TEXT"),
+    ];
+    let p = plan(&[], &live, T0);
+    let names: Vec<&str> = p.rows.iter().map(|r| r.column.column.as_str()).collect();
+    assert_eq!(p.rows.len(), 3, "{names:?}");
+    assert!(p.rows.iter().all(|r| fits_store(&r.column)));
+    assert_eq!(p.outcome.new.len(), 3);
+    // The lens names only the stored columns; it takes the others as personal.
+    let lens = lens_spec(&p.rows);
+    assert_eq!(
+        lens.class_of(&cref("public", "t", &long)),
+        DataClass::Personal
+    );
+
+    // A confirmed column renamed to a long name: its row counts as dropped, and the new name
+    // has no row (no confirmed class follows it).
+    let mut rows = plan(&[], &[pg_col("t", "a", 10, 1, 25)], T0).rows;
+    confirm_row(&mut rows, &cref("public", "t", "a"), DataClass::Normal);
+    let p = plan(&rows, &[pg_col("t", &long, 10, 1, 25)], T1);
+    assert_eq!(p.outcome.dropped, vec![cref("public", "t", "a")]);
+    assert!(p.outcome.new.is_empty());
+    assert_eq!(p.rows.len(), 1);
+    assert!(!p.rows[0].is_live());
+    assert_eq!(
+        lens_spec(&p.rows).class_of(&cref("public", "t", &long)),
+        DataClass::Personal
+    );
+}
+
 #[test]
 fn stale_keys_are_reset_or_gone_columns() {
     let live = [pg_col("t", "a", 10, 1, 25), pg_col("t", "b", 10, 2, 25)];
@@ -530,6 +586,57 @@ async fn store_conforms(
     assert_eq!(store.unconfirmed_count(other, node).await.unwrap(), 0);
 }
 
+/// Review K-1, C-2: a sync with names that `database_columns` cannot hold (over 63 characters,
+/// empty) succeeds on every store, writes no row for them and keeps the other columns. The
+/// live set replaces every earlier column of the database.
+async fn unfit_names_conform(store: &dyn ColumnStore, tenant: TenantId, node: NodeId) {
+    let long = "c".repeat(MAX_NAME_CHARS + 14);
+    let edge = "e".repeat(MAX_NAME_CHARS);
+    let wide = "ä".repeat(MAX_NAME_CHARS);
+    let live = [
+        pg_col("long_names", "a", 90, 1, 25),
+        pg_col("long_names", &long, 90, 2, 25),
+        pg_col(&long, "b", 91, 1, 25),
+        pg_col("long_names", "", 90, 3, 25),
+        pg_col("long_names", &edge, 90, 4, 25),
+        pg_col("long_names", &wide, 90, 5, 25),
+    ];
+    let (rows, o) = store.sync(tenant, node, &live, T0).await.unwrap();
+    assert!(rows.iter().all(|r| fits_store(&r.column)), "{rows:#?}");
+    let mut new = o.new.clone();
+    new.sort();
+    let mut want = vec![
+        cref("public", "long_names", "a"),
+        cref("public", "long_names", &edge),
+        cref("public", "long_names", &wide),
+    ];
+    want.sort();
+    assert_eq!(new, want);
+    assert_eq!(store.list(tenant, node).await.unwrap(), rows);
+    // Only the three stored columns are live (an earlier table's columns count as dropped).
+    assert_eq!(store.unconfirmed_count(tenant, node).await.unwrap(), 3);
+    // The same catalog again changes nothing.
+    let (_, o) = store.sync(tenant, node, &live, T1).await.unwrap();
+    assert!(!o.rows_changed, "{o:?}");
+    // A suggestion for a long name finds no column.
+    assert!(
+        store
+            .suggest(
+                tenant,
+                node,
+                &[(
+                    cref("public", "long_names", &long),
+                    DataClass::Normal,
+                    "x".into()
+                )],
+                system_actor(),
+                T1,
+            )
+            .await
+            .is_err()
+    );
+}
+
 /// The in-memory services with a recording [`MaskingRules`], and an SQLite database made by
 /// Alice that is ready.
 async fn memory_world() -> (World, Arc<RecordingMaskingRules>, NodeId) {
@@ -633,6 +740,7 @@ async fn memory_store_conforms() {
         other,
     )
     .await;
+    unfit_names_conform(&*w.s.databases.deps().columns, w.team.id, id).await;
 }
 
 // ------------------------------------------------------------------------ the service
@@ -955,6 +1063,50 @@ async fn list_suggest_confirm_and_reset() {
     );
 }
 
+/// Review K-1, C-2 (the probe's case): an unaliased expression column of a SQLite view is named
+/// after the expression text, over 63 characters. The sync goes on, the column gets no row and
+/// counts as personal; the other columns are listed as usual.
+#[tokio::test]
+async fn a_long_sqlite_view_column_counts_as_personal() {
+    let (w, _, id) = memory_world().await;
+    let (t, a) = (w.team.id, ctx(w.team.id, w.alice));
+    run_sql(
+        &w.s,
+        t,
+        id,
+        &[
+            "create table plants (id integer primary key, latin_name text, common_name text)",
+            "create view v as select upper(latin_name) || ' (' || lower(common_name) || ') ' \
+             || coalesce(common_name, 'unknown') from plants",
+        ],
+    )
+    .await;
+    let s = &w.s.databases;
+    let outcome = s.sync_columns(t, id).await.unwrap();
+    assert_eq!(outcome.new.len(), 3, "{outcome:?}");
+    let page = s
+        .list_columns(&a, id, false, PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 3);
+    assert!(page.items.iter().all(|c| c.table == "plants"));
+    // The engine catalog has the long name; the store has no row of the view.
+    let db = s.deps().store.get(t, id).await.unwrap().unwrap();
+    let engine = w.s.database_engines.get(db.engine).unwrap().clone();
+    let catalog = engine.catalog(&db.database_ref()).await.unwrap();
+    let long: Vec<ColumnRef> = live_columns(&catalog, "main")
+        .into_iter()
+        .map(|l| l.column)
+        .filter(|c| c.table == "v")
+        .collect();
+    assert_eq!(long.len(), 1, "{long:?}");
+    assert!(long[0].column.chars().count() > MAX_NAME_CHARS, "{long:?}");
+    let rows = s.deps().columns.list(t, id).await.unwrap();
+    assert!(rows.iter().all(|r| r.column.table != "v"), "{rows:#?}");
+    assert_eq!(lens_spec(&rows).class_of(&long[0]), DataClass::Personal);
+    assert_eq!(s.unconfirmed_columns(t, id).await.unwrap(), 3);
+}
+
 #[tokio::test]
 async fn the_scheduled_sync_reaches_every_database() {
     let (w, rec, id) = memory_world().await;
@@ -1093,6 +1245,9 @@ async fn postgres_store_conforms(pool: sqlx::PgPool) {
     let (t, node, user, v) = seed_pg(&pool).await;
     let (other, _, _, _) = seed_pg(&pool).await;
     store_conforms(&store, t, node, user, v, other).await;
+    // Review K-1, C-2: this failed on the check constraint of `database_columns` before.
+    let (ft, fnode, _, _) = seed_pg(&pool).await;
+    unfit_names_conform(&store, ft, fnode).await;
     // The journal entry is in the tenant's journal, with the envelope's type.
     let mut tx = crate::journal::postgres::begin_tenant(&pool, t)
         .await
