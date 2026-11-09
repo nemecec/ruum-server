@@ -7,7 +7,9 @@
 //! function of `ruum_mask` or on a `ruum_dbhost` connection. Every tenant function below calls
 //! `public.mark`, which appends `<path>:<current_user>` to the session setting `ruum_test.hit`
 //! and runs the role-grant probe of `hostile_copy`; the tests assert that nothing was marked
-//! in the sessions they read and that no role gained a membership.
+//! in the sessions they read and that no role gained a membership. Only the `owner` kind may run
+//! `set_config` (review Q-1, S-1), so `mark` takes `current_user` where it runs and hands the
+//! entry to `public.hit`, a `SECURITY DEFINER` function of the owner that writes the setting.
 
 use super::hostile_copy::{escalation, taken};
 use super::*;
@@ -24,11 +26,13 @@ const HIDDEN: &str = lens::SECRET_CONSTANT;
 /// fails while a tenant view reads it; that is a separate gap.)
 fn tenant_types_up(grants: &str) -> String {
     format!(
-        "CREATE FUNCTION public.mark(path text) RETURNS text LANGUAGE plpgsql AS $f$
+        "CREATE FUNCTION public.hit(entry text) RETURNS void LANGUAGE sql SECURITY DEFINER AS $f$
+           SELECT pg_catalog.set_config('ruum_test.hit',
+             coalesce(pg_catalog.current_setting('ruum_test.hit', true), '') || entry, false);
+         $f$;
+         CREATE FUNCTION public.mark(path text) RETURNS text LANGUAGE plpgsql AS $f$
          BEGIN
-           PERFORM pg_catalog.set_config('ruum_test.hit',
-             coalesce(pg_catalog.current_setting('ruum_test.hit', true), '')
-               || path || ':' || current_user || ',', false);
+           PERFORM public.hit(path || ':' || current_user || ',');
            {grants}
            RETURN path;
          END $f$;
@@ -120,16 +124,21 @@ async fn tenant_types_source<'e>(
     f
 }
 
-/// Reads `t` through the masked lens with the setting `ruum_test.hit` cleared first. Returns
-/// the rows and the setting afterwards.
+/// Reads `t` through the masked lens in a new session, whose setting `ruum_test.hit` starts
+/// empty (the masked reader may not run `set_config`). Returns the rows and the setting
+/// afterwards.
 async fn masked_rows(engine: &PostgresEngine, db: &DatabaseRef) -> (Vec<String>, String) {
     let mut s = session(engine, db, RoleKind::MaskedRead).await;
-    psql(
-        &mut s,
-        "select pg_catalog.set_config('ruum_test.hit', '', false)",
-    )
-    .await
-    .unwrap();
+    assert_eq!(
+        psql(
+            &mut s,
+            "select pg_catalog.current_setting('ruum_test.hit', true)",
+        )
+        .await
+        .unwrap(),
+        "",
+        "a new session starts with no mark"
+    );
     let rows = psql(
         &mut s,
         &format!("select {} from t order by id", VALUE_COLUMNS.join(", ")),

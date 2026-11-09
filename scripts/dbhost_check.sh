@@ -131,6 +131,11 @@ su_sql postgres "select count(*) from pg_database d, aclexplode(coalesce(d.datac
 fact "PUBLIC has no CONNECT and no TEMPORARY on postgres and template1" '[[ $OUT == 0 ]]'
 su_sql template1 "select count(*) from pg_namespace n, aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a where n.nspname = 'public' and a.grantee = 0"
 fact "template1: PUBLIC has no right on schema public" '[[ $OUT == 0 ]]'
+SETCFG="pg_catalog.set_config(text, text, boolean)"
+su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where p.oid = '$SETCFG'::regprocedure and a.grantee = 0"
+fact "template1: PUBLIC may not run set_config (review Q-1, S-1)" '[[ $OUT == 0 ]]'
+su_sql template1 "select has_function_privilege('ruum_dbhost', '$SETCFG', 'execute with grant option')"
+fact "template1: ruum_dbhost holds EXECUTE on set_config WITH GRANT OPTION" '[[ $OUT == t ]]'
 su_sql postgres "select rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolpassword like 'SCRAM-SHA-256\$%' from pg_authid where rolname = 'ruum_dbhost'"
 fact "ruum_dbhost: CREATEDB and CREATEROLE, no superuser, no replication, no bypassrls, SCRAM password" '[[ $OUT == "f|t|t|f|f|t" ]]'
 su_sql postgres "select count(*) from pg_auth_members m join pg_roles r on r.oid = m.member where r.rolname = 'ruum_dbhost'"
@@ -178,6 +183,10 @@ make_db() {
   else fail "$p: ruum_dbhost creates role mask"; fi
   # Decision 0004-34 (a): ruum_dbhost holds SET (not INHERIT) membership in mask.
   as dbhost "$ADMIN_DB" "grant $r to ruum_dbhost with inherit false, set true" || fail "$p: grant mask to ruum_dbhost"
+  # As the engine does (review Q-1, S-1): set_config for the owner kind only.
+  local ov="ROLE_${p}_owner"
+  as dbhost "$db" "grant execute on function $SETCFG to ${!ov}" || fail "$p: grant set_config to owner"
+  if grep -q "no privileges were granted" <<<"$OUT"; then fail "$p: ruum_dbhost has no grant option on set_config"; fi
 }
 
 echo "== databases and roles (as ruum_dbhost, no superuser)"
@@ -237,6 +246,45 @@ ok "(owner) creates a SECURITY DEFINER function and a plain one" A_owner "$DBA" 
     as \$f\$ begin execute 'set role ruum_dbhost'; return current_user; end \$f\$;"
 err "(owner) set_config('role') inside a SECURITY DEFINER function" A_owner "$DBA" "select public.sw()" 'cannot set parameter "role" within security-definer function|permission denied to set role'
 err "(owner) SET ROLE ruum_dbhost inside a function" A_owner "$DBA" "select public.sw2()" 'permission denied to set role'
+
+echo "== set_config (review Q-1, S-1): only the owner kind, on no path"
+for k in $LOGIN_KINDS; do
+  [[ $k == owner ]] && continue
+  err "($k) set_config" "A_$k" "$DBA" "select set_config('work_mem', '7MB', true)" 'permission denied for function set_config'
+  err "($k) set_config through query_to_xml" "A_$k" "$DBA" "select query_to_xml('select set_config(''work_mem'', ''7MB'', true)', false, false, '')" 'permission denied for function set_config'
+  err "($k) set_config through query_to_xml with U& escapes" "A_$k" "$DBA" "select query_to_xml(U&'select set\\005fconfig(''statement_timeout'', ''0'', true)', false, false, '')" 'permission denied for function set_config'
+  err "($k) set_config through ts_stat" "A_$k" "$DBA" "select * from ts_stat('select to_tsvector(set_config(''work_mem'', ''7MB'', true))')" 'permission denied for function set_config'
+  err "($k) set_config in a DO block" "A_$k" "$DBA" "do \$\$ begin perform set_config('work_mem', '7MB', true); end \$\$" 'permission denied for function set_config'
+done
+ok "(owner) runs set_config" A_owner "$DBA" "select set_config('work_mem', '7MB', true)" 7MB
+
+echo "== set_config in databases made before the rule (the cluster set-up fixes them)"
+OLD_OPEN="d_$(hex16)"
+OLD_CLOSED="d_$(hex16)"
+for d in $OLD_OPEN $OLD_CLOSED; do
+  if as dbhost "$ADMIN_DB" "create database $d template template0"; then MADE_DBS="$MADE_DBS $d"
+  else fail "ruum_dbhost creates an old-style database (template0)"; fi
+done
+ok "an old-style database: ruum_meta.roles names an owner" dbhost "$OLD_OPEN" "create schema ruum_meta; create table ruum_meta.roles (kind text not null, binding uuid, role_name text not null); insert into ruum_meta.roles values ('owner', null, '$ROLE_A_owner'), ('read', null, '$ROLE_A_read')"
+as dbhost "$ADMIN_DB" "alter database $OLD_CLOSED allow_connections false" || fail "close the old-style database"
+su_sql "$OLD_OPEN" "select has_function_privilege('public', '$SETCFG', 'execute')"
+fact "before: PUBLIC may run set_config in an old-style database" '[[ $OUT == t ]]'
+if OUT="$(docker exec -e PGOPTIONS="-c client_min_messages=warning" "$PGC" bash /docker-entrypoint-initdb.d/10-ruum-data.sh 2>&1)"; then
+  pass "the cluster set-up runs again (idempotent)"
+else fail "the cluster set-up runs again (idempotent)"; fi
+for d in $OLD_OPEN $OLD_CLOSED; do
+  su_sql postgres "select datallowconn from pg_database where datname = '$d'"
+  WANT=t; [[ $d == "$OLD_CLOSED" ]] && WANT=f
+  fact "after: $([[ $WANT == f ]] && echo closed || echo open) old-style database keeps its datallowconn" '[[ $OUT == "$WANT" ]]'
+  [[ $d == "$OLD_CLOSED" ]] && su_sql postgres "alter database $d allow_connections true"
+  su_sql "$d" "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where p.oid = '$SETCFG'::regprocedure and a.grantee = 0"
+  fact "after: PUBLIC may not run set_config in the old-style database" '[[ $OUT == 0 ]]'
+  [[ $d == "$OLD_CLOSED" ]] && su_sql postgres "alter database $d allow_connections false"
+done
+su_sql "$OLD_OPEN" "select has_function_privilege('$ROLE_A_owner', '$SETCFG', 'execute') || '|' || has_function_privilege('$ROLE_A_read', '$SETCFG', 'execute')"
+fact "after: the owner kind of ruum_meta.roles keeps set_config, the read kind has none" '[[ $OUT == "true|false" ]]'
+su_sql "$OLD_OPEN" "select string_agg(distinct g.rolname, ',') from pg_proc p, aclexplode(p.proacl) a join pg_roles g on g.oid = a.grantor join pg_roles e on e.oid = a.grantee where p.oid = '$SETCFG'::regprocedure and e.rolname = '$ROLE_A_owner'"
+fact "after: ruum_dbhost made the owner's grant (so the engine can take it back in a copy)" '[[ $OUT == ruum_dbhost ]]'
 
 echo "== logins only from the platform address"
 CIP="$(docker exec "$PGC" hostname -i | awk '{print $1}')"

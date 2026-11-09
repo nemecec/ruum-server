@@ -1223,6 +1223,33 @@ async fn postgres_engine_masks_secrets_for_viewers_and_takes_a_managers_retype()
         failure(run(a.clone(), sql("select count(*) from public.accounts")).await);
     assert_eq!((status, code.as_str()), (422, "statement_not_allowed"));
     assert_eq!(hint.as_deref(), Some(rules::HINT_UNQUALIFIED_NAMES));
+    // set_config through a function that runs a query given as text (review Q-1, S-1): the
+    // statement rules let it through (the text is a string literal), the engine refuses it for
+    // every kind but owner, and the answer is the fixed text. An agent reads as masked_read.
+    let bot = agent(&w, w.bob, Role::Edit).await;
+    for text in [
+        "select query_to_xml('select set_config(''work_mem'', ''7MB'', true)', false, false, '')",
+        "select query_to_xml(U&'select set\\005fconfig(''statement_timeout'', ''0'', true)', \
+         false, false, '')",
+        "select * from ts_stat('select to_tsvector(set_config(''work_mem'', ''7MB'', true))')",
+    ] {
+        assert!(
+            rules::analyze(EngineKind::Postgres, text).verdict.is_ok(),
+            "{text}"
+        );
+        for (who, req) in [
+            (b.clone(), sql(text)),
+            (b.clone(), write(text)),
+            (bot.clone(), sql(text)),
+        ] {
+            let r = run(who, req).await;
+            let Err(QueryError::Problem(p)) = r else {
+                panic!("{text}: {r:?}");
+            };
+            assert_eq!((p.status, p.code), (400, "query_failed"), "{text}");
+            assert_eq!(p.sqlstate.as_deref(), Some("42501"), "{text}");
+        }
+    }
     let s = schema(svc, &b, db).await.unwrap();
     assert_eq!(s.engine, EngineKind::Postgres);
     assert!(s.tables.iter().all(|t| t.schema == "public"));

@@ -454,6 +454,8 @@ async fn hand_over(
             pseudonyms_for_owner(&mut conn, &new_mask, &new_owner, false).await?;
         }
         setup::rebuild_lens(&mut conn, new_roles, key).await?;
+        // The copy took the rights of its source; the old owner's grant went in step 1.
+        setup::check_set_config(&mut conn, new_roles).await?;
         run(&mut conn, "commit", "commit".to_string()).await
     }
     .await;

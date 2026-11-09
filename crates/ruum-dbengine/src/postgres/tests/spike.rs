@@ -177,11 +177,17 @@ async fn s1_script_sections_pass_against_an_engine_database() {
                 &["permission denied to set role"],
             )
             .await;
+            // Only the owner kind may run set_config at all (review Q-1, S-1); for it, the
+            // role change itself is refused.
             s.err(
                 &format!("({k}) set_config role {target}"),
                 kind,
                 &format!("select set_config('role', '{target}', false)"),
-                &["permission denied to set role"],
+                &[if kind == Owner {
+                    "permission denied to set role"
+                } else {
+                    "permission denied for function set_config"
+                }],
             )
             .await;
             s.err(

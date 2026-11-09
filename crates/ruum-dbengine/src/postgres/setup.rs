@@ -195,12 +195,25 @@ fn schemas_sql(roles: &[EngineRole], extensions: &[String]) -> String {
     sql
 }
 
-/// The schema grants of a database's roles.
+/// `pg_catalog.set_config`, which changes any user-settable option (decision 0004-35 a).
+pub(crate) const SET_CONFIG: &str = "pg_catalog.set_config(text, text, boolean)";
+
+/// The schema grants of a database's roles, and `EXECUTE` on [`SET_CONFIG`] for the `owner`
+/// kind only.
+///
+/// The cluster set-up (`deploy/dev/postgres-data/initdb/10-ruum-data.sh`, as the superuser)
+/// revokes `EXECUTE` on `set_config` from `PUBLIC` in `template1` and in every data database, and
+/// gives it to `ruum_dbhost` `WITH GRANT OPTION`. So no read or masked kind can call it, also not
+/// through a function that runs a query given as text (`query_to_xml`, `ts_stat`; review Q-1,
+/// S-1). The `owner` kind keeps it: it can set options in a function's `SET` clause anyway, and
+/// migrations made with `pg_dump` call it. Without the grant option the `GRANT` only warns;
+/// [`check_set_config`] then still refuses the database if a wrong role can call it.
 pub(crate) fn grants_sql(roles: &[EngineRole]) -> String {
     let r = |k| ident(role_of(roles, k));
     let logins: Vec<String> = RoleKind::SESSION_KINDS.iter().map(|k| r(*k)).collect();
     format!(
-        "grant usage, create on schema public to {owner};\n\
+        "grant execute on function {SET_CONFIG} to {owner};\n\
+         grant usage, create on schema public to {owner};\n\
          grant usage on schema public to {secret_read}, {mask};\n\
          {lens}\
          grant usage on schema extensions to {logins}, {mask};\n",
@@ -226,6 +239,50 @@ fn lens_schema_grants_sql(roles: &[EngineRole]) -> String {
         masked_read = r(RoleKind::MaskedRead),
         masked_write = r(RoleKind::MaskedWrite),
     )
+}
+
+/// Refuses a database in which `PUBLIC` or a role other than the `owner` kind may call
+/// [`SET_CONFIG`] (review Q-1, S-1): the database was made on a data cluster without the set-up
+/// of `10-ruum-data.sh`, or something granted it. The engine holds this line itself, so a query
+/// of a read or masked kind never changes an option of its call, whatever the statement rules let
+/// through.
+pub(crate) async fn check_set_config(
+    conn: &mut PgConnection,
+    roles: &[EngineRole],
+) -> Result<(), EngineError> {
+    let others: Vec<String> = roles
+        .iter()
+        .filter(|r| r.kind != RoleKind::Owner)
+        .map(|r| r.role_name.clone())
+        .collect();
+    let row = sqlx::query(
+        "select exists (select 1 from pg_catalog.pg_proc p,
+                          pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
+                         where p.oid = $1::pg_catalog.regprocedure and a.grantee = 0) as public,
+                coalesce((select pg_catalog.string_agg(r, ', ') from pg_catalog.unnest($2::text[]) r
+                           where pg_catalog.has_function_privilege(r, $1, 'execute')), '') as kinds",
+    )
+    .persistent(false)
+    .bind(SET_CONFIG)
+    .bind(&others)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("check the rights on set_config", e))?;
+    let public: bool = row.get("public");
+    let kinds: String = row.get("kinds");
+    if public {
+        return Err(EngineError::Internal(
+            "PUBLIC may run pg_catalog.set_config in this database: run the data cluster set-up \
+             (deploy/dev/postgres-data/initdb/10-ruum-data.sh) as the superuser"
+                .to_string(),
+        ));
+    }
+    if !kinds.is_empty() {
+        return Err(EngineError::Internal(format!(
+            "roles other than the owner kind may run pg_catalog.set_config: {kinds}"
+        )));
+    }
+    Ok(())
 }
 
 /// The default privileges of the `owner` kind's tables and sequences: `mask` reads and writes
@@ -761,6 +818,7 @@ pub(crate) async fn create_database(
             write_meta(&mut conn, new.tenant_id, new.node_id, &roles).await?;
             install_functions(&mut conn, &roles, key).await?;
             build_lens(&mut conn, &roles, &Catalog::default(), &LensSpec::default()).await?;
+            check_set_config(&mut conn, &roles).await?;
             run(&mut conn, "commit", "commit".to_string()).await
         }
         .await;

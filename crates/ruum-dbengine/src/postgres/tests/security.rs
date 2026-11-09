@@ -432,6 +432,9 @@ async fn a_statement_over_the_timeout_is_cancelled() {
 
 /// After a request, a pooled connection holds no session option: `SHOW` of statement_timeout,
 /// role, search_path (and TimeZone) equal a fresh session.
+///
+/// The `owner` kind sets the options with `set_config(..., false)`; the other kinds may not run
+/// `set_config` (review Q-1, S-1), so they set them with `SET` (session level), one per request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pooled_connection_holds_no_session_option() {
     let Some((engine, seen)) = engine_with_hook().await else {
@@ -442,39 +445,235 @@ async fn a_pooled_connection_holds_no_session_option() {
     const SHOW: &str = "SELECT current_setting('statement_timeout') || '|' || current_user || '|' \
         || current_setting('search_path') || '|' || current_setting('TimeZone') || '|' \
         || current_setting('transaction_read_only')";
-    for kind in [RoleKind::Write, RoleKind::MaskedWrite, RoleKind::Owner] {
-        // A committed write that sets session options (set_config(..., false) inside the
-        // transaction outlives it without DISCARD ALL).
-        f.run(
-            kind,
-            StatementMode::Write,
-            "SELECT set_config('statement_timeout', '123s', false), \
+    const SET_ALL: &str = "SELECT set_config('statement_timeout', '123s', false), \
                     set_config('search_path', 'pg_catalog', false), \
                     set_config('TimeZone', 'Pacific/Chatham', false), \
-                    set_config('default_transaction_read_only', 'on', false)",
+                    set_config('default_transaction_read_only', 'on', false)";
+    const SET_EACH: [&str; 4] = [
+        "SET statement_timeout = '123s'",
+        "SET search_path = pg_catalog",
+        "SET TimeZone = 'Pacific/Chatham'",
+        "SET default_transaction_read_only = on",
+    ];
+    for kind in [RoleKind::Write, RoleKind::MaskedWrite, RoleKind::Owner] {
+        let statements: Vec<&str> = if kind == RoleKind::Owner {
+            vec![SET_ALL]
+        } else {
+            let err = f
+                .run(kind, StatementMode::Write, SET_ALL, vec![])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, EngineError::PermissionDenied(_))
+                    || matches!(&err, EngineError::Sql { code, .. } if code == "42501"),
+                "{}: {err:?}",
+                kind.as_str()
+            );
+            SET_EACH.to_vec()
+        };
+        for sql in statements {
+            // A committed write that sets a session option (it outlives the transaction
+            // without DISCARD ALL).
+            f.run(kind, StatementMode::Write, sql, vec![])
+                .await
+                .unwrap();
+            let pid = seen.last_pid();
+            // The next request gets the same connection, with nothing left.
+            let state = engine.resolve(f.db()).await.unwrap();
+            let pool = engine.pool(&state, kind);
+            assert_eq!(pool.idle_count(), 1);
+            let mut lease = pool.acquire(&engine).await.unwrap();
+            assert_eq!(
+                lease.backend_pid, pid,
+                "the connection went back to the pool"
+            );
+            let pooled = psql(lease.conn(), SHOW).await.unwrap();
+            lease.release(&engine).await;
+            let mut fresh = session(&engine, f.db(), kind).await;
+            let clean = psql(&mut fresh, SHOW).await.unwrap();
+            close(fresh).await;
+            assert_eq!(pooled, clean, "{} {sql}", kind.as_str());
+            assert!(!pooled.contains("Chatham") && !pooled.contains("123s"));
+            assert!(pooled.contains(&role_name(&f.created, kind)));
+        }
+    }
+}
+
+/// The statements that reach `set_config` (review Q-1, R-1 and S-1): directly, through a
+/// function that runs a query given as text (also with Unicode escapes in the text), and in a
+/// DO block. The statement rules of the query layer cannot read the text of a query in a string,
+/// so the engine must refuse them all.
+const SET_CONFIG_PATHS: &[&str] = &[
+    "SELECT set_config('work_mem', '7MB', true)",
+    "SELECT pg_catalog.set_config('statement_timeout', '0', true)",
+    "SELECT query_to_xml('select set_config(''work_mem'', ''7MB'', true)', false, false, '')",
+    "SELECT query_to_xml(U&'select set\\005fconfig(''statement_timeout'', ''0'', true)', \
+     false, false, '')",
+    "SELECT query_to_xml_and_xmlschema('select set_config(''work_mem'', ''7MB'', true) as v', \
+     false, false, '')",
+    "SELECT * FROM ts_stat('select to_tsvector(set_config(''work_mem'', ''7MB'', true))')",
+    "SELECT ts_rewrite('a'::tsquery, \
+     'select ''a''::tsquery, set_config(''work_mem'', ''7MB'', true)::tsquery')",
+    "DO $$ BEGIN PERFORM set_config('work_mem', '7MB', true); END $$",
+];
+
+fn refused_set_config(err: &EngineError) -> bool {
+    match err {
+        EngineError::PermissionDenied(m) => m.contains("set_config"),
+        EngineError::Sql { code, message } => code == "42501" && message.contains("set_config"),
+        _ => false,
+    }
+}
+
+/// No kind but `owner` runs `set_config` (review Q-1, S-1), on any path of
+/// [`SET_CONFIG_PATHS`], in a new database and in a copy (which has roles of its own). `work_mem`
+/// stays the cluster's. The `owner` kind keeps it, also in the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_config_runs_for_no_kind_but_owner() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.seed_users().await;
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Full,
+            &f.key,
+        )
+        .await
+        .expect("copy");
+    let base = f
+        .run(
+            RoleKind::Read,
+            StatementMode::Read,
+            "SELECT current_setting('work_mem')",
             vec![],
         )
         .await
-        .unwrap();
-        let pid = seen.last_pid();
-        // The next request gets the same connection, with nothing left.
-        let state = engine.resolve(f.db()).await.unwrap();
-        let pool = engine.pool(&state, kind);
-        assert_eq!(pool.idle_count(), 1);
-        let mut lease = pool.acquire(&engine).await.unwrap();
+        .unwrap()
+        .rows;
+    for db in [f.db().clone(), copy.database.clone()] {
+        for kind in RoleKind::SESSION_KINDS {
+            if kind == RoleKind::Owner {
+                continue;
+            }
+            let mut modes = vec![StatementMode::Read];
+            if kind.can_write() {
+                modes.push(StatementMode::Write);
+            }
+            for mode in modes {
+                for sql in SET_CONFIG_PATHS {
+                    let err = f.run_on(&db, kind, mode, sql, vec![]).await.unwrap_err();
+                    assert!(
+                        refused_set_config(&err),
+                        "{} {mode:?} {sql}: {err:?}",
+                        kind.as_str()
+                    );
+                }
+            }
+            let now = f
+                .run_on(
+                    &db,
+                    kind,
+                    StatementMode::Read,
+                    "SELECT current_setting('work_mem')",
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .rows;
+            assert_eq!(now, base, "{}", kind.as_str());
+        }
+        let out = f
+            .run_on(
+                &db,
+                RoleKind::Owner,
+                StatementMode::Write,
+                "SELECT set_config('work_mem', '7MB', true), current_setting('work_mem')",
+                vec![],
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            lease.backend_pid, pid,
-            "the connection went back to the pool"
+            out.rows,
+            [vec![Value::Text("7MB".into()), Value::Text("7MB".into())]]
         );
-        let pooled = psql(lease.conn(), SHOW).await.unwrap();
-        lease.release(&engine).await;
-        let mut fresh = session(&engine, f.db(), kind).await;
-        let clean = psql(&mut fresh, SHOW).await.unwrap();
-        close(fresh).await;
-        assert_eq!(pooled, clean, "{}", kind.as_str());
-        assert!(!pooled.contains("Chatham") && !pooled.contains("123s"));
-        assert!(pooled.contains(&role_name(&f.created, kind)));
     }
+    // In each database only the owner kind holds the right: as the cluster set-up and the
+    // engine left it, and the source's owner lost its grant in the copy.
+    for (created, other) in [(&f.created, &copy), (&copy, &f.created)] {
+        let mut conn = dbhost(&engine, &created.database).await;
+        let owner = role_name(created, RoleKind::Owner);
+        let mut names: Vec<String> = created.roles.iter().map(|r| r.role_name.clone()).collect();
+        names.extend(other.roles.iter().map(|r| r.role_name.clone()));
+        let sql = format!(
+            "SELECT string_agg(r, ',' ORDER BY r) FROM unnest(ARRAY['{}']) r \
+              WHERE has_function_privilege(r, '{}', 'execute')",
+            names.join("','"),
+            setup::SET_CONFIG
+        );
+        assert_eq!(psql(&mut conn, &sql).await.unwrap(), owner);
+        close(conn).await;
+    }
+    engine.drop_database(&copy.database).await.unwrap();
+}
+
+async fn read_users(e: &PostgresEngine, f: &Fixture<'_>) -> Result<StatementOutcome, EngineError> {
+    e.execute(
+        &f.role(RoleKind::Read),
+        &f.key,
+        &request("SELECT count(*) FROM users", StatementMode::Read),
+    )
+    .await
+}
+
+/// The engine refuses a database in which `PUBLIC` may run `set_config` (made before the
+/// cluster set-up, or opened by hand): a new engine does not resolve it, and no copy of it is
+/// made. Once the grant is gone, it works again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_where_public_may_run_set_config_is_refused() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.seed_users().await;
+    // ruum_dbhost holds EXECUTE WITH GRANT OPTION (cluster set-up), so it can open the function
+    // to PUBLIC as a database of an older cluster had it.
+    let grant = |verb: &str, to: &str| {
+        format!(
+            "{verb} execute on function {} {to} public",
+            setup::SET_CONFIG
+        )
+    };
+    let mut conn = dbhost(&engine, f.db()).await;
+    psql(&mut conn, &grant("grant", "to")).await.unwrap();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Full,
+            &f.key,
+        )
+        .await;
+    assert!(
+        matches!(&copy, Err(EngineError::Internal(m)) if m.contains("set_config")),
+        "{copy:?}"
+    );
+    let fresh = engine_with(|_| {}).await.expect("a second engine");
+    let err = read_users(&fresh, &f).await.unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Internal(m) if m.contains("set_config")),
+        "{err:?}"
+    );
+    // The copy drained the source, which ended this session too.
+    close(conn).await;
+    let mut conn = dbhost(&engine, f.db()).await;
+    psql(&mut conn, &grant("revoke", "from")).await.unwrap();
+    close(conn).await;
+    let again = engine_with(|_| {}).await.expect("a third engine");
+    read_users(&again, &f)
+        .await
+        .expect("the database works again");
 }
 
 /// A connection whose transaction failed (an error, a timeout, a refused write) is closed; a

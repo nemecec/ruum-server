@@ -318,7 +318,14 @@ impl PostgresEngine {
             Some(s) => s,
             None => {
                 let mut conn = self.dbhost(&db.engine_name).await?;
-                let meta = setup::read_meta(&mut conn).await;
+                let meta = match setup::read_meta(&mut conn).await {
+                    // A database made before the cluster set-up revoked set_config from
+                    // PUBLIC is refused until the set-up has run (review Q-1, S-1).
+                    Ok(Some(meta)) => setup::check_set_config(&mut conn, &meta.roles)
+                        .await
+                        .map(|()| Some(meta)),
+                    other => other,
+                };
                 let _ = sqlx::Connection::close(conn).await;
                 let Some(meta) = meta? else {
                     return Err(EngineError::NotFound);
