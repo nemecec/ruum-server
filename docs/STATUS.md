@@ -521,9 +521,29 @@ SEC-1 (the masking hole) and the Q-1 unblock of the earlier list are merged. In 
 2. **Data cluster per agent** (2026-11-08 B-2, raised): `run.sh --data-cluster` (or always)
    starts `pgdata-<key>` from the tree's set-up; `--stop` removes it. Every data cluster change
    needs it; three agents wrote their own.
-3. **K-1 C-2** (2026-11-08 P-2): names over 63 characters in the catalog sync.
+3. **K-1 C-2** (2026-11-08 P-2): names over 63 characters in the catalog sync. **Built on
+   `f/k1c2-errors`, waiting for review and integration.** `classes::fits_store`: a schema,
+   table or column name of 0 or more than 63 characters, or with a NUL, gets no
+   `database_columns` row (both stores, through `plan`); the lens takes it as `personal`; the
+   sync logs a line with the count (no names) and goes on. Tests: the planner case, a store
+   conformance case on memory and Postgres (`unfit_names_conform`; the Postgres store now sorts
+   `list` in byte order, `collate "C"`, as the memory store does), the SQLite view of the
+   review's probe; mutation `databases-classes-long-name-stored` (KILLED).
 4. **Step 2 error codes** (2026-11-08 P-3), with the Q-1 note N-B (2026-11-09 S-12): a rule
-   that refuses writes to `pg_catalog` relations.
+   that refuses writes to `pg_catalog` relations. **Built on `f/k1c2-errors`, waiting for
+   review and integration.** `ErrorCode` has the nine step 2 codes of the contract (a test
+   checks both directions against `openapi.yaml`); `ApiError` has `sqlstate` and
+   `retry_after`, and `render` sends `Retry-After`. Q-1's own `Problem` struct is gone
+   (`query::Problem` is now a name of `ApiError`), so Q-2, A-2 and D-2 use the shared codes.
+   Rule 10 of `query::rules`: no write to and no schema change of a catalog relation
+   (Postgres: `pg_catalog`, `information_schema`, `pg_*` schemas and unqualified `pg_*` names,
+   also inside `WITH` and `EXPLAIN`; SQLite: `sqlite_schema`, `sqlite_master`); a query with a
+   data-modifying `WITH` is classified as a write. One additive contract change (the rule in
+   the `queryDatabase` text). Hostile rules cases, a Postgres engine case
+   (`UPDATE pg_settings` is `422 statement_not_allowed` now, not `400 query_failed` 42501), an
+   HTTP case; mutation `databases-query-catalog-write-allowed` (KILLED). Panel note: rule 10
+   also refuses `CREATE TABLE pg_x` (an own table with a `pg_` name), because Postgres looks in
+   `pg_catalog` first for an unqualified name; confirm or veto.
 5. **Security follow-ups** (2026-11-08 S-7; 2026-11-09 S-8, S-9, S-11, S-15): DQS off in the
    bundled SQLite (un-ignore the planned Q-1 test); masked copy with a view on a personal
    column; no `USAGE` on `ruum_mask` for the copy's owner; names only in `PrincipalRef` fields;
