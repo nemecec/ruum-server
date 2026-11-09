@@ -101,7 +101,12 @@ test('"Upload new version" always makes a new version, also right after your own
   const panel = page.getByRole('region', { name: 'Versions of plan.txt' })
   // Both versions are there: the first one kept the old content.
   await expect(panel.getByRole('listitem')).toHaveCount(2)
-  const older = panel.getByRole('listitem').filter({ hasNotText: 'Current' })
+  // The newest row is the current one from the first paint (T-13): the panel reads the head with
+  // the versions, not from the list of the page, which can still be loading after the upload.
+  await expect(panel.getByRole('listitem').first()).toContainText('Current')
+  await expect(panel.getByText('Current', { exact: true })).toHaveCount(1)
+  const older = panel.getByRole('listitem').nth(1)
+  await expect(older).not.toContainText('Current')
   await older.getByRole('button', { name: /^More actions for the version of/ }).click()
   const [dl] = await Promise.all([page.waitForEvent('download'), page.getByRole('menu').getByRole('menuitem', { name: 'Download', exact: true }).click()])
   const file = info.outputPath('older.txt')

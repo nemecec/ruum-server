@@ -17,7 +17,10 @@ export type PagedState<T> = ApiState<Paged<T>> & {
  * Loads the first page of a list with `load(undefined)`, and the next pages with `loadMore()`,
  * which follows `next_cursor`. `reload()` starts again at the first page.
  */
-export function usePagedApi<T>(load: (cursor: string | undefined) => Promise<Page<T>>, deps: readonly unknown[]): PagedState<T> {
+export function usePagedApi<T, X extends object = object>(
+  load: (cursor: string | undefined) => Promise<Page<T> & X>,
+  deps: readonly unknown[],
+): PagedState<T> & { /** The first page as `load` answered it, with its other fields (for example a head). */ firstPage: (Page<T> & X) | undefined } {
   const first = useApi(() => load(undefined), deps)
   // The pages after the first one, for the first page they belong to (a reload drops them).
   const [extra, setExtra] = useState<{ base: Page<T>; items: T[]; next: string | null } | null>(null)
@@ -45,5 +48,5 @@ export function usePagedApi<T>(load: (cursor: string | undefined) => Promise<Pag
       .finally(() => setLoadingMore(false))
   }
 
-  return { ...first, data, loadMore, loadingMore, moreError }
+  return { ...first, data, firstPage: first.data, loadMore, loadingMore, moreError }
 }

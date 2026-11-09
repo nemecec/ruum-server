@@ -29,7 +29,7 @@ import {
   Toolbar,
   useToast,
 } from '../../ui'
-import { downloadNode, type Node } from './api'
+import { downloadNode, refreshNode, type Node } from './api'
 import { NameDialog } from './dialogs'
 import { t, type MessageKey } from '../../i18n'
 
@@ -39,11 +39,20 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
   const { toast } = useToast()
   const [error, setError] = useState<unknown>()
   const [compare, setCompare] = useState<Schemas['Version'] | null>(null)
-  const versions = usePagedApi(
-    (cursor) =>
-      unwrap(client.GET('/v1/nodes/{node_id}/versions', { params: { path: { node_id: node.id }, query: cursor ? { cursor } : {} } })),
+  // The first page reads the node again with the versions. The node of the caller can be a moment
+  // old (right after an upload its list is still loading), and its head would put "Current" on
+  // the version before (backlog 2026-11-09 T-13).
+  const versions = usePagedApi<Schemas['Version'], { head: string | null }>(
+    async (cursor) => {
+      const [page, fresh] = await Promise.all([
+        unwrap(client.GET('/v1/nodes/{node_id}/versions', { params: { path: { node_id: node.id }, query: cursor ? { cursor } : {} } })),
+        cursor ? undefined : refreshNode(node),
+      ])
+      return { ...page, head: fresh ? fresh.head_version : node.head_version }
+    },
     [node.id, node.head_version],
   )
+  const head = versions.firstPage?.head ?? node.head_version
   const canEdit = node.my_role === 'edit' || node.my_role === 'manage'
   const [naming, setNaming] = useState<Schemas['Version'] | null>(null)
 
@@ -59,7 +68,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
   }
 
   async function restore(v: Schemas['Version']) {
-    const before = node.head_version
+    const before = head
     await unwrap(
       client.POST('/v1/nodes/{node_id}/versions/{version_id}/restore', { params: { path: { node_id: node.id, version_id: v.id } } }),
     )
@@ -110,7 +119,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
             <>
               <List ordered>
                 {page.items.map((v) => {
-                  const current = v.id === node.head_version
+                  const current = v.id === head
                   const when = formatDate(v.created_at)
                   const source = v.restored_from ? byId.get(v.restored_from) : undefined
                   return (
@@ -165,7 +174,7 @@ export function VersionsPanel(props: { node: Node; onClose: () => void; onRestor
               <Text tone="muted" size="sm">
                 {t('versions.retention')}
               </Text>
-              {compare && <CompareDialog node={node} from={compare} versions={page.items} onClose={() => setCompare(null)} />}
+              {compare && <CompareDialog node={node} head={head} from={compare} versions={page.items} onClose={() => setCompare(null)} />}
             </>
           )
         }}
@@ -235,10 +244,10 @@ function pathLabel(c: Schemas['DiffChange']): string | null {
  * The changes between two versions (`diffVersions`) in a wide dialog (a full page on the phone),
  * in the one change model of all diff plugins (design 5.4).
  */
-function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: Schemas['Version'][]; onClose: () => void }) {
-  const { node, from } = props
+function CompareDialog(props: { node: Node; head: string | null; from: Schemas['Version']; versions: Schemas['Version'][]; onClose: () => void }) {
+  const { node, head, from } = props
   const others = props.versions.filter((v) => v.id !== from.id)
-  const [to, setTo] = useState(from.id === node.head_version ? (others[0]?.id ?? '') : '')
+  const [to, setTo] = useState(from.id === head ? (others[0]?.id ?? '') : '')
   const [plugin, setPlugin] = useState('')
   // "Compare as" is for people who know the plugins; it waits behind "More options".
   const [advanced, setAdvanced] = useState(false)
@@ -248,7 +257,7 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
   )
   // `to` empty means the current version. When `from` is the current version, compare an older
   // one to it instead (older first).
-  const swap = from.id === node.head_version
+  const swap = from.id === head
   const query = swap ? { from: to, to: from.id } : { from: from.id, ...(to ? { to } : {}) }
   const diff = useApi(
     () =>
@@ -265,7 +274,7 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
   const label = (v: Schemas['Version']) =>
     t('compare.version', {
       when: formatShortDate(v.created_at),
-      current: v.id === node.head_version ? 'yes' : 'no',
+      current: v.id === head ? 'yes' : 'no',
       label: v.label ?? '',
       named: v.label ? 'yes' : 'no',
     })
@@ -284,7 +293,7 @@ function CompareDialog(props: { node: Node; from: Schemas['Version']; versions: 
             <Select value={to} onChange={(e) => setTo(e.target.value)}>
               {!swap && <option value="">{t('compare.current')}</option>}
               {others
-                .filter((v) => swap || v.id !== node.head_version)
+                .filter((v) => swap || v.id !== head)
                 .map((v) => (
                   <option key={v.id} value={v.id}>
                     {label(v)}

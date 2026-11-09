@@ -1,6 +1,8 @@
 import { screen, waitFor, within } from '@testing-library/react'
+import { http } from 'msw'
 import { describe, expect, it } from 'vitest'
 import { db } from '../../mocks/db'
+import { server } from '../../mocks/node'
 import { dialog, ids, personal, renderApp, choose } from '../render'
 import { recordRequests } from '../requests'
 
@@ -109,5 +111,36 @@ describe('versions panel', () => {
     expect(within(d).getByRole('textbox')).toHaveFocus()
     await user.type(within(d).getByRole('textbox'), 'Shipped{Enter}')
     expect(await within(panel).findByText('Shipped')).toBeInTheDocument()
+  })
+
+  it('marks the new version "Current" right after an upload, while the file list still loads (T-13)', async () => {
+    const { user } = renderApp(`${personal}/files`)
+    await user.click(await screen.findByRole('button', { name: 'Details of notes.md' }))
+    const details = await screen.findByRole('region', { name: 'notes.md' })
+    // After the upload the page reloads its list; that answer waits here, so the selected node
+    // still names the old head when the panel opens (the race of the browser test).
+    let release = () => {}
+    const held = new Promise<void>((resolve) => (release = resolve))
+    server.use(
+      http.get('*/v1/nodes/:id/children', async () => {
+        await held
+        return undefined
+      }),
+    )
+    try {
+      await user.upload(within(details).getByLabelText('New version of notes.md'), new File(['# v4'], 'notes.md'))
+      expect(await screen.findByText(/^Uploaded notes\.md\.$/)).toBeInTheDocument()
+      await choose(user, 'More actions for notes.md', 'Versions', details)
+      const panel = await screen.findByRole('region', { name: 'Versions of notes.md' })
+      await waitFor(() => expect(within(panel).getAllByRole('listitem')).toHaveLength(4))
+      const items = within(panel).getAllByRole('listitem')
+      // The newest row is the upload, and it is the one current version.
+      expect(within(items[0]).getByText('Current')).toBeInTheDocument()
+      expect(within(panel).getAllByText('Current')).toHaveLength(1)
+      expect(within(items[0]).queryByRole('button', { name: /^Restore version/ })).not.toBeInTheDocument()
+      expect(within(items[1]).getByRole('button', { name: /^Restore version/ })).toBeInTheDocument()
+    } finally {
+      release()
+    }
   })
 })
