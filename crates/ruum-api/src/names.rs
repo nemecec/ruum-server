@@ -19,6 +19,10 @@
 //!   crosses tenants.
 //! - The email of a user grantee is filled only when the handler allowed it
 //!   ([`allow_grantee_emails`]): callers who may share the node and may list the members.
+//! - Data of a database is never read nor changed: in an object marked `content_trust:
+//!   untrusted` (a `QueryResult`), the `rows` are skipped ([`untrusted_data`]). A row can hold
+//!   any JSON, so without this a caller could build `{"kind": "user", "id": ...}` (and a
+//!   `tenant_id`) in a query and read the name of any user (backlog S-3).
 
 use crate::state::AppState;
 use axum::body::Body;
@@ -173,6 +177,12 @@ fn user_grantee(obj: &Map<String, Value>) -> Option<Uuid> {
     uuid_of(obj.get("id"))
 }
 
+/// Whether the value of `key` in `obj` is data of a database, which no name goes into: the
+/// `rows` of an object marked `content_trust: untrusted` (`QueryResult`).
+fn untrusted_data(obj: &Map<String, Value>, key: &str) -> bool {
+    key == "rows" && obj.get("content_trust").and_then(Value::as_str) == Some("untrusted")
+}
+
 fn walk(v: &Value, tenant: Option<TenantId>, found: &mut dyn FnMut(TenantId, Uuid)) {
     match v {
         Value::Array(items) => items.iter().for_each(|i| walk(i, tenant, found)),
@@ -193,7 +203,9 @@ fn walk(v: &Value, tenant: Option<TenantId>, found: &mut dyn FnMut(TenantId, Uui
                     found(t, id);
                 }
             }
-            obj.values().for_each(|c| walk(c, tenant, found));
+            obj.iter()
+                .filter(|(k, _)| !untrusted_data(obj, k))
+                .for_each(|(_, c)| walk(c, tenant, found));
         }
         _ => {}
     }
@@ -236,8 +248,14 @@ fn fill(
                     }
                 }
             }
-            obj.values_mut()
-                .for_each(|c| fill(c, tenant, names, grantee_emails));
+            let skip: Vec<String> = obj
+                .keys()
+                .filter(|k| untrusted_data(obj, k))
+                .cloned()
+                .collect();
+            obj.iter_mut()
+                .filter(|(k, _)| !skip.contains(k))
+                .for_each(|(_, c)| fill(c, tenant, names, grantee_emails));
         }
         _ => {}
     }
@@ -300,6 +318,45 @@ mod tests {
         assert!(i[5].get("display_name").is_none());
         fill(&mut v, Some(t1), &names, true);
         assert_eq!(v["items"][2]["grantee"]["email"], "bob@x");
+    }
+
+    /// Backlog S-3: a query result's rows are data. A guest who builds principal-shaped objects
+    /// in a query (also with `on_behalf_of`, a grantee, or the `tenant_id` of another tenant)
+    /// gets no name, and the rows come back unchanged. The `by` of a log entry next to it is
+    /// still named.
+    #[test]
+    fn query_rows_are_never_named() {
+        let (t1, t2) = (TenantId(Uuid::now_v7()), TenantId(Uuid::now_v7()));
+        let [alice, bob, carol] = [(); 3].map(|_| Uuid::now_v7());
+        let rows = json!([
+            [{"kind": "user", "id": alice}, {"kind": "agent", "id": bob}],
+            [{"actor": {"kind": "user", "id": alice}, "on_behalf_of": bob}],
+            [{"grantee": {"type": "user", "id": alice}}],
+            [{"tenant_id": t2.0, "kind": "user", "id": carol}],
+            [{"node": {"tenant_id": t2.0}, "actor": {"kind": "user", "id": carol}}],
+            [[{"kind": "user", "id": alice}]],
+            [{"$ruum": "literal", "value": {"kind": "user", "id": alice}}],
+        ]);
+        let mut v = json!({
+            "query_id": Uuid::now_v7(), "mode": "read", "columns": [],
+            "rows": rows.clone(), "row_count": 7, "content_trust": "untrusted",
+            "log": {"by": {"kind": "user", "id": bob}},
+        });
+        let mut seen = Vec::new();
+        walk(&v, Some(t1), &mut |t, id| seen.push((t, id)));
+        assert_eq!(seen, [(t1, bob)], "only the log entry's actor");
+        let names = HashMap::from([
+            ((t1, alice), name("Alice", Some("alice@x"))),
+            ((t1, bob), name("Bob", None)),
+            ((t2, carol), name("Carol of t2", None)),
+        ]);
+        fill(&mut v, Some(t1), &names, true);
+        assert_eq!(v["rows"], rows, "the rows are unchanged");
+        assert_eq!(v["log"]["by"]["display_name"], "Bob");
+        // An answer that is not marked untrusted keeps the rule for `rows` of its own.
+        let mut other = json!({"rows": [{"kind": "user", "id": alice}]});
+        fill(&mut other, Some(t1), &names, false);
+        assert_eq!(other["rows"][0]["display_name"], "Alice");
     }
 
     #[test]
