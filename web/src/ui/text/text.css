@@ -59,6 +59,7 @@
   font-style: italic;
 }
 .ui-numeric {
+  font-family: var(--font-family-numeric);
   font-variant-numeric: tabular-nums;
 }
 

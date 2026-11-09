@@ -1,0 +1,66 @@
+{
+  "$description": "Graphite base: IBM Plex Sans and Mono (self-hosted), square corners, square icon caps and mitred joins.",
+  "font": {
+    "family": {
+      "sans": {
+        "$value": [
+          "IBM Plex Sans",
+          "system-ui",
+          "-apple-system",
+          "Segoe UI",
+          "Roboto",
+          "Noto Sans",
+          "sans-serif"
+        ],
+        "$description": "IBM Plex Sans, self-hosted (the theme fonts); the system stack is the fallback"
+      },
+      "mono": {
+        "$value": [
+          "IBM Plex Mono",
+          "ui-monospace",
+          "SF Mono",
+          "Cascadia Mono",
+          "Menlo",
+          "Consolas",
+          "monospace"
+        ],
+        "$description": "IBM Plex Mono, self-hosted; code, key prefixes, sizes and times"
+      },
+      "display": {
+        "$value": "{font.family.sans}"
+      },
+      "numeric": {
+        "$value": "{font.family.mono}",
+        "$description": "Sizes and times in IBM Plex Mono, so numbers line up"
+      }
+    }
+  },
+  "radius": {
+    "sm": {
+      "$value": {
+        "value": 2,
+        "unit": "px"
+      }
+    },
+    "md": {
+      "$value": {
+        "value": 3,
+        "unit": "px"
+      }
+    },
+    "lg": {
+      "$value": {
+        "value": 4,
+        "unit": "px"
+      }
+    }
+  },
+  "icon": {
+    "linecap": {
+      "$value": "square"
+    },
+    "linejoin": {
+      "$value": "miter"
+    }
+  }
+}

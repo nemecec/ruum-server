@@ -1,0 +1,109 @@
+{
+  "$schema": "../theme.schema.json",
+  "format": 1,
+  "id": "graphite",
+  "name": "Graphite",
+  "version": "1.0.0",
+  "description": "The default brand of Ruum (decision 0005 B-5): cool graphite neutrals, fjord blue for actions, raspberry plum for agents, IBM Plex Sans and Mono, square corners and square icon strokes.",
+  "author": "Ruum",
+  "license": "Apache-2.0",
+  "tokens": {
+    "base": "tokens/base.tokens.json",
+    "light": "tokens/color.light.tokens.json",
+    "dark": "tokens/color.dark.tokens.json"
+  },
+  "assets": {
+    "wordmark": "assets/wordmark.svg",
+    "favicon": "assets/favicon.svg",
+    "appIcons": [
+      {
+        "src": "assets/icon-192.png",
+        "size": 192,
+        "purpose": "any"
+      },
+      {
+        "src": "assets/icon-512.png",
+        "size": 512,
+        "purpose": "any"
+      },
+      {
+        "src": "assets/apple-touch-icon.png",
+        "size": 180,
+        "purpose": "apple-touch"
+      }
+    ]
+  },
+  "fonts": [
+    {
+      "family": "IBM Plex Sans",
+      "weight": 400,
+      "style": "normal",
+      "subset": "latin",
+      "src": "fonts/ibm-plex-sans-latin-400-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Sans",
+      "weight": 400,
+      "style": "normal",
+      "subset": "latin-ext",
+      "src": "fonts/ibm-plex-sans-latin-ext-400-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Sans",
+      "weight": 500,
+      "style": "normal",
+      "subset": "latin",
+      "src": "fonts/ibm-plex-sans-latin-500-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Sans",
+      "weight": 500,
+      "style": "normal",
+      "subset": "latin-ext",
+      "src": "fonts/ibm-plex-sans-latin-ext-500-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Sans",
+      "weight": 600,
+      "style": "normal",
+      "subset": "latin",
+      "src": "fonts/ibm-plex-sans-latin-600-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Sans",
+      "weight": 600,
+      "style": "normal",
+      "subset": "latin-ext",
+      "src": "fonts/ibm-plex-sans-latin-ext-600-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 400,
+      "style": "normal",
+      "subset": "latin",
+      "src": "fonts/ibm-plex-mono-latin-400-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 400,
+      "style": "normal",
+      "subset": "latin-ext",
+      "src": "fonts/ibm-plex-mono-latin-ext-400-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 500,
+      "style": "normal",
+      "subset": "latin",
+      "src": "fonts/ibm-plex-mono-latin-500-normal.woff2"
+    },
+    {
+      "family": "IBM Plex Mono",
+      "weight": 500,
+      "style": "normal",
+      "subset": "latin-ext",
+      "src": "fonts/ibm-plex-mono-latin-ext-500-normal.woff2"
+    }
+  ],
+  "fontLicense": "fonts/OFL.txt"
+}

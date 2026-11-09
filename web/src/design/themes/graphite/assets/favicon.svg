@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <title>Ruum</title>
+  <rect x="2" y="2" width="44" height="44" rx="3" fill="#ffffff" stroke="#0b5c86" stroke-width="4"/>
+  <path d="M11 35V14H17M26 14V35H37V14" fill="none" stroke="#16191d" stroke-width="5" stroke-linecap="square"/>
+</svg>

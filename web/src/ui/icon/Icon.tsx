@@ -2,7 +2,8 @@ import { cx } from '../cx'
 import { iconPaths as paths, type IconName } from './paths'
 import './icon.css'
 
-// Outline icons on a 20 px grid with a 1.5 px stroke (design-system 2.6), drawn here: the set is
+// Outline icons on a 20 px grid (design-system 2.6), drawn here; the stroke width, caps and joins
+// come from the icon.* tokens through icon.css (the attributes below are the fallback). The set is
 // small, so no icon dependency. Icons are decorative: the text or `aria-label` beside them names
 // the action.
 

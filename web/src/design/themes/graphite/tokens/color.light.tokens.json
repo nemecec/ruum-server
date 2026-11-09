@@ -1,0 +1,321 @@
+{
+  "$description": "Graphite colour set: light. New values for the tokens of color.light.tokens.json; the tag colours stay.",
+  "color": {
+    "canvas": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.964706,
+          0.968627,
+          0.972549
+        ],
+        "hex": "#f6f7f8"
+      },
+      "$description": "Page background (cool graphite paper)"
+    },
+    "surface": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1,
+          1,
+          1
+        ],
+        "hex": "#ffffff"
+      }
+    },
+    "sunken": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.92549,
+          0.933333,
+          0.945098
+        ],
+        "hex": "#eceef1"
+      }
+    },
+    "border": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.85098,
+          0.866667,
+          0.886275
+        ],
+        "hex": "#d9dde2"
+      }
+    },
+    "border-control": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.482353,
+          0.509804,
+          0.54902
+        ],
+        "hex": "#7b828c"
+      }
+    },
+    "text": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.086275,
+          0.098039,
+          0.113725
+        ],
+        "hex": "#16191d"
+      }
+    },
+    "text-muted": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.294118,
+          0.321569,
+          0.356863
+        ],
+        "hex": "#4b525b"
+      }
+    },
+    "text-faint": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.392157,
+          0.419608,
+          0.458824
+        ],
+        "hex": "#646b75"
+      }
+    },
+    "primary": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.043137,
+          0.360784,
+          0.52549
+        ],
+        "hex": "#0b5c86"
+      },
+      "$description": "Primary buttons, selected nav (fjord blue)"
+    },
+    "primary-hover": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.031373,
+          0.290196,
+          0.423529
+        ],
+        "hex": "#084a6c"
+      }
+    },
+    "on-primary": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1,
+          1,
+          1
+        ],
+        "hex": "#ffffff"
+      }
+    },
+    "primary-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.882353,
+          0.933333,
+          0.964706
+        ],
+        "hex": "#e1eef6"
+      }
+    },
+    "link": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.043137,
+          0.360784,
+          0.52549
+        ],
+        "hex": "#0b5c86"
+      }
+    },
+    "focus": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.043137,
+          0.360784,
+          0.52549
+        ],
+        "hex": "#0b5c86"
+      }
+    },
+    "selected": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.882353,
+          0.933333,
+          0.964706
+        ],
+        "hex": "#e1eef6"
+      }
+    },
+    "danger": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.701961,
+          0.14902,
+          0.117647
+        ],
+        "hex": "#b3261e"
+      },
+      "$description": "Errors, destructive buttons"
+    },
+    "danger-hover": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.572549,
+          0.121569,
+          0.094118
+        ],
+        "hex": "#921f18"
+      }
+    },
+    "on-danger": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          1,
+          1,
+          1
+        ],
+        "hex": "#ffffff"
+      }
+    },
+    "danger-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.984314,
+          0.901961,
+          0.894118
+        ],
+        "hex": "#fbe6e4"
+      }
+    },
+    "success": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.113725,
+          0.419608,
+          0.270588
+        ],
+        "hex": "#1d6b45"
+      },
+      "$description": "Success text and icons"
+    },
+    "success-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.886275,
+          0.945098,
+          0.909804
+        ],
+        "hex": "#e2f1e8"
+      }
+    },
+    "warning": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.490196,
+          0.329412,
+          0
+        ],
+        "hex": "#7d5400"
+      }
+    },
+    "warning-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.984314,
+          0.941176,
+          0.839216
+        ],
+        "hex": "#fbf0d6"
+      }
+    },
+    "agent": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.560784,
+          0.247059,
+          0.443137
+        ],
+        "hex": "#8f3f71"
+      },
+      "$description": "The agent mark and agent names (raspberry plum)"
+    },
+    "agent-soft": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.964706,
+          0.901961,
+          0.941176
+        ],
+        "hex": "#f6e6f0"
+      }
+    },
+    "backdrop": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.086275,
+          0.098039,
+          0.113725
+        ],
+        "hex": "#16191d",
+        "alpha": 0.4
+      }
+    },
+    "shadow-1": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.086275,
+          0.098039,
+          0.113725
+        ],
+        "hex": "#16191d",
+        "alpha": 0.08
+      }
+    },
+    "shadow-2": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [
+          0.086275,
+          0.098039,
+          0.113725
+        ],
+        "hex": "#16191d",
+        "alpha": 0.14
+      }
+    }
+  }
+}

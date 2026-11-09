@@ -3,6 +3,16 @@
   display: block;
   width: var(--size-icon);
   height: var(--size-icon);
+  stroke-width: var(--icon-stroke-width);
+  stroke-linecap: var(--icon-linecap);
+  stroke-linejoin: var(--icon-linejoin);
+}
+
+/* One stroke for every line of every icon: the theme sets it (icon.* tokens). */
+.ui-icon * {
+  stroke-width: inherit;
+  stroke-linecap: inherit;
+  stroke-linejoin: inherit;
 }
 
 .ui-icon-sm {

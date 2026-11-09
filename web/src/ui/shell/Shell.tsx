@@ -1,8 +1,17 @@
-import { useEffect, useRef, useSyncExternalStore, type DragEventHandler, type FormEventHandler, type ReactNode } from 'react'
+import {
+  createElement,
+  useEffect,
+  useRef,
+  useSyncExternalStore,
+  type DragEventHandler,
+  type FormEventHandler,
+  type ReactNode,
+} from 'react'
 import { NavLink } from 'react-router'
 import { Button } from '../button/Button'
 import { cx } from '../cx'
 import { VisuallyHidden } from '../text/Text'
+import { wordmark, type BrandShape } from '../../design/generated/brand'
 import './shell.css'
 import { t } from '../../i18n'
 
@@ -34,11 +43,35 @@ export function TopBar({ children }: { children: ReactNode }) {
  * read as the same word as a label next to it.
  */
 export function Brand({ to, label, children }: { to?: string; label?: string; children: ReactNode }) {
-  if (!to) return <span className="ui-brand">{children}</span>
+  // The theme's wordmark (design 12.6) is drawn; the name stays as text for screen readers.
+  const content = wordmark ? (
+    <>
+      <Wordmark />
+      <VisuallyHidden>{children}</VisuallyHidden>
+    </>
+  ) : (
+    children
+  )
+  if (!to) return <span className="ui-brand">{content}</span>
   return (
     <NavLink to={to} className="ui-brand" aria-label={label}>
-      {children}
+      {content}
     </NavLink>
+  )
+}
+
+/** One shape of the wordmark (plain SVG shapes; check-theme.mjs allows nothing else). */
+function shape(node: BrandShape, key: number): ReactNode {
+  return createElement(node.tag, { key, ...node.props }, ...node.children.map(shape))
+}
+
+/** The theme's wordmark, coloured by the colour tokens, so it follows light and dark. Decorative. */
+function Wordmark() {
+  if (!wordmark) return null
+  return (
+    <svg className="ui-wordmark" {...wordmark.props} aria-hidden="true" focusable="false">
+      {wordmark.children.map(shape)}
+    </svg>
   )
 }
 

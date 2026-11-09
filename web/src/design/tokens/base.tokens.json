@@ -23,6 +23,14 @@
           "Consolas",
           "monospace"
         ]
+      },
+      "display": {
+        "$value": "{font.family.sans}",
+        "$description": "Titles (h1, h2): a theme may give them their own face"
+      },
+      "numeric": {
+        "$value": "{font.family.sans}",
+        "$description": "Sizes, times and counts in lists (with tabular figures)"
       }
     },
     "weight": {
@@ -35,6 +43,10 @@
       },
       "strong": {
         "$value": 600
+      },
+      "display": {
+        "$value": "{font.weight.strong}",
+        "$description": "Titles (h1, h2)"
       },
       "brand": {
         "$value": 700,
@@ -163,9 +175,9 @@
     },
     "lg": {
       "$value": {
-        "fontFamily": "{font.family.sans}",
+        "fontFamily": "{font.family.display}",
         "fontSize": "{font.size.lg}",
-        "fontWeight": "{font.weight.strong}",
+        "fontWeight": "{font.weight.display}",
         "lineHeight": "{font.line.lg}",
         "letterSpacing": {
           "value": 0,
@@ -176,9 +188,9 @@
     },
     "xl": {
       "$value": {
-        "fontFamily": "{font.family.sans}",
+        "fontFamily": "{font.family.display}",
         "fontSize": "{font.size.xl}",
-        "fontWeight": "{font.weight.strong}",
+        "fontWeight": "{font.weight.display}",
         "lineHeight": "{font.line.xl}",
         "letterSpacing": {
           "value": 0,
@@ -189,9 +201,9 @@
     },
     "2xl": {
       "$value": {
-        "fontFamily": "{font.family.sans}",
+        "fontFamily": "{font.family.display}",
         "fontSize": "{font.size.2xl}",
-        "fontWeight": "{font.weight.strong}",
+        "fontWeight": "{font.weight.display}",
         "lineHeight": "{font.line.2xl}",
         "letterSpacing": {
           "value": 0,
@@ -299,6 +311,35 @@
       }
     }
   },
+  "icon": {
+    "$description": "The stroke of the outline icons (design-system 2.6)",
+    "stroke-width": {
+      "$type": "number",
+      "$value": 1.5
+    },
+    "linecap": {
+      "$value": "round",
+      "$description": "round, square or butt",
+      "$extensions": {
+        "org.ruum.allowed": [
+          "round",
+          "square",
+          "butt"
+        ]
+      }
+    },
+    "linejoin": {
+      "$value": "round",
+      "$description": "round, miter or bevel",
+      "$extensions": {
+        "org.ruum.allowed": [
+          "round",
+          "miter",
+          "bevel"
+        ]
+      }
+    }
+  },
   "size": {
     "$type": "dimension",
     "control": {
@@ -353,6 +394,13 @@
         "value": 56,
         "unit": "px"
       }
+    },
+    "wordmark": {
+      "$value": {
+        "value": 28,
+        "unit": "px"
+      },
+      "$description": "Height of the wordmark in the top bar"
     },
     "rail": {
       "$value": {

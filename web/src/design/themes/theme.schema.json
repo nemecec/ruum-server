@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/schemas/theme-1.json",
+  "title": "Ruum theme package manifest (theme.json)",
+  "description": "The manifest of a theme package (design 12.6). A theme holds token values and image and font files, never code. scripts/check-theme.mjs checks the manifest against this schema, then the files it names.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "id", "name", "version", "author", "license", "tokens", "assets"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "format": { "const": 1, "description": "The version of the package format." },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,39}$", "description": "Also the folder name of a built-in theme." },
+    "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "description": { "type": "string", "maxLength": 500 },
+    "author": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "license": { "type": "string", "pattern": "^[A-Za-z0-9.+-]{2,40}$", "description": "An SPDX identifier for the theme as a whole." },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Token overrides in the W3C Design Tokens format. Each file gives new values to tokens of the matching core file in web/src/design/tokens; none adds a token.",
+      "properties": {
+        "base": { "$ref": "#/$defs/file", "description": "Over base.tokens.json: type, radius, spacing rhythm, sizes, motion, icon strokes." },
+        "light": { "$ref": "#/$defs/file", "description": "Over color.light.tokens.json." },
+        "dark": { "$ref": "#/$defs/file", "description": "Over color.dark.tokens.json." }
+      }
+    },
+    "assets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["favicon"],
+      "properties": {
+        "wordmark": {
+          "$ref": "#/$defs/svg",
+          "description": "The wordmark in the top bar. Colours only as currentColor or var(--color-*), so it follows light and dark."
+        },
+        "favicon": { "$ref": "#/$defs/svg", "description": "The browser tab icon. Fixed colours that read on light and dark tab bars." },
+        "appIcons": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["src", "size"],
+            "properties": {
+              "src": { "$ref": "#/$defs/png" },
+              "size": { "enum": [180, 192, 512], "description": "Width and height in pixels; the file must have this size." },
+              "purpose": { "enum": ["any", "maskable", "apple-touch"], "default": "any" }
+            }
+          }
+        }
+      }
+    },
+    "fonts": {
+      "type": "array",
+      "maxItems": 24,
+      "description": "Self-hosted fonts: the package loads nothing from the internet.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["family", "weight", "style", "subset", "src"],
+        "properties": {
+          "family": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 -]{0,63}$" },
+          "weight": { "type": "integer", "minimum": 100, "maximum": 900 },
+          "style": { "enum": ["normal", "italic"] },
+          "subset": { "enum": ["latin", "latin-ext"] },
+          "src": { "type": "string", "pattern": "^fonts/[a-z0-9][a-z0-9._-]*\\.woff2$" }
+        }
+      }
+    },
+    "fontLicense": { "$ref": "#/$defs/file", "description": "The licence text of the fonts (required when there are fonts)." }
+  },
+  "$defs": {
+    "file": { "type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._/-]*$", "maxLength": 120 },
+    "svg": { "type": "string", "pattern": "^assets/[a-z0-9][a-z0-9._-]*\\.svg$" },
+    "png": { "type": "string", "pattern": "^assets/[a-z0-9][a-z0-9._-]*\\.png$" }
+  },
+  "allOf": [{ "if": { "required": ["fonts"] }, "then": { "required": ["fontLicense"] } }]
+}

@@ -37,6 +37,13 @@
   text-decoration: none;
 }
 
+/* The theme's wordmark: its height is a token, its width follows the drawing. */
+.ui-wordmark {
+  display: block;
+  width: auto;
+  height: var(--size-wordmark);
+}
+
 .ui-topbar-item {
   min-width: 0;
   max-width: var(--size-field-sm);

@@ -59,6 +59,7 @@
 }
 
 .ui-cell-numeric {
+  font-family: var(--font-family-numeric);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
