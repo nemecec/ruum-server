@@ -27,3 +27,10 @@ Every field that an agent writes and other agents or people read (for example th
 class suggestion, approvals, issue text) is marked **untrusted** in the contract (an additive
 `content_trust: untrusted`, as for file content), and the MCP tool texts tell agents to treat it as
 data, never as instructions. This is one rule for all such fields, current and future.
+
+## B-4. The sqlx SQLite stand-in crate
+
+The person approved the empty stand-in crate `third_party/sqlx-sqlite-stub` (wired through
+`[patch.crates-io]`), which lets `rusqlite` 0.41.1 fix RUSTSEC-2026-0459 while `sqlx` 0.9.0 still pins
+an older `libsqlite3-sys` for a driver Ruum never builds. Remove it when a `sqlx` release allows
+`libsqlite3-sys` 0.39 or later. Decided 2026-11-09.
