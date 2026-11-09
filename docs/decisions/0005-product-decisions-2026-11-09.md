@@ -8,7 +8,8 @@ Status: decided by the person (not provisional), 2026-11-09. The briefs are in
 The product name is written **Ruum**, with a capital letter. The common Estonian word for a space is
 written **ruum**, all lower case. Both may appear in Estonian text; the capital letter tells them
 apart. So that the difference stays visible, a sentence does not start with the common word "ruum"
-(rephrase instead, for example "Sinu ruum ..."). Plan names stay English; "tööhoog" stays until a
+(rephrase instead, for example "Sinu ruum ..."). Avoid putting the two words side by side; when no
+other wording works, "Ruum ruum" is fine. Plan names stay English; "tööhoog" stays until a
 better word is found. The Estonian style guide (`docs/ux/style-guides/et.md`) and the translation check
 follow this.
 
