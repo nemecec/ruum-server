@@ -1527,6 +1527,29 @@ The look of Ruum is defined in one place, so it can be changed later without tou
 Order of work: the design system first, then localisation (12.4) on top of it, so each component is
 reworked once.
 
+### 12.6 Theme packages
+
+The look of an instance or a space is a **theme package**, so people can customise their own Ruum
+without code (decided 2026-11-09, provisional):
+
+- **Contents**: a `theme.json` manifest (name, version, author, licence); token overrides in the W3C
+  format of 12.5, for light and dark (colour, type, radius, spacing rhythm, motion); assets (logo,
+  wordmark, favicon, app icons, optional fonts and empty-state illustrations); an optional copy pack
+  (product name, tone tweaks).
+- **No code**: a theme cannot run scripts or add CSS selectors, only token values and image and font
+  files. Installation validates the schema, file types and sizes, and the WCAG contrast of every text
+  pair; a failing theme is refused with the failing pairs listed. Fonts are self-hosted, so a theme
+  loads nothing from the internet.
+- **Installation**: an **Appearance** page in the admin console: choose a built-in theme, upload a
+  theme file, or adjust the basics in the browser (accent colour, logo, font), with a live preview of
+  the main screens in light and dark, then Apply. Tokens are CSS variables loaded at runtime, so there
+  is no rebuild or restart; one click goes back to the default.
+- **Scope**: a self-hosted instance sets one theme for everyone. On a shared instance (ruum.space) a
+  space may set its logo and accent within limits, so the platform UI stays recognisable and
+  look-alike phishing is harder. People keep their own light, dark and high-contrast choice on top.
+- **Sharing**: themes are signed and published like extensions, through the same registry. The
+  default brand, **Graphite** (decision 0005 B-5), is built as the first theme package.
+
 ## 13. Hetzner
 
 Hetzner is a good fit for the start: low prices, traffic included in dedicated servers, cheap large
