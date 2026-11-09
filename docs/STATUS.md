@@ -10,7 +10,8 @@ integration of 2026-11-07 (decision 0003 item 6, the C-1 acceptance, cards E-2, 
 the evening integration (run on 2026-11-08: the browser tests on the build server, sign-in
 providers, the second E-2 fix, cards D-1, T-1 and T-2), the night integration of 2026-11-08
 (`f/followups-4`, the new voice and Estonian of `w/voice`, cards K-1 and A-1; run on
-2026-11-09), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+2026-11-09), the integration of 2026-11-09 (the RUSTSEC-2026-0459 fix, `f/masking-hardening`,
+decision 0005 B-3 and B-1, card Q-1), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -244,7 +245,41 @@ Fixes made during the night integration:
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
 
-The digest for the person is `docs/digests/2026-11-08.md` (earlier: `docs/digests/2026-11-07-evening.md`,
+Integration of 2026-11-09 (each branch rebased onto `main`, checked on the build server with
+`cargo test --workspace`, both suite backends with `RUUM_REQUIRE_IMPLEMENTED=1` and
+`scripts/e2e_browser.sh`, pushed as `integ2/...` and green in GitHub CI, then fast-forwarded, in
+this order; linear history, no merge commit, no co-author line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `d/rusqlite-0.41` | RUSTSEC-2026-0459 (SQLite before 3.54 bundled in `libsqlite3-sys` 0.37, CVE-2026-119375): `rusqlite` 0.41.1 with `libsqlite3-sys` 0.39.1 (SQLite 3.54.1). `sqlx-sqlite` 0.9.0, which the lock holds through sqlx but Ruum never builds, asks for `libsqlite3-sys` < 0.38, and Cargo allows one crate that links `sqlite3`; a `[patch.crates-io]` puts an empty stand-in with the same name, version and feature names in its place (`third_party/sqlx-sqlite-stub`, excluded from the workspace). Remove it when a released sqlx accepts `libsqlite3-sys` 0.39. API changes: `Connection::authorizer` takes `&mut self`; `Statement::columns` and `columns_with_metadata` return iterators. | no panel review (a dependency fix); `cargo deny check` passes |
+| `f/masking-hardening` | Decision 0005 B-2 and 0004-37 (backlog S-1, S-4, B-12): tenant-defined types never reach a `ruum_mask` definer function (only built-in base types are converted inside one; others are masked as `secret`); every lens build drops and makes the three lens schemas, the functions and the key table of `mask` again (the key is kept), after a `pg_depend` check; `restore_in_place` rebuilds the lens of the restored copy before the swap; `mask` holds `CREATE` only inside the build transaction; hostile-copy and tenant-type tests; new mutations. | review 1 accepted with notes F1 and F2 (`review-masking-1.md`); review 2 did not accept (`review-masking-2.md` F-1: the state from before the fix survived a build and `restore_in_place` brought it back); fixed (`masking-fix-2.md`); review 3 accepted (`review-masking-3.md`) |
+| `f/untrusted-agent-text` | Decision 0005 B-3 (backlog S-6): 52 marks `x-ruum-content-trust: untrusted` in `contracts/openapi.yaml` on fields that hold text an agent can write and others read, and a section "Untrusted text" in the API description; `untrusted_output` on 62 of 70 MCP tools, whose descriptions say to treat the text as data, never as instructions; the same rule once in the MCP server instructions; `crates/ruum-mcp/tests/content_trust.rs`. No wire change. | no panel review file |
+| `w/et-ruum` | Decision 0005 B-1 in the Estonian UI: rule 9 of `web/scripts/check-translations.mjs` (no Estonian sentence starts with the word "ruum"; no more capital "Ruum" than the English has "Ruum"; a warning when both stand side by side); 12 Estonian messages rephrased; a new key `shared.space`; `docs/ux/style-guides/et.md` section 2, the glossary and `i18n.md`. | no panel review file; the Estonian is still `machine` |
+| `s2/q-1` (head `s2/q-1-fix2`) | Card Q-1: `queryDatabase`, `getDatabaseSchema` and `listDatabaseQueries` for people (three `planned` marks removed): the statement rules (`sqlparser` 0.63.0), read-only mode, the role kind per caller, plan limits, the query log; agents fail closed until Q-2. Fix 2 (backlog S-2, S-3): the data cluster set-up revokes `pg_catalog.set_config` from `PUBLIC` in `template1` and in each data database, the engine refuses a database where `PUBLIC` can still run it (`check_set_config`), and only the owner kind runs `set_config`; the names middleware leaves the rows of a query result alone; Unicode-escaped names are refused. CI's suite jobs run `databases_query_api` (review-Q-1 R-5). | review 1 and 2 requested changes (`review-Q-1.md`, `review-Q-1-2.md` S-1); fixed twice; review 3 accepted (`review-Q-1-3.md`, notes N-A and N-B) |
+
+Fixes made during this integration:
+
+- The first try of this integration (keys `integ-a`, `integ-b`, `integ-c`) stopped: SSH to the
+  build server timed out after a change of the laptop's IP, and RUSTSEC-2026-0459 failed
+  `cargo-deny` on every branch, `main` included. The advisory fix landed first; the stack was
+  rebased onto it once more.
+- At the rebase of Q-1 onto the masking fix (first try, kept): `tools.json` generated again;
+  step 3 of a hand-over in `copy.rs` runs `setup::rebuild_lens`, then `setup::check_set_config`;
+  the hit marker of the masking tests (`public.mark`) called `set_config`, which the masked
+  reader and `mask` may no longer run, so `mark` hands `path:current_user` to `public.hit`, a
+  `SECURITY DEFINER` function of the owner kind. At the rebase onto the advisory fix: one
+  `Cargo.lock` conflict (Q-1's `sqlparser` next to the removed `sqlite-wasm-rs`).
+- The build server's shared data cluster runs the set-up of Q-1 now (`git pull` of the base
+  copy to the Q-1 tip, `scripts/dev.sh up`; `set_config` in `template1` has no `PUBLIC`
+  right). Every laptop stack needs `scripts/dev.sh up` too, or the engine refuses every
+  database with a message that names the set-up.
+- `cargo-deny` 0.20.2 is installed on the build server (`~/.cargo/bin`); `setup.sh` does not
+  install it yet (backlog B-16).
+- The rebased branches were pushed as `integ2/masking-hardening`, `integ2/untrusted-agent-text`,
+  `integ2/et-ruum` and `integ2/s2-q-1` (no force push), and `d/rusqlite-0.41`.
+
+The digest for the person is `docs/digests/2026-11-09.md` (earlier: `docs/digests/2026-11-08.md`, `docs/digests/2026-11-07-evening.md`,
 `docs/digests/2026-11-07-afternoon.md`, `docs/digests/2026-11-07.md`, `docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
 `docs/digests/2026-11-06-evening.md`). The worktrees of the merged branches are removed; the
 branches stay.
@@ -280,7 +315,7 @@ Fixes made during the integration:
   showed `Loading...`; `auth.setup.e2e.ts` navigated while the sign-out redirect chain still ran.
 
 All 93 step 1 operations of `contracts/openapi.yaml` are built. Of the 24 step 2 database
-operations, 9 are built (cards D-1, K-1 and A-1); the other 15 are marked `x-ruum-status:
+operations, 12 are built (cards D-1, K-1, A-1 and Q-1); the other 12 are marked `x-ruum-status:
 planned` (decision 0004-21).
 
 | Area | What works |
@@ -429,95 +464,83 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-09, `main` after the night integration, on the build server)
+## Checks (2026-11-09, `main` after the integration of 2026-11-09, on the build server)
 
-Run with `scripts/buildbox/run.sh integ-main <main> -- ...` (its own Postgres and SpiceDB) and
-a data cluster of its own (`pgdata-<key>` from `deploy/dev/postgres-data` on a free port, in
-`RUUM_DBHOST_URL`, with `RUUM_DBENGINE_REQUIRE_POSTGRES=1`, so the engine tests never skip).
-The checks first run `find crates contracts migrations -type f -exec touch {} +` on the server
-(`run.sh` keeps file times). The server now has the PostgreSQL 17 client (`f/followups-4`);
-the checks set `RUUM_PG_DUMP=/usr/lib/postgresql/17/bin/pg_dump`. They ran with
-`CARGO_BUILD_JOBS=8` and `CARGO_PROFILE_DEV_DEBUG=line-tables-only`, because three full builds
-at once ran out of memory. An SSH drop after 33 minutes stopped the first run; the rest ran
-detached on the server (`setsid nohup`) and was read from its log.
+`main` is `24d192b` before this documentation commit; it is the tree of `integ2/s2-q-1`. The
+checks ran with `scripts/buildbox/run.sh <key> <worktree> -- ...` (own Postgres and SpiceDB)
+and a data cluster of their own (`pgdata-<key>` from the tree's `deploy/dev/postgres-data`, in
+`RUUM_DBHOST_URL`, with `RUUM_DBENGINE_REQUIRE_POSTGRES=1` and
+`RUUM_PG_DUMP=/usr/lib/postgresql/17/bin/pg_dump`), detached on the server (`setsid nohup`, log
+in `~/integ10-<key>.log`), four trees at once with `CARGO_BUILD_JOBS=4`. Each first touches the
+sources (`run.sh` keeps file times).
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 660 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
+- `cargo test --workspace`: 724 passed, 0 failed, 2 ignored (660 before; `tenants/mail.rs`
+  needs SMTP; Q-1's `sqlite_double_quoted_words_are_names_only` waits for DQS off, backlog
+  2026-11-08 S-7).
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` with `RUUM_SUITE_BACKEND=memory` and
-  `postgres` (the same numbers on both): tenant isolation 354 checks (304 passed, 50 planned),
-  permission matrix 1936 checks (1696 passed, 240 planned), trashed file suite 96/96; database
-  cases d1 11/11 passed, agents 13, guests 3 and statements 7 planned, nodes 5 planned and 3
-  pending (card P-3); privacy suite 99 planned; `databases_classes_api` and
-  `databases_grants_api` pass; 0 pending (501), 0 failed. The SpiceDB variant was not run; CI
-  runs memory authz.
-- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 69 of 69 mutations killed, none survived or skipped (56 in the evening; new: two of `f/followups-4`, five of K-1 and six of A-1).
+  `postgres` (the same numbers on both): tenant isolation 354 checks (314 passed, 40 planned;
+  before 304 / 50), permission matrix 1936 checks (1744 passed, 192 planned; before 1696 /
+  240), trashed file suite 96/96; database cases d1 11/11 and grants 7/7 passed, agents 13,
+  guests 3 and statements 7 planned, nodes 5 planned and 3 pending (card P-3); privacy suite 99
+  planned; `databases_classes_api`, `databases_grants_api` and `databases_query_api` pass; 0
+  pending (501), 0 failed. The SpiceDB variant was not run; CI runs memory authz.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh` (with
+  `MUTATION_TARGET_DIR` under the key's target): 88 of 88 mutations killed, none survived, skipped or broken (69 before; new: eight of
+  the masking fix, one names and nine query mutations of Q-1, and `dbengine-set-config-unchecked`).
 - `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
 - `scripts/e2e_browser.sh`: 172 passed, 1 skipped (`sso.e2e.ts`: the shared stack runs no mock
-  provider; CI starts it and requires the test).
-- `web/` (laptop, on `main`): `npm run lint` (translation check: 0 errors, 0 warnings, 834
-  `machine`), `npm run build`, `npx vitest run` (23 files, 304 tests), `npm run e2e:typecheck`:
-  pass.
-- GitHub CI: green on `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1` and
-  `integ/s2-a-1-r` (the tree of `main` before this documentation commit), each at the first run.
-- Known flaky: `sharing::conformance::postgres_add_grant_limits_conform` (1 of 30 runs, fixed
-  10-minute rate windows) and the visual `pseudo-locale > share`. Neither failed in this run.
-- Not run at this integration: `scripts/dbhost_check.sh` (CI's unit job runs it), `cargo deny
-  check` and `oasdiff` (CI runs them; the contract changes of K-1 and A-1 only remove `planned`
-  marks).
+  provider; CI starts it and requires the test), on each of the four tips.
+- `cargo deny check` (on the advisory fix, build server, `cargo-deny` 0.20.2): advisories,
+  bans, licenses and sources ok. CI's `cargo-deny` job is green on every `integ2/...` branch.
+- Each tip on its own, build server: `f/masking-hardening` 670 unit tests, `f/untrusted-agent-text`
+  674, `w/et-ruum` 674, `s2/q-1` 724; both suite backends and the browser tests green on each.
+  The advisory fix alone: 660 unit tests, clippy and `cargo deny check` pass.
+- GitHub CI: green on `d/rusqlite-0.41` (run 42630881821), `integ2/masking-hardening`
+  (42634877658), `integ2/untrusted-agent-text` (42634883345) and `integ2/et-ruum`
+  (42634887154) at the first run. `integ2/s2-q-1` (42634892612): the browser job failed once
+  on the flaky `versions.e2e.ts` C-8 test (172 passed, 1 failed) and passed on the re-run of the
+  failed job; every other job green at the first run.
+- Known flaky: `versions.e2e.ts` "Upload new version ... (C-8)" (cause found: a stale node marks
+  the wrong version "Current"; backlog 2026-11-09 T-13),
+  `sharing::conformance::postgres_add_grant_limits_conform` and the visual `pseudo-locale >
+  share`. The last two did not fail in this run.
+- Not run at this integration: `web/` on the laptop (the browser job and `e2e_browser.sh` run the
+  web build; `w/et-ruum` ran `npm ci && npm run lint && npm run build && npm test` on the build
+  server, 306 tests), `oasdiff` (CI runs it).
 
-## Next cards (2026-11-09, from `docs/backlog/2026-11-08.md`)
+## Next cards (2026-11-09, from `docs/backlog/2026-11-08.md` and `docs/backlog/2026-11-09.md`)
 
-Small, clear fixes that need no person (design 20.3). The IDs are those of the backlog, which
-has the evidence. Each card goes through the normal reviews and gates. In this order:
+Small, clear fixes that need no person (design 20.3). The IDs are those of the backlogs (the
+date tells which), which have the evidence. Each card goes through the normal reviews and gates.
+SEC-1 (the masking hole) and the Q-1 unblock of the earlier list are merged. In this order:
 
-1. **SEC-1, the masking hole** (S-1, S-4; branch `f/masking-hardening`, worktree
-   `ruum-server-wt/mask`; built; two security reviews done (`review-masking-1.md` accepted,
-   `review-masking-2.md` not accepted for F-1), all their findings fixed (`masking-fix-2.md`),
-   **waiting for a short third review of F-1**, not merged): decision
-   0005 B-2 and decision 0004-37. A personal column whose type is not a built-in base type
-   (enum, domain, composite, range, array of one, extension type) shows the hidden constant in
-   the masked lens and holds `NULL` (as `text`) in a masked copy; `pseudonym_other` refuses any
-   such type before it converts; the definer bodies qualify their functions and operators with
-   `pg_catalog`; `mask` holds `CREATE` on the lens schemas only inside the `ruum_dbhost`
-   transaction that builds them; every lens build (migration, `sync_lens`, copy, restore in
-   place) drops the lens schemas and makes the functions, the key table and the views of `mask`
-   again, so neither the state from before the fix nor a change by code as `mask` survives a
-   build or an in-place restore; a build refuses an object outside the lens schemas that
-   depends on one inside them (a masked copy whose step 2 left one is refused). Tests in `ruum-dbengine/src/postgres/tests/tenant_types.rs`
-   (tenant casts, an implicit conversion, an operator, domains, enums, composites, ranges,
-   arrays, a view, default privileges; steps 1 and 3 of every hand-over, `sync_lens`, a restore;
-   the reused admin connection of review-dbhost item 3; the state from before the fix through
-   `sync_lens` and `restore_in_place`; the refused copy; a secret composite; a domain over
-   `text`); eight mutations `dbengine-mask-*`. Records: `ruum-server-wt/panel/masking-fix.md`,
-   `masking-fix-2.md`. Not built: the general helper of B-12 (the
-   tests use `hostile_copy::taken`).
-2. **Q-1 unblock** (S-2, S-3, S-7): revoke `set_config` from `PUBLIC` in each data database
-   (E-2 `setup.rs`) with an engine test as a viewer role; the names middleware skips the rows
-   of `QueryResult`; DQS off in the bundled SQLite. Then a third review of `s2/q-1`, the CI
-   line for `databases_query_api` (review-Q-1 R-5), and the panel's word on the `isolation.rs`
-   change (R-4, backlog P-8).
-3. **K-1 C-2** (P-2): names over 63 characters in the catalog sync, with a conformance case.
-4. **Step 2 error codes** (P-3): the step 2 codes in `ruum-core/src/error.rs`, `sqlstate` and
-   `Retry-After` in `ApiError`, before Q-2, A-2 and D-2.
-5. **CI and harness** (T-1, T-2, T-10): a meta test that every test kit test binary is named in
-   a CI job; answered statuses must be listed in the contract; suite lines in the job summary.
-6. **Flaky tests** (T-4, T-5, T-6): pin the clock in `postgres_add_grant_limits_conform`; a
-   stable wait for the visual `pseudo-locale > share`; a "known flaky" list in
-   `docs/TESTING.md`.
-7. **Build server** (B-2 to B-7, S-5): `run.sh` starts an own data cluster and sets
-   `RUUM_DBENGINE_REQUIRE_POSTGRES=1`, touches the files it synced, says why it refuses
-   arguments, has `--detach` and a full-check lock, and `--stop` removes `~/targets/<key>-mut*`.
-8. **Mutation check** (B-1): `--prefix`, an ad-hoc `--perl` mutation, a build cache per crate.
-9. **Method** (M-1 to M-8): retro files per pass, report paths instead of report text in task
-   texts, a precondition check before a second review, a reviewer checklist, review and fix
-   templates, a shared-lines checklist and `docs/contract-gaps.md` for planners, gates before
-   cards.
-10. **Translation** (L-3, L-4, L-5): a reviewer agent step for Estonian, visual tests in
+1. **The C-8 race** (2026-11-09 T-13): refresh the node when an upload makes a new version;
+   the test asserts that the first row is "Current". It is the one flaky test that failed CI in
+   this run.
+2. **Data cluster per agent** (2026-11-08 B-2, raised): `run.sh --data-cluster` (or always)
+   starts `pgdata-<key>` from the tree's set-up; `--stop` removes it. Every data cluster change
+   needs it; three agents wrote their own.
+3. **K-1 C-2** (2026-11-08 P-2): names over 63 characters in the catalog sync.
+4. **Step 2 error codes** (2026-11-08 P-3), with the Q-1 note N-B (2026-11-09 S-12): a rule
+   that refuses writes to `pg_catalog` relations.
+5. **Security follow-ups** (2026-11-08 S-7; 2026-11-09 S-8, S-9, S-11, S-15): DQS off in the
+   bundled SQLite (un-ignore the planned Q-1 test); masked copy with a view on a personal
+   column; no `USAGE` on `ruum_mask` for the copy's owner; names only in `PrincipalRef` fields;
+   the remaining untrusted marks.
+6. **Connection drops and flaky tests** (2026-11-09 T-12; 2026-11-08 T-4 to T-6): cap the
+   connections of the dbengine Postgres suites; `mutation_check.sh` prints why a mutant died.
+7. **CI and harness** (2026-11-08 T-1, T-2, T-10).
+8. **Build server and mutation check** (2026-11-08 B-1, B-3 to B-7, S-5; 2026-11-09 B-13 to
+   B-16): `--detach`, file touch, a full-check lock, `--perl`, `cargo-deny` in `setup.sh`.
+9. **Method** (2026-11-08 M-1 to M-8; 2026-11-09 M-14 to M-19): templates and workflow.
+10. **Translation** (2026-11-08 L-3 to L-5): a reviewer agent step for Estonian, visual tests in
     Estonian, localised emails.
 
-Waiting for the architect panel: P-1 (K-1 C-1, before Q-2), P-4 (contract gaps, one additive
-change), P-5 (a platform principal), P-9 (split D-2). Waiting for the person: briefs B-1 to B-3
-in `docs/digests/2026-11-08.md`.
+Waiting for the architect panel: 2026-11-08 P-1 (K-1 C-1, before Q-2), P-4, P-5, P-8 (the
+`isolation.rs` change of Q-1 is merged; confirm or veto), P-9; 2026-11-09 S-10 (owner-made
+`SET` and definer functions), S-14 (show agent-written text in the web UI), review-Q-1-3 N-A
+(the owner kind changes options). Waiting for the person: see `docs/digests/2026-11-09.md`.
 
 ## Known gaps
 
@@ -537,17 +560,20 @@ in `docs/digests/2026-11-08.md`.
   Q-4 (tenant pseudonym key) and P-2 (typed node store, delivery worker, reconciler) are
   merged, and so are cards D-1 (`createDatabase`, `getDatabase`, `updateDatabaseManifest`;
   `Services` wires the engines, the tenant keys, the delivery worker and the reconciler), T-1
-  (database acceptance cases), T-2 (privacy suite), K-1 (column classes) and A-1 (grants). The
-  other 15 database operations count as planned in the suites; the privacy suite is all
-  planned until the operations and the filters of Q-2 and Q-3 land. Card Q-1 is not merged
-  (`review-Q-1-2.md` S-1). The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) had two
+  (database acceptance cases), T-2 (privacy suite), K-1 (column classes), A-1 (grants) and Q-1
+  (the query API for people, 2026-11-09). The other 12 database operations count as planned in
+  the suites; the privacy suite is all planned until the operations and the filters of Q-2 and
+  Q-3 land. Q-1 notes open: review-Q-1-3 N-A (the owner kind still changes options; the panel
+  records the intended reading) and N-B (`UPDATE pg_settings` passes the rules as `Write`;
+  backlog 2026-11-09 S-12). The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) had two
   reviews: the first was not complete (`review-dbhost.md`), the second did not accept
   (`review-dbhost-2.md`): the search-path part holds, but **a tenant cast on a tenant type runs
   as `mask` inside `ruum_mask.pseudonym_other`, reads the HMAC key and can replace
   `ruum_mask.hmac12`** (item 2, proved on the data cluster; no agent reads through the lens
   yet), and items 1 and 3 have no test. The fix of item 2 and the tests of items 1 and 3 are on
-  branch `f/masking-hardening` (decision 0004-37, card SEC-1 under "Next cards"); until it is
-  reviewed and merged, the hole is open on `main`. K-1 conditions open: C-1 (the column store and the
+  branch `f/masking-hardening` (decision 0004-37), **merged on 2026-11-09** after three reviews
+  (`review-masking-3.md` accepted; notes N1 to N4: a database from before the fix keeps its
+  key, no repair path for an old foreign dependent, test placement, mutation thread count). K-1 conditions open: C-1 (the column store and the
   manifest's `data_classes` drift apart after a person's `updateDatabaseManifest` or
   `restoreVersion`; before Q-2) and C-2 (a SQLite name over 63 characters stops the Postgres
   sync; before Q-3); notes N-1 to N-6. A-1 notes N-1 to N-5 and N-7; the create codes
@@ -642,6 +668,14 @@ in `docs/digests/2026-11-08.md`.
 - CI (`.github/workflows/`) runs on the pushed branches; `main` itself is not pushed.
 - Older gaps of `docs/FOUNDATION.md` still apply (`node.sharing_updated` is not undone, the
   `idp` hint of `loginStart` is not sent, the in-memory `Arc` cycle).
+
+## Dependencies changed on 2026-11-09
+
+- `rusqlite` 0.39.0 to 0.41.1 (`libsqlite3-sys` 0.37.0 to 0.39.1), for RUSTSEC-2026-0459.
+- `sqlx-sqlite` 0.9.0 is replaced by an empty path crate (`third_party/sqlx-sqlite-stub`,
+  `[patch.crates-io]`); no code of it is built. Remove it with a sqlx release that accepts
+  `libsqlite3-sys` 0.39.
+- `sqlparser` 0.63.0 (Apache-2.0, card Q-1, decision 0004-36), default features off, `std`.
 
 ## Dependencies added in the evening integration (2026-11-08)
 
