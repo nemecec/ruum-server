@@ -35,7 +35,7 @@
 use super::errors::{internal, sqlstate};
 use super::lens::{self, ident};
 use super::setup::{self, run};
-use super::{DbState, Meta, PostgresEngine, catalog, neutral_name};
+use super::{DbState, Meta, PostgresEngine, neutral_name};
 use crate::error::EngineError;
 use crate::key::PseudonymKey;
 use crate::model::*;
@@ -444,17 +444,16 @@ async fn hand_over(
         setup::grant_connect(engine, name, std::slice::from_ref(&owner)).await?;
         change_data(engine, name, new, new_roles, &data).await?;
     }
-    // 3. ruum_dbhost installs the copy's key and builds the lens.
+    // 3. ruum_dbhost makes the objects of mask again with the copy's key and builds the lens.
+    // It refuses the copy when tenant code of step 2 left an object that depends on an object
+    // of the lens schemas (review-masking-1 F2).
     let mut conn = engine.dbhost(name).await?;
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
         if masked {
             pseudonyms_for_owner(&mut conn, &new_mask, &new_owner, false).await?;
-            setup::install_key(&mut conn, new_roles, key).await?;
         }
-        let catalog = catalog::read(&mut conn).await?;
-        let spec = setup::read_lens_spec(&mut conn).await?;
-        setup::build_lens(&mut conn, new_roles, &catalog, &spec).await?;
+        setup::rebuild_lens(&mut conn, new_roles, key).await?;
         run(&mut conn, "commit", "commit".to_string()).await
     }
     .await;
@@ -1030,7 +1029,8 @@ pub(crate) async fn restore_into_new(
 
 /// `restore_in_place`: the database becomes a copy of the snapshot of the restore point. The
 /// new copy is made first; then the names are swapped and the old database dropped, so a failure
-/// leaves the database as it was. The roles stay; the restore points stay; `key` is installed.
+/// leaves the database as it was. The roles stay; the restore points stay; the objects of `mask`
+/// are made again with `key`, and the lens is built again (`mask` holds no `CREATE` afterwards).
 pub(crate) async fn restore_in_place(
     engine: &PostgresEngine,
     db: &DatabaseRef,
@@ -1066,7 +1066,9 @@ pub(crate) async fn restore_in_place(
                 .await
                 .map_err(|e| internal("keep the restore points", e))?;
             }
-            setup::install_key(&mut conn, &state.meta.roles, key).await?;
+            // The snapshot holds the objects of mask as they were then (also from before a
+            // fix, review-masking-2 F-1): make them again, with the key, and build the lens.
+            setup::rebuild_lens(&mut conn, &state.meta.roles, key).await?;
             run(&mut conn, "commit", "commit".to_string()).await
         }
         .await;

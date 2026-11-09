@@ -471,17 +471,25 @@ Small, clear fixes that need no person (design 20.3). The IDs are those of the b
 has the evidence. Each card goes through the normal reviews and gates. In this order:
 
 1. **SEC-1, the masking hole** (S-1, S-4; branch `f/masking-hardening`, worktree
-   `ruum-server-wt/mask`; built, **waiting for two security reviews**, not merged): decision
+   `ruum-server-wt/mask`; built; two security reviews done (`review-masking-1.md` accepted,
+   `review-masking-2.md` not accepted for F-1), all their findings fixed (`masking-fix-2.md`),
+   **waiting for a short third review of F-1**, not merged): decision
    0005 B-2 and decision 0004-37. A personal column whose type is not a built-in base type
    (enum, domain, composite, range, array of one, extension type) shows the hidden constant in
    the masked lens and holds `NULL` (as `text`) in a masked copy; `pseudonym_other` refuses any
    such type before it converts; the definer bodies qualify their functions and operators with
    `pg_catalog`; `mask` holds `CREATE` on the lens schemas only inside the `ruum_dbhost`
-   transaction that builds them. Tests in `ruum-dbengine/src/postgres/tests/tenant_types.rs`
+   transaction that builds them; every lens build (migration, `sync_lens`, copy, restore in
+   place) drops the lens schemas and makes the functions, the key table and the views of `mask`
+   again, so neither the state from before the fix nor a change by code as `mask` survives a
+   build or an in-place restore; a build refuses an object outside the lens schemas that
+   depends on one inside them (a masked copy whose step 2 left one is refused). Tests in `ruum-dbengine/src/postgres/tests/tenant_types.rs`
    (tenant casts, an implicit conversion, an operator, domains, enums, composites, ranges,
    arrays, a view, default privileges; steps 1 and 3 of every hand-over, `sync_lens`, a restore;
-   the reused admin connection of review-dbhost item 3); four mutations `dbengine-mask-*`.
-   Record: `ruum-server-wt/panel/masking-fix.md`. Not built: the general helper of B-12 (the
+   the reused admin connection of review-dbhost item 3; the state from before the fix through
+   `sync_lens` and `restore_in_place`; the refused copy; a secret composite; a domain over
+   `text`); eight mutations `dbengine-mask-*`. Records: `ruum-server-wt/panel/masking-fix.md`,
+   `masking-fix-2.md`. Not built: the general helper of B-12 (the
    tests use `hostile_copy::taken`).
 2. **Q-1 unblock** (S-2, S-3, S-7): revoke `set_config` from `PUBLIC` in each data database
    (E-2 `setup.rs`) with an engine test as a viewer role; the names middleware skips the rows

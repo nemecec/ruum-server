@@ -905,7 +905,7 @@ in step 2 of a masked copy. As `mask` it could read the key and change `ruum_mas
   type is "tenant-defined" here: enums, domains (also over a built-in type), composites,
   ranges and multiranges (also the built-in ones), arrays of those, and the types of
   extensions. The masked lens shows the hidden constant (`NULL` stays `NULL`; the null test is
-  `num_nulls`, so it never looks inside a composite). The query layer turns it into
+  `num_nulls`, so it never looks inside a composite; a `secret` column uses the same form). The query layer turns it into
   `{"$ruum": "hidden", "class": "personal"}`. In a masked copy such a column becomes `text`
   and holds `NULL`. Agents cannot join or group on such a column: every value is the same
   constant. This replaces "a domain uses the overload of its base type" of item 34 (e) and
@@ -922,13 +922,26 @@ in step 2 of a masked copy. As `mask` it could read the key and change `ruum_mas
   `search_path = pg_catalog, pg_temp`; the bodies of `hmac12` and `pseudonym_other` also
   qualify their functions and operators (`operator(pg_catalog.||)`), so they resolve nothing
   outside `pg_catalog` even if a setting of the function were changed.
-- (d) **`mask` cannot change the lens outside a build.** `mask` holds `USAGE` only on
-  `ruum_mask`, `ruum_masked` and `ruum_nosecret`. `ruum_dbhost`, the owner of the schemas,
-  grants it `CREATE` inside the transaction that makes the functions or builds the lens views,
-  and revokes it before the commit. So code that ran as `mask` at read time could not replace a
-  pseudonym function or a lens view. The role kinds are frozen (item 34), so no new role kind
-  was added: `mask` stays the owner of the functions, the key and the views; (b) makes sure no
-  tenant code runs as `mask`.
+- (d) **No tenant code runs as `mask`; every build makes `mask`'s objects again.** The
+  protection is (b): no tenant code ever runs as `mask`. The rest is defence in depth.
+  `mask` holds `USAGE` only on `ruum_mask`, `ruum_masked` and `ruum_nosecret`. `ruum_dbhost`,
+  the owner of the schemas, grants it `CREATE` inside the transaction that makes the functions
+  or builds the lens views, and revokes it before the commit. This blocks only `CREATE OR
+  REPLACE` and new objects (review-masking-1 F1, review-masking-2 F-2): `mask` still owns the
+  functions, the key and the views, and an owner needs no `CREATE` to replace the `_RETURN` rule
+  of a view, to `ALTER FUNCTION`, to add a trigger, to change the key or to grant rights. So
+  every build of the lens (each migration, `sync_lens`, step 3 of a copy, and a restore in
+  place) drops the three lens schemas, makes the functions, the key table (the key is kept or
+  replaced) and the views again, and takes back every default privilege that `mask` gives to
+  another role. A change that code as `mask` made, and the objects of the code from before
+  this fix, do not survive the next build; a restore point from before the fix comes back
+  repaired (review-masking-2 F-1). A build refuses to go on when an object outside the lens
+  schemas depends on an object inside them: only tenant code in step 2 of a masked copy, while
+  the copy's owner holds `USAGE` on `ruum_mask`, could make one, so such a copy is refused
+  (review-masking-1 F2). The role kinds are frozen (item 34), so no new role kind was added:
+  `mask` stays the owner of the functions, the key and the views. A role that lens sessions
+  never run as, as the owner of the functions and the key (review-dbhost-2), needs a later
+  decision.
 - (e) **Tests** (backlog S-4). `crates/ruum-dbengine/src/postgres/tests/tenant_types.rs`, on
   the data cluster: a tenant with an enum, domains (one with a check, one over the enum), a
   composite, a range, an array of the enum, casts of each to `text`, an implicit cast from
@@ -938,9 +951,15 @@ in step 2 of a masked copy. As `mask` it could read the key and change `ruum_mas
   `pseudonym_other` with each tenant type fails; the full, schema-only and masked copies, a
   restore and `sync_lens` grant nothing and leave `mask` without `CREATE`; a pooled admin
   connection keeps its search path after `SET` and `RESET ALL` / `DISCARD ALL`
-  (review-dbhost item 3). Mutations `dbengine-mask-tenant-type-pseudonym`,
-  `dbengine-mask-other-no-type-check`, `dbengine-mask-keeps-create` and
-  `dbengine-mask-copy-tenant-type-pseudonym`.
+  (review-dbhost item 3). The state from before the fix and changes that need only ownership
+  do not survive `sync_lens` or a restore in place of a restore point in that state; a masked
+  copy whose step 2 leaves a view on `ruum_mask.key` is refused; a secret composite whose
+  fields are all `NULL` shows the constant; a domain over `text` is hidden by the guards of the
+  lens and of the masked copy on their own. Mutations `dbengine-mask-tenant-type-pseudonym`,
+  `dbengine-mask-other-no-type-check`, `dbengine-mask-keeps-create`,
+  `dbengine-mask-copy-tenant-type-pseudonym`, `dbengine-mask-build-keeps-mask-objects`,
+  `dbengine-mask-restore-keeps-snapshot-objects`, `dbengine-mask-foreign-dependents-ignored`
+  and `dbengine-mask-secret-is-null`.
 
 **Effect on pseudonyms.** A built-in base type keeps its pseudonym (the canonical text did not
 change). A personal column of a built-in range type or of an extension type (for example
@@ -948,4 +967,5 @@ change). A personal column of a built-in range type or of an extension type (for
 
 **Changes.** `crates/ruum-dbengine/src/postgres/lens.rs`, `setup.rs`, `copy.rs`; the doc of the
 generic overload in `crates/ruum-core/src/privacy/mod.rs`; the tests and mutations above.
-Fix record: `ruum-server-wt/panel/masking-fix.md`.
+Fix records: `ruum-server-wt/panel/masking-fix.md` and `masking-fix-2.md` (the two security
+reviews `review-masking-1.md` and `review-masking-2.md`).

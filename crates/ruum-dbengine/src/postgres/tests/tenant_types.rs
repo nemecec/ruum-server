@@ -435,3 +435,328 @@ async fn a_reused_admin_connection_keeps_its_search_path() {
     }
     assert!(found, "the pool handed the reset connection out again");
 }
+
+/// What every build of the lens leaves, whatever `mask` owned before (review-masking-2 F-1,
+/// review-masking-1 F1): `mask` holds no `CREATE`, `pseudonym_other` checks the type first,
+/// `hmac12` is `SECURITY DEFINER`, the key has no grant to `PUBLIC`, `mask` gives no default
+/// privilege to another role, the masked reader sees what it saw before the changes (the same
+/// key) and runs no tenant code, and the reader sees the clear value of `s`.
+async fn assert_mask_objects_fresh(
+    engine: &PostgresEngine,
+    f: &Fixture<'_>,
+    other: &CreatedDatabase,
+    before: &[String],
+    when: &str,
+) {
+    assert_eq!(
+        mask_creates(engine, &f.created).await,
+        "false|false|false",
+        "{when}: mask holds no CREATE"
+    );
+    let mask = lens::literal(&role_name(&f.created, RoleKind::Mask));
+    let mut host = dbhost(engine, f.db()).await;
+    let state = psql(
+        &mut host,
+        &format!(
+            "select (select (p.prosrc like '%not a built-in base type%')::text from pg_proc p \
+                      where p.oid = 'ruum_mask.pseudonym_other(anyelement)'::regprocedure) \
+                 || '|' || (select p.prosecdef::text from pg_proc p \
+                      where p.oid = 'ruum_mask.hmac12(text)'::regprocedure) \
+                 || '|' || (select count(*)::text from pg_class c, aclexplode(c.relacl) a \
+                      where c.oid = 'ruum_mask.key'::regclass and a.grantee = 0) \
+                 || '|' || (select count(*)::text from pg_default_acl d, aclexplode(d.defaclacl) a \
+                      where d.defaclrole = {mask}::regrole and a.grantee <> d.defaclrole)"
+        ),
+    )
+    .await
+    .unwrap();
+    close(host).await;
+    assert_eq!(
+        state, "true|true|0|0",
+        "{when}: type check | definer | PUBLIC grants on the key | default privileges of mask"
+    );
+    let (rows, hit) = masked_rows(engine, f.db()).await;
+    assert_eq!(
+        hit, "",
+        "{when}: no tenant function ran for the masked reader"
+    );
+    assert_eq!(
+        rows, before,
+        "{when}: the masked lens as before, with the same key"
+    );
+    let mut reader = session(engine, f.db(), RoleKind::Read).await;
+    assert_eq!(
+        psql(&mut reader, "select s from t where id = 1")
+            .await
+            .unwrap(),
+        "alice",
+        "{when}: the _RETURN rule that mask replaced is gone"
+    );
+    close(reader).await;
+    assert_eq!(
+        taken(engine, &[&f.created, other], other).await,
+        "",
+        "{when}: nothing granted a role"
+    );
+}
+
+/// The state of a database from before the fix, and changes that need only the ownership of
+/// `mask`'s objects, do not survive a lens build (`sync_lens`) or an in-place restore of a
+/// restore point taken in that state (review-masking-2 F-1 (a) to (c); review-masking-1 F1).
+/// Without `CREATE`, `mask` cannot `CREATE OR REPLACE` a view, but it can still replace the
+/// view's `_RETURN` rule, alter a function, grant on the key and set default privileges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_state_from_before_the_fix_does_not_survive_a_build_or_a_restore() {
+    let Some(engine) = engine().await else { return };
+    let other = Fixture::new(&engine).await;
+    let f = tenant_types_source(&engine, &other.created).await;
+    let (before, _) = masked_rows(&engine, f.db()).await;
+    let m = lens::ident(&role_name(&f.created, RoleKind::Mask));
+    let mut host = dbhost(&engine, f.db()).await;
+    // Without CREATE: CREATE OR REPLACE fails ...
+    let err = psql(
+        &mut host,
+        &format!("set role {m}; create or replace view ruum_masked.t as select 1 as id"),
+    )
+    .await
+    .expect_err("mask has no CREATE on ruum_masked");
+    assert!(err.contains("permission denied"), "{err}");
+    // ... but an owner needs no CREATE for these.
+    psql(
+        &mut host,
+        &format!(
+            "reset role; set role {m};
+             create or replace rule \"_RETURN\" as on select to ruum_nosecret.t do instead
+               select id, e, d, dm, c, r, a, nc, n, 'tampered'::text as s from public.t;
+             alter function ruum_mask.hmac12(text) security invoker;
+             grant select on ruum_mask.key to public;
+             alter default privileges grant select on tables to public;
+             reset role"
+        ),
+    )
+    .await
+    .expect("changes that need only ownership");
+    // The state of main before the fix: mask holds CREATE, pseudonym_other converts without a
+    // type check, and the masked view calls it on the enum column.
+    psql(
+        &mut host,
+        &format!(
+            "grant create on schema ruum_mask, ruum_masked, ruum_nosecret to {m};
+             set role {m};
+             create or replace function ruum_mask.pseudonym_other(v anyelement) returns text
+               language sql stable strict security definer set search_path = pg_catalog, pg_temp
+               as $f$ select ruum_mask.hmac12(v::text) $f$;
+             create or replace view ruum_masked.t as select id, ruum_mask.pseudonym_other(e) as e,
+               null::text as d, null::text as dm, null::text as c, null::text as r,
+               null::text as a, null::text as nc, null::text as n, null::text as s from public.t;
+             reset role"
+        ),
+    )
+    .await
+    .expect("the state from before the fix");
+    close(host).await;
+    assert_eq!(mask_creates(&engine, &f.created).await, "true|true|true");
+    let mut reader = session(&engine, f.db(), RoleKind::Read).await;
+    assert_eq!(
+        psql(&mut reader, "select s from t where id = 1")
+            .await
+            .unwrap(),
+        "tampered"
+    );
+    close(reader).await;
+    let point = engine
+        .create_restore_point(f.db())
+        .await
+        .expect("a restore point in that state");
+    engine
+        .sync_lens(f.db(), &f.key, &all_personal())
+        .await
+        .expect("sync_lens");
+    assert_mask_objects_fresh(&engine, &f, &other.created, &before, "after sync_lens").await;
+    engine
+        .restore_in_place(f.db(), &point, &f.key)
+        .await
+        .expect("restore in place");
+    assert_mask_objects_fresh(
+        &engine,
+        &f,
+        &other.created,
+        &before,
+        "after restore_in_place",
+    )
+    .await;
+}
+
+/// Tenant code in step 2 of a masked copy runs as the copy's owner, which then holds `USAGE` on
+/// `ruum_mask`. An object it makes there that points into `ruum_mask` would keep working
+/// afterwards. Step 3 refuses the copy instead (review-masking-1 F2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_refuses_an_object_that_points_into_ruum_mask() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec![],
+        secret: vec!["sec"],
+    };
+    let request = MigrationRequest {
+        up: "CREATE TYPE public.mood AS ENUM ('happy', 'sad');
+             CREATE FUNCTION public.plant(public.mood) RETURNS text LANGUAGE plpgsql AS $f$
+             BEGIN
+               BEGIN
+                 EXECUTE 'CREATE VIEW public.k AS SELECT id FROM ruum_mask.key';
+               EXCEPTION WHEN OTHERS THEN NULL;
+               END;
+               RETURN 'planted';
+             END $f$;
+             CREATE CAST (public.mood AS text) WITH FUNCTION public.plant(public.mood) AS IMPLICIT;
+             CREATE TABLE t (id integer PRIMARY KEY, sec public.mood);"
+            .into(),
+        timeout: Duration::from_secs(10),
+        dry_run: false,
+    };
+    engine
+        .apply_migration(f.db(), &f.key, &request, &sync)
+        .await
+        .expect("migration");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO t VALUES (1, 'happy')",
+        vec![],
+    )
+    .await
+    .expect("a row");
+    let plan = MaskPlan {
+        columns: vec![(
+            ColumnRef {
+                schema: "public".into(),
+                table: "t".into(),
+                column: "sec".into(),
+            },
+            MaskAs::Null,
+        )],
+    };
+    let (key, _) = conformance::test_key();
+    let err = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan),
+            &key,
+        )
+        .await
+        .expect_err("the copy is refused");
+    let err = format!("{err:?}");
+    assert!(err.contains("depend on the lens schemas"), "{err}");
+    assert!(err.contains("_RETURN"), "{err}");
+    let mut host = dbhost(&engine, f.db()).await;
+    assert_eq!(
+        psql(&mut host, "select (to_regclass('public.k') is null)::text")
+            .await
+            .unwrap(),
+        "true",
+        "the source has no such view"
+    );
+    close(host).await;
+}
+
+/// A secret column of a composite type whose fields are all `NULL` shows the constant, in the
+/// masked lens and in the lens of the readers (review-masking-2 F-3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_composite_with_null_fields_shows_the_constant() {
+    let Some(engine) = engine().await else { return };
+    let other = Fixture::new(&engine).await;
+    let f = tenant_types_source(&engine, &other.created).await;
+    let sync = ClassSync {
+        personal: vec![],
+        secret: vec!["nc"],
+    };
+    engine
+        .sync_lens(f.db(), &f.key, &sync)
+        .await
+        .expect("sync_lens");
+    for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+        let mut s = session(&engine, f.db(), kind).await;
+        assert_eq!(
+            psql(&mut s, "select coalesce(nc::text, '-') from t order by id")
+                .await
+                .unwrap(),
+            format!("{HIDDEN}\n-"),
+            "{kind:?}"
+        );
+        close(s).await;
+    }
+}
+
+/// A personal column of a domain over `text` is hidden by the guard of the lens and emptied by
+/// the guard of the masked copy on their own: the type check of `pseudonym_other` lets a domain
+/// over a built-in type through (it arrives as its base type), so only the guards stop a
+/// pseudonym here (review-masking-2 F-3, the kills of the two guard mutations).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_guards_hide_a_domain_over_a_built_in_type_on_their_own() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec!["p"],
+        secret: vec![],
+    };
+    let request = MigrationRequest {
+        up: "CREATE DOMAIN public.plain AS text;
+             CREATE TABLE u (id integer PRIMARY KEY, p public.plain);"
+            .into(),
+        timeout: Duration::from_secs(10),
+        dry_run: false,
+    };
+    engine
+        .apply_migration(f.db(), &f.key, &request, &sync)
+        .await
+        .expect("migration");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO u VALUES (1, 'bob'), (2, NULL)",
+        vec![],
+    )
+    .await
+    .expect("rows");
+    let mut s = session(&engine, f.db(), RoleKind::MaskedRead).await;
+    assert_eq!(
+        psql(&mut s, "select coalesce(p, '-') from u order by id")
+            .await
+            .unwrap(),
+        format!("{HIDDEN}\n-"),
+        "the masked lens hides the domain column"
+    );
+    close(s).await;
+    let plan = MaskPlan {
+        columns: vec![(
+            ColumnRef {
+                schema: "public".into(),
+                table: "u".into(),
+                column: "p".into(),
+            },
+            MaskAs::Pseudonym,
+        )],
+    };
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan),
+            &key,
+        )
+        .await
+        .expect("a masked copy");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(&mut owner, "select coalesce(p, '-') from u order by id")
+            .await
+            .unwrap(),
+        "-\n-",
+        "the masked copy holds no value of the domain column"
+    );
+    close(owner).await;
+}

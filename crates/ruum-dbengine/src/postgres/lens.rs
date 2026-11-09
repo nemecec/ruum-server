@@ -62,6 +62,18 @@
 //! - `mask` holds `USAGE` only on `ruum_mask`, `ruum_masked` and `ruum_nosecret`. `ruum_dbhost`
 //!   (the owner of the schemas) grants it `CREATE` inside the transaction that makes the
 //!   functions or builds the lens, and takes it back before the commit ([`mask_create_sql`]).
+//!   This only blocks `CREATE OR REPLACE` and new objects. `mask` still owns the functions, the
+//!   key and the views, and an owner needs no `CREATE` to replace the `_RETURN` rule of a view,
+//!   to `ALTER FUNCTION`, to add a trigger or to grant rights (review-masking-1 F1,
+//!   review-masking-2 F-2). The `CREATE` revoke is defence in depth only.
+//!
+//! **The protection is that no tenant code ever runs as `mask`** (the rules above). In addition,
+//! every build of the lens (`setup::build_lens`: each migration, `sync_lens`, step 3 of a copy, a
+//! restore in place) drops the three lens schemas and makes the functions, the key table (the
+//! key is kept or replaced) and the views again, and takes back the default privileges of
+//! `mask`. So a change that code as `mask` made, or the objects of the code from before a fix,
+//! do not survive the next build. A build refuses to go on when an object outside the lens
+//! schemas depends on an object inside them (`setup::foreign_lens_dependents`).
 //!
 //! The masked kinds have `EXECUTE` on `pseudonym` and `pseudonym_other` only (not on `hmac12`
 //! or `canonical`), and no `USAGE` on `ruum_mask`: only a lens view (owner `mask`) calls them.
@@ -223,11 +235,10 @@ pub(crate) fn pseudonym_call(expr: &str, base_oid: u32) -> String {
 }
 
 /// The masked form of a `secret` value: `NULL` stays `NULL`, anything else is the constant.
+/// The same form as [`hidden_expr`], so a secret composite whose fields are all `NULL` shows the
+/// constant too (review-masking-2 F-3).
 pub(crate) fn secret_expr(expr: &str) -> String {
-    format!(
-        "case when {expr} is null then null else {}::text end",
-        literal(SECRET_CONSTANT)
-    )
+    hidden_expr(expr)
 }
 
 /// The masked form of a value of a type that is not a built-in base type (decision 0005 B-2):
@@ -500,10 +511,10 @@ mod tests {
         };
         let sql = view_sql(&table, &spec, &bases, &roles);
         assert!(sql.contains(
-            "create view ruum_masked.\"users\" as select \"id\", ruum_mask.pseudonym(\"email\") as \"email\", case when \"token\" is null"
+            "create view ruum_masked.\"users\" as select \"id\", ruum_mask.pseudonym(\"email\") as \"email\", case when pg_catalog.num_nulls(\"token\") operator(pg_catalog.=) 1 then null"
         ), "{sql}");
         assert!(sql.contains(
-            "create view ruum_nosecret.\"users\" as select \"id\", \"email\", case when \"token\""
+            "create view ruum_nosecret.\"users\" as select \"id\", \"email\", case when pg_catalog.num_nulls(\"token\")"
         ), "{sql}");
         let back = spec_from_json(&spec_to_json(&spec));
         assert_eq!(back, spec);
