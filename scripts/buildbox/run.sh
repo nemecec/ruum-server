@@ -14,9 +14,14 @@
 #     reused, in DATABASE_URL and TEST_DATABASE_URL;
 #   - its own SpiceDB: the container spicedb-<name> (memory datastore, its own ports), started or
 #     reused, in SPICEDB_ENDPOINT, RUUM_SPICEDB_ENDPOINT and RUUM_SPICEDB_HTTP_URL;
+#   - its own data cluster: the container pgdata-<name>, built from the tree's own
+#     deploy/dev/postgres-data (image ruum-buildbox-pgdata:<name>), started or reused, in
+#     RUUM_DBHOST_URL and DBHOST_CHECK_CONTAINER, with RUUM_DBENGINE_REQUIRE_POSTGRES=1. A change
+#     of that folder builds the image again and starts a new, empty cluster. A tree without the
+#     folder keeps the stack's shared data cluster;
 #   - a dev root of its own, ~/w/.<name>.dev, in RUUM_DEV_ROOT (scripts/e2e_browser.sh) and its
 #     scripts/dev.sh in RUUM_DEV_SH (scripts/e2e_smoke.sh): a wrapper of the base copy's dev.sh
-#     whose `env` prints the agent's Postgres and SpiceDB instead of the stack's, next to a link to
+#     whose `env` prints the agent's Postgres, SpiceDB and data cluster instead of the stack's, next to a link to
 #     the stack's deploy/dev/.env. So the e2e scripts use the agent's databases too;
 #   - free ports for the e2e scripts: RUUM_E2E_PORT and RUUM_E2E_DAV_PORT (e2e_smoke.sh),
 #     RUUM_E2E_BROWSER_PORT, RUUM_E2E_BROWSER_DAV_PORT, RUUM_E2E_WEB_PORT and RUUM_E2E_MOCK_PORT
@@ -24,8 +29,8 @@
 # The output streams here; the exit status is the command's. The command gets no stdin. Ctrl-C or
 # SIGTERM stops the command on the server too.
 #
-# --stop stops a running command of <name> and deletes its Postgres and SpiceDB (with their data),
-# ~/targets/<name>, ~/w/<name> and its dev root ~/w/.<name>.dev.
+# --stop stops a running command of <name> and deletes its Postgres, SpiceDB and data cluster (with
+# their data, and the data cluster's image), ~/targets/<name>, ~/w/<name> and its dev root ~/w/.<name>.dev.
 #
 # Settings: BUILDBOX_HOST (default 2.31.194.2), BUILDBOX_USER (ruum),
 # BUILDBOX_KEY (~/.config/ruum/buildbox_ed25519).
@@ -47,6 +52,7 @@ action=$1 name=$2
 shift 2
 W=$HOME/w/$name T=$HOME/targets/$name C=spicedb-$name BASE=$HOME/ruum-server
 P=pg-$name D=$HOME/w/.$name.dev
+PD=pgdata-$name PDIMAGE=ruum-buildbox-pgdata:$name
 PIDFILE=$HOME/w/.$name.pid
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
@@ -116,6 +122,51 @@ case $action in
     done
     docker exec "$P" pg_isready -q -h 127.0.0.1 -U postgres -d ruum || { echo "$P is not ready" >&2; docker logs --tail 20 "$P" >&2; exit 2; }
     pg=$(docker port "$P" 5432/tcp | head -1 | awk -F: '{print $NF}')
+    # A data cluster of its own, built from the tree's deploy/dev/postgres-data, so a branch that
+    # changes the cluster set-up tests that set-up, and agents never share databases or roles.
+    # The image carries the hash of the folder; a new hash builds it again (docker's layer cache
+    # keeps the slow apt layer) and replaces the container and its volume. Superuser login only
+    # on the local socket (docker exec), as in the stack.
+    pgd=none
+    if [[ -f $W/deploy/dev/postgres-data/Dockerfile ]]; then
+      hash=$(tar -C "$W/deploy/dev/postgres-data" --sort=name --mtime=@0 --owner=0 --group=0 \
+        --numeric-owner -cf - . | sha256sum | cut -c1-16)
+      label=ruum.buildbox.pgdata-hash
+      old=$(docker image inspect -f "{{.Id}} {{index .Config.Labels \"$label\"}}" "$PDIMAGE" 2>/dev/null || true)
+      if [[ ${old#* } != "$hash" ]]; then
+        echo "building $PDIMAGE from deploy/dev/postgres-data ($hash)" >&2
+        docker build -q -t "$PDIMAGE" --label "$label=$hash" --label ruum.buildbox=agent \
+          --label "ruum.buildbox.name=$name" "$W/deploy/dev/postgres-data" >/dev/null
+        if [[ -n $old ]]; then
+          docker rm -f -v "$PD" >/dev/null 2>&1 || true
+          docker rmi "${old%% *}" >/dev/null 2>&1 || true
+        fi
+      fi
+      dbhost_pw=$(secret RUUM_DBHOST_PASSWORD) data_pw=$(secret POSTGRES_DATA_PASSWORD)
+      [[ -n $dbhost_pw && -n $data_pw ]] || { echo "RUUM_DBHOST_PASSWORD or POSTGRES_DATA_PASSWORD is empty in $BASE/deploy/dev/.env" >&2; exit 2; }
+      state=$(docker inspect -f "{{.State.Running}} {{index .Config.Labels \"$label\"}}" "$PD" 2>/dev/null || true)
+      if [[ $state == "false $hash" ]]; then
+        docker start "$PD" >/dev/null
+      elif [[ $state != "true $hash" ]]; then
+        [[ -z $state ]] || docker rm -f -v "$PD" >/dev/null
+        docker run -d --name "$PD" --label ruum.buildbox=agent --label "ruum.buildbox.name=$name" \
+          --label "$label=$hash" --restart unless-stopped --memory 768m --shm-size 256m \
+          -p 127.0.0.1::5432 -v /var/lib/postgresql/data \
+          -e POSTGRES_USER=postgres -e "POSTGRES_PASSWORD=$data_pw" \
+          -e "RUUM_DBHOST_PASSWORD=$dbhost_pw" "$PDIMAGE" >/dev/null
+      fi
+      # Ready means: the init scripts are done and the server listens on TCP (during initdb the
+      # image's entrypoint runs a server on the socket only).
+      for _ in $(seq 1 240); do
+        docker exec "$PD" pg_isready -q -h 127.0.0.1 -U postgres -d postgres 2>/dev/null && break
+        sleep 0.5
+      done
+      docker exec "$PD" pg_isready -q -h 127.0.0.1 -U postgres -d postgres || { echo "$PD is not ready" >&2; docker logs --tail 20 "$PD" >&2; exit 2; }
+      pgd=$(docker port "$PD" 5432/tcp | head -1 | awk -F: '{print $NF}')
+      export RUUM_DBHOST_URL=postgres://ruum_dbhost:$dbhost_pw@127.0.0.1:$pgd/postgres
+      export DBHOST_CHECK_CONTAINER=$PD RUUM_DBENGINE_REQUIRE_POSTGRES=1
+      export BUILDBOX_RUUM_DBHOST_URL=$RUUM_DBHOST_URL
+    fi
     export DATABASE_URL=postgres://ruum:$ruum_pw@127.0.0.1:$pg/ruum
     export TEST_DATABASE_URL=postgres://ruum:$ruum_pw@127.0.0.1:$pg/ruum_test
     export CARGO_TARGET_DIR=$T CARGO_INCREMENTAL=0 BUILDBOX_NAME=$name
@@ -127,8 +178,8 @@ case $action in
     ln -sfn "$BASE/deploy/dev/.env" "$D/deploy/dev/.env"
     cat >"$D/scripts/dev.sh" <<'WRAPPER'
 #!/usr/bin/env bash
-# scripts/dev.sh of the build server's stack, but `env` prints this agent's Postgres and SpiceDB
-# (made by scripts/buildbox/run.sh, which sets the BUILDBOX_* settings).
+# scripts/dev.sh of the build server's stack, but `env` prints this agent's Postgres, SpiceDB and
+# data cluster (made by scripts/buildbox/run.sh, which sets the BUILDBOX_* settings).
 set -euo pipefail
 base=$HOME/ruum-server/scripts/dev.sh
 [[ ${1:-} == env ]] || exec "$base" "$@"
@@ -139,6 +190,9 @@ for v in DATABASE_URL TEST_DATABASE_URL; do
 done
 printf 'export %s=%q\n' SPICEDB_ENDPOINT "$BUILDBOX_SPICEDB_ENDPOINT" \
   RUUM_SPICEDB_ENDPOINT "$BUILDBOX_SPICEDB_ENDPOINT" RUUM_SPICEDB_HTTP_URL "$BUILDBOX_SPICEDB_HTTP_URL"
+if [[ -n ${BUILDBOX_RUUM_DBHOST_URL:-} ]]; then
+  printf 'export %s=%q\n' RUUM_DBHOST_URL "$BUILDBOX_RUUM_DBHOST_URL"
+fi
 WRAPPER
     chmod +x "$D/scripts/dev.sh"
     export RUUM_DEV_ROOT=$D RUUM_DEV_SH=$D/scripts/dev.sh
@@ -153,7 +207,7 @@ print(*[x.getsockname()[1] for x in s])')
     export RUUM_E2E_WEB_PORT=${RUUM_E2E_WEB_PORT:-$p5} RUUM_E2E_MOCK_PORT=${RUUM_E2E_MOCK_PORT:-$p6}
     mkdir -p "$T"
     cd "$W"
-    echo "postgres $P on :$pg; spicedb $C on grpc :$grpc http :$http; target $T; e2e ports: smoke $RUUM_E2E_PORT $RUUM_E2E_DAV_PORT, browser $RUUM_E2E_BROWSER_PORT $RUUM_E2E_BROWSER_DAV_PORT web $RUUM_E2E_WEB_PORT mock $RUUM_E2E_MOCK_PORT" >&2
+    echo "postgres $P on :$pg; data cluster $( [[ $pgd == none ]] && echo "the stack's (no deploy/dev/postgres-data)" || echo "$PD on :$pgd" ); spicedb $C on grpc :$grpc http :$http; target $T; e2e ports: smoke $RUUM_E2E_PORT $RUUM_E2E_DAV_PORT, browser $RUUM_E2E_BROWSER_PORT $RUUM_E2E_BROWSER_DAV_PORT web $RUUM_E2E_WEB_PORT mock $RUUM_E2E_MOCK_PORT" >&2
     # A session of its own, so an interrupt can stop the whole process group.
     status=0
     setsid -w bash -c 'echo $$ >"$0"; exec "$@"' "$PIDFILE" "$@" || status=$?
@@ -163,9 +217,10 @@ print(*[x.getsockname()[1] for x in s])')
   kill) kill_running ;;
   stop)
     kill_running
-    docker rm -f -v "$C" "$P" >/dev/null 2>&1 || true
+    docker rm -f -v "$C" "$P" "$PD" >/dev/null 2>&1 || true
+    docker rmi "$PDIMAGE" >/dev/null 2>&1 || true
     rm -rf "$T" "$W" "$D"
-    echo "removed $C, $P, $T, $W and $D"
+    echo "removed $C, $P, $PD (and image $PDIMAGE), $T, $W and $D"
     ;;
   *) echo "unknown action $action" >&2; exit 2 ;;
 esac

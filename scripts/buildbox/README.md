@@ -2,10 +2,10 @@
 
 A Hetzner server (cax41: 16 ARM cores, 32 GB RAM, 320 GB disk, Ubuntu 24.04) where agents build
 and test instead of the laptop. Each agent gets its own copy of its worktree, its own cargo
-target, its own Postgres and its own SpiceDB, so parallel agents do not wait for or break one
-another. They share the rest of the dev stack (Garage, Zitadel, NATS and so on of
-`scripts/dev.sh up`). The e2e scripts (`scripts/e2e_smoke.sh`, `scripts/e2e_browser.sh`) also use
-the agent's own Postgres and SpiceDB.
+target, its own Postgres, its own data cluster and its own SpiceDB, so parallel agents do not
+wait for or break one another. They share the rest of the dev stack (Garage, Zitadel, NATS and so
+on of `scripts/dev.sh up`). The e2e scripts (`scripts/e2e_smoke.sh`, `scripts/e2e_browser.sh`)
+also use the agent's own Postgres, data cluster and SpiceDB.
 
 | File | What it does |
 |---|---|
@@ -60,7 +60,7 @@ ssh -i ~/.config/ruum/buildbox_ed25519 ruum@<ip> 'bash -s -- --fresh-platform-db
 It refuses while an agent command runs. It stops the stack, keeps the old volume as a tar file
 and the old Zitadel state and KEK in `~/backups/platform-db-<time>/`, and starts the stack with a
 new volume, a new Zitadel instance and new OIDC apps. The agent Postgres containers and the data
-cluster (`postgres-data`) do not change. Delete the backup when the new stack works.
+cluster (`postgres-data`) and the agent data clusters (`pgdata-<name>`) do not change. Delete the backup when the new stack works.
 
 ## How agents use it
 
@@ -82,10 +82,14 @@ scripts/buildbox/run.sh <name> --stop
   - its own SpiceDB (container `spicedb-<name>`, memory datastore) in `SPICEDB_ENDPOINT`,
     `RUUM_SPICEDB_ENDPOINT` and `RUUM_SPICEDB_HTTP_URL`, so branches with different schemas
     do not clash;
+  - its own data cluster (container `pgdata-<name>`, see below) in `RUUM_DBHOST_URL`, with
+    `DBHOST_CHECK_CONTAINER=pgdata-<name>` (for `scripts/dbhost_check.sh`) and
+    `RUUM_DBENGINE_REQUIRE_POSTGRES=1`, so the data cluster tests fail instead of skipping when
+    the cluster does not answer;
   - its own dev root `~/w/.<name>.dev` in `RUUM_DEV_ROOT` (for `scripts/e2e_browser.sh`), and
     its `scripts/dev.sh` in `RUUM_DEV_SH` (for `scripts/e2e_smoke.sh`). It is a wrapper of the
     base copy's `scripts/dev.sh`: its `env` prints the stack's settings, then the agent's
-    Postgres and SpiceDB. Next to it is a link to the stack's `deploy/dev/.env`;
+    Postgres, SpiceDB and data cluster. Next to it is a link to the stack's `deploy/dev/.env`;
   - free ports for the e2e scripts: `RUUM_E2E_PORT` and `RUUM_E2E_DAV_PORT`
     (`e2e_smoke.sh`), `RUUM_E2E_BROWSER_PORT`, `RUUM_E2E_BROWSER_DAV_PORT`, `RUUM_E2E_WEB_PORT`
     and `RUUM_E2E_MOCK_PORT` (`e2e_browser.sh`). A value that you give with `env` wins.
@@ -108,11 +112,39 @@ scripts/buildbox/run.sh feat-x ../ruum-server-wt/feat-x -- scripts/e2e_browser.s
   can reuse a stale binary): `run.sh <name> <worktree> -- bash -c 'find crates contracts
   migrations -type f -exec touch {} + && scripts/e2e_browser.sh'`.
 
+## The agent's data cluster
+
+`run.sh` builds the image `ruum-buildbox-pgdata:<name>` from the tree's own
+`deploy/dev/postgres-data` (its `Dockerfile`, entrypoint and `initdb/`), and starts the container
+`pgdata-<name>` from it on a free port of 127.0.0.1, with the passwords of the stack's
+`deploy/dev/.env`. So a branch that changes the data cluster set-up tests its own set-up, not
+the one of `main`, and two agents never share databases or roles. There is no flag: every run
+of a tree that has `deploy/dev/postgres-data` gets it. A tree without that folder (an old branch)
+keeps the stack's shared data cluster, and the first line of the run says so.
+
+- The image carries a hash of the folder (label `ruum.buildbox.pgdata-hash`). When the folder
+  changes, the next run builds the image again and replaces the container with a new, empty
+  cluster. Otherwise the run reuses the container and its databases.
+- The superuser logs in only on the local socket, as in the stack:
+  `docker exec pgdata-<name> psql -U postgres`.
+- The settings are those of the tree's `Dockerfile` (with fsync), not the faster ones of
+  `pg-<name>`: the cluster under test is the one the tree describes.
+
+Why always, and not only on request (measured on the cax41, 2026-11-09):
+
+| What | Cost |
+|---|---|
+| First run of a key (cached image layers: start and `initdb/`) | about 4 s |
+| Later runs (container reused) | none measurable |
+| Image build with no cache (the apt layer: PostGIS, pgvector) | 29 s, once per server and change of that layer |
+| Disk: volume of a new cluster; image | about 60 MB; the image shares its layers with the other keys |
+| Memory: idle cluster; limit | about 30 MB; 768 MB |
+
 ## Disk and cleanup
 
 - A cargo target of the whole workspace takes several GB. Run `run.sh <name> --stop` when the
-  agent's work is merged or dropped. It deletes `pg-<name>` and `spicedb-<name>` with their
-  data, `~/targets/<name>`, `~/w/<name>` and `~/w/.<name>.dev`. Each agent Postgres may use up
+  agent's work is merged or dropped. It deletes `pg-<name>`, `pgdata-<name>` and
+  `spicedb-<name>` with their data, the image `ruum-buildbox-pgdata:<name>`, `~/targets/<name>`, `~/w/<name>` and `~/w/.<name>.dev`. Each agent Postgres may use up
   to 2 GB of RAM.
 - Keep at least 50 GB free. Check with
   `ssh -i ~/.config/ruum/buildbox_ed25519 ruum@<ip> 'df -h /; du -sh ~/targets/*'`, or run
