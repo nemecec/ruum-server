@@ -676,6 +676,7 @@
     "shared.meta": "{access} · {who}",
     "shared.meta.space": "{space} · {access} · {who}",
     "shared.someoneIn": "Someone in {space}",
+    "shared.space": "Space",
     "shared.when": "Shared",
     "shell.brand.label": "Ruum, files",
     "shell.guestBanner": "You're a guest here. You see only what people shared with you.",

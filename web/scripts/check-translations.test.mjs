@@ -87,6 +87,38 @@ describe('check-translations', () => {
     expect(check('Done', 'Valmis', { status: { 'x.y': `agent-reviewed:${sourceHash('Done')}` } })).toEqual([])
   })
 
+  it('keeps the product "Ruum" and the space "ruum" apart in Estonian (decision 0005 B-1)', () => {
+    // The product with a capital letter, where the English names it.
+    expect(check('Sign in to Ruum', 'Logi Ruumi sisse')).toEqual([])
+    expect(check("You're invited to a space in Ruum", 'Sind kutsutakse Ruumis ühte ruumi')).toEqual([])
+    // A space with a capital letter: the English has no product name.
+    expect(check('A space needs at least one owner.', 'Ruumil peab olema vähemalt üks omanik.')).toEqual(['ruum'])
+    expect(check('Invite them under Space settings.', 'Kutsu ta jaotises „Ruumi seaded“.')).toEqual(['ruum'])
+    expect(check('{hasSpace, select, yes {{space}} other {This space}} is full.', '{hasSpace, select, yes {Ruum {space}} other {See ruum}} on täis.')).toEqual(['ruum'])
+    // More capital words than the English has product names.
+    expect(check('Ruum is ready.', 'Ruum on valmis. Ruumi nimi on muudetud.')).toEqual(['ruum'])
+    // A sentence does not start with the common word, also not after a full stop or in a branch.
+    expect(check('Saved. The space is ready.', 'Salvestatud. ruum on valmis.')).toEqual(['ruum'])
+    expect(check('{n, plural, one {# space} other {# spaces}}', '{n, plural, one {ruum #} other {ruumid #}}')).toEqual(['ruum', 'ruum'])
+    expect(check('Every space needs an owner.', 'Igal ruumil peab olema omanik.')).toEqual([])
+    // An empty branch does not leave the next word at the start.
+    expect(check('{n, plural, =0 {} one {# member} other {# members}} of {space}', '{n, plural, =0 {} one {# liige} other {# liiget}} ruumis {space}')).toEqual([])
+    // A compound or a word in the middle is fine.
+    expect(check('Your team space is ready.', 'Sinu meeskonnaruum on valmis.')).toEqual([])
+    // Other languages are not checked.
+    const source = { 'x.y': 'A space needs an owner.' }
+    const catalogue = { '@metadata': { status: { 'x.y': `machine:${sourceHash(source['x.y'])}` } }, messages: { 'x.y': 'Ruumil peab olema omanik.' } }
+    expect(checkCatalogue({ tag: 'fi', source, catalogue, glossary: { terms: [], keep: [] } }).errors).toEqual([])
+  })
+
+  it('warns when the product and the space stand side by side in Estonian', () => {
+    const source = { 'x.y': 'Ruum spaces' }
+    const catalogue = { '@metadata': { status: { 'x.y': `machine:${sourceHash(source['x.y'])}` } }, messages: { 'x.y': 'Ruumi ruumid' } }
+    const { errors, warnings } = checkCatalogue({ tag: 'et', source, catalogue, glossary })
+    expect(errors).toEqual([])
+    expect(warnings.map((w) => w.rule)).toEqual(['ruum'])
+  })
+
   it('lists the messages to translate again', () => {
     const source = { a: 'One', b: 'Two', c: 'Three' }
     const catalogue = { '@metadata': { status: { a: `machine:${sourceHash('One')}`, b: `machine:${sourceHash('2')}` } }, messages: { a: 'Üks', b: 'Kaks' } }

@@ -40,16 +40,39 @@ program can check.
 ## 2. "Ruum", the product, and "ruum", the space
 
 "Ruum" is the product name, and "ruum" is also the approved Estonian word for a space
-(`glossary.md`). So:
+(`glossary.md`). Both may appear in Estonian text; the capital letter tells them apart. Decided by
+the person on 2026-11-09 (decision 0005 B-1).
 
-- Write the product name only where it is clearly the product: the sign-in page ("Logi Ruumi
-  sisse"), the welcome card, the consent screen ("{app} soovib Ruumiga ühenduda"), the brand link,
-  window titles. It keeps its capital letter in every case form: Ruumi, Ruumis, Ruumiga.
-- In running text, write the sentence without the product name. English "Ruum shows it only
-  once" becomes the impersonal "Seda näidatakse ainult üks kord"; "Ruum couldn't do this" becomes
-  "See ei õnnestunud"; "Ruum emailed them" becomes "Talle saadeti e-kiri".
+- **The product is "Ruum"**, with a capital letter, in every case form: Ruumi, Ruumis, Ruumiga.
+  "Logi Ruumi sisse", "{app} soovib Ruumiga ühenduda", "Tere tulemast Ruumi, {name}".
+- **A space is "ruum"**, all lower case, in every case form: ruumi, ruumis, ruumiga, and in
+  compounds: meeskonnaruum, salvestusruum.
+- **A sentence does not start with the common word "ruum".** At the start of a sentence a
+  capital letter would make the space look like the product. Rephrase: put another word first.
+
+  | Not this | This |
+  |---|---|
+  | Ruumil peab olema vähemalt üks omanik. | Igal ruumil peab olema vähemalt üks omanik. |
+  | Ruumi {space} inimesed. | Inimesed ruumis {space}. |
+  | Ruum {space} on jõudnud oma paketi liikmete piirini. | Liikmete arv on jõudnud ruumi {space} paketi piirini. |
+  | Ruumi {space} muudatused ilmuvad siia. | Siia ilmuvad ruumi {space} muudatused. |
+
+  This holds for labels, buttons and headings too, because they start with a capital letter:
+  "Space settings" is „Selle ruumi seaded“, the space name field is „Selle ruumi nimi“, the space
+  picker is „Vali ruum“, the column of spaces is „Asub ruumis“. Starting with "Sinu ruum ..." or
+  "See ruum ..." works when it is true.
+- **Avoid the two words side by side.** "Ruumi ruumid" makes the reader stop. Rephrase first
+  ("Sind kutsutakse Ruumis ühte ruumi" keeps them apart). When no other wording works,
+  "Ruum ruum" is fine.
+- The product name may stand in running text, but an impersonal sentence is often shorter and
+  reads better: English "Ruum shows it only once" becomes "Seda näidatakse ainult üks kord".
 - Never use "ruum" in its everyday sense (room, free space) in the UI: write "vaba koht" or
   "salvestusruum" (storage).
+
+`web/scripts/check-translations.mjs` (rule `ruum`) fails when a sentence or a branch of the
+Estonian catalogue starts with the common word, and when a word "Ruum..." with a capital letter
+stands where the English message does not name the product (that "Ruum" means a space). It warns
+when the two words stand side by side.
 
 ## 3. Grammar around placeholders
 

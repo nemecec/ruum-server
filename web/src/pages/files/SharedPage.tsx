@@ -71,7 +71,7 @@ export function SharedTable({ items, showSpace }: { items: Schemas['SharedItem']
             <Th scope="col">{t('common.name')}</Th>
             {showSpace && (
               <Th scope="col" hideNarrow>
-                {t('shell.space')}
+                {t('shared.space')}
               </Th>
             )}
             <Th scope="col" hideNarrow>

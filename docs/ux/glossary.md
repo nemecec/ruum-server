@@ -40,7 +40,7 @@ separated by " / " or "; " and pair by position; one Estonian entry stands for a
 | Owner / Admin / Member / Guest | The member roles of a space (`memberRole.*`) | Viewer, Editor (for member roles) | Omanik (omanik-) / Administraator (administraator-) / Liige (liige-, liikme-) / Külaline (külali-) |
 | guest | A person outside the space who sees only what is shared with them | external user | külaline (külali-) |
 | invitation, invite | How people join a space | | kutse, kutsuma (kutse-, kutsu-) |
-| Space settings | The admin pages of a space | Admin console, preferences | Ruumi seaded |
+| Space settings | The admin pages of a space | Admin console, preferences | Selle ruumi seaded |
 | Sharing rules | The space-wide switches for links, guests and sharing | policy | Jagamise reeglid (reegl-, reegel-) |
 | Plan | What the space pays for and its limits | quota, limits (alone), subscription | pakett (paket-) |
 | Activity log | The record of events in a space (admins) | audit log, journal | Tegevuslogi (tegevuslogi-) |
@@ -114,7 +114,7 @@ Keep these as they are, in every language, also inside sentences:
 
 | Kind | Words |
 |---|---|
-| Product name | **Ruum** (the name; it is not the Estonian word "ruum" in running text: see `i18n.md`, "Estonian") |
+| Product name | **Ruum** (the name, always with a capital letter; the Estonian word for a space is "ruum" in lower case: see `style-guides/et.md`, section 2) |
 | Other products | Google, Microsoft, Claude, Claude Desktop, Claude Code, ChatGPT, Finder, Explorer, Firefox, Safari, Chrome, macOS, Windows, iPhone |
 | Protocols and formats | MCP, OAuth, WebDAV, CLI, API, JSON, XML, CSV, PDF, HTML, Markdown, SQL, UUID |
 | Database names and words | Postgres, SQLite, SQL keywords (SELECT, WHERE, LIMIT, CREATE TABLE), extension names (postgis, vector, pg_trgm, ...) |

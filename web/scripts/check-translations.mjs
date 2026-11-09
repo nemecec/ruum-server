@@ -18,9 +18,15 @@
 //                 it) and the hash is the start of the SHA-256 of the English message it was made
 //                 from. A different hash means the English changed after the translation: the
 //                 message must be translated again (pipeline step 1).
+// 9. ruum         Estonian only (decision 0005 B-1, docs/ux/style-guides/et.md section 2): "Ruum"
+//                 with a capital letter is the product, "ruum" in lower case is a space. No
+//                 sentence starts with the common word "ruum" (or one of its case forms), and a
+//                 translation has no more words "Ruum..." than the English has "Ruum": a capital
+//                 "Ruum" where the English has no product name means a space.
 //
 // Warnings (they do not fail): a translation longer than the length budget of its message
-// (`maxLength` in src/locales/context/en.json; the visual tests check the real fit).
+// (`maxLength` in src/locales/context/en.json; the visual tests check the real fit); in
+// Estonian, "Ruum" and "ruum" side by side ("Ruum ruum" only when nothing else works).
 //
 // Run:
 //   node scripts/check-translations.mjs              check (part of `npm run lint`); exit code 1 on errors
@@ -115,6 +121,64 @@ export function visibleLength(elements) {
     else n += 8
   }
   return n
+}
+
+/** A word that is "ruum" or one of its forms: ruumi, ruumis, Ruumiga, ... (not meeskonnaruum). */
+const RUUM_WORD = /(^|[^\p{L}])(ruum\p{L}*)/giu
+
+/**
+ * The words that start a sentence, from every branch: the first word of the message, of a branch
+ * at the start of a sentence, and the word after ".", "!" or "?". `start` says whether the
+ * elements begin a sentence; the result says whether a sentence begins after them. A placeholder
+ * is never the start of a sentence for this check: its value is a name or a number.
+ */
+export function sentenceStarts(elements, start = true, out = []) {
+  for (const el of elements) {
+    if (el.type === LITERAL) {
+      const re = /(^|[.!?]\s+)[\s„“"(]*(\p{L}+)/gu
+      for (const m of el.value.matchAll(re)) if (m.index > 0 || m[1] || start) out.push(m[2])
+      start = /[.!?]\s*$/.test(el.value) || (start && el.value.trim() === '')
+    } else if (el.type === TAG) start = sentenceStarts(el.children, start, out)
+    else if (el.type === SELECT || el.type === PLURAL) {
+      // An empty branch ("=0 {}") shows nothing: the sentence goes on after a branch with text.
+      const full = Object.values(el.options).filter((o) => o.value.length)
+      if (full.length) start = full.map((o) => sentenceStarts(o.value, start, out)).some(Boolean)
+    } else start = false
+  }
+  return start
+}
+
+/** The literal texts of a message, from every branch, each as written. */
+function literals(elements, out = []) {
+  for (const el of elements) {
+    if (el.type === LITERAL) out.push(el.value)
+    else if (el.type === TAG) literals(el.children, out)
+    else if (el.type === SELECT || el.type === PLURAL) for (const o of Object.values(el.options)) literals(o.value, out)
+  }
+  return out
+}
+
+/**
+ * Rule 9 for Estonian (decision 0005 B-1). Returns `{ errors, warnings }`, each a list of texts.
+ */
+export function ruumProblems(english, estonian) {
+  const errors = []
+  const warnings = []
+  const starts = []
+  sentenceStarts(estonian, true, starts)
+  for (const word of starts)
+    if (/^ruum/u.test(word)) errors.push(`a sentence starts with the common word "${word}": rephrase it ("Sinu ruum ...", "See ruum ...")`)
+  const count = (texts, re) => texts.reduce((n, t) => n + [...t.matchAll(re)].length, 0)
+  const product = count(literals(english), /(^|[^\p{L}])Ruum($|[^\p{L}])/gu)
+  const capital = literals(estonian).flatMap((t) => [...t.matchAll(RUUM_WORD)].map((m) => m[2]).filter((w) => w.startsWith('R')))
+  if (capital.length > product)
+    errors.push(
+      `"${capital.join('", "')}" with a capital letter is the product, but the English names the product ${product === 0 ? 'nowhere' : `only ${product} time(s)`}: write a space as "ruum", in lower case, and not at the start of a sentence`,
+    )
+  for (const t of literals(estonian))
+    for (const m of t.matchAll(/(^|[^\p{L}])(Ruum\p{L}*\s+ruum\p{L}*|ruum\p{L}*\s+Ruum\p{L}*)/gu))
+      warnings.push(`"${m[2]}": avoid the product and the space side by side`)
+  return { errors, warnings }
 }
 
 /** The cells of a Markdown table row. */
@@ -282,6 +346,13 @@ export function checkCatalogue({ tag, source, catalogue, glossary, context = {} 
     if (!s) fail(key, 'status', 'no status in @metadata.status')
     else if (!STATES.includes(state)) fail(key, 'status', `status "${s}": the state is ${STATES.join(' or ')}`)
     else if (hash !== sourceHash(english)) fail(key, 'status', 'the English changed after this translation: translate it again, then mark it')
+
+    // 9. ruum (Estonian)
+    if (tag === 'et') {
+      const r = ruumProblems(want, have)
+      for (const m of r.errors) fail(key, 'ruum', m)
+      for (const m of r.warnings) warnings.push({ key, rule: 'ruum', message: m })
+    }
 
     // Warning: length budget
     const max = context[key]?.maxLength

@@ -3359,6 +3359,11 @@
       "tone": "neutral",
       "maxLength": 30
     },
+    "shared.space": {
+      "description": "Shared with me page: the items other people shared with you. Column header: the space that the item is in.",
+      "tone": "neutral",
+      "maxLength": 30
+    },
     "shared.when": {
       "description": "Shared with me page: items other people shared with you. Column heading: when it was shared.",
       "tone": "neutral",
