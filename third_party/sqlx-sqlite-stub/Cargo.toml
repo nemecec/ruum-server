@@ -1,0 +1,41 @@
+# A stand-in for `sqlx-sqlite` 0.9.0 (see `[patch.crates-io]` in the root Cargo.toml).
+#
+# Ruum uses sqlx for Postgres only and never turns on its SQLite driver. But Cargo checks the
+# `links = "sqlite3"` rule over optional dependencies too, and sqlx-sqlite 0.9.0 asks for
+# libsqlite3-sys < 0.38. That keeps rusqlite (ruum-dbengine) on libsqlite3-sys 0.37, which
+# bundles SQLite 3.53 (RUSTSEC-2026-0459). This empty crate has the same name, version and
+# feature names and no dependencies, so rusqlite can use libsqlite3-sys 0.39 (SQLite 3.54).
+#
+# Remove it when a released sqlx accepts libsqlite3-sys 0.39 (sqlx main allows < 0.40).
+# Turning on a sqlx `sqlite` feature with this stub fails to build: that is on purpose.
+[package]
+name = "sqlx-sqlite"
+version = "0.9.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+_unstable-all-sqlite-features = []
+_unstable-all-types = []
+_unstable-docs = []
+any = []
+bigdecimal = []
+bundled = []
+chrono = []
+deserialize = []
+json = []
+load-extension = []
+migrate = []
+offline = []
+preupdate-hook = []
+regexp = []
+rust_decimal = []
+sqlx-toml = []
+time = []
+unbundled = []
+unlock-notify = []
+uuid = []

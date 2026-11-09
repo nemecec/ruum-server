@@ -17,7 +17,7 @@ const PROGRESS_STEPS: i32 = 1000;
 
 /// Opens an empty in-memory connection with the guard installed.
 pub(crate) fn open(guard: &Arc<Guard>) -> Result<Connection, EngineError> {
-    let conn = Connection::open_in_memory().map_err(internal)?;
+    let mut conn = Connection::open_in_memory().map_err(internal)?;
     let auth = guard.clone();
     conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
         auth.authorize(ctx)
@@ -219,7 +219,6 @@ fn run_statement(
     }
     let names: Vec<(String, Option<String>)> = stmt
         .columns()
-        .iter()
         .map(|c| {
             (
                 c.name().to_string(),
@@ -229,7 +228,6 @@ fn run_statement(
         .collect();
     let sources: Vec<Option<ColumnRef>> = stmt
         .columns_with_metadata()
-        .into_iter()
         .map(
             |m| match (m.database_name(), m.table_name(), m.origin_name()) {
                 (Some("main"), Some(table), Some(column)) => Some(ColumnRef {
