@@ -6,20 +6,22 @@ things follow `ia.md`; the strings follow `copy.md`.
 
 ## 1. Identity
 
-Ruum keeps people's work and lets agents touch it. The look must say **calm, trustworthy, a
-little warm**.
+Ruum keeps people's work and lets agents touch it. The look must say **calm, trustworthy,
+exact**. The brand is **Graphite** (decision 0005 B-5), built as the first theme package (design
+12.6, `web/src/design/themes/graphite/`).
 
 - **Calm.** Few colours, much space, one primary action per view, no motion that is not feedback.
 - **Trustworthy.** Plain words, the truth about state (saved, uploading, offline), every
   destructive action explains how to get things back, agents are always visible.
-- **A little warm.** Warm neutrals (paper, stone) instead of blue-grey; a deep spruce green as the
-  primary colour; a clay-ochre for agents; rounded but not bubbly corners; sentence case; a human
-  voice in the copy.
+- **Exact.** Cool graphite neutrals; a deep fjord blue as the primary colour; a raspberry plum
+  for agents that appears nowhere else; square corners and thin rules; IBM Plex Sans for text and
+  IBM Plex Mono for sizes, times and keys, so numbers read like facts. The playfulness lives only
+  in the copy: sentence case and a human voice.
 
 **Not the generic AI look.** No purple-to-blue gradients, no sparkle or magic-wand icons for
 agents, no glass blur, no glowing borders, no dark-mode-first neon, no emoji in the UI, no
 "AI-powered" badges. An agent is a worker with a name, not magic: its mark is a small solid
-key glyph in clay, the same everywhere.
+key glyph in plum, the same everywhere.
 
 **Not a copy of another product.** The tokens below replaced the GitHub Primer palette of the
 first UI. Section 6 says where they live in code.
@@ -27,41 +29,44 @@ first UI. Section 6 says where they live in code.
 ## 2. Tokens
 
 The tokens are defined once, in the W3C Design Tokens format, in `web/src/design/tokens/`
-(section 6). Style Dictionary makes them CSS custom properties on `:root`. Components use only
+(section 6), and the default theme package (`web/src/design/themes/graphite/`) gives many of them
+the Graphite values. The tables below are the effective values. Style Dictionary makes them CSS custom properties on `:root`. Components use only
 tokens, never raw values. Dark mode follows `prefers-color-scheme`; a person can force light or
 dark on the Account page (`data-theme` on `<html>`). Every text pair below is checked by
-`docs/ux/tools/contrast.mjs`, which reads the token files (WCAG 2.2: 4.5:1 for text, 3:1 for
-control borders, icons, tag colours and the focus ring). All 76 pairs pass.
+`docs/ux/tools/contrast.mjs` and by the theme validator `web/scripts/check-theme.mjs`, which read
+the token files with the theme over them (WCAG 2.2: 4.5:1 for text, 3:1 for control borders,
+icons, tag colours and the focus ring). All 84 pairs pass; the lowest text pairs are text-faint on
+canvas in light (5.02:1) and text-faint on surface in dark (5.50:1).
 
 ### 2.1 Colour
 
 | Token | Light | Dark | Use |
 |---|---|---|---|
-| `--color-canvas` | `#FAF8F4` | `#161513` | Page background (warm paper) |
-| `--color-surface` | `#FFFFFF` | `#1E1C19` | Cards, panels, dialogs, the list |
-| `--color-sunken` | `#F2EFE9` | `#121110` | Top bar, rail, code, table header, compare background |
-| `--color-border` | `#E0DBD2` | `#37332D` | Dividers and card edges (decorative, no contrast need) |
-| `--color-border-control` | `#8A8377` | `#7D766A` | Borders of inputs, selects, checkboxes (3:1) |
-| `--color-text` | `#24211C` | `#EDE9E2` | Body text, headings |
-| `--color-text-muted` | `#5C564C` | `#ABA497` | Secondary text, metadata |
-| `--color-text-faint` | `#736C61` | `#948D81` | Placeholders, timestamps (still 4.5:1 on surface) |
-| `--color-primary` | `#1D5C57` | `#72C2B9` | Primary buttons, selected nav, focus ring (spruce) |
-| `--color-primary-hover` | `#164844` | `#8FD1C9` | Hover and pressed primary |
-| `--color-on-primary` | `#FFFFFF` | `#0E1D1C` | Text on primary |
-| `--color-primary-soft` | `#E2EEEB` | `#1E3431` | Info notes, selected rows, drop zone |
-| `--color-link` | `#1D5C57` | `#82CBC2` | Links (always underlined in running text) |
-| `--color-focus` | `#1D5C57` | `#72C2B9` | Focus ring |
-| `--color-selected` | `#E2EEEB` | `#1E3431` | Selected row background |
-| `--color-danger` | `#A3301C` | `#F08B74` | Errors, destructive buttons (brick) |
-| `--color-danger-hover` | `#86271A` | `#F4A693` | Hover of danger buttons |
-| `--color-on-danger` | `#FFFFFF` | `#1A0C08` | Text on danger buttons |
-| `--color-danger-soft` | `#F7E6E1` | `#3B201A` | Error note background |
-| `--color-success` | `#2B6439` | `#82C291` | Success text and icons (moss) |
-| `--color-success-soft` | `#E4EFE5` | `#1D2E21` | Success note background |
-| `--color-warning` | `#7F5300` | `#E2B455` | Warnings (unverified app, plan nearly full) |
-| `--color-warning-soft` | `#FAEFD8` | `#33280F` | Warning note background |
-| `--color-agent` | `#8A4718` | `#E9A672` | The agent mark and agent names (clay) |
-| `--color-agent-soft` | `#F5E7DA` | `#3A2A1D` | Agent badge background, agent rows in Activity |
+| `--color-canvas` | `#F6F7F8` | `#0F1215` | Page background (cool graphite) |
+| `--color-surface` | `#FFFFFF` | `#171B20` | Cards, panels, dialogs, the list |
+| `--color-sunken` | `#ECEEF1` | `#0B0D10` | Top bar, rail, code, table header, compare background |
+| `--color-border` | `#D9DDE2` | `#2A3038` | Dividers and card edges (decorative, no contrast need) |
+| `--color-border-control` | `#7B828C` | `#6F7883` | Borders of inputs, selects, checkboxes (3:1) |
+| `--color-text` | `#16191D` | `#E6E9ED` | Body text, headings |
+| `--color-text-muted` | `#4B525B` | `#A3ABB5` | Secondary text, metadata |
+| `--color-text-faint` | `#646B75` | `#8A929C` | Placeholders, timestamps (still 4.5:1 on surface) |
+| `--color-primary` | `#0B5C86` | `#6CB8E6` | Primary buttons, selected nav, focus ring (fjord blue) |
+| `--color-primary-hover` | `#084A6C` | `#8FCBEF` | Hover and pressed primary |
+| `--color-on-primary` | `#FFFFFF` | `#06202E` | Text on primary |
+| `--color-primary-soft` | `#E1EEF6` | `#13293A` | Info notes, selected rows, drop zone |
+| `--color-link` | `#0B5C86` | `#7CC2EC` | Links (always underlined in running text) |
+| `--color-focus` | `#0B5C86` | `#6CB8E6` | Focus ring |
+| `--color-selected` | `#E1EEF6` | `#152A3A` | Selected row background |
+| `--color-danger` | `#B3261E` | `#FF8F85` | Errors, destructive buttons |
+| `--color-danger-hover` | `#921F18` | `#FFA9A1` | Hover of danger buttons |
+| `--color-on-danger` | `#FFFFFF` | `#2A0B08` | Text on danger buttons |
+| `--color-danger-soft` | `#FBE6E4` | `#3A1A18` | Error note background |
+| `--color-success` | `#1D6B45` | `#6FCF97` | Success text and icons |
+| `--color-success-soft` | `#E2F1E8` | `#142B1E` | Success note background |
+| `--color-warning` | `#7D5400` | `#E8B860` | Warnings (unverified app, plan nearly full) |
+| `--color-warning-soft` | `#FBF0D6` | `#30260F` | Warning note background |
+| `--color-agent` | `#8F3F71` | `#E79AC7` | The agent mark and agent names (raspberry plum) |
+| `--color-agent-soft` | `#F6E6F0` | `#36202E` | Agent badge background, agent rows in Activity |
 
 Rules:
 
@@ -89,13 +94,16 @@ Rules:
 In code the type scale is `--font-size-*` and `--font-line-*`, and `--text-*` is the `font`
 shorthand of each step (weight, size, line height, family).
 
-The system font stack: no font download (fast on slow links, nothing sent to a font host, which
-matters for EU customers), and it reads well in every language. Warmth comes from colour, space
-and copy, not from a display face.
+IBM Plex Sans for text and titles, IBM Plex Mono for code, keys, sizes and times (SIL Open Font
+License). The fonts are self-hosted in the theme package (WOFF2, latin and latin-ext: Estonian,
+German, Finnish, Polish), so nothing is sent to a font host, which matters for EU customers. The
+system stacks stay as the fallback.
 
 ```css
---font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
---font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+--font-family-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+--font-family-display: var(--font-family-sans);   /* titles (h1, h2) */
+--font-family-mono: "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+--font-family-numeric: var(--font-family-mono);   /* sizes, times and counts in lists */
 ```
 
 | Token | Size / line height | Weight | Use |
@@ -108,7 +116,7 @@ and copy, not from a display face.
 | `--text-2xl` | 26 / 34 px | 600 | Page titles (h1) on desktop |
 
 Rules: sentence case everywhere (no Title Case, no ALL CAPS except the file extension in a type
-badge). Numbers in tables use `font-variant-numeric: tabular-nums`. Line length of running text at
+badge). Numbers in tables use `--font-family-numeric` and `font-variant-numeric: tabular-nums`. Line length of running text at
 most 72 characters. Text can grow to 200% (browser zoom) without loss of content; the layout
 reflows at 320 CSS px (WCAG 1.4.10).
 
@@ -133,12 +141,12 @@ Layout: rail 224 px, content max 1200 px, details panel 360 px (min 1024 px wind
 
 | Token | Value | Use |
 |---|---|---|
-| `--radius-sm` | 4 px | Badges, tags, checkboxes |
-| `--radius-md` | 8 px | Buttons, inputs, rows on hover |
-| `--radius-lg` | 12 px | Cards, panels, dialogs, toasts |
+| `--radius-sm` | 2 px | Badges, tags, checkboxes |
+| `--radius-md` | 3 px | Buttons, inputs, rows on hover |
+| `--radius-lg` | 4 px | Cards, panels, dialogs, toasts |
 | `--radius-full` | 999 px | Avatars and the space switcher pill |
-| `--shadow-1` | `0 1px 2px rgb(36 33 28 / 0.08)` | Cards (light only; dark uses a border) |
-| `--shadow-2` | `0 8px 24px rgb(36 33 28 / 0.14)` | Dialogs, menus, toasts, the upload panel |
+| `--shadow-1` | `0 1px 2px rgb(22 25 29 / 0.08)` | Cards (light only; dark uses a border) |
+| `--shadow-2` | `0 8px 24px rgb(22 25 29 / 0.14)` | Dialogs, menus, toasts, the upload panel |
 | `--border-1` | `1px solid var(--color-border)` | Dividers |
 
 ### 2.5 Motion
@@ -162,8 +170,9 @@ progress. With `prefers-reduced-motion: reduce`, all transitions become opacity 
 
 ### 2.6 Icons
 
-One outline icon set at 20 px with a 1.5 px stroke (Lucide, MIT licence, as inline SVG; a new
-dependency needs approval, else draw the 20 icons we need). Icons sit beside a text label;
+One outline icon set at 20 px, drawn in `web/src/ui/icon/`. The stroke comes from the tokens
+`--icon-stroke-width` (1.5), `--icon-linecap` (square) and `--icon-linejoin` (miter), the same for
+every line of every icon. Icons sit beside a text label;
 icon-only buttons have an `aria-label` and a tooltip with the same text, and a 44 x 44 px target.
 
 The **agent mark** is the one custom glyph: a solid rounded square with a small key-shaped cut
@@ -848,12 +857,19 @@ can change without touching screens. Built on the branch `w/design-system`.
   - `base.tokens.json`: type, spacing, radius, border widths, sizes, motion, opacity, layers,
     breakpoints. The same in every theme.
   - `color.light.tokens.json` and `color.dark.tokens.json`: the colour sets and the shadows. Both
-    files have the same names. A new theme or brand is one more colour file, with no change to
-    components.
-- **Build:** `npm run tokens` runs Style Dictionary (`web/scripts/build-tokens.mjs`) and writes
-  `web/src/design/generated/tokens.css` (light on `:root`; dark under `prefers-color-scheme`
-  unless `data-theme="light"`, and under `data-theme="dark"`) and `tokens.ts` (the values for
-  code, and `cssVar()`).
+    files have the same names.
+- **Theme packages** (design 12.6): `web/src/design/themes/<id>/` gives new values to these
+  tokens (never new tokens) and adds the wordmark, favicon, app icons and fonts. The default is
+  `graphite`. `web/scripts/check-theme.mjs` validates a package (schema, file types and sizes,
+  token types, SVG shapes, and every contrast pair) and refuses a failing one with the failing
+  pairs listed. A new brand is a new package, with no change to components or screens. The
+  format is in `web/src/design/themes/README.md`.
+- **Build:** `npm run tokens` runs Style Dictionary (`web/scripts/build-tokens.mjs`) over the core
+  tokens with the default theme over them, and writes `web/src/design/generated/tokens.css` (the
+  theme's `@font-face` rules; light on `:root`; dark under `prefers-color-scheme` unless
+  `data-theme="light"`, and under `data-theme="dark"`), `tokens.ts` (the values for code, the
+  theme's name, and `cssVar()`), `brand.ts` (the wordmark, drawn by `Brand`) and the favicon,
+  app icons and web manifest in `web/public/`.
 - **Committed, not built:** the generated files are committed, like `src/api/schema.d.ts`, so
   Vitest, the type check, Vite and Ladle need no build step. `npm run lint` runs
   `build-tokens.mjs --check` and fails when they are out of date (CI runs `npm run lint`).

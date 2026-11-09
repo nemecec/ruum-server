@@ -1,6 +1,8 @@
 # Brand directions
 
-Status: `proposal`, 2026-11-09. Written by the visual designer agent (design 18.4, 12.5). The brand
+Status: `decided`: the person chose **Graphite** (decision 0005 B-5); it is applied as the first
+theme package, `web/src/design/themes/graphite/` (design 12.6). Proposal of 2026-11-09, written by
+the visual designer agent (design 18.4, 12.5). The brand
 direction is a decision of the person: this page and `directions.html` prepare three directions to
 choose from. Nothing here changes the product's tokens or screens.
 
