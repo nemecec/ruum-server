@@ -3639,7 +3639,11 @@ paths:
         `ROLLBACK PREPARED`; hint `remove_transaction_control`), because each request runs in a
         transaction of the platform that holds the options of the request (decision 0004-34 d);
         references to the platform's schemas (`ruum_*`); `public.` or `main.` before a table
-        name (see "Table names"); and on SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension`
+        name (see "Table names"); writes to and schema changes of the system catalog (on
+        Postgres a relation in `pg_catalog`, `information_schema` or another `pg_*` schema, or
+        an unqualified name that starts with `pg_`, such as `UPDATE pg_settings`, also inside
+        `WITH` and `EXPLAIN`; on SQLite `sqlite_schema` and `sqlite_master`; reads of the
+        catalog run); and on SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension`
         and every `PRAGMA` outside the read-only allow-list. These checks are a first line only:
         the engine sessions are built so that such a statement cannot reach another role, file
         or database even if it runs.
