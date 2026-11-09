@@ -42,7 +42,7 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
   expect(secret).toMatch(/^ruum_agent_/)
   await expect(keyDialog).toContainText('Ruum shows it only once.')
   await keyDialog.getByRole('button', { name: 'Done' }).click()
-  await expect(keys.getByRole('listitem').filter({ hasText: 'e2e' })).toContainText('last used never')
+  await expect(keys.getByRole('listitem').filter({ hasText: 'e2e' })).toContainText('never used')
 
   // The agent works through the API with its key, outside the browser.
   const token = await agentToken(secret)
@@ -73,7 +73,7 @@ test('register an agent, create a key, see its activity and undo it', async ({ p
   await page.reload()
   await expect(activity).toContainText(`Created ${folder}`)
   await expect(activity.getByRole('link', { name: folder })).toBeVisible()
-  await expect(keys.getByRole('listitem').filter({ hasText: 'e2e' })).not.toContainText('last used never')
+  await expect(keys.getByRole('listitem').filter({ hasText: 'e2e' })).not.toContainText('never used')
   await page.getByRole('main').getByRole('link', { name: 'Agents', exact: true }).click()
   const agentRow = page.getByRole('row').filter({ has: page.getByRole('link', { name }) })
   await expect(agentRow).toContainText('Active, last used')
