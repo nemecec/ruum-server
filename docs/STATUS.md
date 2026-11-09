@@ -8,7 +8,9 @@ names of actors (decision 0003, `f/followups`), the step 2 specification (decisi
 S-1, the first step 2 cards, the design system and localisation of the web UI), the afternoon
 integration of 2026-11-07 (decision 0003 item 6, the C-1 acceptance, cards E-2, Q-4 and P-2),
 the evening integration (run on 2026-11-08: the browser tests on the build server, sign-in
-providers, the second E-2 fix, cards D-1, T-1 and T-2), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+providers, the second E-2 fix, cards D-1, T-1 and T-2), the night integration of 2026-11-08
+(`f/followups-4`, the new voice and Estonian of `w/voice`, cards K-1 and A-1; run on
+2026-11-09), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -199,7 +201,50 @@ Fixes made during the evening integration:
   `integ/s2-d-1`, `integ/s2-t-1`, `integ/s2-t-2` and `integ/s2-t-2-r` (no force push) and
   deleted from GitHub after the fast-forward. `f/buildbox-browser` needed no rebase.
 
-The digest for the person is `docs/digests/2026-11-07-evening.md` (earlier:
+Night integration (2026-11-08, run into 2026-11-09; each branch rebased onto `main`, checked on
+the build server with `cargo test --workspace` and both suite backends with
+`RUUM_REQUIRE_IMPLEMENTED=1` and `scripts/e2e_browser.sh`, pushed as `integ/...` and green in
+GitHub CI, then fast-forwarded, in this order; linear history, no merge commit, no co-author
+line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `f/followups-4` | re-review-P-2 F-1 to F-3: a delete-hook delivery whose payload does not read is retried (by the hook column), a provider panic is `500 internal` with the backoff and no longer holds a delivery, `DeliveryWorker::run` survives a panic, two mutations; the flaky log tests of Q-4 (a child process and a global test subscriber); `setup.sh` installs the PostgreSQL 17 client. | no panel review file (follow-ups of reviewed findings) |
+| `w/voice` | The English source text and the invitation and share emails in the voice of `docs/ux/copy.md`; `web/src/locales/context/en.json` (description, tone and length budget of each of the 834 messages); `docs/ux/glossary.md`, `docs/ux/style-guides/et.md`, `docs/ux/i18n.md`; the translation check in `npm run lint` (`web/scripts/check-translations.mjs`: ICU, keys, placeholders, plurals, glossary, a status with the hash of the English text); Estonian translated anew (all `machine`); visual references of the new copy. | no panel review file; the UX review panel has not looked at it |
+| `s2/k-1` | Card K-1: `listDatabaseColumns`, `suggestColumnClasses`, `confirmColumnClasses` (three `planned` marks removed, `database.columns_confirmed` written), the catalog sync (on read and every 10 minutes), the rule-based suggester, the memory and Postgres column stores with one conformance suite, five mutations; gate G-1 (the fixture table `plants`); a `user_required` hint that starts with `<public_url>/t/` is kept (C-16). | accepted with conditions C-1 to C-3 (`review-K-1.md`); C-3 done at the merge; one review only |
+| `s2/a-1` | Card A-1: `createDatabaseAccessGrant`, `listDatabaseAccessGrants`, `revokeDatabaseAccessGrant` (three marks removed, `database.grant_created` and `database.grant_revoked` written), the tuples, the grant sweeper, the restore point before `write_live`, the fixture grant (`read_personal` for 8 hours); writes of one tuple serialized on Postgres by an advisory lock; six mutations. | changes requested (R-1 to R-3), fixed, accepted by the second review (`review-A-1.md`, `review-A-1-fix.md`, `review-A-1-2.md`) |
+
+Not merged:
+
+- `s2/q-1` (card Q-1): the second review requested changes (`review-Q-1-2.md` S-1:
+  `set_config` runs through `query_to_xml` and `ts_stat`). The fix is an engine revoke outside
+  Q-1's files (next cards). The branch and its worktree `ruum-server-wt/s2q1` stay.
+- `f/dbhost-review`: no commit past `main`, and the second review did not accept
+  (`review-dbhost-2.md`: a confirmed hole, item 2). The worktree `ruum-server-wt/secfix` stays.
+
+Fixes made during the night integration:
+
+- The rebase of A-1 onto K-1 joined the shared lines (fields `columns`, `masking`, `grants` in
+  that order; both spawn lines of `main.rs`; MCP tool count 57; both event payloads in
+  `routes/changes/tests.rs`; the envelope exemptions in `journal/mod.rs`; the fixture comment)
+  and generated `tools.json` again. Five `DatabaseParts` literals in tests that git merged
+  without a conflict lacked the other card's fields; CI found them on `integ/s2-a-1`, and the
+  fix went into A-1's implementation commit (`integ/s2-a-1-r`).
+- CI: both suite jobs run `databases_classes_api` and `databases_grants_api` (review-K-1 C-3,
+  review-A-1 N-6).
+- `docs/STEP2.md`: the route files of Q-1, K-1, A-1 and A-2 are
+  `crates/ruum-api/src/routes/databases/{query,classes,access}.rs` (wave decision 4).
+- The K-1 wave exceptions that review-K-1 confirms (`ruum-api/src/error.rs`, the four places a
+  new `EventType` touches, the `DatabaseParts` test literals) are taken as `provisional`.
+- On the build server, three cold workspace builds at once ran out of memory (the linker was
+  killed). The checks then ran two at a time with `CARGO_BUILD_JOBS=8` and
+  `CARGO_PROFILE_DEV_DEBUG=line-tables-only`, each with its own data cluster (`pgdata-<key>`,
+  `RUUM_DBENGINE_REQUIRE_POSTGRES=1`).
+- The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
+  `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
+  fast-forward.
+
+The digest for the person is `docs/digests/2026-11-08.md` (earlier: `docs/digests/2026-11-07-evening.md`,
 `docs/digests/2026-11-07-afternoon.md`, `docs/digests/2026-11-07.md`, `docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
 `docs/digests/2026-11-06-evening.md`). The worktrees of the merged branches are removed; the
 branches stay.
@@ -234,9 +279,9 @@ Fixes made during the integration:
 - `web/e2e`: two timing races. `files.e2e.ts` matched any `status` element while the folder
   showed `Loading...`; `auth.setup.e2e.ts` navigated while the sign-out redirect chain still ran.
 
-All 93 step 1 operations of `contracts/openapi.yaml` are built. The 24 step 2 database
-operations are specified and marked `x-ruum-status: planned` (decision 0004-21); they are not
-built yet.
+All 93 step 1 operations of `contracts/openapi.yaml` are built. Of the 24 step 2 database
+operations, 9 are built (cards D-1, K-1 and A-1); the other 15 are marked `x-ruum-status:
+planned` (decision 0004-21).
 
 | Area | What works |
 |---|---|
@@ -384,51 +429,80 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-08, `main` after the evening integration, on the build server)
+## Checks (2026-11-09, `main` after the night integration, on the build server)
 
-Run with `scripts/buildbox/run.sh integ <main> -- ...` (its own Postgres and SpiceDB). `run.sh`
-keeps the file times of the worktree, so after a rebase cargo can reuse a stale test binary on a
-target it built before: the checks first run `find crates contracts migrations -type f -exec
-touch {} +` on the server. The build server's `pg_dump` is version 16, so the checks set
-`RUUM_PG_DUMP` to a wrapper around the `pg_dump` 17 of the `ruum-dev/postgres-data:17` image
-(review-D-1 N-7); without it, four `ruum-dbengine` export tests fail there.
+Run with `scripts/buildbox/run.sh integ-main <main> -- ...` (its own Postgres and SpiceDB) and
+a data cluster of its own (`pgdata-<key>` from `deploy/dev/postgres-data` on a free port, in
+`RUUM_DBHOST_URL`, with `RUUM_DBENGINE_REQUIRE_POSTGRES=1`, so the engine tests never skip).
+The checks first run `find crates contracts migrations -type f -exec touch {} +` on the server
+(`run.sh` keeps file times). The server now has the PostgreSQL 17 client (`f/followups-4`);
+the checks set `RUUM_PG_DUMP=/usr/lib/postgresql/17/bin/pg_dump`. They ran with
+`CARGO_BUILD_JOBS=8` and `CARGO_PROFILE_DEV_DEBUG=line-tables-only`, because three full builds
+at once ran out of memory. An SSH drop after 33 minutes stopped the first run; the rest ran
+detached on the server (`setsid nohup`) and was read from its log.
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
-- `cargo test --workspace`: 607 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
-  ruum-api 47, ruum-cli 4 + 12 (mock server) + 3 (real server), ruum-core 344 + 15
-  (properties), ruum-dbengine 85, ruum-mcp 5 + 15 (server) + 5 (tools contract), ruum-server 5,
-  ruum-testkit 17 + 1 (batch) + 2 (contract) + 1 each (databases_agents, _d1, _guests, _nodes,
-  _statements) + 6 (databases_meta) + 1 (isolation) + 2 (names) + 3 (permissions) + 5
-  (privacy), ruum-webdav 5 + 20.
+- `cargo test --workspace`: 660 passed, 0 failed, 1 ignored (`tenants/mail.rs`, needs SMTP).
 - `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` with `RUUM_SUITE_BACKEND=memory` and
-  `postgres` (the same numbers on both): tenant isolation 354 checks (284 passed, 70 planned),
-  permission matrix 1936 checks (1600 passed, 336 planned), trashed file suite 96/96; database
+  `postgres` (the same numbers on both): tenant isolation 354 checks (304 passed, 50 planned),
+  permission matrix 1936 checks (1696 passed, 240 planned), trashed file suite 96/96; database
   cases d1 11/11 passed, agents 13, guests 3 and statements 7 planned, nodes 5 planned and 3
-  pending (card P-3); privacy suite 99 planned; 0 pending (501), 0 failed. The SpiceDB variant
-  (`RUUM_SUITE_AUTHZ=spicedb`) was not run; CI runs memory authz.
-- `privacy::keys::tests::no_key_in_the_log_memory` (card Q-4) is flaky: it failed in 3 of 10
-  full runs of the `ruum-core` lib tests on the build server ("the capture works": empty log,
-  probably the global callsite cache of `tracing` with parallel tests). It passed in the final
-  run. `f/followups-4`: the case runs in a child process of the test binary, alone, and a
-  global test subscriber ("sometimes" for every callsite) keeps `no_key_in_the_log_postgres`
-  free of the same race; 30 of 30 full runs passed for both. In those runs
-  `sharing::conformance::postgres_add_grant_limits_conform` failed once (1 of 30): its 61 calls
-  can cross the boundary of the fixed 10-minute window of the rate counter.
-- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 56 of 56 mutations
-  killed, none survived or skipped (51 this afternoon; new: the four of D-1 and
-  `dbengine-dbhost-search-path`).
-- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`, against the agent's own Postgres and SpiceDB
-  (`RUUM_DEV_SH` of `run.sh`).
-- `scripts/e2e_browser.sh` (on the build server, on each branch after `f/buildbox-browser`):
-  172 passed, 1 skipped (`sso.e2e.ts`: the shared stack runs no mock provider; CI starts it and
-  requires the test).
-- `web/` (laptop, on `main`): `npm run lint`, `npm run build`, `npx vitest run` (21 files, 289
-  tests), `npm run e2e:typecheck`: pass.
-- GitHub CI: green on `f/buildbox-browser` (`78a0c6e`), `integ/f-sign-in-providers`,
-  `integ/f-rr-fix-e2`, `integ/s2-d-1`, `integ/s2-t-1`, `integ/s2-t-2` and `integ/s2-t-2-r`
-  (`b4a63e8`, the tree of `main` before this documentation commit), each at the first run.
+  pending (card P-3); privacy suite 99 planned; `databases_classes_api` and
+  `databases_grants_api` pass; 0 pending (501), 0 failed. The SpiceDB variant was not run; CI
+  runs memory authz.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 69 of 69 mutations killed, none survived or skipped (56 in the evening; new: two of `f/followups-4`, five of K-1 and six of A-1).
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `scripts/e2e_browser.sh`: 172 passed, 1 skipped (`sso.e2e.ts`: the shared stack runs no mock
+  provider; CI starts it and requires the test).
+- `web/` (laptop, on `main`): `npm run lint` (translation check: 0 errors, 0 warnings, 834
+  `machine`), `npm run build`, `npx vitest run` (23 files, 304 tests), `npm run e2e:typecheck`:
+  pass.
+- GitHub CI: green on `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1` and
+  `integ/s2-a-1-r` (the tree of `main` before this documentation commit), each at the first run.
+- Known flaky: `sharing::conformance::postgres_add_grant_limits_conform` (1 of 30 runs, fixed
+  10-minute rate windows) and the visual `pseudo-locale > share`. Neither failed in this run.
 - Not run at this integration: `scripts/dbhost_check.sh` (CI's unit job runs it), `cargo deny
-  check` and `oasdiff` (CI runs them; the only contract change is the additive C-21 of D-1).
+  check` and `oasdiff` (CI runs them; the contract changes of K-1 and A-1 only remove `planned`
+  marks).
+
+## Next cards (2026-11-09, from `docs/backlog/2026-11-08.md`)
+
+Small, clear fixes that need no person (design 20.3). The IDs are those of the backlog, which
+has the evidence. Each card goes through the normal reviews and gates. In this order:
+
+1. **SEC-1, the masking hole** (S-1, S-4, B-12; branch `f/dbhost-review`, worktree `secfix`):
+   the `ruum_mask` definer functions belong to a role that lens sessions never run as; no value
+   of a type that is not built in is converted inside a definer function (the masking rule
+   itself waits for brief B-2; until then such a column is masked as `secret`, which fails
+   closed); a test of the four steps of `review-dbhost-2.md` item 2 and a mutation; the tests
+   of items 1 and 3; a helper "no role membership changed". Two security reviews.
+2. **Q-1 unblock** (S-2, S-3, S-7): revoke `set_config` from `PUBLIC` in each data database
+   (E-2 `setup.rs`) with an engine test as a viewer role; the names middleware skips the rows
+   of `QueryResult`; DQS off in the bundled SQLite. Then a third review of `s2/q-1`, the CI
+   line for `databases_query_api` (review-Q-1 R-5), and the panel's word on the `isolation.rs`
+   change (R-4, backlog P-8).
+3. **K-1 C-2** (P-2): names over 63 characters in the catalog sync, with a conformance case.
+4. **Step 2 error codes** (P-3): the step 2 codes in `ruum-core/src/error.rs`, `sqlstate` and
+   `Retry-After` in `ApiError`, before Q-2, A-2 and D-2.
+5. **CI and harness** (T-1, T-2, T-10): a meta test that every test kit test binary is named in
+   a CI job; answered statuses must be listed in the contract; suite lines in the job summary.
+6. **Flaky tests** (T-4, T-5, T-6): pin the clock in `postgres_add_grant_limits_conform`; a
+   stable wait for the visual `pseudo-locale > share`; a "known flaky" list in
+   `docs/TESTING.md`.
+7. **Build server** (B-2 to B-7, S-5): `run.sh` starts an own data cluster and sets
+   `RUUM_DBENGINE_REQUIRE_POSTGRES=1`, touches the files it synced, says why it refuses
+   arguments, has `--detach` and a full-check lock, and `--stop` removes `~/targets/<key>-mut*`.
+8. **Mutation check** (B-1): `--prefix`, an ad-hoc `--perl` mutation, a build cache per crate.
+9. **Method** (M-1 to M-8): retro files per pass, report paths instead of report text in task
+   texts, a precondition check before a second review, a reviewer checklist, review and fix
+   templates, a shared-lines checklist and `docs/contract-gaps.md` for planners, gates before
+   cards.
+10. **Translation** (L-3, L-4, L-5): a reviewer agent step for Estonian, visual tests in
+    Estonian, localised emails.
+
+Waiting for the architect panel: P-1 (K-1 C-1, before Q-2), P-4 (contract gaps, one additive
+change), P-5 (a platform principal), P-9 (split D-2). Waiting for the person: briefs B-1 to B-3
+in `docs/digests/2026-11-08.md`.
 
 ## Known gaps
 
@@ -448,10 +522,19 @@ touch {} +` on the server. The build server's `pg_dump` is version 16, so the ch
   Q-4 (tenant pseudonym key) and P-2 (typed node store, delivery worker, reconciler) are
   merged, and so are cards D-1 (`createDatabase`, `getDatabase`, `updateDatabaseManifest`;
   `Services` wires the engines, the tenant keys, the delivery worker and the reconciler), T-1
-  (database acceptance cases) and T-2 (privacy suite). The other 21 database operations count
-  as planned in the suites; the privacy suite is all planned until the operations and the
-  filters of Q-2 and Q-3 land. The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) has had
-  no review. Open notes for later cards: review-D-1 N-2 to N-5, N-8, N-9 (plan check not
+  (database acceptance cases), T-2 (privacy suite), K-1 (column classes) and A-1 (grants). The
+  other 15 database operations count as planned in the suites; the privacy suite is all
+  planned until the operations and the filters of Q-2 and Q-3 land. Card Q-1 is not merged
+  (`review-Q-1-2.md` S-1). The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) had two
+  reviews: the first was not complete (`review-dbhost.md`), the second did not accept
+  (`review-dbhost-2.md`): the search-path part holds, but **a tenant cast on a tenant type runs
+  as `mask` inside `ruum_mask.pseudonym_other`, reads the HMAC key and can replace
+  `ruum_mask.hmac12`** (item 2, proved on the data cluster; no agent reads through the lens
+  yet), and items 1 and 3 have no test. K-1 conditions open: C-1 (the column store and the
+  manifest's `data_classes` drift apart after a person's `updateDatabaseManifest` or
+  `restoreVersion`; before Q-2) and C-2 (a SQLite name over 63 characters stops the Postgres
+  sync; before Q-3); notes N-1 to N-6. A-1 notes N-1 to N-5 and N-7; the create codes
+  `409`/`503` are a contract gap for the panel. Open notes for later cards: review-D-1 N-2 to N-5, N-8, N-9 (plan check not
   atomic, two server processes, `getVersion`/`restoreVersion` of a manifest version);
   review-T-1 N-3 to N-7; review-T-2 N-5 (no public export operation: the panel decides) and
   N-8 (E-3, Q-2 and Q-3 each remove their own entry of `SQLITE_WAITS_FOR` /

@@ -361,7 +361,7 @@ the key or an offline dictionary attack (decision 0004-4; relates to open questi
 
 | | |
 |---|---|
-| Owns | `crates/ruum-core/src/databases/query/`, `crates/ruum-core/src/privacy/` (`mod.rs` by Q-0, `keys.rs` by Q-4), `crates/ruum-api/src/routes/database_query.rs` |
+| Owns | `crates/ruum-core/src/databases/query/`, `crates/ruum-core/src/privacy/` (`mod.rs` by Q-0, `keys.rs` by Q-4), `crates/ruum-api/src/routes/databases/query.rs` |
 | Implements (OpenAPI) | area `query` |
 | Tables | `database_queries` |
 | Notes | One statement per call (parse with `sqlparser` to count statements, find destructive ones, refuse the statements of `statement_not_allowed`, find the restricted columns a write reads or writes (`class_read_required`), and the columns a result reads; new dependency, needs approval). The role kind follows the caller and the grants (table in "The engine security model"). Read-only transaction for `mode: read`; `statement_timeout`; row and size caps. Result JSON with the typed markers (`HiddenValue`, `Pseudonym`, `LiteralValue`). Masking happens in the engine, through the lens, so every clause sees masked values; the query layer only turns masked values into markers, by the class of each result column (the strictest class it reads; unknown -> `personal`; no column read -> `normal`, never masked). Pseudonyms: one function for both engines (HMAC-SHA-256 with the pseudonym key of the database: the tenant key of `tenant_keys`, wrapped by a key in OpenBao, card Q-4, or the key derived from it for a `masked` / `schema_only` branch; in tests a fixed key; `p_` + 12 hex characters). The query log: a person with `view` reads their own entries and those of their own agents; `manage` reads all; agents read their own. Engine errors are sanitized for agents and people without `manage`. The query log stores the normalized statement (literals replaced) and each parameter as a hidden marker, never a pseudonym (decision 0004-24); agents read only their own entries. |
@@ -370,7 +370,7 @@ the key or an offline dictionary attack (decision 0004-4; relates to open questi
 
 | | |
 |---|---|
-| Owns | `crates/ruum-core/src/databases/classes/`, `crates/ruum-api/src/routes/database_classes.rs` |
+| Owns | `crates/ruum-core/src/databases/classes/`, `crates/ruum-api/src/routes/databases/classes.rs` |
 | Implements (OpenAPI) | area `classes` |
 | Tables | `database_columns` |
 | Notes | Catalog sync after each migration, after each schema change through the query API, and on a schedule (new columns start unconfirmed = `personal`; dropped columns get `dropped_at`). Classes follow column identity (Postgres `rel_oid`/`attnum`/`type_oid`; SQLite by parsing the DDL the platform runs): a rename, retype, table swap or rebuild, or a drop and add of the same name clears the confirmation (`unconfirmed_reason`) and removes the key from `data_classes` (a new manifest version by the system). Suggestions store the newest one per column; every suggestion and confirmation goes to the audit log. Confirmation writes a new manifest version (`data_classes`) and rebuilds the lens views. A rule-based suggester (names such as `email`, `phone`, `password`, `token`, `name`, `address`, `note`) as the default for existing data; agents can do better and send their own. The digest lists unconfirmed columns. |
@@ -379,7 +379,7 @@ the key or an offline dictionary attack (decision 0004-4; relates to open questi
 
 | | |
 |---|---|
-| Owns | `crates/ruum-core/src/databases/access/`, `crates/ruum-api/src/routes/database_access.rs` |
+| Owns | `crates/ruum-core/src/databases/access/`, `crates/ruum-api/src/routes/databases/access.rs` |
 | Implements (OpenAPI) | area `access` |
 | Tables | `database_access_grants`, `database_approvals` (subjects `statement`, `migration`, `grant`) |
 | Contract | `contracts/authz/schema.zed`: `draft_branch`, `live_writer`, `personal_reader`, `agent_write_live`, `agent_read_personal` |
@@ -991,7 +991,7 @@ Goal:        queryDatabase for people: one statement, read-only by default, time
              listDatabaseQueries.
 May change:  crates/ruum-core/src/databases/query/ except postgres_mask.rs and sqlite_mask.rs
              (Q-1 declares them empty in query/mod.rs; Q-2 and Q-3 fill them),
-             crates/ruum-api/src/routes/database_query.rs.
+             crates/ruum-api/src/routes/databases/query.rs.
 Done when:   T-1 cases pass; two statements are 422; a write in read mode is read_only_query; the
              statements of statement_not_allowed are 422 (also SET, SET LOCAL, RESET and
              set_config of any option, and transaction-control statements with hint
@@ -1040,7 +1040,7 @@ After:       Q-1, K-1, E-3
 ID:          K-1
 Goal:        Column classes: catalog sync, listDatabaseColumns, suggestColumnClasses,
              confirmColumnClasses (new manifest version), the rule-based suggester.
-May change:  crates/ruum-core/src/databases/classes/, crates/ruum-api/src/routes/database_classes.rs.
+May change:  crates/ruum-core/src/databases/classes/, crates/ruum-api/src/routes/databases/classes.rs.
 Done when:   T-1 cases pass; unconfirmed = personal; only a person confirms; confirmation is a new
              manifest version and an audit entry; the catalog sync keeps classes by column
              identity and resets renamed, retyped, swapped and re-added columns (T-2 rename
@@ -1059,7 +1059,7 @@ After:       D-1, Q-0, C-2
 ID:          A-1
 Goal:        Grants: createDatabaseAccessGrant, listDatabaseAccessGrants, revokeDatabaseAccessGrant;
              the tuples, the sweeper, the restore point before write_live.
-May change:  crates/ruum-core/src/databases/access/grants.rs, routes/database_access.rs.
+May change:  crates/ruum-core/src/databases/access/grants.rs, routes/databases/access.rs.
 Done when:   only the agent's user grants; an expired or revoked grant gives nothing even before the
              sweeper runs (mutation rule); the agent can give a grant back; the hint of
              write_grant_required is the web URL of the prefilled grant prompt (IDs, kind and
@@ -1073,7 +1073,7 @@ Goal:        Approvals: destructive statements (detection, 202 with a pending ap
              requests with planned_columns and classes, grant requests
              (requestDatabaseAccessGrant), decideDatabaseApproval, listPendingDatabaseApprovals,
              one use within 15 minutes.
-May change:  crates/ruum-core/src/databases/access/approvals.rs, routes/database_access.rs.
+May change:  crates/ruum-core/src/databases/access/approvals.rs, routes/databases/access.rs.
 Done when:   DROP, TRUNCATE, DELETE/UPDATE without WHERE from an agent never run without an
              approval; the write_live check comes first (403 before 202) and an approval never
              replaces it; only the agent's user or a person with manage, with the needed right,
