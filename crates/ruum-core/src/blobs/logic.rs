@@ -85,6 +85,35 @@ pub fn not_a_file() -> Error {
     )
 }
 
+/// A write of content or versions on a node that is not a file: `409 conflict` for a typed
+/// node, whose content changes only through its provider's operations (decision 0004-6;
+/// `contracts/providers/README.md`, "Change"), else [`not_a_file`].
+pub fn not_a_file_to_write(kind: crate::nodes::NodeKind) -> Error {
+    if kind == crate::nodes::NodeKind::Typed {
+        api(
+            ErrorCode::Conflict,
+            "the node is a typed node; its content changes only through its own operations",
+            "for a database: updateDatabaseManifest, queryDatabase or a migration",
+        )
+    } else {
+        not_a_file()
+    }
+}
+
+/// A new file in a parent that is not a folder: `409 conflict` for a typed node (only its own
+/// operations make its children, decision 0004-18), else [`not_a_folder`].
+pub fn not_a_folder_for(kind: crate::nodes::NodeKind) -> Error {
+    if kind == crate::nodes::NodeKind::Typed {
+        api(
+            ErrorCode::Conflict,
+            "the parent is a typed node, not a folder; nothing goes inside it",
+            "pass a folder ID as parent_id",
+        )
+    } else {
+        not_a_folder()
+    }
+}
+
 pub fn not_a_folder() -> Error {
     validation(
         "the parent is not a folder",

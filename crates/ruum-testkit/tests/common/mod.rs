@@ -10,7 +10,7 @@
 //!   `RUUM_REQUIRE_IMPLEMENTED=1`. When the card that builds the operations removes their marks,
 //!   the case runs without a change here.
 //! - **pending (blocked)**: a case in [`PENDING`] waits for a named card (for example the
-//!   step 1 rules on typed nodes of card P-3). It does not run and never fails the suite, also
+//!   branches of card D-3). It does not run and never fails the suite, also
 //!   not with `RUUM_REQUIRE_IMPLEMENTED=1`. The card that unblocks it removes its entry.
 //! - **pending (501)**: a handler answered `501`. It fails only with
 //!   `RUUM_REQUIRE_IMPLEMENTED=1`, like in the isolation and permission suites.
@@ -49,43 +49,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// operations, with that card. They do not run, and they never fail the suite (also not with
 /// `RUUM_REQUIRE_IMPLEMENTED=1`). The card named last unblocks the case and removes its line.
 ///
-/// The step 1 operations on a database node (`putContent`, `createUpload`, `restoreVersion`,
-/// `copyNode`, `moveNode`, `createNode`, `trashNode`, `purgeNode`) are built, so these cases
-/// would run as soon as D-1 makes database nodes, and fail until P-3 adds the typed-node rules
-/// in the node stores (decisions 0004-6, 0004-7 and 0004-18; wave 3 plan, notes for T-1).
+/// Card P-3 added the typed-node rules to the node stores (decisions 0004-6, 0004-7 and
+/// 0004-18) and removed its entries. The cases below need database branches, which card D-3
+/// makes (`createDatabaseBranch`); their typed-node rules (a branch stays with its database, a
+/// copy takes no branch, trash and purge take the branches along) are P-3's and are built.
 pub const PENDING: &[(&str, &str)] = &[
-    (
-        "put_content_on_a_database_is_a_conflict",
-        "needs a database node: D-1, P-3",
-    ),
-    (
-        "new_version_upload_on_a_database_is_a_conflict",
-        "needs a database node: D-1, P-3",
-    ),
-    (
-        "restore_version_of_a_database",
-        "needs a database node: D-1, P-3",
-    ),
-    (
-        "copy_of_a_database_never_raises_the_copiers_rights",
-        "needs a database node and the copy hook: D-1, P-3",
-    ),
-    (
-        "children_of_a_database_are_refused",
-        "needs a database node: D-1, P-3",
-    ),
-    ("a_branch_cannot_move_away", "needs branches: D-3, P-3"),
-    (
-        "copy_of_a_database_copies_no_branch",
-        "needs branches and the copy hook: D-3, P-3",
-    ),
+    ("a_branch_cannot_move_away", "needs branches: D-3"),
+    ("copy_of_a_database_copies_no_branch", "needs branches: D-3"),
     (
         "trash_and_purge_take_the_branches_along",
-        "needs branches: D-3, P-3",
-    ),
-    (
-        "guests_copy_a_database_only_with_the_policy",
-        "needs the copy hook: D-1, P-3",
+        "needs branches: D-3",
     ),
 ];
 

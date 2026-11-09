@@ -103,17 +103,24 @@ fn version_write(
 }
 
 /// Restore a version. `POST /v1/nodes/{node_id}/versions/{version_id}/restore` (operationId `restoreVersion`).
+///
+/// A database node restores a manifest version: a new version with the old manifest, through
+/// the rules of `updateDatabaseManifest` (card P-3).
 pub async fn restore_version(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
     p: Result<Path<(Uuid, Uuid)>, PathRejection>,
 ) -> ApiResult<Json<Value>> {
     let (node, version) = path(p)?;
-    let w = state
-        .services
-        .versions
-        .restore(&ctx, NodeId(node), VersionId(version))
-        .await?;
+    let (node, version) = (NodeId(node), VersionId(version));
+    // A database node restores a manifest version through the manifest rules of its type
+    // (card P-3, decision 0004-6); a file restores its content.
+    let databases = &state.services.databases;
+    let w = if databases.is_database(ctx.tenant, node).await? {
+        databases.restore_version(&ctx, node, version).await?
+    } else {
+        state.services.versions.restore(&ctx, node, version).await?
+    };
     Ok(Json(version_write(w)?))
 }
 

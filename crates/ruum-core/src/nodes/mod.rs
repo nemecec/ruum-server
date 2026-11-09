@@ -22,12 +22,23 @@
 //!   ([`rules::decorate`]).
 //! - Typed nodes (section 7.1) come only from the provider operations (`createDatabase`), through
 //!   [`NodeStore::create_typed`]: the node, its first manifest version and its `typed_nodes`
-//!   row in one transaction. The public `createNode` refuses the kind `typed`. The other rules
-//!   of typed nodes (content writes, children, copy, move, trash and purge hooks) are card P-3.
+//!   row in one transaction. The public `createNode` refuses the kind `typed`.
+//! - The rules of typed nodes in the tree (card P-3, decisions 0004-6, 0004-7 and 0004-18;
+//!   [`typed`]): a typed node is not a folder, so `createNode`, `moveNode` and `copyNode` into
+//!   one are `409 conflict`, and a child of a typed node (a database branch) cannot move away
+//!   from it (`409`). A copy does not descend into a typed node (a copy of a database copies
+//!   no branch). A copy of a typed node makes a new typed node in `provisioning` (its manifest
+//!   copied, its `typed_nodes` row) and a `copied` delivery whose `data` is `full` only for a
+//!   person with `manage` on the source, else `masked`. Copy, move, rename, trash, restore and
+//!   purge write one delivery per typed node they touch ([`TypedHooks::provider_for`]), in the
+//!   transaction of the journal entry. The store learns the providers through
+//!   [`NodeStore::set_typed_hooks`]; without hooks it writes no delivery and refuses to copy a
+//!   typed node.
 
 pub mod memory;
 pub mod postgres;
 pub mod rules;
+pub mod typed;
 
 #[cfg(test)]
 mod conformance;
@@ -38,6 +49,7 @@ use crate::error::Result;
 use crate::ids::{NodeId, TenantId, UserId, VersionId};
 use crate::journal::{ChangeInfo, Written};
 use crate::paging::{Page, PageRequest};
+use crate::providers::HookKind;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -318,10 +330,32 @@ pub trait ContentCopy: Send + Sync {
     fn purged(&self, _nodes: &[NodeId]) {}
 }
 
+/// What the nodes area asks of the providers of typed nodes (card P-3, `nodes::TypedHooks` of
+/// `docs/STEP2.md`): which provider gets a lifecycle hook, and the platform rules for a new
+/// typed node that a copy makes. [`crate::providers::hooks::RegistryHooks`] is the real one.
+#[async_trait]
+pub trait TypedHooks: Send + Sync {
+    /// The provider ID of `type_name` when that provider takes `hook`; `None` when the type has
+    /// no provider or the provider does not take the hook (then no delivery is written).
+    fn provider_for(&self, type_name: &str, hook: HookKind) -> Option<String>;
+
+    /// The rules for a new typed node made by a copy, checked before anything is written:
+    /// a guest, or an agent of a guest, only while the tenant policy
+    /// `guests_create_resources` is true (`403 permission_denied`, hint
+    /// `guests_create_resources`; `contracts/providers/README.md`, "Guests and the host plan").
+    async fn check_new_typed(&self, ctx: &Context, type_name: &str) -> Result<()>;
+}
+
 /// The node tree. Every method filters by `ctx.tenant` and checks permissions through
 /// [`crate::authz::Authz`].
 #[async_trait]
 pub trait NodeStore: Send + Sync {
+    /// Sets the hooks of typed nodes (card P-3). Only the first call counts. A store without
+    /// typed nodes ignores it.
+    fn set_typed_hooks(&self, hooks: std::sync::Arc<dyn TypedHooks>) {
+        let _ = hooks;
+    }
+
     /// The root folder of the tenant.
     async fn root(&self, ctx: &Context) -> Result<Node>;
     async fn create(&self, ctx: &Context, req: NewNode) -> Result<Written<Node>>;

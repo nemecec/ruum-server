@@ -212,7 +212,11 @@ async fn node_row(
 /// [`PgContentStore::require_trashed_read`].
 fn check_file(n: &NodeRow, write: bool) -> Result<()> {
     if n.kind != NodeKind::File {
-        return Err(logic::not_a_file());
+        return Err(if write {
+            logic::not_a_file_to_write(n.kind)
+        } else {
+            logic::not_a_file()
+        });
     }
     if write && n.trashed {
         return Err(Error::not_found("node"));
@@ -893,7 +897,7 @@ impl Transfers for PgContentStore {
             }
             UploadTarget::NewFile { .. } => {
                 if n.kind != NodeKind::Folder || n.trashed {
-                    return Err(logic::not_a_folder());
+                    return Err(logic::not_a_folder_for(n.kind));
                 }
                 0
             }
@@ -1070,7 +1074,7 @@ impl Transfers for PgContentStore {
             } => {
                 let p = node_row(&mut tx, ctx.tenant, *parent_id, false).await?;
                 if p.kind != NodeKind::Folder || p.trashed {
-                    return Err(logic::not_a_folder());
+                    return Err(logic::not_a_folder_for(p.kind));
                 }
                 let (n, o) = Self::insert_file(
                     &mut tx,

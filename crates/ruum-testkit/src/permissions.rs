@@ -945,6 +945,34 @@ pub const TRASHED_FILE_READS: &[&str] = &[
     "diffVersions",
 ];
 
+/// The operations that read a database node, checked on a trashed database by [`run_trashed`]
+/// (card P-3: the trashed file suite also covers a database node).
+pub const TRASHED_DATABASE_READS: &[&str] = &["getDatabase"];
+
+/// The rule for a read of a trashed database: the trash rule of the nodes area, as for a file
+/// ([`trashed_read_rule`]), on the database node. A manager reads it (its status is
+/// `suspended`); everyone else gets `404`.
+pub fn trashed_database_rule(op: &'static str) -> Rule {
+    contract_wide(
+        op,
+        Rule::new(
+            "the trash rule: manage on the trashed database, else 404",
+            |who| {
+                if who == Who::Anonymous {
+                    Access::Unauthenticated
+                } else if who
+                    .role_on(Target::Database)
+                    .is_some_and(|r| r >= Role::Manage)
+                {
+                    Access::Allow
+                } else {
+                    Access::Hidden
+                }
+            },
+        ),
+    )
+}
+
 /// The rule for a read of a trashed file (the trash rule of the nodes area, as `getNode`): a
 /// trashed node has left the tree, so only principals with `manage` on it (those who may
 /// restore it) read it; everyone else gets `404`, also with `view` or `edit`.
@@ -968,7 +996,8 @@ pub fn trashed_read_rule(op: &'static str) -> Rule {
 
 /// The trashed-file suite (security review of 2026-11-06): the owner trashes the plan (a file
 /// with versions v1 and v2), then every principal sends the standard requests of
-/// [`TRASHED_FILE_READS`] and of `listChanges`.
+/// [`TRASHED_FILE_READS`] and of `listChanges`. For [`TRASHED_DATABASE_READS`] the owner
+/// trashes the fixture database instead (card P-3).
 ///
 /// - The reads follow [`trashed_read_rule`]. Before the fix, a principal with `view` or `edit`
 ///   (not `manage`) still downloaded the trashed file, got a content URL and listed its
@@ -987,6 +1016,7 @@ pub async fn run_trashed_on(backend: &fixtures::Backend) -> Report {
     let mut report = Report::new(&format!("trashed file suite [{}]", backend.name()));
     let mut ops: Vec<&'static str> = TRASHED_FILE_READS.to_vec();
     ops.push("listChanges");
+    ops.extend(TRASHED_DATABASE_READS);
     let jobs: Vec<(&'static str, Who)> = ops
         .into_iter()
         .flat_map(|op| Who::ALL.iter().map(move |&who| (op, who)))
@@ -1017,9 +1047,11 @@ async fn trashed_check(backend: &fixtures::Backend, op: &'static str, who: Who) 
     // The owner trashes the plan as one request does: with the tenant's freshness floor
     // (decision 0002-4), so a shared SpiceDB engine reads the seed of this world.
     let services = &state.services;
+    let database = TRASHED_DATABASE_READS.contains(&op);
+    let target = if database { t.database } else { t.plan };
     let trashed = ruum_core::authz::with_request_freshness(async {
         ruum_core::authz::load_request_floor(&*services.freshness, t.id).await?;
-        services.nodes.trash(&owner, t.plan, None).await
+        services.nodes.trash(&owner, target, None).await
     })
     .await;
     if let Err(e) = trashed {
@@ -1033,6 +1065,30 @@ async fn trashed_check(backend: &fixtures::Backend, op: &'static str, who: Who) 
     let res = client::send(&app, &req, t.principal(who)).await;
     if op == "listChanges" {
         trashed_feed_outcome(who, t, &res)
+    } else if database {
+        let outcome = evaluate(
+            &trashed_database_rule(op),
+            who,
+            t,
+            w.seeded,
+            &req.sent_text(),
+            &res,
+            &fallback,
+            false,
+        );
+        // A manager reads the trashed database as suspended (decision 0004-18, card P-3).
+        if matches!(outcome, Outcome::Passed)
+            && res.status.is_success()
+            && res
+                .json()
+                .is_some_and(|v| v["status"]["state"] != "suspended")
+        {
+            return Outcome::Failed(format!(
+                "a trashed database is not suspended: {}",
+                res.text()
+            ));
+        }
+        outcome
     } else {
         evaluate(
             &trashed_read_rule(op),

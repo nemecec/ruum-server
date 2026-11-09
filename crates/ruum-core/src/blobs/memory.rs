@@ -193,7 +193,11 @@ impl MemoryContentStore {
     async fn file(&self, ctx: &Context, id: NodeId, role: Role) -> Result<Node> {
         let n = self.node(ctx, id, role).await?;
         if n.kind != NodeKind::File {
-            return Err(logic::not_a_file());
+            return Err(if role >= Role::Edit {
+                logic::not_a_file_to_write(n.kind)
+            } else {
+                logic::not_a_file()
+            });
         }
         if role >= Role::Edit && n.trashed_at.is_some() {
             return Err(Error::not_found("node"));
@@ -573,7 +577,7 @@ impl Transfers for MemoryContentStore {
             } => {
                 let p = self.node(ctx, *parent_id, Role::Edit).await?;
                 if p.kind != NodeKind::Folder || p.trashed_at.is_some() {
-                    return Err(logic::not_a_folder());
+                    return Err(logic::not_a_folder_for(p.kind));
                 }
                 logic::check_file_name(name)?;
                 0

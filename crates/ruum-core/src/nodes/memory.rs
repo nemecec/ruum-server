@@ -12,8 +12,9 @@
 //! [`MemoryNodeStore::set_head`], and copies content for `copyNode` through
 //! [`MemoryNodeStore::set_content_copy`] ([`ContentCopy`]).
 //!
-//! Typed nodes: the store writes their `typed_nodes` rows (and manifest versions) into the
-//! [`MemoryTypedNodeStore`] set with [`MemoryNodeStore::set_typed`].
+//! Typed nodes: the store writes their `typed_nodes` rows (and manifest versions) and their hook
+//! deliveries into the [`MemoryTypedNodeStore`] set with [`MemoryNodeStore::set_typed`], under
+//! the write lock of the change, so a delivery exists exactly when its journal entry does.
 
 use super::rules::{self, ChildKey, TrashWindows};
 use super::*;
@@ -21,7 +22,8 @@ use crate::authz::{self, Authz, ObjectRef, Permission, RelationshipUpdate, tuple
 use crate::error::Error;
 use crate::journal::memory::MemoryJournal;
 use crate::journal::{EventType, NewEntry};
-use crate::providers::store::{MemoryTypedNodeStore, NewTypedNode};
+use crate::providers::store::{MemoryTypedNodeStore, NewDelivery, NewTypedNode};
+use crate::providers::{DataCopy, HookKind};
 use crate::tenants::{Plan, RootCreated, Tenant, TenantStore};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -193,6 +195,7 @@ pub struct MemoryNodeStore {
     tenants: OnceLock<Arc<dyn TenantStore>>,
     content: OnceLock<Arc<dyn ContentCopy>>,
     typed: OnceLock<Arc<MemoryTypedNodeStore>>,
+    hooks: OnceLock<Arc<dyn TypedHooks>>,
     state: Mutex<State>,
     /// Held across a whole write, so the checks and the change of one write see one state.
     writes: tokio::sync::Mutex<()>,
@@ -214,6 +217,7 @@ impl MemoryNodeStore {
             tenants: OnceLock::new(),
             content: OnceLock::new(),
             typed: OnceLock::new(),
+            hooks: OnceLock::new(),
             state: Mutex::new(State::default()),
             writes: tokio::sync::Mutex::new(()),
         }
@@ -295,6 +299,39 @@ impl MemoryNodeStore {
 
     fn st(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("nodes lock")
+    }
+
+    fn hooks(&self) -> Option<&dyn TypedHooks> {
+        self.hooks.get().map(|h| &**h)
+    }
+
+    /// Writes hook deliveries (card P-3). A store without the typed node store writes none.
+    fn enqueue(&self, deliveries: Vec<NewDelivery>) -> Result<()> {
+        let Some(typed) = self.typed.get() else {
+            return Ok(());
+        };
+        for d in deliveries {
+            typed.enqueue(d)?;
+        }
+        Ok(())
+    }
+
+    /// The deliveries of `hook` for the typed nodes among `ids`, from the journal entry
+    /// `change` with `data`.
+    fn deliveries_of(
+        &self,
+        st: &State,
+        ctx: &Context,
+        hook: HookKind,
+        ids: &[NodeId],
+        change: &ChangeInfo,
+        data: &serde_json::Value,
+    ) -> Vec<NewDelivery> {
+        let refs: Vec<(NodeId, String)> = ids
+            .iter()
+            .filter_map(|n| st.rows.get(n).and_then(|r| typed::typed_ref(&r.node)))
+            .collect();
+        typed::deliveries(self.hooks(), ctx, hook, &refs, change.seq, change.at, data)
     }
 
     fn row(&self, tenant: TenantId, id: NodeId) -> Result<Row> {
@@ -414,7 +451,7 @@ impl MemoryNodeStore {
 
     /// Purges a trashed root and everything below it.
     async fn purge_root(&self, ctx: &Context, id: NodeId, expired: bool) -> Result<ChangeInfo> {
-        let (ids, name, links) = {
+        let (ids, name, links, typed_nodes) = {
             let st = self.st();
             let row = st.row(ctx.tenant, id)?;
             let ids = st.subtree(ctx.tenant, id, false);
@@ -423,7 +460,11 @@ impl MemoryNodeStore {
                 .filter_map(|n| st.rows.get(n))
                 .filter_map(|r| Some((rules::member_target(&r.node)?, r.node.parent_id?)))
                 .collect();
-            (ids, row.node.name.clone(), links)
+            let typed_nodes: Vec<(NodeId, String)> = ids
+                .iter()
+                .filter_map(|n| st.rows.get(n).and_then(|r| typed::typed_ref(&r.node)))
+                .collect();
+            (ids, row.node.name.clone(), links, typed_nodes)
         };
         let mut updates = Vec::new();
         for n in &ids {
@@ -443,13 +484,21 @@ impl MemoryNodeStore {
                     )));
                 }
             }
-            self.append(
+            let data = rules::purged_data(&name, ids.len(), expired);
+            let change = self.append(ctx, id, None, EventType::NodePurged, data.clone())?;
+            // Each typed node of the subtree gets its own `purged` (decision 0004-18). The
+            // provider deletes the content; the typed node store forgets the row when the
+            // delivery is delivered.
+            self.enqueue(typed::deliveries(
+                self.hooks(),
                 ctx,
-                id,
-                None,
-                EventType::NodePurged,
-                rules::purged_data(&name, ids.len(), expired),
-            )?
+                HookKind::Purged,
+                &typed_nodes,
+                change.seq,
+                change.at,
+                &data,
+            ))?;
+            change
         };
         self.relate(updates).await?;
         // The versions of purged files go too, so garbage collection can free their chunks.
@@ -519,6 +568,10 @@ impl RootCreated for MemoryNodeStore {
 
 #[async_trait]
 impl NodeStore for MemoryNodeStore {
+    fn set_typed_hooks(&self, hooks: Arc<dyn TypedHooks>) {
+        let _ = self.hooks.set(hooks);
+    }
+
     async fn root(&self, ctx: &Context) -> Result<Node> {
         let root = self
             .st()
@@ -541,9 +594,7 @@ impl NodeStore for MemoryNodeStore {
         let owner = rules::owner_of(ctx)?;
         self.require(ctx, req.parent_id, Role::Edit).await?;
         let parent = self.live(ctx.tenant, req.parent_id)?;
-        if parent.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the parent is not a folder"));
-        }
+        typed::check_parent(&parent.node, "the parent is not a folder")?;
         if let Some(l) = &link {
             self.live(ctx.tenant, l.target)?;
             let p = match l.kind {
@@ -754,7 +805,8 @@ impl NodeStore for MemoryNodeStore {
         let mut rows: Vec<(ChildKey, Node)> = {
             let st = self.st();
             let p = st.live(ctx.tenant, parent)?;
-            if p.node.kind != NodeKind::Folder {
+            // A typed node lists the children its type makes (database branches, card P-3).
+            if p.node.kind != NodeKind::Folder && !typed::is_typed(&p.node) {
                 return Err(rules::invalid("the node is not a folder"));
             }
             st.live_children(ctx.tenant, parent)
@@ -810,13 +862,16 @@ impl NodeStore for MemoryNodeStore {
                 let old = std::mem::replace(&mut r.node.name, name.clone());
                 touch(&mut r.node, ctx);
                 let node = r.node.clone();
+                let data = rules::renamed_data(Some(parent), &old, &name);
                 let change = self.append(
                     ctx,
                     id,
                     Some(node.revision),
                     EventType::NodeRenamed,
-                    rules::renamed_data(Some(parent), &old, &name),
+                    data.clone(),
                 )?;
+                let ds = self.deliveries_of(&st, ctx, HookKind::Renamed, &[id], &change, &data);
+                self.enqueue(ds)?;
                 Ok((node, change))
             }
         };
@@ -844,8 +899,14 @@ impl NodeStore for MemoryNodeStore {
         };
         self.require(ctx, req.parent_id, Role::Edit).await?;
         let dest = self.live(ctx.tenant, req.parent_id)?;
-        if dest.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the new parent is not a folder"));
+        typed::check_parent(&dest.node, "the new parent is not a folder")?;
+        // A child of a typed node (a database branch) stays with it (decision 0004-18).
+        if old_parent != req.parent_id
+            && self
+                .row(ctx.tenant, old_parent)
+                .is_ok_and(|p| typed::is_typed(&p.node))
+        {
+            return Err(typed::child_stays());
         }
         if req.parent_id == id
             || self
@@ -911,13 +972,16 @@ impl NodeStore for MemoryNodeStore {
                         )));
                     }
                 }
+                let data = rules::moved_data(old_parent, req.parent_id, &row.node.name, &name);
                 let change = self.append(
                     ctx,
                     id,
                     Some(node.revision),
                     EventType::NodeMoved,
-                    rules::moved_data(old_parent, req.parent_id, &row.node.name, &name),
+                    data.clone(),
                 )?;
+                let ds = self.deliveries_of(&st, ctx, HookKind::Moved, &[id], &change, &data);
+                self.enqueue(ds)?;
                 Ok((node, change))
             }
         };
@@ -939,9 +1003,7 @@ impl NodeStore for MemoryNodeStore {
         self.require(ctx, id, Role::View).await?;
         self.require(ctx, req.parent_id, Role::Edit).await?;
         let dest = self.live(ctx.tenant, req.parent_id)?;
-        if dest.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the new parent is not a folder"));
-        }
+        typed::check_parent(&dest.node, "the new parent is not a folder")?;
         let sources: Vec<Node> = {
             let st = self.st();
             if req.parent_id == id || st.ancestors(ctx.tenant, req.parent_id)?.contains(&id) {
@@ -949,12 +1011,15 @@ impl NodeStore for MemoryNodeStore {
                     "a folder cannot be copied into itself or its own subtree",
                 ));
             }
-            // Broken links (the target was purged) are not copied.
-            st.subtree(ctx.tenant, id, true)
-                .iter()
-                .filter_map(|n| st.rows.get(n).map(|r| r.node.clone()))
-                .filter(|n| n.link_target.is_none_or(|t| st.row(ctx.tenant, t).is_ok()))
-                .collect()
+            // Broken links (the target was purged) are not copied; a copy does not descend
+            // into a typed node (its branches stay behind, decision 0004-18).
+            typed::copy_sources(
+                st.subtree(ctx.tenant, id, true)
+                    .iter()
+                    .filter_map(|n| st.rows.get(n).map(|r| r.node.clone()))
+                    .filter(|n| n.link_target.is_none_or(|t| st.row(ctx.tenant, t).is_ok()))
+                    .collect(),
+            )
         };
         if sources.first().is_none_or(|n| n.id != id) {
             return Err(rules::invalid(
@@ -968,10 +1033,37 @@ impl NodeStore for MemoryNodeStore {
             )));
         }
         let content = self.content.get().cloned();
-        if content.is_none() && sources.iter().any(|n| n.head_version.is_some()) {
+        if content.is_none()
+            && sources
+                .iter()
+                .any(|n| n.kind == NodeKind::File && n.head_version.is_some())
+        {
             // A store without the versions area (`set_content_copy`; `Services::in_memory` sets
             // it) cannot copy content.
             return Err(Error::not_implemented("copying file content in memory"));
+        }
+        // Typed nodes (card P-3): each copy is a new typed node of the same provider, with the
+        // data that the caller may have (decision 0004-7), after the rules for a new typed node.
+        let mut copies: HashMap<NodeId, (String, DataCopy, serde_json::Value)> = HashMap::new();
+        if sources.iter().any(typed::is_typed) {
+            let (Some(hooks), Some(store)) = (self.hooks.get().cloned(), self.typed.get()) else {
+                return Err(typed::copy_not_available());
+            };
+            for src in sources.iter().filter(|n| typed::is_typed(n)) {
+                let type_name = src.node_type.clone().unwrap_or_default();
+                let provider = hooks
+                    .provider_for(&type_name, HookKind::Copied)
+                    .ok_or_else(typed::copy_not_available)?;
+                hooks.check_new_typed(ctx, &type_name).await?;
+                let manifest = src
+                    .head_version
+                    .and_then(|v| store.manifest(ctx.tenant, v))
+                    .ok_or_else(|| {
+                        Error::Internal("nodes: a typed node without its manifest".into())
+                    })?;
+                let data = typed::copy_data(&*self.authz, self, ctx, src.id).await?;
+                copies.insert(src.id, (provider, data, manifest));
+            }
         }
         // Member links stay member links only where the caller may share the target.
         let targets: Vec<NodeId> = sources.iter().filter_map(rules::member_target).collect();
@@ -1064,32 +1156,89 @@ impl NodeStore for MemoryNodeStore {
             }
         }
         let mut updates = Vec::new();
+        let mut entries: HashMap<NodeId, (ChangeInfo, serde_json::Value)> = HashMap::new();
         for (node, src) in made.iter().skip(1) {
-            self.append(
+            let data = rules::created_data(node, Some(*src));
+            let c = self.append(
                 ctx,
                 node.id,
                 Some(node.revision),
                 EventType::NodeCreated,
-                rules::created_data(node, Some(*src)),
+                data.clone(),
             )?;
+            entries.insert(node.id, (c, data));
         }
         let root = made[0].0.clone();
+        let root_data = rules::copied_data(id, req.parent_id, &root.name, made.len());
         let change = self.append(
             ctx,
             root.id,
             Some(root.revision),
             EventType::NodeCopied,
-            rules::copied_data(id, req.parent_id, &root.name, made.len()),
+            root_data.clone(),
         )?;
+        entries.insert(root.id, (change.clone(), root_data));
         for (node, _) in &made {
             updates.extend(rules::created_tuples(node));
+        }
+        // Typed copies: the manifest version, the `typed_nodes` row (provisioning), the
+        // `version.created` entry and the `copied` delivery, one unit per copy.
+        if let (Some(hooks), Some(store)) = (self.hooks.get().cloned(), self.typed.get()) {
+            for (src, (node, _)) in sources.iter().zip(made.iter()) {
+                let Some((provider, data, manifest)) = copies.get(&src.id) else {
+                    continue;
+                };
+                let version = VersionId::new();
+                let (bytes, hash) = typed_manifest_bytes(manifest);
+                store.insert(
+                    NewTypedNode {
+                        tenant_id: ctx.tenant,
+                        node_id: node.id,
+                        provider: provider.clone(),
+                        type_name: node.node_type.clone().unwrap_or_default(),
+                        desired_version: version,
+                    },
+                    manifest.clone(),
+                    ctx.actor.into(),
+                )?;
+                {
+                    let mut st = self.st();
+                    let r = st.row_mut(ctx.tenant, node.id)?;
+                    r.node.head_version = Some(version);
+                }
+                self.append(
+                    ctx,
+                    node.id,
+                    Some(node.revision),
+                    EventType::VersionCreated,
+                    typed_version_created_data(version, None, bytes.len(), &hash),
+                )?;
+                let (entry, entry_data) = entries
+                    .get(&node.id)
+                    .ok_or_else(|| Error::Internal("nodes: a copy without its entry".into()))?;
+                if let Some(seq) = entry.seq
+                    && let Some(d) = typed::delivery(
+                        &*hooks,
+                        ctx,
+                        HookKind::Copied,
+                        src.id,
+                        node.node_type.as_deref().unwrap_or_default(),
+                        seq,
+                        entry.at,
+                        entry_data,
+                        Some((node.id, *data)),
+                    )
+                {
+                    store.enqueue(d)?;
+                }
+            }
         }
         self.relate(updates).await?;
         // The content after the node entries: each copied file gets one version with the head
         // of its source (shared chunks) and its own `version.created` entry.
         if let Some(content) = content {
             for (src, (node, _)) in sources.iter().zip(made.iter()) {
-                if src.head_version.is_some() {
+                if src.kind == NodeKind::File && src.head_version.is_some() {
                     let head = content.copy_head(ctx, src, node.id).await?;
                     let mut st = self.st();
                     let r = st.row_mut(ctx.tenant, node.id)?;
@@ -1157,13 +1306,17 @@ impl NodeStore for MemoryNodeStore {
                     }
                 }
                 let node = st.row(ctx.tenant, id)?.node.clone();
+                let data = rules::trashed_data(node.parent_id, &node.name, ids.len(), purge_after);
                 let change = self.append(
                     ctx,
                     id,
                     Some(node.revision),
                     EventType::NodeTrashed,
-                    rules::trashed_data(node.parent_id, &node.name, ids.len(), purge_after),
+                    data.clone(),
                 )?;
+                // Each typed node of the subtree gets its own `trashed` (decision 0004-18).
+                let ds = self.deliveries_of(&st, ctx, HookKind::Trashed, &ids, &change, &data);
+                self.enqueue(ds)?;
                 Ok((node, change))
             }
         };
@@ -1198,8 +1351,13 @@ impl NodeStore for MemoryNodeStore {
             Some(p) => {
                 self.require(ctx, p, Role::Edit).await?;
                 let d = self.live(ctx.tenant, p)?;
-                if d.node.kind != NodeKind::Folder {
-                    return Err(rules::invalid("the new parent is not a folder"));
+                typed::check_parent(&d.node, "the new parent is not a folder")?;
+                if p != old_parent
+                    && self
+                        .row(ctx.tenant, old_parent)
+                        .is_ok_and(|o| typed::is_typed(&o.node))
+                {
+                    return Err(typed::child_stays());
                 }
                 p
             }
@@ -1291,13 +1449,16 @@ impl NodeStore for MemoryNodeStore {
                     t, old_parent,
                 )));
             }
+            let data = rules::restored_data(dest, old_parent, &name);
             let change = self.append(
                 ctx,
                 id,
                 Some(node.revision),
                 EventType::NodeRestored,
-                rules::restored_data(dest, old_parent, &name),
+                data.clone(),
             )?;
+            let ds = self.deliveries_of(&st, ctx, HookKind::Restored, &members, &change, &data);
+            self.enqueue(ds)?;
             (node, change)
         };
         self.relate(updates).await?;

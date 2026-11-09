@@ -11,6 +11,8 @@
 //! - [`PlatformApi`]: what a provider calls on the platform (`/v1/provider-api/...`: the status
 //!   report and the check API), plus the upload of an export file.
 //! - [`registry::ProviderRegistry`]: which provider owns which node type.
+//! - [`hooks::RegistryHooks`]: the hooks of the node stores (card P-3): which provider takes
+//!   which lifecycle hook of a typed node.
 //! - [`memory::MemoryProvider`]: the in-memory test provider; [`memory::MemoryPlatform`]: a
 //!   platform double that records reports and uploads.
 //! - `conformance`: one suite that every provider passes.
@@ -22,6 +24,7 @@
 //! `null` is written as `null`, an optional field that is not set is left out.
 
 pub mod deliveries;
+pub mod hooks;
 pub mod memory;
 pub mod postgres;
 pub mod reconciler;

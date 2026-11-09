@@ -429,7 +429,10 @@ fn engine_of(manifest: &Value) -> Option<EngineKind> {
 #[async_trait]
 impl DatabaseStore for MemoryDatabaseStore {
     async fn manifest(&self, tenant: TenantId, version: VersionId) -> Result<Option<Value>> {
-        Ok(self.lock().manifests.get(&(tenant, version)).cloned())
+        // A copy's first manifest version is written by the node store (card P-3) into the
+        // typed node store only.
+        let own = self.lock().manifests.get(&(tenant, version)).cloned();
+        Ok(own.or_else(|| self.typed.manifest(tenant, version)))
     }
 
     fn created(&self, node: &Node, version: VersionId, manifest: &Value) {
@@ -1013,11 +1016,25 @@ impl DatabaseStore for PgDatabaseStore {
 
     async fn delete(&self, tenant: TenantId, node: NodeId) -> Result<Option<DatabaseRow>> {
         let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
-        sqlx::query("delete from database_roles where tenant_id = $1 and node_id = $2")
-            .bind(tenant)
-            .bind(node)
-            .execute(&mut *tx)
-            .await?;
+        // The rows that refer to the database go first, in the order of their foreign keys
+        // (card P-3: a purge of a database with columns, grants or a query log deletes it).
+        for stmt in [
+            "delete from database_queries where tenant_id = $1 and node_id = $2",
+            "delete from database_approvals where tenant_id = $1 and node_id = $2",
+            "delete from database_access_grants where tenant_id = $1 and node_id = $2",
+            "delete from database_restores where tenant_id = $1 \
+             and (node_id = $2 or target_node_id = $2)",
+            "delete from database_migrations where tenant_id = $1 and node_id = $2",
+            "delete from database_restore_points where tenant_id = $1 and node_id = $2",
+            "delete from database_columns where tenant_id = $1 and node_id = $2",
+            "delete from database_roles where tenant_id = $1 and node_id = $2",
+        ] {
+            sqlx::query(stmt)
+                .bind(tenant)
+                .bind(node)
+                .execute(&mut *tx)
+                .await?;
+        }
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "delete from databases where tenant_id = $1 and node_id = $2 \
              returning {DATABASE_COLUMNS}"
@@ -1291,6 +1308,78 @@ impl DatabaseService {
         })
     }
 
+    /// `restoreVersion` of a database node (card P-3, decision 0004-6): a new manifest version
+    /// with the content of an older one, through the rules of [`Self::update_manifest`]
+    /// (`manage`, the manifest rules, an agent may not change `data_classes`, not in the
+    /// trash), then the provider applies it. It never changes data. Returns the new version.
+    pub async fn restore_version(
+        &self,
+        ctx: &Context,
+        id: NodeId,
+        version: VersionId,
+    ) -> Result<Written<Version>> {
+        refuse_share_link(ctx)?;
+        let d = &self.deps;
+        self.database_node(ctx, id).await?;
+        authz::require(&*d.authz, &*d.nodes, ctx, id, Role::Manage).await?;
+        self.find_version(ctx.tenant, id, version)
+            .await?
+            .ok_or_else(|| Error::not_found("version"))?;
+        let old = d
+            .store
+            .manifest(ctx.tenant, version)
+            .await?
+            .ok_or_else(|| Error::not_found("version"))?;
+        let written = self
+            .update_manifest(
+                ctx,
+                id,
+                UpdateManifest {
+                    manifest: old,
+                    label: None,
+                },
+                None,
+            )
+            .await?;
+        let new = written.value.manifest_version_id;
+        let v = self
+            .find_version(ctx.tenant, id, new)
+            .await?
+            .ok_or_else(|| Error::Internal(format!("database {id}: the new version is missing")))?;
+        Ok(Written {
+            value: v,
+            change: written.change,
+        })
+    }
+
+    /// A manifest version of a database node, by its ID.
+    async fn find_version(
+        &self,
+        tenant: TenantId,
+        id: NodeId,
+        version: VersionId,
+    ) -> Result<Option<Version>> {
+        let mut page = PageRequest {
+            cursor: None,
+            limit: Some(200),
+        };
+        for _ in 0..1000 {
+            let got = self
+                .deps
+                .store
+                .list_versions(tenant, id, VersionFilter::default(), page.clone())
+                .await?;
+            if let Some(v) = got.items.into_iter().find(|v| v.id == version) {
+                return Ok(Some(v));
+            }
+            match got.next_cursor {
+                Some(c) => page.cursor = Some(c),
+                None => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether a node of the tenant is a database node (its `typed_nodes` row names the
     /// type `database`). No permission check: the API uses it to send `listVersions` of a
     /// database node to [`Self::list_versions`], which checks `view`.
@@ -1474,7 +1563,8 @@ pub fn throwaway_kek() -> Arc<dyn crate::privacy::keys::KeyWrapper> {
     ))
 }
 
-/// The provider registry (with `ruum.database`) and the service over these stores.
+/// The provider registry (with `ruum.database`) and the service over these stores. Hands the
+/// typed-node hooks of the registry to `nodes` (card P-3; only the first call counts).
 pub fn build(
     nodes: Arc<dyn NodeStore>,
     authz: Arc<dyn Authz>,
@@ -1498,6 +1588,12 @@ pub fn build(
     }));
     let mut registry = crate::providers::ProviderRegistry::new();
     registry.register(provider.clone())?;
+    let registry = Arc::new(registry);
+    // The node store writes the lifecycle hooks of typed nodes to these providers (card P-3).
+    nodes.set_typed_hooks(Arc::new(crate::providers::hooks::RegistryHooks::new(
+        registry.clone(),
+        tenants.clone(),
+    )));
     let service = DatabaseService::new(DatabaseDeps {
         nodes,
         authz,
@@ -1512,7 +1608,7 @@ pub fn build(
         grants: parts.grants.clone(),
         queries: query::QueryDeps::new(parts.queries.clone(), parts.keys.clone()),
     });
-    Ok((Arc::new(registry), Arc::new(service)))
+    Ok((registry, Arc::new(service)))
 }
 
 /// Builds the database provider, the provider registry and the service over the current
@@ -2153,17 +2249,43 @@ mod tests {
                 .await
                 .is_ok()
         );
-        // A copy is refused (no data leaves; P-3 builds copies).
+        // A copy of the purged database makes nothing (card P-3 builds copies: the hook starts
+        // the work, and the copy fails without a source).
         let mut copied = hook(HookKind::Copied);
-        copied.target_node_id = Some(NodeId::new());
+        let target = NodeId::new();
+        copied.target_node_id = Some(target);
+        assert!(
+            !provider
+                .deliver_hook(crate::providers::DeliveryId::new(), copied)
+                .await
+                .unwrap()
+                .is_done()
+        );
+        for _ in 0..100 {
+            if provider
+                .get_typed_node_status(w.team.id, target)
+                .await
+                .is_ok_and(|s| s.state != ProviderState::Provisioning)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
-            code(
-                provider
-                    .deliver_hook(crate::providers::DeliveryId::new(), copied)
-                    .await
-            )
-            .0,
-            422
+            provider
+                .get_typed_node_status(w.team.id, target)
+                .await
+                .unwrap()
+                .state,
+            ProviderState::Failed
+        );
+        assert!(
+            w.handles
+                .databases
+                .get(w.team.id, target)
+                .await
+                .unwrap()
+                .is_none()
         );
         for source in [
             Source::Copy {

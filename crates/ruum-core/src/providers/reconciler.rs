@@ -16,6 +16,8 @@
 //!   the node): the reconciler sends `createTypedNode` again with the newest manifest, its
 //!   author and a delivery ID from the tenant, the node and the version
 //!   ([`create_delivery_id`]), so the provider makes the content once (review-P-2 note 2).
+//!   A copy (card P-3: a `copied` delivery has the node as its target) is never created again
+//!   this way: its content comes with the hook, so the row waits and the round logs a warning.
 //! - A `4xx` other than `408` and `429` from `applyManifest` or `createTypedNode` is final: the
 //!   row moves to `failed` (reason `manifest_refused` or `create_refused`), so it is not sent
 //!   again in every round. A new manifest version or a person starts it again.
@@ -190,6 +192,19 @@ impl Reconciler {
                     .await
                 {
                     Ok(s) => s,
+                    // A copy (card P-3) gets its content with the `copied` hook, never with
+                    // `createTypedNode`: an empty database in its place would hide that the copy
+                    // is lost. The row waits (a warning each round) for the hook or a person.
+                    Err(e)
+                        if row.observed_version.is_none()
+                            && e.to_api().code == ErrorCode::NotFound
+                            && self
+                                .store
+                                .is_copy_target(row.tenant_id, row.node_id)
+                                .await? =>
+                    {
+                        return Err(e);
+                    }
                     Err(e)
                         if row.observed_version.is_none()
                             && e.to_api().code == ErrorCode::NotFound =>

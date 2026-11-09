@@ -125,6 +125,8 @@ trait Backend: Send + Sync {
     async fn events(&self, w: &World) -> Vec<String>;
     /// The `typed_nodes` row of a node.
     fn typed(&self) -> &dyn crate::providers::store::TypedNodeStore;
+    /// The hooks that the node store has (card P-3).
+    fn hooks(&self) -> &SuiteHooks;
 }
 
 fn code<T: std::fmt::Debug>(r: Result<T>) -> &'static str {
@@ -197,6 +199,7 @@ async fn run(w: &World, b: &dyn Backend) {
     tags(w, b).await;
     search(w, b).await;
     typed_nodes(w, b).await;
+    typed_rules(w, b).await;
     let events = b.events(w).await;
     for e in [
         "node.created",
@@ -308,6 +311,253 @@ async fn typed_nodes(w: &World, b: &dyn Backend) {
         ..folder(dbs.id, "public")
     };
     assert_eq!(code(s.create(&m, public).await), "422");
+}
+
+/// The [`TypedHooks`] of the suite: every hook of the type `database` goes to `ruum.database`;
+/// guests make typed nodes only while `guests_may` is set.
+#[derive(Default)]
+struct SuiteHooks {
+    guests_may: std::sync::atomic::AtomicBool,
+    guests: Vec<UserId>,
+}
+
+#[async_trait]
+impl TypedHooks for SuiteHooks {
+    fn provider_for(&self, type_name: &str, _hook: crate::providers::HookKind) -> Option<String> {
+        (type_name == "database").then(|| "ruum.database".to_string())
+    }
+
+    async fn check_new_typed(&self, ctx: &Context, type_name: &str) -> Result<()> {
+        let guest = ctx
+            .actor
+            .effective_user()
+            .is_some_and(|u| self.guests.contains(&u));
+        if guest && !self.guests_may.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(crate::providers::hooks::guests_may_not_create(type_name))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Takes every due delivery of the store and answers "delivered".
+struct Recorder(std::sync::Mutex<Vec<crate::providers::store::PendingDelivery>>);
+
+#[async_trait]
+impl crate::providers::store::Deliver for Recorder {
+    async fn deliver(
+        &self,
+        d: &crate::providers::store::PendingDelivery,
+    ) -> crate::providers::store::DeliveryOutcome {
+        self.0.lock().unwrap().push(d.clone());
+        crate::providers::store::DeliveryOutcome::Delivered
+    }
+}
+
+/// The deliveries that are due now (tenant A), in the order the worker takes them; each one is
+/// delivered.
+async fn drain(b: &dyn Backend) -> Vec<crate::providers::HookDelivery> {
+    let rec = Recorder(std::sync::Mutex::new(Vec::new()));
+    while b.typed().deliver_next(&rec).await.unwrap().is_some() {}
+    rec.0
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.hook)
+        .collect()
+}
+
+/// Card P-3 (decisions 0004-6, 0004-7 and 0004-18): a typed node is not a folder; a copy of a
+/// typed node is a new typed node with a `copied` delivery and the data the caller may have; a
+/// copy does not descend into a typed node; trash, restore, rename and purge write one
+/// delivery per typed node, in the transaction of the journal entry; a purged typed node is
+/// gone for everyone, and its row goes when the provider took `purged`.
+async fn typed_rules(w: &World, b: &dyn Backend) {
+    use crate::providers::{HookKind, ProviderState};
+    let m = w.user(w.member);
+    let g = w.user(w.guest);
+    let s = b.nodes();
+    let _ = drain(b).await;
+    let area = mk(b, &m, folder(w.root, "P-3")).await;
+    let manifest =
+        serde_json::json!({ "engine": "sqlite", "version": "3", "plan": "shared-small" });
+    let db = s
+        .create_typed(
+            &m,
+            NewTyped {
+                parent_id: area.id,
+                name: "Plants".into(),
+                node_type: "database".into(),
+                provider: "ruum.database".into(),
+                manifest: manifest.clone(),
+                on_conflict: OnConflict::Fail,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let plan = mk(b, &m, file(area.id, "plan.txt")).await;
+    let other = mk(b, &m, folder(area.id, "Other")).await;
+
+    // Nothing goes inside a typed node: 409, and nothing lands there.
+    for req in [folder(db.id, "inside"), file(db.id, "inside.txt")] {
+        assert_eq!(code(s.create(&m, req).await), "409");
+    }
+    let into = |parent| MoveRequest {
+        parent_id: parent,
+        name: None,
+        on_conflict: OnConflict::Fail,
+        if_revision: None,
+    };
+    assert_eq!(code(s.move_node(&m, plan.id, into(db.id)).await), "409");
+    let copy_to = |parent| CopyRequest {
+        parent_id: parent,
+        name: None,
+        on_conflict: OnConflict::Rename,
+    };
+    assert_eq!(code(s.copy(&m, plan.id, copy_to(db.id)).await), "409");
+    assert!(
+        drain(b).await.is_empty(),
+        "a refused change wrote a delivery"
+    );
+    // A typed node lists only the children its type makes: none here.
+    assert!(names(b, &m, db.id).await.is_empty());
+
+    // A rename writes `renamed` with the journal entry.
+    let renamed = s
+        .rename(&m, db.id, "Plants 2".into(), OnConflict::Fail, None)
+        .await
+        .unwrap();
+    let d = drain(b).await;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].hook, HookKind::Renamed);
+    assert_eq!(d[0].node_id, Some(db.id));
+    assert_eq!(d[0].seq, renamed.change.seq);
+    assert_eq!(d[0].tenant_id, w.a);
+
+    // A manager's copy: a new typed node in provisioning with the source's manifest, and a
+    // `copied` delivery with data `full`.
+    let copied = s.copy(&m, db.id, copy_to(other.id)).await.unwrap();
+    let copy = copied.value;
+    assert_eq!(copy.kind, NodeKind::Typed);
+    assert_eq!(copy.node_type.as_deref(), Some("database"));
+    assert_ne!(copy.id, db.id);
+    let head = copy.head_version.expect("the copy has a manifest version");
+    assert_ne!(Some(head), db.head_version);
+    let row = b.typed().get(w.a, copy.id).await.unwrap().expect("the row");
+    assert_eq!(row.state, ProviderState::Provisioning);
+    assert_eq!(row.desired_version, head);
+    assert_eq!(row.provider, "ruum.database");
+    let d = drain(b).await;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].hook, HookKind::Copied);
+    assert_eq!(d[0].node_id, Some(db.id));
+    assert_eq!(d[0].target_node_id, Some(copy.id));
+    assert_eq!(d[0].seq, copied.change.seq);
+    assert_eq!(
+        crate::nodes::typed::data_of(&d[0]),
+        crate::providers::DataCopy::Full
+    );
+    assert!(b.events(w).await.iter().any(|e| e == "version.created"));
+
+    // A guest with edit: refused while the policy is off (403, nothing made); allowed after,
+    // with masked data (edit is not manage).
+    w.grant(area.id, Role::Edit, w.guest).await;
+    let before = names(b, &m, other.id).await.len();
+    assert_eq!(code(s.copy(&g, db.id, copy_to(other.id)).await), "403");
+    assert_eq!(names(b, &m, other.id).await.len(), before);
+    assert!(drain(b).await.is_empty());
+    let hooks = b.hooks();
+    hooks
+        .guests_may
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let guest_copy = s.copy(&g, db.id, copy_to(other.id)).await.unwrap().value;
+    let d = drain(b).await;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].target_node_id, Some(guest_copy.id));
+    assert_eq!(
+        crate::nodes::typed::data_of(&d[0]),
+        crate::providers::DataCopy::Masked
+    );
+    hooks
+        .guests_may
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // A copy of the folder: the database is copied as a typed node (`copied` from the entry of
+    // its new node), the file as a file.
+    let box_ = mk(b, &m, folder(w.root, "P-3 box")).await;
+    let folder_copy = s.copy(&m, area.id, copy_to(box_.id)).await.unwrap().value;
+    let inside = s
+        .get_by_path(&m, &format!("P-3 box/{}/Plants 2", folder_copy.name))
+        .await
+        .unwrap();
+    assert_eq!(inside.kind, NodeKind::Typed);
+    assert!(b.typed().get(w.a, inside.id).await.unwrap().is_some());
+    let d = drain(b).await;
+    let copies: Vec<_> = d.iter().filter(|h| h.hook == HookKind::Copied).collect();
+    assert!(
+        copies
+            .iter()
+            .any(|h| h.node_id == Some(db.id) && h.target_node_id == Some(inside.id)),
+        "{d:?}"
+    );
+    assert!(copies.iter().all(|h| h.seq.is_some()));
+
+    // Trash takes every typed node of the subtree: one `trashed` each; restore: `restored`.
+    let trashed = s.trash(&m, other.id, None).await.unwrap();
+    let d = drain(b).await;
+    let mut got: Vec<NodeId> = d
+        .iter()
+        .filter(|h| h.hook == HookKind::Trashed)
+        .filter_map(|h| h.node_id)
+        .collect();
+    got.sort();
+    let mut want = vec![copy.id, guest_copy.id];
+    want.sort();
+    assert_eq!(got, want, "{d:?}");
+    assert!(d.iter().all(|h| h.seq == trashed.change.seq));
+    s.restore(&m, other.id, RestoreRequest::default())
+        .await
+        .unwrap();
+    let d = drain(b).await;
+    let mut got: Vec<NodeId> = d
+        .iter()
+        .filter(|h| h.hook == HookKind::Restored)
+        .filter_map(|h| h.node_id)
+        .collect();
+    got.sort();
+    assert_eq!(got, want, "{d:?}");
+
+    // Purge: `purged` for the database; the node is gone for everyone at once (404, in no
+    // trash list), and its row goes when the provider took the hook.
+    s.trash(&m, db.id, None).await.unwrap();
+    let _ = drain(b).await;
+    let purged = s.purge(&w.user(w.owner), db.id).await.unwrap();
+    for who in [w.owner, w.member] {
+        assert_eq!(code(s.get(&w.user(who), db.id).await), "404");
+    }
+    let trash = s
+        .list_trash(&w.user(w.owner), true, PageRequest::default())
+        .await
+        .unwrap();
+    assert!(trash.items.iter().all(|n| n.id != db.id));
+    assert_eq!(
+        code(
+            s.restore(&w.user(w.owner), db.id, RestoreRequest::default())
+                .await
+        ),
+        "404"
+    );
+    assert!(b.typed().get(w.a, db.id).await.unwrap().is_some());
+    let d = drain(b).await;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].hook, HookKind::Purged);
+    assert_eq!(d[0].node_id, Some(db.id));
+    assert_eq!(d[0].seq, purged.change.seq);
+    assert!(b.typed().get(w.a, db.id).await.unwrap().is_none());
+    assert_eq!(code(s.get(&w.user(w.owner), db.id).await), "404");
+    // The copies are untouched.
+    assert!(s.get(&m, copy.id).await.is_ok());
 }
 
 async fn names_and_tree(w: &World, b: &dyn Backend) {
@@ -1241,6 +1491,7 @@ struct Mem {
     search: crate::search::memory::MemorySearch,
     journal: Arc<MemoryJournal>,
     typed: Arc<crate::providers::store::MemoryTypedNodeStore>,
+    hooks: Arc<SuiteHooks>,
 }
 
 #[async_trait]
@@ -1263,6 +1514,9 @@ impl Backend for Mem {
     }
     fn typed(&self) -> &dyn crate::providers::store::TypedNodeStore {
         &*self.typed
+    }
+    fn hooks(&self) -> &SuiteHooks {
+        &self.hooks
     }
 }
 
@@ -1291,6 +1545,11 @@ async fn memory_stores_conform() {
     nodes.set_tenants(w.tenants.clone());
     let typed = Arc::new(crate::providers::store::MemoryTypedNodeStore::new());
     nodes.set_typed(typed.clone());
+    let hooks = Arc::new(SuiteHooks {
+        guests: vec![w.guest, w.viewer],
+        ..SuiteHooks::default()
+    });
+    nodes.set_typed_hooks(hooks.clone());
     nodes.root_created(&tenant(w.a, w.root), w.owner);
     nodes.root_created(&tenant(w.b, w.root_b), w.owner_b);
     let tags = Arc::new(crate::tags::memory::MemoryTagStore::new(
@@ -1307,6 +1566,7 @@ async fn memory_stores_conform() {
         search,
         journal,
         typed,
+        hooks,
     };
     run(&w, &b).await;
 }
@@ -1319,6 +1579,7 @@ struct Pg {
     search: crate::search::postgres::PgSearch,
     pool: PgPool,
     typed: crate::providers::postgres::PgTypedNodeStore,
+    hooks: Arc<SuiteHooks>,
 }
 
 #[async_trait]
@@ -1345,6 +1606,9 @@ impl Backend for Pg {
     }
     fn typed(&self) -> &dyn crate::providers::store::TypedNodeStore {
         &self.typed
+    }
+    fn hooks(&self) -> &SuiteHooks {
+        &self.hooks
     }
 }
 
@@ -1425,6 +1689,11 @@ async fn postgres_stores_conform(pool: PgPool) {
     w.seed().await;
     seed_pg(&pool, &w).await;
     let nodes = Arc::new(postgres::PgNodeStore::new(pool.clone(), w.authz.clone()));
+    let hooks = Arc::new(SuiteHooks {
+        guests: vec![w.guest, w.viewer],
+        ..SuiteHooks::default()
+    });
+    nodes.set_typed_hooks(hooks.clone());
     let b = Pg {
         tags: crate::tags::postgres::PgTagStore::new(pool.clone(), w.authz.clone(), nodes.clone()),
         search: crate::search::postgres::PgSearch::new(
@@ -1435,6 +1704,7 @@ async fn postgres_stores_conform(pool: PgPool) {
         nodes,
         pool: pool.clone(),
         typed: crate::providers::postgres::PgTypedNodeStore::new(pool.clone()),
+        hooks,
     };
     run(&w, &b).await;
     // Every outbox row was applied after its commit.

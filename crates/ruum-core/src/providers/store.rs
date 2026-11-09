@@ -347,6 +347,10 @@ pub trait TypedNodeStore: Send + Sync {
     /// Makes a waiting delivery due now (an operator's "retry now"). False when the delivery
     /// does not exist in this tenant or has ended.
     async fn retry_now(&self, tenant: TenantId, delivery: DeliveryId) -> Result<bool>;
+
+    /// True when a `copied` delivery of this tenant has `node` as its target: the node is a
+    /// copy, and its content comes with that hook, never with `createTypedNode` (card P-3).
+    async fn is_copy_target(&self, tenant: TenantId, node: NodeId) -> Result<bool>;
 }
 
 // ----------------------------------------------------------------------------- the platform
@@ -497,6 +501,14 @@ impl MemoryTypedNodeStore {
         );
         inner.rows.insert(key, row.clone());
         Ok(row)
+    }
+
+    /// The manifest of a version of a typed node in this tenant.
+    pub fn manifest(&self, tenant: TenantId, version: VersionId) -> Option<Value> {
+        self.lock()
+            .versions
+            .get(&(tenant, version))
+            .map(|(_, m, _)| m.clone())
     }
 
     /// Writes a new manifest version of a typed node and makes it the desired one.
@@ -684,6 +696,19 @@ impl TypedNodeStore for MemoryTypedNodeStore {
                 }
             }
         }
+        // A delivered `purged` ends the typed node on the platform side too: its row and its
+        // manifest versions go (card P-3; the Postgres store deletes the rows that the purge
+        // kept for the provider).
+        if outcome == DeliveryOutcome::Delivered
+            && pending.kind == HookKind::Purged
+            && let Some(node) = pending.hook.node_id
+        {
+            let tenant = pending.tenant_id;
+            inner.rows.remove(&(tenant, node));
+            inner
+                .versions
+                .retain(|(t, _), (n, _, _)| !(*t == tenant && *n == node));
+        }
         Ok(Some((pending, outcome)))
     }
 
@@ -696,6 +721,12 @@ impl TypedNodeStore for MemoryTypedNodeStore {
             }
             _ => Ok(false),
         }
+    }
+
+    async fn is_copy_target(&self, tenant: TenantId, node: NodeId) -> Result<bool> {
+        Ok(self.lock().deliveries.iter().any(|((t, _), d)| {
+            *t == tenant && d.hook.hook == HookKind::Copied && d.hook.target_node_id == Some(node)
+        }))
     }
 }
 
@@ -2000,6 +2031,43 @@ mod tests {
         assert_eq!(st.attempts, 2);
     }
 
+    /// Card P-3: a copy's content comes with its `copied` hook. The store knows the target of a
+    /// `copied` delivery per tenant, and the reconciler never sends `createTypedNode` (an empty
+    /// node) for a copy that the provider does not know; a node that is no copy is created
+    /// again as before.
+    async fn copies_are_never_created_again(h: &dyn Harness) {
+        let s = h.store();
+        let platform = Arc::new(StoreReports::new(
+            s.clone(),
+            Arc::new(MemoryPlatform::new()),
+        ));
+        let provider = Arc::new(MemoryProvider::new(platform));
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone()).unwrap();
+        let rec = Reconciler::new(s.clone(), Arc::new(registry)).settled(Duration::ZERO);
+        let (a, b) = (h.tenant().await, h.tenant().await);
+        let (source, _) = node_with_row(h, a).await;
+        let (target, _) = node_with_row(h, a).await;
+        let (lost, _) = node_with_row(h, a).await;
+        let mut copied = delivery(HookKind::Copied, a, Some(source));
+        copied.hook.target_node_id = Some(target);
+        let (written, _) = h.enqueue(copied).await;
+        assert!(written);
+        assert!(s.is_copy_target(a, target).await.unwrap());
+        assert!(!s.is_copy_target(a, source).await.unwrap());
+        assert!(!s.is_copy_target(a, lost).await.unwrap());
+        assert!(!s.is_copy_target(b, target).await.unwrap());
+        let round = rec.run_once().await.unwrap();
+        // `lost` (no copy) is created again; `target` waits for its hook; `source` too was
+        // never made by this provider, and is no copy target: created again.
+        assert_eq!(round.created, 2, "{round:?}");
+        assert!(round.errors >= 1, "{round:?}");
+        assert!(
+            provider.get_typed_node_status(a, target).await.is_err(),
+            "the copy got an empty node from createTypedNode"
+        );
+    }
+
     macro_rules! suite {
         ($($case:ident),* $(,)?) => {
             mod memory_runs {
@@ -2033,6 +2101,7 @@ mod tests {
         workers_never_deliver_one_row_twice,
         the_worker_delivers_through_the_registry,
         a_delete_hook_is_retried_after_a_4xx,
+        copies_are_never_created_again,
     );
 
     // -------------------------------------------------------------- re-review-P-2 cases

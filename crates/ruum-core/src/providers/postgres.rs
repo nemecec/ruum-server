@@ -95,6 +95,72 @@ pub async fn enqueue(conn: &mut PgConnection, d: &NewDelivery) -> Result<bool> {
     Ok(done.rows_affected() == 1)
 }
 
+/// After a delivered `purged`: deletes what the purge of a typed node kept for its provider
+/// (card P-3). The purge transaction cannot delete the `nodes` and `versions` rows of a typed
+/// node while the provider's rows (`databases` and the rows that refer to it) still refer to
+/// its `typed_nodes` row, so it keeps them as a hidden tombstone: in the trash, under the tenant
+/// root, with no relationship (404 for everyone, in no trash list, never restored). The
+/// provider deletes its rows when it takes the hook; then this deletes the `typed_nodes` row,
+/// the manifest versions and the node, in the transaction that records the delivery. When a
+/// row of the provider still refers to the node, nothing is deleted (a savepoint), a warning
+/// is logged, and the tombstone stays hidden.
+async fn finish_purge(conn: &mut PgConnection, tenant: TenantId, node: NodeId) -> Result<()> {
+    let tombstone: bool = sqlx::query_scalar(
+        "select exists (select 1 from nodes where tenant_id = $1 and id = $2 \
+         and kind = 'typed' and trashed_at is not null)",
+    )
+    .bind(tenant)
+    .bind(node)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !tombstone {
+        return Ok(());
+    }
+    sqlx::query("savepoint ruum_finish_purge")
+        .execute(&mut *conn)
+        .await?;
+    let mut failed = None;
+    for stmt in [
+        "delete from typed_nodes where tenant_id = $1 and node_id = $2",
+        "update nodes set head_version = null where tenant_id = $1 and id = $2",
+        "delete from versions where tenant_id = $1 and node_id = $2",
+        "delete from nodes where tenant_id = $1 and id = $2",
+    ] {
+        if let Err(e) = sqlx::query(stmt)
+            .bind(tenant)
+            .bind(node)
+            .execute(&mut *conn)
+            .await
+        {
+            failed = Some(e);
+            break;
+        }
+    }
+    match failed {
+        None => {
+            sqlx::query("release savepoint ruum_finish_purge")
+                .execute(&mut *conn)
+                .await?;
+        }
+        Some(e) => {
+            sqlx::query("rollback to savepoint ruum_finish_purge")
+                .execute(&mut *conn)
+                .await?;
+            let code = match &e {
+                sqlx::Error::Database(d) => d.code().map(|c| c.to_string()),
+                _ => None,
+            };
+            tracing::warn!(
+                %tenant,
+                %node,
+                sqlstate = ?code,
+                "the purged typed node keeps its tombstone: a row still refers to it"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The store on Postgres.
 #[derive(Clone, Debug)]
 pub struct PgTypedNodeStore {
@@ -384,6 +450,11 @@ impl TypedNodeStore for PgTypedNodeStore {
                 .bind(delivery.0)
                 .execute(&mut *tx)
                 .await?;
+                if kind == HookKind::Purged
+                    && let Some(node) = pending.hook.node_id
+                {
+                    finish_purge(&mut tx, tenant, node).await?;
+                }
             }
             DeliveryOutcome::Retry { error, after } => {
                 sqlx::query(
@@ -413,6 +484,20 @@ impl TypedNodeStore for PgTypedNodeStore {
         }
         tx.commit().await?;
         Ok(Some((pending, outcome)))
+    }
+
+    async fn is_copy_target(&self, tenant: TenantId, node: NodeId) -> Result<bool> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let found: bool = sqlx::query_scalar(
+            "select exists (select 1 from provider_deliveries where tenant_id = $1 \
+             and hook = 'copied' and target_node_id = $2)",
+        )
+        .bind(tenant)
+        .bind(node)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(found)
     }
 
     async fn retry_now(&self, tenant: TenantId, delivery: DeliveryId) -> Result<bool> {

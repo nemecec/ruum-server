@@ -8,6 +8,13 @@
 //! engine ([`crate::authz::outbox::apply_after_commit`]); the worker retries what fails.
 //! Permission checks run on the engine before the transaction.
 //!
+//! Typed nodes (card P-3): the hook deliveries of a change go into `provider_deliveries` in its
+//! transaction ([`crate::providers::postgres::enqueue`]). A purge cannot delete the `nodes` and
+//! `versions` rows of a typed node while its provider's rows refer to its `typed_nodes` row, so
+//! it keeps them as a hidden tombstone (in the trash, under the tenant root, with no
+//! relationship and no trash root of its own); the delivery worker deletes them after the
+//! provider took the `purged` hook (`providers::postgres`, `finish_purge`).
+//!
 //! Names are unique among the live children of a folder by the index `nodes_live_name_key`
 //! (`lower(name)`); a race on a name ends in `name_taken`. The trigger
 //! `nodes_link_target_check` refuses a link target of another tenant.
@@ -20,11 +27,13 @@ use crate::error::{ApiError, Error, ErrorCode};
 use crate::ids::PrincipalId;
 use crate::journal::postgres::{append, begin_tenant};
 use crate::journal::{EventType, NewEntry};
+use crate::providers::store::NewDelivery;
+use crate::providers::{DataCopy, HookKind};
 use crate::tenants::{MemberRole, Plan};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, PgPool, Row};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 /// The columns that [`node_of`] reads (with the table alias `n`).
@@ -320,6 +329,7 @@ fn from_micros(t: i64) -> OffsetDateTime {
 pub struct PgNodeStore {
     pool: PgPool,
     authz: Arc<dyn Authz>,
+    hooks: OnceLock<Arc<dyn TypedHooks>>,
 }
 
 impl std::fmt::Debug for PgNodeStore {
@@ -336,7 +346,23 @@ struct Tx {
 
 impl PgNodeStore {
     pub fn new(pool: PgPool, authz: Arc<dyn Authz>) -> Self {
-        Self { pool, authz }
+        Self {
+            pool,
+            authz,
+            hooks: OnceLock::new(),
+        }
+    }
+
+    fn hooks(&self) -> Option<&dyn TypedHooks> {
+        self.hooks.get().map(|h| &**h)
+    }
+
+    /// Writes hook deliveries in the transaction of their journal entry (card P-3).
+    async fn enqueue(t: &mut Tx, deliveries: Vec<NewDelivery>) -> Result<()> {
+        for d in deliveries {
+            crate::providers::postgres::enqueue(&mut t.tx, &d).await?;
+        }
+        Ok(())
     }
 
     async fn begin(&self, ctx: &Context) -> Result<Tx> {
@@ -532,19 +558,41 @@ impl PgNodeStore {
                 t.updates.push(RelationshipUpdate::Delete(rel));
             }
         }
+        // Typed nodes stay as hidden tombstones until their provider took `purged` (module
+        // docs): under the tenant root (their parents go now), in the trash with the root as
+        // their trash root (so no trash list shows them and no restore finds them).
+        let typed_refs: Vec<(NodeId, String)> = rows
+            .iter()
+            .filter_map(|r| typed::typed_ref(&r.node))
+            .collect();
+        let typed_ids: Vec<Uuid> = typed_refs.iter().map(|(n, _)| n.0).collect();
+        if !typed_ids.is_empty() {
+            sqlx::query(
+                "update nodes set parent_id = r.id, trash_root = r.id, purge_after = null \
+                 from nodes r where nodes.tenant_id = $1 and nodes.id = any($2) \
+                 and r.tenant_id = $1 and r.parent_id is null",
+            )
+            .bind(ctx.tenant.0)
+            .bind(&typed_ids)
+            .execute(&mut *t.tx)
+            .await?;
+        }
         for stmt in [
             "delete from node_tags where tenant_id = $1 and node_id = any($2)",
             "delete from share_index where tenant_id = $1 and node_id = any($2)",
             "delete from grants where tenant_id = $1 and node_id = any($2)",
             "delete from share_links where tenant_id = $1 and node_id = any($2)",
             "delete from uploads where tenant_id = $1 and (node_id = any($2) or parent_id = any($2))",
-            "update nodes set head_version = null where tenant_id = $1 and id = any($2)",
-            "delete from versions where tenant_id = $1 and node_id = any($2)",
-            "delete from nodes where tenant_id = $1 and id = any($2)",
+            "update nodes set head_version = null where tenant_id = $1 and id = any($2) \
+             and not (id = any($3))",
+            "delete from versions where tenant_id = $1 and node_id = any($2) \
+             and not (node_id = any($3))",
+            "delete from nodes where tenant_id = $1 and id = any($2) and not (id = any($3))",
         ] {
             sqlx::query(stmt)
                 .bind(ctx.tenant.0)
                 .bind(&ids)
+                .bind(&typed_ids)
                 .execute(&mut *t.tx)
                 .await?;
         }
@@ -558,15 +606,20 @@ impl PgNodeStore {
                     )));
             }
         }
-        let change = Self::journal(
-            &mut t,
+        let data = rules::purged_data(&root.node.name, rows.len(), expired);
+        let change =
+            Self::journal(&mut t, ctx, id, None, EventType::NodePurged, data.clone()).await?;
+        // Each typed node of the subtree gets its own `purged` (decision 0004-18).
+        let ds = typed::deliveries(
+            self.hooks(),
             ctx,
-            id,
-            None,
-            EventType::NodePurged,
-            rules::purged_data(&root.node.name, rows.len(), expired),
-        )
-        .await?;
+            HookKind::Purged,
+            &typed_refs,
+            change.seq,
+            change.at,
+            &data,
+        );
+        Self::enqueue(&mut t, ds).await?;
         self.commit(ctx, t).await?;
         Ok(change)
     }
@@ -583,6 +636,10 @@ fn touch_sql(a: usize, b: usize, c: usize) -> String {
 
 #[async_trait]
 impl NodeStore for PgNodeStore {
+    fn set_typed_hooks(&self, hooks: Arc<dyn TypedHooks>) {
+        let _ = self.hooks.set(hooks);
+    }
+
     async fn root(&self, ctx: &Context) -> Result<Node> {
         let mut c = self.conn(ctx).await?;
         let sql =
@@ -607,9 +664,7 @@ impl NodeStore for PgNodeStore {
         let owner = rules::owner_of(ctx)?;
         self.require(ctx, req.parent_id, Role::Edit).await?;
         let parent = self.live(ctx, req.parent_id).await?;
-        if parent.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the parent is not a folder"));
-        }
+        typed::check_parent(&parent.node, "the parent is not a folder")?;
         if let Some(l) = &link {
             self.live(ctx, l.target).await?;
             let p = match l.kind {
@@ -840,7 +895,8 @@ impl NodeStore for PgNodeStore {
         let after = page.cursor.as_ref().map(ChildKey::parse).transpose()?;
         self.require(ctx, parent, Role::View).await?;
         let p = self.live(ctx, parent).await?;
-        if p.node.kind != NodeKind::Folder {
+        // A typed node lists the children its type makes (database branches, card P-3).
+        if p.node.kind != NodeKind::Folder && !typed::is_typed(&p.node) {
             return Err(rules::invalid("the node is not a folder"));
         }
         let limit = page.limit() as usize;
@@ -959,15 +1015,27 @@ impl NodeStore for PgNodeStore {
             .fetch_one(&mut *t.tx)
             .await
             .map_err(name_error(&name))?;
+        let data = rules::renamed_data(Some(parent), &row.node.name, &name);
         let change = Self::journal(
             &mut t,
             ctx,
             id,
             Some(revision),
             EventType::NodeRenamed,
-            rules::renamed_data(Some(parent), &row.node.name, &name),
+            data.clone(),
         )
         .await?;
+        let refs: Vec<(NodeId, String)> = typed::typed_ref(&row.node).into_iter().collect();
+        let ds = typed::deliveries(
+            self.hooks(),
+            ctx,
+            HookKind::Renamed,
+            &refs,
+            change.seq,
+            change.at,
+            &data,
+        );
+        Self::enqueue(&mut t, ds).await?;
         self.commit(ctx, t).await?;
         let node = self.row(ctx, id).await?.node;
         Ok(Written {
@@ -990,8 +1058,15 @@ impl NodeStore for PgNodeStore {
         };
         self.require(ctx, req.parent_id, Role::Edit).await?;
         let dest = self.live(ctx, req.parent_id).await?;
-        if dest.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the new parent is not a folder"));
+        typed::check_parent(&dest.node, "the new parent is not a folder")?;
+        // A child of a typed node (a database branch) stays with it (decision 0004-18).
+        if old_parent != req.parent_id
+            && self
+                .row(ctx, old_parent)
+                .await
+                .is_ok_and(|p| typed::is_typed(&p.node))
+        {
+            return Err(typed::child_stays());
         }
         if req.parent_id == id || self.ancestors(ctx, req.parent_id).await?.contains(&id) {
             return Err(rules::invalid(
@@ -1076,15 +1151,27 @@ impl NodeStore for PgNodeStore {
                 }
             }
         }
+        let data = rules::moved_data(old_parent, req.parent_id, &row.node.name, &name);
         let change = Self::journal(
             &mut t,
             ctx,
             id,
             Some(revision),
             EventType::NodeMoved,
-            rules::moved_data(old_parent, req.parent_id, &row.node.name, &name),
+            data.clone(),
         )
         .await?;
+        let refs: Vec<(NodeId, String)> = typed::typed_ref(&row.node).into_iter().collect();
+        let ds = typed::deliveries(
+            self.hooks(),
+            ctx,
+            HookKind::Moved,
+            &refs,
+            change.seq,
+            change.at,
+            &data,
+        );
+        Self::enqueue(&mut t, ds).await?;
         self.commit(ctx, t).await?;
         let node = self.row(ctx, id).await?.node;
         Ok(Written {
@@ -1100,9 +1187,7 @@ impl NodeStore for PgNodeStore {
         self.require(ctx, id, Role::View).await?;
         self.require(ctx, req.parent_id, Role::Edit).await?;
         let dest = self.live(ctx, req.parent_id).await?;
-        if dest.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the new parent is not a folder"));
-        }
+        typed::check_parent(&dest.node, "the new parent is not a folder")?;
         if req.parent_id == id || self.ancestors(ctx, req.parent_id).await?.contains(&id) {
             return Err(rules::invalid(
                 "a folder cannot be copied into itself or its own subtree",
@@ -1123,6 +1208,8 @@ impl NodeStore for PgNodeStore {
             }
             tx.commit().await?;
         }
+        // A copy does not descend into a typed node (its branches stay, decision 0004-18).
+        let sources = typed::copy_sources(sources);
         if sources.first().is_none_or(|n| n.id != id) {
             return Err(rules::invalid(
                 "the link target is gone; a broken link is not copied",
@@ -1133,6 +1220,23 @@ impl NodeStore for PgNodeStore {
                 "a copy makes at most {} nodes",
                 rules::MAX_COPY_NODES
             )));
+        }
+        // Typed nodes (card P-3): each copy is a new typed node of the same provider, with the
+        // data that the caller may have (decision 0004-7), after the rules for a new typed node.
+        let mut copies: HashMap<NodeId, (String, DataCopy)> = HashMap::new();
+        if sources.iter().any(typed::is_typed) {
+            let Some(hooks) = self.hooks.get().cloned() else {
+                return Err(typed::copy_not_available());
+            };
+            for src in sources.iter().filter(|n| typed::is_typed(n)) {
+                let type_name = src.node_type.clone().unwrap_or_default();
+                let provider = hooks
+                    .provider_for(&type_name, HookKind::Copied)
+                    .ok_or_else(typed::copy_not_available)?;
+                hooks.check_new_typed(ctx, &type_name).await?;
+                let data = typed::copy_data(&*self.authz, self, ctx, src.id).await?;
+                copies.insert(src.id, (provider, data));
+            }
         }
         let targets: Vec<NodeId> = sources.iter().filter_map(rules::member_target).collect();
         let views = rules::caller_view(&*self.authz, self, ctx, &targets).await?;
@@ -1219,32 +1323,133 @@ impl NodeStore for PgNodeStore {
             Self::insert(&mut t, &ins).await?;
             made.push((node, src.id));
         }
+        let mut entries: HashMap<NodeId, (ChangeInfo, serde_json::Value)> = HashMap::new();
         for (node, src) in made.iter().skip(1) {
-            Self::journal(
+            let data = rules::created_data(node, Some(*src));
+            let c = Self::journal(
                 &mut t,
                 ctx,
                 node.id,
                 Some(node.revision),
                 EventType::NodeCreated,
-                rules::created_data(node, Some(*src)),
+                data.clone(),
             )
             .await?;
+            entries.insert(node.id, (c, data));
         }
         let root_id = made[0].0.id;
+        let root_data = rules::copied_data(id, req.parent_id, &root_name, made.len());
         let change = Self::journal(
             &mut t,
             ctx,
             root_id,
             Some(1),
             EventType::NodeCopied,
-            rules::copied_data(id, req.parent_id, &root_name, made.len()),
+            root_data.clone(),
         )
         .await?;
+        entries.insert(root_id, (change.clone(), root_data));
         // Each copied file gets one version with the head of its source (shared chunks), the
         // `version.created` entry and the new head, in this transaction (the versions area).
         for (src, (node, _)) in sources.iter().zip(made.iter()) {
-            if src.head_version.is_some() {
+            if src.kind == NodeKind::File && src.head_version.is_some() {
                 crate::blobs::postgres::copy_head(&mut t.tx, ctx, src.id, node.id).await?;
+            }
+        }
+        // Each typed copy: its manifest version (the source's manifest), its head, its
+        // `typed_nodes` row (provisioning), the `version.created` entry and the `copied`
+        // delivery, in this transaction (the deferred trigger `nodes_typed_row_check`).
+        if let Some(hooks) = self.hooks.get().cloned() {
+            for (src, (node, _)) in sources.iter().zip(made.iter()) {
+                let Some((provider, data)) = copies.get(&src.id) else {
+                    continue;
+                };
+                let head = src
+                    .head_version
+                    .ok_or_else(|| Error::Internal("nodes: a typed node without a head".into()))?;
+                let (manifest, size, hash): (Vec<u8>, i64, Vec<u8>) = sqlx::query_as(
+                    "select manifest, size_bytes, content_hash from versions \
+                     where tenant_id = $1 and id = $2 and node_id = $3 \
+                     and encoding = 'typed_manifest_v1'",
+                )
+                .bind(ctx.tenant.0)
+                .bind(head.0)
+                .bind(src.id.0)
+                .fetch_optional(&mut *t.tx)
+                .await?
+                .ok_or_else(|| {
+                    Error::Internal("nodes: a typed node without its manifest".into())
+                })?;
+                let version = VersionId::new();
+                let now = crate::now();
+                sqlx::query(
+                    "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
+                     content_hash, content_type, actor_kind, actor, on_behalf_of, created_at, \
+                     updated_at) values ($1, $2, $3, $4, $5, $6, $7, 'application/json', $8, $9, \
+                     $10, $11, $11)",
+                )
+                .bind(version.0)
+                .bind(ctx.tenant.0)
+                .bind(node.id.0)
+                .bind(&manifest)
+                .bind(TYPED_MANIFEST_ENCODING)
+                .bind(size)
+                .bind(&hash)
+                .bind(ctx.actor.actor.kind)
+                .bind(ctx.actor.actor.id.0)
+                .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+                .bind(now)
+                .execute(&mut *t.tx)
+                .await?;
+                sqlx::query("update nodes set head_version = $3 where tenant_id = $1 and id = $2")
+                    .bind(ctx.tenant.0)
+                    .bind(node.id.0)
+                    .bind(version.0)
+                    .execute(&mut *t.tx)
+                    .await?;
+                let type_name = node.node_type.clone().unwrap_or_default();
+                crate::providers::postgres::insert_typed_node(
+                    &mut t.tx,
+                    &crate::providers::store::NewTypedNode {
+                        tenant_id: ctx.tenant,
+                        node_id: node.id,
+                        provider: provider.clone(),
+                        type_name: type_name.clone(),
+                        desired_version: version,
+                    },
+                )
+                .await?;
+                let mut fixed = [0u8; 32];
+                if hash.len() == 32 {
+                    fixed.copy_from_slice(&hash);
+                }
+                Self::journal(
+                    &mut t,
+                    ctx,
+                    node.id,
+                    Some(node.revision),
+                    EventType::VersionCreated,
+                    typed_version_created_data(version, None, size.max(0) as usize, &fixed),
+                )
+                .await?;
+                let (entry, entry_data) = entries
+                    .get(&node.id)
+                    .ok_or_else(|| Error::Internal("nodes: a copy without its entry".into()))?;
+                if let Some(seq) = entry.seq
+                    && let Some(d) = typed::delivery(
+                        &*hooks,
+                        ctx,
+                        HookKind::Copied,
+                        src.id,
+                        &type_name,
+                        seq,
+                        entry.at,
+                        entry_data,
+                        Some((node.id, *data)),
+                    )
+                {
+                    crate::providers::postgres::enqueue(&mut t.tx, &d).await?;
+                }
             }
         }
         for (node, _) in &made {
@@ -1294,9 +1499,16 @@ impl NodeStore for PgNodeStore {
         rules::check_revision(&row.node, if_revision)?;
         let now = crate::now();
         let purge_after = windows.purge_after(now);
-        let rows: Vec<(Uuid, Option<Uuid>, NodeKind, Option<LinkKind>, Option<Uuid>)> =
-            sqlx::query_as(
-                "with recursive sub(id, depth) as ( \
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            Option<Uuid>,
+            NodeKind,
+            Option<LinkKind>,
+            Option<Uuid>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "with recursive sub(id, depth) as ( \
                      select id, 0 from nodes where tenant_id = $1 and id = $2 \
                      union all \
                      select c.id, sub.depth + 1 from nodes c join sub on c.parent_id = sub.id \
@@ -1306,18 +1518,18 @@ impl NodeStore for PgNodeStore {
                      revision = revision + 1, updated_at = $3, updated_kind = $5, \
                      updated_by = $6, updated_obo = $7 \
                  where tenant_id = $1 and id in (select id from sub) and trashed_at is null \
-                 returning id, parent_id, kind, link_kind, link_target",
-            )
-            .bind(ctx.tenant.0)
-            .bind(id.0)
-            .bind(now)
-            .bind(purge_after)
-            .bind(ctx.actor.actor.kind)
-            .bind(ctx.actor.actor.id.0)
-            .bind(ctx.actor.on_behalf_of.map(|u| u.0))
-            .fetch_all(&mut *t.tx)
-            .await?;
-        for (_, parent, kind, lk, target) in &rows {
+                 returning id, parent_id, kind, link_kind, link_target, type",
+        )
+        .bind(ctx.tenant.0)
+        .bind(id.0)
+        .bind(now)
+        .bind(purge_after)
+        .bind(ctx.actor.actor.kind)
+        .bind(ctx.actor.actor.id.0)
+        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+        .fetch_all(&mut *t.tx)
+        .await?;
+        for (_, parent, kind, lk, target, _) in &rows {
             if let (NodeKind::Link, Some(LinkKind::Member), Some(tg), Some(p)) =
                 (kind, lk, target, parent)
                 && !has_member_link(&mut t.tx, ctx.tenant, NodeId(*p), NodeId(*tg)).await?
@@ -1330,15 +1542,32 @@ impl NodeStore for PgNodeStore {
             }
         }
         let node = load(&mut t.tx, ctx.tenant, id, false).await?.node;
+        let data = rules::trashed_data(node.parent_id, &node.name, rows.len(), purge_after);
         let change = Self::journal(
             &mut t,
             ctx,
             id,
             Some(node.revision),
             EventType::NodeTrashed,
-            rules::trashed_data(node.parent_id, &node.name, rows.len(), purge_after),
+            data.clone(),
         )
         .await?;
+        // Each typed node of the subtree gets its own `trashed` (decision 0004-18).
+        let refs: Vec<(NodeId, String)> = rows
+            .iter()
+            .filter(|r| r.2 == NodeKind::Typed)
+            .filter_map(|r| r.5.clone().map(|t| (NodeId(r.0), t)))
+            .collect();
+        let ds = typed::deliveries(
+            self.hooks(),
+            ctx,
+            HookKind::Trashed,
+            &refs,
+            change.seq,
+            change.at,
+            &data,
+        );
+        Self::enqueue(&mut t, ds).await?;
         self.commit(ctx, t).await?;
         Ok(Written {
             value: self.out(ctx, node).await?,
@@ -1366,8 +1595,14 @@ impl NodeStore for PgNodeStore {
             Some(p) => {
                 self.require(ctx, p, Role::Edit).await?;
                 let d = self.live(ctx, p).await?;
-                if d.node.kind != NodeKind::Folder {
-                    return Err(rules::invalid("the new parent is not a folder"));
+                typed::check_parent(&d.node, "the new parent is not a folder")?;
+                if p != old_parent
+                    && self
+                        .row(ctx, old_parent)
+                        .await
+                        .is_ok_and(|o| typed::is_typed(&o.node))
+                {
+                    return Err(typed::child_stays());
                 }
                 p
             }
@@ -1406,6 +1641,15 @@ impl NodeStore for PgNodeStore {
             row.node.kind,
             req.on_conflict,
         )
+        .await?;
+        // The typed nodes that come back get `restored` (decision 0004-18).
+        let restored: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+            "select id, type from nodes where tenant_id = $1 and trash_root = $2 \
+             and kind = 'typed'",
+        )
+        .bind(ctx.tenant.0)
+        .bind(id.0)
+        .fetch_all(&mut *t.tx)
         .await?;
         let clear = "trashed_at = null, trash_root = null, purge_after = null, \
                      trashed_kind = null, trashed_by = null, trashed_obo = null";
@@ -1479,15 +1723,30 @@ impl NodeStore for PgNodeStore {
                 )));
         }
         let node = load(&mut t.tx, ctx.tenant, id, false).await?.node;
+        let data = rules::restored_data(dest, old_parent, &name);
         let change = Self::journal(
             &mut t,
             ctx,
             id,
             Some(node.revision),
             EventType::NodeRestored,
-            rules::restored_data(dest, old_parent, &name),
+            data.clone(),
         )
         .await?;
+        let refs: Vec<(NodeId, String)> = restored
+            .into_iter()
+            .filter_map(|(n, ty)| ty.map(|ty| (NodeId(n), ty)))
+            .collect();
+        let ds = typed::deliveries(
+            self.hooks(),
+            ctx,
+            HookKind::Restored,
+            &refs,
+            change.seq,
+            change.at,
+            &data,
+        );
+        Self::enqueue(&mut t, ds).await?;
         self.commit(ctx, t).await?;
         Ok(Written {
             value: self.out(ctx, node).await?,

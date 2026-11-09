@@ -225,10 +225,6 @@ pub struct Wait {
     pub reason: &'static str,
 }
 
-const WAIT_COPY: Wait = Wait {
-    card: "P-3",
-    reason: "copyNode of a database node (the typed node stores refuse typed nodes before P-3)",
-};
 const WAIT_EXPORT: Wait = Wait {
     card: "panel",
     reason: "no public operation starts a database export (exportTypedNode is a provider \
@@ -521,7 +517,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[WAIT_COPY],
+            &[],
             cases::copy_agent,
         ),
         // ---------------------------------------------------------------- oracles
@@ -959,7 +955,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[WAIT_COPY],
+            &[],
             cases::poracle_copy_keeps_key,
         ),
         // ---------------------------------------------------------------- exports

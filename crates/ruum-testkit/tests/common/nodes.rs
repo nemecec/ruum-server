@@ -1,6 +1,6 @@
-//! Step 1 operations on database nodes (decisions 0004-6, 0004-7 and 0004-18). The step 1
-//! operations are built, so most of these cases are in [`super::PENDING`] until card P-3 adds
-//! the typed-node rules to the node stores.
+//! Step 1 operations on database nodes (decisions 0004-6, 0004-7 and 0004-18; card P-3 built
+//! the typed-node rules of the node stores). The cases with branches are in
+//! [`super::PENDING`] until card D-3 makes branches.
 
 use super::api::*;
 use super::{Case, Ctx, Fail};

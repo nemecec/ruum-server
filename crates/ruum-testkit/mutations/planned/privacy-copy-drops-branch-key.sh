@@ -6,6 +6,9 @@
 # mutation_check.sh does not read. Moves up to mutations/ with card P-3: that card writes
 # the real FILE and PERL, checks that the mutation is KILLED under MUTATION_STRICT=1, sets
 # PLACEHOLDER=0 and moves the file.
+# Card P-3 wrote the real FILE and PERL (wave 5). Its cases are still planned (they wait for
+# the filter), so the KILLED check under MUTATION_STRICT=1 and PLACEHOLDER=0 come with the
+# card that removes the last wait.
 # Its cases also wait for the privacy filter (FILTER_WAITS_FOR in privacy.rs: Q-2 removes
 # the Postgres entry, Q-3 the SQLite entry). If they are still planned when CARD lands, the
 # file moves up with the card that removes the last wait (review-T-2 R-2).
@@ -13,7 +16,7 @@ CARD="P-3"
 CASES="poracle.copy_keeps_branch_key"
 DESCRIPTION="a copy of a draft branch sets key_node_id to NULL instead of the source's value"
 FILE="crates/ruum-core/src/databases/provider.rs"
-PERL='s/RUUM_PLANNED_MUTATION_COPY_DROPS_BRANCH_KEY/broken/'
+PERL='s/let key_node_id = src\.key_node_id;/let key_node_id: Option<NodeId> = None;/'
 TESTS="-p ruum-testkit --test privacy privacy_suite"
 ENV="RUUM_SUITE_BACKEND=postgres RUUM_REQUIRE_IMPLEMENTED=1 RUUM_PRIVACY_CASES=poracle.copy_keeps_branch_key"
 PLACEHOLDER=1
