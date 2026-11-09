@@ -1,0 +1,924 @@
+# Ruum operations policy (design 19.3)
+#
+# Status: draft: awaiting the person's approval.
+# Drafted by the architect panel's proposer on 2026-11-10. Not signed. Not in force.
+#
+# This file classifies every action type of the planned operations API. The policy engine reads it
+# and decides, for each request, which class applies: green (the acting agent decides), amber (two
+# independent agents, the guard included), red (a person). See docs/ops/README.md for how the engine
+# evaluates this file, and docs/ops/runbooks/ for one runbook per green and amber action.
+#
+# Rules that hold for the whole file:
+#   - Unlisted means red. An action type that is not in `actions` is red.
+#   - Rules only raise a class (green -> amber -> red). Only the per-action `staging_class` field
+#     lowers a class, and only on staging.
+#   - The engine computes every context fact itself (section `context`). A value that the acting
+#     agent sends is never trusted for a decision. A fact that the engine cannot compute counts as
+#     the worst value (fail closed).
+#   - Agents cannot change this file. A change is a pull request, and approving it is red
+#     (action `policy.change`).
+
+policy:
+  id: ruum-ops
+  version: 0.1.0-draft
+  status: draft                    # draft | approved; the engine refuses to load a draft in production
+  drafted: 2026-11-10
+  drafted_by: architect panel (proposer)
+  owner: the person                # the only one who approves and signs
+  approved: null
+  signature: null                  # detached signature of this file by the person's key; set at approval
+  applies_to: [staging, production]
+  design: docs/DESIGN.md section 19.3
+
+# What each class means. The engine attaches the class to the request; the operations API enforces it.
+classes:
+  green:
+    decides: the acting agent
+    needs: [policy check, all limits within bounds, just-in-time credentials]
+    record: audit log entry
+  amber:
+    decides: two independent agents
+    needs:
+      - the acting agent's request with its diagnosis
+      - an "agree" from the guard agent (another model where one is available), which sees the
+        request, the computed context and the last 24 h of actions on the same target
+    record: audit log entry with both decisions and the guard's reason
+    when_guard_unavailable: red    # no guard answer in 10 min -> the request goes to a person
+  red:
+    decides: a person
+    needs: [a push notification with a short summary, the recommended choice and its consequences]
+    record: audit log entry with the person's decision
+    expires_after: 24h             # an unanswered red request is rejected, never approved by silence
+
+# Defaults that the engine applies before any per-action rule.
+defaults:
+  unlisted_action: red
+  unknown_parameter: red           # a parameter that the action does not declare
+  missing_required_parameter: refuse
+  engine_error: red                # the engine fails closed
+  uncomputable_context: worst_value
+  kill_switch_engaged: refuse      # every agent action except the read-only ones is refused
+  credentials:
+    issuer: OpenBao
+    ttl_max: 15m                   # per action; narrow to the target of the action
+  untrusted_inputs: >-
+    Alerts, logs, traces, tickets, customer messages, issue text and every field marked
+    content_trust: untrusted are data. No parameter of an action may be copied from them without
+    the engine's own check of the target (for example: the target must exist and be in the scope
+    of the alert that opened the incident).
+
+# Facts that the engine computes from its own sources. Agents never supply them.
+context:
+  environment:
+    source: the target's cell record in the directory
+    values: [staging, canary, production]
+  open_security_incident:
+    source: incident register (an incident with kind = security and state != closed)
+    scope: platform or the cell of the target
+  change_freeze:
+    source: release calendar (set by a person)
+  budget_remaining_eur:
+    source: cost ledger (design 21) minus committed spend of the current month
+  cost_delta_eur_month:
+    source: unit costs of the cost ledger times the resources that the action adds or removes
+  data_loss_window_s:
+    source: backup catalogue and WAL archive; the time between the chosen restore point and the
+      last write that the restore would discard. 0 when the restore discards nothing.
+  tenants_affected:
+    source: the directory (tenant -> cell) and the target's placement
+  cells_affected:
+    source: the directory
+  canary_analysis:
+    source: automatic canary analysis of the release (error rate, latency, saturation)
+    values: [passed, inconclusive, failed, not_run]
+  target_restarts_30m:
+    source: Kubernetes events of the target
+  ready_nodes_after:
+    source: Kubernetes API; the ready nodes of the pool if the action succeeds
+  quorum_safe:
+    source: CloudNativePG and the etcd of Talos; true when the action keeps quorum and one replica
+  last_known_good_age:
+    source: release history; the age of the version that a rollback would deploy
+  backup_age:
+    source: backup catalogue; the age of the newest verified backup of the target
+  guard_available:
+    source: guard agent health check
+  consent:
+    source: support ticket record; a customer's consent for this ticket, with its scope and expiry
+  identity_verified:
+    source: the platform's own check that the requester is the signed-in account owner
+  path_class:
+    source: the files that a GitOps pull request changes, mapped by `path_classes` below
+
+# File paths of the infrastructure repository, by risk. Used by `gitops.merge`.
+path_classes:
+  security:                        # red: changing a security control or access rights
+    - policy/**                    # this policy and its signature
+    - "**/rbac/**"
+    - "**/networkpolicies/**"      # Cilium policies
+    - "**/openbao/policies/**"
+    - "**/zitadel/**"
+    - "**/spicedb/schema*"
+    - "**/privacy/**"              # privacy filter and telemetry pipeline processors
+    - "**/runtimeclass*"           # gVisor
+    - "**/firewall/**"
+  data:                            # amber: placement and lifecycle of stored data
+    - "**/cnpg/**"
+    - "**/backups/**"
+    - "**/storage/**"
+    - "**/dns/**"
+  routine:                         # green: image digests and versions that passed every CI gate
+    - "**/images.lock"
+    - "**/charts/*/version"
+  # any other path: amber
+
+# Rules that apply to every action, after its own rules. They only raise a class.
+global_rules:
+  - id: security-incident-raises
+    when: open_security_incident
+    effect: raise_to amber
+    for_tags: [raises_in_security_incident]
+    why: During an open security incident a second agent checks even routine actions (design 19.3).
+  - id: change-freeze
+    when: change_freeze
+    effect: raise_to red
+    for_tags: [deploys_change]
+  - id: many-tenants
+    when: tenants_affected > 50
+    effect: raise_one
+    why: The blast radius is large, even for a routine action.
+  - id: more-than-one-cell
+    when: cells_affected > 1
+    effect: raise_to red
+    except_actions: [release.promote, release.pause, swarm.pause, incident.open, incident.page_person,
+                     diagnostics.read, ai_provider.failover]
+    why: Cells limit the blast radius (design 14). One action touches one cell.
+  - id: guard-down
+    when: class == amber and not guard_available
+    effect: raise_to red
+
+# Totals over time ("no splitting", design 19.3). Counted per acting agent and over all agents.
+# When a request would pass a limit, the engine applies `then` to that request and every later one in
+# the window. The guard agent also watches sequences that the counts do not catch.
+aggregate_limits:
+  - id: deletions-per-hour
+    counts: [actions tagged deletes]
+    window: 1h
+    max: 10
+    scope: all agents
+    then: red
+    why: >-
+      In this draft every action tagged deletes is red already. The limit stays as a backstop: if a
+      later policy change makes a small deletion green, the eleventh one in an hour is still red.
+  - id: capacity-removed-per-hour
+    counts: [actions tagged removes_capacity]
+    window: 1h
+    max: 5
+    scope: all agents, per cell
+    then: red
+    why: Many small scale-downs or drains add up to an outage (no splitting).
+  - id: restarts-fleet
+    counts: [workload.restart]
+    window: 1h
+    max: 30
+    scope: all agents, per cell
+    then: amber
+  - id: restarts-one-target
+    counts: [workload.restart]
+    window: 30m
+    max: 3
+    scope: per target
+    then: amber                    # a restart loop needs a diagnosis, not a fourth restart
+  - id: rollbacks-per-day
+    counts: [workload.rollback]
+    window: 24h
+    max: 10
+    scope: per cell
+    then: amber
+  - id: scale-spend-per-day
+    counts: [cost_delta_eur_month of workload.scale, disk.expand, node.replace, capacity.add_cell]
+    window: 24h
+    max_sum_eur: 200
+    scope: all agents
+    then: red
+  - id: amber-per-day
+    counts: [every amber action]
+    window: 24h
+    max: 20
+    scope: all agents
+    then: red
+    why: Many amber actions in a day mean something larger is wrong; a person looks.
+  - id: tokens-revoked-per-hour
+    counts: [principals in token.revoke]
+    window: 1h
+    max: 25
+    scope: all agents
+    then: red
+  - id: apps-blocked-per-day
+    counts: [app.block, egress.block]
+    window: 24h
+    max: 10
+    scope: all agents
+    then: red
+  - id: silences-open
+    counts: [active alert.silence]
+    window: now
+    max: 5
+    scope: all agents
+    then: amber
+  - id: actions-per-agent-per-hour
+    counts: [every non-read action]
+    window: 1h
+    max: 60
+    scope: per acting agent
+    then: red
+  - id: page-person-per-hour
+    counts: [incident.page_person]
+    window: 1h
+    max: 6
+    scope: all agents
+    then: batch                    # later pages go into one summary page every 30 min; never dropped
+
+# The action types of the operations API.
+#
+# Fields:
+#   class          the base class in production (and canary)
+#   staging_class  optional; the class on staging (may be lower; game days, design 19.5)
+#   params         the parameters that the agent sends; anything else is red (defaults)
+#   rules          ordered; each `when` is evaluated on params and context; `class` sets the class
+#                  if it is higher than the current one (`raise_one` raises by one step)
+#   tags           used by global_rules and aggregate_limits
+#   undo           the action that reverses it, or none
+#   runbook        file in docs/ops/runbooks/ (green and amber actions)
+actions:
+
+  # ---------------------------------------------------------------- workloads and releases
+
+  workload.restart:
+    summary: Restart the pods of one workload (rolling).
+    class: green
+    params:
+      workload: {type: workload_ref, required: true}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: target is a stateful set with a single replica
+        class: amber
+        why: A restart is an outage for it.
+      - when: target is in namespaces [ruum-security, openbao, zitadel, spicedb]
+        class: amber
+    tags: [raises_in_security_incident]
+    undo: none (a restart changes no state)
+    runbook: runbooks/workload.restart.md
+
+  workload.scale:
+    summary: Change the replica count or resource requests of one workload.
+    class: green
+    params:
+      workload: {type: workload_ref, required: true}
+      replicas: {type: integer, min: 0}
+      cpu_request: {type: quantity}
+      memory_request: {type: quantity}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: replicas > declared_max or replicas < declared_min
+        class: amber
+      - when: replicas == 0 and workload is not scale-to-zero
+        class: red
+        why: Scaling a platform service to zero is an outage.
+      - when: cost_delta_eur_month > budget_remaining_eur
+        class: red
+        why: Spending above budget is red (design 19.3).
+      - when: cost_delta_eur_month > 100
+        class: amber
+    tags: [raises_in_security_incident, removes_capacity]   # counted when it lowers replicas or requests
+    undo: workload.scale to the earlier values (recorded in the audit entry)
+    runbook: runbooks/workload.scale.md
+
+  workload.rollback:
+    summary: Deploy the last known good version of one workload or tenant-facing service.
+    class: green
+    params:
+      workload: {type: workload_ref, required: true}
+      to_version: {type: version_ref, required: true}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: to_version is not the previous release
+        class: amber
+      - when: last_known_good_age > 7d
+        class: amber
+      - when: the release between includes a database migration that is not reversible
+        class: red
+        why: The old code may not read the new schema; a rollback can lose writes.
+    tags: [deploys_change]
+    undo: release.promote of the version that was rolled back
+    runbook: runbooks/workload.rollback.md
+
+  release.promote:
+    summary: Promote a release one stage (staging -> canary cell -> all cells).
+    class: green
+    params:
+      release: {type: release_ref, required: true}
+      to_stage: {type: enum, values: [canary, all_cells], required: true}
+    rules:
+      - when: CI gates or the review panel approval of the release are missing
+        class: red
+      - when: to_stage == all_cells and canary_analysis == inconclusive
+        class: amber
+      - when: to_stage == all_cells and canary_analysis in [failed, not_run]
+        class: red
+      - when: the release changes a file of path class security
+        class: red
+    tags: [deploys_change, raises_in_security_incident]
+    undo: workload.rollback in each promoted cell
+    runbook: runbooks/release.promote.md
+
+  release.pause:
+    summary: Stop a rollout where it is. Nothing is rolled back.
+    class: green
+    params:
+      release: {type: release_ref, required: true}
+      reason: {type: incident_ref, required: true}
+    rules: []
+    tags: []
+    undo: release.promote (continues the rollout)
+    runbook: runbooks/release.pause.md
+
+  job.rerun:
+    summary: Run a failed background job or reconciler task again (media, index, webhooks, GC check).
+    class: green
+    params:
+      job: {type: job_ref, required: true}
+    rules:
+      - when: the job kind deletes data (GC sweep, trash purge, retention)
+        class: red
+        why: A rerun of a deleting job is a deletion.
+      - when: the same job failed 3 times in 24 h
+        class: amber
+    tags: []
+    undo: none (jobs are idempotent by design 14; a rerun repeats the same result)
+    runbook: runbooks/job.rerun.md
+
+  queue.redeliver:
+    summary: Move messages from a NATS JetStream dead-letter subject back to their stream.
+    class: green
+    params:
+      stream: {type: stream_ref, required: true}
+      max_messages: {type: integer, min: 1, max: 10000, required: true}
+    rules:
+      - when: max_messages > 1000
+        class: amber
+    tags: [raises_in_security_incident]
+    undo: none; consumers are idempotent (idempotency keys, design 14)
+    runbook: runbooks/queue.redeliver.md
+
+  # ---------------------------------------------------------------- nodes, disks, capacity
+
+  node.cordon:
+    summary: Cordon and drain one Kubernetes node (no new pods; existing pods move away).
+    class: green
+    params:
+      node: {type: node_ref, required: true}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: not quorum_safe
+        class: red
+      - when: ready_nodes_after < 2 for the node's pool
+        class: amber
+      - when: another node of the same cluster is already cordoned by an agent
+        class: amber
+    tags: [removes_capacity]
+    undo: node.uncordon (same runbook)
+    runbook: runbooks/node.cordon.md
+
+  node.uncordon:
+    summary: Let pods schedule on a node again.
+    class: green
+    params:
+      node: {type: node_ref, required: true}
+    rules: []
+    tags: []
+    undo: node.cordon
+    runbook: runbooks/node.cordon.md
+
+  node.replace:
+    summary: Order a new server of the same type, join it to the cluster, and retire the old one.
+    class: amber
+    params:
+      node: {type: node_ref, required: true}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: cost_delta_eur_month > budget_remaining_eur
+        class: red
+      - when: not quorum_safe
+        class: red
+    tags: [raises_in_security_incident, removes_capacity]
+    undo: none for the order; the old server is kept (cordoned) for 72 h before it is returned
+    runbook: runbooks/node.replace.md
+
+  disk.expand:
+    summary: Grow a persistent volume (CloudNativePG data, WAL, NATS, Loki).
+    class: green
+    params:
+      volume: {type: volume_ref, required: true}
+      new_size: {type: quantity, required: true}
+    rules:
+      - when: new_size > 2 x current size
+        class: amber
+      - when: cost_delta_eur_month > budget_remaining_eur
+        class: red
+    tags: []
+    undo: none (volumes do not shrink); the cost is in the weekly digest
+    runbook: runbooks/disk.expand.md
+
+  capacity.add_cell:
+    summary: Create a new cell from the infrastructure code (design 14, stage 2).
+    class: amber
+    params:
+      region: {type: enum, values: [hel1], required: true}
+      size: {type: cell_size_ref, required: true}
+    rules:
+      - when: cost_delta_eur_month > budget_remaining_eur
+        class: red
+      - when: region not in the list above
+        class: red
+        why: A new region is a product and legal decision (data location).
+    tags: [raises_in_security_incident]
+    undo: capacity.remove_cell (red, because it deletes infrastructure) while the cell has no tenants
+    runbook: runbooks/capacity.add_cell.md
+
+  # ---------------------------------------------------------------- databases and backups
+
+  database.failover:
+    summary: Promote a replica of a CloudNativePG cluster to primary (switchover or failover).
+    class: amber
+    params:
+      cluster: {type: cluster_ref, required: true}
+      to_instance: {type: instance_ref}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: the replica's replication lag > 0 and the primary is reachable
+        class: red
+        why: Promoting a lagging replica while the primary still takes writes loses data.
+      - when: data_loss_window_s > 0
+        class: red
+    tags: [raises_in_security_incident]
+    undo: database.failover back to the old primary after it rejoins as a replica
+    runbook: runbooks/database.failover.md
+
+  database.restore:
+    summary: Restore a platform or tenant database cluster from backup and WAL (point in time).
+    class: green                   # only an isolated restore for inspection stays green
+    params:
+      cluster: {type: cluster_ref, required: true}
+      target_time: {type: timestamp_or_latest, required: true}
+      mode: {type: enum, values: [new_cluster, in_place], required: true}
+      reason: {type: incident_ref, required: true}
+    rules:
+      - when: mode == in_place, or the new cluster is to get traffic
+        class: amber
+        why: The restore replaces data that serves users. An isolated restore changes nothing.
+      - when: data_loss_window_s > 0
+        class: red
+        why: A restore that loses data is red (design 19.3).
+      - when: target_time older than the backup promise (7 days, decision 17)
+        class: red
+    tags: [raises_in_security_incident]
+    undo: >-
+      in_place: the engine takes a restore point of the current state first, so the restore can be
+      reversed by a restore to that point; new_cluster: delete the new cluster (red) or keep it
+      until the 72 h clean-up of the runbook asks a person
+    runbook: runbooks/database.restore.md
+
+  backup.retry:
+    summary: Run a failed scheduled backup again.
+    class: green
+    params:
+      backup_job: {type: job_ref, required: true}
+    rules:
+      - when: the same backup failed 3 times in 24 h
+        class: amber
+    tags: []
+    undo: none (a backup adds a copy; retention removes old ones)
+    runbook: runbooks/backup.retry.md
+
+  backup.restore_test:
+    summary: Restore a backup into an isolated scratch cluster, check it, and remove the scratch cluster.
+    class: green
+    params:
+      backup: {type: backup_ref, required: true}
+    rules:
+      - when: the scratch cluster would hold tenant data outside the cell's region
+        class: red
+    tags: []
+    undo: none needed; the scratch cluster is removed by the same action
+    runbook: runbooks/backup.restore_test.md
+
+  # ---------------------------------------------------------------- tenants and apps
+
+  tenant.move_cell:
+    summary: Move one tenant to another cell (export, import, switch the directory entry).
+    class: amber
+    params:
+      tenant: {type: tenant_ref, required: true}
+      to_cell: {type: cell_ref, required: true}
+      reason: {type: text, content_trust: untrusted, required: true}
+    rules:
+      - when: to_cell is in another region
+        class: red
+      - when: the move needs write downtime > 15 min (estimated by the engine from the tenant size)
+        class: red
+    tags: [raises_in_security_incident]
+    undo: tenant.move_cell back to the old cell (the old copy is kept read-only for 7 days)
+    runbook: runbooks/tenant.move_cell.md
+
+  app.block:
+    summary: Take a tenant's app offline (phishing, malware, abuse report, or an app that harms the platform).
+    class: amber
+    params:
+      app: {type: app_ref, required: true}
+      evidence: {type: evidence_ref, required: true}   # URL scan result, abuse report record
+    rules:
+      - when: the app's tenant is on a paid plan and the evidence is only a third-party report
+        class: red
+        why: A person checks before a paying customer's app goes down on a report alone.
+    tags: []
+    undo: app.unblock
+    runbook: runbooks/app.block.md
+
+  app.unblock:
+    summary: Put a blocked app back online.
+    class: amber
+    params:
+      app: {type: app_ref, required: true}
+      reason: {type: text, content_trust: untrusted, required: true}
+    rules:
+      - when: the block was made by a person
+        class: red
+    tags: [raises_in_security_incident]
+    undo: app.block
+    runbook: runbooks/app.unblock.md
+
+  egress.block:
+    summary: Block one destination in the egress proxy for one app (or for all apps of one tenant).
+    class: amber
+    params:
+      app: {type: app_ref}
+      tenant: {type: tenant_ref}
+      destination: {type: host_or_cidr, required: true}
+      evidence: {type: evidence_ref, required: true}
+      expires_in: {type: duration, max: 7d, required: true}
+    rules:
+      - when: destination covers more than one /24 or a whole top-level domain
+        class: red
+    tags: []
+    undo: egress.unblock (same runbook)
+    runbook: runbooks/egress.block.md
+
+  egress.unblock:
+    summary: Remove a block of the egress proxy.
+    class: amber
+    params:
+      block: {type: block_ref, required: true}
+    rules: []
+    tags: [raises_in_security_incident]
+    undo: egress.block
+    runbook: runbooks/egress.block.md
+
+  ratelimit.tighten:
+    summary: Lower a rate limit for a time (one tenant, one app, one IP range), for example in a flood.
+    class: green
+    params:
+      target: {type: ratelimit_target_ref, required: true}
+      limit: {type: rate, required: true}
+      expires_in: {type: duration, max: 24h, required: true}
+    rules:
+      - when: target is the whole platform
+        class: amber
+      - when: limit == 0 for a tenant (that is a block of the tenant)
+        class: red
+    tags: []
+    undo: ratelimit.restore (same runbook); also ends by itself at expires_in
+    runbook: runbooks/ratelimit.tighten.md
+
+  ratelimit.restore:
+    summary: Put a rate limit back to its configured value.
+    class: green
+    params:
+      target: {type: ratelimit_target_ref, required: true}
+    rules: []
+    tags: []
+    undo: ratelimit.tighten
+    runbook: runbooks/ratelimit.tighten.md
+
+  # ---------------------------------------------------------------- security
+
+  token.revoke:
+    summary: Revoke the sessions, OAuth tokens, app passwords or agent tokens of one principal.
+    class: amber
+    params:
+      principal: {type: principal_ref, required: true}
+      kinds: {type: list, values: [sessions, oauth_tokens, app_passwords, agent_tokens], required: true}
+      evidence: {type: evidence_ref, required: true}
+    rules:
+      - when: principal is a Ruum platform admin
+        class: red
+      - when: principal is a team owner and the team has no other owner
+        class: red
+        why: The team can be locked out of its own space.
+    tags: []
+    undo: none; the person signs in again and makes new tokens (the runbook tells them how)
+    runbook: runbooks/token.revoke.md
+
+  secret.rotate:
+    summary: Rotate a platform secret or key in OpenBao and roll it out to its users.
+    class: green
+    params:
+      secret: {type: secret_ref, required: true}
+      scheduled: {type: boolean, required: true}   # checked against the rotation calendar
+    rules:
+      - when: not scheduled (an emergency rotation after a suspected leak)
+        class: amber
+      - when: secret is a tenant pseudonym key or a vault key
+        class: red
+        why: Rotating these changes stored pseudonyms or can make data unreadable (decision 0004-16).
+      - when: secret is the signing key of this policy or a root of trust
+        class: red
+    tags: [raises_in_security_incident]
+    undo: the old version stays readable in OpenBao for 24 h; roll back by pinning it (runbook)
+    runbook: runbooks/secret.rotate.md
+
+  security.patch:
+    summary: Roll out a security patch (image, OS of Talos, dependency) to production.
+    class: amber
+    staging_class: green
+    params:
+      release: {type: release_ref, required: true}
+      advisory: {type: advisory_ref, required: true}
+    rules:
+      - when: the patch changes a file of path class security
+        class: red
+      - when: CI gates of the release are missing
+        class: red
+    tags: [deploys_change]
+    undo: workload.rollback (the runbook says when a rollback would bring the hole back)
+    runbook: runbooks/security.patch.md
+
+  gitops.merge:
+    summary: Merge an infrastructure pull request that the agent panel reviewed; the rollout follows the stages.
+    class: green                   # only routine files stay green
+    params:
+      pull_request: {type: pr_ref, required: true}
+    rules:
+      - when: any changed file has a path_class other than routine
+        class: amber
+      - when: any CI gate did not pass
+        class: red
+      - when: any changed file has path_class security
+        class: red
+      - when: the panel review is missing or not unanimous
+        class: red
+    tags: [deploys_change, raises_in_security_incident]
+    undo: a revert pull request (gitops.merge again)
+    runbook: runbooks/gitops.merge.md
+
+  dns.update:
+    summary: Change one DNS record of a Ruum domain (not a tenant's custom domain, which layer 1 handles).
+    class: amber
+    params:
+      record: {type: dns_record_ref, required: true}
+      value: {type: text, required: true}
+    rules:
+      - when: record is NS, MX, CAA, or a TXT record used for domain verification or email (SPF, DKIM, DMARC)
+        class: red
+      - when: the record belongs to the sign-in domain (ruum.space apex, auth host)
+        class: red
+    tags: [raises_in_security_incident]
+    undo: dns.update to the earlier value (recorded in the audit entry)
+    runbook: runbooks/dns.update.md
+
+  certificate.renew:
+    summary: Renew a TLS certificate that the automatic renewal did not renew in time.
+    class: green
+    params:
+      certificate: {type: certificate_ref, required: true}
+    rules:
+      - when: the renewal needs a new CA or a new key type
+        class: amber
+    tags: []
+    undo: none needed (the old certificate stays valid until it expires)
+    runbook: runbooks/certificate.renew.md
+
+  # ---------------------------------------------------------------- incidents, alerts, people
+
+  incident.open:
+    summary: Open an incident record and its channel; link alerts to it.
+    class: green
+    params:
+      kind: {type: enum, values: [availability, performance, data, security, cost, abuse], required: true}
+      severity: {type: enum, values: [sev1, sev2, sev3], required: true}
+      alerts: {type: list, item: alert_ref}
+    rules: []
+    tags: []
+    undo: incident.close
+    runbook: runbooks/incident.open.md
+
+  incident.close:
+    summary: Close an incident after the checks of its runbook pass; asks the postmortem agent for a report.
+    class: green
+    params:
+      incident: {type: incident_ref, required: true}
+    rules:
+      - when: incident kind == security
+        class: amber
+      - when: incident kind == security and data loss or data exposure is possible
+        class: red
+        why: Any security incident with possible data loss pages a person (design 19.4).
+    tags: []
+    undo: incident.reopen (green, same runbook)
+    runbook: runbooks/incident.close.md
+
+  incident.reopen:
+    summary: Reopen a closed incident within 7 days; it keeps its timeline.
+    class: green
+    params:
+      incident: {type: incident_ref, required: true}
+    rules:
+      - when: closed more than 7 days ago
+        effect: refuse             # open a new incident and link the old one
+    tags: []
+    undo: incident.close
+    runbook: runbooks/incident.close.md
+
+  incident.page_person:
+    summary: Page the person (push notification) about an incident, outside the red-request flow.
+    class: green
+    params:
+      incident: {type: incident_ref, required: true}
+      summary: {type: text, max_length: 300, required: true}
+    rules: []
+    tags: []
+    undo: none
+    runbook: runbooks/incident.page_person.md
+
+  alert.silence:
+    summary: Silence one alert rule for a short time, linked to an open incident.
+    class: green
+    params:
+      alert_rule: {type: alert_rule_ref, required: true}
+      incident: {type: incident_ref, required: true}
+      duration: {type: duration, max: 24h, required: true}
+    rules:
+      - when: duration > 2h
+        class: amber
+      - when: alert_rule has label security or backup or data_integrity
+        class: red
+        why: Silencing these turns off a safety control.
+    tags: [raises_in_security_incident]
+    undo: alert.unsilence (same runbook); a silence ends by itself
+    runbook: runbooks/alert.silence.md
+
+  alert.unsilence:
+    summary: End a silence before its end time.
+    class: green
+    params:
+      silence: {type: silence_ref, required: true}
+    rules: []
+    tags: []
+    undo: alert.silence
+    runbook: runbooks/alert.silence.md
+
+  status.publish:
+    summary: Post or update an outage notice on the public status page.
+    class: amber
+    params:
+      incident: {type: incident_ref, required: true}
+      text: {type: text, max_length: 600, required: true}
+    rules:
+      - when: incident kind == security
+        class: red
+        why: Telling customers about a breach is red (design 19.3).
+      - when: text names a tenant, a person or an app
+        class: red
+    tags: []
+    undo: status.publish with a correction (a post is never deleted)
+    runbook: runbooks/status.publish.md
+
+  # ---------------------------------------------------------------- diagnostics and compliance
+
+  diagnostics.read:
+    summary: Read logs, metrics, traces, events and configuration through the privacy filter (pseudonyms).
+    class: green
+    params:
+      scope: {type: enum, values: [platform, cell, tenant, app], required: true}
+      target: {type: ref, required: true}
+      query: {type: text, required: true}
+      consent: {type: consent_ref}   # required when scope is tenant or app and the reader is the support agent
+    rules:
+      - when: scope in [tenant, app] and the reader is the support agent and consent is missing or expired
+        class: red
+        why: Support diagnostics only with the customer's consent for this ticket (design 22.2).
+      - when: the query asks for raw values (no privacy filter)
+        class: red
+        why: Raw personal data is action diagnostics.read_raw (red).
+    tags: [read_only]
+    undo: none (read only)
+    runbook: runbooks/diagnostics.read.md
+
+  gdpr.export:
+    summary: Prepare a data export for the account that asked for it, delivered only to that signed-in account.
+    class: green
+    params:
+      request: {type: request_ref, required: true}
+    rules:
+      - when: not identity_verified
+        class: red
+      - when: the request comes from someone other than the data subject (a lawyer, an authority)
+        class: red
+        why: That is a legal request.
+      - when: the export covers a team space and the requester is not its owner
+        class: red
+    tags: []
+    undo: the download link ends after 7 days; it can be ended earlier (runbook)
+    runbook: runbooks/gdpr.export.md
+
+  # ---------------------------------------------------------------- the operations swarm itself
+
+  ai_provider.failover:
+    summary: Switch the operations agents to the fallback model or provider.
+    class: green
+    params:
+      to_provider: {type: provider_ref, required: true}   # one of the providers listed in the agents' configuration
+    rules:
+      - when: to_provider is not in the configured list
+        class: red
+    tags: []
+    undo: ai_provider.failover back to the primary
+    runbook: runbooks/ai_provider.failover.md
+
+  swarm.pause:
+    summary: Pause the operations agents (all, or one role). Layer 1 keeps running.
+    class: green
+    params:
+      roles: {type: list, item: role_ref}
+      reason: {type: text, required: true}
+    rules: []
+    tags: []
+    undo: swarm.resume (red)
+    runbook: runbooks/swarm.pause.md
+
+  # ---------------------------------------------------------------- red: listed so that the push
+  # notification can name them; these have no runbook for agents. A person decides each one.
+
+  tenant.delete:
+    summary: Delete a tenant and all its data.
+    class: red
+    tags: [deletes]
+  data.delete:
+    summary: Delete or purge any tenant data (files, versions, databases, trash) outside the product's own retention.
+    class: red
+    tags: [deletes]
+  backup.delete:
+    summary: Delete a backup copy or change backup retention.
+    class: red
+    tags: [deletes]
+  queue.purge:
+    summary: Purge messages of a stream or a dead-letter subject.
+    class: red
+    tags: [deletes]
+  tenant.suspend:
+    summary: Suspend a whole tenant (no sign-in, apps offline).
+    class: red
+  tenant.enable_public_apps:
+    summary: Turn on public apps or custom domains for a tenant (design 9.5, decision 22).
+    class: red
+  capacity.remove_cell:
+    summary: Remove a cell and its infrastructure.
+    class: red
+    tags: [deletes]
+  access.grant:
+    summary: Give any principal platform admin rights, or change an operations agent's allow-list.
+    class: red
+  security_control.disable:
+    summary: Turn off a safety control (privacy filter, row level security, gVisor, network policy, firewall, alert rule, audit log, kill switch wiring).
+    class: red
+  policy.change:
+    summary: Approve a change of this policy (agents propose it as a pull request).
+    class: red
+  budget.raise:
+    summary: Raise a budget, or approve spending above it.
+    class: red
+  diagnostics.read_raw:
+    summary: Read raw personal values (no privacy filter) for a limited time.
+    class: red
+  legal.request:
+    summary: Answer a legal or law-enforcement request.
+    class: red
+  breach.notify:
+    summary: Tell customers or an authority about a breach.
+    class: red
+  swarm.resume:
+    summary: Resume the operations agents after a pause or the kill switch.
+    class: red
+  provider.account_change:
+    summary: Create or change a cloud, DNS registrar, payment or email provider account.
+    class: red
