@@ -135,7 +135,7 @@
       "maxLength": 40
     },
     "account.memberSince": {
-      "description": "Account page (your profile, sign-in methods, devices, app passwords, language, team spaces). Label: the date the account was made.",
+      "description": "Account page (your profile, sign-in methods, devices, app passwords, language, team spaces). Label: the date the account was made (not \"member\", which is a role in a team space).",
       "tone": "neutral",
       "maxLength": 25
     },
@@ -595,7 +595,7 @@
       "maxLength": 40
     },
     "agent.summary": {
-      "description": "Agent page: one agent, its access, keys and state. One line that sums up the access: role, where, end date, change budget. {role} is a role like \"Can edit\"; the selects pick the place and the end. Keep the order natural in your language.",
+      "description": "Agent page: one agent, its access, keys and state. One line that sums up the access: role, where, end date, change budget. {role} is a role like \"Can edit\"; the selects pick the place and the end. \"Its person\" is the person the agent works for (an admin may read this about someone else's agent, so never \"you\"). Keep the order natural in your language.",
       "tone": "neutral",
       "maxLength": 160
     },
@@ -605,7 +605,7 @@
       "maxLength": 160
     },
     "agents.intro.admin": {
-      "description": "Agents page: the list of agents and how to connect one. Extra intro for admins. {space} is the space name.",
+      "description": "Agents page: the list of agents and how to connect one. Extra intro for admins. {space} is the space name; {personal} is yes in a personal space, whose name is a person's name: then say \"your personal space\".",
       "tone": "neutral",
       "maxLength": 80
     },
@@ -675,7 +675,7 @@
       "maxLength": 80
     },
     "audit.action.agent_key_created": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: made an agent key.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: created an agent key.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -725,7 +725,7 @@
       "maxLength": 80
     },
     "audit.action.app_password_created": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: made an app password.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: created an app password.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -735,7 +735,7 @@
       "maxLength": 80
     },
     "audit.action.auth_app_password_created": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: made an app password.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: created an app password.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -865,7 +865,7 @@
       "maxLength": 80
     },
     "audit.action.share_link_created": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase before an item name: made a link to.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase before an item name: created a link to.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -910,17 +910,17 @@
       "maxLength": 80
     },
     "audit.agent.keyRefused": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: an agent key was refused; the select gives the reason (revoked, expired, agent paused, access ended).",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: an agent key was refused; the select gives the reason (key turned off, key ended, agent paused, access ended). Glossary: a key is \"turned off\" and \"ends\", never \"revoked\" or \"expired\".",
       "tone": "calm",
       "maxLength": 80
     },
     "audit.agent.keyUsed": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: an agent used an API key.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: an agent used its agent key (glossary: \"key\", never \"API key\" alone).",
       "tone": "calm",
       "maxLength": 80
     },
     "audit.agent.token": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: an agent got a token.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: an agent signed in and started working (same as audit.action.agent_token_issued; never \"token\" on screen).",
       "tone": "calm",
       "maxLength": 80
     },
@@ -940,7 +940,7 @@
       "maxLength": 80
     },
     "audit.auth.firstUse": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: opened the space {space} in a new session.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: opened the space {space} for the first time after a new sign-in (never \"session\" as a noun on screen).",
       "tone": "calm",
       "maxLength": 80
     },
@@ -1005,7 +1005,7 @@
       "maxLength": 80
     },
     "audit.link.created": {
-      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: made a link to {item}.",
+      "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Verb phrase: created a link to {item}.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -1052,7 +1052,7 @@
     "audit.role.comment": {
       "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Inline role word inside an activity line: comment.",
       "tone": "calm",
-      "maxLength": 15
+      "maxLength": 20
     },
     "audit.role.edit": {
       "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Inline role word inside an activity line: edit.",
@@ -1067,7 +1067,7 @@
     "audit.role.some": {
       "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Inline role word when the role is unknown: some (access).",
       "tone": "calm",
-      "maxLength": 15
+      "maxLength": 20
     },
     "audit.role.view": {
       "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Inline role word inside an activity line: view.",
@@ -1232,7 +1232,7 @@
     "compare.same": {
       "description": "Compare versions view of a file (Versions panel). Result when two versions are the same. Light.",
       "tone": "playful",
-      "maxLength": 60
+      "maxLength": 70
     },
     "compare.title": {
       "description": "Compare versions view of a file (Versions panel). View title.",
@@ -1315,9 +1315,9 @@
       "maxLength": 150
     },
     "connect.app.intro": {
-      "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. Intro of the AI app card. Claude, ChatGPT and MCP are names: do not translate.",
+      "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. Intro of the AI app card, for people who are not technical (no protocol names). Claude and ChatGPT are names: do not translate.",
       "tone": "neutral",
-      "maxLength": 110
+      "maxLength": 130
     },
     "connect.app.title": {
       "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. Card title: connect an AI app.",
@@ -1335,7 +1335,7 @@
       "maxLength": 90
     },
     "connect.chatgpt.2": {
-      "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. Step 2 in ChatGPT.",
+      "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. Step 2 in ChatGPT. OAuth stays because ChatGPT's own form shows that word.",
       "tone": "neutral",
       "maxLength": 90
     },
@@ -1355,7 +1355,7 @@
       "maxLength": 40
     },
     "connect.claudeCode.intro": {
-      "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. How to add Ruum to Claude Code. \"/mcp\" and \"ruum\" are typed literally: do not translate.",
+      "description": "Agents page: cards that explain how to connect an AI app or use a key. Instructions: short steps, exact names of buttons in other products. How to add Ruum to Claude Code. \"/mcp\" and \"ruum\" are typed literally: do not translate. Keep \"ruum\" in quotation marks (in Estonian it would otherwise read as \"a space\").",
       "tone": "neutral",
       "maxLength": 130
     },
@@ -1475,7 +1475,7 @@
       "maxLength": 50
     },
     "consent.folderFirst": {
-      "description": "OAuth consent screen: an AI app asks to connect to Ruum as an agent for you. Security screen: calm and exact, no jokes. Error under the folder choice: choose a folder first, or choose Everywhere (the option name).",
+      "description": "OAuth consent screen: an AI app asks to connect to Ruum as an agent for you. Security screen: calm and exact, no jokes. Error under the folder choice: choose a folder first, or choose the option \"Everywhere you have access\" (scope.everywhere); describe the option, do not quote it.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -1675,7 +1675,7 @@
       "maxLength": 160
     },
     "error.bad_request": {
-      "description": "Error note for people, shown where the problem is (field, row, dialog). It maps an API error code. Calm and exact: say what happened, then what to do. No jokes, no blame. Something in a form is not right; the fields are marked.",
+      "description": "Error note for people, shown where the problem is (field, row, dialog). It maps an API error code. Calm and exact: say what happened, then what to do. No jokes, no blame. The request was wrong in a way that marks no field; Details (ui.error.details) holds the code.",
       "tone": "calm",
       "maxLength": 160
     },
@@ -1760,7 +1760,7 @@
       "maxLength": 160
     },
     "error.plan_limit_reached": {
-      "description": "Error note for people, shown where the problem is (field, row, dialog). It maps an API error code. Calm and exact: say what happened, then what to do. No jokes, no blame. A limit of the plan is reached; the select names members or agents.",
+      "description": "Error note for people, shown where the problem is (field, row, dialog). It maps an API error code. Calm and exact: say what happened, then what to do. No jokes, no blame. A limit of the plan is reached; the select names members, agents or another limit. Only an admin can change the plan.",
       "tone": "calm",
       "maxLength": 160
     },
@@ -1770,7 +1770,7 @@
       "maxLength": 160
     },
     "error.quota_exceeded": {
-      "description": "Error note for people, shown where the problem is (field, row, dialog). It maps an API error code. Calm and exact: say what happened, then what to do. No jokes, no blame. The space is full.",
+      "description": "Error note for people, shown where the problem is (field, row, dialog). It maps an API error code. Calm and exact: say what happened, then what to do. No jokes, no blame. The space is full. Items in the trash still count, so the way out is to empty the trash or delete items for good. Do not use the word for \"space\" (a personal or team space) for free storage.",
       "tone": "calm",
       "maxLength": 160
     },
@@ -2105,7 +2105,7 @@
       "maxLength": 50
     },
     "files.welcome.upload": {
-      "description": "Files page: the list of items in a folder, the selection bar, the welcome card and the empty states. Welcome card point 1: upload from any device, or drop on a folder. Friendly.",
+      "description": "Files page: the list of items in a folder, the selection bar, the welcome card and the empty states. Welcome card point 1: upload from any device, or drag onto a folder on a computer (phones cannot drag). Friendly.",
       "tone": "playful",
       "maxLength": 110
     },
@@ -2160,7 +2160,7 @@
       "maxLength": 25
     },
     "format.when.weekday": {
-      "description": "Units and relative times, filled in by code. Keep them short. A weekday this week and a time: {day} is the weekday name, {time} the time.",
+      "description": "Units and relative times, filled in by code. Keep them short. A weekday this week and a time: {day} is the weekday name in the nominative (\"Thursday\"; Estonian \"neljapäev\", so \"{day}al\" gives \"neljapäeval\"), {time} the time.",
       "tone": "neutral",
       "maxLength": 25
     },
@@ -2273,6 +2273,11 @@
       "description": "Accept invitation page: a person opens the link of an invitation to a space. Page title before Ruum knows the space.",
       "tone": "playful",
       "maxLength": 50
+    },
+    "invitations.badEmail": {
+      "description": "Space settings, Invitations tab: invite people and see open invitations. Error under the form when Ruum refused one address of the list; {email} is that address as typed. The other addresses before it were sent. Calm: what happened, then what to do.",
+      "tone": "calm",
+      "maxLength": 120
     },
     "invitations.cancel": {
       "description": "Space settings, Invitations tab: invite people and see open invitations. Button and confirm: cancel an invitation.",
@@ -2495,14 +2500,14 @@
       "maxLength": 50
     },
     "link.password.wrong": {
-      "description": "Share link visitor page: someone opens a link \"anyone with the link\". Error: the password is wrong. Calm: security.",
+      "description": "Share link visitor page: someone opens a link \"anyone with the link\". Error: the password is wrong; the sender has the password. Calm: security.",
       "tone": "calm",
-      "maxLength": 60
+      "maxLength": 90
     },
     "link.viewing": {
-      "description": "Share link visitor page: someone opens a link \"anyone with the link\". Note for visitors: you view as anyone with the link; the select says what you can do.",
+      "description": "Share link visitor page: someone opens a link \"anyone with the link\". Note for visitors: what anyone with the link can do (the select), and that no account is needed.",
       "tone": "neutral",
-      "maxLength": 100
+      "maxLength": 110
     },
     "memberRole.admin": {
       "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. Role name, starts a label.",
@@ -2530,7 +2535,7 @@
       "maxLength": 20
     },
     "memberRole.guest.meaning": {
-      "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. What a guest sees, after the role name and a colon.",
+      "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. What a guest sees, after the role name and a colon. Third person, like the other role meanings.",
       "tone": "neutral",
       "maxLength": 100
     },
@@ -2545,7 +2550,7 @@
       "maxLength": 20
     },
     "memberRole.member.meaning": {
-      "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. What a member does, after the role name and a colon.",
+      "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. What a member does, after the role name and a colon. Next to it the form asks \"What they can do\" (Can view ... Can manage): this line must not promise more than that choice. Third person, like the other role meanings.",
       "tone": "neutral",
       "maxLength": 90
     },
@@ -2560,7 +2565,7 @@
       "maxLength": 20
     },
     "memberRole.owner.meaning": {
-      "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. What an owner does, after the role name and a colon. Mentions billing: exact.",
+      "description": "Member roles of a space: Owner, Admin, Member, Guest. Use the glossary terms. What an owner does, after the role name and a colon. Mentions the plan (money): exact. Third person, like the other role meanings.",
       "tone": "calm",
       "maxLength": 80
     },
@@ -2980,7 +2985,7 @@
       "maxLength": 80
     },
     "share.add.guestsOff": {
-      "description": "Share dialog of an item: people with access, adding people, the link, the sharing rule. Note: {email} is outside {space} and guests are off.",
+      "description": "Share dialog of an item: people with access, adding people, the link, the sharing rule. Note: {email} is outside the space and guests are off. {personal} is yes in a personal space (its name is a person's name, so say \"your personal space\"; the person is its owner and can change the rules).",
       "tone": "neutral",
       "maxLength": 160
     },
@@ -2990,7 +2995,7 @@
       "maxLength": 160
     },
     "share.add.outside": {
-      "description": "Share dialog of an item: people with access, adding people, the link, the sharing rule. Note: {email} is outside {space}; they sign in with this address and join as a guest.",
+      "description": "Share dialog of an item: people with access, adding people, the link, the sharing rule. Note: {email} is outside the space; to open {item} they join as a guest (the helper above already says they sign in with this address). {personal} is yes in a personal space, whose name is a person's name: then say \"your personal space\".",
       "tone": "neutral",
       "maxLength": 170
     },
@@ -3260,7 +3265,7 @@
       "maxLength": 100
     },
     "share.roleRow.detail": {
-      "description": "Share dialog of an item: people with access, adding people, the link, the sharing rule. Detail: these people manage everything from their role; a share cannot give less.",
+      "description": "Share dialog of an item: people with access, adding people, the link, the sharing rule. Detail under the row of the space's people: they have the access shown on the row (for example \"Can manage\") everywhere, from their role; a share cannot give less.",
       "tone": "neutral",
       "maxLength": 220
     },
@@ -3515,7 +3520,7 @@
       "maxLength": 50
     },
     "signIn.error.failed": {
-      "description": "Sign-in page. Note: sign-in did not work; {error} is a short code from the provider.",
+      "description": "Sign-in page. Note: sign-in did not work; {error} is a short code from the provider, shown at the end as a fact (never inside the sentence).",
       "tone": "calm",
       "maxLength": 120
     },
@@ -3552,7 +3557,7 @@
     "signIn.tagline": {
       "description": "Sign-in page. Tagline under the title: what Ruum is. Friendly, no hype.",
       "tone": "playful",
-      "maxLength": 90
+      "maxLength": 100
     },
     "signIn.title": {
       "description": "Sign-in page. Page title.",
@@ -3655,9 +3660,9 @@
       "maxLength": 130
     },
     "trash.intro.admin": {
-      "description": "Trash page. Deleting for good cannot be undone: those texts are calm and exact. Extra intro for admins.",
+      "description": "Trash page. Deleting for good cannot be undone: those texts are calm and exact. Extra intro for admins. Only some plans have admin restore (Plan tab), so the line must not promise it.",
       "tone": "calm",
-      "maxLength": 60
+      "maxLength": 70
     },
     "trash.more": {
       "description": "Trash page. Deleting for good cannot be undone: those texts are calm and exact. Accessible name: more actions for {name}.",

@@ -27,7 +27,7 @@ describe('error copy (copy.md section 4)', () => {
 
   it('names the limit of a plan', () => {
     const e = new RuumApiError(403, { code: 'plan_limit_reached', message: 'the tenant has reached its limit of 1 members', hint: 'invite the person as a guest, or move to a team plan' })
-    expect(errorText(e)).toBe("You've reached the limit of your plan for members. Remove one you don't use, or change the plan.")
+    expect(errorText(e)).toBe("You've reached the member limit of your plan. Remove a member, or an admin can change the plan.")
   })
 
   it('falls back to the server message for a code the UI does not know', () => {

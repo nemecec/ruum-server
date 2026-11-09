@@ -55,7 +55,7 @@ describe('localisation', () => {
     // The focus comes back to the picker of the new page, which says what changed (A1).
     const picker = await screen.findByRole('combobox', { name: 'Kasutajaliidese keel' })
     await waitFor(() => expect(picker).toHaveFocus())
-    expect(screen.getByText('Selge! Nüüd on keeleks Eesti.')).toBeInTheDocument()
+    expect(screen.getByText('Tehtud. Ruumi keel on nüüd: Eesti.')).toBeInTheDocument()
     // "Same as the browser" clears the preference; jsdom's browser speaks English.
     await user.selectOptions(picker, '')
     await user.click(within(picker.closest('form')!).getByRole('button', { name: 'Salvesta' }))

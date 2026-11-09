@@ -49,7 +49,7 @@ describe('agents', () => {
     await user.click(await screen.findByRole('button', { name: 'Create an agent with a key' }))
     const d = await dialog('Create an agent with a key')
     await user.type(within(d).getByRole('textbox', { name: 'Name' }), 'One too many{Enter}')
-    expect(await within(d).findByRole('alert')).toHaveTextContent("You've reached the limit of your plan")
+    expect(await within(d).findByRole('alert')).toHaveTextContent("You've reached a limit of your plan. An admin can change the plan.")
   })
 
   it('creates a key and shows the secret once, then revokes a key', async () => {

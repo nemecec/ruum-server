@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link } from 'react-router'
 import { client, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
@@ -260,6 +260,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
           <AddPersonForm
             roles={grantable}
             spaceName={tenant.name}
+            personal={tenant.kind === 'personal'}
             team={team}
             membersCanShare={policy.members_can_share}
             itemName={node.name}
@@ -335,7 +336,7 @@ export function ShareDialog(props: { node: Node; open: boolean; onClose: () => v
                     )}
                   </Grow>
                   <Text as="span" tone="muted">
-                    {t('memberRole.owner')}
+                    {roleLabels.manage}
                   </Text>
                 </ListRow>
                 {team &&
@@ -621,6 +622,8 @@ function AddPersonForm(props: {
   onUseLink?: () => void
   roles: Schemas['Role'][]
   spaceName: string
+  /** A personal space is named after its person: the copy then says "your personal space". */
+  personal: boolean
   team: boolean
   membersCanShare: boolean
   itemName: string
@@ -736,11 +739,11 @@ function AddPersonForm(props: {
       {outside &&
         (props.allowGuests ? (
           <Text tone="muted" size="sm">
-            {t('share.add.outside', { email: email.trim(), item: props.itemName, space: spaceName })}
+            {t('share.add.outside', { email: email.trim(), item: props.itemName, space: spaceName, personal: props.personal ? 'yes' : 'no' })}
           </Text>
         ) : (
           <Note tone="warning" role="note">
-            {t('share.add.guestsOff', { email: email.trim(), space: spaceName })}
+            {t('share.add.guestsOff', { email: email.trim(), space: spaceName, personal: props.personal ? 'yes' : 'no' })}
           </Note>
         ))}
       {!everyone && (
@@ -790,6 +793,16 @@ function CreateLinkForm(props: {
   const [password, setPassword] = useState('')
   const [created, setCreated] = useState<Schemas['ShareLink'] | null>(null)
   const [error, setError] = useState<unknown>()
+  const newLink = useRef<HTMLDivElement>(null)
+
+  // Ruum shows a new link only once, and it appears at the end of a long dialog: bring it into
+  // view and put the focus on Copy, so nobody closes the dialog without it.
+  useEffect(() => {
+    if (!created?.url) return
+    const box = newLink.current
+    box?.scrollIntoView?.({ block: 'nearest' })
+    box?.querySelector<HTMLElement>('button')?.focus()
+  }, [created])
 
   async function submit(e: FormEvent) {
     e.preventDefault()
@@ -841,7 +854,11 @@ function CreateLinkForm(props: {
         {t('share.link.once')}
       </Text>
       <ErrorNote error={error} />
-      {created?.url && <SecretBox label={t('share.link.new')} secret={created.url} note={t('share.link.new.note')} />}
+      {created?.url && (
+        <div ref={newLink}>
+          <SecretBox label={t('share.link.new')} secret={created.url} note={t('share.link.new.note')} />
+        </div>
+      )}
     </Stack>
   )
 }

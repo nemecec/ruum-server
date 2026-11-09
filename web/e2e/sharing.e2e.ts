@@ -46,7 +46,7 @@ async function annSharesFolder(browser: Browser, email: string, outDir: string) 
   await expect(people).toContainText(email)
   await expect(people).toContainText('Invited, not joined yet')
   // The owner is the first row.
-  await expect(people.getByRole('listitem').first()).toContainText('Owner')
+  await expect(people.getByRole('listitem').first()).toContainText('Can manage')
   await share.getByRole('button', { name: 'Close' }).click()
   await expect(share).toHaveCount(0)
   return { context, ann, folder, folderId, tenant, note, share }
@@ -178,7 +178,7 @@ test('a link made in the share dialog opens for a visitor without an account', a
   const share = ann.getByRole('dialog', { name: `Share ${folder}` })
   const linkForm = share.getByRole('form', { name: 'Create a link' })
   // The default end is visible.
-  await expect(linkForm.getByLabel('Ends after (days)')).toHaveValue('7')
+  await expect(linkForm.getByLabel('Works for (days)')).toHaveValue('7')
   await linkForm.getByRole('button', { name: 'Create link' }).click()
   const url = await share.getByLabel('New link', { exact: true }).inputValue()
   expect(url).toMatch(/\/s#/)
@@ -191,7 +191,7 @@ test('a link made in the share dialog opens for a visitor without an account', a
   visitor.on('request', (r) => requests.push(r.url()))
   await visitor.goto(url)
   await expect(visitor.getByRole('heading', { name: folder, level: 1 })).toBeVisible()
-  await expect(visitor.getByText("You're viewing as anyone with the link. You can view.")).toBeVisible()
+  await expect(visitor.getByText("Anyone with this link can see this. You don't need an account.")).toBeVisible()
   const [dl] = await Promise.all([visitor.waitForEvent('download'), visitor.getByRole('button', { name: 'Download site.txt' }).click()])
   await dl.saveAs(info.outputPath('visitor-site.txt'))
   expect(fs.readFileSync(info.outputPath('visitor-site.txt'), 'utf8')).toBe('site plan\n')

@@ -30,7 +30,7 @@ describe('OAuth consent screen', () => {
     // The default is a folder the person chooses: without one, Allow waits.
     expect(screen.getByRole('button', { name: 'Allow' })).toBeDisabled()
     await user.click(screen.getByRole('radio', { name: /^Everywhere you have access in Analytical Engines/ }))
-    expect(screen.getByText(/^Can view everywhere you have access in Analytical Engines, until /)).toBeInTheDocument()
+    expect(screen.getByText(/^Can view everywhere its person has access in Analytical Engines, until /)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Allow' }))
     await waitFor(() => expect(assign).toHaveBeenCalledWith('https://claude.example/callback?code=mock-code'))
     expect(await screen.findByText('You can go back to Claude Desktop.')).toBeInTheDocument()

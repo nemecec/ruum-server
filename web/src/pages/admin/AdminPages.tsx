@@ -1,6 +1,6 @@
 import { Fragment, useState, type FormEvent } from 'react'
 import { Link, Outlet, useLocation } from 'react-router'
-import { client, unwrap, type Schemas } from '../../api/client'
+import { client, RuumApiError, unwrap, type Schemas } from '../../api/client'
 import { useApi } from '../../api/useApi'
 import { usePagedApi } from '../../api/usePagedApi'
 import { useSession } from '../../app/useSession'
@@ -384,6 +384,9 @@ export function InvitationsPage() {
   const [content, setContent] = useState<Schemas['ContentRole']>('manage')
   const [message, setMessage] = useState('')
   const [error, setError] = useState<unknown>()
+  // The address the server refused as not an email address: the note names it (a field error
+  // the generic copy cannot point at).
+  const [badEmail, setBadEmail] = useState<string | null>(null)
   const [startTeam, setStartTeam] = useState(false)
   const invitations = usePagedApi(
     (cursor) =>
@@ -397,13 +400,16 @@ export function InvitationsPage() {
   async function invite(e: FormEvent) {
     e.preventDefault()
     setError(undefined)
+    setBadEmail(null)
     const list = emails
       .split(/[\s,;]+/)
       .map((x) => x.trim())
       .filter(Boolean)
     const sent: string[] = []
+    let current = ''
     try {
       for (const email of list) {
+        current = email
         await unwrap(
           client.POST('/v1/tenants/{tenant_id}/invitations', {
             params: { path: { tenant_id: tenant.id } },
@@ -419,7 +425,8 @@ export function InvitationsPage() {
         sent.push(email)
       }
     } catch (err) {
-      setError(err)
+      if (err instanceof RuumApiError && err.code === 'validation_failed') setBadEmail(current)
+      else setError(err)
     }
     if (sent.length) {
       toast(sent.length === 1 ? t('invitations.sent.one', { email: sent[0] }) : t('invitations.sent', { n: sent.length }))
@@ -490,6 +497,11 @@ export function InvitationsPage() {
           <Text tone="danger">{t('invitations.guestsOff')}</Text>
         )}
         <ErrorNote error={error} context={{ space: tenant.name }} />
+        {badEmail && (
+          <Note tone="danger" role="alert">
+            {t('invitations.badEmail', { email: badEmail })}
+          </Note>
+        )}
         <Actions>
           <Button variant="primary" type="submit">
             {t('invitations.send')}

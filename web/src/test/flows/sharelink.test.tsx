@@ -10,7 +10,7 @@ describe('share link visitor (/s#token)', () => {
     const seen = recordRequests()
     const { user, download } = renderApp('/s#demo-folder')
     expect(await screen.findByRole('heading', { name: 'Documents', level: 1 })).toBeInTheDocument()
-    expect(screen.getByText("You're viewing as anyone with the link. You can view.")).toBeInTheDocument()
+    expect(screen.getByText("Anyone with this link can see this. You don't need an account.")).toBeInTheDocument()
     // The reduced shell: no navigation of a signed-in person.
     expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument()
 
@@ -33,7 +33,7 @@ describe('share link visitor (/s#token)', () => {
     expect(await screen.findByRole('heading', { name: 'This link has a password' })).toBeInTheDocument()
     const field = screen.getByLabelText('Password')
     await user.type(field, 'wrong{Enter}')
-    expect(await screen.findByText("That password isn't right. Try again.")).toBeInTheDocument()
+    expect(await screen.findByText("That password isn't right. Try again, or ask the person who sent you the link.")).toBeInTheDocument()
     await user.type(screen.getByLabelText('Password'), 'open sesame{Enter}')
     // A file link: its page with Download.
     expect(await screen.findByRole('heading', { name: 'report.txt', level: 1 })).toBeInTheDocument()

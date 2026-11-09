@@ -50,7 +50,7 @@ describe('tenant admin', () => {
     expect(await screen.findByText('alan@example.com')).toBeInTheDocument()
     const form = screen.getByRole('form', { name: 'Invite people' })
     // A team space offers members; the role's meaning is under the menu.
-    expect(within(form).getByText('Member: can see, change, delete and share everything in the team space')).toBeInTheDocument()
+    expect(within(form).getByText('Member: sees everything in the team space; what they can change depends on their access')).toBeInTheDocument()
     await user.type(within(form).getByRole('textbox', { name: 'Emails' }), 'kathleen@example.com, alan.t@example.com')
     await user.selectOptions(within(form).getByRole('combobox', { name: 'Role' }), 'guest')
     await user.click(within(form).getByRole('button', { name: 'Send invitations' }))
@@ -141,12 +141,12 @@ describe('tenant admin', () => {
     expect(await screen.findByText("Sign-ins of members. Guests' sign-ins aren't shown here.")).toBeInTheDocument()
     const login = (await screen.findByText('signed in')).closest('li')!
     expect(login).toHaveTextContent('192.0.2.10 · Firefox on macOS')
-    expect(screen.getByText('opened Analytical Engines (new session)')).toBeInTheDocument()
+    expect(screen.getByText('opened Analytical Engines (new sign-in)')).toBeInTheDocument()
     expect(screen.getByText('signed out')).toBeInTheDocument()
     await user.selectOptions(screen.getByRole('combobox', { name: 'Show' }), 'agent.')
-    const refused = (await screen.findByText('was refused (key revoked)')).closest('li')!
+    const refused = (await screen.findByText('was refused (key turned off)')).closest('li')!
     expect(within(refused).getByText('Refused')).toBeInTheDocument()
-    expect(screen.getByText('got a token')).toBeInTheDocument()
+    expect(screen.getAllByText('started working').length).toBeGreaterThan(0)
   })
 
   it('says how a person joined through a share to their email (0003-2)', async () => {
@@ -159,7 +159,7 @@ describe('tenant admin', () => {
     renderApp(`${team}/admin/limits`)
     expect(await screen.findByText('Team')).toBeInTheDocument()
     expect(screen.getByRole('meter', { name: 'Agents' })).toHaveAttribute('value', '7')
-    expect(screen.getByText('3 of no limit')).toBeInTheDocument()
+    expect(screen.getByText('3, no limit')).toBeInTheDocument()
   })
 
   it('lists and filters the activity log in plain words', async () => {

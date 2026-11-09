@@ -63,7 +63,7 @@ test('a team: members, an invitation by mail, a new member and a role change', a
 
   // Ann sees Cara among the members, and no open invitation; she makes Cara an admin.
   await ann.reload()
-  await expect(ann.getByText('No open invitations.')).toBeVisible()
+  await expect(ann.getByText('No open invitations. All quiet here.')).toBeVisible()
   await ann.getByRole('navigation', { name: 'Admin' }).getByRole('link', { name: 'Members' }).click()
   const caraRow = members.getByRole('row').filter({ hasText: users.cara.email })
   await expect(caraRow).toContainText(users.cara.displayName)

@@ -49,7 +49,7 @@ export function AgentsPage() {
       </Toolbar>
       <Text tone="muted">
         {t('agents.intro')}
-        {isAdmin && ` ${t('agents.intro.admin', { space: tenant.name })}`}
+        {isAdmin && ` ${t('agents.intro.admin', { space: tenant.name, personal: tenant.kind === 'personal' ? 'yes' : 'no' })}`}
       </Text>
       <Loaded state={agents}>
         {({ items }) =>

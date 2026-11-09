@@ -54,7 +54,7 @@ describe('share dialog', () => {
     await user.type(within(form).getByRole('textbox', { name: 'Email' }), 'cara@example.com')
     expect(
       within(form).getByText(
-        "cara@example.com isn't in Ada Lovelace. They can open notes.md after they sign in with this address, and they join Ada Lovelace as a guest.",
+        "cara@example.com isn't in your personal space. To open notes.md, they join it as a guest.",
       ),
     ).toBeInTheDocument()
     // Never "make an account".
@@ -135,7 +135,7 @@ describe('share dialog', () => {
     const people = within(d).getByRole('region', { name: 'People with access' })
     const row = (await within(people).findByText(/Everyone in Analytical Engines except guests/)).closest('li')!
     expect(row).toHaveTextContent('Can manage')
-    await waitFor(() => expect(row).toHaveTextContent('3 people. Owners, admins and members manage everything in Analytical Engines, and share it.'))
+    await waitFor(() => expect(row).toHaveTextContent('3 people. Owners, admins and members have this access everywhere in Analytical Engines, and can share.'))
   })
 
   it('shares with everyone in the space, and says that view members get the role too (0003-1)', async () => {
@@ -174,7 +174,7 @@ describe('share dialog', () => {
     const { user, d } = await openShare(`${personal}/files`, 'notes.md')
     // The owner is the first row.
     const people = within(d).getByRole('region', { name: 'People with access' })
-    expect(within(people).getAllByRole('listitem')[0]).toHaveTextContent(/Ada Lovelace.*Owner/)
+    expect(within(people).getAllByRole('listitem')[0]).toHaveTextContent(/Ada Lovelace.*Can manage/)
     // The role menu of a row says what each role means, and ends with "Remove access" (design-system 4.8).
     await choose(user, /Access of Charles Babbage$/, /^Can view/, d)
     await waitFor(() => expect(db.grants.find((g) => g.node_id === ids.notes)?.role).toBe('view'))
@@ -190,7 +190,7 @@ describe('share dialog', () => {
     const role = within(form).getByRole('combobox', { name: 'Access' })
     expect(within(role).queryByRole('option', { name: 'Can edit' })).not.toBeInTheDocument()
     // The default end is visible: 7 days.
-    expect(within(form).getByRole('spinbutton', { name: 'Ends after (days)' })).toHaveValue(7)
+    expect(within(form).getByRole('spinbutton', { name: 'Works for (days)' })).toHaveValue(7)
     await user.click(within(d).getByRole('button', { name: 'Create link' }))
     const url = await within(d).findByRole('textbox', { name: 'New link' })
     expect((url as HTMLInputElement).value).toMatch(/\/s#[0-9A-Za-z_-]+$/)

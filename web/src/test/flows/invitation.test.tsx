@@ -10,7 +10,7 @@ describe('accept an invitation (/invitations/accept)', () => {
     const { user, router } = renderApp('/invitations/accept?token=demo-invite')
     expect(await screen.findByRole('heading', { name: 'Charles Babbage invited you to Lovelace Lab', level: 1 })).toBeInTheDocument()
     expect(
-      screen.getByText('As a member who can edit, you change files and folders in Lovelace Lab. You can\'t move, delete or restore them.'),
+      screen.getByText('As a member who can edit, you can change files and folders in Lovelace Lab, but not move, delete or restore them.'),
     ).toBeInTheDocument()
     expect(screen.getByText(/^The invitation is open until /)).toBeInTheDocument()
     // The invitation went to Ada's address (masked alike): no warning.

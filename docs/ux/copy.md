@@ -87,9 +87,9 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Under the buttons | New here? Signing in makes your account and a personal space, all in one go. |
 | Signed out | You're signed out. See you soon. |
 | Cancelled | Sign-in was cancelled. Try again or pick another way to sign in. |
-| Provider failed | Sign-in didn't work (*code*). Try again, or pick another way to sign in. |
+| Provider failed | Sign-in didn't work. Try again, or pick another way to sign in. Code: *code* |
 | Welcome card, title | Welcome to Ruum, *first name* |
-| Welcome card, points | Bring your files: upload them from any device, or drop them right on a folder. / Changed your mind? Ruum keeps every change as a version, so you can always go back. / Get a helper: connect an AI agent that works for you, only in the folders you choose. |
+| Welcome card, points | Bring your files: upload them from any device, or drag them onto a folder on a computer. / Changed your mind? Ruum keeps every change as a version, so you can always go back. / Get a helper: connect an AI agent that works for you, only in the folders you choose. |
 | Welcome card, buttons | Upload files / Connect an agent / Close |
 
 ### 3.2 Files
@@ -136,9 +136,9 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Turn off link, confirm | Title: Turn off this link? Body: People who use it lose access at once. You can make a new link later. Button: Turn off link |
 | Links off | Links are turned off in this space. |
 | Setting | People who can edit can also share / Yes / No / Same as the folder above (now: yes) |
-| Visitor, note | You're viewing as anyone with the link. You can view. |
+| Visitor, note | Anyone with this link can see this. You don't need an account. (comment: "see and comment on") |
 | Visitor, password | This link has a password. / Password / Open |
-| Visitor, wrong password | That password isn't right. Try again. |
+| Visitor, wrong password | That password isn't right. Try again, or ask the person who sent you the link. |
 | Visitor, link ended | This link doesn't work any more. Ask the person who sent it for a new one. |
 
 ### 3.4 Versions
@@ -151,7 +151,7 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Retention note | Versions older than 30 days are removed on your plan. Named versions are kept forever. |
 | Compare header | Compare versions / From / To / Compare as |
 | Summary | 3 added, 1 removed, 2 changed |
-| Same | Nothing changed between these versions. |
+| Same | These two are twins: nothing changed between them. |
 | Cannot compare | These files can't be compared line by line. [Download both] |
 | Truncated | Only the first 500 changes are shown. Download both versions to see all. |
 | Restore, confirm | Title: Restore the version of 5 Nov, 14:00? Body: It becomes the current version. The version you have now stays in Versions. Button: Restore |
@@ -164,11 +164,11 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 |---|---|
 | Page intro | Agents work in Ruum for you, with the access you give them. Every change they make shows their name and yours. |
 | Page intro, admin | As an admin, you see every agent in *Space*. |
-| Connect card 1 | Connect an AI app / Claude, ChatGPT and other apps that use MCP. Add this server address in the app: [address] [Copy] |
+| Connect card 1 | Connect an AI app / Works with Claude, ChatGPT and other AI apps that can add a connector. Add this server address in the app: [address] [Copy] |
 | Connect card 2 | Use a key in a script or the CLI / Create an agent with its own key. |
 | Agent by-line | *Agent* for *Person* |
 | Status | Active / Paused / Access ended / Not used yet / Last used 2 minutes ago |
-| Access summary | Can edit in *Clients/Pärn*, until 4 Feb 2027 / Can view everywhere you have access in *Space*, no end date |
+| Access summary | Can edit in *Clients/Pärn*, until 4 Feb 2027 / Can view everywhere its person has access in *Space*, no end date |
 | Access fields | Where / Only in a folder: [Choose folder] / Everywhere you have access in *Space* / Highest role / Ends on / Changes per hour, at most |
 | Access helper | An agent never gets more access than you have. |
 | Consent title | *App* wants to connect to Ruum |
@@ -183,7 +183,7 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Pause, confirm | Title: Pause *Agent*? Body: It can't read or change anything until you resume it. Its history stays. Button: Pause |
 | Paused note | Paused. Its keys and connections don't work until you resume it. |
 | Activity run | Today, 14:02 to 14:09, 7 changes [Undo these changes] |
-| Activity verbs | Created / Renamed *old* to *new* / Moved to *Folder* / Copied / Moved to the trash / Restored from the trash / Deleted for good / Changed (new version) / Restored a version / Added the tag *tag* / Removed the tag *tag* / Gave access to *person* / Removed access for *person* |
+| Activity verbs | Created / Renamed *old* to *new* / Moved to *Folder* / Copied / Moved to the trash / Restored from the trash / Deleted for good / Saved a new version of *name* / Restored a version / Added the tag *tag* / Removed the tag *tag* / Gave access to *person* / Removed access for *person* |
 | Undo, confirm | Title: Undo 7 changes by *Agent*? Body: These changes will be undone: [list]. These stay as they are: [list with reasons]. Button: Undo 7 changes |
 | Undo reasons | someone changed it later / this can't be undone / you no longer have access |
 | Undo, toast | Undid 7 changes. 1 stayed as it was. |
@@ -195,21 +195,21 @@ language). We are a friendly colleague with a sense of humour, who also keeps yo
 | Start a team | Title: Start a team space. Label: Team name. Body: You'll be the owner. You can invite people next. Button: Create team space |
 | Team ready | *Team* is ready! Now invite the people you work with. [Invite people] |
 | Invite form | Emails / One or more, separated by commas / Role / Message (optional) / Send invitations |
-| Member roles | Owner: everything, including billing and deleting the space / Admin: manage members, sharing rules and all agents / Member: work with everything in the team space / Guest: only what is shared with them |
+| Member roles | Owner: can do everything, also change the plan and delete the space / Admin: manages members, sharing rules and all agents / Member: sees everything in the team space; what they can change depends on their access / Guest: sees only what people share with them |
 | Invite toast | Invitation on its way to *email*. / 3 invitations are on their way. |
 | Invitation row | Invited, waiting. Ends 13 Nov 2026. [Cancel invitation] |
 | Accept page | *Person* invited you to *Space*. / Sign in to join. / [Join *Space*] |
 | Joined | You're in! Welcome to *Space*. |
 | Remove member, confirm | Title: Remove *Name* from *Space*? Body: They lose access to everything in this space at once. Their 2 agents are paused, their 3 links are turned off, and their app passwords stop working. Their files stay. Button: Remove *Name* |
 | Last owner | A space needs at least one owner. |
-| Sharing rules | Allow links / Allow links that can edit / Links end after at most (days) / Allow guests / Members can share |
+| Sharing rules | Allow links / Allow links that can edit / Longest a link works (days; leave empty for no limit) / Allow guests / Members can share |
 
 ### 3.7 Trash
 
 | Where | Copy |
 |---|---|
 | Intro | Items stay in the trash for 30 days. Then Ruum deletes them for good. |
-| Intro, admin | Admins can restore items for 60 days. |
+| Intro, admin | On some plans, admins can restore items for longer. |
 | Restore toast | *name* is back in *Folder*. [Show] |
 | Delete for good, confirm | Title: Delete *name* for good? Body: You can't undo this. Its versions are deleted too. Button: Delete for good |
 | Empty trash, confirm | Title: Delete 12 items for good? Body: Everything in the trash is deleted, with its versions. You can't undo this. Button: Delete 12 items for good |
@@ -249,7 +249,7 @@ Journeys J7 to J14 (`databases/journeys.md`), screens S1 to S10 (`databases/scre
 | Updating | Ruum is applying new settings to *garden*. |
 | Restoring | Ruum is restoring *garden* to *5 Nov, 14:00*. It answers no queries until this is done. |
 | Paused, trash | *garden* is in the trash. It answers no queries. Restore it from the trash to use it again. |
-| Paused, over limit | *garden* is over your plan's limit of *1 GB*. It answers no queries until you free some space or change your plan. |
+| Paused, over limit | *garden* is over your plan's limit of *1 GB*. It answers no queries until you delete data to make it smaller or change your plan. |
 | Didn't start | *garden* didn't start: *reason*. [Try again] [Move to trash] |
 | Status reasons | `disk_quota_exceeded`: it is over the size your plan allows / `migration_failed`: the last migration failed, and nothing changed / `extension_not_available`: an extension in its settings isn't available / other: Ruum couldn't reach it. Ruum keeps trying. |
 | Offline status | Last checked *14:02* |
@@ -420,19 +420,20 @@ and the request ID.
 
 | Code | Copy for people | Action |
 |---|---|---|
-| `bad_request`, `validation_failed` | Something in this form isn't right. Check the marked fields. (Field errors under the field.) | Focus the first field |
+| `bad_request` | Ruum couldn't do this. Try again, and if it keeps happening, contact support with the code under Details. | Details |
+| `validation_failed` | Something in this form isn't right. Check the marked fields. (Field errors under the field; a list of addresses names the one Ruum refused: "*address* isn't an email address. Fix it, then send again.") | Focus the first field |
 | `unauthenticated`, `token_expired` | You've been signed out. Sign in again to keep working. | Session dialog |
 | `permission_denied` | You don't have access to do this. Ask *owner name* or an admin of *Space*. | Close |
-| `scope_exceeded` | (agents only; never shown to people) | |
+| `scope_exceeded` | (agents only; fallback for people:) This agent doesn't have access to do this. You can change its access on the Agents page. | |
 | `user_required` | (agents only; never shown to people) | |
 | `not_found` | This item isn't here any more. Someone may have moved or deleted it. | Go to Files |
 | `conflict` | This changed while you were working on it. Refresh to see the newest version, then try again. | Refresh |
 | `name_taken` | There's already an item called *Name* here. Pick another name. | Under the field |
 | `version_mismatch`, `precondition_failed` | Someone else changed *name* a moment ago. Refresh to see their change. | Refresh |
 | `idempotency_key_reused` | Ruum is still working on your last request. Wait a moment. | Retry later |
-| `payload_too_large` | *name* is larger than *2 GB*, the largest file your plan allows. | Plan (admins) |
-| `quota_exceeded` | *Space* is full. Free some space, or an admin can change the plan. | Plan (admins) |
-| `plan_limit_reached` | You've reached the limit of your plan for *agents*. Remove one you don't use, or change the plan. | Plan (admins) |
+| `payload_too_large` | *name* is larger than the largest file your plan allows. Make it smaller, or an admin can change the plan. (Name the size, "*2 GB*", once the UI knows it.) | Plan (admins) |
+| `quota_exceeded` | *Space* is full. Empty the trash, or delete items for good, to make room. An admin can also change the plan. (Items in the trash still count; never "free some space": a space is a personal or team space.) | Plan (admins) |
+| `plan_limit_reached` | You've reached the agent limit of your plan. Remove an agent you don't use, or an admin can change the plan. (Members: "... Remove a member, or ..."; another limit: "You've reached a limit of your plan. An admin can change the plan.") | Plan (admins) |
 | `rate_limited` | That was a lot at once. Wait a minute and try again. | Retry |
 | `agent_disabled` | (agents only; for people: the agent's Paused state) | |
 | `chunk_missing`, `hash_mismatch` | *name* didn't upload completely. Ruum will try again. | Auto retry once, then "Try again" |
@@ -440,11 +441,11 @@ and the request ID.
 | `query_failed` | The database couldn't run this query: *the sanitized message, in a sentence*. Check the query and try again. | Note under the editor; "Details" with the SQLSTATE |
 | `read_only_query` | This query changes data. Turn on Can change data to run it. (Can view: "You can only read *garden*.") | Note under the editor |
 | `statement_timeout` | The query ran longer than *30 s*, the most your plan allows. Narrow it with WHERE or LIMIT. | Note under the editor |
-| `write_grant_required` | (agents only; for people, the agent's request shows in Agent access) | |
+| `write_grant_required` | (agents only; for people, the agent's request shows in Agent access. Fallback: "This agent needs write access before it can change this database. Approve its request when it asks.") | |
 | `migration_failed` | The migration *name* failed. Nothing changed. | "Details" with the statement number and the SQLSTATE |
 | `database_too_large` | *garden* is too large for a branch. Branches work for databases up to *1 GB*. Make a branch with tables only. | Select "Tables only" |
 | `statement_not_allowed` | Ruum doesn't run this kind of query (it changes roles, settings or files of the server). Leave that part out. | Note under the editor |
-| `class_read_required` | This change reads or writes secret columns, which only people who can manage *garden* may see. Leave out *column*. | Note under the editor |
+| `class_read_required` | This change reads or writes personal or secret columns, which only people who can manage this database may see. Leave those columns out. (Name *garden* and *column* once the UI has them.) | Note under the editor |
 | several statements (`validation_failed` on a query) | Run one query at a time. This has *2*. | Note under the editor |
 | `cursor_expired`, `range_not_satisfiable` | (not shown; the UI recovers by reloading) | |
 | `not_implemented` | This isn't available yet. | Close |
@@ -474,9 +475,9 @@ Never show a stack trace, an HTTP status number or an internal path to people.
 | Agent activity | *Agent* hasn't changed anything yet | When it gets to work, its changes show up here, grouped by run. | |
 | Agent keys | No keys yet | Apps that connect with sign-in (OAuth) don't need one. | New key |
 | Members (only owner) | It's just you here | Invite the people you work with. | Invite people |
-| Invitations | No open invitations | | Invite people |
+| Invitations | No open invitations. All quiet here. | | Invite people |
 | Activity log | No activity yet | Changes in *Space* show up here. | |
-| App passwords | No app passwords yet | Make one to open your files in Finder or Explorer. | New app password |
+| App passwords | No app passwords yet | Create one to open your files in Finder or Explorer. | New app password |
 | Database tables (Query) | No tables yet | Tables come from migrations, or from a CREATE TABLE in Can change data. | |
 | Query result | No rows match | | |
 | Columns | All columns are confirmed | Agents see each column as you chose. | |
