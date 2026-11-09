@@ -34,3 +34,10 @@ The person approved the empty stand-in crate `third_party/sqlx-sqlite-stub` (wir
 `[patch.crates-io]`), which lets `rusqlite` 0.41.1 fix RUSTSEC-2026-0459 while `sqlx` 0.9.0 still pins
 an older `libsqlite3-sys` for a driver Ruum never builds. Remove it when a `sqlx` release allows
 `libsqlite3-sys` 0.39 or later. Decided 2026-11-09.
+
+## B-5. Brand direction
+
+The person chose the brand direction **Graphite** from the visual designer's three directions
+(`docs/ux/brand/directions.html`, branch `w/brand-directions`). The visual designer agent applies it
+through the design tokens only (`docs/ux/brand/README.md`), with the UX review panel checking contrast
+and visual quality in light and dark. Decided 2026-11-09.
