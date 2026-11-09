@@ -8,6 +8,7 @@
 mod hostile_copy;
 mod security;
 mod spike;
+mod tenant_types;
 
 use super::*;
 use crate::conformance::{self, Fixture};

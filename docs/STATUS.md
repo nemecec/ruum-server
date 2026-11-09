@@ -470,12 +470,19 @@ detached on the server (`setsid nohup`) and was read from its log.
 Small, clear fixes that need no person (design 20.3). The IDs are those of the backlog, which
 has the evidence. Each card goes through the normal reviews and gates. In this order:
 
-1. **SEC-1, the masking hole** (S-1, S-4, B-12; branch `f/dbhost-review`, worktree `secfix`):
-   the `ruum_mask` definer functions belong to a role that lens sessions never run as; no value
-   of a type that is not built in is converted inside a definer function (the masking rule
-   itself waits for brief B-2; until then such a column is masked as `secret`, which fails
-   closed); a test of the four steps of `review-dbhost-2.md` item 2 and a mutation; the tests
-   of items 1 and 3; a helper "no role membership changed". Two security reviews.
+1. **SEC-1, the masking hole** (S-1, S-4; branch `f/masking-hardening`, worktree
+   `ruum-server-wt/mask`; built, **waiting for two security reviews**, not merged): decision
+   0005 B-2 and decision 0004-37. A personal column whose type is not a built-in base type
+   (enum, domain, composite, range, array of one, extension type) shows the hidden constant in
+   the masked lens and holds `NULL` (as `text`) in a masked copy; `pseudonym_other` refuses any
+   such type before it converts; the definer bodies qualify their functions and operators with
+   `pg_catalog`; `mask` holds `CREATE` on the lens schemas only inside the `ruum_dbhost`
+   transaction that builds them. Tests in `ruum-dbengine/src/postgres/tests/tenant_types.rs`
+   (tenant casts, an implicit conversion, an operator, domains, enums, composites, ranges,
+   arrays, a view, default privileges; steps 1 and 3 of every hand-over, `sync_lens`, a restore;
+   the reused admin connection of review-dbhost item 3); four mutations `dbengine-mask-*`.
+   Record: `ruum-server-wt/panel/masking-fix.md`. Not built: the general helper of B-12 (the
+   tests use `hostile_copy::taken`).
 2. **Q-1 unblock** (S-2, S-3, S-7): revoke `set_config` from `PUBLIC` in each data database
    (E-2 `setup.rs`) with an engine test as a viewer role; the names middleware skips the rows
    of `QueryResult`; DQS off in the bundled SQLite. Then a third review of `s2/q-1`, the CI
@@ -530,7 +537,9 @@ in `docs/digests/2026-11-08.md`.
   (`review-dbhost-2.md`): the search-path part holds, but **a tenant cast on a tenant type runs
   as `mask` inside `ruum_mask.pseudonym_other`, reads the HMAC key and can replace
   `ruum_mask.hmac12`** (item 2, proved on the data cluster; no agent reads through the lens
-  yet), and items 1 and 3 have no test. K-1 conditions open: C-1 (the column store and the
+  yet), and items 1 and 3 have no test. The fix of item 2 and the tests of items 1 and 3 are on
+  branch `f/masking-hardening` (decision 0004-37, card SEC-1 under "Next cards"); until it is
+  reviewed and merged, the hole is open on `main`. K-1 conditions open: C-1 (the column store and the
   manifest's `data_classes` drift apart after a person's `updateDatabaseManifest` or
   `restoreVersion`; before Q-2) and C-2 (a SQLite name over 63 characters stops the Postgres
   sync; before Q-3); notes N-1 to N-6. A-1 notes N-1 to N-5 and N-7; the create codes

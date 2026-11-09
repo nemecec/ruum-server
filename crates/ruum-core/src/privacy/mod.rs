@@ -52,7 +52,8 @@
 //!
 //! # Types of the generic overload
 //!
-//! A `personal` column of any other type uses the generic overload: the output function of the
+//! A `personal` column of any other **built-in base type** (a type of `pg_catalog` with an OID
+//! below 16384 and `typtype = 'b'`) uses the generic overload: the output function of the
 //! type (`v::text`) with every output setting fixed in the function (`DateStyle = 'ISO, YMD'`,
 //! `IntervalStyle = postgres`, `TimeZone = UTC`, `extra_float_digits = 1`, `bytea_output =
 //! hex`, `lc_monetary = C`). On the Rust side that text is [`SqlValue::Other`], hashed as is.
@@ -63,15 +64,20 @@
 //! - documents: `json`, `jsonb`, `xml`;
 //! - network types: `inet`, `cidr`, `macaddr`, `macaddr8`;
 //! - bit strings: `bit`, `varbit`;
-//! - arrays of any type, enum types, composite (row) types, domains over a type without a
-//!   typed overload, range and multirange types;
+//! - arrays of built-in base types;
 //! - geometric types: `point`, `line`, `lseg`, `box`, `path`, `polygon`, `circle`;
 //! - text search types: `tsvector`, `tsquery`;
-//! - system types: `pg_lsn`, `oid` and the `reg*` types, `xid8`;
-//! - types of the manifest's extensions (for example `citext`, `hstore`, `ltree`, `cube`,
-//!   `geometry`, `geography`, `vector`).
+//! - system types: `pg_lsn`, `oid` and the `reg*` types, `xid8`.
 //!
-//! A domain over a type with a typed overload uses that overload. SQLite has only the
+//! A `personal` column of any type that is not a built-in base type gets **no pseudonym**: it
+//! is masked like `secret` and shows the hidden-value marker with class `personal` (decision
+//! 0005 B-2, decision 0004-37). These are enum, composite, range and multirange types (also
+//! the built-in ranges), domains (also over a type with a typed overload), arrays of those, and
+//! the types of extensions (for example `citext`, `hstore`, `geometry`, `vector`). The tenant
+//! may own such a type and its casts, so no conversion of it may run in the engine's definer
+//! functions.
+//!
+//! SQLite has only the
 //! storage classes `INTEGER`, `REAL`, `TEXT` and `BLOB`, which map to [`SqlValue::Int`],
 //! [`SqlValue::Float8`], [`SqlValue::Text`] and [`SqlValue::Bytes`].
 

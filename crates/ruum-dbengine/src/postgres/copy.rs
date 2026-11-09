@@ -642,7 +642,7 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
     if plan.columns.is_empty() {
         return Ok(());
     }
-    let bases = lens::base_types(conn).await?;
+    let types = lens::pseudonym_types(conn).await?;
     let mut fks: Vec<(String, String, String)> = Vec::new();
     for (column, how) in &plan.columns {
         if column.schema != "public" {
@@ -716,7 +716,22 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         }
         match how {
             MaskAs::Pseudonym => {
-                let base = bases.get(&(rel as u32, attnum)).copied().unwrap_or(0);
+                // A personal column of a type that is not a built-in base type (decision 0005
+                // B-2) holds no value in the copy: it becomes `text` and `NULL`, and no
+                // conversion of the tenant's type runs inside a pseudonym function.
+                let Some(base) = types.get(&(rel as u32, attnum)).copied() else {
+                    run(
+                        conn,
+                        "mask a personal column of a tenant-defined type",
+                        format!(
+                            "alter table {table} alter column {col} drop default;\n\
+                             alter table {table} alter column {col} drop not null;\n\
+                             alter table {table} alter column {col} type text using null::text"
+                        ),
+                    )
+                    .await?;
+                    continue;
+                };
                 run(
                     conn,
                     "mask a personal column",

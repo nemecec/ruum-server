@@ -36,12 +36,32 @@
 //! `0044-03-15 10:00:00 BC`. The Rust side passes such a value as `SqlValue::Other` with
 //! that text.
 //!
-//! Any other type goes through `ruum_mask.pseudonym_other(anyelement)`: the type's output text
-//! (`v::text`) with every output setting fixed (`DateStyle = ISO, YMD`, `IntervalStyle =
-//! postgres`, `TimeZone = UTC`, `extra_float_digits = 1`, `bytea_output = hex`, `lc_monetary =
-//! C`), as the generic overload of `ruum_core::privacy`. It has its own name, so that function
-//! resolution never has to choose between it and a typed overload. A domain uses the overload of
-//! its base type.
+//! Any other **built-in base type** (a type of `pg_catalog` with an OID below 16384 and
+//! `typtype = 'b'`, arrays of such types included) goes through `ruum_mask.pseudonym_other`:
+//! the type's output text (`v::text`) with every output setting fixed (`DateStyle = ISO, YMD`,
+//! `IntervalStyle = postgres`, `TimeZone = UTC`, `extra_float_digits = 1`, `bytea_output =
+//! hex`, `lc_monetary = C`), as the generic overload of `ruum_core::privacy`. It has its own
+//! name, so that function resolution never has to choose between it and a typed overload.
+//!
+//! # Tenant-defined types (decision 0005 B-2, decision 0004-37)
+//!
+//! A `personal` column whose type is **not** a built-in base type (an enum, a domain, a
+//! composite, a range or multirange, an array of one of those, a type of an extension) is masked
+//! like `secret`: the masked view shows [`SECRET_CONSTANT`], never a pseudonym. The tenant may own
+//! such a type and so may add casts, operators or functions for it; none of them may ever run
+//! inside a `SECURITY DEFINER` function of `ruum_mask` (review-dbhost-2 item 2). So:
+//!
+//! - the lens calls a pseudonym function only for a column whose declared type is a built-in
+//!   base type ([`pseudonym_types`]); a column of any other type, or one whose type is unknown,
+//!   gets [`hidden_expr`], which converts nothing;
+//! - `pseudonym_other` checks the type of its argument first and raises an error for any type
+//!   that is not a built-in base type, before any conversion (a direct call, for example from
+//!   tenant code in step 2 of a masked copy, cannot reach a tenant cast);
+//! - every function has `search_path = pg_catalog, pg_temp`, and the bodies of `hmac12` and
+//!   `pseudonym_other` qualify their functions and operators with `pg_catalog`;
+//! - `mask` holds `USAGE` only on `ruum_mask`, `ruum_masked` and `ruum_nosecret`. `ruum_dbhost`
+//!   (the owner of the schemas) grants it `CREATE` inside the transaction that makes the
+//!   functions or builds the lens, and takes it back before the commit ([`mask_create_sql`]).
 //!
 //! The masked kinds have `EXECUTE` on `pseudonym` and `pseudonym_other` only (not on `hmac12`
 //! or `canonical`), and no `USAGE` on `ruum_mask`: only a lens view (owner `mask`) calls them.
@@ -102,6 +122,14 @@ const TYPED: &[(&str, &str, &str)] = &[
     ("uuid", "", "v::text"),
 ];
 
+/// The SQL condition on `pg_catalog.pg_type t` of a built-in base type: in `pg_catalog`, an OID
+/// below `FirstNormalObjectId` (16384, so no type of the tenant or of an extension), and
+/// `typtype = 'b'` (no domain, enum, composite, range, multirange or pseudo-type). A tenant
+/// cannot add a cast between two such types: `CREATE CAST` needs the ownership of one of them.
+pub(crate) const BUILT_IN_BASE: &str = "t.oid operator(pg_catalog.<) 16384::pg_catalog.oid \
+     and t.typtype operator(pg_catalog.=) 'b' \
+     and t.typnamespace operator(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace";
+
 /// The fixed output settings of `pseudonym_other`.
 const OTHER_SETTINGS: &str = " set datestyle = 'ISO, YMD' set intervalstyle = 'postgres' \
      set timezone = 'UTC' set extra_float_digits = 1 set bytea_output = 'hex' \
@@ -115,8 +143,10 @@ pub(crate) fn functions_sql(masked_read: &str, masked_write: &str) -> String {
            ipad bytea not null, opad bytea not null);\n\
          create function ruum_mask.hmac12(t text) returns text language sql stable strict \
            security definer set search_path = pg_catalog, pg_temp as $f$ \
-           select 'p_' || left(encode(sha256(k.opad || sha256(k.ipad || convert_to(t, 'UTF8'))), \
-           'hex'), 12) from ruum_mask.key k where k.id = 1 $f$;\n",
+           select 'p_' operator(pg_catalog.||) pg_catalog.left(pg_catalog.encode(pg_catalog.sha256( \
+           k.opad operator(pg_catalog.||) pg_catalog.sha256(k.ipad operator(pg_catalog.||) \
+           pg_catalog.convert_to(t, 'UTF8'))), 'hex'), 12) \
+           from ruum_mask.key k where k.id operator(pg_catalog.=) 1 $f$;\n",
     );
     for (ty, settings, body) in TYPED {
         sql.push_str(&format!(
@@ -128,9 +158,17 @@ pub(crate) fn functions_sql(masked_read: &str, masked_write: &str) -> String {
         ));
     }
     sql.push_str(&format!(
-        "create function ruum_mask.pseudonym_other(v anyelement) returns text language sql \
+        "create function ruum_mask.pseudonym_other(v anyelement) returns text language plpgsql \
            stable strict security definer set search_path = pg_catalog, pg_temp{OTHER_SETTINGS} \
-           as $f$ select ruum_mask.hmac12(v::text) $f$;\n\
+           as $f$ begin \
+             if not exists (select 1 from pg_catalog.pg_type t \
+                where t.oid operator(pg_catalog.=) pg_catalog.pg_typeof(v)::pg_catalog.oid \
+                  and {BUILT_IN_BASE}) then \
+               raise exception 'ruum_mask: no pseudonym for a type that is not a built-in base type' \
+                 using errcode = '42804'; \
+             end if; \
+             return ruum_mask.hmac12(v::text); \
+           end $f$;\n\
          revoke all on all functions in schema ruum_mask from public;\n\
          revoke all on table ruum_mask.key from public;\n"
     ));
@@ -158,7 +196,8 @@ insert into ruum_mask.key (id, ipad, opad)
 select 1, pg_catalog.decode(ipad, 'hex'), pg_catalog.decode(opad, 'hex') from pads
 on conflict (id) do update set ipad = excluded.ipad, opad = excluded.opad";
 
-/// The SQL call that pseudonymizes the column expression `expr` of base type `base_oid`.
+/// The SQL call that pseudonymizes the column expression `expr` of the built-in base type
+/// `base_oid`. The caller has checked the type with [`pseudonym_types`].
 pub(crate) fn pseudonym_call(expr: &str, base_oid: u32) -> String {
     match base_oid {
         oid::TEXT => format!("ruum_mask.pseudonym({expr})"),
@@ -191,29 +230,53 @@ pub(crate) fn secret_expr(expr: &str) -> String {
     )
 }
 
-/// The base type of every column of the relations in `public`: (rel_oid, attnum) -> OID of
-/// the base type (a domain resolved to the type under it).
-pub(crate) async fn base_types(
+/// The masked form of a value of a type that is not a built-in base type (decision 0005 B-2):
+/// like `secret`, but the null test looks at the value itself (`num_nulls`), never inside it, so
+/// a composite value whose fields are all `NULL` still shows the constant. Nothing of the type
+/// (no cast, operator or function of the tenant) runs.
+pub(crate) fn hidden_expr(expr: &str) -> String {
+    format!(
+        "case when pg_catalog.num_nulls({expr}) operator(pg_catalog.=) 1 then null else {}::text end",
+        literal(SECRET_CONSTANT)
+    )
+}
+
+/// The statement that gives `mask` (`grant: true`) or takes back `CREATE` on the lens schemas.
+/// `ruum_dbhost` (their owner) runs it around the steps that make the functions or the views, in
+/// the same transaction, so `mask` never holds `CREATE` after a commit.
+pub(crate) fn mask_create_sql(mask: &str, grant: bool) -> String {
+    let (verb, to) = if grant {
+        ("grant", "to")
+    } else {
+        ("revoke", "from")
+    };
+    format!(
+        "{verb} create on schema ruum_mask, ruum_masked, ruum_nosecret {to} {}",
+        ident(mask)
+    )
+}
+
+/// The columns of the relations in `public` that may get a pseudonym: (rel_oid, attnum) -> OID
+/// of the declared type, for a column whose declared type is a built-in base type
+/// ([`BUILT_IN_BASE`]). A column of any other type (a domain too) is not in the map and is
+/// masked like `secret`.
+pub(crate) async fn pseudonym_types(
     conn: &mut PgConnection,
 ) -> Result<HashMap<(u32, i16), u32>, EngineError> {
-    let rows = sqlx::query(
-        "with recursive d(rel, attnum, typ, depth) as (
-           select a.attrelid, a.attnum, a.atttypid, 0
-             from pg_catalog.pg_attribute a
-             join pg_catalog.pg_class c on c.oid = a.attrelid
-            where c.relnamespace = 'public'::pg_catalog.regnamespace
-              and a.attnum > 0 and not a.attisdropped
-           union all
-           select d.rel, d.attnum, t.typbasetype, d.depth + 1
-             from d join pg_catalog.pg_type t on t.oid = d.typ
-            where t.typtype = 'd' and d.depth < 32)
-         select distinct on (rel, attnum) rel::int8 as rel, attnum::int2 as attnum, typ::int8 as typ
-           from d order by rel, attnum, depth desc",
-    )
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "select a.attrelid::pg_catalog.int8 as rel, a.attnum::pg_catalog.int2 as attnum,
+                a.atttypid::pg_catalog.int8 as typ
+           from pg_catalog.pg_attribute a
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) a.attrelid
+           join pg_catalog.pg_type t on t.oid operator(pg_catalog.=) a.atttypid
+          where c.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
+            and a.attnum operator(pg_catalog.>) 0 and not a.attisdropped
+            and {BUILT_IN_BASE}"
+    )))
     .persistent(false)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|e| internal("read the base types", e))?;
+    .map_err(|e| internal("read the column types", e))?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -236,7 +299,7 @@ pub(crate) struct LensRoles<'a> {
 pub(crate) fn view_sql(
     table: &CatalogTable,
     spec: &LensSpec,
-    base_types: &HashMap<(u32, i16), u32>,
+    pseudonym_types: &HashMap<(u32, i16), u32>,
     roles: &LensRoles<'_>,
 ) -> String {
     let mut nosecret = Vec::with_capacity(table.columns.len());
@@ -248,10 +311,10 @@ pub(crate) fn view_sql(
             table: table.name.clone(),
             column: col.name.clone(),
         });
-        let base = col
+        // `None`: not a built-in base type, or unknown. Masked like `secret` (0005 B-2).
+        let pseudonym_type = col
             .identity
-            .and_then(|i| base_types.get(&(i.rel_oid, i.attnum)).copied())
-            .unwrap_or(0);
+            .and_then(|i| pseudonym_types.get(&(i.rel_oid, i.attnum)).copied());
         match class {
             DataClass::Normal => {
                 nosecret.push(name.clone());
@@ -259,7 +322,10 @@ pub(crate) fn view_sql(
             }
             DataClass::Personal => {
                 nosecret.push(name.clone());
-                masked.push(format!("{} as {name}", pseudonym_call(&name, base)));
+                match pseudonym_type {
+                    Some(t) => masked.push(format!("{} as {name}", pseudonym_call(&name, t))),
+                    None => masked.push(format!("{} as {name}", hidden_expr(&name))),
+                }
             }
             DataClass::Secret => {
                 nosecret.push(format!("{} as {name}", secret_expr(&name)));
@@ -314,7 +380,7 @@ pub(crate) async fn build_views(
     spec: &LensSpec,
     roles: &LensRoles<'_>,
 ) -> Result<(), EngineError> {
-    let bases = base_types(conn).await?;
+    let bases = pseudonym_types(conn).await?;
     for table in catalog.tables.iter().filter(|t| t.schema == "public") {
         let sql = view_sql(table, spec, &bases, roles);
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
@@ -441,5 +507,82 @@ mod tests {
         ), "{sql}");
         let back = spec_from_json(&spec_to_json(&spec));
         assert_eq!(back, spec);
+    }
+
+    /// Decision 0005 B-2: a personal column whose type is not a built-in base type (not in the
+    /// map of `pseudonym_types`), or whose identity is unknown, is masked like `secret` and
+    /// never reaches a pseudonym function.
+    #[test]
+    fn a_personal_column_of_a_tenant_type_is_hidden_not_pseudonymized() {
+        let column = |name: &str, attnum: Option<i16>| CatalogColumn {
+            name: name.to_string(),
+            data_type: "mood".into(),
+            nullable: true,
+            identity: attnum.map(|a| ColumnIdentity {
+                rel_oid: 7,
+                attnum: a,
+                type_oid: 90001,
+            }),
+        };
+        let table = CatalogTable {
+            schema: "public".into(),
+            name: "t".into(),
+            kind: RelationKind::Table,
+            columns: vec![
+                column("ok", Some(1)),
+                column("mood", Some(2)),
+                column("lost", None),
+            ],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let spec = LensSpec { columns: vec![] };
+        let types = HashMap::from([((7, 1), oid::TEXT)]);
+        let roles = LensRoles {
+            read: "r_1",
+            write: "r_2",
+            masked_read: "r_3",
+            masked_write: "r_4",
+        };
+        let sql = view_sql(&table, &spec, &types, &roles);
+        let masked = sql
+            .lines()
+            .find(|l| l.starts_with("create view ruum_masked."))
+            .unwrap();
+        assert!(
+            masked.contains("ruum_mask.pseudonym(\"ok\") as \"ok\""),
+            "{masked}"
+        );
+        assert!(
+            masked.contains(&format!("{} as \"mood\"", hidden_expr("\"mood\""))),
+            "{masked}"
+        );
+        assert!(
+            masked.contains(&format!("{} as \"lost\"", hidden_expr("\"lost\""))),
+            "{masked}"
+        );
+        assert_eq!(masked.matches("ruum_mask.").count(), 1, "{masked}");
+    }
+
+    /// `pseudonym_other` refuses a type that is not a built-in base type before it converts,
+    /// and the definer bodies resolve nothing outside `pg_catalog`.
+    #[test]
+    fn the_definer_functions_check_the_type_first() {
+        let sql = functions_sql("r_3", "r_4");
+        let other = &sql[sql
+            .find("create function ruum_mask.pseudonym_other")
+            .unwrap()..];
+        let check = other.find("raise exception").unwrap();
+        let convert = other.find("v::text").unwrap();
+        assert!(check < convert, "{other}");
+        assert!(other.contains(BUILT_IN_BASE), "{other}");
+        let hmac = &sql[sql.find("create function ruum_mask.hmac12").unwrap()..];
+        let hmac = &hmac[..hmac.find("$f$;").unwrap()];
+        assert!(!hmac.contains(" || "), "{hmac}");
+        assert!(hmac.contains("pg_catalog.sha256"), "{hmac}");
+        assert_eq!(
+            mask_create_sql("r_9", false),
+            "revoke create on schema ruum_mask, ruum_masked, ruum_nosecret from \"r_9\""
+        );
     }
 }

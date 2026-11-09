@@ -202,7 +202,7 @@ pub(crate) fn grants_sql(roles: &[EngineRole]) -> String {
     format!(
         "grant usage, create on schema public to {owner};\n\
          grant usage on schema public to {secret_read}, {mask};\n\
-         grant usage, create on schema ruum_mask, ruum_masked, ruum_nosecret to {mask};\n\
+         grant usage on schema ruum_mask, ruum_masked, ruum_nosecret to {mask};\n\
          grant usage on schema ruum_nosecret to {read}, {write};\n\
          grant usage on schema ruum_masked to {masked_read}, {masked_write};\n\
          grant usage on schema extensions to {logins}, {mask};\n",
@@ -344,13 +344,20 @@ async fn write_lens_spec(conn: &mut PgConnection, spec: &LensSpec) -> Result<(),
 }
 
 /// Makes the key table and the pseudonym functions as `mask`, and installs `key` (in the
-/// caller's transaction).
+/// caller's transaction). `mask` holds `CREATE` on the lens schemas for this step only.
 pub(crate) async fn install_functions(
     conn: &mut PgConnection,
     roles: &[EngineRole],
     key: &PseudonymKey,
 ) -> Result<(), EngineError> {
-    let mask = ident(role_of(roles, RoleKind::Mask));
+    let mask_name = role_of(roles, RoleKind::Mask);
+    let mask = ident(mask_name);
+    run(
+        conn,
+        "let mask create in the lens schemas",
+        lens::mask_create_sql(mask_name, true),
+    )
+    .await?;
     run(conn, "become mask", format!("set local role {mask}")).await?;
     run(
         conn,
@@ -362,7 +369,13 @@ pub(crate) async fn install_functions(
     )
     .await?;
     install_key_as_mask(conn, key).await?;
-    run(conn, "leave mask", "reset role".to_string()).await
+    run(conn, "leave mask", "reset role".to_string()).await?;
+    run(
+        conn,
+        "take CREATE in the lens schemas back from mask",
+        lens::mask_create_sql(mask_name, false),
+    )
+    .await
 }
 
 /// Writes `key` into `ruum_mask.key`. The caller is `mask` already.
@@ -411,7 +424,14 @@ pub(crate) async fn build_lens(
     spec: &LensSpec,
 ) -> Result<(), EngineError> {
     write_lens_spec(conn, spec).await?;
-    let mask = ident(role_of(roles, RoleKind::Mask));
+    let mask_name = role_of(roles, RoleKind::Mask);
+    let mask = ident(mask_name);
+    run(
+        conn,
+        "let mask create in the lens schemas",
+        lens::mask_create_sql(mask_name, true),
+    )
+    .await?;
     run(conn, "become mask", format!("set local role {mask}")).await?;
     lens::drop_views(conn).await?;
     let lens_roles = LensRoles {
@@ -421,7 +441,13 @@ pub(crate) async fn build_lens(
         masked_write: role_of(roles, RoleKind::MaskedWrite),
     };
     lens::build_views(conn, catalog, spec, &lens_roles).await?;
-    run(conn, "leave mask", "reset role".to_string()).await
+    run(conn, "leave mask", "reset role".to_string()).await?;
+    run(
+        conn,
+        "take CREATE in the lens schemas back from mask",
+        lens::mask_create_sql(mask_name, false),
+    )
+    .await
 }
 
 /// Reads the catalog, calls `sync` and rebuilds the lens views from its answer, in one

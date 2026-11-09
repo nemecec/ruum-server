@@ -705,7 +705,8 @@ one is fixed below, and the safer option is taken where there was a choice. The 
   for a decimal exponent in [-4, 15), else `d.ddde+XX`; `NaN`, `Infinity`, `-0`); `timestamptz`
   and `timestamp` as `YYYY-MM-DDTHH:MM:SS[.ffffff without trailing zeros]Z` in UTC; `date` as
   `YYYY-MM-DD`; `bytea` as lowercase hex without `\x`; `boolean` as `true` / `false`; `uuid`
-  in lowercase. A `personal` column of another type uses a generic overload over `::text` with
+  in lowercase. A `personal` column of another built-in base type (item 37: any other type is
+  masked like `secret`) uses a generic overload over `::text` with
   every output setting fixed (`DateStyle`, `IntervalStyle`, `TimeZone`, `extra_float_digits`,
   `bytea_output`); card Q-0 lists those types. Only the agent kinds get `EXECUTE`, on
   `pseudonym` only (not on the HMAC helper).
@@ -883,3 +884,68 @@ The person approved two new dependencies (design 18.4: a new dependency needs ap
   pseudonym key.
 
 Status: decided (not provisional).
+
+## 37. Tenant-defined types never reach a definer function (review-dbhost-2 item 2, backlog S-1, S-4)
+
+Status: `provisional` (design 18.9); it carries out decision 0005 B-2 of the person, which is
+not provisional.
+
+**Problem.** `ruum_mask.pseudonym_other(anyelement)` is `SECURITY DEFINER` (owner `mask`) and
+ran `v::text`. A tenant owns its own types, so it may `CREATE CAST (its_type AS text) WITH
+FUNCTION ...`. Cast lookup does not use `search_path`, so the fixed path of the function did not
+help: the tenant's function ran as `mask` each time a masked reader read the column, and also
+in step 2 of a masked copy. As `mask` it could read the key and change `ruum_mask` objects
+(`review-dbhost-2.md` item 2, proved on the data cluster).
+
+**Decision.**
+
+- (a) **The masking rule** (0005 B-2). A `personal` column whose declared type is not a
+  built-in base type is masked like `secret`. A built-in base type is a type of `pg_catalog`
+  with an OID below 16384 and `typtype = 'b'` (arrays of such types included). Every other
+  type is "tenant-defined" here: enums, domains (also over a built-in type), composites,
+  ranges and multiranges (also the built-in ones), arrays of those, and the types of
+  extensions. The masked lens shows the hidden constant (`NULL` stays `NULL`; the null test is
+  `num_nulls`, so it never looks inside a composite). The query layer turns it into
+  `{"$ruum": "hidden", "class": "personal"}`. In a masked copy such a column becomes `text`
+  and holds `NULL`. Agents cannot join or group on such a column: every value is the same
+  constant. This replaces "a domain uses the overload of its base type" of item 34 (e) and
+  the list of generic types of card Q-0 for every type that is not a built-in base type.
+- (b) **Only built-in base types reach a definer function.** The lens and the masked copy
+  call a pseudonym function only for a column whose declared type is a built-in base type; any
+  other column, or one whose type the engine cannot read, gets the hidden form (fail closed).
+  `pseudonym_other` is PL/pgSQL and first checks the type of its argument; for any other type
+  it raises `42804` before any conversion, so a direct call (tenant code in step 2 of a masked
+  copy, while the copy's owner holds `EXECUTE`) cannot reach a tenant cast. A tenant cannot add
+  a cast between two built-in types (`CREATE CAST` needs the ownership of one of them), so the
+  remaining conversions are those of PostgreSQL itself.
+- (c) **Fixed search path and qualified bodies.** Every function of `ruum_mask` keeps
+  `search_path = pg_catalog, pg_temp`; the bodies of `hmac12` and `pseudonym_other` also
+  qualify their functions and operators (`operator(pg_catalog.||)`), so they resolve nothing
+  outside `pg_catalog` even if a setting of the function were changed.
+- (d) **`mask` cannot change the lens outside a build.** `mask` holds `USAGE` only on
+  `ruum_mask`, `ruum_masked` and `ruum_nosecret`. `ruum_dbhost`, the owner of the schemas,
+  grants it `CREATE` inside the transaction that makes the functions or builds the lens views,
+  and revokes it before the commit. So code that ran as `mask` at read time could not replace a
+  pseudonym function or a lens view. The role kinds are frozen (item 34), so no new role kind
+  was added: `mask` stays the owner of the functions, the key and the views; (b) makes sure no
+  tenant code runs as `mask`.
+- (e) **Tests** (backlog S-4). `crates/ruum-dbengine/src/postgres/tests/tenant_types.rs`, on
+  the data cluster: a tenant with an enum, domains (one with a check, one over the enum), a
+  composite, a range, an array of the enum, casts of each to `text`, an implicit cast from
+  `integer` to its enum, an operator, a view and default privileges. Every tenant function
+  marks a session setting and tries the role grants of `hostile_copy`. The masked reader sees
+  the hidden constant, no tenant function runs, no role gains a membership; a direct call of
+  `pseudonym_other` with each tenant type fails; the full, schema-only and masked copies, a
+  restore and `sync_lens` grant nothing and leave `mask` without `CREATE`; a pooled admin
+  connection keeps its search path after `SET` and `RESET ALL` / `DISCARD ALL`
+  (review-dbhost item 3). Mutations `dbengine-mask-tenant-type-pseudonym`,
+  `dbengine-mask-other-no-type-check`, `dbengine-mask-keeps-create` and
+  `dbengine-mask-copy-tenant-type-pseudonym`.
+
+**Effect on pseudonyms.** A built-in base type keeps its pseudonym (the canonical text did not
+change). A personal column of a built-in range type or of an extension type (for example
+`int4range`, `geometry`, `vector`) now shows the hidden constant instead of a pseudonym.
+
+**Changes.** `crates/ruum-dbengine/src/postgres/lens.rs`, `setup.rs`, `copy.rs`; the doc of the
+generic overload in `crates/ruum-core/src/privacy/mod.rs`; the tests and mutations above.
+Fix record: `ruum-server-wt/panel/masking-fix.md`.

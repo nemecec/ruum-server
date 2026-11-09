@@ -52,7 +52,7 @@ async fn tenant_code_state(conn: &mut PgConnection) -> String {
 /// The PL/pgSQL statements of hostile tenant code: each one tries to give a role of `other` to
 /// a role of `own` or to `ruum_dbhost`, and ignores its own failure. Only a session with
 /// `ruum_dbhost`'s `ADMIN` on the roles of `other` can make one succeed.
-fn escalation(other: &CreatedDatabase, own: &CreatedDatabase) -> String {
+pub(super) fn escalation(other: &CreatedDatabase, own: &CreatedDatabase) -> String {
     let grant = |role: RoleKind, to: String| {
         format!(
             "BEGIN EXECUTE 'GRANT {} TO {}'; EXCEPTION WHEN OTHERS THEN NULL; END;",
@@ -331,7 +331,7 @@ async fn a_masked_copy_builds_foreign_keys_again_or_leaves_them_out() {
 /// The memberships that a hostile tenant could have taken: those of the LOGIN roles of
 /// `databases`, and those of `ruum_dbhost` in the LOGIN roles of `other` (it holds `SET` in
 /// every `mask` by design). Empty when nothing was taken.
-async fn taken(
+pub(super) async fn taken(
     engine: &PostgresEngine,
     databases: &[&CreatedDatabase],
     other: &CreatedDatabase,
