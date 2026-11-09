@@ -41,7 +41,10 @@ fn the_role_kind_follows_the_caller() {
 fn agents_fail_closed() {
     assert_eq!(agent_kind(StatementMode::Read), Ok(RoleKind::MaskedRead));
     let p = agent_kind(StatementMode::Write).unwrap_err();
-    assert_eq!((p.status, p.code), (403, "write_grant_required"));
+    assert_eq!(
+        (p.code.http_status(), p.code.as_str()),
+        (403, "write_grant_required")
+    );
 
     let mut columns = vec![QueryColumn {
         name: "email".into(),
@@ -107,7 +110,7 @@ fn engine_errors_are_sanitized_without_manage() {
     };
     let p = problem(e(), false);
     assert_eq!(
-        (p.status, p.code, p.sqlstate.as_deref()),
+        (p.code.http_status(), p.code.as_str(), p.sqlstate.as_deref()),
         (400, "query_failed", Some("22P02"))
     );
     assert!(!p.message.contains("alice"), "{}", p.message);
@@ -155,13 +158,13 @@ fn engine_errors_are_sanitized_without_manage() {
         (Some("42501"), "permission denied")
     );
     assert_eq!(
-        problem(EngineError::ReadOnly, false).code,
+        problem(EngineError::ReadOnly, false).code.as_str(),
         "read_only_query"
     );
-    assert_eq!(problem(EngineError::Timeout, false).status, 504);
+    assert_eq!(problem(EngineError::Timeout, false).code.http_status(), 504);
     let p = problem(EngineError::NotReady, false);
     assert_eq!(
-        (p.status, p.code, p.retry_after),
+        (p.code.http_status(), p.code.as_str(), p.retry_after),
         (503, "database_not_ready", Some(RETRY_AFTER_SECONDS))
     );
     assert_eq!(p.hint.as_deref(), Some("retry"));
@@ -392,7 +395,7 @@ impl Q {
 fn failure(r: std::result::Result<QueryResult, QueryError>) -> (u16, String, Option<String>) {
     match r {
         Ok(v) => panic!("the call succeeded: {v:?}"),
-        Err(QueryError::Problem(p)) => (p.status, p.code.to_string(), p.hint),
+        Err(QueryError::Problem(p)) => (p.code.http_status(), p.code.as_str().to_string(), p.hint),
         Err(QueryError::Core(e)) => (e.http_status(), e.to_api().code.as_str().into(), None),
     }
 }
@@ -457,7 +460,7 @@ async fn people_read_and_write_by_their_role() {
     match ddl {
         Err(QueryError::Problem(p)) => {
             assert_eq!(
-                (p.code, p.sqlstate.as_deref()),
+                (p.code.as_str(), p.sqlstate.as_deref()),
                 ("query_failed", Some("42501"))
             );
         }
@@ -842,7 +845,10 @@ async fn a_database_that_is_not_ready_answers_503_except_to_the_owner_kind() {
     for c in [q.carol(), q.alice()] {
         match query(&svc, &c, q.db, sql("select count(*) from plants")).await {
             Err(QueryError::Problem(p)) => {
-                assert_eq!((p.status, p.code), (503, "database_not_ready"));
+                assert_eq!(
+                    (p.code.http_status(), p.code.as_str()),
+                    (503, "database_not_ready")
+                );
                 assert_eq!(p.retry_after, Some(RETRY_AFTER_SECONDS));
                 assert_eq!(p.hint.as_deref(), Some("retry"));
             }
@@ -850,7 +856,7 @@ async fn a_database_that_is_not_ready_answers_503_except_to_the_owner_kind() {
         }
     }
     match schema(&svc, &q.carol(), q.db).await {
-        Err(QueryError::Problem(p)) => assert_eq!(p.code, "database_not_ready"),
+        Err(QueryError::Problem(p)) => assert_eq!(p.code.as_str(), "database_not_ready"),
         other => panic!("{other:?}"),
     }
     // The owner kind (a write by a person with manage) runs.
@@ -1223,6 +1229,31 @@ async fn postgres_engine_masks_secrets_for_viewers_and_takes_a_managers_retype()
         failure(run(a.clone(), sql("select count(*) from public.accounts")).await);
     assert_eq!((status, code.as_str()), (422, "statement_not_allowed"));
     assert_eq!(hint.as_deref(), Some(rules::HINT_UNQUALIFIED_NAMES));
+    // Review Q-1-3, N-B: `UPDATE pg_settings` (set_config through the view's rewrite rule) is
+    // the contract's `422 statement_not_allowed` now, for the manager too, not the engine's
+    // `400 query_failed` (42501); a read of pg_settings still runs.
+    for text in [
+        "update pg_settings set setting = '7MB' where name = 'work_mem'",
+        "update pg_catalog.pg_settings set setting = '0' where name = 'statement_timeout'",
+        "with x as (update pg_settings set setting = '0' where name = 'statement_timeout' \
+         returning name) select * from x",
+    ] {
+        for req in [write(text), sql(text)] {
+            let (status, code, _) = failure(run(a.clone(), req).await);
+            assert_eq!(
+                (status, code.as_str()),
+                (422, "statement_not_allowed"),
+                "{text}"
+            );
+        }
+    }
+    let r = run(
+        a.clone(),
+        sql("select setting from pg_settings where name = 'work_mem'"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.rows.len(), 1);
     // set_config through a function that runs a query given as text (review Q-1, S-1): the
     // statement rules let it through (the text is a string literal), the engine refuses it for
     // every kind but owner, and the answer is the fixed text. An agent reads as masked_read.
@@ -1246,7 +1277,11 @@ async fn postgres_engine_masks_secrets_for_viewers_and_takes_a_managers_retype()
             let Err(QueryError::Problem(p)) = r else {
                 panic!("{text}: {r:?}");
             };
-            assert_eq!((p.status, p.code), (400, "query_failed"), "{text}");
+            assert_eq!(
+                (p.code.http_status(), p.code.as_str()),
+                (400, "query_failed"),
+                "{text}"
+            );
             assert_eq!(p.sqlstate.as_deref(), Some("42501"), "{text}");
         }
     }

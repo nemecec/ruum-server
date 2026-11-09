@@ -142,95 +142,50 @@ pub struct ListQueries {
 
 // -------------------------------------------------------------------------------- errors
 
-/// An error answer of the query API that the step 1 [`ErrorCode`] list has no code for
-/// (`query_failed`, `read_only_query`, `statement_not_allowed`, `database_not_ready`,
-/// `statement_timeout`, `write_grant_required`; contract `ErrorCode`), with the optional
-/// `sqlstate` of the contract's `Error` and the `Retry-After` of `503`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Problem {
-    pub status: u16,
-    pub code: &'static str,
-    pub message: String,
-    pub hint: Option<String>,
-    pub sqlstate: Option<String>,
-    /// Seconds for the `Retry-After` header.
-    pub retry_after: Option<u64>,
+/// An error answer of the query API with a step 2 code (`query_failed`, `read_only_query`,
+/// `statement_not_allowed`, `database_not_ready`, `statement_timeout`, `write_grant_required`),
+/// the optional `sqlstate` and the `Retry-After` of `503`. It is the shared [`ApiError`]
+/// (backlog 2026-11-08 P-3); the name stays for the callers of Q-1.
+pub type Problem = ApiError;
+
+/// `503 database_not_ready`, hint `retry`, `Retry-After` (decision 0004-35 d).
+pub fn not_ready_error() -> Problem {
+    ApiError::new(
+        ErrorCode::DatabaseNotReady,
+        "the database is not ready for queries right now; nothing ran",
+    )
+    .with_hint("retry")
+    .with_retry_after(RETRY_AFTER_SECONDS)
 }
 
-impl Problem {
-    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Problem {
-        Problem {
-            status,
-            code,
-            message: message.into(),
-            hint: None,
-            sqlstate: None,
-            retry_after: None,
-        }
-    }
+fn read_only_error() -> Problem {
+    ApiError::new(
+        ErrorCode::ReadOnlyQuery,
+        "a read-only query cannot change data",
+    )
+    .with_hint("send mode write for a statement that changes data (needs edit)")
+}
 
-    fn hint(mut self, hint: impl Into<String>) -> Problem {
-        self.hint = Some(hint.into());
-        self
-    }
+fn timeout_error() -> Problem {
+    ApiError::new(
+        ErrorCode::StatementTimeout,
+        "the statement ran longer than the timeout and was cancelled",
+    )
+    .with_hint("make the statement cheaper, or send a smaller result (max_rows)")
+}
 
-    /// The `error` object of the answer.
-    pub fn body(&self) -> serde_json::Value {
-        let mut e = serde_json::json!({ "code": self.code, "message": self.message });
-        if let Some(h) = &self.hint {
-            e["hint"] = h.clone().into();
-        }
-        if let Some(s) = &self.sqlstate {
-            e["sqlstate"] = s.clone().into();
-        }
-        serde_json::json!({ "error": e })
-    }
+fn validation_error(message: impl Into<String>, hint: impl Into<String>) -> Problem {
+    ApiError::new(ErrorCode::ValidationFailed, message).with_hint(hint)
+}
 
-    /// `503 database_not_ready`, hint `retry`, `Retry-After` (decision 0004-35 d).
-    pub fn not_ready() -> Problem {
-        let mut p = Problem::new(
-            503,
-            "database_not_ready",
-            "the database is not ready for queries right now; nothing ran",
-        )
-        .hint("retry");
-        p.retry_after = Some(RETRY_AFTER_SECONDS);
-        p
-    }
+fn refusal_error(r: rules::Refusal) -> Problem {
+    let mut p = ApiError::new(r.code.error_code(), r.message);
+    p.hint = r.hint;
+    p
+}
 
-    fn read_only() -> Problem {
-        Problem::new(
-            400,
-            "read_only_query",
-            "a read-only query cannot change data",
-        )
-        .hint("send mode write for a statement that changes data (needs edit)")
-    }
-
-    fn timeout() -> Problem {
-        Problem::new(
-            504,
-            "statement_timeout",
-            "the statement ran longer than the timeout and was cancelled",
-        )
-        .hint("make the statement cheaper, or send a smaller result (max_rows)")
-    }
-
-    fn validation(message: impl Into<String>, hint: impl Into<String>) -> Problem {
-        Problem::new(422, "validation_failed", message).hint(hint)
-    }
-
-    fn refusal(r: rules::Refusal) -> Problem {
-        let mut p = Problem::new(422, r.code.as_str(), r.message);
-        p.hint = r.hint;
-        p
-    }
-
-    fn query_failed(sqlstate: String, message: String) -> Problem {
-        let mut p = Problem::new(400, "query_failed", message);
-        p.sqlstate = Some(sqlstate);
-        p
-    }
+fn query_failed_error(sqlstate: String, message: String) -> Problem {
+    ApiError::new(ErrorCode::QueryFailed, message).with_sqlstate(sqlstate)
 }
 
 /// An error of the query API: a step 1 error, or a [`Problem`].
@@ -257,13 +212,15 @@ impl QueryError {
     fn code(&self) -> String {
         match self {
             QueryError::Core(e) => e.to_api().code.as_str().to_string(),
-            QueryError::Problem(p) => p.code.to_string(),
+            QueryError::Problem(p) => p.code.as_str().to_string(),
         }
     }
 
     fn outcome(&self) -> QueryOutcome {
         match self {
-            QueryError::Problem(p) if p.code == "statement_timeout" => QueryOutcome::Timeout,
+            QueryError::Problem(p) if p.code == ErrorCode::StatementTimeout => {
+                QueryOutcome::Timeout
+            }
             _ => QueryOutcome::Error,
         }
     }
@@ -449,12 +406,11 @@ pub fn person_kind(role: Option<Role>, mode: StatementMode) -> Option<RoleKind> 
 pub fn agent_kind(mode: StatementMode) -> std::result::Result<RoleKind, Problem> {
     match mode {
         StatementMode::Read => Ok(RoleKind::MaskedRead),
-        StatementMode::Write => Err(Problem::new(
-            403,
-            "write_grant_required",
+        StatementMode::Write => Err(ApiError::new(
+            ErrorCode::WriteGrantRequired,
             "an agent writes to a live database only with a write grant (write_live) from its user",
         )
-        .hint("ask your user to give you a write grant on this database in the Ruum web UI")),
+        .with_hint("ask your user to give you a write grant on this database in the Ruum web UI")),
     }
 }
 
@@ -683,29 +639,27 @@ fn engine_problem(e: EngineError, manage: bool) -> QueryError {
                 format!("{fixed}: {}", names.join(", "))
             }
         };
-        QueryError::Problem(Problem::query_failed(sqlstate, message))
+        QueryError::Problem(query_failed_error(sqlstate, message))
     };
     match e {
-        EngineError::ReadOnly => Problem::read_only().into(),
-        EngineError::Timeout => Problem::timeout().into(),
-        EngineError::NotReady => Problem::not_ready().into(),
-        EngineError::MultipleStatements => Problem::validation(
+        EngineError::ReadOnly => read_only_error().into(),
+        EngineError::Timeout => timeout_error().into(),
+        EngineError::NotReady => not_ready_error().into(),
+        EngineError::MultipleStatements => validation_error(
             "send one statement per call",
             "/sql: send each statement in its own call",
         )
         .into(),
-        EngineError::StatementNotAllowed(rule) => Problem::new(
-            422,
-            "statement_not_allowed",
+        EngineError::StatementNotAllowed(rule) => ApiError::new(
+            ErrorCode::StatementNotAllowed,
             format!("the engine refused the statement: {rule}"),
         )
         .into(),
-        EngineError::TransactionEnded => Problem::new(
-            422,
-            "statement_not_allowed",
+        EngineError::TransactionEnded => ApiError::new(
+            ErrorCode::StatementNotAllowed,
             "the statement ended the transaction of the call",
         )
-        .hint(rules::HINT_TRANSACTION_CONTROL)
+        .with_hint(rules::HINT_TRANSACTION_CONTROL)
         .into(),
         EngineError::PermissionDenied(text) => failed("42501".into(), text),
         EngineError::Sql { code, message } => {
@@ -717,7 +671,7 @@ fn engine_problem(e: EngineError, manage: bool) -> QueryError {
             failed(sqlstate, message)
         }
         EngineError::MigrationFailed(inner) => engine_problem(*inner, manage),
-        EngineError::Unsupported(_) => Problem::validation(
+        EngineError::Unsupported(_) => validation_error(
             "this engine does not support a value or a feature of the statement",
             "/params: send numbers, strings, booleans or null",
         )
@@ -894,7 +848,7 @@ async fn wait_ready(
             return Ok(row);
         }
         if Instant::now() >= deadline {
-            return Err(Problem::not_ready().into());
+            return Err(not_ready_error().into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -989,36 +943,36 @@ async fn run(
     };
     // 4. The request limits, then the statement rules.
     if req.params.len() > MAX_PARAMS {
-        return Err(Problem::validation(
+        return Err(validation_error(
             format!("at most {MAX_PARAMS} parameters"),
             "/params: send fewer parameters",
         )
         .into());
     }
     if req.max_rows == Some(0) {
-        return Err(Problem::validation("max_rows is at least 1", "/max_rows").into());
+        return Err(validation_error("max_rows is at least 1", "/max_rows").into());
     }
     if req.timeout_ms.is_some_and(|ms| ms < MIN_TIMEOUT_MS) {
-        return Err(Problem::validation(
+        return Err(validation_error(
             format!("timeout_ms is at least {MIN_TIMEOUT_MS}"),
             "/timeout_ms",
         )
         .into());
     }
     if req.approval_id.is_some() {
-        return Err(Problem::validation(
+        return Err(validation_error(
             "approvals of statements are not available yet",
             "/approval_id: leave it out",
         )
         .into());
     }
     if req.sql.trim().is_empty() {
-        return Err(Problem::validation("sql is empty", "/sql: send one SQL statement").into());
+        return Err(validation_error("sql is empty", "/sql: send one SQL statement").into());
     }
-    let statement = verdict.map_err(Problem::refusal)?;
+    let statement = verdict.map_err(refusal_error)?;
     // 5. Read mode.
     if mode == StatementMode::Read && statement != rules::StatementKind::Read {
-        return Err(Problem::read_only().into());
+        return Err(read_only_error().into());
     }
     // 7. Ready.
     let row = wait_ready(svc, ctx.tenant, id, t.trashed, kind == RoleKind::Owner).await?;
@@ -1040,7 +994,7 @@ async fn run(
     // 8. A schema change by a person with manage: the migration path.
     if statement == rules::StatementKind::SchemaChange && kind == RoleKind::Owner {
         if !req.params.is_empty() {
-            return Err(Problem::validation(
+            return Err(validation_error(
                 "a schema change takes no parameters",
                 "/params: leave them out",
             )
@@ -1200,7 +1154,7 @@ pub async fn schema(
         .catalog(&row.database_ref())
         .await
         .map_err(|e| match e {
-            EngineError::NotReady => QueryError::Problem(Problem::not_ready()),
+            EngineError::NotReady => QueryError::Problem(not_ready_error()),
             other => QueryError::Core(Error::Internal(format!("catalog: {other}"))),
         })?;
     Ok(schema_of(row.engine, &catalog, &t.manifest))

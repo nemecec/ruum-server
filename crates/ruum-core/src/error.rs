@@ -34,6 +34,24 @@ pub enum ErrorCode {
     AgentDisabled,
     ChunkMissing,
     HashMismatch,
+    /// Step 2: the database is not ready for queries (`503`, with `Retry-After`).
+    DatabaseNotReady,
+    /// Step 2: the engine refused or failed the statement (`400`, with `sqlstate`).
+    QueryFailed,
+    /// Step 2: a statement of a `mode: read` call changes data.
+    ReadOnlyQuery,
+    /// Step 2: the statement ran longer than the timeout (`504`).
+    StatementTimeout,
+    /// Step 2: an agent writes to a live database only with a write grant.
+    WriteGrantRequired,
+    /// Step 2: a migration statement failed (`422`, with `sqlstate`).
+    MigrationFailed,
+    /// Step 2: the database is too large for the operation (`422`).
+    DatabaseTooLarge,
+    /// Step 2: the statement rules of the query API refuse the statement (`422`).
+    StatementNotAllowed,
+    /// Step 2: an agent write reads a column whose class the agent may not read (`403`).
+    ClassReadRequired,
     NotImplemented,
     Internal,
     Unavailable,
@@ -64,6 +82,15 @@ impl ErrorCode {
         ErrorCode::AgentDisabled,
         ErrorCode::ChunkMissing,
         ErrorCode::HashMismatch,
+        ErrorCode::DatabaseNotReady,
+        ErrorCode::QueryFailed,
+        ErrorCode::ReadOnlyQuery,
+        ErrorCode::StatementTimeout,
+        ErrorCode::WriteGrantRequired,
+        ErrorCode::MigrationFailed,
+        ErrorCode::DatabaseTooLarge,
+        ErrorCode::StatementNotAllowed,
+        ErrorCode::ClassReadRequired,
         ErrorCode::NotImplemented,
         ErrorCode::Internal,
         ErrorCode::Unavailable,
@@ -85,6 +112,11 @@ impl ErrorCode {
             CursorExpired => 410,
             HashMismatch => 422,
             QuotaExceeded | PlanLimitReached => 403,
+            QueryFailed | ReadOnlyQuery => 400,
+            WriteGrantRequired | ClassReadRequired => 403,
+            MigrationFailed | DatabaseTooLarge | StatementNotAllowed => 422,
+            DatabaseNotReady => 503,
+            StatementTimeout => 504,
             RateLimited => 429,
             NotImplemented => 501,
             Internal => 500,
@@ -118,6 +150,15 @@ impl ErrorCode {
             AgentDisabled => "agent_disabled",
             ChunkMissing => "chunk_missing",
             HashMismatch => "hash_mismatch",
+            DatabaseNotReady => "database_not_ready",
+            QueryFailed => "query_failed",
+            ReadOnlyQuery => "read_only_query",
+            StatementTimeout => "statement_timeout",
+            WriteGrantRequired => "write_grant_required",
+            MigrationFailed => "migration_failed",
+            DatabaseTooLarge => "database_too_large",
+            StatementNotAllowed => "statement_not_allowed",
+            ClassReadRequired => "class_read_required",
             NotImplemented => "not_implemented",
             Internal => "internal",
             Unavailable => "unavailable",
@@ -132,6 +173,13 @@ pub struct ApiError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// The SQLSTATE of a `query_failed` or `migration_failed` error (step 2; contract `Error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlstate: Option<String>,
+    /// Seconds for the `Retry-After` header of the answer (for example of `503
+    /// database_not_ready`). Not part of the body.
+    #[serde(skip)]
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -140,11 +188,23 @@ impl ApiError {
             code,
             message: message.into(),
             hint: None,
+            sqlstate: None,
+            retry_after: None,
         }
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    pub fn with_sqlstate(mut self, sqlstate: impl Into<String>) -> Self {
+        self.sqlstate = Some(sqlstate.into());
+        self
+    }
+
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
         self
     }
 }
@@ -245,6 +305,58 @@ mod tests {
             let json = serde_json::to_string(code).unwrap();
             assert_eq!(json, format!("\"{}\"", code.as_str()));
         }
+    }
+
+    /// The other direction: the Rust list has every code of the contract's `ErrorCode` enum
+    /// (backlog 2026-11-08 P-3: the step 2 codes were missing).
+    #[test]
+    fn every_contract_code_is_in_the_list() {
+        let spec = include_str!("../../../contracts/openapi.yaml");
+        let start = spec.find("\n    ErrorCode:\n").expect("ErrorCode schema");
+        let rest = &spec[start..];
+        let enum_at = rest.find("      enum:\n").expect("ErrorCode enum") + "      enum:\n".len();
+        let codes: Vec<&str> = rest[enum_at..]
+            .lines()
+            .take_while(|l| l.starts_with("        - "))
+            .map(|l| l.trim_start_matches("        - ").trim())
+            .collect();
+        assert!(codes.len() >= 30, "{codes:?}");
+        for c in &codes {
+            assert!(
+                ErrorCode::ALL.iter().any(|k| k.as_str() == *c),
+                "{c} of openapi.yaml is not in ErrorCode::ALL"
+            );
+        }
+        assert_eq!(codes.len(), ErrorCode::ALL.len());
+    }
+
+    #[test]
+    fn step2_codes_have_the_contract_status() {
+        for (code, status) in [
+            (ErrorCode::DatabaseNotReady, 503),
+            (ErrorCode::QueryFailed, 400),
+            (ErrorCode::ReadOnlyQuery, 400),
+            (ErrorCode::StatementTimeout, 504),
+            (ErrorCode::WriteGrantRequired, 403),
+            (ErrorCode::MigrationFailed, 422),
+            (ErrorCode::DatabaseTooLarge, 422),
+            (ErrorCode::StatementNotAllowed, 422),
+            (ErrorCode::ClassReadRequired, 403),
+        ] {
+            assert_eq!(code.http_status(), status, "{}", code.as_str());
+        }
+    }
+
+    #[test]
+    fn sqlstate_is_in_the_body_and_retry_after_is_not() {
+        let e = ApiError::new(ErrorCode::QueryFailed, "x")
+            .with_sqlstate("23505")
+            .with_retry_after(2);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["sqlstate"], "23505");
+        assert!(v.get("retry_after").is_none(), "{v}");
+        let plain = serde_json::to_value(ApiError::new(ErrorCode::NotFound, "x")).unwrap();
+        assert!(plain.get("sqlstate").is_none(), "{plain}");
     }
 
     #[test]

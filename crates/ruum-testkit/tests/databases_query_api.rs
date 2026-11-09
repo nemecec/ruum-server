@@ -233,6 +233,14 @@ async fn the_statement_rules_answer_422() {
         .refused(Who::Member, t.write("commit"), 422, "statement_not_allowed")
         .await;
     assert_eq!(e["hint"], "remove_transaction_control");
+    // Writes to the catalog (review Q-1-3, N-B; on SQLite the schema table), for the manager.
+    for sql in [
+        "update sqlite_master set sql = 'x'",
+        "with x as (select 1) delete from sqlite_schema",
+    ] {
+        t.refused(Who::Member, t.write(sql), 422, "statement_not_allowed")
+            .await;
+    }
     // A write in read mode: by the parser, and by the engine alone.
     t.refused(
         Who::Member,

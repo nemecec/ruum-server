@@ -4,8 +4,9 @@
 //!
 //! The step 2 error codes of the query API (`query_failed`, `read_only_query`,
 //! `statement_not_allowed`, `database_not_ready`, `statement_timeout`, `write_grant_required`)
-//! come as a [`Problem`] and render here with the standard error body, the `sqlstate` of a
-//! failed statement and the `Retry-After` header of `503 database_not_ready`.
+//! are codes of the shared `ErrorCode`; they render with [`crate::error::render`]: the standard
+//! error body, the `sqlstate` of a failed statement and the `Retry-After` header of `503
+//! database_not_ready`.
 
 use crate::auth::{JsonBody, RequestContext};
 use crate::error::{ApiResult, HttpError};
@@ -14,12 +15,10 @@ use crate::state::AppState;
 use axum::Router;
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Json, Path, Query, State};
-use axum::http::header::RETRY_AFTER;
-use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ruum_core::databases::engine::StatementMode;
-use ruum_core::databases::query::{self, ListQueries, Problem, QueryError, QueryRequest};
+use ruum_core::databases::query::{self, ListQueries, QueryError, QueryRequest};
 use ruum_core::{ApiError, Cursor, Error, ErrorCode, PageRequest};
 use serde::Deserialize;
 use serde_json::json;
@@ -35,22 +34,10 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// Renders a [`Problem`]: its status, the error body and `Retry-After`.
-fn problem(p: Problem) -> Response {
-    let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut res = (status, Json(p.body())).into_response();
-    if let Some(secs) = p.retry_after
-        && let Ok(v) = HeaderValue::from_str(&secs.to_string())
-    {
-        res.headers_mut().insert(RETRY_AFTER, v);
-    }
-    res
-}
-
 fn answer(e: QueryError) -> Response {
     match e {
         QueryError::Core(e) => HttpError(e).into_response(),
-        QueryError::Problem(p) => problem(p),
+        QueryError::Problem(p) => crate::error::render(p),
     }
 }
 

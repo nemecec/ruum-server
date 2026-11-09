@@ -27,11 +27,20 @@ impl IntoResponse for HttpError {
     }
 }
 
-/// Renders an [`ApiError`] with its HTTP status.
+/// Renders an [`ApiError`] with its HTTP status, and its `Retry-After` header when it has one
+/// (for example `503 database_not_ready`).
 pub fn render(e: ApiError) -> Response {
     let status =
         StatusCode::from_u16(e.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(json!({ "error": e }))).into_response()
+    let retry_after = e.retry_after;
+    let mut res = (status, Json(json!({ "error": e }))).into_response();
+    if let Some(secs) = retry_after {
+        res.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(secs),
+        );
+    }
+    res
 }
 
 /// The `501 not_implemented` answer of a handler that is not built yet.
@@ -122,7 +131,30 @@ pub async fn user_required_hint(
 
 #[cfg(test)]
 mod tests {
-    use super::user_page;
+    use super::{render, user_page};
+    use ruum_core::{ApiError, ErrorCode};
+
+    #[tokio::test]
+    async fn render_sends_the_status_sqlstate_and_retry_after() {
+        let res = render(
+            ApiError::new(ErrorCode::DatabaseNotReady, "not ready")
+                .with_hint("retry")
+                .with_retry_after(2),
+        );
+        assert_eq!(res.status().as_u16(), 503);
+        assert_eq!(res.headers()["retry-after"], "2");
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "database_not_ready");
+        assert!(v["error"].get("retry_after").is_none(), "{v}");
+
+        let res = render(ApiError::new(ErrorCode::QueryFailed, "failed").with_sqlstate("23505"));
+        assert_eq!(res.status().as_u16(), 400);
+        assert!(res.headers().get("retry-after").is_none());
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["sqlstate"], "23505");
+    }
 
     #[test]
     fn user_required_hints_name_the_page() {

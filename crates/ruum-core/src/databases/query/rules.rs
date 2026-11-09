@@ -29,7 +29,17 @@
 //!    `ALTER` of tables, views, indexes, sequences, types, domains, functions and triggers; their
 //!    `DROP`; `COMMENT ON`; `ALTER TABLE ... RENAME`). On SQLite also `PRAGMA` of the read-only
 //!    allow-list. Every other kind (roles, `GRANT`, `REVOKE`, schemas, databases, extensions,
-//!    `COPY`, `CALL`, `DO`, `ATTACH`, `DETACH`, `VACUUM`, `LISTEN`, ...) is refused.
+//!    `COPY`, `CALL`, `DO`, `ATTACH`, `DETACH`, `VACUUM`, `LISTEN`, ...) is refused. A query
+//!    with a data-modifying `WITH` (`WITH x AS (DELETE ... RETURNING ...) SELECT ...`) counts
+//!    as a write.
+//! 10. No write and no schema change of a catalog relation (review Q-1-3, N-B; backlog
+//!     2026-11-09 S-12). On Postgres, the target of an `INSERT`, `UPDATE`, `DELETE`, `MERGE` or
+//!     `TRUNCATE` (also inside `WITH` and `EXPLAIN`), and the object of a schema change, may not
+//!     be in `pg_catalog`, `information_schema` or a `pg_*` schema (`pg_toast`, `pg_temp`, ...),
+//!     and an unqualified one may not start with `pg_`: Postgres looks in `pg_catalog` first,
+//!     so `UPDATE pg_settings` is `set_config` under another name (`pg_settings` has a rewrite
+//!     rule that calls it). On SQLite, the target may not be `sqlite_schema`, `sqlite_master` or
+//!     their `temp` forms. Reads of the catalog still run.
 //!
 //! `set_config` inside a function body or a `DO` block is out of the parser's reach: the engine
 //! holds that line (card E-2). A `DO` block does not parse, so it is refused here anyway.
@@ -38,8 +48,12 @@
 //! nest deeply (a long chain of operators), and both the parse and the drop of its syntax tree
 //! recurse.
 
+use crate::error::ErrorCode;
 use ruum_dbengine::EngineKind;
-use sqlparser::ast::{ObjectType, Query, SetExpr, Statement};
+use sqlparser::ast::{
+    CommentObject, Expr, FromTable, ObjectName, ObjectType, Query, SetExpr, Statement, TableFactor,
+    TableObject, TableWithJoins,
+};
 use sqlparser::dialect::{Dialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
@@ -89,9 +103,14 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     pub fn as_str(self) -> &'static str {
+        self.error_code().as_str()
+    }
+
+    /// The shared error code of the answer.
+    pub fn error_code(self) -> ErrorCode {
         match self {
-            RefusalCode::ValidationFailed => "validation_failed",
-            RefusalCode::StatementNotAllowed => "statement_not_allowed",
+            RefusalCode::ValidationFailed => ErrorCode::ValidationFailed,
+            RefusalCode::StatementNotAllowed => ErrorCode::StatementNotAllowed,
         }
     }
 }
@@ -263,7 +282,10 @@ fn check(
         return Err(unparsed());
     };
     // 9. The statement kinds that run.
-    classify(engine, statement)
+    let kind = classify(engine, statement)?;
+    // 10. No write to the catalog.
+    check_catalog_targets(engine, statement)?;
+    Ok(kind)
 }
 
 fn transaction_control() -> Refusal {
@@ -365,6 +387,8 @@ fn classify(engine: EngineKind, statement: &Statement) -> Result<StatementKind, 
     Ok(match statement {
         // `SELECT ... INTO` makes a table: a schema change (review Q-1, N-2).
         Statement::Query(q) if query_has_into(q) => SchemaChange,
+        // `WITH x AS (UPDATE ...) SELECT ...` and `WITH ... DELETE ...` change rows.
+        Statement::Query(q) if !modifying_statements(q).is_empty() => Write,
         Statement::Query(_) => Read,
         Statement::Insert(_)
         | Statement::Update(_)
@@ -444,6 +468,249 @@ fn classify(engine: EngineKind, statement: &Statement) -> Result<StatementKind, 
         Statement::Reset(_) | Statement::Discard { .. } => return Err(session_statement()),
         _ => return Err(not_allowed_kind()),
     })
+}
+
+/// The data-modifying statements of a query: the `INSERT`, `UPDATE`, `DELETE` and `MERGE` of
+/// its `WITH` and of its body (also of set operations and nested queries there). Postgres
+/// takes them only at the top level of a statement, but the walk takes every one it finds.
+fn modifying_statements(q: &Query) -> Vec<&Statement> {
+    fn in_set<'a>(s: &'a SetExpr, out: &mut Vec<&'a Statement>) {
+        match s {
+            SetExpr::Insert(st)
+            | SetExpr::Update(st)
+            | SetExpr::Delete(st)
+            | SetExpr::Merge(st) => out.push(st),
+            SetExpr::Query(q) => in_query(q, out),
+            SetExpr::SetOperation { left, right, .. } => {
+                in_set(left, out);
+                in_set(right, out);
+            }
+            _ => {}
+        }
+    }
+    fn in_query<'a>(q: &'a Query, out: &mut Vec<&'a Statement>) {
+        if let Some(with) = &q.with {
+            for cte in &with.cte_tables {
+                in_query(&cte.query, out);
+            }
+        }
+        in_set(&q.body, out);
+    }
+    let mut out = Vec::new();
+    in_query(q, &mut out);
+    out
+}
+
+/// The catalog rule (rule 10): refuses a statement that writes to a catalog relation or changes
+/// a catalog object.
+fn check_catalog_targets(engine: EngineKind, statement: &Statement) -> Result<(), Refusal> {
+    let mut t = Targets::default();
+    t.statement(statement);
+    let hit = t.names.iter().any(|n| is_catalog_name(engine, n, false))
+        || t.column_names
+            .iter()
+            .any(|n| is_catalog_name(engine, n, true));
+    if hit {
+        return Err(Refusal::not_allowed(
+            "writes to the system catalog never run (pg_catalog, information_schema and names \
+             that start with pg_; on SQLite sqlite_schema); the catalog can be read",
+            Some(
+                "write to the database's own tables; the platform's options hold the limits of \
+                 the call",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A part of a name that is not a plain name (a function call, an expression): the catalog
+/// rule takes it as a catalog name (fail closed).
+const ODD_PART: &str = "pg_";
+
+/// The lower-case parts of a name.
+fn name_parts(name: &ObjectName) -> Vec<String> {
+    name.0
+        .iter()
+        .map(|p| match p.as_ident() {
+            Some(i) => i.value.to_ascii_lowercase(),
+            None => ODD_PART.to_string(),
+        })
+        .collect()
+}
+
+/// The names that a statement writes to or changes ([`Targets::statement`]), as lower-case
+/// parts.
+#[derive(Default)]
+struct Targets {
+    names: Vec<Vec<String>>,
+    /// Names of the form `<table>.<column>` (`COMMENT ON COLUMN`): the last part is a column.
+    column_names: Vec<Vec<String>>,
+}
+
+impl Targets {
+    fn name(&mut self, n: &ObjectName) {
+        self.names.push(name_parts(n));
+    }
+
+    fn factor(&mut self, f: &TableFactor) {
+        if let TableFactor::Table { name, .. } = f {
+            self.name(name);
+        }
+    }
+
+    /// `a JOIN b ...` of an `UPDATE` or `DELETE`: a multi-table write writes to every one.
+    fn joined(&mut self, t: &TableWithJoins) {
+        self.factor(&t.relation);
+        for j in &t.joins {
+            self.factor(&j.relation);
+        }
+    }
+
+    /// The tables that `SELECT ... INTO` makes.
+    fn into(&mut self, s: &SetExpr) {
+        match s {
+            SetExpr::Select(select) => {
+                for target in select.into.iter().flat_map(|i| &i.targets) {
+                    self.names.push(match target {
+                        Expr::Identifier(i) => vec![i.value.to_ascii_lowercase()],
+                        Expr::CompoundIdentifier(is) => {
+                            is.iter().map(|i| i.value.to_ascii_lowercase()).collect()
+                        }
+                        _ => vec![ODD_PART.to_string()],
+                    });
+                }
+            }
+            SetExpr::Query(q) => self.into(&q.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.into(left);
+                self.into(right);
+            }
+            _ => {}
+        }
+    }
+
+    /// Write targets (also of nested data-modifying statements and of `EXPLAIN`) and the
+    /// objects of schema changes.
+    fn statement(&mut self, statement: &Statement) {
+        match statement {
+            Statement::Query(q) => {
+                for s in modifying_statements(q) {
+                    self.statement(s);
+                }
+                self.into(&q.body);
+            }
+            Statement::Insert(i) => {
+                if let TableObject::TableName(n) = &i.table {
+                    self.name(n);
+                }
+                if let Some(source) = &i.source {
+                    for s in modifying_statements(source) {
+                        self.statement(s);
+                    }
+                }
+            }
+            Statement::Update(u) => self.joined(&u.table),
+            Statement::Delete(d) => {
+                for n in &d.tables {
+                    self.name(n);
+                }
+                match &d.from {
+                    FromTable::WithFromKeyword(ts) | FromTable::WithoutKeyword(ts) => {
+                        for t in ts {
+                            self.joined(t);
+                        }
+                    }
+                }
+            }
+            Statement::Merge(m) => self.factor(&m.table),
+            Statement::Truncate(t) => {
+                for target in &t.table_names {
+                    self.name(&target.name);
+                }
+            }
+            Statement::Explain { statement, .. } => self.statement(statement),
+            Statement::CreateTable(c) => self.name(&c.name),
+            Statement::CreateView(c) => self.name(&c.name),
+            Statement::CreateIndex(c) => {
+                self.name(&c.table_name);
+                if let Some(n) = &c.name {
+                    self.name(n);
+                }
+            }
+            Statement::CreateVirtualTable { name, .. }
+            | Statement::AlterIndex { name, .. }
+            | Statement::AlterView { name, .. }
+            | Statement::CreateSequence { name, .. }
+            | Statement::CreateType { name, .. } => self.name(name),
+            Statement::AlterTable(a) => self.name(&a.name),
+            Statement::AlterType(a) => self.name(&a.name),
+            Statement::CreateFunction(f) => self.name(&f.name),
+            Statement::DropFunction(f) => {
+                for d in &f.func_desc {
+                    self.name(&d.name);
+                }
+            }
+            Statement::CreateTrigger(t) => {
+                self.name(&t.table_name);
+                self.name(&t.name);
+            }
+            Statement::DropTrigger(t) => {
+                if let Some(n) = &t.table_name {
+                    self.name(n);
+                }
+            }
+            Statement::CreateDomain(d) => self.name(&d.name),
+            Statement::DropDomain(d) => self.name(&d.name),
+            Statement::RenameTable(rs) => {
+                for r in rs {
+                    self.name(&r.old_name);
+                    self.name(&r.new_name);
+                }
+            }
+            Statement::Drop { names, .. } => {
+                for n in names {
+                    self.name(n);
+                }
+            }
+            Statement::Comment {
+                object_type,
+                object_name,
+                ..
+            } => match object_type {
+                CommentObject::Column => self.column_names.push(name_parts(object_name)),
+                _ => self.name(object_name),
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Whether a name (lower-case parts, in the dialect of `engine`) names a catalog relation or
+/// object. `column`: the last part is a column, so the relation is the part before it.
+fn is_catalog_name(engine: EngineKind, parts: &[String], column: bool) -> bool {
+    let parts = if column && parts.len() > 1 {
+        &parts[..parts.len() - 1]
+    } else {
+        parts
+    };
+    let Some((relation, schemas)) = parts.split_last() else {
+        return false;
+    };
+    match engine {
+        EngineKind::Postgres => {
+            if schemas.is_empty() {
+                relation.starts_with("pg_")
+            } else {
+                schemas
+                    .iter()
+                    .any(|s| s == "pg_catalog" || s == "information_schema" || s.starts_with("pg_"))
+            }
+        }
+        EngineKind::Sqlite => matches!(
+            relation.as_str(),
+            "sqlite_schema" | "sqlite_master" | "sqlite_temp_schema" | "sqlite_temp_master"
+        ),
+    }
 }
 
 /// Whether a query (or one of its set operations) has `INTO`.
@@ -832,6 +1099,161 @@ mod tests {
             StatementKind::Read
         );
         assert_eq!(kind(LITE, "select 'main.plants'"), StatementKind::Read);
+    }
+
+    /// Review Q-1-3, N-B (backlog 2026-11-09 S-12): `UPDATE pg_settings` is `set_config` under
+    /// another name. Every write to a catalog relation, and every schema change of a catalog
+    /// object, is refused, however it is spelled.
+    #[test]
+    fn writes_to_the_catalog_never_run() {
+        let catalog_hint = |r: &Refusal| {
+            r.message.contains("system catalog")
+                && r.hint.as_deref().is_some_and(|h| h.contains("own tables"))
+        };
+        for sql in [
+            // The finding itself.
+            "update pg_settings set setting = '0' where name = 'statement_timeout'",
+            "update pg_catalog.pg_settings set setting = '0' where name = 'work_mem'",
+            // Case, quotes and whitespace.
+            "UPDATE PG_SETTINGS SET setting = '0' WHERE name = 'work_mem'",
+            "update \"pg_catalog\".\"pg_settings\" set setting = '0'",
+            "update pg_catalog . pg_settings set setting = '0'",
+            "update /* x */ pg_settings s set setting = '0' where s.name = 'work_mem'",
+            "update pg_catalog.pg_class set relname = 'x'",
+            // Every write kind.
+            "insert into pg_catalog.pg_class (relname) values ('x')",
+            "insert into pg_description select * from pg_description",
+            "delete from pg_catalog.pg_description",
+            "delete from pg_largeobject where loid = 1",
+            "truncate pg_class",
+            "truncate table only plants, pg_catalog.pg_class",
+            "merge into pg_settings s using plants p on s.name = p.name \
+             when matched then update set setting = '0'",
+            // Nested writes: data-modifying WITH, EXPLAIN (with and without ANALYZE).
+            "with x as (update pg_settings set setting = '0' where name = 'work_mem' \
+             returning name) select * from x",
+            "with x as (select 1) update pg_settings set setting = '0'",
+            "with a as (select 1), b as (delete from pg_catalog.pg_description returning 1) \
+             select * from b",
+            "explain analyze update pg_settings set setting = '0'",
+            "explain update pg_settings set setting = '0'",
+            "insert into plants (id) with x as (delete from pg_description returning 1) \
+             select 1 from x",
+            // Other catalog schemas.
+            "insert into information_schema.sql_features (feature_id) values ('x')",
+            "update pg_toast.pg_toast_1 set chunk_seq = 0",
+            "delete from pg_temp.scratch",
+            // Schema changes of catalog objects.
+            "create index on pg_catalog.pg_class (relname)",
+            "create index pg_x on plants (name)",
+            "create trigger t before update on pg_settings for each row execute function f()",
+            "alter table pg_catalog.pg_class add column x integer",
+            "alter table pg_settings rename to settings",
+            "comment on table pg_class is 'x'",
+            "comment on column pg_catalog.pg_class.relname is 'x'",
+            "drop table pg_catalog.pg_class",
+            "drop view pg_settings",
+            "create table pg_catalog.x (id integer)",
+            "create table pg_x (id integer)",
+            "create view pg_catalog.v as select 1",
+            "select * into pg_catalog.copy from plants",
+            "create function pg_catalog.f() returns integer language sql as 'select 1'",
+        ] {
+            let r = not_allowed(PG, sql);
+            assert!(catalog_hint(&r), "{sql}: {r:?}");
+        }
+        for sql in [
+            "update sqlite_master set sql = 'x'",
+            "UPDATE SQLITE_SCHEMA SET sql = 'x'",
+            "delete from temp.sqlite_master",
+            "insert into sqlite_temp_master (name) values ('x')",
+            "with x as (select 1) delete from sqlite_schema",
+        ] {
+            let r = not_allowed(LITE, sql);
+            assert!(catalog_hint(&r), "{sql}: {r:?}");
+        }
+    }
+
+    /// The catalog rule refuses writes only: reads of the catalog, writes that read it, and
+    /// names that only look like catalog names still run.
+    #[test]
+    fn the_catalog_rule_leaves_reads_and_own_tables_alone() {
+        for sql in [
+            "select * from pg_settings",
+            "select name, setting from pg_catalog.pg_settings where name = 'work_mem'",
+            "select * from information_schema.columns",
+            "with x as (select * from pg_class) select count(*) from x",
+            "explain select * from pg_class",
+        ] {
+            assert_eq!(kind(PG, sql), StatementKind::Read, "{sql}");
+        }
+        for sql in [
+            "insert into plants (name) select relname from pg_catalog.pg_class",
+            "update plants set name = 'pg_settings' where id = 1",
+            "update plants set name = c.relname from pg_class c where c.oid = plants.id",
+            "delete from plants using pg_class c where c.relname = plants.name",
+            "update plants set pg_note = 'x'",
+            "insert into extensions_log (pg_x) values (1)",
+        ] {
+            assert_eq!(kind(PG, sql), StatementKind::Write, "{sql}");
+        }
+        for sql in [
+            "create view plant_settings as select * from pg_settings",
+            "comment on column plants.pg_note is 'x'",
+            "create index plants_name on plants (name)",
+        ] {
+            assert_eq!(kind(PG, sql), StatementKind::SchemaChange, "{sql}");
+        }
+        // On SQLite, `pg_` names are the database's own; sqlite_sequence may be written.
+        assert_eq!(
+            kind(LITE, "update pg_settings set setting = '0'"),
+            StatementKind::Write
+        );
+        assert_eq!(
+            kind(
+                LITE,
+                "update sqlite_sequence set seq = 0 where name = 'plants'"
+            ),
+            StatementKind::Write
+        );
+        assert_eq!(
+            kind(LITE, "select * from sqlite_schema"),
+            StatementKind::Read
+        );
+    }
+
+    /// A query with a data-modifying `WITH` changes rows: it counts as a write, so a `mode:
+    /// read` call gets `read_only_query` before the engine.
+    #[test]
+    fn a_data_modifying_with_is_a_write() {
+        for sql in [
+            "with x as (delete from plants returning id) select * from x",
+            "with x as (insert into plants (id) values (1) returning id) select id from x",
+            "with x as (select 1) update plants set name = 'x'",
+            "with x as (select id from plants) delete from plants where id in (select id from x)",
+        ] {
+            assert_eq!(kind(PG, sql), StatementKind::Write, "{sql}");
+        }
+        assert_eq!(
+            kind(PG, "with x as (select 1) select * from x"),
+            StatementKind::Read
+        );
+    }
+
+    #[test]
+    fn refusal_codes_are_shared_error_codes() {
+        assert_eq!(
+            RefusalCode::StatementNotAllowed.error_code(),
+            ErrorCode::StatementNotAllowed
+        );
+        assert_eq!(
+            RefusalCode::ValidationFailed.error_code(),
+            ErrorCode::ValidationFailed
+        );
+        assert_eq!(
+            RefusalCode::StatementNotAllowed.as_str(),
+            "statement_not_allowed"
+        );
     }
 
     #[test]
