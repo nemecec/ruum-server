@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    inputs:
+      mutations:
+        description: "Only these mutations (names in crates/ruum-testkit/mutations, space separated); empty runs all"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -36,6 +41,13 @@ jobs:
       DATABASE_URL: postgres://ruum_test:ruum_test@localhost:5432/ruum
       # The mutations of ruum-dbengine run against the data cluster (see ci.yml).
       RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
+      # SpiceDB (memory datastore), as scripts/buildbox/run.sh starts it. Without it the tests of
+      # decision 0002-4 (wiring::tests::writes_of_another_server_hold_at_once) skip, and the
+      # mutations authz-ignores-tenant-token and authz-spicedb-ignores-request-floor survive.
+      SPICEDB_PRESHARED_KEY: ci-spicedb
+      SPICEDB_ENDPOINT: http://127.0.0.1:50051
+      RUUM_SPICEDB_ENDPOINT: http://127.0.0.1:50051
+      RUUM_SPICEDB_HTTP_URL: http://127.0.0.1:8543
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -60,13 +72,26 @@ jobs:
             sleep 1
           done
           docker exec postgres-data pg_isready -h 127.0.0.1 -U postgres -d postgres
+      - name: Start SpiceDB (memory datastore)
+        run: |
+          image=$(awk '/image: authzed\/spicedb:/ {print $2; exit}' deploy/dev/docker-compose.yml)
+          docker run -d --name spicedb -p 127.0.0.1:50051:50051 -p 127.0.0.1:8543:8443 \
+            -e SPICEDB_GRPC_PRESHARED_KEY="$SPICEDB_PRESHARED_KEY" -e SPICEDB_DATASTORE_ENGINE=memory \
+            "$image" serve --http-enabled
+          for _ in $(seq 1 120); do
+            docker exec spicedb grpc_health_probe -addr=localhost:50051 >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          docker exec spicedb grpc_health_probe -addr=localhost:50051
       # Strict: step 1 is built, so a survived or skipped mutation fails the run. Set the
       # repository variable MUTATION_STRICT=0 to make them warnings again.
       - name: Break each security rule in a copy; the suites must fail
         env:
           MUTATION_STRICT: ${{ vars.MUTATION_STRICT || '1' }}
           RUUM_REQUIRE_IMPLEMENTED: ${{ vars.RUUM_REQUIRE_IMPLEMENTED || '0' }}
-        run: crates/ruum-testkit/scripts/mutation_check.sh
+          MUTATIONS: ${{ github.event.inputs.mutations }}
+        # MUTATIONS is split into names on purpose (word splitting).
+        run: crates/ruum-testkit/scripts/mutation_check.sh $MUTATIONS
 
   progress:
     name: security suites with RUUM_REQUIRE_IMPLEMENTED=1 (progress report)
