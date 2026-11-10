@@ -225,7 +225,12 @@ pseudonyms of chosen values (`poracle.*`, decisions 0004-24 and 0004-25) and exp
 **Fixture.** The suite builds its own state through the API on the `fixtures.rs` world. `member`
 creates a database in `Private`, applies one migration (tables `people` and `orders`), confirms
 every class but `people.note` (unconfirmed, so `personal`), and inserts seven people and six
-orders. `agent_out` is the agent; `member_view` and `member_edit` are the people without
+orders. While `applyDatabaseMigration` is planned (card D-2), `member` runs the statements of the
+migration through `queryDatabase` instead (`Ctx::schema_change`): a person with `manage` takes a
+schema change through the engine's migration path and the catalog sync (Q-1 wave decision 3), so
+the database is the same. `migrate_ok` does the same. A case that needs a named migration itself
+(its status, its error, a migration on a branch) lists `applyDatabaseMigration` in its own
+operations (card Q-2). `agent_out` is the agent; `member_view` and `member_edit` are the people without
 `manage`.
 
 **Markers.** Most `personal` values hold `ruum-raw-<tag>-p<n>` and most `secret` values
@@ -259,7 +264,7 @@ all its reasons, also with `RUUM_REQUIRE_IMPLEMENTED=1`:
   operation, a contract gap for the panel);
 - its engine is in `Services` (SQLite: `SQLITE_WAITS_FOR`, card E-3 sets it to `None`);
 - if it needs the privacy filter (`Case::filter` is `Filter::Needed`), the filter card of its
-  engine has landed (`FILTER_WAITS_FOR`: Q-2 for Postgres, Q-3 for SQLite). Q-1 builds the query
+  engine has landed (`FILTER_WAITS_FOR`: Q-3 for SQLite; Q-2 removed the Postgres entry). Q-1 builds the query
   for people only, and Q-2 and Q-3 remove no planned mark, so without this wait the lens cases
   would run, and fail, between Q-1 and Q-2 (Postgres) and between E-3 and Q-3 (SQLite). A case
   needs the filter when it sends a statement as an agent or reads a masked value or a marker.
@@ -271,14 +276,21 @@ all its reasons, also with `RUUM_REQUIRE_IMPLEMENTED=1`:
   (Q-2)", `MEMORY_FAKE`). The memory run only lists the planned cases.
 
 An operation that is not planned but answers `501` makes the case `pending`. The report lists
-the planned case runs by reason. Today all 99 case runs (56 cases) are planned.
+the planned case runs by reason. With card Q-2, 37 case runs pass on the Postgres backend; the
+other 62 are planned (SQLite, branches, approvals, copies, exports, the migration list).
 
 **Mutation rules.** The rules guard code that does not exist yet, so they are placeholders in
 `crates/ruum-testkit/mutations/planned/privacy-*.sh`. `mutation_check.sh` does not read that
 directory. Each file names its `CARD` and its `CASES`. The card writes the real `FILE` and
 `PERL`, checks that the mutation is `KILLED` under `MUTATION_STRICT=1`, sets `PLACEHOLDER=0`
 and moves the file up to `mutations/`. A test (`every_rule_has_a_planned_mutation`) keeps every
-case under at least one mutation.
+case under at least one mutation, planned or moved up (a moved-up file keeps its `CASES`). Card
+Q-2 moved up 15 of them; four guard rules that the statement rules hold before the engine
+(the key, the pseudonym function, `pg_stats`, role membership), so their `TESTS` are the hostile
+engine tests of `ruum-core` (`query::postgres_mask::engine_tests`), which reach the engine through
+dynamic SQL in a string. Three stay planned with a reason: `privacy-write-class-read-required`
+(the write cases need branches, D-3), `privacy-error-detail` and `privacy-schema-values` (no
+single-file mutation can break them; for the panel).
 
 **When a card lands.** The card removes its planned marks (or its `waits` entry, or sets
 `SQLITE_WAITS_FOR` to `None`; Q-2 and Q-3 remove their entry of `FILTER_WAITS_FOR`). A
