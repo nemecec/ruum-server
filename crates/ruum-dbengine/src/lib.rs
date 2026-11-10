@@ -73,13 +73,15 @@ pub trait DatabaseEngine: Send + Sync {
     /// The schema of the database, without the Ruum objects.
     async fn catalog(&self, db: &DatabaseRef) -> Result<Catalog, EngineError>;
 
-    /// Whether a row write in the database can run tenant code that sees the real row: a
-    /// trigger or a rule of the tenant (review-Q-2-2 P-1). Such code runs on the base table with
-    /// the real `NEW` and `OLD`, whatever lens the writer has, and can copy a value into a column
-    /// the writer may read. The query layer refuses agent writes there (an approval of a person,
-    /// card A-2). An engine without a lens shows an agent no value at all, so the default is
-    /// `false`.
-    async fn write_side_effects(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
+    /// Whether a masked session (a kind whose lens hides a value: `masked_write`, `write`) may
+    /// not write here: the database holds tenant code (functions, triggers, rules, policies,
+    /// foreign tables, decision 0004-38). Draft branches do not exist yet; the card that builds
+    /// them marks their engine copy so that this answers `false` there. Tenant code runs on the real rows, whatever lens the writer has, and can copy a
+    /// value into a column the writer may read (review-Q-2-2 P-1, review-Q-2-3 R-1). The query
+    /// layer refuses such writes with an answer; the engine refuses them again in the request's
+    /// own transaction, before and after the statement. An engine without a lens shows an agent
+    /// no value at all, so the default is `false`.
+    async fn tenant_code_on_live(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
         let _ = db;
         Ok(false)
     }

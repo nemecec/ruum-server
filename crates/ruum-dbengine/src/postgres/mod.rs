@@ -231,6 +231,11 @@ pub struct PostgresEngine {
     /// Tests only: let transaction control past the splitter, to show the second line.
     #[cfg(test)]
     pub(crate) allow_transaction_control: AtomicBool,
+    /// Tests only: a script that the database's `owner` runs and commits in a session of its
+    /// own, after the engine's first tenant-code check of the next masked write and before its
+    /// statement (the race of decision 0004-38 b).
+    #[cfg(test)]
+    pub(crate) between_checks: crate::lock::Mutex<Option<String>>,
 }
 
 /// Whether a name is a neutral database name (`d_` + 16 hex).
@@ -267,6 +272,8 @@ impl PostgresEngine {
             hook: None,
             #[cfg(test)]
             allow_transaction_control: AtomicBool::new(false),
+            #[cfg(test)]
+            between_checks: Default::default(),
         })
     }
 
@@ -419,13 +426,13 @@ impl DatabaseEngine for PostgresEngine {
         out
     }
 
-    async fn write_side_effects(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
+    async fn tenant_code_on_live(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
         let state = self.resolve(db).await?;
         let _gate = self.enter(&state).await?;
         let mut conn = self.dbhost(&state.name).await?;
-        let out = depends::write_side_effects(&mut conn).await;
+        let out = depends::tenant_code(&mut conn, state.meta.role(RoleKind::Owner)).await;
         let _ = sqlx::Connection::close(conn).await;
-        out
+        Ok(out?.any())
     }
 
     async fn size_bytes(&self, db: &DatabaseRef) -> Result<u64, EngineError> {

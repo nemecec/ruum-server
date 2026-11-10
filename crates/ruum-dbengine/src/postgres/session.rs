@@ -100,6 +100,26 @@ fn call_hook(
     }
 }
 
+/// The kinds whose lens hides a value and that may write: `masked_write` (agents without
+/// `read_personal`) and `write` (people with `edit`, agents with `read_personal`; lens
+/// `nosecret`). Tenant code may not run on the real rows of a live database in their writable
+/// transactions (decision 0004-38).
+pub(crate) fn masked_write_kind(kind: RoleKind) -> bool {
+    matches!(kind, RoleKind::MaskedWrite | RoleKind::Write)
+}
+
+/// `statement_not_allowed` (`tenant_code_on_live`) when the database holds tenant code; checked
+/// in the request's own transaction (decision 0004-38).
+async fn refuse_tenant_code(conn: &mut PgConnection, state: &DbState) -> Result<(), EngineError> {
+    let found = super::depends::tenant_code(conn, state.meta.role(RoleKind::Owner)).await?;
+    if found.any() {
+        return Err(EngineError::StatementNotAllowed(
+            "tenant_code_on_live".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses transaction control before anything runs (the first line).
 fn refuse_transaction_control(engine: &PostgresEngine, stmt: &str) -> Result<(), EngineError> {
     #[cfg(test)]
@@ -167,27 +187,42 @@ pub(crate) async fn execute(
         &(session_user, current_user),
         &request.sql,
     );
-    // The second line of review-Q-2-2 P-1: a `masked_write` session (agents only) never writes
-    // where a trigger or a rule of the tenant would see the real row. Checked in the request's
-    // own transaction, so no trigger made in between slips through. The query layer refuses
-    // first, with an answer.
-    if kind == RoleKind::MaskedWrite && !read_only {
-        match super::depends::write_side_effects(lease.conn()).await {
-            Ok(false) => {}
-            Ok(true) => {
-                lease.close().await;
-                return Err(EngineError::StatementNotAllowed(
-                    "tenant_triggers_or_rules".to_string(),
-                ));
-            }
-            Err(e) => {
-                lease.close().await;
-                return Err(e);
-            }
+    // The engine's line of decision 0004-38 (review-Q-2-2 P-1, review-Q-2-3 R-1 and N-2): a
+    // masked session (`masked_write`, `write`: a lens that hides a value) never runs tenant code
+    // on the real rows of a live database. It follows the session, not the query layer's view of
+    // the statement: every writable transaction of such a kind is checked, before the statement
+    // (a clear refusal) and again after it, before `COMMIT`. The second check closes the race of a
+    // trigger made in between: DDL that commits before the statement's locks is seen, DDL after
+    // them waits for this transaction, and the rollback takes back what the code wrote.
+    // Draft branches do not exist yet: the card that builds them marks their engine copy, and
+    // this line then lets tenant code run there (the rule allows it on masked data).
+    let guarded = masked_write_kind(kind) && !read_only;
+    if guarded && let Err(e) = refuse_tenant_code(lease.conn(), &state).await {
+        lease.close().await;
+        return Err(e);
+    }
+    #[cfg(test)]
+    if guarded {
+        let script = engine.between_checks.lock().take();
+        if let Some(script) = script {
+            let (mut owner, _) = engine.pool(&state, RoleKind::Owner).open(engine).await?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(script))
+                .execute(&mut owner)
+                .await
+                .map_err(|e| internal("run the script between the checks", e))?;
+            let _ = sqlx::Connection::close(owner).await;
         }
     }
     let result = run_statement(lease.conn(), request, read_only).await;
     let tx = transaction_state(lease.conn(), marker).await;
+    let result = match result {
+        Ok(outcome) if guarded && tx == TransactionState::Open => {
+            refuse_tenant_code(lease.conn(), &state)
+                .await
+                .map(|()| outcome)
+        }
+        other => other,
+    };
     match (result, tx) {
         (Ok(outcome), TransactionState::Open) => {
             let end = if read_only { "rollback" } else { "commit" };

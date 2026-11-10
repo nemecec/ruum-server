@@ -8,6 +8,7 @@
 mod hostile_copy;
 mod security;
 mod spike;
+mod tenant_code;
 mod tenant_types;
 
 use super::*;

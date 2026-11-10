@@ -1,0 +1,8 @@
+# The tenant-code check misses triggers (decision 0004-38, S-21; card Q-2).
+# Security rule: a masked session never runs tenant code on the real rows of a live database (design 8.5).
+DESCRIPTION="a trigger with a built-in function does not count as tenant code"
+FILE="crates/ruum-dbengine/src/postgres/depends.rs"
+PERL='s/exists \(\n(\s+)select 1 from pg_catalog.pg_trigger t/false and exists (\n\1select 1 from pg_catalog.pg_trigger t/'
+TESTS="-p ruum-core --lib databases::query::postgres_mask::engine_tests::masked_sessions_never_run_tenant_code_on_live"
+ENV="RUUM_DBENGINE_REQUIRE_POSTGRES=1"
+PLACEHOLDER=0

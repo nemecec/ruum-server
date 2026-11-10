@@ -195,30 +195,116 @@ select reach.rel::pg_catalog.int8 as rel, reach.att::pg_catalog.int2 as att,
     Ok(out)
 }
 
-/// Whether a write in `public` can run tenant code that sees the real row: an enabled trigger
-/// that is not internal (a foreign key's triggers are internal), or a rule other than a view's
-/// `_RETURN` (review-Q-2-2 P-1). Such code runs on the base table with the real `NEW` and
-/// `OLD`, and can copy a value into a column that the writer may read.
-pub(crate) const SIDE_EFFECTS_SQL: &str = "
+/// Whether the database holds **tenant code**: any object of the tenant that Postgres may run
+/// during a statement and that sees the real rows, whatever lens the session has (decision
+/// 0004-38, design 8.5 "Tenant code and masked sessions"; review-Q-2-2 P-1, review-Q-2-3 R-1).
+///
+/// The tenant's objects are those owned by the database's `owner` role (`$1`) or in a schema
+/// that it may create in (today `public` only), so a later grant cannot open a gap. Each clause
+/// is one kind:
+///
+/// - `functions`: any function, procedure or aggregate of the tenant, of any language,
+///   volatility or security. A `STABLE` function can call a `VOLATILE` one, so volatility tells
+///   nothing. Casts, operators, aggregates, column defaults, generated expressions, domain
+///   checks and range types all need such a function to run tenant code, so this clause covers
+///   them. Functions of the allow-listed extensions are in schema `extensions`, which the
+///   tenant does not own and cannot create in.
+/// - `triggers`: every trigger that is not internal (a foreign key's triggers are internal),
+///   enabled or not (an `ENABLE TRIGGER` is DDL with the same race as a new trigger). A
+///   trigger can call a built-in function (`tsvector_update_trigger`), so this is not covered
+///   by `functions`.
+/// - `rules`: every rule but a view's own `_RETURN` (`ON SELECT`), enabled or not.
+/// - `policies`: row-level security policies; their expressions run on the real rows.
+/// - `relations`: a relation of a kind outside the known list (`r` table, `p` partitioned
+///   table, `v` view, `m` materialized view, `S` sequence, `i` and `I` indexes, `c` composite
+///   type, `t` TOAST). A foreign table (`f`) sends a write to another server, and an unknown
+///   kind counts as tenant code (fail closed).
+/// - `event_triggers`: owned by the tenant (they need a superuser today; listed so that a later
+///   grant cannot open a gap).
+///
+/// Every name and operator is qualified: this runs in the session of an untrusted request too,
+/// whose search path is a lens schema.
+pub(crate) const TENANT_CODE_SQL: &str = "
+with owner as (
+  select r.oid from pg_catalog.pg_roles r where r.rolname operator(pg_catalog.=) $1
+), tenant as (
+  select n.oid from pg_catalog.pg_namespace n
+   where n.nspowner operator(pg_catalog.=) (select oid from owner)
+      or pg_catalog.has_schema_privilege($1, n.oid, 'CREATE')
+)
 select exists (
+         select 1 from pg_catalog.pg_proc p
+          where p.pronamespace operator(pg_catalog.=) any (select oid from tenant)
+             or p.proowner operator(pg_catalog.=) (select oid from owner)) as functions,
+       exists (
          select 1 from pg_catalog.pg_trigger t
            join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) t.tgrelid
-          where c.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
-            and not t.tgisinternal
-            and t.tgenabled operator(pg_catalog.<>) 'D'::pg_catalog.\"char\")
-    or exists (
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and not t.tgisinternal) as triggers,
+       exists (
          select 1 from pg_catalog.pg_rewrite r
            join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) r.ev_class
-          where c.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
-            and r.rulename operator(pg_catalog.<>) '_RETURN'
-            and r.ev_enabled operator(pg_catalog.<>) 'D'::pg_catalog.\"char\") as side_effects";
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and not (r.rulename operator(pg_catalog.=) '_RETURN'
+                     and r.ev_type operator(pg_catalog.=) '1'::pg_catalog.\"char\")) as rules,
+       exists (
+         select 1 from pg_catalog.pg_policy y
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) y.polrelid
+          where c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+             or c.relowner operator(pg_catalog.=) (select oid from owner)) as policies,
+       exists (
+         select 1 from pg_catalog.pg_class c
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and c.relkind operator(pg_catalog.<>) all
+                ('{r,p,v,m,S,i,I,c,t}'::pg_catalog.\"char\"[])) as relations,
+       exists (
+         select 1 from pg_catalog.pg_event_trigger e
+          where e.evtowner operator(pg_catalog.=) (select oid from owner)) as event_triggers";
 
-/// [`SIDE_EFFECTS_SQL`] in the session of `conn`.
-pub(crate) async fn write_side_effects(conn: &mut PgConnection) -> Result<bool, EngineError> {
-    let row = sqlx::query(SIDE_EFFECTS_SQL)
+/// The kinds of tenant code that [`TENANT_CODE_SQL`] found (all `false`: none).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TenantCode {
+    pub functions: bool,
+    pub triggers: bool,
+    pub rules: bool,
+    pub policies: bool,
+    pub relations: bool,
+    pub event_triggers: bool,
+}
+
+impl TenantCode {
+    /// Whether any kind was found.
+    pub fn any(self) -> bool {
+        self.functions
+            || self.triggers
+            || self.rules
+            || self.policies
+            || self.relations
+            || self.event_triggers
+    }
+}
+
+/// [`TENANT_CODE_SQL`] in the session of `conn`; `owner` is the role name of the database's
+/// `owner` kind.
+pub(crate) async fn tenant_code(
+    conn: &mut PgConnection,
+    owner: &str,
+) -> Result<TenantCode, EngineError> {
+    let row = sqlx::query(TENANT_CODE_SQL)
         .persistent(false)
+        .bind(owner)
         .fetch_one(&mut *conn)
         .await
-        .map_err(|e| internal("read the triggers and rules", e))?;
-    Ok(row.get("side_effects"))
+        .map_err(|e| internal("read the tenant code", e))?;
+    Ok(TenantCode {
+        functions: row.get("functions"),
+        triggers: row.get("triggers"),
+        rules: row.get("rules"),
+        policies: row.get("policies"),
+        relations: row.get("relations"),
+        event_triggers: row.get("event_triggers"),
+    })
 }

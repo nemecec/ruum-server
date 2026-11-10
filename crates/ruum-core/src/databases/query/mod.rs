@@ -536,17 +536,29 @@ pub fn approval_not_available() -> Problem {
     .with_hint("add a WHERE clause, or ask your user to run the statement")
 }
 
-/// `501 not_implemented` for an agent's row write in a database with a trigger or a rule of the
-/// tenant (review-Q-2-2 P-1). Such code runs on the base table with the real `NEW` and `OLD`,
-/// whatever lens the agent has, so it could copy a value the agent may not read into a column it
-/// may read. Until a person can approve the write (card A-2), nothing runs.
-pub fn side_effects_need_approval() -> Problem {
-    ApiError::new(
-        ErrorCode::NotImplemented,
-        "this database has triggers or rules, which run on the real rows of a write; an agent's \
-         write there needs a person's approval, which this server does not offer yet; nothing ran",
-    )
-    .with_hint("ask your user to run the statement, or to remove the trigger or rule")
+/// The hint code of [`tenant_code_on_live`] (decision 0004-38; hints are fixed codes, 0004-35).
+pub const TENANT_CODE_ON_LIVE: &str = "tenant_code_on_live";
+
+/// `501 not_implemented` (hint `tenant_code_on_live`) for a row write of a masked session (an
+/// agent, with or without `read_personal`; a person with `edit` but not `manage`) on a live
+/// database that holds tenant code (decision 0004-38, design 8.5 "Tenant code and masked
+/// sessions"). Tenant code runs on the real rows, whatever lens the writer has, so it could copy
+/// a value the writer may not read into a column it may read. The rule lets the write run on a
+/// draft branch (masked data); draft branches are not built yet, so today every database counts
+/// as live (fail closed). On live, a person with `manage` makes the change; card A-2 turns this into a `202` approval
+/// (reason `tenant_code`) that is always a person's and counts as a real-data access. Nothing
+/// ran.
+pub fn tenant_code_on_live(is_agent: bool) -> Problem {
+    let message = if is_agent {
+        "this live database runs its own code (functions, triggers, rules or policies) on the \
+         real rows of a write; an agent's write here needs a person's approval, which this server \
+         does not offer yet; ask your user to make the change; nothing ran"
+    } else {
+        "this live database runs its own code (functions, triggers, rules or policies) on the \
+         real rows of a write, and that code can see values hidden from you; a person with manage \
+         on the database makes this change; nothing ran"
+    };
+    ApiError::new(ErrorCode::NotImplemented, message).with_hint(TENANT_CODE_ON_LIVE)
 }
 
 /// Marks an agent's result on an engine without a lens (wave decision 1, kept by card Q-2 for
@@ -791,6 +803,14 @@ fn engine_problem(e: EngineError, manage: bool) -> QueryError {
             "send one statement per call",
             "/sql: send each statement in its own call",
         )
+        .into(),
+        // The engine's own line of decision 0004-38 (tenant code made between the query
+        // layer's check and the statement) keeps the hint code of the query layer's answer.
+        EngineError::StatementNotAllowed(rule) if rule == TENANT_CODE_ON_LIVE => ApiError::new(
+            ErrorCode::StatementNotAllowed,
+            format!("the engine refused the statement: {rule}"),
+        )
+        .with_hint(TENANT_CODE_ON_LIVE)
         .into(),
         EngineError::StatementNotAllowed(rule) => ApiError::new(
             ErrorCode::StatementNotAllowed,
@@ -1241,17 +1261,20 @@ async fn run(
         .keys
         .engine_key(ctx.tenant, row.key_node_id)
         .await?;
-    // 7a. An agent's row write where a trigger or a rule of the tenant would see the real row
-    // (review-Q-2-2 P-1): it needs a person's approval (card A-2). The engine refuses it again
-    // for `masked_write`, in the request's own transaction.
-    if is_agent
+    // 7a. A masked session never runs tenant code on the real rows of a live database
+    // (decision 0004-38): a row write of `masked_write` or `write` (agents with or without
+    // `read_personal`, people without `manage`) where the database holds tenant code and is no
+    // draft copy is refused. The engine refuses it again in the request's own transaction,
+    // before and after the statement.
+    let masked_writer = matches!(kind, RoleKind::MaskedWrite | RoleKind::Write);
+    if masked_writer
         && row_write
         && engine_impl
-            .write_side_effects(&row.database_ref())
+            .tenant_code_on_live(&row.database_ref())
             .await
             .map_err(|e| engine_problem(e, manage))?
     {
-        return Err(side_effects_need_approval().into());
+        return Err(tenant_code_on_live(is_agent).into());
     }
     let s = d.settings;
     let timeout_ms = req
@@ -1285,10 +1308,10 @@ async fn run(
     }
     let role = RoleRef::new(row.database_ref(), kind)
         .map_err(|e| Error::Internal(format!("role: {e}")))?;
-    // An agent's statement that writes no row runs read-only, also in mode `write`: a tenant
-    // function that it calls (through a view) cannot write or change the schema with the rights
-    // of its owner then (the P-1 rule of review-Q-2-2 covers triggers and rules of row writes).
-    let engine_mode = if is_agent && !row_write {
+    // A masked session's statement that writes no row runs read-only, also in mode `write`: a
+    // tenant function that it calls (through a view) cannot write or change the schema with the
+    // rights of its owner then (decision 0004-38 covers the row writes).
+    let engine_mode = if masked_writer && !row_write {
         StatementMode::Read
     } else {
         mode

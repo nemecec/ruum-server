@@ -81,16 +81,21 @@ impl Pg {
     }
 
     fn agent(&self) -> Context {
+        self.agent_ctx(self.agent, &self.scope)
+    }
+
+    /// The context of an agent of Alice.
+    fn agent_ctx(&self, agent: AgentId, scope: &crate::authz::Scope) -> Context {
         Context {
             tenant: self.w.team.id,
             actor: Actor {
                 actor: PrincipalRef {
                     kind: PrincipalKind::Agent,
-                    id: self.agent.into(),
+                    id: agent.into(),
                 },
                 on_behalf_of: Some(self.w.alice),
             },
-            scope: Some(self.scope.clone()),
+            scope: Some(scope.clone()),
             idempotency_key: None,
         }
     }
@@ -128,6 +133,10 @@ impl Pg {
     }
 
     async fn grant(&self, kind: GrantKind) {
+        self.grant_to(self.agent, kind).await
+    }
+
+    async fn grant_to(&self, agent: AgentId, kind: GrantKind) {
         self.w
             .s
             .databases
@@ -137,7 +146,7 @@ impl Pg {
                 self.db,
                 CreateGrant {
                     kind,
-                    agent_id: self.agent,
+                    agent_id: agent,
                     duration_minutes: 60,
                     reason: Some("privacy test".into()),
                 },
@@ -204,7 +213,8 @@ async fn register_agent(w: &World, user: UserId) -> crate::agents::Agent {
 }
 
 /// A Postgres database with `people`, `orders`, a tenant enum, a view over a secret column and a
-/// view without one; the classes confirmed by Alice (`manage`).
+/// view without one; the classes confirmed by Alice (`manage`). It holds no tenant code
+/// (decision 0004-38), so masked sessions may write; [`definer_view`] adds some.
 async fn setup() -> Option<Pg> {
     let engine = engine().await?;
     let mut w = world().await;
@@ -265,9 +275,6 @@ async fn setup() -> Option<Pg> {
          amount integer, label text)",
         "create view v as select id, upper(token) as t, name from people",
         "create view safe as select id, name from people",
-        "create function peek(i integer) returns text language sql stable security definer \
-         set search_path = public as $$ select token from people where id = i $$",
-        "create view w as select id, peek(id) as p from people",
     ] {
         pg.ok(&a, write(s)).await;
     }
@@ -313,6 +320,18 @@ async fn setup() -> Option<Pg> {
     ])
     .await;
     Some(pg)
+}
+
+/// Adds `peek(i)`, a `SECURITY DEFINER` function of the tenant that reads `token`, and the view
+/// `w` over it. This is tenant code: masked sessions no longer write to the database.
+async fn definer_view(pg: &Pg) {
+    for s in [
+        "create function peek(i integer) returns text language sql stable security definer \
+         set search_path = public as $$ select token from people where id = i $$",
+        "create view w as select id, peek(id) as p from people",
+    ] {
+        pg.ok(&pg.alice(), write(s)).await;
+    }
 }
 
 fn hidden(class: &str) -> Value {
@@ -537,6 +556,7 @@ async fn agents_read_markers_in_every_clause_and_never_a_value() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tenant_view_over_a_secret_hides_its_columns_from_viewers_and_agents() {
     let Some(pg) = setup().await else { return };
+    definer_view(&pg).await;
     // `v` reads `token` (secret): its unconfirmed columns are masked like secret, for Bob
     // (edit, no manage: the nosecret lens) and for the agent; `v.id` stays normal.
     for who in [pg.bob(), pg.agent()] {
@@ -1101,6 +1121,7 @@ async fn a_view_or_function_replaced_in_place_loses_its_confirmation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn computed_columns_over_a_secret_never_show_it() {
     let Some(pg) = setup().await else { return };
+    definer_view(&pg).await;
     let a = pg.alice();
     for s in [
         "create view j as select id, to_json(p)::text as doc from people p",
@@ -1171,14 +1192,150 @@ async fn computed_columns_over_a_secret_never_show_it() {
     pg.drop().await;
 }
 
-/// Review-Q-2-2 P-1: a tenant trigger or rule runs on the real row of a write, whatever lens the
-/// writer has. An agent's write in a database with one needs a person's approval (501 until card
-/// A-2); nothing runs, and the engine refuses a `masked_write` there by itself.
+/// A kind of tenant code for [`masked_sessions_never_run_tenant_code_on_live`]: how Alice
+/// makes it (`make`: query API; `owner`: an engine `owner` session, for statements the query API
+/// cannot parse), the writes that would run it, and how it goes again.
+struct CodeCase {
+    label: &'static str,
+    make: &'static [&'static str],
+    owner: &'static [&'static str],
+    writes: &'static [&'static str],
+    drop: &'static [&'static str],
+}
+
+/// The writes of every case: the forms of the P-1 probe (review-Q-2-2).
+const PLAIN_WRITES: &[&str] = &[
+    "update orders set amount = 3 where id = 1",
+    "insert into orders (id, amount) values (70, 1)",
+    "with u as (update orders set amount = 4 where id = 2 returning id) select count(*) from u",
+];
+
+const CODE_CASES: &[CodeCase] = &[
+    // Review-Q-2-2 P-1: a trigger copies a personal value into `audit`.
+    CodeCase {
+        label: "trigger",
+        make: &[
+            "create function log_it() returns trigger language plpgsql as $$ \
+             begin insert into audit (what) values (new.person_email); return new; end $$",
+            "create trigger orders_log after update on orders for each row execute function log_it()",
+        ],
+        owner: &[],
+        writes: &[],
+        drop: &[
+            "drop trigger orders_log on orders",
+            "drop function log_it()",
+        ],
+    },
+    // Disabled code counts: `ENABLE TRIGGER` is DDL with the race of a new trigger.
+    CodeCase {
+        label: "disabled trigger with a built-in function",
+        make: &["create table docs (id integer primary key, body text, tsv tsvector)"],
+        owner: &[
+            "create trigger docs_tsv before insert or update on docs for each row \
+             execute function tsvector_update_trigger(tsv, 'pg_catalog.simple', body)",
+            "alter table docs disable trigger docs_tsv",
+        ],
+        writes: &[],
+        drop: &["drop table docs"],
+    },
+    CodeCase {
+        label: "rule",
+        make: &[],
+        owner: &["create rule orders_copy as on update to orders do also \
+             insert into audit (what) values (new.person_email)"],
+        writes: &[],
+        drop: &[],
+    },
+    CodeCase {
+        label: "policy",
+        make: &[],
+        owner: &["create policy orders_p on orders using (amount >= 0)"],
+        writes: &[],
+        drop: &[],
+    },
+    // Review-Q-2-3 R-1: a plain (not definer) volatile function behind a view gets the real
+    // secret as its argument; a row write runs it in a writable transaction.
+    CodeCase {
+        label: "function behind a view",
+        make: &[
+            "create function log_v(t text) returns text language plpgsql volatile as \
+             $$ begin insert into audit (what) values (t); return 'ok'; end $$",
+            "create view v2 as select id, log_v(token) as x from people",
+        ],
+        owner: &[],
+        writes: &[
+            "update orders set amount = (select count(*) from v2) where id = 1",
+            "update orders set amount = 5 where id = 1 and exists (select 1 from v2 where id = 1)",
+        ],
+        drop: &["drop view v2", "drop function log_v(text)"],
+    },
+    // A STABLE function that calls a VOLATILE one writes too (S-21 review 2): volatility
+    // tells nothing.
+    CodeCase {
+        label: "stable function over a volatile one behind a view",
+        make: &[
+            "create function log_s(t text) returns text language plpgsql volatile as \
+             $$ begin insert into audit (what) values (t); return 'ok'; end $$",
+            "create function quiet(t text) returns text language plpgsql stable as \
+             $$ begin return log_s(t); end $$",
+            "create view v3 as select id, quiet(token) as x from people",
+        ],
+        owner: &[],
+        writes: &["update orders set amount = (select count(*) from v3) where id = 1"],
+        drop: &[
+            "drop view v3",
+            "drop function quiet(text)",
+            "drop function log_s(text)",
+        ],
+    },
+    // A definer function behind a view writes with the owner's rights.
+    CodeCase {
+        label: "definer function behind a view",
+        make: &[
+            "create function stash_it2() returns integer language plpgsql volatile security \
+             definer set search_path = public as $$ begin insert into audit (what) \
+             select token from people where id = 1; return 1; end $$",
+            "create view sv2 as select id, stash_it2() as s from people where id = 1",
+        ],
+        owner: &[],
+        writes: &["update orders set amount = (select count(*) from sv2) where id = 1"],
+        drop: &["drop view sv2", "drop function stash_it2()"],
+    },
+    // A volatile default runs on an insert.
+    CodeCase {
+        label: "volatile default",
+        make: &[
+            "create function stamp() returns text language plpgsql volatile as \
+             $$ begin insert into audit (what) values ('ran'); return 'x'; end $$",
+            "alter table orders alter column label set default stamp()",
+        ],
+        owner: &[],
+        writes: &[],
+        drop: &[
+            "alter table orders alter column label drop default",
+            "drop function stamp()",
+        ],
+    },
+    // Any function counts, also one that runs only built-ins (an aggregate).
+    CodeCase {
+        label: "aggregate over a built-in function",
+        make: &[],
+        owner: &["create aggregate total(integer) (sfunc = int4pl, stype = integer)"],
+        writes: &[],
+        drop: &[],
+    },
+];
+
+/// Decision 0004-38 (design 8.5 "Tenant code and masked sessions"; review-Q-2-2 P-1,
+/// review-Q-2-3 R-1 and N-3, the S-21 panel): tenant code runs on the real rows of a write,
+/// whatever lens the writer has. A row write of a masked session (an agent without and with
+/// `read_personal`, a person with `edit` but not `manage`) on a live database that holds any
+/// tenant code gets `501` with the hint `tenant_code_on_live`; nothing runs, nothing is copied.
+/// One case per kind of tenant code, and a control after each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_writes_never_run_tenant_triggers_or_rules() {
+async fn masked_sessions_never_run_tenant_code_on_live() {
     let Some(pg) = setup().await else { return };
     let a = pg.alice();
-    let agent = pg.agent();
     pg.ok(
         &a,
         write("create table audit (id serial primary key, what text)"),
@@ -1190,41 +1347,92 @@ async fn agent_writes_never_run_tenant_triggers_or_rules() {
     ])
     .await;
     pg.grant(GrantKind::WriteLive).await;
-    // Control: without a trigger the agent's write runs.
-    pg.ok(&agent, write("update orders set amount = 2 where id = 1"))
-        .await;
-    for s in [
-        "create function log_it() returns trigger language plpgsql as $$ \
-         begin insert into audit (what) values (new.person_email); return new; end $$",
-        "create trigger orders_log after update on orders for each row execute function log_it()",
-    ] {
-        pg.ok(&a, write(s)).await;
+    let other = register_agent(&pg.w, pg.w.alice).await;
+    pg.grant_to(other.id, GrantKind::WriteLive).await;
+    pg.grant_to(other.id, GrantKind::ReadPersonal).await;
+    let other_scope = other.scope.as_scope();
+    let sessions = [
+        ("agent (masked_write)", pg.agent()),
+        (
+            "agent with read_personal (write)",
+            pg.agent_ctx(other.id, &other_scope),
+        ),
+        ("person with edit (write)", pg.bob()),
+    ];
+    let state = || async {
+        let r = pg
+            .ok(
+                &pg.alice(),
+                sql("select (select count(*) from audit), \
+                     (select coalesce(sum(amount), 0) from orders), \
+                     (select count(*) from orders)"),
+            )
+            .await;
+        r.rows[0].clone()
+    };
+    // Control: without tenant code every session writes.
+    for (label, c) in &sessions {
+        let r = pg
+            .run(c, write("update orders set amount = 2 where id = 1"))
+            .await;
+        assert!(r.is_ok(), "{label}: {r:?}");
     }
-    let refuse = |label: &'static str| {
-        let pg = &pg;
-        let agent = agent.clone();
-        async move {
-            for text in [
-                "update orders set amount = 3 where id = 1",
-                "insert into orders (id, amount) values (70, 1)",
-                "with u as (update orders set amount = 4 where id = 2 returning id) select count(*) from u",
-            ] {
-                let (status, code, hint) = pg.refused(&agent, write(text)).await;
-                assert_eq!(
-                    (status, code.as_str()),
-                    (501, "not_implemented"),
-                    "{label}: {text}"
-                );
-                assert!(hint.is_some());
+    let before = state().await;
+    for case in CODE_CASES {
+        for s in case.make {
+            pg.ok(&a, write(s)).await;
+        }
+        for s in case.owner {
+            as_owner(&pg, s).await;
+        }
+        // The views' `id` columns are confirmed `normal`, so the footprint lets the writes reach
+        // the tenant-code check.
+        for view in ["v2", "v3", "sv2"] {
+            if case
+                .make
+                .iter()
+                .any(|m| m.contains(&format!("create view {view} ")))
+            {
+                pg.confirm(&[(view, "id", DataClass::Normal)]).await;
             }
         }
-    };
-    refuse("masked_write").await;
-    let audit = || async { pg.count(&pg.alice(), "select count(*) from audit").await };
-    assert_eq!(audit().await, json!(0), "nothing ran");
-    let r = pg.ok(&agent, sql("select what from audit")).await;
-    assert!(r.rows.is_empty());
-    // The engine's own line: a masked_write session refuses the write in its transaction.
+        for (label, c) in &sessions {
+            for text in PLAIN_WRITES.iter().chain(case.writes) {
+                let (status, code, hint) = pg.refused(c, write(text)).await;
+                assert_eq!(
+                    (status, code.as_str(), hint.as_deref()),
+                    (501, "not_implemented", Some("tenant_code_on_live")),
+                    "{}: {label}: {text}",
+                    case.label
+                );
+            }
+        }
+        assert_eq!(state().await, before, "{}: nothing ran", case.label);
+        for s in case.drop {
+            pg.ok(&a, write(s)).await;
+        }
+        for s in case.owner {
+            let undo = if s.starts_with("create rule orders_copy") {
+                "drop rule orders_copy on orders"
+            } else if s.starts_with("create policy orders_p") {
+                "drop policy orders_p on orders"
+            } else if s.starts_with("create aggregate total") {
+                "drop aggregate total(integer)"
+            } else {
+                continue;
+            };
+            as_owner(&pg, undo).await;
+        }
+        // Control: with the code gone, the agent writes again.
+        pg.ok(
+            &pg.agent(),
+            write("update orders set amount = 2 where id = 1"),
+        )
+        .await;
+    }
+    // The engine's own line, for both masked write kinds: in the request's own transaction.
+    pg.ok(&a, write(CODE_CASES[0].make[0])).await;
+    pg.ok(&a, write(CODE_CASES[0].make[1])).await;
     let d = pg.w.s.databases.deps();
     let row = d.store.get(pg.w.team.id, pg.db).await.unwrap().unwrap();
     let key = d
@@ -1233,111 +1441,57 @@ async fn agent_writes_never_run_tenant_triggers_or_rules() {
         .engine_key(pg.w.team.id, row.key_node_id)
         .await
         .unwrap();
-    let role = RoleRef::new(row.database_ref(), RoleKind::MaskedWrite).unwrap();
-    let r = d
-        .engines
-        .postgres
-        .as_ref()
-        .unwrap()
-        .execute(
-            &role,
-            &key,
-            &StatementRequest {
-                sql: "update orders set amount = 5 where id = 1".into(),
-                params: vec![],
-                mode: StatementMode::Write,
-                timeout: Duration::from_secs(5),
-                max_rows: 10,
-                max_bytes: None,
-            },
-        )
+    for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+        let role = RoleRef::new(row.database_ref(), kind).unwrap();
+        let r = d
+            .engines
+            .postgres
+            .as_ref()
+            .unwrap()
+            .execute(
+                &role,
+                &key,
+                &StatementRequest {
+                    sql: "update orders set amount = 5 where id = 1".into(),
+                    params: vec![],
+                    mode: StatementMode::Write,
+                    timeout: Duration::from_secs(5),
+                    max_rows: 10,
+                    max_bytes: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&r, Err(EngineError::StatementNotAllowed(m)) if m == "tenant_code_on_live"),
+            "{kind:?}: {r:?}"
+        );
+    }
+    assert_eq!(state().await, before, "the engine ran nothing");
+    // A person with manage writes: the trigger runs for them (they may see every value).
+    pg.ok(&a, write("update orders set amount = 2 where id = 1"))
         .await;
-    assert!(
-        matches!(&r, Err(EngineError::StatementNotAllowed(m)) if m == "tenant_triggers_or_rules"),
-        "{r:?}"
+    assert_eq!(
+        pg.count(&a, "select count(*) from audit").await,
+        json!(1),
+        "the owner's write ran the trigger"
     );
-    assert_eq!(audit().await, json!(0), "nothing ran");
-    // With read_personal (the `write` kind) too.
-    pg.grant(GrantKind::ReadPersonal).await;
-    refuse("write").await;
-    assert_eq!(audit().await, json!(0));
-    // A rule does the same as a trigger.
-    pg.ok(&a, write("drop trigger orders_log on orders")).await;
-    pg.ok(&agent, write("update orders set amount = 6 where id = 1"))
-        .await;
-    // The query API cannot parse `CREATE RULE`; a rule can still come with a restored or copied
-    // database, so the owner makes it in the engine.
-    as_owner(
-        &pg,
-        "create rule orders_copy as on update to orders do also \
-         insert into audit (what) values (new.person_email)",
-    )
-    .await;
-    refuse("rule").await;
-    assert_eq!(audit().await, json!(0));
     pg.drop().await;
 }
 
-/// Review-Q-2-2 P-2: tenant code (a trigger, a function in a check constraint) can raise any
-/// SQLSTATE with any text, with the values of the real row. A caller without `manage` gets the
-/// fixed text, never a name from such an error.
+/// Review-Q-2-2 P-2: tenant code (a function in a view, a check function, a trigger) can raise
+/// any SQLSTATE with any text, with the values of the real row. A caller without `manage` gets
+/// the fixed text, never a name from such an error. Since decision 0004-38 masked sessions reach
+/// tenant code only in reads (their row writes are refused where tenant code exists), so the
+/// error comes from a function in a view.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_raised_by_tenant_code_name_nothing() {
     let Some(pg) = setup().await else { return };
     let a = pg.alice();
-    for s in [
-        "create table notes (id integer primary key, code text, n integer)",
-        "insert into notes values (1, 'tokcommon', 1)",
-        "create function chk(c text, n integer) returns boolean language plpgsql immutable as $$ \
-         begin if n = 7 then raise exception using errcode = '23514', \
-         message = format('bad \"%s\"', c); end if; return true; end $$",
-        "alter table notes add constraint notes_chk check (chk(code, n))",
-    ] {
-        pg.ok(&a, write(s)).await;
-    }
-    pg.confirm(&[
-        ("notes", "id", DataClass::Normal),
-        ("notes", "code", DataClass::Secret),
-        ("notes", "n", DataClass::Normal),
-    ])
-    .await;
-    pg.grant(GrantKind::WriteLive).await;
     let message = |r: std::result::Result<QueryResult, QueryError>| match r {
         Err(QueryError::Problem(p)) => (p.sqlstate.clone(), p.message.clone()),
         other => panic!("{other:?}"),
     };
-    // The agent (no trigger in the database, so its write reaches the engine).
-    let (state, text) = message(
-        pg.run(&pg.agent(), write("update notes set n = 7 where id = 1"))
-            .await,
-    );
-    assert_eq!(state.as_deref(), Some("23514"));
-    assert_eq!(text, "a check constraint was violated");
-    // A trigger that names the real secret, for Bob (edit, no manage).
-    for s in [
-        "create function shout() returns trigger language plpgsql as $$ begin \
-         if new.score = 99 then raise exception using errcode = '23505', \
-         message = format('dup \"%s\"', replace(new.token, '-', '_')); end if; return new; end $$",
-        "create trigger people_shout before update on people for each row execute function shout()",
-    ] {
-        pg.ok(&a, write(s)).await;
-    }
-    let (state, text) = message(
-        pg.run(
-            &pg.bob(),
-            write("update people set score = 99 where id = 1"),
-        )
-        .await,
-    );
-    assert_eq!(state.as_deref(), Some("23505"));
-    assert_eq!(text, "a unique constraint was violated");
-    // Control: a person with manage reads the engine's text.
-    let (_, text) = message(
-        pg.run(&a, write("update people set score = 99 where id = 1"))
-            .await,
-    );
-    assert!(text.contains("tok_1_secret"), "{text}");
-    // The engine's own errors still name their objects.
+    // The engine's own errors still name their objects (no tenant code yet, so Bob writes).
     let (_, text) = message(
         pg.run(
             &pg.bob(),
@@ -1349,6 +1503,44 @@ async fn errors_raised_by_tenant_code_name_nothing() {
         text.starts_with("a check constraint was violated: ")
             && text.contains("people_score_check"),
         "{text}"
+    );
+    for s in [
+        "create table notes (id integer primary key, code text, n integer)",
+        "insert into notes values (1, 'tokcommon', 7)",
+        "create function chk(c text, n integer) returns text language plpgsql stable as $$ \
+         begin if n = 7 then raise exception using errcode = '23514', \
+         message = format('bad \"%s\"', c); end if; return 'ok'; end $$",
+        // The function is in the view's filter, so every read of the view runs it.
+        "create view nv as select id, n from notes where chk(code, n) = 'ok'",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    pg.confirm(&[
+        ("notes", "id", DataClass::Normal),
+        ("notes", "code", DataClass::Secret),
+        ("notes", "n", DataClass::Normal),
+        ("nv", "id", DataClass::Normal),
+        ("nv", "n", DataClass::Normal),
+    ])
+    .await;
+    // The agent and Bob (edit, no manage) read the view: the function raises with the real
+    // secret in its text.
+    for who in [pg.agent(), pg.bob()] {
+        let (state, text) = message(pg.run(&who, sql("select n from nv where id = 1")).await);
+        assert_eq!(state.as_deref(), Some("23514"));
+        assert_eq!(text, "a check constraint was violated");
+    }
+    // Control: a person with manage reads the engine's text.
+    let (_, text) = message(pg.run(&a, sql("select n from nv where id = 1")).await);
+    assert!(text.contains("tokcommon"), "{text}");
+    // A masked write that would run the function never reaches it.
+    pg.grant(GrantKind::WriteLive).await;
+    let (status, _, hint) = pg
+        .refused(&pg.agent(), write("update notes set n = 7 where id = 1"))
+        .await;
+    assert_eq!(
+        (status, hint.as_deref()),
+        (501, Some("tenant_code_on_live"))
     );
     pg.drop().await;
 }
@@ -1454,13 +1646,20 @@ async fn agent_statements_that_write_no_row_run_read_only() {
     );
     let r = pg.ok(&pg.agent(), sql("select what from stash")).await;
     assert!(r.rows.is_empty());
-    // A row write of the agent still runs (no trigger or rule in the database).
-    let r = pg
-        .ok(
-            &pg.agent(),
-            write("update orders set amount = 9 where id = 1"),
-        )
-        .await;
-    assert_eq!(r.rows_affected, Some(1));
+    // The same for Bob (edit, no manage): his statements that write no row run read-only too.
+    let (status, code, _) = pg.refused(&pg.bob(), write("select s from sv")).await;
+    assert_eq!((status, code.as_str()), (400, "read_only_query"));
+    assert_eq!(pg.count(&a, "select count(*) from stash").await, json!(0));
+    // A row write of a masked session is refused: the database holds tenant code (decision
+    // 0004-38).
+    for who in [pg.agent(), pg.bob()] {
+        let (status, _, hint) = pg
+            .refused(&who, write("update orders set amount = 9 where id = 1"))
+            .await;
+        assert_eq!(
+            (status, hint.as_deref()),
+            (501, Some("tenant_code_on_live"))
+        );
+    }
     pg.drop().await;
 }

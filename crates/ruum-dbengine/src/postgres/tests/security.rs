@@ -1189,10 +1189,11 @@ async fn an_export_holds_no_ruum_object_and_imports_with_the_key_handed_in() {
         ]
     );
     assert_eq!(out.rows[1][1], Value::Text("tab\there".into()));
-    // The sequence of the serial column came along.
+    // The sequence of the serial column came along. (The owner writes: the database holds the
+    // tenant function `shout`, so a `write` session may not, decision 0004-38.)
     engine
         .execute(
-            &role(RoleKind::Write),
+            &role(RoleKind::Owner),
             &vector_key(),
             &request(
                 "INSERT INTO users (email) VALUES ('c@example.com')",
