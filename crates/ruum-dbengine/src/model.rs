@@ -117,12 +117,19 @@ pub struct CatalogColumn {
     pub identity: Option<ColumnIdentity>,
 }
 
-/// `rel_oid`, `attnum`, `type_oid` of `database_columns`.
+/// `rel_oid`, `attnum`, `type_oid` and `definition_hash` of `database_columns`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnIdentity {
     pub rel_oid: u32,
     pub attnum: i16,
     pub type_oid: u32,
+    /// What the column computes, for a column that computes something: a column of a view or a
+    /// materialized view (its `_RETURN` rule, the rules of the views it reads and the functions
+    /// it calls) and a generated column (its expression and the functions it calls). A hash;
+    /// `None` for a plain table column. `CREATE OR REPLACE VIEW`, `ALTER COLUMN ... SET
+    /// EXPRESSION` and `CREATE OR REPLACE FUNCTION` keep `rel_oid` and `attnum`, so a changed
+    /// definition clears the confirmation like a retype (review-Q-2-1 F-1).
+    pub definition: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

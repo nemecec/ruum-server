@@ -654,6 +654,11 @@ async fn agent_writes_need_a_grant_and_never_touch_a_restricted_column() {
         "insert into orders (id, person_email) values (61, 'x')",
         "delete from people where name = 'Name 1'",
         "with x as (select email from people) update orders set label = (select min(email) from x) where id = 1",
+        // Review-Q-2-2 P-3: a whole row and functional notation read columns too.
+        "update orders set label = (select p::text from people p where p.id = 1) where id = 1",
+        "update orders set label = email(p) from people p where p.id = orders.id and orders.id = 2",
+        "update orders set label = token(p) from people p where p.id = orders.id and orders.id = 3",
+        "update orders set label = upper(score) from people p(id, score, x, y, z, w) where p.id = orders.id and orders.id = 4",
     ] {
         let (status, code, hint) = pg.refused(&agent, write(text)).await;
         assert_eq!(
@@ -690,6 +695,15 @@ async fn agent_writes_need_a_grant_and_never_touch_a_restricted_column() {
         )
         .await,
         json!(PEOPLE)
+    );
+    assert_eq!(
+        pg.count(
+            &pg.alice(),
+            "select count(*) from orders where label like 'order-%' and id <= 4"
+        )
+        .await,
+        json!(PEOPLE),
+        "no pseudonym or lens constant was stored as a normal value"
     );
     // An engine error is sanitized: no row value.
     let r = pg
@@ -860,6 +874,12 @@ async fn the_lens_follows_confirmations_and_the_stricter_of_store_and_manifest()
         .as_object_mut()
         .unwrap()
         .remove("public.people.score");
+    // Review-Q-2-1 F-2: and makes `nick` secret. No manual rebuild: the manifest write itself
+    // rebuilds the lens (`applyManifest` -> `classes_changed`).
+    manifest["data_classes"]
+        .as_object_mut()
+        .unwrap()
+        .insert("public.people.nick".into(), json!("secret"));
     pg.w.s
         .databases
         .update_manifest(
@@ -873,13 +893,492 @@ async fn the_lens_follows_confirmations_and_the_stricter_of_store_and_manifest()
         )
         .await
         .unwrap();
-    crate::privacy::postgres::rebuild_lens(&pg.w.s.databases, pg.w.team.id, pg.db)
-        .await
-        .unwrap();
     let r = pg
         .ok(&agent, sql("select score from people where id = 1"))
         .await;
     assert_eq!(r.columns[0].data_class, DataClass::Personal);
     assert!(is_pseudonym_marker(&r.rows[0][0]), "{}", r.rows[0][0]);
+    // The filters see the new lens at once: a raw value of a column taken back finds nothing,
+    // and a column made secret is the constant, for the agent and for Bob (no manage).
+    for who in [pg.agent(), pg.bob()] {
+        assert_eq!(
+            pg.count(&who, "select count(*) from people where score::text = '10'")
+                .await,
+            json!(if who.actor.is_agent() { 0 } else { 1 }),
+        );
+        assert_eq!(
+            pg.count(&who, "select count(*) from people where nick = 'nick-1'")
+                .await,
+            json!(0)
+        );
+        let r = pg
+            .ok(
+                &who,
+                sql("select nick, nick || '' from people where id = 1"),
+            )
+            .await;
+        assert_eq!(r.rows[0][0], hidden("secret"), "{:?}", r.rows);
+        assert_eq!(r.rows[0][1], hidden("secret"), "{:?}", r.rows);
+    }
+    pg.drop().await;
+}
+
+/// Runs a statement in an `owner` session of the engine (statements the query API refuses, such
+/// as `ANALYZE`).
+async fn as_owner(pg: &Pg, text: &str) {
+    let d = pg.w.s.databases.deps();
+    let row = d.store.get(pg.w.team.id, pg.db).await.unwrap().unwrap();
+    let key = d
+        .queries
+        .keys
+        .engine_key(pg.w.team.id, row.key_node_id)
+        .await
+        .unwrap();
+    let owner = RoleRef::new(row.database_ref(), RoleKind::Owner).unwrap();
+    d.engines
+        .postgres
+        .as_ref()
+        .unwrap()
+        .execute(
+            &owner,
+            &key,
+            &StatementRequest {
+                sql: text.into(),
+                params: vec![],
+                mode: StatementMode::Write,
+                timeout: Duration::from_secs(10),
+                max_rows: 10,
+                max_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// The class store's row of a column.
+async fn column_row(pg: &Pg, table: &str, column: &str) -> crate::databases::classes::ColumnRow {
+    pg.w.s
+        .databases
+        .deps()
+        .columns
+        .list(pg.w.team.id, pg.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.is_live() && r.column.table == table && r.column.column == column)
+        .unwrap()
+}
+
+/// Review-Q-2-1 F-1: a view replaced in place, or a function replaced in place that a view
+/// calls, keeps the view's OID and `attnum`s; the confirmation of its columns is cleared
+/// (`redefined`), so a column confirmed `normal` never shows what it computes now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_view_or_function_replaced_in_place_loses_its_confirmation() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    for s in [
+        "create view x as select id, nick as n from people",
+        "create view y as select id, nick as n from people",
+        "create function nick_of(i integer) returns text language sql stable security definer \
+         set search_path = public as $$ select nick from people where id = i $$",
+        "create view z as select id, nick_of(id) as n from people",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    use DataClass::Normal as N;
+    pg.confirm(&[
+        ("x", "id", N),
+        ("x", "n", N),
+        ("y", "id", N),
+        ("y", "n", N),
+        ("z", "id", N),
+        ("z", "n", N),
+    ])
+    .await;
+    // Control: the confirmed columns show their values to the agent and to Bob.
+    for who in [pg.agent(), pg.bob()] {
+        for v in ["x", "y", "z"] {
+            let r = pg
+                .ok(&who, sql(&format!("select n from {v} where id = 1")))
+                .await;
+            assert_eq!(r.rows[0][0], json!("nick-1"), "{v}");
+        }
+    }
+    for s in [
+        "create or replace view x as select id, token as n from people",
+        "create or replace view y as select id, email as n from people",
+        "create or replace function nick_of(i integer) returns text language sql stable \
+         security definer set search_path = public as $$ select token from people where id = i $$",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    for (v, col) in [("x", "n"), ("y", "n"), ("z", "n")] {
+        let row = column_row(&pg, v, col).await;
+        assert!(row.confirmed.is_none(), "{v}.{col}: {row:?}");
+        assert_eq!(
+            row.unconfirmed_reason,
+            Some(crate::databases::classes::UnconfirmedReason::Redefined),
+            "{v}.{col}"
+        );
+    }
+    assert!(
+        column_row(&pg, "people", "nick").await.confirmed.is_some(),
+        "a table column keeps its class"
+    );
+    for who in [pg.agent(), pg.bob()] {
+        for v in ["x", "z"] {
+            let r = pg
+                .ok(&who, sql(&format!("select n from {v} order by id")))
+                .await;
+            no_raw(&r);
+            let c = &r.rows[0][0];
+            assert!(
+                c == &hidden("secret") || c == &hidden("personal"),
+                "{v}: {c}"
+            );
+            assert_eq!(
+                pg.count(
+                    &who,
+                    &format!("select count(*) from {v} where n = 'tok-1-secret'")
+                )
+                .await,
+                json!(0),
+                "{v}"
+            );
+        }
+    }
+    // y now reads a personal column: a pseudonym for the agent, never the address.
+    let r = pg.ok(&pg.agent(), sql("select n from y")).await;
+    no_raw(&r);
+    assert!(is_pseudonym_marker(&r.rows[0][0]), "{}", r.rows[0][0]);
+    pg.drop().await;
+}
+
+/// Review-Q-2-1 F-3, F-4, F-5: a whole-row reference in a view, a definer function reached
+/// through a plain SQL-standard function, and a generated column over a secret never show the
+/// secret to a reader of the `nosecret` lens (Bob, an agent with `read_personal`) or the masked
+/// lens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn computed_columns_over_a_secret_never_show_it() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    for s in [
+        "create view j as select id, to_json(p)::text as doc from people p",
+        "create view k as select id, p::text as doc from people p",
+        "create function wrap(i integer) returns text language sql stable return peek(i)",
+        "create view w2 as select id, wrap(id) as p from people",
+        "alter table people add column tok2 text generated always as (upper(token)) stored",
+        // Control: a whole-row reference to a table without a secret column.
+        "create view oj as select id, to_json(o)::text as doc from orders o",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    pg.confirm(&[("oj", "id", DataClass::Normal)]).await;
+    pg.grant(GrantKind::ReadPersonal).await;
+    for who in [pg.bob(), pg.agent()] {
+        for (v, col) in [("j", "doc"), ("k", "doc"), ("w2", "p"), ("people", "tok2")] {
+            let r = pg
+                .ok(&who, sql(&format!("select {col} from {v} order by id")))
+                .await;
+            let text = serde_json::to_string(&r.rows).unwrap();
+            assert!(
+                !text.contains("tok-") && !text.contains("TOK-"),
+                "{v}.{col}: {text}"
+            );
+            assert_eq!(r.rows[0][0], hidden("secret"), "{v}.{col}");
+        }
+        assert_eq!(
+            pg.count(
+                &who,
+                "select count(*) from people where tok2 = 'TOK-1-SECRET'"
+            )
+            .await,
+            json!(0)
+        );
+        assert_eq!(
+            pg.count(&who, "select count(*) from j where doc like '%tok-1%'")
+                .await,
+            json!(0)
+        );
+        // The other columns keep their lens: a personal value for these readers.
+        let r = pg
+            .ok(
+                &who,
+                sql("select email, doc from people, oj where people.id = 1 and oj.id = 1"),
+            )
+            .await;
+        assert_eq!(r.rows[0][0], json!("a1@example.test"));
+        assert!(
+            r.rows[0][1].as_str().is_some_and(|d| d.contains("order-1")),
+            "{}",
+            r.rows[0][1]
+        );
+    }
+    // The owner's control finds the values.
+    assert_eq!(
+        pg.count(
+            &a,
+            "select count(*) from people where tok2 = 'TOK-1-SECRET'"
+        )
+        .await,
+        json!(1)
+    );
+    assert_eq!(
+        pg.count(&a, "select count(*) from w2 where p like 'tok%'")
+            .await,
+        json!(3)
+    );
+    pg.drop().await;
+}
+
+/// Review-Q-2-2 P-1: a tenant trigger or rule runs on the real row of a write, whatever lens the
+/// writer has. An agent's write in a database with one needs a person's approval (501 until card
+/// A-2); nothing runs, and the engine refuses a `masked_write` there by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_writes_never_run_tenant_triggers_or_rules() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    let agent = pg.agent();
+    pg.ok(
+        &a,
+        write("create table audit (id serial primary key, what text)"),
+    )
+    .await;
+    pg.confirm(&[
+        ("audit", "id", DataClass::Normal),
+        ("audit", "what", DataClass::Normal),
+    ])
+    .await;
+    pg.grant(GrantKind::WriteLive).await;
+    // Control: without a trigger the agent's write runs.
+    pg.ok(&agent, write("update orders set amount = 2 where id = 1"))
+        .await;
+    for s in [
+        "create function log_it() returns trigger language plpgsql as $$ \
+         begin insert into audit (what) values (new.person_email); return new; end $$",
+        "create trigger orders_log after update on orders for each row execute function log_it()",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    let refuse = |label: &'static str| {
+        let pg = &pg;
+        let agent = agent.clone();
+        async move {
+            for text in [
+                "update orders set amount = 3 where id = 1",
+                "insert into orders (id, amount) values (70, 1)",
+                "with u as (update orders set amount = 4 where id = 2 returning id) select count(*) from u",
+            ] {
+                let (status, code, hint) = pg.refused(&agent, write(text)).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (501, "not_implemented"),
+                    "{label}: {text}"
+                );
+                assert!(hint.is_some());
+            }
+        }
+    };
+    refuse("masked_write").await;
+    let audit = || async { pg.count(&pg.alice(), "select count(*) from audit").await };
+    assert_eq!(audit().await, json!(0), "nothing ran");
+    let r = pg.ok(&agent, sql("select what from audit")).await;
+    assert!(r.rows.is_empty());
+    // The engine's own line: a masked_write session refuses the write in its transaction.
+    let d = pg.w.s.databases.deps();
+    let row = d.store.get(pg.w.team.id, pg.db).await.unwrap().unwrap();
+    let key = d
+        .queries
+        .keys
+        .engine_key(pg.w.team.id, row.key_node_id)
+        .await
+        .unwrap();
+    let role = RoleRef::new(row.database_ref(), RoleKind::MaskedWrite).unwrap();
+    let r = d
+        .engines
+        .postgres
+        .as_ref()
+        .unwrap()
+        .execute(
+            &role,
+            &key,
+            &StatementRequest {
+                sql: "update orders set amount = 5 where id = 1".into(),
+                params: vec![],
+                mode: StatementMode::Write,
+                timeout: Duration::from_secs(5),
+                max_rows: 10,
+                max_bytes: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(&r, Err(EngineError::StatementNotAllowed(m)) if m == "tenant_triggers_or_rules"),
+        "{r:?}"
+    );
+    assert_eq!(audit().await, json!(0), "nothing ran");
+    // With read_personal (the `write` kind) too.
+    pg.grant(GrantKind::ReadPersonal).await;
+    refuse("write").await;
+    assert_eq!(audit().await, json!(0));
+    // A rule does the same as a trigger.
+    pg.ok(&a, write("drop trigger orders_log on orders")).await;
+    pg.ok(&agent, write("update orders set amount = 6 where id = 1"))
+        .await;
+    // The query API cannot parse `CREATE RULE`; a rule can still come with a restored or copied
+    // database, so the owner makes it in the engine.
+    as_owner(
+        &pg,
+        "create rule orders_copy as on update to orders do also \
+         insert into audit (what) values (new.person_email)",
+    )
+    .await;
+    refuse("rule").await;
+    assert_eq!(audit().await, json!(0));
+    pg.drop().await;
+}
+
+/// Review-Q-2-2 P-2: tenant code (a trigger, a function in a check constraint) can raise any
+/// SQLSTATE with any text, with the values of the real row. A caller without `manage` gets the
+/// fixed text, never a name from such an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errors_raised_by_tenant_code_name_nothing() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    for s in [
+        "create table notes (id integer primary key, code text, n integer)",
+        "insert into notes values (1, 'tokcommon', 1)",
+        "create function chk(c text, n integer) returns boolean language plpgsql immutable as $$ \
+         begin if n = 7 then raise exception using errcode = '23514', \
+         message = format('bad \"%s\"', c); end if; return true; end $$",
+        "alter table notes add constraint notes_chk check (chk(code, n))",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    pg.confirm(&[
+        ("notes", "id", DataClass::Normal),
+        ("notes", "code", DataClass::Secret),
+        ("notes", "n", DataClass::Normal),
+    ])
+    .await;
+    pg.grant(GrantKind::WriteLive).await;
+    let message = |r: std::result::Result<QueryResult, QueryError>| match r {
+        Err(QueryError::Problem(p)) => (p.sqlstate.clone(), p.message.clone()),
+        other => panic!("{other:?}"),
+    };
+    // The agent (no trigger in the database, so its write reaches the engine).
+    let (state, text) = message(
+        pg.run(&pg.agent(), write("update notes set n = 7 where id = 1"))
+            .await,
+    );
+    assert_eq!(state.as_deref(), Some("23514"));
+    assert_eq!(text, "a check constraint was violated");
+    // A trigger that names the real secret, for Bob (edit, no manage).
+    for s in [
+        "create function shout() returns trigger language plpgsql as $$ begin \
+         if new.score = 99 then raise exception using errcode = '23505', \
+         message = format('dup \"%s\"', replace(new.token, '-', '_')); end if; return new; end $$",
+        "create trigger people_shout before update on people for each row execute function shout()",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    let (state, text) = message(
+        pg.run(
+            &pg.bob(),
+            write("update people set score = 99 where id = 1"),
+        )
+        .await,
+    );
+    assert_eq!(state.as_deref(), Some("23505"));
+    assert_eq!(text, "a unique constraint was violated");
+    // Control: a person with manage reads the engine's text.
+    let (_, text) = message(
+        pg.run(&a, write("update people set score = 99 where id = 1"))
+            .await,
+    );
+    assert!(text.contains("tok_1_secret"), "{text}");
+    // The engine's own errors still name their objects.
+    let (_, text) = message(
+        pg.run(
+            &pg.bob(),
+            write("update people set score = -1 where id = 2"),
+        )
+        .await,
+    );
+    assert!(
+        text.starts_with("a check constraint was violated: ")
+            && text.contains("people_score_check"),
+        "{text}"
+    );
+    pg.drop().await;
+}
+
+/// Review-Q-2-2 P-4, side channels and the survivor `other-schema-normal`: whole rows and
+/// renamed columns are never labelled `normal`; a column of another schema is `personal`;
+/// `EXPLAIN` with costs gives the agent no estimate that depends on a hidden value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn labels_of_whole_rows_and_estimates_of_plans() {
+    let Some(pg) = setup().await else { return };
+    let agent = pg.agent();
+    for text in [
+        "select row_to_json(p) from people p where id = 1",
+        "select upper(score) from people p(id, score, x, y, z, w) where id = 1",
+    ] {
+        let r = pg.ok(&agent, sql(text)).await;
+        no_raw(&r);
+        assert_ne!(r.columns[0].data_class, DataClass::Normal, "{text}");
+        assert_ne!(r.columns[0].masking, Masking::None, "{text}");
+        let cell = serde_json::to_string(&r.rows[0][0]).unwrap();
+        assert!(!cell.contains("ruum:hidden"), "{text}: {cell}");
+    }
+    let r = pg
+        .ok(
+            &agent,
+            sql("select relname from pg_class where relname = 'people'"),
+        )
+        .await;
+    assert_eq!(r.columns[0].data_class, DataClass::Personal);
+    // EXPLAIN with costs after ANALYZE of a skewed table.
+    let a = pg.alice();
+    for s in [
+        "create table big (id integer primary key, email text, token text)",
+        "insert into big select g, case when g <= 900 then 'common@x.test' else 'rare' || g || '@x.test' end, \
+         case when g <= 900 then 'tokcommon' else 'tok' || g end from generate_series(1, 1000) g",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    pg.confirm(&[
+        ("big", "id", DataClass::Normal),
+        ("big", "email", DataClass::Personal),
+        ("big", "token", DataClass::Secret),
+    ])
+    .await;
+    as_owner(&pg, "analyze big").await;
+    let rows_estimate = |plan: &QueryResult| -> String {
+        let text = plan.rows[0][0].as_str().unwrap_or_default().to_string();
+        let at = text.find("rows=").expect("an estimate");
+        text[at..].split_whitespace().next().unwrap().to_string()
+    };
+    for (common, rare) in [
+        (
+            "explain select * from big where email = 'common@x.test'",
+            "explain select * from big where email = 'rare950@x.test'",
+        ),
+        (
+            "explain select * from big where token = 'tokcommon'",
+            "explain select * from big where token = 'tok950'",
+        ),
+    ] {
+        let owner = (
+            rows_estimate(&pg.ok(&a, sql(common)).await),
+            rows_estimate(&pg.ok(&a, sql(rare)).await),
+        );
+        assert_ne!(owner.0, owner.1, "control: the owner's estimates differ");
+        let seen = (
+            rows_estimate(&pg.ok(&agent, sql(common)).await),
+            rows_estimate(&pg.ok(&agent, sql(rare)).await),
+        );
+        assert_eq!(seen.0, seen.1, "{common}");
+    }
     pg.drop().await;
 }

@@ -73,6 +73,10 @@ pub struct ProviderDeps {
     pub typed: Arc<dyn TypedNodeStore>,
     /// Where the provider reports (`reportStatus`).
     pub platform: Arc<dyn PlatformApi>,
+    /// Told when a manifest changes the confirmed classes (`data_classes`), so the lens of the
+    /// database follows at once (review-Q-2-1 F-2): `updateDatabaseManifest` and
+    /// `restoreVersion` both reach the database through `applyManifest`.
+    pub masking: Arc<dyn crate::privacy::MaskingRules>,
 }
 
 /// The provider.
@@ -653,6 +657,27 @@ impl Provider for DatabaseProvider {
                 "the extensions of a database are fixed when it is made",
                 "/extensions",
             ));
+        }
+        // A change of `data_classes` (a class taken back or made stricter) rebuilds the lens
+        // now, not at the next confirmation or schema change (review-Q-2-1 F-2). A failure
+        // fails the delivery, so the reconciler tries again. A write of the column classes
+        // themselves (a confirmation, a reset of the catalog sync) is left out: that code calls
+        // `classes_changed` after it changed the store, and a reset is written from inside a
+        // lens rebuild, which already uses it.
+        let by_sync = super::classes::OWN_CLASSES_WRITE.try_with(|_| ()).is_ok();
+        let before = self
+            .inner
+            .deps
+            .store
+            .manifest(tenant, req.previous_version_id)
+            .await?
+            .map(|m| super::query::manifest_classes(&m));
+        if !by_sync && before.as_ref() != Some(&super::query::manifest_classes(&req.manifest)) {
+            self.inner
+                .deps
+                .masking
+                .manifest_changed(tenant, node)
+                .await?;
         }
         let generation = self.inner.next_generation(tenant, node).await?;
         let s = status(node, ProviderState::Ready, generation, Some(req.version_id));

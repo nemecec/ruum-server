@@ -29,7 +29,7 @@ impl PgColumnStore {
 
 /// The columns that [`row_from`] reads.
 const COLUMNS: &str = "schema_name, table_name, column_name, data_type, rel_oid::int8 as rel_oid, \
-    attnum, type_oid::int8 as type_oid, unconfirmed_reason, suggested_class::text as suggested_class, \
+    attnum, type_oid::int8 as type_oid, definition_hash, unconfirmed_reason, suggested_class::text as suggested_class, \
     suggested_reason, suggested_kind, suggested_by, suggested_obo, suggested_at, \
     confirmed_class::text as confirmed_class, confirmed_by, confirmed_at, confirmed_version, \
     dropped_at, first_seen_at";
@@ -51,6 +51,7 @@ fn row_from(r: &sqlx::postgres::PgRow) -> Result<ColumnRow> {
             rel_oid: rel as u32,
             attnum,
             type_oid: r.try_get::<Option<i64>, _>("type_oid")?.unwrap_or(0) as u32,
+            definition: r.try_get::<Option<i64>, _>("definition_hash")?,
         }),
         _ => None,
     };
@@ -145,8 +146,9 @@ async fn insert_row(
          data_type, rel_oid, attnum, type_oid, unconfirmed_reason, suggested_class, \
          suggested_reason, suggested_kind, suggested_by, suggested_obo, suggested_at, \
          confirmed_class, confirmed_by, confirmed_at, confirmed_version, dropped_at, \
-         first_seen_at) values ($1, $2, $3, $4, $5, $6, $7::int8::oid, $8, $9::int8::oid, $10, \
-         $11::data_class, $12, $13, $14, $15, $16, $17::data_class, $18, $19, $20, $21, $22)",
+         first_seen_at, definition_hash) values ($1, $2, $3, $4, $5, $6, $7::int8::oid, $8, \
+         $9::int8::oid, $10, $11::data_class, $12, $13, $14, $15, $16, $17::data_class, $18, \
+         $19, $20, $21, $22, $23)",
     )
     .bind(tenant)
     .bind(node)
@@ -170,6 +172,7 @@ async fn insert_row(
     .bind(c.map(|c| c.version))
     .bind(r.dropped_at)
     .bind(r.first_seen_at)
+    .bind(r.identity.and_then(|i| i.definition))
     .execute(&mut *conn)
     .await?;
     Ok(())

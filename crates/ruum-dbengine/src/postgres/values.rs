@@ -106,6 +106,7 @@ pub(crate) fn arguments(params: &[Value]) -> Result<PgArguments, EngineError> {
                 EngineError::Sql {
                     code: "22P02".to_string(),
                     message: "invalid input syntax for type numeric".to_string(),
+                    in_routine: false,
                 }
             })?)),
             Value::Text(s) => args.add(s.clone()),

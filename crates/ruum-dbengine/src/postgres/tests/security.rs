@@ -520,7 +520,7 @@ const SET_CONFIG_PATHS: &[&str] = &[
 fn refused_set_config(err: &EngineError) -> bool {
     match err {
         EngineError::PermissionDenied(m) => m.contains("set_config"),
-        EngineError::Sql { code, message } => code == "42501" && message.contains("set_config"),
+        EngineError::Sql { code, message, .. } => code == "42501" && message.contains("set_config"),
         _ => false,
     }
 }
@@ -1514,7 +1514,7 @@ async fn errors_hold_no_row_values() {
             )
             .await
             .unwrap_err();
-        let EngineError::Sql { code, message } = &err else {
+        let EngineError::Sql { code, message, .. } = &err else {
             panic!("{err:?}")
         };
         assert_eq!(code, "23505");

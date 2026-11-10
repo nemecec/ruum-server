@@ -37,8 +37,17 @@ pub enum EngineError {
     PermissionDenied(String),
     /// An error of the engine for the statement: a code (SQLSTATE on Postgres, the extended
     /// result code name on SQLite) and the engine's text, not sanitized yet.
+    ///
+    /// `in_routine`: the error came from inside a function, a trigger or a `RAISE` (Postgres
+    /// reports a `CONTEXT`; SQLite reports `SQLITE_CONSTRAINT_TRIGGER`). Tenant code may have
+    /// written its text, its SQLSTATE and its fields, with the values of the real row, so no
+    /// part of it is shown to a caller without `manage` (review-Q-2-2 P-2).
     #[error("sql error {code}: {message}")]
-    Sql { code: String, message: String },
+    Sql {
+        code: String,
+        message: String,
+        in_routine: bool,
+    },
     /// A migration failed and was rolled back; the catalog sync and the lens rebuild still
     /// ran on the unchanged schema (decision 0004-34 f).
     #[error("migration failed: {0}")]

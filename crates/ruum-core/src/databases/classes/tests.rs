@@ -34,8 +34,18 @@ fn pg_col(table: &str, column: &str, rel: u32, attnum: i16, ty: u32) -> LiveColu
             rel_oid: rel,
             attnum,
             type_oid: ty,
+            definition: None,
         }),
     }
+}
+
+/// A column of a view (or a generated column) with the hash of its definition.
+fn computed_col(table: &str, column: &str, rel: u32, attnum: i16, definition: i64) -> LiveColumn {
+    let mut c = pg_col(table, column, rel, attnum, 25);
+    if let Some(i) = c.identity.as_mut() {
+        i.definition = Some(definition);
+    }
+    c
 }
 
 fn lite_col(table: &str, column: &str, ty: &str) -> LiveColumn {
@@ -155,6 +165,43 @@ fn a_retype_resets_the_class() {
     let a = row(&p.rows, &cref("public", "t", "a"));
     assert_eq!(a.unconfirmed_reason, Some(UnconfirmedReason::Retyped));
     assert!(a.confirmed.is_none());
+}
+
+/// Review-Q-2-1 F-1: `CREATE OR REPLACE VIEW` (or a changed generated expression, or a
+/// function replaced in place) keeps `rel_oid`, `attnum` and `type_oid`; a changed definition
+/// resets the class, also of a column confirmed `normal`, and an unchanged one keeps it. A row
+/// from before the store kept definitions resets once.
+#[test]
+fn a_redefined_computed_column_resets_the_class() {
+    let n = cref("public", "x", "n");
+    let mut rows = plan(&[], &[computed_col("x", "n", 30, 2, 7)], T0).rows;
+    confirm_row(&mut rows, &n, DataClass::Normal);
+    let same = plan(&rows, &[computed_col("x", "n", 30, 2, 7)], T1);
+    assert!(!same.outcome.classes_changed());
+    assert_eq!(
+        row(&same.rows, &n).confirmed.as_ref().map(|c| c.class),
+        Some(DataClass::Normal)
+    );
+    let p = plan(&rows, &[computed_col("x", "n", 30, 2, 8)], T1);
+    let r = row(&p.rows, &n);
+    assert_eq!(r.unconfirmed_reason, Some(UnconfirmedReason::Redefined));
+    assert!(r.confirmed.is_none());
+    assert_eq!(effective_class(r), DataClass::Personal);
+    assert_eq!(r.identity.and_then(|i| i.definition), Some(8));
+    assert_eq!(p.outcome.reset.len(), 1);
+    assert!(UnconfirmedReason::Redefined.is_reset());
+    assert_eq!(
+        UnconfirmedReason::parse("redefined"),
+        Some(UnconfirmedReason::Redefined)
+    );
+    // A row without a definition (before migration 0012) and a live hash: reset once.
+    let mut old = plan(&[], &[pg_col("x", "n", 30, 2, 25)], T0).rows;
+    confirm_row(&mut old, &n, DataClass::Normal);
+    let p = plan(&old, &[computed_col("x", "n", 30, 2, 7)], T1);
+    assert_eq!(
+        row(&p.rows, &n).unconfirmed_reason,
+        Some(UnconfirmedReason::Redefined)
+    );
 }
 
 #[test]
@@ -589,6 +636,27 @@ async fn store_conforms(
 /// Review K-1, C-2: a sync with names that `database_columns` cannot hold (over 63 characters,
 /// empty) succeeds on every store, writes no row for them and keeps the other columns. The
 /// live set replaces every earlier column of the database.
+/// A store keeps the definition hash of a computed column (review-Q-2-1 F-1).
+async fn definitions_conform(store: &dyn ColumnStore, tenant: TenantId, node: NodeId) {
+    let live = [computed_col("defs", "n", 95, 1, -42)];
+    let (rows, _) = store.sync(tenant, node, &live, T0).await.unwrap();
+    assert_eq!(store.list(tenant, node).await.unwrap(), rows);
+    let stored = row(&rows, &cref("public", "defs", "n"));
+    assert_eq!(stored.identity.and_then(|i| i.definition), Some(-42));
+    let (_, o) = store.sync(tenant, node, &live, T1).await.unwrap();
+    assert!(!o.rows_changed, "{o:?}");
+    let (rows, o) = store
+        .sync(tenant, node, &[computed_col("defs", "n", 95, 1, 43)], T1)
+        .await
+        .unwrap();
+    assert_eq!(o.reset.len(), 1, "{o:?}");
+    assert_eq!(
+        row(&rows, &cref("public", "defs", "n")).unconfirmed_reason,
+        Some(UnconfirmedReason::Redefined)
+    );
+    assert_eq!(store.list(tenant, node).await.unwrap(), rows);
+}
+
 async fn unfit_names_conform(store: &dyn ColumnStore, tenant: TenantId, node: NodeId) {
     let long = "c".repeat(MAX_NAME_CHARS + 14);
     let edge = "e".repeat(MAX_NAME_CHARS);
@@ -741,6 +809,7 @@ async fn memory_store_conforms() {
     )
     .await;
     unfit_names_conform(&*w.s.databases.deps().columns, w.team.id, id).await;
+    definitions_conform(&*w.s.databases.deps().columns, w.team.id, id).await;
 }
 
 // ------------------------------------------------------------------------ the service
@@ -1248,6 +1317,8 @@ async fn postgres_store_conforms(pool: sqlx::PgPool) {
     // Review K-1, C-2: this failed on the check constraint of `database_columns` before.
     let (ft, fnode, _, _) = seed_pg(&pool).await;
     unfit_names_conform(&store, ft, fnode).await;
+    let (dt, dnode, _, _) = seed_pg(&pool).await;
+    definitions_conform(&store, dt, dnode).await;
     // The journal entry is in the tenant's journal, with the envelope's type.
     let mut tx = crate::journal::postgres::begin_tenant(&pool, t)
         .await

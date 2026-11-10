@@ -1,5 +1,6 @@
-//! The catalog of a database with column identity (`rel_oid`, `attnum`, `type_oid`; decision
-//! 0004: classes follow identity), without the Ruum schemas (`ruum_*`), the schema
+//! The catalog of a database with column identity (`rel_oid`, `attnum`, `type_oid`, and the
+//! definition hash of a computed column, `depends::definitions`; decision 0004: classes follow
+//! identity), without the Ruum schemas (`ruum_*`), the schema
 //! `extensions`, the system schemas and the objects of extensions.
 //!
 //! It runs in any session of the database (`ruum_dbhost`, or the `owner` session of a
@@ -90,6 +91,9 @@ pub(crate) async fn read(conn: &mut PgConnection) -> Result<Catalog, EngineError
         return Ok(Catalog::default());
     }
     let oids: Vec<i64> = order.clone();
+    // What the computed columns compute (review-Q-2-1 F-1): a view's hash for each of its
+    // columns, a generated column's own hash.
+    let definitions = super::depends::definitions(&mut *conn).await?;
     for r in sqlx::query(COLUMNS)
         .persistent(false)
         .bind(&oids)
@@ -101,14 +105,20 @@ pub(crate) async fn read(conn: &mut PgConnection) -> Result<Catalog, EngineError
         if let Some(t) = tables.get_mut(&rel) {
             let notnull: bool = r.get("notnull");
             let type_oid: i64 = r.get("type_oid");
+            let attnum: i16 = r.get("attnum");
+            let definition = definitions
+                .get(&(rel as u32, 0))
+                .or_else(|| definitions.get(&(rel as u32, attnum)))
+                .copied();
             t.columns.push(CatalogColumn {
                 name: r.get("name"),
                 data_type: r.get("data_type"),
                 nullable: !notnull,
                 identity: Some(ColumnIdentity {
                     rel_oid: rel as u32,
-                    attnum: r.get("attnum"),
+                    attnum,
                     type_oid: type_oid as u32,
+                    definition,
                 }),
             });
         }

@@ -21,13 +21,18 @@ const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// How often the mail outbox worker looks for due mails when nothing wakes it.
 const MAIL_EVERY: Duration = Duration::from_secs(5);
 
+/// The log directive that silences the notices of tenant databases.
+const QUIET_NOTICES: &str = "sqlx::postgres::notice=off";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Notices of a tenant database (`RAISE NOTICE` in a trigger, with the values of the real
+    // row) never reach the platform log, whatever RUST_LOG says (design 8.5: logs carry markers;
+    // review-Q-2-2, notes).
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive(QUIET_NOTICES.parse()?);
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = Config::from_env()?;
     let args: Vec<String> = std::env::args().skip(1).collect();

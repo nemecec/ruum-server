@@ -15,9 +15,12 @@
 //!   transaction (the journal is the audit log of node changes: `AuditLog::list` merges it in),
 //!   then calls [`MaskingRules::classes_changed`](crate::privacy::MaskingRules).
 //! - **Classes follow column identity** (decision 0004-5 b). Postgres: `rel_oid`, `attnum`,
-//!   `type_oid` ([`ColumnIdentity`]). A rename (also of the table), a retype, a table swap or
-//!   rebuild, and a drop followed by an add of the same name clear the confirmation
-//!   ([`UnconfirmedReason`]: `renamed`, `retyped`, `table_changed`, `recreated`). SQLite has no
+//!   `type_oid` ([`ColumnIdentity`]), and for a column of a view or a generated column the hash
+//!   of what it computes (`definition`). A rename (also of the table), a retype, a table swap or
+//!   rebuild, a drop followed by an add of the same name, and a changed definition (a view
+//!   replaced in place, a generated expression or a function it calls changed, review-Q-2-1
+//!   F-1) clear the confirmation ([`UnconfirmedReason`]: `renamed`, `retyped`, `table_changed`,
+//!   `recreated`, `redefined`). SQLite has no
 //!   column identity in the engine (`identity: None`): the sync matches by schema, table and
 //!   column name, and a changed declared type counts as `retyped`. The SQLite resets that come
 //!   from parsing the DDL the platform runs (a rename or a table rebuild, decision 0004-5 b)
@@ -85,6 +88,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 
+tokio::task_local! {
+    /// Set while this module applies a manifest version that it wrote (a confirmation, a reset):
+    /// the provider then leaves `classes_changed` to this module, which calls it after the store
+    /// changed (review-Q-2-1 F-2).
+    pub static OWN_CLASSES_WRITE: ();
+}
+
 /// How often the server syncs the catalog of every database ([`run_scheduled_sync`]).
 pub const SYNC_EVERY: Duration = Duration::from_secs(600);
 
@@ -124,6 +134,9 @@ pub enum UnconfirmedReason {
     Retyped,
     TableChanged,
     Recreated,
+    /// Same identity, but the column computes something else: a view replaced in place, a
+    /// generated expression or a function it calls changed (review-Q-2-1 F-1).
+    Redefined,
 }
 
 impl UnconfirmedReason {
@@ -134,6 +147,7 @@ impl UnconfirmedReason {
             UnconfirmedReason::Retyped => "retyped",
             UnconfirmedReason::TableChanged => "table_changed",
             UnconfirmedReason::Recreated => "recreated",
+            UnconfirmedReason::Redefined => "redefined",
         }
     }
 
@@ -144,6 +158,7 @@ impl UnconfirmedReason {
             UnconfirmedReason::Retyped,
             UnconfirmedReason::TableChanged,
             UnconfirmedReason::Recreated,
+            UnconfirmedReason::Redefined,
         ]
         .into_iter()
         .find(|r| r.as_str() == s)
@@ -343,7 +358,16 @@ fn reset_reason(
             (Some(a), Some(b)) => a.type_oid != b.type_oid,
             _ => old.data_type != live.data_type,
         };
-        return retyped.then_some(UnconfirmedReason::Retyped);
+        if retyped {
+            return Some(UnconfirmedReason::Retyped);
+        }
+        // A computed column whose definition changed, or a row from before the store kept
+        // definitions (fail safe: the column is confirmed again once).
+        let redefined = match (old.identity, live.identity) {
+            (Some(a), Some(b)) => a.definition != b.definition,
+            _ => false,
+        };
+        return redefined.then_some(UnconfirmedReason::Redefined);
     }
     if !old.is_live() {
         return Some(UnconfirmedReason::Recreated);
@@ -1212,7 +1236,9 @@ impl DatabaseService {
                     let delivery =
                         crate::providers::reconciler::apply_delivery_id(ctx.tenant, id, w.value);
                     use crate::providers::Provider;
-                    match d.provider.apply_manifest(delivery, id, apply).await {
+                    let applied =
+                        OWN_CLASSES_WRITE.scope((), d.provider.apply_manifest(delivery, id, apply));
+                    match applied.await {
                         Ok(reply) => self.store_status(ctx.tenant, reply.into_inner()).await,
                         Err(e) => tracing::warn!(
                             tenant = %ctx.tenant,

@@ -1638,12 +1638,21 @@ pub fn build(
             parts.typed.clone(),
             Arc::new(provider::NoPlatformCalls),
         ));
+    // The lens of a Postgres database follows its classes (card Q-2), next to the rules of the
+    // caller (a recording one in tests).
+    let postgres_rules = Arc::new(crate::privacy::postgres::PostgresMaskingRules::new());
+    let masking: Arc<dyn crate::privacy::MaskingRules> =
+        Arc::new(crate::privacy::AllMaskingRules::new(vec![
+            parts.masking.clone(),
+            postgres_rules.clone(),
+        ]));
     let provider = Arc::new(provider::DatabaseProvider::new(provider::ProviderDeps {
         engines: parts.engines.clone(),
         keys: parts.keys.clone(),
         store: parts.store.clone(),
         typed: parts.typed.clone(),
         platform,
+        masking: masking.clone(),
     }));
     let mut registry = crate::providers::ProviderRegistry::new();
     registry.register(provider.clone())?;
@@ -1653,14 +1662,6 @@ pub fn build(
         registry.clone(),
         tenants.clone(),
     )));
-    // The lens of a Postgres database follows its classes (card Q-2), next to the rules of the
-    // caller (a recording one in tests).
-    let postgres_rules = Arc::new(crate::privacy::postgres::PostgresMaskingRules::new());
-    let masking: Arc<dyn crate::privacy::MaskingRules> =
-        Arc::new(crate::privacy::AllMaskingRules::new(vec![
-            parts.masking.clone(),
-            postgres_rules.clone(),
-        ]));
     let service = DatabaseService::new(DatabaseDeps {
         nodes,
         authz,

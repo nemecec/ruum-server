@@ -115,6 +115,7 @@ fn engine_errors_are_sanitized_without_manage() {
     let e = || EngineError::Sql {
         code: "22P02".into(),
         message: "invalid input syntax for type integer: \"alice@example.test\"".into(),
+        in_routine: false,
     };
     let p = problem(e(), false);
     assert_eq!(
@@ -128,6 +129,7 @@ fn engine_errors_are_sanitized_without_manage() {
         EngineError::Sql {
             code: "23505".into(),
             message: "duplicate key value violates unique constraint \"plants_pkey\"".into(),
+            in_routine: false,
         },
         false,
     );
@@ -137,6 +139,7 @@ fn engine_errors_are_sanitized_without_manage() {
         EngineError::Sql {
             code: "ConstraintViolation".into(),
             message: "UNIQUE constraint failed: plants.id".into(),
+            in_routine: false,
         },
         false,
     );
@@ -146,6 +149,7 @@ fn engine_errors_are_sanitized_without_manage() {
         EngineError::Sql {
             code: "Unknown".into(),
             message: "no such table: nosuch".into(),
+            in_routine: false,
         },
         false,
     );
@@ -155,10 +159,24 @@ fn engine_errors_are_sanitized_without_manage() {
         EngineError::Sql {
             code: "42703".into(),
             message: "column \"x y'z\" does not exist".into(),
+            in_routine: false,
         },
         false,
     );
     assert_eq!(p.message, "the column does not exist");
+    // Review-Q-2-2 P-2: an error from inside a trigger or a function shows no name, whatever
+    // SQLSTATE and text tenant code chose; a person with manage still reads the text.
+    let raised = || EngineError::Sql {
+        code: "23514".into(),
+        message: "bad \"tokcommon\"".into(),
+        in_routine: true,
+    };
+    let p = problem(raised(), false);
+    assert_eq!(
+        (p.sqlstate.as_deref(), p.message.as_str()),
+        (Some("23514"), "a check constraint was violated")
+    );
+    assert!(problem(raised(), true).message.contains("tokcommon"));
     // DDL by the write kind.
     let p = problem(EngineError::PermissionDenied("DDL by write".into()), false);
     assert_eq!(

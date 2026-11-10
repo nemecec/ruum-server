@@ -43,9 +43,12 @@
 //! - `personal` column: a value that is a pseudonym (`p_` and 12 hex characters) becomes
 //!   `{"$ruum": "pseudonym", "id": ...}`; the lens constant (a `personal` column of a
 //!   tenant-defined type, decision 0004-37 a) becomes `{"$ruum": "hidden", "class":
-//!   "personal"}`; another value (an expression over pseudonyms, for example `length(email)`)
-//!   stays as the engine computed it. `masking` is `hidden` when every value that is not `NULL`
-//!   is the constant, else `pseudonym`.
+//!   "personal"}`; another value of an expression over pseudonyms (for example
+//!   `length(email)`) stays as the engine computed it. Another value of a plain column (the
+//!   engine names its source) can only come from a lens that is behind the classes: it becomes
+//!   the hidden marker, and the server logs a warning (fail closed, review-Q-2-1 F-6). `masking`
+//!   is `hidden` when every value that is not `NULL` is the constant (or hidden so), else
+//!   `pseudonym`.
 //!
 //! For a caller that reads through the `nosecret` lens (an agent with `read_personal`, a person
 //! without `manage`): every value of a `secret` column that is not `NULL` becomes the `secret`
@@ -266,6 +269,10 @@ pub struct Footprint {
     table_words: Vec<Name>,
     /// Alias -> what it stands for (`Some(table name)`, `None` for a subquery or a CTE).
     aliases: Vec<(Name, Option<Name>)>,
+    /// Aliases with a column list (`people p(a, b)`): the alias, its table and the new column
+    /// names. The names map to the table's columns by position, which the server does not know,
+    /// so each counts as the strictest column of the table (review-Q-2-2 P-4).
+    alias_lists: Vec<(Name, Name, Vec<Name>)>,
     /// `INSERT INTO t` without a column list (also `DEFAULT VALUES`), or `MERGE ... INSERT
     /// VALUES`: every column of `t` is written.
     insert_all: Option<Name>,
@@ -677,6 +684,14 @@ impl Footprint {
                 j += 1;
             }
             if let Some(alias) = ts.get(j).and_then(|t| alias_name(t, fold)) {
+                if matches!(ts.get(j + 1), Some(T::LParen)) {
+                    let end = skip_group(ts, j + 1);
+                    let cols = ts[j + 2..end.saturating_sub(1).max(j + 2)]
+                        .iter()
+                        .filter_map(|t| t.name(fold))
+                        .collect();
+                    self.alias_lists.push((alias.clone(), name.clone(), cols));
+                }
                 self.aliases.push((alias, Some(name)));
             }
         }
@@ -697,6 +712,42 @@ impl Footprint {
                 self.aliases.push((alias, None));
             }
         }
+    }
+
+    /// Whether `name` is a table of the statement or an alias (of a table, a subquery or a CTE).
+    fn is_relation(&self, name: &Name, tables: &ClassMap) -> bool {
+        self.alias(name).is_some() || tables.table_name(name).is_some()
+    }
+
+    /// The table that `name` (a table or an alias) stands for, if it is a table.
+    fn relation_table(&self, name: &Name, tables: &ClassMap) -> Option<String> {
+        match self.alias(name) {
+            Some(t) => t.as_ref().and_then(|n| tables.table_name(n)),
+            None => tables.table_name(name),
+        }
+    }
+
+    /// The table of an alias with a column list whose list holds `column`, or whose alias is
+    /// `qualifier` (see `alias_lists`).
+    fn renamed_table(
+        &self,
+        qualifier: Option<&Name>,
+        column: &Name,
+        tables: &ClassMap,
+    ) -> Option<String> {
+        self.alias_lists.iter().find_map(|(alias, table, cols)| {
+            let hit = match qualifier {
+                Some(q) => {
+                    q.text.eq_ignore_ascii_case(&alias.text)
+                        && (q.quoted == alias.quoted || self.fold)
+                }
+                None => cols.iter().any(|c| {
+                    c.text.eq_ignore_ascii_case(&column.text)
+                        && (c.quoted == column.quoted || self.fold)
+                }),
+            };
+            if hit { tables.table_name(table) } else { None }
+        })
     }
 
     fn alias(&self, name: &Name) -> Option<&Option<Name>> {
@@ -731,6 +782,28 @@ impl Footprint {
             }
             if !t.is_name() {
                 i += 1;
+                continue;
+            }
+            // Functional notation (review-Q-2-2 P-3): Postgres reads `email(p)` as `p.email`
+            // when `p` is a table or an alias, and calls a function `f(p)` with the whole row.
+            if matches!(next, Some(T::LParen))
+                && !matches!(prev, Some(T::DoubleColon))
+                && !prev.is_some_and(|p| p.is_kw("AS"))
+                && ts.get(i + 2).is_some_and(T::is_name)
+                && matches!(ts.get(i + 3), Some(T::RParen))
+                && let Some(arg) = ts[i + 2].name(self.fold)
+                && self.is_relation(&arg, tables)
+            {
+                let func = t.name(self.fold).expect("a name");
+                let column = self
+                    .relation_table(&arg, tables)
+                    .is_some_and(|table| tables.column_names(&table).any(|(c, _)| func.matches(c)));
+                refs.push(if column {
+                    Ref::Column(Some(arg), func)
+                } else {
+                    Ref::Whole(Some(arg))
+                });
+                i += 4;
                 continue;
             }
             // A type after `::`, an alias after `AS`, a function name.
@@ -797,6 +870,11 @@ impl Footprint {
                     .values()
                     .any(|cols| cols.keys().any(|c| name.matches(c)));
             if is_table || self.alias(&name).is_some() {
+                // A table or alias in an expression is its whole row (`p::text`,
+                // `row_to_json(p)`, `select p`): every column of it (review-Q-2-2 P-3, P-4).
+                if in_expression(ts, i) {
+                    refs.push(Ref::Whole(Some(name)));
+                }
                 i += 1;
                 continue;
             }
@@ -925,6 +1003,16 @@ impl Footprint {
             }
             hit.unwrap_or(DataClass::Personal)
         };
+        // A column of an alias with a column list: the strictest column of its table.
+        if let Ref::Column(q, c) = r
+            && let Some(table) = self.renamed_table(q.as_ref(), c, tables)
+        {
+            let base = match q {
+                Some(_) => DataClass::Normal,
+                None => by_name(c),
+            };
+            return stricter(base, tables.whole_table(&table));
+        }
         match r {
             Ref::Column(Some(q), c) => match resolve_table(q) {
                 Some(Some(table)) => tables
@@ -1038,6 +1126,74 @@ impl MaxPersonal for DataClass {
         } else {
             self
         }
+    }
+}
+
+/// Words after which a name is a table (or a CTE), not an expression.
+const TABLE_POSITION: &[&str] = &[
+    "FROM", "JOIN", "UPDATE", "INTO", "ONLY", "TABLE", "LATERAL", "USING", "TRUNCATE", "VIEW",
+    "EXISTS", "ANALYZE", "VACUUM",
+];
+
+/// Words that start a clause, for [`in_expression`].
+const CLAUSES: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "SET",
+    "ON",
+    "USING",
+    "RETURNING",
+    "VALUES",
+    "LIMIT",
+    "OFFSET",
+    "JOIN",
+    "WINDOW",
+    "WHEN",
+    "THEN",
+];
+
+/// Whether the table or alias name at `i` stands in an expression (its whole row), not in a
+/// table position: not after `FROM`, `JOIN`, `UPDATE`, `INTO`, `ONLY`, `TABLE`, `LATERAL`,
+/// `USING` (or `TRUNCATE`, `VIEW`, `IF EXISTS`, `ANALYZE`, `VACUUM`), not after a comma of a
+/// `FROM` list, not the definition of an alias (after a table name or `)`), not the name of a
+/// CTE (`x AS (`).
+fn in_expression(ts: &[T], i: usize) -> bool {
+    let prev = i.checked_sub(1).map(|p| &ts[p]);
+    let next = ts.get(i + 1);
+    if next.is_some_and(|t| t.is_kw("AS")) || matches!(next, Some(T::Period)) {
+        return false;
+    }
+    match prev {
+        // The start of a select item (the footprint reads items one by one).
+        None => true,
+        Some(p) if p.kw().is_some_and(|k| TABLE_POSITION.contains(&k)) => false,
+        // `people p`, `) s`: the definition of an alias.
+        Some(T::RParen) => false,
+        Some(p) if p.is_name() && !p.kw().is_some_and(|k| RESERVED.contains(&k)) => false,
+        Some(T::Comma) => {
+            // A comma of a `FROM` list, or of an expression list.
+            let depth = depths(ts);
+            let d = depth[i];
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                if depth[j] < d {
+                    return true;
+                }
+                if depth[j] == d
+                    && let Some(k) = ts[j].kw()
+                    && CLAUSES.contains(&k)
+                {
+                    return !matches!(k, "FROM" | "USING");
+                }
+            }
+            true
+        }
+        Some(_) => true,
     }
 }
 
@@ -1174,7 +1330,8 @@ pub fn is_pseudonym(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// One result column for [`mark_result`]: its class and whether the engine named a source.
+/// One result column for [`mark_result`]: its class and whether the engine named a source
+/// column in the database's own schema (a column that the lens covers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColumnFacts {
     pub class: DataClass,
@@ -1236,6 +1393,7 @@ pub fn mark_result(
                 let m = hidden(DataClass::Personal);
                 let mut all_hidden = true;
                 let mut any = false;
+                let mut stale = false;
                 for r in rows.iter_mut() {
                     let Some(cell) = r.get_mut(i) else { continue };
                     let next = match &*cell {
@@ -1245,6 +1403,14 @@ pub fn mark_result(
                             Some(pseudonym(s))
                         }
                         J::Null => None,
+                        // A plain column of a table or view: through a current lens it holds a
+                        // pseudonym, the constant or `NULL`. Anything else means the lens is
+                        // behind the classes (review-Q-2-1 F-6): fail closed.
+                        _ if c.has_source => {
+                            stale = true;
+                            Some(m.clone())
+                        }
+                        // An expression over pseudonyms (`length(email)`).
                         _ => {
                             all_hidden = false;
                             None
@@ -1256,6 +1422,13 @@ pub fn mark_result(
                     if let Some(n) = next {
                         *cell = n;
                     }
+                }
+                if stale {
+                    tracing::warn!(
+                        column = i,
+                        "a personal column read through the masked lens held a value that is no \
+                         pseudonym: the lens is behind the classes; the value is hidden"
+                    );
                 }
                 Some(any && all_hidden)
             }
@@ -1409,6 +1582,92 @@ mod tests {
         );
         // A name the server cannot resolve counts as personal.
         assert_eq!(w("update orders set label = mystery where id = 1"), P);
+        // Review-Q-2-2 P-3: a whole row (`p::text`, `row_to_json(p)`, `returning p`) reads every
+        // column of its table; functional notation (`email(p)`) reads that column; an alias
+        // with a column list renames columns, so each counts as the strictest of its table.
+        assert_eq!(
+            w(
+                "update orders set label = (select p::text from people p where p.id = 1) where id = 1"
+            ),
+            S
+        );
+        assert_eq!(
+            w(
+                "update orders set label = email(p) from people p where p.id = orders.id and orders.id = 2"
+            ),
+            P
+        );
+        assert_eq!(
+            w(
+                "update orders set label = token(p) from people p where p.id = orders.id and orders.id = 3"
+            ),
+            S
+        );
+        assert_eq!(
+            w(
+                "update orders set label = row_to_json(p)::text from people p where p.id = orders.id"
+            ),
+            S
+        );
+        assert_eq!(
+            w(
+                "update orders set label = upper(score) from people p(id, score, x, y, z) where p.id = orders.id"
+            ),
+            S
+        );
+        assert_eq!(
+            w("update people p set score = 1 where id = 1 returning p"),
+            S
+        );
+        // Table positions stay tables.
+        assert_eq!(
+            w(
+                "update orders o set amount = 1 from people p, orders q where o.id = p.id and q.id = o.id"
+            ),
+            N
+        );
+        assert_eq!(
+            w("delete from orders o using people p where o.id = p.id"),
+            N
+        );
+        assert_eq!(w("truncate orders"), N);
+    }
+
+    #[test]
+    fn whole_rows_and_renamed_columns_label_strictly() {
+        // Review-Q-2-2 P-4: never `normal` for a whole row or a renamed personal column.
+        assert_eq!(
+            classes("select row_to_json(p) from people p where id = 1", 1),
+            vec![S]
+        );
+        assert_eq!(classes("select p::text, p.id from people p", 2), vec![S, N]);
+        assert_eq!(
+            classes(
+                "select upper(score) from people p(id, score, x, y, z, w) where id = 1",
+                1
+            ),
+            vec![S]
+        );
+        assert_eq!(
+            classes("select email(p), score(p) from people p", 2),
+            vec![P, N]
+        );
+        assert_eq!(classes("select to_json(o) from orders o", 1), vec![P]);
+        // A table in a FROM list and an alias definition are no whole row.
+        assert_eq!(
+            classes(
+                "select o.label, p.score from orders o, people p where o.id = p.id",
+                2
+            ),
+            vec![N, N]
+        );
+        let m = map();
+        let f = Footprint::of(
+            EngineKind::Postgres,
+            "select count(*) from orders o, people p where o.id = p.id",
+            &m,
+        );
+        assert_eq!(f.column_classes(1, &m), vec![N]);
     }
 
     #[test]
@@ -1611,6 +1870,50 @@ mod tests {
         assert_eq!(rows[0][0], json!("a@b"));
         assert_eq!(rows[0][1], json!({ "$ruum": "hidden", "class": "secret" }));
         assert_eq!(m[0].masking, None);
+        // Review-Q-2-1 F-6: a raw value in a personal source column (a lens behind the classes)
+        // is hidden, never labelled a pseudonym; an expression keeps its value.
+        let mut rows = vec![
+            vec![json!(10), json!(10)],
+            vec![json!("p_0123456789ab"), json!(11)],
+        ];
+        let m = mark_result(
+            Lens::Masked,
+            &[
+                ColumnFacts {
+                    class: P,
+                    has_source: true,
+                },
+                ColumnFacts {
+                    class: P,
+                    has_source: false,
+                },
+            ],
+            &mut rows,
+        );
+        assert_eq!(
+            rows[0][0],
+            json!({ "$ruum": "hidden", "class": "personal" })
+        );
+        assert_eq!(
+            rows[1][0],
+            json!({ "$ruum": "pseudonym", "id": "p_0123456789ab" })
+        );
+        assert_eq!(rows[0][1], json!(10));
+        assert_eq!(m[0].class, P);
+        let mut rows = vec![vec![json!("nick-1")]];
+        let m = mark_result(
+            Lens::Masked,
+            &[ColumnFacts {
+                class: P,
+                has_source: true,
+            }],
+            &mut rows,
+        );
+        assert_eq!(
+            rows[0][0],
+            json!({ "$ruum": "hidden", "class": "personal" })
+        );
+        assert_eq!(m[0].masking, Some(true));
         // Base: nothing changes.
         let mut rows = vec![vec![json!("tok")]];
         mark_result(

@@ -24,6 +24,7 @@
 
 mod catalog;
 mod copy;
+mod depends;
 mod errors;
 mod export;
 pub mod lens;
@@ -414,6 +415,15 @@ impl DatabaseEngine for PostgresEngine {
         let _gate = self.enter(&state).await?;
         let mut conn = self.dbhost(&state.name).await?;
         let out = catalog::read(&mut conn).await;
+        let _ = sqlx::Connection::close(conn).await;
+        out
+    }
+
+    async fn write_side_effects(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
+        let state = self.resolve(db).await?;
+        let _gate = self.enter(&state).await?;
+        let mut conn = self.dbhost(&state.name).await?;
+        let out = depends::write_side_effects(&mut conn).await;
         let _ = sqlx::Connection::close(conn).await;
         out
     }

@@ -85,9 +85,16 @@ fn sql_error(e: rusqlite::Error) -> EngineError {
         Some(code) => format!("{code:?}"),
         None => "error".to_string(),
     };
+    // A `RAISE()` of a trigger: the text is the trigger's (review-Q-2-2 P-2).
+    let in_routine = matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+    );
     EngineError::Sql {
         code,
         message: e.to_string(),
+        in_routine,
     }
 }
 

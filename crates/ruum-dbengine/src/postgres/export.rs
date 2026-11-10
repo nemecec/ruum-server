@@ -225,6 +225,7 @@ impl PostgresEngine {
                         .ok_or_else(|| EngineError::Sql {
                             code: "22P04".to_string(),
                             message: "a COPY block of the export has no end".to_string(),
+                            in_routine: false,
                         })?;
                     let mut copy = lease
                         .conn()

@@ -618,6 +618,17 @@ impl Pseudonymizer for HmacPseudonymizer {
 pub trait MaskingRules: Send + Sync {
     /// The classes of the database `node` of `tenant` changed.
     async fn classes_changed(&self, tenant: TenantId, node: NodeId) -> Result<()>;
+
+    /// The head manifest's `data_classes` changed without the column store
+    /// (`updateDatabaseManifest`, `restoreVersion`; review-Q-2-1 F-2). An implementation
+    /// rebuilds from the store and the manifest as they are, without a catalog sync (a sync
+    /// would remove the keys of columns that do not exist yet, with a manifest version of its
+    /// own). The default does nothing: an engine that masks from the classes at query time needs
+    /// no rebuild.
+    async fn manifest_changed(&self, tenant: TenantId, node: NodeId) -> Result<()> {
+        let _ = (tenant, node);
+        Ok(())
+    }
 }
 
 /// Calls each implementation in order and stops at the first error.
@@ -637,6 +648,13 @@ impl MaskingRules for AllMaskingRules {
     async fn classes_changed(&self, tenant: TenantId, node: NodeId) -> Result<()> {
         for rules in &self.rules {
             rules.classes_changed(tenant, node).await?;
+        }
+        Ok(())
+    }
+
+    async fn manifest_changed(&self, tenant: TenantId, node: NodeId) -> Result<()> {
+        for rules in &self.rules {
+            rules.manifest_changed(tenant, node).await?;
         }
         Ok(())
     }

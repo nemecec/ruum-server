@@ -73,6 +73,17 @@ pub trait DatabaseEngine: Send + Sync {
     /// The schema of the database, without the Ruum objects.
     async fn catalog(&self, db: &DatabaseRef) -> Result<Catalog, EngineError>;
 
+    /// Whether a row write in the database can run tenant code that sees the real row: a
+    /// trigger or a rule of the tenant (review-Q-2-2 P-1). Such code runs on the base table with
+    /// the real `NEW` and `OLD`, whatever lens the writer has, and can copy a value into a column
+    /// the writer may read. The query layer refuses agent writes there (an approval of a person,
+    /// card A-2). An engine without a lens shows an agent no value at all, so the default is
+    /// `false`.
+    async fn write_side_effects(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
+        let _ = db;
+        Ok(false)
+    }
+
     /// The size of the database in bytes (`databases.size_bytes`).
     async fn size_bytes(&self, db: &DatabaseRef) -> Result<u64, EngineError>;
 

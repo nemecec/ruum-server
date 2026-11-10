@@ -536,6 +536,19 @@ pub fn approval_not_available() -> Problem {
     .with_hint("add a WHERE clause, or ask your user to run the statement")
 }
 
+/// `501 not_implemented` for an agent's row write in a database with a trigger or a rule of the
+/// tenant (review-Q-2-2 P-1). Such code runs on the base table with the real `NEW` and `OLD`,
+/// whatever lens the agent has, so it could copy a value the agent may not read into a column it
+/// may read. Until a person can approve the write (card A-2), nothing runs.
+pub fn side_effects_need_approval() -> Problem {
+    ApiError::new(
+        ErrorCode::NotImplemented,
+        "this database has triggers or rules, which run on the real rows of a write; an agent's \
+         write there needs a person's approval, which this server does not offer yet; nothing ran",
+    )
+    .with_hint("ask your user to run the statement, or to remove the trigger or rule")
+}
+
 /// Marks an agent's result on an engine without a lens (wave decision 1, kept by card Q-2 for
 /// the memory engine): every cell that is not `NULL` becomes the hidden-value marker `{"$ruum":
 /// "hidden", "class": "personal"}`, and every column has the class `personal` and the masking
@@ -668,7 +681,9 @@ fn fixed_text(sqlstate: &str) -> &'static str {
 }
 
 /// The SQLSTATEs whose engine text names objects only (never values), so the names may be
-/// shown next to the fixed text.
+/// shown next to the fixed text. Only for an error that the engine raised itself: an error from
+/// inside a function or a trigger (`EngineError::Sql::in_routine`) shows no name, because tenant
+/// code can raise any SQLSTATE with any text (review-Q-2-2 P-2).
 const NAMES_ALLOWED: &[&str] = &[
     "23505", "23503", "23502", "23514", "23000", "42P01", "42703", "42883", "42P07", "42701",
 ];
@@ -747,11 +762,18 @@ fn is_sqlstate(code: &str) -> bool {
 
 /// The answer of an engine error. `manage`: the caller may read the engine's text.
 fn engine_problem(e: EngineError, manage: bool) -> QueryError {
-    let failed = |sqlstate: String, engine_text: String| {
+    // `in_routine`: tenant code (a trigger, a function, a `RAISE`) may have written the text and
+    // chosen the SQLSTATE, with the values of the real row, so no part of it is shown
+    // (review-Q-2-2 P-2).
+    let failed = |sqlstate: String, engine_text: String, in_routine: bool| {
         let message = if manage {
             engine_text
         } else {
-            let names = object_names(&sqlstate, &engine_text);
+            let names = if in_routine {
+                Vec::new()
+            } else {
+                object_names(&sqlstate, &engine_text)
+            };
             let fixed = fixed_text(&sqlstate);
             if names.is_empty() {
                 fixed.to_string()
@@ -781,19 +803,24 @@ fn engine_problem(e: EngineError, manage: bool) -> QueryError {
         )
         .with_hint(rules::HINT_TRANSACTION_CONTROL)
         .into(),
-        EngineError::PermissionDenied(text) => failed("42501".into(), text),
-        EngineError::Sql { code, message } => {
+        EngineError::PermissionDenied(text) => failed("42501".into(), text, false),
+        EngineError::Sql {
+            code,
+            message,
+            in_routine,
+        } => {
             let sqlstate = if is_sqlstate(&code) {
                 code
             } else {
                 sqlite_sqlstate(&code, &message).to_string()
             };
-            failed(sqlstate, message)
+            failed(sqlstate, message, in_routine)
         }
         EngineError::MigrationFailed(inner) => engine_problem(*inner, manage),
         EngineError::Unsupported(_) => validation_error(
             "this engine does not support a value or a feature of the statement",
-            "/params: send numbers, strings, booleans or null",
+            "/params: send numbers, strings, booleans or null; /sql: select columns of plain \
+             types (cast a row or a value of an unusual type to text)",
         )
         .into(),
         other => QueryError::Core(Error::Internal(format!("engine: {other}"))),
@@ -1171,9 +1198,9 @@ async fn run(
     }
     // A query with a data-modifying `WITH` is classified as a read by the rules; the footprint
     // finds its writes.
-    if statement == rules::StatementKind::Write
-        || (mode == StatementMode::Write && footprint.writes())
-    {
+    let row_write = statement == rules::StatementKind::Write
+        || (mode == StatementMode::Write && footprint.writes());
+    if row_write {
         let limit = match kind {
             RoleKind::MaskedWrite => Some(DataClass::Normal),
             RoleKind::Write => Some(DataClass::Personal),
@@ -1214,6 +1241,18 @@ async fn run(
         .keys
         .engine_key(ctx.tenant, row.key_node_id)
         .await?;
+    // 7a. An agent's row write where a trigger or a rule of the tenant would see the real row
+    // (review-Q-2-2 P-1): it needs a person's approval (card A-2). The engine refuses it again
+    // for `masked_write`, in the request's own transaction.
+    if is_agent
+        && row_write
+        && engine_impl
+            .write_side_effects(&row.database_ref())
+            .await
+            .map_err(|e| engine_problem(e, manage))?
+    {
+        return Err(side_effects_need_approval().into());
+    }
     let s = d.settings;
     let timeout_ms = req
         .timeout_ms
@@ -1345,7 +1384,8 @@ fn shape(
             };
             facts.push(postgres_mask::ColumnFacts {
                 class: data_class,
-                has_source: c.source.is_some(),
+                // Only a column of the database's own schema is behind the lens.
+                has_source: c.source.as_ref().is_some_and(|s| s.schema == own),
             });
             QueryColumn {
                 name: c.name.clone(),

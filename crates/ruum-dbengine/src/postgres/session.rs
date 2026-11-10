@@ -167,6 +167,25 @@ pub(crate) async fn execute(
         &(session_user, current_user),
         &request.sql,
     );
+    // The second line of review-Q-2-2 P-1: a `masked_write` session (agents only) never writes
+    // where a trigger or a rule of the tenant would see the real row. Checked in the request's
+    // own transaction, so no trigger made in between slips through. The query layer refuses
+    // first, with an answer.
+    if kind == RoleKind::MaskedWrite && !read_only {
+        match super::depends::write_side_effects(lease.conn()).await {
+            Ok(false) => {}
+            Ok(true) => {
+                lease.close().await;
+                return Err(EngineError::StatementNotAllowed(
+                    "tenant_triggers_or_rules".to_string(),
+                ));
+            }
+            Err(e) => {
+                lease.close().await;
+                return Err(e);
+            }
+        }
+    }
     let result = run_statement(lease.conn(), request, read_only).await;
     let tx = transaction_state(lease.conn(), marker).await;
     match (result, tx) {
