@@ -103,6 +103,13 @@ removes the mark and the list entry; `tests/contract.rs` (`every_operation_is_ro
 a planned operation answers anything but a missing route or `501`, so a built operation cannot
 keep the mark. The MCP server does not offer tools of planned operations.
 
+Step 3 (`docs/STEP3.md`, draft) adds 45 planned operations (tags `apps`, `issues`,
+`templates`) with their cases, the fixture targets `App`, `Issue` and `Template` (all in
+`Projects`) and the fixture fields of the app, its deployment, role grant, domain, API key,
+approval and trace, the issue with its receipt token, and the template with its setup. The IDs are
+placeholders until the card that builds an operation seeds them; the rules assume that both
+fixture tenants have the platform admin's approval of public apps and custom domains.
+
 ### The tenant isolation suite
 
 The rule: a principal of tenant B acting on a resource of tenant A gets `404`, never data. For each
