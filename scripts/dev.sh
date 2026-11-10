@@ -5,7 +5,8 @@
 #                                 create .env on the first run, start, wait until healthy, init
 #                                 (--sso-mock: also the mock OIDC provider for sign-in tests)
 #   scripts/dev.sh down           stop the stack (keeps the data)
-#   scripts/dev.sh clean          stop the stack and delete all its data (the local KEK file too)
+#   scripts/dev.sh clean          stop the stack and delete all its data (the local KEK file and
+#                                 the local SQLite files too)
 #   scripts/dev.sh logs [svc]     follow the logs
 #   scripts/dev.sh status         show the services and their health
 #   scripts/dev.sh psql [db]      open psql as the ruum role (default database: ruum)
@@ -22,6 +23,10 @@ STATE="$DEV/.state"
 # The local key-encryption key of the tenant pseudonym keys (decision 0004-16, docs/DEVSTACK.md).
 # It lives and dies with the platform database volume: `up` makes it, `clean` deletes it.
 KEK_FILE="$STATE/tenant-keys.kek"
+# The SQLite files of the db host (docs/STEP2.md "Infrastructure work" 4): one directory per
+# tenant, one file per database. The litestream service replicates them to SQLITE_BUCKET.
+SQLITE_DIR="$DEV/data/sqlite"
+SQLITE_BUCKET=ruum-sqlite
 ZITADEL_URL="http://localhost:8180"
 
 # No provenance attestation: it carries a build time, so every `up --build` would give the postgres
@@ -165,6 +170,21 @@ init_garage() {
     garage bucket create "$S3_BUCKET" >/dev/null
   fi
   garage bucket allow --read --write --owner "$S3_BUCKET" --key "$S3_ACCESS_KEY_ID" >/dev/null
+  if ! garage bucket info "$SQLITE_BUCKET" >/dev/null 2>&1; then
+    garage bucket create "$SQLITE_BUCKET" >/dev/null
+  fi
+  garage bucket allow --read --write "$SQLITE_BUCKET" --key "$S3_ACCESS_KEY_ID" >/dev/null
+}
+
+# Delete the local SQLite files. The litestream container writes as root, so on Linux a file can
+# belong to root; then the pinned image deletes it.
+clean_sqlite() {
+  [[ -e "$SQLITE_DIR" ]] || return 0
+  if ! rm -rf "$SQLITE_DIR" 2>/dev/null; then
+    local image
+    image="$(awk '/image: litestream\/litestream:/ {print $2; exit}' "$DEV/docker-compose.yml")"
+    docker run --rm -v "$DEV/data:/d" --entrypoint rm "$image" -rf /d/sqlite
+  fi
 }
 
 # Zitadel management API as the bootstrap service account.
@@ -229,6 +249,8 @@ cmd_up() {
   ensure_env
   ensure_kek
   mkdir -p "$STATE/zitadel"
+  # Made here, not by docker: a bind mount that docker creates belongs to root.
+  mkdir -p "$SQLITE_DIR"
   local profile=() arg
   for arg in "$@"; do
     case "$arg" in
@@ -249,6 +271,9 @@ cmd_up() {
   init_zitadel
   init_idps
   init_openbao
+  if [[ "$(uname -s)" == Darwin ]]; then
+    log "note: on macOS, litestream (in the Docker VM) must not replicate SQLite files that a process on the host writes; see docs/DEVSTACK.md \"SQLite storage\""
+  fi
   log "all services are healthy"
   compose ${profile[@]+"${profile[@]}"} ps --format 'table {{.Service}}\t{{.Status}}'
 }
@@ -289,6 +314,8 @@ export NATS_URL=nats://127.0.0.1:4222
 export BAO_ADDR=http://127.0.0.1:8200
 export BAO_TOKEN=$BAO_DEV_ROOT_TOKEN
 export RUUM_LOCAL_KEK_FILE=$KEK_FILE
+export RUUM_SQLITE_DIR=$SQLITE_DIR
+export RUUM_SQLITE_BUCKET=$SQLITE_BUCKET
 export SMTP_URL=smtp://127.0.0.1:1025
 export RUUM_PUBLIC_URL=https://ruum.localhost
 export RUUM_APPS_DOMAIN=ruumapps.localhost
@@ -320,7 +347,8 @@ main() {
       ensure_env
       compose --profile step4 --profile sso-mock down -v --remove-orphans
       rm -rf "$STATE"
-      log "volumes and deploy/dev/.state (with the local KEK file) deleted (deploy/dev/.env is kept)"
+      clean_sqlite
+      log "volumes, deploy/dev/.state (with the local KEK file) and deploy/dev/data/sqlite deleted (deploy/dev/.env is kept)"
       ;;
     logs) compose logs -f --tail=200 "$@" ;;
     status) compose --profile step4 --profile sso-mock ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
@@ -334,7 +362,7 @@ main() {
     env) cmd_env ;;
     ca) cmd_ca ;;
     idps) init_idps "$@" ;;
-    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$cmd" ]] || exit 1 ;;
+    *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$cmd" ]] || exit 1 ;;
   esac
 }
 

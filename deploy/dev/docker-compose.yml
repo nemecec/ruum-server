@@ -88,6 +88,36 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Replication of the SQLite databases (docs/STEP2.md "Infrastructure work" 4, docs/DEVSTACK.md
+  # "SQLite storage"). One process watches RUUM_SQLITE_DIR (deploy/dev/data/sqlite) and
+  # replicates every <tenant>/<database>.db in it to the Garage bucket ruum-sqlite, also files
+  # that appear later. No port: the control socket stays inside the container. Pinned by version
+  # and digest; scripts/sqlite_restore_test.sh reads this line.
+  litestream:
+    image: litestream/litestream:0.5.17@sha256:4b02b9859a6b6b4087d8b8944e15f7e984bd7957cba322bbeee38b0e27b9656a
+    command: replicate
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      LITESTREAM_S3_ENDPOINT: http://garage:3900
+      LITESTREAM_BUCKET: ${RUUM_SQLITE_BUCKET:-ruum-sqlite}
+      LITESTREAM_PATH: ""
+    volumes:
+      - ./litestream/litestream.yml:/etc/litestream.yml:ro
+      - ./data/sqlite:/data
+      - litestream-meta:/var/lib/litestream/meta
+    depends_on:
+      garage:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "litestream", "list", "-timeout", "2"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+
   zitadel:
     image: ghcr.io/zitadel/zitadel:v4.19.5
     command: start-from-init --masterkeyFromEnv --tlsMode disabled
@@ -334,6 +364,7 @@ volumes:
   postgres-data:
   garage-meta:
   garage-data:
+  litestream-meta:
   nats:
   caddy-data:
   caddy-config:

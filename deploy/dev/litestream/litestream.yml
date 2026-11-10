@@ -1,0 +1,31 @@
+# Litestream for the SQLite files of the db host (docs/STEP2.md "Infrastructure work" 4,
+# docs/DEVSTACK.md "SQLite storage"). One process watches the whole directory: a tenant
+# directory or a database file that appears later is found and replicated, and a file that
+# goes away is dropped. Litestream expands ${VAR} from its environment; the compose service
+# and scripts/sqlite_restore_test.sh set the values. S3 keys come from AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY.
+
+# The control socket stays inside the container (the healthcheck runs `litestream list`).
+# Nothing listens on TCP.
+socket:
+  enabled: true
+  path: /var/run/litestream.sock
+
+dbs:
+  # One directory per tenant, one file per database: <dir>/<tenant>/<database>.db.
+  - dir: /data
+    pattern: "*.db"
+    recursive: true
+    watch: true
+    # Litestream's own state lives outside the watched directory, so the engine's directory
+    # holds only the database files (and their -wal and -shm files).
+    meta-dir: /var/lib/litestream/meta
+    replica:
+      type: s3
+      endpoint: ${LITESTREAM_S3_ENDPOINT}
+      region: garage
+      force-path-style: true
+      bucket: ${LITESTREAM_BUCKET}
+      # The replica of <tenant>/<database>.db is <path>/<tenant>/<database>.db in the bucket.
+      path: ${LITESTREAM_PATH}
+      sync-interval: 1s
