@@ -759,12 +759,22 @@ databases that AI agents make. One writer at a time is enough for most small app
   as an access to real data. On a draft branch with masked data tenant code runs freely. The query
   layer and the engine both check this from the catalog, the engine before and after the statement;
   any object of the tenant that can run counts. The person never sees these words: the agent picks
-  the way, and the approval says what happens in plain words. Accepted risk: masked reads still run
-  tenant code, read-only; an error or its timing can tell one fact per row that the code's author
-  chose (the same holds for a `CHECK` or a partial index). The rule removes the masked session as the
-  starter of tenant code, not tenant code that others start (an app's users, a manager): tenant code
-  that copies data gives its target columns the class of what it reads, the agent that writes it
-  suggests that class, and the `privacy` stage of the pipeline (11.2) checks it.
+  the way, and the approval says what happens in plain words.
+  **What a masked read may run is an allow-list.** A view, a policy, a `CHECK`, an index
+  expression or a generated column runs on the real rows, so it may call only functions on a short
+  explicit list of built-in functions that cannot carry state between statements or rows: plain
+  operators, comparison, string, date, array and JSON functions, and aggregates. A function of the
+  tenant or of an extension, a session setting, a lock, a random seed, a sequence or a large object
+  is not on the list. A view or policy that reaches anything outside the list is not part of the
+  masked lens: a statement that reads it gets the refusal `statement_not_allowed` with the hint
+  `tenant_code_on_live`, and the database counts as holding tenant code for writes. The functions
+  that a statement calls itself are held by the cluster: every volatile built-in function outside a
+  named few is revoked from the masked kinds, also inside views. The session state is reset between
+  uses (`DISCARD ALL`). Accepted read-path limit: an error or its timing can reveal one fixed fact
+  per row. The rule removes the masked session as the starter of tenant code, not tenant code that
+  others start (an app's users, a manager): tenant code that copies data gives its target columns
+  the class of what it reads, the agent that writes it suggests that class, and the `privacy` stage
+  of the pipeline (11.2) checks it.
 - **Typed markers, not look-alike strings.** A hidden or pseudonymised value is a distinct typed value,
   so nobody mistakes it for real data: in JSON results (the HTTP query API, MCP) a secret is
   `{"$ruum": "hidden", "class": "secret"}` and a pseudonym is `{"$ruum": "pseudonym", "id":

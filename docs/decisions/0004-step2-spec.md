@@ -1007,6 +1007,20 @@ behind a view in a row write). A list of paths is never complete.
   never SQL-standard, so a dependency walk would count every trigger anyway). Review 2 N-3
   suggested scoping the `write` kind to databases with a `secret` column; the stricter form is
   taken, and the scope stays an option for later.
+  **Built-in functions are code too, unless they are on the allow-list** (review-Q-2-s21-2 R-2,
+  review-Q-2-harden H-1). A built-in function can carry state out of an expression: `set_config`,
+  `setseed` with `random()`, advisory locks, sequences and large objects. A list of such functions
+  is never complete, so the rule is the other way round. Code that runs on the real rows (a view
+  of the tenant, a policy, a `CHECK` constraint including a domain's, an index expression or
+  predicate, a generated column) may call only: a built-in function that Postgres does not mark
+  `VOLATILE` and that is named in `ROW_FUNCTIONS` (`crates/ruum-dbengine/src/postgres/allow.rs`:
+  aggregates and window functions, math, strings, dates and times, arrays, ranges, JSON and text
+  search), the function of a built-in operator, and the function of a built-in cast. A function of
+  the tenant or of an extension, a session setting, a lock, a random seed, a sequence, a large
+  object, and a function that runs a query given as text are not on the list. Built-in functions
+  are pinned, so `pg_depend` does not show them; the engine reads the stored node tree of the
+  object. Such an object counts as tenant code for writes (kind `unlisted_functions`; a
+  column default is not scanned, it sees no row).
 - (c) **Three lines, each fails closed.**
   1. The query layer refuses a row write (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, a
      data-modifying `WITH`) of a masked session when the database holds tenant code:
@@ -1025,12 +1039,27 @@ behind a view in a row write). A list of paths is never complete.
      (before: agents only; now people with `edit` too).
   The proposal's "code fingerprint" is dropped: the check after the statement closes the race
   without it (review 2 N-6).
-- (d) **Reads.** Masked reads keep running tenant code (a function in a view), read-only. The rule
-  is named for writes on purpose (both reviews). Accepted risk: tenant code that a masked read
-  runs cannot write, but whether it raises an error, and its timing, can tell one fact per row
-  that the code's author chose; the error text itself is hidden (P-2, `in_routine`). The same
-  holds for built-in expressions on the real row (a `CHECK`, a partial unique index, a policy):
-  not tenant code, one fixed bit per row (review 1 L-3). Review 1 M-1 option 1 (evaluate tenant
+- (d) **Reads.** A masked read may run a view or a policy of the tenant only when everything it
+  calls is on the allow-list of (b). A relation whose view or policy reaches a function outside
+  the list (and every view that reads such a relation) is not part of the masked lens: both lens
+  schemas hold a *refusal view* of the same name and columns, and a statement that reads it gets
+  `422 statement_not_allowed` with the hint `tenant_code_on_live` (the planner raises it before
+  any tenant code runs; a person with `manage` and the owner kind still read the real view). This
+  closes review-Q-2-s21-2 R-1 (a tenant function that writes a session setting) and R-2 and
+  review-Q-2-harden H-1 (built-in functions that take a lock, set a seed or use a sequence).
+  The functions that the statement calls itself are held by the cluster: the set-up revokes
+  `EXECUTE` on every `VOLATILE` function of `pg_catalog` from `PUBLIC`, except `nextval`,
+  `currval`, `lastval`, `gen_random_uuid`, `uuidv7`, `clock_timestamp`, `timeofday`, `random`,
+  the `pg_sleep` family and `pg_cancel_backend` / `pg_terminate_backend` (none of them carries a
+  value from one expression to another; the last two end only sessions of the caller's own
+  role, which the engine does when it drains a copy). Postgres
+  marks a function `IMMUTABLE` or `STABLE` only when it cannot write. The `owner` kind keeps
+  every function, and the engine refuses a database where another kind may call a revoked one.
+  Postgres checks the right of a function in a view against the reader, so the line holds inside
+  views, and for a function that runs a query given as text. The pooled connection is reset with
+  `DISCARD ALL` after every use, so no session state outlives a lease. **Accepted read-path
+  limit:** an error or its timing can reveal one fixed fact per row, and a masked read still
+  evaluates the built-in expressions of the lens itself. Review 1 M-1 option 1 (evaluate tenant
   views over the lens tables) stays open as a later hardening.
 - (e) **Draft branches.** The rule lets tenant code run freely on a draft branch with `masked` or
   `schema_only` data: its rows are pseudonyms and `NULL` secrets, so tenant code learns nothing
@@ -1088,3 +1117,22 @@ a test cannot make a foreign table (no allow-listed foreign data wrapper) or an 
 `SIDE_EFFECTS_SQL`), `session.rs`, `mod.rs`, `lib.rs` (`DatabaseEngine::tenant_code_on_live`
 replaces `write_side_effects`); `crates/ruum-core/src/databases/query/mod.rs`; the tests and
 mutations above; design 8.5.
+
+**Hardening of the read path (review-Q-2-s21-2 R-1 and R-2, review-Q-2-harden H-1).** Items (b)
+and (d) above carry the rule. Fix record: `ruum-server-wt/panel/q2-harden.md`. Code:
+`crates/ruum-dbengine/src/postgres/allow.rs` (the two lists), `depends.rs` (`RootFacts::unlisted`,
+`tenant_code_sql`), `lens.rs` (`policy_edges`, `code_relations`, `refusal_view_sql`), `setup.rs`
+(`grants_sql`, `check_volatile_revoked`), `errors.rs`, `deploy/dev/postgres-data/initdb/10-ruum-data.sh`,
+`scripts/dbhost_check.sh`. Tests: `crates/ruum-dbengine/src/postgres/tests/allow_list.rs` (one per
+rule: statements, views and policies, writes, the check of the cluster set-up, the reset of the
+pooled connection), the new cases of `tenant_code.rs`, `errors_from_inside_a_routine_are_marked`
+in `security.rs`, and `masked_reads_of_code_outside_the_allow_list_are_refused` in
+`postgres_mask_tests.rs` (the S1, U2, V and H1 attacks as statements, for an agent and for Bob).
+Mutations: `dbengine-allow-list-views`, `-built-ins`, `-names`, `-policies`, `-writes`,
+`dbengine-refusal-view-dropped`, `dbengine-volatile-unchecked`, `dbengine-volatile-granted-to-public`,
+`dbengine-pool-keeps-session-state`. **Consequences.** A view or policy that calls a function of an
+extension (`citext` operators, `pgcrypto`, `postgis`) is outside the list until a panel decision
+names the functions; a person with `manage` and the agent's migration path are not affected. A
+column default is not scanned. A `CHECK` of a domain is scanned for writes, not for a cast to the
+domain inside a view (backlog). The tests of P-2 and F-1 to F-5 that read a view with a function of
+the tenant as a masked session now expect the refusal.

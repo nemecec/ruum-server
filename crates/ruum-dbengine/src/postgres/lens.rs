@@ -86,7 +86,7 @@
 //! view column counts as `personal` (a new column is unconfirmed). A generated column is the same
 //! on a table: its stored value is computed from other columns. So a column of a tenant view, or
 //! a generated column, whose class is `personal` (confirmed or not) is masked like `secret` when
-//! it reads a `secret` value ([`secret_reading_views`], from `depends::root_facts`):
+//! it reads a `secret` value ([`secret_reading`], from `depends::root_facts`):
 //!
 //! - it reads a column whose class is `secret` (`pg_depend` of the view's `_RETURN` rule or of
 //!   the generated expression, also through other views);
@@ -108,7 +108,20 @@
 //! and a change of that (a view replaced in place, a generated expression or a function changed
 //! in place) changes the column's definition hash and clears the confirmation (catalog sync,
 //! `ColumnIdentity::definition`, review-Q-2-1 F-1).
+//!
+//! # Code on the real rows: the function allow-list (decision 0004-38, review-Q-2-harden)
+//!
+//! A tenant view runs with the rights of its owner on the real rows, and a table with a policy
+//! runs the policy there. A function with an effect that outlives the expression (a session
+//! setting, a lock, a random seed, a sequence, a large object) can carry a whole `secret` out of
+//! such code into the same statement. So a relation whose view or policy reaches any function
+//! outside the allow-list ([`super::allow`]: named built-in functions that cannot write, the
+//! functions of built-in operators and casts) is **not part of the masked lens**: both lens
+//! schemas hold a *refusal view* of the same name in its place ([`refusal_view_sql`]), and a
+//! statement that reads it gets `statement_not_allowed` with the hint `tenant_code_on_live`. The
+//! same holds for every view that reads such a relation ([`code_relations`]).
 
+use super::allow;
 use super::errors::internal;
 use super::values::oid;
 use crate::error::EngineError;
@@ -407,19 +420,8 @@ pub(crate) fn view_sql(
 /// `personal` (see the module docs): `(view, 0)` for every column of a view, `(table, attnum)`
 /// for a generated column. A root counts when it reads a column whose class in `spec` is
 /// `secret`, reaches a `SECURITY DEFINER` function of the tenant, or holds a whole-row reference
-/// while it names a relation that has a `secret` column. Run as `mask` in the caller's
-/// transaction.
-pub(crate) async fn secret_reading_views(
-    conn: &mut PgConnection,
-    catalog: &Catalog,
-    spec: &LensSpec,
-) -> Result<HashSet<(u32, i16)>, EngineError> {
-    let facts = super::depends::root_facts(conn).await?;
-    Ok(secret_reading(catalog, spec, &facts))
-}
-
-/// The roots of `facts` that read a `secret` value (see [`secret_reading_views`]). A column that
-/// the catalog does not name (another schema) does not count.
+/// while it names a relation that has a `secret` column. A column that the catalog does not name
+/// (another schema) does not count.
 pub(crate) fn secret_reading(
     catalog: &Catalog,
     spec: &LensSpec,
@@ -460,6 +462,185 @@ pub(crate) fn secret_reading(
         .collect()
 }
 
+/// The text that the planner raises when a statement reads a refusal view
+/// ([`refusal_view_sql`]): the input of a cast to `int4`, so the error is `22P02` with this text
+/// in quotes. The engine turns it into `statement_not_allowed` (`tenant_code_on_live`).
+pub const REFUSAL_TEXT: &str = "ruum:tenant_code_on_live";
+
+/// What the policies of the tables of `public` reach: (table, `None` for a function or operator
+/// outside the allow-list, or `Some` relation that the policy reads). Run as `mask` in the
+/// caller's transaction.
+///
+/// A policy of the tenant runs on the real rows when the lens view reads the table. Built-in
+/// functions are pinned, so `pg_depend` has no row for them: the first part of the query reads
+/// the stored tree of each policy ([`allow::unlisted`]); the second part is the dependency rows
+/// (a relation that the policy reads; a function or operator of the tenant or of an extension).
+pub(crate) async fn policy_edges(
+    conn: &mut PgConnection,
+) -> Result<Vec<(u32, Option<u32>)>, EngineError> {
+    let allowed = allow::allowed_cte(1);
+    let unlisted = allow::unlisted(
+        "pg_catalog.concat_ws(' ', y.polqual::pg_catalog.text, y.polwithcheck::pg_catalog.text)",
+    );
+    let sql = format!(
+        "with {allowed}
+         select y.polrelid::pg_catalog.int8 as rel, null::pg_catalog.int8 as names
+           from pg_catalog.pg_policy y
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) y.polrelid
+          where c.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
+            and {unlisted}
+         union all
+         select y.polrelid::pg_catalog.int8 as rel,
+                case when d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
+                     then d.refobjid::pg_catalog.int8 end as names
+           from pg_catalog.pg_policy y
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) y.polrelid
+           join pg_catalog.pg_depend d
+             on d.classid operator(pg_catalog.=) 'pg_catalog.pg_policy'::pg_catalog.regclass::pg_catalog.oid
+            and d.objid operator(pg_catalog.=) y.oid
+          where c.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
+            and d.refobjid operator(pg_catalog.>=) 16384::pg_catalog.oid
+            and (d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
+                 or d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_operator'::pg_catalog.regclass::pg_catalog.oid
+                 or d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass::pg_catalog.oid)"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .bind(allow::row_functions())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| internal("read the policies", e))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let rel: i64 = r.get("rel");
+            let names: Option<i64> = r.get("names");
+            (rel as u32, names.map(|n| n as u32))
+        })
+        .collect())
+}
+
+/// The relations of `public` whose read would run code outside the allow-list on the real rows
+/// (review-Q-2-s21-2 R-1 and R-2, review-Q-2-harden H-1): a view that reaches such a function
+/// ([`allow`]; `facts.unlisted`), a table with a policy that reaches one (the lens view reads
+/// the table as `mask`, so its policies run), and every view or policy table that reads such a
+/// relation. A materialized view runs nothing when it is read. The lens builds these as refusal
+/// views in both masked lenses ([`refusal_view_sql`]). `edges` are the [`policy_edges`]: `None`
+/// for a function or operator outside the allow-list.
+pub(crate) fn code_relations(
+    catalog: &Catalog,
+    facts: &[super::depends::RootFacts],
+    edges: &[(u32, Option<u32>)],
+) -> HashSet<u32> {
+    let views: HashSet<u32> = catalog
+        .tables
+        .iter()
+        .filter(|t| t.kind == RelationKind::View)
+        .filter_map(|t| t.columns.iter().find_map(|c| c.identity).map(|i| i.rel_oid))
+        .collect();
+    let view_facts: Vec<_> = facts
+        .iter()
+        .filter(|f| f.att == 0 && views.contains(&f.rel))
+        .collect();
+    let mut code: HashSet<u32> = view_facts
+        .iter()
+        .filter(|f| f.unlisted)
+        .map(|f| f.rel)
+        .chain(edges.iter().filter(|(_, n)| n.is_none()).map(|(r, _)| *r))
+        .collect();
+    loop {
+        let before = code.len();
+        for f in &view_facts {
+            let reads_code = f
+                .whole_relations
+                .iter()
+                .chain(f.columns.iter().map(|(r, _)| r))
+                .any(|r| code.contains(r));
+            if reads_code {
+                code.insert(f.rel);
+            }
+        }
+        for (rel, names) in edges {
+            if names.is_some_and(|n| code.contains(&n)) {
+                code.insert(*rel);
+            }
+        }
+        if code.len() == before {
+            return code;
+        }
+    }
+}
+
+/// The declared type of each column of `rels`, as `format_type` writes it with the search path
+/// of `mask` (`pg_catalog`), so a type of the tenant is qualified. Run as `mask`.
+async fn column_types(
+    conn: &mut PgConnection,
+    rels: &HashSet<u32>,
+) -> Result<HashMap<(u32, i16), String>, EngineError> {
+    if rels.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let oids: Vec<i64> = rels.iter().map(|r| *r as i64).collect();
+    let rows = sqlx::query(
+        "select a.attrelid::pg_catalog.int8 as rel, a.attnum::pg_catalog.int2 as attnum,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as typ
+           from pg_catalog.pg_attribute a
+          where a.attrelid operator(pg_catalog.=) any ($1::pg_catalog.int8[]::pg_catalog.oid[])
+            and a.attnum operator(pg_catalog.>) 0 and not a.attisdropped",
+    )
+    .persistent(false)
+    .bind(&oids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("read the column types of the refused relations", e))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let rel: i64 = r.get("rel");
+            ((rel as u32, r.get::<i16, _>("attnum")), r.get("typ"))
+        })
+        .collect())
+}
+
+/// The lens views of a relation whose read would run code outside the allow-list on the real
+/// rows ([`code_relations`]): the same names, columns and types, but the view never reads the
+/// relation. Planning any statement that reads it raises `22P02` with [`REFUSAL_TEXT`] (a cast of
+/// a constant, folded by the planner, in the `FROM` clause so that no statement can leave it
+/// out). Nothing of the tenant runs. Run as `mask`.
+pub(crate) fn refusal_view_sql(
+    table: &CatalogTable,
+    types: &HashMap<(u32, i16), String>,
+    roles: &LensRoles<'_>,
+) -> String {
+    let columns: Vec<String> = table
+        .columns
+        .iter()
+        .map(|c| {
+            let ty = c
+                .identity
+                .and_then(|i| types.get(&(i.rel_oid, i.attnum)))
+                .map_or("pg_catalog.text", String::as_str);
+            format!("null::{ty} as {}", ident(&c.name))
+        })
+        .collect();
+    let body = format!(
+        "select {} from pg_catalog.generate_series(1, ({}::pg_catalog.text)::pg_catalog.int4) g",
+        columns.join(", "),
+        literal(REFUSAL_TEXT)
+    );
+    let view = ident(&table.name);
+    format!(
+        "create view ruum_nosecret.{view} as {body};\n\
+         grant select on ruum_nosecret.{view} to {read}, {write};\n\
+         create view ruum_masked.{view} as {body};\n\
+         grant select on ruum_masked.{view} to {masked_read}, {masked_write};\n",
+        read = ident(roles.read),
+        write = ident(roles.write),
+        masked_read = ident(roles.masked_read),
+        masked_write = ident(roles.masked_write),
+    )
+}
+
 /// Drops every lens view. Run as `mask` in the caller's transaction.
 pub(crate) async fn drop_views(conn: &mut PgConnection) -> Result<(), EngineError> {
     let rows = sqlx::query(
@@ -490,9 +671,22 @@ pub(crate) async fn build_views(
     roles: &LensRoles<'_>,
 ) -> Result<(), EngineError> {
     let bases = pseudonym_types(conn).await?;
-    let secret_reading = secret_reading_views(conn, catalog, spec).await?;
+    let facts = super::depends::root_facts(conn).await?;
+    let secret_reading = secret_reading(catalog, spec, &facts);
+    let edges = policy_edges(conn).await?;
+    let refused = code_relations(catalog, &facts, &edges);
+    let types = column_types(conn, &refused).await?;
     for table in catalog.tables.iter().filter(|t| t.schema == "public") {
-        let sql = view_sql(table, spec, &bases, &secret_reading, roles);
+        let refused_rel = table
+            .columns
+            .iter()
+            .find_map(|c| c.identity)
+            .is_some_and(|i| refused.contains(&i.rel_oid));
+        let sql = if refused_rel {
+            refusal_view_sql(table, &types, roles)
+        } else {
+            view_sql(table, spec, &bases, &secret_reading, roles)
+        };
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&mut *conn)
             .await
@@ -758,6 +952,7 @@ mod tests {
             whole_relations: vec![1],
             definer: false,
             whole_row: false,
+            unlisted: false,
         };
         let facts = [
             fact(2, vec![(1, 1), (1, 2)]),

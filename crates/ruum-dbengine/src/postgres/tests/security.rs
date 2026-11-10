@@ -517,10 +517,18 @@ const SET_CONFIG_PATHS: &[&str] = &[
     "DO $$ BEGIN PERFORM set_config('work_mem', '7MB', true); END $$",
 ];
 
+/// Whether the error is the refusal of a function that is revoked from the kind: `set_config`,
+/// or (review-Q-2-harden) the function that runs the query text, which is volatile and so
+/// revoked too (`query_to_xml`, `ts_stat`, `ts_rewrite`). The `DO` block reaches `set_config`.
 fn refused_set_config(err: &EngineError) -> bool {
+    let names = |m: &str| {
+        ["set_config", "query_to_xml", "ts_stat", "ts_rewrite"]
+            .iter()
+            .any(|n| m.contains(&format!("permission denied for function {n}")))
+    };
     match err {
-        EngineError::PermissionDenied(m) => m.contains("set_config"),
-        EngineError::Sql { code, message, .. } => code == "42501" && message.contains("set_config"),
+        EngineError::PermissionDenied(m) => names(m),
+        EngineError::Sql { code, message, .. } => code == "42501" && names(message),
         _ => false,
     }
 }
@@ -1612,4 +1620,46 @@ async fn result_values_and_sources() {
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+}
+
+/// An error raised inside a function, a trigger or a `RAISE` is marked `in_routine`, because the
+/// code chose its SQLSTATE and text (review-Q-2-2 P-2); an error of the engine itself is not.
+/// The query layer shows no object name for the first. Masked sessions reach no tenant code any
+/// more (decision 0004-38), so a `DO` block, which the query rules refuse but the engine runs,
+/// stands for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errors_from_inside_a_routine_are_marked() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    f.seed_users().await;
+    for kind in [
+        RoleKind::Read,
+        RoleKind::MaskedRead,
+        RoleKind::Write,
+        RoleKind::MaskedWrite,
+    ] {
+        let err = f
+            .run(
+                kind,
+                StatementMode::Read,
+                "DO $$ BEGIN RAISE EXCEPTION USING errcode = '23514', message = 'bad \"tokcommon\"'; END $$",
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Sql { code, in_routine: true, .. } if code == "23514"),
+            "{}: {err:?}",
+            kind.as_str()
+        );
+        let err = f
+            .run(kind, StatementMode::Read, "SELECT 1 / 0", vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Sql { code, in_routine: false, .. } if code == "22012"),
+            "{}: {err:?}",
+            kind.as_str()
+        );
+    }
 }

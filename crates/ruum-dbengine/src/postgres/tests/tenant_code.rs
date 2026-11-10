@@ -88,14 +88,19 @@ type Case = (
 async fn each_kind_of_tenant_code_is_found_on_its_own() {
     let Some(engine) = engine().await else { return };
     let f = plain_fixture(&engine, &["citext", "pgcrypto"]).await;
-    // Control: tables, a view, an index, a sequence and the extensions are no tenant code.
+    // Control: tables, views, an index, a sequence, the extensions, and expressions that call only
+    // functions of the allow-list are no tenant code.
     as_owner(
         &engine,
         &f,
         "CREATE VIEW plain AS SELECT id, n FROM t; CREATE INDEX t_n ON t (n); \
          CREATE SEQUENCE s; CREATE TYPE mood AS ENUM ('a', 'b'); \
          ALTER TABLE t ADD CONSTRAINT n_ok CHECK (n >= 0); \
-         CREATE OPERATOR ### (LEFTARG = text, RIGHTARG = text, FUNCTION = textcat)",
+         CREATE OPERATOR ### (LEFTARG = text, RIGHTARG = text, FUNCTION = textcat); \
+         CREATE VIEW listed AS SELECT id, upper(body) AS b, n + 1 AS n1, count(*) OVER () AS c FROM t; \
+         CREATE INDEX t_low ON t (lower(body)); \
+         ALTER TABLE t ADD COLUMN g text GENERATED ALWAYS AS (upper(body)) STORED; \
+         CREATE DOMAIN small AS integer CHECK (VALUE < 1000)",
     )
     .await;
     let mut conn = dbhost(&engine, f.db()).await;
@@ -174,6 +179,39 @@ async fn each_kind_of_tenant_code_is_found_on_its_own() {
             "CREATE POLICY t_p ON t USING (n >= 0)",
             "DROP POLICY t_p ON t",
             |c| c.policies && !c.functions,
+        ),
+        // Built-in functions outside the allow-list (decision 0004-38 (b), review-Q-2-harden
+        // H-1): not tenant functions, but code that runs on the real rows.
+        (
+            "a view that calls a built-in function outside the allow-list",
+            "CREATE VIEW sv AS SELECT id, setseed(n / 1000.0) IS NULL AS x FROM t",
+            "DROP VIEW sv",
+            |c| c.unlisted_functions && !c.functions,
+        ),
+        (
+            "a CHECK constraint that calls a built-in function outside the allow-list",
+            "ALTER TABLE t ADD CONSTRAINT c_rand CHECK (random() < 2)",
+            "ALTER TABLE t DROP CONSTRAINT c_rand",
+            |c| c.unlisted_functions && !c.functions,
+        ),
+        (
+            "a domain whose CHECK calls a built-in function outside the allow-list",
+            "CREATE DOMAIN d_rand AS integer CHECK (random() < 2)",
+            "DROP DOMAIN d_rand",
+            |c| c.unlisted_functions && !c.functions,
+        ),
+        (
+            "an index expression outside the allow-list",
+            "CREATE INDEX i_expr ON t ((array_to_tsvector(ARRAY['x' || coalesce(body, '')])))",
+            "DROP INDEX i_expr",
+            |c| c.unlisted_functions && !c.functions,
+        ),
+        (
+            "a generated column outside the allow-list",
+            "ALTER TABLE t ADD COLUMN gen tsvector GENERATED ALWAYS AS \
+             (array_to_tsvector(ARRAY['x' || coalesce(body, '')])) STORED",
+            "ALTER TABLE t DROP COLUMN gen",
+            |c| c.unlisted_functions && !c.functions,
         ),
     ];
     for (label, make, drop, clause) in cases {

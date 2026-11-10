@@ -62,6 +62,13 @@ pub(crate) fn untrusted(e: sqlx::Error) -> EngineError {
         // Cancelled by the drain of a copy ("canceling statement due to user request").
         "57014" => EngineError::NotReady,
         "25006" => EngineError::ReadOnly,
+        // A refusal view of the lens: the relation would run tenant code on the real rows
+        // (review-Q-2-s21-2 R-1, `lens::refusal_view_sql`). The planner raised it, not tenant code.
+        "22P02"
+            if !in_routine && message.ends_with(&format!("\"{}\"", super::lens::REFUSAL_TEXT)) =>
+        {
+            EngineError::StatementNotAllowed("tenant_code_on_live".to_string())
+        }
         "42501" => EngineError::PermissionDenied(message),
         "42601" if message.contains("cannot insert multiple commands") => {
             EngineError::MultipleStatements

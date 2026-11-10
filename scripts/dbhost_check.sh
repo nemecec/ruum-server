@@ -136,6 +136,13 @@ su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, 
 fact "template1: PUBLIC may not run set_config (review Q-1, S-1)" '[[ $OUT == 0 ]]'
 su_sql template1 "select has_function_privilege('ruum_dbhost', '$SETCFG', 'execute with grant option')"
 fact "template1: ruum_dbhost holds EXECUTE on set_config WITH GRANT OPTION" '[[ $OUT == t ]]'
+KEEP_VOLATILE="'nextval','currval','lastval','gen_random_uuid','uuidv7','clock_timestamp','timeofday','random','pg_sleep','pg_sleep_for','pg_sleep_until','pg_cancel_backend','pg_terminate_backend'"
+su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where p.pronamespace = 'pg_catalog'::regnamespace and p.prokind = 'f' and p.provolatile = 'v' and p.proname not in ($KEEP_VOLATILE) and a.grantee = 0"
+fact "template1: PUBLIC may not run a volatile function of pg_catalog, except the named few (review-Q-2-harden H-1)" '[[ $OUT == 0 ]]'
+su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where p.pronamespace = 'pg_catalog'::regnamespace and p.proname in ($KEEP_VOLATILE) and a.grantee = 0"
+fact "template1: PUBLIC may still run the named volatile functions (nextval, random, ...)" '[[ $OUT -ge 11 ]]'
+su_sql template1 "select count(*) from pg_proc p where p.pronamespace = 'pg_catalog'::regnamespace and p.proname in ('setseed', 'pg_advisory_lock', 'pg_try_advisory_xact_lock', 'lo_from_bytea', 'pg_notify', 'query_to_xml') and has_function_privilege('ruum_dbhost', p.oid, 'execute with grant option')"
+fact "template1: ruum_dbhost holds EXECUTE WITH GRANT OPTION on setseed, the lock, large object and query-text functions" '[[ $OUT -ge 6 ]]'
 su_sql postgres "select rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolpassword like 'SCRAM-SHA-256\$%' from pg_authid where rolname = 'ruum_dbhost'"
 fact "ruum_dbhost: CREATEDB and CREATEROLE, no superuser, no replication, no bypassrls, SCRAM password" '[[ $OUT == "f|t|t|f|f|t" ]]'
 su_sql postgres "select count(*) from pg_auth_members m join pg_roles r on r.oid = m.member where r.rolname = 'ruum_dbhost'"
@@ -187,6 +194,8 @@ make_db() {
   local ov="ROLE_${p}_owner"
   as dbhost "$db" "grant execute on function $SETCFG to ${!ov}" || fail "$p: grant set_config to owner"
   if grep -q "no privileges were granted" <<<"$OUT"; then fail "$p: ruum_dbhost has no grant option on set_config"; fi
+  # The engine grants every revoked volatile function; the checks below need setseed too.
+  as dbhost "$db" "grant execute on function pg_catalog.setseed(double precision) to ${!ov}" || fail "$p: grant setseed to owner"
 }
 
 echo "== databases and roles (as ruum_dbhost, no superuser)"
@@ -250,13 +259,22 @@ err "(owner) SET ROLE ruum_dbhost inside a function" A_owner "$DBA" "select publ
 echo "== set_config (review Q-1, S-1): only the owner kind, on no path"
 for k in $LOGIN_KINDS; do
   [[ $k == owner ]] && continue
-  err "($k) set_config" "A_$k" "$DBA" "select set_config('work_mem', '7MB', true)" 'permission denied for function set_config'
-  err "($k) set_config through query_to_xml" "A_$k" "$DBA" "select query_to_xml('select set_config(''work_mem'', ''7MB'', true)', false, false, '')" 'permission denied for function set_config'
-  err "($k) set_config through query_to_xml with U& escapes" "A_$k" "$DBA" "select query_to_xml(U&'select set\\005fconfig(''statement_timeout'', ''0'', true)', false, false, '')" 'permission denied for function set_config'
-  err "($k) set_config through ts_stat" "A_$k" "$DBA" "select * from ts_stat('select to_tsvector(set_config(''work_mem'', ''7MB'', true))')" 'permission denied for function set_config'
-  err "($k) set_config in a DO block" "A_$k" "$DBA" "do \$\$ begin perform set_config('work_mem', '7MB', true); end \$\$" 'permission denied for function set_config'
+  err "($k) set_config" "A_$k" "$DBA" "select set_config('work_mem', '7MB', true)" 'permission denied for function (set_config|query_to_xml|ts_stat)'
+  err "($k) set_config through query_to_xml" "A_$k" "$DBA" "select query_to_xml('select set_config(''work_mem'', ''7MB'', true)', false, false, '')" 'permission denied for function (set_config|query_to_xml|ts_stat)'
+  err "($k) set_config through query_to_xml with U& escapes" "A_$k" "$DBA" "select query_to_xml(U&'select set\\005fconfig(''statement_timeout'', ''0'', true)', false, false, '')" 'permission denied for function (set_config|query_to_xml|ts_stat)'
+  err "($k) set_config through ts_stat" "A_$k" "$DBA" "select * from ts_stat('select to_tsvector(set_config(''work_mem'', ''7MB'', true))')" 'permission denied for function (set_config|query_to_xml|ts_stat)'
+  err "($k) set_config in a DO block" "A_$k" "$DBA" "do \$\$ begin perform set_config('work_mem', '7MB', true); end \$\$" 'permission denied for function (set_config|query_to_xml|ts_stat)'
 done
 ok "(owner) runs set_config" A_owner "$DBA" "select set_config('work_mem', '7MB', true)" 7MB
+echo "== every volatile function but the named few (review-Q-2-harden H-1): only the owner kind"
+for k in $LOGIN_KINDS; do
+  [[ $k == owner ]] && continue
+  err "($k) setseed" "A_$k" "$DBA" "select setseed(0.5)" 'permission denied for function setseed'
+  err "($k) advisory lock" "A_$k" "$DBA" "select pg_advisory_lock(1)" 'permission denied for function pg_advisory_lock'
+  err "($k) large object" "A_$k" "$DBA" "select lo_from_bytea(0, 'a'::bytea)" 'permission denied for function lo_from_bytea'
+  ok "($k) random() stays" "A_$k" "$DBA" "select random() < 2" t
+done
+ok "(owner) runs setseed" A_owner "$DBA" "select count(*) from (select setseed(0.5)) s" 1
 
 echo "== set_config in databases made before the rule (the cluster set-up fixes them)"
 OLD_OPEN="d_$(hex16)"

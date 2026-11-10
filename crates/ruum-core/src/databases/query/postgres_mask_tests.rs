@@ -593,16 +593,19 @@ async fn a_tenant_view_over_a_secret_hides_its_columns_from_viewers_and_agents()
         json!(1)
     );
     // `w` calls a SECURITY DEFINER function of the tenant, which reads `token` with the
-    // owner's rights: pg_depend cannot tell what it reads, so `w.p` is masked like secret.
+    // owner's rights. A function of the tenant is outside the allow-list (decision 0004-38), so
+    // `w` is not in the masked lens at all: the refusal, never a value or a marker.
     for who in [pg.bob(), pg.agent()] {
-        let r = pg.ok(&who, sql("select id, p from w order by id")).await;
-        no_raw(&r);
-        let c = &r.rows[0][1];
-        assert!(c == &hidden("secret") || c == &hidden("personal"), "{c}");
+        let r = pg
+            .refused(&who, sql("select id, p from w order by id"))
+            .await;
         assert_eq!(
-            pg.count(&who, "select count(*) from w where p like 'tok%'")
-                .await,
-            json!(0)
+            r,
+            (
+                422,
+                "statement_not_allowed".to_string(),
+                Some("tenant_code_on_live".to_string())
+            )
         );
     }
     assert_eq!(
@@ -1055,14 +1058,22 @@ async fn a_view_or_function_replaced_in_place_loses_its_confirmation() {
         ("z", "n", N),
     ])
     .await;
-    // Control: the confirmed columns show their values to the agent and to Bob.
+    // Control: the confirmed columns of the views on the allow-list show their values to the
+    // agent and to Bob. `z` calls a function of the tenant: it is outside the lens (refusal).
+    let refusal = (
+        422,
+        "statement_not_allowed".to_string(),
+        Some("tenant_code_on_live".to_string()),
+    );
     for who in [pg.agent(), pg.bob()] {
-        for v in ["x", "y", "z"] {
+        for v in ["x", "y"] {
             let r = pg
                 .ok(&who, sql(&format!("select n from {v} where id = 1")))
                 .await;
             assert_eq!(r.rows[0][0], json!("nick-1"), "{v}");
         }
+        let r = pg.refused(&who, sql("select n from z where id = 1")).await;
+        assert_eq!(r, refusal, "z");
     }
     for s in [
         "create or replace view x as select id, token as n from people",
@@ -1086,7 +1097,9 @@ async fn a_view_or_function_replaced_in_place_loses_its_confirmation() {
         "a table column keeps its class"
     );
     for who in [pg.agent(), pg.bob()] {
-        for v in ["x", "z"] {
+        let r = pg.refused(&who, sql("select n from z order by id")).await;
+        assert_eq!(r, refusal, "z");
+        for v in ["x"] {
             let r = pg
                 .ok(&who, sql(&format!("select n from {v} order by id")))
                 .await;
@@ -1129,6 +1142,13 @@ async fn computed_columns_over_a_secret_never_show_it() {
         "create function wrap(i integer) returns text language sql stable return peek(i)",
         "create view w2 as select id, wrap(id) as p from people",
         "alter table people add column tok2 text generated always as (upper(token)) stored",
+        // Review-Q-2-1 F-4: a generated column reaches a definer function through a plain one.
+        // A table is not a view, so the lens keeps it (no refusal); the walk must still find the
+        // definer function and mask the column like a secret.
+        "create function peekd(i integer) returns text language sql immutable security definer \
+         set search_path = public as $$ select token from people where id = i $$",
+        "create function wrapd(i integer) returns text language sql immutable return peekd(i)",
+        "alter table orders add column leaked text generated always as (wrapd(id)) stored",
         // Control: a whole-row reference to a table without a secret column.
         "create view oj as select id, to_json(o)::text as doc from orders o",
     ] {
@@ -1137,7 +1157,19 @@ async fn computed_columns_over_a_secret_never_show_it() {
     pg.confirm(&[("oj", "id", DataClass::Normal)]).await;
     pg.grant(GrantKind::ReadPersonal).await;
     for who in [pg.bob(), pg.agent()] {
-        for (v, col) in [("j", "doc"), ("k", "doc"), ("w2", "p"), ("people", "tok2")] {
+        // `w2` reaches a definer function of the tenant: outside the allow-list, so outside the
+        // lens (the refusal, no value and no marker).
+        let r = pg.refused(&who, sql("select p from w2 order by id")).await;
+        assert_eq!(
+            r,
+            (
+                422,
+                "statement_not_allowed".to_string(),
+                Some("tenant_code_on_live".to_string())
+            ),
+            "w2"
+        );
+        for (v, col) in [("j", "doc"), ("k", "doc"), ("people", "tok2")] {
             let r = pg
                 .ok(&who, sql(&format!("select {col} from {v} order by id")))
                 .await;
@@ -1148,6 +1180,12 @@ async fn computed_columns_over_a_secret_never_show_it() {
             );
             assert_eq!(r.rows[0][0], hidden("secret"), "{v}.{col}");
         }
+        let r = pg
+            .ok(&who, sql("select leaked from orders order by id"))
+            .await;
+        let text = serde_json::to_string(&r.rows).unwrap();
+        assert!(!text.contains("tok-"), "orders.leaked: {text}");
+        assert_eq!(r.rows[0][0], hidden("secret"), "orders.leaked");
         assert_eq!(
             pg.count(
                 &who,
@@ -1481,8 +1519,10 @@ async fn masked_sessions_never_run_tenant_code_on_live() {
 /// Review-Q-2-2 P-2: tenant code (a function in a view, a check function, a trigger) can raise
 /// any SQLSTATE with any text, with the values of the real row. A caller without `manage` gets
 /// the fixed text, never a name from such an error. Since decision 0004-38 masked sessions reach
-/// tenant code only in reads (their row writes are refused where tenant code exists), so the
-/// error comes from a function in a view.
+/// no tenant code: their row writes are refused where tenant code exists, and a view that calls a
+/// function of the tenant is outside the masked lens. The marking of an error from inside a
+/// routine (`in_routine`) is tested on the engine (`errors_from_inside_a_routine_are_marked`) and
+/// in the unit tests of the mapping; here the manager still reads the engine's own text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_raised_by_tenant_code_name_nothing() {
     let Some(pg) = setup().await else { return };
@@ -1523,12 +1563,19 @@ async fn errors_raised_by_tenant_code_name_nothing() {
         ("nv", "n", DataClass::Normal),
     ])
     .await;
-    // The agent and Bob (edit, no manage) read the view: the function raises with the real
-    // secret in its text.
+    // The agent and Bob (edit, no manage) cannot reach the function at all: the view calls a
+    // function of the tenant, so it is outside the lens (decision 0004-38). Without the refusal
+    // the function would raise with the real secret in its text.
     for who in [pg.agent(), pg.bob()] {
-        let (state, text) = message(pg.run(&who, sql("select n from nv where id = 1")).await);
-        assert_eq!(state.as_deref(), Some("23514"));
-        assert_eq!(text, "a check constraint was violated");
+        let r = pg.refused(&who, sql("select n from nv where id = 1")).await;
+        assert_eq!(
+            r,
+            (
+                422,
+                "statement_not_allowed".to_string(),
+                Some("tenant_code_on_live".to_string())
+            )
+        );
     }
     // Control: a person with manage reads the engine's text.
     let (_, text) = message(pg.run(&a, sql("select n from nv where id = 1")).await);
@@ -1615,51 +1662,166 @@ async fn labels_of_whole_rows_and_estimates_of_plans() {
     pg.drop().await;
 }
 
-/// An agent's statement that writes no row runs read-only, also in mode `write`: a `SECURITY
-/// DEFINER` function of the tenant behind a view cannot copy a secret into a table the agent may
-/// read (found while closing review-Q-2-2 P-1).
+/// A masked session's statement that writes no row runs read-only, also in mode `write`
+/// (found while closing review-Q-2-2 P-1): its transaction is read-only, and a row write of the
+/// same session is not. The agent and Bob (edit, no manage) both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_statements_that_write_no_row_run_read_only() {
     let Some(pg) = setup().await else { return };
-    let a = pg.alice();
-    for s in [
-        "create table stash (id serial primary key, what text)",
-        "create function stash_it() returns integer language plpgsql volatile security definer \
-         set search_path = public as $$ begin insert into stash (what) \
-         select token from people where id = 1; return 1; end $$",
-        "create view sv as select id, stash_it() as s from people where id = 1",
-    ] {
-        pg.ok(&a, write(s)).await;
-    }
-    pg.confirm(&[
-        ("stash", "id", DataClass::Normal),
-        ("stash", "what", DataClass::Normal),
-    ])
-    .await;
     pg.grant(GrantKind::WriteLive).await;
-    let (status, code, _) = pg.refused(&pg.agent(), write("select s from sv")).await;
-    assert_eq!((status, code.as_str()), (400, "read_only_query"));
-    assert_eq!(
-        pg.count(&a, "select count(*) from stash").await,
-        json!(0),
-        "nothing was copied"
-    );
-    let r = pg.ok(&pg.agent(), sql("select what from stash")).await;
-    assert!(r.rows.is_empty());
-    // The same for Bob (edit, no manage): his statements that write no row run read-only too.
-    let (status, code, _) = pg.refused(&pg.bob(), write("select s from sv")).await;
-    assert_eq!((status, code.as_str()), (400, "read_only_query"));
-    assert_eq!(pg.count(&a, "select count(*) from stash").await, json!(0));
-    // A row write of a masked session is refused: the database holds tenant code (decision
-    // 0004-38).
-    for who in [pg.agent(), pg.bob()] {
-        let (status, _, hint) = pg
-            .refused(&who, write("update orders set amount = 9 where id = 1"))
+    for (who, name) in [(pg.agent(), "agent"), (pg.bob(), "bob")] {
+        let r = pg
+            .ok(
+                &who,
+                write("select current_setting('transaction_read_only')"),
+            )
             .await;
         assert_eq!(
-            (status, hint.as_deref()),
-            (501, Some("tenant_code_on_live"))
+            r.rows[0][0],
+            json!("on"),
+            "{name}: no row written: read-only"
+        );
+        let r = pg
+            .ok(
+                &who,
+                write(
+                    "update orders set amount = amount where id = 1 \
+                     returning current_setting('transaction_read_only')",
+                ),
+            )
+            .await;
+        assert_eq!(
+            r.rows[0][0],
+            json!("off"),
+            "{name}: a row write is writable"
         );
     }
+    pg.drop().await;
+}
+
+/// A label, the statements that make the code, the statements that remove it, the view, and the
+/// attack statement.
+type AttackCase<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a str, &'a str);
+
+/// Review-Q-2-s21-2 R-1 and R-2 and review-Q-2-harden H-1 (decision 0004-38 (b) and (d)): code
+/// that runs on the real rows may call only functions of the allow-list. A view that carries a
+/// whole value out through a session setting (S1: a tenant function), advisory locks (U2: built-in
+/// functions only), a large object (V) or a random seed (H1) is not part of the masked lens: the
+/// agent and Bob (edit, no manage) get the refusal `statement_not_allowed`, hint
+/// `tenant_code_on_live`, for the attack statement of each review, and a write that reads the
+/// view is refused with the `501` of the write rule. Nothing leaks and nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn masked_reads_of_code_outside_the_allow_list_are_refused() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    pg.grant(GrantKind::WriteLive).await;
+    // (label, statements that make it, statements that remove it, view, the attack statement)
+    let cases: [AttackCase; 4] = [
+        (
+            "S1: a tenant function writes the value into a session setting",
+            &[
+                "create function leak(t text) returns text language plpgsql volatile as $$ \
+                 begin execute pg_catalog.format('set local ruum_probe.v = %L', t); return 'ok'; end $$",
+                "create view lv as select id, leak(token) as x from people",
+            ],
+            &["drop view lv", "drop function leak(text)"],
+            "lv",
+            "with a as materialized (select count(*) as c from lv where id = 1) \
+             select c, current_setting('ruum_probe.v', true) as s from a",
+        ),
+        (
+            "U2: built-in advisory locks keyed by the characters of the value",
+            &["create view bv as select id, \
+               pg_try_advisory_xact_lock(1001, ascii(substr(token, 1, 1))) as x, \
+               pg_try_advisory_xact_lock(1002, ascii(substr(token, 2, 1))) as y from people"],
+            &["drop view bv"],
+            "bv",
+            "with a as materialized (select count(*) as c from bv where id = 1) \
+             select l.s from a, lateral (select string_agg(chr(objid::int), '' order by classid) as s \
+             from pg_locks where locktype = 'advisory' and pid = pg_backend_pid() and a.c >= 0) l",
+        ),
+        (
+            "V: a built-in large object made from the value",
+            &["create view lov as select id, \
+               lo_from_bytea(0, convert_to(coalesce(token, ''), 'UTF8')) as o from people"],
+            &["drop view lov"],
+            "lov",
+            "with a as materialized (select count(*) as c from lov where id = 1) \
+             select (select c from a) as c, \
+             (select convert_from(lo_get(m.oid), 'UTF8') from pg_largeobject_metadata m limit 1) as v",
+        ),
+        (
+            "H1: a built-in random seed set from the value",
+            &["create view sv as select id, \
+               (select 1 from (select setseed(ascii(substr(token, 1, 1)) / 1000.0)) q) as x from people"],
+            &["drop view sv"],
+            "sv",
+            "with a as materialized (select count(*) as c from sv where id = 1) \
+             select (select c from a) as c, random() as r",
+        ),
+    ];
+    let refusal = (
+        422,
+        "statement_not_allowed".to_string(),
+        Some("tenant_code_on_live".to_string()),
+    );
+    let write_refusal = (
+        501,
+        "not_implemented".to_string(),
+        Some("tenant_code_on_live".to_string()),
+    );
+    for (label, make, unmake, view, attack) in cases {
+        for s in make {
+            pg.ok(&a, write(s)).await;
+        }
+        // The view's `id` is confirmed `normal`, so the class rule of the write path lets the
+        // statement through to the rule under test.
+        pg.confirm(&[(view, "id", DataClass::Normal)]).await;
+        for (who, name) in [(pg.agent(), "agent"), (pg.bob(), "bob")] {
+            for text in [attack.to_string(), format!("select id from {view}")] {
+                let r = pg.refused(&who, sql(&text)).await;
+                assert_eq!(r, refusal, "{label}: {name}: {text}");
+            }
+            let r = pg
+                .refused(
+                    &who,
+                    write(&format!(
+                        "update orders set amount = (select count(*) from {view} where id = 1) \
+                         where id = 1"
+                    )),
+                )
+                .await;
+            assert_eq!(
+                r, write_refusal,
+                "{label}: {name}: a write that reads the view"
+            );
+        }
+        assert_eq!(
+            pg.count(&a, "select amount from orders where id = 1").await,
+            json!(1),
+            "{label}: nothing changed"
+        );
+        for s in unmake {
+            pg.ok(&a, write(s)).await;
+        }
+        // Control: with the view gone, the lens is whole again.
+        let r = pg.ok(&pg.agent(), sql("select count(*) from orders")).await;
+        assert_eq!(r.rows[0][0], json!(PEOPLE), "{label}");
+    }
+    // An agent with `read_personal` reads the `nosecret` lens, and gets the same refusal.
+    pg.grant(GrantKind::ReadPersonal).await;
+    pg.ok(
+        &a,
+        write(
+            "create view sv as select id, (select 1 from (select setseed(0.5)) q) as x from people",
+        ),
+    )
+    .await;
+    let r = pg.refused(&pg.agent(), sql("select id from sv")).await;
+    assert_eq!(r, refusal, "an agent with read_personal");
+    // The person with manage (the owner kind, in a writable statement) still reads the real view.
+    let r = pg.ok(&a, write("select count(*) from sv")).await;
+    assert_eq!(r.rows[0][0], json!(PEOPLE));
+    pg.ok(&a, write("drop view sv")).await;
     pg.drop().await;
 }

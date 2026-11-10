@@ -20,11 +20,14 @@
 //!   (`lens::secret_reading`): the columns and whole relations it reads, whether it reaches a
 //!   `SECURITY DEFINER` function of the tenant (also through other functions, F-4), and whether a
 //!   rule it reaches holds a whole-row reference (`to_json(t)`, `t::text`: a `Var` with
-//!   `varattno 0`, which `pg_depend` records only as the whole relation, F-3).
+//!   `varattno 0`, which `pg_depend` records only as the whole relation, F-3), and whether it
+//!   reaches a function outside the allow-list (`lens::code_relations`, [`super::allow`];
+//!   review-Q-2-s21-2 R-1 and R-2, review-Q-2-harden H-1).
 //!
 //! Every name and operator is qualified with `pg_catalog`: this runs as `mask` (search path
 //! `pg_catalog`) and in the `owner` session of a migration.
 
+use super::allow;
 use super::errors::internal;
 use crate::error::EngineError;
 use sqlx::{PgConnection, Row};
@@ -146,12 +149,22 @@ pub(crate) struct RootFacts {
     pub definer: bool,
     /// A rule it reaches holds a whole-row reference.
     pub whole_row: bool,
+    /// It reaches a function or operator outside the allow-list ([`allow`]): a function of the
+    /// tenant or of an extension, or a built-in function that is not on the list of functions
+    /// that may run on the real rows (a session setting, a lock, a random seed, a sequence, a
+    /// large object). A masked read of the view would run it on the real rows
+    /// (review-Q-2-s21-2 R-1 and R-2, review-Q-2-harden H-1).
+    pub unlisted: bool,
 }
 
 /// The [`RootFacts`] of every root of `public`.
 pub(crate) async fn root_facts(conn: &mut PgConnection) -> Result<Vec<RootFacts>, EngineError> {
+    let rule_unlisted = allow::unlisted("r.ev_action::pg_catalog.text");
+    let default_unlisted = allow::unlisted("ad.adbin::pg_catalog.text");
+    let allowed = allow::allowed_cte(1);
     let sql = format!(
-        r#"{REACH}
+        r#"{REACH},
+{allowed}
 select reach.rel::pg_catalog.int8 as rel, reach.att::pg_catalog.int2 as att,
        (reach.classid operator(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid) as is_rel,
        reach.objid::pg_catalog.int8 as obj, reach.subid::pg_catalog.int4 as sub,
@@ -163,11 +176,26 @@ select reach.rel::pg_catalog.int8 as rel, reach.att::pg_catalog.int2 as att,
         and exists (select 1 from pg_catalog.pg_rewrite r
                      where r.oid operator(pg_catalog.=) reach.objid
                        and pg_catalog.strpos(r.ev_action::pg_catalog.text, ':varattno 0 ')
-                           operator(pg_catalog.>) 0)) as whole_row
+                           operator(pg_catalog.>) 0)) as whole_row,
+       (
+         -- A function or operator of the tenant or of an extension that the walk reached (the
+         -- walk follows only objects of OID 16384 and above; built-ins are pinned).
+         reach.classid operator(pg_catalog.=) any (array[
+              'pg_catalog.pg_proc'::pg_catalog.regclass::pg_catalog.oid,
+              'pg_catalog.pg_operator'::pg_catalog.regclass::pg_catalog.oid])
+         -- A built-in function or operator in the stored tree of a rule that the walk reached.
+         or (reach.classid operator(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass::pg_catalog.oid
+             and exists (select 1 from pg_catalog.pg_rewrite r
+                          where r.oid operator(pg_catalog.=) reach.objid and {rule_unlisted}))
+         or (reach.classid operator(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass::pg_catalog.oid
+             and exists (select 1 from pg_catalog.pg_attrdef ad
+                          where ad.oid operator(pg_catalog.=) reach.objid and {default_unlisted}))
+       ) as unlisted
   from reach"#
     );
     let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .persistent(false)
+        .bind(allow::row_functions())
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| internal("read the dependencies of the computed columns", e))?;
@@ -189,6 +217,7 @@ select reach.rel::pg_catalog.int8 as rel, reach.att::pg_catalog.int2 as att,
         }
         f.definer |= r.get::<bool, _>("definer");
         f.whole_row |= r.get::<bool, _>("whole_row");
+        f.unlisted |= r.get::<bool, _>("unlisted");
     }
     let mut out: Vec<RootFacts> = by_root.into_values().collect();
     out.sort_by_key(|f| (f.rel, f.att));
@@ -221,17 +250,25 @@ select reach.rel::pg_catalog.int8 as rel, reach.att::pg_catalog.int2 as att,
 ///   kind counts as tenant code (fail closed).
 /// - `event_triggers`: owned by the tenant (they need a superuser today; listed so that a later
 ///   grant cannot open a gap).
+/// - `unlisted_functions`: code that runs on the real rows and calls a built-in function outside
+///   the allow-list ([`allow`]): the `_RETURN` rule of a view, a `CHECK` constraint (also of a
+///   domain), an index expression or predicate, a generated column. Built-in functions are
+///   pinned, so `pg_depend` cannot see them; the clause reads the stored node trees. A column
+///   default is not scanned: it sees no row. A function of the tenant is in `functions`; a
+///   policy is in `policies`.
 ///
+/// `$1` is the role name of the `owner` kind, `$2` the names of [`allow::ROW_FUNCTIONS`].
 /// Every name and operator is qualified: this runs in the session of an untrusted request too,
 /// whose search path is a lens schema.
-pub(crate) const TENANT_CODE_SQL: &str = "
+pub(crate) fn tenant_code_sql() -> String {
+    const TEMPLATE: &str = "
 with owner as (
   select r.oid from pg_catalog.pg_roles r where r.rolname operator(pg_catalog.=) $1
 ), tenant as (
   select n.oid from pg_catalog.pg_namespace n
    where n.nspowner operator(pg_catalog.=) (select oid from owner)
       or pg_catalog.has_schema_privilege($1, n.oid, 'CREATE')
-)
+), @ALLOWED@
 select exists (
          select 1 from pg_catalog.pg_proc p
           where p.pronamespace operator(pg_catalog.=) any (select oid from tenant)
@@ -262,9 +299,58 @@ select exists (
                 ('{r,p,v,m,S,i,I,c,t}'::pg_catalog.\"char\"[])) as relations,
        exists (
          select 1 from pg_catalog.pg_event_trigger e
-          where e.evtowner operator(pg_catalog.=) (select oid from owner)) as event_triggers";
+          where e.evtowner operator(pg_catalog.=) (select oid from owner)) as event_triggers,
+       exists (
+         select 1 from pg_catalog.pg_rewrite r
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) r.ev_class
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and c.relkind operator(pg_catalog.=) 'v'::pg_catalog.\"char\"
+            and r.rulename operator(pg_catalog.=) '_RETURN'
+            and @RULE@) as unlisted_views,
+       exists (
+         select 1 from pg_catalog.pg_constraint k
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) k.conrelid
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+            and @CHECK@) as unlisted_checks,
+       exists (
+         select 1 from pg_catalog.pg_constraint k
+           join pg_catalog.pg_type t on t.oid operator(pg_catalog.=) k.contypid
+          where (t.typnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or t.typowner operator(pg_catalog.=) (select oid from owner))
+            and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+            and @CHECK@) as unlisted_domains,
+       exists (
+         select 1 from pg_catalog.pg_index i
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) i.indrelid
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and @INDEX@) as unlisted_indexes,
+       exists (
+         select 1 from pg_catalog.pg_attrdef ad
+           join pg_catalog.pg_attribute a
+             on a.attrelid operator(pg_catalog.=) ad.adrelid and a.attnum operator(pg_catalog.=) ad.adnum
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) ad.adrelid
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and a.attgenerated operator(pg_catalog.<>) ''::pg_catalog.\"char\"
+            and @GENERATED@) as unlisted_generated";
+    TEMPLATE
+        .replace("@ALLOWED@", &allow::allowed_cte(2))
+        .replace("@RULE@", &allow::unlisted("r.ev_action::pg_catalog.text"))
+        .replace("@CHECK@", &allow::unlisted("k.conbin::pg_catalog.text"))
+        .replace(
+            "@INDEX@",
+            &allow::unlisted(
+                "pg_catalog.concat_ws(' ', i.indexprs::pg_catalog.text, i.indpred::pg_catalog.text)",
+            ),
+        )
+        .replace("@GENERATED@", &allow::unlisted("ad.adbin::pg_catalog.text"))
+}
 
-/// The kinds of tenant code that [`TENANT_CODE_SQL`] found (all `false`: none).
+/// The kinds of tenant code that [`tenant_code_sql`] found (all `false`: none).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TenantCode {
     pub functions: bool,
@@ -273,6 +359,8 @@ pub(crate) struct TenantCode {
     pub policies: bool,
     pub relations: bool,
     pub event_triggers: bool,
+    /// Code that runs on the real rows and calls a function outside the allow-list.
+    pub unlisted_functions: bool,
 }
 
 impl TenantCode {
@@ -284,18 +372,20 @@ impl TenantCode {
             || self.policies
             || self.relations
             || self.event_triggers
+            || self.unlisted_functions
     }
 }
 
-/// [`TENANT_CODE_SQL`] in the session of `conn`; `owner` is the role name of the database's
+/// [`tenant_code_sql`] in the session of `conn`; `owner` is the role name of the database's
 /// `owner` kind.
 pub(crate) async fn tenant_code(
     conn: &mut PgConnection,
     owner: &str,
 ) -> Result<TenantCode, EngineError> {
-    let row = sqlx::query(TENANT_CODE_SQL)
+    let row = sqlx::query(sqlx::AssertSqlSafe(tenant_code_sql()))
         .persistent(false)
         .bind(owner)
+        .bind(allow::row_functions())
         .fetch_one(&mut *conn)
         .await
         .map_err(|e| internal("read the tenant code", e))?;
@@ -306,5 +396,8 @@ pub(crate) async fn tenant_code(
         policies: row.get("policies"),
         relations: row.get("relations"),
         event_triggers: row.get("event_triggers"),
+        unlisted_functions: ["views", "checks", "domains", "indexes", "generated"]
+            .into_iter()
+            .any(|kind| row.get::<bool, _>(format!("unlisted_{kind}").as_str())),
     })
 }

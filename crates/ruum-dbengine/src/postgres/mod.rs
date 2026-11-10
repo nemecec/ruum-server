@@ -22,6 +22,7 @@
 //!   must be a PostgreSQL 17 client) without the Ruum schemas, roles and grants, and the import
 //!   of such an export into a new database.
 
+mod allow;
 mod catalog;
 mod copy;
 mod depends;
@@ -329,7 +330,7 @@ impl PostgresEngine {
                 let meta = match setup::read_meta(&mut conn).await {
                     // A database made before the cluster set-up revoked set_config from
                     // PUBLIC is refused until the set-up has run (review Q-1, S-1).
-                    Ok(Some(meta)) => setup::check_set_config(&mut conn, &meta.roles)
+                    Ok(Some(meta)) => setup::check_volatile_revoked(&mut conn, &meta.roles)
                         .await
                         .map(|()| Some(meta)),
                     other => other,

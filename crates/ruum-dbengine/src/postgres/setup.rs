@@ -5,6 +5,7 @@
 //! it, decision 0004-34 a). The base-table rights of `mask` and `secret_read` come from
 //! `ALTER DEFAULT PRIVILEGES` that the platform runs once in an `owner` session (0004-34 b).
 
+use super::allow;
 use super::errors::internal;
 use super::lens::{self, LensRoles, ident};
 use super::pool::search_path;
@@ -198,26 +199,37 @@ fn schemas_sql(roles: &[EngineRole], extensions: &[String]) -> String {
 /// `pg_catalog.set_config`, which changes any user-settable option (decision 0004-35 a).
 pub(crate) const SET_CONFIG: &str = "pg_catalog.set_config(text, text, boolean)";
 
-/// The schema grants of a database's roles, and `EXECUTE` on [`SET_CONFIG`] for the `owner`
-/// kind only.
+/// The schema grants of a database's roles, and `EXECUTE` on the revoked functions
+/// ([`allow::revoked_condition`]: every `VOLATILE` function of `pg_catalog` but the few in
+/// [`allow::STATEMENT_VOLATILE`]) for the `owner` kind only.
 ///
 /// The cluster set-up (`deploy/dev/postgres-data/initdb/10-ruum-data.sh`, as the superuser)
-/// revokes `EXECUTE` on `set_config` from `PUBLIC` in `template1` and in every data database, and
-/// gives it to `ruum_dbhost` `WITH GRANT OPTION`. So no read or masked kind can call it, also not
-/// through a function that runs a query given as text (`query_to_xml`, `ts_stat`; review Q-1,
-/// S-1). The `owner` kind keeps it: it can set options in a function's `SET` clause anyway, and
-/// migrations made with `pg_dump` call it. Without the grant option the `GRANT` only warns;
-/// [`check_set_config`] then still refuses the database if a wrong role can call it.
+/// revokes `EXECUTE` on them from `PUBLIC` in `template1` and in every data database, and gives
+/// them to `ruum_dbhost` `WITH GRANT OPTION`. So no read or masked kind can call a function that
+/// can write a session setting (`set_config`), a lock, a random seed, a sequence or a large
+/// object, also not through a function that runs a query given as text (`query_to_xml`,
+/// `ts_stat`; review Q-1, S-1) or through a view of the tenant (review-Q-2-s21-2 R-2;
+/// Postgres checks the right of a function in a view against the reader). The `owner` kind
+/// keeps them: it can set options in a function's `SET` clause anyway, and migrations made with
+/// `pg_dump` call `set_config`. Without the grant option the `GRANT` only warns;
+/// [`check_volatile_revoked`] then still refuses the database if a wrong role can call one.
 pub(crate) fn grants_sql(roles: &[EngineRole]) -> String {
     let r = |k| ident(role_of(roles, k));
     let logins: Vec<String> = RoleKind::SESSION_KINDS.iter().map(|k| r(*k)).collect();
+    let revoked = allow::revoked_condition();
     format!(
-        "grant execute on function {SET_CONFIG} to {owner};\n\
+        "do $revoked$ declare f pg_catalog.text; begin \
+           select pg_catalog.string_agg(p.oid::pg_catalog.regprocedure::pg_catalog.text, ', ') into f \
+             from pg_catalog.pg_proc p where {revoked}; \
+           if f is not null then \
+             execute pg_catalog.format('grant execute on function %s to %I', f, {owner_name}); \
+           end if; end $revoked$;\n\
          grant usage, create on schema public to {owner};\n\
          grant usage on schema public to {secret_read}, {mask};\n\
          {lens}\
          grant usage on schema extensions to {logins}, {mask};\n",
         owner = r(RoleKind::Owner),
+        owner_name = lens::literal(role_of(roles, RoleKind::Owner)),
         secret_read = r(RoleKind::SecretRead),
         mask = r(RoleKind::Mask),
         lens = lens_schema_grants_sql(roles),
@@ -225,8 +237,6 @@ pub(crate) fn grants_sql(roles: &[EngineRole]) -> String {
     )
 }
 
-/// The grants on the three lens schemas: `USAGE` (never `CREATE`) for `mask`, and `USAGE` on the
-/// lens schema of each session kind that reads through it.
 fn lens_schema_grants_sql(roles: &[EngineRole]) -> String {
     let r = |k| ident(role_of(roles, k));
     format!(
@@ -241,12 +251,13 @@ fn lens_schema_grants_sql(roles: &[EngineRole]) -> String {
     )
 }
 
-/// Refuses a database in which `PUBLIC` or a role other than the `owner` kind may call
-/// [`SET_CONFIG`] (review Q-1, S-1): the database was made on a data cluster without the set-up
-/// of `10-ruum-data.sh`, or something granted it. The engine holds this line itself, so a query
-/// of a read or masked kind never changes an option of its call, whatever the statement rules let
-/// through.
-pub(crate) async fn check_set_config(
+/// Refuses a database in which `PUBLIC` or a role other than the `owner` kind may call a revoked
+/// function ([`allow::revoked_condition`]; review Q-1, S-1; review-Q-2-s21-2 R-1, R-2;
+/// review-Q-2-harden H-1): the database was made on a data cluster without the set-up of
+/// `10-ruum-data.sh`, or something granted it. The engine holds this line itself, so a query of
+/// a read or masked kind never changes an option of its call or leaves state for a later part of
+/// the statement, whatever the statement rules let through.
+pub(crate) async fn check_volatile_revoked(
     conn: &mut PgConnection,
     roles: &[EngineRole],
 ) -> Result<(), EngineError> {
@@ -255,31 +266,43 @@ pub(crate) async fn check_set_config(
         .filter(|r| r.kind != RoleKind::Owner)
         .map(|r| r.role_name.clone())
         .collect();
-    let row = sqlx::query(
-        "select exists (select 1 from pg_catalog.pg_proc p,
-                          pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
-                         where p.oid = $1::pg_catalog.regprocedure and a.grantee = 0) as public,
-                coalesce((select pg_catalog.string_agg(r, ', ') from pg_catalog.unnest($2::text[]) r
-                           where pg_catalog.has_function_privilege(r, $1, 'execute')), '') as kinds",
-    )
+    let revoked = allow::revoked_condition();
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "with f as (select p.oid, p.oid::pg_catalog.regprocedure::pg_catalog.text as name
+                      from pg_catalog.pg_proc p where {revoked})
+         select coalesce((select pg_catalog.string_agg(f.name, ', ' order by f.name) from f
+                           where exists (select 1 from pg_catalog.pg_proc p,
+                             pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
+                             where p.oid operator(pg_catalog.=) f.oid and a.grantee operator(pg_catalog.=) 0)), '') as public,
+                coalesce((select pg_catalog.string_agg(r operator(pg_catalog.||) ': ' operator(pg_catalog.||) f.name, ', ' order by r, f.name)
+                            from pg_catalog.unnest($1::text[]) r, f
+                           where pg_catalog.has_function_privilege(r, f.oid, 'execute')), '') as kinds,
+                exists (select 1 from f where f.name operator(pg_catalog.=) 'set_config(text,text,boolean)') as found"
+    )))
     .persistent(false)
-    .bind(SET_CONFIG)
     .bind(&others)
     .fetch_one(&mut *conn)
     .await
-    .map_err(|e| internal("check the rights on set_config", e))?;
-    let public: bool = row.get("public");
+    .map_err(|e| internal("check the rights on the volatile functions", e))?;
+    let public: String = row.get("public");
     let kinds: String = row.get("kinds");
-    if public {
-        return Err(EngineError::Internal(
-            "PUBLIC may run pg_catalog.set_config in this database: run the data cluster set-up \
-             (deploy/dev/postgres-data/initdb/10-ruum-data.sh) as the superuser"
-                .to_string(),
-        ));
+    let found: bool = row.get("found");
+    if !found {
+        return Err(EngineError::Internal(format!(
+            "the revoked functions were not found ({SET_CONFIG})"
+        )));
+    }
+    if !public.is_empty() {
+        return Err(EngineError::Internal(format!(
+            "PUBLIC may run volatile functions in this database (for example {}): run the data \
+             cluster set-up (deploy/dev/postgres-data/initdb/10-ruum-data.sh) as the superuser",
+            public.split(", ").next().unwrap_or_default()
+        )));
     }
     if !kinds.is_empty() {
         return Err(EngineError::Internal(format!(
-            "roles other than the owner kind may run pg_catalog.set_config: {kinds}"
+            "roles other than the owner kind may run volatile functions (for example {})",
+            kinds.split(", ").next().unwrap_or_default()
         )));
     }
     Ok(())
@@ -818,7 +841,7 @@ pub(crate) async fn create_database(
             write_meta(&mut conn, new.tenant_id, new.node_id, &roles).await?;
             install_functions(&mut conn, &roles, key).await?;
             build_lens(&mut conn, &roles, &Catalog::default(), &LensSpec::default()).await?;
-            check_set_config(&mut conn, &roles).await?;
+            check_volatile_revoked(&mut conn, &roles).await?;
             run(&mut conn, "commit", "commit".to_string()).await
         }
         .await;

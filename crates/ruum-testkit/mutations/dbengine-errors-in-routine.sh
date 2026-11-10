@@ -3,6 +3,6 @@
 DESCRIPTION="the engine reports an error from a trigger or a function as its own"
 FILE="crates/ruum-dbengine/src/postgres/errors.rs"
 PERL='s/\.is_some_and\(\|pg\| pg\.r#where\(\)\.is_some\(\)\);/.is_some_and(|_pg| false);/'
-TESTS="-p ruum-core --lib databases::query::postgres_mask::engine_tests::errors_raised_by_tenant_code_name_nothing"
+TESTS="-p ruum-dbengine --lib -- postgres::tests::security::errors_from_inside_a_routine_are_marked"
 ENV="RUUM_DBENGINE_REQUIRE_POSTGRES=1"
 PLACEHOLDER=0

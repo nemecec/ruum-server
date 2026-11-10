@@ -5,6 +5,7 @@
 //! (`CI` set) or with `RUUM_DBENGINE_REQUIRE_POSTGRES=1`, where they fail. Databases and roles
 //! have random names, so several runs can share one cluster.
 
+mod allow_list;
 mod hostile_copy;
 mod security;
 mod spike;

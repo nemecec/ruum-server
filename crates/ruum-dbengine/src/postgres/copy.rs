@@ -455,7 +455,7 @@ async fn hand_over(
         }
         setup::rebuild_lens(&mut conn, new_roles, key).await?;
         // The copy took the rights of its source; the old owner's grant went in step 1.
-        setup::check_set_config(&mut conn, new_roles).await?;
+        setup::check_volatile_revoked(&mut conn, new_roles).await?;
         run(&mut conn, "commit", "commit".to_string()).await
     }
     .await;
