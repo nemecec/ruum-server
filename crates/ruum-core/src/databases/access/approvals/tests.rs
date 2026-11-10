@@ -858,7 +858,7 @@ async fn conformance(
         .unwrap();
     let ids: Vec<Uuid> = all.items.iter().map(|a| a.id).collect();
     let mut sorted = ids.clone();
-    sorted.sort_by(|x, y| y.cmp(x));
+    sorted.sort_by_key(|x| std::cmp::Reverse(*x));
     assert_eq!(ids, sorted);
     let first = store
         .list(
