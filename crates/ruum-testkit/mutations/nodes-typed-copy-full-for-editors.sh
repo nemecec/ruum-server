@@ -6,5 +6,5 @@
 DESCRIPTION="copy_data gives full data to every person who sees the source"
 FILE="crates/ruum-core/src/nodes/typed.rs"
 PERL='s/v\.role\) == Some\(Role::Manage\)/v.role) >= Some(Role::View)/'
-TESTS="-p ruum-core --lib nodes:: databases::provider"
+TESTS="-p ruum-core --lib -- nodes:: databases::provider"
 PLACEHOLDER=0
