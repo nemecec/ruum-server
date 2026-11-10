@@ -193,6 +193,8 @@ assertions:
     - node:garden_app#deploy@user:jaan
     - node:garden_app#read_telemetry@user:jaan
     - node:garden_app#configure@user:mari
+    # An editor opens previews (open_preview; step 5 widens it to comment).
+    - node:garden_app#open_preview@user:jaan
     # An app role alone opens the app (design 9.3), without view on the node.
     - node:garden_app#use@user:liisa
     - app_role:garden_app/approver#has@user:liisa
@@ -285,6 +287,10 @@ assertions:
     # A role the live manifest removed (no `active` tuple) gives nothing, though its grant stays.
     - app_role:garden_app/old_role#has@user:vello
     - node:garden_app#use@user:vello
+    - app_role:garden_app/old_role#grant@user:vello
+    # Previews are for editors: a viewer or an app role holder does not open them.
+    - node:garden_app#open_preview@user:kati
+    - node:garden_app#open_preview@user:liisa
     # A role holder without grants_roles cannot grant; a viewer of the node cannot either.
     - app_role:garden_app/member#grant@user:liisa
     - app_role:garden_app/member#grant@user:kati

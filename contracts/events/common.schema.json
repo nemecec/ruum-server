@@ -52,7 +52,8 @@
         "group",
         "app",
         "agent",
-        "share_link"
+        "share_link",
+        "issue_receipt"
       ]
     },
     "principal_ref": {

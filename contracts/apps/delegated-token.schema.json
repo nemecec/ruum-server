@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/apps/delegated-token.schema.json",
+  "title": "Delegated access token claims",
+  "description": "The claims of the token that `exchangeAppUserToken` (runtime API) returns: the app acts for the signed-in user (docs/DESIGN.md section 9.4) against the runtime API and the internal gateway at `ruum.internal`, never against the REST API or another app's origin. A JWT (EdDSA, the workload-token keys). The effective right of every call is the user's right intersected with the named bindings. Valid for 5 minutes, not renewable. Apps never parse it: they send it as `Authorization: Bearer` to `ruum.internal`. Unknown claims are ignored by the platform (contracts/apps/README.md). DRAFT for review (step 3 specify phase, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "iss",
+    "aud",
+    "typ",
+    "sub",
+    "tid",
+    "act",
+    "on_behalf_of",
+    "env",
+    "bindings",
+    "iat",
+    "exp",
+    "jti"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "iss": {
+      "type": "string",
+      "format": "uri",
+      "description": "The origin of the Ruum instance."
+    },
+    "aud": {
+      "const": "ruum.internal"
+    },
+    "typ": {
+      "const": "app_delegated"
+    },
+    "sub": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The app principal that asked: the app node ID (live) or the deployment ID (preview)."
+    },
+    "tid": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The tenant."
+    },
+    "env": {
+      "enum": [
+        "live",
+        "preview"
+      ]
+    },
+    "act": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "description": "The actor of every write made with this token: the app.",
+      "properties": {
+        "kind": {
+          "const": "app"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "on_behalf_of": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The platform user ID that the user token named (resolved from its pairwise `sub`; never shown to the app). Every write records it."
+    },
+    "agent": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "description": "When the user token's `actor` was `agent`: the agent, whose scope also limits every call."
+    },
+    "chain": {
+      "type": "array",
+      "maxItems": 3,
+      "description": "The apps of a delegation chain (design 9.10), oldest first.",
+      "items": {
+        "type": "string",
+        "pattern": "^app:[0-9a-f-]{36}$"
+      }
+    },
+    "bindings": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The binding names this token may use: those with `on_behalf_of_user` (node bindings) or `delegate` (API bindings).",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]{0,31}$"
+      }
+    },
+    "iat": {
+      "type": "integer"
+    },
+    "exp": {
+      "type": "integer",
+      "description": "At most 300 seconds after `iat`."
+    },
+    "jti": {
+      "type": "string"
+    }
+  },
+  "examples": [
+    {
+      "iss": "https://ruum.space",
+      "aud": "ruum.internal",
+      "typ": "app_delegated",
+      "sub": "0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+      "tid": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+      "env": "live",
+      "act": {
+        "kind": "app",
+        "id": "0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d"
+      },
+      "on_behalf_of": "0190b6c4-6000-7cc1-9a4b-1f2e3d4c5b6b",
+      "agent": null,
+      "chain": [],
+      "bindings": [
+        "photos"
+      ],
+      "iat": 1762379940,
+      "exp": 1762380240,
+      "jti": "01J9ZK4R2X"
+    }
+  ]
+}

@@ -26,6 +26,11 @@ create type issue_status as enum ('open', 'in_progress', 'closed', 'regressed');
 create type issue_source as enum ('person', 'agent', 'monitoring', 'report');
 create type publication_audience as enum ('private', 'signed_in', 'public');
 
+-- The bearer of an issue receipt token (decision 0006, open question 24): the actor of
+-- `issue.reveal_decided`. Like `share_link`, it is not a member; the ID is the issue node of the
+-- report. `PrincipalKind` is an open enum (contracts/README.md).
+alter type principal_kind add value if not exists 'issue_receipt';
+
 -- A live deployment of a web app is a version of its node with this encoding: `manifest` holds
 -- the canonical JSON `{ "deployment_id", "archive": { "content_hash", "size", "chunks": [...] },
 -- "app_manifest": {...} }`, so the blob GC finds the chunks of every release (decision 0006-2).
@@ -36,12 +41,14 @@ alter table versions add constraint versions_encoding_check
 -- ---------------------------------------------------------------------------- tenants
 
 -- Per tenant: the slug of the apps domain (`<app>.<slug>.ruumapps.net`, fixed once the first app
--- is deployed) and what a Ruum platform admin approved in the admin console (design 9.5 and 12.3,
+-- is deployed; 2 to 40 characters, no `--`, no `xn--` prefix, no `-` at either end, never one of
+-- the reserved slugs of docs/STEP3.md, never a slug that another tenant used: `retired_app_slugs`) and what a Ruum platform admin approved in the admin console (design 9.5 and 12.3,
 -- decision 22). `*_approved_by` names the platform admin's identity in the admin console (not a
 -- tenant principal).
 create table tenant_app_settings (
     tenant_id                   uuid primary key references tenants (id),
-    slug                        text not null check (slug ~ '^[a-z0-9][a-z0-9-]{0,40}[a-z0-9]$'),
+    slug                        text not null check (slug ~ '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'
+                                    and slug !~ '--' and slug !~ '^xn-'),
     public_apps_approved_at     timestamptz,
     public_apps_approved_by     text,
     custom_domains_approved_at  timestamptz,
@@ -57,11 +64,15 @@ create unique index tenant_app_settings_slug_idx on tenant_app_settings (slug);
 
 -- ---------------------------------------------------------------------------- apps
 
--- One row per web app node (typed node of type 'webapp', provider 'ruum.webapp').
+-- One row per web app node (typed node of type 'webapp', provider 'ruum.webapp'). The slug is one
+-- DNS label with room for the preview prefix (`<8-char short_id>--<slug>` is at most 63
+-- characters): 2 to 53 characters, no `--` (it separates the preview prefix), no `-` at either
+-- end, no `xn--` prefix (decision 0006, review R10 and RC-5).
 create table apps (
     tenant_id           uuid not null references tenants (id),
     node_id             uuid not null,
-    slug                text not null check (slug ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
+    slug                text not null check (slug ~ '^[a-z0-9][a-z0-9-]{0,51}[a-z0-9]$'
+                            and slug !~ '--' and slug !~ '^xn-'),
     -- `AppSettings` of openapi.yaml: access, telemetry_mode, raw_copy_days, report_widget,
     -- auto_rollback.
     settings            jsonb not null default '{}'::jsonb,
@@ -74,6 +85,22 @@ create table apps (
     foreign key (tenant_id, node_id) references typed_nodes (tenant_id, node_id),
     unique (tenant_id, slug)
 );
+
+-- Slugs that were used once and are never given again (decision 0006, review R10): old links and
+-- bookmarks must not reach a stranger's app. `kind` `tenant`: the tenant slug of the apps domain,
+-- unique across tenants (a system lookup, like `tenant_app_settings_slug_idx`); the row survives
+-- the tenant, so `tenant_id` has no foreign key and names the last owner. `kind` `app`: an app
+-- slug inside one tenant, given again only to the same app node (a restore from the trash).
+create table retired_app_slugs (
+    tenant_id           uuid not null,
+    kind                text not null check (kind in ('tenant', 'app')),
+    slug                text not null check (slug ~ '^[a-z0-9][a-z0-9-]{0,51}[a-z0-9]$'),
+    app_node_id         uuid,
+    retired_at          timestamptz not null default now(),
+    check ((kind = 'app') = (app_node_id is not null))
+);
+create unique index retired_app_slugs_tenant_idx on retired_app_slugs (slug) where kind = 'tenant';
+create unique index retired_app_slugs_app_idx on retired_app_slugs (tenant_id, slug) where kind = 'app';
 
 -- Every deployment: previews and live ones (design 9.1). A live deployment has `version_id`, the
 -- version of the app node it wrote at publish. `short_id` is the preview host prefix
@@ -91,9 +118,12 @@ create table app_deployments (
     version_id          uuid,
     label               text check (label is null or length(label) <= 200),
     draft               text check (draft is null or draft ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
-    source_kind         text not null default 'file' check (source_kind in ('file', 'build')),
+    source_kind         text not null default 'file' check (source_kind in ('file', 'folder', 'build')),
     source_node_id      uuid,
     source_version_id   uuid,
+    -- `source_kind` `folder`: the file versions that the platform packed into the archive
+    -- (`[{"node_id", "version_id", "path"}]`), so `AppDeployment.source` names the code exactly.
+    source_files        jsonb,
     archive_hash        bytea not null check (length(archive_hash) = 32),
     archive_size        bigint not null check (archive_size >= 0),
     archive_chunks      bytea not null,
@@ -113,7 +143,8 @@ create table app_deployments (
     foreign key (tenant_id, app_node_id) references apps (tenant_id, node_id),
     foreign key (tenant_id, version_id) references versions (tenant_id, id),
     check ((environment = 'live') = (version_id is not null) or state in ('pending', 'running', 'failed')),
-    check (environment = 'preview' or expires_at is null)
+    check (environment = 'preview' or expires_at is null),
+    check ((source_kind = 'folder') = (source_files is not null))
 );
 create unique index app_deployments_short_id_idx on app_deployments (tenant_id, short_id);
 create index app_deployments_app_idx on app_deployments (tenant_id, app_node_id, created_at desc);
@@ -188,7 +219,10 @@ create table app_secrets (
     app_node_id         uuid not null,
     name                text not null check (name ~ '^[A-Z][A-Z0-9_]{0,63}$' and name !~ '^(RUUM_|PORT$)'),
     kind                app_secret_kind not null,
+    -- Previews get the live value of this entered secret. Stored state only: a user with `manage`
+    -- sets it (`setAppSecret`); the manifest cannot (decision 0006-5, review R4).
     preview             boolean not null default false,
+    preview_set_by      uuid references users (id),
     generator           text check (generator is null or generator in
                             ('random-16-bytes', 'random-32-bytes', 'random-64-bytes', 'ed25519-keypair', 'rsa-3072-keypair')),
     rotate_days         integer check (rotate_days is null or rotate_days between 1 and 9999),
@@ -205,12 +239,17 @@ create table app_secrets (
     foreign key (tenant_id, app_node_id) references apps (tenant_id, node_id),
     check ((kind = 'generated') = (generator is not null)),
     check (kind = 'generated' or rotate_days is null),
-    check ((set_at is null) = (vault_version is null))
+    check ((set_at is null) = (vault_version is null)),
+    check (kind = 'entered' or not preview),
+    check (not preview or preview_set_by is not null)
 );
 create index app_secrets_rotation_idx on app_secrets (next_rotation_at) where next_rotation_at is not null;
 
--- Custom domains (design 9.5; decision 22). Host names are global, so the unique index spans
--- tenants; a clash answers `409 conflict` without naming the other tenant.
+-- Custom domains (design 9.5; decision 22). Host names are global, but only a verified (`active`)
+-- domain holds its host across tenants: a pending row is unique only inside its tenant and
+-- expires after 7 days (`pending_expires_at`), so nobody can squat a host they cannot prove. The
+-- TXT proof decides who gets the host; a clash answers `409 conflict` without naming the other
+-- tenant (decision 0006, review R10).
 create table app_domains (
     tenant_id           uuid not null references tenants (id),
     id                  uuid not null,
@@ -220,17 +259,21 @@ create table app_domains (
     txt_token_hash      bytea not null check (length(txt_token_hash) = 32),
     error               text check (error is null or length(error) <= 500),
     certificate_expires_at timestamptz,
+    pending_expires_at  timestamptz,
     created_kind        principal_kind not null,
     created_by          uuid not null,
     created_obo         uuid,
     created_at          timestamptz not null default now(),
     primary key (tenant_id, id),
-    foreign key (tenant_id, app_node_id) references apps (tenant_id, node_id)
+    foreign key (tenant_id, app_node_id) references apps (tenant_id, node_id),
+    check ((state in ('pending_dns', 'pending_certificate')) = (pending_expires_at is not null))
 );
-create unique index app_domains_host_idx on app_domains (host);
+create unique index app_domains_host_idx on app_domains (host) where state = 'active';
+create unique index app_domains_tenant_host_idx on app_domains (tenant_id, host);
 
 -- Partner API keys for external APIs (design 9.10). Only the SHA-256 of the key is stored; keys
--- start with `ruum_appkey_` so secret scanners find leaks.
+-- start with `ruum_appkey_` so secret scanners find leaks (a rule in .gitleaks.toml), and carry at
+-- least 128 random bits after the prefix.
 create table app_api_keys (
     tenant_id           uuid not null references tenants (id),
     id                  uuid not null,
@@ -266,6 +309,13 @@ create table app_approvals (
     status              approval_status not null default 'pending',
     changes             jsonb not null,               -- `AppApproval.changes` (names only)
     telemetry_fields    jsonb not null default '[]'::jsonb,
+    -- The column classes the decider confirmed with the publish (`DecideAppApprovalRequest.classes`).
+    classes             jsonb not null default '[]'::jsonb,
+    -- What the approval is bound to (review S5): the archive hash, the parsed manifest's hash and
+    -- the binding targets resolved at preview time. A publish that resolves anything else fails.
+    bound_archive_hash  bytea not null check (length(bound_archive_hash) = 32),
+    bound_manifest_hash bytea not null check (length(bound_manifest_hash) = 32),
+    bound_bindings      jsonb not null default '[]'::jsonb,
     requested_kind      principal_kind not null,
     requested_by        uuid not null,
     requested_obo       uuid,
@@ -364,7 +414,11 @@ create index issues_board_idx on issues (tenant_id, status, updated_at desc);
 
 -- A report from the report widget (design 9.7): the reporter's choices per field and the hold on
 -- the raw copies of the visit. `receipt_token_hash` is the SHA-256 of the receipt token (reporters
--- who are not members). `reporter_email` is set only when the reporter typed one for a reply.
+-- who are not members). `reporter_email` is set only when the reporter typed one for a reply, and
+-- is deleted 30 days after the issue closes (`reporter_email_delete_at`; decision 0006, review R13).
+-- `visit_id` is the visit that the gateway issued (never a value from the client). Report
+-- attachments (screenshot, records, choices, revealed values) never leave the issue: no copy,
+-- template or publication carries them (review R12).
 create table issue_reports (
     tenant_id           uuid not null references tenants (id),
     issue_node_id       uuid not null,
@@ -372,6 +426,7 @@ create table issue_reports (
     reporter            text not null check (reporter ~ '^[A-Za-z0-9_-]{1,64}$'),
     reporter_member     boolean not null,
     reporter_email      text check (reporter_email is null or length(reporter_email) <= 320),
+    reporter_email_delete_at timestamptz,
     choices             jsonb not null default '{}'::jsonb,
     context             jsonb not null default '{}'::jsonb,
     screenshot_node_id  uuid,
@@ -448,7 +503,7 @@ begin
         'tenant_app_settings', 'apps', 'app_deployments', 'app_bindings', 'app_role_grants',
         'app_secrets', 'app_domains', 'app_api_keys', 'app_approvals', 'telemetry_fields',
         'telemetry_end_user_keys', 'issues', 'issue_reports', 'issue_reveal_requests',
-        'template_setups', 'project_publications'
+        'template_setups', 'project_publications', 'retired_app_slugs'
     ] loop
         execute format('alter table %I enable row level security', t);
         execute format('alter table %I force row level security', t);

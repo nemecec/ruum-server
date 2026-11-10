@@ -756,9 +756,13 @@ fn operation_rule(op: &str) -> Option<Rule> {
             Role::Edit,
         )),
         "getApp" | "listAppDeployments" | "getAppDeployment" | "listAppDomains"
-        | "listAppRoles" | "listAppRoleGrants" | "listAppApprovals" => {
-            node("Needs view on the app", App, Role::View)
-        }
+        | "listAppRoles" | "listAppRoleGrants" => node("Needs view on the app", App, Role::View),
+        "listAppApprovals" => node(
+            "Needs edit on the app (pending binding changes and migration names, review R14); \
+             an agent sees only its own requests",
+            App,
+            Role::Edit,
+        ),
         "createAppDeployment" => node(
             "previews: Needs edit on the app and view on the source file",
             App,
@@ -807,10 +811,10 @@ fn operation_rule(op: &str) -> Option<Rule> {
             App,
         ),
         "getAppApproval" => Rule::new(
-            "Needs view; an agent sees only its own requests (the request is agent's), others \
-             get 404",
+            "Needs edit (review R14); an agent sees only its own requests (the request is \
+             agent's), others get 404",
             |who| {
-                let base = node("", Target::App, Role::View).access;
+                let base = node("", Target::App, Role::Edit).access;
                 match base(who) {
                     Access::Allow if who.is_agent() && who != Who::Agent => Access::Hidden,
                     other => other,
@@ -843,9 +847,10 @@ fn operation_rule(op: &str) -> Option<Rule> {
         )
         .hide(Issue, Role::View),
         "createIssue" => node(
-            "Needs edit on the folder (open question: comment)",
+            "Needs comment on the folder (decision 0006, open question 7); the standard request \
+             sets no assignee, status or links",
             Projects,
-            Role::Edit,
+            Role::Comment,
         ),
         "getIssue" => node(
             "Needs view; report attachments need edit",

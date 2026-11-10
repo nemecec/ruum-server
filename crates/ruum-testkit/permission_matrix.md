@@ -155,8 +155,8 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `listAppRoleGrants` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
 | `addAppRoleGrant` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs share on the app (or the grants_roles role; no fixture principal holds it) |
 | `removeAppRoleGrant` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs share on the app (or the grants_roles role; no fixture principal holds it) |
-| `listAppApprovals` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
-| `getAppApproval` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | 404 | 403 | Needs view; an agent sees only its own requests (the request is agent's), others get 404 |
+| `listAppApprovals` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the app (pending binding changes and migration names, review R14); an agent sees only its own requests |
+| `getAppApproval` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit (review R14); an agent sees only its own requests (the request is agent's), others get 404 |
 | `decideAppApproval` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; the agent's user (member) or a person with manage on the app, with edit on the app |
 | `listAppApiKeys` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage on the app |
 | `createAppApiKey` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; Needs manage |
@@ -170,7 +170,7 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `getProjectPublication` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the project folder |
 | `updateProjectPublication` | 401 | ok | ok | 403 | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs manage on the project and its items, and in a team tenant an owner or admin (the fixture tenants have public apps approved) |
 | `listIssues` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | only issues the caller can see (agents: inside the scope) |
-| `createIssue` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the folder (open question: comment) |
+| `createIssue` | 401 | ok | ok | ok | 403 | ok | ok | 404 | 403 | ok | ok | ok | 403 | 403/404 | 403 | 403 | Needs comment on the folder (decision 0006, open question 7); the standard request sets no assignee, status or links |
 | `getIssue` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view; report attachments need edit |
 | `updateIssue` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the issue |
 | `listIssueEvents` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the issue and on its app (both in Projects) |

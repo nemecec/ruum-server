@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ruum.space/contracts/events/app.rolled_back.schema.json",
   "title": "app.rolled_back",
-  "description": "The live deployment was replaced by an earlier one: by the automatic rollback after a publish (design 9.6) or by a person. `node_id` of the entry is the app node. This schema is the `data` of a journal entry with `type` `app.rolled_back`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "description": "The live deployment was replaced by an earlier one: by the automatic rollback after a publish (design 9.6) or by a person. `node_id` of the entry is the app node. The automatic rollback has the app as actor (reason `error_rate`); a person's rollback has that person. **Actor of platform actions** (decision 0006, review R14): when the platform acts on its own, the actor is the app (`{kind: app, id: <app node ID>}`), `on_behalf_of` is null, and the reason is in `data`. This schema is the `data` of a journal entry with `type` `app.rolled_back`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
   "type": "object",
   "required": [
     "from_deployment_id",

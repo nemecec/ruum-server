@@ -2,49 +2,128 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ruum.space/contracts/apps/user-token.schema.json",
   "title": "Ruum-User token claims",
-  "description": "The claims of the signed token that the app gateway sends to an app in the header `Ruum-User` (docs/DESIGN.md section 9.4; the design text calls it `Platform-User`). A JWT (EdDSA) signed with the platform's app-token keys (`https://ruum.space/.well-known/app-jwks.json`, a key set apart from the API keys). The app checks it with the Ruum SDK: signature, `iss`, `aud` = its own app ID, `exp`. It holds only the facts this app may know. It is made for each request (or cached for at most 5 seconds), so a removed role stops working at once; the app should not keep its own copy of roles. The same format identifies calls from other apps (`actor: app`, design 9.10) and from partners (`actor: partner`). DRAFT for review (step 3 specify phase, docs/STEP3.md).",
+  "description": "The claims of the signed token that the app gateway sends to an app in the header `Ruum-User` (docs/DESIGN.md section 9.4; the design text calls it `Platform-User`). A JWT (EdDSA) signed with the platform's app-token keys (`<issuer>/.well-known/app-jwks.json`, a key set apart from the API keys). The app checks it with the Ruum SDK: signature, `iss` = `RUUM_ISSUER`, `aud` = `RUUM_AUDIENCE` (its own app ID, or for a preview the preview audience), `typ` = `app_user`, `env` = `RUUM_ENV`, `exp`. It holds only the facts this app may know. It is made for each request (or cached for at most 5 seconds), so a removed role stops working at once; the app should not keep its own copy of roles. The same format identifies calls from other apps (`actor: app`, design 9.10) and from partners (`actor: partner`). **Open for later steps** (contracts/apps/README.md): apps and the SDK ignore claims they do not know and accept unknown values of `actor` and new `sub` prefixes; they never reject a token for an extra claim. DRAFT for review (step 3 specify phase, docs/STEP3.md).",
   "type": "object",
-  "required": ["iss", "aud", "sub", "tenant", "roles", "node_roles", "actor", "iat", "exp", "jti"],
-  "additionalProperties": false,
+  "required": [
+    "iss",
+    "aud",
+    "typ",
+    "env",
+    "sub",
+    "tenant",
+    "roles",
+    "node_roles",
+    "actor",
+    "iat",
+    "exp",
+    "jti"
+  ],
+  "additionalProperties": true,
   "properties": {
-    "iss": { "const": "https://ruum.space", "description": "The laptop stack uses `https://ruum.localhost`; the SDK takes the issuer from `RUUM_ISSUER`." },
-    "aud": { "type": "string", "pattern": "^app:[0-9a-f-]{36}$", "description": "`app:<app-node-id>`. A preview gets the same audience; `env` tells them apart." },
-    "typ": { "const": "app_user" },
-    "env": { "enum": ["live", "preview"] },
+    "iss": {
+      "type": "string",
+      "format": "uri",
+      "description": "The origin of the Ruum instance that signed the token (`https://ruum.space`; the laptop stack `https://ruum.localhost`; a self-hosted instance its own origin). The SDK compares it with `RUUM_ISSUER`, which the runtime sets."
+    },
+    "aud": {
+      "type": "string",
+      "pattern": "^app:[0-9a-f-]{36}(/preview/[0-9a-f-]{36})?$",
+      "description": "Live: `app:<app-node-id>`. A preview: `app:<app-node-id>/preview/<deployment-id>`, so a token that a preview received never passes the live app's check (review R3). The runtime sets `RUUM_AUDIENCE` to the value the app must accept."
+    },
+    "typ": {
+      "const": "app_user"
+    },
+    "env": {
+      "enum": [
+        "live",
+        "preview"
+      ],
+      "description": "Must match `RUUM_ENV` of the receiving app."
+    },
     "sub": {
       "type": "string",
-      "pattern": "^(pairwise|app|partner|anonymous):[A-Za-z0-9_-]{1,64}$",
-      "description": "`pairwise:<id>`: a person or an agent, stable for this app and different for every other app, so two apps cannot join their user lists. `app:<id>`: a calling app of the same tenant. `partner:<key-id>`: a partner API key. `anonymous:<visit>`: a visitor of a public app without sign-in."
+      "pattern": "^[a-z][a-z_]{0,31}:[A-Za-z0-9_-]{1,64}$",
+      "description": "`pairwise:<id>`: a person or an agent, stable for this app and different for every other app, so two apps cannot join their user lists. `app:<id>`: a calling app of the same tenant. `partner:<key-id>`: a partner API key. `anonymous:<visit>`: a visitor of a public app without sign-in (the visit that the gateway issued). Later steps may add prefixes (federation: `remote:`); apps treat an unknown prefix as an opaque ID."
     },
-    "tenant": { "type": "string", "description": "The tenant slug." },
-    "name": { "type": "string", "description": "Only if the manifest asks (`claims`) and the tenant allows." },
-    "email": { "type": "string", "format": "email", "description": "Only if the manifest asks and the tenant allows (never for public apps by default)." },
-    "locale": { "type": "string" },
+    "tenant": {
+      "type": "string",
+      "description": "The tenant slug."
+    },
+    "name": {
+      "type": "string",
+      "description": "Only if the manifest asks (`claims`) and the tenant allows."
+    },
+    "email": {
+      "type": "string",
+      "format": "email",
+      "description": "Only if the manifest asks and the tenant allows (never for public apps by default)."
+    },
+    "locale": {
+      "type": "string"
+    },
     "roles": {
       "type": "array",
       "description": "The app roles of the visitor (design 9.3): explicit grants of active roles, or the default role for a visitor with `view` and no explicit role. Empty for anonymous visitors and partners.",
-      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" }
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]{0,31}$"
+      }
     },
     "node_roles": {
       "type": "object",
       "description": "The visitor's effective rights on the bound nodes, by binding name, for UI decisions (`{\"db\": \"edit\"}`). Not a grant: the app's own access goes through its bindings.",
-      "additionalProperties": { "enum": ["view", "comment", "edit", "manage"] }
+      "additionalProperties": {
+        "enum": [
+          "view",
+          "comment",
+          "edit",
+          "manage"
+        ]
+      }
     },
     "actor": {
-      "enum": ["user", "agent", "app", "partner", "anonymous"],
-      "description": "Who sends the request. `agent`: an agent acting for a user (its user's pairwise ID is `on_behalf_of`)."
+      "type": "string",
+      "pattern": "^[a-z][a-z_]{0,31}$",
+      "description": "Who sends the request. Known values: `user`, `agent` (an agent acting for a user; its user's pairwise ID is `on_behalf_of`; in step 3 only on preview hosts), `app`, `partner`, `anonymous`. An open set: apps treat an unknown value like `anonymous` for their own decisions.",
+      "examples": [
+        "user",
+        "agent",
+        "app",
+        "partner",
+        "anonymous"
+      ]
     },
-    "on_behalf_of": { "type": "string", "pattern": "^pairwise:[A-Za-z0-9_-]{1,64}$", "description": "The user that an agent or a calling app acts for (a delegation chain, design 9.10)." },
+    "on_behalf_of": {
+      "type": "string",
+      "pattern": "^pairwise:[A-Za-z0-9_-]{1,64}$",
+      "description": "The user that an agent or a calling app acts for (a delegation chain, design 9.10)."
+    },
     "chain": {
       "type": "array",
       "maxItems": 3,
       "description": "The apps of a delegation chain, oldest first (user → app A → app B: B sees `[\"app:<A>\"]`).",
-      "items": { "type": "string", "pattern": "^app:[0-9a-f-]{36}$" }
+      "items": {
+        "type": "string",
+        "pattern": "^app:[0-9a-f-]{36}$"
+      }
     },
-    "scopes": { "type": "array", "description": "For `app` and `partner` actors: the API scopes of the binding or the key.", "items": { "type": "string" } },
-    "iat": { "type": "integer" },
-    "exp": { "type": "integer", "description": "At most 60 seconds after `iat`." },
-    "jti": { "type": "string" }
+    "scopes": {
+      "type": "array",
+      "description": "For `app` and `partner` actors: the API scopes of the binding or the key.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "iat": {
+      "type": "integer"
+    },
+    "exp": {
+      "type": "integer",
+      "description": "At most 60 seconds after `iat`."
+    },
+    "jti": {
+      "type": "string"
+    }
   },
   "examples": [
     {
@@ -55,8 +134,13 @@
       "sub": "pairwise:6f2c9a81d4",
       "tenant": "acme",
       "name": "Mari Tamm",
-      "roles": ["member", "approver"],
-      "node_roles": { "db": "edit" },
+      "roles": [
+        "member",
+        "approver"
+      ],
+      "node_roles": {
+        "db": "edit"
+      },
       "actor": "user",
       "iat": 1762379940,
       "exp": 1762380000,

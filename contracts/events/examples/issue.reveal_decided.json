@@ -5,8 +5,8 @@
   "revision": 4,
   "type": "issue.reveal_decided",
   "actor": {
-    "kind": "app",
-    "id": "0190b6c4-7200-7cc1-9a4b-1f2e3d4c5b6e"
+    "kind": "issue_receipt",
+    "id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70"
   },
   "on_behalf_of": null,
   "at": "2026-11-10T10:15:00Z",

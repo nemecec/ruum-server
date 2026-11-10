@@ -1251,7 +1251,8 @@ export interface paths {
          *     new values, entered secrets are not copied, app role grants and custom domains are not
          *     copied, and bindings resolve again at the copy's first deployment (a relative binding to
          *     a database copied in the same folder copy points to the copy). Issues copy as nodes;
-         *     their error counts and report attachments stay with the source.
+         *     their error counts and report attachments (screenshots, attached visit records, the
+         *     reporter's choices and revealed raw values) never copy: they stay with the source.
          */
         post: operations["copyNode"];
         delete?: never;
@@ -1683,8 +1684,9 @@ export interface paths {
          *     Web apps (step 3, planned): a version of a `webapp` node is one live deployment, so
          *     restoring it by a person is a rollback with the rules of `publishAppDeployment` (across
          *     a later migration it needs `publishAppDeployment` with `force`). An agent cannot restore
-         *     an app version here (`403 permission_denied`, hint `publishAppDeployment`): its rollback
-         *     goes through `publishAppDeployment`, where it waits for a person.
+         *     an app version here (`403 permission_denied`, hint `publishAppDeployment`, with the
+         *     deployment of that version in `error.details.deployment_id`): its rollback goes through
+         *     `publishAppDeployment`, where it waits for a person.
          */
         post: operations["restoreVersion"];
         delete?: never;
@@ -3228,7 +3230,12 @@ export interface paths {
          *
          *     Writes `node.created` (kind `typed`, type `webapp`). The address is
          *     `https://<app-slug>.<tenant-slug>.ruumapps.net` (`App.url`); the slugs come from the node
-         *     name and the tenant name and never change after the first deployment.
+         *     name and the tenant name and never change after the first deployment. An app slug is one
+         *     DNS label with room for the preview prefix: 2 to 53 characters, lower-case letters,
+         *     digits and single `-` (no `--`, no `-` at either end, no `xn--` prefix), not a reserved
+         *     slug (`docs/STEP3.md`) and not a slug that this tenant used before for another app
+         *     (`409 conflict`, hint `slug_retired`). A clash with a name rule makes the platform pick a
+         *     free slug from the name; the person can change it until the first deployment.
          */
         post: operations["createApp"];
         delete?: never;
@@ -3297,9 +3304,12 @@ export interface paths {
          *     automatic rollback. Needs `manage`. `access: public` needs the platform admin's approval
          *     for the tenant (`403 permission_denied`, hint `public_apps_not_allowed`) and the tenant
          *     admins' choice: in a team tenant only an owner or admin makes an app public (decision 22;
-         *     `403 permission_denied`, hint `tenant_admin_required`). Agents may not change `access`
-         *     (`403 user_required`); they may change the other settings within their scope. The change
-         *     takes effect at the gateway within a few seconds. Writes `app.settings_changed`.
+         *     `403 permission_denied`, hint `tenant_admin_required`). Agents may not change `access`,
+         *     may not raise `telemetry_mode` to `full` and may not raise `raw_copy_days` (`403
+         *     user_required`): full telemetry and the raw copy are a person's choice (design 9.6). An
+         *     agent may lower both, and may change the report widget and the automatic rollback within
+         *     its scope. The change takes effect at the gateway within a few seconds. Writes
+         *     `app.settings_changed`.
          */
         patch: operations["updateAppSettings"];
         trace?: never;
@@ -3330,32 +3340,48 @@ export interface paths {
          * Deploy an archive as a preview
          * @description Starts a **preview** deployment of a deployment archive (design 9.1: a `.tar.gz` or
          *     `.zip` with `app.yaml` at its root, valid against `contracts/manifests/app.schema.json`).
-         *     The archive comes from a file node version the caller can `view` (`source.kind: file`);
-         *     builds from a repo node come in step 4 (`source.kind: build`, not accepted yet). Needs
-         *     `edit` on the app. The deployment runs these stages, each reported in
-         *     `AppDeployment.stages`: `unpack` (size and file count limits), `validate` (the manifest
-         *     schema and the provider rules), `bindings` (resolve every binding to a node ID and check
-         *     that the deployer may give it, below), `migrations` (on the preview's database branches),
-         *     `image` (static files to object storage, or an OCI image for `node22`), `start`, `check`
-         *     (the health path, then the post-deploy browser check of design 9.6 level 1). The answer
-         *     is `202`; poll `getAppDeployment`.
+         *     The archive comes from a file node version the caller can `view` (`source.kind: file`),
+         *     or from a folder the caller can `view` (`source.kind: folder`): the platform packs the
+         *     head versions of the folder's files into an archive and records the file versions it
+         *     used, so an agent with only MCP tools deploys with `write_file` and then this call.
+         *     Builds from a repo node come in step 4 (`source.kind: build`, not accepted yet); clients
+         *     accept unknown source kinds in answers. Needs `edit` on the app.
+         *
+         *     The cheap stages run **before the answer**: `unpack` (size and file count limits),
+         *     `validate` (the manifest schema and the provider rules; a bad manifest is a direct `422`
+         *     whose `error.details.pointer` points into `app.yaml`) and `bindings` (resolve every
+         *     binding to a node ID and check that the deployer may give it, below; a refused binding
+         *     is a direct `403`). The other stages run after the `202` and are reported in
+         *     `AppDeployment.stages`, each with a machine-readable `error` when it fails: `build` and
+         *     `test` (always `skipped` in step 3; step 4), `migrations` (on the preview's database
+         *     branches), `image` (static files to object storage, or an OCI image for `node22`, built
+         *     in the app sandbox with no secrets and no bindings), `start`, `check` (the health path,
+         *     then the post-deploy browser check of design 9.6 level 1). Wait with
+         *     `getAppDeployment?wait=30`.
          *
          *     **No privilege escalation through bindings** (design 9.4): for every binding the deployer
          *     (for an agent: its user's right intersected with its scope) must hold the binding's role
          *     on the target node, and for an API binding the right to grant its scopes (`manage` on the
-         *     called app, or an app role named in the API's `granted_by`). Else the deployment fails at
-         *     stage `bindings` (`403 permission_denied`, hint `binding_not_allowed`, with the binding
-         *     name). The grant records `granted_by` = the deployer.
+         *     called app, or an app role named in the API's `granted_by`). Else the call answers `403
+         *     permission_denied`, hint `binding_not_allowed`, with the binding name in
+         *     `error.details.binding`. The grant records `granted_by` = the deployer. In step 3 a file
+         *     or folder binding is `view` (`edit` only on a database). A binding that names a node of
+         *     another tenant fails exactly like a missing node.
          *
          *     **Previews never touch live data.** A preview gets a principal of its own (the
          *     deployment ID). A database binding resolves to a branch of the bound database with
          *     `masked` data, made for the preview or reused from the same `draft` label (decision 30);
-         *     other node bindings are capped at `view`; API bindings call the live API of the other app
-         *     with the scopes of the binding, on behalf of the preview's principal; generated secrets
-         *     get preview values; entered secrets are not given to previews unless the manifest marks
-         *     them `preview: true`. A preview is reachable only by people with `edit` on the app, at
-         *     `https://<deployment-short-id>--<app-slug>.<tenant-slug>.ruumapps.net`, and expires after
-         *     7 days without a request.
+         *     other node bindings are capped at `view` (reads of live data, allowed because the deployer
+         *     can read them); an API binding gets only the scopes that the called API lists in
+         *     `preview_scopes` (the stage `bindings` warns about the scopes left out), so preview code
+         *     never writes live data of another app; generated secrets get preview values; entered
+         *     secrets are not given to previews unless a user with `manage` turned on `preview` for
+         *     that secret (`setAppSecret`; stored state, never the manifest). A preview keeps the
+         *     egress proxy limits and runs no jobs. A preview is reachable only by people with
+         *     `open_preview` on the app (today `edit`), and by agents through the gateway, at
+         *     `https://<deployment-short-id>--<app-slug>.<tenant-slug>.ruumapps.net`; `short_id` is 8
+         *     characters of lower-case base32. It expires after 7 days without a request; a new preview
+         *     with the same `draft` label supersedes the older ready one (state `superseded`).
          *
          *     `publishAppDeployment` makes a preview live.
          */
@@ -3385,9 +3411,11 @@ export interface paths {
         /**
          * One deployment with its stages and check result
          * @description The stages, the resolved bindings, the migrations it ran, the result of the post-deploy
-         *     check (console errors, failing requests, server errors, new issues) and its address.
-         *     Needs `view`; the check result and stage messages need `edit` (they can quote log
-         *     lines), else they are left out.
+         *     check (console errors, failing requests, server errors, new issues), the source (which
+         *     file or folder versions are deployed) and its address. Needs `view`; the check result and
+         *     stage messages need `edit` (they can quote log lines), else they are left out. With
+         *     `wait`, the call holds up to that many seconds until the state changes, so a client does
+         *     not poll in a loop.
          */
         get: operations["getAppDeployment"];
         put?: never;
@@ -3433,15 +3461,21 @@ export interface paths {
          *     waits for a person** (design 11.1, decision 0006-4): the answer is `202` with a pending
          *     approval (`AppApprovalRequired`) that the agent's user, or a person with `manage` on the
          *     app, decides (`decideAppApproval`); the agent then sends the same call with `approval_id`.
-         *     An approval is used once, within 15 minutes, for exactly this deployment.
+         *     An approval is used once, within 15 minutes, only by the agent that asked, for exactly
+         *     this deployment: its archive hash, its parsed manifest and the binding targets resolved
+         *     at preview time. A publish that resolves anything differently fails (`409 conflict`,
+         *     hint `approval_stale`) and asks again. An approved publish also covers the database
+         *     migration approvals of its migrations (the D-2 rules, including `write_live` for an
+         *     agent): the person decides once.
          *
          *     Entered secrets that the manifest lists and that have no value fail the publish (`409
          *     conflict`, hint `secret_missing`, with the names). The new live deployment takes traffic
          *     when its check passes; the old one keeps running until then. **Automatic rollback**
-         *     (design 9.6): when the error rate rises clearly within 15 minutes after a publish (the
-         *     rule is in `AppSettings.auto_rollback`), the platform publishes the previous live
-         *     deployment and writes `app.rolled_back` (reason `error_rate`). Writes `version.created`
-         *     and `app.deployed`.
+         *     (design 9.6): when the server-side error rate (the gateway's `5xx` answers, the runtime's
+         *     crashes and failed health checks; never browser events, which anyone can send) rises
+         *     clearly within 15 minutes after a publish (the rule is in `AppSettings.auto_rollback`),
+         *     the platform publishes the previous live deployment and writes `app.rolled_back` (reason
+         *     `error_rate`, actor the app). Writes `version.created` and `app.deployed`.
          */
         post: operations["publishAppDeployment"];
         delete?: never;
@@ -3537,7 +3571,11 @@ export interface paths {
          *     step 3 (decision 0006-7). The value is never returned, logged or put in the journal; the
          *     running app gets it at its next start (the platform restarts the live deployment within a
          *     minute). A secret of kind `generated` cannot be set (`409 conflict`, hint
-         *     `rotateAppSecret`). Writes `app.secret_changed` (name and action only).
+         *     `rotateAppSecret`). `preview: true` lets previews of this app get the live value of this
+         *     entered secret (stored state; the manifest cannot ask for it, decision 0006-5); a call
+         *     may change only `preview`. The log shipper of the app redacts the current and the
+         *     previous value by exact match before anything is stored. Writes `app.secret_changed`
+         *     (name and action only).
          */
         put: operations["setAppSecret"];
         post?: never;
@@ -3764,7 +3802,7 @@ export interface paths {
         };
         /**
          * Publishes of agents that wait for a person
-         * @description Needs `view`; an agent sees only its own requests.
+         * @description Needs `edit` (the requests show pending binding changes and migration names); an agent sees only its own requests.
          */
         get: operations["listAppApprovals"];
         put?: never;
@@ -3793,7 +3831,7 @@ export interface paths {
         };
         /**
          * One publish request
-         * @description Needs `view`; an agent sees only its own requests.
+         * @description Needs `edit`; an agent sees only its own requests. With `wait`, the call holds up to that many seconds until the status changes (an agent waits for the person's decision without a poll loop).
          */
         get: operations["getAppApproval"];
         put?: never;
@@ -3827,10 +3865,12 @@ export interface paths {
          * @description The person sees the deployment (its preview address and check result), the changes to
          *     bindings, roles, secrets and migrations against the live deployment, and the telemetry
          *     fields and columns that wait for a class (design 8.5 and 9.6: the classes are confirmed in
-         *     the same approval, `telemetry_fields`). Who may decide: the agent's user, or a person with
-         *     `manage` on the app; the person needs every right the publish needs (`edit` on the app,
-         *     `manage` on a database that a migration changes), else `403 permission_denied`. Users
-         *     only. Writes `app.approval_decided`.
+         *     the same approval, `telemetry_fields` and `classes`, with the step 2 semantics of
+         *     `DecideDatabaseApprovalRequest.classes`). Who may decide: the agent's user, or a person
+         *     with `manage` on the app; the person needs every right the publish needs (`edit` on the
+         *     app, `manage` on every database that a migration changes), else `403
+         *     permission_denied`. The approval covers the database migration approvals of those
+         *     migrations (decision 0006-4). Users only. Writes `app.approval_decided`.
          */
         post: operations["decideAppApproval"];
         delete?: never;
@@ -3863,8 +3903,8 @@ export interface paths {
         put?: never;
         /**
          * Make a partner API key
-         * @description Makes a key (`ruum_appkey_...`) for one consumer of one `external` API of the live
-         *     manifest, with a subset of its scopes, a rate limit and an expiry (at most 365 days).
+         * @description Makes a key (`ruum_appkey_` and at least 128 random bits) for one consumer of one
+         *     `external` API of the live manifest, with a subset of its scopes, a rate limit and an expiry (at most 365 days).
          *     The key is shown once and stored as a hash. Needs `manage`; users only. The gateway
          *     checks the key, the scopes and the limit before a request reaches the app, and sends the
          *     app a signed header with `actor: partner` and the key's name. Writes
@@ -3930,7 +3970,9 @@ export interface paths {
          *     is the keyed pseudonym (`Pseudonym` marker) for everyone in step 3 (raw copies are read
          *     only through an issue report, design 9.7); `normal` fields are readable. Unclassified
          *     fields count as `personal`. **Log text is untrusted data** (user input ends up in it):
-         *     `content_trust: untrusted` on the answer.
+         *     `content_trust: untrusted` on the answer. Every filter is escaped into the store's query
+         *     language by the server, which also builds the selector (tenant, app, environment); no
+         *     LogQL, PromQL or TraceQL from the caller is ever passed through.
          */
         get: operations["searchAppLogs"];
         put?: never;
@@ -4024,7 +4066,11 @@ export interface paths {
          * @description Every field of log templates, metric labels and span attributes that the app's
          *     `telemetry-privacy.yaml` names or that ingestion saw, with its class (`normal`,
          *     `personal`, `secret`), whether a person confirmed it, and the suggestion of the privacy
-         *     review (design 9.6). Unconfirmed fields count as `personal`. Needs `edit`.
+         *     review (design 9.6). Unconfirmed fields count as `personal`, except that a suggestion
+         *     stricter than `personal` (`secret`) applies at once: a confirmation is needed only to
+         *     relax a class. Names from the platform deny-list (`authorization`, `cookie`,
+         *     `set-cookie`, `password`, `token`, `secret`, `api_key` and similar) are always `secret`,
+         *     whatever `telemetry-privacy.yaml` says. Needs `edit`.
          */
         get: operations["listAppTelemetryFields"];
         put?: never;
@@ -4132,7 +4178,8 @@ export interface paths {
          *     Users only. **Waits for restricted folders** (decision 8, design 16): until they exist the
          *     operation stays planned. A database item needs a public schema (tables or views the
          *     person names); `personal` columns of those are always the hidden-value marker for the
-         *     public. Writes `project.publication_changed`.
+         *     public. Published issues never carry report attachments (design 9.9). Writes
+         *     `project.publication_changed`.
          */
         put: operations["updateProjectPublication"];
         post?: never;
@@ -4162,10 +4209,12 @@ export interface paths {
          * @description Creates a typed node of type `issue` (provider `ruum.issue`) under `parent_id` (the
          *     project's `Issues/` folder by default; any folder works). Its content (`IssueContent`,
          *     `contracts/manifests/issue.schema.json`) is validated against the issue template's JSON
-         *     Schema (`template_ref`, recorded in the issue). Needs `edit` on the folder (open
-         *     question: `comment`). `source` is `person` for a user and `agent` for an agent;
-         *     `monitoring` and `report` issues are made by the platform only. Writes `node.created`
-         *     and `issue.created`.
+         *     Schema (`template_ref`, recorded in the issue). Needs `comment` on the folder (filing is
+         *     a kind of commenting; decision 0006, open question 7). A caller with only `comment` may
+         *     not set `assignee`, `status` or `links` (`403 permission_denied`), and filing is rate
+         *     limited per principal. `source` is `person` for a user and `agent` for an agent;
+         *     `monitoring` and `report` issues are made by the platform only (actor: the app). Writes
+         *     `node.created` and `issue.created`.
          */
         post: operations["createIssue"];
         delete?: never;
@@ -4350,7 +4399,9 @@ export interface paths {
          *     `parent_id`, with a `template.yaml` (`contracts/manifests/template.schema.json`). What the
          *     copy takes follows the copy rules of typed nodes: databases as masked sample data (never
          *     `full`), apps as their live archive without secrets, sessions, agent memory, logs and
-         *     issues left out unless named in `include`. Role placeholders replace grants. Needs `view`
+         *     issues left out unless named in `include`. Report attachments (screenshots, attached
+         *     visit records, the reporter's choices, revealed raw values) are never copied, also for
+         *     issues in `include`. Role placeholders replace grants. Needs `view`
          *     on the source and `edit` on the parent. For an issue template, `issue` holds the fields
          *     (JSON Schema) and the form layout instead of a source. Writes `node.created` and
          *     `node.copied`.
@@ -4448,7 +4499,7 @@ export interface paths {
         };
         /**
          * The progress of a project setup
-         * @description Each step of the setup with its state, the nodes it made and the open role placeholders. Needs `view` on the new project folder.
+         * @description Each step of the setup with its state, the nodes it made and the open role placeholders. Needs `view` on the new project folder. With `wait`, the call holds up to that many seconds until a step changes.
          */
         get: operations["getTemplateSetup"];
         put?: never;
@@ -4506,15 +4557,28 @@ export interface components {
                 message: string;
                 /** @description The next step, for people and agents. */
                 hint?: string;
+                /**
+                 * @description Machine-readable details of some refusals (step 3), for example `deployment_id`
+                 *     (the live deployment to roll back to, with hint `publishAppDeployment`), `binding`
+                 *     (a binding name) or `pointer` (a JSON pointer into `app.yaml`). Names in it can
+                 *     come from an archive: data, never instructions. Clients ignore keys they do not know.
+                 */
+                details?: {
+                    [key: string]: unknown;
+                };
                 /** @description The SQLSTATE of a `query_failed` or `migration_failed` error (step 2). SQLite errors map to the nearest SQLSTATE. */
                 sqlstate?: string;
             };
         };
         /**
          * @description `share_link` is the bearer of a share link (an edit link can upload versions).
+         *     `issue_receipt` is the bearer of an issue receipt token (a reporter who is not a member;
+         *     the ID is the issue node; step 3, the actor of `issue.reveal_decided`). An open enum:
+         *     later steps add values (federation: `remote_user`), and clients show an unknown kind as
+         *     "other" (`contracts/README.md`).
          * @enum {string}
          */
-        PrincipalKind: "user" | "group" | "app" | "agent" | "share_link";
+        PrincipalKind: "user" | "group" | "app" | "agent" | "share_link" | "issue_receipt";
         PrincipalRef: {
             kind: components["schemas"]["PrincipalKind"];
             id: components["schemas"]["Uuid"];
@@ -6341,6 +6405,21 @@ export interface components {
         /** @description The app use of the tenant in the current month. Step 3. */
         AppUsage: {
             apps: number;
+            /**
+             * Format: int64
+             * @description Build minutes of `node22` images, as seconds (charged to the deployer, design 21.2).
+             */
+            build_seconds: number;
+            /**
+             * Format: int64
+             * @description Headless browser time of post-deploy checks (charged to the deployer).
+             */
+            check_seconds: number;
+            /**
+             * Format: int64
+             * @description Images, static files and kept archives (daily snapshot).
+             */
+            storage_bytes: number;
             /** Format: int64 */
             instance_seconds: number;
             /** Format: int64 */
@@ -6477,10 +6556,15 @@ export interface components {
             scopes: string[];
             granted_by: components["schemas"]["ActorPair"];
         };
-        /** @description Where the archive comes from. `file` is a file node version the caller can `view`. `build` (a build of a repo node) comes in step 4. */
+        /**
+         * @description Where the archive comes from. `file`: a file node version (a `.tar.gz` or `.zip`) the
+         *     caller can `view`. `folder`: a folder the caller can `view`; the platform packs the head
+         *     versions of its files (`version_id` is not accepted). `build` (a build of a repo node)
+         *     comes in step 4. An open set: clients accept unknown kinds in answers.
+         */
         AppDeploymentSource: {
             /** @enum {string} */
-            kind: "file";
+            kind: "file" | "folder";
             node_id: components["schemas"]["Uuid"];
             /** @description The version; the head version when missing. */
             version_id?: components["schemas"]["Uuid"];
@@ -6493,14 +6577,28 @@ export interface components {
             draft?: string;
         };
         AppDeploymentStage: {
-            /** @enum {string} */
-            name: "unpack" | "validate" | "bindings" | "migrations" | "image" | "start" | "check" | "switch";
+            /**
+             * @description `build` and `test` are always `skipped` in step 3 (step 4: tests block Publish, decision 31). An open set.
+             * @enum {string}
+             */
+            name: "unpack" | "validate" | "bindings" | "build" | "test" | "migrations" | "image" | "start" | "check" | "switch";
             /** @enum {string} */
             state: "pending" | "running" | "done" | "failed" | "skipped";
             /** @description What failed, for people and agents with `edit`. Can quote file names and log lines of the app. */
             message: string | null;
+            /** @description The machine-readable reason when the stage failed (or warned, with `state` `done`), for the agent's next step. */
+            error: components["schemas"]["AppStageError"] | null;
             started_at: components["schemas"]["Timestamp"] | null;
             finished_at: components["schemas"]["Timestamp"] | null;
+        };
+        AppStageError: {
+            code: components["schemas"]["ErrorCode"];
+            /** @description The next step (`binding_not_allowed`, `secret_missing`, `migration_failed`, `preview_scopes_left_out`, ...). */
+            hint: string | null;
+            /** @description `binding`, `pointer` (a JSON pointer into `app.yaml`), `migration`, `scopes`; names from the archive. */
+            details?: {
+                [key: string]: unknown;
+            };
         };
         /** @description The post-deploy browser check (design 9.6 level 1). Shown only to callers with `edit`. */
         AppCheckResult: {
@@ -6542,6 +6640,20 @@ export interface components {
             version_id: components["schemas"]["Uuid"] | null;
             label: string | null;
             draft: string | null;
+            /** @description The code of this deployment. Step 4 adds the commit of a build. */
+            source: {
+                /** @description `file`, `folder` (`build` in step 4). An open set. */
+                kind: string;
+                node_id: components["schemas"]["Uuid"];
+                /** @description The file version used (`file`); `null` for a folder. */
+                version_id: components["schemas"]["Uuid"] | null;
+                /** @description `folder` only: the file versions that were packed. */
+                files?: {
+                    node_id: components["schemas"]["Uuid"];
+                    version_id: components["schemas"]["Uuid"];
+                    path: string;
+                }[];
+            };
             /** Format: uri */
             url: string | null;
             /** @description The parsed `app.yaml`; `null` until the stage `validate` is done. */
@@ -6561,7 +6673,7 @@ export interface components {
         App: {
             node: components["schemas"]["Node"];
             settings: components["schemas"]["AppSettings"];
-            /** @description The app part of the address; fixed after the first deployment. */
+            /** @description The app part of the address; fixed after the first deployment. One DNS label of 2 to 53 characters, no `--`, no `-` at either end, no `xn--` prefix (so the preview host `<short_id>--<slug>` fits in 63 characters and cannot clash with another app). */
             slug: string;
             /** Format: uri */
             url: string;
@@ -6597,6 +6709,10 @@ export interface components {
                 roles_removed: string[];
                 secrets_missing: components["schemas"]["AppSecretName"][];
                 migrations: components["schemas"]["AppMigrationRun"][];
+                /** @description The columns that the publish's migrations add, rename or retype, per database, with the author's class (as `DatabaseApproval.planned_columns`). */
+                planned_columns: (components["schemas"]["PlannedColumn"] & {
+                    database_id: components["schemas"]["Uuid"];
+                })[];
                 unconfirmed_telemetry_fields: number;
                 unconfirmed_columns: number;
             };
@@ -6625,6 +6741,16 @@ export interface components {
             comment?: string;
             /** @description The classes the person confirms for the unconfirmed telemetry fields of the deployment, in the same step (as `confirmAppTelemetryFields`, needs `manage`). */
             telemetry_fields?: components["schemas"]["TelemetryFieldClass"][];
+            /**
+             * @description The classes the person confirms for the planned columns of the publish's migrations,
+             *     in the same decision, with the step 2 semantics (`DecideDatabaseApprovalRequest.classes`):
+             *     stored with the approval and confirmed in the same transaction as each migration when it
+             *     runs. Needs `manage` on that database.
+             */
+            classes?: (components["schemas"]["ColumnRef"] & {
+                database_id: components["schemas"]["Uuid"];
+                class: components["schemas"]["DataClass"];
+            })[];
         };
         AppMetricSummary: {
             /** Format: int64 */
@@ -6660,7 +6786,7 @@ export interface components {
             kind: "generated" | "entered";
             /** @description A value exists. */
             set: boolean;
-            /** @description Previews get the value (entered secrets only; the manifest says so). */
+            /** @description Previews get the live value (entered secrets only). Stored state that only a user with `manage` sets (`setAppSecret`); the manifest cannot. */
             preview: boolean;
             rotate_days: number | null;
             set_at: components["schemas"]["Timestamp"] | null;
@@ -6672,7 +6798,9 @@ export interface components {
         };
         SetAppSecretRequest: {
             /** @description The value. Never returned, logged or stored outside OpenBao. */
-            value: string;
+            value?: string;
+            /** @description Previews get the live value of this entered secret (default false). Without `value`, only this flag changes. */
+            preview?: boolean;
         };
         AppDomain: {
             id: components["schemas"]["Uuid"];
@@ -7312,6 +7440,8 @@ export interface components {
         LinkId: components["schemas"]["Uuid"];
         AppPasswordId: components["schemas"]["Uuid"];
         ApprovalId: components["schemas"]["Uuid"];
+        /** @description Hold the answer up to this many seconds until the object changes (long poll). `0` answers at once. */
+        Wait: number;
         DeploymentId: components["schemas"]["Uuid"];
         SecretName: components["schemas"]["AppSecretName"];
         DomainId: components["schemas"]["Uuid"];
@@ -11824,7 +11954,10 @@ export interface operations {
     };
     getAppDeployment: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Hold the answer up to this many seconds until the object changes (long poll). `0` answers at once. */
+                wait?: components["parameters"]["Wait"];
+            };
             header?: {
                 /**
                  * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
@@ -12334,7 +12467,10 @@ export interface operations {
     };
     getAppApproval: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Hold the answer up to this many seconds until the object changes (long poll). `0` answers at once. */
+                wait?: components["parameters"]["Wait"];
+            };
             header?: {
                 /**
                  * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for
@@ -13255,7 +13391,10 @@ export interface operations {
     };
     getTemplateSetup: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Hold the answer up to this many seconds until the object changes (long poll). `0` answers at once. */
+                wait?: components["parameters"]["Wait"];
+            };
             header?: {
                 /**
                  * @description The tenant of the call. Required for users (`400 bad_request` without it). Optional for

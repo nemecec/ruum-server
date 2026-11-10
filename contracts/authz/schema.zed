@@ -255,8 +255,11 @@ definition node {
     // A grant of any active app role lets its holder use the app (design 9.3).
     relation active_role: app_role#has
 
-    // The gateway's check before a request reaches the app (design 9.2). A preview needs `edit`.
+    // The gateway's check before a request reaches the app (design 9.2).
     permission use = view + active_role
+    // Opening a preview (decision 0006, review RC-7). The gateway checks this permission, never
+    // `edit` directly, so step 5 (commenters annotate a shared preview) widens one line here.
+    permission open_preview = edit
     permission deploy = edit
     permission publish = edit
     permission read_telemetry = edit

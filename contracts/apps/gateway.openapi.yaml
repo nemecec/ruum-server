@@ -13,17 +13,29 @@ info:
     request reaches the app.**
 
     ## The check of every request
-    1. Find the app and the deployment by host name. Unknown host: `404` page. App suspended:
-       a status page (`503`).
+    1. Find the app and the deployment by host name (a narrow system lookup that returns only
+       the tenant, the app and the deployment; `docs/STEP3.md` "System lookups"). Unknown host:
+       `404` page. App suspended: a status page (`503`).
     2. `access: platform`: the visitor needs a Ruum sign-in **for this app origin** (below) and
        the permission `use` on the app node (`view`, or any app role; `schema.zed`). A preview
-       needs `edit`. Without sign-in: redirect to `/.ruum/v1/auth/start`. Without the right: a
-       `403` page with "ask for access". `access: public`: everybody passes; a signed-in visitor
-       still gets a user token.
-    3. Strip every incoming `Ruum-*` header (a client can never send its own `Ruum-User`), add
-       `Ruum-User` (the user token, `contracts/apps/user-token.schema.json`), `Ruum-Request-Id`
-       and the W3C `traceparent`, and forward to the deployment.
-    4. Add the response headers: `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+       needs `open_preview` (today `edit`; step 5 widens it to `comment` in `schema.zed` only).
+       Without sign-in: redirect to `/.ruum/v1/auth/start`. Without the right: a `403` page with
+       "ask for access". `access: public`: everybody passes; a signed-in visitor still gets a user
+       token. **Agents** reach previews only, with an agent token (`agentToken`, audience
+       `ruumapps`, never the API audience); a live host refuses an agent token (`403`) in step 3
+       (decision 0006, review S1). A partner key (`partnerKey`) reaches only the external API it
+       was made for.
+    3. Clean the request before it is forwarded (review R2):
+       - remove every incoming `Ruum-*` header (a client can never send its own `Ruum-User`);
+       - remove the gateway's cookies (`__Host-ruum_app`, `__Host-ruum_visit`) from `Cookie`;
+       - remove `Authorization` when it holds a partner key or an agent token;
+       - drop an incoming `traceparent` from the internet: start a new trace and keep the
+         incoming one only as a span link;
+       then add `Ruum-User` (the user token, `contracts/apps/user-token.schema.json`, with the
+       preview audience on a preview host), `Ruum-Request-Id` and the new `traceparent`, and
+       forward to the deployment.
+    4. Clean the response: remove every `Set-Cookie` whose name starts with `__Host-ruum` or
+       `ruum` (no session fixation by the app). Then add the response headers: `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
        `Referrer-Policy: strict-origin-when-cross-origin`, and `Content-Security-Policy:
        frame-ancestors` that allows only the Ruum UI origin for previews and `'none'` for live
        apps unless the app sets its own value.
@@ -36,13 +48,39 @@ info:
     the platform session cookie never reaches it. The gateway runs its own short code flow with
     the platform (`/.ruum/v1/auth/start` → the platform's `/v1/auth/login` with an app audience →
     `/.ruum/v1/auth/callback`) and sets a host-only cookie `__Host-ruum_app` (HttpOnly, Secure,
-    SameSite=Lax, 12 hours) that holds a session ID, never a token. Signing out of Ruum ends
-    these sessions within a minute.
+    SameSite=Lax, 12 hours) that holds a session ID, never a token. The session is bound to the
+    app node ID and the environment (and to the deployment for a preview), not only to the host:
+    a session of one app is refused by every other app, also when a host name is used again.
+    Signing out of Ruum ends these sessions within a minute.
+
+    ## Visits
+    The gateway issues the visit: a random ID in a host-only cookie `__Host-ruum_visit`
+    (HttpOnly, Secure, SameSite=Lax, ends with the browser session). It records server side
+    which trace IDs it started for which visit and session. Telemetry and reports attach records
+    only through this map, never through a visit or trace ID that the client sends (review R1).
 
     ## Paths the gateway keeps for itself
     Every path under `/.ruum/` belongs to the gateway; an app cannot serve it. The browser
-    script and the report widget send to these paths on the app's own origin, so they need no
-    CORS and no cookies of their own.
+    script sends frontend events to `/.ruum/v1/telemetry` on the app's own origin. App code runs
+    on that origin too, so nothing on it may read personal values or record a consent.
+
+    ## The report origin
+    The report widget's consent step (design 9.7) runs where app code cannot script it: a page
+    of the platform origin (`https://ruum.space/report`, laptop `https://ruum.localhost/report`),
+    opened by the widget as a top-level window (never a frame: `frame-ancestors 'none'`). The
+    page gets a report session by a handoff through the gateway (below), reads the preview and
+    sends the reporter's choices to the paths under `/.ruum-report/v1/` of the platform origin,
+    which Caddy routes to the gateway. Those paths accept only the report session cookie
+    `__Host-ruum_report` (host-only on the platform origin, 15 minutes, bound to the app, the
+    deployment, the app session or visit, and one handoff) together with the header
+    `Ruum-Report-Csrf` (a token that only the report page holds). App code can neither get the
+    session nor read the preview.
+
+    The handoff: the report page sets a random state in its own cookie and navigates the window
+    to `/.ruum/v1/reports/handoff?state=...` on the app origin; the gateway (never the app)
+    checks the app session or visit and redirects back to `/report/callback?code=...&state=...`
+    on the platform origin; the page redeems the code (`createReportSession`, once, within 60
+    seconds, only with the matching state cookie).
 
     ## Identity of calls between apps and from partners
     Internal calls (`http://<binding>.<api>.ruum.internal`) go through the internal gateway,
@@ -57,8 +95,12 @@ servers:
     description: An app on the laptop stack (Caddy serves `*.ruumapps.localhost`).
   - url: https://garden.acme.ruumapps.net
     description: An app in production.
+  - url: https://ruum.space
+    description: The report origin (paths under `/.ruum-report/v1/` only; Caddy routes them to the gateway).
 security:
   - appSession: []
+  - agentToken: []
+  - partnerKey: []
   - {}
 tags:
   - name: auth
@@ -121,7 +163,9 @@ paths:
       summary: The Ruum browser script
       description: |
         Records JavaScript errors, unhandled rejections, console errors, failed requests and Core
-        Web Vitals, and shows the report widget. In live apps the privacy-aware mode is the
+        Web Vitals, and shows the report widget button, which opens the report page of the
+        platform origin in a window of its own (the consent step never runs on the app origin).
+        In live apps the privacy-aware mode is the
         default (design 9.6): errors and Web Vitals only, no cookies of its own, URLs without
         query strings, no request bodies or form values, the user only as the pairwise pseudonym
         of the user token. The full mode adds breadcrumbs and failed request details. Previews
@@ -141,11 +185,15 @@ paths:
       summary: Send frontend events
       description: |
         Batches of frontend events from the browser script. The gateway adds the app, the
-        deployment, the pairwise user (from the session, never from the body) and the trace ID,
-        drops IP addresses, strips query strings, and hands the batch to the ingestion pipeline,
-        which applies the telemetry classes (`telemetry-privacy.yaml`) before storage. Rate
-        limited per visitor and per app; over the limit events are dropped and counted. Accepts
-        `text/plain` so `navigator.sendBeacon` works.
+        deployment, the environment, the tenant, the pairwise user (from the session, never from
+        the body) and the visit (from `__Host-ruum_visit`, never from the body), drops IP
+        addresses, strips query strings, and hands the batch to the ingestion pipeline, which
+        applies the telemetry classes (`telemetry-privacy.yaml`) before storage. Resource
+        attributes in the body are ignored. An app with `access: platform` refuses a batch
+        without an app session (`401`); only public apps take anonymous batches. Rate limited per
+        visitor and per app; over the limit events are dropped and counted. Browser events never
+        count for the automatic rollback, and new fingerprints from browser events are capped per
+        app and hour (`docs/STEP3.md`). Accepts `text/plain` so `navigator.sendBeacon` works.
       security:
         - appSession: []
         - {}
@@ -162,29 +210,142 @@ paths:
       responses:
         '202':
           description: Accepted (also when some events were dropped).
+        '401':
+          description: An app with `access` `platform` and no app session.
         '413':
           description: The batch is larger than 64 KiB.
         '429':
           description: Too many batches.
-  /.ruum/v1/reports:
-    post:
+  /.ruum/v1/reports/handoff:
+    get:
       tags: [reports]
-      operationId: createAppReport
-      summary: File a report from the report widget
+      operationId: handOffAppReport
+      summary: Hand the visit over to the report page (top-level navigation only)
       description: |
-        Design 9.7. The reporter saw every item before it was sent and could remove or blur each
-        one. The gateway attaches, server side, the log records of this visit (frontend and
-        backend, linked by the visit's trace IDs; only records of this visitor), applies the
-        reporter's choices per `personal` field (`include` decrypts the reporter's own values
-        from the raw copy, only for this issue, only when the app keeps a raw copy;
-        `pseudonymise` is the default; `remove` gives the hidden-value marker), holds the raw
-        copies of the visit until the issue closes (at most 30 days), and makes an issue from the
-        app's bug template, linked to the matching error group. Reporters who are not members
-        of the tenant get a receipt token (`IssueReceiptToken`) shown once. Public apps limit
-        reports per visitor and per app.
+        Served by the gateway on the app origin; an app cannot serve or call it usefully. The
+        report page of the platform origin navigates its window here. The gateway checks the app
+        session (or, on a public app, the visit cookie), makes a one-time code bound to the app,
+        the deployment, the session or visit and `state`, and redirects to
+        `<platform origin>/report/callback?code=...&state=...`. A request with `Sec-Fetch-Mode`
+        other than `navigate` is refused, so a script of the app cannot collect a code.
       security:
         - appSession: []
         - {}
+      parameters:
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{32,64}$'
+      responses:
+        '302':
+          description: Redirect to the report page of the platform origin with the code.
+        '400':
+          description: Not a top-level navigation, or a bad state.
+        '429':
+          description: Too many reports from this visitor.
+  /.ruum-report/v1/session:
+    post:
+      tags: [reports]
+      operationId: createReportSession
+      summary: Redeem the handoff code for a report session (report origin)
+      description: |
+        On the platform origin only. Needs the state cookie that the report page set before the
+        handoff, matching `state`. The code is used once, within 60 seconds. Sets
+        `__Host-ruum_report` and returns the CSRF token that the page sends as
+        `Ruum-Report-Csrf` with every later call. CORS allows no other origin.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, state]
+              properties:
+                code:
+                  type: string
+                state:
+                  type: string
+      responses:
+        '201':
+          description: The report session; the cookie is set.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [csrf_token, app_name, expires_at]
+                properties:
+                  csrf_token:
+                    type: string
+                  app_name:
+                    type: string
+                    description: The app's name, for the page title (untrusted text).
+                  expires_at:
+                    type: string
+                    format: date-time
+        '400':
+          description: A bad, used or expired code, or a state that does not match.
+  /.ruum-report/v1/preview:
+    get:
+      tags: [reports]
+      operationId: previewAppReport
+      summary: What a report would attach, before the reporter sends it (report origin)
+      description: |
+        The log records of the reporter's visit (by the gateway's visit-to-trace map, never by a
+        client value) that have `personal` fields, with each such field shown as the reporter's
+        own value when the raw copy exists (the reporter is the person the value is about, or
+        typed it), so the reporter can choose per field. Secret values never appear: they were
+        redacted before storage. Records without `personal` fields are only counted. Records
+        about other people are never offered.
+      security:
+        - reportSession: []
+      parameters:
+        - name: Ruum-Report-Csrf
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The candidate records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportPreview'
+        '401':
+          description: No report session.
+        '403':
+          description: A missing or wrong CSRF token.
+        '429':
+          description: Too many requests.
+  /.ruum-report/v1/reports:
+    post:
+      tags: [reports]
+      operationId: createAppReport
+      summary: File a report with the reporter's choices (report origin)
+      description: |
+        Design 9.7. The reporter saw every item on the report page before it was sent and could
+        remove or blur each one. The gateway attaches, server side, the log records of the
+        reporter's visit (frontend and backend, by its own visit-to-trace map; only records of
+        this visitor), applies the reporter's choices per `personal` field (`include` decrypts the
+        reporter's own values from the raw copy, only for this issue, only when the app keeps a
+        raw copy; `pseudonymise` is the default; `remove` gives the hidden-value marker), holds
+        the raw copies of the visit until the issue closes (at most 30 days), and makes an issue
+        from the app's bug template, linked to the matching error group. The choices are stored
+        with the issue as the reporter's consent; they are accepted only here, never from the
+        app origin. Reporters who are not members of the tenant get a receipt token
+        (`IssueReceiptToken`, at least 128 random bits) shown once. Public apps limit reports
+        per visitor and per app. The report session ends with the report.
+      security:
+        - reportSession: []
+      parameters:
+        - name: Ruum-Report-Csrf
+          in: header
+          required: true
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -198,61 +359,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppReportReceipt'
+        '401':
+          description: No report session.
+        '403':
+          description: A missing or wrong CSRF token.
         '413':
           description: The screenshot is larger than 5 MiB.
         '422':
           description: The report is not valid.
         '429':
           description: Too many reports.
-  /.ruum/v1/reports/preview:
-    post:
-      tags: [reports]
-      operationId: previewAppReport
-      summary: What a report would attach, before the reporter sends it
-      description: |
-        The log records of this visit that have `personal` fields, with each such field shown as
-        the reporter's own value when the raw copy exists (the reporter is the person the value
-        is about, or typed it), so the reporter can choose per field. Records without `personal`
-        fields are only counted. Records about other people are never offered.
-      security:
-        - appSession: []
-        - {}
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [visit_id]
-              properties:
-                visit_id:
-                  type: string
-                  pattern: '^[0-9a-f]{32}$'
-      responses:
-        '200':
-          description: The candidate records.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ReportPreview'
-        '429':
-          description: Too many requests.
 components:
   securitySchemes:
     appSession:
       type: apiKey
       in: cookie
       name: __Host-ruum_app
-      description: The gateway's session on this app origin (a session ID, never a token).
+      description: The gateway's session on this app origin (a session ID, never a token), bound to the app node ID and the environment. Never forwarded to the app.
+    agentToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'An agent token with the audience `ruumapps` (never the REST API audience, decision 0006-10). Accepted on preview hosts only in step 3; the agent needs `open_preview` on the app through its user and scope. Removed before the request is forwarded; the app sees `actor: agent` in `Ruum-User`.'
+    partnerKey:
+      type: http
+      scheme: bearer
+      description: 'A partner API key (`ruum_appkey_...`, `createAppApiKey`) for one external API of the app, with its scopes and rate. Removed before the request is forwarded; the app sees `actor: partner`.'
+    reportSession:
+      type: apiKey
+      in: cookie
+      name: __Host-ruum_report
+      description: The report session on the platform origin (paths under `/.ruum-report/v1/` only), with the header `Ruum-Report-Csrf`.
   schemas:
     TelemetryBatch:
       type: object
-      required: [visit_id, events]
+      required: [events]
+      description: The visit comes from the gateway's visit cookie, never from the body.
       properties:
-        visit_id:
-          type: string
-          pattern: '^[0-9a-f]{32}$'
-          description: Random per page load; links the frontend events and the backend records of one visit through the trace IDs.
         events:
           type: array
           maxItems: 50
@@ -299,13 +442,12 @@ components:
         trace_id:
           type: string
           pattern: '^[0-9a-f]{32}$'
+          description: The trace that the page saw (from the gateway's `traceparent`). Kept as data; records are linked only when the gateway's visit-to-trace map has this trace for this visit.
     AppReport:
       type: object
-      required: [visit_id, description]
+      required: [description]
+      description: The visit and the app come from the report session, never from the body.
       properties:
-        visit_id:
-          type: string
-          pattern: '^[0-9a-f]{32}$'
         description:
           type: string
           minLength: 1

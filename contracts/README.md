@@ -17,7 +17,7 @@ The contracts are the shared ground between people and agents that work in paral
 | `manifests/database.schema.json` | The manifest of a `database` node (design section 8; step 2, DRAFT): engine, version, plan, extensions, backups, data classes per column. | `ajv validate --spec=draft2020` |
 | `manifests/app.schema.json` | The manifest of a web app, `app.yaml` in the deployment archive (design section 9; step 3, DRAFT): runtime, start, static files, bindings, migrations, secrets, roles, claims, APIs, events, jobs, telemetry, egress. | `ajv validate --spec=draft2020` (the `examples` of the schema) |
 | `manifests/template.schema.json`, `manifests/issue.schema.json`, `manifests/telemetry-privacy.schema.json` | `template.yaml` of a template folder (design 2.7), the content of an issue node (9.7), and `telemetry-privacy.yaml` of an app (9.6). Step 3, DRAFT. | same |
-| `apps/README.md`, `apps/gateway.openapi.yaml`, `apps/runtime.openapi.yaml`, `apps/user-token.schema.json` | What the app gateway serves on app origins and adds to requests, what a running app may call at `http://ruum.internal`, and the claims of the `Ruum-User` token (design 9.2 to 9.10; step 3, DRAFT). | `npx @redocly/cli lint --config contracts/redocly.yaml contracts/apps/<file>.openapi.yaml`; `ajv` for the token example |
+| `apps/README.md`, `apps/gateway.openapi.yaml`, `apps/runtime.openapi.yaml`, `apps/user-token.schema.json`, `apps/delegated-token.schema.json` | What the app gateway serves on app origins (and on the report origin) and adds to requests, what a running app may call at `http://ruum.internal`, the claims of the `Ruum-User` token and of the delegated token (design 9.2 to 9.10; step 3, DRAFT). | `npx @redocly/cli lint --config contracts/redocly.yaml contracts/apps/<file>.openapi.yaml`; `ajv` for the token examples |
 | `mcp/tools.yaml` | The MCP tool list: one tool per REST operation that makes sense for an agent (name, `operationId`, description, input by JSON pointer), and the operations that are not exposed, with the reason. | `cargo test -p ruum-mcp --test tools_contract` |
 
 The SQL schema in `migrations/` is a contract too, with its own rule: one migration change at a time.
@@ -51,4 +51,9 @@ stop and ask for one.
   `crates/ruum-mcp/tests/content_trust.rs` keeps its list equal to `openapi.yaml`.
 - Writes accept `Idempotency-Key`. Write responses carry `change` with `actor` and `on_behalf_of`.
 - Lists use cursor paging: `cursor`, `limit`, and `{ items, next_cursor }`.
+- **Open enums.** `PrincipalKind`, `EventType`, `AppDeploymentSource.kind` and the stage names of
+  `AppDeploymentStage` are open sets: later steps add values (federation adds `remote_user`, step
+  4 adds the source kind `build`). Clients accept an unknown value and show it as "other"; they
+  never fail on it. `oasdiff` reports a new value of these response enums as a warning, not an
+  error (decision 0006, review RC-4).
 - Tenant-scoped calls name the tenant in the `Ruum-Tenant` header.

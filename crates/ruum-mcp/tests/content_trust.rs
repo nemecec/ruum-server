@@ -30,6 +30,7 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "AppBinding.target_name",
     "AppCheckResult.details.message",
     "AppDeployment.label",
+    "AppDeployment.source.files.path", // file paths in the deployed folder
     "AppDeploymentComparison.new_issues.title",
     "AppDeploymentStage.message",
     "AppLogRecord.fields",
@@ -37,6 +38,7 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "AppLogRecord.route",
     "AppLogRecord.template",
     "AppRole.description",
+    "AppStageError.details", // binding names and pointers from the archive
     "AppTrace.spans.app_name",
     "AppTrace.spans.attributes",
     "AppTrace.spans.name",
@@ -68,7 +70,8 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "DiffChange.new",
     "DiffChange.old",
     "DiffChange.path",
-    "Error.error.message",                 // can quote a name or an identifier
+    "Error.error.details", // binding names and pointers from an archive (step 3)
+    "Error.error.message", // can quote a name or an identifier
     "GET /v1/nodes/{node_id}/content 200", // file content
     "GET /v1/nodes/{node_id}/content 206",
     "GrantRequestDetails.reason", // `requestDatabaseAccessGrant`

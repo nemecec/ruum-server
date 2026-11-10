@@ -12,7 +12,7 @@
       "const": 1
     },
     "runtime": {
-      "description": "`static`: files served from object storage through the gateway and the CDN (no process). `node22`: an OCI image built from the archive with buildpacks, run in gVisor with scale to zero. `python3.13`: later in step 3.",
+      "description": "`static`: files served from object storage through the gateway and the CDN (no process). `node22`: an OCI image built from the archive by the platform's builder (Railpack behind a `Builder` trait, decision 0006), run in gVisor with scale to zero. The build runs in the app sandbox with no secrets and no bindings. `python3.13`: later in step 3.",
       "type": "string",
       "enum": ["static", "node22", "python3.13"]
     },
@@ -23,7 +23,7 @@
       "maxLength": 500
     },
     "build": {
-      "description": "The build command that buildpacks run before the image is made (`npm run build`). Optional; without it buildpacks use their default. A build from a repo node (step 4) runs it too.",
+      "description": "The build command that the builder runs before the image is made (`npm run build`). Optional; without it the builder uses its default. The build is untrusted code: it runs in the app sandbox, with no secrets, no bindings, egress only through the proxy, and limits on CPU, memory, time and disk (decision 0006). A build from a repo node (step 4) runs it too.",
       "type": "string",
       "maxLength": 500
     },
@@ -97,7 +97,7 @@
       "additionalProperties": { "type": "string", "maxLength": 4000 }
     },
     "bindings": {
-      "description": "What the app may reach (design 9.1, 9.4, 9.10). Each binding gives the `app` principal a role on a node, or scopes of another app's API. The deployer must hold that role (or the right to grant those scopes); else the deployment fails at stage `bindings`. A preview binds a database to a masked branch of it and every other node at most with `view`. The runtime gives the app one environment variable per binding: `RUUM_BINDING_<NAME>` with how to reach it (database: a connection URL with a short-lived role, no password in the archive; file or folder: the node ID for the runtime API; API: the internal address).",
+      "description": "What the app may reach (design 9.1, 9.4, 9.10). Each binding gives the `app` principal a role on a node, or scopes of another app's API. The deployer must hold that role (or the right to grant those scopes); else the deployment fails at stage `bindings` (checked before the `202`). In step 3 `edit` is accepted only on a database; a file or folder binding is `view` (the runtime API has no write path yet, decision 0006). A preview binds a database to a masked branch of it, every other node at most with `view`, and an API only with the called API's `preview_scopes`. The runtime gives the app one environment variable per binding: `RUUM_BINDING_<NAME>` with how to reach it (database: a connection URL with a short-lived role, no password in the archive; file or folder: the node ID for the runtime API; API: the internal address).",
       "type": "object",
       "maxProperties": 30,
       "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
@@ -115,7 +115,7 @@
       "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" }
     },
     "secrets": {
-      "description": "The secrets the app needs (design 9.9). Values are never in the archive; they are write-only in OpenBao and reach only the running app, as environment variables. A list of names means `entered` for each (the short form of design 9.1). The long form says how each value is made: `generate` (Ruum makes and rotates it; most secrets) or `entered` (a person with `manage` pastes it once). There is never a database password: databases come through bindings.",
+      "description": "The secrets the app needs (design 9.9). Values are never in the archive; they are write-only in OpenBao and reach only the running app, as environment variables. Previews get generated secrets with preview values and no entered secret, unless a user with `manage` turned on `preview` for that secret (`setAppSecret`, stored state; the manifest cannot ask for it: decision 0006-5). A list of names means `entered` for each (the short form of design 9.1). The long form says how each value is made: `generate` (Ruum makes and rotates it; most secrets) or `entered` (a person with `manage` pastes it once). There is never a database password: databases come through bindings.",
       "oneOf": [
         {
           "type": "array",
@@ -181,6 +181,13 @@
             "uniqueItems": true,
             "items": { "$ref": "#/$defs/scope" }
           },
+          "preview_scopes": {
+            "description": "The scopes that a preview of a calling app may use (a subset of `scopes`; review R4). A preview runs code that no person approved, so it gets only the scopes listed here; without `preview_scopes` a preview gets no scope of a binding to this API, and its stage `bindings` warns which scopes were left out. List only scopes that cannot change data (`orders.read`).",
+            "type": "array",
+            "maxItems": 50,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/scope" }
+          },
           "granted_by": {
             "description": "An app role of this app whose holders may grant the scopes to other apps, besides people with `manage` on this app (design 9.10).",
             "type": "string",
@@ -220,7 +227,7 @@
       }
     },
     "jobs": {
-      "description": "Scheduled jobs (decision 21): the platform calls the path on schedule (cron, UTC), with a token whose `actor` is the app itself. At most one run of a job at a time.",
+      "description": "Scheduled jobs (decision 21): the scheduler calls the path on schedule (cron, UTC) through the internal gateway, with a user token whose `actor` is the app itself. At most one run of a job at a time; a run that is still going skips the next one; a suspended app runs no jobs. Previews run no jobs.",
       "type": "object",
       "maxProperties": 10,
       "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
@@ -330,11 +337,7 @@
           "additionalProperties": false,
           "properties": {
             "entered": { "const": true },
-            "description": { "type": "string", "maxLength": 200 },
-            "preview": {
-              "description": "Previews get the live value too (default false: previews run without it).",
-              "type": "boolean"
-            }
+            "description": { "type": "string", "maxLength": 200 }
           }
         }
       ]

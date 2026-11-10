@@ -9,3 +9,12 @@ regexes = [
   # crates/ruum-mcp/src/tools.json records the SHA-256 of contracts/openapi.yaml.
   '''"openapi_sha256": "[0-9a-f]{64}"''',
 ]
+
+# Partner API keys of web apps (step 3, docs/STEP3.md; decision 0006): `ruum_appkey_` and at
+# least 128 random bits (22 or more base62 characters). The stored display prefix
+# (`ruum_appkey_` and 6 characters) is shorter and does not match.
+[[rules]]
+id = "ruum-app-api-key"
+description = "Ruum partner API key of a web app"
+regex = '''ruum_appkey_[A-Za-z0-9]{22,}'''
+keywords = ["ruum_appkey_"]

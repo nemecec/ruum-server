@@ -19,10 +19,17 @@ info:
     before it ends. Send it as `Authorization: Bearer`. It is never written to logs (the
     ingestion pipeline treats `authorization` as `secret`).
 
+    The internal gateway authenticates the calling app by this token and **removes
+    `Authorization`** before it forwards a call to another app (review R2), so app B never sees
+    app A's workload token. It finds the calling app from the token and the network identity of
+    the sandbox, never from a header that the app sends.
+
     ## What the token allows
     Only what the app's bindings allow, as the `app` principal (design 9.4). Acting for a user
     needs the token exchange below; then the effective right is the user's right intersected
-    with the binding.
+    with the binding. In step 3 file and folder bindings are `view`: the app reads bound files
+    and lists bound folders; writes to files (uploads) come with a later additive change of this
+    contract (decision 0006).
   license:
     name: Apache 2.0
     identifier: Apache-2.0
@@ -30,6 +37,7 @@ servers:
   - url: http://ruum.internal
 security:
   - workloadToken: []
+  - delegatedToken: []
 paths:
   /v1/self:
     get:
@@ -85,13 +93,22 @@ paths:
   /v1/token/exchange:
     post:
       operationId: exchangeAppUserToken
+      security:
+        - workloadToken: []
       summary: Act on behalf of the signed-in user (token exchange)
       description: |
         Design 9.4: the app sends the user token it got in `Ruum-User` (at most 60 seconds old)
-        and gets an access token for the bindings marked `on_behalf_of_user`, with `actor` = the
-        app and `on_behalf_of` = the user. Every write through it records both. The effective
-        right is the user's right intersected with the binding. Valid for 5 minutes; not
-        renewable.
+        and gets an access token (`contracts/apps/delegated-token.schema.json`, `typ`
+        `app_delegated`, `aud` `ruum.internal`) for the bindings marked `on_behalf_of_user` (and
+        API bindings with `delegate`), with `actor` = the app and `on_behalf_of` = the user.
+        Every write through it records both. The effective right is the user's right intersected
+        with the binding (and, for an agent, its scope). Valid for 5 minutes; not renewable.
+
+        Refused (`401`) when the user token's `aud` or `env` does not match the calling
+        workload principal (a preview's token never works for the live app, and the other way
+        round), or when its `typ` is not `app_user`. Refused (`403`) when its `actor` is not
+        `user` or `agent`, unless the binding has `delegate: true` (then the chain rules of
+        design 9.10 apply, at most 3 hops).
       requestBody:
         required: true
         content:
@@ -130,7 +147,7 @@ paths:
     get:
       operationId: readBoundContent
       summary: Read a file inside a bound file or folder
-      description: The node must be the bound node or below a bound folder. With a delegated token, the user's right counts too. Uploads go through the blob API in the same way (decision 21); the records API of design 9.8 comes later.
+      description: The node must be the bound node or below a bound folder. With a delegated token, the user's right counts too. In step 3 there is no write path (file bindings are `view`); uploads through the blob API (decision 21) come with a later additive change, and the records API of design 9.8 later still.
       responses:
         '200':
           description: The content.
@@ -143,6 +160,45 @@ paths:
           description: Not inside a binding.
         '404':
           description: No such node (or not visible).
+  /v1/nodes/{node_id}/children:
+    parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listBoundChildren
+      summary: List a bound folder (or a folder below it)
+      description: |
+        The children of the bound folder, or of a folder below it, one page at a time, with name,
+        kind, size and the head version. Names are untrusted text. With a delegated token, only
+        the children the user may see.
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: One page of children.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoundChildPage'
+        '401':
+          description: A missing or expired token.
+        '403':
+          description: Not inside a binding.
+        '404':
+          description: No such folder (or not visible).
   /v1/events/{topic}:
     parameters:
       - name: topic
@@ -181,6 +237,11 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: The workload token of the app (`typ` `app_workload`, `aud` `ruum.internal`).
+    delegatedToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The token of `exchangeAppUserToken` (`contracts/apps/delegated-token.schema.json`, `typ` `app_delegated`), for the bindings it names, for 5 minutes.
   schemas:
     AppSelf:
       type: object
@@ -220,6 +281,35 @@ components:
           type: array
           items:
             type: string
+    BoundChildPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [node_id, name, kind]
+            properties:
+              node_id:
+                type: string
+                format: uuid
+              name:
+                type: string
+                description: Untrusted text.
+              kind:
+                type: string
+                description: '`file`, `folder` or `typed` (an open set).'
+              size:
+                type: [integer, 'null']
+              version_id:
+                type: [string, 'null']
+                format: uuid
+              updated_at:
+                type: string
+                format: date-time
+        next_cursor:
+          type: [string, 'null']
     AppUserPage:
       type: object
       required: [items, next_cursor]
