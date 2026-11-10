@@ -116,13 +116,16 @@ technical words.
 
 | Term | Meaning | Never | Estonian |
 |---|---|---|---|
-| draft | The changes being worked on, not visible to the app's users | staging, branch (for code), dev environment | mustand (mustand-) |
+| draft | The changes being worked on, not visible to the app's users | staging, dev environment | mustand (mustand-) |
 | preview | A private, working copy of the app with the draft's changes | staging site, test environment | eelvaade (eelvaade-) |
 | publish | Make the draft live for the app's users | deploy, release, promote, ship | avalda (avalda-) |
 | live | What the app's users use now | production, prod, environment | avaldatud (avaldatud-) |
 | go back to the previous version | Undo a publish | rollback, revert, redeploy | mine tagasi eelmisele versioonile |
 
-"Branch" stays the approved term only for a **database** branch (above).
+**Simplify, do not rename.** Draft, preview and live hide a whole mechanism (branches, builds, environments,
+rollouts) behind three simple ideas, so the technical words stay out there. Where Ruum shows a real technical
+object, it uses its real name: a git **branch** is "branch", a commit is "commit", a database **branch** is
+"branch". Do not invent new words or hide a thing that already has a good, widely known name.
 
 ## Do not translate
 
