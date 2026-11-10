@@ -48,6 +48,9 @@ jobs:
       SPICEDB_ENDPOINT: http://127.0.0.1:50051
       RUUM_SPICEDB_ENDPOINT: http://127.0.0.1:50051
       RUUM_SPICEDB_HTTP_URL: http://127.0.0.1:8543
+      # A local key-encryption key (32 random bytes, made in a step below), as scripts/dev.sh env
+      # gives on the laptop: the server tests with RUUM_DBHOST_URL need one.
+      RUUM_LOCAL_KEK_FILE: /tmp/ruum-ci-tenant-keys.kek
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -72,6 +75,8 @@ jobs:
             sleep 1
           done
           docker exec postgres-data pg_isready -h 127.0.0.1 -U postgres -d postgres
+      - name: Local key-encryption key
+        run: head -c 32 /dev/urandom > "$RUUM_LOCAL_KEK_FILE"
       - name: Start SpiceDB (memory datastore)
         run: |
           image=$(awk '/image: authzed\/spicedb:/ {print $2; exit}' deploy/dev/docker-compose.yml)
