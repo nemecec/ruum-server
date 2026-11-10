@@ -13,7 +13,8 @@ providers, the second E-2 fix, cards D-1, T-1 and T-2), the night integration of
 2026-11-09), the integration of 2026-11-09 (the RUSTSEC-2026-0459 fix, `f/masking-hardening`,
 decision 0005 B-3 and B-1, card Q-1), the evening integration of 2026-11-09 (the C-8 race, a data
 cluster per agent, K-1 C-2, the step 2 error codes and query rule 10, the brand directions; run
-on 2026-11-10), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+on 2026-11-10), the integration of 2026-11-10 (run 7: card P-3, the Graphite theme, the drafts of
+the operations policy and the product direction), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -246,6 +247,35 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Integration of 2026-11-10 (run 7; each branch rebased onto `main`, pushed as `integ7/...`,
+checked in GitHub CI, then fast-forwarded, in this order; linear history, no merge commit, no
+co-author line). The build server could not be reached (its firewall allows the laptop's old IP
+address), so GitHub Actions did the checks: `ci` on each branch (fmt, clippy, unit and
+migration tests with the data cluster, both suite backends with `RUUM_REQUIRE_IMPLEMENTED=1`,
+contracts, web, browser e2e, cargo-deny) and `nightly` (strict mutation check) dispatched on the
+last tip:
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `s2/wave5-fix` (pushed as `integ7/wave5`) | Card P-3, the typed-node rules of the tree: a typed node's parent is a folder; a copy of a folder with a database makes a new typed node in `provisioning` and a `copied` delivery, with data `full` only for a person with `manage` on the source, masked for an editor, a viewer and every agent (`nodes/typed.rs`, `providers/hooks.rs`); trash, restore and purge of typed nodes send `trashed`, `restored` and `purged`; the Postgres purge keeps a hidden tombstone until the provider takes `purged`; `putContent` and uploads refuse a typed node (`409`); `restoreVersion` of a database by an agent cannot change `data_classes`. Four new mutations (`nodes-typed-*`). It is `s2/wave5` rebased plus the review fix (`5d674e4`). | accepted at the second review (`review-wave5.md` B-1 fixed, `review-wave5-fix.md`, `review-wave5-2.md`); should-fix items in backlog 2026-11-09 section 10 |
+| `w/graphite-theme` (= `w/graphite-theme-ux`, pushed as `integ7/graphite-theme`) | Decision 0005 B-5 and design 12.6: theme packages (`web/src/design/themes/`, format 1, JSON Schema, validator `scripts/check-theme.mjs`, token build), Graphite 1.0.1 as the default theme (IBM Plex Sans and Mono self-hosted, wordmark, favicon, app icons), additive core tokens (display and numeric font, icon stroke), the UX panel fixes (violet `tag-plum`, a raised dark `sunken`, a wordmark that forced colours repaint), the design system and brand docs, the Linux and darwin visual references. Web and docs only. | UX panel: `ux-graphite-visual.md` and `ux-graphite-access.md` (no blocker; the 3 majors caused by Graphite fixed, `retro-theme.md`); the rest is backlog 2026-11-10 U-6 to U-10 |
+| `d/ops-policy` (pushed as `integ7/ops-policy`) | Drafts, **awaiting the person's approval**, nothing in force: the operations policy of design 19.3 (`docs/ops/policy.yaml` 0.2.0-draft: 28 green, 16 amber, 16 red action types, unlisted is red, 80 context facts, 27 aggregate limits), 35 runbooks (`docs/ops/runbooks/`), `docs/ops/README.md`, and the product direction of design 20.4 (`docs/product/direction.md`). Docs only. | guard review `review-ops.md`: not ready (9 blocking); all findings applied in the revision `b7b1e40`; the revision had no second guard review |
+
+After the three branches: `integ7/nightly-role` (`d159b25`, `.github/workflows/nightly.yml`
+only). The nightly mutation check connected as the superuser of the service container, which
+bypasses RLS, so its baseline failed every night since 2026-11-07 (the RLS tests of
+`databases::`); it now connects as `ruum_test`, as `ci.yml` does (backlog 2026-11-10 T-26). Then
+`integ7/nightly-spicedb` (`nightly.yml` only): the job starts SpiceDB (memory datastore) and makes
+a local KEK, as `run.sh` and `dev.sh env` do, so the two SpiceDB mutations no longer survive; a
+manual run takes an optional list of mutation names (`gh workflow run nightly.yml --ref <branch>
+-f mutations="a b"`).
+
+Not merged: `s2/q-2` (card Q-2, the privacy filter of Postgres queries for agents). Three
+security reviews did not accept it: `review-Q-2-1.md` and `review-Q-2-2.md` found 14 holes (two
+gave raw values to an agent without a grant); the fixes closed all 14, but `review-Q-2-3.md`
+found a new one (R-1, a tenant function behind a view runs on the real row in an agent's row
+write) and 43 mutations were never run strictly (backlog 2026-11-10 S-19, T-21).
 
 Integration of 2026-11-09 evening (run 6, done on 2026-11-10; each branch rebased onto `main`,
 checked on the build server with `cargo test --workspace`, both suite backends with
@@ -493,7 +523,48 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-10, `main` after the integration of 2026-11-09 evening, on the build server)
+## Checks (2026-11-10, `main` after the integration of 2026-11-10, run 7, in GitHub CI)
+
+`main` is `3139cf9` before this documentation commit: the tree of `integ7/ops-policy`
+(`b7b1e40`) plus three commits to `.github/workflows/nightly.yml`. Three `docs/DESIGN.md` commits
+(`7a6ee14..17ad5d2`: design 9.11 background work and 9.12 resource access) landed on `main`
+after the checks; they are not part of this integration and change no code. The
+build server could not be reached (SSH timeout: the Hetzner firewall `ruum-buildbox` allows the
+laptop's old public IP only; backlog 2026-11-10 B-22), so the checks ran in GitHub Actions on the
+pushed branches. Run `ci` 42791678823 on `b7b1e40` (all 8 jobs green; the same on
+`integ7/wave5`, 42791474404, and `integ7/graphite-theme`, 42791578867):
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`:
+  pass (also `cargo fmt --check` on the laptop).
+- Unit, conformance and migration tests with the data cluster (`cargo test --workspace
+  --exclude ruum-testkit` and the testkit's `--lib`, `contract`, `databases_meta`): 718 passed,
+  0 failed, 1 ignored. Data cluster checks (`scripts/dbhost_check.sh`): 272 passed, 0 failed.
+  The build server count (`cargo test --workspace`, which also counts the suite binaries) is
+  not comparable; `w5` reported 744 passed on the build server for P-3 alone.
+- Suites with `RUUM_REQUIRE_IMPLEMENTED=1`, the same numbers on memory and on Postgres stores:
+  tenant isolation 354 checks (314 passed, 40 planned), permission matrix 1936 checks (1744
+  passed, 192 planned), trashed file suite 112/112 (96 before: 16 new checks of a trashed
+  database), database cases d1 11/11, grants 7/7, nodes 8 (3 passed, 5 planned; 3 pending
+  before P-3), agents 13, guests 3 and statements 7 planned, privacy suite 99 planned; 0 pending
+  (501), 0 failed.
+- Web: `npm ci`, `npm run lint` (theme check: 86 contrast pairs pass), `npm test` (318
+  passed) and `npm run build` on the laptop, on the Graphite tip; CI's web job green.
+- `scripts/e2e_browser.sh` (CI job `e2e-browser`): 173 passed (CI runs `sso.e2e.ts` too), on
+  each of the three tips.
+- Mutation check (`nightly` run 42796204146, dispatched on `integ7/nightly-role` = `d159b25`,
+  `MUTATION_STRICT=1`, 1 h 53 min): 94 of 94 mutations killed in all, none skipped or broken (93 on the build server
+  for P-3; new since: `nodes-typed-copy-full-for-agents`). The full run killed 92 and 2 survived:
+  `authz-ignores-tenant-token` and `authz-spicedb-ignores-request-floor`, because nightly had no
+  SpiceDB and their test (`wiring::tests::writes_of_another_server_hold_at_once`) skipped. With
+  SpiceDB and a local KEK in the job (`integ7/nightly-spicedb`), a run of those two (42814274876)
+  killed both. Then a full run on `3139cf9` (42815050584, 1 h 11 min): 94 of 94 killed, none survived, skipped
+  or broken. The first dispatch, on `integ7/ops-policy`
+  (42791679098), failed its baseline (the nightly superuser bug above).
+- Not run: `scripts/e2e_smoke.sh` (needs the build server or a laptop stack; the CI `e2e` job is
+  a placeholder, backlog 2026-11-10 T-25). `w5` ran it on P-3 at `7a87e4e` on the build server:
+  `PASSED: 59 checks`; the other two branches change only `web/` and `docs/`.
+
+### Checks of the integration of 2026-11-09 evening (on the build server)
 
 `main` is `4b15efc` before this documentation commit. The checks ran with
 `scripts/buildbox/run.sh` of `main`, which now gives each key its own data cluster
@@ -561,7 +632,7 @@ sources (`run.sh` keeps file times).
   web build; `w/et-ruum` ran `npm ci && npm run lint && npm run build && npm test` on the build
   server, 306 tests), `oasdiff` (CI runs it).
 
-## Next cards (2026-11-10, from `docs/backlog/2026-11-08.md` and `docs/backlog/2026-11-09.md`)
+## Next cards (2026-11-10, run 7, from `docs/backlog/2026-11-08.md`, `2026-11-09.md` and `2026-11-10.md`)
 
 Small, clear fixes that need no person (design 20.3). The IDs are those of the backlogs (the
 date tells which), which have the evidence. Each card goes through the normal reviews and gates.
@@ -570,8 +641,16 @@ race (2026-11-09 T-13, `w/c8-race`), the data cluster per agent (2026-11-08 B-2,
 `f/pgdata-per-agent`: every `run.sh` run of a current tree gets its own `pgdata-<key>`), K-1
 C-2 and the step 2 error codes with query rule 10 (2026-11-08 P-2, P-3; 2026-11-09 S-12,
 `f/k1c2-errors`). The brand directions (`w/brand-directions`, `docs/ux/brand/`) are merged too.
-In this order:
+Run 7 merged card P-3 (`s2/wave5-fix`), the Graphite theme (`w/graphite-theme`, which closes
+backlog 2026-11-09 U-1 to U-4, the old card 3) and the drafts of the operations policy and the
+product direction (`d/ops-policy`). In this order:
 
+0. **Finish card Q-2 on `s2/q-2`** (backlog 2026-11-10 S-19, T-21, S-24; 2026-11-09 S-18,
+   P-15): close R-1 (a volatile tenant function behind a view in an agent's row write) with a
+   hostile test and a mutation; run the 43 open mutations with `MUTATION_STRICT=1`; at the
+   rebase onto `main` keep P-3's `set_typed_hooks` in `databases::build` and make
+   `provider::mask_plan` take the stricter of the column store and the manifest. Then a fourth
+   security review. The panel items of Q-2 (S-20 to S-23, S-25, S-26) go to the architect panel.
 1. **Security follow-ups** (2026-11-08 S-7; 2026-11-09 S-8, S-9, S-11, S-15, S-16, S-17): DQS
    off in the bundled SQLite (un-ignore the planned Q-1 test); masked copy with a view on a
    personal column; no `USAGE` on `ruum_mask` for the copy's owner; names only in
@@ -582,15 +661,18 @@ In this order:
    in run 6, among them `oauth.e2e.ts`, which failed in 2 of 4 full browser runs of this
    integration); cap the connections of the dbengine Postgres suites; `mutation_check.sh`
    prints why a mutant died.
-3. **Brand tokens for Graphite** (2026-11-09 U-1 to U-4; decision 0005 B-5, design 12.6): the
-   missing tokens with today's values (title font, icon stroke, control edge and shadow), the
-   favicon and wordmark assets, self-hosted IBM Plex. With the visual designer's Graphite work
-   (`w/graphite-theme` is open).
+3. **Graphite follow-ups** (2026-11-10 U-6 to U-10, T-22, T-23): the tab bar focus ring and the
+   forced-colours markers first (small, component CSS), then the high-contrast layer
+   (`prefers-contrast: more`, design 12.6), the visual minors V-3 to V-9, a token snapshot check
+   and forced-colours options for `drive.mjs` and the axe spec.
 4. **CI and harness** (2026-11-08 T-1, T-2, T-10; 2026-11-09 U-5).
 5. **Build server and mutation check** (2026-11-08 B-1, B-3 to B-7, the `docs/TESTING.md` half
-   of S-5; 2026-11-09 B-13 to B-16, B-18 to B-20): `--detach`, file touch, a full-check lock,
+   of S-5; 2026-11-09 B-13 to B-16, B-18 to B-20; 2026-11-10 B-22 to B-24, T-24, T-25): first
+   `hcloud.py allow-ip` and a firewall hint in `run.sh` after the person fixes the rule, the
+   GitHub Actions fallback in the README, `e2e_smoke.sh` in CI; `--detach`, file touch, a full-check lock,
    `--perl`, `cargo-deny` in `setup.sh`, a sweep of abandoned keys.
-6. **Method** (2026-11-08 M-1 to M-8; 2026-11-09 M-14 to M-19, M-21, M-22): templates and
+6. **Method** (2026-11-08 M-1 to M-8; 2026-11-09 M-14 to M-19, M-21, M-22; 2026-11-10 M-25 to
+   M-28, among them the rebase-or-no-force-push rule of the task template): templates and
    workflow; tasks name the base commit.
 7. **Translation** (2026-11-08 L-3 to L-5; 2026-11-09 L-10, L-12): a reviewer agent step for
    Estonian, visual tests in Estonian, localised emails, the voice panel follow-ups.
@@ -601,8 +683,11 @@ Waiting for the architect panel: 2026-11-08 P-1 (K-1 C-1, before Q-2), P-4, P-5,
 `isolation.rs` change of Q-1 is merged; confirm or veto), P-9; 2026-11-09 S-10 (owner-made
 `SET` and definer functions), S-14 (show agent-written text in the web UI), review-Q-1-3 N-A
 (the owner kind changes options); 2026-11-09 P-13 (rule 10 and own `pg_*` tables), P-14 (why a
-long-named column stays personal), L-11 (a size limit in the error answer). Waiting for the person: see
-`docs/digests/2026-11-09-evening.md`.
+long-named column stays personal), L-11 (a size limit in the error answer); 2026-11-10 S-20 to
+S-23, S-25, S-26 (Q-2), P-25, P-27 (the operations policy). Before the policy engine card:
+2026-11-10 P-24 (a schema and linter for `policy.yaml`). Waiting for the person: see
+`docs/digests/2026-11-10.md` (the build server firewall, the drafts of the operations policy and
+the product direction, P-28, P-29) and `docs/digests/2026-11-09-evening.md`.
 
 ## Known gaps
 
@@ -623,7 +708,7 @@ long-named column stays personal), L-11 (a size limit in the error answer). Wait
   merged, and so are cards D-1 (`createDatabase`, `getDatabase`, `updateDatabaseManifest`;
   `Services` wires the engines, the tenant keys, the delivery worker and the reconciler), T-1
   (database acceptance cases), T-2 (privacy suite), K-1 (column classes), A-1 (grants) and Q-1
-  (the query API for people, 2026-11-09). The other 12 database operations count as planned in
+  (the query API for people, 2026-11-09) and P-3 (typed-node rules of the tree, 2026-11-10; open: backlog 2026-11-09 S-18, P-17 to P-23). Card Q-2 is not merged: its security reviews did not accept it (`review-Q-2-3.md` R-1, 43 mutations not run). The other 12 database operations count as planned in
   the suites; the privacy suite is all planned until the operations and the filters of Q-2 and
   Q-3 land. Q-1 notes open: review-Q-1-3 N-A (the owner kind still changes options; the panel
   records the intended reading). N-B is fixed: query rule 10 refuses writes to the catalog
