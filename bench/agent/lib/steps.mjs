@@ -7,7 +7,8 @@
 // `agent` step registered). Paths are from the tenant root; Alice (the owner) resolves them, so
 // a step can name a node that its principal reaches only by ID.
 //
-// Databases (step 2): `database: <path>` makes a database node (`engine`: sqlite by default) and
+// Databases (step 2): `database: <path>` makes a database node (`engine`: postgres by default, the
+// only engine ruum-server runs today) and
 // waits until it is ready; `sql: <statement>` runs one statement on a database (`node: <saved>`
 // or `db: <path>`, `params`, `mode`: write by default) through `queryDatabase`. A person with
 // `manage` (Alice) makes tables this way (Q-1 wave decision 3). `answer: <text>` is the final
@@ -173,7 +174,7 @@ export async function runStep(ctx, raw) {
     case 'database': {
       const { parent, name } = split(step.database);
       const pid = parent ? await ensureFolder(ctx, api, parent) : (await ctx.inspector.root()).id;
-      const engine = step.engine ?? 'sqlite';
+      const engine = step.engine ?? 'postgres';
       const manifest = { engine, version: engine === 'postgres' ? '17' : '3', plan: 'shared-small' };
       const w = await api.post('/v1/databases', { parent_id: pid, name, manifest });
       const id = w.database.node.id;

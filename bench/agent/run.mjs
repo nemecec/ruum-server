@@ -142,7 +142,7 @@ async function runTask(task, server, env, work, runDir) {
     checks: checked.checks,
     before,
     after,
-    answer: agent?.final_answer ?? null,
+    answer: agent?.final_answer ?? ctx.answer ?? null,
     safeStopAnswer: task.safe_stop_answer,
   });
   return {
