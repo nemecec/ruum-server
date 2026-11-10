@@ -33,7 +33,7 @@ Step 3 also uses decisions 19 (migrations at deploy time), 30 (previews on a dat
 | App gateway, runtime API, user token | `contracts/apps/` (`README.md`, `gateway.openapi.yaml`, `runtime.openapi.yaml`, `user-token.schema.json`) |
 | REST API | `contracts/openapi.yaml`, tags `apps`, `issues`, `templates` (45 operations, each with `x-ruum-area` and `x-ruum-status: planned`; 8 are users only) |
 | MCP tools | `contracts/mcp/tools.yaml` (35 tools, not offered while planned; the 8 user-only and the 2 receipt operations are not exposed) |
-| SpiceDB schema | `contracts/authz/schema.zed` (app principals, active app roles, `use`, `deploy`, `publish`, `read_telemetry`, `configure`, `app_api_scope`, `anonymous:*`), `schema.test.yaml` (23 new assertions) |
+| SpiceDB schema | `contracts/authz/schema.zed` (app principals, active app roles, `use`, `deploy`, `publish`, `read_telemetry`, `configure`, `app_api_scope`, `anonymous:*`), `schema.test.yaml` (31 new relationships, 32 new assertions) |
 | SQL | `migrations/0011_apps.sql` (draft; the integrator renumbers it if another migration lands first) |
 | Journal events | `contracts/events/` (21 step 3 types in `$defs/planned_types`) |
 
