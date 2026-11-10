@@ -4,6 +4,10 @@
 //! The key is exchanged at `POST /v1/oauth/token` (RFC 8693 token exchange) for a 15-minute
 //! access token. The CLI keeps the key and the current token in the credentials file (mode
 //! 0600) and exchanges the key again when the token is about to end or the API answers `401`.
+//!
+//! A person can give their own access token instead (`--token`, `RUUM_TOKEN`): it is sent as it
+//! is, never saved and never exchanged. Some operations are for people only (`ruum db grant`,
+//! `ruum db confirm`).
 
 use anyhow::{Context as _, Result, anyhow};
 use reqwest::{Method, StatusCode};
@@ -93,6 +97,8 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub hint: Option<String>,
+    /// The `Retry-After` header in seconds (for example `503 database_not_ready`).
+    pub retry_after: Option<u64>,
 }
 
 impl std::fmt::Display for ApiError {
@@ -100,6 +106,9 @@ impl std::fmt::Display for ApiError {
         write!(f, "{}: {}", self.code, self.message)?;
         if let Some(h) = &self.hint {
             write!(f, "\nhint: {h}")?;
+        }
+        if let Some(s) = self.retry_after {
+            write!(f, "\nretry after: {s} s")?;
         }
         Ok(())
     }
@@ -110,6 +119,11 @@ impl std::error::Error for ApiError {}
 impl ApiError {
     async fn from_response(res: reqwest::Response) -> Self {
         let status = res.status();
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
         let text = res.text().await.unwrap_or_default();
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let e = &v["error"];
@@ -119,6 +133,7 @@ impl ApiError {
                 code: code.to_string(),
                 message: e["message"].as_str().unwrap_or_default().to_string(),
                 hint: e["hint"].as_str().map(str::to_string),
+                retry_after,
             };
         }
         // OAuth errors of the token endpoint (`OAuthError`):
@@ -141,6 +156,7 @@ impl ApiError {
                 code,
                 message,
                 hint: Some(hint.into()),
+                retry_after,
             };
         }
         Self {
@@ -152,6 +168,7 @@ impl ApiError {
                 text.chars().take(300).collect()
             },
             hint: None,
+            retry_after,
         }
     }
 }
@@ -170,6 +187,10 @@ pub struct Client {
     creds: Credentials,
     /// Where the token is saved; `None` keeps it in memory (a key from the command line).
     path: Option<PathBuf>,
+    /// A person's access token: sent as it is, never exchanged or saved.
+    user_token: Option<String>,
+    /// The `Ruum-Tenant` header (a person names the tenant; an agent token is bound to one).
+    tenant: Option<String>,
 }
 
 impl Client {
@@ -190,7 +211,39 @@ impl Client {
                 expires_at: None,
             },
             path,
+            user_token: None,
+            tenant: None,
         })
+    }
+
+    /// A client for `url` with a person's access token (`--token`). Nothing is sent yet, and
+    /// nothing is saved.
+    pub fn with_user_token(url: &str, token: &str) -> Result<Self> {
+        let url = check_url(url)?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(anyhow!("the access token is empty"));
+        }
+        if token.starts_with(API_KEY_PREFIX) {
+            return Err(anyhow!(
+                "--token takes a person's access token, not an agent API key\nhint: give an agent key with --api-key"
+            ));
+        }
+        Ok(Self {
+            http: http_client()?,
+            creds: Credentials {
+                url,
+                ..Credentials::default()
+            },
+            path: None,
+            user_token: Some(token.to_string()),
+            tenant: None,
+        })
+    }
+
+    /// Sends the `Ruum-Tenant` header with every request from now on.
+    pub fn set_tenant(&mut self, tenant: Option<String>) {
+        self.tenant = tenant;
     }
 
     /// A client from saved credentials (the cached token is reused while it is valid).
@@ -200,6 +253,8 @@ impl Client {
             http: http_client()?,
             creds,
             path: Some(path),
+            user_token: None,
+            tenant: None,
         })
     }
 
@@ -248,6 +303,9 @@ impl Client {
     }
 
     async fn token(&mut self) -> Result<String> {
+        if let Some(t) = &self.user_token {
+            return Ok(t.clone());
+        }
         let valid = matches!(
             (&self.creds.access_token, self.creds.expires_at),
             (Some(_), Some(exp)) if exp > now() + TOKEN_MARGIN
@@ -283,6 +341,9 @@ impl Client {
             if let Some(k) = &idem {
                 req = req.header("Idempotency-Key", k);
             }
+            if let Some(t) = &self.tenant {
+                req = req.header("Ruum-Tenant", t);
+            }
             for (k, v) in headers {
                 req = req.header(*k, v);
             }
@@ -297,7 +358,7 @@ impl Client {
                 .send()
                 .await
                 .with_context(|| format!("connect to {}", self.creds.url))?;
-            if res.status() == StatusCode::UNAUTHORIZED && !retried {
+            if res.status() == StatusCode::UNAUTHORIZED && !retried && self.user_token.is_none() {
                 retried = true;
                 self.creds.access_token = None;
                 continue;

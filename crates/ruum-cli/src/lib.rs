@@ -2,13 +2,19 @@
 //! API with an agent API key (`ruum_agent_...`), which it exchanges for short-lived access
 //! tokens. Paths are from the tenant root: `/Projects/Garden/plan.md`.
 //!
+//! A person can give their own access token with `--token` (`RUUM_TOKEN`) instead; it is never
+//! saved. `ruum db grant` and `ruum db confirm` are for people only.
+//!
 //! Every command prints text for people, or the API's JSON with `--json` (for scripts and
 //! agents). An API error prints its Ruum code, message and hint, and the exit code is 1.
 //!
 //! Owned by the MCP server + CLI area.
 
 pub mod client;
+mod db;
 mod upload;
+
+pub use db::DbCommand;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -31,6 +37,20 @@ pub struct Cli {
     /// An agent API key (`ruum_agent_...`). Overrides the key of `ruum login`; not saved.
     #[arg(long, env = "RUUM_API_KEY", hide_env_values = true, global = true)]
     pub api_key: Option<String>,
+    /// A person's access token, sent as it is (for commands that only people may run, such as
+    /// `ruum db grant`). Not saved. Cannot be given with --api-key.
+    #[arg(
+        long,
+        env = "RUUM_TOKEN",
+        hide_env_values = true,
+        global = true,
+        conflicts_with = "api_key"
+    )]
+    pub token: Option<String>,
+    /// The tenant (space) ID to act in, sent as the `Ruum-Tenant` header. Default with --token:
+    /// the person's home space. An agent key is bound to its tenant.
+    #[arg(long, env = "RUUM_TENANT", global = true)]
+    pub tenant: Option<String>,
     /// The credentials file. Default: ~/.config/ruum/credentials.json.
     #[arg(long, env = "RUUM_CREDENTIALS", global = true)]
     pub credentials: Option<PathBuf>,
@@ -145,6 +165,9 @@ pub enum Command {
     },
     /// List your agents (an agent sees itself).
     Agents,
+    /// Databases: create, show, query, data classes and agent grants.
+    #[command(subcommand)]
+    Db(DbCommand),
 }
 
 /// Runs the command line `args` (without the program name), writing to `out`.
@@ -180,6 +203,14 @@ pub async fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         _ => {}
     }
     let mut c = client_for(&cli, creds_path)?;
+    if cli.token.is_some() && cli.tenant.is_none() {
+        // A person acts in one space per request: the home space unless --tenant names one.
+        let me = c.get("/v1/me", &[]).await?;
+        let home = me["user"]["home_tenant_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("the answer of /v1/me has no home space"))?;
+        c.set_tenant(Some(home.to_string()));
+    }
     let mut ctx = Ctx {
         c: &mut c,
         out,
@@ -217,6 +248,7 @@ pub async fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             follow,
         } => ctx.changes(cursor, limit, follow).await,
         Command::Agents => ctx.agents().await,
+        Command::Db(cmd) => ctx.db(cmd).await,
     }
 }
 
@@ -229,6 +261,17 @@ pub fn report(e: &anyhow::Error) -> String {
 }
 
 fn client_for(cli: &Cli, creds_path: PathBuf) -> Result<Client> {
+    let mut c = client_without_tenant(cli, creds_path)?;
+    c.set_tenant(cli.tenant.clone());
+    Ok(c)
+}
+
+fn client_without_tenant(cli: &Cli, creds_path: PathBuf) -> Result<Client> {
+    if let Some(token) = &cli.token {
+        // A person's token is sent only to the URL given here, or to the default.
+        let url = cli.url.clone().unwrap_or_else(|| DEFAULT_URL.into());
+        return Client::with_user_token(&url, token);
+    }
     if let Some(key) = &cli.api_key {
         let saved = Credentials::load(&creds_path).ok().flatten();
         let url = cli
