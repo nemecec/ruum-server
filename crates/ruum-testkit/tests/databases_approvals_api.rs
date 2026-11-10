@@ -112,9 +112,7 @@ fn cases() -> Vec<Case> {
                 // The fixture request is the pending read_personal request of `agent`: its user
                 // denies it first, so the agent can ask anew.
                 let fx = fixture_request(&cx);
-                let denied = cx
-                    .ok(Who::Member, decide(&cx, &fx, "deny"), &[200])
-                    .await?;
+                let denied = cx.ok(Who::Member, decide(&cx, &fx, "deny"), &[200]).await?;
                 check!(denied["status"] == "denied", "the denial: {denied}");
                 let first = cx
                     .ok(Who::Agent, ask(&cx, "read_personal", 60), &[201])
