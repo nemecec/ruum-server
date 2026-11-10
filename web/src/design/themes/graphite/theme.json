@@ -3,7 +3,7 @@
   "format": 1,
   "id": "graphite",
   "name": "Graphite",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "The default brand of Ruum (decision 0005 B-5): cool graphite neutrals, fjord blue for actions, raspberry plum for agents, IBM Plex Sans and Mono, square corners and square icon strokes.",
   "author": "Ruum",
   "license": "Apache-2.0",

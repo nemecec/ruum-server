@@ -44,7 +44,7 @@ canvas in light (5.02:1) and text-faint on surface in dark (5.50:1).
 |---|---|---|---|
 | `--color-canvas` | `#F6F7F8` | `#0F1215` | Page background (cool graphite) |
 | `--color-surface` | `#FFFFFF` | `#171B20` | Cards, panels, dialogs, the list |
-| `--color-sunken` | `#ECEEF1` | `#0B0D10` | Top bar, rail, code, table header, compare background |
+| `--color-sunken` | `#EAECEF` | `#1D2228` | Top bar, rail, code, table header, compare background |
 | `--color-border` | `#D9DDE2` | `#2A3038` | Dividers and card edges (decorative, no contrast need) |
 | `--color-border-control` | `#7B828C` | `#6F7883` | Borders of inputs, selects, checkboxes (3:1) |
 | `--color-text` | `#16191D` | `#E6E9ED` | Body text, headings |
@@ -74,7 +74,9 @@ Rules:
   `+` and the word "Added" for screen readers; the agent mark is a glyph and a name.
 - **Tag colours** come from a fixed set of 8 (spruce, moss, clay, brick, ochre, slate, plum, sand)
   with a light and a dark value each (`--color-tag-*`), used as a 3 px left edge and a dot, never
-  as text colour. The API's free `color` value maps to the nearest of the 8 (`nearestTagColor`).
+  as text colour. The API's free `color` value maps to the nearest of the 8 (`nearestTagColor`,
+  which keeps the original light values, so stored colours map as before). In Graphite, plum is a
+  blue violet, away from the raspberry agent colour (UX panel V-1).
 
   | Tag | Light | Dark |
   |---|---|---|
@@ -84,7 +86,7 @@ Rules:
   | brick | `#A3301C` | `#F08B74` |
   | ochre | `#7F5300` | `#E2B455` |
   | slate | `#4A5868` | `#9AA8B8` |
-  | plum | `#6E3B5E` | `#C99BBC` |
+  | plum | `#5B4A94` | `#B0A4E0` |
   | sand | `#8A7A55` | `#C8B78E` |
 - **Diff colours**: insertions on `--color-success-soft` with `--color-success` text, deletions
   on `--color-danger-soft` with `--color-danger` text and a strike-through.

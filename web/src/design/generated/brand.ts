@@ -28,7 +28,7 @@ export const wordmark: Omit<BrandShape, 'tag'> | null = {
     {
       "tag": "g",
       "props": {
-        "stroke": "var(--color-text, #16191d)",
+        "stroke": "currentColor",
         "strokeWidth": "7"
       },
       "children": [

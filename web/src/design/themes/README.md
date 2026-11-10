@@ -31,8 +31,10 @@ components change only through tokens.
 - **SVGs** hold only plain shapes (`svg`, `g`, `path`, `rect`, `circle`, `ellipse`, `line`,
   `polyline`, `polygon`, `title`) with geometry and paint attributes. Paint is `none`,
   `currentColor`, a hex colour or `var(--color-<token>, #fallback)`. No script, style, text,
-  links, `use`, filters or event attributes. The wordmark uses `var(--color-*)` so it follows
-  light and dark; the favicon uses fixed colours (an image cannot read the page's properties).
+  links, `use`, filters or event attributes. The wordmark uses `currentColor` (the text colour of
+  the top bar) and `var(--color-*)`, so it follows light and dark; draw the name itself in
+  `currentColor`, because forced colours repaint only that. The favicon uses fixed colours (an
+  image cannot read the page's properties).
 - **Fonts** are WOFF2 files in the package. The build writes one `@font-face` per file with the
   unicode range of its subset. Nothing loads from a font host.
 - **Limits**: 64 files, 4 MB in all; theme.json 64 KB, a token file 256 KB, an SVG 64 KB, a PNG
@@ -44,7 +46,7 @@ components change only through tokens.
 `node scripts/check-theme.mjs [folder ...]` (in `npm run lint`) checks the manifest against the
 schema, the files (types, sizes, PNG and WOFF2 signatures, PNG sizes), the token overrides, the
 SVGs, and the WCAG 2.2 contrast of every pair of `scripts/theme-lib.mjs` in light and dark, with
-the theme over the core: 34 text and control pairs and the 8 tag colours, per scheme. A failing
+the theme over the core: 35 text and control pairs and the 8 tag colours, per scheme. A failing
 theme is refused, and the failing pairs are listed with their ratios. `--verbose` lists every pair.
 
 ## The build
@@ -76,4 +78,11 @@ the app icon is "ru" in a fjord frame. The source of the palette and the directi
 `docs/ux/brand/`. The PNG app icons are drawn from the favicon geometry (axis-aligned strokes,
 scaled to 78% so the iOS corner rounding does not touch the frame).
 
-Lowest text pairs: light text-faint on canvas 5.02:1, dark text-faint on surface 5.50:1.
+Lowest text pairs: light text-faint on sunken 4.55:1, dark text-faint on sunken 5.09:1.
+
+After the UX panel (V-1, V-2, access 1): the plum tag is a blue violet (`#5b4a94`, dark
+`#b0a4e0`), so a tag no longer looks like the agent colour; dark `sunken` is a raised tone
+(`#1d2228`) between surface and border, so table headers, the top bar and the rail read as bands,
+not holes, and light `sunken` steps a little further from the canvas (`#eaecef`); the letters of
+the wordmark use `currentColor` (the colour of `.ui-brand`, the text colour), so forced colours
+repaint them.

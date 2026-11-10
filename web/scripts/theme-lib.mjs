@@ -69,6 +69,7 @@ export const pairs = [
   ['text-muted', 'selected', 4.5, 'secondary text in a selected row'],
   ['text-faint', 'surface', 4.5, 'placeholders and timestamps'],
   ['text-faint', 'canvas', 4.5, 'timestamps on the page'],
+  ['text-faint', 'sunken', 4.5, 'timestamps in a hovered row, placeholders in the top bar'],
   ['link', 'canvas', 4.5, 'links'],
   ['link', 'surface', 4.5, 'links on cards'],
   ['link', 'selected', 4.5, 'links in a selected row'],

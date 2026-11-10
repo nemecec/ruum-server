@@ -28,11 +28,11 @@
       "$value": {
         "colorSpace": "srgb",
         "components": [
+          0.917647,
           0.92549,
-          0.933333,
-          0.945098
+          0.937255
         ],
-        "hex": "#eceef1"
+        "hex": "#eaecef"
       }
     },
     "border": {
@@ -315,6 +315,19 @@
         ],
         "hex": "#16191d",
         "alpha": 0.14
+      }
+    },
+    "tag": {
+      "plum": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [
+            0.356863,
+            0.290196,
+            0.580392
+          ],
+          "hex": "#5b4a94"
+        }
       }
     }
   }

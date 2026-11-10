@@ -205,7 +205,7 @@ Graphite:
 |---|---|---|
 | `canvas` | `#f6f7f8` | `#0f1215` |
 | `surface` | `#ffffff` | `#171b20` |
-| `sunken` | `#eceef1` | `#0b0d10` |
+| `sunken` | `#eaecef` | `#1d2228` |
 | `border` | `#d9dde2` | `#2a3038` |
 | `border-control` | `#7b828c` | `#6f7883` |
 | `text` | `#16191d` | `#e6e9ed` |

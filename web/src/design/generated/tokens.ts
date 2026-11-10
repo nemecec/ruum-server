@@ -5,7 +5,7 @@
 export const themes = ["light","dark"] as const
 
 /** The theme package the tokens come from (design 12.6). */
-export const theme = {"id":"graphite","name":"Graphite","version":"1.0.0"} as const
+export const theme = {"id":"graphite","name":"Graphite","version":"1.0.1"} as const
 
 export const tokens = {
   'font-family-sans': "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', sans-serif",
@@ -101,7 +101,7 @@ export const tokens = {
   'breakpoint-wide': "900px",
   'color-canvas': "#f6f7f8",
   'color-surface': "#ffffff",
-  'color-sunken': "#eceef1",
+  'color-sunken': "#eaecef",
   'color-border': "#d9dde2",
   'color-border-control': "#7b828c",
   'color-text': "#16191d",
@@ -130,7 +130,7 @@ export const tokens = {
   'color-tag-brick': "#a3301c",
   'color-tag-ochre': "#7f5300",
   'color-tag-slate': "#4a5868",
-  'color-tag-plum': "#6e3b5e",
+  'color-tag-plum': "#5b4a94",
   'color-tag-sand': "#8a7a55",
   'color-backdrop': "rgba(22, 25, 29, 0.4)",
   'color-shadow-1': "rgba(22, 25, 29, 0.08)",

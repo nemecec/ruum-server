@@ -46,7 +46,7 @@ export const directions = {
   },
   graphite: {
     light: {
-      canvas: '#f6f7f8', surface: '#ffffff', sunken: '#eceef1', border: '#d9dde2', 'border-control': '#7b828c',
+      canvas: '#f6f7f8', surface: '#ffffff', sunken: '#eaecef', border: '#d9dde2', 'border-control': '#7b828c',
       text: '#16191d', 'text-muted': '#4b525b', 'text-faint': '#646b75',
       primary: '#0b5c86', 'primary-hover': '#084a6c', 'on-primary': '#ffffff', 'primary-soft': '#e1eef6',
       link: '#0b5c86', focus: '#0b5c86', selected: '#e1eef6',
@@ -55,7 +55,7 @@ export const directions = {
       agent: '#8f3f71', 'agent-soft': '#f6e6f0',
     },
     dark: {
-      canvas: '#0f1215', surface: '#171b20', sunken: '#0b0d10', border: '#2a3038', 'border-control': '#6f7883',
+      canvas: '#0f1215', surface: '#171b20', sunken: '#1d2228', border: '#2a3038', 'border-control': '#6f7883',
       text: '#e6e9ed', 'text-muted': '#a3abb5', 'text-faint': '#8a929c',
       primary: '#6cb8e6', 'primary-hover': '#8fcbef', 'on-primary': '#06202e', 'primary-soft': '#13293a',
       link: '#7cc2ec', focus: '#6cb8e6', selected: '#152a3a',
