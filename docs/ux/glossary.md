@@ -108,6 +108,22 @@ separated by " / " or "; " and pair by position; one Estonian entry stands for a
 | write access / personal data access | Short-time extra access for agents | write grant | kirjutusligipääs (kirjutusligipääs-) / isikuandmete ligipääs (isikuandmete ligipääs-) |
 | request; Waiting for you; Approve / Deny | An agent asks a person | ticket | taotlus; Ootab sind; Kinnita / Keeldu |
 
+### Apps and publishing (step 3, design 9.12)
+
+Users never see environments or pipelines (decided by the person, 2026-11-10). These terms apply to the UI,
+emails, error texts and examples in them; technical documentation for developers and operators may use the
+technical words.
+
+| Term | Meaning | Never | Estonian |
+|---|---|---|---|
+| draft | The changes being worked on, not visible to the app's users | staging, branch (for code), dev environment | mustand (mustand-) |
+| preview | A private, working copy of the app with the draft's changes | staging site, test environment | eelvaade (eelvaade-) |
+| publish | Make the draft live for the app's users | deploy, release, promote, ship | avalda (avalda-) |
+| live | What the app's users use now | production, prod, environment | avaldatud (avaldatud-) |
+| go back to the previous version | Undo a publish | rollback, revert, redeploy | mine tagasi eelmisele versioonile |
+
+"Branch" stays the approved term only for a **database** branch (above).
+
 ## Do not translate
 
 Keep these as they are, in every language, also inside sentences:
