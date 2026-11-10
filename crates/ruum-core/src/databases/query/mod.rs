@@ -1285,10 +1285,18 @@ async fn run(
     }
     let role = RoleRef::new(row.database_ref(), kind)
         .map_err(|e| Error::Internal(format!("role: {e}")))?;
+    // An agent's statement that writes no row runs read-only, also in mode `write`: a tenant
+    // function that it calls (through a view) cannot write or change the schema with the rights
+    // of its owner then (the P-1 rule of review-Q-2-2 covers triggers and rules of row writes).
+    let engine_mode = if is_agent && !row_write {
+        StatementMode::Read
+    } else {
+        mode
+    };
     let request = StatementRequest {
         sql: req.sql.clone(),
         params: req.params.iter().map(param_value).collect(),
-        mode,
+        mode: engine_mode,
         timeout,
         max_rows,
         max_bytes: u64::try_from(s.max_result_bytes).ok(),

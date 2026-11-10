@@ -920,6 +920,46 @@ async fn the_lens_follows_confirmations_and_the_stricter_of_store_and_manifest()
         assert_eq!(r.rows[0][0], hidden("secret"), "{:?}", r.rows);
         assert_eq!(r.rows[0][1], hidden("secret"), "{:?}", r.rows);
     }
+    // A manifest version that the reconciler applies (as after `restoreVersion`): the provider's
+    // `applyManifest` rebuilds the lens too. The version takes `nick` out of `data_classes`, so
+    // it reads as a pseudonym again (store `normal`, manifest none: `personal`).
+    let typed = d.typed.get(pg.w.team.id, pg.db).await.unwrap().unwrap();
+    let mut manifest = d
+        .store
+        .manifest(pg.w.team.id, typed.desired_version)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = manifest.clone();
+    manifest["data_classes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("public.people.nick");
+    let manifest = crate::databases::manifest::check(&manifest, Some(&current), false).unwrap();
+    d.store
+        .put_manifest(
+            &pg.alice(),
+            pg.db,
+            &manifest,
+            Some("restored"),
+            typed.desired_version,
+            None,
+        )
+        .await
+        .unwrap();
+    let round = crate::providers::reconciler::Reconciler::new(
+        pg.w.s.typed_nodes.clone(),
+        pg.w.s.providers.clone(),
+    )
+    .settled(Duration::ZERO)
+    .run_once()
+    .await
+    .unwrap();
+    assert_eq!(round.applied, 1, "{round:?}");
+    let r = pg
+        .ok(&agent, sql("select nick from people where id = 1"))
+        .await;
+    assert!(is_pseudonym_marker(&r.rows[0][0]), "{}", r.rows[0][0]);
     pg.drop().await;
 }
 
@@ -1380,5 +1420,47 @@ async fn labels_of_whole_rows_and_estimates_of_plans() {
         );
         assert_eq!(seen.0, seen.1, "{common}");
     }
+    pg.drop().await;
+}
+
+/// An agent's statement that writes no row runs read-only, also in mode `write`: a `SECURITY
+/// DEFINER` function of the tenant behind a view cannot copy a secret into a table the agent may
+/// read (found while closing review-Q-2-2 P-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_statements_that_write_no_row_run_read_only() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    for s in [
+        "create table stash (id serial primary key, what text)",
+        "create function stash_it() returns integer language plpgsql volatile security definer \
+         set search_path = public as $$ begin insert into stash (what) \
+         select token from people where id = 1; return 1; end $$",
+        "create view sv as select id, stash_it() as s from people where id = 1",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    pg.confirm(&[
+        ("stash", "id", DataClass::Normal),
+        ("stash", "what", DataClass::Normal),
+    ])
+    .await;
+    pg.grant(GrantKind::WriteLive).await;
+    let (status, code, _) = pg.refused(&pg.agent(), write("select s from sv")).await;
+    assert_eq!((status, code.as_str()), (400, "read_only_query"));
+    assert_eq!(
+        pg.count(&a, "select count(*) from stash").await,
+        json!(0),
+        "nothing was copied"
+    );
+    let r = pg.ok(&pg.agent(), sql("select what from stash")).await;
+    assert!(r.rows.is_empty());
+    // A row write of the agent still runs (no trigger or rule in the database).
+    let r = pg
+        .ok(
+            &pg.agent(),
+            write("update orders set amount = 9 where id = 1"),
+        )
+        .await;
+    assert_eq!(r.rows_affected, Some(1));
     pg.drop().await;
 }

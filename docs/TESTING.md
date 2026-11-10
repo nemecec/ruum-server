@@ -288,9 +288,12 @@ case under at least one mutation, planned or moved up (a moved-up file keeps its
 Q-2 moved up 15 of them; four guard rules that the statement rules hold before the engine
 (the key, the pseudonym function, `pg_stats`, role membership), so their `TESTS` are the hostile
 engine tests of `ruum-core` (`query::postgres_mask::engine_tests`), which reach the engine through
-dynamic SQL in a string. Three stay planned with a reason: `privacy-write-class-read-required`
-(the write cases need branches, D-3), `privacy-error-detail` and `privacy-schema-values` (no
-single-file mutation can break them; for the panel).
+dynamic SQL in a string. `privacy-error-detail` moved up as two mutations, one per line of the
+rule (the engine keeps no `DETAIL`: the dbengine test `errors_hold_no_row_values`; the query
+layer's fixed text: the unit test `engine_errors_are_sanitized_without_manage`), because the T-2
+cases need both lines broken (review-Q-2-2). Two stay planned with a reason:
+`privacy-write-class-read-required` (the write cases need branches, D-3) and
+`privacy-schema-values` (no code path holds a value; for the panel).
 
 **When a card lands.** The card removes its planned marks (or its `waits` entry, or sets
 `SQLITE_WAITS_FOR` to `None`; Q-2 and Q-3 remove their entry of `FILTER_WAITS_FOR`). A
