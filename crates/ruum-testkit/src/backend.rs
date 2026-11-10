@@ -173,6 +173,16 @@ impl Backend {
         self.kind
     }
 
+    /// Whether the databases of `engine` run on an engine with a lens in this run
+    /// (`DatabaseEngine::has_lens`): on the Postgres backend, the Postgres engine of
+    /// `RUUM_DBHOST_URL` for `postgres` manifests. The memory engine has none.
+    pub fn engine_has_lens(&self, engine: ruum_core::databases::engine::EngineKind) -> bool {
+        self.pg
+            .as_ref()
+            .and_then(|pg| pg.engines.get(engine))
+            .is_some_and(|e| e.has_lens())
+    }
+
     /// A short name for reports: `memory`, `postgres (memory authz)` or
     /// `postgres (spicedb, rls off)`.
     pub fn name(&self) -> String {

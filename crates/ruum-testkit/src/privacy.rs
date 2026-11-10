@@ -3932,6 +3932,27 @@ async fn run_one(backend: &Backend, case: Case, engine: Engine) -> (Outcome, Opt
     if let Some(why) = case.planned_reason(engine, backend.kind()) {
         return (Outcome::Planned, Some(why));
     }
+    // Without the data cluster the Postgres backend gives `postgres` manifests the memory
+    // engine, on which no privacy case may run (MEMORY_ENGINE). Planned with the reason, or a
+    // failure where the data cluster is required (CI, RUUM_DBENGINE_REQUIRE_POSTGRES).
+    let kind = match engine {
+        Engine::Postgres => ruum_core::databases::engine::EngineKind::Postgres,
+        Engine::Sqlite => ruum_core::databases::engine::EngineKind::Sqlite,
+    };
+    if !backend.engine_has_lens(kind) {
+        let why = format!(
+            "no {} engine with a lens in this run: postgres manifests use the memory engine \
+             (set RUUM_DBHOST_URL to the data cluster)",
+            engine.name()
+        );
+        let required = std::env::var_os("CI").is_some()
+            || std::env::var_os("RUUM_DBENGINE_REQUIRE_POSTGRES").is_some();
+        return if required {
+            (Outcome::Failed(why), None)
+        } else {
+            (Outcome::Planned, Some(why))
+        };
+    }
     let (state, db) = backend.world().await;
     let w = fixtures::seed(&state).await;
     let result = if !w.seeded {
