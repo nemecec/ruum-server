@@ -120,6 +120,13 @@
 //! schemas hold a *refusal view* of the same name in its place ([`refusal_view_sql`]), and a
 //! statement that reads it gets `statement_not_allowed` with the hint `tenant_code_on_live`. The
 //! same holds for every view that reads such a relation ([`code_relations`]).
+//!
+//! Two more places run code on the real values, and the allow-list covers both (review
+//! Q-2-harden-2 F-1 and F-2): a cast to a domain runs the checks of the domain (a view or a
+//! policy that coerces to a domain with a check outside the list is outside the list, also when
+//! the domain is nested in another type), and an index calls the support functions and operators
+//! of its operator class on the raw keys (a table or materialized view with such an index, and
+//! every view that reads it, is refused: [`index_relations`]).
 
 use super::allow;
 use super::errors::internal;
@@ -478,12 +485,12 @@ pub const REFUSAL_TEXT: &str = "ruum:tenant_code_on_live";
 pub(crate) async fn policy_edges(
     conn: &mut PgConnection,
 ) -> Result<Vec<(u32, Option<u32>)>, EngineError> {
-    let allowed = allow::allowed_cte(1);
+    let allowed = allow::ctes(1);
     let unlisted = allow::unlisted(
         "pg_catalog.concat_ws(' ', y.polqual::pg_catalog.text, y.polwithcheck::pg_catalog.text)",
     );
     let sql = format!(
-        "with {allowed}
+        "with recursive {allowed}
          select y.polrelid::pg_catalog.int8 as rel, null::pg_catalog.int8 as names
            from pg_catalog.pg_policy y
            join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) y.polrelid
@@ -520,17 +527,52 @@ pub(crate) async fn policy_edges(
         .collect())
 }
 
+/// The relations of `public` with an index whose operator class holds a support function or an
+/// operator outside the allow-list (review-Q-2-harden-2 F-2; [`allow::unlisted_index_support`]),
+/// and the relations that inherit from or are partitions of them: a scan of the index, or of the
+/// parent that reads it, calls the function on the raw keys. Run as `mask` in the caller's
+/// transaction.
+pub(crate) async fn index_relations(conn: &mut PgConnection) -> Result<Vec<u32>, EngineError> {
+    let ctes = allow::ctes(1);
+    let unlisted = allow::unlisted_index_support("i");
+    let sql = format!(
+        "with recursive {ctes},
+         bad(rel) as (
+           select i.indrelid from pg_catalog.pg_index i
+             join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) i.indrelid
+            where c.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
+              and {unlisted}
+           union
+           select h.inhparent from pg_catalog.pg_inherits h
+             join bad on bad.rel operator(pg_catalog.=) h.inhrelid
+         )
+         select rel::pg_catalog.int8 as rel from bad"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .bind(allow::row_functions())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| internal("read the index support functions", e))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<i64, _>("rel") as u32)
+        .collect())
+}
+
 /// The relations of `public` whose read would run code outside the allow-list on the real rows
 /// (review-Q-2-s21-2 R-1 and R-2, review-Q-2-harden H-1): a view that reaches such a function
 /// ([`allow`]; `facts.unlisted`), a table with a policy that reaches one (the lens view reads
 /// the table as `mask`, so its policies run), and every view or policy table that reads such a
 /// relation. A materialized view runs nothing when it is read. The lens builds these as refusal
 /// views in both masked lenses ([`refusal_view_sql`]). `edges` are the [`policy_edges`]: `None`
-/// for a function or operator outside the allow-list.
+/// for a function or operator outside the allow-list. `indexes` are the [`index_relations`]: a
+/// table or a materialized view whose index would call code outside the list on the raw keys.
 pub(crate) fn code_relations(
     catalog: &Catalog,
     facts: &[super::depends::RootFacts],
     edges: &[(u32, Option<u32>)],
+    indexes: &[u32],
 ) -> HashSet<u32> {
     let views: HashSet<u32> = catalog
         .tables
@@ -547,6 +589,7 @@ pub(crate) fn code_relations(
         .filter(|f| f.unlisted)
         .map(|f| f.rel)
         .chain(edges.iter().filter(|(_, n)| n.is_none()).map(|(r, _)| *r))
+        .chain(indexes.iter().copied())
         .collect();
     loop {
         let before = code.len();
@@ -674,7 +717,8 @@ pub(crate) async fn build_views(
     let facts = super::depends::root_facts(conn).await?;
     let secret_reading = secret_reading(catalog, spec, &facts);
     let edges = policy_edges(conn).await?;
-    let refused = code_relations(catalog, &facts, &edges);
+    let indexes = index_relations(conn).await?;
+    let refused = code_relations(catalog, &facts, &edges, &indexes);
     let types = column_types(conn, &refused).await?;
     for table in catalog.tables.iter().filter(|t| t.schema == "public") {
         let refused_rel = table

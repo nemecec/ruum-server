@@ -367,6 +367,502 @@ async fn code_outside_the_list_refuses_masked_writes() {
     }
 }
 
+/// The attack of review-Q-2-harden-2 F-1 as a statement: force the cast in the view with
+/// `count(x)` (a plain `count(*)` evaluates nothing), then read the setting that the check
+/// wrote.
+fn domain_attack(relation: &str) -> String {
+    format!(
+        "WITH a AS MATERIALIZED (SELECT count(x) AS c FROM {relation} WHERE id = 1) \
+         SELECT c, current_setting('ruum.v', true) AS s FROM a"
+    )
+}
+
+/// The tenant function that a domain check calls to carry a whole value out through a session
+/// setting (review-Q-2-harden-2 F-1), and the domain with that check.
+const LEAK_DOMAIN: &str = "CREATE FUNCTION leakd(t text) RETURNS text LANGUAGE plpgsql AS \
+     $$ BEGIN EXECUTE format('set local ruum.v = %L', t); RETURN 'ok'; END $$; \
+     CREATE DOMAIN leaked AS text CHECK (leakd(VALUE) = 'ok')";
+const DROP_LEAK_DOMAIN: &str = "DROP DOMAIN leaked CASCADE; DROP FUNCTION leakd(text)";
+
+/// One domain coercion that reaches a check outside the allow-list: what it makes, what removes
+/// it, the relation that the lens must refuse, and whether the statement of
+/// [`domain_attack`] carries the value out when nothing guards it (the owner kind shows it).
+struct DomainCase {
+    label: &'static str,
+    make: String,
+    unmake: String,
+    relation: &'static str,
+    carries: bool,
+}
+
+fn domain_cases() -> Vec<DomainCase> {
+    let leak = |label, view: &str, extra: &str, extra_drop: &str| DomainCase {
+        label,
+        make: format!("{LEAK_DOMAIN}; {extra} CREATE VIEW bad AS {view}"),
+        unmake: format!("DROP VIEW bad; {extra_drop} {DROP_LEAK_DOMAIN}"),
+        relation: "bad",
+        carries: true,
+    };
+    vec![
+        leak(
+            "a cast to a domain whose check calls a tenant function (F-1)",
+            "SELECT id, body::leaked AS x FROM t",
+            "",
+            "",
+        ),
+        leak(
+            "a cast to a domain over that domain (nested)",
+            "SELECT id, body::outer_d AS x FROM t",
+            "CREATE DOMAIN outer_d AS leaked CHECK (VALUE <> '');",
+            "DROP DOMAIN outer_d;",
+        ),
+        leak(
+            "a cast to a domain over a domain over that domain",
+            "SELECT id, body::top_d AS x FROM t",
+            "CREATE DOMAIN mid_d AS leaked; CREATE DOMAIN top_d AS mid_d CHECK (VALUE <> '');",
+            "DROP DOMAIN top_d; DROP DOMAIN mid_d;",
+        ),
+        leak(
+            "a cast to a domain whose own check casts to that domain",
+            "SELECT id, body::wraps AS x FROM t",
+            "CREATE DOMAIN wraps AS text CHECK (VALUE::leaked IS NOT NULL);",
+            "DROP DOMAIN wraps;",
+        ),
+        leak(
+            "a cast to an array of that domain",
+            "SELECT id, ARRAY[body]::leaked[] AS x FROM t",
+            "",
+            "",
+        ),
+        leak(
+            "a cast to a domain over an array of that domain",
+            "SELECT id, ARRAY[body]::leaked[]::arr_d AS x FROM t",
+            "CREATE DOMAIN arr_d AS leaked[] CHECK (VALUE IS NOT NULL);",
+            "DROP DOMAIN arr_d;",
+        ),
+        leak(
+            "a row of a composite type with a field of that domain",
+            "SELECT id, ROW(body)::pair AS x FROM t",
+            "CREATE TYPE pair AS (a leaked);",
+            "DROP TYPE pair;",
+        ),
+        leak(
+            "a cast to that domain through a view over a view",
+            "SELECT id, x FROM bad0",
+            "CREATE VIEW bad0 AS SELECT id, body::leaked AS x FROM t;",
+            "DROP VIEW bad0;",
+        ),
+        DomainCase {
+            label: "a domain whose check takes advisory locks (built-in functions only)",
+            make:
+                "CREATE DOMAIN locked AS text CHECK (pg_try_advisory_xact_lock(7, length(VALUE))); \
+                   CREATE VIEW bad AS SELECT id, body::locked AS x FROM t"
+                    .to_string(),
+            unmake: "DROP VIEW bad; DROP DOMAIN locked".to_string(),
+            relation: "bad",
+            carries: false,
+        },
+        DomainCase {
+            label: "a domain whose check advances a sequence (built-in functions only)",
+            make: "CREATE DOMAIN counted AS integer CHECK (nextval('side') > 0); \
+                   CREATE VIEW bad AS SELECT id, n::counted AS x FROM t"
+                .to_string(),
+            unmake: "DROP VIEW bad; DROP DOMAIN counted".to_string(),
+            relation: "bad",
+            carries: false,
+        },
+        DomainCase {
+            label: "a policy that casts to that domain",
+            make: format!(
+                "{LEAK_DOMAIN}; ALTER TABLE t ENABLE ROW LEVEL SECURITY; \
+                 CREATE POLICY p_dom ON t USING (body::leaked IS NOT NULL)"
+            ),
+            unmake: format!(
+                "DROP POLICY p_dom ON t; ALTER TABLE t DISABLE ROW LEVEL SECURITY; {DROP_LEAK_DOMAIN}"
+            ),
+            relation: "t",
+            carries: false,
+        },
+    ]
+}
+
+/// Review-Q-2-harden-2 F-1: a cast to a domain runs the checks of the domain on the real value,
+/// also inside a view or a policy that calls nothing else. A view or policy whose coercion
+/// reaches a check outside the allow-list (also nested in another domain, an array, a composite
+/// type or the check of another domain; also when the check calls built-in functions only) is not
+/// part of the masked lens: `masked_read` and `read` get the refusal, the attack statement
+/// included. The owner kind shows that the same statement carries the value out when nothing
+/// guards it. Domains whose checks are on the list stay in the lens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_checks_outside_the_list_are_not_in_the_masked_lens() {
+    let Some(engine) = engine().await else { return };
+    let f = fixture(&engine).await;
+    // Control: domains whose checks are on the list (also nested, in an array, in a policy, and
+    // a built-in domain) are in the lens.
+    f.migrate(
+        "CREATE DOMAIN shorty AS text CHECK (length(VALUE) < 100); \
+         CREATE DOMAIN shorter AS shorty CHECK (VALUE <> ''); \
+         CREATE DOMAIN nonneg AS integer CHECK (VALUE >= 0 AND abs(VALUE) < 1000000); \
+         CREATE VIEW good AS SELECT id, body::shorter AS b, ARRAY[body]::shorty[] AS arr, \
+                n::nonneg AS nn, n::information_schema.cardinal_number AS cn FROM t; \
+         ALTER TABLE t ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY p_ok ON t USING (body::shorty <> '' AND n::nonneg >= 0)",
+    )
+    .await
+    .expect("migration");
+    for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+        let r = read(&f, kind, "SELECT b, nn, cn FROM good WHERE id = 1")
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:?}", kind.as_str()));
+        assert_eq!(r.rows.len(), 1, "{}", kind.as_str());
+        let r = read(&f, kind, "SELECT id FROM t ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(
+            r.rows.len(),
+            2,
+            "{}: the policy lets rows through",
+            kind.as_str()
+        );
+    }
+    f.migrate(
+        "DROP VIEW good; DROP POLICY p_ok ON t; ALTER TABLE t DISABLE ROW LEVEL SECURITY; \
+         DROP DOMAIN shorter; DROP DOMAIN shorty; DROP DOMAIN nonneg",
+    )
+    .await
+    .expect("migration");
+
+    for case in domain_cases() {
+        f.migrate(&case.make)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:?}", case.label));
+        if case.carries {
+            // Without the guard the statement discloses the value: the owner kind reads it.
+            let r = read(&f, RoleKind::Owner, &domain_attack(case.relation))
+                .await
+                .unwrap_or_else(|e| panic!("{} (owner): {e:?}", case.label));
+            assert!(
+                format!("{:?}", r.rows).contains("hidden-value"),
+                "{}: the attack discloses the value when nothing guards it: {r:?}",
+                case.label
+            );
+        }
+        for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+            let mut statements = vec![
+                format!("SELECT id FROM {}", case.relation),
+                format!("SELECT count(*) FROM {}", case.relation),
+                attack(case.relation),
+            ];
+            if case.relation == "bad" {
+                statements.push(domain_attack(case.relation));
+            }
+            for sql in statements {
+                let r = read(&f, kind, &sql).await;
+                assert!(refused(&r), "{} {} {sql}: {r:?}", case.label, kind.as_str());
+            }
+        }
+        f.migrate(&case.unmake)
+            .await
+            .unwrap_or_else(|e| panic!("{} (remove): {e:?}", case.label));
+        // Removed: the lens is whole again.
+        for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+            let r = read(&f, kind, "SELECT id FROM t ORDER BY id").await;
+            assert_eq!(r.unwrap().rows.len(), 2, "{} {}", case.label, kind.as_str());
+        }
+    }
+}
+
+/// The same domains count as tenant code for writes: a view, a `CHECK`, an index expression or a
+/// generated column that casts to a domain with a check outside the list refuses the writes of
+/// `masked_write` and `write`. A domain on the list does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn casts_to_domains_outside_the_list_refuse_masked_writes() {
+    let Some(engine) = engine().await else { return };
+    let f = fixture(&engine).await;
+    f.migrate(
+        "CREATE DOMAIN shorty AS text CHECK (length(VALUE) < 100); \
+         CREATE VIEW good AS SELECT id, body::shorty AS b FROM t; \
+         ALTER TABLE t ADD CONSTRAINT c_ok CHECK (body::shorty IS NOT NULL); \
+         CREATE INDEX t_dom ON t ((body::shorty)); \
+         ALTER TABLE t ADD COLUMN g text GENERATED ALWAYS AS (body::shorty) STORED",
+    )
+    .await
+    .expect("migration");
+    for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+        let r = write(&f, kind, "UPDATE t SET n = 7 WHERE id = 1").await;
+        assert!(r.is_ok(), "a domain on the list: {} {r:?}", kind.as_str());
+    }
+    f.migrate(
+        "DROP VIEW good; ALTER TABLE t DROP CONSTRAINT c_ok; DROP INDEX t_dom; \
+         ALTER TABLE t DROP COLUMN g; DROP DOMAIN shorty",
+    )
+    .await
+    .expect("migration");
+    let before = n_of_1(&f).await;
+    for case in domain_cases() {
+        f.migrate(&case.make)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:?}", case.label));
+        for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+            let r = write(&f, kind, "UPDATE t SET n = 99 WHERE id = 1").await;
+            assert!(refused(&r), "{} {}: {r:?}", case.label, kind.as_str());
+        }
+        assert_eq!(n_of_1(&f).await, before, "{}: nothing changed", case.label);
+        f.migrate(&case.unmake)
+            .await
+            .unwrap_or_else(|e| panic!("{} (remove): {e:?}", case.label));
+        for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+            let r = write(&f, kind, "UPDATE t SET n = 7 WHERE id = 1").await;
+            assert!(
+                r.is_ok(),
+                "{}: removed: {} {r:?}",
+                case.label,
+                kind.as_str()
+            );
+        }
+    }
+}
+
+/// A fixture with extensions: `ci (id, c citext)`, `trg (id, s text)` (for a trigram index), `plain
+/// (id, n)`, one row each, every column `normal`.
+async fn extension_fixture(engine: &PostgresEngine) -> Fixture<'_> {
+    let key = vector_key();
+    let mut new = conformance::new_database(Uuid::now_v7());
+    new.extensions = vec!["citext".to_string(), "pg_trgm".to_string()];
+    let created = engine
+        .create_database(&new, &key)
+        .await
+        .expect("create_database");
+    let f = Fixture {
+        engine,
+        created,
+        key,
+        key_bytes: std::array::from_fn(|i| i as u8),
+    };
+    f.migrate(
+        "CREATE TABLE ci (id integer PRIMARY KEY, c citext); \
+         CREATE TABLE trg (id integer PRIMARY KEY, s text); \
+         CREATE TABLE plain (id integer PRIMARY KEY, n integer)",
+    )
+    .await
+    .expect("migration");
+    f.migrate(
+        "INSERT INTO ci VALUES (1, 'hidden-value'); INSERT INTO trg VALUES (1, 'hidden-value'); \
+         INSERT INTO plain VALUES (1, 7)",
+    )
+    .await
+    .expect("insert");
+    f
+}
+
+/// One index whose operator class is outside the list: what makes it, what removes it, the
+/// relations that the lens must refuse, and a statement of a hostile read of the relation.
+struct IndexCase {
+    label: &'static str,
+    make: &'static str,
+    unmake: &'static str,
+    relations: &'static [&'static str],
+    read: &'static str,
+    write: &'static str,
+}
+
+const INDEX_CASES: &[IndexCase] = &[
+    IndexCase {
+        label: "a B-tree index with the operator class of an extension (citext_ops)",
+        make: "CREATE INDEX ci_c ON ci (c)",
+        unmake: "DROP INDEX ci_c",
+        relations: &["ci"],
+        read: "SELECT id FROM ci WHERE c = 'hidden-value'",
+        write: "UPDATE ci SET id = 2 WHERE id = 1",
+    },
+    IndexCase {
+        label: "a GIN index with the operator class of an extension (gin_trgm_ops)",
+        make: "CREATE INDEX trg_s ON trg USING gin (s gin_trgm_ops)",
+        unmake: "DROP INDEX trg_s",
+        relations: &["trg"],
+        read: "SELECT id FROM trg WHERE s LIKE '%hidden%'",
+        write: "UPDATE trg SET id = 2 WHERE id = 1",
+    },
+    IndexCase {
+        label: "a view over a table with such an index",
+        make: "CREATE INDEX ci_c ON ci (c); CREATE VIEW civ AS SELECT id FROM ci",
+        unmake: "DROP VIEW civ; DROP INDEX ci_c",
+        relations: &["ci", "civ"],
+        read: "SELECT id FROM civ",
+        write: "UPDATE ci SET id = 2 WHERE id = 1",
+    },
+    IndexCase {
+        label: "a partitioned table whose partition has such an index",
+        make: "CREATE TABLE pt (id integer, c citext) PARTITION BY RANGE (id); \
+               CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (10); \
+               CREATE INDEX pt1_c ON pt1 (c)",
+        unmake: "DROP TABLE pt",
+        relations: &["pt", "pt1"],
+        read: "SELECT id FROM pt WHERE c = 'x'",
+        write: "UPDATE ci SET id = 2 WHERE id = 1",
+    },
+];
+
+/// Review-Q-2-harden-2 F-2: an index calls the support functions and operators of its operator
+/// class on the raw keys. A relation with an index whose class holds a function outside the
+/// allow-list (here the classes of extensions; a tenant cannot make a class itself, but a class
+/// of an extension, or one that a superuser made from a function of the tenant, calls code of
+/// its own) is not part of the masked lens: `masked_read` and `read` get the refusal, also for
+/// the read that would use the index, and so does every view over it. The owner kind reads the
+/// same relation. Built-in classes stay in the lens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_support_outside_the_list_is_not_in_the_masked_lens() {
+    let Some(engine) = engine().await else { return };
+    let f = extension_fixture(&engine).await;
+    // Control: indexes of the built-in classes are in the lens (B-tree of several types, with
+    // pattern ops, hash, GIN, GiST, SP-GiST, BRIN, expression and partial indexes).
+    f.migrate(
+        "CREATE TABLE b (id integer PRIMARY KEY, s text, u uuid, ts timestamptz, j jsonb, \
+                         a integer[], r int4range, tv tsvector, ip inet, bx box); \
+         CREATE INDEX b_s ON b (s); CREATE INDEX b_sp ON b (s text_pattern_ops); \
+         CREATE INDEX b_u ON b (u); CREATE INDEX b_ts ON b (ts); \
+         CREATE INDEX b_h ON b USING hash (s); CREATE INDEX b_j ON b USING gin (j); \
+         CREATE INDEX b_a ON b USING gin (a); CREATE INDEX b_tv ON b USING gin (tv); \
+         CREATE INDEX b_r ON b USING gist (r); CREATE INDEX b_bx ON b USING gist (bx); \
+         CREATE INDEX b_ip ON b USING spgist (ip); CREATE INDEX b_sps ON b USING spgist (s); \
+         CREATE INDEX b_br ON b USING brin (ts); CREATE INDEX b_x ON b (lower(s)); \
+         CREATE INDEX b_pp ON b (id) WHERE s IS NOT NULL; \
+         CREATE VIEW bv AS SELECT id, s FROM b",
+    )
+    .await
+    .expect("migration");
+    for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+        for rel in ["b", "bv", "plain"] {
+            let r = read(&f, kind, &format!("SELECT id FROM {rel}")).await;
+            assert!(
+                r.is_ok(),
+                "built-in classes: {rel} {}: {r:?}",
+                kind.as_str()
+            );
+        }
+    }
+    for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+        let r = write(&f, kind, "UPDATE plain SET n = 8 WHERE id = 1").await;
+        assert!(r.is_ok(), "built-in classes: {} {r:?}", kind.as_str());
+    }
+    f.migrate("DROP VIEW bv; DROP TABLE b")
+        .await
+        .expect("migration");
+
+    for case in INDEX_CASES {
+        f.migrate(case.make)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:?}", case.label));
+        // The owner kind reads the relation (the code is not broken, only not offered).
+        let r = read(&f, RoleKind::Owner, case.read).await;
+        assert!(r.is_ok(), "{} (owner): {r:?}", case.label);
+        for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+            for rel in case.relations {
+                for sql in [
+                    format!("SELECT id FROM {rel}"),
+                    format!("SELECT count(*) FROM {rel}"),
+                ] {
+                    let r = read(&f, kind, &sql).await;
+                    assert!(refused(&r), "{} {} {sql}: {r:?}", case.label, kind.as_str());
+                }
+            }
+            let r = read(&f, kind, case.read).await;
+            assert!(
+                refused(&r),
+                "{} {}: {}: {r:?}",
+                case.label,
+                kind.as_str(),
+                case.read
+            );
+            // What has no such index stays in the lens.
+            let r = read(&f, kind, "SELECT id FROM plain").await;
+            assert!(r.is_ok(), "{} {}: plain: {r:?}", case.label, kind.as_str());
+        }
+        f.migrate(case.unmake)
+            .await
+            .unwrap_or_else(|e| panic!("{} (remove): {e:?}", case.label));
+        for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+            for rel in ["ci", "trg"] {
+                let r = read(&f, kind, &format!("SELECT id FROM {rel}")).await;
+                assert!(
+                    r.is_ok(),
+                    "{} removed: {rel} {}: {r:?}",
+                    case.label,
+                    kind.as_str()
+                );
+            }
+        }
+    }
+}
+
+/// An index whose operator class is outside the allow-list counts as tenant code for writes:
+/// `masked_write` and `write` get the refusal, nothing changes, and the write runs again once the
+/// index is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_support_outside_the_list_refuses_masked_writes() {
+    let Some(engine) = engine().await else { return };
+    let f = extension_fixture(&engine).await;
+    for case in INDEX_CASES {
+        f.migrate(case.make)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:?}", case.label));
+        for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+            let r = write(&f, kind, "UPDATE plain SET n = 99 WHERE id = 1").await;
+            assert!(refused(&r), "{} {}: {r:?}", case.label, kind.as_str());
+            let r = write(&f, kind, case.write).await;
+            assert!(refused(&r), "{} {}: {r:?}", case.label, kind.as_str());
+        }
+        let r = read(&f, RoleKind::Owner, "SELECT n FROM plain WHERE id = 1")
+            .await
+            .unwrap();
+        assert!(
+            format!("{:?}", r.rows).contains('7'),
+            "{}: nothing changed: {r:?}",
+            case.label
+        );
+        f.migrate(case.unmake)
+            .await
+            .unwrap_or_else(|e| panic!("{} (remove): {e:?}", case.label));
+        for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+            let r = write(&f, kind, "UPDATE plain SET n = 7 WHERE id = 1").await;
+            assert!(
+                r.is_ok(),
+                "{}: removed: {} {r:?}",
+                case.label,
+                kind.as_str()
+            );
+        }
+    }
+}
+
+/// Every operator class that Postgres ships is on the list: its family holds only non-volatile
+/// functions of `pg_catalog` and operators of `pg_catalog` that are allowed. If a Postgres
+/// upgrade adds a class that is not, every relation with an index of that class would be refused:
+/// this test names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_built_in_operator_classes_are_on_the_list() {
+    let Some(engine) = engine().await else { return };
+    let f = fixture(&engine).await;
+    let mut conn = dbhost(&engine, f.db()).await;
+    let ctes = crate::postgres::allow::ctes(1);
+    let unlisted = crate::postgres::allow::unlisted_index_support("i");
+    let sql = format!(
+        "WITH RECURSIVE {ctes} \
+         SELECT count(*), coalesce(string_agg(oc.opcname, ','), '') \
+           FROM (SELECT oid, ARRAY[oid] AS indclass FROM pg_catalog.pg_opclass WHERE oid < 16384) i \
+           JOIN pg_catalog.pg_opclass oc ON oc.oid = i.oid WHERE {unlisted}"
+    );
+    use sqlx::Row;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(crate::postgres::allow::row_functions())
+        .fetch_one(&mut conn)
+        .await
+        .expect("query");
+    let (n, names): (i64, String) = (row.get(0), row.get(1));
+    close(conn).await;
+    assert_eq!(n, 0, "built-in operator classes outside the list: {names}");
+}
+
 /// The engine refuses a database where a role other than the owner kind, or `PUBLIC`, may call a
 /// revoked function (a database of an older cluster, or something granted it), and accepts it
 /// again once the grant is gone. The check names the function.

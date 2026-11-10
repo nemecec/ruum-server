@@ -1021,6 +1021,22 @@ behind a view in a row write). A list of paths is never complete.
   are pinned, so `pg_depend` does not show them; the engine reads the stored node tree of the
   object. Such an object counts as tenant code for writes (kind `unlisted_functions`; a
   column default is not scanned, it sees no row).
+  **Two more places run code on the real values, and the list covers both** (review-Q-2-harden-2
+  F-1 and F-2). A *cast to a domain* runs the checks of the domain on the value, also inside a view
+  or policy that calls nothing else. The engine follows every type that a stored tree coerces to
+  (`:resulttype` and the other type fields of the tree) to the domains it reaches: the base type
+  of a domain, the element of an array, the subtype of a range, the fields of a composite type,
+  and the types that the check of a domain itself coerces to. A domain with a `CHECK` outside the
+  list (a function of the tenant or of an extension, a built-in function not on the list) makes
+  every type that reaches it unvetted, and a tree that coerces to such a type is outside the list.
+  A domain whose checks are on the list stays inside. An *index* calls the support functions
+  (`pg_amproc.amproc`) and the operators (`pg_amop.amopopr`) of its operator class on the raw keys
+  while a view or policy runs. A tenant cannot create an operator class (superuser only), but the
+  class of an extension, or one that a superuser made from a function of the tenant, calls code
+  of its own. A table or materialized view with an index whose operator family holds a function
+  or operator outside the list (the built-in families are on it) is outside the list, and so
+  is every view that reads it; it also counts as tenant code for writes. Both are conservative:
+  a relation that is refused is never read by a masked session.
 - (c) **Three lines, each fails closed.**
   1. The query layer refuses a row write (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, a
      data-modifying `WITH`) of a masked session when the database holds tenant code:
@@ -1133,6 +1149,17 @@ Mutations: `dbengine-allow-list-views`, `-built-ins`, `-names`, `-policies`, `-w
 `dbengine-pool-keeps-session-state`. **Consequences.** A view or policy that calls a function of an
 extension (`citext` operators, `pgcrypto`, `postgis`) is outside the list until a panel decision
 names the functions; a person with `manage` and the agent's migration path are not affected. A
-column default is not scanned. A `CHECK` of a domain is scanned for writes, not for a cast to the
-domain inside a view (backlog). The tests of P-2 and F-1 to F-5 that read a view with a function of
+column default is not scanned. The tests of P-2 and F-1 to F-5 that read a view with a function of
 the tenant as a masked session now expect the refusal.
+
+**Closing the classes (review-Q-2-harden-2 F-1 and F-2).** The cast to a domain and the index
+support functions are inside the rule of (b) and (d) now: the domain-cast exception of the first
+hardening is gone. A table or view whose domain checks or index support reach anything outside the
+list gets the refusal view in the masked lenses, and counts as tenant code for writes. Fix record:
+`ruum-server-wt/panel/q2-harden-3.md`. Tests: `domain_checks_outside_the_list_are_not_in_the_masked_lens`,
+`index_support_outside_the_list_is_not_in_the_masked_lens` and the two write tests in `allow_list.rs`,
+and `masked_reads_through_domains_and_indexes_outside_the_allow_list_are_refused` in
+`postgres_mask_tests.rs`. Mutations: `dbengine-allow-list-domains`, `dbengine-allow-list-index-support`,
+`dbengine-index-support-lens`, `dbengine-index-support-writes`. **Consequence.** A table with an
+index of an extension (`citext`, `pgvector`, `postgis`) is refused in the masked lenses; a
+person with `manage` and the owner kind still read it.

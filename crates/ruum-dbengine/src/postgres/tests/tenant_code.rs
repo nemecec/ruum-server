@@ -388,6 +388,11 @@ const FUNCTION_PLACES: &[&str] = &[
     // Access methods, languages, FDWs, conversions, transforms, text search parsers and
     // templates: superuser only, or C functions (superuser).
     "pg_am.amhandler",
+    // Support functions of operator classes and families: NOT superuser-only or C-only. Only a
+    // superuser can create the class, but the function it names can be any function, an
+    // extension's or one of the tenant (review-Q-2-harden-2 F-2). An index calls it on the raw
+    // keys. The unlisted_support clause covers it (`allow::unlisted_index_support`, with the
+    // operators of `pg_amop`); a tenant function there is also in the functions clause.
     "pg_amproc.amproc",
     "pg_cast.castfunc",
     "pg_conversion.conproc",
@@ -431,9 +436,11 @@ const EXPRESSION_PLACES: &[&str] = &[
     "pg_attrdef.adbin",
     // Partition bounds: constants.
     "pg_class.relpartbound",
-    // Check constraints and domain checks: as defaults (accepted one-bit answer, design 8.5).
+    // Check constraints and domain checks: the unlisted_checks and unlisted_domains clauses; a
+    // cast to a domain in a view or policy follows the checks of the domain on the read side
+    // (`allow::bad_types_cte`, review-Q-2-harden-2 F-1).
     "pg_constraint.conbin",
-    // Index expressions and predicates: as defaults.
+    // Index expressions and predicates: the unlisted_indexes clause.
     "pg_index.indexprs",
     "pg_index.indpred",
     "pg_partitioned_table.partexprs",

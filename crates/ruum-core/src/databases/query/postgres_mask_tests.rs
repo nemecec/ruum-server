@@ -216,6 +216,11 @@ async fn register_agent(w: &World, user: UserId) -> crate::agents::Agent {
 /// view without one; the classes confirmed by Alice (`manage`). It holds no tenant code
 /// (decision 0004-38), so masked sessions may write; [`definer_view`] adds some.
 async fn setup() -> Option<Pg> {
+    setup_with(&[]).await
+}
+
+/// [`setup`] with the extensions of the manifest.
+async fn setup_with(extensions: &[&str]) -> Option<Pg> {
     let engine = engine().await?;
     let mut w = world().await;
     let parts = DatabaseParts {
@@ -233,24 +238,26 @@ async fn setup() -> Option<Pg> {
     };
     install(&mut w.s, parts).unwrap();
     let a = ctx(w.team.id, w.alice);
-    let db = w
-        .s
-        .databases
-        .create(
-            &a,
-            CreateDatabase {
-                parent_id: w.folder,
-                name: format!("People {}", Uuid::now_v7().simple()),
-                manifest: json!({ "engine": "postgres", "version": "17", "plan": "shared-small" }),
-                source: None,
-                on_conflict: OnConflict::Fail,
-            },
-        )
-        .await
-        .unwrap()
-        .value
-        .node
-        .id;
+    let db =
+        w.s.databases
+            .create(
+                &a,
+                CreateDatabase {
+                    parent_id: w.folder,
+                    name: format!("People {}", Uuid::now_v7().simple()),
+                    manifest: json!({
+                        "engine": "postgres", "version": "17", "plan": "shared-small",
+                        "extensions": extensions,
+                    }),
+                    source: None,
+                    on_conflict: OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .node
+            .id;
     // The data cluster can be slow while other suites run: wait up to 60 s.
     for i in 0.. {
         let d = w.s.databases.get(&a, db).await.unwrap();
@@ -1823,5 +1830,174 @@ async fn masked_reads_of_code_outside_the_allow_list_are_refused() {
     let r = pg.ok(&a, write("select count(*) from sv")).await;
     assert_eq!(r.rows[0][0], json!(PEOPLE));
     pg.ok(&a, write("drop view sv")).await;
+    pg.drop().await;
+}
+
+/// Review-Q-2-harden-2 F-1 and F-2 (decision 0004-38 (b) and (d)): a cast to a domain runs the
+/// checks of the domain on the real value, and an index calls the support functions of its
+/// operator class on the raw keys, also in a view or a table that calls nothing else. The
+/// domain case is the review's attack: a check that carries the secret `token` into a session
+/// setting through a view. The owner kind (Alice, `manage`) shows that the statement discloses
+/// the value when nothing guards it. The agent without `read_personal` (`masked_read`), Bob (edit,
+/// no `manage`) and the agent with `read_personal` (`read`) get the refusal
+/// `statement_not_allowed`, hint `tenant_code_on_live`, for the attack statement and for a plain
+/// read, and a write that reads the relation gets the `501` of the write rule. Nothing changes.
+/// The table with the index of an extension (`citext_ops`) is refused the same way; once the
+/// index is gone the lens is whole again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn masked_reads_through_domains_and_indexes_outside_the_allow_list_are_refused() {
+    let Some(pg) = setup_with(&["citext"]).await else {
+        return;
+    };
+    let a = pg.alice();
+    pg.grant(GrantKind::WriteLive).await;
+    // (label, statements that make it, statements that remove it, relation, the attack)
+    let cases: [AttackCase; 3] = [
+        (
+            "F-1: a domain whose check writes the value into a session setting",
+            &[
+                "create function leakd(t text) returns text language plpgsql volatile as $$ \
+                 begin execute pg_catalog.format('set local ruum_probe.v = %L', t); return 'ok'; end $$",
+                "create domain leaked as text check (leakd(value) = 'ok')",
+                "create view dv as select id, token::leaked as x from people",
+            ],
+            &[
+                "drop view dv",
+                "drop domain leaked",
+                "drop function leakd(text)",
+            ],
+            "dv",
+            "with a as materialized (select count(x) as c from dv where id = 1) \
+             select c, current_setting('ruum_probe.v', true) as s from a",
+        ),
+        (
+            "F-1: a domain nested in another domain and an array, read through a view of a view",
+            &[
+                "create function leakd(t text) returns text language plpgsql volatile as $$ \
+                 begin execute pg_catalog.format('set local ruum_probe.v = %L', t); return 'ok'; end $$",
+                "create domain leaked as text check (leakd(value) = 'ok')",
+                "create domain outer_d as leaked check (value <> '')",
+                "create view dv0 as select id, array[token]::leaked[] as y, token::outer_d as x from people",
+                "create view dv as select id, x from dv0",
+            ],
+            &[
+                "drop view dv",
+                "drop view dv0",
+                "drop domain outer_d",
+                "drop domain leaked",
+                "drop function leakd(text)",
+            ],
+            "dv",
+            "with a as materialized (select count(x) as c from dv where id = 1) \
+             select c, current_setting('ruum_probe.v', true) as s from a",
+        ),
+        (
+            "F-2: an index whose operator class is the one of an extension",
+            &[
+                "create table cit (id integer primary key, c citext)",
+                "insert into cit values (1, 'tok-1-secret')",
+                "create index cit_c on cit (c)",
+            ],
+            &["drop index cit_c", "drop table cit"],
+            "cit",
+            "select id from cit where c = 'tok-1-secret'",
+        ),
+    ];
+    let refusal = (
+        422,
+        "statement_not_allowed".to_string(),
+        Some("tenant_code_on_live".to_string()),
+    );
+    let write_refusal = (
+        501,
+        "not_implemented".to_string(),
+        Some("tenant_code_on_live".to_string()),
+    );
+    for (i, (label, make, unmake, relation, attack)) in cases.into_iter().enumerate() {
+        for s in make {
+            pg.ok(&a, write(s)).await;
+        }
+        pg.confirm(&[(relation, "id", DataClass::Normal)]).await;
+        if i < 2 {
+            // Without the guard the statement discloses the value (Alice reads as the owner).
+            let r = pg.ok(&a, write(attack)).await;
+            assert_eq!(
+                r.rows[0][1],
+                json!("tok-1-secret"),
+                "{label}: the attack discloses the value when nothing guards it"
+            );
+        } else {
+            let r = pg.ok(&a, write(attack)).await;
+            assert_eq!(r.rows.len(), 1, "{label}: the owner reads the table");
+        }
+        for (who, name) in [(pg.agent(), "agent"), (pg.bob(), "bob")] {
+            for text in [attack.to_string(), format!("select id from {relation}")] {
+                let r = pg.refused(&who, sql(&text)).await;
+                assert_eq!(r, refusal, "{label}: {name}: {text}");
+            }
+            let r = pg
+                .refused(
+                    &who,
+                    write(&format!(
+                        "update orders set amount = (select count(*) from {relation} where id = 1) \
+                         where id = 1"
+                    )),
+                )
+                .await;
+            assert_eq!(
+                r, write_refusal,
+                "{label}: {name}: a write that reads the relation"
+            );
+        }
+        assert_eq!(
+            pg.count(&a, "select amount from orders where id = 1").await,
+            json!(1),
+            "{label}: nothing changed"
+        );
+        for s in unmake {
+            pg.ok(&a, write(s)).await;
+        }
+        // Control: with the relation gone, the lens is whole again.
+        let r = pg.ok(&pg.agent(), sql("select count(*) from orders")).await;
+        assert_eq!(r.rows[0][0], json!(PEOPLE), "{label}");
+    }
+    // The agent with `read_personal` reads the `nosecret` lens, and gets the same refusal.
+    pg.grant(GrantKind::ReadPersonal).await;
+    for s in [
+        "create function leakd(t text) returns text language plpgsql volatile as $$ \
+         begin execute pg_catalog.format('set local ruum_probe.v = %L', t); return 'ok'; end $$",
+        "create domain leaked as text check (leakd(value) = 'ok')",
+        "create view dv as select id, nick::leaked as x from people",
+        "create table cit (id integer primary key, c citext)",
+        "create index cit_c on cit (c)",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    pg.confirm(&[
+        ("dv", "id", DataClass::Normal),
+        ("cit", "id", DataClass::Normal),
+    ])
+    .await;
+    for text in [
+        "with a as materialized (select count(x) as c from dv where id = 1) \
+         select c, current_setting('ruum_probe.v', true) as s from a",
+        "select id from dv",
+        "select id from cit where c = 'x'",
+    ] {
+        let r = pg.refused(&pg.agent(), sql(text)).await;
+        assert_eq!(r, refusal, "an agent with read_personal: {text}");
+    }
+    // The person with `manage` (the owner kind, in a writable statement) still reads them.
+    let r = pg.ok(&a, write("select count(x) from dv")).await;
+    assert_eq!(r.rows[0][0], json!(PEOPLE));
+    for s in [
+        "drop view dv",
+        "drop domain leaked",
+        "drop function leakd(text)",
+        "drop index cit_c",
+        "drop table cit",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
     pg.drop().await;
 }

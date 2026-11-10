@@ -765,8 +765,10 @@ databases that AI agents make. One writer at a time is enough for most small app
   explicit list of built-in functions that cannot carry state between statements or rows: plain
   operators, comparison, string, date, array and JSON functions, and aggregates. A function of the
   tenant or of an extension, a session setting, a lock, a random seed, a sequence or a large object
-  is not on the list. A view or policy that reaches anything outside the list is not part of the
-  masked lens: a statement that reads it gets the refusal `statement_not_allowed` with the hint
+  is not on the list. The same list applies to the checks of every domain that a cast in a view or
+  policy can reach (also a domain nested in another type), and to the support functions and
+  operators of the operator classes of the indexes of a table. A view or policy that reaches
+  anything outside the list is not part of the masked lens: a statement that reads it gets the refusal `statement_not_allowed` with the hint
   `tenant_code_on_live`, and the database counts as holding tenant code for writes. The functions
   that a statement calls itself are held by the cluster: every volatile built-in function outside a
   named few is revoked from the masked kinds, also inside views. The session state is reset between

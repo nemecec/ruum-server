@@ -161,7 +161,7 @@ pub(crate) struct RootFacts {
 pub(crate) async fn root_facts(conn: &mut PgConnection) -> Result<Vec<RootFacts>, EngineError> {
     let rule_unlisted = allow::unlisted("r.ev_action::pg_catalog.text");
     let default_unlisted = allow::unlisted("ad.adbin::pg_catalog.text");
-    let allowed = allow::allowed_cte(1);
+    let allowed = allow::ctes(1);
     let sql = format!(
         r#"{REACH},
 {allowed}
@@ -262,7 +262,7 @@ select reach.rel::pg_catalog.int8 as rel, reach.att::pg_catalog.int2 as att,
 /// whose search path is a lens schema.
 pub(crate) fn tenant_code_sql() -> String {
     const TEMPLATE: &str = "
-with owner as (
+with recursive owner as (
   select r.oid from pg_catalog.pg_roles r where r.rolname operator(pg_catalog.=) $1
 ), tenant as (
   select n.oid from pg_catalog.pg_namespace n
@@ -329,6 +329,12 @@ select exists (
                  or c.relowner operator(pg_catalog.=) (select oid from owner))
             and @INDEX@) as unlisted_indexes,
        exists (
+         select 1 from pg_catalog.pg_index i
+           join pg_catalog.pg_class c on c.oid operator(pg_catalog.=) i.indrelid
+          where (c.relnamespace operator(pg_catalog.=) any (select oid from tenant)
+                 or c.relowner operator(pg_catalog.=) (select oid from owner))
+            and @SUPPORT@) as unlisted_support,
+       exists (
          select 1 from pg_catalog.pg_attrdef ad
            join pg_catalog.pg_attribute a
              on a.attrelid operator(pg_catalog.=) ad.adrelid and a.attnum operator(pg_catalog.=) ad.adnum
@@ -338,7 +344,7 @@ select exists (
             and a.attgenerated operator(pg_catalog.<>) ''::pg_catalog.\"char\"
             and @GENERATED@) as unlisted_generated";
     TEMPLATE
-        .replace("@ALLOWED@", &allow::allowed_cte(2))
+        .replace("@ALLOWED@", &allow::ctes(2))
         .replace("@RULE@", &allow::unlisted("r.ev_action::pg_catalog.text"))
         .replace("@CHECK@", &allow::unlisted("k.conbin::pg_catalog.text"))
         .replace(
@@ -347,6 +353,7 @@ select exists (
                 "pg_catalog.concat_ws(' ', i.indexprs::pg_catalog.text, i.indpred::pg_catalog.text)",
             ),
         )
+        .replace("@SUPPORT@", &allow::unlisted_index_support("i"))
         .replace("@GENERATED@", &allow::unlisted("ad.adbin::pg_catalog.text"))
 }
 
@@ -396,8 +403,15 @@ pub(crate) async fn tenant_code(
         policies: row.get("policies"),
         relations: row.get("relations"),
         event_triggers: row.get("event_triggers"),
-        unlisted_functions: ["views", "checks", "domains", "indexes", "generated"]
-            .into_iter()
-            .any(|kind| row.get::<bool, _>(format!("unlisted_{kind}").as_str())),
+        unlisted_functions: [
+            "views",
+            "checks",
+            "domains",
+            "indexes",
+            "support",
+            "generated",
+        ]
+        .into_iter()
+        .any(|kind| row.get::<bool, _>(format!("unlisted_{kind}").as_str())),
     })
 }

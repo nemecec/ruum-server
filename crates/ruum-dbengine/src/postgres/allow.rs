@@ -22,6 +22,23 @@
 //!    - Built-in functions are *pinned* in Postgres: `pg_depend` records no dependency on them.
 //!      The engine finds them in the stored node tree of the object (`:funcid 1234`, `:opfuncid`,
 //!      `:aggfnoid`, `:winfnoid`, `:opno`, ...), and looks each OID up in the allowed set.
+//!    - **Domain checks** (review-Q-2-harden-2 F-1). A cast to a domain runs the checks of the
+//!      domain on the value, also inside a view or a policy that is otherwise on the list. The
+//!      engine follows every type that a stored tree names as the result of a coercion
+//!      (`:resulttype`, ...) to the domains it reaches: the base type of a domain, the element
+//!      of an array, the subtype of a range, the fields of a composite type, and the types that
+//!      the check of a domain itself coerces to. A domain with a `CHECK` that is outside the list
+//!      (a function of the tenant or of an extension, a built-in function not on the list, an
+//!      operator of the tenant) makes every type that reaches it *unvetted* (`bad_types`), and a
+//!      tree that coerces to an unvetted type is outside the list. A domain whose checks are on
+//!      the list is fine.
+//!    - **Index support** (review-Q-2-harden-2 F-2). A scan of an index calls the support
+//!      functions of its operator classes, and the operators of the class, on the raw keys. The
+//!      slots `pg_amproc.amproc` and `pg_amop.amopopr` can hold a function of an extension, or of
+//!      the tenant when a superuser made the operator class. A relation with an index whose
+//!      operator class holds a function outside the list ([`support_cte`]) is treated as code
+//!      outside the list. The built-in operator families are on the list: their support
+//!      functions are non-volatile functions of `pg_catalog`.
 //! 2. **The statement itself.** The cluster set-up revokes `EXECUTE` on every `VOLATILE` function
 //!    of `pg_catalog` from `PUBLIC`, except the few in [`STATEMENT_VOLATILE`] (they carry no
 //!    state that a secret can reach). Postgres marks a function `IMMUTABLE` or `STABLE` only when
@@ -368,16 +385,121 @@ pub(crate) fn allowed_cte(param: usize) -> String {
     )
 }
 
+/// Every common table expression that the conditions of this module need, for the bind parameter
+/// `$param` (the names of [`ROW_FUNCTIONS`]): [`allowed_cte`], [`bad_types_cte`] and
+/// [`support_cte`]. The `WITH` list that holds them must be `WITH RECURSIVE`.
+pub(crate) fn ctes(param: usize) -> String {
+    format!(
+        "{},\n{},\n{}",
+        allowed_cte(param),
+        bad_types_cte(),
+        support_cte()
+    )
+}
+
 /// The OID fields of a stored node tree that name a function.
 const FUNCTION_FIELDS: &str = "funcid|opfuncid|aggfnoid|winfnoid|tsmhandler|hashfuncid|negfuncid|\
      startInRangeFunc|endInRangeFunc";
 /// The OID fields that name an operator (the operator's function is looked up).
 const OPERATOR_FIELDS: &str = "opno|eqop|sortop|hashop";
+/// The OID fields that name the type of a value that the tree coerces, builds or returns. A
+/// coercion to a domain (`CoerceToDomain`) runs the checks of the domain; the input function of a
+/// domain runs them too (`CoerceViaIO` to an array or composite of the domain). A plain
+/// reference to a column (`:vartype`) runs nothing and is not listed.
+const TYPE_FIELDS: &str = "resulttype|array_typeid|element_typeid|row_typeid|paramtype|aggtype|\
+     wintype|funcresulttype";
+
+/// The common table expressions for the types that a tree coerces to (review-Q-2-harden-2 F-1),
+/// after [`allowed_cte`] in the same `WITH RECURSIVE` list:
+///
+/// - `type_edges(src, dst)`: which type holds which (a domain its base type and the types that
+///   its own checks coerce to, an array its element, a range its subtype, a multirange its range,
+///   a composite type the types of its fields);
+/// - `bad_types(oid)`: the domains that have a `CHECK` outside the allow-list, and every type
+///   that reaches one through `type_edges`.
+pub(crate) fn bad_types_cte() -> String {
+    let check_outside = unlisted_calls("k.conbin::pg_catalog.text");
+    format!(
+        "type_edges(src, dst) as (
+  select t.oid, t.typbasetype from pg_catalog.pg_type t
+   where t.typtype operator(pg_catalog.=) 'd'::pg_catalog.\"char\"
+  union all
+  select t.oid, t.typelem from pg_catalog.pg_type t where t.typelem operator(pg_catalog.<>) 0::pg_catalog.oid
+  union all
+  select r.rngtypid, r.rngsubtype from pg_catalog.pg_range r
+  union all
+  select r.rngmultitypid, r.rngtypid from pg_catalog.pg_range r
+  union all
+  select t.oid, a.atttypid
+    from pg_catalog.pg_type t
+    join pg_catalog.pg_attribute a on a.attrelid operator(pg_catalog.=) t.typrelid
+   where t.typtype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+     and t.typrelid operator(pg_catalog.<>) 0::pg_catalog.oid
+     and a.attnum operator(pg_catalog.>) 0::pg_catalog.int2 and not a.attisdropped
+  union all
+  select k.contypid, m.g[1]::pg_catalog.oid
+    from pg_catalog.pg_constraint k,
+         pg_catalog.regexp_matches(k.conbin::pg_catalog.text, ':(?:{TYPE_FIELDS}) ([1-9][0-9]*)', 'g') as m(g)
+   where k.contypid operator(pg_catalog.<>) 0::pg_catalog.oid
+     and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+),
+bad_types(oid) as (
+  select k.contypid from pg_catalog.pg_constraint k
+   where k.contypid operator(pg_catalog.<>) 0::pg_catalog.oid
+     and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+     and {check_outside}
+  union
+  select e.src from type_edges e join bad_types b on b.oid operator(pg_catalog.=) e.dst
+)"
+    )
+}
+
+/// The common table expression `support(oid)` (after [`allowed_cte`]): the functions that may
+/// run as the support function of an operator class on the raw keys of an index (review
+/// Q-2-harden-2 F-2): the allowed functions, and the non-volatile functions of `pg_catalog` that
+/// a built-in operator family names as a support function (`btint4cmp`, `hashtext`, the GiST and
+/// GIN functions of the built-in classes).
+pub(crate) fn support_cte() -> String {
+    "support as (
+  select a.oid from allowed a
+  union
+  select ap.amproc::pg_catalog.oid
+    from pg_catalog.pg_amproc ap
+    join pg_catalog.pg_proc p on p.oid operator(pg_catalog.=) ap.amproc::pg_catalog.oid
+   where ap.amprocfamily operator(pg_catalog.<) 16384::pg_catalog.oid
+     and p.pronamespace operator(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace
+     and p.provolatile operator(pg_catalog.<>) 'v'::pg_catalog.\"char\"
+)"
+    .to_string()
+}
+
+/// A SQL condition that is true when the index `index` (the alias of a `pg_catalog.pg_index`
+/// row) has an operator class whose family holds a support function (`pg_amproc`) or an operator
+/// (`pg_amop`) outside the allow-list. It needs the CTEs [`allowed_cte`] and [`support_cte`] in
+/// scope. The family is checked as a whole, whichever of its types the index uses: this is
+/// conservative.
+pub(crate) fn unlisted_index_support(index: &str) -> String {
+    format!(
+        "exists (
+  select 1
+    from pg_catalog.unnest({index}.indclass::pg_catalog.oid[]) as k(opc)
+    join pg_catalog.pg_opclass oc on oc.oid operator(pg_catalog.=) k.opc
+   where exists (select 1 from pg_catalog.pg_amproc ap
+                  where ap.amprocfamily operator(pg_catalog.=) oc.opcfamily
+                    and not exists (select 1 from support s
+                                     where s.oid operator(pg_catalog.=) ap.amproc::pg_catalog.oid))
+      or exists (select 1 from pg_catalog.pg_amop ao
+                   join pg_catalog.pg_operator o on o.oid operator(pg_catalog.=) ao.amopopr
+                  where ao.amopfamily operator(pg_catalog.=) oc.opcfamily
+                    and not exists (select 1 from allowed a
+                                     where a.oid operator(pg_catalog.=) o.oprcode::pg_catalog.oid)))"
+    )
+}
 
 /// A SQL condition that is true when the stored node tree `tree` (a text expression: a
 /// `pg_node_tree` cast to `text`) names a function or operator outside the allowed set. It needs
 /// the CTE [`allowed_cte`] in scope. A tree that is `NULL` or names nothing gives false.
-pub(crate) fn unlisted(tree: &str) -> String {
+pub(crate) fn unlisted_calls(tree: &str) -> String {
     format!(
         "(exists (select 1 from pg_catalog.regexp_matches({tree}, ':(?:{FUNCTION_FIELDS}) ([1-9][0-9]*)', 'g') as m(g)
                   where not exists (select 1 from allowed a
@@ -393,6 +515,24 @@ pub(crate) fn unlisted(tree: &str) -> String {
                                           join allowed a on a.oid operator(pg_catalog.=) o.oprcode::pg_catalog.oid
                                          where o.oid operator(pg_catalog.=) s.op::pg_catalog.oid)))"
     )
+}
+
+/// A SQL condition that is true when the stored node tree `tree` coerces a value to a type that
+/// reaches a domain with a check outside the allow-list (review-Q-2-harden-2 F-1). It needs the
+/// CTEs [`allowed_cte`] and [`bad_types_cte`] in scope.
+pub(crate) fn unlisted_domains(tree: &str) -> String {
+    format!(
+        "exists (select 1 from pg_catalog.regexp_matches({tree}, ':(?:{TYPE_FIELDS}) ([1-9][0-9]*)', 'g') as m(g)
+                  where m.g[1]::pg_catalog.oid operator(pg_catalog.=) any (array(select b.oid from bad_types b)))"
+    )
+}
+
+/// A SQL condition that is true when the stored node tree `tree` is outside the allow-list: it
+/// names a function or operator outside the allowed set ([`unlisted_calls`]), or it coerces a
+/// value to a type that reaches a domain with a check outside the allowed set
+/// ([`unlisted_domains`]). It needs the CTEs [`allowed_cte`] and [`bad_types_cte`] in scope.
+pub(crate) fn unlisted(tree: &str) -> String {
+    format!("({} or {})", unlisted_calls(tree), unlisted_domains(tree))
 }
 
 #[cfg(test)]
