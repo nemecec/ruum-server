@@ -393,6 +393,10 @@ impl DatabaseEngine for PostgresEngine {
         EngineKind::Postgres
     }
 
+    fn has_lens(&self) -> bool {
+        true
+    }
+
     async fn create_database(
         &self,
         new: &NewDatabase,

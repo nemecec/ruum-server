@@ -51,6 +51,14 @@ pub trait DatabaseEngine: Send + Sync {
     /// The engine kind (`databases.engine`).
     fn kind(&self) -> EngineKind;
 
+    /// Whether the engine masks every read of a restricted column in the engine itself (the lens
+    /// of decision 0004-3): the Postgres engine (card Q-2) and the SQLite engine (card Q-3). The
+    /// memory engine has no lens, so the query layer hides every value of an agent's result
+    /// there (fail closed).
+    fn has_lens(&self) -> bool {
+        false
+    }
+
     /// Makes an empty database with neutral names and its roles (one per kind of
     /// [`RoleKind::ALL`]), and installs `key` as its pseudonym key.
     async fn create_database(

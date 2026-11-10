@@ -77,6 +77,24 @@
 //!
 //! The masked kinds have `EXECUTE` on `pseudonym` and `pseudonym_other` only (not on `hmac12`
 //! or `canonical`), and no `USAGE` on `ruum_mask`: only a lens view (owner `mask`) calls them.
+//!
+//! # Views of the tenant over `secret` columns (card Q-2, review-Q-1 N-9)
+//!
+//! A view or a materialized view of the tenant reads the base tables with the rights of its owner
+//! (the `owner` kind), so its lens view would show what the tenant view computes from a `secret`
+//! column: as a pseudonym to the masked kinds, and as it is to the `nosecret` kinds while the
+//! view column counts as `personal` (a new column is unconfirmed). So a column of a tenant view
+//! whose class is `personal` (confirmed or not) is masked like `secret` when the view reads a
+//! `secret` column ([`secret_reading_views`]: the columns that its `_RETURN` rule depends on in
+//! `pg_depend`, also through other views). A column that a person confirmed as `normal` keeps
+//! its class. `pg_depend` names the columns that the view reads, not which output column reads
+//! which, so every `personal` column of such a view is masked like `secret` (fail safe).
+//!
+//! A view that calls a `SECURITY DEFINER` function of the tenant counts as reading a `secret`
+//! column too: such a function reads any table with the rights of its owner, and `pg_depend`
+//! does not show what it reads. (A function without `SECURITY DEFINER` runs as the reader, who
+//! has no right on the base tables.) A whole-row reference (`to_json(t)`) is not in `pg_depend` as
+//! columns; only a person with `manage` can make such a view.
 
 use super::errors::internal;
 use super::values::oid;
@@ -311,17 +329,22 @@ pub(crate) fn view_sql(
     table: &CatalogTable,
     spec: &LensSpec,
     pseudonym_types: &HashMap<(u32, i16), u32>,
+    reads_secret: bool,
     roles: &LensRoles<'_>,
 ) -> String {
     let mut nosecret = Vec::with_capacity(table.columns.len());
     let mut masked = Vec::with_capacity(table.columns.len());
     for col in &table.columns {
         let name = ident(&col.name);
-        let class = spec.class_of(&ColumnRef {
+        let class = match spec.class_of(&ColumnRef {
             schema: table.schema.clone(),
             table: table.name.clone(),
             column: col.name.clone(),
-        });
+        }) {
+            // A tenant view that reads a secret column (see the module docs).
+            DataClass::Personal if reads_secret => DataClass::Secret,
+            other => other,
+        };
         // `None`: not a built-in base type, or unknown. Masked like `secret` (0005 B-2).
         let pseudonym_type = col
             .identity
@@ -362,6 +385,134 @@ pub(crate) fn view_sql(
     )
 }
 
+/// The column dependencies of the views and materialized views of `public`: (view OID,
+/// relation OID, `attnum`) for each column that the `_RETURN` rule of the view reads, also
+/// through other views (`pg_depend`, recursively). Whole-relation entries (`attnum` 0) are left
+/// out.
+const VIEW_COLUMN_DEPENDENCIES_SQL: &str = "
+with recursive deps(view, rel, att) as (
+  select r.ev_class, d.refobjid, d.refobjsubid
+    from pg_catalog.pg_rewrite r
+    join pg_catalog.pg_class v on v.oid operator(pg_catalog.=) r.ev_class
+    join pg_catalog.pg_depend d
+      on d.classid operator(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+     and d.objid operator(pg_catalog.=) r.oid
+   where v.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
+     and v.relkind operator(pg_catalog.=) any ('{v,m}'::pg_catalog.\"char\"[])
+     and r.rulename operator(pg_catalog.=) '_RETURN'
+     and d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+     and d.refobjid operator(pg_catalog.<>) r.ev_class
+  union
+  select deps.view, d.refobjid, d.refobjsubid
+    from deps
+    join pg_catalog.pg_rewrite r
+      on r.ev_class operator(pg_catalog.=) deps.rel
+     and r.rulename operator(pg_catalog.=) '_RETURN'
+    join pg_catalog.pg_depend d
+      on d.classid operator(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+     and d.objid operator(pg_catalog.=) r.oid
+   where d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+     and d.refobjid operator(pg_catalog.<>) r.ev_class
+)
+select view::pg_catalog.int8 as view, rel::pg_catalog.int8 as rel, att::pg_catalog.int2 as att
+  from deps where att operator(pg_catalog.>) 0";
+
+/// The views and materialized views of `public` whose `_RETURN` rule calls a `SECURITY DEFINER`
+/// function outside `pg_catalog`, also through other views (see the module docs).
+const DEFINER_VIEWS_SQL: &str = "
+with recursive views(view, rel) as (
+  select v.oid, v.oid
+    from pg_catalog.pg_class v
+   where v.relnamespace operator(pg_catalog.=) 'public'::pg_catalog.regnamespace
+     and v.relkind operator(pg_catalog.=) any ('{v,m}'::pg_catalog.\"char\"[])
+  union
+  select views.view, d.refobjid
+    from views
+    join pg_catalog.pg_rewrite r
+      on r.ev_class operator(pg_catalog.=) views.rel
+     and r.rulename operator(pg_catalog.=) '_RETURN'
+    join pg_catalog.pg_depend d
+      on d.classid operator(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+     and d.objid operator(pg_catalog.=) r.oid
+   where d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+     and d.refobjid operator(pg_catalog.<>) r.ev_class
+)
+select distinct views.view::pg_catalog.int8 as view
+  from views
+  join pg_catalog.pg_rewrite r
+    on r.ev_class operator(pg_catalog.=) views.rel
+   and r.rulename operator(pg_catalog.=) '_RETURN'
+  join pg_catalog.pg_depend d
+    on d.classid operator(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+   and d.objid operator(pg_catalog.=) r.oid
+   and d.refclassid operator(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+  join pg_catalog.pg_proc p on p.oid operator(pg_catalog.=) d.refobjid
+ where p.prosecdef
+   and p.pronamespace operator(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace";
+
+/// The OIDs of the views and materialized views of `public` that read a column whose class in
+/// `spec` is `secret`, or call a `SECURITY DEFINER` function of the tenant (see the module docs).
+/// Run as `mask` in the caller's transaction.
+pub(crate) async fn secret_reading_views(
+    conn: &mut PgConnection,
+    catalog: &Catalog,
+    spec: &LensSpec,
+) -> Result<std::collections::HashSet<u32>, EngineError> {
+    let rows = sqlx::query(VIEW_COLUMN_DEPENDENCIES_SQL)
+        .persistent(false)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| internal("read the column dependencies of the views", e))?;
+    let deps: Vec<(u32, u32, i16)> = rows
+        .into_iter()
+        .map(|r| {
+            let view: i64 = r.get("view");
+            let rel: i64 = r.get("rel");
+            (view as u32, rel as u32, r.get::<i16, _>("att"))
+        })
+        .collect();
+    let mut views = views_reading_secrets(catalog, spec, &deps);
+    let definer = sqlx::query(DEFINER_VIEWS_SQL)
+        .persistent(false)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| internal("read the definer functions of the views", e))?;
+    views.extend(definer.into_iter().map(|r| r.get::<i64, _>("view") as u32));
+    Ok(views)
+}
+
+/// The views of `deps` ((view, relation, `attnum`)) that read a column whose class in `spec` is
+/// `secret`. A column that the catalog does not name (another schema) does not count.
+pub(crate) fn views_reading_secrets(
+    catalog: &Catalog,
+    spec: &LensSpec,
+    deps: &[(u32, u32, i16)],
+) -> std::collections::HashSet<u32> {
+    let mut columns: HashMap<(u32, i16), ColumnRef> = HashMap::new();
+    for t in &catalog.tables {
+        for c in &t.columns {
+            if let Some(i) = c.identity {
+                columns.insert(
+                    (i.rel_oid, i.attnum),
+                    ColumnRef {
+                        schema: t.schema.clone(),
+                        table: t.name.clone(),
+                        column: c.name.clone(),
+                    },
+                );
+            }
+        }
+    }
+    deps.iter()
+        .filter(|(_, rel, att)| {
+            columns
+                .get(&(*rel, *att))
+                .is_some_and(|c| spec.class_of(c) == DataClass::Secret)
+        })
+        .map(|(view, _, _)| *view)
+        .collect()
+}
+
 /// Drops every lens view. Run as `mask` in the caller's transaction.
 pub(crate) async fn drop_views(conn: &mut PgConnection) -> Result<(), EngineError> {
     let rows = sqlx::query(
@@ -392,8 +543,15 @@ pub(crate) async fn build_views(
     roles: &LensRoles<'_>,
 ) -> Result<(), EngineError> {
     let bases = pseudonym_types(conn).await?;
+    let secret_views = secret_reading_views(conn, catalog, spec).await?;
     for table in catalog.tables.iter().filter(|t| t.schema == "public") {
-        let sql = view_sql(table, spec, &bases, roles);
+        let reads_secret = table.kind != RelationKind::Table
+            && table
+                .columns
+                .iter()
+                .filter_map(|c| c.identity)
+                .any(|i| secret_views.contains(&i.rel_oid));
+        let sql = view_sql(table, spec, &bases, reads_secret, roles);
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&mut *conn)
             .await
@@ -509,7 +667,7 @@ mod tests {
             masked_read: "r_3",
             masked_write: "r_4",
         };
-        let sql = view_sql(&table, &spec, &bases, &roles);
+        let sql = view_sql(&table, &spec, &bases, false, &roles);
         assert!(sql.contains(
             "create view ruum_masked.\"users\" as select \"id\", ruum_mask.pseudonym(\"email\") as \"email\", case when pg_catalog.num_nulls(\"token\") operator(pg_catalog.=) 1 then null"
         ), "{sql}");
@@ -555,7 +713,7 @@ mod tests {
             masked_read: "r_3",
             masked_write: "r_4",
         };
-        let sql = view_sql(&table, &spec, &types, &roles);
+        let sql = view_sql(&table, &spec, &types, false, &roles);
         let masked = sql
             .lines()
             .find(|l| l.starts_with("create view ruum_masked."))
@@ -595,5 +753,92 @@ mod tests {
             mask_create_sql("r_9", false),
             "revoke create on schema ruum_mask, ruum_masked, ruum_nosecret from \"r_9\""
         );
+    }
+
+    /// Review-Q-1 N-9: a personal column of a tenant view that reads a secret column is masked
+    /// like secret in both lenses; a column confirmed as normal keeps its class; a table is
+    /// never treated so.
+    #[test]
+    fn a_view_over_a_secret_masks_its_personal_columns_like_secret() {
+        let col = |name: &str, rel: u32, attnum: i16| CatalogColumn {
+            name: name.to_string(),
+            data_type: "text".into(),
+            nullable: true,
+            identity: Some(ColumnIdentity {
+                rel_oid: rel,
+                attnum,
+                type_oid: oid::TEXT,
+            }),
+        };
+        let table = |name: &str, kind: RelationKind, columns: Vec<CatalogColumn>| CatalogTable {
+            schema: "public".into(),
+            name: name.into(),
+            kind,
+            columns,
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let users = table(
+            "users",
+            RelationKind::Table,
+            vec![col("id", 1, 1), col("token", 1, 2), col("name", 1, 3)],
+        );
+        let v = table(
+            "v",
+            RelationKind::View,
+            vec![col("id", 2, 1), col("t", 2, 2), col("n", 2, 3)],
+        );
+        let names = table("names", RelationKind::View, vec![col("n", 3, 1)]);
+        let catalog = Catalog {
+            tables: vec![users, v.clone(), names],
+        };
+        let r = |t: &str, c: &str| ColumnRef {
+            schema: "public".into(),
+            table: t.into(),
+            column: c.into(),
+        };
+        let spec = LensSpec {
+            columns: vec![
+                (r("users", "id"), DataClass::Normal),
+                (r("users", "token"), DataClass::Secret),
+                (r("users", "name"), DataClass::Personal),
+                (r("v", "id"), DataClass::Normal),
+            ],
+        };
+        // v reads users.id and users.token; names reads users.name only.
+        let deps = [(2, 1, 1), (2, 1, 2), (3, 1, 3), (3, 77, 1)];
+        let hits = views_reading_secrets(&catalog, &spec, &deps);
+        assert_eq!(hits, std::collections::HashSet::from([2]));
+        let types = HashMap::from([
+            ((2, 1), oid::TEXT),
+            ((2, 2), oid::TEXT),
+            ((2, 3), oid::TEXT),
+        ]);
+        let roles = LensRoles {
+            read: "r_1",
+            write: "r_2",
+            masked_read: "r_3",
+            masked_write: "r_4",
+        };
+        let sql = view_sql(&v, &spec, &types, true, &roles);
+        for lens in ["ruum_nosecret", "ruum_masked"] {
+            let line = sql
+                .lines()
+                .find(|l| l.starts_with(&format!("create view {lens}.")))
+                .unwrap();
+            assert!(line.contains("select \"id\", "), "{line}");
+            assert!(
+                line.contains(&format!("{} as \"t\"", hidden_expr("\"t\""))),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("{} as \"n\"", hidden_expr("\"n\""))),
+                "{line}"
+            );
+            assert!(!line.contains("ruum_mask.pseudonym"), "{line}");
+        }
+        // Without a secret dependency the same view pseudonymizes for the masked kinds.
+        let sql = view_sql(&v, &spec, &types, false, &roles);
+        assert!(sql.contains("ruum_mask.pseudonym(\"t\") as \"t\""), "{sql}");
     }
 }
