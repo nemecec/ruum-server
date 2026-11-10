@@ -52,9 +52,10 @@
 //!
 //! 1. Agents fail closed until card Q-2. Card Q-2 replaced it: [`agent_access`] and the
 //!    markers of [`postgres_mask`]; [`mark_agent_result`] stays for engines without a lens.
-//! 2. Classes come from the head manifest's `data_classes` ([`manifest_classes`]). The privacy
-//!    filter of card Q-2 takes the stricter of the column store (card K-1) and the manifest
-//!    ([`postgres_mask::class_map`]); `getDatabaseSchema` still answers the manifest's classes.
+//! 2. Classes come from the head manifest's `data_classes` ([`manifest_classes`]). Card Q-2
+//!    takes the stricter of the column store (card K-1) and the manifest
+//!    ([`postgres_mask::class_map`]) for the privacy filter and for `DatabaseTable.columns[]
+//!    .data_class`; `confirmed` still says whether the manifest lists the column.
 //! 3. A person's schema change runs through `DatabaseEngine::apply_migration`. Card Q-2 gives it
 //!    card K-1's sync with the manifest's classes on top
 //!    ([`crate::privacy::postgres::StrictSync`]); [`interim_catalog_sync`] stays for
@@ -1466,7 +1467,17 @@ pub async fn schema(
             EngineError::NotReady => QueryError::Problem(not_ready_error()),
             other => QueryError::Core(Error::Internal(format!("catalog: {other}"))),
         })?;
-    Ok(schema_of(row.engine, &catalog, &t.manifest))
+    let mut answer = schema_of(row.engine, &catalog, &t.manifest);
+    // The class the lens applies (card Q-2): the stricter of the column store and the manifest.
+    let classes = class_map_of(svc, ctx.tenant, id, row.engine, &t.manifest).await?;
+    for table in &mut answer.tables {
+        for c in &mut table.columns {
+            if let Some(k) = classes.class(&table.name, &c.name) {
+                c.data_class = k;
+            }
+        }
+    }
+    Ok(answer)
 }
 
 /// The catalog as `DatabaseSchema`: the database's own schema only, classes by the manifest.
