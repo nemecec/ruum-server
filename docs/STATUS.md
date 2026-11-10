@@ -11,7 +11,9 @@ the evening integration (run on 2026-11-08: the browser tests on the build serve
 providers, the second E-2 fix, cards D-1, T-1 and T-2), the night integration of 2026-11-08
 (`f/followups-4`, the new voice and Estonian of `w/voice`, cards K-1 and A-1; run on
 2026-11-09), the integration of 2026-11-09 (the RUSTSEC-2026-0459 fix, `f/masking-hardening`,
-decision 0005 B-3 and B-1, card Q-1), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+decision 0005 B-3 and B-1, card Q-1), the evening integration of 2026-11-09 (the C-8 race, a data
+cluster per agent, K-1 C-2, the step 2 error codes and query rule 10, the brand directions; run
+on 2026-11-10), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -245,6 +247,33 @@ Fixes made during the night integration:
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
 
+Integration of 2026-11-09 evening (run 6, done on 2026-11-10; each branch rebased onto `main`,
+checked on the build server with `cargo test --workspace`, both suite backends with
+`RUUM_REQUIRE_IMPLEMENTED=1` and `scripts/e2e_browser.sh`, pushed as `integ6/...-2` and green in
+GitHub CI, then fast-forwarded, in this order; linear history, no merge commit, no co-author
+line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `w/c8-race` | Backlog 2026-11-09 T-13: the versions panel reads the node again with the first page of versions, so "Current", the restore Undo and the compare dialog use the real head right after an upload; `usePagedApi` keeps the first page (additive); a flow test that holds the children reload; the C-8 browser test asserts the first row is the one "Current" row. | accepted (`review-c8-r6.md`; notes: the Vitest flake T-19, the Chromium network flake T-18) |
+| `f/pgdata-per-agent` | Backlog 2026-11-08 B-2: every `run.sh` run of a tree with `deploy/dev/postgres-data` builds `ruum-buildbox-pgdata:<key>` from the tree's own folder and starts `pgdata-<key>` (its own port, `RUUM_DBHOST_URL`, `DBHOST_CHECK_CONTAINER`, `RUUM_DBENGINE_REQUIRE_POSTGRES=1`); a changed folder gives a new image and an empty cluster; `--stop` removes container, volume and image. | accepted (`review-dc-r6.md`, notes N-1 to N-6) |
+| `f/k1c2-errors` | Backlog 2026-11-08 P-2 (K-1 C-2), P-3 and 2026-11-09 S-12: a name that does not fit the class store gets no row and counts as personal; the nine step 2 error codes in `ErrorCode`, `sqlstate` and `Retry-After` in `ApiError`, Q-1's `Problem` is `ApiError`; query rule 10 refuses writes to and schema changes of catalog relations; a data-modifying `WITH` is a write. One additive contract change (the rule in the `queryDatabase` text). | accepted (`review-srv-r6.md`, notes N-1 to N-5) |
+| `w/brand-directions` | Three brand directions for the person (`docs/ux/brand/directions.html`, `palettes.mjs`, `build.mjs`, `README.md`): Paper and spruce, Marker, Graphite; 252 contrast pairs pass. The person chose Graphite (decision 0005 B-5) before the merge. | docs only, no panel review file |
+
+Notes of this integration:
+
+- `main` moved during the run (the voice panel integration, three commits), so the stack was
+  rebased twice. The first rebase was pushed as `integ6/c8-race`, `integ6/pgdata-per-agent`,
+  `integ6/k1c2-errors` and `integ6/brand-directions`; the second, which is on `main`, as the
+  same names with `-2`. The Rust, contract, migration and deploy trees of the two rebases are
+  the same, so the Rust checks of the first rebase hold; the browser tests ran again on each
+  tip of the second.
+- All checks used the new per-agent data cluster (`f/pgdata-per-agent`'s `run.sh`).
+- The browser test `oauth.e2e.ts` failed in 2 of 4 full runs of the first rebase (`page.goto`
+  after the app's callback: `net::ERR_ABORTED`) and passed alone and on the second rebase
+  (backlog 2026-11-09 T-20). One more full run on `w/brand-directions` failed once (output
+  trimmed) and passed on the re-run. CI was green on all eight branches.
+
 Integration of 2026-11-09 (each branch rebased onto `main`, checked on the build server with
 `cargo test --workspace`, both suite backends with `RUUM_REQUIRE_IMPLEMENTED=1` and
 `scripts/e2e_browser.sh`, pushed as `integ2/...` and green in GitHub CI, then fast-forwarded, in
@@ -279,7 +308,7 @@ Fixes made during this integration:
 - The rebased branches were pushed as `integ2/masking-hardening`, `integ2/untrusted-agent-text`,
   `integ2/et-ruum` and `integ2/s2-q-1` (no force push), and `d/rusqlite-0.41`.
 
-The digest for the person is `docs/digests/2026-11-09.md` (earlier: `docs/digests/2026-11-08.md`, `docs/digests/2026-11-07-evening.md`,
+The digest for the person is `docs/digests/2026-11-09-evening.md` (earlier: `docs/digests/2026-11-09.md`, `docs/digests/2026-11-08.md`, `docs/digests/2026-11-07-evening.md`,
 `docs/digests/2026-11-07-afternoon.md`, `docs/digests/2026-11-07.md`, `docs/digests/2026-11-06-night.md`, `docs/digests/2026-11-06.md`,
 `docs/digests/2026-11-06-evening.md`). The worktrees of the merged branches are removed; the
 branches stay.
@@ -464,7 +493,30 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-09, `main` after the integration of 2026-11-09, on the build server)
+## Checks (2026-11-10, `main` after the integration of 2026-11-09 evening, on the build server)
+
+`main` is `4b15efc` before this documentation commit. The checks ran with
+`scripts/buildbox/run.sh` of `main`, which now gives each key its own data cluster
+(`pgdata-<key>`, `RUUM_DBENGINE_REQUIRE_POSTGRES=1`):
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace`: 734 passed, 0 failed, 2 ignored (724 before; the new tests of
+  `f/k1c2-errors`).
+- `RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit` with `RUUM_SUITE_BACKEND=memory`:
+  tenant isolation 354 checks (314 passed, 40 planned), permission matrix 1936 checks (1744
+  passed, 192 planned), trashed file suite 96/96, database cases d1 11/11, grants 7/7, agents
+  13, guests 3 and statements 7 planned, nodes 5 planned and 3 pending (card P-3), privacy
+  suite 99 planned; 0 pending (501), 0 failed. With `postgres`: pass, 0 failed (the summary
+  lines were cut from the log).
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 90 of 90 mutations killed, none survived, skipped or broken (88 before; new: `databases-classes-long-name-stored` and `databases-query-catalog-write-allowed`), 2 h 48 min with another agent's check on the server.
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `scripts/e2e_browser.sh`: 172 passed, 1 skipped (`sso.e2e.ts`), on each of the four tips of
+  the second rebase; `oauth.e2e.ts` is flaky on the build server (backlog 2026-11-09 T-20).
+- GitHub CI: green on `integ6/c8-race`, `integ6/pgdata-per-agent`, `integ6/k1c2-errors`,
+  `integ6/brand-directions` and on the same names with `-2` (the tips on `main`).
+
+### Checks of the integration of 2026-11-09 (earlier)
+
 
 `main` is `24d192b` before this documentation commit; it is the tree of `integ2/s2-q-1`. The
 checks ran with `scripts/buildbox/run.sh <key> <worktree> -- ...` (own Postgres and SpiceDB)
@@ -509,58 +561,48 @@ sources (`run.sh` keeps file times).
   web build; `w/et-ruum` ran `npm ci && npm run lint && npm run build && npm test` on the build
   server, 306 tests), `oasdiff` (CI runs it).
 
-## Next cards (2026-11-09, from `docs/backlog/2026-11-08.md` and `docs/backlog/2026-11-09.md`)
+## Next cards (2026-11-10, from `docs/backlog/2026-11-08.md` and `docs/backlog/2026-11-09.md`)
 
 Small, clear fixes that need no person (design 20.3). The IDs are those of the backlogs (the
 date tells which), which have the evidence. Each card goes through the normal reviews and gates.
-SEC-1 (the masking hole) and the Q-1 unblock of the earlier list are merged. In this order:
+Cards 1 to 4 of the earlier list are merged (integration of 2026-11-09 evening, run 6): the C-8
+race (2026-11-09 T-13, `w/c8-race`), the data cluster per agent (2026-11-08 B-2,
+`f/pgdata-per-agent`: every `run.sh` run of a current tree gets its own `pgdata-<key>`), K-1
+C-2 and the step 2 error codes with query rule 10 (2026-11-08 P-2, P-3; 2026-11-09 S-12,
+`f/k1c2-errors`). The brand directions (`w/brand-directions`, `docs/ux/brand/`) are merged too.
+In this order:
 
-1. **The C-8 race** (2026-11-09 T-13): refresh the node when an upload makes a new version;
-   the test asserts that the first row is "Current". It is the one flaky test that failed CI in
-   this run.
-2. **Data cluster per agent** (2026-11-08 B-2, raised): `run.sh --data-cluster` (or always)
-   starts `pgdata-<key>` from the tree's set-up; `--stop` removes it. Every data cluster change
-   needs it; three agents wrote their own.
-3. **K-1 C-2** (2026-11-08 P-2): names over 63 characters in the catalog sync. **Built on
-   `f/k1c2-errors`, waiting for review and integration.** `classes::fits_store`: a schema,
-   table or column name of 0 or more than 63 characters, or with a NUL, gets no
-   `database_columns` row (both stores, through `plan`); the lens takes it as `personal`; the
-   sync logs a line with the count (no names) and goes on. Tests: the planner case, a store
-   conformance case on memory and Postgres (`unfit_names_conform`; the Postgres store now sorts
-   `list` in byte order, `collate "C"`, as the memory store does), the SQLite view of the
-   review's probe; mutation `databases-classes-long-name-stored` (KILLED).
-4. **Step 2 error codes** (2026-11-08 P-3), with the Q-1 note N-B (2026-11-09 S-12): a rule
-   that refuses writes to `pg_catalog` relations. **Built on `f/k1c2-errors`, waiting for
-   review and integration.** `ErrorCode` has the nine step 2 codes of the contract (a test
-   checks both directions against `openapi.yaml`); `ApiError` has `sqlstate` and
-   `retry_after`, and `render` sends `Retry-After`. Q-1's own `Problem` struct is gone
-   (`query::Problem` is now a name of `ApiError`), so Q-2, A-2 and D-2 use the shared codes.
-   Rule 10 of `query::rules`: no write to and no schema change of a catalog relation
-   (Postgres: `pg_catalog`, `information_schema`, `pg_*` schemas and unqualified `pg_*` names,
-   also inside `WITH` and `EXPLAIN`; SQLite: `sqlite_schema`, `sqlite_master`); a query with a
-   data-modifying `WITH` is classified as a write. One additive contract change (the rule in
-   the `queryDatabase` text). Hostile rules cases, a Postgres engine case
-   (`UPDATE pg_settings` is `422 statement_not_allowed` now, not `400 query_failed` 42501), an
-   HTTP case; mutation `databases-query-catalog-write-allowed` (KILLED). Panel note: rule 10
-   also refuses `CREATE TABLE pg_x` (an own table with a `pg_` name), because Postgres looks in
-   `pg_catalog` first for an unqualified name; confirm or veto.
-5. **Security follow-ups** (2026-11-08 S-7; 2026-11-09 S-8, S-9, S-11, S-15): DQS off in the
-   bundled SQLite (un-ignore the planned Q-1 test); masked copy with a view on a personal
-   column; no `USAGE` on `ruum_mask` for the copy's owner; names only in `PrincipalRef` fields;
-   the remaining untrusted marks.
-6. **Connection drops and flaky tests** (2026-11-09 T-12; 2026-11-08 T-4 to T-6): cap the
-   connections of the dbengine Postgres suites; `mutation_check.sh` prints why a mutant died.
-7. **CI and harness** (2026-11-08 T-1, T-2, T-10).
-8. **Build server and mutation check** (2026-11-08 B-1, B-3 to B-7, S-5; 2026-11-09 B-13 to
-   B-16): `--detach`, file touch, a full-check lock, `--perl`, `cargo-deny` in `setup.sh`.
-9. **Method** (2026-11-08 M-1 to M-8; 2026-11-09 M-14 to M-19): templates and workflow.
-10. **Translation** (2026-11-08 L-3 to L-5): a reviewer agent step for Estonian, visual tests in
-    Estonian, localised emails.
+1. **Security follow-ups** (2026-11-08 S-7; 2026-11-09 S-8, S-9, S-11, S-15, S-16, S-17): DQS
+   off in the bundled SQLite (un-ignore the planned Q-1 test); masked copy with a view on a
+   personal column; no `USAGE` on `ruum_mask` for the copy's owner; names only in
+   `PrincipalRef` fields; the remaining untrusted marks; rule 10 walks the query of
+   `CREATE TABLE ... AS` and `CREATE VIEW ... AS`; one line on "names, not relations".
+2. **Flaky tests and connection drops** (2026-11-09 T-12, T-18 to T-20; 2026-11-08 T-4 to
+   T-6): first the list of known flaky tests in `docs/TESTING.md` (T-6, raised: three new ones
+   in run 6, among them `oauth.e2e.ts`, which failed in 2 of 4 full browser runs of this
+   integration); cap the connections of the dbengine Postgres suites; `mutation_check.sh`
+   prints why a mutant died.
+3. **Brand tokens for Graphite** (2026-11-09 U-1 to U-4; decision 0005 B-5, design 12.6): the
+   missing tokens with today's values (title font, icon stroke, control edge and shadow), the
+   favicon and wordmark assets, self-hosted IBM Plex. With the visual designer's Graphite work
+   (`w/graphite-theme` is open).
+4. **CI and harness** (2026-11-08 T-1, T-2, T-10; 2026-11-09 U-5).
+5. **Build server and mutation check** (2026-11-08 B-1, B-3 to B-7, the `docs/TESTING.md` half
+   of S-5; 2026-11-09 B-13 to B-16, B-18 to B-20): `--detach`, file touch, a full-check lock,
+   `--perl`, `cargo-deny` in `setup.sh`, a sweep of abandoned keys.
+6. **Method** (2026-11-08 M-1 to M-8; 2026-11-09 M-14 to M-19, M-21, M-22): templates and
+   workflow; tasks name the base commit.
+7. **Translation** (2026-11-08 L-3 to L-5; 2026-11-09 L-10, L-12): a reviewer agent step for
+   Estonian, visual tests in Estonian, localised emails, the voice panel follow-ups.
+
+With card Q-2: 2026-11-09 P-15 (`QueryError` becomes `Error`).
 
 Waiting for the architect panel: 2026-11-08 P-1 (K-1 C-1, before Q-2), P-4, P-5, P-8 (the
 `isolation.rs` change of Q-1 is merged; confirm or veto), P-9; 2026-11-09 S-10 (owner-made
 `SET` and definer functions), S-14 (show agent-written text in the web UI), review-Q-1-3 N-A
-(the owner kind changes options). Waiting for the person: see `docs/digests/2026-11-09.md`.
+(the owner kind changes options); 2026-11-09 P-13 (rule 10 and own `pg_*` tables), P-14 (why a
+long-named column stays personal), L-11 (a size limit in the error answer). Waiting for the person: see
+`docs/digests/2026-11-09-evening.md`.
 
 ## Known gaps
 
@@ -584,8 +626,8 @@ Waiting for the architect panel: 2026-11-08 P-1 (K-1 C-1, before Q-2), P-4, P-5,
   (the query API for people, 2026-11-09). The other 12 database operations count as planned in
   the suites; the privacy suite is all planned until the operations and the filters of Q-2 and
   Q-3 land. Q-1 notes open: review-Q-1-3 N-A (the owner kind still changes options; the panel
-  records the intended reading) and N-B (`UPDATE pg_settings` passes the rules as `Write`;
-  backlog 2026-11-09 S-12). The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) had two
+  records the intended reading). N-B is fixed: query rule 10 refuses writes to the catalog
+  (`f/k1c2-errors`, merged 2026-11-09 evening; follow-ups backlog 2026-11-09 S-16, S-17, P-13). The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) had two
   reviews: the first was not complete (`review-dbhost.md`), the second did not accept
   (`review-dbhost-2.md`): the search-path part holds, but **a tenant cast on a tenant type runs
   as `mask` inside `ruum_mask.pseudonym_other`, reads the HMAC key and can replace
@@ -595,8 +637,8 @@ Waiting for the architect panel: 2026-11-08 P-1 (K-1 C-1, before Q-2), P-4, P-5,
   (`review-masking-3.md` accepted; notes N1 to N4: a database from before the fix keeps its
   key, no repair path for an old foreign dependent, test placement, mutation thread count). K-1 conditions open: C-1 (the column store and the
   manifest's `data_classes` drift apart after a person's `updateDatabaseManifest` or
-  `restoreVersion`; before Q-2) and C-2 (a SQLite name over 63 characters stops the Postgres
-  sync; before Q-3); notes N-1 to N-6. A-1 notes N-1 to N-5 and N-7; the create codes
+  `restoreVersion`; before Q-2); C-2 is fixed (`f/k1c2-errors`, merged 2026-11-09 evening: a
+  name over 63 characters gets no class row and counts as personal); notes N-1 to N-6. A-1 notes N-1 to N-5 and N-7; the create codes
   `409`/`503` are a contract gap for the panel. Open notes for later cards: review-D-1 N-2 to N-5, N-8, N-9 (plan check not
   atomic, two server processes, `getVersion`/`restoreVersion` of a manifest version);
   review-T-1 N-3 to N-7; review-T-2 N-5 (no public export operation: the panel decides) and
