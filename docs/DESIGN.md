@@ -1167,9 +1167,14 @@ workers:
   signature checks; at least once, with retries, a dead-letter queue and replay; actor and on_behalf_of
   are passed on.
 - **Long-running workers**: a small CPU share (gVisor allows tiny limits), billed by memory-time (21);
-  restart on crash with backoff. Work that mostly waits uses **durable sleeps and timers** instead ("wake me
-  in 3 hours or on event X"): the sandbox is released while waiting and costs nothing. The default
-  `AGENTS.md` steers agents to this pattern; workers that hold a connection open stay always-on.
+  restart on crash with backoff. Workers that hold a connection open (a chat bot socket) stay always-on.
+- **Durable workflows (later)**: jobs and triggers are stateless; each run starts from zero. A durable
+  workflow is one process that spans time ("send a welcome email, wait 3 days or until they reply, then
+  follow up only if they did not"): Ruum saves its state at each wait, releases the sandbox (no cost while
+  waiting), and resumes it at the same point on the timer or the event, one instance per case (customer,
+  order), each cancellable. It saves apps the bookkeeping of "who waits since when" in a table. It is built
+  on the timers and events above as an SDK feature after step 3, preferably on an open-source engine
+  (Restate, Temporal or similar); the default `AGENTS.md` then steers mostly-waiting work to it.
 - Logs, errors, issues and the after-run checks of 9.6 apply; every run is attributed for cost (21).
 
 ### 9.12 Resource access instead of secrets
