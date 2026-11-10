@@ -329,8 +329,8 @@ pub struct TenantFixture {
     /// A `read_personal` grant of `agent` on the database, given by `member` for 8 hours (card
     /// A-1; `write_live` needs an agent scope of `edit`).
     pub database_grant: Uuid,
-    /// A pending request of `agent` on the database: a `DELETE` without `WHERE` (placeholder
-    /// until A-2).
+    /// A pending request of `agent` on the database (card A-2): a grant request for
+    /// `read_personal`, 60 minutes. Only `member` (the agent's user) decides it.
     pub database_approval: Uuid,
     /// An upload of an empty file (no chunks), started by `member`, ready to complete.
     pub upload_empty: UploadId,
@@ -1279,6 +1279,49 @@ mod seed {
         .await
         {
             t.database_grant = g.value.id;
+        } else {
+            agents_ok = false;
+        }
+
+        // The pending request of `agent` on the database (card A-2): a grant request for
+        // `read_personal`, 60 minutes, made as the agent, so `getDatabaseApproval` and
+        // `decideDatabaseApproval` have a real row without the statement path of the query API.
+        let (s2, db, agent, member) = (
+            s.clone(),
+            t.database,
+            t.agent_id(Who::Agent),
+            t.user_id(Who::Member),
+        );
+        if let Some((a, _)) = step("database approval", async move {
+            let scope = s2.agents.authenticate(tid, agent).await?.scope.as_scope();
+            let c = Context {
+                tenant: tid,
+                actor: Actor {
+                    actor: ruum_core::actor::PrincipalRef {
+                        kind: ruum_core::actor::PrincipalKind::Agent,
+                        id: agent.0.into(),
+                    },
+                    on_behalf_of: Some(member),
+                },
+                scope: Some(scope),
+                idempotency_key: None,
+            };
+            s2.databases
+                .request_grant(
+                    &c,
+                    &*s2.agents,
+                    db,
+                    ruum_core::databases::access::approvals::RequestGrant {
+                        kind: ruum_core::databases::access::grants::GrantKind::ReadPersonal,
+                        duration_minutes: 60,
+                        reason: Some("fixture request".into()),
+                    },
+                )
+                .await
+        })
+        .await
+        {
+            t.database_approval = a.id;
         } else {
             agents_ok = false;
         }

@@ -670,8 +670,7 @@
         "database.branch_created",
         "database.restore_started",
         "database.restored",
-        "database.restore_failed",
-        "database.approval_decided"
+        "database.restore_failed"
       ]
     }
   }

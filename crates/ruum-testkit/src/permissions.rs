@@ -728,15 +728,11 @@ fn operation_rule(op: &str) -> Option<Rule> {
             },
         ),
         "decideDatabaseApproval" => database_rule(
-            "users only; the agent's user (member) or a person with manage, with the right the \
-             statement needs (edit: a DELETE without WHERE)",
-            |who| {
-                who == Who::Member
-                    || who
-                        .role_on(Target::Database)
-                        .is_some_and(|r| r >= Role::Manage)
-            },
-            false,
+            "users only; the fixture request is a grant request of agent, which only the \
+             agent's user (member) decides (decision 0004-20 C-17); a statement or a migration: \
+             the agent's user or a person with manage, with the right it needs",
+            |who| who == Who::Member,
+            true,
         ),
         "listPendingDatabaseApprovals" => signed_in(
             "the requests the caller may decide (agents: their own), across the tenant; only \
