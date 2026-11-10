@@ -202,11 +202,51 @@ fn var(text: &str, name: &str) -> Option<String> {
 
 /// "A mutation rule per rule": every planned mutation is a placeholder that names the card that
 /// moves it up to `mutations/`, runs this suite, and names cases that exist; every case is
-/// guarded by at least one mutation.
+/// guarded by at least one mutation, planned or moved up (a moved-up `privacy-*.sh` keeps its
+/// `CASES`, names cases that exist and is no placeholder any more).
 #[test]
 fn every_rule_has_a_planned_mutation() {
     let cases = privacy::cases();
     let mut covered: BTreeSet<&str> = BTreeSet::new();
+    let active_dir = planned_mutations_dir().parent().unwrap().to_path_buf();
+    let mut active: Vec<PathBuf> = std::fs::read_dir(&active_dir)
+        .expect("mutations exists")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|x| x == "sh")
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("privacy-"))
+        })
+        .collect();
+    active.sort();
+    for f in &active {
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(f).unwrap();
+        let Some(prefixes) = var(&text, "CASES") else {
+            continue;
+        };
+        assert_eq!(
+            var(&text, "PLACEHOLDER").as_deref(),
+            Some("0"),
+            "{name}: a moved-up mutation is no placeholder"
+        );
+        for v in ["DESCRIPTION", "FILE", "PERL", "TESTS", "CARD"] {
+            assert!(
+                var(&text, v).is_some_and(|x| !x.is_empty()),
+                "{name}: {v} is missing"
+            );
+        }
+        for p in prefixes.split(',') {
+            let hits: Vec<&str> = cases
+                .iter()
+                .filter(|c| c.id.starts_with(p))
+                .map(|c| c.id)
+                .collect();
+            assert!(!hits.is_empty(), "{name}: CASES {p} names no case");
+            covered.extend(hits);
+        }
+    }
     let mut files: Vec<PathBuf> = std::fs::read_dir(planned_mutations_dir())
         .expect("mutations/planned exists")
         .flatten()

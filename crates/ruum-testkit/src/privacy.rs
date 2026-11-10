@@ -86,9 +86,8 @@ pub const SQLITE_WAITS_FOR: Option<&str> = Some("E-3");
 /// `class_read_required` and the sanitized errors for agents. Q-1 builds `queryDatabase` for
 /// people only ("Out of scope: agents (Q-2, Q-3)"), and Q-2 and Q-3 remove no planned mark.
 /// So every case with [`Filter::Needed`] waits here for the card of its engine, on both
-/// backends. Q-2 removes the Postgres entry when it lands, and Q-3 the SQLite entry.
-pub const FILTER_WAITS_FOR: &[(Engine, &str)] =
-    &[(Engine::Postgres, "Q-2"), (Engine::Sqlite, "Q-3")];
+/// backends. Q-2 removed the Postgres entry when it landed; Q-3 removes the SQLite entry.
+pub const FILTER_WAITS_FOR: &[(Engine, &str)] = &[(Engine::Sqlite, "Q-3")];
 
 /// The card in [`FILTER_WAITS_FOR`] for `engine`, while it has one.
 pub fn filter_waits_for(engine: Engine) -> Option<&'static str> {
@@ -98,11 +97,16 @@ pub fn filter_waits_for(engine: Engine) -> Option<&'static str> {
         .map(|(_, card)| *card)
 }
 
-/// The operations every case uses to build its fixture.
+/// The operations every case uses to build its fixture. The fixture's tables come from
+/// `applyDatabaseMigration` once it is built (card D-2); while it is planned, `member` (a person
+/// with `manage`) runs the same statements through `queryDatabase`, which takes a schema change
+/// through the engine's migration path and the catalog sync (Q-1 wave decision 3, card Q-2).
+/// Both paths end with the same confirmation of the classes, so the cases see the same
+/// database. A case that needs a named migration itself (its status, its error, a migration on a
+/// branch) lists `applyDatabaseMigration` in its own operations.
 pub const FIXTURE_OPERATIONS: &[&str] = &[
     "createDatabase",
     "getDatabase",
-    "applyDatabaseMigration",
     "confirmColumnClasses",
     "queryDatabase",
 ];
@@ -850,7 +854,7 @@ pub fn cases() -> Vec<Case> {
             "leak.failed_migration",
             Leak,
             "a failed migration in listDatabaseMigrations shows no value to a viewer or an agent",
-            &["listDatabaseMigrations"],
+            &["applyDatabaseMigration", "listDatabaseMigrations"],
             BOTH,
             MEMORY_ENGINE,
             NO_FILTER,
@@ -861,7 +865,7 @@ pub fn cases() -> Vec<Case> {
             "leak.status_message",
             Leak,
             "the status message holds no row value, for anyone",
-            &[],
+            &["applyDatabaseMigration"],
             BOTH,
             MEMORY_ENGINE,
             NO_FILTER,
@@ -929,7 +933,7 @@ pub fn cases() -> Vec<Case> {
             "poracle.masked_branch_key",
             PseudonymOracle,
             "a masked branch's lens gives other pseudonyms than its source's (agent rows, migration, DO)",
-            &["createDatabaseBranch"],
+            &["createDatabaseBranch", "applyDatabaseMigration"],
             BOTH,
             MEMORY_LENS,
             FILTER,
@@ -940,7 +944,7 @@ pub fn cases() -> Vec<Case> {
             "poracle.schema_only_branch_key",
             PseudonymOracle,
             "a schema_only branch's lens gives other pseudonyms than its source's",
-            &["createDatabaseBranch"],
+            &["createDatabaseBranch", "applyDatabaseMigration"],
             BOTH,
             MEMORY_LENS,
             FILTER,
@@ -951,7 +955,7 @@ pub fn cases() -> Vec<Case> {
             "poracle.copy_keeps_branch_key",
             PseudonymOracle,
             "a copy of a masked branch keeps the branch's key",
-            &["createDatabaseBranch", "copyNode"],
+            &["createDatabaseBranch", "copyNode", "applyDatabaseMigration"],
             BOTH,
             MEMORY_LENS,
             FILTER,
@@ -1353,10 +1357,26 @@ impl Ctx {
         self.send(who, db, spec).await
     }
 
-    /// Applies a migration as `member` and expects it to be applied.
+    /// Applies a migration as `member` and expects it to be applied. While
+    /// `applyDatabaseMigration` is planned (card D-2), `member` runs each statement of `up`
+    /// through `queryDatabase` instead ([`Ctx::schema_change`]).
     pub async fn migrate_ok(&mut self, db: &Db, up: &str) -> Step<()> {
+        if crate::contract::is_planned("applyDatabaseMigration") {
+            return self.schema_change(db, up).await;
+        }
         let res = self.migrate(Who::Member, db, up, json!({})).await?;
         want(&res, 200, None, "the migration of member")?;
+        self.wait_ready(db).await
+    }
+
+    /// Runs each statement of `up` (split at `;`; the statements of the suite hold no `;` in a
+    /// literal) as `member` through `queryDatabase` in write mode: a person with `manage` runs a
+    /// schema change through the engine's migration path and the catalog sync (Q-1 wave
+    /// decision 3), so the classes follow column identity as after a migration.
+    pub async fn schema_change(&mut self, db: &Db, up: &str) -> Step<()> {
+        for statement in up.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            self.write_ok(Who::Member, db, statement, vec![]).await?;
+        }
         self.wait_ready(db).await
     }
 
@@ -1425,16 +1445,20 @@ impl Ctx {
             .iter()
             .map(|(t, c, k)| (format!("{}.{t}.{c}", self.engine.schema()), json!(k)))
             .collect();
-        let res = self
-            .migrate(
-                Who::Member,
-                &db,
-                &fixture_ddl(self.engine),
-                Value::Object(classes),
-            )
-            .await?;
-        want(&res, 200, None, "the fixture migration")?;
-        self.wait_ready(&db).await?;
+        if crate::contract::is_planned("applyDatabaseMigration") {
+            self.schema_change(&db, &fixture_ddl(self.engine)).await?;
+        } else {
+            let res = self
+                .migrate(
+                    Who::Member,
+                    &db,
+                    &fixture_ddl(self.engine),
+                    Value::Object(classes),
+                )
+                .await?;
+            want(&res, 200, None, "the fixture migration")?;
+            self.wait_ready(&db).await?;
+        }
         self.confirm(&db, CLASSES).await?;
         let people = self.people();
         for p in &people {
@@ -2857,15 +2881,36 @@ mod cases {
                     col["column"]
                 );
             }
+            // Every column of the swapped table is unconfirmed, `id` too, so the agent reads
+            // `id` as a pseudonym (text): a filter `id = 1` cannot find the row (Postgres:
+            // no `text = integer` operator, a refusal; SQLite: no row). So the case reads the
+            // first row by order instead, and checks the filter apart.
+            let res = c
+                .query(
+                    A,
+                    &f.db,
+                    "select id from orders where id = 1",
+                    vec![],
+                    false,
+                )
+                .await?;
+            if res.status.as_u16() == 200 {
+                ensure!(
+                    Rows::parse(&res)?.is_empty(),
+                    "a filter on the masked id finds the row"
+                );
+            } else {
+                want_any(&res, REFUSED, "a filter on the masked id")?;
+            }
             let r = c
                 .rows(
                     A,
                     &f.db,
-                    "select id, email, nick, score from orders where id = 1",
+                    "select id, email, nick, score from orders order by id limit 1",
                     vec![],
                 )
                 .await?;
-            for i in 1..4 {
+            for i in 0..4 {
                 ensure!(
                     is_masked(&r.cell(0, i)?),
                     "column {i} of the swapped table must be masked"
