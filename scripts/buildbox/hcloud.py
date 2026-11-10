@@ -62,8 +62,10 @@ def ensure_ssh_key():
 
 
 def ensure_firewall(allow_ip):
-    rules = [{'direction': 'in', 'protocol': 'tcp', 'port': '22', 'source_ips': [f'{allow_ip}/32']},
-             {'direction': 'in', 'protocol': 'icmp', 'source_ips': [f'{allow_ip}/32']}]
+    # 'any': SSH from every address (key-only login; decided 2026-11-10, the laptop IP changes often).
+    src = ['0.0.0.0/0', '::/0'] if allow_ip == 'any' else [f'{allow_ip}/32']
+    rules = [{'direction': 'in', 'protocol': 'tcp', 'port': '22', 'source_ips': src},
+             {'direction': 'in', 'protocol': 'icmp', 'source_ips': src}]
     fw = find('firewalls', NAME)
     if fw:
         call('POST', f'/firewalls/{fw["id"]}/actions/set_rules', {'rules': rules})
@@ -117,8 +119,11 @@ p = argparse.ArgumentParser()
 p.add_argument('cmd', choices=['create', 'status', 'delete'])
 p.add_argument('--type', default='cax41')
 p.add_argument('--location', default='hel1')
-p.add_argument('--allow-ip', default=None)
+p.add_argument('--allow-ip', default=None)  # an IPv4 address, or 'any'
+p.add_argument('--firewall-only', action='store_true')
 a = p.parse_args()
+if a.firewall_only:
+    print('firewall', ensure_firewall(a.allow_ip or 'any')); sys.exit(0)
 if a.cmd == 'create' and not a.allow_ip:
     sys.exit('create needs --allow-ip (the public IP that may use SSH)')
 {'create': create, 'status': status, 'delete': delete}[a.cmd](a)

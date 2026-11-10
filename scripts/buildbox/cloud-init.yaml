@@ -24,9 +24,12 @@ packages:
   - curl
   - unzip
   - postgresql-client
+  - fail2ban
   - python3
   - xz-utils
 runcmd:
+  - echo 'PermitRootLogin no' > /etc/ssh/sshd_config.d/10-ruum.conf && systemctl reload ssh
+  - systemctl enable --now fail2ban
   - mkdir -p /home/ruum/.ssh && cp /root/.ssh/authorized_keys /home/ruum/.ssh/ && chown -R ruum:ruum /home/ruum/.ssh && chmod 700 /home/ruum/.ssh
   - systemctl enable --now docker
   # Node.js 22 from the official binaries, pinned with its SHA-256 (keep in step with setup.sh,
