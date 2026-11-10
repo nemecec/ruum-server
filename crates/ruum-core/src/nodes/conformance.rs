@@ -479,6 +479,53 @@ async fn typed_rules(w: &World, b: &dyn Backend) {
         crate::nodes::typed::data_of(&d[0]),
         crate::providers::DataCopy::Masked
     );
+    // A viewer of the source who copies into a folder where they have edit: masked data
+    // (decision 0004-7; review-wave5 B-1).
+    let elsewhere = mk(b, &m, folder(w.root, "P-3 elsewhere")).await;
+    w.grant(area.id, Role::View, w.viewer).await;
+    w.grant(elsewhere.id, Role::Edit, w.viewer).await;
+    let viewer_copy = s
+        .copy(&w.user(w.viewer), db.id, copy_to(elsewhere.id))
+        .await
+        .unwrap()
+        .value;
+    let d = drain(b).await;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].target_node_id, Some(viewer_copy.id));
+    assert_eq!(
+        crate::nodes::typed::data_of(&d[0]),
+        crate::providers::DataCopy::Masked
+    );
+    // The member's agent, with a manage scope over the whole tenant: still masked, an agent
+    // never makes a full copy (decision 0004-7; review-wave5 B-1).
+    let agent = Context {
+        tenant: w.a,
+        actor: Actor {
+            actor: crate::actor::PrincipalRef {
+                kind: crate::actor::PrincipalKind::Agent,
+                id: crate::ids::PrincipalId(uuid::Uuid::now_v7()),
+            },
+            on_behalf_of: Some(w.member),
+        },
+        scope: Some(crate::authz::Scope {
+            subtree: None,
+            max_role: Role::Manage,
+            expires_at: None,
+        }),
+        idempotency_key: None,
+    };
+    let agent_copy = s
+        .copy(&agent, db.id, copy_to(elsewhere.id))
+        .await
+        .unwrap()
+        .value;
+    let d = drain(b).await;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].target_node_id, Some(agent_copy.id));
+    assert_eq!(
+        crate::nodes::typed::data_of(&d[0]),
+        crate::providers::DataCopy::Masked
+    );
     hooks
         .guests_may
         .store(false, std::sync::atomic::Ordering::SeqCst);

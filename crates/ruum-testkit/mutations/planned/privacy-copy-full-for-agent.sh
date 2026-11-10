@@ -12,6 +12,8 @@
 # Its cases also wait for the privacy filter (FILTER_WAITS_FOR in privacy.rs: Q-2 removes
 # the Postgres entry, Q-3 the SQLite entry). If they are still planned when CARD lands, the
 # file moves up with the card that removes the last wait (review-T-2 R-2).
+# The same mutation is killed today by the node suites: mutations/nodes-typed-copy-full-for-agents.sh
+# (review-wave5 B-1). This file stays for the privacy suite's own case.
 CARD="P-3"
 CASES="copy.agent"
 DESCRIPTION="copyNode of a database copies full data for every caller"
