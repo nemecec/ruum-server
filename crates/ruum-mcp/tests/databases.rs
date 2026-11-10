@@ -156,6 +156,7 @@ async fn world(postgres: Option<Arc<dyn DatabaseEngine>>) -> World {
     let (mut services, handles) = Services::in_memory_with_handles();
     if let Some(pg) = postgres {
         let d = services.databases.deps().clone();
+        let keys = services.tenant_keys.clone();
         databases::install(
             &mut services,
             DatabaseParts {
@@ -163,7 +164,7 @@ async fn world(postgres: Option<Arc<dyn DatabaseEngine>>) -> World {
                     postgres: Some(pg),
                     sqlite: Engines::memory().sqlite,
                 },
-                keys: services.tenant_keys.clone(),
+                keys,
                 store: d.store.clone(),
                 typed: d.typed.clone(),
                 columns: d.columns.clone(),
