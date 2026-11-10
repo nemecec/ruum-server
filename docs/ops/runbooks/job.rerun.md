@@ -31,4 +31,4 @@ This page never overrides the policy. When they differ, the policy wins, and the
 ## Stop and escalate
 
 - The job failed 3 times in 24 hours: amber, and file a bug with the three errors.
-- The job deletes data (GC sweep, trash purge, retention): red. Never rerun a deleting job by yourself.
+- The job deletes data (GC sweep, trash purge, retention): red, and it counts in the deletions limit. Never rerun a deleting job by yourself.

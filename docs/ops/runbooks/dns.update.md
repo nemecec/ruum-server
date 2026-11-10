@@ -16,8 +16,9 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## How
 
-1. Lower the TTL first when the change can wait one TTL.
-2. Call `dns.update` with the record and the value. NS, MX, CAA, email and verification records, and records of the sign-in domain, are red.
+1. Lower the TTL first when the change can wait one TTL. A TTL above 1 hour or below 60 seconds is red.
+2. Call `dns.update` with the record and the value.
+3. Red: NS, MX and CAA records; mail and verification records (SPF, DKIM, DMARC); every wildcard record; and the records of the sign-in domain, the app domain (apex and wildcard), the API host and the WebDAV host. These send every tenant's traffic.
 
 ## How to check
 

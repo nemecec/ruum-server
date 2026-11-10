@@ -16,12 +16,14 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## How
 
-1. Call `ai_provider.failover` with a provider from the configured list. Any other provider is red.
+1. Call `ai_provider.failover` with the primary or the named fallback. The list is in the infrastructure repository (a security path) and holds only providers with a data processing agreement and an EU region. Any other provider is red.
+2. When the guard and an acting role then run on the same provider, the failover is amber. While it lasts, every amber request goes to the person, because the guard is not independent.
 
 ## How to check
 
 - The operations agents answer health prompts through the new provider.
 - Token spend is now counted on the new provider in the cost ledger.
+- The guard runs on a different provider from the acting roles, or the person knows that amber requests come to them.
 
 ## How to undo
 

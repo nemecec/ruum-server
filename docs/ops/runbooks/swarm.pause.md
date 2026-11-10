@@ -13,11 +13,13 @@ This page never overrides the policy. When they differ, the policy wins, and the
 ## When
 
 - The guard sees a sequence of actions that looks wrong, an agent loops, token budgets run out, or a person asks.
+- The engine pauses a role by itself when the role sent more than 5 red requests in a day.
 
 ## How
 
 1. Call `swarm.pause` with the roles (empty means all) and the reason.
 2. Layer 1 keeps running. Alerts still reach the person by the fallback route.
+3. A pause of all roles, of the `security` role or of the `guard` role pages the person. Without the guard, amber requests go to the person.
 
 ## How to check
 
@@ -29,4 +31,4 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## Stop and escalate
 
-- Always page the person after a pause of all roles.
+- Always page the person after a pause of all roles, the security role or the guard role (the engine does it).

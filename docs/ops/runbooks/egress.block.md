@@ -18,7 +18,7 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 1. Call `egress.block` with the app (or tenant), the destination, the evidence and `expires_in` (at most 7 days).
 2. A range larger than one /24 or a whole top-level domain is red.
-3. To remove it: `egress.unblock` with the block.
+3. To remove it: `egress.unblock` with the block. A block that a person made is red to remove.
 
 ## How to check
 
@@ -27,7 +27,7 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## How to undo
 
-- `egress.unblock`, or wait for `expires_in`.
+- `egress.unblock`, or wait for `expires_in` (lifecycle `egress-block-expiry`).
 
 ## Stop and escalate
 

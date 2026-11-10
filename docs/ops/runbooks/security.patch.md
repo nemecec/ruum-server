@@ -17,8 +17,8 @@ This page never overrides the policy. When they differ, the policy wins, and the
 ## How
 
 1. On staging this is green: roll it out and run the game-day checks.
-2. In production: call `security.patch` with the release and the advisory. The guard checks the advisory and the change.
-3. The rollout uses the normal stages (canary cell first).
+2. In production: call `security.patch` with the release and the advisory. The guard checks the advisory and the change. This action rolls out to the canary cell only.
+3. The next stage (all cells) is a `release.promote` request, with its canary rules. A release with an irreversible migration or a change of a security path is red.
 
 ## How to check
 
@@ -27,8 +27,8 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## How to undo
 
-- `workload.rollback`. Before you roll back, say in the incident that the hole comes back; prefer a forward fix.
+- `workload.rollback`. Over a security patch it is amber, and red during an open security incident, because the hole comes back. Prefer a forward fix.
 
 ## Stop and escalate
 
-- The patch changes a security path: red.
+- The patch changes a security path, or its release has an irreversible migration: red.

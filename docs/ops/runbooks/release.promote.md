@@ -18,8 +18,10 @@ This page never overrides the policy. When they differ, the policy wins, and the
 ## How
 
 1. Call `release.promote` with `to_stage: canary` or `to_stage: all_cells`.
-2. The rollout goes cell by cell, with a pause between cells for the analysis.
-3. During a change freeze set by the person, the policy makes this red; wait.
+2. The engine reads the migrations of the release. None: no change. Additive: amber at `all_cells`, so the guard checks that the canary ran them cleanly. Irreversible (a drop, a lossy type change, a data rewrite, no tested down step): red at the first production stage.
+3. The engine maps the changed files by `path_classes.application`. A change of authorization, the privacy filter, identity, audit, tenant isolation, the database engine's roles and masking, the isolation suites or the CI gates is red.
+4. The rollout goes cell by cell, with a pause between cells for the analysis.
+5. During a change freeze set by the person, the policy makes this red; wait.
 
 ## How to check
 
@@ -34,4 +36,4 @@ This page never overrides the policy. When they differ, the policy wins, and the
 ## Stop and escalate
 
 - The canary analysis is `inconclusive`: amber, the guard looks at the metrics with you.
-- The analysis `failed` or did not run, or the release touches a security path: red.
+- The analysis `failed` or did not run, the release touches a security path, or it has an irreversible migration: red.

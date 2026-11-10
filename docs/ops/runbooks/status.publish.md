@@ -16,9 +16,10 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## How
 
-1. Write the notice in the calm voice: what does not work, since when, what users can do, when the next update comes. No names of tenants, people or apps (red).
-2. Call `status.publish`. The guard checks the text against the incident facts.
-3. A security incident is red: the person decides what customers are told.
+1. Write the notice in the calm voice: what does not work, since when, what users can do, when the next update comes.
+2. No names. The engine matches the text against the directory (tenant names, app names, account names, custom domains); a match is red. When the matcher cannot run, the notice is red.
+3. Call `status.publish`. The guard checks the text against the incident facts.
+4. A security incident, or an incident with a computed data risk, is red: the person decides what customers are told.
 
 ## How to check
 

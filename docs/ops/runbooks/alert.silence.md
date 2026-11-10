@@ -17,7 +17,8 @@ This page never overrides the policy. When they differ, the policy wins, and the
 ## How
 
 1. Call `alert.silence` with the alert rule, the incident and a duration (at most 2 hours green; up to 24 hours amber).
-2. Security, backup and data integrity alerts are red: never silence them.
+2. The engine adds up the silences of one rule: more than 2 hours in 24 hours is amber, also as a chain of short silences.
+3. Alerts labelled `security`, `backup`, `data_integrity` or `ops_safety` (the operations API, the guard, the audit pipeline, the kill switch) are red: never silence them.
 
 ## How to check
 

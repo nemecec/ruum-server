@@ -18,8 +18,9 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 1. Collect the evidence as a record (audit log entries, the leak location).
 2. Call `token.revoke` with the principal and the kinds of tokens. The guard checks the evidence.
-3. Revoking a platform admin, or the only owner of a team, is red.
-4. The person gets a calm notice: what was revoked, why, and how to sign in again and make new tokens.
+3. Red: revoking a platform admin, and any revoke after which a team has no owner with a live credential. The engine counts every revoke of the last 24 hours, so two revokes cannot lock out both owners.
+4. Revoking an operations agent's token pages the person. Without the guard's token, every amber request goes to the person.
+5. The person gets a calm notice: what was revoked, why, and how to sign in again and make new tokens.
 
 ## How to check
 

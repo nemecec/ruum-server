@@ -12,14 +12,14 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## When
 
-- The primary of a CloudNativePG cluster is unhealthy and the automatic failover of layer 1 did not act (for example a primary that answers health checks but not queries).
 - A planned switchover before node maintenance.
+- The primary of a CloudNativePG cluster is unhealthy and the automatic failover of layer 1 did not act (for example a primary that answers health checks but not queries).
 
 ## How
 
-1. Check the replication lag of each replica. Choose the replica with zero lag.
-2. Call `database.failover` with the cluster, the replica and the incident. The guard checks the lag and the primary's state.
-3. If the primary still takes writes and the replica lags, the policy makes it red: do not force it.
+1. Use `mode: switchover` whenever the primary is reachable. CloudNativePG fences the primary, waits until the replica's lag is 0, and then promotes it. The loss window is 0: amber.
+2. Call `database.failover` with the cluster, the replica, the mode and the incident. The guard checks the lag and the primary's state.
+3. `mode: failover` is red. With a reachable primary it loses writes; with an unreachable primary the loss window cannot be computed. Layer 1 does that failover by itself; ask the person when it did not.
 
 ## How to check
 
@@ -29,8 +29,9 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 ## How to undo
 
-- After the old primary rejoins as a replica with zero lag, `database.failover` back to it (only if there is a reason).
+- After the old primary rejoins as a replica with zero lag, `database.failover` with `mode: switchover` back to it (only if there is a reason).
 
 ## Stop and escalate
 
+- The switchover does not finish because the lag does not reach 0: stop and diagnose; do not change to failover.
 - The engine computes a data loss window above 0: red.

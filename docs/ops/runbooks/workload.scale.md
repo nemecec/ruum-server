@@ -20,6 +20,7 @@ This page never overrides the policy. When they differ, the policy wins, and the
 1. Read the declared min and max of the workload (its manifest in the infrastructure repo).
 2. Call `workload.scale` with the new `replicas` or requests and the incident as `reason`.
 3. The engine computes the cost change from the cost ledger. Above EUR 100 a month it is amber; above the budget it is red.
+4. Fewer replicas of a stateful set (NATS, Loki) is amber: a member can go with its volume. A CloudNativePG cluster is never a target; the engine refuses it.
 
 ## How to check
 

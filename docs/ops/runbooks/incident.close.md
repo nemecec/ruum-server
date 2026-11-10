@@ -18,7 +18,8 @@ This page never overrides the policy. When they differ, the policy wins, and the
 
 1. Write the end of the timeline: what happened, what was done, what is still open.
 2. Call `incident.close`. The postmortem agent gets the incident for a report (sev1 and sev2).
-3. A security incident needs the guard (amber), or a person when data loss or exposure is possible (red).
+3. A security incident needs the guard (amber).
+4. A person decides (red) when the engine computes a data risk: a linked alert labelled `data_integrity`, `backup` or `security`, a linked raw read or data incident, a token revoke with evidence of downloads, or a restore with a loss window above 0. No field that you fill in changes this.
 
 ## How to check
 
