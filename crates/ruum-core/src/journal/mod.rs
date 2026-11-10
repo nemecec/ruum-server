@@ -78,6 +78,8 @@ pub enum EventType {
     DatabaseGrantCreated,
     #[serde(rename = "database.grant_revoked")]
     DatabaseGrantRevoked,
+    #[serde(rename = "database.approval_decided")]
+    DatabaseApprovalDecided,
 }
 
 impl EventType {
@@ -104,6 +106,7 @@ impl EventType {
         EventType::DatabaseColumnsConfirmed,
         EventType::DatabaseGrantCreated,
         EventType::DatabaseGrantRevoked,
+        EventType::DatabaseApprovalDecided,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -131,6 +134,7 @@ impl EventType {
             DatabaseColumnsConfirmed => "database.columns_confirmed",
             DatabaseGrantCreated => "database.grant_created",
             DatabaseGrantRevoked => "database.grant_revoked",
+            DatabaseApprovalDecided => "database.approval_decided",
         }
     }
 
@@ -447,6 +451,9 @@ mod tests {
                             | EventType::ShareLinkRevoked
                             | EventType::DatabaseGrantRevoked
                     )
+                    // Only a person decides an approval (`decideDatabaseApproval` is users
+                    // only), so `undoAgent` never meets this entry among an agent's changes.
+                    || *e == EventType::DatabaseApprovalDecided
                     // Only a person confirms classes (`confirmColumnClasses` is users only), so
                     // `undoAgent` never meets this entry among an agent's changes.
                     || *e == EventType::DatabaseColumnsConfirmed,

@@ -422,6 +422,13 @@ pub trait DatabaseStore: Send + Sync {
     /// The database nodes of the tenant that are not purged, per engine (also those in the
     /// trash and those still provisioning), and the branches apart (C-21).
     async fn usage(&self, tenant: TenantId) -> Result<DatabaseUsage>;
+
+    /// The approval store over the same backend (card A-2); `grants` is the grant store that an
+    /// approved grant request writes to. [`build`] calls it once.
+    fn approvals(
+        &self,
+        grants: Arc<dyn access::grants::GrantStore>,
+    ) -> Arc<dyn access::approvals::ApprovalStore>;
 }
 
 // ---------------------------------------------------------------------------- the memory
@@ -479,6 +486,17 @@ fn engine_of(manifest: &Value) -> Option<EngineKind> {
 
 #[async_trait]
 impl DatabaseStore for MemoryDatabaseStore {
+    fn approvals(
+        &self,
+        grants: Arc<dyn access::grants::GrantStore>,
+    ) -> Arc<dyn access::approvals::ApprovalStore> {
+        Arc::new(access::approvals::MemoryApprovalStore::new(
+            self.nodes.clone(),
+            self.journal.clone(),
+            grants,
+        ))
+    }
+
     async fn manifest(&self, tenant: TenantId, version: VersionId) -> Result<Option<Value>> {
         // A copy's first manifest version is written by the node store (card P-3) into the
         // typed node store only.
@@ -809,6 +827,13 @@ fn database_row(r: &sqlx::postgres::PgRow) -> Result<DatabaseRow> {
 
 #[async_trait]
 impl DatabaseStore for PgDatabaseStore {
+    fn approvals(
+        &self,
+        _grants: Arc<dyn access::grants::GrantStore>,
+    ) -> Arc<dyn access::approvals::ApprovalStore> {
+        Arc::new(access::approvals::PgApprovalStore::new(self.pool.clone()))
+    }
+
     async fn manifest(&self, tenant: TenantId, version: VersionId) -> Result<Option<Value>> {
         let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
         let bytes: Option<Vec<u8>> = sqlx::query_scalar(
@@ -1163,6 +1188,8 @@ pub struct DatabaseDeps {
     pub columns: Arc<dyn classes::ColumnStore>,
     pub masking: Arc<dyn crate::privacy::MaskingRules>,
     pub grants: Arc<dyn access::grants::GrantStore>,
+    /// The approvals of agent requests (card A-2), over the backend of `store`.
+    pub approvals: Arc<dyn access::approvals::ApprovalStore>,
     pub queries: query::QueryDeps,
 }
 
@@ -1674,6 +1701,7 @@ pub fn build(
         columns: parts.columns.clone(),
         masking,
         grants: parts.grants.clone(),
+        approvals: parts.store.approvals(parts.grants.clone()),
         queries: query::QueryDeps::new(parts.queries.clone(), parts.keys.clone()),
     });
     let service = Arc::new(service);
