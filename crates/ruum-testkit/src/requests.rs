@@ -37,6 +37,8 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
     let agent = t.agent_id(Who::Agent);
     let node = |n: ruum_core::NodeId, rest: &str| format!("/v1/nodes/{n}{rest}");
     let db = |rest: &str| format!("/v1/databases/{}{rest}", t.database);
+    let app = |rest: &str| format!("/v1/apps/{}{rest}", t.app);
+    let issue = |rest: &str| format!("/v1/issues/{}{rest}", t.issue);
     let plan = t.plan;
     let r = match op {
         // ------------------------------------------------------------ system and auth
@@ -377,6 +379,148 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         )))
         .tenant(tid)
         .json(json!({ "decision": "approve", "comment": "ok, the old rows can go" })),
+
+        // ------------------------------------------------------------ apps (step 3, planned)
+        "createApp" => RequestSpec::post("/v1/apps").tenant(tid).json(json!({
+            "parent_id": t.projects,
+            "name": "new app",
+        })),
+        "getApp" => RequestSpec::get(app("")).tenant(tid),
+        "updateAppSettings" => RequestSpec::new(Method::PATCH, app("/settings"))
+            .tenant(tid)
+            .json(json!({ "telemetry_mode": "privacy" })),
+        "listAppDeployments" => RequestSpec::get(app("/deployments")).tenant(tid),
+        "createAppDeployment" => RequestSpec::post(app("/deployments"))
+            .tenant(tid)
+            .json(json!({
+                "source": { "kind": "file", "node_id": plan },
+                "label": "plant list",
+            })),
+        "getAppDeployment" => {
+            RequestSpec::get(app(&format!("/deployments/{}", t.app_deployment))).tenant(tid)
+        }
+        "publishAppDeployment" => {
+            RequestSpec::post(app(&format!("/deployments/{}/publish", t.app_deployment)))
+                .tenant(tid)
+                .json(json!({}))
+        }
+        "compareAppDeployment" => RequestSpec::get(app(&format!(
+            "/deployments/{}/comparison",
+            t.app_deployment
+        )))
+        .tenant(tid),
+        "listAppSecrets" => RequestSpec::get(app("/secrets")).tenant(tid),
+        "setAppSecret" => RequestSpec::new(Method::PUT, app("/secrets/STRIPE_KEY"))
+            .tenant(tid)
+            .json(json!({ "value": "sk_test_ruum_fixture" })),
+        "rotateAppSecret" => RequestSpec::post(app("/secrets/SESSION_KEY/rotate")).tenant(tid),
+        "listAppDomains" => RequestSpec::get(app("/domains")).tenant(tid),
+        "addAppDomain" => RequestSpec::post(app("/domains"))
+            .tenant(tid)
+            .json(json!({ "host": format!("{}-shop.example.test", t.prefix) })),
+        "removeAppDomain" => {
+            RequestSpec::new(Method::DELETE, app(&format!("/domains/{}", t.app_domain)))
+                .tenant(tid)
+        }
+        "listAppRoles" => RequestSpec::get(app("/roles")).tenant(tid),
+        "listAppRoleGrants" => RequestSpec::get(app("/role-grants")).tenant(tid),
+        "addAppRoleGrant" => RequestSpec::post(app("/role-grants"))
+            .tenant(tid)
+            .json(json!({
+                "role": "approver",
+                "grantee": { "type": "user", "id": t.user_id(Who::Guest) },
+            })),
+        "removeAppRoleGrant" => RequestSpec::new(
+            Method::DELETE,
+            app(&format!("/role-grants/{}", t.app_role_grant)),
+        )
+        .tenant(tid),
+        "listAppApprovals" => RequestSpec::get(app("/approvals")).tenant(tid),
+        "getAppApproval" => {
+            RequestSpec::get(app(&format!("/approvals/{}", t.app_approval))).tenant(tid)
+        }
+        "decideAppApproval" => {
+            RequestSpec::post(app(&format!("/approvals/{}/decision", t.app_approval)))
+                .tenant(tid)
+                .json(json!({ "decision": "approve", "comment": "the preview looks right" }))
+        }
+        "listAppApiKeys" => RequestSpec::get(app("/api-keys")).tenant(tid),
+        "createAppApiKey" => RequestSpec::post(app("/api-keys")).tenant(tid).json(json!({
+            "name": "garden centre",
+            "api": "orders",
+            "scopes": ["orders.read"],
+        })),
+        "revokeAppApiKey" => {
+            RequestSpec::new(Method::DELETE, app(&format!("/api-keys/{}", t.app_api_key)))
+                .tenant(tid)
+        }
+        "searchAppLogs" => RequestSpec::get(app("/logs?level=error")).tenant(tid),
+        "getAppMetrics" => RequestSpec::get(app("/metrics")).tenant(tid),
+        "getAppTrace" => RequestSpec::get(app(&format!("/traces/{}", t.app_trace))).tenant(tid),
+        "listAppTelemetryFields" => RequestSpec::get(app("/telemetry-fields")).tenant(tid),
+        "confirmAppTelemetryFields" => RequestSpec::post(app("/telemetry-fields/confirm"))
+            .tenant(tid)
+            .json(json!({ "fields": [{
+                "field": "order_id", "kind": "log_field", "class": "normal",
+            }] })),
+        "computeAppPseudonym" => RequestSpec::post(app("/pseudonyms"))
+            .tenant(tid)
+            .json(json!({ "field": "customer", "value": "kati@example.test" })),
+        "getProjectPublication" => {
+            RequestSpec::get(format!("/v1/projects/{}/publication", t.projects)).tenant(tid)
+        }
+        "updateProjectPublication" => {
+            RequestSpec::new(Method::PUT, format!("/v1/projects/{}/publication", t.projects))
+                .tenant(tid)
+                .json(json!({
+                    "audience": "signed_in",
+                    "items": [{ "node_id": t.app, "kind": "app" }],
+                }))
+        }
+
+        // ------------------------------------------------------------ issues (step 3, planned)
+        "listIssues" => RequestSpec::get("/v1/issues").tenant(tid),
+        "createIssue" => RequestSpec::post("/v1/issues").tenant(tid).json(json!({
+            "parent_id": t.projects,
+            "template_id": "gallery:bug",
+            "title": "The plant list does not sort",
+            "fields": { "severity": "low" },
+        })),
+        "getIssue" => RequestSpec::get(issue("")).tenant(tid),
+        "updateIssue" => RequestSpec::new(Method::PATCH, issue(""))
+            .tenant(tid)
+            .json(json!({ "status": "in_progress" })),
+        "listIssueEvents" => RequestSpec::get(issue("/events")).tenant(tid),
+        "createIssueRevealRequest" => RequestSpec::post(issue("/reveal-requests"))
+            .tenant(tid)
+            .json(json!({
+                "fields": ["customer"],
+                "reason": "to find the order that failed",
+            })),
+        "resolveIssueReceipt" => RequestSpec::post("/v1/issue-receipts/resolve")
+            .json(json!({ "token": t.issue_receipt_token })),
+        "decideIssueReveal" => RequestSpec::post("/v1/issue-receipts/decision").json(json!({
+            "token": t.issue_receipt_token,
+            "fields": [{ "field": "customer", "choice": "refuse" }],
+        })),
+
+        // ------------------------------------------------------------ templates (step 3, planned)
+        "listTemplates" => RequestSpec::get("/v1/templates").tenant(tid),
+        "createTemplate" => RequestSpec::post("/v1/templates").tenant(tid).json(json!({
+            "parent_id": t.projects,
+            "name": "archive kit",
+            "kind": "project",
+            "source_id": t.archive,
+        })),
+        "getTemplate" => RequestSpec::get(format!("/v1/templates/{}", t.template)).tenant(tid),
+        "instantiateTemplate" => {
+            RequestSpec::post(format!("/v1/templates/{}/instantiate", t.template))
+                .tenant(tid)
+                .json(json!({ "parent_id": t.projects, "name": "new project" }))
+        }
+        "getTemplateSetup" => {
+            RequestSpec::get(format!("/v1/template-setups/{}", t.template_setup)).tenant(tid)
+        }
 
         _ => return None,
     };

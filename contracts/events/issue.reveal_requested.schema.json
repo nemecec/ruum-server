@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/issue.reveal_requested.schema.json",
+  "title": "issue.reveal_requested",
+  "description": "A person asked a reporter to reveal fields of a report (design 9.7). `node_id` of the entry is the issue node. Field names only. This schema is the `data` of a journal entry with `type` `issue.reveal_requested`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "request_id",
+    "fields"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "fields": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "minItems": 1
+    }
+  }
+}

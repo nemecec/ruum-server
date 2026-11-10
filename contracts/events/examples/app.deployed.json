@@ -1,0 +1,22 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 30001,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 4,
+  "type": "app.deployed",
+  "actor": {
+    "kind": "agent",
+    "id": "0190b6c4-7000-7cc1-9a4b-1f2e3d4c5b6c"
+  },
+  "on_behalf_of": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d",
+  "at": "2026-11-10T10:15:00Z",
+  "data": {
+    "deployment_id": "0190b6c4-a000-7cc1-9a4b-1f2e3d4c5b70",
+    "environment": "live",
+    "version_id": "0190b6c4-a001-7cc1-9a4b-1f2e3d4c5b71",
+    "previous_deployment_id": "0190b6c4-a002-7cc1-9a4b-1f2e3d4c5b72",
+    "kind": "publish",
+    "migrations_applied": 1,
+    "approval_id": "0190b6c4-a003-7cc1-9a4b-1f2e3d4c5b73"
+  }
+}

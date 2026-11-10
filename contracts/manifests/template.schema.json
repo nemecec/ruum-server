@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/manifests/template.schema.json",
+  "title": "Template manifest (template.yaml)",
+  "description": "The file `template.yaml` at the root of a template folder (a folder of type `template`, docs/DESIGN.md section 2.7). Two kinds: `project` (a blueprint of a project: the folder structure, `project.yaml`, `AGENTS.md`, database manifests with migrations and masked sample data, an app archive, issue templates, smart folders and role placeholders) and `issue` (the fields of one kind of issue, design 9.7). Gallery templates of Ruum use the same file. A project records the template and version it came from (`template_ref` in its `project.yaml`), so a later step can update it from the template. DRAFT for review (step 3 specify phase, docs/STEP3.md).",
+  "type": "object",
+  "required": ["kind", "name", "version"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "kind": { "type": "string", "enum": ["project", "issue"] },
+    "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "description": { "type": "string", "maxLength": 1000 },
+    "version": {
+      "description": "A version of the template (semantic version for gallery templates; tenant templates use the node version and may leave `0`).",
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+){0,2}$"
+    },
+    "setup": {
+      "description": "`project` only: what the setup makes, in order. Paths are relative to the new project folder; `from` is relative to the template folder.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["database"],
+            "additionalProperties": false,
+            "properties": {
+              "database": {
+                "type": "object",
+                "required": ["name", "manifest"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+                  "manifest": { "type": "string", "description": "A database manifest file in the template (`contracts/manifests/database.schema.json`)." },
+                  "migrations": { "type": "string" },
+                  "sample_data": { "type": "string", "description": "A SQL or CSV file with masked sample data (never real personal data)." }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["app"],
+            "additionalProperties": false,
+            "properties": {
+              "app": {
+                "type": "object",
+                "required": ["name", "archive"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+                  "archive": { "type": "string", "description": "A deployment archive in the template (`app.yaml` at its root). Step 4 replaces it with a repo scaffold." },
+                  "preview": { "type": "boolean", "description": "Deploy the first preview (default true)." }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["folder"],
+            "additionalProperties": false,
+            "properties": {
+              "folder": {
+                "type": "object",
+                "required": ["path"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                  "type": { "type": "string", "enum": ["issues", "sessions", "smart_folder", "album"] },
+                  "from": { "type": "string", "description": "Copy this folder of the template." }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "placeholders": {
+      "description": "`project` only: role placeholders (\"client: comment\"). The setup asks who fills each one and writes the grant on `on` (a path, default the project folder). An app role placeholder names `app_role` instead of `role`.",
+      "type": "object",
+      "maxProperties": 20,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["description"],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string", "maxLength": 200 },
+          "role": { "type": "string", "enum": ["view", "comment", "edit", "manage"] },
+          "app_role": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+          "on": { "type": "string", "maxLength": 1000 }
+        },
+        "oneOf": [ { "required": ["role"] }, { "required": ["app_role"] } ]
+      }
+    },
+    "issue": {
+      "description": "`issue` only: the fields of the issue as a JSON Schema (an object schema; draft 2020-12) and the form layout. The template version is recorded in each issue, so old issues still read correctly after the template changes.",
+      "type": "object",
+      "required": ["schema"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "type": "object" },
+        "layout": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "required": ["field"],
+            "additionalProperties": false,
+            "properties": {
+              "field": { "type": "string" },
+              "widget": { "type": "string", "enum": ["text", "textarea", "select", "number", "checkbox", "date", "app_version"] },
+              "label": { "type": "string", "maxLength": 100 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "kind": { "const": "issue" } } }, "then": { "required": ["issue"], "not": { "anyOf": [ { "required": ["setup"] }, { "required": ["placeholders"] } ] } } },
+    { "if": { "properties": { "kind": { "const": "project" } } }, "then": { "not": { "required": ["issue"] } } }
+  ],
+  "examples": [
+    {
+      "kind": "project",
+      "name": "Web app + Postgres + sign-in",
+      "version": "1.0.0",
+      "setup": [
+        { "folder": { "path": "Issues", "type": "issues" } },
+        { "database": { "name": "app.db", "manifest": "db/manifest.yaml", "migrations": "db/migrations/", "sample_data": "db/sample.sql" } },
+        { "app": { "name": "app", "archive": "app.tar.gz" } }
+      ],
+      "placeholders": {
+        "client": { "description": "The client who reviews the app", "role": "comment" },
+        "approver": { "description": "Who approves orders", "app_role": "approver", "on": "app" }
+      }
+    },
+    {
+      "kind": "issue",
+      "name": "Bug",
+      "version": "1.0.0",
+      "issue": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "steps": { "type": "string" },
+            "expected": { "type": "string" },
+            "actual": { "type": "string" },
+            "severity": { "enum": ["low", "medium", "high", "critical"] }
+          }
+        },
+        "layout": [ { "field": "steps", "widget": "textarea" }, { "field": "severity", "widget": "select" } ]
+      }
+    }
+  ]
+}

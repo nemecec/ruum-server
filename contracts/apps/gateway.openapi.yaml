@@ -1,0 +1,378 @@
+openapi: 3.1.0
+info:
+  title: Ruum app gateway
+  version: 0.1.0-draft
+  summary: What the app gateway serves on every app origin, and what it adds to requests (docs/DESIGN.md, sections 9.2 to 9.7).
+  description: |
+    DRAFT for review (step 3 specify phase). Read `contracts/apps/README.md` first.
+
+    The app gateway answers every request to an app origin
+    (`https://<app-slug>.<tenant-slug>.ruumapps.net`, a preview
+    `https://<deployment-short-id>--<app-slug>.<tenant-slug>.ruumapps.net`, or a custom domain).
+    It is the model of Google IAP and Cloudflare Access: **it checks who may use the app before a
+    request reaches the app.**
+
+    ## The check of every request
+    1. Find the app and the deployment by host name. Unknown host: `404` page. App suspended:
+       a status page (`503`).
+    2. `access: platform`: the visitor needs a Ruum sign-in **for this app origin** (below) and
+       the permission `use` on the app node (`view`, or any app role; `schema.zed`). A preview
+       needs `edit`. Without sign-in: redirect to `/.ruum/v1/auth/start`. Without the right: a
+       `403` page with "ask for access". `access: public`: everybody passes; a signed-in visitor
+       still gets a user token.
+    3. Strip every incoming `Ruum-*` header (a client can never send its own `Ruum-User`), add
+       `Ruum-User` (the user token, `contracts/apps/user-token.schema.json`), `Ruum-Request-Id`
+       and the W3C `traceparent`, and forward to the deployment.
+    4. Add the response headers: `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
+       `Referrer-Policy: strict-origin-when-cross-origin`, and `Content-Security-Policy:
+       frame-ancestors` that allows only the Ruum UI origin for previews and `'none'` for live
+       apps unless the app sets its own value.
+    5. Inject the Ruum browser script (`/.ruum/v1/script.js`) into HTML answers of live apps
+       (unless `telemetry.browser_script: false`) and the annotation script into previews only
+       (design 11.1; step 5).
+
+    ## Sign-in on an app origin
+    The apps domain is a separate registered domain on the Public Suffix List (design 9.5), so
+    the platform session cookie never reaches it. The gateway runs its own short code flow with
+    the platform (`/.ruum/v1/auth/start` → the platform's `/v1/auth/login` with an app audience →
+    `/.ruum/v1/auth/callback`) and sets a host-only cookie `__Host-ruum_app` (HttpOnly, Secure,
+    SameSite=Lax, 12 hours) that holds a session ID, never a token. Signing out of Ruum ends
+    these sessions within a minute.
+
+    ## Paths the gateway keeps for itself
+    Every path under `/.ruum/` belongs to the gateway; an app cannot serve it. The browser
+    script and the report widget send to these paths on the app's own origin, so they need no
+    CORS and no cookies of their own.
+
+    ## Identity of calls between apps and from partners
+    Internal calls (`http://<binding>.<api>.ruum.internal`) go through the internal gateway,
+    which adds `Ruum-User` with `actor: app` (and `on_behalf_of` when delegated, design 9.10).
+    Partner calls with a `ruum_appkey_...` key get `actor: partner`. The app checks the header
+    with the same SDK in every case.
+  license:
+    name: Apache 2.0
+    identifier: Apache-2.0
+servers:
+  - url: https://garden.acme.ruumapps.localhost
+    description: An app on the laptop stack (Caddy serves `*.ruumapps.localhost`).
+  - url: https://garden.acme.ruumapps.net
+    description: An app in production.
+security:
+  - appSession: []
+  - {}
+tags:
+  - name: auth
+    description: Sign-in on the app origin.
+  - name: telemetry
+    description: Frontend errors and Web Vitals from the Ruum browser script.
+  - name: reports
+    description: Reports from the people who use the app (the report widget).
+paths:
+  /.ruum/v1/auth/start:
+    get:
+      tags: [auth]
+      operationId: appAuthStart
+      summary: Start the sign-in for this app origin
+      security: []
+      parameters:
+        - name: return_to
+          in: query
+          description: A path on this origin.
+          schema:
+            type: string
+            pattern: '^/[^/].*$|^/$'
+      responses:
+        '302':
+          description: Redirect to the platform sign-in with a signed state.
+  /.ruum/v1/auth/callback:
+    get:
+      tags: [auth]
+      operationId: appAuthCallback
+      summary: Finish the sign-in and set the app session cookie
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Sets `__Host-ruum_app` and redirects to `return_to`.
+        '400':
+          description: A bad or expired state.
+  /.ruum/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: appAuthLogout
+      summary: Sign out of this app origin
+      responses:
+        '204':
+          description: The app session is gone.
+  /.ruum/v1/script.js:
+    get:
+      tags: [telemetry]
+      operationId: getBrowserScript
+      summary: The Ruum browser script
+      description: |
+        Records JavaScript errors, unhandled rejections, console errors, failed requests and Core
+        Web Vitals, and shows the report widget. In live apps the privacy-aware mode is the
+        default (design 9.6): errors and Web Vitals only, no cookies of its own, URLs without
+        query strings, no request bodies or form values, the user only as the pairwise pseudonym
+        of the user token. The full mode adds breadcrumbs and failed request details. Previews
+        always record in full.
+      security: []
+      responses:
+        '200':
+          description: The script.
+          content:
+            text/javascript:
+              schema:
+                type: string
+  /.ruum/v1/telemetry:
+    post:
+      tags: [telemetry]
+      operationId: sendBrowserTelemetry
+      summary: Send frontend events
+      description: |
+        Batches of frontend events from the browser script. The gateway adds the app, the
+        deployment, the pairwise user (from the session, never from the body) and the trace ID,
+        drops IP addresses, strips query strings, and hands the batch to the ingestion pipeline,
+        which applies the telemetry classes (`telemetry-privacy.yaml`) before storage. Rate
+        limited per visitor and per app; over the limit events are dropped and counted. Accepts
+        `text/plain` so `navigator.sendBeacon` works.
+      security:
+        - appSession: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelemetryBatch'
+          text/plain:
+            schema:
+              type: string
+              description: The same JSON as a string.
+      responses:
+        '202':
+          description: Accepted (also when some events were dropped).
+        '413':
+          description: The batch is larger than 64 KiB.
+        '429':
+          description: Too many batches.
+  /.ruum/v1/reports:
+    post:
+      tags: [reports]
+      operationId: createAppReport
+      summary: File a report from the report widget
+      description: |
+        Design 9.7. The reporter saw every item before it was sent and could remove or blur each
+        one. The gateway attaches, server side, the log records of this visit (frontend and
+        backend, linked by the visit's trace IDs; only records of this visitor), applies the
+        reporter's choices per `personal` field (`include` decrypts the reporter's own values
+        from the raw copy, only for this issue, only when the app keeps a raw copy;
+        `pseudonymise` is the default; `remove` gives the hidden-value marker), holds the raw
+        copies of the visit until the issue closes (at most 30 days), and makes an issue from the
+        app's bug template, linked to the matching error group. Reporters who are not members
+        of the tenant get a receipt token (`IssueReceiptToken`) shown once. Public apps limit
+        reports per visitor and per app.
+      security:
+        - appSession: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AppReport'
+      responses:
+        '201':
+          description: The report is filed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppReportReceipt'
+        '413':
+          description: The screenshot is larger than 5 MiB.
+        '422':
+          description: The report is not valid.
+        '429':
+          description: Too many reports.
+  /.ruum/v1/reports/preview:
+    post:
+      tags: [reports]
+      operationId: previewAppReport
+      summary: What a report would attach, before the reporter sends it
+      description: |
+        The log records of this visit that have `personal` fields, with each such field shown as
+        the reporter's own value when the raw copy exists (the reporter is the person the value
+        is about, or typed it), so the reporter can choose per field. Records without `personal`
+        fields are only counted. Records about other people are never offered.
+      security:
+        - appSession: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [visit_id]
+              properties:
+                visit_id:
+                  type: string
+                  pattern: '^[0-9a-f]{32}$'
+      responses:
+        '200':
+          description: The candidate records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportPreview'
+        '429':
+          description: Too many requests.
+components:
+  securitySchemes:
+    appSession:
+      type: apiKey
+      in: cookie
+      name: __Host-ruum_app
+      description: The gateway's session on this app origin (a session ID, never a token).
+  schemas:
+    TelemetryBatch:
+      type: object
+      required: [visit_id, events]
+      properties:
+        visit_id:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+          description: Random per page load; links the frontend events and the backend records of one visit through the trace IDs.
+        events:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/BrowserEvent'
+    BrowserEvent:
+      type: object
+      required: [kind, at]
+      properties:
+        kind:
+          type: string
+          enum: [error, unhandled_rejection, console_error, failed_request, web_vital, breadcrumb]
+        at:
+          type: string
+          format: date-time
+        route:
+          type: string
+          maxLength: 500
+          description: The path without the query string (the script strips it; the gateway strips it again).
+        message:
+          type: string
+          maxLength: 2000
+        template:
+          type: string
+          maxLength: 500
+          description: The message template when the app logs with the Ruum helpers ("order {order_id} failed").
+        fields:
+          type: object
+          maxProperties: 30
+          additionalProperties:
+            type: [string, number, boolean, 'null']
+        stack:
+          type: string
+          maxLength: 8000
+          description: The minified stack; the platform maps it with the private source maps.
+        web_vital:
+          type: object
+          properties:
+            name:
+              type: string
+              enum: [LCP, INP, CLS, FCP, TTFB]
+            value:
+              type: number
+        trace_id:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+    AppReport:
+      type: object
+      required: [visit_id, description]
+      properties:
+        visit_id:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+        description:
+          type: string
+          minLength: 1
+          maxLength: 5000
+          description: What the reporter was doing.
+        screenshot:
+          type: string
+          format: binary
+          description: A PNG after the reporter's drawing and blur (optional).
+        drawing:
+          type: string
+          description: The drawing as shapes (Excalidraw JSON), optional.
+        context:
+          type: string
+          description: 'JSON: route, browser, screen size and app version, as the reporter saw them.'
+        choices:
+          type: string
+          description: 'JSON: `{"<field>": "include" | "pseudonymise" | "remove", "*": ...}` for the `personal` fields of the preview. Missing fields are `pseudonymise`.'
+        attach_logs:
+          type: boolean
+          default: true
+        email:
+          type: string
+          format: email
+          description: Only when the reporter types one for a reply.
+    AppReportReceipt:
+      type: object
+      required: [issue_id, receipt_token]
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+          description: Shown only to reporters who can see the issue in Ruum; else the field is absent.
+        receipt_token:
+          type: [string, 'null']
+          description: The receipt token (`https://ruum.space/r#<token>`), shown once, for reporters who are not members of the tenant.
+    ReportPreview:
+      type: object
+      required: [records, records_without_personal_fields, raw_copy]
+      properties:
+        raw_copy:
+          type: boolean
+          description: The app keeps a raw copy, so `include` is possible.
+        records_without_personal_fields:
+          type: integer
+        records:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            required: [at, level, template, personal_fields]
+            properties:
+              at:
+                type: string
+                format: date-time
+              level:
+                type: string
+              template:
+                type: [string, 'null']
+              personal_fields:
+                type: array
+                items:
+                  type: object
+                  required: [field, value]
+                  properties:
+                    field:
+                      type: string
+                    value:
+                      type: [string, 'null']
+                      description: The reporter's own value from the raw copy, or `null` when there is no raw copy.

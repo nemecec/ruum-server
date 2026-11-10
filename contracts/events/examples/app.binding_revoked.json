@@ -1,0 +1,19 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 30006,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 4,
+  "type": "app.binding_revoked",
+  "actor": {
+    "kind": "app",
+    "id": "0190b6c4-7200-7cc1-9a4b-1f2e3d4c5b6e"
+  },
+  "on_behalf_of": null,
+  "at": "2026-11-10T10:15:00Z",
+  "data": {
+    "binding": "photos",
+    "principal_id": "0190b6c4-a005-7cc1-9a4b-1f2e3d4c5b75",
+    "target_node_id": "0190b6c4-a007-7cc1-9a4b-1f2e3d4c5b77",
+    "reason": "dropped"
+  }
+}

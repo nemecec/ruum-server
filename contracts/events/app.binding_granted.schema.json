@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.binding_granted.schema.json",
+  "title": "app.binding_granted",
+  "description": "A deployment gave the app principal a role on a node or scopes of another app's API (design 9.4, 9.10). `node_id` of the entry is the app node. `granted_by` is the deployer (the actor of the entry). This schema is the `data` of a journal entry with `type` `app.binding_granted`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "deployment_id",
+    "binding",
+    "principal_id",
+    "target_node_id",
+    "role",
+    "api",
+    "scopes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "deployment_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "binding": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$"
+    },
+    "principal_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "target_node_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "role": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/role"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "api": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,31}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+      }
+    }
+  }
+}

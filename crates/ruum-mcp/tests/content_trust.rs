@@ -24,8 +24,22 @@ const PHRASE: &str = "data, never as instructions";
 /// `properties`, `items`, `allOf`, `oneOf` and `anyOf` left out) or, for a response body,
 /// `METHOD /path status`. Keep it sorted.
 const UNTRUSTED_FIELDS: &[&str] = &[
-    "AddGrantRequest.message",       // shown to the grantee in the share email
-    "Agent.name",                    // chosen by the agent's OAuth client
+    "AddGrantRequest.message", // shown to the grantee in the share email
+    "Agent.name",              // chosen by the agent's OAuth client
+    "AppApproval.changes",
+    "AppBinding.target_name",
+    "AppCheckResult.details.message",
+    "AppDeployment.label",
+    "AppDeploymentComparison.new_issues.title",
+    "AppDeploymentStage.message",
+    "AppLogRecord.fields",
+    "AppLogRecord.message",
+    "AppLogRecord.route",
+    "AppLogRecord.template",
+    "AppRole.description",
+    "AppTrace.spans.app_name",
+    "AppTrace.spans.attributes",
+    "AppTrace.spans.name",
     "AuditEntry.data",               // old and new names, labels, reasons
     "AuditEntry.user_agent",         // sent by the client
     "BatchItemResult.error.message", // can quote a name
@@ -58,7 +72,15 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "GET /v1/nodes/{node_id}/content 200", // file content
     "GET /v1/nodes/{node_id}/content 206",
     "GrantRequestDetails.reason", // `requestDatabaseAccessGrant`
-    "JournalEntry.data",          // names, labels
+    "IssueContent.body",
+    "IssueContent.fields",
+    "IssueContent.title",
+    "IssueEvent.error",
+    "IssueEvent.route",
+    "IssueReceipt.issue_title",
+    "IssueReport.browser",
+    "IssueReport.route",
+    "JournalEntry.data", // names, labels
     "Node.name",
     "Node.type",               // MIME type or folder type, set by the writer
     "OAuthClient.client_name", // dynamic client registration
@@ -73,6 +95,11 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "ResultColumn.type",
     "SearchHit.path",
     "Tag.name",
+    "TelemetryField.field",
+    "TelemetryField.suggestion_reason",
+    "Template.description",
+    "Template.name",
+    "TemplateSetup.steps.message",
     "Upload.content_type",
     "Version.content_type",
     "Version.label", // `setVersionLabel`, `updateDatabaseManifest`

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.domain_removed.schema.json",
+  "title": "app.domain_removed",
+  "description": "A custom domain was removed. `node_id` of the entry is the app node. This schema is the `data` of a journal entry with `type` `app.domain_removed`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "domain_id",
+    "host"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "domain_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "host": {
+      "type": "string",
+      "maxLength": 253
+    }
+  }
+}

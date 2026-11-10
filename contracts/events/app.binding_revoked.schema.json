@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.binding_revoked.schema.json",
+  "title": "app.binding_revoked",
+  "description": "A binding's grant ended: a new live deployment dropped it, a preview expired, or the app was trashed. `node_id` of the entry is the app node. This schema is the `data` of a journal entry with `type` `app.binding_revoked`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "binding",
+    "principal_id",
+    "target_node_id",
+    "reason"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "binding": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$"
+    },
+    "principal_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "target_node_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "reason": {
+      "enum": [
+        "dropped",
+        "preview_expired",
+        "app_trashed",
+        "target_gone"
+      ]
+    }
+  }
+}

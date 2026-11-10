@@ -83,6 +83,37 @@ relationships: |-
   node:delta_root#manager@tenant:delta#administer
   node:delta_root#team@tenant:delta
   node:delta_docs#parent@node:delta_root
+  node:garden_app#parent@node:garden
+  app:garden_app#app_node@node:garden_app
+  node:garden_db#editor@app:garden_app
+  node:photo#viewer@app:garden_app
+  app:garden_preview#app_node@node:garden_app
+  node:garden_db_preview#editor@app:garden_preview
+  app_role:garden_app/member#app@node:garden_app
+  app_role:garden_app/member#active@user:*
+  node:garden_app#active_role@app_role:garden_app/member#has
+  app_role:garden_app/approver#app@node:garden_app
+  app_role:garden_app/approver#active@user:*
+  node:garden_app#active_role@app_role:garden_app/approver#has
+  app_role:garden_app/admin#app@node:garden_app
+  app_role:garden_app/admin#active@user:*
+  node:garden_app#active_role@app_role:garden_app/admin#has
+  app_role:garden_app/member#granter@app_role:garden_app/admin
+  app_role:garden_app/approver#granter@app_role:garden_app/admin
+  app_role:garden_app/admin#granter@app_role:garden_app/admin
+  app_role:garden_app/approver#holder@user:liisa
+  app_role:garden_app/admin#holder@user:aivar
+  app_role:garden_app/old_role#app@node:garden_app
+  app_role:garden_app/old_role#holder@user:vello
+  node:garden_app#active_role@app_role:garden_app/old_role#has
+  node:shop_app#parent@node:garden
+  app_api_scope:shop_app/orders/orders|read#app@node:shop_app
+  app_api_scope:shop_app/orders/orders|read#consumer@app:garden_app
+  app_api_scope:shop_app/orders/orders|write#app@node:shop_app
+  node:public_item#parent@node:projects
+  node:public_item#viewer@anonymous:*
+  node:signed_in_item#parent@node:projects
+  node:signed_in_item#viewer@user:*
 assertions:
   assertTrue:
     - node:plan#share@user:mari
@@ -156,6 +187,29 @@ assertions:
     - node:gamma_all#edit@user:kadri
     - node:gamma_all#edit@user:kaarel
     - node:delta_docs#edit@user:toomas
+    # Step 3: an app inherits the roles of its folder. view = use, edit = deploy, publish and
+    # read telemetry, manage = configure.
+    - node:garden_app#use@user:jaan
+    - node:garden_app#deploy@user:jaan
+    - node:garden_app#read_telemetry@user:jaan
+    - node:garden_app#configure@user:mari
+    # An app role alone opens the app (design 9.3), without view on the node.
+    - node:garden_app#use@user:liisa
+    - app_role:garden_app/approver#has@user:liisa
+    # The holder of the grants_roles role grants every app role; so does share on the node.
+    - app_role:garden_app/approver#grant@user:aivar
+    - app_role:garden_app/member#grant@user:aivar
+    - app_role:garden_app/approver#grant@user:jaan
+    # The live app principal has its binding's role; the preview has the branch only.
+    - node:garden_db#edit@app:garden_app
+    - node:photo#view@app:garden_app
+    - node:garden_db_preview#edit@app:garden_preview
+    # An API scope: the bound caller calls; a manager of the called app grants.
+    - app_api_scope:shop_app/orders/orders|read#call@app:garden_app
+    - app_api_scope:shop_app/orders/orders|write#grant@user:mari
+    # Public project items: anyone (anonymous) or anyone signed in.
+    - node:public_item#view@anonymous:any
+    - node:signed_in_item#view@user:stranger
   assertFalse:
     - node:projects#view@user:jaan
     - node:plan#manage@user:jaan
@@ -220,3 +274,29 @@ assertions:
     # Without members_can_share an edit member edits but does not share.
     - node:delta_docs#share@user:toomas
     - node:delta_docs#manage@user:toomas
+    # Step 3: a viewer uses the app but does not deploy or read logs; an app role holder only
+    # uses it (no view of the node, no deploy).
+    - node:garden_app#deploy@user:kati
+    - node:garden_app#read_telemetry@user:kati
+    - node:garden_app#view@user:liisa
+    - node:garden_app#deploy@user:liisa
+    # An editor does not configure the app (settings, secrets, domains).
+    - node:garden_app#configure@user:jaan
+    # A role the live manifest removed (no `active` tuple) gives nothing, though its grant stays.
+    - app_role:garden_app/old_role#has@user:vello
+    - node:garden_app#use@user:vello
+    # A role holder without grants_roles cannot grant; a viewer of the node cannot either.
+    - app_role:garden_app/member#grant@user:liisa
+    - app_role:garden_app/member#grant@user:kati
+    # The app principal never manages its targets; a preview never reaches the live database.
+    - node:garden_db#manage@app:garden_app
+    - node:garden_db#edit@app:garden_preview
+    - node:garden_db#view@app:garden_preview
+    # An app without a binding to the API scope cannot call it; an editor of the called app
+    # cannot grant its scopes.
+    - app_api_scope:shop_app/orders/orders|write#call@app:garden_app
+    - app_api_scope:shop_app/orders/orders|write#grant@user:jaan
+    # A public item is not visible to anonymous visitors through its folder, and the folder
+    # stays private.
+    - node:projects#view@anonymous:any
+    - node:signed_in_item#view@anonymous:any

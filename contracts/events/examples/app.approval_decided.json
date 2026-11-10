@@ -1,0 +1,20 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 30014,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 4,
+  "type": "app.approval_decided",
+  "actor": {
+    "kind": "user",
+    "id": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d"
+  },
+  "on_behalf_of": null,
+  "at": "2026-11-10T10:15:00Z",
+  "data": {
+    "approval_id": "0190b6c4-a003-7cc1-9a4b-1f2e3d4c5b73",
+    "deployment_id": "0190b6c4-a000-7cc1-9a4b-1f2e3d4c5b70",
+    "agent_id": "0190b6c4-a00c-7cc1-9a4b-1f2e3d4c5b7c",
+    "decision": "approve",
+    "telemetry_fields_confirmed": 2
+  }
+}

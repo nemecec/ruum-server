@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/project.publication_changed.schema.json",
+  "title": "project.publication_changed",
+  "description": "What of a project is public changed (`updateProjectPublication`, design 9.9). `node_id` of the entry is the project folder. This schema is the `data` of a journal entry with `type` `project.publication_changed`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "audience",
+    "items"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "audience": {
+      "enum": [
+        "private",
+        "signed_in",
+        "public"
+      ]
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "kind"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "node_id": {
+            "$ref": "common.schema.json#/$defs/uuid"
+          },
+          "kind": {
+            "enum": [
+              "app",
+              "repo",
+              "database",
+              "issues"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

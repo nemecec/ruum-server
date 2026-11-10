@@ -1067,6 +1067,282 @@ pub fn case(op: &str, w: &World) -> Option<IsolationCase> {
             own_tenant(op, w, None),
         ),
 
+        // ------------------------------------------------------------ apps (step 3, planned)
+        "createApp" => addressed_case(NotFound, Some(("listChildren", o))),
+        "getApp"
+        | "listAppDeployments"
+        | "getAppDeployment"
+        | "compareAppDeployment"
+        | "listAppSecrets"
+        | "listAppDomains"
+        | "listAppRoles"
+        | "listAppRoleGrants"
+        | "listAppApprovals"
+        | "getAppApproval"
+        | "listAppApiKeys"
+        | "searchAppLogs"
+        | "getAppMetrics"
+        | "getAppTrace"
+        | "listAppTelemetryFields"
+        | "getProjectPublication" => addressed_case(NotFound, None),
+        "updateAppSettings" | "setAppSecret" | "rotateAppSecret" => {
+            addressed_case(NotFound, Some(("getApp", o)))
+        }
+        "createAppDeployment" => {
+            let mut p = addressed(op, w, NotFound, Some(("listAppDeployments", o)));
+            p.push(
+                Probe::new(
+                    "B's owner deploys A's file to B's app",
+                    o,
+                    std_req(op, b).json(json!({
+                        "source": { "kind": "file", "node_id": a.plan },
+                        "label": "bravo from alpha",
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listAppDeployments", a)),
+            );
+            plain("app or source file in tenant A", p)
+        }
+        "publishAppDeployment" => {
+            let mut p = addressed(op, w, NotFound, Some(("getApp", o)));
+            p.push(
+                Probe::new(
+                    "B's owner, A's deployment under B's app",
+                    o,
+                    RequestSpec::post(format!(
+                        "/v1/apps/{}/deployments/{}/publish",
+                        b.app, a.app_deployment
+                    ))
+                    .tenant(b.id)
+                    .json(json!({})),
+                    NotFound,
+                )
+                .unchanged(o, std_req("getApp", a)),
+            );
+            // An approval binds one deployment of one tenant; A's approval never counts here.
+            p.push(
+                Probe::new(
+                    "B's owner publishes B's deployment with A's approval",
+                    o,
+                    std_req(op, b).json(json!({ "approval_id": a.app_approval })),
+                    NoLeak,
+                )
+                .unchanged(o, std_req("getAppApproval", a)),
+            );
+            plain(
+                "addressed resource of tenant A; an approval of tenant A in the body is not used",
+                p,
+            )
+        }
+        "addAppDomain" | "removeAppDomain" => addressed_case(NotFound, Some(("listAppDomains", o))),
+        "addAppRoleGrant" => {
+            let mut p = addressed(op, w, NotFound, Some(("listAppRoleGrants", o)));
+            p.push(
+                Probe::new(
+                    "B's owner gives an app role of B's app to A's guest",
+                    o,
+                    std_req(op, b).json(json!({
+                        "role": "approver",
+                        "grantee": { "type": "user", "id": a.user_id(Who::Guest) },
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listAppRoleGrants", a)),
+            );
+            plain("app or grantee in tenant A", p)
+        }
+        "removeAppRoleGrant" => {
+            let mut p = addressed(op, w, NotFound, Some(("listAppRoleGrants", o)));
+            p.push(
+                Probe::new(
+                    "B's owner, A's role grant under B's app",
+                    o,
+                    RequestSpec::new(
+                        Method::DELETE,
+                        format!("/v1/apps/{}/role-grants/{}", b.app, a.app_role_grant),
+                    )
+                    .tenant(b.id),
+                    NotFound,
+                )
+                .unchanged(o, std_req("listAppRoleGrants", a)),
+            );
+            plain("addressed resource of tenant A", p)
+        }
+        "decideAppApproval" => {
+            let mut p = addressed(op, w, NotFound, Some(("getAppApproval", o)));
+            p.push(
+                Probe::new(
+                    "B's owner, A's publish request under B's app",
+                    o,
+                    RequestSpec::post(format!(
+                        "/v1/apps/{}/approvals/{}/decision",
+                        b.app, a.app_approval
+                    ))
+                    .tenant(b.id)
+                    .json(json!({ "decision": "approve" })),
+                    NotFound,
+                )
+                .unchanged(o, std_req("getAppApproval", a)),
+            );
+            plain("addressed resource of tenant A", p)
+        }
+        "createAppApiKey" | "revokeAppApiKey" => {
+            addressed_case(NotFound, Some(("listAppApiKeys", o)))
+        }
+        "confirmAppTelemetryFields" => {
+            addressed_case(NotFound, Some(("listAppTelemetryFields", o)))
+        }
+        "computeAppPseudonym" => addressed_case(NotFound, None),
+        "updateProjectPublication" => {
+            let mut p = addressed(op, w, NotFound, Some(("getProjectPublication", o)));
+            p.push(
+                Probe::new(
+                    "B's owner publishes A's app as an item of B's project",
+                    o,
+                    std_req(op, b).json(json!({
+                        "audience": "public",
+                        "items": [{ "node_id": a.app, "kind": "app" }],
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("getApp", a)),
+            );
+            plain("project or item in tenant A", p)
+        }
+
+        // ------------------------------------------------------------ issues (step 3, planned)
+        "listIssues" => {
+            let mut p = own_tenant(op, w, None);
+            for (label, q) in [
+                (
+                    "B's owner lists issues within A's folder",
+                    format!("within={}", a.projects),
+                ),
+                (
+                    "B's owner lists issues of A's app",
+                    format!("app_id={}", a.app),
+                ),
+                (
+                    "B's owner lists issues assigned to A's agent",
+                    format!("assignee={}", a.agent_id(Who::Agent).0),
+                ),
+            ] {
+                p.push(Probe::new(
+                    label,
+                    o,
+                    RequestSpec::get(format!("/v1/issues?{q}")).tenant(b.id),
+                    NoLeak,
+                ));
+            }
+            plain(
+                "issues in the caller's tenant; filters by A's IDs find nothing",
+                p,
+            )
+        }
+        "createIssue" => {
+            let mut p = addressed(op, w, NotFound, Some(("listChildren", o)));
+            p.push(
+                Probe::new(
+                    "B's owner files an issue in B linked to A's app",
+                    o,
+                    std_req(op, b).json(json!({
+                        "parent_id": b.projects,
+                        "template_id": "gallery:bug",
+                        "title": "bravo issue",
+                        "app_id": a.app,
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listChildren", a)),
+            );
+            p.push(
+                Probe::new(
+                    "B's owner files an issue in B assigned to A's member",
+                    o,
+                    std_req(op, b).json(json!({
+                        "parent_id": b.projects,
+                        "template_id": "gallery:bug",
+                        "title": "bravo issue",
+                        "assignee": a.user_id(Who::Member),
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listChildren", a)),
+            );
+            plain("folder, app or assignee in tenant A", p)
+        }
+        "getIssue" | "listIssueEvents" => addressed_case(NotFound, None),
+        "updateIssue" | "createIssueRevealRequest" => {
+            addressed_case(NotFound, Some(("getIssue", o)))
+        }
+        "resolveIssueReceipt" | "decideIssueReveal" => plain(
+            "receipt tokens are bearer secrets by design (shown once to the reporter); the probes \
+             check that an unknown token is 404 and that B's own token leaks nothing of A",
+            vec![
+                Probe::new(
+                    "anonymous, unknown token",
+                    Who::Anonymous,
+                    std_req(op, b).json(if op == "resolveIssueReceipt" {
+                        json!({ "token": "no-such-receipt-token-0000" })
+                    } else {
+                        json!({
+                            "token": "no-such-receipt-token-0000",
+                            "fields": [{ "field": "customer", "choice": "refuse" }],
+                        })
+                    }),
+                    NotFound,
+                ),
+                Probe::new(
+                    "anonymous, B's token",
+                    Who::Anonymous,
+                    std_req(op, b),
+                    NoLeak,
+                ),
+                Probe::new("B's owner, B's token", o, std_req(op, b), NoLeak),
+            ],
+        ),
+
+        // ------------------------------------------------------------ templates (step 3, planned)
+        "listTemplates" => plain(
+            "the gallery and the templates of the caller's tenant",
+            own_tenant(op, w, None),
+        ),
+        "createTemplate" => {
+            let mut p = addressed(op, w, NotFound, Some(("listChildren", o)));
+            p.push(
+                Probe::new(
+                    "B's owner saves A's folder as a template in B",
+                    o,
+                    std_req(op, b).json(json!({
+                        "parent_id": b.projects,
+                        "name": "bravo kit from alpha",
+                        "kind": "project",
+                        "source_id": a.archive,
+                    })),
+                    Rejected,
+                )
+                .unchanged(o, std_req("listChildren", a)),
+            );
+            plain("parent or source folder in tenant A", p)
+        }
+        "getTemplate" | "getTemplateSetup" => addressed_case(NotFound, None),
+        "instantiateTemplate" => {
+            let mut p = addressed(op, w, NotFound, Some(("listChildren", o)));
+            p.push(
+                Probe::new(
+                    "B's owner makes a project in B from A's template",
+                    o,
+                    RequestSpec::post(format!("/v1/templates/{}/instantiate", a.template))
+                        .tenant(b.id)
+                        .json(json!({ "parent_id": b.projects, "name": "bravo from alpha kit" })),
+                    NotFound,
+                )
+                .unchanged(o, std_req("listChildren", a)),
+            );
+            plain("template or parent folder in tenant A", p)
+        }
+
         _ => None,
     }
 }

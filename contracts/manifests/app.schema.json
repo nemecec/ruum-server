@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/manifests/app.schema.json",
+  "title": "Web app manifest (app.yaml)",
+  "description": "The manifest of a web app: the file `app.yaml` at the root of a deployment archive (docs/DESIGN.md, sections 9.1 to 9.10; decisions 20 to 26). Each live deployment is a version of the `webapp` node (encoding `app_release_v1`); the manifest travels in the archive, not in the node. The settings that are not in the archive (who may use the app, the telemetry mode, the report widget) are `AppSettings` of openapi.yaml. Binding targets are paths relative to the app node (`../garden.db`) or absolute in the tenant (`/Photos/Garden`) and are resolved to node IDs at deploy time. Step 3 accepts the runtimes `static` and `node22`; `python3.13` comes later in step 3 (decision 20) and fails validation until its card lands; `container` is not accepted in step 3. DRAFT for review (step 3 specify phase, docs/STEP3.md).",
+  "type": "object",
+  "required": ["runtime"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": {
+      "description": "The version of this schema. Missing means 1.",
+      "const": 1
+    },
+    "runtime": {
+      "description": "`static`: files served from object storage through the gateway and the CDN (no process). `node22`: an OCI image built from the archive with buildpacks, run in gVisor with scale to zero. `python3.13`: later in step 3.",
+      "type": "string",
+      "enum": ["static", "node22", "python3.13"]
+    },
+    "start": {
+      "description": "The command that starts the server (`node server.js`). Required for every runtime except `static`. It must listen on `$PORT` (the platform sets it).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "build": {
+      "description": "The build command that buildpacks run before the image is made (`npm run build`). Optional; without it buildpacks use their default. A build from a repo node (step 4) runs it too.",
+      "type": "string",
+      "maxLength": 500
+    },
+    "static": {
+      "description": "The static part: the folder in the archive that the gateway serves, and how. For `runtime: static` it is the whole app; for a server runtime, the gateway serves these files and sends every other path to the server.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "description": "The folder in the archive (`dist`). Default: the archive root.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/-]{1,200}$"
+        },
+        "spa_fallback": {
+          "description": "Answer unknown paths with this file (`index.html`), for single-page apps.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._/-]{1,200}$"
+        },
+        "headers": {
+          "description": "Extra response headers per path glob. The gateway always sets its own security headers (CSP frame-ancestors, nosniff); these cannot weaken them.",
+          "type": "object",
+          "maxProperties": 50,
+          "additionalProperties": {
+            "type": "object",
+            "maxProperties": 20,
+            "additionalProperties": { "type": "string", "maxLength": 1000 }
+          }
+        }
+      }
+    },
+    "health": {
+      "description": "The path the platform calls before a deployment takes traffic (server runtimes). Default `/`. A `2xx` or `3xx` within 30 s passes.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "pattern": "^/[A-Za-z0-9._~/-]{0,200}$" },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 }
+      }
+    },
+    "check": {
+      "description": "The post-deploy browser check (design 9.6 level 1): the routes the headless browser opens. Default: `/` and the first five links it finds there.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "routes": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "type": "string", "pattern": "^/[A-Za-z0-9._~/?=&%-]{0,300}$" }
+        }
+      }
+    },
+    "resources": {
+      "description": "Limits of one instance and of the scaling (design 9.5). The plan caps them (`AppPlanLimits`); a higher value fails validation.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memory_mb": { "type": "integer", "enum": [128, 256, 512, 1024, 2048] },
+        "min_instances": {
+          "description": "0 (the default) scales to zero: the first request after idle takes about 1 to 3 s (decision 25).",
+          "type": "integer", "minimum": 0, "maximum": 3
+        },
+        "max_instances": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "request_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 300 }
+      }
+    },
+    "env": {
+      "description": "Plain environment variables (not secrets). A name that is also in `secrets` fails validation. Values are visible to everyone who can view the app.",
+      "type": "object",
+      "maxProperties": 100,
+      "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "not": { "pattern": "^(RUUM_|PORT$)" } },
+      "additionalProperties": { "type": "string", "maxLength": 4000 }
+    },
+    "bindings": {
+      "description": "What the app may reach (design 9.1, 9.4, 9.10). Each binding gives the `app` principal a role on a node, or scopes of another app's API. The deployer must hold that role (or the right to grant those scopes); else the deployment fails at stage `bindings`. A preview binds a database to a masked branch of it and every other node at most with `view`. The runtime gives the app one environment variable per binding: `RUUM_BINDING_<NAME>` with how to reach it (database: a connection URL with a short-lived role, no password in the archive; file or folder: the node ID for the runtime API; API: the internal address).",
+      "type": "object",
+      "maxProperties": 30,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/$defs/node_binding" },
+          { "$ref": "#/$defs/api_binding" }
+        ]
+      }
+    },
+    "migrations": {
+      "description": "The migrations per database binding (decision 19): a folder in the archive with files `NNNN_name.sql`. At deploy time the platform runs the ones not yet applied, in order, each in one transaction with a restore point first (`applyDatabaseMigration` rules); a failure stops the deployment and nothing changes. On a preview they run on the preview's branch. Each migration may carry a `-- ruum:classes` header with the classes of its new columns (design 8.5).",
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" }
+    },
+    "secrets": {
+      "description": "The secrets the app needs (design 9.9). Values are never in the archive; they are write-only in OpenBao and reach only the running app, as environment variables. A list of names means `entered` for each (the short form of design 9.1). The long form says how each value is made: `generate` (Ruum makes and rotates it; most secrets) or `entered` (a person with `manage` pastes it once). There is never a database password: databases come through bindings.",
+      "oneOf": [
+        {
+          "type": "array",
+          "maxItems": 50,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/secret_name" }
+        },
+        {
+          "type": "object",
+          "maxProperties": 50,
+          "propertyNames": { "$ref": "#/$defs/secret_name" },
+          "additionalProperties": { "$ref": "#/$defs/secret" }
+        }
+      ]
+    },
+    "access": {
+      "description": "Only the first deployment's value is used, as the initial `AppSettings.access`; afterwards the setting decides (`updateAppSettings`), so a new archive can never make an app public by itself. `public` needs the platform admin's approval for the tenant (decision 22).",
+      "type": "string",
+      "enum": ["platform", "public"]
+    },
+    "roles": {
+      "description": "App-defined roles (design 9.3). Stored and granted by the platform (`app_role:<app-node-id>/<role>`). Every role includes the right to use the app. At most one role has `default: true` (the role of everybody with `view` and no explicit role) and at most one has `grants_roles: true`. When a version removes a role, its grants stay inactive; a rollback makes them active again.",
+      "type": "object",
+      "maxProperties": 20,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["description"],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "default": { "type": "boolean" },
+          "grants_roles": { "type": "boolean" }
+        }
+      }
+    },
+    "claims": {
+      "description": "The facts about the user that the app asks for in the user token (design 9.4), beyond the pairwise `sub`, `roles`, `node_roles` and `actor`. The tenant policy can refuse a claim (no email for public apps); a refused claim is left out of the token, never an error.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "enum": ["name", "email", "locale"] }
+    },
+    "apis": {
+      "description": "The APIs this app offers to other apps (design 9.10). `internal`: only apps of the same tenant that bind to it, at `http://<binding>.<api>.ruum.internal`. `external`: through the app gateway, for signed-in users with app roles, agents (Ruum can publish the OpenAPI as MCP tools, later), partners with API keys, or the public. The spec file is in the archive; a later change that breaks a bound consumer is refused by the breaking-change check of design 11.2 (step 5); in step 3 the deploy shows a warning.",
+      "type": "object",
+      "maxProperties": 10,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["visibility", "protocol", "spec", "scopes"],
+        "additionalProperties": false,
+        "properties": {
+          "visibility": { "type": "string", "enum": ["internal", "external"] },
+          "protocol": {
+            "description": "`http` (OpenAPI file) or `events` (AsyncAPI file, NATS JetStream subjects through the platform bus).",
+            "type": "string", "enum": ["http", "events"]
+          },
+          "spec": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" },
+          "scopes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/scope" }
+          },
+          "granted_by": {
+            "description": "An app role of this app whose holders may grant the scopes to other apps, besides people with `manage` on this app (design 9.10).",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,31}$"
+          },
+          "audience": {
+            "description": "`external` only: who may call it. Default `[users]`.",
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "type": "string", "enum": ["users", "agents", "partners", "public"] }
+          }
+        }
+      }
+    },
+    "events": {
+      "description": "Topics of the platform bus (design 9.10). `publishes`: the topics this app writes (declared in an `events` API). `subscribes`: Ruum's own events for nodes in a binding's scope (`node.created` below a bound folder) and topics of bound apps, by binding name.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "subscribes": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "required": ["binding", "topic", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "binding": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+              "topic": { "type": "string", "pattern": "^[a-z][a-z0-9_.*]{0,99}$" },
+              "path": {
+                "description": "The path of this app that receives the events (POST, at least once, with retries and a dead-letter queue).",
+                "type": "string", "pattern": "^/[A-Za-z0-9._~/-]{0,200}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "jobs": {
+      "description": "Scheduled jobs (decision 21): the platform calls the path on schedule (cron, UTC), with a token whose `actor` is the app itself. At most one run of a job at a time.",
+      "type": "object",
+      "maxProperties": 10,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["schedule", "path"],
+        "additionalProperties": false,
+        "properties": {
+          "schedule": { "type": "string", "pattern": "^[0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+$" },
+          "path": { "type": "string", "pattern": "^/[A-Za-z0-9._~/-]{0,200}$" },
+          "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 900 }
+        }
+      }
+    },
+    "telemetry": {
+      "description": "Telemetry (design 9.6). The classes of fields are in `telemetry-privacy.yaml` (`contracts/manifests/telemetry-privacy.schema.json`) at the archive root, or at `privacy_file`. Source maps under `source_maps` are kept private and never served.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "privacy_file": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" },
+        "source_maps": { "type": "string", "pattern": "^[A-Za-z0-9._/*-]{1,200}$" },
+        "browser_script": {
+          "description": "Set to false to leave out the Ruum browser script (no frontend errors, no report widget). Default true.",
+          "type": "boolean"
+        }
+      }
+    },
+    "egress": {
+      "description": "Internet access goes through the egress proxy, which logs and limits (decision 23). `allow` narrows it to these host names; without it every host is allowed within the limits.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "type": "string", "pattern": "^(\\*\\.)?([a-z0-9-]+\\.)+[a-z]{2,63}$" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "runtime": { "const": "static" } } },
+      "then": { "not": { "anyOf": [ { "required": ["start"] }, { "required": ["jobs"] }, { "required": ["events"] } ] } },
+      "else": { "required": ["start"] }
+    }
+  ],
+  "$defs": {
+    "secret_name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "not": { "pattern": "^(RUUM_|PORT$)" } },
+    "scope": { "type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$" },
+    "node_binding": {
+      "type": "object",
+      "required": ["node", "role"],
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "description": "A path relative to the app node (`../garden.db`) or absolute in the tenant (`/Photos/Garden`), or a node ID (`node:<uuid>`). Resolved at deploy time; the version records the ID.",
+          "type": "string", "minLength": 1, "maxLength": 1000
+        },
+        "role": {
+          "description": "The role the app principal gets on the node. `manage` is never given to an app; migrations run as the platform at deploy time.",
+          "type": "string", "enum": ["view", "edit"]
+        },
+        "on_behalf_of_user": {
+          "description": "The app reads the node for the signed-in user (token exchange, design 9.4): the effective right is the user's right intersected with the binding. Default false (the app's own right).",
+          "type": "boolean"
+        }
+      }
+    },
+    "api_binding": {
+      "type": "object",
+      "required": ["node", "api", "scopes"],
+      "additionalProperties": false,
+      "properties": {
+        "node": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "api": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/scope" }
+        },
+        "delegate": {
+          "description": "Calls carry the signed-in user as `on_behalf_of` (a delegation chain, design 9.10): the effective right is the user's right intersected with this app's binding and the called API's scopes. The chain length is capped at 3 hops.",
+          "type": "boolean"
+        }
+      }
+    },
+    "secret": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["generate"],
+          "additionalProperties": false,
+          "properties": {
+            "generate": { "type": "string", "enum": ["random-16-bytes", "random-32-bytes", "random-64-bytes", "ed25519-keypair", "rsa-3072-keypair"] },
+            "rotate": { "type": "string", "pattern": "^[1-9][0-9]{0,3}d$" },
+            "overlap": {
+              "description": "How long the previous value stays readable after a rotation (`RUUM_SECRET_<NAME>_PREVIOUS`).",
+              "type": "string", "pattern": "^[1-9][0-9]{0,2}[hd]$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["entered"],
+          "additionalProperties": false,
+          "properties": {
+            "entered": { "const": true },
+            "description": { "type": "string", "maxLength": 200 },
+            "preview": {
+              "description": "Previews get the live value too (default false: previews run without it).",
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "runtime": "node22",
+      "start": "node server.js",
+      "bindings": {
+        "db": { "node": "../garden.db", "role": "edit" },
+        "photos": { "node": "/Photos/Garden", "role": "view" },
+        "shop": { "node": "../shop-app", "api": "orders", "scopes": ["orders.read"] }
+      },
+      "migrations": { "db": "migrations/" },
+      "secrets": {
+        "SESSION_KEY": { "generate": "random-32-bytes", "rotate": "90d", "overlap": "24h" },
+        "STRIPE_KEY": { "entered": true, "description": "Stripe secret key of the shop account" }
+      },
+      "access": "platform",
+      "roles": {
+        "member": { "description": "Can add plants and see the plan", "default": true },
+        "approver": { "description": "Can approve orders" },
+        "admin": { "description": "Can change app settings and grant app roles", "grants_roles": true }
+      },
+      "claims": ["name"],
+      "jobs": { "nightly_report": { "schedule": "0 3 * * *", "path": "/jobs/report" } }
+    },
+    {
+      "runtime": "static",
+      "static": { "root": "dist", "spa_fallback": "index.html" }
+    }
+  ]
+}

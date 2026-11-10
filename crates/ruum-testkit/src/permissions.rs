@@ -745,9 +745,169 @@ fn operation_rule(op: &str) -> Option<Rule> {
         )
         .hide(Database, Role::View),
 
+        // ------------------------------------------------------------ apps (step 3, planned)
+        // The permission table of docs/STEP3.md. The fixture app W is in `Projects`, with one
+        // live deployment (roles, secrets, the external API `orders`), and both tenants have the
+        // platform admin's approval of public apps and custom domains.
+        "createApp" => guests_need_policy(node(
+            "Needs edit on the parent folder (agents: max_role edit); guests and agents of \
+             guests need guests_create_resources (default false: 403)",
+            Projects,
+            Role::Edit,
+        )),
+        "getApp" | "listAppDeployments" | "getAppDeployment" | "listAppDomains"
+        | "listAppRoles" | "listAppRoleGrants" | "listAppApprovals" => {
+            node("Needs view on the app", App, Role::View)
+        }
+        "createAppDeployment" => node(
+            "previews: Needs edit on the app and view on the source file",
+            App,
+            Role::Edit,
+        ),
+        "publishAppDeployment" => node(
+            "Needs edit; a person publishes at once (200), an agent gets a pending approval \
+             (202); the narrow agents of the fixture have view only",
+            App,
+            Role::Edit,
+        ),
+        "compareAppDeployment"
+        | "searchAppLogs"
+        | "getAppMetrics"
+        | "getAppTrace"
+        | "listAppTelemetryFields" => node(
+            "telemetry reads need edit on the app (logs can hold personal data, design 9.6)",
+            App,
+            Role::Edit,
+        ),
+        "listAppSecrets" => node("Needs edit (names and states only)", App, Role::Edit),
+        "updateAppSettings" => node(
+            "Needs manage; the standard request changes telemetry_mode (agents may; access is \
+             users only)",
+            App,
+            Role::Manage,
+        ),
+        "setAppSecret" => node("users only; Needs manage", App, Role::Manage),
+        "rotateAppSecret" | "removeAppDomain" | "listAppApiKeys" | "revokeAppApiKey" => {
+            node("Needs manage on the app", App, Role::Manage)
+        }
+        "createAppApiKey" => node("users only; Needs manage", App, Role::Manage),
+        "confirmAppTelemetryFields" => node("users only; Needs manage", App, Role::Manage),
+        "computeAppPseudonym" => node("users only; Needs edit", App, Role::Edit),
+        "addAppDomain" => app_rule(
+            "users only; Needs manage, and in a team tenant an owner or admin (the fixture \
+             tenants have custom domains approved)",
+            |who| {
+                matches!(who, Who::Owner | Who::Admin)
+                    && who.role_on(Target::App).is_some_and(|r| r >= Role::Manage)
+            },
+            Target::App,
+        ),
+        "addAppRoleGrant" | "removeAppRoleGrant" => node_share(
+            "Needs share on the app (or the grants_roles role; no fixture principal holds it)",
+            App,
+        ),
+        "getAppApproval" => Rule::new(
+            "Needs view; an agent sees only its own requests (the request is agent's), others \
+             get 404",
+            |who| {
+                let base = node("", Target::App, Role::View).access;
+                match base(who) {
+                    Access::Allow if who.is_agent() && who != Who::Agent => Access::Hidden,
+                    other => other,
+                }
+            },
+        ),
+        "decideAppApproval" => app_rule(
+            "users only; the agent's user (member) or a person with manage on the app, with \
+             edit on the app",
+            |who| who == Who::Member || who.role_on(Target::App).is_some_and(|r| r >= Role::Manage),
+            Target::App,
+        ),
+        "getProjectPublication" => node("Needs view on the project folder", Projects, Role::View),
+        "updateProjectPublication" => app_rule(
+            "users only; Needs manage on the project and its items, and in a team tenant an \
+             owner or admin (the fixture tenants have public apps approved)",
+            |who| {
+                matches!(who, Who::Owner | Who::Admin)
+                    && who
+                        .role_on(Target::Projects)
+                        .is_some_and(|r| r >= Role::Manage)
+            },
+            Target::Projects,
+        ),
+
+        // ------------------------------------------------------------ issues (step 3, planned)
+        "listIssues" => signed_in(
+            "only issues the caller can see (agents: inside the scope)",
+            Agents::Allow,
+        )
+        .hide(Issue, Role::View),
+        "createIssue" => node(
+            "Needs edit on the folder (open question: comment)",
+            Projects,
+            Role::Edit,
+        ),
+        "getIssue" => node(
+            "Needs view; report attachments need edit",
+            Issue,
+            Role::View,
+        ),
+        "updateIssue" => node("Needs edit on the issue", Issue, Role::Edit),
+        "listIssueEvents" => node(
+            "Needs edit on the issue and on its app (both in Projects)",
+            Issue,
+            Role::Edit,
+        ),
+        "createIssueRevealRequest" => node("users only; Needs edit", Issue, Role::Edit),
+        "resolveIssueReceipt" => Rule::new(
+            "public; the receipt token in the body is the credential, nothing changes",
+            |_| Access::Allow,
+        ),
+        "decideIssueReveal" => Rule::new(
+            "public; the receipt token in the body is the credential (the reporter may change a \
+             choice at any time)",
+            |_| Access::Allow,
+        ),
+
+        // ------------------------------------------------------------ templates (step 3, planned)
+        "listTemplates" => signed_in(
+            "the gallery and the tenant templates the caller can see",
+            Agents::Allow,
+        )
+        .hide(Template, Role::View),
+        "createTemplate" => node(
+            "Needs view on the source (Archive) and edit on the parent (Projects)",
+            Projects,
+            Role::Edit,
+        ),
+        "getTemplate" => node("tenant template: Needs view", Template, Role::View),
+        "instantiateTemplate" => guests_need_policy(node(
+            "Needs view on the template and edit on the parent; the fixture template makes a \
+             database and an app, so guests and agents of guests need guests_create_resources",
+            Projects,
+            Role::Edit,
+        )),
+        "getTemplateSetup" => node(
+            "Needs view on the new project folder (in Projects)",
+            Projects,
+            Role::View,
+        ),
+
         _ => return None,
     };
     Some(r)
+}
+
+/// Like [`database_rule`] for another node of the fixture: who cannot see `target` gets `404`
+/// (or `403`/`404` when its user sees it); who sees it but is not chosen by `allowed` gets
+/// `403`. Agents follow `allowed` (the user-only operations get `403` from [`contract_wide`]).
+fn app_rule(note: &'static str, allowed: fn(Who) -> bool, target: Target) -> Rule {
+    let sees = node("", target, Role::View).access;
+    Rule::new(note, move |who| match sees(who) {
+        Access::Allow if allowed(who) => Access::Allow,
+        Access::Allow => Access::Forbidden,
+        other => other,
+    })
 }
 
 /// The rule of decision 0002-2 / 0004-10: a guest, or an agent of a guest, gets `403` on an
@@ -793,6 +953,9 @@ fn markers_of(t: &TenantFixture, target: Target) -> Vec<String> {
         Target::Archive => vec![t.archive.to_string()],
         Target::Private => vec![t.private.to_string()],
         Target::Database => vec![t.database.to_string(), t.database_name.clone()],
+        Target::App => vec![t.app.to_string(), t.app_name.clone()],
+        Target::Issue => vec![t.issue.to_string(), t.issue_name.clone()],
+        Target::Template => vec![t.template.to_string(), t.template_name.clone()],
     }
 }
 

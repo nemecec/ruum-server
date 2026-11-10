@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.deployment_failed.schema.json",
+  "title": "app.deployment_failed",
+  "description": "A deployment stopped at a stage. `node_id` of the entry is the app node. The stage message is not in the journal (it can quote log lines); `getAppDeployment` shows it to callers with `edit`. This schema is the `data` of a journal entry with `type` `app.deployment_failed`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "deployment_id",
+    "environment",
+    "stage",
+    "reason"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "deployment_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "environment": {
+      "enum": [
+        "live",
+        "preview"
+      ]
+    },
+    "stage": {
+      "enum": [
+        "unpack",
+        "validate",
+        "bindings",
+        "migrations",
+        "image",
+        "start",
+        "check",
+        "switch"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,62}$"
+    }
+  }
+}

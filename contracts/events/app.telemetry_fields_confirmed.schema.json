@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.telemetry_fields_confirmed.schema.json",
+  "title": "app.telemetry_fields_confirmed",
+  "description": "A person confirmed the classes of telemetry fields (design 9.6). `node_id` of the entry is the app node. Counts per class only. This schema is the `data` of a journal entry with `type` `app.telemetry_fields_confirmed`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "normal",
+    "personal",
+    "secret"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "normal": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "personal": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "secret": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

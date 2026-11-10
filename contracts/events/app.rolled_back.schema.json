@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.rolled_back.schema.json",
+  "title": "app.rolled_back",
+  "description": "The live deployment was replaced by an earlier one: by the automatic rollback after a publish (design 9.6) or by a person. `node_id` of the entry is the app node. This schema is the `data` of a journal entry with `type` `app.rolled_back`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "from_deployment_id",
+    "to_deployment_id",
+    "reason",
+    "error_rate_before",
+    "error_rate_after"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "from_deployment_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "to_deployment_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "reason": {
+      "enum": [
+        "error_rate",
+        "failed_check",
+        "manual"
+      ]
+    },
+    "error_rate_before": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "error_rate_after": {
+      "type": [
+        "number",
+        "null"
+      ]
+    }
+  }
+}

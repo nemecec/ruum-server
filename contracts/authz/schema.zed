@@ -1,5 +1,6 @@
 // Ruum SpiceDB schema, step 1 (docs/DESIGN.md, section 3; docs/decisions/0001), with the
-// step 2 additions for database nodes (section 8.4 and 8.5; DRAFT, docs/STEP2.md).
+// step 2 additions for database nodes (section 8.4 and 8.5; docs/STEP2.md) and the step 3
+// additions for web apps (sections 9.2 to 9.10; DRAFT, docs/STEP3.md).
 //
 // Roles follow Google Drive: view < comment < edit < manage. A higher role includes all lower
 // ones. Roles are inherited from parent folders; in step 1 a grant on a child can only add rights
@@ -85,10 +86,22 @@ definition tenant {
     permission sharing_team_editor = (member & content_editor) & members_can_share
 }
 
-// A deployed web app with its own identity (step 3). Kept here so node relations can name it.
+// A deployed web app with its own identity (step 3, design 9.4). The ID of the live principal is
+// the app node ID; a preview deployment is a principal of its own, with the deployment ID, so a
+// preview's bindings (database branches, `view` on other nodes) never become the live app's.
+// Bindings give an app a role on a node through `node#viewer` or `node#editor` (never manage);
+// the deployer must hold that role (the core checks it; decision 0006-3).
 definition app {
     relation tenant: tenant
+    // The app node this principal belongs to.
+    relation app_node: node
 }
+
+// Visitors without sign-in (step 3, design 9.9 audience `public`). Only `node#viewer` names it
+// (`anonymous:*`), on the items of a public project; the API checks anonymous subjects only in
+// the public read paths of those items. A public APP needs no tuple: the gateway lets everybody
+// in when the app's setting `access` is `public`.
+definition anonymous {}
 
 // An AI agent principal. It always acts for one user (no team agents in step 1, decision 13).
 definition agent {
@@ -132,8 +145,10 @@ definition node {
     relation manager: user | group#member | tenant#member | tenant#administer
     relation editor: user | group#member | app | tenant#member
     relation commenter: user | group#member | tenant#member
-    // `user:*` is for public files and apps; not used in step 1 (decision 9).
-    relation viewer: user | group#member | app | tenant#member | user:*
+    // `user:*` is for public files and apps; not used in step 1 (decision 9). Step 3: `user:*`
+    // is "anyone signed in to Ruum" and `anonymous:*` is "anyone" for the items of a public
+    // project (design 9.9; written only by updateProjectPublication, never on a folder).
+    relation viewer: user | group#member | app | tenant#member | user:* | anonymous:*
 
     // Share links, one relation per link role. Kept apart from the grants to people so that a
     // link never gets `share` (and never `manage`: there is no relation for it).
@@ -224,17 +239,59 @@ definition node {
 
     // An agent may see real `personal` values (otherwise pseudonyms).
     permission agent_read_personal = personal_reader
+
+    // ---------------------------------------------------------------- step 3: web apps (DRAFT)
+    // Web app nodes are ordinary nodes (kind `typed`, type `webapp`); what each role means for an
+    // app (design section 3.2):
+    //   view   = use the app (plus app-defined roles, `use` below)
+    //   edit   = deploy previews, publish (agents: the publish waits for a person), read logs,
+    //            metrics, traces and error events (logs can hold personal data, design 9.6)
+    //   manage = settings, secrets, domains, partner API keys, telemetry classes
+    //   share  = grants on the node and every app role
+    // The core checks them with the subject of the request (the user, also for an agent) and
+    // intersects the answer with the agent's scope, as for every node.
+
+    // One tuple per ACTIVE role of the live manifest: node:<app>#active_role@app_role:<app>/<r>#has.
+    // A grant of any active app role lets its holder use the app (design 9.3).
+    relation active_role: app_role#has
+
+    // The gateway's check before a request reaches the app (design 9.2). A preview needs `edit`.
+    permission use = view + active_role
+    permission deploy = edit
+    permission publish = edit
+    permission read_telemetry = edit
+    permission configure = manage
 }
 
 // Roles that a web app declares in its manifest (design section 9.3). ID: "<app-node-id>/<role>".
-// Not used in step 1; kept so the schema grows without a rewrite.
+// Step 3 (DRAFT). The role names come from the live manifest. `active` holds `user:*` while the
+// live manifest declares the role; a new version that removes the role deletes that one tuple,
+// so the grants (`holder`) stay but give nothing, and a rollback writes it again (design 9.3).
+// `granter` points from every role to the role that the manifest marks `grants_roles`.
+// The default role (`default: true`) is not in the graph: the gateway gives it to a visitor with
+// `view` on the app node and no explicit active role.
 definition app_role {
     relation app: node
     relation holder: user | group#member | tenant#member
     relation granter: app_role
+    relation active: user:*
 
-    permission has = holder
+    permission has = holder & active
     permission grant = app->share + granter->has
+}
+
+// A scope of an API that a web app offers to other apps (design 9.10). ID:
+// "<app-node-id>/<api>/<scope>", with each `.` of the scope written as `|` (SpiceDB object IDs
+// have no `.`): `orders.read` is `.../orders/orders|read`. A binding of a calling app writes `consumer@app:<caller>`; the
+// deployer of the calling app must have `grant` (manage on the called app, or a holder of the
+// app role that the API's `granted_by` names). The core records `granted_by`.
+definition app_api_scope {
+    relation app: node
+    relation consumer: app
+    relation granter: app_role
+
+    permission call = consumer
+    permission grant = app->configure + granter->has
 }
 
 // Tuples that the core writes when a tenant is made:
@@ -272,3 +329,21 @@ definition app_role {
 //   a read_personal grant to agent A on D:             node:D#personal_reader@agent:A
 //   The grant's end (expiry or revoke) deletes its tuple; the core also checks the row in
 //   `database_access_grants`, so a tuple that the sweeper has not deleted yet gives nothing.
+//
+// Step 3 (DRAFT), web app nodes:
+//   the live principal of app node A:            app:A#tenant@tenant:T  app:A#app_node@node:A
+//   a preview deployment P of A:                 app:P#tenant@tenant:T  app:P#app_node@node:A
+//   a binding of A with role edit on node N:     node:N#editor@app:A   (view: node:N#viewer@app:A)
+//   a preview's database binding to branch B:    node:B#editor@app:P
+//   an active role r of A's live manifest:       app_role:A/r#app@node:A
+//                                                app_role:A/r#active@user:*
+//                                                node:A#active_role@app_role:A/r#has
+//   the role g with grants_roles:                app_role:A/r#granter@app_role:A/g  (every r)
+//   a grant of role r to user U:                 app_role:A/r#holder@user:U
+//   an API scope s of API x of app B, bound by A: app_api_scope:B/x/s#app@node:B
+//                                                app_api_scope:B/x/s#consumer@app:A
+//   the item I of a public project, audience public:     node:I#viewer@anonymous:*
+//   ...                                  audience signed_in:  node:I#viewer@user:*
+//   A binding's end (a new live deployment drops it, the preview expires, the app is trashed)
+//   deletes its tuple and writes `app.binding_revoked`. The rows of `app_bindings` and
+//   `app_role_grants` imply every tuple above, so the graph can be rebuilt.

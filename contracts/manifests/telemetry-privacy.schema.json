@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/manifests/telemetry-privacy.schema.json",
+  "title": "Telemetry privacy file (telemetry-privacy.yaml)",
+  "description": "The classes of the telemetry fields of an app (docs/DESIGN.md section 9.6): every field of log message templates, every metric label and every span attribute that the app's code writes, with its class. A privacy review agent writes it from the code (step 5; in step 3 the agent that writes the code writes it), it lives in the archive (and later the repo), and a person confirms new fields in the publish approval. The ingestion pipeline (OpenTelemetry Collector processors) reads the confirmed classes: a non-empty `secret` value becomes the hidden-value marker, a `personal` value becomes a keyed pseudonym, before storage. A field that is not listed, or not confirmed, counts as `personal`. A metric label may not be `personal` or `secret` (validation fails). DRAFT for review (step 3 specify phase, docs/STEP3.md).",
+  "type": "object",
+  "required": ["fields"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "fields": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": {
+        "type": "object",
+        "required": ["name", "kind", "class"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]{0,199}$" },
+          "kind": { "type": "string", "enum": ["log_field", "metric_label", "span_attribute"] },
+          "class": { "type": "string", "enum": ["normal", "personal", "secret"] },
+          "reason": { "type": "string", "maxLength": 500, "description": "Why this class (shown to the person who confirms; untrusted text)." },
+          "where": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 300 }, "description": "Source locations (`src/orders.ts:42`)." }
+        },
+        "if": { "properties": { "kind": { "const": "metric_label" } } },
+        "then": { "properties": { "class": { "const": "normal" } } }
+      }
+    }
+  },
+  "examples": [
+    {
+      "fields": [
+        { "name": "order_id", "kind": "log_field", "class": "normal" },
+        { "name": "customer", "kind": "log_field", "class": "personal", "reason": "a customer's email" },
+        { "name": "stripe_token", "kind": "span_attribute", "class": "secret" },
+        { "name": "route", "kind": "metric_label", "class": "normal" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.settings_changed.schema.json",
+  "title": "app.settings_changed",
+  "description": "Settings of a web app changed (`updateAppSettings`). `node_id` of the entry is the app node. Names and the new values of `access` and `telemetry_mode` only. This schema is the `data` of a journal entry with `type` `app.settings_changed`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "changed",
+    "access",
+    "telemetry_mode"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "changed": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "access",
+          "telemetry_mode",
+          "raw_copy_days",
+          "report_widget",
+          "auto_rollback"
+        ]
+      },
+      "minItems": 1
+    },
+    "access": {
+      "enum": [
+        "platform",
+        "public",
+        null
+      ]
+    },
+    "telemetry_mode": {
+      "enum": [
+        "privacy",
+        "full",
+        null
+      ]
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.role_revoked.schema.json",
+  "title": "app.role_revoked",
+  "description": "An app role was taken away (`removeAppRoleGrant`). `node_id` of the entry is the app node. This schema is the `data` of a journal entry with `type` `app.role_revoked`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "role_grant_id",
+    "role",
+    "grantee"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "role_grant_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "role": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$"
+    },
+    "grantee": {
+      "$ref": "common.schema.json#/$defs/grantee"
+    }
+  }
+}

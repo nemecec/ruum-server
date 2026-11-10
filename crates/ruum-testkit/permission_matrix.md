@@ -137,3 +137,48 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `listDatabaseApprovals` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
 | `getDatabaseApproval` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | 404 | 403 | Needs view; an agent sees only its own requests (the request is agent's), others get 404 |
 | `decideDatabaseApproval` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; the agent's user (member) or a person with manage, with the right the statement needs (edit: a DELETE without WHERE) |
+| `createApp` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | Needs edit on the parent folder (agents: max_role edit); guests and agents of guests need guests_create_resources (default false: 403) |
+| `getApp` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `updateAppSettings` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage; the standard request changes telemetry_mode (agents may; access is users only) |
+| `listAppDeployments` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `createAppDeployment` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | previews: Needs edit on the app and view on the source file |
+| `getAppDeployment` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `publishAppDeployment` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit; a person publishes at once (200), an agent gets a pending approval (202); the narrow agents of the fixture have view only |
+| `compareAppDeployment` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | telemetry reads need edit on the app (logs can hold personal data, design 9.6) |
+| `listAppSecrets` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit (names and states only) |
+| `setAppSecret` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; Needs manage |
+| `rotateAppSecret` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage on the app |
+| `listAppDomains` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `addAppDomain` | 401 | ok | ok | 403 | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs manage, and in a team tenant an owner or admin (the fixture tenants have custom domains approved) |
+| `removeAppDomain` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage on the app |
+| `listAppRoles` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `listAppRoleGrants` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `addAppRoleGrant` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs share on the app (or the grants_roles role; no fixture principal holds it) |
+| `removeAppRoleGrant` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs share on the app (or the grants_roles role; no fixture principal holds it) |
+| `listAppApprovals` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the app |
+| `getAppApproval` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | 404 | 403 | Needs view; an agent sees only its own requests (the request is agent's), others get 404 |
+| `decideAppApproval` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; the agent's user (member) or a person with manage on the app, with edit on the app |
+| `listAppApiKeys` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage on the app |
+| `createAppApiKey` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; Needs manage |
+| `revokeAppApiKey` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | Needs manage on the app |
+| `searchAppLogs` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | telemetry reads need edit on the app (logs can hold personal data, design 9.6) |
+| `getAppMetrics` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | telemetry reads need edit on the app (logs can hold personal data, design 9.6) |
+| `getAppTrace` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | telemetry reads need edit on the app (logs can hold personal data, design 9.6) |
+| `listAppTelemetryFields` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | telemetry reads need edit on the app (logs can hold personal data, design 9.6) |
+| `confirmAppTelemetryFields` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403 | 403 | 403 | users only; Needs manage |
+| `computeAppPseudonym` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403 | 403 | 403 | users only; Needs edit |
+| `getProjectPublication` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the project folder |
+| `updateProjectPublication` | 401 | ok | ok | 403 | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs manage on the project and its items, and in a team tenant an owner or admin (the fixture tenants have public apps approved) |
+| `listIssues` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | only issues the caller can see (agents: inside the scope) |
+| `createIssue` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the folder (open question: comment) |
+| `getIssue` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view; report attachments need edit |
+| `updateIssue` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the issue |
+| `listIssueEvents` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the issue and on its app (both in Projects) |
+| `createIssueRevealRequest` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403 | 403 | 403 | users only; Needs edit |
+| `resolveIssueReceipt` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public; the receipt token in the body is the credential, nothing changes |
+| `decideIssueReveal` | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | public; the receipt token in the body is the credential (the reporter may change a choice at any time) |
+| `listTemplates` | 401 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | 403 | the gallery and the tenant templates the caller can see |
+| `createTemplate` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs view on the source (Archive) and edit on the parent (Projects) |
+| `getTemplate` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | tenant template: Needs view |
+| `instantiateTemplate` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | Needs view on the template and edit on the parent; the fixture template makes a database and an app, so guests and agents of guests need guests_create_resources |
+| `getTemplateSetup` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the new project folder (in Projects) |

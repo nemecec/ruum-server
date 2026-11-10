@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/issue.status_changed.schema.json",
+  "title": "issue.status_changed",
+  "description": "The status of an issue changed: by a person or agent (`updateIssue`), by the regression check (`regressed`), or when a fix was published. `node_id` of the entry is the issue node. This schema is the `data` of a journal entry with `type` `issue.status_changed`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "from",
+    "to",
+    "reason"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "from": {
+      "enum": [
+        "open",
+        "in_progress",
+        "closed",
+        "regressed"
+      ]
+    },
+    "to": {
+      "enum": [
+        "open",
+        "in_progress",
+        "closed",
+        "regressed"
+      ]
+    },
+    "reason": {
+      "enum": [
+        "manual",
+        "regressed",
+        "fix_published",
+        "error_stopped"
+      ]
+    }
+  }
+}

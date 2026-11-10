@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.approval_decided.schema.json",
+  "title": "app.approval_decided",
+  "description": "A person decided an agent's publish (`decideAppApproval`). `node_id` of the entry is the app node. This schema is the `data` of a journal entry with `type` `app.approval_decided`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "approval_id",
+    "deployment_id",
+    "agent_id",
+    "decision",
+    "telemetry_fields_confirmed"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "approval_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "deployment_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "agent_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "decision": {
+      "enum": [
+        "approve",
+        "deny"
+      ]
+    },
+    "telemetry_fields_confirmed": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

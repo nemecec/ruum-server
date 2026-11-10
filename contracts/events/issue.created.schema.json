@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/issue.created.schema.json",
+  "title": "issue.created",
+  "description": "An issue was filed (design 9.7). `node_id` of the entry is the issue node; `node.created` is written too. No title or text: those are in the node. This schema is the `data` of a journal entry with `type` `issue.created`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "source",
+    "template_id",
+    "app_id",
+    "fingerprint",
+    "parent_issue_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "source": {
+      "enum": [
+        "person",
+        "agent",
+        "monitoring",
+        "report"
+      ]
+    },
+    "template_id": {
+      "type": "string",
+      "maxLength": 100
+    },
+    "app_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fingerprint": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "parent_issue_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

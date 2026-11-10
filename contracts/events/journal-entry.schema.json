@@ -76,9 +76,30 @@
         "database.restore_failed",
         "database.grant_created",
         "database.grant_revoked",
-        "database.approval_decided"
+        "database.approval_decided",
+        "app.deployed",
+        "app.deployment_failed",
+        "app.rolled_back",
+        "app.settings_changed",
+        "app.binding_granted",
+        "app.binding_revoked",
+        "app.role_granted",
+        "app.role_revoked",
+        "app.secret_changed",
+        "app.domain_added",
+        "app.domain_removed",
+        "app.api_key_created",
+        "app.api_key_revoked",
+        "app.approval_decided",
+        "app.telemetry_fields_confirmed",
+        "issue.created",
+        "issue.status_changed",
+        "issue.reveal_requested",
+        "issue.reveal_decided",
+        "template.instantiated",
+        "project.publication_changed"
       ],
-      "description": "The event type. The types in `$defs/planned_types` (step 2) are specified but not written by the server yet (decision 0004-21); the task that builds the first writer of a type removes it from that list."
+      "description": "The event type. The types in `$defs/planned_types` (step 2 and step 3) are specified but not written by the server yet (decision 0004-21); the task that builds the first writer of a type removes it from that list."
     },
     "actor": {
       "$ref": "common.schema.json#/$defs/principal_ref",
@@ -658,6 +679,405 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.deployed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.deployed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.deployment_failed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.deployment_failed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.rolled_back"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.rolled_back.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.settings_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.settings_changed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.binding_granted"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.binding_granted.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.binding_revoked"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.binding_revoked.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.role_granted"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.role_granted.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.role_revoked"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.role_revoked.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.secret_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.secret_changed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.domain_added"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.domain_added.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.domain_removed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.domain_removed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.api_key_created"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.api_key_created.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.api_key_revoked"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.api_key_revoked.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.approval_decided"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.approval_decided.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "app.telemetry_fields_confirmed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "app.telemetry_fields_confirmed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "issue.created"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "issue.created.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "issue.status_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "issue.status_changed.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "issue.reveal_requested"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "issue.reveal_requested.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "issue.reveal_decided"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "issue.reveal_decided.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "template.instantiated"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "template.instantiated.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "project.publication_changed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "project.publication_changed.schema.json"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -671,7 +1091,28 @@
         "database.restore_started",
         "database.restored",
         "database.restore_failed",
-        "database.approval_decided"
+        "database.approval_decided",
+        "app.deployed",
+        "app.deployment_failed",
+        "app.rolled_back",
+        "app.settings_changed",
+        "app.binding_granted",
+        "app.binding_revoked",
+        "app.role_granted",
+        "app.role_revoked",
+        "app.secret_changed",
+        "app.domain_added",
+        "app.domain_removed",
+        "app.api_key_created",
+        "app.api_key_revoked",
+        "app.approval_decided",
+        "app.telemetry_fields_confirmed",
+        "issue.created",
+        "issue.status_changed",
+        "issue.reveal_requested",
+        "issue.reveal_decided",
+        "template.instantiated",
+        "project.publication_changed"
       ]
     }
   }

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/app.api_key_created.schema.json",
+  "title": "app.api_key_created",
+  "description": "A partner API key was made for an external API of the app. `node_id` of the entry is the app node. Never the key. This schema is the `data` of a journal entry with `type` `app.api_key_created`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "credential_id",
+    "api",
+    "scopes",
+    "expires_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "credential_id": {
+      "$ref": "common.schema.json#/$defs/uuid",
+      "description": "The ID of the partner API key (`AppApiKey.id`)."
+    },
+    "api": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$"
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+      }
+    },
+    "expires_at": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/template.instantiated.schema.json",
+  "title": "template.instantiated",
+  "description": "A project was made from a template (`instantiateTemplate`). `node_id` of the entry is the new project folder. This schema is the `data` of a journal entry with `type` `template.instantiated`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "setup_id",
+    "template_id",
+    "template_version",
+    "nodes_created",
+    "open_placeholders"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "setup_id": {
+      "$ref": "common.schema.json#/$defs/uuid"
+    },
+    "template_id": {
+      "type": "string",
+      "maxLength": 100
+    },
+    "template_version": {
+      "type": "string",
+      "maxLength": 100
+    },
+    "nodes_created": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "open_placeholders": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

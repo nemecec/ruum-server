@@ -11,6 +11,9 @@
 //! │   ├── Archive/          (S)  editors_can_share = false (editors keep edit, lose share)
 //! │   ├── <prefix>-garden   (D)  a database node (SQLite 3), made by `member` (card D-1), with
 //! │   │                          the table `plants` (id, latin_name, common_name; two rows)
+//! │   ├── <prefix>-planner  (W)  a web app node (step 3, planned; docs/STEP3.md "Fixtures")
+//! │   ├── <prefix>-bug      (I)  an issue node (step 3, planned)
+//! │   ├── <prefix>-kit      (K)  a project template folder (step 3, planned)
 //! │   └── <prefix>-old.txt  (Y)  in the trash (its old parent is Projects)
 //! └── Private/             (G)  no grants
 //! ```
@@ -35,6 +38,19 @@
 //! `confirmColumnClasses` address it. `member` gives `agent` a `read_personal` grant on it for 8
 //! hours (card A-1). The pending request of `agent` on it is a placeholder ID until A-2 seeds it
 //! (it keeps the field name).
+//!
+//! Step 3 (planned; docs/STEP3.md, section "Fixtures"): the IDs of the web app W, its deployment,
+//! role grant, domain, API key, approval and trace, the issue I with its receipt token, the
+//! template K and its setup are placeholders until the cards that build their operations seed
+//! them (they keep the field names). The seeded W is made by `member` and has one live
+//! deployment whose manifest declares the roles `member` (default) and `approver`, the entered
+//! secret `STRIPE_KEY` and the generated secret `SESSION_KEY`, an external API `orders` with the
+//! scopes `orders.read` and `orders.write`, and a binding `db` with role `edit` on D. Both tenants
+//! have the platform admin's approval of public apps and custom domains. The pending publish
+//! request of W is a request of `agent` (seeded through the store; its `view` scope cannot
+//! publish through the API). I is a `report` issue of W in `Projects` (the reporter is not a
+//! member, so it has a receipt token); K is a project template whose setup makes a database and
+//! an app; the setup made the project `<prefix>-from-kit` in `Projects`.
 //!
 //! The tag T was made by `member`. The upload sessions were started by `member`. The web session
 //! and the WebDAV app password belong to `member`. The invitation is for a new email address with the role `member`. The
@@ -253,6 +269,12 @@ pub enum Target {
     Private,
     /// The database node in `Projects` (step 2).
     Database,
+    /// The web app node in `Projects` (step 3).
+    App,
+    /// The issue node in `Projects` (step 3).
+    Issue,
+    /// The project template folder in `Projects` (step 3).
+    Template,
 }
 
 impl Target {
@@ -268,9 +290,13 @@ impl Target {
             || match self {
                 Target::Root => false,
                 Target::Projects | Target::Private => other == Target::Root,
-                Target::Plan | Target::Archive | Target::Old | Target::Database => {
-                    other == Target::Projects || other == Target::Root
-                }
+                Target::Plan
+                | Target::Archive
+                | Target::Old
+                | Target::Database
+                | Target::App
+                | Target::Issue
+                | Target::Template => other == Target::Projects || other == Target::Root,
             }
     }
 }
@@ -332,6 +358,31 @@ pub struct TenantFixture {
     /// A pending request of `agent` on the database: a `DELETE` without `WHERE` (placeholder
     /// until A-2).
     pub database_approval: Uuid,
+    /// The web app node in `Projects` and its name (step 3, planned).
+    pub app: NodeId,
+    pub app_name: String,
+    /// The live deployment of the app.
+    pub app_deployment: Uuid,
+    /// A grant of the app role `approver` to `guest_view`.
+    pub app_role_grant: Uuid,
+    /// A custom domain of the app (`<prefix>-plants.example.test`).
+    pub app_domain: Uuid,
+    /// A partner API key of the app's `orders` API.
+    pub app_api_key: Uuid,
+    /// A pending publish request of `agent` on the app.
+    pub app_approval: Uuid,
+    /// A trace of the app in the telemetry store (32 hex characters).
+    pub app_trace: String,
+    /// A `report` issue of the app in `Projects`, and its name.
+    pub issue: NodeId,
+    pub issue_name: String,
+    /// The receipt token of the issue's reporter.
+    pub issue_receipt_token: String,
+    /// A project template folder in `Projects`, and its name.
+    pub template: NodeId,
+    pub template_name: String,
+    /// The setup that made `<prefix>-from-kit` from the template.
+    pub template_setup: Uuid,
     /// An upload of an empty file (no chunks), started by `member`, ready to complete.
     pub upload_empty: UploadId,
     /// An upload with one chunk ([`TenantFixture::chunk`]) not sent yet, started by `member`.
@@ -415,6 +466,20 @@ impl TenantFixture {
             database_name: format!("{prefix}-garden"),
             database_grant: Uuid::now_v7(),
             database_approval: Uuid::now_v7(),
+            app: NodeId::new(),
+            app_name: format!("{prefix}-planner"),
+            app_deployment: Uuid::now_v7(),
+            app_role_grant: Uuid::now_v7(),
+            app_domain: Uuid::now_v7(),
+            app_api_key: Uuid::now_v7(),
+            app_approval: Uuid::now_v7(),
+            app_trace: Uuid::new_v4().simple().to_string(),
+            issue: NodeId::new(),
+            issue_name: format!("{prefix}-bug"),
+            issue_receipt_token: format!("{prefix}-receipt-token-{}", Uuid::now_v7().simple()),
+            template: NodeId::new(),
+            template_name: format!("{prefix}-kit"),
+            template_setup: Uuid::now_v7(),
             upload_empty: UploadId::new(),
             upload_chunked: UploadId::new(),
             chunk: format!("{prefix} chunk content").into_bytes(),
@@ -461,6 +526,9 @@ impl TenantFixture {
             Target::Old => self.old,
             Target::Private => self.private,
             Target::Database => self.database,
+            Target::App => self.app,
+            Target::Issue => self.issue,
+            Target::Template => self.template,
         }
     }
 
@@ -494,6 +562,20 @@ impl TenantFixture {
             self.database_name.clone(),
             self.database_grant.to_string(),
             self.database_approval.to_string(),
+            self.app.to_string(),
+            self.app_name.clone(),
+            self.app_deployment.to_string(),
+            self.app_role_grant.to_string(),
+            self.app_domain.to_string(),
+            self.app_api_key.to_string(),
+            self.app_approval.to_string(),
+            self.app_trace.clone(),
+            self.issue.to_string(),
+            self.issue_name.clone(),
+            self.issue_receipt_token.clone(),
+            self.template.to_string(),
+            self.template_name.clone(),
+            self.template_setup.to_string(),
             self.upload_empty.to_string(),
             self.upload_chunked.to_string(),
             self.invitation.to_string(),
@@ -533,6 +615,12 @@ impl TenantFixture {
             self.v2.to_string(),
             self.database.to_string(),
             self.database_name.clone(),
+            self.app.to_string(),
+            self.app_name.clone(),
+            self.issue.to_string(),
+            self.issue_name.clone(),
+            self.template.to_string(),
+            self.template_name.clone(),
         ]
     }
 }

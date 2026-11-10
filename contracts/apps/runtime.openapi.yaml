@@ -1,0 +1,244 @@
+openapi: 3.1.0
+info:
+  title: Ruum app runtime API
+  version: 0.1.0-draft
+  summary: What a running app may call, at `http://ruum.internal` inside its sandbox (docs/DESIGN.md, sections 9.4, 9.9, 9.10).
+  description: |
+    DRAFT for review (step 3 specify phase). Read `contracts/apps/README.md` first.
+
+    A running app reaches the platform only here: `http://ruum.internal` resolves inside the
+    sandbox to the internal gateway (Cilium allows the sandbox to reach it, its bound databases,
+    the bound apps along their bindings, and the egress proxy; nothing else, design 9.5). The
+    public REST API (`contracts/openapi.yaml`) does not accept app credentials: app tokens have
+    another `aud` and `typ`, so they cannot be replayed there.
+
+    ## The app's credential
+    The runtime mounts a workload token at `/var/run/ruum/token` (and `RUUM_TOKEN_FILE`): a JWT
+    with `typ: app_workload`, `sub` = the app principal (the app node ID for live, the deployment
+    ID for a preview), `tid`, `aud: ruum.internal`, valid for 15 minutes, renewed by the runtime
+    before it ends. Send it as `Authorization: Bearer`. It is never written to logs (the
+    ingestion pipeline treats `authorization` as `secret`).
+
+    ## What the token allows
+    Only what the app's bindings allow, as the `app` principal (design 9.4). Acting for a user
+    needs the token exchange below; then the effective right is the user's right intersected
+    with the binding.
+  license:
+    name: Apache 2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://ruum.internal
+security:
+  - workloadToken: []
+paths:
+  /v1/self:
+    get:
+      operationId: getAppSelf
+      summary: Who this app is
+      description: The app node ID, the deployment, the environment, the tenant slug, the bindings with how to reach them, and the roles of the manifest.
+      responses:
+        '200':
+          description: The app.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppSelf'
+        '401':
+          description: A missing or expired workload token.
+  /v1/self/users:
+    get:
+      operationId: listAppSelfUsers
+      summary: Holders of an app role
+      description: |
+        `GET /v1/apps/self/users?role=approver` of design 9.4: the holders of an app role, as
+        pairwise IDs with the claims the manifest asks for and the tenant allows, for screens like
+        "assign to an approver". A group grant lists its members; a `tenant_members` grant is
+        listed as one entry (`everyone: true`), never as the member list.
+      parameters:
+        - name: role
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,31}$'
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: One page of holders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppUserPage'
+        '401':
+          description: A missing or expired workload token.
+        '404':
+          description: The role is not in the live manifest.
+  /v1/token/exchange:
+    post:
+      operationId: exchangeAppUserToken
+      summary: Act on behalf of the signed-in user (token exchange)
+      description: |
+        Design 9.4: the app sends the user token it got in `Ruum-User` (at most 60 seconds old)
+        and gets an access token for the bindings marked `on_behalf_of_user`, with `actor` = the
+        app and `on_behalf_of` = the user. Every write through it records both. The effective
+        right is the user's right intersected with the binding. Valid for 5 minutes; not
+        renewable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_token]
+              properties:
+                user_token:
+                  type: string
+      responses:
+        '200':
+          description: The delegated token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, expires_in]
+                properties:
+                  access_token:
+                    type: string
+                  expires_in:
+                    type: integer
+        '401':
+          description: A bad workload token or user token.
+        '403':
+          description: No binding allows acting for the user.
+  /v1/nodes/{node_id}/content:
+    parameters:
+      - name: node_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: readBoundContent
+      summary: Read a file inside a bound file or folder
+      description: The node must be the bound node or below a bound folder. With a delegated token, the user's right counts too. Uploads go through the blob API in the same way (decision 21); the records API of design 9.8 comes later.
+      responses:
+        '200':
+          description: The content.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '403':
+          description: Not inside a binding.
+        '404':
+          description: No such node (or not visible).
+  /v1/events/{topic}:
+    parameters:
+      - name: topic
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[a-z][a-z0-9_.]{0,99}$'
+    post:
+      operationId: publishAppEvent
+      summary: Publish an event to the platform bus
+      description: |
+        Design 9.10: the topic must be declared in an `events` API of the live manifest. The
+        platform adds `actor`, `on_behalf_of` (from a delegated token) and the trace context,
+        and delivers at least once to the apps bound to the topic, with retries, a dead-letter
+        queue and replay. The payload follows the classes of `telemetry-privacy.yaml` in the
+        platform's own logs of the event.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              maxProperties: 200
+      responses:
+        '202':
+          description: Accepted.
+        '403':
+          description: The topic is not declared by this app.
+        '413':
+          description: The event is larger than 256 KiB.
+components:
+  securitySchemes:
+    workloadToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The workload token of the app (`typ` `app_workload`, `aud` `ruum.internal`).
+  schemas:
+    AppSelf:
+      type: object
+      required: [app_id, deployment_id, environment, tenant_slug, bindings, roles]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        deployment_id:
+          type: string
+          format: uuid
+        environment:
+          type: string
+          enum: [live, preview]
+        tenant_slug:
+          type: string
+        bindings:
+          type: array
+          items:
+            type: object
+            required: [name, kind, target_node_id]
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+                enum: [node, database_branch, api]
+              target_node_id:
+                type: string
+                format: uuid
+              role:
+                type: [string, 'null']
+              address:
+                type: [string, 'null']
+                description: 'The internal address of an API binding (`http://<binding>.<api>.ruum.internal`); the env variable `RUUM_BINDING_<NAME>` of a database binding has its connection URL.'
+        roles:
+          type: array
+          items:
+            type: string
+    AppUserPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [sub]
+            properties:
+              sub:
+                type: string
+                description: The pairwise ID (`pairwise:...`), the same as `sub` in the user token.
+              everyone:
+                type: boolean
+                description: The role is granted to everyone in the tenant.
+              name:
+                type: string
+              email:
+                type: string
+        next_cursor:
+          type: [string, 'null']

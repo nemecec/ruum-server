@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/manifests/issue.schema.json",
+  "title": "Issue content",
+  "description": "The content of a typed node of type `issue` (provider `ruum.issue`, docs/DESIGN.md section 9.7). Each change is a version of the node (encoding `typed_manifest_v1`), so the versions are the issue's history; comments are node comments and labels are tags. `fields` is valid against the JSON Schema of the issue template named in `template_ref` (that version). Counts of error issues (occurrences, users, first and last seen) are provider state, not content, so a count does not make a version. Same shape as `IssueContent` of openapi.yaml. DRAFT for review (step 3 specify phase, docs/STEP3.md).",
+  "type": "object",
+  "required": ["title", "status", "source", "template_ref"],
+  "additionalProperties": false,
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+    "status": { "type": "string", "enum": ["open", "in_progress", "closed", "regressed"] },
+    "source": { "type": "string", "enum": ["person", "agent", "monitoring", "report"] },
+    "template_ref": {
+      "type": "object",
+      "required": ["template_id", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "template_id": { "type": "string", "maxLength": 100 },
+        "version": { "type": "string", "maxLength": 100 }
+      }
+    },
+    "fields": { "type": "object" },
+    "body": { "type": "string", "maxLength": 100000 },
+    "assignee": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "id"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "enum": ["user", "agent"] },
+            "id": { "type": "string", "format": "uuid" }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "links": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "app_id": { "type": "string", "format": "uuid" },
+        "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "parent_issue_id": { "type": "string", "format": "uuid" },
+        "deployment_id": { "type": "string", "format": "uuid" },
+        "session_ids": { "type": "array", "maxItems": 50, "items": { "type": "string", "format": "uuid" } }
+      }
+    },
+    "muted_until": { "oneOf": [ { "type": "string", "format": "date-time" }, { "type": "null" } ] }
+  },
+  "examples": [
+    {
+      "title": "TypeError in PlantList.tsx:42",
+      "status": "open",
+      "source": "monitoring",
+      "template_ref": { "template_id": "gallery:error", "version": "1.0.0" },
+      "fields": { "error_type": "TypeError" },
+      "assignee": null,
+      "links": { "app_id": "0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d", "fingerprint": "3f2a9c1e5b7d4a6f8e0c2b4d6f8a0c2e" },
+      "muted_until": null
+    }
+  ]
+}

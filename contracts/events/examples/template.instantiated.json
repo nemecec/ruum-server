@@ -1,0 +1,20 @@
+{
+  "tenant_id": "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a",
+  "seq": 30020,
+  "node_id": "0190b6c4-8a00-7cc1-9a4b-1f2e3d4c5b70",
+  "revision": 4,
+  "type": "template.instantiated",
+  "actor": {
+    "kind": "agent",
+    "id": "0190b6c4-7000-7cc1-9a4b-1f2e3d4c5b6c"
+  },
+  "on_behalf_of": "0190b6c4-7100-7cc1-9a4b-1f2e3d4c5b6d",
+  "at": "2026-11-10T10:15:00Z",
+  "data": {
+    "setup_id": "0190b6c4-a00f-7cc1-9a4b-1f2e3d4c5b7f",
+    "template_id": "gallery:web-app-postgres",
+    "template_version": "1.0.0",
+    "nodes_created": 9,
+    "open_placeholders": 1
+  }
+}

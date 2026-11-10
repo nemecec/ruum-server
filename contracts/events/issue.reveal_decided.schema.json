@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ruum.space/contracts/events/issue.reveal_decided.schema.json",
+  "title": "issue.reveal_decided",
+  "description": "The reporter allowed or refused fields (`decideIssueReveal`). `node_id` of the entry is the issue node. The actor is the app the report came from (kind `app`), with `on_behalf_of` null: the reporter is a pairwise pseudonym, not a principal. Field names and choices only, never values. This schema is the `data` of a journal entry with `type` `issue.reveal_decided`. Step 3, planned (decision 0004-21, docs/STEP3.md).",
+  "type": "object",
+  "required": [
+    "request_id",
+    "allowed",
+    "refused"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "allowed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      }
+    },
+    "refused": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      }
+    }
+  }
+}
