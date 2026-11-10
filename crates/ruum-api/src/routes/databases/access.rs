@@ -1,7 +1,7 @@
 //! Access grants and approvals (cards A-1, A-2). The three grant operations are card A-1
-//! (`ruum_core::databases::access::grants`); the approval operations are `501` stubs until A-2.
+//! (`ruum_core::databases::access::grants`); the grant request and the four approval operations
+//! are card A-2 (`ruum_core::databases::access::approvals`).
 
-use super::stub;
 use crate::auth::{JsonBody, Paging, QueryParams, RequestContext};
 use crate::error::ApiResult;
 use crate::routes::nodes::{path_id, to_json};
@@ -11,6 +11,9 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
+use ruum_core::databases::access::approvals::{
+    ApprovalStatus, DatabaseApproval, DecideRequest, RequestGrant,
+};
 use ruum_core::databases::access::grants::{CreateGrant, DatabaseAccessGrant};
 use ruum_core::journal::Written;
 use ruum_core::{ApiError, Error, ErrorCode, NodeId};
@@ -125,11 +128,131 @@ pub async fn revoke_database_access_grant(
     Ok(grant_write(&w)?)
 }
 
-stub!(request_database_access_grant, "requestDatabaseAccessGrant");
-stub!(
-    list_pending_database_approvals,
-    "listPendingDatabaseApprovals"
-);
-stub!(list_database_approvals, "listDatabaseApprovals");
-stub!(get_database_approval, "getDatabaseApproval");
-stub!(decide_database_approval, "decideDatabaseApproval");
+/// The contract's `DatabaseApproval` of `a`, with its `review_url`.
+fn approval_json(state: &AppState, a: &DatabaseApproval) -> Value {
+    a.view(&state.config.public_url, ruum_core::now())
+}
+
+/// Two IDs of a path (`node_id`, `approval_id`).
+fn path_ids(ids: Result<Path<(Uuid, Uuid)>, PathRejection>) -> Result<(NodeId, Uuid), Error> {
+    let Path((node, id)) = ids.map_err(|e| {
+        Error::Api(
+            ApiError::new(ErrorCode::BadRequest, format!("bad path: {e}"))
+                .with_hint("IDs are UUIDs"),
+        )
+    })?;
+    Ok((NodeId(node), id))
+}
+
+/// Ask your user for a time-limited grant. `POST /v1/databases/{node_id}/access-grant-requests`
+/// (operationId `requestDatabaseAccessGrant`, agents only): `201` with the new pending request,
+/// `200` with the pending request of the same kind.
+pub async fn request_database_access_grant(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    node: Result<Path<Uuid>, PathRejection>,
+    JsonBody(b): JsonBody<RequestGrant>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let id = path_id(node)?;
+    let (a, created) = state
+        .services
+        .databases
+        .request_grant(&ctx, &*state.services.agents, id, b)
+        .await?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(approval_json(&state, &a))))
+}
+
+/// The query of the approval lists. Not `#[serde(flatten)]`: a flattened query reads every
+/// value as a string.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListApprovalsQuery {
+    pub status: Option<ApprovalStatus>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+fn approval_page(state: &AppState, p: &ruum_core::paging::Page<DatabaseApproval>) -> Json<Value> {
+    Json(json!({
+        "items": p.items.iter().map(|a| approval_json(state, a)).collect::<Vec<_>>(),
+        "next_cursor": p.next_cursor.as_ref().map(|c| c.0.clone()),
+    }))
+}
+
+/// Requests that wait for the caller, across the tenant. `GET /v1/database-approvals`
+/// (operationId `listPendingDatabaseApprovals`).
+pub async fn list_pending_database_approvals(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    QueryParams(q): QueryParams<ListApprovalsQuery>,
+) -> ApiResult<Json<Value>> {
+    let paging = Paging {
+        cursor: q.cursor,
+        limit: q.limit,
+    };
+    let page = state
+        .services
+        .databases
+        .list_pending_approvals(&ctx, q.status, paging.page()?)
+        .await?;
+    Ok(approval_page(&state, &page))
+}
+
+/// The requests of agents on a database. `GET /v1/databases/{node_id}/approvals` (operationId
+/// `listDatabaseApprovals`).
+pub async fn list_database_approvals(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    node: Result<Path<Uuid>, PathRejection>,
+    QueryParams(q): QueryParams<ListApprovalsQuery>,
+) -> ApiResult<Json<Value>> {
+    let id = path_id(node)?;
+    let paging = Paging {
+        cursor: q.cursor,
+        limit: q.limit,
+    };
+    let page = state
+        .services
+        .databases
+        .list_approvals(&ctx, id, q.status, paging.page()?)
+        .await?;
+    Ok(approval_page(&state, &page))
+}
+
+/// One request. `GET /v1/databases/{node_id}/approvals/{approval_id}` (operationId
+/// `getDatabaseApproval`).
+pub async fn get_database_approval(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    ids: Result<Path<(Uuid, Uuid)>, PathRejection>,
+) -> ApiResult<Json<Value>> {
+    let (node, id) = path_ids(ids)?;
+    let a = state
+        .services
+        .databases
+        .get_approval(&ctx, node, id)
+        .await?;
+    Ok(Json(approval_json(&state, &a)))
+}
+
+/// Approve or deny a request of an agent. `POST
+/// /v1/databases/{node_id}/approvals/{approval_id}/decision` (operationId
+/// `decideDatabaseApproval`, users only).
+pub async fn decide_database_approval(
+    State(state): State<AppState>,
+    RequestContext(ctx): RequestContext,
+    ids: Result<Path<(Uuid, Uuid)>, PathRejection>,
+    JsonBody(b): JsonBody<DecideRequest>,
+) -> ApiResult<Json<Value>> {
+    let (node, id) = path_ids(ids)?;
+    let w = state
+        .services
+        .databases
+        .decide_approval(&ctx, &*state.services.agents, node, id, b)
+        .await?;
+    Ok(Json(approval_json(&state, &w.value)))
+}

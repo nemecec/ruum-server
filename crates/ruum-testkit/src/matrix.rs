@@ -75,11 +75,6 @@ pub const PLANNED_OPERATIONS: &[&str] = &[
     "listDatabaseRestorePoints",
     "createDatabaseRestorePoint",
     "restoreDatabase",
-    "requestDatabaseAccessGrant",
-    "listPendingDatabaseApprovals",
-    "listDatabaseApprovals",
-    "getDatabaseApproval",
-    "decideDatabaseApproval",
 ];
 
 /// The operations that a share-link bearer may call (the `Users only` section of
