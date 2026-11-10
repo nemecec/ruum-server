@@ -8,7 +8,9 @@
 //! 1. A share-link bearer gets `403 user_required`; a caller who cannot see the database gets
 //!    `404`; `view` is needed for every call.
 //! 2. `mode: write` needs `edit` (`403 permission_denied`, or `scope_exceeded` for an agent).
-//! 3. Agents: wave decision 1 (see [`agent_kind`]).
+//! 3. Agents (card Q-2, [`agent_access`]): `mode: write` needs a `write_live` grant (`403
+//!    write_grant_required`, hint: the grant prompt URL) except on a branch with `masked` or
+//!    `schema_only` data; the kind follows the `read_personal` grant.
 //! 4. The request limits (`422`), then the statement rules of [`rules`] (`422
 //!    validation_failed` for no or two statements, `422 statement_not_allowed`).
 //! 5. `mode: read` with a statement that writes is `400 read_only_query`, also when only the
@@ -23,12 +25,13 @@
 //!
 //! The limits come from the plan (`Database.limits`, [`super::DatabaseSettings`]); the request
 //! may only lower them. Each result cell is the engine's typed value as JSON; an object with the
-//! key `$ruum` comes back wrapped as a `LiteralValue`. A person without `manage` never sees a
-//! `secret` value: the `nosecret` lens of the engine masks it, and the result marks each cell of
-//! a column whose class (the head manifest's `data_classes`, wave decision 2) is `secret` as the
-//! hidden-value marker. Errors are `query_failed` with the SQLSTATE; for agents and people
-//! without `manage` the text is a fixed one per SQLSTATE plus object names, never the engine's
-//! text (decision 0004-8).
+//! key `$ruum` comes back wrapped as a `LiteralValue`. The privacy filter of card Q-2 marks the
+//! cells by the class of each result column ([`postgres_mask`]): the engine's lens masks every
+//! read, and the result shows pseudonyms and hidden-value markers. On an engine without a lens
+//! (the memory engine), every value of an agent's result that is not `NULL` is the hidden-value
+//! marker ([`mark_agent_result`], fail closed). Errors are `query_failed` with the SQLSTATE; for
+//! agents and people without `manage` the text is a fixed one per SQLSTATE plus object names,
+//! never the engine's text (decision 0004-8).
 //!
 //! Every call that reaches the rules (also a refused or failed one) writes one row of the query
 //! log ([`log`]): the normalized statement, the parameters as hidden-value markers, the outcome.
@@ -47,11 +50,15 @@
 //!
 //! # Wave decisions (`provisional`, `ruum-server-wt/panel/step2-wave4.md`)
 //!
-//! 1. Agents fail closed until card Q-2: [`agent_kind`] and [`mark_agent_result`].
-//! 2. Classes come from the head manifest's `data_classes` ([`manifest_classes`]).
-//! 3. A person's schema change runs through `DatabaseEngine::apply_migration` with an interim
-//!    catalog sync ([`interim_catalog_sync`], called only by [`run_schema_change`]); the
-//!    integrator swaps it for card K-1's sync at that one call site.
+//! 1. Agents fail closed until card Q-2. Card Q-2 replaced it: [`agent_access`] and the
+//!    markers of [`postgres_mask`]; [`mark_agent_result`] stays for engines without a lens.
+//! 2. Classes come from the head manifest's `data_classes` ([`manifest_classes`]). The privacy
+//!    filter of card Q-2 takes the stricter of the column store (card K-1) and the manifest
+//!    ([`postgres_mask::class_map`]); `getDatabaseSchema` still answers the manifest's classes.
+//! 3. A person's schema change runs through `DatabaseEngine::apply_migration`. Card Q-2 gives it
+//!    card K-1's sync with the manifest's classes on top
+//!    ([`crate::privacy::postgres::StrictSync`]); [`interim_catalog_sync`] stays for
+//!    [`run_schema_change`] alone.
 
 pub mod log;
 pub mod postgres_mask;
@@ -397,30 +404,142 @@ pub fn person_kind(role: Option<Role>, mode: StatementMode) -> Option<RoleKind> 
     }
 }
 
-/// The role kind of an agent (wave decision 1, `provisional`): agents fail closed until card
-/// Q-2. A read runs in the `masked_read` kind; a write answers `403 write_grant_required`,
-/// because no grant check exists before cards A-1 and Q-2.
-///
-/// Card Q-2 replaces this function (the grant check of A-1's `grants::active`,
-/// `class_read_required`, the `masked_write` kind and the hint URL of the grant prompt).
-pub fn agent_kind(mode: StatementMode) -> std::result::Result<RoleKind, Problem> {
-    match mode {
-        StatementMode::Read => Ok(RoleKind::MaskedRead),
-        StatementMode::Write => Err(ApiError::new(
-            ErrorCode::WriteGrantRequired,
-            "an agent writes to a live database only with a write grant (write_live) from its user",
+/// What an agent may do on one database for one call (card Q-2): its role kind and the grant
+/// that allowed it (for the query log).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentAccess {
+    pub kind: RoleKind,
+    pub grant_id: Option<Uuid>,
+}
+
+/// The default length of a grant that a hint URL offers, in minutes.
+pub const GRANT_PROMPT_MINUTES: u32 = 60;
+
+/// `403 write_grant_required` with the web URL of the grant prompt as the hint (IDs only).
+pub fn write_grant_required(hint: String) -> Problem {
+    ApiError::new(
+        ErrorCode::WriteGrantRequired,
+        "an agent writes to a live database only with a write grant (write_live) from its user",
+    )
+    .with_hint(hint)
+}
+
+/// The role kind of an agent and the grant behind it (card Q-2; contract `queryDatabase`,
+/// "Agent writes"): a read runs as `masked_read`, or as `read` with a live `read_personal`
+/// grant; a write needs a live `write_live` grant (`403 write_grant_required` without one),
+/// except on a branch with `masked` or `schema_only` data (`draft_branch`), and runs as
+/// `masked_write`, or as `write` with `read_personal`. A grant counts only while its row is live
+/// and its tuple holds (`grants::active`).
+pub async fn agent_access(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+    row: Option<&DatabaseRow>,
+    mode: StatementMode,
+    public_url: &str,
+) -> std::result::Result<AgentAccess, QueryError> {
+    use super::access::grants::{self, GrantKind};
+    let d = svc.deps();
+    let agent = crate::ids::AgentId(ctx.actor.actor.id.0);
+    let active = |kind| {
+        grants::active(
+            &*d.grants,
+            &*d.authz,
+            ctx.tenant,
+            id,
+            agent,
+            kind,
+            crate::now(),
         )
-        .with_hint("ask your user to give you a write grant on this database in the Ruum web UI")),
+    };
+    let personal = active(GrantKind::ReadPersonal).await?;
+    match mode {
+        StatementMode::Read => Ok(match personal {
+            Some(g) => AgentAccess {
+                kind: RoleKind::Read,
+                grant_id: Some(g.id),
+            },
+            None => AgentAccess {
+                kind: RoleKind::MaskedRead,
+                grant_id: None,
+            },
+        }),
+        StatementMode::Write => {
+            let draft = row.is_some_and(|r| {
+                matches!(
+                    r.branch_data,
+                    Some(
+                        crate::providers::DataCopy::Masked | crate::providers::DataCopy::SchemaOnly
+                    )
+                )
+            });
+            let live = if draft {
+                None
+            } else {
+                match active(GrantKind::WriteLive).await? {
+                    Some(g) => Some(g.id),
+                    None => {
+                        return Err(write_grant_required(grants::grant_prompt_url(
+                            public_url,
+                            ctx.tenant,
+                            id,
+                            agent,
+                            GrantKind::WriteLive,
+                            GRANT_PROMPT_MINUTES,
+                        ))
+                        .into());
+                    }
+                }
+            };
+            Ok(match personal {
+                Some(g) => AgentAccess {
+                    kind: RoleKind::Write,
+                    grant_id: live.or(Some(g.id)),
+                },
+                None => AgentAccess {
+                    kind: RoleKind::MaskedWrite,
+                    grant_id: live,
+                },
+            })
+        }
     }
 }
 
-/// Marks an agent's result (wave decision 1, `provisional`): until card Q-2 builds the markers
-/// by class, every cell that is not `NULL` becomes the hidden-value marker `{"$ruum": "hidden",
-/// "class": "personal"}`, and every column has the class `personal` and the masking `hidden`.
-/// The memory engine has no lens, so this is the only line that keeps real values away from an
-/// agent there.
-///
-/// Card Q-2 replaces this function.
+/// `403 class_read_required` (decision 0004-5 a). `hint`: the grant prompt URL of
+/// `read_personal` for an agent that may ask for one, else a sentence.
+pub fn class_read_required(class: DataClass, hint: String) -> Problem {
+    let what = match class {
+        DataClass::Secret => "a secret column",
+        _ => "a personal column",
+    };
+    ApiError::new(
+        ErrorCode::ClassReadRequired,
+        format!(
+            "this write reads or writes {what} that the caller may not see, so it would copy or \
+             overwrite values the caller cannot read"
+        ),
+    )
+    .with_hint(hint)
+}
+
+/// `501 not_implemented` for a destructive statement of an agent: it needs a person's approval
+/// (`202` with a `DatabaseApproval`, card A-2), which this server does not build yet. Nothing
+/// ran.
+pub fn approval_not_available() -> Problem {
+    ApiError::new(
+        ErrorCode::NotImplemented,
+        "a destructive statement of an agent (DROP, TRUNCATE, DELETE or UPDATE without WHERE, a \
+         schema change) needs a person's approval, which this server does not offer yet; nothing \
+         ran",
+    )
+    .with_hint("add a WHERE clause, or ask your user to run the statement")
+}
+
+/// Marks an agent's result on an engine without a lens (wave decision 1, kept by card Q-2 for
+/// the memory engine): every cell that is not `NULL` becomes the hidden-value marker `{"$ruum":
+/// "hidden", "class": "personal"}`, and every column has the class `personal` and the masking
+/// `hidden`. The memory engine has no lens, so this is the only line that keeps real values away
+/// from an agent there.
 pub fn mark_agent_result(columns: &mut [QueryColumn], rows: &mut [Vec<serde_json::Value>]) {
     for c in columns.iter_mut() {
         c.data_class = DataClass::Personal;
@@ -726,11 +845,9 @@ pub fn interim_catalog_sync(engine: EngineKind, manifest: &serde_json::Value) ->
     }
 }
 
-/// A person's schema change through `queryDatabase` (wave decision 3): the engine's migration
-/// path (drop the lens views, run in an `owner` session, sync the catalog, rebuild the views),
-/// not `execute`. No `database_migrations` row and no restore point (cards D-2 and D-4).
-///
-/// This is the one call site of the interim catalog sync.
+/// A person's schema change through `queryDatabase` (wave decision 3) with the interim sync of
+/// the manifest's classes. The query API itself calls [`run_schema_change_with`] with the sync
+/// of card Q-2.
 pub async fn run_schema_change(
     engine: &dyn DatabaseEngine,
     db: &DatabaseRef,
@@ -741,17 +858,32 @@ pub async fn run_schema_change(
     timeout: Duration,
 ) -> std::result::Result<(), EngineError> {
     let sync = interim_catalog_sync(kind, manifest);
+    run_schema_change_with(engine, db, key, &sync, sql, timeout).await
+}
+
+/// A person's schema change through `queryDatabase` (wave decision 3): the engine's migration
+/// path (drop the lens views, run in an `owner` session, sync the catalog with `sync`, rebuild
+/// the views), not `execute`. No `database_migrations` row and no restore point (cards D-2 and
+/// D-4).
+pub async fn run_schema_change_with(
+    engine: &dyn DatabaseEngine,
+    db: &DatabaseRef,
+    key: &PseudonymKey,
+    sync: &dyn CatalogSync,
+    sql: &str,
+    timeout: Duration,
+) -> std::result::Result<(), EngineError> {
     let request = MigrationRequest {
         up: sql.to_string(),
         timeout,
         dry_run: false,
     };
-    match engine.apply_migration(db, key, &request, &sync).await {
+    match engine.apply_migration(db, key, &request, sync).await {
         Ok(_) => Ok(()),
         // `up` is committed, but the lens is not rebuilt: try once more. The lens kinds fail
         // closed until a rebuild works.
         Err(EngineError::CatalogSync(first)) => {
-            if let Err(e) = engine.sync_lens(db, key, &sync).await {
+            if let Err(e) = engine.sync_lens(db, key, sync).await {
                 tracing::warn!(
                     tenant = %db.tenant_id,
                     node = %db.node_id,
@@ -854,12 +986,24 @@ async fn wait_ready(
     }
 }
 
-/// `queryDatabase`. See the module docs.
+/// `queryDatabase`, with hint URLs relative to the site (tests). See the module docs.
 pub async fn query(
     svc: &DatabaseService,
     ctx: &Context,
     id: NodeId,
     req: QueryRequest,
+) -> std::result::Result<QueryResult, QueryError> {
+    query_at(svc, ctx, id, req, "").await
+}
+
+/// `queryDatabase`; `public_url` is the web address of the site, for the hint URLs of agents'
+/// grant prompts. See the module docs.
+pub async fn query_at(
+    svc: &DatabaseService,
+    ctx: &Context,
+    id: NodeId,
+    req: QueryRequest,
+    public_url: &str,
 ) -> std::result::Result<QueryResult, QueryError> {
     let t = target(svc, ctx, id).await?;
     let mode = req.mode.unwrap_or(StatementMode::Read);
@@ -887,13 +1031,30 @@ pub async fn query(
         params: QueryLogEntry::hide_params(&req.params),
     };
     let started = Instant::now();
-    let result = run(svc, ctx, id, &t, engine, mode, &req, analysis.verdict).await;
+    let result = run(
+        svc,
+        ctx,
+        id,
+        &t,
+        engine,
+        mode,
+        &req,
+        analysis.verdict,
+        public_url,
+    )
+    .await;
     let elapsed = started.elapsed();
     let query_id = Uuid::now_v7();
     if t.row.is_some() {
         write_log(svc, ctx, id, query_id, draft, &result, elapsed).await?;
     }
-    let (columns, rows, truncated_reason, rows_affected) = result?;
+    let Ran {
+        columns,
+        rows,
+        truncated_reason,
+        rows_affected,
+        ..
+    } = result?;
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     Ok(QueryResult {
         query_id,
@@ -910,12 +1071,27 @@ pub async fn query(
     })
 }
 
-type RunOutput = (
-    Vec<QueryColumn>,
-    Vec<Vec<serde_json::Value>>,
-    Option<&'static str>,
-    Option<u64>,
-);
+/// What a call that ran gives back.
+struct Ran {
+    columns: Vec<QueryColumn>,
+    rows: Vec<Vec<serde_json::Value>>,
+    truncated_reason: Option<&'static str>,
+    rows_affected: Option<u64>,
+    /// The grant that allowed an agent's call (the query log).
+    grant_id: Option<Uuid>,
+}
+
+impl Ran {
+    fn empty(grant_id: Option<Uuid>) -> Ran {
+        Ran {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated_reason: None,
+            rows_affected: None,
+            grant_id,
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
@@ -927,7 +1103,8 @@ async fn run(
     mode: StatementMode,
     req: &QueryRequest,
     verdict: std::result::Result<rules::StatementKind, rules::Refusal>,
-) -> std::result::Result<RunOutput, QueryError> {
+    public_url: &str,
+) -> std::result::Result<Ran, QueryError> {
     let d = svc.deps();
     let is_agent = ctx.actor.is_agent();
     let manage = !is_agent && t.role >= Some(Role::Manage);
@@ -935,11 +1112,15 @@ async fn run(
     if mode == StatementMode::Write {
         authz::require(&*d.authz, &*d.nodes, ctx, id, Role::Edit).await?;
     }
-    // 3. Agents (wave decision 1).
-    let kind = if is_agent {
-        agent_kind(mode)?
+    // 3. Agents: the grants (card Q-2).
+    let (kind, grant_id) = if is_agent {
+        let a = agent_access(svc, ctx, id, t.row.as_ref(), mode, public_url).await?;
+        (a.kind, a.grant_id)
     } else {
-        person_kind(t.role, mode).ok_or_else(Error::permission_denied)?
+        (
+            person_kind(t.role, mode).ok_or_else(Error::permission_denied)?,
+            None,
+        )
     };
     // 4. The request limits, then the statement rules.
     if req.params.len() > MAX_PARAMS {
@@ -974,6 +1155,53 @@ async fn run(
     if mode == StatementMode::Read && statement != rules::StatementKind::Read {
         return Err(read_only_error().into());
     }
+    // The classes of the database's columns and what the statement reads (card Q-2).
+    let classes = class_map_of(svc, ctx.tenant, id, engine, &t.manifest).await?;
+    let sql = req.sql.clone();
+    let map = classes.clone();
+    let footprint =
+        tokio::task::spawn_blocking(move || postgres_mask::Footprint::of(engine, &sql, &map))
+            .await
+            .map_err(|e| Error::Internal(format!("the statement check stopped: {e}")))?;
+    // 6a. Writes that read or write a column the caller may not see; then the destructive
+    // statements of agents.
+    if is_agent && statement == rules::StatementKind::SchemaChange {
+        return Err(approval_not_available().into());
+    }
+    // A query with a data-modifying `WITH` is classified as a read by the rules; the footprint
+    // finds its writes.
+    if statement == rules::StatementKind::Write
+        || (mode == StatementMode::Write && footprint.writes())
+    {
+        let limit = match kind {
+            RoleKind::MaskedWrite => Some(DataClass::Normal),
+            RoleKind::Write => Some(DataClass::Personal),
+            _ => None,
+        };
+        let class = footprint.write_class(&classes);
+        if let Some(limit) = limit
+            && postgres_mask::stricter(class, limit) != limit
+        {
+            let hint = if is_agent && class == DataClass::Personal {
+                super::access::grants::grant_prompt_url(
+                    public_url,
+                    ctx.tenant,
+                    id,
+                    crate::ids::AgentId(ctx.actor.actor.id.0),
+                    super::access::grants::GrantKind::ReadPersonal,
+                    GRANT_PROMPT_MINUTES,
+                )
+            } else if is_agent {
+                "secret columns are never read or written by agents; leave the column out".into()
+            } else {
+                "secret columns need manage on the database; leave the column out".into()
+            };
+            return Err(class_read_required(class, hint).into());
+        }
+        if is_agent && footprint.destructive() {
+            return Err(approval_not_available().into());
+        }
+    }
     // 7. Ready.
     let row = wait_ready(svc, ctx.tenant, id, t.trashed, kind == RoleKind::Owner).await?;
     let engine_impl = d
@@ -991,7 +1219,8 @@ async fn run(
         .map_or(s.statement_timeout_ms, |ms| ms.min(s.statement_timeout_ms));
     let max_rows = req.max_rows.map_or(s.max_rows, |n| n.min(s.max_rows));
     let timeout = Duration::from_millis(timeout_ms);
-    // 8. A schema change by a person with manage: the migration path.
+    // 8. A schema change by a person with manage: the migration path, with card K-1's sync and
+    // the manifest's classes on top (card Q-2).
     if statement == rules::StatementKind::SchemaChange && kind == RoleKind::Owner {
         if !req.params.is_empty() {
             return Err(validation_error(
@@ -1000,18 +1229,19 @@ async fn run(
             )
             .into());
         }
-        run_schema_change(
+        let sync = crate::privacy::postgres::strict_sync(svc, ctx.tenant, id, row.engine).await?;
+        run_schema_change_with(
             &**engine_impl,
             &row.database_ref(),
             &key,
-            engine,
-            &t.manifest,
+            &sync,
             &req.sql,
             timeout,
         )
         .await
         .map_err(|e| engine_problem(e, manage))?;
-        return Ok((Vec::new(), Vec::new(), None, None));
+        sync.columns().finish().await?;
+        return Ok(Ran::empty(grant_id));
     }
     let role = RoleRef::new(row.database_ref(), kind)
         .map_err(|e| Error::Internal(format!("role: {e}")))?;
@@ -1027,27 +1257,95 @@ async fn run(
         .execute(&role, &key, &request)
         .await
         .map_err(|e| engine_problem(e, manage))?;
-    Ok(shape(out, max_rows, &t.manifest, is_agent, manage))
+    let view = Shape {
+        engine,
+        lens: lens_of(kind),
+        engine_masks: engine_impl.has_lens(),
+        is_agent,
+    };
+    let mut ran = shape(out, max_rows, &classes, &footprint, view);
+    ran.grant_id = grant_id;
+    Ok(ran)
 }
 
-/// The result of the engine as the answer: columns with class and masking, cells as JSON.
+/// The lens a role kind reads through.
+pub fn lens_of(kind: RoleKind) -> postgres_mask::Lens {
+    match kind {
+        RoleKind::Owner | RoleKind::SecretRead | RoleKind::Mask => postgres_mask::Lens::Base,
+        RoleKind::Read | RoleKind::Write => postgres_mask::Lens::NoSecret,
+        RoleKind::MaskedRead | RoleKind::MaskedWrite => postgres_mask::Lens::Masked,
+    }
+}
+
+/// The classes of the database's own columns: the column store (card K-1) and the head
+/// manifest's `data_classes`, the stricter of the two ([`postgres_mask::class_map`]).
+async fn class_map_of(
+    svc: &DatabaseService,
+    tenant: TenantId,
+    id: NodeId,
+    engine: EngineKind,
+    manifest: &serde_json::Value,
+) -> Result<postgres_mask::ClassMap> {
+    let rows = svc.deps().columns.list(tenant, id).await?;
+    let store: Vec<(String, String, String, DataClass)> = rows
+        .iter()
+        .filter(|r| r.is_live())
+        .map(|r| {
+            (
+                r.column.schema.clone(),
+                r.column.table.clone(),
+                r.column.column.clone(),
+                super::classes::effective_class(r),
+            )
+        })
+        .collect();
+    Ok(postgres_mask::class_map(
+        engine,
+        &store,
+        &manifest_classes(manifest),
+    ))
+}
+
+/// Who reads a result, for [`shape`].
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    engine: EngineKind,
+    lens: postgres_mask::Lens,
+    /// The engine masks reads itself (`DatabaseEngine::has_lens`).
+    engine_masks: bool,
+    is_agent: bool,
+}
+
+/// The result of the engine as the answer: columns with class and masking, cells as JSON and
+/// markers (card Q-2, [`postgres_mask`]).
 fn shape(
     out: StatementOutcome,
     max_rows: u64,
-    manifest: &serde_json::Value,
-    is_agent: bool,
-    manage: bool,
-) -> RunOutput {
-    let classes = manifest_classes(manifest);
+    classes: &postgres_mask::ClassMap,
+    footprint: &postgres_mask::Footprint,
+    view: Shape,
+) -> Ran {
+    let own = own_schema(view.engine);
+    let by_item = footprint.column_classes(out.columns.len(), classes);
+    let mut facts = Vec::with_capacity(out.columns.len());
     let mut columns: Vec<QueryColumn> = out
         .columns
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let data_class = match &c.source {
-                Some(s) => class_of(&classes, &s.schema, &s.table, &s.column).0,
-                // The server cannot tell which columns an expression reads.
-                None => DataClass::Personal,
+                Some(s) if s.schema == own => classes
+                    .class(&s.table, &s.column)
+                    .unwrap_or(DataClass::Personal),
+                // A column of another schema (the system catalogs) or one the store does not
+                // know yet: personal.
+                Some(_) => DataClass::Personal,
+                None => by_item.get(i).copied().unwrap_or(DataClass::Personal),
             };
+            facts.push(postgres_mask::ColumnFacts {
+                class: data_class,
+                has_source: c.source.is_some(),
+            });
             QueryColumn {
                 name: c.name.clone(),
                 type_name: c.type_name.clone(),
@@ -1066,23 +1364,18 @@ fn shape(
         .iter()
         .map(|r| r.iter().map(cell_value).collect())
         .collect();
-    if is_agent {
+    if view.is_agent && !view.engine_masks {
+        // No lens in the engine: hide every value of an agent (fail closed).
         mark_agent_result(&mut columns, &mut rows);
-    } else if !manage {
-        // A person without manage never sees a secret value (the nosecret lens masks it in
-        // the engine; the result shows the marker).
-        let secret = serde_json::to_value(HiddenValue::SECRET).expect("a marker serializes");
-        for (i, c) in columns.iter_mut().enumerate() {
-            if c.data_class == DataClass::Secret {
-                c.masking = Masking::Hidden;
-                for row in rows.iter_mut() {
-                    if let Some(cell) = row.get_mut(i)
-                        && !cell.is_null()
-                    {
-                        *cell = secret.clone();
-                    }
-                }
-            }
+    } else {
+        let marked = postgres_mask::mark_result(view.lens, &facts, &mut rows);
+        for (c, m) in columns.iter_mut().zip(marked) {
+            c.data_class = m.class;
+            c.masking = match m.masking {
+                None => Masking::None,
+                Some(true) => Masking::Hidden,
+                Some(false) => Masking::Pseudonym,
+            };
         }
     }
     let reason = if rows.len() as u64 >= max_rows {
@@ -1091,7 +1384,13 @@ fn shape(
         "max_result_bytes"
     };
     let truncated_reason = out.truncated.then_some(reason);
-    (columns, rows, truncated_reason, out.rows_affected)
+    Ran {
+        columns,
+        rows,
+        truncated_reason,
+        rows_affected: out.rows_affected,
+        grant_id: None,
+    }
 }
 
 async fn write_log(
@@ -1100,20 +1399,30 @@ async fn write_log(
     id: NodeId,
     query_id: Uuid,
     draft: LogDraft,
-    result: &std::result::Result<RunOutput, QueryError>,
+    result: &std::result::Result<Ran, QueryError>,
     elapsed: Duration,
 ) -> Result<()> {
-    let (outcome, error_code, sqlstate, row_count, rows_affected, truncated) = match result {
-        Ok((_, rows, reason, affected)) => (
-            QueryOutcome::Ok,
-            None,
-            None,
-            i32::try_from(rows.len()).ok(),
-            affected.and_then(|n| i64::try_from(n).ok()),
-            reason.is_some(),
-        ),
-        Err(e) => (e.outcome(), Some(e.code()), e.sqlstate(), None, None, false),
-    };
+    let (outcome, error_code, sqlstate, row_count, rows_affected, truncated, grant_id) =
+        match result {
+            Ok(r) => (
+                QueryOutcome::Ok,
+                None,
+                None,
+                i32::try_from(r.rows.len()).ok(),
+                r.rows_affected.and_then(|n| i64::try_from(n).ok()),
+                r.truncated_reason.is_some(),
+                r.grant_id,
+            ),
+            Err(e) => (
+                e.outcome(),
+                Some(e.code()),
+                e.sqlstate(),
+                None,
+                None,
+                false,
+                None,
+            ),
+        };
     let entry = QueryLogEntry {
         id: query_id,
         tenant_id: ctx.tenant,
@@ -1129,7 +1438,7 @@ async fn write_log(
         rows_affected,
         truncated,
         elapsed_ms: i32::try_from(elapsed.as_millis()).ok(),
-        grant_id: None,
+        grant_id,
         approval_id: None,
         by: ctx.actor,
         at: crate::now(),

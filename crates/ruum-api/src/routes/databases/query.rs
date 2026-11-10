@@ -3,7 +3,8 @@
 //! the JSON of `contracts/openapi.yaml`.
 //!
 //! The step 2 error codes of the query API (`query_failed`, `read_only_query`,
-//! `statement_not_allowed`, `database_not_ready`, `statement_timeout`, `write_grant_required`)
+//! `statement_not_allowed`, `database_not_ready`, `statement_timeout`, `write_grant_required`,
+//! `class_read_required`)
 //! are codes of the shared `ErrorCode`; they render with [`crate::error::render`]: the standard
 //! error body, the `sqlstate` of a failed statement and the `Retry-After` header of `503
 //! database_not_ready`.
@@ -66,7 +67,15 @@ pub async fn query_database(
 ) -> ApiResult<Response> {
     let id = path_id(node)?;
     Ok(
-        match query::query(&state.services.databases, &ctx, id, b).await {
+        match query::query_at(
+            &state.services.databases,
+            &ctx,
+            id,
+            b,
+            &state.config.public_url,
+        )
+        .await
+        {
             Ok(r) => Json(to_json(&r)?).into_response(),
             Err(e) => answer(e),
         },

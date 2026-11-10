@@ -36,15 +36,23 @@ fn the_role_kind_follows_the_caller() {
     }
 }
 
-/// Wave decision 1: an agent reads as `masked_read` and never writes before Q-2.
+/// On an engine without a lens, every value of an agent's result is hidden (wave decision 1,
+/// kept by card Q-2 for the memory engine); a write without a grant is `403
+/// write_grant_required` with the grant prompt as the hint.
 #[test]
 fn agents_fail_closed() {
-    assert_eq!(agent_kind(StatementMode::Read), Ok(RoleKind::MaskedRead));
-    let p = agent_kind(StatementMode::Write).unwrap_err();
+    let p = write_grant_required("/t/x/item/y?give=write_live".into());
     assert_eq!(
         (p.code.http_status(), p.code.as_str()),
         (403, "write_grant_required")
     );
+    assert_eq!(p.hint.as_deref(), Some("/t/x/item/y?give=write_live"));
+    assert_eq!(lens_of(RoleKind::MaskedRead), postgres_mask::Lens::Masked);
+    assert_eq!(lens_of(RoleKind::MaskedWrite), postgres_mask::Lens::Masked);
+    assert_eq!(lens_of(RoleKind::Read), postgres_mask::Lens::NoSecret);
+    assert_eq!(lens_of(RoleKind::Write), postgres_mask::Lens::NoSecret);
+    assert_eq!(lens_of(RoleKind::SecretRead), postgres_mask::Lens::Base);
+    assert_eq!(lens_of(RoleKind::Owner), postgres_mask::Lens::Base);
 
     let mut columns = vec![QueryColumn {
         name: "email".into(),

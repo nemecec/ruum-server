@@ -205,8 +205,8 @@ pub struct DatabaseLimits {
     pub max_branch_source_bytes: i64,
 }
 
-/// `DatabasePermissions`: what the caller may do now (after the scope; no grant of A-1 exists
-/// yet, so an agent has no `write_live` and no `read_personal` on a live database).
+/// `DatabasePermissions`: what the caller may do now, after the scope and, for an agent, its
+/// grants ([`DatabasePermissions::with_grants`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct DatabasePermissions {
     pub query_read: bool,
@@ -230,6 +230,57 @@ impl DatabasePermissions {
             read_personal: at(Role::View) && !agent,
             read_secret: at(Role::Manage) && !agent,
         }
+    }
+
+    /// Adds the live grants of an agent (`grants::active`): `write_live` (or a branch with
+    /// `masked` or `schema_only` data) lets it write where its role (after the scope) has
+    /// `edit`; `read_personal` shows it real `personal` values where it has `view`.
+    async fn with_grants(
+        &mut self,
+        svc: &DatabaseService,
+        ctx: &Context,
+        node: NodeId,
+        role: Option<Role>,
+        row: Option<&DatabaseRow>,
+    ) -> Result<()> {
+        use access::grants::{GrantKind, active};
+        let d = svc.deps();
+        let agent = crate::ids::AgentId(ctx.actor.actor.id.0);
+        let now = crate::now();
+        let draft = row.is_some_and(|r| {
+            matches!(
+                r.branch_data,
+                Some(crate::providers::DataCopy::Masked | crate::providers::DataCopy::SchemaOnly)
+            )
+        });
+        let edit = role.is_some_and(|r| r >= Role::Edit);
+        let live = draft
+            || active(
+                &*d.grants,
+                &*d.authz,
+                ctx.tenant,
+                node,
+                agent,
+                GrantKind::WriteLive,
+                now,
+            )
+            .await?
+            .is_some();
+        let personal = active(
+            &*d.grants,
+            &*d.authz,
+            ctx.tenant,
+            node,
+            agent,
+            GrantKind::ReadPersonal,
+            now,
+        )
+        .await?
+        .is_some();
+        self.write_live = live && edit;
+        self.query_write = self.write_live;
+        self.read_personal = personal && self.query_read;
+        Ok(())
     }
 }
 
@@ -1520,7 +1571,15 @@ impl DatabaseService {
             EngineKind::Sqlite => plan.sqlite.size_bytes,
         };
         let s = d.settings;
-        let my_permissions = Some(DatabasePermissions::of(node.my_role, ctx.actor.is_agent()));
+        let mut permissions = DatabasePermissions::of(node.my_role, ctx.actor.is_agent());
+        if ctx.actor.is_agent() {
+            // The grants of card A-1 count for an agent (review-A-1 N-2, card Q-2): live rows
+            // whose tuples hold; on a draft branch writes need no grant.
+            permissions
+                .with_grants(self, ctx, node.id, node.my_role, db.as_ref())
+                .await?;
+        }
+        let my_permissions = Some(permissions);
         Ok(Database {
             manifest_version_id: row.desired_version,
             status: DatabaseStatus::of(&row, node.trashed_at.is_some()),
@@ -1594,6 +1653,14 @@ pub fn build(
         registry.clone(),
         tenants.clone(),
     )));
+    // The lens of a Postgres database follows its classes (card Q-2), next to the rules of the
+    // caller (a recording one in tests).
+    let postgres_rules = Arc::new(crate::privacy::postgres::PostgresMaskingRules::new());
+    let masking: Arc<dyn crate::privacy::MaskingRules> =
+        Arc::new(crate::privacy::AllMaskingRules::new(vec![
+            parts.masking.clone(),
+            postgres_rules.clone(),
+        ]));
     let service = DatabaseService::new(DatabaseDeps {
         nodes,
         authz,
@@ -1604,11 +1671,13 @@ pub fn build(
         engines: parts.engines.clone(),
         settings: DatabaseSettings::default(),
         columns: parts.columns.clone(),
-        masking: parts.masking.clone(),
+        masking,
         grants: parts.grants.clone(),
         queries: query::QueryDeps::new(parts.queries.clone(), parts.keys.clone()),
     });
-    Ok((registry, Arc::new(service)))
+    let service = Arc::new(service);
+    postgres_rules.bind(&service);
+    Ok((registry, service))
 }
 
 /// Builds the database provider, the provider registry and the service over the current
