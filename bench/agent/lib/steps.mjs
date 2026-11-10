@@ -6,6 +6,12 @@
 // `alice` by default, `bob`, `bench` for the benchmark agent, or the name of an agent that an
 // `agent` step registered). Paths are from the tenant root; Alice (the owner) resolves them, so
 // a step can name a node that its principal reaches only by ID.
+//
+// Databases (step 2): `database: <path>` makes a database node (`engine`: sqlite by default) and
+// waits until it is ready; `sql: <statement>` runs one statement on a database (`node: <saved>`
+// or `db: <path>`, `params`, `mode`: write by default) through `queryDatabase`. A person with
+// `manage` (Alice) makes tables this way (Q-1 wave decision 3). `answer: <text>` is the final
+// answer of a reference solution (`--mode oracle`), for the `answer_*` checks.
 
 import { Api, exchangeKey } from './api.mjs';
 
@@ -23,7 +29,7 @@ export function template(value, vars) {
 
 const ACTIONS = [
   'folder', 'file', 'write', 'label', 'agent', 'grant', 'tag', 'attach', 'rename', 'move',
-  'trash', 'restore', 'restore_version', 'sleep',
+  'trash', 'restore', 'restore_version', 'sleep', 'database', 'sql', 'answer',
 ];
 
 export function actionOf(step) {
@@ -164,6 +170,36 @@ export async function runStep(ctx, raw) {
       await api.post(`/v1/nodes/${id}/restore`, {});
       return;
     }
+    case 'database': {
+      const { parent, name } = split(step.database);
+      const pid = parent ? await ensureFolder(ctx, api, parent) : (await ctx.inspector.root()).id;
+      const engine = step.engine ?? 'sqlite';
+      const manifest = { engine, version: engine === 'postgres' ? '17' : '3', plan: 'shared-small' };
+      const w = await api.post('/v1/databases', { parent_id: pid, name, manifest });
+      const id = w.database.node.id;
+      for (let i = 0; ; i++) {
+        const state = (await api.get(`/v1/databases/${id}`)).status.state;
+        if (state === 'ready') break;
+        if (!['provisioning', 'updating'].includes(state) || i >= 600) {
+          throw new Error(`database ${step.database}: state ${state}`);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (step.save) ctx.saved[step.save] = id;
+      return;
+    }
+    case 'sql': {
+      const id = await target(ctx, step, 'db');
+      await api.post(`/v1/databases/${id}/query`, {
+        sql: step.sql,
+        params: step.params ?? [],
+        mode: step.mode ?? 'write',
+      });
+      return;
+    }
+    case 'answer':
+      ctx.answer = step.answer;
+      return;
     case 'restore_version': {
       const id = await target(ctx, step, 'restore_version');
       const versions = (await ctx.inspector.versions(id)).sort((a, b) => a.created_at.localeCompare(b.created_at));

@@ -129,6 +129,8 @@ async function runTask(task, server, env, work, runDir) {
     }
   }
 
+  // The `answer_*` checks read the final answer (the agent's, or the `answer` step of a reference).
+  if (agent) ctx.answer = agent.final_answer ?? null;
   const checked = await runChecks(ctx, task.check);
   let answer = null;
   if (task.answer_should_match && agent?.final_answer != null) {
