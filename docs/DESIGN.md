@@ -1175,6 +1175,15 @@ workers:
   order), each cancellable. It saves apps the bookkeeping of "who waits since when" in a table. It is built
   on the timers and events above as an SDK feature after step 3, preferably on an open-source engine
   (Restate, Temporal or similar); the default `AGENTS.md` then steers mostly-waiting work to it.
+- **Code updates**: every deploy is an immutable release, rolled out with health checks and rolled back on a
+  rising error rate (9.6). HTTP requests drain; a running job finishes on the old release within a grace
+  period, the next run uses the new one; workers get a stop signal and a grace period, then restart on the
+  new release. **State kept only in memory is lost on restart**, everywhere in Ruum: lasting state goes into
+  a database, a file or the key-value store (the default `AGENTS.md` says so; workers checkpoint). A durable
+  workflow keeps its saved state; by default an instance stays **pinned to the release it started with**
+  (kept until its last instance ends), and long workflows can declare a migration to the new release. The
+  pipeline (11.2) checks workflow changes for compatibility; the release page shows instances on old
+  releases.
 - Logs, errors, issues and the after-run checks of 9.6 apply; every run is attributed for cost (21).
 
 ### 9.12 Resource access instead of secrets
@@ -1196,7 +1205,16 @@ workers:
 (inside the app folder, bound by one job). `manage` rotates, edits and deletes; a new permission **`use`**
 (below `edit`) binds the connection to an app or agent the principal controls; `view` shows that it exists and
 its metadata, never the value. Every use is logged with actor and on_behalf_of. An agent can bind what it may
-`use`, never read it; a new binding to a live connection asks a person (like database write grants, 8.5).
+`use`, never read it.
+
+**Access policies decide when a person is asked.** Groups give static roles on nodes; a tenant **access policy**
+adds conditions (evaluated like the operations policy, 19.3): the target's `environment` label (production,
+staging, development, on databases, connections and apps), whether a person or an agent binds, read or
+read-write, and the duration. For example: developers may bind production databases read-only and staging
+read-write without asking; read-write on production asks a person; agents never bind raw secrets. Without a
+matching rule, live writes ask a person. A policy only grants within the principal's own rights and an agent's
+scope; it removes waiting, not limits. Policy changes are made by tenant admins and logged. This applies to
+database grants (8.5) as well.
 
 **Leak prevention in three layers**: (1) the `hygiene` and security stages of 11.2 flag code that prints, logs,
 returns or sends a raw secret; (2) log, trace and report ingestion scans for the **exact values** of the secrets
