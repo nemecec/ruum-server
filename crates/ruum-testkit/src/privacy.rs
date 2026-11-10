@@ -1210,6 +1210,10 @@ pub struct Ctx {
     read_personal: BTreeSet<String>,
     fixture: Option<Fixture>,
     migration_no: usize,
+    /// The hook deliveries of typed nodes (a copy's database is made from its `copied`
+    /// delivery). `ruum-server` runs this worker as a task; the suite runs a round where a case
+    /// waits for one ([`Ctx::copy`]).
+    deliveries: Option<std::sync::Arc<ruum_core::providers::deliveries::DeliveryWorker>>,
 }
 
 impl Ctx {
@@ -1224,6 +1228,7 @@ impl Ctx {
             tag,
             read_personal: BTreeSet::new(),
             fixture: None,
+            deliveries: None,
             migration_no: 1,
         }
     }
@@ -1658,6 +1663,13 @@ impl Ctx {
             .and_then(|v| v["node"]["id"].as_str().map(str::to_string))
             .ok_or_else(|| Stop::Failed(format!("copyNode gave no node ID: {}", excerpt(&res))))?;
         let db = Db { id, data };
+        // The provider makes the copy's database when the `copied` delivery reaches it.
+        if let Some(worker) = &self.deliveries {
+            worker
+                .run_once(ruum_core::providers::deliveries::DeliveryWorker::ROUND_LIMIT)
+                .await
+                .map_err(|e| Stop::Failed(format!("the hook deliveries failed: {e}")))?;
+        }
         self.wait_ready(&db).await?;
         Ok(db)
     }
@@ -3958,7 +3970,14 @@ async fn run_one(backend: &Backend, case: Case, engine: Engine) -> (Outcome, Opt
     let result = if !w.seeded {
         Err(Stop::Failed("the fixture world is not seeded".into()))
     } else {
+        let deliveries =
+            std::sync::Arc::new(ruum_core::providers::deliveries::DeliveryWorker::new(
+                state.services.typed_nodes.clone(),
+                state.services.providers.clone(),
+                ruum_core::providers::deliveries::Backoff::default(),
+            ));
         let mut ctx = Ctx::new(case.id, engine, backend.kind(), client::app(state), w);
+        ctx.deliveries = Some(deliveries);
         match (case.run)(&mut ctx).await {
             Ok(()) => ctx.sweep().await,
             Err(e) => {
