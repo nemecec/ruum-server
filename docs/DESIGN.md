@@ -1146,6 +1146,59 @@ bindings:
 development pipeline (11.2) runs a breaking-change check when other apps depend on the API, so an
 agent changing one app cannot silently break another.
 
+### 9.11 Background work: jobs, triggers, workers
+
+Declared in the app manifest; run in the same gVisor sandbox pool under the app's identity:
+
+```yaml
+jobs:
+  nightly-report: { run: "node report.js", schedule: "0 6 * * *", timezone: Europe/Tallinn, timeout: 15m }
+triggers:
+  on-invoice: { run: "node invoice.js", on: { node_event: file.created, path: ./Invoices/ } }
+  on-order:   { run: "node order.js",   on: { topic: shop.orders.created } }   # app events, 9.10
+  on-webhook: { run: "node hook.js",    on: { webhook: stripe } }              # signature checked
+workers:
+  telegram-bot: { run: "node bot.js", memory: 128Mi, cpu: 0.05, restart: always }
+```
+
+- **Scheduled jobs**: cron with a timezone, timeout and retry policy; at most one run at a time by default;
+  missed runs are recorded, not piled up.
+- **Event triggers**: Ruum's events (nodes, databases, issues), other apps' events, incoming webhooks with
+  signature checks; at least once, with retries, a dead-letter queue and replay; actor and on_behalf_of
+  are passed on.
+- **Long-running workers**: a small CPU share (gVisor allows tiny limits), billed by memory-time (21);
+  restart on crash with backoff. Work that mostly waits uses **durable sleeps and timers** instead ("wake me
+  in 3 hours or on event X"): the sandbox is released while waiting and costs nothing. The default
+  `AGENTS.md` steers agents to this pattern; workers that hold a connection open stay always-on.
+- Logs, errors, issues and the after-run checks of 9.6 apply; every run is attributed for cost (21).
+
+### 9.12 Resource access instead of secrets
+
+1. **A credential lives inside the node it gives access to.** Databases already work so (no password in the
+   binding). Other resources are **connection nodes** (type `connection`: a Stripe account, an SMTP server,
+   a bot token, an S3 bucket, a REST API). Credentials are set by OAuth where possible, otherwise pasted once,
+   and are **write-only**: nobody reads them back. Apps, jobs and agents bind to a connection like to a
+   database.
+2. **Code does not see the credential where it can be avoided**: the **egress proxy injects it** (a binding
+   says "requests to `api.stripe.com` get this header"; also SMTP and S3 signing). A process cannot leak what
+   it never had.
+3. **Raw secrets only when unavoidable** (a library that needs a key): a `secret` node, write-only, injected as
+   an environment variable or file only into the bound process, rotated on schedule where possible.
+   Generated secrets (9.9) are the same node type, made by Ruum.
+
+**They are nodes, so the tree gives the levels and the permissions**: instance (platform admins), tenant
+(a `Connections/` folder), project (inside the project folder), personal (the personal space), app or job
+(inside the app folder, bound by one job). `manage` rotates, edits and deletes; a new permission **`use`**
+(below `edit`) binds the connection to an app or agent the principal controls; `view` shows that it exists and
+its metadata, never the value. Every use is logged with actor and on_behalf_of. An agent can bind what it may
+`use`, never read it; a new binding to a live connection asks a person (like database write grants, 8.5).
+
+**Leak prevention in three layers**: (1) the `hygiene` and security stages of 11.2 flag code that prints, logs,
+returns or sends a raw secret; (2) log, trace and report ingestion scans for the **exact values** of the secrets
+bound to that app and replaces a match with the hidden-value marker before storage; (3) a match opens a
+security issue, marks the secret **exposed**, and rotates it automatically where the provider allows, or asks
+the owner to rotate it.
+
 ## 10. Source code and builds
 
 Store code in **Git**, even if the user never sees Git. Do not invent a new version control system.
