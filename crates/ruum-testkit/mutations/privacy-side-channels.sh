@@ -6,7 +6,7 @@ CARD="Q-2"
 CASES="side."
 DESCRIPTION="the masked_read kind gets SELECT on the base tables, so pg_stats shows it the statistics of every column"
 FILE="crates/ruum-dbengine/src/postgres/setup.rs"
-PERL='s/grant select on tables to \{secret_read\};/grant select on tables to {secret_read}, {masked_read};/; s/secret_read = r\(RoleKind::SecretRead\),/secret_read = r(RoleKind::SecretRead),\n        masked_read = r(RoleKind::MaskedRead),/'
+PERL='s/grant select on tables to \{secret_read\};/grant select on tables to {secret_read}, {masked_read};/; s/secret_read = r\(RoleKind::SecretRead\),\n(\s*)write = r\(RoleKind::Write\),/secret_read = r(RoleKind::SecretRead),\n${1}masked_read = r(RoleKind::MaskedRead),\n${1}write = r(RoleKind::Write),/'
 TESTS="-p ruum-core --lib databases::query::postgres_mask::engine_tests"
 ENV="RUUM_DBENGINE_REQUIRE_POSTGRES=1"
 PLACEHOLDER=0
