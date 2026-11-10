@@ -168,7 +168,7 @@ impl ApprovalStore for MemoryApprovalStore {
             .filter(|a| after.is_none_or(|c| a.id < c))
             .cloned()
             .collect();
-        items.sort_by(|x, y| y.id.cmp(&x.id));
+        items.sort_by_key(|x| std::cmp::Reverse(x.id));
         items.truncate(limit + 1);
         Ok(page_of(items, limit))
     }
