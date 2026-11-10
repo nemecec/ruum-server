@@ -1181,9 +1181,14 @@ workers:
   new release. **State kept only in memory is lost on restart**, everywhere in Ruum: lasting state goes into
   a database, a file or the key-value store (the default `AGENTS.md` says so; workers checkpoint). A durable
   workflow keeps its saved state; by default an instance stays **pinned to the release it started with**
-  (kept until its last instance ends), and long workflows can declare a migration to the new release. The
-  pipeline (11.2) checks workflow changes for compatibility; the release page shows instances on old
-  releases.
+  (kept until its last instance ends), and long workflows can declare a migration to the new release.
+- **Compatibility is the agents' job, and easy to test**: before every publish the pipeline (11.2) tests the new
+  code against the old state on the preview: masked snapshots of sleeping workflow instances are resumed on it,
+  a sample of recent events and job runs is replayed, and migrations run on a branch of the live schema. When
+  something breaks, the agent fixes it on the draft; publishing waits until the checks pass. The person sees
+  "Ready to publish", or one plain question when the decision is theirs ("3 customers are in the middle of
+  onboarding: finish their old flow, or move them to the new one?"). Release counts and pinned versions are on
+  an agent-facing details page.
 - Logs, errors, issues and the after-run checks of 9.6 apply; every run is attributed for cost (21).
 
 ### 9.12 Resource access instead of secrets
@@ -1208,10 +1213,17 @@ its metadata, never the value. Every use is logged with actor and on_behalf_of. 
 `use`, never read it.
 
 **Access policies decide when a person is asked.** Groups give static roles on nodes; a tenant **access policy**
-adds conditions (evaluated like the operations policy, 19.3): the target's `environment` label (production,
-staging, development, on databases, connections and apps), whether a person or an agent binds, read or
-read-write, and the duration. For example: developers may bind production databases read-only and staging
-read-write without asking; read-write on production asks a person; agents never bind raw secrets. Without a
+adds conditions (evaluated like the operations policy, 19.3): whether the target is **live** or **draft** (derived by
+Ruum, never labelled by hand: see below), whether a person or an agent binds, read or read-write, and the
+duration. For example: developers may read live databases and write drafts without asking; writes to live data
+ask a person; agents never bind raw secrets.
+
+**Live and draft instead of environments.** Users never see "staging", branches or deploy pipelines. The **live**
+state is the published app with its real databases and connections; a **draft** is a session's draft with its
+preview, a database branch (masked data by default, 8.5) and connections in test or sandbox mode (for example
+Stripe test mode). There is one codebase: drafts are branches underneath, and **Publish** is the promotion (merge,
+build, roll out, roll back on errors). A team that wants an extra stage (a client's acceptance test) can name an
+extra preview later, as an advanced option. Without a
 matching rule, live writes ask a person. A policy only grants within the principal's own rights and an agent's
 scope; it removes waiting, not limits. Policy changes are made by tenant admins and logged. This applies to
 database grants (8.5) as well.
