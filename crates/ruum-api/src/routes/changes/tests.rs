@@ -167,6 +167,10 @@ fn sample(event: EventType, user: UserId) -> Value {
         EventType::DatabaseGrantRevoked => json!({
             "grant_id": id(), "kind": "read_personal", "agent_id": id(), "cause": "revoked"
         }),
+        EventType::DatabaseApprovalDecided => json!({
+            "approval_id": id(), "subject": "grant", "decision": "approve",
+            "reasons": ["grant"], "classes_confirmed": 0
+        }),
     }
 }
 

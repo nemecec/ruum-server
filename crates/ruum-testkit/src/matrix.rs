@@ -84,11 +84,6 @@ pub const PLANNED_OPERATIONS: &[&str] = &[
     "listDatabaseRestorePoints",
     "createDatabaseRestorePoint",
     "restoreDatabase",
-    "requestDatabaseAccessGrant",
-    "listPendingDatabaseApprovals",
-    "listDatabaseApprovals",
-    "getDatabaseApproval",
-    "decideDatabaseApproval",
     // Step 3 (web apps, issues, templates; docs/STEP3.md).
     "createApp",
     "getApp",

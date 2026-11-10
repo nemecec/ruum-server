@@ -1091,7 +1091,6 @@
         "database.restore_started",
         "database.restored",
         "database.restore_failed",
-        "database.approval_decided",
         "app.deployed",
         "app.deployment_failed",
         "app.rolled_back",
