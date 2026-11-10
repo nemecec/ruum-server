@@ -31,7 +31,9 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U ruum" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
-      DATABASE_URL: postgres://ruum:ruum@localhost:5432/ruum
+      # A role without superuser, as in ci.yml: the superuser of the service container bypasses
+      # row-level security, so the RLS tests of the baseline failed with it.
+      DATABASE_URL: postgres://ruum_test:ruum_test@localhost:5432/ruum
       # The mutations of ruum-dbengine run against the data cluster (see ci.yml).
       RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
     steps:
@@ -40,6 +42,12 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
+      # CREATEDB for the per-test databases, CREATE on the main database for the schema in which
+      # sqlx keeps its list of test databases (as in ci.yml).
+      - name: Role for the tests
+        run: |
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant create on database ruum to ruum_test"
       # The data cluster of step 2, as in ci.yml (a service container cannot be built).
       - name: Start the data cluster (postgres-data)
         run: |
