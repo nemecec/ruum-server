@@ -969,3 +969,122 @@ change). A personal column of a built-in range type or of an extension type (for
 generic overload in `crates/ruum-core/src/privacy/mod.rs`; the tests and mutations above.
 Fix records: `ruum-server-wt/panel/masking-fix.md` and `masking-fix-2.md` (the two security
 reviews `review-masking-1.md` and `review-masking-2.md`).
+
+## 38. Masked sessions never run tenant code on live data (backlog S-21, review-Q-2-3 R-1)
+
+Status: `provisional` (design 18.9). The architect proposal `ruum-server-wt/panel/s21-proposal.md`
+(option B of four) and its two reviews (`s21-review-1.md`, security: changes requested;
+`s21-review-2.md`, use and cost: accepted with changes). Every required change of both reviews
+is applied. Where they differ, the safer option is taken and the text says so. Fix record:
+`ruum-server-wt/panel/q2-s21-fix.md`.
+
+**Problem.** The lens decides what a statement may read. But a session also starts tenant code:
+functions in views, triggers, rules, defaults, policies. That code runs on the base tables and
+sees the real rows, whatever lens the session has, and it can copy a value into a column the
+session may read. Each Q-2 review found one more such path (P-1: triggers; R-1: a function
+behind a view in a row write). A list of paths is never complete.
+
+**Decision.**
+
+- (a) **The rule.** A masked session never runs tenant code in a writable transaction on a
+  live database. A *masked session* is any session whose lens hides a value that tenant code can
+  see: the kinds `masked_write` (agents without `read_personal`) and `write` (agents with
+  `read_personal`, people with `edit` but not `manage`; lens `nosecret`, so secrets stay
+  hidden). Only `owner` (people with `manage`, migrations) and, in step 3, the app kinds (lens
+  `base`) are outside the rule. Agents with `read_personal` are masked sessions (both reviews:
+  the proposal had exempted them, which reopened P-1 for secrets).
+- (b) **Tenant code** is any object of the tenant that Postgres may run during a statement:
+  functions, procedures and aggregates (any language, volatility or security: a `STABLE`
+  function can call a `VOLATILE` one), triggers (also with a built-in function, also disabled),
+  rules other than a view's own `_RETURN`, row-level security policies, relations of a kind
+  outside the known list (a foreign table) and event triggers. Casts, operators, defaults,
+  generated expressions, domain checks and range types need a tenant function to run tenant
+  code, so the function clause covers them. An object is the tenant's when the database's
+  `owner` role owns it or it is in a schema that role may create in, so a later grant cannot open
+  a gap (review 1 L-2). The functions of allow-listed extensions are in schema `extensions`,
+  which the tenant does not own and cannot create in. The check is strict: **any** tenant code
+  counts, not only code that depends on a restricted column (review 1 L-1: trigger functions are
+  never SQL-standard, so a dependency walk would count every trigger anyway). Review 2 N-3
+  suggested scoping the `write` kind to databases with a `secret` column; the stricter form is
+  taken, and the scope stays an option for later.
+- (c) **Three lines, each fails closed.**
+  1. The query layer refuses a row write (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, a
+     data-modifying `WITH`) of a masked session when the database holds tenant code:
+     `501 not_implemented` with the hint code `tenant_code_on_live` (review 2 R-4: the shape
+     of the destructive statements until card A-2, and a fixed hint code, 0004-35; no new
+     error code, so no contract change). Nothing runs.
+  2. The engine refuses the same in the request's own transaction, for every writable
+     transaction of `masked_write` and `write`, whatever the query layer thought the statement
+     was: once before the statement (a clear refusal) and again after it, before `COMMIT`
+     (review 1 M-2, review 2 N-6). DDL that commits before the statement's locks is seen by the
+     second check; DDL after them waits for this transaction; the rollback takes back what the
+     code wrote. Only effects outside the transaction stay (a sequence number, timing). This
+     closes review-Q-2-3 N-2 and S-24's second half. Error: `422 statement_not_allowed`, hint
+     `tenant_code_on_live`.
+  3. A masked session's statement that writes no row runs read-only, also in mode `write`
+     (before: agents only; now people with `edit` too).
+  The proposal's "code fingerprint" is dropped: the check after the statement closes the race
+  without it (review 2 N-6).
+- (d) **Reads.** Masked reads keep running tenant code (a function in a view), read-only. The rule
+  is named for writes on purpose (both reviews). Accepted risk: tenant code that a masked read
+  runs cannot write, but whether it raises an error, and its timing, can tell one fact per row
+  that the code's author chose; the error text itself is hidden (P-2, `in_routine`). The same
+  holds for built-in expressions on the real row (a `CHECK`, a partial unique index, a policy):
+  not tenant code, one fixed bit per row (review 1 L-3). Review 1 M-1 option 1 (evaluate tenant
+  views over the lens tables) stays open as a later hardening.
+- (e) **Draft branches.** The rule lets tenant code run freely on a draft branch with `masked` or
+  `schema_only` data: its rows are pseudonyms and `NULL` secrets, so tenant code learns nothing
+  beyond a masked read (review 2 N-4 checked this). Draft branches are not built yet, and a
+  masked *copy* of a node is not a draft branch (people may add real rows to it later). So today
+  every database counts as live. The card that builds draft branches marks the engine copy of a
+  branch at its creation, and both lines then skip it.
+- (f) **The ways on.** Until card A-2, a person with `manage` makes the change. A-2 turns the
+  `501` into a `202` with a new `DatabaseApproval.reasons` value `tenant_code` (additive). That
+  approval (review 1 H-2, review 2 R-4): is always a person's, and no access policy can grant it
+  in advance (like the migration approval, 0004-5); counts as a real-data access of the agent,
+  logged as such; and says so in the person's words, without "trigger", "function" or "branch"
+  ("This database runs its own logic on changes, and that logic can copy real data to places
+  the agent can read"). A data change from a branch is a migration with DML, which runs as
+  `owner` and already waits for a person. There is no "publish a data change" (review 2 R-4).
+- (g) **Residual, stated.** The rule removes the masked session as the starter of tenant code. It
+  does not stop tenant code that others start: an app's users, a person with `manage`, a job. A
+  trigger can still copy a personal value into a column confirmed `normal`, where a masked
+  agent reads it later (review 1 M-3, review 2 R-3). Tenant code that copies data gives its
+  target columns the class of what it reads: the agent that writes the code suggests that class
+  in its migration, and the `privacy` stage of the pipeline (design 11.2) checks it. That stage
+  is a card of step 4 or 5. A narrow case also stays: tenant code made between the two engine
+  checks that removes every trace of tenant code before the second check (it would need to drop
+  itself while it runs).
+- (h) **Answers to the panel's open items.** S-23 (editors without `manage`): decided, the strict
+  form. Platform helpers (an `updated_at` trigger the platform installs: owned by a platform role,
+  in a schema the tenant cannot write, a pinned body, known by owner and OID; review 1 L-1, review
+  2 N-2): wanted, not in this cut; a card before step 3 templates use a trigger. An agent should
+  see before it plans that live writes need a person (review 2 N-1): an additive field of
+  `getDatabase` later, with A-2.
+
+**Tests.** `crates/ruum-core/src/databases/query/postgres_mask_tests.rs`
+`masked_sessions_never_run_tenant_code_on_live`: one hostile case per kind (a trigger; a disabled
+trigger with a built-in function; a rule; a policy; the R-1 function behind a view; a `STABLE`
+function over a `VOLATILE` one; a definer function behind a view; a volatile default; an
+aggregate over a built-in function), each for an agent, an agent with `read_personal` and a
+person with `edit`, three or more write forms each; `501` with `tenant_code_on_live`, no row
+changed and nothing copied; a control write after each case; the engine line for both kinds; a
+person with `manage` still writes. `crates/ruum-dbengine/src/postgres/tests/tenant_code.rs`: each
+clause of the check on its own (and the extensions' functions never count); the engine line
+before and after the statement, with a trigger made between the two checks (a sequence shows
+that the statement ran and was rolled back); a guard over every catalog column that points to a
+function or holds an expression, so a Postgres upgrade that adds one fails. The test database of
+the hostile tests holds no tenant code by default; P-2 is now tested through a function in a
+view (masked sessions reach tenant code only in reads). Mutations: `databases-query-agent-side-effects`,
+`databases-query-tenant-code-write-kind`, `databases-query-agent-read-only`,
+`dbengine-masked-write-side-effects` (the check before), `dbengine-tenant-code-post-check`,
+`dbengine-tenant-code-write-kind`, `dbengine-tenant-code-functions`,
+`dbengine-tenant-code-triggers`, `dbengine-tenant-code-disabled`, `dbengine-side-effects-rules`,
+`dbengine-tenant-code-policies`. The clauses for relations and event triggers have no mutation:
+a test cannot make a foreign table (no allow-listed foreign data wrapper) or an event trigger
+(superuser only).
+
+**Changes.** `crates/ruum-dbengine/src/postgres/depends.rs` (`TENANT_CODE_SQL` replaces
+`SIDE_EFFECTS_SQL`), `session.rs`, `mod.rs`, `lib.rs` (`DatabaseEngine::tenant_code_on_live`
+replaces `write_side_effects`); `crates/ruum-core/src/databases/query/mod.rs`; the tests and
+mutations above; design 8.5.

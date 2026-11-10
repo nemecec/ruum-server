@@ -745,9 +745,26 @@ databases that AI agents make. One writer at a time is enough for most small app
 - **Writes in steps.** On a draft, the agent writes freely to a **database branch**, made with
   masked data by default, so previews do not copy real personal data. Schema changes are
   migrations (decision 19). Writes to the **live** database need a grant: per workspace in
-  `project.yaml` or per session through a prompt, limited in time and revocable. Destructive
+  `project.yaml` or per session through a prompt, limited in time and revocable; and, for a masked
+  session, a database without tenant code (below). Destructive
   statements (DROP, TRUNCATE, DELETE or UPDATE without WHERE) always ask, with the statement and the
   number of rows. The backup point in time is recorded before each granted write session.
+- **Tenant code and masked sessions** (decision 0004-38). Tenant code (functions, triggers, rules,
+  policies, and the defaults, casts and operators that call a function) runs on the real rows,
+  whatever the lens shows. So a **masked session** (any session whose lens hides a value: an agent,
+  also one with `read_personal`, which never sees secrets; a person without `manage`) never runs
+  tenant code in a writable transaction on live data. Its row writes to a live database with tenant
+  code are refused, and the agent asks a person instead: a person with `manage` makes the change,
+  and later an approval that is always a person's, never granted ahead by a policy, and that counts
+  as an access to real data. On a draft branch with masked data tenant code runs freely. The query
+  layer and the engine both check this from the catalog, the engine before and after the statement;
+  any object of the tenant that can run counts. The person never sees these words: the agent picks
+  the way, and the approval says what happens in plain words. Accepted risk: masked reads still run
+  tenant code, read-only; an error or its timing can tell one fact per row that the code's author
+  chose (the same holds for a `CHECK` or a partial index). The rule removes the masked session as the
+  starter of tenant code, not tenant code that others start (an app's users, a manager): tenant code
+  that copies data gives its target columns the class of what it reads, the agent that writes it
+  suggests that class, and the `privacy` stage of the pipeline (11.2) checks it.
 - **Typed markers, not look-alike strings.** A hidden or pseudonymised value is a distinct typed value,
   so nobody mistakes it for real data: in JSON results (the HTTP query API, MCP) a secret is
   `{"$ruum": "hidden", "class": "secret"}` and a pseudonym is `{"$ruum": "pseudonym", "id":
