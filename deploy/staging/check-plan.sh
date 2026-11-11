@@ -10,7 +10,10 @@
 #   - has a resource that can carry labels or tags without env=staging and managed-by=tofu;
 #   - has a resource type it does not know (fail closed: a new type needs a rule here first);
 #   - has an hcloud_server without firewall_ids, with a known firewall ID that is not the
-#     staging firewall of this plan, or with user_data;
+#     staging firewall of this plan, with a firewall ID unknown at plan time while the plan
+#     creates no firewall, or with user_data;
+#   - changes the firewall_ids of a server that exists (an in-place update): the firewall goes on
+#     only when a server is created, and stays the same after that;
 #   - creates, changes or deletes a DNS record outside the staging names, or a notify.staging one;
 #   - touches anything named ruum-buildbox, or a bucket outside ruum-staging-*;
 #   - has more than 4 servers (child modules included), or a server type other than the pinned one;
@@ -20,11 +23,13 @@
 #     (STG_ADMIN_CIDRS: a JSON list of exactly one IPv4 /32, the build server's fixed address; the
 #     Mac reaches the APIs through an SSH tunnel over it; without it every firewall rule is
 #     refused), or has rules or apply_to that are unknown at plan time;
-#   - sets apply_to on a firewall, except an existing firewall whose apply_to stays the same and
-#     lists only staging servers of this plan (Hetzner reports the servers that carry it there);
-#   - attaches the firewall, a load balancer target, a network or a primary IP to a server outside
-#     the plan (or the build server, STG_BUILDBOX_ID), or uses a label selector other than
-#     env=staging,role=node;
+#   - sets, changes or clears apply_to on a firewall, except an existing firewall that is updated
+#     in place (not replaced) and whose apply_to stays exactly the same and lists only staging
+#     servers of this plan (Hetzner reports the servers that carry it there);
+#   - creates, changes or deletes an hcloud_firewall_attachment (the staging code has none; a
+#     standalone attachment could put a foreign firewall on the nodes or take the staging one off);
+#   - attaches a load balancer target, a network or a primary IP to a server outside the plan (or
+#     the build server, STG_BUILDBOX_ID), or uses a label selector other than env=staging,role=node;
 #   - sets an object lock other than COMPLIANCE for BACKUP_LOCK_DAYS days, or removes one.
 # It reads only the plan; it never contacts a provider. The plan JSON must not hold the
 # variables or the prior state (steps.sh pipes it through plan-scrub.jq before it writes it).
@@ -127,11 +132,13 @@ violations="$(jq -r \
       if unknown == true then true
       elif id == null then false
       else ((id | tostring) as $i | ($plan_server_ids | index($i)) != null and $i != $buildbox) end;
-  # apply_to_kept: an existing firewall whose apply_to is the same before and after, and lists
-  # only servers of this plan (never the build server, never a label selector). Hetzner fills
-  # apply_to with the servers that carry the firewall through their firewall_ids.
+  # apply_to_kept: an existing firewall that is updated in place (a replace creates a new
+  # firewall) and whose apply_to is exactly the same before and after, and lists only servers of
+  # this plan (never the build server, never a label selector). Hetzner fills apply_to with the
+  # servers that carry the firewall through their firewall_ids.
   def apply_to_kept($r):
-      ($r.change.before != null)
+      ($r.change.actions == ["update"])
+      and ($r.change.before != null) and ($r.change.after != null)
       and (($r.change.before.apply_to // []) == ($r.change.after.apply_to // []))
       and all(($r.change.after.apply_to // [])[];
             ((.label_selector // "") == "") and (.server != null) and server_id_ok(.server; false));
@@ -139,6 +146,9 @@ violations="$(jq -r \
   def unknown_any(x): (x == true) or ([x | .. | select(. == true)] | length > 0);
   # The Hetzner IDs of the firewalls of this plan (known once the firewall exists).
   ([ .resource_changes[]? | select(.type == "hcloud_firewall") | (.change.before.id?, .change.after.id?) | select(. != null) | tostring ] | unique) as $plan_firewall_ids
+  # True when this plan creates a firewall (a fresh create or a replace): only then can a server
+  # firewall ID be unknown at plan time.
+  | ([ $rc[] | select(.type == "hcloud_firewall") | select((.change.actions | index("create")) != null) ] | length > 0) as $creates_firewall
   | (
     # 1. No zone resource at all (review 1 B-9).
     [ $rc[] | select(.type == "hcloud_zone") | "zone resource \(.address) (\(acts)): zones are data sources only" ]
@@ -163,6 +173,18 @@ violations="$(jq -r \
         | select(.value != null)
         | select((.value | tostring) as $f | ($plan_firewall_ids | index($f)) == null)
         | "server \($r.address) firewall \(.value) is not the staging firewall of this plan" ]
+    # Kimi review F1: an unknown firewall ID is only the firewall that this plan creates.
+    + [ $rc[] | select(.type == "hcloud_server") | select(.change.after != null)
+        | select(unknown_any(.change.after_unknown.firewall_ids // false))
+        | select($creates_firewall | not)
+        | "server \(.address) has a firewall ID unknown at plan time, but this plan creates no firewall" ]
+    # Kimi review F1: the firewall_ids of a server that exists never change in place (a server
+    # gets the staging firewall when it is created; a replace creates the server anew).
+    + [ $rc[] | select(.type == "hcloud_server") | select(.change.before != null and .change.after != null)
+        | select((.change.actions | index("create")) == null)
+        | select(((.change.before.firewall_ids // []) != (.change.after.firewall_ids // []))
+                 or unknown_any(.change.after_unknown.firewall_ids // false))
+        | "server \(.address) would change its firewall_ids in place (\(.change.before.firewall_ids // [] | map(tostring) | join(",")) -> \(if unknown_any(.change.after_unknown.firewall_ids // false) then "unknown" else (.change.after.firewall_ids // [] | map(tostring) | join(",")) end)): the firewall goes on only at server create" ]
     + [ $rc[] | select(.type == "hcloud_server") | select(.change.after != null)
         | select(((.change.after.user_data // "") != "") or ((.change.after_unknown.user_data // false) == true))
         | "server \(.address) has user_data: the Talos config must not go through the metadata service" ]
@@ -200,9 +222,12 @@ violations="$(jq -r \
     # 9. Firewall rules (code review F-4): inbound only, only the three rules, only from the
     # build server. Unknown sources are refused. Code review 2 G-1: apply_to is checked once per
     # firewall (also with zero rules), and rules unknown at plan time are refused.
+    # Kimi review F2: apply_to is checked when it is set before or after, so clearing it (which
+    # takes the firewall off the nodes) is refused too.
     + [ $rc[] | select(.type == "hcloud_firewall") | select(.change.after != null) | . as $r
-        | ( (if ((($r.change.after.apply_to // []) | length) > 0) and (apply_to_kept($r) | not)
-               then ["\($r.address): apply_to is not used (the firewall goes on at server create); only the unchanged servers of this plan of an existing firewall"] else [] end)
+        | ( (if (((($r.change.before.apply_to? // []) | length) > 0) or ((($r.change.after.apply_to // []) | length) > 0))
+                and (apply_to_kept($r) | not)
+               then ["\($r.address): apply_to is not used (the firewall goes on at server create); only an in-place update of an existing firewall may keep exactly the same servers of this plan"] else [] end)
           + (if unknown_any($r.change.after_unknown.apply_to // false)
                then ["\($r.address): apply_to unknown at plan time"] else [] end)
           + (if (($r.change.after_unknown.rule // false) == true)
@@ -222,16 +247,11 @@ violations="$(jq -r \
           + (if (($rule.source_ips // []) | length) == 0 then ["\($r.address) rule \($i): no source_ips"] else [] end)
           + (if (($rule.destination_ips // []) | length) > 0 then ["\($r.address) rule \($i): destination_ips are not used"] else [] end)
           ) | .[] ]
-    # 10. Firewall attachments: only servers of this plan, never the build server; a label
-    # selector only for the staging nodes.
-    + [ $rc[] | select(.type == "hcloud_firewall_attachment") | select(.change.after != null) | . as $r
-        | ( [ (.change.after.server_ids // [])[] | select(server_id_ok(.; false) | not)
-              | "\($r.address): firewall attachment to server \(.) outside this plan" ]
-          + [ (.change.after.label_selectors // [])[] | select(node_selector_ok(.) | not)
-              | "\($r.address): firewall attachment by label selector \(.) (only env=staging,role=node)" ]
-          + (if ((.change.after_unknown.server_ids // false) == true) and (($rc | map(select(.type == "hcloud_server" and (.change.actions | index("create")))) | length) == 0)
-               then ["\($r.address): firewall attachment to servers unknown at plan time, but this plan creates no server"] else [] end)
-          ) | .[] ]
+    # 10. Firewall attachments (Kimi review F1): none at all. The staging code puts the firewall
+    # on through firewall_ids at server create; a standalone attachment, in any action (deletes
+    # included), could put a foreign firewall on the nodes or take the staging one off.
+    + [ $rc[] | select(.type == "hcloud_firewall_attachment")
+        | "\(.address) (\(acts)): firewall attachments are not used (the firewall goes on through firewall_ids at server create)" ]
     # 11. Load balancer targets: the staging node selector, or a server of this plan; never an IP.
     + [ $rc[] | select(.type == "hcloud_load_balancer_target") | select(.change.after != null) | .change.after as $a | . as $r
         | if $a.type == "label_selector" then

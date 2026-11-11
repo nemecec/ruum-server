@@ -154,13 +154,34 @@ stg_audit() {
 # records the host key.
 STG_TUNNEL_KEY="$HOME/.config/ruum/staging_tunnel_ed25519"
 STG_TUNNEL_KNOWN_HOSTS="$HOME/.config/ruum/staging_tunnel_known_hosts"
-STG_TUNNEL_SOCK="$STG_WORK/tunnel.sock"
+# The control socket of the open tunnel. stg_tunnel_up names it after a fingerprint of the
+# connection (tunnel-<fingerprint>.sock), so a tunnel is joined only when it was opened to the same
+# build server, with the same host key, key and forwards (Kimi review F4).
+STG_TUNNEL_SOCK=""
 STG_TUNNEL_PORTS=""
 STG_TUNNEL_BASTION=""
+# STG_TUNNEL_FRESH=1 (ops/tunnel-setup.sh): close every open tunnel and open a new one, so the test
+# uses the key, host key and forwards that were just installed.
+STG_TUNNEL_FRESH=0
 
 # The build server and the staging nodes, from the Hetzner API (in the tools container).
 stg_tunnel_targets() {
   stg_secret_stream HCLOUD_TOKEN | stg_run ro tunnel-targets
+}
+
+# The SHA-256 of stdin, in hex (shasum on the Mac, sha256sum where there is no shasum).
+stg_sha256() {
+  if command -v shasum >/dev/null; then shasum -a 256; else sha256sum; fi | cut -d' ' -f1
+}
+
+# After tunnel_parse: the fingerprint of the tunnel connection: the user and the build server, the
+# forwards, the recorded host key and the public half of the key. Any change gives another
+# control socket.
+stg_tunnel_fingerprint() {
+  local pub
+  pub="$(ssh-keygen -y -f "$STG_TUNNEL_KEY" 2>/dev/null)" || return 1
+  { printf '%s\n' "$TUNNEL_USER@$TUNNEL_BASTION" "$pub"; tunnel_forward_args; cat "$STG_TUNNEL_KNOWN_HOSTS"; } |
+    stg_sha256 | cut -c1-16
 }
 
 # The ssh options of every tunnel connection: only this key and this host key, no user ssh
@@ -175,10 +196,57 @@ stg_tunnel_ssh_opts() {
     -o ControlPath="$STG_TUNNEL_SOCK"
 }
 
-# Opens the tunnel (or joins one that is up already) and sets STG_TUNNEL_PORTS, so the next
-# stg_docker and stg_run calls reach the APIs. A tunnel that this script opened is closed on exit.
+# stg_tunnel_close_others [all]: close the tunnels of other control sockets in the work folder
+# (they hold the local ports), or every tunnel with "all".
+stg_tunnel_close_others() {
+  local s
+  for s in "$STG_WORK"/tunnel*.sock; do
+    [[ -S "$s" ]] || continue
+    [[ "${1:-}" == all || "$s" != "$STG_TUNNEL_SOCK" ]] || continue
+    stg_log "admin tunnel: closing the tunnel of $(basename "$s") (another build server, host key, key or forwards)"
+    ssh -F /dev/null -o ControlPath="$s" -O exit "$TUNNEL_USER@$TUNNEL_BASTION" 2>/dev/null || true
+    rm -f "$s"
+  done
+}
+
+# stg_tunnel_probe TARGET: open one channel to TARGET (address:port) over the tunnel
+# connection (ssh -W, no data sent) and close it. Fails when the build server refuses or cannot
+# connect, or after 20 seconds.
+stg_tunnel_probe() {
+  local target="$1" pid watchdog rc
+  ssh "${STG_TUNNEL_OPTS[@]}" -o ControlMaster=no -W "$target" "$TUNNEL_USER@$TUNNEL_BASTION" </dev/null >/dev/null 2>&1 &
+  pid=$!
+  (sleep 20 && kill "$pid") >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid"
+  rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$rc"
+}
+
+# After tunnel_parse: check every forward of the tunnel (Kimi review F4). The local port must
+# listen on 127.0.0.1, and the build server must open a connection to its node port.
+stg_tunnel_verify() {
+  local fwd=() line i spec port target
+  while IFS= read -r line; do fwd+=("$line"); done < <(tunnel_forward_args)
+  for ((i = 1; i < ${#fwd[@]}; i += 2)); do
+    spec="${fwd[i]#127.0.0.1:}"
+    port="${spec%%:*}"
+    target="${spec#*:}"
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null ||
+      { stg_warn "admin tunnel: nothing listens on 127.0.0.1:$port"; return 1; }
+    stg_tunnel_probe "$target" ||
+      { stg_warn "admin tunnel: the build server cannot open $target (the forward of 127.0.0.1:$port)"; return 1; }
+  done
+}
+
+# Opens the tunnel (or joins one that is up already with the same fingerprint) and sets
+# STG_TUNNEL_PORTS, so the next stg_docker and stg_run calls reach the APIs. A tunnel that this
+# script opened is closed on exit. Every forward is checked before the tunnel is used.
+STG_TUNNEL_OPTS=()
 stg_tunnel_up() {
-  local targets opts=() fwd=() line
+  local targets fwd=() line
   [[ -z "$STG_TUNNEL_PORTS" ]] || return 0
   command -v ssh >/dev/null || stg_die "ssh is missing"
   [[ -r "$STG_TUNNEL_KEY" ]] || stg_die "the tunnel key $STG_TUNNEL_KEY is missing: run deploy/staging/ops/tunnel-setup.sh (README 'Admin access')"
@@ -186,26 +254,33 @@ stg_tunnel_up() {
   stg_work
   targets="$(stg_tunnel_targets)" || stg_die "cannot read the tunnel targets from the Hetzner API"
   tunnel_parse "$targets" >&2 || stg_die "unexpected tunnel targets"
-  while IFS= read -r line; do opts+=("$line"); done < <(stg_tunnel_ssh_opts)
+  line="$(stg_tunnel_fingerprint)" || stg_die "cannot read the public key of $STG_TUNNEL_KEY"
+  STG_TUNNEL_SOCK="$STG_WORK/tunnel-$line.sock"
+  STG_TUNNEL_OPTS=()
+  while IFS= read -r line; do STG_TUNNEL_OPTS+=("$line"); done < <(stg_tunnel_ssh_opts)
   while IFS= read -r line; do fwd+=("$line"); done < <(tunnel_forward_args)
   STG_TUNNEL_BASTION="$TUNNEL_BASTION"
-  if ssh "${opts[@]}" -O check "$TUNNEL_USER@$TUNNEL_BASTION" 2>/dev/null; then
+  if [[ "$STG_TUNNEL_FRESH" == 1 ]]; then
+    stg_tunnel_close_others all
+  else
+    stg_tunnel_close_others
+  fi
+  if [[ "$STG_TUNNEL_FRESH" != 1 ]] && ssh "${STG_TUNNEL_OPTS[@]}" -O check "$TUNNEL_USER@$TUNNEL_BASTION" 2>/dev/null; then
     stg_log "admin tunnel: joining the open tunnel over $TUNNEL_BASTION"
   else
     rm -f "$STG_TUNNEL_SOCK"
     stg_log "admin tunnel: $TUNNEL_USER@$TUNNEL_BASTION, local ports $(tunnel_ports)"
-    ssh "${opts[@]}" -o ControlMaster=yes -f -N "${fwd[@]}" "$TUNNEL_USER@$TUNNEL_BASTION" ||
+    ssh "${STG_TUNNEL_OPTS[@]}" -o ControlMaster=yes -f -N "${fwd[@]}" "$TUNNEL_USER@$TUNNEL_BASTION" ||
       stg_die "the admin tunnel over $TUNNEL_BASTION did not open (key installed? ops/tunnel-setup.sh)"
     stg_on_exit stg_tunnel_down
   fi
+  stg_tunnel_verify || stg_die "the admin tunnel over $TUNNEL_BASTION does not reach every node API (run deploy/staging/ops/tunnel-setup.sh after a node or key change)"
   STG_TUNNEL_PORTS="$(tunnel_ports)"
 }
 
 # Closes the tunnel that stg_tunnel_up opened.
 stg_tunnel_down() {
-  local opts=() line
-  [[ -n "$STG_TUNNEL_BASTION" && -S "$STG_TUNNEL_SOCK" ]] || return 0
-  while IFS= read -r line; do opts+=("$line"); done < <(stg_tunnel_ssh_opts)
-  ssh "${opts[@]}" -O exit "$TUNNEL_USER@$STG_TUNNEL_BASTION" 2>/dev/null || true
+  [[ -n "$STG_TUNNEL_BASTION" && -n "$STG_TUNNEL_SOCK" && -S "$STG_TUNNEL_SOCK" ]] || return 0
+  ssh "${STG_TUNNEL_OPTS[@]}" -O exit "$TUNNEL_USER@$STG_TUNNEL_BASTION" 2>/dev/null || true
   STG_TUNNEL_PORTS=""
 }

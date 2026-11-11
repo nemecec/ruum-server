@@ -9,7 +9,8 @@
 #   each mutation of code review F-4 (firewall rules, deletes and replaces, attachments,
 #   load balancer targets, object lock, child modules) and of code review 2 G-1 (a foreign
 #   firewall ID, apply_to without rules, unknown rules, primary IP assignee), only the build
-#   server's /32 as the admin source, and apply_to only unchanged on an existing firewall;
+#   server's /32 as the admin source, apply_to only unchanged on an existing firewall that is
+#   updated in place, and (Kimi review) no firewall attachment and no in-place firewall_ids change;
 # - plan-scrub.jq removes the prior state and every sensitive value (F-5);
 # - the sweep deletes only the staging names (F-6);
 # - deploy-chart.sh refuses bad arguments (F-3); the admin address must be a public IPv4;
@@ -18,6 +19,8 @@
 #   refuse without RUUM_STAGING_APPLY=yes;
 # - the admin tunnel: targets, ssh forwards and options, talosconfig endpoints, the kubeconfig
 #   rewrite (with kubectl), the restricted key line and the sshd config of the build server;
+#   (Kimi review) the control socket fingerprint, the forward checks, the rollback of
+#   buildbox-tunnel-user.sh and the relay checks of tunnel-relay.sh;
 # - price.sh prices the plan and refuses above the budget;
 # - the secret lists: nothing forbidden goes to the cluster, the two lists agree;
 # - one Zitadel and SpiceDB pin for the laptop and staging (review 2 U-5);
@@ -109,7 +112,38 @@ ATT='{"address":"hcloud_firewall_attachment.x","mode":"managed","type":"hcloud_f
 expect 3 "refuses a firewall attachment to the build server" bash "$cp" "$(mutate attbb ".resource_changes += [${ATT/ATTAFTER/{\"server_ids\":[99999],\"label_selectors\":null}}]")"
 expect 3 "refuses a firewall attachment to a server outside the plan" bash "$cp" "$(mutate attout ".resource_changes += [${ATT/ATTAFTER/{\"server_ids\":[4242],\"label_selectors\":null}}]")"
 expect 3 "refuses a firewall attachment by another label selector" bash "$cp" "$(mutate attsel ".resource_changes += [${ATT/ATTAFTER/{\"server_ids\":[],\"label_selectors\":[\"env=prod\"]}}]")"
-expect 0 "accepts a firewall attachment to a server of the plan" bash "$cp" "$(mutate attin "(.resource_changes[] | select(.address == \"hcloud_server.node[\\\"stg-1\\\"]\") | .change) |= (.actions = [\"update\"] | .before = (.after + {\"id\":4243}) | .after.id = 4243) | .resource_changes += [${ATT/ATTAFTER/{\"server_ids\":[4243],\"label_selectors\":null}}]")"
+# Kimi review F1: no standalone firewall attachment at all, in any action, to any firewall.
+FW77='(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["update"] | .before = (.after + {"id":"77"}) | .after.id = "77")
+  | (.resource_changes[] | select(.type == "hcloud_server") | .change) |= (.after.firewall_ids = [77] | .after_unknown.firewall_ids = [false])'
+expect 3 "refuses a firewall attachment to a server of the plan" bash "$cp" "$(mutate attin "$FW77 | (.resource_changes[] | select(.address == \"hcloud_server.node[\\\"stg-1\\\"]\") | .change) |= (.actions = [\"no-op\"] | .before = (.after + {\"id\":4243}) | .after.id = 4243) | .resource_changes += [${ATT/ATTAFTER/{\"server_ids\":[4243],\"label_selectors\":null}}]")"
+ATTX='{"address":"hcloud_firewall_attachment.x","mode":"managed","type":"hcloud_firewall_attachment","change":{"actions":ATTACTS,"before":ATTBEFORE,"after":ATTAFTER,"after_unknown":{}}}'
+ATTB='{"id":5,"firewall_id":999999,"server_ids":[4243],"label_selectors":null}'
+ATTA='{"id":5,"firewall_id":999999,"server_ids":[4243],"label_selectors":null}'
+a="${ATTX/ATTACTS/[\"create\"]}"; a="${a/ATTBEFORE/null}"; a="${a/ATTAFTER/$ATTA}"
+expect 3 "refuses a firewall attachment of a foreign firewall ID (create)" bash "$cp" "$(mutate attfw "$FW77 | .resource_changes += [$a]")"
+a="${ATTX/ATTACTS/[\"update\"]}"; a="${a/ATTBEFORE/${ATTB/4243/4241}}"; a="${a/ATTAFTER/$ATTA}"
+expect 3 "refuses a firewall attachment update" bash "$cp" "$(mutate attupd "$FW77 | .resource_changes += [$a]")"
+a="${ATTX/ATTACTS/[\"delete\"]}"; a="${a/ATTBEFORE/$ATTB}"; a="${a/ATTAFTER/null}"
+expect 3 "refuses a firewall attachment delete" bash "$cp" "$(mutate attdel "$FW77 | .resource_changes += [$a]")"
+a="${ATTX/ATTACTS/[\"no-op\"]}"; a="${a/ATTBEFORE/$ATTB}"; a="${a/ATTAFTER/$ATTB}"
+expect 0 "accepts an unchanged (no-op) firewall attachment" bash "$cp" "$(mutate attnoop "$FW77 | .resource_changes += [$a]")"
+# Kimi review F1: the firewall_ids of a server that exists never change in place.
+# refuses_with PATTERN DESCRIPTION PLAN [OPTIONS]: exit 3 and a refusal line that matches PATTERN.
+refuses_with() {
+  local pat="$1" what="$2"
+  shift 2
+  expect 3 "$what" bash "$cp" "$@"
+  grep -qE -- "$pat" "$TMP/out" || bad "$what: no refusal that matches '$pat'"
+}
+UPD1='(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.actions = ["update"] | .before = (.after + {"id": 4241}) | .after.id = 4241)'
+SRV1='(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change)'
+refuses_with 'stg-1.*in place' "refuses removing the firewall from an existing server" "$(mutate fwrm "$FW77 | $UPD1 | $SRV1.after.firewall_ids = []")"
+refuses_with 'stg-1.*in place' "refuses adding the firewall again to an existing server ([77] -> [77, 77])" "$(mutate fwadd2 "$FW77 | $UPD1 | $SRV1.after.firewall_ids = [77, 77]")"
+refuses_with 'stg-1.*in place' "refuses moving an existing server to the staging firewall ([76] -> [77])" "$(mutate fwmove "$FW77 | $UPD1 | $SRV1.before.firewall_ids = [76]")"
+refuses_with 'stg-1.*in place' "refuses an existing server whose firewall_ids become unknown" "$(mutate fwunk2 "$UPD1 | $SRV1.after_unknown.firewall_ids = true")"
+refuses_with 'stg-1.*creates no firewall' "refuses a created server with an unknown firewall ID when the plan creates no firewall" "$(mutate fwunk3 "$FW77 | $SRV1.after_unknown.firewall_ids = true")"
+expect 0 "accepts an existing server updated in place with the same firewall_ids" bash "$cp" "$(mutate fwsame "$FW77 | $UPD1 | $SRV1.before.labels.role = \"old\"")"
+expect 0 "accepts replacing a server with --allow-replace (created anew with the staging firewall)" bash "$cp" "$(mutate srvrep77 "$FW77 | $UPD1 | $SRV1 |= (.actions = [\"delete\",\"create\"] | .after.id = null)")" --allow-replace
 LBT='(.resource_changes[] | select(.type == "hcloud_load_balancer_target") | .change.after)'
 expect 3 "refuses a load balancer target by a wider label selector" bash "$cp" "$(mutate lbsel "$LBT.label_selector = \"env=staging\"")"
 expect 3 "refuses a load balancer target by another label selector" bash "$cp" "$(mutate lbsel2 "$LBT.label_selector = \"role=node\"")"
@@ -127,14 +161,14 @@ expect 1 "refuses a plan JSON that holds the prior state" bash "$cp" "$(mutate p
 echo "== check-plan.sh: code review 2 G-1"
 expect 3 "refuses a server with a known firewall ID that is not the staging firewall" bash "$cp" "$(mutate fwforeign '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.after.firewall_ids = [42] | .after_unknown.firewall_ids = [false])')"
 expect 3 "refuses a server with a known foreign firewall ID next to an unknown one" bash "$cp" "$(mutate fwmix '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.after.firewall_ids = [null, 42] | .after_unknown.firewall_ids = [true, false])')"
-expect 0 "accepts a server with the ID of the staging firewall of this plan" bash "$cp" "$(mutate fwown '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["update"] | .before = (.after + {"id":"77"}) | .after.id = "77") | (.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.after.firewall_ids = [77] | .after_unknown.firewall_ids = [false])')"
+expect 0 "accepts servers with the ID of the staging firewall of this plan" bash "$cp" "$(mutate fwown "$FW77")"
 expect 3 "refuses a firewall with no rules and apply_to" bash "$cp" "$(mutate fwnorules '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.after.rule = [] | .after.apply_to = [{"label_selector":"env=prod"}] | .after_unknown.rule = [])')"
 expect 3 "refuses firewall apply_to unknown at plan time" bash "$cp" "$(mutate fwapplyu '(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after_unknown.apply_to) = true')"
 expect 3 "refuses firewall rules wholly unknown at plan time" bash "$cp" "$(mutate fwruleu '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.after.rule = [] | .after_unknown.rule = true)')"
 expect 3 "refuses one firewall rule unknown at plan time" bash "$cp" "$(mutate fwrule1u '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.after.rule += [null] | .after_unknown.rule += [true])')"
 expect 3 "refuses a primary IP assigned to the build server" bash "$cp" "$(mutate pipbb '(.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 99999')"
 expect 3 "refuses a primary IP assigned to a server outside the plan" bash "$cp" "$(mutate pipout '(.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4242')"
-expect 0 "accepts a primary IP assigned to a server of this plan" bash "$cp" "$(mutate pipin '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.actions = ["update"] | .before = (.after + {"id":4243}) | .after.id = 4243) | (.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4243')"
+expect 0 "accepts a primary IP assigned to a server of this plan" bash "$cp" "$(mutate pipin "$FW77"' | (.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.actions = ["update"] | .before = (.after + {"id":4243}) | .after.id = 4243) | (.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4243')"
 
 echo "== check-plan.sh: apply_to of an existing firewall (2026-11-11)"
 # The servers exist (IDs 4241-4243) and carry the existing firewall 77; Hetzner reports them in
@@ -155,6 +189,13 @@ expect 3 "refuses unchanged apply_to with a label selector" bash "$cp" "$(mutate
 expect 3 "refuses apply_to on a new firewall (no before)" bash "$cp" "$(mutate apnew "$EXIST | $FWC |= (.actions = [\"create\"] | .before = null)")"
 expect 3 "refuses apply_to of an existing firewall that is unknown at plan time" bash "$cp" "$(mutate apunk "$EXIST | $FWC.after_unknown.apply_to = [{\"server\":true}]")"
 expect 3 "refuses the existing firewall's rules from the old address" bash "$cp" "$(mutate apold "$EXIST | $FWC.after.rule[0].source_ips = [\"198.51.100.20/32\"]")"
+# Kimi review F2: apply_to that loses servers, or is cleared, is refused (checked before or after).
+expect 3 "refuses apply_to that removes one server" bash "$cp" "$(mutate aprm1 "$EXIST | $FWC.after.apply_to |= .[1:]")"
+expect 3 "refuses clearing apply_to ([])" bash "$cp" "$(mutate apclr "$EXIST | $FWC.after.apply_to = []")"
+expect 3 "refuses clearing apply_to (null)" bash "$cp" "$(mutate apnull "$EXIST | $FWC.after.apply_to = null")"
+# Kimi review F3: a replace is a new firewall, so its apply_to is refused even with --allow-replace.
+expect 3 "refuses apply_to on a replaced firewall (--allow-replace)" bash "$cp" "$(mutate aprep "$EXIST | $FWC |= (.actions = [\"delete\",\"create\"] | .after.id = null | .after_unknown = {\"id\":true})")" --allow-replace
+expect 3 "refuses apply_to on a replaced firewall (create,delete, --allow-replace)" bash "$cp" "$(mutate aprep2 "$EXIST | $FWC |= (.actions = [\"create\",\"delete\"] | .after.id = null | .after_unknown = {\"id\":true})")" --allow-replace
 
 bash "$STG/price.sh" "$FIX/pricing.json" "$TMP/child.json" >"$TMP/out" 2>&1
 grep -qE "server cx23 \(hel1\) +5 " "$TMP/out" && ok "price.sh counts the servers of child modules" || { bad "price.sh child modules"; cat "$TMP/out"; }
@@ -265,7 +306,7 @@ for o in ExitOnForwardFailure=yes StrictHostKeyChecking=yes 'UserKnownHostsFile=
   grep -qF -- "-o $o" "$STG/lib.sh" || grep -qF -- "-o \"$o\"" "$STG/lib.sh" || bad "lib.sh tunnel ssh option $o is missing"
 done
 ok "the tunnel ssh options: ExitOnForwardFailure, a fixed known-hosts file, no agent, X11 or tty"
-grep -qE 'ssh "\$\{opts\[@\]\}" -o ControlMaster=yes -f -N "\$\{fwd\[@\]\}"' "$STG/lib.sh" && ok "the tunnel runs no command (-N) and only the forwards" || bad "the tunnel ssh command line"
+grep -qE 'ssh "\$\{STG_TUNNEL_OPTS\[@\]\}" -o ControlMaster=yes -f -N "\$\{fwd\[@\]\}"' "$STG/lib.sh" && ok "the tunnel runs no command (-N) and only the forwards" || bad "the tunnel ssh command line"
 grep -q 'STG_TUNNEL_KEY="$HOME/.config/ruum/staging_tunnel_ed25519"' "$STG/lib.sh" && ok "the tunnel key is ~/.config/ruum/staging_tunnel_ed25519" || bad "tunnel key path"
 grep -q "ssh-keygen -q -t ed25519" "$STG/ops/tunnel-setup.sh" && grep -q 'if \[\[ ! -e "$STG_TUNNEL_KEY" \]\]' "$STG/ops/tunnel-setup.sh" &&
   ! grep -qE 'cat "\$STG_TUNNEL_KEY"( |$|\))' "$STG/ops/tunnel-setup.sh" && ok "tunnel-setup.sh makes the key only when it is missing and never prints it" || bad "tunnel-setup.sh key handling"
@@ -297,6 +338,111 @@ grep -q 'sshd -t' "$bt" && grep -q 'systemctl reload' "$bt" && grep -q "chown ro
   ok "buildbox-tunnel-user.sh validates with sshd -t before the reload; root-owned key file" || bad "buildbox-tunnel-user.sh order or ownership"
 grep -q -- '--shell /usr/sbin/nologin' "$bt" && grep -q "usermod --password '\*'" "$bt" && ok "ruumtunnel: shell nologin, no password" || bad "ruumtunnel user"
 grep -q 'refuse_talos_changes' "$STG/steps.sh" && ok "apply refuses a plan that changes the Talos machine config (closed to the tools container)" || bad "refuse_talos_changes"
+
+echo "== admin tunnel: control socket and forward checks (Kimi review F4)"
+F4="$TMP/f4"
+mkdir -p "$F4/home/.config/ruum" "$F4/work" "$F4/work2"
+ssh-keygen -q -t ed25519 -N '' -C t -f "$F4/home/.config/ruum/staging_tunnel_ed25519" </dev/null >/dev/null
+echo "5.9.0.2 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPrObEPrObEPrObEPrObEPrObEPrObEPrObEPrObEPrO" >"$F4/home/.config/ruum/staging_tunnel_known_hosts"
+# inlib SCRIPT [ARGS...]: run SCRIPT with lib.sh sourced, a test HOME and work folder.
+inlib() { local c="$1"; shift; HOME="$F4/home" RUUM_STAGING_WORK="$F4/work" bash -c "set -uo pipefail; . '$STG/lib.sh'; $c" _ "$@"; }
+fp() { inlib 'tunnel_parse "$1" >/dev/null && stg_tunnel_fingerprint' "$1"; }
+fp1="$(fp "$T1")"
+[[ "$fp1" =~ ^[0-9a-f]{16}$ && "$(fp "$T1")" == "$fp1" ]] && ok "the tunnel fingerprint is 16 hex and stable" || bad "tunnel fingerprint: '$fp1'"
+[[ "$(fp "${T1/5.9.0.13/5.9.0.23}")" != "$fp1" ]] && ok "a changed node address gives another control socket" || bad "fingerprint ignores the forwards"
+[[ "$(fp "$(grep -v stg-3 <<<"$T1")")" != "$fp1" ]] && ok "a removed node gives another control socket" || bad "fingerprint ignores a removed node"
+[[ "$(fp "${T1/bastion 5.9.0.2/bastion 5.9.0.3}")" != "$fp1" ]] && ok "another build server gives another control socket" || bad "fingerprint ignores the build server"
+cp "$F4/home/.config/ruum/staging_tunnel_known_hosts" "$F4/kh"
+echo "5.9.0.2 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherOtherOtherOtherOtherOtherOtherOtherOthe" >"$F4/home/.config/ruum/staging_tunnel_known_hosts"
+[[ "$(fp "$T1")" != "$fp1" ]] && ok "a new host key gives another control socket" || bad "fingerprint ignores the host key"
+cp "$F4/kh" "$F4/home/.config/ruum/staging_tunnel_known_hosts"
+mv "$F4/home/.config/ruum/staging_tunnel_ed25519" "$F4/key.old"
+ssh-keygen -q -t ed25519 -N '' -C t -f "$F4/home/.config/ruum/staging_tunnel_ed25519" </dev/null >/dev/null
+[[ "$(fp "$T1")" != "$fp1" ]] && ok "a new tunnel key gives another control socket" || bad "fingerprint ignores the key"
+grep -q 'STG_TUNNEL_SOCK="$STG_WORK/tunnel-$line.sock"' "$STG/lib.sh" && ok "the control socket is named after the fingerprint" || bad "control socket name"
+# Other control sockets (the old name, another fingerprint) are closed; ours stays, unless "all".
+if command -v python3 >/dev/null; then
+  python3 -c 'import os, socket, sys
+os.chdir(sys.argv[1])
+for n in sys.argv[2:]:
+    socket.socket(socket.AF_UNIX).bind(n)' "$F4/work" tunnel.sock tunnel-aaaaaaaaaaaaaaaa.sock tunnel-bbbbbbbbbbbbbbbb.sock
+  inlib 'log="$1"; ssh() { printf "%s\n" "$*" >>"$log"; }; TUNNEL_BASTION=5.9.0.2; STG_TUNNEL_SOCK="$STG_WORK/tunnel-bbbbbbbbbbbbbbbb.sock"; stg_tunnel_close_others 2>/dev/null' "$F4/ssh.log"
+  [[ ! -e "$F4/work/tunnel.sock" && ! -e "$F4/work/tunnel-aaaaaaaaaaaaaaaa.sock" && -S "$F4/work/tunnel-bbbbbbbbbbbbbbbb.sock" ]] &&
+    grep -q 'tunnel.sock -O exit' "$F4/ssh.log" && grep -q 'tunnel-aaaaaaaaaaaaaaaa.sock -O exit' "$F4/ssh.log" && ! grep -q bbbbbbbb "$F4/ssh.log" &&
+    ok "stg_tunnel_close_others closes the tunnels of other control sockets and keeps the current one" || { bad "stg_tunnel_close_others"; cat "$F4/ssh.log"; }
+  inlib 'log="$1"; ssh() { printf "%s\n" "$*" >>"$log"; }; TUNNEL_BASTION=5.9.0.2; STG_TUNNEL_SOCK="$STG_WORK/tunnel-bbbbbbbbbbbbbbbb.sock"; stg_tunnel_close_others all 2>/dev/null' "$F4/ssh.log"
+  [[ ! -e "$F4/work/tunnel-bbbbbbbbbbbbbbbb.sock" ]] && grep -q 'tunnel-bbbbbbbbbbbbbbbb.sock -O exit' "$F4/ssh.log" &&
+    ok "stg_tunnel_close_others all closes the current tunnel too (tunnel-setup.sh)" || { bad "stg_tunnel_close_others all"; cat "$F4/ssh.log"; }
+  # stg_tunnel_verify: every local port must listen, and ssh -W to every node port must succeed.
+  python3 -c 'import socket, sys, time
+ss = []
+for p in sys.argv[1:]:
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", int(p))); s.listen(8); ss.append(s)
+time.sleep(30)' 38443 38001 38002 38003 &
+  lpid=$!
+  sleep 1
+  V='TUNNEL_KUBE_PORT=38443; TUNNEL_TALOS_BASE=38000; STG_TUNNEL_OPTS=(-F /dev/null); tunnel_parse "$1" >/dev/null'
+  if inlib "$V; ssh() { [[ \"\$*\" == *' -W '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then ok "stg_tunnel_verify passes when every forward listens and opens"; else bad "stg_tunnel_verify (all good)"; cat "$TMP/out"; fi
+  if inlib "$V; ssh() { [[ \"\$*\" != *'-W 5.9.0.12:50000 '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then bad "stg_tunnel_verify passes when the build server cannot open a node port"; else grep -q '5.9.0.12:50000' "$TMP/out" && ok "stg_tunnel_verify fails when the build server cannot open a node port" || { bad "stg_tunnel_verify message"; cat "$TMP/out"; }; fi
+  if inlib "TUNNEL_KUBE_PORT=38443; TUNNEL_TALOS_BASE=38010; STG_TUNNEL_OPTS=(-F /dev/null); tunnel_parse \"\$1\" >/dev/null; ssh() { return 0; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then bad "stg_tunnel_verify passes when a local port does not listen"; else grep -q 'nothing listens on 127.0.0.1:38011' "$TMP/out" && ok "stg_tunnel_verify fails when a local port does not listen" || { bad "stg_tunnel_verify listener message"; cat "$TMP/out"; }; fi
+  kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null
+else
+  echo "== admin tunnel: control socket and listener tests skipped (no python3)"
+fi
+awk '/^stg_tunnel_up\(\)/,/^}/' "$STG/lib.sh" >"$TMP/up.txt"
+grep -q 'stg_tunnel_verify ||' "$TMP/up.txt" && [[ "$(grep -n 'stg_tunnel_verify ||' "$TMP/up.txt" | cut -d: -f1)" -lt "$(grep -n 'STG_TUNNEL_PORTS="$(tunnel_ports)"' "$TMP/up.txt" | cut -d: -f1)" ]] &&
+  ok "stg_tunnel_up checks every forward before it sets STG_TUNNEL_PORTS" || bad "stg_tunnel_up does not verify the forwards first"
+grep -q 'if \[\[ "$STG_TUNNEL_FRESH" != 1 \]\] && ssh' "$TMP/up.txt" && grep -q 'stg_tunnel_close_others all' "$TMP/up.txt" &&
+  awk '/^STG_TUNNEL_FRESH=1$/ {f=1} f && /^stg_tunnel_up$/ {ok=1} END {exit !ok}' "$STG/ops/tunnel-setup.sh" &&
+  ok "tunnel-setup.sh closes every tunnel and tests a new one (never joins)" || bad "tunnel-setup.sh fresh tunnel"
+
+echo "== buildbox-tunnel-user.sh rollback (Kimi review F5)"
+R="$TMP/f5"
+mkdir -p "$R/stub" "$R/etc/keys" "$R/etc/sshd_config.d"
+printf 'Include /etc/ssh/sshd_config.d/*.conf\n' >"$R/etc/sshd_config"
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPrObEPrObEPrObEPrObEPrObEPrObEPrObEPrObEPrO root@bb" >"$R/etc/hostkey.pub"
+for c in useradd usermod chown; do printf '#!/bin/sh\nexit 0\n' >"$R/stub/$c"; done
+printf '#!/bin/sh\ncase "$1" in -u) echo 0 ;; -nG) echo ruumtunnel ;; esac\nexit 0\n' >"$R/stub/id"
+printf '#!/bin/sh\nfor a; do last="$a"; done\nmkdir -p "$last"\n' >"$R/stub/install"
+printf '#!/bin/sh\necho "root:root 644"\n' >"$R/stub/stat"
+printf '#!/bin/sh\ncase "$1" in is-active) [ "$3" = ssh ] ;; reload) exit "${FAKE_RELOAD_RC:-0}" ;; esac\n' >"$R/stub/systemctl"
+cat >"$R/stub/sshd" <<'SSHD'
+#!/bin/sh
+[ "$1" = -t ] && exit "${FAKE_T_RC:-0}"
+case "$3" in
+  user=ruumtunnel,*) cat "$FAKE_EFF" ;;
+  *) echo "allowtcpforwarding no" ;;
+esac
+SSHD
+chmod +x "$R"/stub/*
+sed -e "s|^KEYS_DIR=.*|KEYS_DIR=$R/etc/keys|" -e "s|^DROPIN=.*|DROPIN=$R/etc/sshd_config.d/10-ruumtunnel.conf|" \
+  -e "s|^SSHD=.*|SSHD=$R/stub/sshd|" -e "s|^SSHD_CONFIG=.*|SSHD_CONFIG=$R/etc/sshd_config|" -e "s|^HOSTKEY_PUB=.*|HOSTKEY_PUB=$R/etc/hostkey.pub|" \
+  -e '/-x \/usr\/sbin\/nologin/d' "$bt" >"$R/bt.sh"
+if [[ "$(grep -c "$R" "$R/bt.sh")" == 5 ]] && ! grep -q '/usr/sbin/nologin && ' "$R/bt.sh"; then
+  KF="$R/etc/keys/ruumtunnel" DF="$R/etc/sshd_config.d/10-ruumtunnel.conf"
+  printf '%s\n' "allowtcpforwarding local" "permitopen 5.9.0.11:6443 5.9.0.11:50000" "x11forwarding no" "allowagentforwarding no" "permittty no" \
+    "permitlisten none" "allowstreamlocalforwarding no" "permittunnel no" "forcecommand /bin/false" "authorizedkeysfile $KF" >"$R/eff-good"
+  sed 's/^permittty no$/permittty yes/' "$R/eff-good" >"$R/eff-bad"
+  # bt5 DESCRIPTION WANT_EXIT ENV...: run the patched script with the stubs and ENV.
+  bt5() { local what="$1" want="$2"; shift 2; expect "$want" "$what" env PATH="$R/stub:$PATH" "$@" bash "$R/bt.sh" "$KEY" 5.9.0.11; }
+  old() { echo "old key line" >"$KF"; echo "# old drop-in" >"$DF"; }
+  is_old() { [[ "$(cat "$KF")" == "old key line" && "$(cat "$DF")" == "# old drop-in" ]]; }
+  old; bt5 "a failed sshd -T check exits non-zero" 1 FAKE_EFF="$R/eff-bad"
+  is_old && ok "a failed sshd -T check puts the previous key file and drop-in back" || bad "sshd -T failure leaves the new config"
+  rm -f "$KF" "$DF"; bt5 "a failed sshd -T check on a first install exits non-zero" 1 FAKE_EFF="$R/eff-bad"
+  [[ ! -e "$KF" && ! -e "$DF" ]] && ok "a failed sshd -T check on a first install removes the new key file and drop-in" || bad "first-install rollback"
+  old; bt5 "a failed sshd -t exits non-zero" 1 FAKE_EFF="$R/eff-good" FAKE_T_RC=1
+  is_old && ok "a failed sshd -t puts the previous files back" || bad "sshd -t failure rollback"
+  old; bt5 "a failed reload exits non-zero" 1 FAKE_EFF="$R/eff-good" FAKE_RELOAD_RC=1
+  is_old && ok "a failed reload puts the previous files back" || bad "reload failure rollback"
+  old; bt5 "all checks and the reload pass" 0 FAKE_EFF="$R/eff-good"
+  grep -q '^hostkey ssh-ed25519 ' "$TMP/out" && grep -q 'permitopen="5.9.0.11:6443"' "$KF" && grep -q '^Match User ruumtunnel$' "$DF" &&
+    ok "on success the new key file and drop-in stay and the host key is printed" || { bad "success path"; cat "$TMP/out"; }
+  left="$(find "$R/etc/keys" "$R/etc/sshd_config.d" -type f ! -name ruumtunnel ! -name 10-ruumtunnel.conf)"
+  [[ -z "$left" ]] && ok "no temporary files are left" || bad "temporary files are left: $left"
+else
+  bad "the rollback test could not patch the paths of buildbox-tunnel-user.sh"
+fi
 
 echo "== shell syntax"
 for f in "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh; do
@@ -431,6 +577,23 @@ if [[ -s "$TMP/out" ]] && grep -q 16443 "$TMP/out"; then
   [[ "$(cat "$TMP/out")" == "https://127.0.0.1:16443 kubernetes Y2E=" ]] &&
     ok "kubeconfig: server https://127.0.0.1:16443, tls-server-name kubernetes, the CA kept" || { bad "kubeconfig rewrite"; cat "$TMP/out"; }
 fi
+
+# tunnel-relay.sh (Kimi review F6): the command runs only when every relay listens.
+TR="cd '$STG' && export STG_TUNNEL_PORTS='15001 15002'"
+TR_GOOD="$TR && bash tunnel-relay.sh echo RAN"
+TR_EXIT="$TR && mkdir -p /tmp/fs && printf '#!/bin/sh\nexit 1\n' >/tmp/fs/socat && chmod +x /tmp/fs/socat && PATH=/tmp/fs:\$PATH bash tunnel-relay.sh echo RAN"
+TR_TAKEN="$TR && (socat TCP-LISTEN:15002,bind=127.0.0.1 /dev/null &) && sleep 0.5 && bash tunnel-relay.sh echo RAN"
+relay() { if [[ -r /proc/net/tcp ]] && command -v socat >/dev/null; then bash -c "$1"; elif declare -F intools >/dev/null; then intools bash -c "$1"; else return 99; fi; }
+relay "$TR_GOOD" >"$TMP/out" 2>&1
+case $? in
+  99) echo "== tunnel-relay.sh: skipped (no socat and /proc here, no tools image)" ;;
+  0)
+    grep -qx RAN "$TMP/out" && ok "tunnel-relay.sh runs the command when every relay listens" || bad "tunnel-relay.sh good path"
+    relay "$TR_EXIT" >"$TMP/out" 2>&1 && bad "tunnel-relay.sh exits 0 when a relay fails" || { grep -q RAN "$TMP/out" && bad "tunnel-relay.sh runs the command after a relay failed" || ok "tunnel-relay.sh exits non-zero, without the command, when a relay exits"; }
+    relay "$TR_TAKEN" >"$TMP/out" 2>&1 && bad "tunnel-relay.sh exits 0 when a port is taken" || { grep -q RAN "$TMP/out" && bad "tunnel-relay.sh runs the command when a port is taken" || ok "tunnel-relay.sh exits non-zero, without the command, when a port is taken"; }
+    ;;
+  *) bad "tunnel-relay.sh good path"; cat "$TMP/out" ;;
+esac
 
 if [[ $failed == 0 ]]; then echo "staging tests: all passed"; else echo "staging tests: FAILED"; fi
 exit "$failed"

@@ -15,7 +15,9 @@
 #   - /etc/ssh/sshd_config.d/10-ruumtunnel.conf: TCP forwarding off for every user but
 #     ruumtunnel; for ruumtunnel only local forwards to the node ports, no X11, no agent, no tty,
 #     no stream-local or remote forward, ForceCommand /bin/false, public key only;
-#   - sshd -t, the effective settings checked with sshd -T, then a reload of sshd.
+#   - sshd -t, the effective settings checked with sshd -T, then a reload of sshd. Until all of
+#     that succeeds, an EXIT trap puts the previous key file and drop-in back (or removes them
+#     when they were not there), so a failed check never leaves the new config in place.
 # At the end it prints the host key of the build server ("hostkey ssh-ed25519 ..."), which
 # tunnel-setup.sh records on the Mac (the admin connection checked it already).
 #
@@ -28,6 +30,9 @@ USER_NAME=ruumtunnel
 KEYS_DIR=/etc/ssh/authorized_keys
 KEYS_FILE="$KEYS_DIR/$USER_NAME"
 DROPIN=/etc/ssh/sshd_config.d/10-ruumtunnel.conf
+SSHD=/usr/sbin/sshd
+SSHD_CONFIG=/etc/ssh/sshd_config
+HOSTKEY_PUB=/etc/ssh/ssh_host_ed25519_key.pub
 KEY_RE='^ssh-ed25519 [A-Za-z0-9+/]{68}( [A-Za-z0-9@._-]{1,64})?$'
 
 die() { printf 'buildbox-tunnel-user: %s\n' "$*" >&2; exit 1; }
@@ -132,10 +137,10 @@ shift || true
 check_key "$key"
 check_nodes "$@"
 [[ "$(id -u)" == 0 ]] || die "run as root (sudo bash -s -- ...)"
-[[ -x /usr/sbin/sshd ]] || die "no /usr/sbin/sshd"
+[[ -x "$SSHD" ]] || die "no $SSHD"
 [[ -x /usr/sbin/nologin && -x /bin/false ]] || die "no /usr/sbin/nologin or /bin/false"
-grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config ||
-  die "/etc/ssh/sshd_config does not include /etc/ssh/sshd_config.d/*.conf"
+grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONFIG" ||
+  die "$SSHD_CONFIG does not include /etc/ssh/sshd_config.d/*.conf"
 
 changed=0
 # write_file PATH MODE CONTENT: replace the file only when the content differs (atomic, root-owned).
@@ -166,21 +171,46 @@ for g in $(id -nG "$USER_NAME"); do
   [[ "$g" == "$USER_NAME" ]] || die "$USER_NAME is in group $g; it must be in its own group only"
 done
 
-# 2. The restricted key, root-owned (the user cannot change it).
+# The rollback (Kimi review F5): a copy of the key file and the drop-in as they are now. Until
+# every check and the reload succeed, the EXIT trap puts them back (or removes a file that was
+# not there), so a failed check never leaves the new config for a later reload or restart.
+rollback_dir="$(mktemp -d)"
+committed=0
+snapshot() { # PATH NAME
+  if [[ -e "$1" ]]; then cp -p "$1" "$rollback_dir/$2"; else : >"$rollback_dir/$2.absent"; fi
+}
+restore() { # PATH NAME
+  if [[ -e "$rollback_dir/$2.absent" ]]; then
+    rm -f "$1"
+  elif [[ -e "$rollback_dir/$2" ]]; then
+    cp -p "$rollback_dir/$2" "$1.rollback" && mv -f "$1.rollback" "$1"
+  fi
+}
+rollback() {
+  local rc=$?
+  if [[ $committed != 1 ]]; then
+    restore "$KEYS_FILE" keys
+    restore "$DROPIN" dropin
+    printf 'buildbox-tunnel-user: failed; the previous key file and sshd drop-in are back, sshd was not reloaded with the new config\n' >&2
+    [[ $rc != 0 ]] || rc=1
+  fi
+  rm -rf "$rollback_dir"
+  exit "$rc"
+}
+trap rollback EXIT
 install -d -o root -g root -m 0755 "$KEYS_DIR"
+snapshot "$KEYS_FILE" keys
+snapshot "$DROPIN" dropin
+
+# 2. The restricted key, root-owned (the user cannot change it).
 write_file "$KEYS_FILE" 644 "$(authorized_keys_line "$key" "$@")"
 
 # 3. sshd: forwarding only for ruumtunnel, only to the node ports.
-backup=""
-if [[ -f "$DROPIN" ]]; then backup="$(cat "$DROPIN")"; fi
 write_file "$DROPIN" 644 "$(sshd_dropin "$@")"
-if ! /usr/sbin/sshd -t; then
-  if [[ -n "$backup" ]]; then printf '%s\n' "$backup" >"$DROPIN"; else rm -f "$DROPIN"; fi
-  die "sshd -t failed; the previous sshd config is back, sshd was not reloaded"
-fi
+"$SSHD" -t || die "sshd -t failed"
 
 # 4. The effective settings (sshd -T for a connection of each user).
-eff() { /usr/sbin/sshd -T -C "user=$1,host=staging-check,addr=192.0.2.1" 2>/dev/null; }
+eff() { "$SSHD" -T -C "user=$1,host=staging-check,addr=192.0.2.1" 2>/dev/null; }
 t="$(eff "$USER_NAME")"
 expect() { grep -qixF "$1" <<<"$t" || die "effective sshd setting for $USER_NAME is not '$1'"; }
 expect "allowtcpforwarding local"
@@ -197,7 +227,7 @@ grep -qiE '^(allowusers|allowgroups|denyusers|denygroups) ' <<<"$t" &&
   log "note: sshd has AllowUsers/AllowGroups/DenyUsers/DenyGroups; check that $USER_NAME may log in"
 eff root | grep -qix 'allowtcpforwarding no' || die "TCP forwarding is still on for other users"
 
-# 5. Reload only when something changed.
+# 5. Reload only when something changed. A failed reload rolls back too (set -e, the EXIT trap).
 if [[ $changed == 1 ]]; then
   if systemctl is-active --quiet ssh 2>/dev/null; then
     systemctl reload ssh
@@ -211,7 +241,8 @@ if [[ $changed == 1 ]]; then
 else
   log "no change"
 fi
+committed=1
 
-hostkey="$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"
+hostkey="$(cut -d' ' -f1,2 "$HOSTKEY_PUB")"
 [[ "$hostkey" =~ ^ssh-ed25519\ [A-Za-z0-9+/]{68}$ ]] || die "no ed25519 host key"
 printf 'hostkey %s\n' "$hostkey"

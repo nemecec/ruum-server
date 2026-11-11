@@ -14,7 +14,8 @@
 #    (the admin connection checks the host key against ~/.ssh/known_hosts).
 # 4. Records the build server's ed25519 host key, which that script prints, in
 #    ~/.config/ruum/staging_tunnel_known_hosts (the tunnel trusts only this file).
-# 5. Opens and closes the tunnel once (lib.sh stg_tunnel_up).
+# 5. Closes any open tunnel, opens a new one with the new key, host key and forwards, checks that
+#    every forward reaches its node port (lib.sh stg_tunnel_up), and closes it.
 # Run it again after the node addresses change (a recreate): the key line lists them.
 set -euo pipefail
 # shellcheck source=../lib.sh
@@ -58,6 +59,9 @@ hostkey="$(sed -n 's/^hostkey \(ssh-ed25519 [A-Za-z0-9+/]\{68\}\)$/\1/p' <<<"$ou
 (umask 077 && printf '%s %s\n' "$TUNNEL_BASTION" "$hostkey" >"$STG_TUNNEL_KNOWN_HOSTS")
 stg_log "recorded the host key of $TUNNEL_BASTION in $STG_TUNNEL_KNOWN_HOSTS"
 
+# A new tunnel, never a joined one: the test must use what was just installed (Kimi review F4).
+# shellcheck disable=SC2034 # read by stg_tunnel_up in lib.sh
+STG_TUNNEL_FRESH=1
 stg_tunnel_up
-stg_log "the admin tunnel opens (ports $STG_TUNNEL_PORTS on 127.0.0.1); closing it"
+stg_log "the admin tunnel opens and reaches every node API (ports $STG_TUNNEL_PORTS on 127.0.0.1); closing it"
 stg_audit tunnel-setup ok
