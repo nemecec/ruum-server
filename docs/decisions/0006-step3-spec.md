@@ -312,3 +312,14 @@ milestone M2, except where named.
   fallback for Railpack is a fixed recipe (base image, `npm ci` in a sandbox job), if S-2 point 5
   shows that rootless BuildKit does not hold in the sandbox.
 - **Needed by**: M2 (R-2a, R-2b, O-1b).
+
+## F. The person's answers to the briefs (2026-11-11)
+
+- **E-2**: the free-tier app limits are accepted as placeholders (configuration); the cost agent replaces them from
+  staging costs (design 21.4).
+- **E-3**: the person alone is platform admin at first, in a separate Zitadel organisation with passkeys only, on an
+  admin origin apart from `ruum.space` (card C-4).
+- **E-5**: Railpack (with rootless BuildKit; fixed-recipe fallback), `bollard`, OTLP protobuf with `tonic`, and a
+  database pooler image (PgBouncer or pgcat) are approved; each card names the exact version.
+- **E-1** (Public Suffix List request) and **E-4** (npm publishing) stay open until the first public app and a stable
+  API.
