@@ -1,0 +1,7 @@
+{"pricing":{"currency":"EUR","vat_rate":"24.000000",
+ "image":{"price_per_gb_month":{"net":"0.0143","gross":"0.017732"}},
+ "primary_ips":[{"type":"ipv4","prices":[{"location":"hel1","price_hourly":{"net":"0.0008","gross":"0.000992"},"price_monthly":{"net":"0.50","gross":"0.62"}}]},
+                {"type":"ipv6","prices":[{"location":"hel1","price_hourly":{"net":"0","gross":"0"},"price_monthly":{"net":"0","gross":"0"}}]}],
+ "server_types":[{"name":"cx23","prices":[{"location":"hel1","price_hourly":{"net":"0.0088","gross":"0.010912"},"price_monthly":{"net":"5.49","gross":"6.8076"}}]},
+                 {"name":"cpx22","prices":[{"location":"hel1","price_hourly":{"net":"0.0264","gross":"0.032736"},"price_monthly":{"net":"16.49","gross":"20.4476"}}]}],
+ "load_balancer_types":[{"name":"lb11","prices":[{"location":"hel1","price_hourly":{"net":"0.0112","gross":"0.013888"},"price_monthly":{"net":"6.99","gross":"8.6676"}}]}]}}

@@ -1,0 +1,83 @@
+# SpiceDB (plan 5.2): one replica, datastore Postgres database `spicedb` (TLS verified with the
+# CNPG CA). Only ruum-server reaches it (networkpolicies.yaml).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spicedb-migrate-{{ .Values.spicedb.image | splitList ":" | last | replace "." "-" }}
+  namespace: authz
+spec:
+  backoffLimit: 20
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      {{- include "platform.podSecurity" . | nindent 6 }}
+      containers:
+        - name: migrate
+          image: {{ .Values.spicedb.image }}
+          args: [migrate, head]
+          env:
+            - name: SPICEDB_DATASTORE_ENGINE
+              value: postgres
+            - name: SPICEDB_DATASTORE_CONN_URI
+              valueFrom: { secretKeyRef: { name: spicedb, key: datastore-uri } }
+          volumeMounts:
+            - { name: pg-ca, mountPath: /pg-ca, readOnly: true }
+          {{- include "platform.restricted" . | nindent 10 }}
+      volumes:
+        - name: pg-ca
+          secret: { secretName: pg-ca, items: [{ key: ca.crt, path: ca.crt }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb
+  namespace: authz
+  labels: { app: spicedb }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: spicedb }
+  template:
+    metadata:
+      labels: { app: spicedb }
+    spec:
+      automountServiceAccountToken: false
+      {{- include "platform.podSecurity" . | nindent 6 }}
+      containers:
+        - name: spicedb
+          image: {{ .Values.spicedb.image }}
+          args: [serve]
+          env:
+            - name: SPICEDB_GRPC_PRESHARED_KEY
+              valueFrom: { secretKeyRef: { name: spicedb, key: preshared-key } }
+            - name: SPICEDB_DATASTORE_ENGINE
+              value: postgres
+            - name: SPICEDB_DATASTORE_CONN_URI
+              valueFrom: { secretKeyRef: { name: spicedb, key: datastore-uri } }
+            - name: SPICEDB_HTTP_ENABLED
+              value: "false"
+          ports:
+            - { name: grpc, containerPort: 50051 }
+          readinessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.spicedb.resources | nindent 12 }}
+          volumeMounts:
+            - { name: pg-ca, mountPath: /pg-ca, readOnly: true }
+          {{- include "platform.restricted" . | nindent 10 }}
+      volumes:
+        - name: pg-ca
+          secret: { secretName: pg-ca, items: [{ key: ca.crt, path: ca.crt }] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb
+  namespace: authz
+spec:
+  selector: { app: spicedb }
+  ports:
+    - { name: grpc, port: 50051, targetPort: grpc, appProtocol: kubernetes.io/h2c }

@@ -1,0 +1,54 @@
+# Machine config patch for every staging node (all control plane and worker).
+machine:
+  kubelet:
+    nodeIP:
+      # etcd, kubelet and Flannel use the private network (plan 3.3).
+      validSubnets:
+        - 10.20.1.0/24
+    extraMounts:
+      - destination: /var/mnt/local-path
+        type: bind
+        source: /var/mnt/local-path
+        options: [bind, rshared, rw]
+  time:
+    servers:
+      - ntp1.hetzner.de
+      - ntp2.hetzner.com
+      - ntp3.hetzner.net
+  features:
+    kubePrism:
+      enabled: true
+      port: 7445
+  install:
+    extraKernelArgs:
+      # No Talos dashboard on the server console.
+      - talos.dashboard.disabled=1
+  sysctls:
+    # Caddy's on-demand TLS and many tenant hosts; also useful for NATS.
+    net.core.somaxconn: "4096"
+cluster:
+  allowSchedulingOnControlPlanes: true
+  etcd:
+    advertisedSubnets:
+      - 10.20.1.0/24
+  network:
+    cni:
+      name: flannel
+  apiServer:
+    admissionControl:
+      - name: PodSecurity
+        configuration:
+          apiVersion: pod-security.admission.config.k8s.io/v1
+          kind: PodSecurityConfiguration
+          defaults:
+            enforce: restricted
+            enforce-version: latest
+            audit: restricted
+            audit-version: latest
+            warn: restricted
+            warn-version: latest
+          exemptions:
+            namespaces:
+              - kube-system
+  discovery:
+    enabled: true

@@ -5,9 +5,11 @@
 
 pub mod auth;
 pub mod error;
+pub mod internal;
 pub mod limits;
 pub mod names;
 pub mod routes;
+pub mod signup;
 pub mod state;
 
 pub use error::{ApiResult, HttpError, not_implemented};

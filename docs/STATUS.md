@@ -450,6 +450,17 @@ listener, default `127.0.0.1:8492`), `RUUM_DAV_URL` (the public URL of the WebDA
 `https://dav.<host>/` for an https public URL, else `http://<RUUM_DAV_BIND>/`),
 `RUUM_DAV_SPOOL_DIR` (WebDAV upload spool), `RUUM_PLAN_LIMITS`, `SMTP_URL`, `RUUM_MAIL_FROM`.
 
+A closed server (staging, `ops/staging`): `RUUM_SIGNUP_ALLOWED_EMAILS` (addresses or `@domain`
+entries, comma- or space-separated; the email must be verified by the provider; `none` allows
+nobody) and `RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS` (exact addresses that may sign in without a
+verified email). When either is set, only listed addresses can sign in (a sign-in creates the user
+and the personal space) and create spaces; others get `401` at the sign-in callback and `403` at
+`createTenant` (`crates/ruum-api/src/signup.rs`). `RUUM_INTERNAL_BIND` (off by default) serves
+the internal router for the edge: `GET /internal/tls-ask?domain=` answers `200` only for
+`<tenant>.<content host>` of an existing tenant, at most `RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR` new
+hosts per hour (default 20); Caddy's on-demand TLS asks it (`crates/ruum-api/src/internal.rs`).
+Never route that listener through the public edge.
+
 ### Test users without a browser
 
 ```sh

@@ -1,0 +1,9 @@
+# A user volume of 15 GB on the system disk for local-path-provisioner (CNPG data, plan 3.5).
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: local-path
+provisioning:
+  diskSelector:
+    match: system_disk
+  minSize: 15GB
+  maxSize: 15GB

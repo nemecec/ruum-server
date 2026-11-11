@@ -1,0 +1,58 @@
+# Zitadel on staging (plan 5.3, review 1 B-7, B-8).
+# - First instance: a machine user with a PAT (secret iam-admin-pat in `auth`), no human user,
+#   so there is no default admin password. The PAT expires after 90 days (helmfile sets the
+#   date from ZITADEL_PAT_EXPIRY; the digest records it).
+# - The built-in login (v1): no separate login container. Password login and registration are
+#   turned off by ops/zitadel-bootstrap.sh (login policy), which also adds Google and
+#   Microsoft without automatic linking.
+# - Database `zitadel` (owner `zitadel`) is made by CNPG; the init job only creates Zitadel's
+#   schema (command "zitadel"). TLS to Postgres is verified with the CNPG CA.
+replicaCount: 1
+zitadel:
+  masterkeySecretName: zitadel-masterkey
+  dbSslCaCrtSecret: pg-ca
+  configmapConfig:
+    ExternalDomain: auth.staging.ruum.space
+    ExternalPort: 443
+    ExternalSecure: true
+    TLS:
+      Enabled: false
+    FirstInstance:
+      InstanceName: Ruum staging
+      Org:
+        Name: Ruum
+        Machine:
+          Machine:
+            Username: iam-admin
+            Name: Ruum bootstrap (machine)
+          # ExpirationDate of both: 90 days, set by helmfile from ZITADEL_PAT_EXPIRY.
+          MachineKey:
+            Type: 1
+          Pat: {}
+    DefaultInstance:
+      Features:
+        LoginV2:
+          Required: false
+      LoginPolicy:
+        AllowUsernamePassword: false
+        AllowRegister: false
+        AllowExternalIDP: true
+      SMTPConfiguration:
+        SMTP:
+          Host: mailpit.ops.svc.cluster.local:1025
+        TLS: false
+        From: noreply@notify.staging.ruum.space
+        FromName: Ruum staging
+login:
+  enabled: false
+env:
+  - name: ZITADEL_DATABASE_POSTGRES_DSN
+    valueFrom:
+      secretKeyRef:
+        name: zitadel-db
+        key: dsn
+initJob:
+  command: zitadel
+resources:
+  requests: { cpu: 100m, memory: 384Mi }
+  limits: { memory: 768Mi }

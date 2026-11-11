@@ -225,6 +225,23 @@ pub async fn login_callback(
         .finish_login(&code, &start)
         .await
         .map_err(|e| login_refused("code_refused", HttpError(e)))?;
+    // The allow-list of a closed server (staging, review 1 B-5): an address that is not on it
+    // gets no user, no personal tenant and no session. The check runs before the upsert, so
+    // nothing is written for a refused address.
+    if let Some(list) = &state.config.signup
+        && !list.allows(login.email.as_deref(), login.email_verified)
+    {
+        return Err(login_refused(
+            "email_not_allowed",
+            HttpError(Error::Api(
+                ApiError::new(
+                    ErrorCode::Unauthenticated,
+                    "this server is open only to invited addresses, and yours is not one of them",
+                )
+                .with_hint("ask the operator to add your address to the allow-list"),
+            )),
+        ));
+    }
     let user = state.services.identity.upsert_from_login(&login).await?;
     let user_agent = headers
         .get(USER_AGENT)

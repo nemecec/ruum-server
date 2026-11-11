@@ -14,7 +14,9 @@ use axum::routing::{delete, get, patch, post};
 use ruum_core::authz::Role;
 use ruum_core::identity::Authenticated;
 use ruum_core::tenants::{MemberRole, TenantPolicyChange, tenant_limits};
-use ruum_core::{Context, Error, InvitationId, PrincipalKind, TenantId, UserId};
+use ruum_core::{
+    ApiError, Context, Error, ErrorCode, InvitationId, PrincipalKind, TenantId, UserId,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -90,7 +92,21 @@ pub async fn create_tenant(
     Principal(who): Principal,
     JsonBody(body): JsonBody<CreateTenant>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_user(&who)?;
+    let user = require_user(&who)?;
+    // The allow-list of a closed server (staging, review 1 B-5): a user whose address is not
+    // (or no longer) on it cannot create tenants.
+    if let Some(list) = &state.config.signup {
+        let u = state.services.identity.get_user(user).await?;
+        if !list.allows(Some(&u.email), u.email_verified) {
+            return Err(HttpError(Error::Api(
+                ApiError::new(
+                    ErrorCode::PermissionDenied,
+                    "this server lets only invited addresses create spaces",
+                )
+                .with_hint("ask the operator to add your address to the allow-list"),
+            )));
+        }
+    }
     let t = state
         .services
         .tenants

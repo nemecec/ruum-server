@@ -1,0 +1,5 @@
+apiVersion: v2
+name: ruum-platform
+description: Staging platform services of Ruum (CNPG cluster and backups, SpiceDB, Mailpit, blob copy, network policy, deployer RBAC).
+type: application
+version: 0.1.0

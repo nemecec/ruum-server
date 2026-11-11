@@ -1,0 +1,125 @@
+{{- if not .Values.generation }}{{ fail "generation is required (tofu output pg_generation)" }}{{ end }}
+# Backups (review 1 B-3): the key in Secret pg-backup-s3 is the backup writer key, with object
+# read and write only. Barman retention is off: nothing in the cluster deletes backups; the
+# bucket's lifecycle and the compliance lock do (tofu/persistent).
+# Encryption (review 1 S-5): HTTPS in transit; at rest only Scaleway's provider-side encryption.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: pg-backup
+  namespace: data
+spec:
+  configuration:
+    destinationPath: s3://{{ .Values.backup.bucket }}/
+    endpointURL: {{ .Values.backup.endpoint }}
+    s3Credentials:
+      accessKeyId:
+        name: pg-backup-s3
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: pg-backup-s3
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+  namespace: data
+spec:
+  instances: {{ .Values.postgres.instances }}
+  imageName: {{ .Values.postgres.image }}
+  enableSuperuserAccess: false
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: {{ .Values.postgres.size }}
+    storageClass: {{ .Values.postgres.storageClass }}
+  resources:
+    {{- toYaml .Values.postgres.resources | nindent 4 }}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: 128MB
+  managed:
+    roles:
+      - name: ruum
+        ensure: present
+        login: true
+        passwordSecret: { name: pg-role-ruum }
+      - name: zitadel
+        ensure: present
+        login: true
+        passwordSecret: { name: pg-role-zitadel }
+      - name: spicedb
+        ensure: present
+        login: true
+        passwordSecret: { name: pg-role-spicedb }
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: pg-backup
+        # A new path per cluster generation: a recreated cluster never finds a non-empty
+        # archive (review 2 R-2).
+        serverName: pg-{{ .Values.generation }}
+  bootstrap:
+    {{- if .Values.restoreFrom }}
+    recovery:
+      source: origin
+      database: ruum
+      owner: ruum
+    {{- else }}
+    initdb:
+      database: ruum
+      owner: ruum
+    {{- end }}
+  {{- if .Values.restoreFrom }}
+  externalClusters:
+    - name: origin
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: pg-backup
+          serverName: pg-{{ .Values.restoreFrom }}
+  {{- end }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: zitadel
+  namespace: data
+spec:
+  cluster: { name: pg }
+  name: zitadel
+  owner: zitadel
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: spicedb
+  namespace: data
+spec:
+  cluster: { name: pg }
+  name: spicedb
+  owner: spicedb
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-daily
+  namespace: data
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  backupOwnerReference: self
+  immediate: true
+  cluster: { name: pg }
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

@@ -1,0 +1,18 @@
+# Only for the Barman Cloud plugin's mTLS with the CNPG operator. No ACME issuer here: the edge
+# gets its certificates itself, and no DNS token is ever in the cluster.
+crds:
+  enabled: true
+replicaCount: 1
+resources:
+  requests: { cpu: 10m, memory: 48Mi }
+  limits: { memory: 128Mi }
+webhook:
+  resources:
+    requests: { cpu: 10m, memory: 24Mi }
+    limits: { memory: 64Mi }
+cainjector:
+  resources:
+    requests: { cpu: 10m, memory: 48Mi }
+    limits: { memory: 128Mi }
+startupapicheck:
+  enabled: false

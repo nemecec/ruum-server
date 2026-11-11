@@ -1,0 +1,47 @@
+# Mailpit: the only SMTP target of staging (Zitadel and ruum-server). No mail leaves the
+# cluster. ClusterIP only, no edge route: the UI is reachable only by `kubectl port-forward`
+# (review stgsec S-12).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailpit
+  namespace: ops
+  labels: { app: mailpit }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mailpit }
+  template:
+    metadata:
+      labels: { app: mailpit }
+    spec:
+      automountServiceAccountToken: false
+      {{- include "platform.podSecurity" . | nindent 6 }}
+      containers:
+        - name: mailpit
+          image: {{ .Values.mailpit.image }}
+          env:
+            - { name: MP_MAX_MESSAGES, value: "2000" }
+          ports:
+            - { name: smtp, containerPort: 1025 }
+            - { name: ui, containerPort: 8025 }
+          resources:
+            {{- toYaml .Values.mailpit.resources | nindent 12 }}
+          {{- include "platform.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: { sizeLimit: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailpit
+  namespace: ops
+spec:
+  type: ClusterIP
+  selector: { app: mailpit }
+  ports:
+    - { name: smtp, port: 1025, targetPort: smtp }
+    - { name: ui, port: 8025, targetPort: ui }

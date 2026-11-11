@@ -1,0 +1,83 @@
+# The edge (plan 5.7): Caddy with the web UI in /srv. One replica: certificates live in an
+# emptyDir (never in the tenant blob bucket, review 1 S-4 / stgsec M-8), so a second replica
+# would issue its own and could miss HTTP-01 challenges. The ACME CA is never production Let's
+# Encrypt (review 2 R-3), so a restart costs no production quota.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: caddy
+  namespace: edge
+data:
+  Caddyfile: |
+    {{- include "ruum.caddyfile" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruum-edge
+  namespace: edge
+  labels: { app: ruum-edge }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: ruum-edge }
+  template:
+    metadata:
+      labels: { app: ruum-edge }
+      annotations:
+        ruum.space/caddyfile: {{ include "ruum.caddyfile" . | sha256sum | trunc 16 }}
+        ruum.space/commit: {{ .Values.commit | quote }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: caddy
+          image: {{ include "ruum.byDigest" .Values.images.edge }}
+          args: [caddy, run, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]
+          env:
+            - { name: XDG_DATA_HOME, value: /data }
+            - { name: XDG_CONFIG_HOME, value: /config }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: https, containerPort: 8443 }
+          readinessProbe:
+            tcpSocket: { port: https }
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.edge.resources | nindent 12 }}
+          {{- include "ruum.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: caddyfile, mountPath: /etc/caddy, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /config }
+      volumes:
+        - name: caddyfile
+          configMap: { name: caddy }
+        - name: data
+          emptyDir: { sizeLimit: 256Mi }
+        - name: config
+          emptyDir: { sizeLimit: 16Mi }
+---
+# NodePorts behind the load balancer (tofu/cluster: 80 -> 30080, 443 -> 30443, proxy protocol).
+# externalTrafficPolicy Local keeps the source address (the LB, 10.20.1.5), which the proxy
+# protocol allow-list and the network policy expect; the LB health check finds the node that
+# runs the edge.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-edge
+  namespace: edge
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector: { app: ruum-edge }
+  ports:
+    - { name: http, port: 80, targetPort: http, nodePort: 30080 }
+    - { name: https, port: 443, targetPort: https, nodePort: 30443 }

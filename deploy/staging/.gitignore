@@ -1,0 +1,6 @@
+# OpenTofu work files never go into git (remote.sh works in ~/.ruum-staging on the build server).
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+backend_override.tf

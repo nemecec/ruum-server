@@ -1,0 +1,82 @@
+# The release agent and the deploy timer use this ServiceAccount, not the admin kubeconfig
+# (review 1 S-2, review 2 O-1): Helm in `ruum` and `edge` only. ops/deployer-kubeconfig.sh
+# writes its kubeconfig for the ruum-ops user.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deployer
+  namespace: ruum
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: deployer-token
+  namespace: ruum
+  annotations:
+    kubernetes.io/service-account.name: deployer
+type: kubernetes.io/service-account-token
+{{- range list "ruum" "edge" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: {{ . }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [services, configmaps, pods, pods/log, events, serviceaccounts]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # No Secrets: deploy-chart.sh runs Helm with HELM_DRIVER=configmap, and the chart has no
+  # Secret of its own (k8s/apply.sh makes them), so the deployer cannot read the database
+  # password or the token key (review stgsec S-11).
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployer
+  namespace: {{ . }}
+subjects:
+  - kind: ServiceAccount
+    name: deployer
+    namespace: ruum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deployer
+{{- end }}
+---
+# Before a release with new migrations, deploy.sh asks CNPG for an on-demand backup (review 2
+# U-3). The deployer may create and read Backup objects in `data`, nothing else there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer-backup
+  namespace: data
+rules:
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [backups]
+    verbs: [get, list, watch, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployer-backup
+  namespace: data
+subjects:
+  - kind: ServiceAccount
+    name: deployer
+    namespace: ruum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deployer-backup

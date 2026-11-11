@@ -1,5 +1,6 @@
 //! The shared state of all handlers.
 
+use crate::signup::EmailAllowList;
 use ruum_core::Services;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,8 @@ pub struct ApiConfig {
     /// The URL of the WebDAV host (decision 0002-3), for example `https://dav.ruum.localhost/`.
     /// `createAppPassword` returns it as `dav_url`.
     pub dav_url: String,
+    /// The email allow-list for sign-up and tenant creation ([`crate::signup`]). `None`: open.
+    pub signup: Option<Arc<EmailAllowList>>,
 }
 
 impl Default for ApiConfig {
@@ -23,6 +26,7 @@ impl Default for ApiConfig {
             public_url: "https://ruum.localhost".into(),
             content_url: "https://content.ruumapps.localhost".into(),
             dav_url: "https://dav.ruum.localhost/".into(),
+            signup: None,
         }
     }
 }

@@ -1,0 +1,121 @@
+# ruum-server (plan 5.8). One replica, so the start-up migration is safe (RUUM_MIGRATE=true).
+# Migrations follow expand and contract (README "Deploy"): the previous image must work on the
+# new schema, because a failed rollout rolls the image back but not the schema (review 2 U-3).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruum-server
+  namespace: ruum
+  labels: { app: ruum-server }
+  annotations:
+    ruum.space/commit: {{ .Values.commit | quote }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: ruum-server }
+  template:
+    metadata:
+      labels: { app: ruum-server }
+      annotations:
+        ruum.space/commit: {{ .Values.commit | quote }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: server
+          image: {{ include "ruum.byDigest" .Values.images.server }}
+          envFrom:
+            # DATABASE_URL, RUUM_S3_*, RUUM_SPICEDB_PRESHARED_KEY, RUUM_TOKEN_SIGNING_KEY,
+            # RUUM_CONTENT_SIGNING_KEY, RUUM_SIGNUP_ALLOWED_* (k8s/apply.sh).
+            - secretRef: { name: ruum-server-env }
+          env:
+            - { name: RUST_LOG, value: "info" }
+            - { name: RUUM_BIND, value: "0.0.0.0:8491" }
+            - { name: RUUM_DAV_BIND, value: "0.0.0.0:8492" }
+            - { name: RUUM_INTERNAL_BIND, value: "0.0.0.0:8493" }
+            - { name: RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR, value: {{ .Values.server.tlsAskNewHostsPerHour | quote }} }
+            - { name: RUUM_PUBLIC_URL, value: "https://{{ .Values.hosts.public }}" }
+            - { name: RUUM_DAV_URL, value: "https://{{ .Values.hosts.dav }}/" }
+            - { name: RUUM_CONTENT_URL, value: "https://{{ .Values.hosts.content }}" }
+            - { name: RUUM_OIDC_ISSUER, value: "https://{{ .Values.hosts.auth }}" }
+            - name: RUUM_OIDC_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: ruum-oidc, key: client-id } }
+            - { name: RUUM_MIGRATE, value: "true" }
+            - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
+            - { name: RUUM_SPICEDB_ENDPOINT, value: "http://spicedb.authz.svc.cluster.local:50051" }
+            - { name: RUUM_S3_ENDPOINT, value: "https://hel1.your-objectstorage.com" }
+            - { name: RUUM_S3_REGION, value: hel1 }
+            - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs }
+            - { name: RUUM_S3_FORCE_PATH_STYLE, value: "false" }
+            - { name: SMTP_URL, value: "smtp://mailpit.ops.svc.cluster.local:1025" }
+            - { name: RUUM_MAIL_FROM, value: "no-reply@notify.staging.ruum.space" }
+            - { name: RUUM_DAV_SPOOL_DIR, value: /spool }
+            - { name: TMPDIR, value: /tmp }
+          ports:
+            - { name: platform, containerPort: 8491 }
+            - { name: dav, containerPort: 8492 }
+            - { name: internal, containerPort: 8493 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: platform }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: platform }
+            periodSeconds: 30
+            failureThreshold: 5
+          startupProbe:
+            httpGet: { path: /healthz, port: platform }
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
+          {{- include "ruum.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: pg-ca, mountPath: /pg-ca, readOnly: true }
+            - { name: spool, mountPath: /spool }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: pg-ca
+          secret: { secretName: pg-ca, items: [{ key: ca.crt, path: ca.crt }] }
+        - name: spool
+          emptyDir: { sizeLimit: 2Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-server
+  namespace: ruum
+spec:
+  selector: { app: ruum-server }
+  ports:
+    - { name: platform, port: 8491, targetPort: platform }
+    - { name: dav, port: 8492, targetPort: dav }
+---
+# The internal listener: the edge's on-demand TLS `ask` (review 1 B-6). No public route.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-server-internal
+  namespace: ruum
+spec:
+  selector: { app: ruum-server }
+  ports:
+    - { name: internal, port: 8493, targetPort: internal }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ruum-release
+  namespace: ruum
+data:
+  commit: {{ .Values.commit | quote }}
+  server: {{ .Values.images.server | quote }}
+  edge: {{ .Values.images.edge | quote }}

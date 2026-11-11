@@ -1,0 +1,85 @@
+# The platform of staging (plan 5). k8s/apply.sh runs `helmfile apply` with the versions of
+# versions.env in the environment. Charts and images are pinned there (Renovate opens PRs).
+repositories:
+  - name: jetstack
+    url: https://charts.jetstack.io
+  - name: cnpg
+    url: https://cloudnative-pg.github.io/charts
+  - name: zitadel
+    url: https://charts.zitadel.com
+  - name: nats
+    url: https://nats-io.github.io/k8s/helm/charts
+
+helmDefaults:
+  wait: true
+  timeout: 900
+  # Helm 4 renamed --atomic (review 2 U-4).
+  args: []
+
+releases:
+  - name: cert-manager
+    namespace: cert-manager
+    chart: jetstack/cert-manager
+    version: {{ requiredEnv "CERT_MANAGER_CHART_VERSION" }}
+    values:
+      - values/cert-manager.yaml
+
+  - name: cnpg
+    namespace: cnpg-system
+    chart: cnpg/cloudnative-pg
+    version: {{ requiredEnv "CNPG_CHART_VERSION" }}
+    values:
+      - values/cnpg.yaml
+
+  - name: barman-cloud
+    namespace: cnpg-system
+    chart: cnpg/plugin-barman-cloud
+    version: {{ requiredEnv "BARMAN_PLUGIN_CHART_VERSION" }}
+    needs: [cert-manager/cert-manager, cnpg-system/cnpg]
+    values:
+      - values/barman-cloud.yaml
+
+  - name: platform
+    namespace: data
+    chart: ../charts/platform
+    needs: [cnpg-system/barman-cloud]
+    # apply.sh waits for the CNPG cluster itself, then copies its CA to the client namespaces.
+    wait: false
+    values:
+      - generation: {{ requiredEnv "PG_GENERATION" | quote }}
+        restoreFrom: {{ env "PG_RESTORE_FROM" | default "" | quote }}
+        postgres:
+          image: {{ requiredEnv "POSTGRES_IMAGE" }}
+        spicedb:
+          image: authzed/spicedb:{{ requiredEnv "SPICEDB_VERSION" }}
+        mailpit:
+          image: axllent/mailpit:{{ requiredEnv "MAILPIT_VERSION" }}
+        blobCopy:
+          image: rclone/rclone:{{ requiredEnv "RCLONE_VERSION" }}
+
+  - name: nats
+    namespace: nats
+    chart: nats/nats
+    version: {{ requiredEnv "NATS_CHART_VERSION" }}
+    values:
+      - values/nats.yaml
+
+  - name: zitadel
+    namespace: auth
+    chart: zitadel/zitadel
+    version: {{ requiredEnv "ZITADEL_CHART_VERSION" }}
+    needs: [data/platform]
+    values:
+      - values/zitadel.yaml
+      - image:
+          tag: {{ requiredEnv "ZITADEL_VERSION" }}
+        zitadel:
+          configmapConfig:
+            FirstInstance:
+              Org:
+                Machine:
+                  # 90 days from the first install (review 1 B-8); the digest records it.
+                  MachineKey:
+                    ExpirationDate: {{ requiredEnv "ZITADEL_PAT_EXPIRY" | quote }}
+                  Pat:
+                    ExpirationDate: {{ requiredEnv "ZITADEL_PAT_EXPIRY" | quote }}
