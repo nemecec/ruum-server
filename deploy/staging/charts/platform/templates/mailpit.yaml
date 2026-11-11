@@ -22,6 +22,8 @@ spec:
           image: {{ .Values.mailpit.image }}
           env:
             - { name: MP_MAX_MESSAGES, value: "2000" }
+            # The root file system is read-only; the default database goes to /tmp.
+            - { name: MP_DATABASE, value: /data/mailpit.db }
           ports:
             - { name: smtp, containerPort: 1025 }
             - { name: ui, containerPort: 8025 }
