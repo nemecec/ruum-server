@@ -19,12 +19,11 @@ acme:
   issuer: letsencrypt-staging
   email: ""
 
-# Sources allowed to reach the Zitadel console and admin APIs (review stgsec M-4): the build
-# server, IPv4 and IPv6 (the same as admin_cidrs of tofu/cluster). When the build server moves,
-# change both (review 2 O-3).
-adminSources:
-  - 2.31.194.2/32
-  - 2a01:4f8:c015:3c76::/64
+# Public sources allowed to reach the Zitadel console and admin APIs (review stgsec M-4). Empty:
+# they answer 403 to every public address. The operations run on the person's Mac, whose address
+# changes, and reach Zitadel in the cluster (zitadel-bootstrap.sh and the person use
+# `deploy/staging/tool.sh --port 8080 kubectl -n auth port-forward --address 0.0.0.0 svc/zitadel 8080`).
+adminSources: []
 
 # The load balancer's private subnet: the only source allowed to send proxy protocol headers.
 proxyProtocolFrom: 10.20.1.0/24

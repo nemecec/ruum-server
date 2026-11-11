@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Upgrades Talos one node at a time (review 2 U-1). On the build server as ruum-ops, with the
-# admin talosconfig and kubeconfig of ~/.ruum-staging. Change TALOS_VERSION (and the installer
-# image) in versions.env in a pull request first; then run this from that commit.
+# Upgrades Talos one node at a time (review 2 U-1). On the Mac, in the tools container, with the
+# admin talosconfig and kubeconfig of ~/.config/ruum/staging:
+#   deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh
+# Change TALOS_VERSION (and the installer image) in versions.env in a pull request first; then
+# run this from that commit.
 #
 # Before each node: etcd has 3 healthy members, every pod is Running, and the CNPG primary is
 # moved away from the node (switchover). The sum of requests must fit on N-1 nodes (review 2
@@ -10,7 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../versions.env
 . "$HERE/../versions.env"
-WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
+WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export TALOSCONFIG="$WORK/talosconfig" KUBECONFIG="$WORK/kubeconfig"
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }

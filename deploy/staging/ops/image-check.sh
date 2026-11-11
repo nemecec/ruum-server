@@ -1,6 +1,6 @@
-# Checks of a Ruum image before it runs in staging (code review F-3). Sourced by deploy.sh (laptop)
-# and ops/deploy-chart.sh (build server, as ruum-ops), so the provenance check cannot be skipped
-# by calling the lower-level script directly.
+# Checks of a Ruum image before it runs in staging (code review F-3). Sourced by deploy.sh (on the
+# Mac, with gh) and ops/deploy-chart.sh (in the tools container, with cosign), so the provenance
+# check cannot be skipped by calling the lower-level script directly.
 # shellcheck shell=bash
 # shellcheck disable=SC2034 # the patterns are used by the scripts that source this file
 
@@ -36,7 +36,7 @@ ghcr_digest() {
 cosign_verify_provenance() {
   local ref="$1"
   [[ "$ref" =~ $RUUM_IMAGE_RE ]] || { echo "not a Ruum image by digest: $ref" >&2; return 1; }
-  command -v cosign >/dev/null || { echo "cosign is missing (setup.sh installs it)" >&2; return 1; }
+  command -v cosign >/dev/null || { echo "cosign is missing (it is in the tools image, tools-image.sh)" >&2; return 1; }
   cosign verify-attestation "$ref" \
     --type https://slsa.dev/provenance/v1 \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \

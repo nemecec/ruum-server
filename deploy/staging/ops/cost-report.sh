@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The monthly price of what exists in the Hetzner project now, except the build server
-# (review 2 C-2). A daily timer of ruum-ops runs it; the digest reads the last line.
+# (review 2 C-2). status.sh runs it in the tools container; the digest reads the last line.
 # Environment: HCLOUD_TOKEN. Prices gross from GET /pricing.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

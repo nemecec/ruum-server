@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Sizing rule (review 2 U-2): the sum of the memory requests of all pods must fit on N-1 nodes,
 # or a node upgrade (or a lost node) leaves pods Pending and the drain hangs. Exit 1 when it
-# does not fit: add stg-4 (NODE_COUNT=4, about EUR 7.43) before the next upgrade.
+# does not fit: add stg-4 (NODE_COUNT=4, about EUR 7.43) before the next upgrade. On the Mac:
+#   deploy/staging/tool.sh bash deploy/staging/ops/check-capacity.sh
 set -euo pipefail
 # Decimal points, whatever the locale of the caller.
 export LC_ALL=C
-WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
+WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export KUBECONFIG="${KUBECONFIG:-$WORK/kubeconfig}"
 to_mi() { # Kubernetes quantity -> MiB
   awk -v q="$1" 'BEGIN {

@@ -47,7 +47,7 @@ terraform {
 
 provider "scaleway" {
   # SCW_ACCESS_KEY / SCW_SECRET_KEY / SCW_DEFAULT_PROJECT_ID from the environment: the full
-  # key, on the build server only, for OpenTofu. The cluster never gets it (review 1 B-3).
+  # key, on the person's Mac only, for OpenTofu. The cluster never gets it (review 1 B-3).
   region = "nl-ams"
   zone   = "nl-ams-1"
 }

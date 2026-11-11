@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zitadel on staging (plan 5.3, review 1 B-7, B-8), on the build server as ruum-ops with the admin
+# Zitadel on staging (plan 5.3, review 1 B-7, B-8), in the tools container with the admin
 # kubeconfig. It talks to Zitadel through `kubectl port-forward` (in-cluster), with the machine
 # user's PAT from the Secret auth/iam-admin-pat; the PAT never leaves this process.
 #
@@ -7,7 +7,7 @@
 #   zitadel-bootstrap.sh check   report drift: password login, registration, auto linking,
 #                                Microsoft email trust, human users, the PAT's expiry
 #
-# The Google and Microsoft keys come in the environment (remote.sh reads them from stdin) and go
+# The Google and Microsoft keys come in the environment (steps.sh reads them from stdin) and go
 # to curl on stdin; they are never printed or stored outside Zitadel's database.
 set -euo pipefail
 mode="${1:-check}"

@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # Tests of the staging code that need no cloud account and create nothing (CI job "staging",
-# and on the laptop or build server):
+# and on the Mac):
 #
 #   deploy/staging/tests/run.sh            all tests that the installed tools allow
 #
 # - check-plan.sh accepts a good plan and refuses each bad variant (zone resource, labels,
 #   firewall, user_data, DNS names, build server, size, unknown type, variables in the JSON),
-#   and each mutation of code review F-4 (firewall rules, deletes and replaces, attachments,
-#   load balancer targets, object lock, child modules);
+#   each mutation of code review F-4 (firewall rules, deletes and replaces, attachments,
+#   load balancer targets, object lock, child modules) and of code review 2 G-1 (a foreign
+#   firewall ID, apply_to without rules, unknown rules, primary IP assignee), and only the
+#   Mac's /32 as the admin source;
 # - plan-scrub.jq removes the prior state and every sensitive value (F-5);
 # - the sweep deletes only the staging names (F-6);
-# - deploy-chart.sh and ssh-entry.sh refuse bad arguments (F-2, F-3);
+# - deploy-chart.sh refuses bad arguments (F-3); the admin address must be a public IPv4;
+# - the Mac-only layout: no ssh, no build-server credential path, the checkout read-only in the
+#   tools container, rw steps refuse without RUUM_STAGING_APPLY=yes;
 # - price.sh prices the plan and refuses above the budget;
 # - the secret lists: nothing forbidden goes to the cluster, the two lists agree;
 # - one Zitadel and SpiceDB pin for the laptop and staging (review 2 U-5);
@@ -18,6 +22,8 @@
 # - with helm: lint and render both charts, digests required, never production Let's Encrypt;
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate);
 # - with tofu: fmt and validate of both roots.
+# helm and tofu come from PATH (CI: setup.sh) or, when they are not there and Docker is, from the
+# tools image (tools-image.sh, the same pins).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STG="$(cd "$HERE/.." && pwd)"
@@ -27,8 +33,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export PATH="$HOME/.local/bin:$PATH"
 failed=0
-# The build server's addresses, as remote.sh gives them to check-plan.sh.
-export STG_ADMIN_CIDRS='["2.31.194.2/32","2a01:4f8:c015:3c76::/64"]'
+# The Mac's public IPv4 as steps.sh gives it to check-plan.sh (a documentation address here).
+export STG_ADMIN_CIDRS='["203.0.113.10/32"]'
 export STG_BUILDBOX_ID=99999
 ok() { printf 'ok   %s\n' "$*"; }
 bad() { printf 'FAIL %s\n' "$*"; failed=1; }
@@ -62,7 +68,7 @@ expect 3 "refuses another server type" bash "$STG/check-plan.sh" "$(mutate type 
 expect 3 "refuses an unknown resource type" bash "$STG/check-plan.sh" "$(mutate unknown '.resource_changes += [{"address":"hcloud_volume_attachment.x","mode":"managed","type":"hcloud_volume_attachment","change":{"actions":["create"],"after":{}}}]')"
 expect 3 "refuses a non-staging bucket" bash "$STG/check-plan.sh" "$(mutate bucket '(.resource_changes[] | select(.type == "minio_s3_bucket") | .change.after.bucket) = "ruum-prod-blobs"')"
 expect 3 "refuses deleting a backup bucket" bash "$STG/check-plan.sh" "$(mutate bdel '.resource_changes += [{"address":"scaleway_object_bucket.backup[\"pg_backup\"]","mode":"managed","type":"scaleway_object_bucket","change":{"actions":["delete"],"before":{"name":"ruum-staging-pg-backup","tags":{"env":"staging","managed-by":"tofu"}},"after":null}}]')"
-expect 1 "refuses a plan JSON that holds the variables" bash "$STG/check-plan.sh" "$(mutate vars '. + {"variables":{"state_passphrase":{"value":"x"}}}')"
+expect 1 "refuses a plan JSON that holds the variables" bash "$STG/check-plan.sh" "$(mutate vars '. + {"variables":{"scrub_probe_0":{"value":"SCRUB-PROBE-0"}}}')"
 expect 0 "check-plan --repo: no HCLOUD_TOKEN or Stripe key in cluster or CI files" bash "$STG/check-plan.sh" --repo
 
 echo "== check-plan.sh: code review F-4"
@@ -71,7 +77,7 @@ FW='(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after.ru
 expect 3 "refuses a firewall rule from 0.0.0.0/0" bash "$cp" "$(mutate fw4 "${FW}[1].source_ips += [\"0.0.0.0/0\"]")"
 expect 3 "refuses a firewall rule from ::/0" bash "$cp" "$(mutate fw6 "${FW}[2].source_ips = [\"::/0\"]")"
 expect 3 "refuses a firewall rule from 0.0.0.0/1" bash "$cp" "$(mutate fw1 "${FW}[0].source_ips = [\"0.0.0.0/1\"]")"
-RULE_ANY='{"direction":"in","protocol":"tcp","port":"any","source_ips":["2.31.194.2/32"],"destination_ips":[]}'
+RULE_ANY='{"direction":"in","protocol":"tcp","port":"any","source_ips":["203.0.113.10/32"],"destination_ips":[]}'
 expect 3 "refuses a new rule with port any" bash "$cp" "$(mutate fwany "$FW += [$RULE_ANY]")"
 expect 3 "refuses a udp rule" bash "$cp" "$(mutate fwudp "${FW}[1].protocol = \"udp\"")"
 expect 3 "refuses another tcp port" bash "$cp" "$(mutate fw22 "${FW}[1].port = \"22\"")"
@@ -79,8 +85,16 @@ expect 3 "refuses an outbound rule" bash "$cp" "$(mutate fwout "${FW}[0].directi
 expect 3 "refuses firewall sources unknown at plan time" bash "$cp" "$(mutate fwunk '(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after_unknown.rule[0].source_ips) = true')"
 expect 3 "refuses firewall apply_to" bash "$cp" "$(mutate fwapply '(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after.apply_to) = [{"server":1}]')"
 expect 3 "refuses firewall rules without STG_ADMIN_CIDRS" env -u STG_ADMIN_CIDRS bash "$cp" "$FIX/plan-good.json"
-expect 1 "refuses STG_ADMIN_CIDRS wider than one host or one /64" env STG_ADMIN_CIDRS='["0.0.0.0/0"]' bash "$cp" "$FIX/plan-good.json"
-expect 1 "refuses STG_ADMIN_CIDRS with an IPv6 /48" env STG_ADMIN_CIDRS='["2a01:4f8::/48"]' bash "$cp" "$FIX/plan-good.json"
+expect 3 "refuses firewall rules from another address than the Mac" env STG_ADMIN_CIDRS='["203.0.113.11/32"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS of 0.0.0.0/0" env STG_ADMIN_CIDRS='["0.0.0.0/0"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS wider than one host (/31)" env STG_ADMIN_CIDRS='["203.0.113.10/31"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS without a prefix" env STG_ADMIN_CIDRS='["203.0.113.10"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS with an IPv6 /64" env STG_ADMIN_CIDRS='["2a01:4f8:c015:3c76::/64"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS with an IPv6 /128" env STG_ADMIN_CIDRS='["2a01:4f8::1/128"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS with two addresses" env STG_ADMIN_CIDRS='["203.0.113.10/32","203.0.113.11/32"]' bash "$cp" "$FIX/plan-good.json"
+expect 1 "refuses STG_ADMIN_CIDRS with an octet above 255" env STG_ADMIN_CIDRS='["203.0.113.300/32"]' bash "$cp" "$FIX/plan-good.json"
+expect 3 "refuses a rule with the Mac and a second /32" bash "$cp" "$(mutate fwtwo "${FW}[1].source_ips += [\"203.0.113.11/32\"]")"
+expect 3 "refuses a rule with the Mac's /24" bash "$cp" "$(mutate fw24 "${FW}[1].source_ips = [\"203.0.113.0/24\"]")"
 expect 3 "refuses deleting the firewall" bash "$cp" "$(mutate fwdel '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["delete"] | .before = .after | .after = null)')"
 expect 3 "refuses replacing the firewall" bash "$cp" "$(mutate fwrep '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["delete","create"] | .before = .after)')"
 expect 0 "accepts replacing the firewall with --allow-replace" bash "$cp" "$TMP/fwrep.json" --allow-replace
@@ -105,28 +119,42 @@ expect 3 "refuses a lock in years" bash "$cp" "$(mutate lockyr "$LOCK |= (.days 
 expect 3 "refuses deleting the lock" bash "$cp" "$(mutate lockdel '(.resource_changes[] | select(.type == "scaleway_object_bucket_lock_configuration") | .change) |= (.actions = ["delete"] | .before = .after | .after = null)')"
 expect 3 "refuses five servers when two are in a child module" bash "$cp" "$(mutate child '.planned_values.root_module.child_modules = [{"address":"module.extra","resources":[range(2) | {"type":"hcloud_server","values":{"server_type":"cx23","location":"hel1"}}]}]')"
 expect 1 "refuses a plan JSON that holds the prior state" bash "$cp" "$(mutate prior '. + {"prior_state":{"values":{}}}')"
+
+echo "== check-plan.sh: code review 2 G-1"
+expect 3 "refuses a server with a known firewall ID that is not the staging firewall" bash "$cp" "$(mutate fwforeign '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.after.firewall_ids = [42] | .after_unknown.firewall_ids = [false])')"
+expect 3 "refuses a server with a known foreign firewall ID next to an unknown one" bash "$cp" "$(mutate fwmix '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.after.firewall_ids = [null, 42] | .after_unknown.firewall_ids = [true, false])')"
+expect 0 "accepts a server with the ID of the staging firewall of this plan" bash "$cp" "$(mutate fwown '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["update"] | .before = (.after + {"id":"77"}) | .after.id = "77") | (.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.after.firewall_ids = [77] | .after_unknown.firewall_ids = [false])')"
+expect 3 "refuses a firewall with no rules and apply_to" bash "$cp" "$(mutate fwnorules '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.after.rule = [] | .after.apply_to = [{"label_selector":"env=prod"}] | .after_unknown.rule = [])')"
+expect 3 "refuses firewall apply_to unknown at plan time" bash "$cp" "$(mutate fwapplyu '(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after_unknown.apply_to) = true')"
+expect 3 "refuses firewall rules wholly unknown at plan time" bash "$cp" "$(mutate fwruleu '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.after.rule = [] | .after_unknown.rule = true)')"
+expect 3 "refuses one firewall rule unknown at plan time" bash "$cp" "$(mutate fwrule1u '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.after.rule += [null] | .after_unknown.rule += [true])')"
+expect 3 "refuses a primary IP assigned to the build server" bash "$cp" "$(mutate pipbb '(.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 99999')"
+expect 3 "refuses a primary IP assigned to a server outside the plan" bash "$cp" "$(mutate pipout '(.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4242')"
+expect 0 "accepts a primary IP assigned to a server of this plan" bash "$cp" "$(mutate pipin '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.actions = ["update"] | .before = (.after + {"id":4243}) | .after.id = 4243) | (.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4243')"
 bash "$STG/price.sh" "$FIX/pricing.json" "$TMP/child.json" >"$TMP/out" 2>&1
 grep -qE "server cx23 \(hel1\) +5 " "$TMP/out" && ok "price.sh counts the servers of child modules" || { bad "price.sh child modules"; cat "$TMP/out"; }
 
 echo "== plan-scrub.jq (code review F-5)"
-jq '. + {"variables":{"state_passphrase":{"value":"SECRET-MARKER-1"}},
-         "prior_state":{"values":{"root_module":{"resources":[{"type":"talos_machine_secrets","values":{"machine_secrets":"SECRET-MARKER-2"}}]}}},
-         "configuration":{"provider_config":{"x":{"expressions":{"token":{"constant_value":"SECRET-MARKER-3"}}}}},
-         "output_changes":{"talosconfig":{"actions":["no-op"],"before":"SECRET-MARKER-4","after":"SECRET-MARKER-4","before_sensitive":true,"after_sensitive":true}}}
+# Probe values in the places where a real plan holds secrets. The key names and values are
+# plain probes (scrub_probe_N, SCRUB-PROBE-N), so secret scanners do not read them as credentials.
+jq '. + {"variables":{"scrub_probe_1":{"value":"SCRUB-PROBE-1"}},
+         "prior_state":{"values":{"root_module":{"resources":[{"type":"talos_machine_secrets","values":{"scrub_probe_2":"SCRUB-PROBE-2"}}]}}},
+         "configuration":{"provider_config":{"x":{"expressions":{"scrub_probe_3":{"constant_value":"SCRUB-PROBE-3"}}}}},
+         "output_changes":{"talosconfig":{"actions":["no-op"],"before":"SCRUB-PROBE-4","after":"SCRUB-PROBE-4","before_sensitive":true,"after_sensitive":true}}}
     | .resource_changes += [
-        {"address":"talos_machine_secrets.this","mode":"managed","type":"talos_machine_secrets","change":{"actions":["no-op"],"before":{"machine_secrets":{"certs":{"etcd":{"key":"SECRET-MARKER-5"}}}},"after":{"machine_secrets":{"certs":{"etcd":{"key":"SECRET-MARKER-5"}}}}}},
-        {"address":"data.talos_client_configuration.this","mode":"data","type":"talos_client_configuration","change":{"actions":["read"],"before":null,"after":{"talos_config":"SECRET-MARKER-6"}}},
-        {"address":"terraform_data.x","mode":"managed","type":"terraform_data","change":{"actions":["update"],"before":{"input":{"a":"SECRET-MARKER-7","b":"keep"}},"after":{"input":{"a":"SECRET-MARKER-7","b":"keep"}},"before_sensitive":{"input":{"a":true}},"after_sensitive":{"input":{"a":true}}}}]
-    | .planned_values.root_module.resources += [{"type":"terraform_data","values":{"input":{"a":"SECRET-MARKER-8"}},"sensitive_values":{"input":{"a":true}}}]
-    | .planned_values.outputs = {"talosconfig":{"sensitive":true,"value":"SECRET-MARKER-9"}}' \
-  "$FIX/plan-good.json" >"$TMP/secret-plan.json"
-jq -f "$STG/plan-scrub.jq" "$TMP/secret-plan.json" >"$TMP/scrubbed.json"
-if grep -q SECRET-MARKER "$TMP/scrubbed.json"; then bad "plan-scrub.jq leaves a secret: $(grep -o 'SECRET-MARKER-[0-9]' "$TMP/scrubbed.json" | sort -u | tr '\n' ' ')"; else ok "plan-scrub.jq removes the variables, prior state, configuration, sensitive, Talos, data source and output values"; fi
+        {"address":"talos_machine_secrets.this","mode":"managed","type":"talos_machine_secrets","change":{"actions":["no-op"],"before":{"scrub_probe_5":{"certs":{"etcd":{"probe":"SCRUB-PROBE-5"}}}},"after":{"scrub_probe_5":{"certs":{"etcd":{"probe":"SCRUB-PROBE-5"}}}}}},
+        {"address":"data.talos_client_configuration.this","mode":"data","type":"talos_client_configuration","change":{"actions":["read"],"before":null,"after":{"scrub_probe_6":"SCRUB-PROBE-6"}}},
+        {"address":"terraform_data.x","mode":"managed","type":"terraform_data","change":{"actions":["update"],"before":{"input":{"a":"SCRUB-PROBE-7","b":"keep"}},"after":{"input":{"a":"SCRUB-PROBE-7","b":"keep"}},"before_sensitive":{"input":{"a":true}},"after_sensitive":{"input":{"a":true}}}}]
+    | .planned_values.root_module.resources += [{"type":"terraform_data","values":{"input":{"a":"SCRUB-PROBE-8"}},"sensitive_values":{"input":{"a":true}}}]
+    | .planned_values.outputs = {"talosconfig":{"sensitive":true,"value":"SCRUB-PROBE-9"}}' \
+  "$FIX/plan-good.json" >"$TMP/probe-plan.json"
+jq -f "$STG/plan-scrub.jq" "$TMP/probe-plan.json" >"$TMP/scrubbed.json"
+if grep -q SCRUB-PROBE "$TMP/scrubbed.json"; then bad "plan-scrub.jq leaves a probe value: $(grep -o 'SCRUB-PROBE-[0-9]' "$TMP/scrubbed.json" | sort -u | tr '\n' ' ')"; else ok "plan-scrub.jq removes the variables, prior state, configuration, sensitive, Talos, data source and output values"; fi
 jq -e '[.resource_changes[] | select(.type == "terraform_data") | .change.after.input.b] | index("keep")' "$TMP/scrubbed.json" >/dev/null && ok "plan-scrub.jq keeps the values that are not sensitive" || bad "plan-scrub.jq drops plain values"
 expect 0 "check-plan.sh accepts the scrubbed plan" bash "$cp" "$TMP/scrubbed.json"
-expect 1 "check-plan.sh refuses the unscrubbed plan" bash "$cp" "$TMP/secret-plan.json"
-if grep -nE 'tofu show -json "' "$STG/remote.sh" "$STG/ops/destroy-remote.sh" | grep -v 'jq -f "$HERE/plan-scrub.jq"' | grep -q .; then
-  bad "a 'tofu show -json' in remote.sh or destroy-remote.sh does not pipe through plan-scrub.jq"
+expect 1 "check-plan.sh refuses the unscrubbed plan" bash "$cp" "$TMP/probe-plan.json"
+if grep -nE 'tofu show -json "' "$STG/steps.sh" "$STG/ops/destroy-steps.sh" | grep -v 'jq -f "$HERE/plan-scrub.jq"' | grep -q .; then
+  bad "a 'tofu show -json' in steps.sh or destroy-steps.sh does not pipe through plan-scrub.jq"
 else
   ok "every 'tofu show -json' pipes through plan-scrub.jq before it is written"
 fi
@@ -136,12 +164,12 @@ printf '%s\n' "servers stg-1" "servers stg-5" "servers ruum-buildbox" "servers w
   "load_balancers ruum-staging" "load_balancers ruum-prod" "networks ruum-staging" "firewalls ruum-staging-nodes" "firewalls ruum-buildbox" \
   "placement_groups ruum-staging-nodes" "rrset ruum.space staging A" "rrset ruumapps.net *.content.staging AAAA" "rrset ruum.space @ A" \
   "rrset ruum.space notify.staging MX" "rrset ruum.space www A" "rrset ruumapps.net staging A" "snapshot talos" >"$TMP/sweep-in.txt"
-HERE="$STG" bash "$STG/ops/destroy-remote.sh" sweep-filter <"$TMP/sweep-in.txt" >"$TMP/sweep-out.txt" 2>/dev/null
+HERE="$STG" bash "$STG/ops/destroy-steps.sh" sweep-filter <"$TMP/sweep-in.txt" >"$TMP/sweep-out.txt" 2>/dev/null
 want="$(printf '%s\n' "servers stg-1" "primary_ips stg-2-v4" "load_balancers ruum-staging" "networks ruum-staging" "firewalls ruum-staging-nodes" \
   "placement_groups ruum-staging-nodes" "rrset ruum.space staging A" "rrset ruumapps.net *.content.staging AAAA")"
 if [[ "$(cat "$TMP/sweep-out.txt")" == "$want" ]]; then ok "sweep keeps only the staging names (rrsets.json), never the build server, the apex or notify"; else bad "sweep filter"; diff <(echo "$want") "$TMP/sweep-out.txt"; fi
 jq -e --slurpfile r "$STG/rrsets.json" 'length == ($r[0] | length)' "$STG/rrsets.json" >/dev/null &&
-  ! grep -q 'STAGING_RRSETS=' "$STG/ops/destroy-remote.sh" && ok "one rrset list for check-plan and sweep (rrsets.json)" || bad "rrset lists"
+  ! grep -q 'STAGING_RRSETS=' "$STG/ops/destroy-steps.sh" && ok "one rrset list for check-plan and sweep (rrsets.json)" || bad "rrset lists"
 
 echo "== deploy-chart.sh arguments (code review F-3)"
 dc="$STG/ops/deploy-chart.sh"
@@ -157,17 +185,30 @@ expect 1 "refuses an issuer outside the list" bash "$dc" "$C" "$SV" "$ED" --acme
 expect 1 "refuses an email with a comma" bash "$dc" "$C" "$SV" "$ED" --acme zerossl --acme-email "a@b.io,adminSources={0.0.0.0/0}" --validate-only
 expect 1 "refuses zerossl without an email" bash "$dc" "$C" "$SV" "$ED" --acme zerossl --validate-only
 grep -vE '^[[:space:]]*#' "$dc" | grep -qE -- '--set[ =]' && bad "deploy-chart.sh passes values with --set" || ok "deploy-chart.sh gives helm a values file, never --set"
-grep -q 'cosign_verify_provenance' "$dc" && ok "deploy-chart.sh verifies the provenance on the build server" || bad "deploy-chart.sh skips the provenance check"
+grep -q 'cosign_verify_provenance' "$dc" && ok "deploy-chart.sh verifies the provenance in the tools container" || bad "deploy-chart.sh skips the provenance check"
 
-echo "== ssh-entry.sh (code review F-2)"
-se="$STG/ops/ssh-entry.sh"
-expect 0 "accepts a remote.sh step with plain words" env SSH_ORIGINAL_COMMAND="deploy $C $SV $ED --acme zerossl --acme-email ops+stg@example.com" bash "$se" --parse
-expect 2 "refuses shell syntax" env SSH_ORIGINAL_COMMAND='status; id' bash "$se" --parse
-expect 2 "refuses command substitution" env SSH_ORIGINAL_COMMAND='status $(id)' bash "$se" --parse
-expect 2 "refuses an unknown step" env SSH_ORIGINAL_COMMAND='bash -i' bash "$se" --parse
-expect 2 "refuses an empty command" env SSH_ORIGINAL_COMMAND= bash "$se" --parse
-grep -q 'sudoers' "$STG/ops/install-ops-user.sh" && grep -qE '^ruum ALL' "$STG/ops/install-ops-user.sh" && bad "install-ops-user.sh writes a sudoers rule" || ok "install-ops-user.sh writes no sudoers rule"
-grep -q 'merge-base --is-ancestor "$commit" origin/main' "$STG/ops/install-ops-user.sh" && ok "install-ops-user.sh accepts only commits of main" || bad "install-ops-user.sh accepts branch commits"
+echo "== the Mac only (decision of the person, 2026-11-11)"
+st="$STG/steps.sh"
+expect 0 "the admin source is the given public IPv4 as a /32" env RUUM_STAGING_WORK="$TMP" RUUM_ADMIN_IP=8.8.8.8 bash "$st" admin-cidrs
+[[ "$(tr -d '\n' <"$TMP/out")" == '["8.8.8.8/32"]' ]] && ok "admin-cidrs prints [\"8.8.8.8/32\"]" || { bad "admin-cidrs output"; cat "$TMP/out"; }
+for ip in 10.1.2.3 192.168.1.10 172.16.0.1 100.64.0.1 127.0.0.1 169.254.1.1 0.0.0.0 224.0.0.1 203.0.113.5 8.8.8.256 08.8.8.8 8.8.8.8/24 2a01:4f8::1; do
+  expect 1 "refuses the admin address $ip" env RUUM_STAGING_WORK="$TMP" RUUM_ADMIN_IP="$ip" bash "$st" admin-cidrs
+done
+for step in apply platform; do
+  expect 1 "steps.sh $step refuses without RUUM_STAGING_APPLY=yes" env -u RUUM_STAGING_APPLY RUUM_STAGING_WORK="$TMP" bash "$st" "$step" </dev/null
+  grep -q 'needs RUUM_STAGING_APPLY=yes' "$TMP/out" || bad "steps.sh $step: the refusal names RUUM_STAGING_APPLY"
+done
+hits="$(grep -nE '(^|[^a-z])(ssh|rsync|scp)( |$)|ruum-ops|buildbox_ed25519|staging_ops_ed25519|RUUM_STAGING_REMOTE|RUUM_BUILD_HOST|/opt/ruum-staging|2\.31\.194\.2' \
+  "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh "$STG"/charts/ruum/values.yaml "$STG"/tofu/*/*.tf 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+[[ -z "$hits" ]] && ok "no ssh, no build-server address or credential path in the staging code" || { bad "build-server paths are left"; echo "$hits"; }
+[[ ! -e "$STG/ops/install-ops-user.sh" && ! -e "$STG/ops/ssh-entry.sh" && ! -e "$STG/remote.sh" ]] && ok "no ruum-ops installer, ssh entry or remote mode" || bad "remote mode files are left"
+grep -q -- '-v "$STG_ROOT:$STG_ROOT:ro"' "$STG/lib.sh" && ok "the checkout is mounted read-only in the tools container" || bad "lib.sh mounts the checkout writable"
+grep -q -- '--cap-drop ALL --security-opt no-new-privileges' "$STG/lib.sh" && ok "the tools container runs without capabilities" || bad "lib.sh: capabilities"
+grep -qE 'rw\) \[\[ "\$\{RUUM_STAGING_APPLY:-\}" != yes \]\] \|\| env\+=\(-e RUUM_STAGING_APPLY=yes\)' "$STG/lib.sh" && ok "only rw steps get RUUM_STAGING_APPLY" || bad "lib.sh passes RUUM_STAGING_APPLY to every step"
+. "$STG/versions.env"
+[[ "$TOOLS_BASE_IMAGE" =~ ^alpine:[0-9.]+@sha256:[0-9a-f]{64}$ ]] && ok "the tools image base is pinned by digest" || bad "TOOLS_BASE_IMAGE is not pinned by digest"
+[[ "$(bash "$STG/tools-image.sh" name 2>/dev/null)" =~ ^ruum-staging-tools:[0-9a-f]{16}$ ]] && ok "the tools image name is a hash of its pins" || bad "tools-image.sh name"
+grep -vE '^[[:space:]]*#' "$STG/tools-image.sh" | grep -q 'docker build' && bad "tools-image.sh uses docker build (build cache)" || ok "tools-image.sh leaves no build cache (run and commit)"
 
 echo "== shell syntax"
 for f in "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh; do
@@ -187,8 +228,8 @@ if grep -qE '^(HCLOUD_TOKEN|HETZNER_DNS_TOKEN|STRIPE_.*|SCW_ACCESS_KEY|SCW_SECRE
 else
   ok "secrets-push.sh platform never sends HCLOUD_TOKEN, Stripe keys, the full Scaleway key or the passphrase"
 fi
-remote_names="$(sed -n 's/^CLUSTER_SECRET_NAMES="\(.*\)"$/\1/p' "$STG/remote.sh" | tr ' ' '\n' | sort)"
-if [[ "$(sort <<<"$list")" == "$remote_names" ]]; then ok "secrets-push.sh and remote.sh list the same cluster names"; else bad "secrets-push.sh and remote.sh lists differ"; fi
+step_names="$(sed -n 's/^CLUSTER_SECRET_NAMES="\(.*\)"$/\1/p' "$STG/steps.sh" | tr ' ' '\n' | sort)"
+if [[ "$(sort <<<"$list")" == "$step_names" ]]; then ok "secrets-push.sh and steps.sh list the same cluster names"; else bad "secrets-push.sh and steps.sh lists differ"; fi
 if grep -rqE 'STRIPE_|HCLOUD_TOKEN' "$STG/k8s/apply.sh"; then bad "k8s/apply.sh names HCLOUD_TOKEN or a Stripe key"; else ok "k8s/apply.sh never puts HCLOUD_TOKEN or a Stripe key into a Secret"; fi
 
 echo "== pins (review 2 U-5)"
@@ -199,8 +240,24 @@ grep -q "authzed/spicedb:$SPICEDB_VERSION" "$ROOT/deploy/dev/docker-compose.yml"
 
 echo "== up.sh guard"
 expect 1 "up.sh --apply refuses without RUUM_STAGING_APPLY=yes" env -u RUUM_STAGING_APPLY bash "$STG/up.sh" --apply
+expect 1 "up.sh refuses a malformed --restore-from" bash "$STG/up.sh" --restore-from 'x;id'
 
-if command -v helm >/dev/null; then
+# helm and tofu: from PATH (CI), else from the tools image (the Mac).
+have_docker=0
+command -v docker >/dev/null && docker info >/dev/null 2>&1 && have_docker=1
+if { ! command -v helm >/dev/null || ! command -v tofu >/dev/null; } && [[ $have_docker == 1 ]]; then
+  if TOOLS_IMG="$(bash "$STG/tools-image.sh" ensure 2>"$TMP/tools-image.log")"; then
+    intools() { docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL --tmpfs /tmp:rw,exec -e HOME=/tmp -v "$ROOT:$ROOT:ro" -w "$ROOT" "$TOOLS_IMG" "$@"; }
+    command -v helm >/dev/null || helm() { intools helm "$@"; }
+    command -v tofu >/dev/null || tofu() { intools tofu "$@"; }
+    echo "== helm and tofu from the tools image $TOOLS_IMG"
+  else
+    cat "$TMP/tools-image.log"
+  fi
+fi
+has() { command -v "$1" >/dev/null || declare -F "$1" >/dev/null; }
+
+if has helm; then
   echo "== charts (helm)"
   d="ghcr.io/nemecec/ruum-server@sha256:$(printf '%064d' 0)"
   e="ghcr.io/nemecec/ruum-edge@sha256:$(printf '%064d' 1)"
@@ -221,27 +278,31 @@ if command -v helm >/dev/null; then
   expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200
   grep -q "serverName: pg-202611111200" "$TMP/out" && grep -q "recovery:" "$TMP/out" && ok "restore mode bootstraps from the old generation" || bad "restore mode"
   expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform"
-  if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+  if [[ $have_docker == 1 ]]; then
     echo "== Caddyfile (caddy adapt --validate)"
     awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum.yaml" >"$TMP/Caddyfile"
     expect 0 "the rendered Caddyfile adapts" docker run --rm -v "$TMP/Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:$CADDY_VERSION-alpine" caddy adapt --config /etc/caddy/Caddyfile --validate
   fi
 else
-  echo "== charts: skipped (no helm; setup.sh installs it)"
+  echo "== charts: skipped (no helm; setup.sh installs it, or Docker for the tools image)"
 fi
 
-if command -v tofu >/dev/null; then
+if has tofu; then
   echo "== OpenTofu"
   for r in cluster persistent; do
     expect 0 "tofu fmt $r" tofu -chdir="$STG/tofu/$r" fmt -check -recursive
-    # The same layout as the checkout (the patches are read from ../../talos).
-    mkdir -p "$TMP/tree/tofu" "$TMP/tree/talos"
-    cp -R "$STG/tofu/$r" "$TMP/tree/tofu/$r"
-    cp -R "$STG/talos/." "$TMP/tree/talos/"
-    expect 0 "tofu validate $r" bash -c "cd '$TMP/tree/tofu/$r' && tofu init -backend=false -input=false >/dev/null && tofu validate -no-color"
+    # The same layout as the checkout (the patches are read from ../../talos), in a temp folder
+    # of wherever tofu runs.
+    v="t=\$(mktemp -d) && mkdir -p \$t/tofu && cp -R '$STG/tofu/$r' \$t/tofu/$r && cp -R '$STG/talos' \$t/talos"
+    v="$v && cd \$t/tofu/$r && tofu init -backend=false -input=false >/dev/null && tofu validate -no-color; rc=\$?; rm -rf \$t; exit \$rc"
+    if type -P tofu >/dev/null; then
+      expect 0 "tofu validate $r" bash -c "$v"
+    else
+      expect 0 "tofu validate $r (tools image)" intools bash -c "$v"
+    fi
   done
 else
-  echo "== OpenTofu: skipped (no tofu; setup.sh installs it)"
+  echo "== OpenTofu: skipped (no tofu; setup.sh installs it, or Docker for the tools image)"
 fi
 
 if [[ $failed == 0 ]]; then echo "staging tests: all passed"; else echo "staging tests: FAILED"; fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke checks of staging without any sign-in (plan 6.2 step 3, review 1 S-8, stgsec section 5).
-# Runs anywhere (laptop or build server); reads only public endpoints. Client IDs are compared
+# Runs on the Mac (curl, openssl, jq); reads only public endpoints. Client IDs are compared
 # with secrets.env locally and never printed.
 #
 #   ops/smoke.sh            all checks; exit 1 when one fails
@@ -45,13 +45,12 @@ done
 hsts="$(c -o /dev/null -D - "https://$CONTENT/" | tr -d '\r' | awk -F': ' 'tolower($1) == "strict-transport-security"')"
 [[ -z "$hsts" ]] && pass "no HSTS on $CONTENT" || fail "HSTS on $CONTENT (ruumapps.net must not get it)"
 
-# Review 1 B-8 / stgsec M-4: the console and admin APIs answer 403 from outside the build server.
-if [[ "$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)" != 2.31.194.2 ]]; then
-  for p in /ui/console /admin/v1/healthz /management/v1/healthz /system/v1/healthz; do
-    code="$(c -o /dev/null -w '%{http_code}' "https://$AUTH$p")"
-    [[ "$code" == 403 ]] && pass "$AUTH$p 403 from outside" || fail "$AUTH$p $code from outside (want 403)"
-  done
-fi
+# Review 1 B-8 / stgsec M-4: the console and admin APIs answer 403 to every public address
+# (adminSources is empty; the person reaches the console with kubectl port-forward).
+for p in /ui/console /admin/v1/healthz /management/v1/healthz /system/v1/healthz; do
+  code="$(c -o /dev/null -w '%{http_code}' "https://$AUTH$p")"
+  [[ "$code" == 403 ]] && pass "$AUTH$p 403 from outside" || fail "$AUTH$p $code from outside (want 403)"
+done
 
 # On-demand TLS: a content host that is no tenant gets no certificate (review 1 B-6).
 rnd="x$(openssl rand -hex 6).$CONTENT"

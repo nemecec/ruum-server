@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# The build-server half of destroy.sh (review 2 D-1, D-2, D-3). Environment: WORK, HERE and the
-# tofu settings of remote.sh (tofu_env has run), HCLOUD_TOKEN.
+# The container half of destroy.sh (review 2 D-1, D-2, D-3), run by steps.sh in the tools
+# container. Environment: WORK, HERE, TREE and the tofu settings of steps.sh (tofu_env has run),
+# HCLOUD_TOKEN.
 #
-#   destroy-remote.sh destroy-plan          three lists + state vs labels; changes nothing
-#   destroy-remote.sh destroy               the same plan, then apply it; snapshot; checks
-#   destroy-remote.sh sweep                 delete env=staging resources by label (lost state)
-#   destroy-remote.sh sweep-filter          read "kind ..." lines on stdin, print the ones that
+#   destroy-steps.sh destroy-plan          three lists + state vs labels; changes nothing
+#   destroy-steps.sh destroy               the same plan, then apply it; snapshot; checks
+#   destroy-steps.sh sweep                 delete env=staging resources by label (lost state)
+#   destroy-steps.sh sweep-filter          read "kind ..." lines on stdin, print the ones that
 #                                           sweep may delete (the rule of sweep; tests/run.sh)
 set -euo pipefail
 step="$1"
@@ -64,12 +65,14 @@ sweep_filter() {
 }
 
 plan_destroy() {
-  local dir="$WORK/tree/tofu/cluster"
+  local dir="$TREE/tofu/cluster" lock=()
   [[ -d "$dir/.terraform" ]] || die "no initialised cluster root in $dir"
+  # destroy-plan is read-only: it takes no state lock.
+  [[ "$step" == destroy-plan ]] && lock=(-lock=false)
   # D-1: a normal plan first; when the nodes do not answer, -refresh=false.
-  if ! (cd "$dir" && tofu plan -destroy -input=false -no-color -lock-timeout=60s -out="$WORK/destroy.tfplan" >"$WORK/destroy-plan.log" 2>&1); then
+  if ! (cd "$dir" && tofu plan -destroy -input=false -no-color -lock-timeout=60s ${lock[@]+"${lock[@]}"} -out="$WORK/destroy.tfplan" >"$WORK/destroy-plan.log" 2>&1); then
     log "the normal destroy plan failed (nodes down?); retrying with -refresh=false"
-    (cd "$dir" && tofu plan -destroy -refresh=false -input=false -no-color -lock-timeout=60s -out="$WORK/destroy.tfplan" >"$WORK/destroy-plan.log" 2>&1) ||
+    (cd "$dir" && tofu plan -destroy -refresh=false -input=false -no-color -lock-timeout=60s ${lock[@]+"${lock[@]}"} -out="$WORK/destroy.tfplan" >"$WORK/destroy-plan.log" 2>&1) ||
       { tail -30 "$WORK/destroy-plan.log" >&2; die "tofu plan -destroy failed also without refresh; see --sweep"; }
   fi
   # Scrubbed in the pipe: the destroy plan holds the whole prior state (code review F-5).
@@ -146,7 +149,7 @@ case "$step" in
     [[ "${RUUM_STAGING_DESTROY:-}" == "destroy ruum-staging" ]] || die "destroy needs RUUM_STAGING_DESTROY='destroy ruum-staging'"
     plan_destroy
     three_lists
-    (cd "$WORK/tree/tofu/cluster" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/destroy.tfplan")
+    (cd "$TREE/tofu/cluster" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/destroy.tfplan")
     for id in $(hapi "images?type=snapshot&label_selector=env%3Dstaging%2Cos%3Dtalos" | jq -r '.images[].id'); do
       HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud image delete "$id"
     done

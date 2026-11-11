@@ -58,36 +58,33 @@
           "name": "ruum-staging-nodes",
           "rule": [
             {
-              "description": "ICMP from the build server (review stgsec S-13)",
+              "description": "ICMP from the operator Mac (review stgsec S-13)",
               "destination_ips": [],
               "direction": "in",
               "port": "",
               "protocol": "icmp",
               "source_ips": [
-                "2.31.194.2/32",
-                "2a01:4f8:c015:3c76::/64"
+                "203.0.113.10/32"
               ]
             },
             {
-              "description": "Kubernetes API from the build server",
+              "description": "Kubernetes API from the operator Mac",
               "destination_ips": [],
               "direction": "in",
               "port": "6443",
               "protocol": "tcp",
               "source_ips": [
-                "2.31.194.2/32",
-                "2a01:4f8:c015:3c76::/64"
+                "203.0.113.10/32"
               ]
             },
             {
-              "description": "Talos API from the build server",
+              "description": "Talos API from the operator Mac",
               "destination_ips": [],
               "direction": "in",
               "port": "50000",
               "protocol": "tcp",
               "source_ips": [
-                "2.31.194.2/32",
-                "2a01:4f8:c015:3c76::/64"
+                "203.0.113.10/32"
               ]
             }
           ]
@@ -100,21 +97,18 @@
             {
               "destination_ips": [],
               "source_ips": [
-                false,
                 false
               ]
             },
             {
               "destination_ips": [],
               "source_ips": [
-                false,
                 false
               ]
             },
             {
               "destination_ips": [],
               "source_ips": [
-                false,
                 false
               ]
             }

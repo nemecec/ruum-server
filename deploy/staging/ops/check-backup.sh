@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bring-up check of the backups (code review F-7), on the build server as ruum-ops with the admin
-# kubeconfig (remote.sh check-backup; up.sh --apply runs it after the platform step).
+# Bring-up check of the backups (code review F-7), in the tools container with the admin
+# kubeconfig (steps.sh check-backup; up.sh --apply runs it after the platform step).
 #
 #   KUBECONFIG=... ops/check-backup.sh [--wal-only]
 #

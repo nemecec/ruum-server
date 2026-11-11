@@ -1,4 +1,5 @@
-# OpenTofu work files never go into git (remote.sh works in ~/.ruum-staging on the build server).
+# OpenTofu work files never go into git (steps.sh works in the container's /tmp and in
+# ~/.config/ruum/staging on the Mac).
 .terraform/
 *.tfstate
 *.tfstate.*

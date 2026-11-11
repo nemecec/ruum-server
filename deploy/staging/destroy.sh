@@ -25,7 +25,7 @@ case "${1:-}" in
 runs it, after the compliance retention (7 days after the last write) has ended:
   1. stop staging first (destroy.sh), so nothing writes to the buckets;
   2. remove `lifecycle { prevent_destroy = true }` from tofu/persistent/main.tf in a branch;
-  3. RUUM_STAGING_APPLY=yes ... tofu destroy of tofu/persistent on the build server as ruum-ops.
+  3. tofu destroy of tofu/persistent on the Mac, in the tools container (deploy/staging/tool.sh).
 Scaleway refuses to delete a locked version before its retention date, whatever the key.
 TXT
     exit 0
@@ -35,16 +35,16 @@ TXT
 esac
 
 if [[ $mode == plan ]]; then
-  stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_remote ro destroy-plan
+  stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run ro destroy-plan
   exit 0
 fi
 
-stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_remote ro destroy-plan
+stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run ro destroy-plan
 printf '\nType "destroy ruum-staging" to %s: ' "$([[ $mode == sweep ]] && echo "delete by label" || echo destroy)"
 read -r answer </dev/tty
 [[ "$answer" == "destroy ruum-staging" ]] || stg_die "not confirmed; nothing was changed"
 step=destroy
 [[ $mode == sweep ]] && step=sweep
 # The typed confirmation goes to the remote step on stdin, with the secrets.
-{ printf 'RUUM_STAGING_DESTROY=%s\n' "$answer"; stg_secret_stream "${STG_NAMES_TOFU[@]}"; } | stg_remote rw "$step"
+{ printf 'RUUM_STAGING_DESTROY=%s\n' "$answer"; stg_secret_stream "${STG_NAMES_TOFU[@]}"; } | stg_run rw "$step"
 stg_audit "$step" "done"

@@ -3,7 +3,7 @@
 #
 #   price.sh <pricing.json> <cluster-plan.json> [<persistent-plan.json>] [--snapshot-gb N]
 #
-# pricing.json is `GET https://api.hetzner.cloud/v1/pricing` (remote.sh fetches it live). Prices
+# pricing.json is `GET https://api.hetzner.cloud/v1/pricing` (steps.sh fetches it live). Prices
 # are gross (with VAT, as the API reports them), per month. The end state of the plan counts
 # (planned_values), not only what is new. Items that the Hetzner API does not price are fixed
 # estimates and marked "estimate": the Hetzner Object Storage base fee and Scaleway.

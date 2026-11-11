@@ -1,22 +1,24 @@
-# Shared functions of the laptop-side staging scripts (up.sh, deploy.sh, status.sh, destroy.sh,
-# secrets-push.sh). Sourced, not run.
+# Shared functions of the staging scripts (up.sh, deploy.sh, status.sh, destroy.sh,
+# secrets-push.sh, bootstrap-state.sh, tool.sh). Sourced, not run.
 #
-# Where things run (review 2 R-1): the scripts run on the laptop, where the secrets file is. Each
-# step runs on the build server over ssh. Secrets go to the remote process on its stdin as
-# NAME=value lines: never on a command line (not in `ps`), never in a file, never printed.
+# Where things run (decision of the person, 2026-11-11): every staging step runs on the person's
+# Mac, never on the build server. The build server's agent user is in the docker group, which is
+# root on that host, so no user separation there can protect the staging credentials.
 #
-# Remote modes:
-#   ops     (default) ssh as `ruum-ops` with the laptop's ops key (RUUM_OPS_KEY). The key has a
-#           forced command (ops/ssh-entry.sh) that runs only remote.sh steps from the root-owned
-#           checkout of a commit of main (/opt/ruum-staging/current, ops/install-ops-user.sh).
-#           Build jobs run as `ruum`, have no ops key and no sudo rule into ruum-ops, and cannot
-#           read the staging credentials (review 2 O-1, review 1 S-2, code review F-2).
-#   sudo    the older form: ssh as `ruum`, then `sudo -n -u ruum-ops` remote.sh. Works only when
-#           the person has kept a sudo rule for it (panel/staging-buildbox-hardening.md); it lets
-#           any build job call the steps too, so ops is the default.
-#   direct  RUUM_STAGING_REMOTE=direct: rsync this checkout to ~/stg-direct of `ruum` and run there.
-#           Read-only only: plans, validate, status without cluster credentials. Every step that
-#           creates, changes or deletes something refuses this mode.
+# - The scripts run in the Mac's own bash (macOS bash 3.2 is enough). They read the secrets file
+#   ~/.config/ruum/secrets.env line by line, one name at a time, and never source it.
+# - Each step runs steps.sh in the tools container (tools-image.sh: one local image with
+#   OpenTofu, talosctl, kubectl, helm, helmfile, cosign, hcloud and hcloud-upload-image at the
+#   versions and SHA-256 sums of versions.env, on a digest-pinned Alpine base). Docker Desktop
+#   runs it; `docker run --rm`, so nothing stays behind but the files in the work folder.
+# - Secrets go to the container on its stdin as NAME=value lines: never on a command line (not
+#   in `ps`, not in `docker inspect`), never in a file, never printed.
+# - The work folder ~/.config/ruum/staging (0700) holds the kubeconfig, the talosconfig and the
+#   plans. It is the only folder that the container can write. The checkout is mounted read-only.
+#
+# The staging firewall opens the Talos API (50000) and the Kubernetes API (6443) only to the Mac's
+# current public IPv4 address (steps.sh admin_cidrs). When that address changes, run
+# `RUUM_STAGING_APPLY=yes up.sh --apply --infra-only` to move the firewall rule.
 
 # shellcheck shell=bash
 STG_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,14 +26,8 @@ STG_ROOT="$(cd "$STG_HERE/../.." && pwd)"
 # shellcheck source=versions.env
 . "$STG_HERE/versions.env"
 
-STG_HOST="${RUUM_BUILD_HOST:-ruum@2.31.194.2}"
-STG_SSH_KEY="${RUUM_BUILD_KEY:-$HOME/.config/ruum/buildbox_ed25519}"
 STG_SECRETS="${RUUM_SECRETS_FILE:-$HOME/.config/ruum/secrets.env}"
-STG_MODE="${RUUM_STAGING_REMOTE:-ops}"
-STG_OPS_HOST="${RUUM_OPS_HOST:-ruum-ops@${STG_HOST#*@}}"
-STG_OPS_KEY="${RUUM_OPS_KEY:-$HOME/.config/ruum/staging_ops_ed25519}"
-STG_OPS_RUN="/opt/ruum-staging/current/deploy/staging/remote.sh"
-STG_DIRECT_DIR="stg-direct"
+STG_WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 
 stg_log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 stg_warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -58,7 +54,7 @@ stg_missing() {
   for n in "$@"; do stg_has_secret "$n" || echo "$n"; done
 }
 
-# Prints NAME=value for each name (to be piped into stg_remote). Never call it on a terminal.
+# Prints NAME=value for each name (to be piped into stg_run). Never call it on a terminal.
 stg_secret_stream() {
   local n v
   for n in "$@"; do
@@ -68,43 +64,63 @@ stg_secret_stream() {
   printf '__END__\n'
 }
 
-# The names each remote step needs. Nothing else is ever sent.
+# The names each step needs. Nothing else is ever sent.
 # shellcheck disable=SC2034 # used by the scripts that source this file
 STG_NAMES_TOFU=(HCLOUD_TOKEN HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY SCW_ACCESS_KEY SCW_SECRET_KEY
   SCW_DEFAULT_PROJECT_ID SCW_DEFAULT_ORGANIZATION_ID TOFU_STATE_PASSPHRASE)
 
-stg_ssh() {
-  ssh -o BatchMode=yes -o ConnectTimeout=15 -i "$STG_SSH_KEY" "$STG_HOST" "$@"
+# The work folder on the Mac: 0700, owned by the person.
+stg_work() {
+  mkdir -p "$STG_WORK"
+  chmod 700 "$STG_WORK"
 }
 
-# Sync this checkout's deploy/staging to the build server (direct mode only).
-stg_sync_direct() {
-  # </dev/null: the secrets on stdin are for the remote step, not for these helpers.
-  stg_ssh "mkdir -p $STG_DIRECT_DIR/deploy/staging" </dev/null
-  rsync -az --delete -e "ssh -o BatchMode=yes -i $STG_SSH_KEY" \
-    "$STG_ROOT/deploy/staging/" "$STG_HOST:$STG_DIRECT_DIR/deploy/staging/" </dev/null
+# The name of the tools image for this checkout (tools-image.sh builds it when it is missing).
+stg_image() {
+  STG_IMAGE="$(bash "$STG_HERE/tools-image.sh" ensure)" || stg_die "the tools image is not available (deploy/staging/tools-image.sh build)"
+  [[ "$STG_IMAGE" =~ ^ruum-staging-tools:[0-9a-f]{16}$ ]] || stg_die "unexpected tools image name '$STG_IMAGE'"
 }
 
-# stg_remote MUTATES STEP ARGS...: run remote.sh STEP on the build server; stdin is passed on.
-# MUTATES is "ro" or "rw": an "rw" step refuses direct mode.
-stg_remote() {
-  local mutates="$1"
+# stg_docker [docker run options...] -- COMMAND...: run COMMAND in the tools container.
+# The checkout is mounted read-only and the work folder read-write, both at their Mac paths, so
+# every path in a message is the same on both sides. No capabilities, no new privileges, the
+# person's user and group IDs. stdin is passed on (-i), so the secrets reach the command.
+stg_docker() {
+  local opts=()
+  while [[ $# -gt 0 && "$1" != -- ]]; do opts+=("$1"); shift; done
+  [[ "${1:-}" == -- ]] && shift
+  command -v docker >/dev/null || stg_die "docker is missing (Docker Desktop)"
+  stg_work
+  stg_image
+  docker run --rm -i --init \
+    --user "$(id -u):$(id -g)" \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,exec,size=2g \
+    -e HOME=/tmp \
+    -e RUUM_STAGING_WORK="$STG_WORK" \
+    -e KUBECONFIG="$STG_WORK/kubeconfig" \
+    -e TALOSCONFIG="$STG_WORK/talosconfig" \
+    -v "$STG_ROOT:$STG_ROOT:ro" \
+    -v "$STG_WORK:$STG_WORK" \
+    -w "$STG_ROOT" \
+    ${opts[@]+"${opts[@]}"} \
+    "$STG_IMAGE" "$@"
+}
+
+# stg_run MUTATES STEP ARGS...: run steps.sh STEP in the tools container; stdin is passed on.
+# MUTATES is "ro" or "rw". Only an "rw" step gets RUUM_STAGING_APPLY (when it is "yes" here), and
+# the steps that create or change cloud resources refuse to run without it (steps.sh).
+# RUUM_ADMIN_IP, when set, replaces the detected public address of the Mac (steps.sh checks it).
+stg_run() {
+  local mutates="$1" env=()
   shift
-  case "$STG_MODE" in
-    direct)
-      [[ "$mutates" == ro ]] || stg_die "RUUM_STAGING_REMOTE=direct is for read-only steps; '$1' changes staging. Use the ruum-ops mode (ops/install-ops-user.sh)."
-      stg_sync_direct
-      stg_ssh "bash $STG_DIRECT_DIR/deploy/staging/remote.sh $(printf '%q ' "$@")"
-      ;;
-    ops)
-      # The forced command takes plain words only (ops/ssh-entry.sh); no quoting needed.
-      ssh -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes -i "$STG_OPS_KEY" "$STG_OPS_HOST" "$*"
-      ;;
-    sudo)
-      stg_ssh "sudo -n -u ruum-ops $STG_OPS_RUN $(printf '%q ' "$@")"
-      ;;
-    *) stg_die "RUUM_STAGING_REMOTE must be ops, sudo or direct" ;;
+  case "$mutates" in
+    ro) ;;
+    rw) [[ "${RUUM_STAGING_APPLY:-}" != yes ]] || env+=(-e RUUM_STAGING_APPLY=yes) ;;
+    *) stg_die "stg_run: ro or rw, not '$mutates'" ;;
   esac
+  [[ -z "${RUUM_ADMIN_IP:-}" ]] || env+=(-e "RUUM_ADMIN_IP=$RUUM_ADMIN_IP")
+  stg_docker ${env[@]+"${env[@]}"} -- bash "$STG_HERE/steps.sh" "$@"
 }
 
 # One audit line per operation (review 2 O-2): who, what, when, result. Local file; the digest
