@@ -11,7 +11,7 @@ variable "state_passphrase" {
 variable "location" {
   description = "Hetzner location. Ruum starts in Helsinki (DESIGN 13)."
   type        = string
-  default     = "hel1"
+  default     = "fsn1"
 }
 
 variable "server_type" {
