@@ -52,6 +52,16 @@ pub struct Config {
     /// `RUUM_REQUEST_TIMEOUT_SECONDS`: a request without an answer after this time gets `408`
     /// (default 120; the longest long poll is 30 seconds).
     pub request_timeout: std::time::Duration,
+    /// `RUUM_INTERNAL_BIND`: the listener of the internal router (`ruum_api::internal`: the
+    /// on-demand TLS `ask` endpoint of the edge). Off when not set. Never route it through the
+    /// public edge.
+    pub internal_bind: Option<String>,
+    /// `RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR`: new content hosts that may get a certificate per hour
+    /// (default 20).
+    pub tls_ask_new_hosts_per_hour: usize,
+    /// `RUUM_SIGNUP_ALLOWED_EMAILS` and `RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS`: the allow-list of
+    /// a closed server (`ruum_api::signup`). `None` when neither is set: open.
+    pub signup: Option<ruum_api::signup::EmailAllowList>,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -100,6 +110,16 @@ impl Config {
                     .context("RUUM_REQUEST_TIMEOUT_SECONDS must be a number")?
                     .unwrap_or(120)
                     .max(31),
+            ),
+            internal_bind: var("RUUM_INTERNAL_BIND"),
+            tls_ask_new_hosts_per_hour: var("RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR")
+                .map(|v| v.parse::<usize>())
+                .transpose()
+                .context("RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR must be a number")?
+                .unwrap_or(20),
+            signup: ruum_api::signup::EmailAllowList::from_settings(
+                var("RUUM_SIGNUP_ALLOWED_EMAILS").as_deref(),
+                var("RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS").as_deref(),
             ),
         })
     }

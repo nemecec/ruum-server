@@ -254,6 +254,7 @@ mod tests {
             public_url: URL.into(),
             content_url: "http://content.ruumapps.localhost".into(),
             dav_url: "http://127.0.0.1:8492/".into(),
+            signup: None,
         };
         let router = crate::app::platform(
             AppState::new(s.clone(), config),

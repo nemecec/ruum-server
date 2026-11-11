@@ -11,6 +11,8 @@ them. The working method is section 18.
 - `migrations/`: SQL migrations (sqlx). One migration change at a time.
 - `web/`: the web UI (React + TypeScript + Vite). The API client is generated from `contracts/openapi.yaml`.
 - `deploy/dev/`: the laptop stack (Docker Compose). `scripts/dev.sh up|down|seed|logs|clean`.
+- `deploy/staging/`: staging as code (OpenTofu, Talos, Helm). `deploy/staging/README.md`. Plans are
+  read-only (`up.sh`); applying needs `RUUM_STAGING_APPLY=yes`. Images: `deploy/images/`, `.github/workflows/images.yml`.
 
 ## Rust rules
 

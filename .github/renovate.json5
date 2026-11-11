@@ -1,0 +1,26 @@
+// Renovate (review 2 U-1): opens pull requests for the pinned versions of staging
+// (deploy/staging/versions.env, the "# renovate:" comments) and for the GitHub Actions.
+// A version change is reviewed like code: up.sh (plan) and the staging tests run on the PR.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  minimumReleaseAge: "14 days",
+  enabledManagers: ["custom.regex", "github-actions", "dockerfile"],
+  customManagers: [
+    {
+      customType: "regex",
+      managerFilePatterns: ["/^deploy/staging/versions\\.env$/"],
+      matchStrings: [
+        "# renovate: datasource=(?<datasource>\\S+)( registryUrl=(?<registryUrl>\\S+))? depName=(?<depName>\\S+)\\n[A-Z_]+=(?<currentValue>\\S+)",
+      ],
+    },
+  ],
+  packageRules: [
+    {
+      // A new tool version also needs new SHA-256 lines in versions.env; the PR is a reminder.
+      matchFileNames: ["deploy/staging/versions.env"],
+      labels: ["staging"],
+      automerge: false,
+    },
+  ],
+}

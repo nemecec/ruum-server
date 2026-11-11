@@ -1,0 +1,42 @@
+# deploy-chart.sh sets the two image references, always by digest (review 1 S-7):
+#   ghcr.io/nemecec/ruum-server@sha256:...   ghcr.io/nemecec/ruum-edge@sha256:...
+images:
+  server: ""
+  edge: ""
+# The commit of the images, recorded in the release (and in the ConfigMap ruum-release).
+commit: ""
+
+hosts:
+  public: staging.ruum.space
+  auth: auth.staging.ruum.space
+  dav: dav.staging.ruum.space
+  content: content.staging.ruumapps.net
+
+# ACME (review 2 R-3): staging never uses production's Let's Encrypt quota.
+#   letsencrypt-staging: the Let's Encrypt staging CA (not trusted by browsers; for bring-up)
+#   zerossl:             ZeroSSL (trusted; separate limits; for the person's sign-in test)
+acme:
+  issuer: letsencrypt-staging
+  email: ""
+
+# Sources allowed to reach the Zitadel console and admin APIs (review stgsec M-4): the build
+# server, IPv4 and IPv6 (the same as admin_cidrs of tofu/cluster). When the build server moves,
+# change both (review 2 O-3).
+adminSources:
+  - 2.31.194.2/32
+  - 2a01:4f8:c015:3c76::/64
+
+# The load balancer's private subnet: the only source allowed to send proxy protocol headers.
+proxyProtocolFrom: 10.20.1.0/24
+
+server:
+  resources:
+    requests: { cpu: 100m, memory: 200Mi }
+    limits: { memory: 512Mi }
+  # New content hosts per hour that may get a certificate (the ask endpoint, review 1 B-5).
+  tlsAskNewHostsPerHour: 20
+
+edge:
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }

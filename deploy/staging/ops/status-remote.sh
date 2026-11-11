@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# The build-server half of status.sh. Environment: WORK, KUBECONFIG_FILE, HCLOUD_TOKEN.
+#   status-remote.sh [--checks]          the report
+#   status-remote.sh --deployed-commit   only the deployed commit (deploy.sh), or nothing
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+kc=()
+if [[ -s "${KUBECONFIG_FILE:-}" ]]; then
+  kc=(--kubeconfig "$KUBECONFIG_FILE")
+elif [[ -s "$WORK/deployer.kubeconfig" ]]; then
+  kc=(--kubeconfig "$WORK/deployer.kubeconfig")
+fi
+if [[ "${1:-}" == --deployed-commit ]]; then
+  [[ ${#kc[@]} -gt 0 ]] && kubectl "${kc[@]}" -n ruum get configmap ruum-release -o jsonpath='{.data.commit}' 2>/dev/null
+  exit 0
+fi
+hapi() {
+  printf 'header = "Authorization: Bearer %s"\n' "$HCLOUD_TOKEN" | curl -fsS -K - "https://api.hetzner.cloud/v1/$1"
+}
+echo "== Hetzner resources with env=staging"
+for kind in servers load_balancers primary_ips networks firewalls placement_groups; do
+  hapi "$kind?label_selector=env%3Dstaging" | jq -r --arg k "$kind" '.[$k][] | "  \($k): \(.name)\(if .server_type then " (" + .server_type.name + ", " + .status + ")" else "" end)"'
+done
+hapi "images?type=snapshot&label_selector=env%3Dstaging" | jq -r '.images[] | "  snapshot: \(.description) (\(.image_size // 0) GB)"'
+echo "== Orphans: resources without env=staging, except the build server (review 2 C-2)"
+for kind in servers load_balancers primary_ips networks firewalls volumes floating_ips; do
+  hapi "$kind" | jq -r --arg k "$kind" '.[$k][] | select((.labels.env // "") != "staging") | select((.name // "") | test("buildbox|^primary_ip-160842") | not) | "  ORPHAN \($k): \(.name)"'
+done
+echo "== Monthly price of what exists"
+bash "$HERE/cost-report.sh" 2>/dev/null || echo "  (cost-report failed)"
+if [[ ${#kc[@]} -eq 0 ]]; then
+  echo "== Cluster: no kubeconfig here (direct mode, or staging not created)"
+  exit 0
+fi
+echo "== Nodes"
+kubectl "${kc[@]}" get nodes -o wide 2>&1 | sed 's/^/  /'
+echo "== Pods not Running/Completed"
+kubectl "${kc[@]}" get pods -A --no-headers 2>&1 | awk '$4 != "Running" && $4 != "Completed"' | sed 's/^/  /'
+echo "== Services that are not ClusterIP (only the edge NodePort is expected)"
+kubectl "${kc[@]}" get svc -A --no-headers 2>&1 | awk '$3 != "ClusterIP"' | sed 's/^/  /'
+echo "== CNPG"
+kubectl "${kc[@]}" -n data get cluster pg -o jsonpath='  phase: {.status.phase}; primary: {.status.currentPrimary}; last backup: {.status.lastSuccessfulBackup}{"\n"}' 2>&1
+kubectl "${kc[@]}" -n data get backups --sort-by=.metadata.creationTimestamp 2>&1 | tail -3 | sed 's/^/  /'
+echo "== Deployed commit"
+kubectl "${kc[@]}" -n ruum get configmap ruum-release -o jsonpath='  {.data.commit}{"\n"}' 2>&1
+if [[ "${1:-}" == --checks ]]; then
+  echo "== Secrets that must not be in the cluster (stgsec 5.8)"
+  if kubectl "${kc[@]}" get secrets -A -o json | jq -r '.items[].data // {} | keys[]' | grep -qiE 'HCLOUD|STRIPE'; then
+    echo "  FAIL: a secret key named HCLOUD* or STRIPE* exists"
+  else
+    echo "  PASS: no HCLOUD or Stripe key in any Secret"
+  fi
+  echo "== Zitadel drift"
+  bash "$HERE/zitadel-bootstrap.sh" check 2>&1 | sed 's/^/  /'
+fi

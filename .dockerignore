@@ -1,0 +1,13 @@
+# Build context of deploy/images/*.Dockerfile (the repository root).
+.git
+target
+target.*
+**/node_modules
+web/dist
+web/test-results
+web/playwright-report
+deploy/dev/.env
+deploy/dev/.state
+docs
+bench
+spikes

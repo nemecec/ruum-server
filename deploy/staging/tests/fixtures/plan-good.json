@@ -1,0 +1,809 @@
+{
+ "format_version": "1.2",
+ "resource_changes": [
+  {
+   "address": "hcloud_network.staging",
+   "mode": "managed",
+   "type": "hcloud_network",
+   "name": "staging",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "ruum-staging",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_network_subnet.nodes",
+   "mode": "managed",
+   "type": "hcloud_network_subnet",
+   "name": "nodes",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "ip_range": "10.20.1.0/24"
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_firewall.nodes",
+   "mode": "managed",
+   "type": "hcloud_firewall",
+   "name": "nodes",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "ruum-staging-nodes",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_placement_group.nodes",
+   "mode": "managed",
+   "type": "hcloud_placement_group",
+   "name": "nodes",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "ruum-staging-nodes",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     },
+     "type": "spread"
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_primary_ip.v4[\"stg-1\"]",
+   "mode": "managed",
+   "type": "hcloud_primary_ip",
+   "name": "v4",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-1-v4",
+     "type": "ipv4",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_primary_ip.v6[\"stg-1\"]",
+   "mode": "managed",
+   "type": "hcloud_primary_ip",
+   "name": "v6",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-1-v6",
+     "type": "ipv6",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_server.node[\"stg-1\"]",
+   "mode": "managed",
+   "type": "hcloud_server",
+   "name": "node",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-1",
+     "server_type": "cx23",
+     "location": "hel1",
+     "image": "pending-talos-snapshot",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     },
+     "user_data": null,
+     "firewall_ids": null
+    },
+    "after_unknown": {
+     "firewall_ids": true
+    }
+   }
+  },
+  {
+   "address": "hcloud_primary_ip.v4[\"stg-2\"]",
+   "mode": "managed",
+   "type": "hcloud_primary_ip",
+   "name": "v4",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-2-v4",
+     "type": "ipv4",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_primary_ip.v6[\"stg-2\"]",
+   "mode": "managed",
+   "type": "hcloud_primary_ip",
+   "name": "v6",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-2-v6",
+     "type": "ipv6",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_server.node[\"stg-2\"]",
+   "mode": "managed",
+   "type": "hcloud_server",
+   "name": "node",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-2",
+     "server_type": "cx23",
+     "location": "hel1",
+     "image": "pending-talos-snapshot",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     },
+     "user_data": null,
+     "firewall_ids": null
+    },
+    "after_unknown": {
+     "firewall_ids": true
+    }
+   }
+  },
+  {
+   "address": "hcloud_primary_ip.v4[\"stg-3\"]",
+   "mode": "managed",
+   "type": "hcloud_primary_ip",
+   "name": "v4",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-3-v4",
+     "type": "ipv4",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_primary_ip.v6[\"stg-3\"]",
+   "mode": "managed",
+   "type": "hcloud_primary_ip",
+   "name": "v6",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-3-v6",
+     "type": "ipv6",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_server.node[\"stg-3\"]",
+   "mode": "managed",
+   "type": "hcloud_server",
+   "name": "node",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "stg-3",
+     "server_type": "cx23",
+     "location": "hel1",
+     "image": "pending-talos-snapshot",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum",
+      "role": "node"
+     },
+     "user_data": null,
+     "firewall_ids": null
+    },
+    "after_unknown": {
+     "firewall_ids": true
+    }
+   }
+  },
+  {
+   "address": "hcloud_load_balancer.edge",
+   "mode": "managed",
+   "type": "hcloud_load_balancer",
+   "name": "edge",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "name": "ruum-staging",
+     "load_balancer_type": "lb11",
+     "location": "hel1",
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_load_balancer_service.https",
+   "mode": "managed",
+   "type": "hcloud_load_balancer_service",
+   "name": "https",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "listen_port": 443
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_zone_rrset.r[\"staging-A\"]",
+   "mode": "managed",
+   "type": "hcloud_zone_rrset",
+   "name": "r",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "zone": "ruum.space",
+     "name": "staging",
+     "type": "A",
+     "ttl": 300,
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_zone_rrset.r[\"auth.staging-AAAA\"]",
+   "mode": "managed",
+   "type": "hcloud_zone_rrset",
+   "name": "r",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "zone": "ruum.space",
+     "name": "auth.staging",
+     "type": "AAAA",
+     "ttl": 300,
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_zone_rrset.r[\"*.content.staging-A\"]",
+   "mode": "managed",
+   "type": "hcloud_zone_rrset",
+   "name": "r",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "zone": "ruumapps.net",
+     "name": "*.content.staging",
+     "type": "A",
+     "ttl": 300,
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "hcloud_zone_rrset.r[\"content.staging-CAA\"]",
+   "mode": "managed",
+   "type": "hcloud_zone_rrset",
+   "name": "r",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "zone": "ruumapps.net",
+     "name": "content.staging",
+     "type": "CAA",
+     "ttl": 300,
+     "labels": {
+      "env": "staging",
+      "managed-by": "tofu",
+      "project": "ruum"
+     }
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "minio_s3_bucket.blobs",
+   "mode": "managed",
+   "type": "minio_s3_bucket",
+   "name": "blobs",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {
+     "bucket": "ruum-staging-blobs"
+    },
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "talos_machine_secrets.this",
+   "mode": "managed",
+   "type": "talos_machine_secrets",
+   "name": "this",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {},
+    "after_unknown": {}
+   }
+  },
+  {
+   "address": "terraform_data.generation",
+   "mode": "managed",
+   "type": "terraform_data",
+   "name": "generation",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "before": null,
+    "after": {},
+    "after_unknown": {}
+   }
+  }
+ ],
+ "planned_values": {
+  "root_module": {
+   "resources": [
+    {
+     "address": "hcloud_network.staging",
+     "mode": "managed",
+     "type": "hcloud_network",
+     "values": {
+      "name": "ruum-staging",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "hcloud_network_subnet.nodes",
+     "mode": "managed",
+     "type": "hcloud_network_subnet",
+     "values": {
+      "ip_range": "10.20.1.0/24"
+     }
+    },
+    {
+     "address": "hcloud_firewall.nodes",
+     "mode": "managed",
+     "type": "hcloud_firewall",
+     "values": {
+      "name": "ruum-staging-nodes",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "hcloud_placement_group.nodes",
+     "mode": "managed",
+     "type": "hcloud_placement_group",
+     "values": {
+      "name": "ruum-staging-nodes",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      },
+      "type": "spread"
+     }
+    },
+    {
+     "address": "hcloud_primary_ip.v4[\"stg-1\"]",
+     "mode": "managed",
+     "type": "hcloud_primary_ip",
+     "values": {
+      "name": "stg-1-v4",
+      "type": "ipv4",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      }
+     }
+    },
+    {
+     "address": "hcloud_primary_ip.v6[\"stg-1\"]",
+     "mode": "managed",
+     "type": "hcloud_primary_ip",
+     "values": {
+      "name": "stg-1-v6",
+      "type": "ipv6",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      }
+     }
+    },
+    {
+     "address": "hcloud_server.node[\"stg-1\"]",
+     "mode": "managed",
+     "type": "hcloud_server",
+     "values": {
+      "name": "stg-1",
+      "server_type": "cx23",
+      "location": "hel1",
+      "image": "pending-talos-snapshot",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      },
+      "user_data": null,
+      "firewall_ids": null
+     }
+    },
+    {
+     "address": "hcloud_primary_ip.v4[\"stg-2\"]",
+     "mode": "managed",
+     "type": "hcloud_primary_ip",
+     "values": {
+      "name": "stg-2-v4",
+      "type": "ipv4",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      }
+     }
+    },
+    {
+     "address": "hcloud_primary_ip.v6[\"stg-2\"]",
+     "mode": "managed",
+     "type": "hcloud_primary_ip",
+     "values": {
+      "name": "stg-2-v6",
+      "type": "ipv6",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      }
+     }
+    },
+    {
+     "address": "hcloud_server.node[\"stg-2\"]",
+     "mode": "managed",
+     "type": "hcloud_server",
+     "values": {
+      "name": "stg-2",
+      "server_type": "cx23",
+      "location": "hel1",
+      "image": "pending-talos-snapshot",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      },
+      "user_data": null,
+      "firewall_ids": null
+     }
+    },
+    {
+     "address": "hcloud_primary_ip.v4[\"stg-3\"]",
+     "mode": "managed",
+     "type": "hcloud_primary_ip",
+     "values": {
+      "name": "stg-3-v4",
+      "type": "ipv4",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      }
+     }
+    },
+    {
+     "address": "hcloud_primary_ip.v6[\"stg-3\"]",
+     "mode": "managed",
+     "type": "hcloud_primary_ip",
+     "values": {
+      "name": "stg-3-v6",
+      "type": "ipv6",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      }
+     }
+    },
+    {
+     "address": "hcloud_server.node[\"stg-3\"]",
+     "mode": "managed",
+     "type": "hcloud_server",
+     "values": {
+      "name": "stg-3",
+      "server_type": "cx23",
+      "location": "hel1",
+      "image": "pending-talos-snapshot",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum",
+       "role": "node"
+      },
+      "user_data": null,
+      "firewall_ids": null
+     }
+    },
+    {
+     "address": "hcloud_load_balancer.edge",
+     "mode": "managed",
+     "type": "hcloud_load_balancer",
+     "values": {
+      "name": "ruum-staging",
+      "load_balancer_type": "lb11",
+      "location": "hel1",
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "hcloud_load_balancer_service.https",
+     "mode": "managed",
+     "type": "hcloud_load_balancer_service",
+     "values": {
+      "listen_port": 443
+     }
+    },
+    {
+     "address": "hcloud_zone_rrset.r[\"staging-A\"]",
+     "mode": "managed",
+     "type": "hcloud_zone_rrset",
+     "values": {
+      "zone": "ruum.space",
+      "name": "staging",
+      "type": "A",
+      "ttl": 300,
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "hcloud_zone_rrset.r[\"auth.staging-AAAA\"]",
+     "mode": "managed",
+     "type": "hcloud_zone_rrset",
+     "values": {
+      "zone": "ruum.space",
+      "name": "auth.staging",
+      "type": "AAAA",
+      "ttl": 300,
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "hcloud_zone_rrset.r[\"*.content.staging-A\"]",
+     "mode": "managed",
+     "type": "hcloud_zone_rrset",
+     "values": {
+      "zone": "ruumapps.net",
+      "name": "*.content.staging",
+      "type": "A",
+      "ttl": 300,
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "hcloud_zone_rrset.r[\"content.staging-CAA\"]",
+     "mode": "managed",
+     "type": "hcloud_zone_rrset",
+     "values": {
+      "zone": "ruumapps.net",
+      "name": "content.staging",
+      "type": "CAA",
+      "ttl": 300,
+      "labels": {
+       "env": "staging",
+       "managed-by": "tofu",
+       "project": "ruum"
+      }
+     }
+    },
+    {
+     "address": "minio_s3_bucket.blobs",
+     "mode": "managed",
+     "type": "minio_s3_bucket",
+     "values": {
+      "bucket": "ruum-staging-blobs"
+     }
+    },
+    {
+     "address": "talos_machine_secrets.this",
+     "mode": "managed",
+     "type": "talos_machine_secrets",
+     "values": {}
+    },
+    {
+     "address": "terraform_data.generation",
+     "mode": "managed",
+     "type": "terraform_data",
+     "values": {}
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: ruum
+description: ruum-server and the Caddy edge (with the web UI) on staging.
+type: application
+version: 0.1.0

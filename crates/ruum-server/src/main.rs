@@ -82,8 +82,16 @@ async fn main() -> anyhow::Result<()> {
             public_url: config.public_url.clone(),
             content_url: config.content_url.clone(),
             dav_url: config.dav_url.clone(),
+            signup: config.signup.clone().map(std::sync::Arc::new),
         },
     );
+    match &config.signup {
+        Some(list) => tracing::info!(
+            entries = list.len(),
+            "sign-up is closed: only addresses on the allow-list can sign in and create spaces"
+        ),
+        None => tracing::info!("sign-up is open (RUUM_SIGNUP_ALLOWED_EMAILS is not set)"),
+    }
 
     // The sweeper deletes what has ended: unused OAuth clients, OAuth codes, idempotency keys
     // and sessions.
@@ -118,7 +126,34 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown());
     let dav = axum::serve(dav_listener, dav.into_make_service()).with_graceful_shutdown(shutdown());
-    tokio::try_join!(platform, dav)?;
+    // The internal listener (the edge's on-demand TLS `ask`, review 1 B-6), when configured.
+    let internal = match &config.internal_bind {
+        Some(bind) => {
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("bind {bind} (RUUM_INTERNAL_BIND)"))?;
+            tracing::info!(addr = %bind, "internal listener (edge only) listening");
+            let router = ruum_api::internal::router(
+                state.clone(),
+                ruum_api::internal::TlsAskConfig::for_content_url(
+                    &config.content_url,
+                    config.tls_ask_new_hosts_per_hour,
+                ),
+            );
+            Some(
+                axum::serve(listener, router.into_make_service())
+                    .with_graceful_shutdown(shutdown()),
+            )
+        }
+        None => None,
+    };
+    let internal = async move {
+        match internal {
+            Some(serve) => serve.await,
+            None => Ok(()),
+        }
+    };
+    tokio::try_join!(platform, dav, internal)?;
     Ok(())
 }
 

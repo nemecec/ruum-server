@@ -1,0 +1,61 @@
+# Nightly copy of the Hetzner blob bucket to Scaleway (plan 5.6), through an rclone crypt
+# remote, so the copy is unreadable at Scaleway; the crypt key lives in secrets.env, off the
+# cluster (review 1 S-5). `copy`, not `sync`: a deletion in Hetzner never deletes the copy.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: blob-copy
+  namespace: ops
+spec:
+  schedule: {{ .Values.blobCopy.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 14400
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          {{- include "platform.podSecurity" . | nindent 10 }}
+          containers:
+            - name: rclone
+              image: {{ .Values.blobCopy.image }}
+              command: [/bin/sh, -c]
+              args:
+                - |
+                  set -eu
+                  # rclone wants the crypt secrets obscured; the plain values stay in memory.
+                  export RCLONE_CONFIG_SECURE_PASSWORD="$(rclone obscure "$CRYPT_PASSWORD")"
+                  export RCLONE_CONFIG_SECURE_PASSWORD2="$(rclone obscure "$CRYPT_SALT")"
+                  exec rclone copy hetzner:{{ .Values.blobCopy.source }} secure: \
+                    --checksum --transfers 4 --s3-no-check-bucket --stats-one-line --stats 5m
+              env:
+                - { name: RCLONE_CONFIG_HETZNER_TYPE, value: s3 }
+                - { name: RCLONE_CONFIG_HETZNER_PROVIDER, value: Other }
+                - { name: RCLONE_CONFIG_HETZNER_ENDPOINT, value: {{ .Values.blobCopy.sourceEndpoint | quote }} }
+                - { name: RCLONE_CONFIG_HETZNER_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: blob-copy, key: HETZNER_ACCESS_KEY_ID } } }
+                - { name: RCLONE_CONFIG_HETZNER_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: blob-copy, key: HETZNER_SECRET_ACCESS_KEY } } }
+                - { name: RCLONE_CONFIG_SCW_TYPE, value: s3 }
+                - { name: RCLONE_CONFIG_SCW_PROVIDER, value: Scaleway }
+                - { name: RCLONE_CONFIG_SCW_REGION, value: nl-ams }
+                - { name: RCLONE_CONFIG_SCW_ENDPOINT, value: {{ .Values.blobCopy.destinationEndpoint | quote }} }
+                - { name: RCLONE_CONFIG_SCW_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: blob-copy, key: SCW_ACCESS_KEY_ID } } }
+                - { name: RCLONE_CONFIG_SCW_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: blob-copy, key: SCW_SECRET_ACCESS_KEY } } }
+                - { name: RCLONE_CONFIG_SECURE_TYPE, value: crypt }
+                - { name: RCLONE_CONFIG_SECURE_REMOTE, value: "scw:{{ .Values.blobCopy.destination }}" }
+                - { name: CRYPT_PASSWORD, valueFrom: { secretKeyRef: { name: blob-copy, key: CRYPT_PASSWORD } } }
+                - { name: CRYPT_SALT, valueFrom: { secretKeyRef: { name: blob-copy, key: CRYPT_SALT } } }
+                - { name: RCLONE_CONFIG, value: /tmp/rclone.conf }
+                - { name: HOME, value: /tmp }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { memory: 256Mi }
+              {{- include "platform.restricted" . | nindent 14 }}
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: tmp
+              emptyDir: {}

@@ -1,0 +1,55 @@
+# NATS JetStream, small (plan 5.4 as amended: present on staging so the first consumer can
+# land). One server, file store on local-path, user/password auth for ruum-server.
+config:
+  cluster:
+    enabled: false
+  jetstream:
+    enabled: true
+    fileStore:
+      enabled: true
+      pvc:
+        enabled: true
+        size: 2Gi
+        storageClassName: local-path
+    memoryStore:
+      enabled: true
+      maxSize: 64Mi
+  merge:
+    authorization:
+      users:
+        - user: ruum
+          password: << $NATS_RUUM_PASSWORD >>
+container:
+  env:
+    NATS_RUUM_PASSWORD:
+      valueFrom:
+        secretKeyRef:
+          name: nats-auth
+          key: ruum-password
+  merge:
+    resources:
+      requests: { cpu: 20m, memory: 64Mi }
+      limits: { memory: 192Mi }
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities: { drop: [ALL] }
+      seccompProfile: { type: RuntimeDefault }
+reloader:
+  enabled: false
+natsBox:
+  enabled: false
+podTemplate:
+  merge:
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+service:
+  merge:
+    spec:
+      type: ClusterIP

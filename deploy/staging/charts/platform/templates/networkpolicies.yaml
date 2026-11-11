@@ -1,0 +1,157 @@
+# Network policy (review 1 S-1), enforced by kube-network-policies next to Flannel. Each
+# namespace of Ruum denies all ingress by default; the rules below open only what a client
+# needs. Kubelet probes are not affected (kube-network-policies passes node-root traffic).
+{{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" }}
+{{- range $ns }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: {{ . }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+{{- end }}
+---
+# Postgres: its own instances (replication), the CNPG operator, and the three databases' clients.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pg-clients
+  namespace: data
+spec:
+  podSelector:
+    matchLabels: { cnpg.io/cluster: pg }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { cnpg.io/cluster: pg }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: cnpg-system }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-server }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: auth }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: authz }
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spicedb-from-ruum-server
+  namespace: authz
+spec:
+  podSelector:
+    matchLabels: { app: spicedb }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-server }
+      ports:
+        - { protocol: TCP, port: 50051 }
+---
+# Zitadel: only through the edge (the browser, and ruum-server via the public issuer URL).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zitadel-from-edge
+  namespace: auth
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: zitadel }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: edge }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mailpit-smtp
+  namespace: ops
+spec:
+  podSelector:
+    matchLabels: { app: mailpit }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: auth }
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-server }
+      ports:
+        - { protocol: TCP, port: 1025 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nats-clients
+  namespace: nats
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    # The NATS servers of the cluster route to each other.
+    - from:
+        - podSelector: {}
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-server }
+      ports:
+        - { protocol: TCP, port: 4222 }
+---
+# ruum-server: the platform and WebDAV listeners and the internal `ask` listener, from the edge
+# only (review 1 B-6: the ask endpoint is never routed through the public edge).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ruum-server-from-edge
+  namespace: ruum
+spec:
+  podSelector:
+    matchLabels: { app: ruum-server }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: edge }
+          podSelector:
+            matchLabels: { app: ruum-edge }
+      ports:
+        - { protocol: TCP, port: 8491 }
+        - { protocol: TCP, port: 8492 }
+        - { protocol: TCP, port: 8493 }
+---
+# The edge: from the load balancer over the private network (proxy protocol from 10.20.1.5).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edge-from-load-balancer
+  namespace: edge
+spec:
+  podSelector:
+    matchLabels: { app: ruum-edge }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: {{ .Values.nodeSubnet }} }
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8443 }
