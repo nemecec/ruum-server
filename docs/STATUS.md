@@ -14,7 +14,8 @@ providers, the second E-2 fix, cards D-1, T-1 and T-2), the night integration of
 decision 0005 B-3 and B-1, card Q-1), the evening integration of 2026-11-09 (the C-8 race, a data
 cluster per agent, K-1 C-2, the step 2 error codes and query rule 10, the brand directions; run
 on 2026-11-10), the integration of 2026-11-10 (run 7: card P-3, the Graphite theme, the drafts of
-the operations policy and the product direction), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+the operations policy and the product direction), the integration of run 8 (2026-11-10 to
+11-11: card M-1, card I-3, the step 3 specification and its UX package), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -247,6 +248,32 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Integration of run 8 (2026-11-10 to 2026-11-11; each branch rebased onto `main`, checked on the
+build server with `cargo test --workspace`, both suite backends with `RUUM_REQUIRE_IMPLEMENTED=1`
+and `scripts/e2e_browser.sh`, pushed as `integ8/...`, green in GitHub CI, then fast-forwarded, in
+this order; linear history, no merge commit, no co-author line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `s2/m-1-r1` (pushed as `integ8/m-1`) | Card M-1: `ruum db` in the CLI for the built database operations (create, show, manifest, schema, query, queries, columns, suggest, confirm, grants, grant, revoke; markers print as `<pseudonym p_...>` and `<hidden ...>`, a value that looks like a marker prints in JSON quotes; `--token`/`--tenant` for a person); MCP tests (a database tool is listed exactly when its operation is built; an agent smoke test on memory and Postgres: every cell a marker, `content_trust: untrusted`, `write_grant_required`, `database_not_ready` with `retry_after`); a tool error now carries `retry_after` (`dispatch.rs`, additive); three benchmark tasks (`10_count_plants`, `11_no_personal_value`, `12_delete_without_grant`). No new dependency, no contract change. | accepted (`review-M-1.md`; S-1 and N-1 to N-4 are backlog 2026-11-10-run8 S-27, S-28, P-33, P-34, T-28, T-29) |
+| `s2/i-3` (pushed as `integ8/i-3`, then `integ8/i-3-2` and `integ8/i-3-3` after two docs commits of the person on `main`) | Card I-3: SQLite storage with Litestream replication. Compose service `litestream` (v0.5.17, pinned by digest) watching `RUUM_SQLITE_DIR`, the Garage bucket `ruum-sqlite`, `dev.sh` settings, `scripts/sqlite_restore_test.sh` (new tenant directory replicated within 10 s, restore to a time, restore after a local delete), `docs/DEVSTACK.md`. Open question 6 of step 2 answered: yes, with a delete order (the `.db` first). | accepted with one merge condition (`review-I-3.md`: the test must pass on the build server); it passed there twice in this integration |
+| `s3/ux-apps` (= the revised `s3/spec-3` plus card U-3; pushed as `integ8/s3-spec`, then `-2` and `-3`) | The step 3 (web apps) specification, revised after the architect panel: draft contracts (`contracts/manifests/app.schema.json` and three more manifests, `contracts/apps/` gateway, runtime API and token schemas, 45 operations in `openapi.yaml` all `x-ruum-status: planned`, 35 MCP tools not offered, `schema.zed` app relations, 21 event schemas, `migrations/0011_apps.sql` as a draft), `docs/STEP3.md` (security model, cards, order, milestones), decision record 0006 (`provisional`, 20 decisions, 24 answers, five decision briefs for the person), and the UX package `docs/ux/apps/` (journeys J15 to J21, screens A1 to A16, copy, agent rules). Nothing of step 3 is built. | architect panel (`step3-review-1.md`, `step3-review-2.md`): every required change applied in `s3/spec-3`; no second review of the revision; the UX package has no UX panel review yet (backlog 2026-11-10-run8 P-40) |
+
+Fixes made during the integration:
+
+- `integ8/m-1`, one commit (`8677aef`, `bench/agent` only): the three new benchmark tasks failed
+  in their setup (`422`: ruum-server runs no SQLite engine), so the `database` step now makes a
+  Postgres database by default; and the oracle mode now passes the reference `answer` to
+  `outcomeOf`, so task 12 reaches `safe_stop` as designed. Benchmark on the build server:
+  `--mode oracle` 2 passed and 1 safe stop of 3, `--mode null` 1 of 3 (the refusal task), 0
+  harmful. The agent mode was not run (it needs the Claude CLI signed in).
+- Not integrated: `s2/a-2` (card A-2, approvals). Its review (`review-A-2.md`) accepts it, but the
+  task of this run did not; its findings are in backlog 2026-11-10-run8 S-29, P-35, P-36, T-30.
+- `main` got two documentation commits of the person during the integration (decision 0007 and
+  the Estonian eID research). `integ8/i-3` and `integ8/s3-spec` were rebased onto each and pushed
+  under new names (no force push); only a documentation file differs between those trees and the
+  checked ones.
 
 Integration of 2026-11-10 (run 7; each branch rebased onto `main`, pushed as `integ7/...`,
 checked in GitHub CI, then fast-forwarded, in this order; linear history, no merge commit, no
@@ -523,7 +550,32 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
-## Checks (2026-11-10, `main` after the integration of 2026-11-10, run 7, in GitHub CI)
+## Checks (2026-11-11, `main` after the integration of run 8, on the build server)
+
+`main` is `b6489b6` before this documentation commit (the tree of `integ8/s3-spec-3`). The checks
+ran with `scripts/buildbox/run.sh integ8` (own Postgres, SpiceDB and data cluster):
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`:
+  pass.
+- `cargo test --workspace --locked`: 753 passed, 0 failed, 2 ignored.
+- Suites with `RUUM_REQUIRE_IMPLEMENTED=1`, the same numbers on memory and on Postgres stores (the
+  counts from CI run 42926680310 of the same code; the build server run passed too): tenant
+  isolation 503 checks (314 passed, 189 planned; the 149 new planned checks are the 45 step 3
+  operations), permission matrix 2656 checks (1744 passed, 912 planned), trashed file suite
+  112/112, database cases d1, grants, classes and query pass, privacy suite 99 planned; 0 pending
+  (501), 0 failed.
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `scripts/e2e_browser.sh`: 172 passed on the tips of M-1, I-3 and the step 3 branch (CI: 173,
+  with `sso.e2e.ts`).
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: 94 of 94 mutations killed,
+  none survived, skipped or broken.
+- `scripts/sqlite_restore_test.sh` (card I-3): passed twice. Benchmark of card M-1 (`bench/agent`,
+  tasks 10 to 12): `--mode oracle` 2 passed and 1 safe stop, `--mode null` 1 of 3, 0 harmful.
+- GitHub CI: green on `integ8/m-1`, `integ8/i-3`, `integ8/i-3-2`, `integ8/i-3-3`,
+  `integ8/s3-spec`, `integ8/s3-spec-2` and `integ8/s3-spec-3` (unit and migration tests 727
+  passed, 0 failed, 1 ignored; `dbhost_check.sh` 272 passed).
+
+### Checks of the integration of 2026-11-10 (run 7, in GitHub CI)
 
 `main` is `3139cf9` before this documentation commit: the tree of `integ7/ops-policy`
 (`b7b1e40`) plus three commits to `.github/workflows/nightly.yml`. Three `docs/DESIGN.md` commits
@@ -644,6 +696,11 @@ C-2 and the step 2 error codes with query rule 10 (2026-11-08 P-2, P-3; 2026-11-
 Run 7 merged card P-3 (`s2/wave5-fix`), the Graphite theme (`w/graphite-theme`, which closes
 backlog 2026-11-09 U-1 to U-4, the old card 3) and the drafts of the operations policy and the
 product direction (`d/ops-policy`). In this order:
+
+Run 8 merged card M-1 (`s2/m-1-r1`), card I-3 (`s2/i-3`) and the step 3 specification with its
+UX package (`s3/ux-apps`); its new items are in `docs/backlog/2026-11-10-run8.md`. Card A-2
+(`s2/a-2-r1`, accepted by its review) waits for a go; before it merges, the panel should decide
+backlog 2026-11-10-run8 S-29 (the raw `up` of a migration approval).
 
 0. **Finish card Q-2 on `s2/q-2`** (backlog 2026-11-10 S-19, T-21, S-24; 2026-11-09 S-18,
    P-15): close R-1 (a volatile tenant function behind a view in an agent's row write) with a
