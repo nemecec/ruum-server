@@ -710,6 +710,41 @@ const INDEX_CASES: &[IndexCase] = &[
 /// its own) is not part of the masked lens: `masked_read` and `read` get the refusal, also for
 /// the read that would use the index, and so does every view over it. The owner kind reads the
 /// same relation. Built-in classes stay in the lens.
+/// Review-Q-2-kimi-3 item 2: the `pg_type` branch of the type rule (`bad_types` in `allow.rs`),
+/// apart from its range branch (`lens_rebuild::unvetted_types`). A tenant cannot make a base
+/// type (superuser only), so the test uses the extension type `citext` (a trusted extension of
+/// the data cluster): its input, output, receive and send functions belong to the extension (OID
+/// 16384 or above). A view that coerces to it is outside the allow-list and refused in every
+/// lens. The rebuild alone would let the view through (it runs the cast on masked text), so
+/// without the rule the view is readable. A view with nothing of the type is a control. The
+/// test runs inside the database of the index test, so the suite makes no new database (the
+/// data cluster of the build server is small).
+async fn extension_types_outside_the_list_are_not_in_the_masked_lens(f: &Fixture<'_>) {
+    f.migrate(
+        "CREATE VIEW cast_to_citext AS SELECT id, ('X'::text)::citext AS c FROM plain; \
+         CREATE VIEW plain_v AS SELECT id, upper('x') AS u FROM plain",
+    )
+    .await
+    .expect("migration");
+    for kind in [RoleKind::MaskedRead, RoleKind::Read] {
+        for sql in [
+            "SELECT id FROM cast_to_citext",
+            "SELECT count(*) FROM cast_to_citext",
+        ] {
+            let r = read(f, kind, sql).await;
+            assert!(refused(&r), "citext view {} {sql}: {r:?}", kind.as_str());
+        }
+        let r = read(f, kind, "SELECT id FROM plain_v").await;
+        assert!(r.is_ok(), "control view {}: {r:?}", kind.as_str());
+    }
+    // The owner kind reads the view: the code is not broken, only not offered.
+    let r = read(f, RoleKind::Owner, "SELECT id FROM cast_to_citext").await;
+    assert!(r.is_ok(), "citext view (owner): {r:?}");
+    f.migrate("DROP VIEW cast_to_citext; DROP VIEW plain_v")
+        .await
+        .expect("migration");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn index_support_outside_the_list_is_not_in_the_masked_lens() {
     let Some(engine) = engine().await else { return };
@@ -793,6 +828,7 @@ async fn index_support_outside_the_list_is_not_in_the_masked_lens() {
             }
         }
     }
+    extension_types_outside_the_list_are_not_in_the_masked_lens(&f).await;
 }
 
 /// An index whose operator class is outside the allow-list counts as tenant code for writes:

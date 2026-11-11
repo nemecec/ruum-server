@@ -782,8 +782,10 @@ databases that AI agents make. One writer at a time is enough for most small app
   pseudonym, a function or type outside the list, a system catalog) gets the refusal in that lens;
   so does a table whose policy reads a restricted column. What a masked reader can learn: only
   what can be computed from pseudonyms and hidden markers (equality, grouping, counts, the fixed
-  length of a pseudonym or marker) and from `normal` columns, plus the errors and the timing of the
-  statement, which can still depend on the real values that the lens reads to make a pseudonym.
+  length of a pseudonym or marker), from whether a value is `NULL` (masking keeps `NULL`, so an
+  answer or a row count can show nullness and facts computed from it) and from `normal` columns,
+  plus the errors and the timing of the statement, which can still depend on the real values that
+  the lens reads to make a pseudonym.
   The rule removes the masked session as the starter of tenant code, not tenant code that
   others start (an app's users, a manager): tenant code that copies data gives its target columns
   the class of what it reads, the agent that writes it suggests that class, and the `privacy` stage

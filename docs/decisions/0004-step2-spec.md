@@ -1222,20 +1222,32 @@ functions and types is never complete; the cure is to give such code nothing rea
   reaches one. This is defence in depth: the rebuild already runs the cast on masked text. A
   tenant cannot create the shell type that a range canonical function needs (superuser only), and
   `subtype_diff` must be `IMMUTABLE`, so it cannot write a session setting; the extension types are
-  the ones that count in practice.
+  the ones that count in practice. Tests: the `pg_type` branch is tested with the extension type
+  `citext` (its input, output, receive and send functions belong to the extension), in
+  `allow_list::extension_types_outside_the_list_are_not_in_the_masked_lens`, with the mutation
+  `dbengine-allow-list-type-functions-io`; the range branch is tested with a range whose
+  `subtype_diff` is a tenant function (`unvetted_types`), with the mutation
+  `dbengine-allow-list-type-functions`. A hostile type that discloses without the guard cannot be
+  made (a base type needs a superuser), so these tests prove the clause, not an attack. The
+  slots of `pg_type` are in one clause and are not tested one by one: the modifier, analyze and
+  subscript slots have no test of their own (`citext` has none of them; the types of pgvector and
+  PostGIS have some, but no test uses them). They are best-effort defence in depth; the rebuild
+  is the protection.
 - (f) **What stays.** The allow-list, the domain, index and type guards, the revoked volatile
   functions, the reset of the pooled connection and the write checks of 0004-38 stay as defence in
   depth.
 - (g) **What a masked reader can learn (this replaces the one-fixed-fact sentence of 0004-38 (d)).**
   Only facts that can be computed from pseudonyms and hidden markers: that two values are equal
   or different, how many distinct values there are, how rows group and join, the number of rows
-  that such a computation gives, and the fixed length of a pseudonym or of the marker; and
-  everything that comes from `normal` columns and from policies over them. In addition, the
-  errors and the timing of a statement can depend on the real values that the lens itself reads
-  to make a pseudonym (the time of a pseudonym grows with the length of the value). No tenant
-  expression, type function or row-producing function receives a real restricted value in a masked
-  read, so there is no way to get a restricted value itself, or a fact about it other than
-  equality, from the answer.
+  that such a computation gives, and the fixed length of a pseudonym or of the marker; whether a
+  value is `NULL` (masking keeps `NULL` as `NULL` on purpose, so an answer or a row count can show
+  nullness, and any fact that is computed from nullness, for example "how many rows have no
+  value"); and everything that comes from `normal` columns and from policies over them. In
+  addition, the errors and the timing of a statement can depend on the real values that the lens
+  itself reads to make a pseudonym (the time of a pseudonym grows with the length of the value).
+  No tenant expression, type function or row-producing function receives a real restricted value
+  in a masked read, so there is no way to get a restricted value itself from the answer. The only
+  facts about it are the ones listed here (review Q-2-kimi-3, D-1).
 - (h) **Consequences, stated.** (1) A tenant view with arithmetic, `generate_series` or a typed
   join on a personal column is refused for `masked_read` (it still runs for `read`, which sees the
   value), and one over a secret column is refused for both. (2) A personal column of a tenant
