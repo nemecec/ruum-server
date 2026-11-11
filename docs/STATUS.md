@@ -15,7 +15,8 @@ decision 0005 B-3 and B-1, card Q-1), the evening integration of 2026-11-09 (the
 cluster per agent, K-1 C-2, the step 2 error codes and query rule 10, the brand directions; run
 on 2026-11-10), the integration of 2026-11-10 (run 7: card P-3, the Graphite theme, the drafts of
 the operations policy and the product direction), the integration of run 8 (2026-11-10 to
-11-11: card M-1, card I-3, the step 3 specification and its UX package), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-11: card M-1, card I-3, the step 3 specification and its UX package), the integration of card Q-2
+(2026-11-11: the privacy filter of Postgres queries for agents), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -249,6 +250,43 @@ Fixes made during the night integration:
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
 
+Integration of card Q-2 (2026-11-11; the branch `s2/q-2-harden-5` rebased onto `main` `4019de1`,
+checked on the build server, pushed as `integq2/q-2`, green in GitHub CI, then fast-forwarded;
+linear history, no merge commit, no co-author line):
+
+| Branch | What it adds | Review |
+|---|---|---|
+| `s2/q-2-harden-5` (pushed as `integq2/q-2`, 18 commits) | Card Q-2, the privacy filter of Postgres queries for agents. `queryDatabase` for agents runs through the lens of the engine (`masked_read`, `masked_write`, or `read` and `write` with a live `read_personal` and `write_live` grant); the query layer labels the result columns and marks pseudonyms and hidden values (`{"$ruum":"pseudonym"}`, `{"$ruum":"hidden"}`); `getDatabaseSchema` answers the class that the lens applies; destructive statements of agents are `501`; the privacy suite runs its Postgres cases on the data cluster (CI starts it). **The S-21 rule** (decision 0004-38, design 8.5): a masked session never starts tenant code on live data (a write that would start a trigger, rule, volatile function, default or policy is `501 tenant_code_on_live`, checked in the query layer and twice in the engine). **The allow-list**: code that runs on real rows (views, policies, checks, generated columns, domains, index expressions, index support functions, type functions) may call only listed functions; anything else gets a refusal in the masked lens; volatile built-ins are revoked from the masked roles; pooled connections run `DISCARD ALL`. **The masked-view rebuild** (decision 0004-39): a tenant view is rebuilt over the lens relations, so the logic of a view runs on pseudonyms and hidden markers, never on a real value; a view that cannot be rebuilt gets a refusal view in that lens only. Migration `0012_column_definition.sql` (the definition hash of a computed column; it was `0011` on the branch, and step 3 took `0011_apps.sql` first). 70 mutations are new (`dbengine-*`, `databases-*`, `privacy-*`, 16 of them moved up from `planned/`); the strict check now runs 164 mutations, 94 before. | Claude reviews `review-Q-2-1` to `-3`, `review-Q-2-s21-1` to `-3`, `review-Q-2-harden`; Kimi K3.1 Pro `review-Q-2-kimi`, `-2`, `-3` (round 3 asked for two changes, both made in the last commit) |
+
+What agents can and cannot do on a Postgres database now:
+
+- **Can**: read any table or view; see pseudonyms for personal columns, the hidden marker for
+  secret columns, `NULL` as `NULL`, and normal columns as they are; compare, join, group and count
+  on pseudonyms; read real personal values with a live `read_personal` grant (secrets stay hidden
+  for every agent); write rows with a live `write_live` grant when the database holds no tenant
+  code that the write would start.
+- **Cannot**: see a real secret value; see a real personal value without the grant; write without
+  the grant (`403` with the grant prompt); start a trigger, rule, volatile function or default of
+  the tenant (`501 tenant_code_on_live`); run `DELETE`/`UPDATE` without `WHERE`, `TRUNCATE` or a
+  schema change (`501`, the approval is card A-2); reach a function outside the allow-list through a
+  view, policy, check, index or type; call `set_config`, locks, large-object or sequence writers.
+- **A masked reader still learns** (0004-39 (g)): equality, grouping, counts, the fixed length of a
+  pseudonym, whether a value is `NULL` and facts computed from that, `normal` columns, and errors
+  and timing that depend on the real value the lens reads to make a pseudonym.
+- **Limits**: tenant code that others start can copy a restricted value into a `normal` column
+  (the `privacy` stage of the pipeline will check it); the lens view of a tenant view is read-only;
+  a table whose policy reads a restricted column is not readable by masked sessions; the type
+  function slots for modifier, analyze and subscript have no test of their own (0004-39 (e)).
+  Not closed, in the backlog: catalog-cell labels (review-Q-2-s21-2 N-1), the trait default for
+  future engines (N-2), S-18, execution tests for foreign tables and event triggers; panel items
+  S-20, S-22, S-25, S-26 and P-29. Backlog S-19 and the second half of S-24 (the engine check of the write kind, N-2) are closed by this merge; S-24 N-1 (the lens rebuild after `NotReady`) was not checked.
+
+The story in short: `docs/digests/2026-11-11-q2.md`.
+
+Fix made during the integration: `0011_column_definition.sql` became `0012_column_definition.sql`
+(a duplicate version of `0011_apps.sql` on `main`); the generated web types and `tools.json` did
+not change.
+
 Integration of run 8 (2026-11-10 to 2026-11-11; each branch rebased onto `main`, checked on the
 build server with `cargo test --workspace`, both suite backends with `RUUM_REQUIRE_IMPLEMENTED=1`
 and `scripts/e2e_browser.sh`, pushed as `integ8/...`, green in GitHub CI, then fast-forwarded, in
@@ -298,11 +336,8 @@ a local KEK, as `run.sh` and `dev.sh env` do, so the two SpiceDB mutations no lo
 manual run takes an optional list of mutation names (`gh workflow run nightly.yml --ref <branch>
 -f mutations="a b"`).
 
-Not merged: `s2/q-2` (card Q-2, the privacy filter of Postgres queries for agents). Three
-security reviews did not accept it: `review-Q-2-1.md` and `review-Q-2-2.md` found 14 holes (two
-gave raw values to an agent without a grant); the fixes closed all 14, but `review-Q-2-3.md`
-found a new one (R-1, a tenant function behind a view runs on the real row in an agent's row
-write) and 43 mutations were never run strictly (backlog 2026-11-10 S-19, T-21).
+Card Q-2 (`s2/q-2`) was not merged in run 7: its security reviews did not accept it. It is merged
+now, after five rounds of hardening (see "Integration of card Q-2" above).
 
 Integration of 2026-11-09 evening (run 6, done on 2026-11-10; each branch rebased onto `main`,
 checked on the build server with `cargo test --workspace`, both suite backends with
@@ -550,6 +585,32 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
+## Checks (2026-11-11, card Q-2 on `main`, on the build server)
+
+The branch `s2/q-2-harden-5` (head `d0cda8c`) was checked first with `scripts/buildbox/run.sh q2h5`
+(`cargo test -p ruum-dbengine`: 119 passed, 0 failed; `cargo test -p ruum-core --lib
+databases::query`: 67 passed; clippy `-D warnings`: clean; `MUTATION_STRICT=1` on the 45
+`dbengine-*`, 18 `databases-*` and 3 `privacy-*` mutations of the card: 66 of 66 killed) and is green
+in GitHub CI (run 43005261687). The data cluster of the build server has a 768 MiB limit and the
+`ruum-dbengine` suite peaks near it: two runs of the 119 tests on a fresh cluster were killed by
+the out-of-memory killer, the third passed (the extension-type test runs inside an existing test, so
+the suite makes no new database). The tree rebased onto `main` `4019de1` (`integq2/q-2`) was
+checked with `run.sh q2int` (and `q2m0` to `q2m2` for the mutations):
+
+- `cargo test --workspace --locked`: 801 passed, 0 failed, 2 ignored (753 before the card).
+- Suites with `RUUM_REQUIRE_IMPLEMENTED=1`, on memory and on Postgres stores: tenant isolation 503
+  checks (314 passed, 189 planned), permission matrix 2656 checks (1744 passed, 912 planned),
+  trashed file suite 112/112, database cases d1 (11) and grants (7) pass, 0 failed. The privacy
+  suite is 99 planned on memory and **38 passed, 61 planned on Postgres** (it was 99 planned).
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`, all mutations in three
+  parallel runs: **164 of 164 killed**, none survived, skipped or broken (94 on `main` before; 70
+  new). Two mutations of `privacy-*` (`privacy-key-readable`, `privacy-pseudonym-callable`) survived
+  in the first run: since `query_to_xml` is revoked from the masked kinds, the dynamic SQL test
+  of the query layer never reaches the schema rights they break. Both now run the engine test
+  `masked_roles_reach_neither_the_base_tables_nor_the_key`, which calls the function and reads the
+  key by name as a masked role; both are killed (the run of these two alone).
+
 ## Checks (2026-11-11, `main` after the integration of run 8, on the build server)
 
 `main` is `b6489b6` before this documentation commit (the tree of `integ8/s3-spec-3`). The checks
@@ -702,12 +763,11 @@ UX package (`s3/ux-apps`); its new items are in `docs/backlog/2026-11-10-run8.md
 (`s2/a-2-r1`, accepted by its review) waits for a go; before it merges, the panel should decide
 backlog 2026-11-10-run8 S-29 (the raw `up` of a migration approval).
 
-0. **Finish card Q-2 on `s2/q-2`** (backlog 2026-11-10 S-19, T-21, S-24; 2026-11-09 S-18,
-   P-15): close R-1 (a volatile tenant function behind a view in an agent's row write) with a
-   hostile test and a mutation; run the 43 open mutations with `MUTATION_STRICT=1`; at the
-   rebase onto `main` keep P-3's `set_typed_hooks` in `databases::build` and make
-   `provider::mask_plan` take the stricter of the column store and the manifest. Then a fourth
-   security review. The panel items of Q-2 (S-20 to S-23, S-25, S-26) go to the architect panel.
+0. **Card Q-2 follow-ups** (card Q-2 is merged, 2026-11-11): the labelling of values that come from
+   catalogs outside the tenant schema (review-Q-2-s21-2 N-1), the trait default for future engines
+   (N-2), 2026-11-09 S-18 and P-15 (`QueryError` becomes `Error`), execution tests for foreign
+   tables and event triggers, `current_setting` revoked from the masked roles, a test of each
+   `pg_type` slot of the type rule. The panel items of Q-2 (S-20, S-22, S-25, S-26, P-29) wait.
 1. **Security follow-ups** (2026-11-08 S-7; 2026-11-09 S-8, S-9, S-11, S-15, S-16, S-17): DQS
    off in the bundled SQLite (un-ignore the planned Q-1 test); masked copy with a view on a
    personal column; no `USAGE` on `ruum_mask` for the copy's owner; names only in
@@ -765,9 +825,8 @@ the product direction, P-28, P-29) and `docs/digests/2026-11-09-evening.md`.
   merged, and so are cards D-1 (`createDatabase`, `getDatabase`, `updateDatabaseManifest`;
   `Services` wires the engines, the tenant keys, the delivery worker and the reconciler), T-1
   (database acceptance cases), T-2 (privacy suite), K-1 (column classes), A-1 (grants) and Q-1
-  (the query API for people, 2026-11-09) and P-3 (typed-node rules of the tree, 2026-11-10; open: backlog 2026-11-09 S-18, P-17 to P-23). Card Q-2 is not merged: its security reviews did not accept it (`review-Q-2-3.md` R-1, 43 mutations not run). The other 12 database operations count as planned in
-  the suites; the privacy suite is all planned until the operations and the filters of Q-2 and
-  Q-3 land. Q-1 notes open: review-Q-1-3 N-A (the owner kind still changes options; the panel
+  (the query API for people, 2026-11-09) and P-3 (typed-node rules of the tree, 2026-11-10; open: backlog 2026-11-09 S-18, P-17 to P-23). Card Q-2 (the privacy filter of Postgres queries for agents) is merged (2026-11-11, after five rounds of hardening and ten reviews). The other 12 database operations count as planned in
+  the suites; the privacy suite runs its Postgres cases, and the cases that need the filters of Q-3 stay planned. Q-1 notes open: review-Q-1-3 N-A (the owner kind still changes options; the panel
   records the intended reading). N-B is fixed: query rule 10 refuses writes to the catalog
   (`f/k1c2-errors`, merged 2026-11-09 evening; follow-ups backlog 2026-11-09 S-16, S-17, P-13). The fix of `f/rr-fix-e2` (`ruum_dbhost` search path) had two
   reviews: the first was not complete (`review-dbhost.md`), the second did not accept
