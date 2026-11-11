@@ -24,7 +24,7 @@ case "$issuer" in
   "") fail "TLS: no certificate on $PUBLIC" ;;
   *) pass "TLS: $issuer" ;;
 esac
-c() { curl -sS --max-time 20 "${K[@]}" "$@"; }
+c() { curl -sS --max-time 20 ${K[@]+"${K[@]}"} "$@"; }
 
 code="$(c -o /dev/null -w '%{http_code}' "https://$PUBLIC/healthz")"
 [[ "$code" == 200 ]] && pass "healthz 200" || fail "healthz $code"
