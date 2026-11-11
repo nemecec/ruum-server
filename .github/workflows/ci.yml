@@ -282,9 +282,10 @@ jobs:
       - uses: actions/checkout@v5
       # Pinned and checksummed tools (deploy/staging/versions.env); nothing cloud is touched and no
       # secret is used: check-plan, price, the secret lists, helm lint/template, caddy adapt,
-      # tofu fmt and validate (deploy/staging/tests/run.sh).
+      # tofu fmt and validate, talosctl validate of the rendered machine configs
+      # (deploy/staging/tests/run.sh).
       - name: Tools
-        run: deploy/staging/setup.sh tofu helm
+        run: deploy/staging/setup.sh tofu talosctl helm
       - name: Shellcheck
         run: shellcheck -x -S warning deploy/staging/*.sh deploy/staging/ops/*.sh deploy/staging/k8s/*.sh deploy/staging/tests/*.sh
       - name: Staging tests

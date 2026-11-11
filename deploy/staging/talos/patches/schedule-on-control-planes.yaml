@@ -1,0 +1,7 @@
+# All three nodes are control plane nodes and run the workloads (Talos v1.14: the old
+# cluster.allowSchedulingOnControlPlanes is the absence of this taint in KubeNodeConfig).
+# A separate patch, because a delete and a merge of the same document cannot share one patch.
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+taints:
+  $patch: delete
