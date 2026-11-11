@@ -65,6 +65,25 @@ for n in $(jq -r 'keys[]' mc.json); do
   need "^hostname: $n\$" "static hostname $n"
   need '^kind: UnattendedInstallConfig$' "install document"
   need '^ *- --iface-can-reach=10\.20\.0\.1$' "Flannel VXLAN on the private network"
+  # local-path-provisioner's host path (talos/patches/local-path-volume.yaml): a user volume on
+  # the system disk, and a capped EPHEMERAL so that the disk has room for it.
+  # doc KIND NAME: the rendered document of that kind and name (documents split at "---").
+  doc() {
+    awk -v k="kind: $1" -v nm="name: $2" '
+      function out() { if (hk && hn) printf "%s", d; d = ""; hk = hn = 0 }
+      /^---$/ { out(); next }
+      { d = d $0 "\n"; if ($0 == k) hk = 1; if ($0 == nm) hn = 1 }
+      END { out() }' "$n.yaml"
+  }
+  doc UserVolumeConfig local-path | grep -qE '^ +match: system_disk$' &&
+    echo "ok   $n: user volume local-path on the system disk" ||
+    { echo "FAIL $n: user volume local-path on the system disk"; failed=1; }
+  doc VolumeConfig EPHEMERAL | grep -qE '^ +maxSize: [0-9]+GiB$' &&
+    echo "ok   $n: EPHEMERAL has a maximum size (room for the user volume)" ||
+    { echo "FAIL $n: EPHEMERAL has a maximum size (room for the user volume)"; failed=1; }
+  grep -q '"paths":\["/var/mnt/local-path"\]' "$STG/k8s/manifests/local-path-storage.yaml" &&
+    echo "ok   $n: local-path-provisioner uses /var/mnt/local-path" ||
+    { echo "FAIL $n: local-path-provisioner uses /var/mnt/local-path"; failed=1; }
   never 'node-role.kubernetes.io/control-plane: NoSchedule' "workloads may run on the control plane nodes"
   never '^    (kubelet|install|network):' "no v1alpha1 machine.kubelet/install/network"
   never '^    (apiServer|network|discovery|allowSchedulingOnControlPlanes):' "no v1alpha1 cluster.apiServer/network/discovery"

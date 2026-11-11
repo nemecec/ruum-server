@@ -1,9 +1,29 @@
-# A user volume of 15 GB on the system disk for local-path-provisioner (CNPG data, plan 3.5).
+# Storage for local-path-provisioner (CNPG data, NATS file store; plan 3.5).
+#
+# Talos v1.14 has no kubelet extraMounts, and the kubelet sees /var/mnt read-only. Only a user
+# volume makes a writable host path: Talos mounts it at /var/mnt/<name> and propagates that mount
+# into the kubelet container. No KubeletConfig setting is needed. local-path-provisioner uses
+# /var/mnt/local-path (k8s/manifests/local-path-storage.yaml). Without the mount, the helper pod
+# fails with "mkdir /var/mnt/local-path/: read-only file system".
+#
+# The cx23 system disk is 40 GB (about 38 GiB). By default EPHEMERAL (/var: images, etcd, logs)
+# grows to fill the whole disk, and then there is no free space for the user volume: Talos does
+# not create it. So EPHEMERAL has a maximum size. Layout: about 1.2 GiB for EFI/BOOT/META/STATE,
+# EPHEMERAL up to 14 GiB, the user volume 20 to 22 GiB.
+#
+# Talos applies a VolumeConfig only when it provisions the volume. On a node whose EPHEMERAL
+# already fills the disk, the cap has no effect until EPHEMERAL is wiped (README, "Storage").
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: EPHEMERAL
+provisioning:
+  maxSize: 14GiB
+---
 apiVersion: v1alpha1
 kind: UserVolumeConfig
 name: local-path
 provisioning:
   diskSelector:
     match: system_disk
-  minSize: 15GB
-  maxSize: 15GB
+  minSize: 20GiB
+  maxSize: 22GiB
