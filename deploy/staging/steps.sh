@@ -244,7 +244,7 @@ upload_image() {
   [[ -n "$(talos_image_id)" ]] && return
   log "uploading the Talos $TALOS_VERSION snapshot (temporary $HCLOUD_SERVER_TYPE for about 10 minutes)"
   HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud-upload-image upload \
-    --image-url "$TALOS_IMAGE_URL" --compression xz --architecture x86 \
+    --image-url "$TALOS_IMAGE_URL" --compression xz \
     --location "$HCLOUD_LOCATION" --server-type "$HCLOUD_SERVER_TYPE" \
     --description "talos $TALOS_VERSION staging" \
     --labels "env=staging,managed-by=up.sh,project=ruum,os=talos,version=$TALOS_VERSION,role=image"
