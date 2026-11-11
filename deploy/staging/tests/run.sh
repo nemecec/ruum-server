@@ -532,6 +532,12 @@ if has helm; then
     echo "== Caddyfile (caddy adapt --validate)"
     awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum.yaml" >"$TMP/Caddyfile"
     expect 0 "the rendered Caddyfile adapts" docker run --rm -v "$TMP/Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:$CADDY_VERSION-alpine" caddy adapt --config /etc/caddy/Caddyfile --validate
+    # Every server, port 80 (8080) included, reads the load balancer's PROXY header: a server
+    # that automatic HTTPS adds at runtime would not, and port 80 would answer 400.
+    docker run --rm -v "$TMP/Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:$CADDY_VERSION-alpine" caddy adapt --config /etc/caddy/Caddyfile 2>/dev/null >"$TMP/caddy.json"
+    jq -e '[.apps.http.servers[]] as $s | ($s | map(.listen[]) | index(":8080")) != null and ($s | all((.listener_wrappers // []) | map(.wrapper) | index("proxy_protocol") != null))' "$TMP/caddy.json" >/dev/null &&
+      ok "port 80 is an explicit server, and every server has the proxy_protocol wrapper" ||
+      bad "a Caddy server without the proxy_protocol wrapper, or no explicit port 80 server"
   fi
 else
   echo "== charts: skipped (no helm; setup.sh installs it, or Docker for the tools image)"

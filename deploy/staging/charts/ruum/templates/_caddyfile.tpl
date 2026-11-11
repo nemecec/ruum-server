@@ -98,4 +98,13 @@
 	header -Server
 	reverse_proxy ruum-server.ruum.svc.cluster.local:8491
 }
+
+# Port 80 as an explicit site. Without it, automatic HTTPS creates the HTTP redirect server at
+# runtime, outside this config, so it never gets the proxy_protocol listener wrapper: the load
+# balancer's PROXY header then reaches the HTTP parser, every request on port 80 answers 400,
+# and the ACME HTTP-01 challenge fails (staging bring-up, 2026-11-12). Caddy still answers
+# HTTP-01 challenges on this server before the redirect.
+http:// {
+	redir https://{host}{uri} 308
+}
 {{- end }}
