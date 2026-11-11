@@ -269,7 +269,18 @@ jobs:
         working-directory: web
         run: |
           npm ci
-          npx playwright install --with-deps chromium
+          # The runner's Azure apt mirror sometimes stops resolving (2026-11-11, about an hour);
+          # then apt uses the main Ubuntu archive. The install is retried for short outages.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            echo "azure.archive.ubuntu.com does not resolve; apt uses archive.ubuntu.com"
+            echo "http://archive.ubuntu.com/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          for attempt in 1 2 3; do
+            npx playwright install --with-deps chromium && break
+            [ "$attempt" = 3 ] && exit 1
+            echo "playwright install failed (attempt $attempt); retrying in 30 s"
+            sleep 30
+          done
       # Builds the server, seeds, starts the server (8492) and Vite (5182), runs web/e2e, stops both.
       - name: Browser end-to-end tests
         env:
