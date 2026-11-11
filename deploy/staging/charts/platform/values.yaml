@@ -37,7 +37,7 @@ mailpit:
 blobCopy:
   image: rclone/rclone:1.75.2
   schedule: "30 2 * * *"
-  source: ruum-staging-blobs
+  source: ruum-staging-blobs-768usm
   sourceEndpoint: https://hel1.your-objectstorage.com
   destination: ruum-staging-blobs-copy
   destinationEndpoint: https://s3.nl-ams.scw.cloud

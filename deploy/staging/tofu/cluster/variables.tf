@@ -68,5 +68,5 @@ variable "admin_cidrs" {
 variable "bucket_blobs" {
   description = "Hetzner bucket of the Ruum chunks (destroyed with staging)."
   type        = string
-  default     = "ruum-staging-blobs"
+  default     = "ruum-staging-blobs-768usm"
 }
