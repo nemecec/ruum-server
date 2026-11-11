@@ -21,7 +21,8 @@
 # - check-plan.sh --repo; up.sh --apply refuses without RUUM_STAGING_APPLY=yes;
 # - with helm: lint and render both charts, digests required, never production Let's Encrypt;
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate);
-# - with tofu: fmt and validate of both roots.
+# - with tofu: fmt and validate of both roots; with tofu and talosctl: the machine config of
+#   every node, rendered by the Talos provider, passes talosctl validate (tests/talos-validate.sh).
 # helm and tofu come from PATH (CI: setup.sh) or, when they are not there and Docker is, from the
 # tools image (tools-image.sh, the same pins).
 set -uo pipefail
@@ -301,6 +302,15 @@ if has tofu; then
       expect 0 "tofu validate $r (tools image)" intools bash -c "$v"
     fi
   done
+  # The rendered machine configs of the Talos provider pass talosctl validate (Talos v1.14 moved
+  # settings into their own documents; a setting in both places fails only at apply time).
+  if type -P tofu >/dev/null && type -P talosctl >/dev/null; then
+    expect 0 "talosctl validate of every rendered node config" bash "$STG/tests/talos-validate.sh"
+  elif declare -F intools >/dev/null; then
+    expect 0 "talosctl validate of every rendered node config (tools image)" intools bash "$STG/tests/talos-validate.sh"
+  else
+    echo "== talosctl validate: skipped (no talosctl; setup.sh installs it)"
+  fi
 else
   echo "== OpenTofu: skipped (no tofu; setup.sh installs it, or Docker for the tools image)"
 fi

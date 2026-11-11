@@ -256,6 +256,12 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 - `k8s/apply.sh` uses `helmfile sync`, not `apply`: `apply` needs the helm-diff plugin, which the
   tools image does not carry.
 
+- The Talos dashboard on the Hetzner server console is on. Talos v1.14 has no kernel argument in
+  the machine config (`talos.dashboard.disabled=1` was in `machine.install`); turning it off
+  needs an Image Factory schematic with that argument (a new snapshot and installer image).
+- Talos v1.14 mounts user volumes (`/var/mnt`) read-only into the kubelet and has no kubelet
+  `extraMounts`; local-path-provisioner's helper pods create the volume folders. Check after
+  bring-up that a CNPG volume binds and the pod writes to it.
 - kube-network-policies needs the `nfnetlink_queue` kernel module; check after bring-up that a pod
   in `default` cannot reach `pg-rw.data:5432` (stgsec section 5).
 - The first `helmfile apply` waits for the CNPG cluster before SpiceDB and Zitadel can start; a

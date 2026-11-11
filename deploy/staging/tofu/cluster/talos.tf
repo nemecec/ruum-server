@@ -28,26 +28,42 @@ data "talos_machine_configuration" "node" {
   kubernetes_version = var.kubernetes_version
   docs               = false
   examples           = false
+  # Talos v1.14 config: one document per setting (talos/patches/cluster.yaml explains why the
+  # v1alpha1 document stays almost empty). tests/run.sh validates the same patches offline.
   config_patches = [
     file("${path.module}/../../talos/patches/cluster.yaml"),
+    file("${path.module}/../../talos/patches/schedule-on-control-planes.yaml"),
     file("${path.module}/../../talos/patches/local-path-volume.yaml"),
-    yamlencode({
-      machine = {
-        install = {
-          disk  = "/dev/sda"
+    join("---\n", [
+      yamlencode({
+        machine = {
+          certSANs = values(local.public_v4)
+        }
+      }),
+      yamlencode({
+        apiVersion = "v1alpha1"
+        kind       = "UnattendedInstallConfig"
+        installer = {
           image = var.talos_installer_image
         }
-        network = {
-          hostname = each.key
+        provisioning = {
+          diskSelector = {
+            match = "disk.dev_path == \"/dev/sda\""
+          }
         }
-        certSANs = values(local.public_v4)
-      }
-      cluster = {
-        apiServer = {
-          certSANs = concat(values(local.public_v4), [local.nodes["stg-1"].private_ip])
-        }
-      }
-    }),
+      }),
+      yamlencode({
+        apiVersion = "v1alpha1"
+        kind       = "HostnameConfig"
+        auto       = "off"
+        hostname   = each.key
+      }),
+      yamlencode({
+        apiVersion    = "v1alpha1"
+        kind          = "KubeAPIServerConfig"
+        certExtraSANs = concat(values(local.public_v4), [local.nodes["stg-1"].private_ip])
+      }),
+    ]),
   ]
 }
 
