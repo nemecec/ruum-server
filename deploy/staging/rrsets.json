@@ -1,0 +1,14 @@
+[
+  ["ruum.space", "staging", "A"],
+  ["ruum.space", "staging", "AAAA"],
+  ["ruum.space", "staging", "CAA"],
+  ["ruum.space", "auth.staging", "A"],
+  ["ruum.space", "auth.staging", "AAAA"],
+  ["ruum.space", "dav.staging", "A"],
+  ["ruum.space", "dav.staging", "AAAA"],
+  ["ruumapps.net", "content.staging", "A"],
+  ["ruumapps.net", "content.staging", "AAAA"],
+  ["ruumapps.net", "content.staging", "CAA"],
+  ["ruumapps.net", "*.content.staging", "A"],
+  ["ruumapps.net", "*.content.staging", "AAAA"]
+]

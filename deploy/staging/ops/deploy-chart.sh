@@ -1,30 +1,63 @@
 #!/usr/bin/env bash
 # Rolls out charts/ruum by digest, on the build server as ruum-ops with the namespaced deployer
-# kubeconfig (review 2 O-1). Called by remote.sh deploy; deploy.sh (laptop) has checked CI,
-# the digests and the provenance first.
+# kubeconfig (review 2 O-1). Called by remote.sh deploy. deploy.sh (laptop) checks CI, the
+# digests and the provenance first; this script checks again here (code review F-3), because a
+# caller on the build server can reach remote.sh without the laptop:
+#   - every argument is validated: the commit is 40 hex characters, the images are
+#     ghcr.io/nemecec/ruum-{server,edge}@sha256:<64 hex>, the issuer is from a fixed list, the
+#     email matches a strict pattern;
+#   - the tag <commit> of each image resolves to exactly that digest;
+#   - each digest has a provenance attestation of images.yml on refs/heads/main (cosign);
+#   - the values go to helm in a values file (JSON), never through --set, so no value can add
+#     another key (helm splits --set on commas).
 #
-#   deploy-chart.sh <commit> <server-ref@sha256:...> <edge-ref@sha256:...> [--backup] [--acme ISSUER] [--acme-email EMAIL]
+#   deploy-chart.sh <commit> <server-ref@sha256:...> <edge-ref@sha256:...> [--backup] [--acme ISSUER] [--acme-email EMAIL] [--validate-only]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STG="$(cd "$HERE/.." && pwd)"
+# shellcheck source=image-check.sh
+. "$HERE/image-check.sh"
+die() { echo "deploy-chart: $*" >&2; exit 1; }
+
+[[ $# -ge 3 ]] || die "usage: deploy-chart.sh <commit> <server-ref> <edge-ref> [--backup] [--acme ISSUER] [--acme-email EMAIL]"
+commit="$1" server="$2" edge="$3"
+shift 3
+backup=0
+validate_only=0
+acme="" acme_email=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backup) backup=1; shift ;;
+    --acme) [[ $# -ge 2 ]] || die "--acme needs a value"; acme="$2"; shift 2 ;;
+    --acme-email) [[ $# -ge 2 ]] || die "--acme-email needs a value"; acme_email="$2"; shift 2 ;;
+    --validate-only) validate_only=1; shift ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+[[ "$commit" =~ $RUUM_COMMIT_RE ]] || die "the commit must be 40 lowercase hex characters"
+[[ "$server" =~ $RUUM_IMAGE_RE && "$server" == ghcr.io/nemecec/ruum-server@* ]] || die "the server image must be ghcr.io/nemecec/ruum-server@sha256:<digest>"
+[[ "$edge" =~ $RUUM_IMAGE_RE && "$edge" == ghcr.io/nemecec/ruum-edge@* ]] || die "the edge image must be ghcr.io/nemecec/ruum-edge@sha256:<digest>"
+if [[ -n "$acme" ]]; then
+  ruum_acme_issuer_ok "$acme" || die "--acme must be one of: ${RUUM_ACME_ISSUERS[*]}"
+fi
+if [[ -n "$acme_email" ]]; then
+  [[ "$acme_email" =~ $RUUM_EMAIL_RE ]] || die "--acme-email is not a plain email address"
+fi
+[[ "$acme" != zerossl || -n "$acme_email" ]] || die "--acme zerossl needs --acme-email"
+[[ $validate_only == 0 ]] || { echo "deploy-chart: arguments are valid"; exit 0; }
+
 WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
 export KUBECONFIG="$WORK/deployer.kubeconfig"
 # Helm keeps release records in ConfigMaps, so the deployer needs no access to Secrets.
 export HELM_DRIVER=configmap
-commit="${1:?commit}" server="${2:?server image by digest}" edge="${3:?edge image by digest}"
-shift 3
-backup=0
-extra=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --backup) backup=1; shift ;;
-    --acme) extra+=(--set "acme.issuer=$2"); shift 2 ;;
-    --acme-email) extra+=(--set "acme.email=$2"); shift 2 ;;
-    *) echo "deploy-chart: unknown argument $1" >&2; exit 1 ;;
-  esac
+
+echo "==> provenance of both images (images.yml on refs/heads/main), checked on the build server" >&2
+for ref in "$server" "$edge"; do
+  name="${ref%%@*}"; name="${name#ghcr.io/}"
+  tagged="$(ghcr_digest "$name" "$commit" || true)"
+  [[ "$tagged" == "${ref#*@}" ]] || die "ghcr.io/$name:$commit is not ${ref#*@} (got ${tagged:-nothing})"
+  cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"
 done
-re='^ghcr\.io/nemecec/ruum-(server|edge)@sha256:[a-f0-9]{64}$'
-[[ "$server" =~ $re && "$edge" =~ $re ]] || { echo "deploy-chart: images must be ghcr.io/nemecec/ruum-*@sha256:<digest>" >&2; exit 1; }
 
 if [[ $backup == 1 ]]; then
   # Review 2 U-3: a release with new migrations gets an on-demand backup first.
@@ -45,17 +78,24 @@ YAML
   for _ in $(seq 1 120); do
     phase="$(kubectl -n data get backup "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     [[ "$phase" == completed ]] && break
-    [[ "$phase" == failed ]] && { echo "deploy-chart: the backup failed; not deploying" >&2; exit 1; }
+    [[ "$phase" == failed ]] && die "the backup failed; not deploying"
     sleep 10
   done
-  [[ "$phase" == completed ]] || { echo "deploy-chart: the backup did not finish in 20 minutes; not deploying" >&2; exit 1; }
+  [[ "$phase" == completed ]] || die "the backup did not finish in 20 minutes; not deploying"
 fi
+
+# The values as JSON (valid YAML), built by jq from validated strings.
+values="$(mktemp "$WORK/deploy-values.XXXXXX.json")"
+trap 'rm -f "$values"' EXIT
+jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg acme "$acme" --arg email "$acme_email" '
+  { images: { server: $server, edge: $edge }, commit: $commit }
+  + (if $acme != "" then { acme: ({ issuer: $acme } + (if $email != "" then { email: $email } else {} end)) } else {} end)
+' >"$values"
 
 # --rollback-on-failure is Helm 4's name for --atomic (review 2 U-4): a failed rollout rolls
 # the release back by itself (DESIGN 19.1 layer 1).
 helm upgrade --install ruum "$STG/charts/ruum" --namespace ruum \
   --reset-then-reuse-values \
-  --set "images.server=$server" --set "images.edge=$edge" --set "commit=$commit" \
-  "${extra[@]}" \
+  --values "$values" \
   --rollback-on-failure --wait --timeout 10m
 kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.commit}{"\n"}'

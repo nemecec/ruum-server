@@ -4,8 +4,8 @@
 #   also fires for pull requests (from forks too, whose head branch can be called `main`), so
 #   every condition below is required. The job checks out the exact commit that ci tested and
 #   never runs code from a pull request. It pushes ghcr.io/nemecec/ruum-server and ruum-edge
-#   with the tags <full sha> and main, and a provenance attestation that deploy.sh verifies
-#   before it deploys by digest.
+#   with the tags <full sha> and main, scans the pushed digest, and only then adds the
+#   provenance attestation that deploy.sh and ops/deploy-chart.sh verify before a deploy.
 # - build-check: on branches and pull requests that change the images, build without pushing,
 #   with a read-only token.
 name: images
@@ -91,25 +91,6 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build (not pushed yet)
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: deploy/images/${{ matrix.image }}.Dockerfile
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: ${{ env.IMAGE }}:${{ env.SHA }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
-      - name: Scan before the push (vulnerabilities and secrets in the layers)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}:${{ env.SHA }}
-          scanners: vuln,secret
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -132,6 +113,18 @@ jobs:
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+      # Code review F-10: scan the pushed digest itself, so the scanned image and the deployed
+      # image are the same. The attestation comes only after a clean scan, and deploy.sh and
+      # ops/deploy-chart.sh refuse a digest without it.
+      - name: Scan the pushed digest (vulnerabilities and secrets in the layers)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          scanners: vuln,secret
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
       - name: Provenance attestation (deploy.sh verifies it)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

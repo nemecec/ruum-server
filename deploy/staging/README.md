@@ -23,10 +23,25 @@ server over ssh; secrets go to the remote process on stdin as `NAME=value` lines
 command line, never in a file, never printed (`lib.sh`, `remote.sh`).
 
 On the build server, the steps that create, change or delete something run as the user
-`ruum-ops` from a root-owned checkout of a pushed commit (`/opt/ruum-staging/current`, set up by
-`ops/install-ops-user.sh`). Build jobs run as `ruum` and cannot read the staging credentials.
+`ruum-ops` from a root-owned checkout of a commit of main (`/opt/ruum-staging/current`). Only
+the person moves it, with `ops/install-ops-user.sh` as root (code review F-2):
+
+- the commit must be on main; with `/etc/ruum-staging/allowed_signers` it must also carry a good
+  SSH signature by the person, otherwise the script shows the diff of `deploy/staging` and asks
+  for the commit's first 12 characters;
+- the laptop reaches ruum-ops with its own key (`~/.config/ruum/staging_ops_ed25519`,
+  `RUUM_OPS_KEY`). The key has a forced command, `ops/ssh-entry.sh`, which runs only `remote.sh`
+  steps with plain-word arguments from the pinned checkout;
+- no sudoers rule lets `ruum` (the build jobs) run anything as ruum-ops or root. The person's
+  decision on the existing broad sudo of `ruum` (code review F-1) and the exact proposed
+  changes are in `panel/staging-buildbox-hardening.md`. Until `ruum` loses that sudo, the
+  separation does not protect the credentials.
+
 Read-only steps (plans, `destroy.sh --plan`) can also run as `ruum` from a synced copy:
-`RUUM_STAGING_REMOTE=direct`.
+`RUUM_STAGING_REMOTE=direct`. Plan JSON is scrubbed in a pipe (`plan-scrub.jq`: no variables,
+no prior state, no sensitive or Talos values) before it is written, so no plan file on the
+build server holds the cluster secrets (code review F-5). The binary plan files are encrypted
+by OpenTofu with the state passphrase.
 
 OpenTofu state: `ruum-staging-tfstate` at Scaleway (kept on destroy), encrypted by OpenTofu with
 `TOFU_STATE_PASSPHRASE` before it leaves the build server. Keep a copy of the passphrase in the
@@ -41,15 +56,16 @@ staging.
 | `RUUM_STAGING_APPLY=yes deploy/staging/bootstrap-state.sh` | Creates the state bucket once. |
 | `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices, applies the exact plan, checks that every node has empty user data, writes the kubeconfig, installs the platform, and configures Zitadel. |
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
-| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest, after the provenance check; `--rollback` to go back on purpose; `--acme zerossl` to switch the CA. |
+| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest, after the provenance check (on the laptop with `gh`, and again on the build server with `cosign`); `--rollback` to go back on purpose; `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
 | `deploy/staging/destroy.sh` | The same, then asks you to type `destroy ruum-staging`. |
-| `deploy/staging/destroy.sh --sweep` | When the state is lost: deletes by label `env=staging`, never the build server or the zones. |
+| `deploy/staging/destroy.sh --sweep` | When the state is lost: deletes by label `env=staging`, only the staging names (nodes, their IPs, LB, network, firewall, placement group, and the rrsets of `rrsets.json`), never the build server or the zones. |
 | `deploy/staging/tests/run.sh` | The tests of this folder (also CI job `staging`). |
 | `ops/upgrade-talos.sh`, `ops/upgrade-k8s.sh` | Upgrades, one node at a time, after a version change in `versions.env`. |
 | `ops/restore-test.sh` | Monthly restore test into a temporary cluster. |
 | `ops/check-capacity.sh` | The N-1 sizing rule (below). |
+| `ops/check-backup.sh` | Bring-up check (`up.sh --apply` runs it after the platform): a forced WAL switch is archived into the COMPLIANCE-locked bucket and an on-demand base backup completes (code review F-7). |
 
 ## Before the first apply (the person)
 
@@ -64,8 +80,11 @@ staging.
    "Sign-in test").
 3. **Zone delete protection.** Hetzner console, DNS: turn on delete protection for `ruum.space`
    and `ruumapps.net`. The code never manages the zones, but the token could delete them.
-4. **ruum-ops.** On the build server: `sudo bash install-ops-user.sh <commit>` with the commit to
-   run from (the script is in `ops/`; copy it from that commit).
+4. **ruum-ops.** On the laptop: `ssh-keygen -t ed25519 -f ~/.config/ruum/staging_ops_ed25519`.
+   On the build server, as the person: `sudo bash install-ops-user.sh <commit of main>
+   staging_ops_ed25519.pub` (copy the script from that commit and read it first). Repeat it to
+   move ruum-ops to a newer commit. See `panel/staging-buildbox-hardening.md` for the sudo
+   changes of user `ruum` that the person decides.
 5. Optional: `STG_ACME_EMAIL` for ZeroSSL (the trusted CA for the sign-in test).
 
 ## Secrets
@@ -107,8 +126,12 @@ the blob copy is encrypted by rclone crypt with a key that lives off the cluster
 
 ## Deploy rules
 
-- By digest only: the chart refuses an image tag. `deploy.sh` checks CI, the digest and the
-  provenance attestation of `images.yml` on `refs/heads/main`.
+- By digest only: the chart accepts only `ghcr.io/nemecec/ruum-{server,edge}@sha256:...`.
+  `deploy.sh` checks CI, the digest and the provenance attestation of `images.yml` on
+  `refs/heads/main`. `ops/deploy-chart.sh` on the build server validates every argument (commit
+  40 hex, issuer from a fixed list, a plain email), checks that the tag `<commit>` is that
+  digest, verifies the attestation again with `cosign`, and gives helm a values file, never
+  `--set` (code review F-3).
 - Migrations follow **expand and contract**: a release only adds; a removal comes one release
   later. A failed rollout rolls the image back (`--rollback-on-failure`, Helm 4) but not the
   schema, so the previous image must work on the new schema. `deploy.sh` takes an on-demand CNPG
@@ -161,8 +184,9 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | B-7 | `autoLinking` unspecified for every provider; Microsoft `emailVerified: false`; `zitadel-bootstrap.sh check` reports drift. |
 | B-8 | Machine-only first instance, PAT 90 days; no password login, no registration; console and admin APIs 403 except from the build server; smoke and drift checks. |
 | B-9 | Zones are data sources; `check-plan.sh` refuses any `hcloud_zone` resource and any DNS name outside staging. |
+| F-4 (code review) | `check-plan.sh` also refuses firewall rules other than inbound tcp 50000, tcp 6443 and ICMP from the build server's addresses, a firewall or server delete or replace (only `--allow-delete` for the destroy plan, `--allow-replace` on purpose), firewall attachments, LB targets and server networks outside the plan or on the build server, label selectors other than `env=staging,role=node`, and any object lock other than COMPLIANCE for `BACKUP_LOCK_DAYS`; servers in child modules count. |
 | S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads. |
-| S-2 | `ruum-ops` user, root-owned code, sudo for `remote.sh` only; namespaced `deployer` ServiceAccount. |
+| S-2 | `ruum-ops` user, root-owned checkout of a commit of main that only the person moves, laptop key with a forced command (no sudo rule for `ruum`); namespaced `deployer` ServiceAccount. |
 | S-3 | One Secret per consumer; `secrets-push.sh` fixed list, refuses forbidden names; tests. |
 | S-4 | Certificates in the edge's emptyDir; no Hetzner key in the edge. |
 | S-5 | rclone crypt for the blob copy; provider-side encryption stated for CNPG; HTTPS endpoints only. |
@@ -187,6 +211,15 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | O-1 | As S-2. |
 
 ## Known gaps
+
+- One API endpoint (code review F-8): `cluster_endpoint` is the private IP of stg-1, and the
+  build server's kubeconfig points at the public IP of stg-1. KubePrism covers the kubelets and
+  pods, but joins and the build server need stg-1. If stg-1 is lost, point the kubeconfig at
+  stg-2 (`write_configs` in `remote.sh` reads `node_ipv4["stg-1"]`; use `stg-2` there) until stg-1
+  is back.
+- The provenance check with `cosign` on the build server (`ops/image-check.sh`) is written for the
+  attestation that `actions/attest-build-provenance` pushes to GHCR. Check it on the first image
+  that `images.yml` publishes from main.
 
 - kube-network-policies needs the `nfnetlink_queue` kernel module; check after bring-up that a pod
   in `default` cannot reach `pg-rw.data:5432` (stgsec section 5).

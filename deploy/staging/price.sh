@@ -38,7 +38,9 @@ lines="$(jq -r --slurpfile p "$pricing" --argjson snap "$snapshot_gb" \
   ($p[0].pricing) as $P
   | def loc_price(prices; loc): ([prices[] | select(.location == loc) | .price_monthly.gross | tonumber] | first)
       // error("no price for location \(loc)");
-  [ .planned_values.root_module.resources[]? ] as $r
+  # Every resource of the end state, child modules included (code review F-4).
+  def all_planned: [ .planned_values.root_module // {} | recurse(.child_modules[]?) | .resources[]? ];
+  all_planned as $r
   | ( [ $r[] | select(.type == "hcloud_server") | .values ] | group_by(.server_type + "@" + .location)
       | map(.[0] as $f | { item: "server \($f.server_type) (\($f.location))", count: length,
               each: loc_price([$P.server_types[] | select(.name == $f.server_type)][0].prices; $f.location) }) )
@@ -51,7 +53,7 @@ lines="$(jq -r --slurpfile p "$pricing" --argjson snap "$snapshot_gb" \
     + [ { item: "Talos snapshot (\($snap) GB)", count: 1, each: ($snap * ($P.image.price_per_gb_month.gross | tonumber)) } ]
     + ( if ([ $r[] | select(.type == "minio_s3_bucket") ] | length) > 0
         then [ { item: "Hetzner Object Storage base fee (estimate, not in the API)", count: 1, each: $osb } ] else [] end )
-    + ( if ([ ($pers[0].planned_values.root_module.resources // [])[] | select(.type == "scaleway_object_bucket") ] | length) > 0
+    + ( if ([ $pers[0] | all_planned[] | select(.type == "scaleway_object_bucket") ] | length) > 0
           or ([ $r[] | select(.type == "minio_s3_bucket") ] | length) > 0
         then [ { item: "Scaleway Object Storage: backups, blob copy, state (estimate)", count: 1, each: $scw } ] else [] end )
   | .[] | [ .item, .count, .each, (.count * .each) ] | @tsv

@@ -96,8 +96,15 @@ install_hcloud_upload_image() {
   log "hcloud-upload-image $HCLOUD_UPLOAD_IMAGE_VERSION"
 }
 
+install_cosign() {
+  have cosign "${COSIGN_VERSION#v}" version && return
+  fetch "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign-linux-$ARCH" "$(sha COSIGN)" "$TMP/cosign"
+  install -m 0755 "$TMP/cosign" "$BIN/cosign"
+  log "cosign $COSIGN_VERSION"
+}
+
 tools=("$@")
-[[ ${#tools[@]} -gt 0 ]] || tools=(tofu talosctl kubectl helm helmfile hcloud hcloud_upload_image)
+[[ ${#tools[@]} -gt 0 ]] || tools=(tofu talosctl kubectl helm helmfile hcloud hcloud_upload_image cosign)
 for t in "${tools[@]}"; do
   "install_${t//-/_}"
 done

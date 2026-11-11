@@ -1,3 +1,4 @@
+{{- include "ruum.checkCommit" . }}
 # ruum-server (plan 5.8). One replica, so the start-up migration is safe (RUUM_MIGRATE=true).
 # Migrations follow expand and contract (README "Deploy"): the previous image must work on the
 # new schema, because a failed rollout rolls the image back but not the schema (review 2 U-3).

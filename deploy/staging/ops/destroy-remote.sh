@@ -5,9 +5,12 @@
 #   destroy-remote.sh destroy-plan          three lists + state vs labels; changes nothing
 #   destroy-remote.sh destroy               the same plan, then apply it; snapshot; checks
 #   destroy-remote.sh sweep                 delete env=staging resources by label (lost state)
+#   destroy-remote.sh sweep-filter          read "kind ..." lines on stdin, print the ones that
+#                                           sweep may delete (the rule of sweep; tests/run.sh)
 set -euo pipefail
 step="$1"
 shift || true
+HERE="${HERE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # shellcheck source=../versions.env
 . "$HERE/versions.env"
 log() { printf '==> %s\n' "$*" >&2; }
@@ -16,24 +19,48 @@ hapi() {
   printf 'header = "Authorization: Bearer %s"\n' "$HCLOUD_TOKEN" | curl -fsS -K - "https://api.hetzner.cloud/v1/$1"
 }
 
-# The staging DNS names (check-plan.sh has the same list).
-STAGING_RRSETS='ruum.space staging A|ruum.space staging AAAA|ruum.space staging CAA|ruum.space auth.staging A|ruum.space auth.staging AAAA|ruum.space dav.staging A|ruum.space dav.staging AAAA|ruumapps.net content.staging A|ruumapps.net content.staging AAAA|ruumapps.net content.staging CAA|ruumapps.net *.content.staging A|ruumapps.net *.content.staging AAAA'
+# The staging DNS names: the same list as check-plan.sh (rrsets.json), as "zone name type" lines.
+staging_rrsets() { jq -r '.[] | join(" ")' "$HERE/rrsets.json"; }
 
 # What exists in Hetzner with env=staging (servers, IPs, LB, network, firewall, placement
-# group, snapshots) and the staging rrsets, as "kind name" lines.
+# group, snapshots) and the staging rrsets that carry env=staging, as "kind name" lines
+# ("rrset zone name type" for DNS).
 labelled() {
-  local kind
+  local kind zone name type
   for kind in servers primary_ips load_balancers networks firewalls placement_groups; do
     hapi "$kind?label_selector=env%3Dstaging&per_page=50" | jq -r --arg k "$kind" '.[$k][] | "\($k) \(.name)"'
   done
   hapi "images?type=snapshot&label_selector=env%3Dstaging" | jq -r '.images[] | "snapshot \(.description)"'
-  local zone name type
-  IFS='|' read -ra sets <<<"$STAGING_RRSETS"
-  for s in "${sets[@]}"; do
-    read -r zone name type <<<"$s"
-    hapi "zones/$zone/rrsets/$name/$type" >/dev/null 2>&1 && echo "rrset $name.$zone $type"
-  done
+  while read -r zone name type; do
+    hapi "zones/$zone/rrsets/$name/$type" 2>/dev/null |
+      jq -r --arg z "$zone" --arg n "$name" --arg t "$type" 'select(.rrset.labels.env == "staging") | "rrset \($z) \($n) \($t)"'
+  done < <(staging_rrsets)
   return 0
+}
+
+# sweep_filter: the "kind name..." lines on stdin that sweep may delete (code review F-6). Only
+# the staging names: the nodes, their addresses, the LB, network, firewall and placement group of
+# tofu/cluster, and the rrsets of rrsets.json. Anything else, and anything named buildbox, is
+# dropped with a note on stderr.
+sweep_filter() {
+  local kind rest allowed
+  allowed="$(staging_rrsets)"
+  while read -r kind rest; do
+    [[ -n "$kind" ]] || continue
+    if [[ "$rest" == *buildbox* ]]; then
+      echo "sweep: never touching $kind $rest" >&2
+      continue
+    fi
+    case "$kind" in
+      servers) [[ "$rest" =~ ^stg-[1-4]$ ]] ;;
+      primary_ips) [[ "$rest" =~ ^stg-[1-4]-v[46]$ ]] ;;
+      load_balancers | networks) [[ "$rest" == ruum-staging ]] ;;
+      firewalls | placement_groups) [[ "$rest" == ruum-staging-nodes ]] ;;
+      rrset) grep -qxF -- "$rest" <<<"$allowed" ;;
+      *) false ;;
+    esac && { printf '%s %s\n' "$kind" "$rest"; continue; }
+    echo "sweep: not a staging name, left alone: $kind $rest" >&2
+  done
 }
 
 plan_destroy() {
@@ -45,7 +72,9 @@ plan_destroy() {
     (cd "$dir" && tofu plan -destroy -refresh=false -input=false -no-color -lock-timeout=60s -out="$WORK/destroy.tfplan" >"$WORK/destroy-plan.log" 2>&1) ||
       { tail -30 "$WORK/destroy-plan.log" >&2; die "tofu plan -destroy failed also without refresh; see --sweep"; }
   fi
-  (cd "$dir" && tofu show -json "$WORK/destroy.tfplan" | jq 'del(.variables)' >"$WORK/destroy.json")
+  # Scrubbed in the pipe: the destroy plan holds the whole prior state (code review F-5).
+  (cd "$dir" && set -o pipefail && tofu show -json "$WORK/destroy.tfplan" | jq -f "$HERE/plan-scrub.jq" >"$WORK/destroy.json") ||
+    { rm -f "$WORK/destroy.json"; die "tofu show -json failed for the destroy plan"; }
 }
 
 # three_lists [PLAN_JSON ACTION]: from the destroy plan (deletes), or, before staging exists,
@@ -73,7 +102,11 @@ three_lists() {
   local zones
   zones="$(jq -r '[.resource_changes[] | select(.type == "hcloud_zone")] | length' "$src")"
   [[ "$zones" == 0 ]] || die "the plan contains a zone resource; refusing"
-  bash "$HERE/check-plan.sh" "$src"
+  if [[ "$action" == delete ]]; then
+    bash "$HERE/check-plan.sh" "$src" --allow-delete
+  else
+    bash "$HERE/check-plan.sh" "$src"
+  fi
   echo
   echo "################ STATE vs LABELS (review 2 D-2) ################"
   if [[ "$action" == delete ]]; then
@@ -123,32 +156,33 @@ case "$step" in
     echo "after destroy: staging servers $left, load balancers $lbs, ruum-buildbox $bb"
     [[ "$left" == 0 && "$lbs" == 0 && "$bb" == running ]] || die "destroy check failed"
     ;;
+  sweep-filter)
+    sweep_filter
+    ;;
   sweep)
     [[ "${RUUM_STAGING_DESTROY:-}" == "destroy ruum-staging" ]] || die "sweep needs RUUM_STAGING_DESTROY='destroy ruum-staging'"
-    labelled | while read -r kind name; do
-      [[ "$name" == *buildbox* ]] && die "refusing to touch $name"
+    labelled | sweep_filter >"$WORK/sweep.txt"
+    while read -r kind name; do
       case "$kind" in
         servers) HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud server delete "$name" ;;
         load_balancers) HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud load-balancer delete "$name" ;;
         *) : ;;
       esac
-    done
+    done <"$WORK/sweep.txt"
     sleep 20
-    labelled | while read -r kind name; do
+    while read -r kind name; do
       case "$kind" in
         primary_ips) HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud primary-ip delete "$name" ;;
         networks) HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud network delete "$name" ;;
         firewalls) HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud firewall delete "$name" ;;
         placement_groups) HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud placement-group delete "$name" ;;
         rrset)
-          read -r fqdn type <<<"$name"
-          zone="${fqdn#*.staging.}"; zone="${zone#staging.}"
-          case "$fqdn" in *.ruum.space) zone=ruum.space ;; *.ruumapps.net) zone=ruumapps.net ;; esac
-          HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud zone rrset delete "$zone" "${fqdn%.$zone}" "$type"
+          read -r zone rname type <<<"$name"
+          HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud zone rrset delete "$zone" "$rname" "$type"
           ;;
         *) : ;;
       esac
-    done
+    done <"$WORK/sweep.txt"
     echo "sweep done; the Hetzner blob bucket ruum-staging-blobs is removed with the S3 API (README)"
     ;;
 esac

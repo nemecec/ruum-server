@@ -4,7 +4,7 @@
 #   deploy/staging/up.sh                     the priced plan only (default; changes nothing)
 #   deploy/staging/up.sh --out FILE          the same, also written to FILE (no secrets in it)
 #   RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply [--restore-from GENERATION]
-#                                            plan, guard, price, apply, platform, Zitadel
+#                                            plan, guard, price, apply, platform, backup check, Zitadel
 #
 # Runs on the laptop (the secrets file is here); every step runs on the build server over ssh,
 # with the secrets on stdin (lib.sh). The plan is refused when check-plan.sh finds a resource
@@ -88,7 +88,7 @@ stg_audit plan ok
 [[ $apply == 1 ]] || { stg_log "plan only. To apply: RUUM_STAGING_APPLY=yes $0 --apply"; exit 0; }
 
 # --- Apply ---
-[[ "$STG_MODE" == ops ]] || stg_die "--apply runs only in the ruum-ops mode"
+[[ "$STG_MODE" == ops || "$STG_MODE" == sudo ]] || stg_die "--apply runs only as ruum-ops (RUUM_STAGING_REMOTE=ops)"
 bash "$STG_HERE/secrets-init.sh"
 stg_log "apply: snapshot, OpenTofu (exact reviewed plan), user_data check, kubeconfig"
 stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_remote rw apply
@@ -96,6 +96,9 @@ stg_audit apply "tofu ok"
 stg_log "platform: namespaces, network policy, CNPG, SpiceDB, Zitadel, NATS, Mailpit, edge"
 bash "$STG_HERE/secrets-push.sh" platform ${restore_from:+--restore-from "$restore_from"}
 stg_audit apply "platform ok"
+stg_log "backups: WAL push and a base backup into the COMPLIANCE-locked bucket (code review F-7)"
+printf '__END__\n' | stg_remote rw check-backup
+stg_audit apply "backup check ok"
 stg_log "Zitadel: OIDC app, Google, Microsoft, login policy"
 stg_secret_stream GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET |
   stg_remote rw zitadel-bootstrap apply
