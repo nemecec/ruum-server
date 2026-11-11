@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Sends the cluster secrets from the laptop to the build server, over ssh stdin, for one target
+# Sends the cluster secrets from the Mac's secrets file to the tools container, on its stdin, for one target
 # (review 1 S-3). Each target has a fixed list of names; nothing else is ever sent, and the
 # Hetzner token and the Stripe keys are never sent to the cluster (tests/run.sh checks the lists).
 #
 #   deploy/staging/secrets-push.sh platform [--restore-from GENERATION]
 #
-# On the build server, k8s/apply.sh splits them into one Kubernetes Secret per consumer and
+# In the container, k8s/apply.sh splits them into one Kubernetes Secret per consumer and
 # namespace (README "Secrets").
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-# The platform target. Keep in sync with CLUSTER_SECRET_NAMES in remote.sh (tests/run.sh).
+# The platform target. Keep in sync with CLUSTER_SECRET_NAMES in steps.sh (tests/run.sh).
 PLATFORM_NAMES=(SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY
   GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET
   STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD
@@ -37,6 +37,6 @@ required=(SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZ
   STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS)
 missing="$(stg_missing "${required[@]}")"
 [[ -z "$missing" ]] || stg_die "missing in secrets.env: $(echo $missing) (secrets-init.sh generates the STG_* ones; the person adds SCW_BACKUP_* and STG_ALLOWED_EMAILS)"
-stg_log "sending ${#names[@]} names to the build server (values on stdin, never printed)"
+stg_log "sending ${#names[@]} names to the tools container (values on stdin, never printed)"
 # The tofu names too: apply.sh reads the generation from the encrypted state.
-stg_secret_stream "${names[@]}" "${STG_NAMES_TOFU[@]}" | stg_remote rw platform "$@"
+stg_secret_stream "${names[@]}" "${STG_NAMES_TOFU[@]}" | stg_run rw platform "$@"

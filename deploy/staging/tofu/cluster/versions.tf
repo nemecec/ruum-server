@@ -19,7 +19,7 @@ terraform {
     }
   }
 
-  # State at Scaleway (kept on destroy), encrypted before it leaves the build server.
+  # State at Scaleway (kept on destroy), encrypted before it leaves the Mac.
   # up.sh passes the bucket settings with -backend-config; the passphrase comes from
   # TF_VAR_state_passphrase (TOFU_STATE_PASSPHRASE in secrets.env), never from a file.
   backend "s3" {

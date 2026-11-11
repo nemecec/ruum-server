@@ -3,9 +3,9 @@
 #
 #   deploy/staging/deploy.sh <sha> [--rollback] [--acme letsencrypt-staging|zerossl]
 #
-# Steps (laptop; the rollout itself runs on the build server as ruum-ops, and
-# ops/deploy-chart.sh validates the arguments and checks the digests and the provenance again
-# there, code review F-3):
+# Steps (on the Mac; the rollout itself runs in the tools container, where ops/deploy-chart.sh
+# validates the arguments and checks the digests and the provenance again with cosign, code
+# review F-3):
 #   1. <sha> is on origin/main and the `ci` workflow passed for it on a push to main;
 #   2. the tag <sha> of ghcr.io/nemecec/ruum-server and ruum-edge resolves to a digest;
 #   3. each digest has a provenance attestation from images.yml on refs/heads/main;
@@ -69,7 +69,7 @@ for ref in "${refs[@]}"; do
 done
 
 stg_log "4. the deployed commit"
-deployed="$(printf '__END__\n' | stg_remote ro status --deployed-commit 2>/dev/null || true)"
+deployed="$(printf '__END__\n' | stg_run ro status --deployed-commit 2>/dev/null || true)"
 backup=()
 if [[ "$deployed" =~ ^[0-9a-f]{40}$ ]]; then
   if [[ "$deployed" != "$sha" ]] && git -C "$STG_ROOT" merge-base --is-ancestor "$sha" "$deployed"; then
@@ -84,6 +84,6 @@ else
 fi
 
 stg_log "6. rollout of $sha"
-printf '__END__\n' | stg_remote rw deploy "$sha" "${refs[0]}" "${refs[1]}" ${backup[@]+"${backup[@]}"} ${acme[@]+"${acme[@]}"}
+printf '__END__\n' | stg_run rw deploy "$sha" "${refs[0]}" "${refs[1]}" ${backup[@]+"${backup[@]}"} ${acme[@]+"${acme[@]}"}
 stg_audit deploy "$sha"
 bash "$STG_HERE/ops/smoke.sh"

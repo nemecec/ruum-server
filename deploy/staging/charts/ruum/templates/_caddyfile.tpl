@@ -61,17 +61,20 @@
 }
 
 # Zitadel: sign-in and OIDC are public; the console and the admin, management and system
-# APIs answer only to the build server (review 1 B-8, stgsec M-4).
+# APIs answer only to adminSources, which is empty by default: 403 for every public address
+# (review 1 B-8, stgsec M-4).
 {{ .Values.hosts.auth }} {
 	import platform_headers
 	@public path /.well-known/* /oauth/v2/* /oidc/v1/* /ui/login/* /idps/callback /idps/callback/* /assets/v1/*
-	@admin remote_ip{{ range .Values.adminSources }} {{ . }}{{ end }}
 	handle @public {
 		reverse_proxy h2c://zitadel.auth.svc.cluster.local:8080
 	}
+{{- if .Values.adminSources }}
+	@admin remote_ip{{ range .Values.adminSources }} {{ . }}{{ end }}
 	handle @admin {
 		reverse_proxy h2c://zitadel.auth.svc.cluster.local:8080
 	}
+{{- end }}
 	handle {
 		respond "Forbidden" 403
 	}

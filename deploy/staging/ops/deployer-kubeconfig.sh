@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Writes the kubeconfig of the ServiceAccount ruum/deployer (Helm in `ruum` and `edge` only,
-# charts/platform/templates/deployer-rbac.yaml) to ~/.ruum-staging/deployer.kubeconfig (0600).
-# The release agent and the deploy timer use it; the admin kubeconfig stays for up.sh,
-# upgrades and destroy (review 1 S-2, review 2 O-1).
+# charts/platform/templates/deployer-rbac.yaml) to ~/.config/ruum/staging/deployer.kubeconfig (0600, on
+# the Mac). deploy.sh uses it; the admin kubeconfig stays for up.sh, upgrades and destroy (review 1 S-2, review 2 O-1).
 set -euo pipefail
-WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
+WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 out="$WORK/deployer.kubeconfig"
 umask 077
 server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"

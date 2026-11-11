@@ -1,5 +1,5 @@
-# Talos bootstrap, applied from the build server (where OpenTofu runs) over the Talos API, which
-# the firewall opens only to admin_cidrs. The machine config never goes through user_data, so no
+# Talos bootstrap, applied from the operator's Mac (where OpenTofu runs, in the tools container)
+# over the Talos API, which the firewall opens only to admin_cidrs (the Mac's public IPv4). The machine config never goes through user_data, so no
 # pod can read it from the metadata service (review 1 B-1).
 #
 # Destroy without node access (review 2 D-1): no talos_cluster_health and no
@@ -9,7 +9,7 @@
 locals {
   cluster_name = "ruum-staging"
   # The API endpoint inside the cluster: the private address of stg-1. Nodes reach it over the
-  # private network; the build server uses the public addresses (in the cert SANs).
+  # private network; the Mac uses the public addresses (in the cert SANs).
   cluster_endpoint = "https://${local.nodes["stg-1"].private_ip}:6443"
   public_v4        = { for k, s in hcloud_server.node : k => s.ipv4_address }
 }

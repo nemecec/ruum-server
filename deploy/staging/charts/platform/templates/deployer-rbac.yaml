@@ -1,6 +1,6 @@
-# The release agent and the deploy timer use this ServiceAccount, not the admin kubeconfig
-# (review 1 S-2, review 2 O-1): Helm in `ruum` and `edge` only. ops/deployer-kubeconfig.sh
-# writes its kubeconfig for the ruum-ops user.
+# deploy.sh uses this ServiceAccount, not the admin kubeconfig (review 1 S-2, review 2 O-1):
+# Helm in `ruum` and `edge` only. ops/deployer-kubeconfig.sh writes its kubeconfig into the
+# person's work folder on the Mac.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

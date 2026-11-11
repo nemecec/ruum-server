@@ -57,11 +57,11 @@ variable "talos_installer_image" {
 }
 
 variable "admin_cidrs" {
-  description = "Sources allowed to reach the Talos API (50000) and the Kubernetes API (6443): the build server, IPv4 and IPv6. Review 2 O-3: change it with up.sh when the build server moves."
+  description = "The one source allowed to reach the Talos API (50000) and the Kubernetes API (6443): the current public IPv4 address of the operator's Mac as a /32. up.sh reads it at run time (steps.sh admin_cidrs)."
   type        = list(string)
   validation {
-    condition     = length(var.admin_cidrs) > 0 && alltrue([for c in var.admin_cidrs : !contains(["0.0.0.0/0", "::/0"], c)])
-    error_message = "admin_cidrs must list the build server, never the whole Internet."
+    condition     = length(var.admin_cidrs) == 1 && alltrue([for c in var.admin_cidrs : can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/32$", c))])
+    error_message = "admin_cidrs must be exactly one IPv4 address as a /32 (the operator's Mac), never a wider range."
   }
 }
 

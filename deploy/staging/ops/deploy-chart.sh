@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Rolls out charts/ruum by digest, on the build server as ruum-ops with the namespaced deployer
-# kubeconfig (review 2 O-1). Called by remote.sh deploy. deploy.sh (laptop) checks CI, the
-# digests and the provenance first; this script checks again here (code review F-3), because a
-# caller on the build server can reach remote.sh without the laptop:
+# Rolls out charts/ruum by digest, in the tools container on the Mac with the namespaced deployer
+# kubeconfig (review 2 O-1). Called by steps.sh deploy. deploy.sh (Mac) checks CI, the digests
+# and the provenance first with gh; this script checks again here with cosign (code review F-3),
+# so a call of steps.sh deploy that skips deploy.sh cannot deploy another image:
 #   - every argument is validated: the commit is 40 hex characters, the images are
 #     ghcr.io/nemecec/ruum-{server,edge}@sha256:<64 hex>, the issuer is from a fixed list, the
 #     email matches a strict pattern;
@@ -46,12 +46,12 @@ fi
 [[ "$acme" != zerossl || -n "$acme_email" ]] || die "--acme zerossl needs --acme-email"
 [[ $validate_only == 0 ]] || { echo "deploy-chart: arguments are valid"; exit 0; }
 
-WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
+WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export KUBECONFIG="$WORK/deployer.kubeconfig"
 # Helm keeps release records in ConfigMaps, so the deployer needs no access to Secrets.
 export HELM_DRIVER=configmap
 
-echo "==> provenance of both images (images.yml on refs/heads/main), checked on the build server" >&2
+echo "==> provenance of both images (images.yml on refs/heads/main), checked with cosign" >&2
 for ref in "$server" "$edge"; do
   name="${ref%%@*}"; name="${name#ghcr.io/}"
   tagged="$(ghcr_digest "$name" "$commit" || true)"

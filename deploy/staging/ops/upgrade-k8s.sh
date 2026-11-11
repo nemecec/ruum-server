@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Upgrades Kubernetes with `talosctl upgrade-k8s` (review 2 U-1), after upgrade-talos.sh. Change
 # KUBERNETES_VERSION in versions.env in a pull request first. talosctl upgrades the control plane
-# components and the kubelets node by node and checks each step.
+# components and the kubelets node by node and checks each step. On the Mac:
+#   deploy/staging/tool.sh bash deploy/staging/ops/upgrade-k8s.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../versions.env
 . "$HERE/../versions.env"
-WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
+WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export TALOSCONFIG="$WORK/talosconfig" KUBECONFIG="$WORK/kubeconfig"
 bash "$HERE/check-capacity.sh"
 first="$(talosctl config info -o json | jq -r '.endpoints[0]')"

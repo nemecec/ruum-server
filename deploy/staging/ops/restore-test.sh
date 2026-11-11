@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Monthly restore test (DESIGN 5.2: an untested backup is not a backup). On the build server as
-# ruum-ops. It bootstraps a temporary CNPG cluster pg-restore from the backup path of the current
+# Monthly restore test (DESIGN 5.2: an untested backup is not a backup). On the Mac, in the tools
+# container (deploy/staging/tool.sh bash deploy/staging/ops/restore-test.sh). It bootstraps a temporary CNPG cluster pg-restore from the backup path of the current
 # generation, compares row counts with the live cluster, and deletes pg-restore. About 0.8 GB of
 # memory for a few minutes; one instance.
 #
 # The full disaster-recovery rehearsal is `up.sh --apply --restore-from <generation>` on a new
 # cluster: it starts Zitadel on the restored database with the escrowed master key (review 1 S-6).
 set -euo pipefail
-WORK="${RUUM_STAGING_WORK:-$HOME/.ruum-staging}"
+WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export KUBECONFIG="$WORK/kubeconfig"
 log() { printf '==> %s\n' "$*" >&2; }
 gen="$(kubectl -n data get cluster pg -o jsonpath='{.spec.plugins[0].parameters.serverName}')"

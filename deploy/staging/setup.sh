@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Installs the staging tools into ~/.local/bin of the current user, pinned by version and
-# SHA-256 (versions.env). Runs on the build server (arm64) or a Linux CI runner (amd64).
+# SHA-256 (versions.env). Runs in the tools image build (tools-image.sh, linux arm64 on the Mac)
+# or on a Linux CI runner (amd64).
 # Idempotent: a tool with the right version is not downloaded again.
 #
 #   deploy/staging/setup.sh            install or check every tool
@@ -19,7 +20,7 @@ case "$(uname -m)" in
   x86_64 | amd64) ARCH=amd64 ;;
   *) echo "setup.sh: unsupported machine $(uname -m)" >&2; exit 1 ;;
 esac
-[[ "$(uname -s)" == Linux ]] || { echo "setup.sh: Linux only (the build server or CI)" >&2; exit 1; }
+[[ "$(uname -s)" == Linux ]] || { echo "setup.sh: Linux only (the tools image or CI)" >&2; exit 1; }
 
 log() { printf '==> %s\n' "$*" >&2; }
 TMP="$(mktemp -d)"

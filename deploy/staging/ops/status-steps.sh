@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# The build-server half of status.sh. Environment: WORK, KUBECONFIG_FILE, HCLOUD_TOKEN.
-#   status-remote.sh [--checks]          the report
-#   status-remote.sh --deployed-commit   only the deployed commit (deploy.sh), or nothing
+# The container half of status.sh (steps.sh status). Environment: WORK, KUBECONFIG_FILE,
+# HCLOUD_TOKEN.
+#   status-steps.sh [--checks]          the report
+#   status-steps.sh --deployed-commit   only the deployed commit (deploy.sh), or nothing
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 kc=()
@@ -29,7 +30,7 @@ done
 echo "== Monthly price of what exists"
 bash "$HERE/cost-report.sh" 2>/dev/null || echo "  (cost-report failed)"
 if [[ ${#kc[@]} -eq 0 ]]; then
-  echo "== Cluster: no kubeconfig here (direct mode, or staging not created)"
+  echo "== Cluster: no kubeconfig in $WORK (staging not created yet)"
   exit 0
 fi
 echo "== Nodes"

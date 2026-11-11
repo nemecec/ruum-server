@@ -27,7 +27,8 @@ data "hcloud_zone" "ruumapps_net" {
   name = "ruumapps.net"
 }
 
-# The build server's key, only so Hetzner sends no root password mail. Talos ignores it.
+# An existing project key (read only, never changed), only so Hetzner sends no root password
+# mail. Talos ignores it.
 data "hcloud_ssh_key" "buildbox" {
   name = "ruum-buildbox"
 }
@@ -54,7 +55,7 @@ resource "hcloud_firewall" "nodes" {
   labels = local.labels
 
   rule {
-    description = "Talos API from the build server"
+    description = "Talos API from the operator's Mac"
     direction   = "in"
     protocol    = "tcp"
     port        = "50000"
@@ -62,7 +63,7 @@ resource "hcloud_firewall" "nodes" {
   }
 
   rule {
-    description = "Kubernetes API from the build server"
+    description = "Kubernetes API from the operator's Mac"
     direction   = "in"
     protocol    = "tcp"
     port        = "6443"
@@ -70,7 +71,7 @@ resource "hcloud_firewall" "nodes" {
   }
 
   rule {
-    description = "ICMP from the build server (review stgsec S-13)"
+    description = "ICMP from the operator's Mac (review stgsec S-13)"
     direction   = "in"
     protocol    = "icmp"
     source_ips  = var.admin_cidrs
@@ -104,7 +105,7 @@ resource "hcloud_primary_ip" "v6" {
 
 # --- Servers: Talos snapshot, no user_data (review 1 B-1), firewall from the first boot. ---
 # The node boots into Talos maintenance mode. talos_machine_configuration_apply below sends the
-# machine config from the build server over the firewalled Talos API.
+# machine config from the operator's Mac over the firewalled Talos API.
 resource "hcloud_server" "node" {
   for_each           = local.nodes
   name               = each.key

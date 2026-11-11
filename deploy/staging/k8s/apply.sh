@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The platform of staging, on the build server as ruum-ops (remote.sh platform). The cluster
-# secrets are in the environment (from secrets.env over ssh stdin); they become one Kubernetes
+# The platform of staging, in the tools container on the Mac (steps.sh platform). The cluster
+# secrets are in the environment (from secrets.env over the container's stdin); they become one Kubernetes
 # Secret per consumer and namespace (review 1 S-3), through `kubectl apply -f -` on stdin, never
 # a file or an argument.
 #
@@ -73,6 +73,8 @@ printf 'ruum-password=%s\n' "$STG_NATS_RUUM_PASSWORD" | secret nats nats-auth
   [[ -z "${STG_ALLOWED_UNVERIFIED_EMAILS:-}" ]] || printf 'RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS=%s\n' "$STG_ALLOWED_UNVERIFIED_EMAILS"
 } | secret ruum ruum-server-env
 
+# `helmfile sync`, not `apply`: apply needs the helm-diff plugin, which the tools image does not
+# carry (every tool there is pinned by SHA-256; a plugin would be one more download).
 log "platform charts (helmfile)"
 export PG_GENERATION="$generation" PG_RESTORE_FROM="$restore_from"
 export ZITADEL_PAT_EXPIRY
@@ -80,8 +82,8 @@ ZITADEL_PAT_EXPIRY="$(date -u -d '+90 days' +%Y-%m-%dT00:00:00Z)"
 # The CNPG CA must exist in the client namespaces before SpiceDB and Zitadel start; the
 # cluster makes it, so the first pass installs the operators and the cluster, then copies it.
 helmfile --file "$HERE/helmfile.yaml.gotmpl" --selector name=cert-manager --selector name=cnpg \
-  --selector name=barman-cloud apply --suppress-diff
-helmfile --file "$HERE/helmfile.yaml.gotmpl" --selector name=platform apply --suppress-diff --skip-deps
+  --selector name=barman-cloud sync
+helmfile --file "$HERE/helmfile.yaml.gotmpl" --selector name=platform sync --skip-deps
 log "waiting for the CNPG cluster pg"
 k -n data wait --for=condition=Ready cluster/pg --timeout=20m >/dev/null
 for ns in authz auth ruum; do
@@ -90,7 +92,7 @@ for ns in authz auth ruum; do
     k apply -f - >/dev/null
   log "secret $ns/pg-ca (CNPG CA)"
 done
-helmfile --file "$HERE/helmfile.yaml.gotmpl" apply --suppress-diff
+helmfile --file "$HERE/helmfile.yaml.gotmpl" sync
 
 log "deployer kubeconfig (namespaced, review 2 O-1)"
 bash "$STG/ops/deployer-kubeconfig.sh"

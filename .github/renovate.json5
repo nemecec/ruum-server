@@ -14,6 +14,15 @@
         "# renovate: datasource=(?<datasource>\\S+)( registryUrl=(?<registryUrl>\\S+))? depName=(?<depName>\\S+)\\n[A-Z_]+=(?<currentValue>\\S+)",
       ],
     },
+    {
+      // The base of the staging tools image: NAME=image:tag@sha256:digest (tools-image.sh).
+      customType: "regex",
+      managerFilePatterns: ["/^deploy/staging/versions\\.env$/"],
+      datasourceTemplate: "docker",
+      matchStrings: [
+        "# renovate-image: depName=(?<depName>\\S+)\\n[A-Z_]+=[^:\\s]+:(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[0-9a-f]{64})",
+      ],
+    },
   ],
   packageRules: [
     {

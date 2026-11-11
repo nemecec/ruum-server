@@ -2,10 +2,10 @@
 # Creates the OpenTofu state bucket ruum-staging-tfstate at Scaleway (nl-ams), once: private,
 # versioned, kept on destroy. CREATES A CLOUD RESOURCE (about EUR 0.01 per month): run it only
 # with RUUM_STAGING_APPLY=yes, after the person or the orchestrator has read the plan.
-# The state in it is encrypted by OpenTofu (TOFU_STATE_PASSPHRASE) before it leaves the build
-# server, so the bucket never holds a readable secret.
+# The state in it is encrypted by OpenTofu (TOFU_STATE_PASSPHRASE) before it leaves the Mac,
+# so the bucket never holds a readable secret.
 #
-#   RUUM_STAGING_APPLY=yes deploy/staging/bootstrap-state.sh     (laptop)
+#   RUUM_STAGING_APPLY=yes deploy/staging/bootstrap-state.sh     (on the Mac; curl only)
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"

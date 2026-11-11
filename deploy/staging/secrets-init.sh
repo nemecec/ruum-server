@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generates the staging secrets that nobody has to type, once, into the secrets file (laptop).
+# Generates the staging secrets that nobody has to type, once, into the secrets file (on the Mac).
 # A name that is present is never changed. Values are never printed; the script prints names.
 #
 # Why in the secrets file and not only in the cluster (review 1 S-6): a restore after the loss of
