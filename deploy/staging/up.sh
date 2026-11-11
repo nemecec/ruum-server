@@ -6,12 +6,12 @@
 #   RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply [--restore-from GENERATION]
 #                                            plan, guard, price, apply, platform, backup check, Zitadel
 #   RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only
-#                                            only OpenTofu and the kubeconfig: for example after the
-#                                            Mac's public IPv4 address changed (the firewall rule)
+#                                            only OpenTofu, the talosconfig and the kubeconfig
 #
 # Runs on the person's Mac (the secrets file and the credentials are here); every step runs in
 # the tools container with the secrets on stdin (lib.sh). The Talos and Kubernetes APIs are open
-# only to the Mac's current public IPv4 address, which the plan reads at run time. The plan is
+# only to the build server's fixed IPv4 address; after the OpenTofu apply the Mac reaches them
+# through the SSH tunnel over the build server (lib.sh stg_tunnel_up, ops/tunnel-setup.sh). The plan is
 # refused when check-plan.sh finds a resource outside staging, or when it costs more than EUR 50
 # per month (BUDGET_EUR_PER_MONTH). --apply also needs the environment variable
 # RUUM_STAGING_APPLY=yes: an agent cannot apply by passing a flag alone.
@@ -59,7 +59,7 @@ missing_platform="$(stg_missing SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY)"
 missing_signup="$(stg_missing STG_ALLOWED_EMAILS)"
 
 plan_file="$(mktemp)"
-trap 'rm -f "$plan_file"' EXIT
+stg_on_exit 'rm -f "$plan_file"'
 stg_log "planning in the tools container (plan only, no state lock)"
 set +e
 stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run ro plan >"$plan_file"
@@ -99,9 +99,12 @@ stg_audit plan ok
 
 # --- Apply ---
 bash "$STG_HERE/secrets-init.sh"
-stg_log "apply: snapshot, OpenTofu (exact reviewed plan), user_data check, kubeconfig"
+stg_log "apply: snapshot, OpenTofu (exact reviewed plan), user_data check, talosconfig"
 stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run rw apply
 stg_audit apply "tofu ok"
+stg_log "kubeconfig through the admin tunnel over the build server"
+stg_tunnel_up
+printf '__END__\n' | stg_run rw kubeconfig
 if [[ $infra_only == 1 ]]; then
   stg_log "done (--infra-only). kubeconfig and talosconfig are in $STG_WORK"
   exit 0

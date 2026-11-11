@@ -33,13 +33,50 @@ the `docker` group, which is root on that host, so no user separation there coul
 - Secrets go to the container on its stdin as `NAME=value` lines: never on a command line (not in
   `ps`, not in `docker inspect`), never in a file, never printed. Each step gets only the names
   of its list.
-- The firewall opens the Talos API (tcp 50000), the Kubernetes API (tcp 6443) and ICMP only to
-  the Mac's current public IPv4 address as one /32. `steps.sh` reads the address at run time
-  (two echo services must agree; `RUUM_ADMIN_IP` overrides) and refuses a private, shared or
-  reserved address. `check-plan.sh` accepts exactly that /32 and nothing wider, no IPv6.
-- When the address of the Mac changes (another network), kubectl and talosctl stop answering.
-  Then run `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only`: it plans, checks
-  and prices as always, and the plan updates the firewall rule in place.
+- The Talos and Kubernetes APIs are reached through an SSH tunnel over the build server (next
+  section). The build server relays encrypted bytes only; it holds no staging credential.
+
+## Admin access
+
+Decision of the person, 2026-11-11: the Mac's public address changes too often for a firewall
+rule, so admin access goes through the build server, whose public IPv4 is fixed.
+
+- **Firewall.** The Talos API (tcp 50000), the Kubernetes API (tcp 6443) and ICMP are open only
+  to the build server's public IPv4 as one /32. `steps.sh admin_cidrs` reads it at plan time from
+  the Hetzner API (server `ruum-buildbox`); it is not in the code. `check-plan.sh` accepts exactly
+  that /32 and nothing wider, no IPv6.
+- **Tunnel.** `lib.sh stg_tunnel_up` opens an SSH local forward from the Mac, as the build-server
+  user `ruumtunnel`, around the steps that need the cluster (`up.sh --apply` after OpenTofu,
+  `deploy.sh`, `status.sh`, `secrets-push.sh`, `tool.sh`), and closes it when the script ends.
+  Ports on `127.0.0.1` of the Mac: `16443` to stg-1:6443, and `1500N` to stg-N:50000. The ssh
+  options: only the key `~/.config/ruum/staging_tunnel_ed25519`, only the host key in
+  `~/.config/ruum/staging_tunnel_known_hosts` (`StrictHostKeyChecking=yes`),
+  `ExitOnForwardFailure=yes`, no command (`-N`), no agent, no X11, no tty, no user ssh config.
+  The node targets come from the Hetzner API (`steps.sh tunnel-targets`).
+- **TLS through the tunnel.** The kubeconfig has `server: https://127.0.0.1:16443` and
+  `tls-server-name: kubernetes`; the talosconfig has the endpoints `127.0.0.1:1500N` and the
+  nodes by their private address (the endpoint's apid relays to the node over the private
+  network). Talos v1.14 puts `127.0.0.1` into both the apid and the kube-apiserver certificate
+  by itself, so the machine config does not change. The tools container cannot reach the Mac's
+  `127.0.0.1`, so `tunnel-relay.sh` listens on the same ports in the container and relays them to
+  `host.docker.internal` (Docker Desktop): the same files work on the Mac and in the container.
+- **The build-server user.** `ruumtunnel` has no password and the shell `/usr/sbin/nologin`.
+  Its only key is in `/etc/ssh/authorized_keys/ruumtunnel` (root, 0644):
+  `restrict,port-forwarding,permitopen="<node>:6443",permitopen="<node>:50000",...,command="/bin/false"`
+  with the nodes' public IPv4 (the build server is not on the private network). sshd turns TCP
+  forwarding off for every other user and allows ruumtunnel local forwards to those ports only
+  (`Match User ruumtunnel`: `AllowTcpForwarding local`, `PermitOpen`, `X11Forwarding no`,
+  `AllowAgentForwarding no`, `PermitTTY no`, `ForceCommand /bin/false`).
+  `ops/buildbox-tunnel-user.sh` sets this up, checks `sshd -t` and the effective settings
+  (`sshd -T`) before it reloads sshd, and is idempotent.
+- **Setup, once, and again when the node addresses change** (a recreate):
+  `deploy/staging/ops/tunnel-setup.sh`. It makes the tunnel key when it is missing (never
+  printed), runs `ops/buildbox-tunnel-user.sh` on the build server as the admin user
+  (`ssh -i ~/.config/ruum/buildbox_admin_ed25519 ruumadmin@<build server> 'sudo bash -s -- <key> <node IPs>'`),
+  records the build server's host key that the script prints, and opens the tunnel once.
+- **OpenTofu and Talos.** The Talos provider of `tofu/cluster` talks to the nodes' public
+  addresses, which only the build server can reach. `up.sh --apply` refuses a plan that creates
+  or changes a machine config or the bootstrap (the plan prints a warning). See "Known gaps".
 
 Plan JSON is scrubbed in a pipe (`plan-scrub.jq`: no variables, no prior state, no sensitive or
 Talos values) before it is written, so no plan file holds the cluster secrets (code review F-5).
@@ -56,7 +93,7 @@ manager: without it the state cannot be read, and only `destroy.sh --sweep` can 
 needs it (about 2.5 minutes, about 760 MB):
 
 - the base `TOOLS_BASE_IMAGE` of `versions.env` (Alpine, pinned by digest) with bash, coreutils,
-  curl, jq and openssl;
+  curl, jq, openssl and socat (`tunnel-relay.sh`);
 - OpenTofu, talosctl, kubectl, helm, helmfile, cosign, hcloud and hcloud-upload-image, each
   downloaded by `setup.sh` at the version of `versions.env` and checked against its SHA-256 (the
   same pins as CI);
@@ -71,8 +108,9 @@ one, so the Mac keeps one. The build is `docker run` and `docker commit`, not `d
 so it leaves no build cache. `tools-image.sh clean` removes it.
 
 `deploy/staging/tool.sh` runs any command in that container with the work folder mounted and
-`KUBECONFIG`/`TALOSCONFIG` set, for example `deploy/staging/tool.sh kubectl get pods -A`. It
-gets no value from `secrets.env`.
+`KUBECONFIG`/`TALOSCONFIG` set, for example `deploy/staging/tool.sh kubectl get pods -A`, with the
+admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no value from
+`secrets.env`; only the separate container that reads the tunnel targets gets `HCLOUD_TOKEN`.
 
 ## Commands
 
@@ -80,9 +118,10 @@ gets no value from `secrets.env`.
 |---|---|
 | `deploy/staging/up.sh [--out FILE]` | The priced plan: `tofu plan` of both roots, `check-plan.sh`, `price.sh`, and the platform preflight. Changes nothing, takes no state lock. |
 | `RUUM_STAGING_APPLY=yes deploy/staging/bootstrap-state.sh` | Creates the state bucket once. |
-| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices, applies the exact plan, checks that every node has empty user data, writes the kubeconfig, installs the platform, and configures Zitadel. |
+| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices, applies the exact plan, checks that every node has empty user data, writes the talosconfig, opens the admin tunnel, writes the kubeconfig, installs the platform, and configures Zitadel. |
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
-| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply and the kubeconfig: for example after the Mac's address changed (the firewall rule). |
+| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply, the talosconfig and the kubeconfig. |
+| `deploy/staging/ops/tunnel-setup.sh` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). |
 | `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest, after the provenance check (with `gh` on the Mac, and again with `cosign` in the tools container); `--rollback` to go back on purpose; `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
@@ -110,6 +149,7 @@ gets no value from `secrets.env`.
 3. **Zone delete protection.** Hetzner console, DNS: turn on delete protection for `ruum.space`
    and `ruumapps.net`. The code never manages the zones, but the token could delete them.
 4. **Docker Desktop** on the Mac, running. The first step builds the tools image (above).
+   The admin tunnel needs `host.docker.internal` (Docker Desktop has it).
 5. Optional: `STG_ACME_EMAIL` for ZeroSSL (the trusted CA for the sign-in test).
 
 ## Secrets
@@ -212,10 +252,11 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | B-7 | `autoLinking` unspecified for every provider; Microsoft `emailVerified: false`; `zitadel-bootstrap.sh check` reports drift. |
 | B-8 | Machine-only first instance, PAT 90 days; no password login, no registration; console and admin APIs 403 to every public address; smoke and drift checks. |
 | B-9 | Zones are data sources; `check-plan.sh` refuses any `hcloud_zone` resource and any DNS name outside staging. |
-| F-4 (code review) | `check-plan.sh` also refuses firewall rules other than inbound tcp 50000, tcp 6443 and ICMP from the Mac's /32, a firewall or server delete or replace (only `--allow-delete` for the destroy plan, `--allow-replace` on purpose), firewall attachments, LB targets and server networks outside the plan or on the build server, label selectors other than `env=staging,role=node`, and any object lock other than COMPLIANCE for `BACKUP_LOCK_DAYS`; servers in child modules count. |
-| G-1 (code review 2) | `check-plan.sh` also refuses a known server firewall ID that is not the staging firewall of the plan, `apply_to` on a firewall with or without rules (also unknown), firewall rules unknown at plan time, and a primary IP assigned to a server outside the plan or to the build server. |
+| F-4 (code review) | `check-plan.sh` also refuses firewall rules other than inbound tcp 50000, tcp 6443 and ICMP from the build server's /32, a firewall or server delete or replace (only `--allow-delete` for the destroy plan, `--allow-replace` on purpose), firewall attachments, LB targets and server networks outside the plan or on the build server, label selectors other than `env=staging,role=node`, and any object lock other than COMPLIANCE for `BACKUP_LOCK_DAYS`; servers in child modules count. |
+| G-1 (code review 2) | `check-plan.sh` also refuses a known server firewall ID that is not the staging firewall of the plan, `apply_to` on a firewall with or without rules (also unknown; only an existing firewall may keep an unchanged `apply_to` that lists the plan's own servers, which Hetzner reports there), firewall rules unknown at plan time, and a primary IP assigned to a server outside the plan or to the build server. |
 | G-2 (code review 2) | No longer applies: `install-ops-user.sh` and its `allowed_signers` check are gone with the build-server mode. |
-| Mac only (2026-11-11) | `lib.sh`, `steps.sh`, `tools-image.sh`, `tool.sh`: every step on the Mac in the tools container; no ssh, no ruum-ops, no credential on the build server; `STG_ADMIN_CIDRS` exactly one IPv4 /32 (`check-plan.sh`, the `admin_cidrs` validation in `tofu/cluster`). |
+| Mac only (2026-11-11) | `lib.sh`, `steps.sh`, `tools-image.sh`, `tool.sh`: every step on the Mac in the tools container; no ruum-ops, no credential on the build server; `STG_ADMIN_CIDRS` exactly one IPv4 /32 (`check-plan.sh`, the `admin_cidrs` validation in `tofu/cluster`). |
+| Admin tunnel (2026-11-11) | The firewall source is the build server's /32 from the Hetzner API (no Mac address detection); `tunnel.sh`, `lib.sh stg_tunnel_up`, `tunnel-relay.sh`, `ops/tunnel-setup.sh`, `ops/buildbox-tunnel-user.sh`: an SSH local forward as `ruumtunnel`, restricted to the node API ports; the credentials stay on the Mac. |
 | S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads. |
 | S-2 | The admin credentials only on the person's Mac (`~/.config/ruum`), never on the build server; namespaced `deployer` ServiceAccount for deploys. |
 | S-3 | One Secret per consumer; `secrets-push.sh` fixed list, refuses forbidden names; tests. |
@@ -272,15 +313,23 @@ PVC binds by itself when a node has the volume: the provisioner retries.
 ## Known gaps
 
 - One API endpoint (code review F-8): `cluster_endpoint` is the private IP of stg-1, and the
-  Mac's kubeconfig points at the public IP of stg-1. KubePrism covers the kubelets and pods, but
-  joins and the Mac need stg-1. If stg-1 is lost, point the kubeconfig at stg-2 (`write_configs`
-  in `steps.sh` reads `node_ipv4["stg-1"]`; use `stg-2` there) until stg-1 is back.
+  tunnel port 16443 goes to stg-1's public IP. KubePrism covers the kubelets and pods, but joins
+  and the Mac need stg-1. If stg-1 is lost (or reboots in an upgrade), the Kubernetes API through
+  the tunnel is down until it is back; `tunnel_forward_args` in `tunnel.sh` picks stg-1.
+- A fresh create (and any change of the Talos machine config through OpenTofu) is not possible
+  from the Mac now: the Talos provider dials the nodes' public addresses, which only the build
+  server reaches, and the node addresses are new after a recreate (the `ruumtunnel` key line
+  lists them). `up.sh --apply` refuses such a plan before it applies anything. A recreate needs
+  either the Talos resources pointed at the tunnel (`endpoint = 127.0.0.1:1500N`, after a
+  targeted apply of the servers and `ops/tunnel-setup.sh` for the new addresses) or the build
+  server on the staging network; both are follow-ups.
+- `ops/buildbox-tunnel-user.sh` turns TCP forwarding off for every user of the build server
+  except `ruumtunnel` (`AllowTcpForwarding no` before `Match User ruumtunnel`).
 - The provenance check with `cosign` in the tools container (`ops/image-check.sh`) is written for
   the attestation that `actions/attest-build-provenance` pushes to GHCR. Check it on the first
   image that `images.yml` publishes from main.
-- The Mac's address can change at any time (another network, a new lease). Until
-  `up.sh --apply --infra-only` moves the firewall rule, kubectl, talosctl and the steps that need
-  the cluster fail; the public endpoints of staging are not affected.
+- If the build server is down, kubectl, talosctl and the steps that need the cluster fail; the
+  public endpoints of staging are not affected.
 - `k8s/apply.sh` uses `helmfile sync`, not `apply`: `apply` needs the helm-diff plugin, which the
   tools image does not carry.
 

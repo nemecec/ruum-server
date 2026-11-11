@@ -68,7 +68,8 @@ for ref in "${refs[@]}"; do
     stg_die "no valid provenance attestation for $ref"
 done
 
-stg_log "4. the deployed commit"
+stg_log "4. the deployed commit (through the admin tunnel)"
+stg_tunnel_up
 deployed="$(printf '__END__\n' | stg_run ro status --deployed-commit 2>/dev/null || true)"
 backup=()
 if [[ "$deployed" =~ ^[0-9a-f]{40}$ ]]; then

@@ -5,11 +5,16 @@
 # names of the step's allow-list are taken; nothing is printed.
 #
 # Steps (read-only unless marked rw):
-#   admin-cidrs          print the firewall's admin source: the Mac's public IPv4 as a /32
+#   admin-cidrs          print the firewall's admin source: the build server's public IPv4 as a
+#                        /32 (Hetzner API, server ruum-buildbox)
+#   ipv4-check ADDRESS   print ADDRESS/32 when it is a public IPv4 address (tests)
+#   tunnel-targets       print the build server and the nodes for the admin tunnel (tunnel.sh)
 #   plan                 tofu plan of both roots, check-plan, price
 #   apply          (rw)  image upload if missing, plan, check-plan, price, apply the exact plan,
-#                        user_data check, kubeconfig; needs RUUM_STAGING_APPLY=yes
-#   talosconfig    (rw)  write the talosconfig and kubeconfig from the state (0600)
+#                        user_data check, talosconfig; needs RUUM_STAGING_APPLY=yes
+#   talosconfig    (rw)  write the talosconfig from the state, then the kubeconfig (0600; both
+#                        through the admin tunnel, which the Mac opens first)
+#   kubeconfig     (rw)  write the kubeconfig with talosctl through the admin tunnel (0600)
 #   platform       (rw)  helmfile sync of the platform (needs the cluster secrets on stdin);
 #                        needs RUUM_STAGING_APPLY=yes
 #   zitadel-bootstrap (rw) OIDC app, Google and Microsoft, login policy; `check` reports drift
@@ -28,6 +33,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=versions.env
 . "$HERE/versions.env"
+# shellcheck source=tunnel.sh
+. "$HERE/tunnel.sh"
 
 STEP="${1:-}"
 shift || true
@@ -83,44 +90,38 @@ hapi() {
     curl -fsS -K - "https://api.hetzner.cloud/v1/$1"
 }
 
-# ipv4_public ADDRESS: true for a public unicast IPv4 address (no private, loopback, link-local,
-# shared (CGNAT), multicast, reserved or documentation range).
-ipv4_public() {
-  local a b c o octets
-  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-  octets=("${BASH_REMATCH[@]:1}")
-  for o in "${octets[@]}"; do
-    [[ "$o" == 0 || "${o:0:1}" != 0 ]] || return 1
-    ((10#$o <= 255)) || return 1
-  done
-  a=${octets[0]} b=${octets[1]} c=${octets[2]}
-  ((a == 0 || a == 10 || a == 127 || a >= 224)) && return 1
-  ((a == 100 && b >= 64 && b <= 127)) && return 1
-  ((a == 169 && b == 254)) && return 1
-  ((a == 172 && b >= 16 && b <= 31)) && return 1
-  ((a == 192 && b == 168)) && return 1
-  ((a == 192 && b == 0 && (c == 0 || c == 2))) && return 1
-  ((a == 198 && (b == 18 || b == 19))) && return 1
-  ((a == 198 && b == 51 && c == 100)) && return 1
-  ((a == 203 && b == 0 && c == 113)) && return 1
-  return 0
+# The only admin source of the firewall (decision of the person, 2026-11-11): the build server's
+# fixed public IPv4 address, as one /32, read from the Hetzner API by the server name. The Talos
+# API (50000), the Kubernetes API (6443) and ICMP are open to this address only; the Mac reaches
+# the APIs through the SSH tunnel over the build server (lib.sh stg_tunnel_up).
+buildbox_ipv4() {
+  [[ -n "${HCLOUD_TOKEN:-}" ]] || die "HCLOUD_TOKEN is missing (the build server's address comes from the Hetzner API)"
+  hapi "servers?name=ruum-buildbox" | jq -r '.servers[0].public_net.ipv4.ip // empty'
 }
 
-# The only admin source of the firewall (decision of the person, 2026-11-11): the current public
-# IPv4 address of the Mac, as one /32. Two echo services must agree, or RUUM_ADMIN_IP gives it.
-# The Talos API (50000), the Kubernetes API (6443) and ICMP are open to this address only.
+admin_cidr_of() {
+  ipv4_public "$1" || die "the admin address '$1' is not a public IPv4 address"
+  printf '["%s/32"]' "$1"
+}
+
 admin_cidrs() {
-  local ip a b
-  if [[ -n "${RUUM_ADMIN_IP:-}" ]]; then
-    ip="$RUUM_ADMIN_IP"
-  else
-    a="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)"
-    b="$(curl -4 -fsS --max-time 10 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
-    [[ -n "$a" && "$a" == "$b" ]] || die "cannot find the public IPv4 address of the Mac (api.ipify.org '$a', ipv4.icanhazip.com '$b'); set RUUM_ADMIN_IP"
-    ip="$a"
-  fi
-  ipv4_public "$ip" || die "the admin address '$ip' is not a public IPv4 address"
-  printf '["%s/32"]' "$ip"
+  local ip
+  ip="$(buildbox_ipv4)"
+  [[ -n "$ip" ]] || die "the build server ruum-buildbox has no public IPv4 address in the Hetzner API"
+  admin_cidr_of "$ip"
+}
+
+# The targets of the admin tunnel (tunnel.sh tunnel_parse reads them): the build server, and each
+# staging node with its public and private IPv4 address, from the Hetzner API.
+tunnel_targets() {
+  local ip lines
+  ip="$(buildbox_ipv4)"
+  [[ -n "$ip" ]] || die "the build server ruum-buildbox has no public IPv4 address in the Hetzner API"
+  lines="$(printf 'bastion %s\n' "$ip"
+    hapi "servers?label_selector=env%3Dstaging%2Crole%3Dnode" |
+      jq -r '.servers | sort_by(.name)[] | "node \(.name) \(.public_net.ipv4.ip // "-") \(.private_net[0].ip // "-")"')"
+  tunnel_parse "$lines" >&2 || die "unexpected tunnel targets from the Hetzner API"
+  printf '%s\n' "$lines"
 }
 
 # The build server's Hetzner ID: check-plan.sh refuses any attachment or target that names it.
@@ -188,9 +189,10 @@ plan_all() {
     image="$TALOS_PLACEHOLDER"
   fi
   cidrs="$(admin_cidrs)"
-  log "admin source of the firewall (Talos and Kubernetes API): $cidrs"
+  log "admin source of the firewall (Talos and Kubernetes API): the build server, $cidrs"
   export TF_VAR_talos_image="$image" TF_VAR_admin_cidrs="$cidrs"
-  # check-plan.sh compares the firewall rules with this /32 (code review F-4).
+  # check-plan.sh compares the firewall rules with this /32 (code review F-4): exactly the build
+  # server's address, nothing wider.
   export STG_ADMIN_CIDRS="$cidrs"
   STG_BUILDBOX_ID="$(buildbox_id)"
   export STG_BUILDBOX_ID
@@ -252,17 +254,51 @@ upload_image() {
   [[ -n "$(talos_image_id)" ]] || die "the snapshot upload did not produce an image"
 }
 
-write_configs() {
-  local dir first
+# The talosconfig from the state, pointed at the admin tunnel: endpoints 127.0.0.1:1500N (one
+# per node, through the build server), nodes by their private IPv4 (the endpoint's apid relays
+# over the private network). No node is contacted.
+write_talosconfig() {
+  local dir tmp
   tofu_env
+  tunnel_parse "$(tunnel_targets)" >&2 || die "unexpected tunnel targets"
   dir="$(prepare_root cluster s3)"
-  (cd "$dir" && tofu output -raw talosconfig) >"$TALOSCONFIG_FILE"
-  first="$(cd "$dir" && tofu output -json node_ipv4 | jq -r '.["stg-1"]')"
-  talosctl --talosconfig "$TALOSCONFIG_FILE" -n "$first" -e "$first" kubeconfig --force "$KUBECONFIG_FILE" >/dev/null
-  # The kubeconfig points at the private endpoint; the Mac uses the public address.
-  sed -i -E "s#server: https://10\.20\.1\.[0-9]+:6443#server: https://$first:6443#" "$KUBECONFIG_FILE"
-  chmod 600 "$TALOSCONFIG_FILE" "$KUBECONFIG_FILE"
-  log "talosconfig and kubeconfig in $WORK (0600)"
+  tmp="$TALOSCONFIG_FILE.new"
+  (cd "$dir" && tofu output -raw talosconfig) >"$tmp"
+  # shellcheck disable=SC2046 # one word per endpoint and node
+  talosctl --talosconfig "$tmp" config endpoint $(tunnel_talos_endpoints)
+  # shellcheck disable=SC2046
+  talosctl --talosconfig "$tmp" config node $(tunnel_talos_nodes)
+  chmod 600 "$tmp"
+  mv "$tmp" "$TALOSCONFIG_FILE"
+  log "talosconfig in $WORK (0600; endpoints $(tunnel_talos_endpoints))"
+}
+
+# The kubeconfig from Talos, through the admin tunnel (the Mac opened it; tunnel-relay.sh relays
+# it into this container): server https://127.0.0.1:16443, tls-server-name kubernetes (a name in
+# the API server certificate).
+write_kubeconfig() {
+  local first tmp="$KUBECONFIG_FILE.new"
+  [[ -n "${STG_TUNNEL_PORTS:-}" ]] || die "the kubeconfig step needs the admin tunnel (lib.sh stg_tunnel_up)"
+  [[ -s "$TALOSCONFIG_FILE" ]] || die "no talosconfig in $WORK (step talosconfig)"
+  first="$(talosctl --talosconfig "$TALOSCONFIG_FILE" config info -o json | jq -r '.nodes[0] // empty')"
+  [[ "$first" =~ $TUNNEL_PRIVATE_RE ]] || die "the talosconfig has no private node address"
+  rm -f "$tmp"
+  talosctl --talosconfig "$TALOSCONFIG_FILE" -n "$first" kubeconfig --merge=false --force "$tmp" >/dev/null
+  tunnel_kube_rewrite "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$KUBECONFIG_FILE"
+  log "kubeconfig in $WORK (0600; https://127.0.0.1:$TUNNEL_KUBE_PORT through the build server)"
+}
+
+# The talos provider in tofu/cluster talks to the nodes' public addresses, which the firewall
+# now opens only to the build server. A plan that would create or change a machine config or the
+# bootstrap is refused before anything is applied (README 'Admin access', fresh create).
+refuse_talos_changes() {
+  local hits
+  hits="$(jq -r '.resource_changes[]? | select(.type | IN("talos_machine_configuration_apply","talos_machine_bootstrap"))
+    | select(.change.actions != ["no-op"] and .change.actions != ["read"] and .change.actions != ["delete"]) | "\(.address) (\(.change.actions | join(",")))"' "$WORK/cluster.json")"
+  [[ -z "$hits" ]] || die "the plan changes the Talos machine config or bootstrap, which needs the Talos API from the tools container (closed by the firewall; README 'Admin access'):
+$hits"
 }
 
 k() { kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"; }
@@ -271,13 +307,25 @@ CLUSTER_SECRET_NAMES="SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACC
 
 case "$STEP" in
   admin-cidrs)
+    read_secrets HCLOUD_TOKEN
     admin_cidrs
     echo
+    ;;
+  ipv4-check)
+    admin_cidr_of "${1:-}"
+    echo
+    ;;
+  tunnel-targets)
+    read_secrets HCLOUD_TOKEN
+    tunnel_targets
     ;;
   plan)
     read_secrets $TOFU_NAMES
     plan_all plan
-    report_plan
+    rc=0
+    report_plan || rc=$?
+    (refuse_talos_changes) || echo "WARNING: up.sh --apply refuses this plan: it changes the Talos machine config or bootstrap (README 'Admin access')"
+    exit "$rc"
     ;;
   apply)
     require_apply
@@ -286,14 +334,20 @@ case "$STEP" in
     upload_image
     plan_all apply
     report_plan || die "the plan was refused (check-plan or budget); nothing was applied"
+    refuse_talos_changes
     (cd "$TREE/tofu/persistent" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/persistent.tfplan")
     (cd "$TREE/tofu/cluster" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/cluster.tfplan")
     check_user_data
-    write_configs
+    write_talosconfig
     ;;
   talosconfig)
     read_secrets $TOFU_NAMES
-    write_configs
+    write_talosconfig
+    write_kubeconfig
+    ;;
+  kubeconfig)
+    read_secrets
+    write_kubeconfig
     ;;
   platform)
     require_apply
@@ -345,6 +399,6 @@ case "$STEP" in
     bash "$HERE/ops/destroy-steps.sh" "$STEP" "$@"
     ;;
   *)
-    die "unknown step '$STEP' (admin-cidrs, plan, apply, talosconfig, platform, zitadel-bootstrap, check-backup, deploy, status, destroy-plan, destroy, sweep)"
+    die "unknown step '$STEP' (admin-cidrs, ipv4-check, tunnel-targets, plan, kubeconfig, apply, talosconfig, platform, zitadel-bootstrap, check-backup, deploy, status, destroy-plan, destroy, sweep)"
     ;;
 esac
