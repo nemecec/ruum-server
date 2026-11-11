@@ -33,8 +33,19 @@ secret() {
   log "secret $ns/$name"
 }
 
-log "waiting for the nodes"
-k wait --for=condition=Ready node --all --timeout=15m >/dev/null
+# Right after the bootstrap the API server refuses connections, and then the nodes register one by
+# one; `kubectl wait --all` fails at once on the first and passes on a partial list. So: retry
+# until the API answers, NODE_COUNT nodes exist, and every one is Ready (15 minutes at most).
+log "waiting for the API server and $NODE_COUNT Ready nodes"
+deadline=$(( $(date +%s) + 900 ))
+while :; do
+  ready="$(k get nodes --request-timeout=10s --no-headers 2>/dev/null |
+    awk '$2 == "Ready" { r++ } END { printf "%d/%d", r, NR }')" || ready="0/0"
+  [[ "$ready" == "$NODE_COUNT/$NODE_COUNT" ]] && break
+  (( $(date +%s) < deadline )) || die "after 15 minutes $ready nodes are Ready (want $NODE_COUNT/$NODE_COUNT)"
+  log "  nodes Ready: $ready; retry in 10 s"
+  sleep 10
+done
 
 log "namespaces, network policy engine, local-path storage"
 k apply -f "$HERE/manifests/namespaces.yaml" >/dev/null
