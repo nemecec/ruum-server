@@ -241,6 +241,34 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | U-4 | Helm 4 `--rollback-on-failure`. |
 | O-1 | As S-2. |
 
+## Storage (local-path)
+
+Talos v1.14 has no kubelet `extraMounts`, and the kubelet sees `/var/mnt` read-only. The writable
+host path of local-path-provisioner is the Talos user volume `local-path`
+(`talos/patches/local-path-volume.yaml`): a partition of 20 to 22 GiB on the system disk, which
+Talos mounts at `/var/mnt/local-path` and propagates into the kubelet. No kubelet setting is
+needed. `k8s/manifests/local-path-storage.yaml` points `DEFAULT_PATH_FOR_NON_LISTED_NODES` at that
+path. The same patch caps EPHEMERAL (`/var`: images, etcd, logs) at 14 GiB. Without the cap,
+EPHEMERAL takes the whole 40 GB disk and Talos cannot create the user volume; then the helper pod
+fails with `mkdir /var/mnt/local-path/: read-only file system` and every local-path PVC stays
+`Pending`. `tests/talos-validate.sh` checks both documents in the config of every node.
+
+Talos applies a `VolumeConfig` only when it creates the volume. On a node that was installed
+without the cap, EPHEMERAL already fills the disk, and a config apply alone does not shrink it.
+Do this one node at a time (no reboot is needed for the apply itself):
+
+1. `up.sh --apply` (the new machine config; in-place, no reboot).
+2. Check: `talosctl -n <node> get volumestatus u-local-path` (phase `ready` means done; a missing
+   or `waiting` volume means EPHEMERAL has no room).
+3. If it is not ready: `talosctl -n <node> reset --graceful --reboot --system-labels-to-wipe EPHEMERAL`.
+   The node leaves etcd, wipes `/var` (images, the etcd member, pod data on that node), keeps its
+   machine config in STATE, reboots, creates EPHEMERAL (14 GiB) and the user volume, and joins
+   etcd again. Wait for `talosctl -n <node> etcd members` to show three members and for the node
+   to be `Ready` before the next node.
+
+A new cluster (`destroy.sh` and `up.sh --apply`) gets the right layout on first boot. A pending
+PVC binds by itself when a node has the volume: the provisioner retries.
+
 ## Known gaps
 
 - One API endpoint (code review F-8): `cluster_endpoint` is the private IP of stg-1, and the
@@ -259,9 +287,6 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 - The Talos dashboard on the Hetzner server console is on. Talos v1.14 has no kernel argument in
   the machine config (`talos.dashboard.disabled=1` was in `machine.install`); turning it off
   needs an Image Factory schematic with that argument (a new snapshot and installer image).
-- Talos v1.14 mounts user volumes (`/var/mnt`) read-only into the kubelet and has no kubelet
-  `extraMounts`; local-path-provisioner's helper pods create the volume folders. Check after
-  bring-up that a CNPG volume binds and the pod writes to it.
 - kube-network-policies needs the `nfnetlink_queue` kernel module; check after bring-up that a pod
   in `default` cannot reach `pg-rw.data:5432` (stgsec section 5).
 - The first `helmfile apply` waits for the CNPG cluster before SpiceDB and Zitadel can start; a

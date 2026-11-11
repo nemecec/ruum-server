@@ -1,5 +1,6 @@
 # Vendored from rancher/local-path-provisioner v0.0.37 deploy/local-path-storage.yaml.
-# Changes: the data path is the Talos user volume /var/mnt/local-path (talos/patches),
+# Changes: the data path is the Talos user volume /var/mnt/local-path
+# (talos/patches/local-path-volume.yaml; the only writable /var/mnt path for the kubelet),
 # the namespace is privileged for Pod Security (the helper pods use hostPath).
 apiVersion: v1
 kind: Namespace
