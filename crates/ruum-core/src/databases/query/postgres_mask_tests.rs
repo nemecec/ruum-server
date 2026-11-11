@@ -2001,3 +2001,115 @@ async fn masked_reads_through_domains_and_indexes_outside_the_allow_list_are_ref
     }
     pg.drop().await;
 }
+
+/// Decision 0004-39 (review-Q-2-harden-3 F-3 and F-4): masked sessions only ever see tenant views
+/// evaluated over masked inputs. `pin` is a secret integer (2 for person 1). A view that makes
+/// rows from it, joins a table on it, or filters on it can show its value through the row count
+/// or the rows that come back; the owner (Alice, `manage`) reads that computation on the real
+/// value, and the agent, Bob (edit, no `manage`) and the agent with `read_personal` get the
+/// refusal, since the view cannot run over a hidden marker. A join on a personal column keeps
+/// working for all of them (consistent pseudonyms), and a join of a personal column to a normal
+/// column matches only for the readers who see the personal value. A policy that reads the secret
+/// refuses the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tenant_views_are_evaluated_over_masked_inputs() {
+    let Some(pg) = setup().await else { return };
+    let a = pg.alice();
+    for s in [
+        "alter table people add column pin integer",
+        "update people set pin = 2 where id = 1",
+        "create view gs as select p.id from people p cross join lateral generate_series(1, p.pin) g",
+        "create view rj as select p.id, o.label from people p join orders o on o.id = p.pin",
+        "create view je as select p.id, o.label from people p join orders o on o.person_email = p.email",
+        "create view jn as select p.id, o.label from people p join orders o on o.name_copy = p.name",
+    ] {
+        pg.ok(&a, write(s)).await;
+    }
+    use DataClass::{Normal as N, Secret as S};
+    pg.confirm(&[
+        ("people", "pin", S),
+        ("gs", "id", N),
+        ("rj", "id", N),
+        ("rj", "label", N),
+        ("je", "id", N),
+        ("je", "label", N),
+        ("jn", "id", N),
+        ("jn", "label", N),
+    ])
+    .await;
+    let refusal = (
+        422,
+        "statement_not_allowed".to_string(),
+        Some("tenant_code_on_live".to_string()),
+    );
+    // The control: the computation on the real values.
+    assert_eq!(
+        pg.count(&a, "select count(*) from gs where id = 1").await,
+        json!(2)
+    );
+    let r = pg.ok(&a, sql("select label from rj where id = 1")).await;
+    assert_eq!(
+        r.rows[0][0],
+        json!("order-2"),
+        "the owner joins on the real pin"
+    );
+    // The masked kinds: the agent without `read_personal`, then Bob, then the agent with it.
+    for round in 0..2 {
+        if round == 1 {
+            pg.grant(GrantKind::ReadPersonal).await;
+        }
+        let sees_personal = round == 1;
+        for (who, name, personal) in [
+            (pg.agent(), "agent", sees_personal),
+            (pg.bob(), "bob", true),
+        ] {
+            // F-4: rows made from the secret, and a join on it: the refusal.
+            for text in [
+                "select count(*) from gs where id = 1",
+                "select label from rj where id = 1",
+            ] {
+                let r = pg.refused(&who, sql(text)).await;
+                assert_eq!(r, refusal, "{name} {round}: {text}");
+            }
+            // A join on a personal column works for all (consistent pseudonyms).
+            assert_eq!(
+                pg.count(&who, "select count(*) from je where id = 1").await,
+                json!(1),
+                "{name} {round}: the pseudonym join in a view"
+            );
+            assert_eq!(
+                pg.count(
+                    &who,
+                    "select count(*) from people p join orders o on o.person_email = p.email"
+                )
+                .await,
+                json!(PEOPLE),
+                "{name} {round}: the pseudonym join of two tables"
+            );
+            // A personal column against a normal one matches where the reader sees the value.
+            assert_eq!(
+                pg.count(&who, "select count(*) from jn where id = 1").await,
+                json!(i32::from(personal)),
+                "{name} {round}: a personal value against a normal one"
+            );
+        }
+    }
+    // A policy that reads the secret refuses the table (it runs on the real rows).
+    for s in [
+        "alter table people enable row level security",
+        "create policy sp on people using (pin >= 0 or pin is null)",
+    ] {
+        as_owner(&pg, s).await;
+    }
+    // A statement outside the query API's reach does not build the lens; a view does.
+    pg.ok(&a, write("create view poke as select 1 as x")).await;
+    for who in [pg.agent(), pg.bob()] {
+        let r = pg.refused(&who, sql("select count(*) from people")).await;
+        assert_eq!(r, refusal);
+    }
+    assert_eq!(
+        pg.count(&a, "select count(*) from people").await,
+        json!(PEOPLE)
+    );
+    pg.drop().await;
+}

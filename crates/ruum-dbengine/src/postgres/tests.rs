@@ -7,6 +7,8 @@
 
 mod allow_list;
 mod hostile_copy;
+mod lens_rebuild;
+
 mod security;
 mod spike;
 mod tenant_code;

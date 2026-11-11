@@ -1073,10 +1073,11 @@ behind a view in a row write). A list of paths is never complete.
   every function, and the engine refuses a database where another kind may call a revoked one.
   Postgres checks the right of a function in a view against the reader, so the line holds inside
   views, and for a function that runs a query given as text. The pooled connection is reset with
-  `DISCARD ALL` after every use, so no session state outlives a lease. **Accepted read-path
-  limit:** an error or its timing can reveal one fixed fact per row, and a masked read still
-  evaluates the built-in expressions of the lens itself. Review 1 M-1 option 1 (evaluate tenant
-  views over the lens tables) stays open as a later hardening.
+  `DISCARD ALL` after every use, so no session state outlives a lease. **Read-path limit (corrected
+  by 0004-39):** the earlier text said that an error or its timing can reveal one fixed fact per
+  row. That was wrong: an allowed function that makes rows (`generate_series`), or a join to a
+  table, let the row count of a view carry a whole value. Review 1 M-1 option 1 (evaluate tenant
+  views over the lens tables) is now the rule (0004-39), and the limit is stated there.
 - (e) **Draft branches.** The rule lets tenant code run freely on a draft branch with `masked` or
   `schema_only` data: its rows are pseudonyms and `NULL` secrets, so tenant code learns nothing
   beyond a masked read (review 2 N-4 checked this). Draft branches are not built yet, and a
@@ -1163,3 +1164,108 @@ and `masked_reads_through_domains_and_indexes_outside_the_allow_list_are_refused
 `dbengine-index-support-lens`, `dbengine-index-support-writes`. **Consequence.** A table with an
 index of an extension (`citext`, `pgvector`, `postgis`) is refused in the masked lenses; a
 person with `manage` and the owner kind still read it.
+
+## 39. Masked sessions only ever see tenant views evaluated over masked inputs (review-Q-2-harden-3 F-3 and F-4)
+
+Status: `provisional` (design 18.9). Architect decision after the third re-review of the read-path
+hardening (`ruum-server-wt/panel/review-Q-2-kimi-2.md`: CHANGES REQUESTED, F-3 type input and
+range support functions, F-4 result shape of tenant views over raw values). Fix record:
+`ruum-server-wt/panel/q2-harden-4.md`.
+
+**Problem.** The allow-list of 0004-38 decides which functions code on the real rows may call. It
+cannot decide what the code does with the value. F-4: `generate_series(1, p.n)` is allowed, and
+the number of rows of a view that uses it equals the secret `n`; `count(*)` hands it to the reader
+(a join to a reference table on a restricted column does the same, and so do the set-returning
+array, JSON, string and regular-expression functions). F-3: a type's input, output and range
+support functions run when a value is cast to the type, and they were not on the list. A list of
+functions and types is never complete; the cure is to give such code nothing real to work on.
+
+**Decision.** *Masked sessions only ever see tenant views evaluated over masked inputs.*
+
+- (a) **The rule.** For both masked lenses (`ruum_masked`: the kinds `masked_read` and
+  `masked_write`; `ruum_nosecret`: `read` and `write`) the lens view of a tenant view is built
+  from the definition of the view with its base relations replaced by the lens relations of the
+  same schema, never the base tables. Personal columns of those relations are already pseudonyms
+  (in `ruum_masked`), secret columns and columns of a tenant type are already the hidden marker,
+  so the logic of the view (its joins, filters, expressions, row-producing functions, casts and
+  type functions) runs on masked data. Consistent pseudonyms keep equality joins, grouping and
+  `count(distinct ...)` working. On top of the rebuilt view the lens still masks the view's own
+  columns by class (a column of a view is `personal` until confirmed; a column that reads a secret
+  is masked like a secret, 0004-37). A view over a view is built over the lens view of the inner
+  view; the lens builds the views in dependency order.
+- (b) **How.** The engine reads `pg_get_viewdef` with `public` first on the search path (names of
+  the tenant come out unqualified), and makes the view again with
+  `search_path = <lens schema>, public, pg_catalog`: a relation is found in the lens first (every
+  relation of `public` has a lens view of the same name), a type of the tenant that the lens does
+  not have is found in `public`. It then reads the stored tree of the new view and requires that
+  every relation in it is in the lens schema (a system catalog, another schema, or a relation the
+  lens does not hold is not) and that the tree is inside the allow-list. Everything runs under a
+  savepoint in the transaction of the lens build, so a failed attempt leaves nothing. A migration,
+  a class change, a copy and a restore build the lens the same way as before.
+- (c) **A view that cannot be rebuilt gets the existing refusal view, in that lens only.** Postgres
+  refuses the rebuilt definition when a function, operator or cast does not fit a pseudonym (text)
+  or the hidden marker (text): `npers + 1`, `generate_series(1, p.n)`, a join of a text pseudonym
+  to an integer key, `sum(secret)`. A view that reads a system catalog, a relation outside the
+  lens, a function or type outside the allow-list, or a refusal view also stays out. `read` can
+  hold a view over a personal integer (it sees the integer) that `masked_read` cannot; neither
+  holds it over a secret integer. The refusal is `statement_not_allowed` with the hint
+  `tenant_code_on_live`, as before; the person with `manage` and the owner kind read the real view.
+- (d) **Policies.** Postgres applies a policy to the table that the lens view reads, so a policy
+  cannot be evaluated over the lens. A table whose policy reads a column that is not `normal`
+  (also in a sub-select), reads a view, or holds a whole-row reference next to a relation with such
+  a column gets the refusal view in both lenses. A policy over `normal` columns of plain tables,
+  built from functions on the list, stays in the lens: its input is not restricted.
+- (e) **Types (F-3).** A type is also unvetted (`bad_types`) when its input, output, receive,
+  send, modifier, analyze or subscript function is not built in (OID 16384 or above: a function of
+  the tenant or of an extension), or, for a range, its canonical or subtype-difference function
+  is not. A tree that coerces to such a type is outside the list, and so is every type that
+  reaches one. This is defence in depth: the rebuild already runs the cast on masked text. A
+  tenant cannot create the shell type that a range canonical function needs (superuser only), and
+  `subtype_diff` must be `IMMUTABLE`, so it cannot write a session setting; the extension types are
+  the ones that count in practice.
+- (f) **What stays.** The allow-list, the domain, index and type guards, the revoked volatile
+  functions, the reset of the pooled connection and the write checks of 0004-38 stay as defence in
+  depth.
+- (g) **What a masked reader can learn (this replaces the one-fixed-fact sentence of 0004-38 (d)).**
+  Only facts that can be computed from pseudonyms and hidden markers: that two values are equal
+  or different, how many distinct values there are, how rows group and join, the number of rows
+  that such a computation gives, and the fixed length of a pseudonym or of the marker; and
+  everything that comes from `normal` columns and from policies over them. In addition, the
+  errors and the timing of a statement can depend on the real values that the lens itself reads
+  to make a pseudonym (the time of a pseudonym grows with the length of the value). No tenant
+  expression, type function or row-producing function receives a real restricted value in a masked
+  read, so there is no way to get a restricted value itself, or a fact about it other than
+  equality, from the answer.
+- (h) **Consequences, stated.** (1) A tenant view with arithmetic, `generate_series` or a typed
+  join on a personal column is refused for `masked_read` (it still runs for `read`, which sees the
+  value), and one over a secret column is refused for both. (2) A personal column of a tenant
+  view is the pseudonym of what the view computes from masked inputs, so it does not equal the
+  pseudonym of the same value in a table: a join of a view's personal column to a table's does
+  not match (a join of two tables, or inside one view, does). (3) The lens view of a tenant view
+  is read-only: writes go to the tables. (4) A table whose policy reads a restricted column is not
+  readable by masked sessions. (5) A person with `manage` and the owner kind are not affected.
+
+**Tests.** `crates/ruum-dbengine/src/postgres/tests/lens_rebuild.rs`:
+`tenant_views_compute_only_from_masked_inputs` (rows made from a secret integer, a personal
+integer and the lengths of texts; joins to reference tables on a secret integer, a secret text and a
+personal text; filters on a secret; a view over a system catalog; each for the owner kind as the
+control, `masked_read` and `read`) and
+`tenant_views_over_masked_inputs_keep_their_meaning_and_are_refused_by_lens` (one database, four
+parts: a join of tables, a join and a group inside views and a view over a view that sorts before the
+view it reads; a view that is refused in one lens and held in the other; policies that read a secret
+column, a personal column, a sub-select and a whole row, with a policy over a normal column as the
+control; a range type with a `subtype_diff` function of the tenant). Unit tests in `lens.rs`
+(`views_are_built_after_the_views_they_read`, `a_policy_that_reads_a_restricted_value_refuses_its_table`,
+`a_rebuilt_view_puts_the_lens_columns_over_the_definition`). In
+`crates/ruum-core/src/databases/query/postgres_mask_tests.rs`:
+`tenant_views_are_evaluated_over_masked_inputs` (the agent, Bob and the agent with `read_personal`;
+Alice as the control). Mutations: `dbengine-lens-rebuild-over-base`, `-relations`, `-order`,
+`-no-refusal`, `dbengine-lens-policy-restricted`, `-whole-row`, `dbengine-allow-list-type-functions`;
+`dbengine-refusal-view-dropped` follows the code. **Not testable:** the review's custom range with a
+tenant canonical function (a superuser makes the shell type) and a `subtype_diff` that writes a
+setting (it must be `IMMUTABLE`), so there is no control that shows a type function disclosing a
+value when nothing guards it.
+
+**Changes.** `crates/ruum-dbengine/src/postgres/lens.rs` (`build_views`, `rebuild_view`,
+`rebuilt_view_sql`, `build_order`, `policy_edges`, `code_relations`, `refusal_lens_sql`),
+`allow.rs` (`bad_types_cte`); the tests and mutations above; design 8.5; 0004-38 (d).

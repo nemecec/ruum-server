@@ -772,8 +772,19 @@ databases that AI agents make. One writer at a time is enough for most small app
   `tenant_code_on_live`, and the database counts as holding tenant code for writes. The functions
   that a statement calls itself are held by the cluster: every volatile built-in function outside a
   named few is revoked from the masked kinds, also inside views. The session state is reset between
-  uses (`DISCARD ALL`). Accepted read-path limit: an error or its timing can reveal one fixed fact
-  per row. The rule removes the masked session as the starter of tenant code, not tenant code that
+  uses (`DISCARD ALL`).
+  **Masked sessions only ever see tenant views evaluated over masked inputs** (decision 0004-39). The
+  lens view of a tenant view is built from the definition of the view with its base relations
+  replaced by the lens relations: a personal column is already a pseudonym and a secret already the
+  hidden marker, so the logic of the view (joins, filters, expressions, functions that make rows,
+  casts and type functions) runs on masked data, and consistent pseudonyms keep equality joins and
+  grouping working. A view that cannot be built over the lens (a function that does not fit a
+  pseudonym, a function or type outside the list, a system catalog) gets the refusal in that lens;
+  so does a table whose policy reads a restricted column. What a masked reader can learn: only
+  what can be computed from pseudonyms and hidden markers (equality, grouping, counts, the fixed
+  length of a pseudonym or marker) and from `normal` columns, plus the errors and the timing of the
+  statement, which can still depend on the real values that the lens reads to make a pseudonym.
+  The rule removes the masked session as the starter of tenant code, not tenant code that
   others start (an app's users, a manager): tenant code that copies data gives its target columns
   the class of what it reads, the agent that writes it suggests that class, and the `privacy` stage
   of the pipeline (11.2) checks it.

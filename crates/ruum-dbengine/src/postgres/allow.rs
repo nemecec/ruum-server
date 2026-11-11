@@ -39,6 +39,14 @@
 //!      operator class holds a function outside the list ([`support_cte`]) is treated as code
 //!      outside the list. The built-in operator families are on the list: their support
 //!      functions are non-volatile functions of `pg_catalog`.
+//!    - **Type functions** (review-Q-2-harden-3 F-3). A cast to a type calls its input function,
+//!      and a value of the type calls its output, modifier and (for a range) canonical and
+//!      subtype-difference functions. A type with such a function that is not built in (OID
+//!      16384 or above: a function of the tenant or of an extension) is unvetted (`bad_types`),
+//!      like a domain with a check outside the list.
+//!    - The rebuild of tenant views over the lens (decision 0004-39, `lens::rebuild_view`) is the
+//!      structural cure: a tenant view only ever runs on masked values. This list stays as
+//!      defence in depth.
 //! 2. **The statement itself.** The cluster set-up revokes `EXECUTE` on every `VOLATILE` function
 //!    of `pg_catalog` from `PUBLIC`, except the few in [`STATEMENT_VOLATILE`] (they carry no
 //!    state that a secret can reach). Postgres marks a function `IMMUTABLE` or `STABLE` only when
@@ -415,8 +423,10 @@ const TYPE_FIELDS: &str = "resulttype|array_typeid|element_typeid|row_typeid|par
 /// - `type_edges(src, dst)`: which type holds which (a domain its base type and the types that
 ///   its own checks coerce to, an array its element, a range its subtype, a multirange its range,
 ///   a composite type the types of its fields);
-/// - `bad_types(oid)`: the domains that have a `CHECK` outside the allow-list, and every type
-///   that reaches one through `type_edges`.
+/// - `bad_types(oid)`: the domains that have a `CHECK` outside the allow-list, the types with an
+///   input, output or other type function (or a range with a canonical or subtype-difference
+///   function) that is not a built-in function, and every type that reaches one through
+///   `type_edges`.
 pub(crate) fn bad_types_cte() -> String {
     let check_outside = unlisted_calls("k.conbin::pg_catalog.text");
     format!(
@@ -448,6 +458,25 @@ bad_types(oid) as (
    where k.contypid operator(pg_catalog.<>) 0::pg_catalog.oid
      and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
      and {check_outside}
+  union
+  -- A type whose own input, output, receive, send, modifier, analyze or subscript function is
+  -- not a built-in function (OID 16384 or above: a function of the tenant or of an extension):
+  -- a cast to it runs that function (review-Q-2-harden-3 F-3).
+  select t.oid from pg_catalog.pg_type t
+   where t.typinput::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typoutput::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typreceive::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typsend::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typmodin::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typmodout::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typanalyze::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or t.typsubscript::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+  union
+  -- A range type whose canonical or subtype-difference function is not a built-in function (the
+  -- range constructor and the range index code call them on the bounds).
+  select r.rngtypid from pg_catalog.pg_range r
+   where r.rngcanonical::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+      or r.rngsubdiff::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
   union
   select e.src from type_edges e join bad_types b on b.oid operator(pg_catalog.=) e.dst
 )"
