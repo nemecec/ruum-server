@@ -186,6 +186,6 @@ case "$step" in
         *) : ;;
       esac
     done <"$WORK/sweep.txt"
-    echo "sweep done; the Hetzner blob bucket ruum-staging-blobs is removed with the S3 API (README)"
+    echo "sweep done; the Hetzner blob bucket ruum-staging-blobs-768usm is removed with the S3 API (README)"
     ;;
 esac

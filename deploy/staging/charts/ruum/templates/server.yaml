@@ -53,7 +53,7 @@ spec:
             - { name: RUUM_SPICEDB_ENDPOINT, value: "http://spicedb.authz.svc.cluster.local:50051" }
             - { name: RUUM_S3_ENDPOINT, value: "https://hel1.your-objectstorage.com" }
             - { name: RUUM_S3_REGION, value: hel1 }
-            - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs }
+            - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs-768usm }
             - { name: RUUM_S3_FORCE_PATH_STYLE, value: "false" }
             - { name: SMTP_URL, value: "smtp://mailpit.ops.svc.cluster.local:1025" }
             - { name: RUUM_MAIL_FROM, value: "no-reply@notify.staging.ruum.space" }
