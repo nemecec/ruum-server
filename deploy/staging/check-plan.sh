@@ -16,9 +16,12 @@
 #   - has more than 4 servers (child modules included), or a server type other than the pinned one;
 #   - deletes or replaces a server or the firewall (unless --allow-delete for the destroy plan,
 #     or --allow-replace on purpose);
-#   - has a firewall rule that is not inbound tcp 50000, tcp 6443 or ICMP from the operator's Mac
-#     (STG_ADMIN_CIDRS: a JSON list of exactly one IPv4 /32; without it every firewall rule is
-#     refused), has rules or apply_to that are unknown at plan time, or uses apply_to;
+#   - has a firewall rule that is not inbound tcp 50000, tcp 6443 or ICMP from the build server
+#     (STG_ADMIN_CIDRS: a JSON list of exactly one IPv4 /32, the build server's fixed address; the
+#     Mac reaches the APIs through an SSH tunnel over it; without it every firewall rule is
+#     refused), or has rules or apply_to that are unknown at plan time;
+#   - sets apply_to on a firewall, except an existing firewall whose apply_to stays the same and
+#     lists only staging servers of this plan (Hetzner reports the servers that carry it there);
 #   - attaches the firewall, a load balancer target, a network or a primary IP to a server outside
 #     the plan (or the build server, STG_BUILDBOX_ID), or uses a label selector other than
 #     env=staging,role=node;
@@ -68,13 +71,14 @@ jq -e 'has("prior_state") | not' "$plan" >/dev/null || die "the plan JSON holds 
 # The staging DNS names (zone, name, type). Plan section 7. One list for check-plan and sweep.
 ALLOWED_RRSETS="$(jq -c . "$HERE/rrsets.json")"
 
-# The firewall source: the current public IPv4 address of the operator's Mac as one /32 (steps.sh
-# admin_cidrs; decision of the person, 2026-11-11). Exactly one IPv4 host, nothing wider, no
-# IPv6. Without it a plan that creates or changes a firewall rule is refused (fail closed).
+# The firewall source: the build server's fixed public IPv4 address as one /32 (steps.sh
+# admin_cidrs reads it from the Hetzner API; decision of the person, 2026-11-11). Exactly one IPv4
+# host, nothing wider, no IPv6. Without it a plan that creates or changes a firewall rule is
+# refused (fail closed).
 admin_cidrs="${STG_ADMIN_CIDRS:-[]}"
 jq -e 'type == "array" and all(.[]; type == "string")' <<<"$admin_cidrs" >/dev/null 2>&1 ||
   die "STG_ADMIN_CIDRS must be a JSON list of CIDR strings"
-jq -e 'length <= 1' <<<"$admin_cidrs" >/dev/null || die "STG_ADMIN_CIDRS must hold exactly one address (the Mac's public IPv4 as a /32)"
+jq -e 'length <= 1' <<<"$admin_cidrs" >/dev/null || die "STG_ADMIN_CIDRS must hold exactly one address (the build server's public IPv4 as a /32)"
 bad_cidr="$(jq -r '.[] | select(test("^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])/32$") | not)' <<<"$admin_cidrs")"
 [[ -z "$bad_cidr" ]] || die "STG_ADMIN_CIDRS must be one IPv4 address as a /32, not $bad_cidr"
 # The build server's Hetzner ID (steps.sh), so no attachment or target can name it.
@@ -103,7 +107,7 @@ violations="$(jq -r \
     "hcloud_firewall_attachment","scaleway_object_bucket_lock_configuration",
     "minio_s3_bucket","talos_machine_secrets","talos_machine_configuration_apply",
     "talos_machine_bootstrap","terraform_data"];
-  # The only firewall rules: Talos API, Kubernetes API, ICMP, inbound, from the Mac of the operator.
+  # The only firewall rules: Talos API, Kubernetes API, ICMP, inbound, from the build server.
   def allowed_rules: [["tcp","50000"],["tcp","6443"],["icmp",""]];
   # The only label selector of a target or an attachment: the staging nodes.
   def node_selector_ok(s): (s // "" | split(",") | map(gsub("^ +| +$"; "")) | sort) == ["env=staging","role=node"];
@@ -123,6 +127,16 @@ violations="$(jq -r \
       if unknown == true then true
       elif id == null then false
       else ((id | tostring) as $i | ($plan_server_ids | index($i)) != null and $i != $buildbox) end;
+  # apply_to_kept: an existing firewall whose apply_to is the same before and after, and lists
+  # only servers of this plan (never the build server, never a label selector). Hetzner fills
+  # apply_to with the servers that carry the firewall through their firewall_ids.
+  def apply_to_kept($r):
+      ($r.change.before != null)
+      and (($r.change.before.apply_to // []) == ($r.change.after.apply_to // []))
+      and all(($r.change.after.apply_to // [])[];
+            ((.label_selector // "") == "") and (.server != null) and server_id_ok(.server; false));
+  # unknown_any(x): true when x, or anything in it, is unknown at plan time.
+  def unknown_any(x): (x == true) or ([x | .. | select(. == true)] | length > 0);
   # The Hetzner IDs of the firewalls of this plan (known once the firewall exists).
   ([ .resource_changes[]? | select(.type == "hcloud_firewall") | (.change.before.id?, .change.after.id?) | select(. != null) | tostring ] | unique) as $plan_firewall_ids
   | (
@@ -184,11 +198,12 @@ violations="$(jq -r \
     + ( [ all_planned[] | select(.type == "hcloud_server") ] | length
         | if . > 4 then ["\(.) servers planned: at most 4 within the budget"] else [] end )
     # 9. Firewall rules (code review F-4): inbound only, only the three rules, only from the
-    # Mac of the operator. Unknown sources are refused. Code review 2 G-1: apply_to is checked once per
+    # build server. Unknown sources are refused. Code review 2 G-1: apply_to is checked once per
     # firewall (also with zero rules), and rules unknown at plan time are refused.
     + [ $rc[] | select(.type == "hcloud_firewall") | select(.change.after != null) | . as $r
-        | ( (if (($r.change.after.apply_to // []) | length) > 0 then ["\($r.address): apply_to is not used (the firewall goes on at server create)"] else [] end)
-          + (if (($r.change.after_unknown.apply_to // false) == true) or (($r.change.after_unknown.apply_to // []) | type == "array" and any(.[]; . != false))
+        | ( (if ((($r.change.after.apply_to // []) | length) > 0) and (apply_to_kept($r) | not)
+               then ["\($r.address): apply_to is not used (the firewall goes on at server create); only the unchanged servers of this plan of an existing firewall"] else [] end)
+          + (if unknown_any($r.change.after_unknown.apply_to // false)
                then ["\($r.address): apply_to unknown at plan time"] else [] end)
           + (if (($r.change.after_unknown.rule // false) == true)
                or (($r.change.after_unknown.rule // []) | type == "array" and any(.[]; . == true))
@@ -203,7 +218,7 @@ violations="$(jq -r \
           + (if (($u.source_ips // false) == true) or (($u.source_ips // []) | type == "array" and any(.[]; . == true))
                then ["\($r.address) rule \($i): source_ips unknown at plan time"] else [] end)
           + [ ($rule.source_ips // [])[] | select(. as $s | ($admin | index($s)) == null)
-              | "\($r.address) rule \($i): source \(.) is not the operator address \($admin | join(", ") | if . == "" then "(none given: STG_ADMIN_CIDRS)" else . end)" ]
+              | "\($r.address) rule \($i): source \(.) is not the build server address \($admin | join(", ") | if . == "" then "(none given: STG_ADMIN_CIDRS)" else . end)" ]
           + (if (($rule.source_ips // []) | length) == 0 then ["\($r.address) rule \($i): no source_ips"] else [] end)
           + (if (($rule.destination_ips // []) | length) > 0 then ["\($r.address) rule \($i): destination_ips are not used"] else [] end)
           ) | .[] ]

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs one command in the tools container on the Mac, with the work folder
 # (~/.config/ruum/staging: kubeconfig, talosconfig) and this checkout mounted (lib.sh stg_docker).
-# KUBECONFIG and TALOSCONFIG point at the admin files there. No secret from secrets.env goes in.
+# KUBECONFIG and TALOSCONFIG point at the admin files there. No secret from secrets.env goes in
+# (only HCLOUD_TOKEN, to a separate container that reads the tunnel targets). The admin tunnel
+# over the build server is open while the command runs (lib.sh stg_tunnel_up); --no-tunnel skips it.
 #
 #   deploy/staging/tool.sh kubectl get pods -A
 #   deploy/staging/tool.sh talosctl -n <node IP> health
@@ -15,6 +17,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 opts=()
+tunnel=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)
@@ -22,11 +25,13 @@ while [[ $# -gt 0 ]]; do
       opts+=(-p "127.0.0.1:$2:$2")
       shift 2
       ;;
-    -h | --help) sed -n '2,12p' "$0"; exit 0 ;;
+    --no-tunnel) tunnel=0; shift ;;
+    -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
     *) break ;;
   esac
 done
-[[ $# -gt 0 ]] || stg_die "usage: tool.sh [--port N] COMMAND [ARGS...]"
+[[ $# -gt 0 ]] || stg_die "usage: tool.sh [--port N] [--no-tunnel] COMMAND [ARGS...]"
+[[ $tunnel == 0 ]] || stg_tunnel_up
 # A terminal gets a tty (for kubectl exec -it, less); a pipe does not.
 [[ -t 0 && -t 1 ]] && opts+=(-t)
 stg_docker ${opts[@]+"${opts[@]}"} -- "$@"

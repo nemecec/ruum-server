@@ -18,11 +18,14 @@ log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 bash "$HERE/check-capacity.sh"
-nodes="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}')"
+# Each node by its private address: the talosctl endpoints are the admin tunnel (127.0.0.1:1500N),
+# and the endpoint's apid relays to the node over the private network (the firewall closes the
+# public Talos API to everything but the build server).
+nodes="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}')"
 [[ -n "$nodes" ]] || die "no nodes"
 while IFS='=' read -r name ip; do
   [[ -n "$name" ]] || continue
-  [[ -n "$ip" ]] || die "no external address for $name"
+  [[ -n "$ip" ]] || die "no internal address for $name"
   current="$(talosctl -n "$ip" version --short 2>/dev/null | awk '/Tag:/ {print $2}' | tail -1)"
   if [[ "$current" == "$TALOS_VERSION" ]]; then
     log "$name is at $TALOS_VERSION"

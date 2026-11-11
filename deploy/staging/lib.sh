@@ -16,15 +16,20 @@
 # - The work folder ~/.config/ruum/staging (0700) holds the kubeconfig, the talosconfig and the
 #   plans. It is the only folder that the container can write. The checkout is mounted read-only.
 #
-# The staging firewall opens the Talos API (50000) and the Kubernetes API (6443) only to the Mac's
-# current public IPv4 address (steps.sh admin_cidrs). When that address changes, run
-# `RUUM_STAGING_APPLY=yes up.sh --apply --infra-only` to move the firewall rule.
+# Admin access (decision of the person, 2026-11-11): the staging firewall opens the Talos API
+# (50000) and the Kubernetes API (6443) only to the build server's fixed public IPv4 (steps.sh
+# admin_cidrs reads it from the Hetzner API). The Mac reaches them through an SSH local forward
+# over the build server (stg_tunnel_up below, tunnel.sh), as the user ruumtunnel, which may only
+# forward to those ports. The admin credentials stay on the Mac; the build server relays the
+# encrypted TLS and mTLS bytes only.
 
 # shellcheck shell=bash
 STG_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STG_ROOT="$(cd "$STG_HERE/../.." && pwd)"
 # shellcheck source=versions.env
 . "$STG_HERE/versions.env"
+# shellcheck source=tunnel.sh
+. "$STG_HERE/tunnel.sh"
 
 STG_SECRETS="${RUUM_SECRETS_FILE:-$HOME/.config/ruum/secrets.env}"
 STG_WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
@@ -32,6 +37,14 @@ STG_WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 stg_log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 stg_warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 stg_die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# stg_on_exit COMMAND: run COMMAND when the script exits (after the ones added later).
+STG_EXIT_CMDS=""
+stg_on_exit() {
+  STG_EXIT_CMDS="$1${STG_EXIT_CMDS:+; $STG_EXIT_CMDS}"
+  # shellcheck disable=SC2064
+  trap "$STG_EXIT_CMDS" EXIT
+}
 
 # The value of one name in the secrets file. The file is read line by line for that name and
 # never sourced, so no other secret gets into the shell.
@@ -92,6 +105,12 @@ stg_docker() {
   command -v docker >/dev/null || stg_die "docker is missing (Docker Desktop)"
   stg_work
   stg_image
+  # While the admin tunnel is up, the command runs behind tunnel-relay.sh, which listens on the
+  # tunnel ports on 127.0.0.1 of the container and relays them to the Mac.
+  if [[ -n "$STG_TUNNEL_PORTS" ]]; then
+    opts+=(-e "STG_TUNNEL_PORTS=$STG_TUNNEL_PORTS")
+    set -- bash "$STG_HERE/tunnel-relay.sh" "$@"
+  fi
   docker run --rm -i --init \
     --user "$(id -u):$(id -g)" \
     --cap-drop ALL --security-opt no-new-privileges \
@@ -110,7 +129,6 @@ stg_docker() {
 # stg_run MUTATES STEP ARGS...: run steps.sh STEP in the tools container; stdin is passed on.
 # MUTATES is "ro" or "rw". Only an "rw" step gets RUUM_STAGING_APPLY (when it is "yes" here), and
 # the steps that create or change cloud resources refuse to run without it (steps.sh).
-# RUUM_ADMIN_IP, when set, replaces the detected public address of the Mac (steps.sh checks it).
 stg_run() {
   local mutates="$1" env=()
   shift
@@ -119,7 +137,6 @@ stg_run() {
     rw) [[ "${RUUM_STAGING_APPLY:-}" != yes ]] || env+=(-e RUUM_STAGING_APPLY=yes) ;;
     *) stg_die "stg_run: ro or rw, not '$mutates'" ;;
   esac
-  [[ -z "${RUUM_ADMIN_IP:-}" ]] || env+=(-e "RUUM_ADMIN_IP=$RUUM_ADMIN_IP")
   stg_docker ${env[@]+"${env[@]}"} -- bash "$STG_HERE/steps.sh" "$@"
 }
 
@@ -129,4 +146,66 @@ stg_audit() {
   local dir="${RUUM_STAGING_AUDIT_DIR:-$HOME/.local/state/ruum}"
   mkdir -p "$dir"
   printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${USER:-agent}" "$1" "$2" >>"$dir/staging-audit.tsv"
+}
+
+# --- The admin tunnel over the build server (tunnel.sh, ops/buildbox-tunnel-user.sh) ---
+# The key and the host key of the build server live only on the Mac. ops/tunnel-setup.sh makes
+# the key when it is missing, installs it on the build server (ops/buildbox-tunnel-user.sh) and
+# records the host key.
+STG_TUNNEL_KEY="$HOME/.config/ruum/staging_tunnel_ed25519"
+STG_TUNNEL_KNOWN_HOSTS="$HOME/.config/ruum/staging_tunnel_known_hosts"
+STG_TUNNEL_SOCK="$STG_WORK/tunnel.sock"
+STG_TUNNEL_PORTS=""
+STG_TUNNEL_BASTION=""
+
+# The build server and the staging nodes, from the Hetzner API (in the tools container).
+stg_tunnel_targets() {
+  stg_secret_stream HCLOUD_TOKEN | stg_run ro tunnel-targets
+}
+
+# The ssh options of every tunnel connection: only this key and this host key, no user ssh
+# config, no agent, no X11, no tty, no command; a forward that cannot listen ends ssh.
+stg_tunnel_ssh_opts() {
+  printf '%s\n' -F /dev/null \
+    -o BatchMode=yes -o IdentitiesOnly=yes -o "IdentityFile=$STG_TUNNEL_KEY" -o IdentityAgent=none \
+    -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$STG_TUNNEL_KNOWN_HOSTS" -o GlobalKnownHostsFile=/dev/null \
+    -o HostKeyAlgorithms=ssh-ed25519 -o UpdateHostKeys=no -o CheckHostIP=no \
+    -o ExitOnForwardFailure=yes -o ForwardAgent=no -o ForwardX11=no -o RequestTTY=no -o PermitLocalCommand=no \
+    -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -o ControlPath="$STG_TUNNEL_SOCK"
+}
+
+# Opens the tunnel (or joins one that is up already) and sets STG_TUNNEL_PORTS, so the next
+# stg_docker and stg_run calls reach the APIs. A tunnel that this script opened is closed on exit.
+stg_tunnel_up() {
+  local targets opts=() fwd=() line
+  [[ -z "$STG_TUNNEL_PORTS" ]] || return 0
+  command -v ssh >/dev/null || stg_die "ssh is missing"
+  [[ -r "$STG_TUNNEL_KEY" ]] || stg_die "the tunnel key $STG_TUNNEL_KEY is missing: run deploy/staging/ops/tunnel-setup.sh (README 'Admin access')"
+  [[ -s "$STG_TUNNEL_KNOWN_HOSTS" ]] || stg_die "the build server's host key is not recorded in $STG_TUNNEL_KNOWN_HOSTS: run deploy/staging/ops/tunnel-setup.sh"
+  stg_work
+  targets="$(stg_tunnel_targets)" || stg_die "cannot read the tunnel targets from the Hetzner API"
+  tunnel_parse "$targets" >&2 || stg_die "unexpected tunnel targets"
+  while IFS= read -r line; do opts+=("$line"); done < <(stg_tunnel_ssh_opts)
+  while IFS= read -r line; do fwd+=("$line"); done < <(tunnel_forward_args)
+  STG_TUNNEL_BASTION="$TUNNEL_BASTION"
+  if ssh "${opts[@]}" -O check "$TUNNEL_USER@$TUNNEL_BASTION" 2>/dev/null; then
+    stg_log "admin tunnel: joining the open tunnel over $TUNNEL_BASTION"
+  else
+    rm -f "$STG_TUNNEL_SOCK"
+    stg_log "admin tunnel: $TUNNEL_USER@$TUNNEL_BASTION, local ports $(tunnel_ports)"
+    ssh "${opts[@]}" -o ControlMaster=yes -f -N "${fwd[@]}" "$TUNNEL_USER@$TUNNEL_BASTION" ||
+      stg_die "the admin tunnel over $TUNNEL_BASTION did not open (key installed? ops/tunnel-setup.sh)"
+    stg_on_exit stg_tunnel_down
+  fi
+  STG_TUNNEL_PORTS="$(tunnel_ports)"
+}
+
+# Closes the tunnel that stg_tunnel_up opened.
+stg_tunnel_down() {
+  local opts=() line
+  [[ -n "$STG_TUNNEL_BASTION" && -S "$STG_TUNNEL_SOCK" ]] || return 0
+  while IFS= read -r line; do opts+=("$line"); done < <(stg_tunnel_ssh_opts)
+  ssh "${opts[@]}" -O exit "$TUNNEL_USER@$STG_TUNNEL_BASTION" 2>/dev/null || true
+  STG_TUNNEL_PORTS=""
 }

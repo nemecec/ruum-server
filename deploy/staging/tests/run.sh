@@ -8,13 +8,16 @@
 #   firewall, user_data, DNS names, build server, size, unknown type, variables in the JSON),
 #   each mutation of code review F-4 (firewall rules, deletes and replaces, attachments,
 #   load balancer targets, object lock, child modules) and of code review 2 G-1 (a foreign
-#   firewall ID, apply_to without rules, unknown rules, primary IP assignee), and only the
-#   Mac's /32 as the admin source;
+#   firewall ID, apply_to without rules, unknown rules, primary IP assignee), only the build
+#   server's /32 as the admin source, and apply_to only unchanged on an existing firewall;
 # - plan-scrub.jq removes the prior state and every sensitive value (F-5);
 # - the sweep deletes only the staging names (F-6);
 # - deploy-chart.sh refuses bad arguments (F-3); the admin address must be a public IPv4;
-# - the Mac-only layout: no ssh, no build-server credential path, the checkout read-only in the
-#   tools container, rw steps refuse without RUUM_STAGING_APPLY=yes;
+# - the Mac-only layout: no Mac IP detection, ssh only for the admin tunnel, no build-server
+#   address or agent credential path, the checkout read-only in the tools container, rw steps
+#   refuse without RUUM_STAGING_APPLY=yes;
+# - the admin tunnel: targets, ssh forwards and options, talosconfig endpoints, the kubeconfig
+#   rewrite (with kubectl), the restricted key line and the sshd config of the build server;
 # - price.sh prices the plan and refuses above the budget;
 # - the secret lists: nothing forbidden goes to the cluster, the two lists agree;
 # - one Zitadel and SpiceDB pin for the laptop and staging (review 2 U-5);
@@ -34,7 +37,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export PATH="$HOME/.local/bin:$PATH"
 failed=0
-# The Mac's public IPv4 as steps.sh gives it to check-plan.sh (a documentation address here).
+# The build server's public IPv4 as steps.sh gives it to check-plan.sh (a documentation address here).
 export STG_ADMIN_CIDRS='["203.0.113.10/32"]'
 export STG_BUILDBOX_ID=99999
 ok() { printf 'ok   %s\n' "$*"; }
@@ -86,7 +89,7 @@ expect 3 "refuses an outbound rule" bash "$cp" "$(mutate fwout "${FW}[0].directi
 expect 3 "refuses firewall sources unknown at plan time" bash "$cp" "$(mutate fwunk '(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after_unknown.rule[0].source_ips) = true')"
 expect 3 "refuses firewall apply_to" bash "$cp" "$(mutate fwapply '(.resource_changes[] | select(.type == "hcloud_firewall") | .change.after.apply_to) = [{"server":1}]')"
 expect 3 "refuses firewall rules without STG_ADMIN_CIDRS" env -u STG_ADMIN_CIDRS bash "$cp" "$FIX/plan-good.json"
-expect 3 "refuses firewall rules from another address than the Mac" env STG_ADMIN_CIDRS='["203.0.113.11/32"]' bash "$cp" "$FIX/plan-good.json"
+expect 3 "refuses firewall rules from another address than the build server" env STG_ADMIN_CIDRS='["203.0.113.11/32"]' bash "$cp" "$FIX/plan-good.json"
 expect 1 "refuses STG_ADMIN_CIDRS of 0.0.0.0/0" env STG_ADMIN_CIDRS='["0.0.0.0/0"]' bash "$cp" "$FIX/plan-good.json"
 expect 1 "refuses STG_ADMIN_CIDRS wider than one host (/31)" env STG_ADMIN_CIDRS='["203.0.113.10/31"]' bash "$cp" "$FIX/plan-good.json"
 expect 1 "refuses STG_ADMIN_CIDRS without a prefix" env STG_ADMIN_CIDRS='["203.0.113.10"]' bash "$cp" "$FIX/plan-good.json"
@@ -94,8 +97,8 @@ expect 1 "refuses STG_ADMIN_CIDRS with an IPv6 /64" env STG_ADMIN_CIDRS='["2a01:
 expect 1 "refuses STG_ADMIN_CIDRS with an IPv6 /128" env STG_ADMIN_CIDRS='["2a01:4f8::1/128"]' bash "$cp" "$FIX/plan-good.json"
 expect 1 "refuses STG_ADMIN_CIDRS with two addresses" env STG_ADMIN_CIDRS='["203.0.113.10/32","203.0.113.11/32"]' bash "$cp" "$FIX/plan-good.json"
 expect 1 "refuses STG_ADMIN_CIDRS with an octet above 255" env STG_ADMIN_CIDRS='["203.0.113.300/32"]' bash "$cp" "$FIX/plan-good.json"
-expect 3 "refuses a rule with the Mac and a second /32" bash "$cp" "$(mutate fwtwo "${FW}[1].source_ips += [\"203.0.113.11/32\"]")"
-expect 3 "refuses a rule with the Mac's /24" bash "$cp" "$(mutate fw24 "${FW}[1].source_ips = [\"203.0.113.0/24\"]")"
+expect 3 "refuses a rule with the build server and a second /32" bash "$cp" "$(mutate fwtwo "${FW}[1].source_ips += [\"203.0.113.11/32\"]")"
+expect 3 "refuses a rule with the build server's /24" bash "$cp" "$(mutate fw24 "${FW}[1].source_ips = [\"203.0.113.0/24\"]")"
 expect 3 "refuses deleting the firewall" bash "$cp" "$(mutate fwdel '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["delete"] | .before = .after | .after = null)')"
 expect 3 "refuses replacing the firewall" bash "$cp" "$(mutate fwrep '(.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["delete","create"] | .before = .after)')"
 expect 0 "accepts replacing the firewall with --allow-replace" bash "$cp" "$TMP/fwrep.json" --allow-replace
@@ -132,6 +135,27 @@ expect 3 "refuses one firewall rule unknown at plan time" bash "$cp" "$(mutate f
 expect 3 "refuses a primary IP assigned to the build server" bash "$cp" "$(mutate pipbb '(.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 99999')"
 expect 3 "refuses a primary IP assigned to a server outside the plan" bash "$cp" "$(mutate pipout '(.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4242')"
 expect 0 "accepts a primary IP assigned to a server of this plan" bash "$cp" "$(mutate pipin '(.resource_changes[] | select(.address == "hcloud_server.node[\"stg-1\"]") | .change) |= (.actions = ["update"] | .before = (.after + {"id":4243}) | .after.id = 4243) | (.resource_changes[] | select(.address == "hcloud_primary_ip.v4[\"stg-1\"]") | .change.after.assignee_id) = 4243')"
+
+echo "== check-plan.sh: apply_to of an existing firewall (2026-11-11)"
+# The servers exist (IDs 4241-4243) and carry the existing firewall 77; Hetzner reports them in
+# apply_to. The firewall rules change in place (the admin source moves to the build server).
+EXIST='(.resource_changes[] | select(.type == "hcloud_server")) |= (.change |= (.actions = ["no-op"] | .after.id = (4240 + (.after.name | ltrimstr("stg-") | tonumber)) | .before = .after | .after_unknown = {}))
+  | (.resource_changes[] | select(.type == "hcloud_firewall") | .change) |= (.actions = ["update"] | .after.id = "77"
+      | .after.apply_to = [{"label_selector":"","server":4241},{"label_selector":"","server":4242},{"label_selector":"","server":4243}]
+      | .before = (.after | .rule = [.rule[] | .source_ips = ["198.51.100.20/32"]]) | .after_unknown = {})'
+expect 0 "accepts an existing firewall whose apply_to stays the same and lists the plan's servers" bash "$cp" "$(mutate apkept "$EXIST")"
+FWC='(.resource_changes[] | select(.type == "hcloud_firewall") | .change)'
+S4244='{"label_selector":"","server":4244}'
+SOUT='{"label_selector":"","server":4242424}'
+SEL='{"label_selector":"env=staging,role=node","server":null}'
+expect 3 "refuses apply_to that adds a server" bash "$cp" "$(mutate apadd "$EXIST | $FWC.after.apply_to += [$S4244]")"
+expect 3 "refuses unchanged apply_to with a server outside the plan" bash "$cp" "$(mutate apout "$EXIST | $FWC |= (.before.apply_to += [$SOUT] | .after.apply_to += [$SOUT])")"
+expect 3 "refuses unchanged apply_to that lists the build server" env STG_BUILDBOX_ID=4243 bash "$cp" "$TMP/apkept.json"
+expect 3 "refuses unchanged apply_to with a label selector" bash "$cp" "$(mutate apsel "$EXIST | $FWC |= (.before.apply_to += [$SEL] | .after.apply_to += [$SEL])")"
+expect 3 "refuses apply_to on a new firewall (no before)" bash "$cp" "$(mutate apnew "$EXIST | $FWC |= (.actions = [\"create\"] | .before = null)")"
+expect 3 "refuses apply_to of an existing firewall that is unknown at plan time" bash "$cp" "$(mutate apunk "$EXIST | $FWC.after_unknown.apply_to = [{\"server\":true}]")"
+expect 3 "refuses the existing firewall's rules from the old address" bash "$cp" "$(mutate apold "$EXIST | $FWC.after.rule[0].source_ips = [\"198.51.100.20/32\"]")"
+
 bash "$STG/price.sh" "$FIX/pricing.json" "$TMP/child.json" >"$TMP/out" 2>&1
 grep -qE "server cx23 \(hel1\) +5 " "$TMP/out" && ok "price.sh counts the servers of child modules" || { bad "price.sh child modules"; cat "$TMP/out"; }
 
@@ -190,18 +214,24 @@ grep -q 'cosign_verify_provenance' "$dc" && ok "deploy-chart.sh verifies the pro
 
 echo "== the Mac only (decision of the person, 2026-11-11)"
 st="$STG/steps.sh"
-expect 0 "the admin source is the given public IPv4 as a /32" env RUUM_STAGING_WORK="$TMP" RUUM_ADMIN_IP=8.8.8.8 bash "$st" admin-cidrs
-[[ "$(tr -d '\n' <"$TMP/out")" == '["8.8.8.8/32"]' ]] && ok "admin-cidrs prints [\"8.8.8.8/32\"]" || { bad "admin-cidrs output"; cat "$TMP/out"; }
+expect 0 "a public IPv4 becomes one /32" env RUUM_STAGING_WORK="$TMP" bash "$st" ipv4-check 8.8.8.8
+[[ "$(tr -d '\n' <"$TMP/out")" == '["8.8.8.8/32"]' ]] && ok "ipv4-check prints [\"8.8.8.8/32\"]" || { bad "ipv4-check output"; cat "$TMP/out"; }
 for ip in 10.1.2.3 192.168.1.10 172.16.0.1 100.64.0.1 127.0.0.1 169.254.1.1 0.0.0.0 224.0.0.1 203.0.113.5 8.8.8.256 08.8.8.8 8.8.8.8/24 2a01:4f8::1; do
-  expect 1 "refuses the admin address $ip" env RUUM_STAGING_WORK="$TMP" RUUM_ADMIN_IP="$ip" bash "$st" admin-cidrs
+  expect 1 "refuses the admin address $ip" env RUUM_STAGING_WORK="$TMP" bash "$st" ipv4-check "$ip"
 done
+expect 1 "admin-cidrs needs HCLOUD_TOKEN (the build server's address from the Hetzner API)" env RUUM_STAGING_WORK="$TMP" bash "$st" admin-cidrs </dev/null
+grep -q "servers?name=ruum-buildbox" "$st" && grep -q 'public_net.ipv4.ip' "$st" && ok "admin-cidrs reads ruum-buildbox's public IPv4 from the Hetzner API" || bad "admin-cidrs source"
+hits="$(grep -nE 'ipify|icanhazip|ifconfig\.me|checkip|RUUM_ADMIN_IP' "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh "$STG"/tofu/*/*.tf "$STG/README.md" 2>/dev/null || true)"
+[[ -z "$hits" ]] && ok "no Mac IP detection and no RUUM_ADMIN_IP left" || { bad "Mac IP logic is left"; echo "$hits"; }
 for step in apply platform; do
   expect 1 "steps.sh $step refuses without RUUM_STAGING_APPLY=yes" env -u RUUM_STAGING_APPLY RUUM_STAGING_WORK="$TMP" bash "$st" "$step" </dev/null
   grep -q 'needs RUUM_STAGING_APPLY=yes' "$TMP/out" || bad "steps.sh $step: the refusal names RUUM_STAGING_APPLY"
 done
-hits="$(grep -nE '(^|[^a-z])(ssh|rsync|scp)( |$)|ruum-ops|buildbox_ed25519|staging_ops_ed25519|RUUM_STAGING_REMOTE|RUUM_BUILD_HOST|/opt/ruum-staging|2\.31\.194\.2' \
+hits="$(grep -nE '(^|[^a-z])(rsync|scp)( |$)|ruum-ops|buildbox_ed25519|staging_ops_ed25519|RUUM_STAGING_REMOTE|RUUM_BUILD_HOST|/opt/ruum-staging|2\.31\.194\.2' \
   "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh "$STG"/charts/ruum/values.yaml "$STG"/tofu/*/*.tf 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
-[[ -z "$hits" ]] && ok "no ssh, no build-server address or credential path in the staging code" || { bad "build-server paths are left"; echo "$hits"; }
+[[ -z "$hits" ]] && ok "no rsync or scp, no hard-coded build-server address, no agent credential path" || { bad "build-server paths are left"; echo "$hits"; }
+hits="$(grep -lE '(^|[^a-z-])ssh( |$)' "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh 2>/dev/null | xargs -n1 basename 2>/dev/null | grep -vxE 'lib.sh|tunnel-setup.sh|buildbox-tunnel-user.sh|tunnel.sh|tunnel-relay.sh' || true)"
+[[ -z "$hits" ]] && ok "ssh only in the admin tunnel (lib.sh, ops/tunnel-setup.sh)" || { bad "ssh outside the admin tunnel: $hits"; }
 [[ ! -e "$STG/ops/install-ops-user.sh" && ! -e "$STG/ops/ssh-entry.sh" && ! -e "$STG/remote.sh" ]] && ok "no ruum-ops installer, ssh entry or remote mode" || bad "remote mode files are left"
 grep -q -- '-v "$STG_ROOT:$STG_ROOT:ro"' "$STG/lib.sh" && ok "the checkout is mounted read-only in the tools container" || bad "lib.sh mounts the checkout writable"
 grep -q -- '--cap-drop ALL --security-opt no-new-privileges' "$STG/lib.sh" && ok "the tools container runs without capabilities" || bad "lib.sh: capabilities"
@@ -210,6 +240,63 @@ grep -qE 'rw\) \[\[ "\$\{RUUM_STAGING_APPLY:-\}" != yes \]\] \|\| env\+=\(-e RUU
 [[ "$TOOLS_BASE_IMAGE" =~ ^alpine:[0-9.]+@sha256:[0-9a-f]{64}$ ]] && ok "the tools image base is pinned by digest" || bad "TOOLS_BASE_IMAGE is not pinned by digest"
 [[ "$(bash "$STG/tools-image.sh" name 2>/dev/null)" =~ ^ruum-staging-tools:[0-9a-f]{16}$ ]] && ok "the tools image name is a hash of its pins" || bad "tools-image.sh name"
 grep -vE '^[[:space:]]*#' "$STG/tools-image.sh" | grep -q 'docker build' && bad "tools-image.sh uses docker build (build cache)" || ok "tools-image.sh leaves no build cache (run and commit)"
+
+echo "== admin tunnel (2026-11-11)"
+. "$STG/tunnel.sh"
+T1=$'bastion 5.9.0.2\nnode stg-1 5.9.0.11 10.20.1.11\nnode stg-2 5.9.0.12 10.20.1.12\nnode stg-3 5.9.0.13 10.20.1.13'
+if tunnel_parse "$T1" >"$TMP/out"; then ok "tunnel targets parse"; else bad "tunnel targets parse"; cat "$TMP/out"; fi
+[[ "$(tunnel_forward_args | tr '\n' ' ')" == "-L 127.0.0.1:16443:5.9.0.11:6443 -L 127.0.0.1:15001:5.9.0.11:50000 -L 127.0.0.1:15002:5.9.0.12:50000 -L 127.0.0.1:15003:5.9.0.13:50000 " ]] &&
+  ok "ssh forwards: 16443 -> stg-1:6443, 1500N -> stg-N:50000, all on 127.0.0.1" || { bad "ssh forwards"; tunnel_forward_args; }
+[[ "$(tunnel_ports)" == "16443 15001 15002 15003" ]] && ok "tunnel ports" || bad "tunnel ports: $(tunnel_ports)"
+[[ "$(tunnel_talos_endpoints)" == "127.0.0.1:15001 127.0.0.1:15002 127.0.0.1:15003" && "$(tunnel_talos_nodes)" == "10.20.1.11 10.20.1.12 10.20.1.13" ]] &&
+  ok "talosconfig: endpoints through the tunnel, nodes by private address" || bad "talosconfig endpoints or nodes"
+tbad() { if tunnel_parse "$2" >/dev/null; then bad "tunnel targets accept $1"; else ok "tunnel targets refuse $1"; fi; }
+tbad "a private build server address" "${T1/bastion 5.9.0.2/bastion 10.0.0.2}"
+tbad "a private node public address" "${T1/node stg-2 5.9.0.12/node stg-2 192.168.1.12}"
+tbad "a node private address outside 10.20.1.0/24" "${T1/10.20.1.13/10.20.2.13}"
+tbad "a node that is the build server" "${T1/node stg-3 5.9.0.13/node stg-3 5.9.0.2}"
+tbad "another server name" "${T1/stg-3/web}"
+tbad "no stg-1" "$(grep -v stg-1 <<<"$T1")"
+tbad "no build server" "$(grep -v bastion <<<"$T1")"
+tbad "a node twice" "$T1"$'\nnode stg-2 5.9.0.14 10.20.1.14'
+tbad "an extra field" "${T1/10.20.1.12/10.20.1.12 x}"
+for o in ExitOnForwardFailure=yes StrictHostKeyChecking=yes 'UserKnownHostsFile=$STG_TUNNEL_KNOWN_HOSTS' GlobalKnownHostsFile=/dev/null \
+  ForwardAgent=no ForwardX11=no RequestTTY=no IdentitiesOnly=yes BatchMode=yes; do
+  grep -qF -- "-o $o" "$STG/lib.sh" || grep -qF -- "-o \"$o\"" "$STG/lib.sh" || bad "lib.sh tunnel ssh option $o is missing"
+done
+ok "the tunnel ssh options: ExitOnForwardFailure, a fixed known-hosts file, no agent, X11 or tty"
+grep -qE 'ssh "\$\{opts\[@\]\}" -o ControlMaster=yes -f -N "\$\{fwd\[@\]\}"' "$STG/lib.sh" && ok "the tunnel runs no command (-N) and only the forwards" || bad "the tunnel ssh command line"
+grep -q 'STG_TUNNEL_KEY="$HOME/.config/ruum/staging_tunnel_ed25519"' "$STG/lib.sh" && ok "the tunnel key is ~/.config/ruum/staging_tunnel_ed25519" || bad "tunnel key path"
+grep -q "ssh-keygen -q -t ed25519" "$STG/ops/tunnel-setup.sh" && grep -q 'if \[\[ ! -e "$STG_TUNNEL_KEY" \]\]' "$STG/ops/tunnel-setup.sh" &&
+  ! grep -qE 'cat "\$STG_TUNNEL_KEY"( |$|\))' "$STG/ops/tunnel-setup.sh" && ok "tunnel-setup.sh makes the key only when it is missing and never prints it" || bad "tunnel-setup.sh key handling"
+bt="$STG/ops/buildbox-tunnel-user.sh"
+KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPrObEPrObEPrObEPrObEPrObEPrObEPrObEPrObEPrO ruum-staging-tunnel"
+expect 0 "the restricted key line renders" bash "$bt" --print-authorized-keys "$KEY" 5.9.0.11 5.9.0.12 5.9.0.13
+[[ "$(cat "$TMP/out")" == 'restrict,port-forwarding,permitopen="5.9.0.11:6443",permitopen="5.9.0.11:50000",permitopen="5.9.0.12:6443",permitopen="5.9.0.12:50000",permitopen="5.9.0.13:6443",permitopen="5.9.0.13:50000",command="/bin/false" '"$KEY" ]] &&
+  ok "authorized_keys: restrict, port-forwarding, permitopen per node port, command /bin/false" || { bad "authorized_keys line"; cat "$TMP/out"; }
+expect 1 "the key line refuses a private node address" bash "$bt" --print-authorized-keys "$KEY" 10.20.1.11
+expect 1 "the key line refuses an RSA key" bash "$bt" --print-authorized-keys "ssh-rsa AAAAB3NzaC1yc2E= x" 5.9.0.11
+expect 1 "the key line refuses a key with options" bash "$bt" --print-authorized-keys "command=\"/bin/sh\" $KEY" 5.9.0.11
+expect 1 "the key line refuses a quote in an address" bash "$bt" --print-authorized-keys "$KEY" '5.9.0.11",permitopen="*:*'
+expect 0 "the sshd config renders" bash "$bt" --print-sshd-config 5.9.0.11 5.9.0.12 5.9.0.13
+cp "$TMP/out" "$TMP/sshd.conf"
+for want in '^AllowTcpForwarding no$' '^Match User ruumtunnel$' '^    AllowTcpForwarding local$' '^    PermitOpen 5\.9\.0\.11:6443 5\.9\.0\.11:50000 5\.9\.0\.12:6443 5\.9\.0\.12:50000 5\.9\.0\.13:6443 5\.9\.0\.13:50000$' \
+  '^    X11Forwarding no$' '^    AllowAgentForwarding no$' '^    PermitTTY no$' '^    ForceCommand /bin/false$' '^    PermitListen none$' '^    AuthorizedKeysFile /etc/ssh/authorized_keys/ruumtunnel$' '^Match all$'; do
+  grep -qE "$want" "$TMP/sshd.conf" || bad "sshd config: no line $want"
+done
+ok "sshd: forwarding only for ruumtunnel, only to the node ports; no X11, agent or tty; ForceCommand /bin/false"
+if [[ -x /usr/sbin/sshd ]] && command -v ssh-keygen >/dev/null; then
+  ssh-keygen -q -t ed25519 -N '' -f "$TMP/hk" </dev/null >/dev/null
+  if /usr/sbin/sshd -t -f "$TMP/sshd.conf" -h "$TMP/hk" 2>"$TMP/out"; then ok "sshd -t accepts the sshd config"; else bad "sshd -t"; cat "$TMP/out"; fi
+  eff="$(/usr/sbin/sshd -T -f "$TMP/sshd.conf" -h "$TMP/hk" -C user=ruumtunnel,host=x,addr=192.0.2.1 2>/dev/null)"
+  grep -qx 'allowtcpforwarding local' <<<"$eff" && grep -qx 'forcecommand /bin/false' <<<"$eff" && grep -qx 'permittty no' <<<"$eff" &&
+    /usr/sbin/sshd -T -f "$TMP/sshd.conf" -h "$TMP/hk" -C user=ruumadmin,host=x,addr=192.0.2.1 2>/dev/null | grep -qx 'allowtcpforwarding no' &&
+    ok "sshd -T: ruumtunnel forwards locally only, every other user not at all" || bad "sshd -T effective settings"
+fi
+grep -q 'sshd -t' "$bt" && grep -q 'systemctl reload' "$bt" && grep -q "chown root:root" "$bt" && grep -q 'install -d -o root -g root -m 0755' "$bt" &&
+  ok "buildbox-tunnel-user.sh validates with sshd -t before the reload; root-owned key file" || bad "buildbox-tunnel-user.sh order or ownership"
+grep -q -- '--shell /usr/sbin/nologin' "$bt" && grep -q "usermod --password '\*'" "$bt" && ok "ruumtunnel: shell nologin, no password" || bad "ruumtunnel user"
+grep -q 'refuse_talos_changes' "$STG/steps.sh" && ok "apply refuses a plan that changes the Talos machine config (closed to the tools container)" || bad "refuse_talos_changes"
 
 echo "== shell syntax"
 for f in "$STG"/*.sh "$STG"/ops/*.sh "$STG"/k8s/*.sh; do
@@ -313,6 +400,36 @@ if has tofu; then
   fi
 else
   echo "== OpenTofu: skipped (no tofu; setup.sh installs it, or Docker for the tools image)"
+fi
+
+# The kubeconfig rewrite of the admin tunnel, with the kubectl of the tools image (or PATH).
+KRW="cat >/tmp/k <<'KC'
+apiVersion: v1
+kind: Config
+clusters:
+- name: ruum-staging
+  cluster:
+    server: https://10.20.1.11:6443
+    certificate-authority-data: Y2E=
+contexts:
+- name: admin@ruum-staging
+  context: {cluster: ruum-staging, user: admin@ruum-staging}
+current-context: admin@ruum-staging
+users:
+- name: admin@ruum-staging
+  user: {}
+KC
+. '$STG/tunnel.sh' && tunnel_kube_rewrite /tmp/k && kubectl --kubeconfig /tmp/k config view --raw -o jsonpath='{.clusters[0].cluster.server} {.clusters[0].cluster.tls-server-name} {.clusters[0].cluster.certificate-authority-data}'"
+if declare -F intools >/dev/null; then
+  echo "== kubeconfig through the tunnel (kubectl of the tools image)"
+  expect 0 "tunnel_kube_rewrite runs" intools bash -c "$KRW"
+elif command -v kubectl >/dev/null; then
+  echo "== kubeconfig through the tunnel (kubectl)"
+  expect 0 "tunnel_kube_rewrite runs" bash -c "${KRW//\/tmp\/k/$TMP/k}"
+fi
+if [[ -s "$TMP/out" ]] && grep -q 16443 "$TMP/out"; then
+  [[ "$(cat "$TMP/out")" == "https://127.0.0.1:16443 kubernetes Y2E=" ]] &&
+    ok "kubeconfig: server https://127.0.0.1:16443, tls-server-name kubernetes, the CA kept" || { bad "kubeconfig rewrite"; cat "$TMP/out"; }
 fi
 
 if [[ $failed == 0 ]]; then echo "staging tests: all passed"; else echo "staging tests: FAILED"; fi

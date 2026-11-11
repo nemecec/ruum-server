@@ -10,7 +10,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 export TALOSCONFIG="$WORK/talosconfig" KUBECONFIG="$WORK/kubeconfig"
 bash "$HERE/check-capacity.sh"
-first="$(talosctl config info -o json | jq -r '.endpoints[0]')"
+# The first node of the talosconfig: a private address (the endpoints are the admin tunnel).
+first="$(talosctl config info -o json | jq -r '.nodes[0]')"
 talosctl -n "$first" upgrade-k8s --to "${KUBERNETES_VERSION#v}"
 kubectl -n data wait --for=condition=Ready cluster/pg --timeout=15m >/dev/null
 echo "Kubernetes is at $KUBERNETES_VERSION"

@@ -37,6 +37,7 @@ required=(SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZ
   STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS)
 missing="$(stg_missing "${required[@]}")"
 [[ -z "$missing" ]] || stg_die "missing in secrets.env: $(echo $missing) (secrets-init.sh generates the STG_* ones; the person adds SCW_BACKUP_* and STG_ALLOWED_EMAILS)"
+stg_tunnel_up
 stg_log "sending ${#names[@]} names to the tools container (values on stdin, never printed)"
 # The tofu names too: apply.sh reads the generation from the encrypted state.
 stg_secret_stream "${names[@]}" "${STG_NAMES_TOFU[@]}" | stg_run rw platform "$@"
