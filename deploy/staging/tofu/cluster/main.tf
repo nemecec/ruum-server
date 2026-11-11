@@ -94,14 +94,8 @@ resource "hcloud_primary_ip" "v4" {
   labels      = local.node_labels
 }
 
-resource "hcloud_primary_ip" "v6" {
-  for_each    = local.nodes
-  name        = "${each.key}-v6"
-  type        = "ipv6"
-  location    = var.location
-  auto_delete = false
-  labels      = local.node_labels
-}
+# No per-node IPv6 address: the account's primary IP limit (decided 2026-11-11). Public traffic
+# reaches the cluster through the load balancer, which keeps its own IPv4 and IPv6.
 
 # --- Servers: Talos snapshot, no user_data (review 1 B-1), firewall from the first boot. ---
 # The node boots into Talos maintenance mode. talos_machine_configuration_apply below sends the
@@ -121,8 +115,7 @@ resource "hcloud_server" "node" {
   public_net {
     ipv4_enabled = true
     ipv4         = hcloud_primary_ip.v4[each.key].id
-    ipv6_enabled = true
-    ipv6         = hcloud_primary_ip.v6[each.key].id
+    ipv6_enabled = false
   }
 
   network {
