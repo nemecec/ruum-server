@@ -5,10 +5,15 @@
 # step runs on the build server over ssh. Secrets go to the remote process on its stdin as
 # NAME=value lines: never on a command line (not in `ps`), never in a file, never printed.
 #
-# Two remote modes:
-#   ops     (default) ssh as `ruum`, then `sudo -n -u ruum-ops` into a root-owned checkout of a
-#           pushed commit (/opt/ruum-staging/current, ops/install-ops-user.sh). Build jobs run as
-#           `ruum` and cannot read the staging credentials (review 2 O-1, review 1 S-2).
+# Remote modes:
+#   ops     (default) ssh as `ruum-ops` with the laptop's ops key (RUUM_OPS_KEY). The key has a
+#           forced command (ops/ssh-entry.sh) that runs only remote.sh steps from the root-owned
+#           checkout of a commit of main (/opt/ruum-staging/current, ops/install-ops-user.sh).
+#           Build jobs run as `ruum`, have no ops key and no sudo rule into ruum-ops, and cannot
+#           read the staging credentials (review 2 O-1, review 1 S-2, code review F-2).
+#   sudo    the older form: ssh as `ruum`, then `sudo -n -u ruum-ops` remote.sh. Works only when
+#           the person has kept a sudo rule for it (panel/staging-buildbox-hardening.md); it lets
+#           any build job call the steps too, so ops is the default.
 #   direct  RUUM_STAGING_REMOTE=direct: rsync this checkout to ~/stg-direct of `ruum` and run there.
 #           Read-only only: plans, validate, status without cluster credentials. Every step that
 #           creates, changes or deletes something refuses this mode.
@@ -23,6 +28,8 @@ STG_HOST="${RUUM_BUILD_HOST:-ruum@2.31.194.2}"
 STG_SSH_KEY="${RUUM_BUILD_KEY:-$HOME/.config/ruum/buildbox_ed25519}"
 STG_SECRETS="${RUUM_SECRETS_FILE:-$HOME/.config/ruum/secrets.env}"
 STG_MODE="${RUUM_STAGING_REMOTE:-ops}"
+STG_OPS_HOST="${RUUM_OPS_HOST:-ruum-ops@${STG_HOST#*@}}"
+STG_OPS_KEY="${RUUM_OPS_KEY:-$HOME/.config/ruum/staging_ops_ed25519}"
 STG_OPS_RUN="/opt/ruum-staging/current/deploy/staging/remote.sh"
 STG_DIRECT_DIR="stg-direct"
 
@@ -90,9 +97,13 @@ stg_remote() {
       stg_ssh "bash $STG_DIRECT_DIR/deploy/staging/remote.sh $(printf '%q ' "$@")"
       ;;
     ops)
+      # The forced command takes plain words only (ops/ssh-entry.sh); no quoting needed.
+      ssh -o BatchMode=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes -i "$STG_OPS_KEY" "$STG_OPS_HOST" "$*"
+      ;;
+    sudo)
       stg_ssh "sudo -n -u ruum-ops $STG_OPS_RUN $(printf '%q ' "$@")"
       ;;
-    *) stg_die "RUUM_STAGING_REMOTE must be ops or direct" ;;
+    *) stg_die "RUUM_STAGING_REMOTE must be ops, sudo or direct" ;;
   esac
 }
 

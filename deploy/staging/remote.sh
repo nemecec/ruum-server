@@ -10,6 +10,7 @@
 #   talosconfig    (rw)  write the talosconfig and kubeconfig from the state (0600, ruum-ops)
 #   platform       (rw)  helmfile apply of the platform (needs the cluster secrets on stdin)
 #   zitadel-bootstrap (rw) OIDC app, Google and Microsoft, login policy; `check` reports drift
+#   check-backup   (rw)  WAL push and a base backup into the locked bucket work (bring-up check)
 #   deploy <server-ref> <edge-ref> [--rollback] (rw)  helm upgrade of charts/ruum by digest
 #   status               what exists: state, hcloud by label, nodes, pods, backups
 #   destroy-plan         three lists: removed, kept on purpose, never touched; state vs labels
@@ -17,7 +18,8 @@
 #   sweep          (rw)  delete by label when the state is lost (review 2 D-2)
 #
 # Read-only steps run in "direct" mode too (as user ruum); rw steps refuse it and must run as
-# ruum-ops from /opt/ruum-staging/current (lib.sh).
+# ruum-ops from /opt/ruum-staging/current, a root-owned checkout of a commit of main that only
+# the person moves (ops/install-ops-user.sh, code review F-2).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=versions.env
@@ -69,6 +71,7 @@ tofu_env() {
   export TF_VAR_node_count="$NODE_COUNT" TF_VAR_lb_type="$HCLOUD_LB_TYPE"
   export TF_VAR_talos_version="$TALOS_VERSION" TF_VAR_kubernetes_version="${KUBERNETES_VERSION#v}"
   export TF_VAR_talos_installer_image="$TALOS_INSTALLER_IMAGE"
+  export TF_VAR_retention_days="$BACKUP_LOCK_DAYS"
 }
 
 # GET on the Hetzner API; the token goes to curl on stdin (-K -), never on the command line.
@@ -79,15 +82,16 @@ hapi() {
 
 # The build server's own addresses: the only admin source of the firewall (review 2 O-3).
 admin_cidrs() {
-  local v4 v6
-  v4="$(hapi "servers?name=ruum-buildbox" | jq -r '.servers[0].public_net.ipv4.ip // empty')"
-  v6="$(hapi "servers?name=ruum-buildbox" | jq -r '.servers[0].public_net.ipv6.ip // empty')"
-  [[ -n "$v4" ]] || die "cannot find the build server ruum-buildbox in the Hetzner project"
-  if [[ -n "$v6" ]]; then
-    printf '["%s/32","%s"]' "$v4" "$v6"
-  else
-    printf '["%s/32"]' "$v4"
-  fi
+  hapi "servers?name=ruum-buildbox" | jq -ce '
+    .servers[0].public_net as $n
+    | if ($n.ipv4.ip // "") == "" then error("no ruum-buildbox") else . end
+    | [ "\($n.ipv4.ip)/32" ] + (if ($n.ipv6.ip // "") != "" then [ $n.ipv6.ip ] else [] end)' 2>/dev/null ||
+    die "cannot find the build server ruum-buildbox in the Hetzner project"
+}
+
+# The build server's Hetzner ID: check-plan.sh refuses any attachment or target that names it.
+buildbox_id() {
+  hapi "servers?name=ruum-buildbox" | jq -r '.servers[0].id // empty'
 }
 
 TALOS_PLACEHOLDER="pending-talos-snapshot"
@@ -128,7 +132,9 @@ EOF
   printf '%s' "$dir"
 }
 
-# plan_all MODE: writes $WORK/{cluster,persistent}.tfplan, .json (no variables), .txt.
+# plan_all MODE: writes $WORK/{cluster,persistent}.tfplan (encrypted by OpenTofu), .json and .txt.
+# The JSON goes through plan-scrub.jq in a pipe, so the unscrubbed JSON (the prior state with
+# the Talos secrets after the first apply) never lands on disk (code review F-5).
 plan_all() {
   local mode="$1" backend=s3 image cidrs dir root
   tofu_env
@@ -144,11 +150,16 @@ plan_all() {
   fi
   cidrs="$(admin_cidrs)"
   export TF_VAR_talos_image="$image" TF_VAR_admin_cidrs="$cidrs"
+  # check-plan.sh compares the firewall rules and attachments with these (code review F-4).
+  export STG_ADMIN_CIDRS="$cidrs"
+  STG_BUILDBOX_ID="$(buildbox_id)"
+  export STG_BUILDBOX_ID
   for root in persistent cluster; do
     dir="$(prepare_root "$root" "$backend")"
     (cd "$dir" && tofu plan -input=false -no-color -lock-timeout=60s -out="$WORK/$root.tfplan" >"$WORK/plan-$root.log" 2>&1) ||
       { tail -40 "$WORK/plan-$root.log" >&2; die "tofu plan failed for $root"; }
-    (cd "$dir" && tofu show -json "$WORK/$root.tfplan" | jq 'del(.variables)' >"$WORK/$root.json")
+    (cd "$dir" && set -o pipefail && tofu show -json "$WORK/$root.tfplan" | jq -f "$HERE/plan-scrub.jq" >"$WORK/$root.json") ||
+      { rm -f "$WORK/$root.json"; die "tofu show -json failed for $root"; }
     (cd "$dir" && tofu show -no-color "$WORK/$root.tfplan" >"$WORK/$root.txt")
   done
   hapi pricing >"$WORK/pricing.json"
@@ -257,6 +268,12 @@ case "$STEP" in
     read_secrets GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET
     KUBECONFIG="$KUBECONFIG_FILE" bash "$HERE/ops/zitadel-bootstrap.sh" "$@"
     ;;
+  check-backup)
+    # Code review F-7: WAL push and a base backup into the COMPLIANCE-locked bucket work.
+    require_ops
+    read_secrets
+    KUBECONFIG="$KUBECONFIG_FILE" bash "$HERE/ops/check-backup.sh" "$@"
+    ;;
   deploy)
     require_ops
     read_secrets
@@ -270,6 +287,9 @@ case "$STEP" in
     [[ "$STEP" == destroy-plan ]] || require_ops
     read_secrets $TOFU_NAMES
     tofu_env
+    STG_ADMIN_CIDRS="$(admin_cidrs)"
+    STG_BUILDBOX_ID="$(buildbox_id)"
+    export STG_ADMIN_CIDRS STG_BUILDBOX_ID
     if state_bucket_exists; then
       prepare_root cluster s3 >/dev/null
       export STG_HAS_STATE=1
@@ -280,6 +300,6 @@ case "$STEP" in
     bash "$HERE/ops/destroy-remote.sh" "$STEP" "$@"
     ;;
   *)
-    die "unknown step '$STEP' (plan, apply, talosconfig, platform, zitadel-bootstrap, deploy, status, destroy-plan, destroy, sweep)"
+    die "unknown step '$STEP' (plan, apply, talosconfig, platform, zitadel-bootstrap, check-backup, deploy, status, destroy-plan, destroy, sweep)"
     ;;
 esac

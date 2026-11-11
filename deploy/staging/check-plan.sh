@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The guard of every staging plan (plan section 7 and 11.2, review 1 B-1, B-2, B-9, review 2 D-3).
 #
-#   check-plan.sh <plan.json>           check a plan (the JSON of `tofu show -json <planfile>`)
+#   check-plan.sh <plan.json> [--allow-delete] [--allow-replace]
+#                                       check a plan (the scrubbed JSON of `tofu show -json`)
 #   check-plan.sh --repo                check the repository: no HCLOUD_TOKEN in any cluster file
 #
 # It refuses (exit 3) a plan that:
@@ -11,9 +12,16 @@
 #   - has an hcloud_server without firewall_ids, or with user_data;
 #   - creates, changes or deletes a DNS record outside the staging names, or a notify.staging one;
 #   - touches anything named ruum-buildbox, or a bucket outside ruum-staging-*;
-#   - has more than 4 servers, or a server type other than the pinned one.
+#   - has more than 4 servers (child modules included), or a server type other than the pinned one;
+#   - deletes or replaces a server or the firewall (unless --allow-delete for the destroy plan,
+#     or --allow-replace on purpose);
+#   - has a firewall rule that is not inbound tcp 50000, tcp 6443 or ICMP from the build server's
+#     addresses (STG_ADMIN_CIDRS, a JSON list; without it every firewall rule is refused);
+#   - attaches the firewall, a load balancer target or a network to a server outside the plan
+#     (or the build server, STG_BUILDBOX_ID), or uses a label selector other than env=staging,role=node;
+#   - sets an object lock other than COMPLIANCE for BACKUP_LOCK_DAYS days, or removes one.
 # It reads only the plan; it never contacts a provider. The plan JSON must not hold the
-# variables (remote.sh removes them before it writes the file: they include the passphrase).
+# variables or the prior state (remote.sh pipes it through plan-scrub.jq before it writes it).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=versions.env
@@ -38,22 +46,46 @@ if [[ "${1:-}" == --repo ]]; then
   exit 0
 fi
 
-plan="${1:-}"
-[[ -r "$plan" ]] || die "usage: check-plan.sh <plan.json> | --repo"
+plan=""
+allow_delete=0
+allow_replace=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow-delete) allow_delete=1; shift ;;
+    --allow-replace) allow_replace=1; shift ;;
+    -*) die "unknown option $1" ;;
+    *) [[ -z "$plan" ]] || die "one plan at a time"; plan="$1"; shift ;;
+  esac
+done
+[[ -r "$plan" ]] || die "usage: check-plan.sh <plan.json> [--allow-delete] [--allow-replace] | --repo"
 command -v jq >/dev/null || die "jq is required"
-jq -e 'has("variables") | not' "$plan" >/dev/null || die "the plan JSON holds the variables (with the passphrase); remove them first (jq 'del(.variables)')"
+jq -e 'has("variables") | not' "$plan" >/dev/null || die "the plan JSON holds the variables (with the passphrase); scrub it first (jq -f plan-scrub.jq)"
+jq -e 'has("prior_state") | not' "$plan" >/dev/null || die "the plan JSON holds the prior state (Talos secrets after the first apply); scrub it first (jq -f plan-scrub.jq)"
 
-# The staging DNS names (zone, name, type). Plan section 7.
-ALLOWED_RRSETS='[
-  ["ruum.space","staging","A"],["ruum.space","staging","AAAA"],["ruum.space","staging","CAA"],
-  ["ruum.space","auth.staging","A"],["ruum.space","auth.staging","AAAA"],
-  ["ruum.space","dav.staging","A"],["ruum.space","dav.staging","AAAA"],
-  ["ruumapps.net","content.staging","A"],["ruumapps.net","content.staging","AAAA"],["ruumapps.net","content.staging","CAA"],
-  ["ruumapps.net","*.content.staging","A"],["ruumapps.net","*.content.staging","AAAA"]
-]'
+# The staging DNS names (zone, name, type). Plan section 7. One list for check-plan and sweep.
+ALLOWED_RRSETS="$(jq -c . "$HERE/rrsets.json")"
+
+# The firewall sources: the build server's own addresses (remote.sh admin_cidrs, review 2 O-3).
+# Without them a plan that creates or changes a firewall rule is refused (fail closed).
+admin_cidrs="${STG_ADMIN_CIDRS:-[]}"
+jq -e 'type == "array" and all(.[]; type == "string")' <<<"$admin_cidrs" >/dev/null 2>&1 ||
+  die "STG_ADMIN_CIDRS must be a JSON list of CIDR strings"
+# Each admin source is one IPv4 host (/32) or at most one IPv6 /64 (the build server's block).
+bad_cidr="$(jq -r '.[] | select((test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}/32$") or (test(":") and (capture("/(?<p>[0-9]+)$").p // "0" | tonumber) >= 64)) | not)' <<<"$admin_cidrs")"
+[[ -z "$bad_cidr" ]] || die "STG_ADMIN_CIDRS has a source wider than one host or one /64: $bad_cidr"
+# The build server's Hetzner ID (remote.sh), so no attachment or target can name it.
+buildbox_id="${STG_BUILDBOX_ID:-}"
+[[ -z "$buildbox_id" || "$buildbox_id" =~ ^[0-9]+$ ]] || die "STG_BUILDBOX_ID must be a number"
+# The object lock of the backup buckets: COMPLIANCE for exactly these days (versions.env).
+lock_days="${BACKUP_LOCK_DAYS:?versions.env sets BACKUP_LOCK_DAYS}"
 
 violations="$(jq -r \
   --argjson rrsets "$ALLOWED_RRSETS" \
+  --argjson admin "$admin_cidrs" \
+  --arg buildbox "$buildbox_id" \
+  --argjson lock_days "$lock_days" \
+  --argjson allow_delete "$allow_delete" \
+  --argjson allow_replace "$allow_replace" \
   --arg server_type "$HCLOUD_SERVER_TYPE" '
   # Types that carry labels (hcloud) or tags (scaleway): they must be labelled.
   def labelled_types: ["hcloud_server","hcloud_network","hcloud_firewall","hcloud_load_balancer",
@@ -67,11 +99,27 @@ violations="$(jq -r \
     "hcloud_firewall_attachment","scaleway_object_bucket_lock_configuration",
     "minio_s3_bucket","talos_machine_secrets","talos_machine_configuration_apply",
     "talos_machine_bootstrap","terraform_data"];
+  # The only firewall rules: Talos API, Kubernetes API, ICMP, inbound, from the build server.
+  def allowed_rules: [["tcp","50000"],["tcp","6443"],["icmp",""]];
+  # The only label selector of a target or an attachment: the staging nodes.
+  def node_selector_ok(s): (s // "" | split(",") | map(gsub("^ +| +$"; "")) | sort) == ["env=staging","role=node"];
   def val: (.change.after // .change.before // {});
   def acts: (.change.actions | join(","));
+  def deletes: (.change.actions | index("delete")) != null;
+  def replaces: deletes and ((.change.actions | index("create")) != null);
   def labels_ok(l): (l != null) and (l.env == "staging") and (l["managed-by"] == "tofu");
+  # Every resource of the end state, child modules included (review 2 P-1 plans modules).
+  def all_planned: [ .planned_values.root_module // {} | recurse(.child_modules[]?) | .resources[]? ];
   [ .resource_changes[]? | select(.mode == "managed") | select(.change.actions != ["no-op"] and .change.actions != ["read"]) ] as $rc
-  | (
+  # The Hetzner IDs of the servers of this plan (known only for servers that exist already).
+  | ([ .resource_changes[]? | select(.type == "hcloud_server") | (.change.before.id?, .change.after.id?) | select(. != null) | tostring ] | unique) as $plan_server_ids
+  # server_id_ok(id; unknown): an ID of a server of this plan, or one that is known only after
+  # apply (a server that this plan creates); never the build server.
+  | def server_id_ok(id; unknown):
+      if unknown == true then true
+      elif id == null then false
+      else ((id | tostring) as $i | ($plan_server_ids | index($i)) != null and $i != $buildbox) end;
+  (
     # 1. No zone resource at all (review 1 B-9).
     [ $rc[] | select(.type == "hcloud_zone") | "zone resource \(.address) (\(acts)): zones are data sources only" ]
     # 2. Unknown types (fail closed).
@@ -83,15 +131,24 @@ violations="$(jq -r \
     + [ $rc[] | select(.type | IN(tagged_types[])) | select(labels_ok(val.tags) | not)
         | "untagged \(.address) (\(acts)): needs tags env=staging and managed-by=tofu" ]
     # 4. Servers: firewall at create, no user_data (review 1 B-1, B-2), pinned type.
-    + [ $rc[] | select(.type == "hcloud_server") | select(.change.actions | index("delete") | not)
+    + [ $rc[] | select(.type == "hcloud_server") | select(.change.after != null)
         | select(((.change.after.firewall_ids // []) | length) == 0 and ((.change.after_unknown.firewall_ids // false) == false))
         | "server \(.address) has no firewall_ids: the firewall must be on from the first boot" ]
-    + [ $rc[] | select(.type == "hcloud_server") | select(.change.actions | index("delete") | not)
+    + [ $rc[] | select(.type == "hcloud_server") | select(.change.after != null)
         | select(((.change.after.user_data // "") != "") or ((.change.after_unknown.user_data // false) == true))
         | "server \(.address) has user_data: the Talos config must not go through the metadata service" ]
-    + [ $rc[] | select(.type == "hcloud_server") | select(.change.actions | index("delete") | not)
+    + [ $rc[] | select(.type == "hcloud_server") | select(.change.after != null)
         | select(.change.after.server_type != $server_type)
         | "server \(.address) type \(.change.after.server_type) is not the pinned \($server_type)" ]
+    # 4b. No server or firewall is deleted or replaced by accident (code review F-4): a replace
+    # loses the node data, a firewall delete opens the nodes. destroy-remote.sh passes
+    # --allow-delete for the destroy plan; an intended replace needs --allow-replace.
+    + [ $rc[] | select(.type | IN("hcloud_server","hcloud_firewall")) | select(replaces)
+        | select($allow_replace == 0 and $allow_delete == 0)
+        | "\(.address) would be replaced (\(acts)): pass --allow-replace only on purpose" ]
+    + [ $rc[] | select(.type | IN("hcloud_server","hcloud_firewall")) | select(deletes and (replaces | not))
+        | select($allow_delete == 0)
+        | "\(.address) would be deleted (\(acts)): only the destroy plan deletes it (--allow-delete)" ]
     # 5. Never the build server.
     + [ $rc[] | select((val.name // "") | test("buildbox"))
         | "\(.address) is named \(val.name): the build server is never touched" ]
@@ -106,11 +163,57 @@ violations="$(jq -r \
         | "bucket \(val.bucket) is not a staging bucket" ]
     + [ $rc[] | select(.type == "scaleway_object_bucket") | select((val.name // "") | startswith("ruum-staging-") | not)
         | "bucket \(val.name) is not a staging bucket" ]
-    + [ $rc[] | select(.type == "scaleway_object_bucket") | select(.change.actions | index("delete"))
+    + [ $rc[] | select(.type == "scaleway_object_bucket") | select(deletes)
         | "bucket \(val.name) would be deleted: backup buckets are kept on purpose" ]
-    # 8. Size: at most 4 servers in the end state (review 2 C-1).
-    + ( [ .planned_values.root_module.resources[]? | select(.type == "hcloud_server") ] | length
+    # 8. Size: at most 4 servers in the end state (review 2 C-1), child modules included.
+    + ( [ all_planned[] | select(.type == "hcloud_server") ] | length
         | if . > 4 then ["\(.) servers planned: at most 4 within the budget"] else [] end )
+    # 9. Firewall rules (code review F-4): inbound only, only the three rules, only from the
+    # build server. Unknown sources are refused.
+    + [ $rc[] | select(.type == "hcloud_firewall") | select(.change.after != null) | . as $r
+        | (.change.after.rule // []) | to_entries[] | .key as $i | .value as $rule
+        | ($r.change.after_unknown.rule[$i]? // {}) as $u
+        | ( (if ($rule.direction // "") != "in" then ["\($r.address) rule \($i): direction \($rule.direction) (only inbound rules)"] else [] end)
+          + (if ([($rule.protocol // ""), ($rule.port // "")] as $pp | allowed_rules | index([$pp])) == null
+               then ["\($r.address) rule \($i): \($rule.protocol) port \($rule.port // "") is not Talos (tcp 50000), Kubernetes (tcp 6443) or ICMP"] else [] end)
+          + (if (($u.source_ips // false) == true) or (($u.source_ips // []) | type == "array" and any(.[]; . == true))
+               then ["\($r.address) rule \($i): source_ips unknown at plan time"] else [] end)
+          + [ ($rule.source_ips // [])[] | select(. as $s | ($admin | index($s)) == null)
+              | "\($r.address) rule \($i): source \(.) is not one of the build server addresses \($admin | join(", ") | if . == "" then "(none given: STG_ADMIN_CIDRS)" else . end)" ]
+          + (if (($rule.source_ips // []) | length) == 0 then ["\($r.address) rule \($i): no source_ips"] else [] end)
+          + (if (($rule.destination_ips // []) | length) > 0 then ["\($r.address) rule \($i): destination_ips are not used"] else [] end)
+          + (if (($r.change.after.apply_to // []) | length) > 0 then ["\($r.address): apply_to is not used (the firewall goes on at server create)"] else [] end)
+          ) | .[] ]
+    # 10. Firewall attachments: only servers of this plan, never the build server; a label
+    # selector only for the staging nodes.
+    + [ $rc[] | select(.type == "hcloud_firewall_attachment") | select(.change.after != null) | . as $r
+        | ( [ (.change.after.server_ids // [])[] | select(server_id_ok(.; false) | not)
+              | "\($r.address): firewall attachment to server \(.) outside this plan" ]
+          + [ (.change.after.label_selectors // [])[] | select(node_selector_ok(.) | not)
+              | "\($r.address): firewall attachment by label selector \(.) (only env=staging,role=node)" ]
+          + (if ((.change.after_unknown.server_ids // false) == true) and (($rc | map(select(.type == "hcloud_server" and (.change.actions | index("create")))) | length) == 0)
+               then ["\($r.address): firewall attachment to servers unknown at plan time, but this plan creates no server"] else [] end)
+          ) | .[] ]
+    # 11. Load balancer targets: the staging node selector, or a server of this plan; never an IP.
+    + [ $rc[] | select(.type == "hcloud_load_balancer_target") | select(.change.after != null) | .change.after as $a | . as $r
+        | if $a.type == "label_selector" then
+            (if node_selector_ok($a.label_selector) then empty else "\($r.address): target label selector \($a.label_selector) (only env=staging,role=node)" end)
+          elif $a.type == "server" then
+            (if server_id_ok($a.server_id; ($r.change.after_unknown.server_id // false)) then empty else "\($r.address): target server \($a.server_id) is outside this plan" end)
+          else "\($r.address): target type \($a.type) (only the staging nodes)" end ]
+    # 12. Server networks: only servers of this plan.
+    + [ $rc[] | select(.type == "hcloud_server_network") | select(.change.after != null) | . as $r
+        | select(server_id_ok(.change.after.server_id; (.change.after_unknown.server_id // false)) | not)
+        | "\($r.address): network attachment of server \(.change.after.server_id) outside this plan" ]
+    # 13. Object lock: COMPLIANCE for exactly the planned days, never deleted (review 1 B-3).
+    + [ $rc[] | select(.type == "scaleway_object_bucket_lock_configuration") | select(deletes)
+        | "\(.address) would be deleted (\(acts)): the compliance lock is never removed" ]
+    + [ $rc[] | select(.type == "scaleway_object_bucket_lock_configuration") | select(.change.after != null) | . as $r
+        | ([ (.change.after.rule // [])[] | (.default_retention // [])[] ]) as $d
+        | if ($d | length) != 1 then "\($r.address): needs exactly one default retention"
+          elif ($d[0].mode != "COMPLIANCE") or ($d[0].days != $lock_days) or ($d[0].years != null)
+            then "\($r.address): lock \($d[0].mode) \($d[0].days // "-") days \($d[0].years // "-") years; only COMPLIANCE for \($lock_days) days"
+          else empty end ]
   ) | .[]
 ' "$plan")"
 
