@@ -1,4 +1,7 @@
-//! Configuration from the environment. Every setting has a `RUUM_` name, except `DATABASE_URL`.
+//! Configuration from the environment. Every setting has a `RUUM_` name, except `DATABASE_URL`
+//! and `SMTP_URL`. Other crates read more settings (identity, SpiceDB, S3, KEK, WebDAV). Every
+//! name the server reads is listed in `crates/ruum-server/env-names.txt`; the staging tests
+//! (`deploy/staging/tests/server-env.sh`) check that list against the code and the Helm chart.
 
 use anyhow::Context as _;
 use std::path::PathBuf;
@@ -8,7 +11,8 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8490";
 /// The default listen address of the WebDAV host (decision 0002-3).
 pub const DEFAULT_DAV_BIND: &str = "127.0.0.1:8492";
 
-// The OIDC, S3 and SpiceDB settings are read when the real implementations are wired in.
+// The OIDC and S3 settings are read again by `ruum_core` (`identity::setup`, `blobs::object`);
+// these copies are not used yet.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -42,8 +46,6 @@ pub struct Config {
     pub s3_endpoint: Option<String>,
     /// `RUUM_S3_BUCKET`
     pub s3_bucket: Option<String>,
-    /// `RUUM_SPICEDB_ENDPOINT`
-    pub spicedb_endpoint: Option<String>,
     /// `RUUM_DBHOST_URL`: the `ruum_dbhost` URL of the data cluster (card D-1). Without it the
     /// server has no database engine and `createDatabase` answers `422` (no node is made).
     /// With it the server needs a key-encryption key (`RUUM_LOCAL_KEK_FILE` or
@@ -101,7 +103,6 @@ impl Config {
             oidc_client_secret: var("RUUM_OIDC_CLIENT_SECRET"),
             s3_endpoint: var("RUUM_S3_ENDPOINT"),
             s3_bucket: var("RUUM_S3_BUCKET"),
-            spicedb_endpoint: var("RUUM_SPICEDB_ENDPOINT"),
             dbhost_url: var("RUUM_DBHOST_URL"),
             request_timeout: std::time::Duration::from_secs(
                 var("RUUM_REQUEST_TIMEOUT_SECONDS")

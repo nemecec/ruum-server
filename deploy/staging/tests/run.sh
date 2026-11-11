@@ -26,6 +26,8 @@
 # - one Zitadel and SpiceDB pin for the laptop and staging (review 2 U-5);
 # - check-plan.sh --repo; up.sh --apply refuses without RUUM_STAGING_APPLY=yes;
 # - with helm: lint and render both charts, digests required, never production Let's Encrypt;
+#   the ruum-server env of the chart and of ruum-server-env matches what the server reads
+#   (tests/server-env.sh against crates/ruum-server/env-names.txt);
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate);
 # - with tofu: fmt and validate of both roots; with tofu and talosctl: the machine config of
 #   every node, rendered by the Talos provider, passes talosctl validate (tests/talos-validate.sh).
@@ -499,6 +501,20 @@ if has helm; then
   expect 0 "helm lint charts/platform" helm lint "$STG/charts/platform" --set generation=202611111200
   expect 0 "render charts/ruum by digest" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e"
   cp "$TMP/out" "$TMP/ruum.yaml"
+  # The server and the chart agree on the settings (tests/server-env.sh, crates/ruum-server/env-names.txt).
+  se="$HERE/server-env.sh"
+  expect 0 "charts/ruum and ruum-server-env set exactly settings the server reads, and all it needs" bash "$se" "$TMP/ruum.yaml"
+  sed 's/name: RUUM_SPICEDB_HTTP_URL,/name: RUUM_SPICEDB_ENDPOINT,/' "$TMP/ruum.yaml" >"$TMP/ruum-drift.yaml"
+  expect 1 "server-env.sh refuses a renamed setting (RUUM_SPICEDB_ENDPOINT, the first deploy's crash)" bash "$se" "$TMP/ruum-drift.yaml"
+  sed 's/name: RUUM_SPICEDB_HTTP_URL,/name: RUUM_SUITE_RLS,/' "$TMP/ruum.yaml" >"$TMP/ruum-drift.yaml"
+  expect 1 "server-env.sh refuses a test-only setting in the chart" bash "$se" "$TMP/ruum-drift.yaml"
+  sed 's/RUUM_SPICEDB_PRESHARED_KEY=/RUUM_SPICEDB_KEY=/' "$STG/k8s/apply.sh" >"$TMP/apply-drift.sh"
+  expect 1 "server-env.sh refuses an unknown key in ruum-server-env" bash "$se" "$TMP/ruum.yaml" "$TMP/apply-drift.sh"
+  mkdir -p "$TMP/crates/ruum-core/src"
+  { grep -vE '^[[:space:]]*(#|$)' "$ROOT/crates/ruum-server/env-names.txt" | cut -d' ' -f1; echo RUUM_NEW_SETTING; } |
+    sed 's/.*/"&"/' >"$TMP/crates/ruum-core/src/lib.rs"
+  expect 1 "server-env.sh refuses a setting the code reads but env-names.txt does not list" bash "$se" "$TMP/ruum.yaml" "$STG/k8s/apply.sh" "$TMP/crates"
+  [[ "$(cat "$TMP/out")" == "the server reads RUUM_NEW_SETTING, but env-names.txt does not list it" ]] || bad "server-env.sh: the only problem is the new setting"
   expect 1 "charts/ruum refuses an image by tag" helm template ruum "$STG/charts/ruum" --set "images.server=ghcr.io/nemecec/ruum-server:main" --set "images.edge=$e"
   expect 1 "charts/ruum refuses another registry (code review F-3)" helm template ruum "$STG/charts/ruum" --set "images.server=evil.example/a@sha256:$(printf '%064d' 0)" --set "images.edge=$e"
   expect 1 "charts/ruum refuses a commit that is not 40 hex" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set-string commit=main

@@ -58,7 +58,8 @@ spec:
           podSelector:
             matchLabels: { app: ruum-server }
       ports:
-        - { protocol: TCP, port: 50051 }
+        # The HTTP gateway only: ruum-server never uses gRPC.
+        - { protocol: TCP, port: 8443 }
 ---
 # Zitadel: only through the edge (the browser, and ruum-server via the public issuer URL).
 apiVersion: networking.k8s.io/v1

@@ -56,10 +56,14 @@ spec:
               value: postgres
             - name: SPICEDB_DATASTORE_CONN_URI
               valueFrom: { secretKeyRef: { name: spicedb, key: datastore-uri } }
+            # ruum-server uses the HTTP gateway (RUUM_SPICEDB_HTTP_URL), as on the laptop.
             - name: SPICEDB_HTTP_ENABLED
-              value: "false"
+              value: "true"
+            - name: SPICEDB_HTTP_ADDR
+              value: ":8443"
           ports:
             - { name: grpc, containerPort: 50051 }
+            - { name: http, containerPort: 8443 }
           readinessProbe:
             grpc: { port: 50051 }
             periodSeconds: 10
@@ -81,3 +85,4 @@ spec:
   selector: { app: spicedb }
   ports:
     - { name: grpc, port: 50051, targetPort: grpc, appProtocol: kubernetes.io/h2c }
+    - { name: http, port: 8443, targetPort: http }

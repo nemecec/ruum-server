@@ -32,9 +32,19 @@ spec:
       containers:
         - name: server
           image: {{ include "ruum.byDigest" .Values.images.server }}
+          # Every RUUM_* name here and in ruum-server-env must be one the server reads, and every
+          # name the server needs in production must be set: crates/ruum-server/env-names.txt,
+          # checked by tests/server-env.sh. Not set on purpose:
+          # - RUUM_OIDC_CLIENT_SECRET: ruum-web is a public client with PKCE (zitadel-bootstrap.sh);
+          # - RUUM_OIDC_REDIRECT_URI: the default <RUUM_PUBLIC_URL>/v1/auth/callback is the URI
+          #   that zitadel-bootstrap.sh registers;
+          # - RUUM_DBHOST_URL and a KEK (RUUM_LOCAL_KEK_FILE, RUUM_OPENBAO_*): staging runs step 1
+          #   (decision 0007) and has no data cluster, so createDatabase answers 422 and no tenant
+          #   key is made. Add them together with a data cluster.
           envFrom:
-            # DATABASE_URL, RUUM_S3_*, RUUM_SPICEDB_PRESHARED_KEY, RUUM_TOKEN_SIGNING_KEY,
-            # RUUM_CONTENT_SIGNING_KEY, RUUM_SIGNUP_ALLOWED_* (k8s/apply.sh).
+            # DATABASE_URL, RUUM_S3_ACCESS_KEY_ID, RUUM_S3_SECRET_ACCESS_KEY,
+            # RUUM_SPICEDB_PRESHARED_KEY, RUUM_TOKEN_SIGNING_KEY, RUUM_CONTENT_SIGNING_KEY,
+            # RUUM_SIGNUP_ALLOWED_EMAILS, RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS (k8s/apply.sh).
             - secretRef: { name: ruum-server-env }
           env:
             - { name: RUST_LOG, value: "info" }
@@ -50,13 +60,15 @@ spec:
               valueFrom: { secretKeyRef: { name: ruum-oidc, key: client-id } }
             - { name: RUUM_MIGRATE, value: "true" }
             - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
-            - { name: RUUM_SPICEDB_ENDPOINT, value: "http://spicedb.authz.svc.cluster.local:50051" }
+            # The server talks to SpiceDB's HTTP gateway, not gRPC (ruum_core::authz::spicedb).
+            - { name: RUUM_SPICEDB_HTTP_URL, value: "http://spicedb.authz.svc.cluster.local:8443" }
             - { name: RUUM_S3_ENDPOINT, value: "https://hel1.your-objectstorage.com" }
             - { name: RUUM_S3_REGION, value: hel1 }
             - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs-768usm }
             - { name: RUUM_S3_FORCE_PATH_STYLE, value: "false" }
             - { name: SMTP_URL, value: "smtp://mailpit.ops.svc.cluster.local:1025" }
             - { name: RUUM_MAIL_FROM, value: "no-reply@notify.staging.ruum.space" }
+            # PUT bodies of the WebDAV host (ruum_webdav::SPOOL_DIR_ENV).
             - { name: RUUM_DAV_SPOOL_DIR, value: /spool }
             - { name: TMPDIR, value: /tmp }
           ports:

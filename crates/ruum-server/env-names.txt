@@ -1,0 +1,73 @@
+# Every environment variable that ruum-server reads (with the crates it links: ruum-core,
+# ruum-api, ruum-mcp, ruum-webdav, ruum-dbengine). One name and one class per line:
+#
+#   required  a production deploy sets it (staging too). The server starts without most of them,
+#             but then it falls back to laptop defaults or in-memory parts.
+#   optional  the default fits, or the feature is off without it.
+#   test      read only by tests. A deploy never sets it.
+#
+# deploy/staging/tests/server-env.sh checks this list both ways against the code (string
+# literals in crates/*/src, without ruum-cli and ruum-testkit), and checks the rendered Helm chart
+# with the keys of the Secret ruum/ruum-server-env (deploy/staging/k8s/apply.sh) against it.
+# A literal "S3_<X>" counts as RUUM_S3_<X> (blobs/object.rs adds the prefix). The unprefixed
+# laptop fallbacks (S3_*, SPICEDB_PRESHARED_KEY) are not listed.
+
+# Listeners and public URLs (crates/ruum-server/src/config.rs)
+RUUM_BIND required
+RUUM_PUBLIC_URL required
+RUUM_CONTENT_URL required
+RUUM_DAV_BIND required
+RUUM_DAV_URL required
+RUUM_INTERNAL_BIND required
+RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR optional
+RUUM_REQUEST_TIMEOUT_SECONDS optional
+
+# Platform database (config.rs)
+DATABASE_URL required
+RUUM_DB_MAX_CONNECTIONS optional
+RUUM_MIGRATE optional
+RUUM_MIGRATIONS_DIR required
+
+# Identity, tokens, mail, plans (ruum-core identity/setup.rs)
+RUUM_OIDC_ISSUER required
+RUUM_OIDC_CLIENT_ID required
+RUUM_OIDC_CLIENT_SECRET optional
+RUUM_OIDC_REDIRECT_URI optional
+RUUM_TOKEN_SIGNING_KEY required
+SMTP_URL required
+RUUM_MAIL_FROM required
+RUUM_PLAN_LIMITS optional
+
+# Sign-up allow-list (config.rs, ruum-api signup.rs). Required until the public launch.
+RUUM_SIGNUP_ALLOWED_EMAILS required
+RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS optional
+
+# Authz (ruum-core authz/spicedb.rs): the HTTP gateway of SpiceDB
+RUUM_SPICEDB_HTTP_URL required
+RUUM_SPICEDB_PRESHARED_KEY required
+
+# Content store (ruum-core blobs/setup.rs, blobs/object.rs)
+RUUM_CONTENT_SIGNING_KEY required
+RUUM_S3_ENDPOINT required
+RUUM_S3_REGION required
+RUUM_S3_BUCKET required
+RUUM_S3_ACCESS_KEY_ID required
+RUUM_S3_SECRET_ACCESS_KEY required
+RUUM_S3_FORCE_PATH_STYLE required
+
+# WebDAV host (ruum-webdav lib.rs)
+RUUM_DAV_SPOOL_DIR optional
+
+# Databases (card D-1): the data cluster and the key-encryption key. Off without RUUM_DBHOST_URL.
+RUUM_DBHOST_URL optional
+RUUM_DATA_CLUSTER optional
+RUUM_PG_DUMP optional
+RUUM_LOCAL_KEK_FILE optional
+RUUM_OPENBAO_ADDR optional
+RUUM_OPENBAO_TOKEN optional
+RUUM_OPENBAO_TRANSIT_MOUNT optional
+
+# Tests only
+RUUM_DBENGINE_REQUIRE_POSTGRES test
+RUUM_SUITE_RLS test
+RUUM_TEST_LOG_CHILD test
