@@ -17,6 +17,17 @@ nodeIP:
   validSubnets:
     - 10.20.1.0/24
 ---
+# Flannel's VXLAN must use the private network. Without this, flanneld takes the interface of the
+# default route (eth0, the public address), and the firewall drops the VXLAN packets between the
+# nodes: no pod traffic between nodes (the API server could not reach the cert-manager webhook).
+# 10.20.0.1 is the gateway of the Hetzner network; only the private interface routes to it.
+# A change here reaches a running cluster only after `talosctl upgrade-k8s` (ops/upgrade-k8s.sh):
+# Talos does not update the bootstrap manifests by itself.
+apiVersion: v1alpha1
+kind: KubeFlannelCNIConfig
+extraArgs:
+  - --iface-can-reach=10.20.0.1
+---
 apiVersion: v1alpha1
 kind: TimeSyncConfig
 ntp:

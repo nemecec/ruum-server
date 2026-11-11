@@ -64,6 +64,7 @@ for n in $(jq -r 'keys[]' mc.json); do
   need '^        enforce: restricted$' "Pod Security enforces restricted"
   need "^hostname: $n\$" "static hostname $n"
   need '^kind: UnattendedInstallConfig$' "install document"
+  need '^ *- --iface-can-reach=10\.20\.0\.1$' "Flannel VXLAN on the private network"
   never 'node-role.kubernetes.io/control-plane: NoSchedule' "workloads may run on the control plane nodes"
   never '^    (kubelet|install|network):' "no v1alpha1 machine.kubelet/install/network"
   never '^    (apiServer|network|discovery|allowSchedulingOnControlPlanes):' "no v1alpha1 cluster.apiServer/network/discovery"
