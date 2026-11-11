@@ -53,6 +53,28 @@ env:
         key: dsn
 initJob:
   command: zitadel
+# Pod Security `restricted` on namespace auth (review 1 S-9). The chart uses these two for every
+# pod and container: the init, setup and machine key/PAT writer jobs and the Zitadel deployment.
+# The Zitadel image runs as UID 1000 and writes nothing to its root file system; the writers
+# (kubectl) write only to the machinekey emptyDir.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  readOnlyRootFilesystem: true
+  privileged: false
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
 resources:
   requests: { cpu: 100m, memory: 384Mi }
   limits: { memory: 768Mi }
