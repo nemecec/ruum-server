@@ -345,8 +345,10 @@ enum Data<'a> {
 /// `CREATEROLE` and its `ADMIN` on the roles of other databases.
 ///
 /// Steps 1 and 3 run no tenant code (re-review of E-2): they change ownership, rights and
-/// `ruum_*` objects, and create views, which fires no trigger, rule or policy (event triggers
-/// need a superuser); they write only tables of `ruum_*`, which no tenant role owns; and their
+/// `ruum_*` objects, and create views, which fires no trigger, rule or policy. An event trigger
+/// would fire on that DDL with the rights of `ruum_dbhost`; only a superuser can make one, and
+/// step 1 refuses a copy that holds an enabled one before its first DDL statement
+/// ([`refuse_event_triggers`], review FU-1-2 of Kimi). They write only tables of `ruum_*`, which no tenant role owns; and their
 /// queries resolve names in `pg_catalog` only, since every `ruum_dbhost` session has the
 /// `search_path` [`super::DBHOST_SEARCH_PATH`]. Before that fix, the `= 0` of
 /// `revoke_old_rights` (step 1) and the `!~` of the catalog (step 3) picked a tenant's
@@ -386,6 +388,7 @@ async fn hand_over(
     let mut conn = engine.dbhost(name).await?;
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
+        refuse_event_triggers(&mut conn).await?;
         drop_old_mask_objects(&mut conn, &old_mask).await?;
         // The schema rights first: a function or a type goes to a new owner only when that
         // owner may create in its schema.
@@ -462,6 +465,32 @@ async fn hand_over(
     let _ = conn.close().await;
     result?;
     setup::grant_connect(engine, name, new_roles).await
+}
+
+/// Refuses a copy that holds an enabled event trigger (review FU-1-2 of Kimi). The hand-over
+/// runs DDL as `ruum_dbhost` (`DROP`, `REASSIGN OWNED`, `GRANT`, `CREATE VIEW`), and an event
+/// trigger fires on DDL with the rights of the role that runs it. A tenant cannot make an event
+/// trigger (Postgres lets only a superuser make one, and `ruum_dbhost` is none), so this is
+/// a second line: the copy fails closed instead of running such a function with
+/// `CREATEROLE` and `ADMIN` on the roles of other databases.
+async fn refuse_event_triggers(conn: &mut PgConnection) -> Result<(), EngineError> {
+    let names: String = sqlx::query_scalar(
+        "select coalesce(pg_catalog.string_agg(pg_catalog.quote_ident(e.evtname::pg_catalog.text),
+                                               ', ' order by e.evtname), '')
+           from pg_catalog.pg_event_trigger e
+          where e.evtenabled operator(pg_catalog.<>) 'D'::pg_catalog.\"char\"",
+    )
+    .persistent(false)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("list the event triggers", e))?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::Unsupported(format!(
+        "the database has an enabled event trigger ({names}), which would fire on the DDL of the \
+         copy's hand-over; a superuser must disable or drop it first"
+    )))
 }
 
 /// The schema of the entry points of step 2 of a masked copy (backlog 2026-11-09 S-9). It holds
@@ -683,7 +712,16 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// built again, and one that cannot be built again (its other side is not masked the same way)
 /// is left out. Runs in the `owner` session of [`change_data`], with the tenant's triggers and
 /// rules parked; a secret column is checked to hold no value afterwards.
+///
+/// Derived data goes too: every materialized view of the database's own schema is made again
+/// from the masked tables ([`dependent_views`]), and the masked tables are analyzed again, so
+/// `pg_statistic` and the extended statistics hold values of the masked rows, not of the source
+/// (review FU-1 required changes 1 and 2). Limit: `ANALYZE` keeps the old statistics of a table
+/// that has no row, so a table the source emptied after its last `ANALYZE` keeps them (as in a
+/// `schema_only` copy); only a superuser (or `pg_clear_attribute_stats` of Postgres 18) can
+/// remove them.
 async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
+    check_planned_from(conn, plan).await?;
     if plan.columns.is_empty() {
         return Ok(());
     }
@@ -847,7 +885,66 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         };
         run(conn, "end the savepoint", end.to_string()).await?;
     }
+    // The statistics of the masked tables (review FU-1 required change 2): `UPDATE ... SET NULL`
+    // of a secret column leaves the source's `most_common_vals` and `histogram_bounds` in
+    // `pg_statistic` (and in `pg_statistic_ext_data`), which `pg_stats` shows to the copy's
+    // owner. `ANALYZE` computes them again from the masked rows.
+    let tables: Vec<String> = plan
+        .columns
+        .iter()
+        .filter(|(c, _)| c.schema == "public")
+        .map(|(c, _)| format!("public.{}", ident(&c.table)))
+        .collect();
+    let list: Option<String> = sqlx::query_scalar(
+        "select pg_catalog.string_agg(distinct r::pg_catalog.text, ', ')
+           from pg_catalog.unnest($1::text[]) t, pg_catalog.to_regclass(t) r
+          where r is not null",
+    )
+    .persistent(false)
+    .bind(&tables)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| internal("list the masked tables", e))?;
+    if let Some(list) = list {
+        run(conn, "analyze the masked tables", format!("analyze {list}")).await?;
+    }
     Ok(())
+}
+
+/// Refuses a masked copy whose tables of the own schema have a column that the catalog of the
+/// plan did not have (review FU-1-3 of Kimi). The platform reads the catalog and the classes
+/// before the engine drains the source, so a migration can add a column in between; the plan
+/// does not name it, and it would be copied in clear. The copy fails with `NotReady` (try
+/// again), and the caller discards it.
+async fn check_planned_from(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
+    let Some(known) = &plan.planned_from else {
+        return Ok(());
+    };
+    let known: std::collections::HashSet<(&str, &str)> = known
+        .iter()
+        .filter(|c| c.schema == "public")
+        .map(|c| (c.table.as_str(), c.column.as_str()))
+        .collect();
+    let catalog = super::catalog::read(conn).await?;
+    let unplanned: Vec<String> = catalog
+        .tables
+        .iter()
+        .filter(|t| t.schema == "public" && t.kind == RelationKind::Table)
+        .flat_map(|t| {
+            t.columns
+                .iter()
+                .filter(|c| !known.contains(&(t.name.as_str(), c.name.as_str())))
+                .map(move |c| format!("{}.{}", t.name, c.name))
+        })
+        .collect();
+    if unplanned.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(
+        columns = %unplanned.join(", "),
+        "a masked copy is refused: the source has columns that its plan does not know"
+    );
+    Err(EngineError::NotReady)
 }
 
 /// A view or materialized view of the tenant that a masked copy drops and makes again
@@ -969,6 +1066,13 @@ impl DependentView {
 /// directly or through other views, in the order in which they can be made (every view after
 /// the views it reads). A view with a trigger or a rule of its own (other than `_RETURN`) would
 /// lose it, so it refuses the copy (backlog 2026-11-09 S-8).
+///
+/// Every materialized view of the own schema is in the list too, with the views that read it
+/// (review FU-1 required change 1). `pg_depend` names a column only for a direct read: a
+/// whole-row reference (`SELECT p::text FROM people p`) depends on the table, and a read inside
+/// a function depends on nothing. Such a materialized view would keep the source's rows.
+/// Made again, it is filled from the masked tables, or left unpopulated when its query fails
+/// (for example a function that reads a materialized view that is not made yet).
 async fn dependent_views(
     conn: &mut PgConnection,
     plan: &MaskPlan,
@@ -989,14 +1093,19 @@ async fn dependent_views(
              join pg_catalog.pg_attribute a
                on a.attrelid = pg_catalog.to_regclass(m.t) and a.attname = m.c
               and a.attnum > 0 and not a.attisdropped),
-         deps(oid, depth) as (
-           select r.ev_class, 1
+         seed(oid) as (
+           select r.ev_class
              from pg_catalog.pg_depend d
              join pg_catalog.pg_rewrite r on r.oid = d.objid
              join start s on d.refobjid = s.rel and d.refobjsubid = s.att
             where d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
               and d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
               and r.ev_class <> d.refobjid
+           union
+           select c.oid from pg_catalog.pg_class c
+            where c.relnamespace = 'public'::pg_catalog.regnamespace and c.relkind = 'm'),
+         deps(oid, depth) as (
+           select seed.oid, 1 from seed
            union
            select r.ev_class, deps.depth + 1
              from pg_catalog.pg_depend d

@@ -265,6 +265,14 @@ fn lens_schema_grants_sql(roles: &[EngineRole]) -> String {
 /// `10-ruum-data.sh`, or something granted it. The engine holds this line itself, so a query of
 /// a read or masked kind never changes an option of its call or leaves state for a later part of
 /// the statement, whatever the statement rules let through.
+///
+/// Expand, then contract (design 12.7, decision 42; review FU-1-4 of Kimi): a setting reader
+/// ([`allow::SETTING_READERS`], `current_setting`) that `PUBLIC` still holds is let through with
+/// a warning, because the cluster set-up before card FU-1 left it to `PUBLIC`, and the previous
+/// release needs it for its `mask` kind (it reads `search_path` with `current_setting`). The
+/// rollout runs this release first, and the new cluster set-up (the contract step, which
+/// revokes it from `PUBLIC`) once the previous release is gone. As long as `PUBLIC` does not
+/// hold it, a read, write or masked kind that may run it refuses the database.
 pub(crate) async fn check_volatile_revoked(
     conn: &mut PgConnection,
     roles: &[EngineRole],
@@ -284,16 +292,19 @@ pub(crate) async fn check_volatile_revoked(
     let readers = allow::setting_readers_condition();
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "with f as (select p.oid, p.oid::pg_catalog.regprocedure::pg_catalog.text as name,
-                           ({readers}) as reader
+                           ({readers}) as reader,
+                           exists (select 1 from pg_catalog.aclexplode(coalesce(p.proacl,
+                                     pg_catalog.acldefault('f', p.proowner))) a
+                                    where a.grantee operator(pg_catalog.=) 0) as public_held
                       from pg_catalog.pg_proc p where {revoked})
          select coalesce((select pg_catalog.string_agg(f.name, ', ' order by f.name) from f
-                           where exists (select 1 from pg_catalog.pg_proc p,
-                             pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
-                             where p.oid operator(pg_catalog.=) f.oid and a.grantee operator(pg_catalog.=) 0)), '') as public,
+                           where f.public_held and not f.reader), '') as public,
+                coalesce((select pg_catalog.string_agg(f.name, ', ' order by f.name) from f
+                           where f.public_held and f.reader), '') as public_readers,
                 coalesce((select pg_catalog.string_agg(r operator(pg_catalog.||) ': ' operator(pg_catalog.||) f.name, ', ' order by r, f.name)
                             from pg_catalog.unnest($1::text[]) r, f
                            where pg_catalog.has_function_privilege(r, f.oid, 'execute')
-                             and not (f.reader and r operator(pg_catalog.=) any ($2::text[]))), '') as kinds,
+                             and not (f.reader and (r operator(pg_catalog.=) any ($2::text[]) or f.public_held))), '') as kinds,
                 exists (select 1 from f where f.name operator(pg_catalog.=) 'set_config(text,text,boolean)')
                   and exists (select 1 from f where f.name operator(pg_catalog.=) 'current_setting(text)') as found"
     )))
@@ -304,7 +315,16 @@ pub(crate) async fn check_volatile_revoked(
     .await
     .map_err(|e| internal("check the rights on the volatile functions", e))?;
     let public: String = row.get("public");
+    let public_readers: String = row.get("public_readers");
     let kinds: String = row.get("kinds");
+    if !public_readers.is_empty() {
+        tracing::warn!(
+            functions = %public_readers,
+            "PUBLIC may still read session settings in this database: run the data cluster \
+             set-up (deploy/dev/postgres-data/initdb/10-ruum-data.sh) once the previous release \
+             is gone"
+        );
+    }
     let found: bool = row.get("found");
     if !found {
         return Err(EngineError::Internal(format!(
