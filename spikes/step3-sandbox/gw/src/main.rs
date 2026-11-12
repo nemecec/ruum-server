@@ -11,8 +11,9 @@
 //! - `put <dir>`: upload every file under `<dir>` to `GW_PREFIX/<relative path>`.
 //! - `clean`: delete every object of the bucket.
 //! - `egress`: a CONNECT proxy on `GW_LISTEN` (docs/STEP3.md "Infrastructure work" 4): resolve the
-//!   host, refuse private, loopback, link-local (metadata), CGNAT and `EGRESS_DENY` addresses,
-//!   check `EGRESS_ALLOW`, connect to the checked IP, log host, port, bytes and status.
+//!   host, refuse private, loopback, link-local (metadata), CGNAT, non-global IPv6 and
+//!   `EGRESS_DENY` addresses (addresses or CIDR prefixes, on the canonical IPv4 form of a mapped
+//!   address), check `EGRESS_ALLOW`, connect to the checked IP, log host, port, bytes and status.
 
 use std::{
     convert::Infallible,
@@ -78,18 +79,24 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-/// Headers a client may never send to an app: the platform's own (`Ruum-*`) and trace and
-/// forwarding headers that the gateway sets itself.
+/// Headers a client may never send to an app (besides `Ruum-*` and every `X-Forwarded-*`, see
+/// `is_client_dropped`): trace headers the gateway sets itself, and forwarding headers. The
+/// gateway does not pass the visitor's IP address to apps (design 9.6: apps know end users only by
+/// a pairwise pseudonym), so it adds none of the forwarding headers either.
 const CLIENT_DROPPED: &[&str] = &[
     "traceparent",
     "tracestate",
     "baggage",
     "forwarded",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
     "x-real-ip",
 ];
+
+/// A forwarding or trace header from the internet: the list above and every name that starts with
+/// `x-forwarded-` (`-For`, `-Host`, `-Proto`, `-Port`, `-Prefix`, `-Server`, `-Ssl`, ...).
+pub fn is_client_dropped(name: &HeaderName) -> bool {
+    let n = name.as_str(); // lower case already
+    n.starts_with("x-forwarded-") || CLIENT_DROPPED.contains(&n)
+}
 
 /// `Ruum-User`, `ruum_user`, `RUUM-anything`: some app frameworks (CGI, WSGI, PHP) map `_` to `-`,
 /// so `Ruum_User` would reach them as `HTTP_RUUM_USER`. Both spellings are platform headers.
@@ -154,19 +161,18 @@ fn clean_cookie(h: &mut HeaderMap) {
 
 pub fn clean_request(h: &mut HeaderMap) {
     strip_hop_by_hop(h);
-    let platform: Vec<HeaderName> = h
+    let dropped: Vec<HeaderName> = h
         .keys()
-        .filter(|n| is_platform_header(n))
+        .filter(|n| is_platform_header(n) || is_client_dropped(n))
         .cloned()
         .collect();
-    for n in platform {
+    for n in dropped {
         h.remove(n);
     }
-    for n in CLIENT_DROPPED {
-        h.remove(*n);
-    }
     clean_cookie(h);
-    // A partner key or an agent token is the gateway's, never the app's.
+    // A partner key or an agent token is the gateway's, never the app's. The spike knows only the
+    // partner key prefix. The agent token is a JWT (no prefix), so G-1a removes `Authorization`
+    // whenever the gateway authenticated the request with it, not by a prefix match (section G).
     let drop_auth = h.get_all(header::AUTHORIZATION).iter().any(|v| {
         let v = String::from_utf8_lossy(v.as_bytes()).to_ascii_lowercase();
         v.starts_with("bearer ruum_") || v.contains("ruum_appkey_")
@@ -252,11 +258,7 @@ fn mint(cfg: &ProxyCfg) -> String {
     jsonwebtoken::encode(&h, &claims, &cfg.key).expect("sign")
 }
 
-async fn proxy(
-    cfg: Arc<ProxyCfg>,
-    peer: SocketAddr,
-    req: Request<Incoming>,
-) -> Result<Response<Body>, Infallible> {
+async fn proxy(cfg: Arc<ProxyCfg>, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
     let (mut parts, body) = req.into_parts();
     clean_request(&mut parts.headers);
     let token = mint(&cfg);
@@ -272,10 +274,6 @@ async fn proxy(
     h.insert(
         "traceparent",
         HeaderValue::from_str(&format!("00-{}-{}-01", hex(32), hex(16))).expect("ASCII"),
-    );
-    h.insert(
-        "x-forwarded-for",
-        HeaderValue::from_str(&peer.ip().to_string()).expect("ASCII"),
     );
     let pq = parts
         .uri
@@ -416,22 +414,63 @@ fn files(dir: &FsPath, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------------------------
 // Egress proxy.
 
-pub fn is_public(ip: IpAddr) -> bool {
+/// The address the kernel connects to: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is the IPv4
+/// address. Every check (public, deny list) runs on this form, so `::ffff:<host IP>` cannot pass a
+/// deny entry written as `<host IP>`.
+pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+pub fn is_public(ip: IpAddr) -> bool {
+    match canonical(ip) {
         IpAddr::V4(v4) => is_public_v4(v4),
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_v4(v4);
-            }
+            // Only global unicast (2000::/3) can pass. That alone refuses loopback, unspecified,
+            // IPv4-compatible `::/96`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48` (they translate
+            // to any IPv4), discard `100::/64`, unique local, link local and multicast.
             let s = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00 // unique local, fd00::/8 included
-                || (s[0] & 0xffc0) == 0xfe80 // link local
-                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-                || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64 can reach any IPv4
-                || s[0] == 0x2002) // 6to4
+            (s[0] & 0xe000) == 0x2000
+                && !((s[0] == 0x2001 && s[1] < 0x0200) // 2001::/23: Teredo, benchmarking, ORCHID
+                    || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+                    || s[0] == 0x2002 // 6to4 (embeds any IPv4)
+                    || (s[0] & 0xfff0) == 0x3ff0) // documentation 3fff::/20
+        }
+    }
+}
+
+/// One entry of `EGRESS_DENY`: an address or a CIDR prefix (`a.b.c.d/n`, `x::/n`). The host's
+/// IPv6 is a whole `/64`, so single addresses are not enough.
+#[derive(Clone, Copy, Debug)]
+pub struct Cidr {
+    net: IpAddr,
+    len: u8,
+}
+
+impl Cidr {
+    pub fn parse(s: &str) -> Option<Cidr> {
+        let (a, l) = s.split_once('/').map_or((s, None), |(a, l)| (a, Some(l)));
+        let net = canonical(a.trim().parse().ok()?);
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let len = match l {
+            Some(l) => l.trim().parse().ok().filter(|l| *l <= max)?,
+            None => max,
+        };
+        Some(Cidr { net, len })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // Compare the top `len` bits; `checked_shr` covers `len == 0` (shift by the full width).
+        let same = |a: u128, n: u128, width: u32| {
+            let shift = width - u32::from(self.len);
+            a.checked_shr(shift).unwrap_or(0) == n.checked_shr(shift).unwrap_or(0)
+        };
+        match (canonical(ip), self.net) {
+            (IpAddr::V4(a), IpAddr::V4(n)) => same(u32::from(a).into(), u32::from(n).into(), 32),
+            (IpAddr::V6(a), IpAddr::V6(n)) => same(a.into(), n.into(), 128),
+            _ => false,
         }
     }
 }
@@ -454,7 +493,7 @@ fn is_public_v4(v4: Ipv4Addr) -> bool {
 
 struct EgressCfg {
     allow: Vec<String>,
-    deny: Vec<IpAddr>,
+    deny: Vec<Cidr>,
     ports: Vec<u16>,
 }
 
@@ -524,9 +563,11 @@ async fn egress(cfg: Arc<EgressCfg>, peer: SocketAddr, mut client: TcpStream) {
             return;
         }
     };
+    // Check and connect to the canonical form (`::ffff:a.b.c.d` becomes `a.b.c.d`).
     let ok: Vec<SocketAddr> = addrs
         .into_iter()
-        .filter(|a| is_public(a.ip()) && !cfg.deny.contains(&a.ip()))
+        .map(|a| SocketAddr::new(canonical(a.ip()), a.port()))
+        .filter(|a| is_public(a.ip()) && !cfg.deny.iter().any(|d| d.contains(a.ip())))
         .collect();
     let Some(addr) = ok.first() else {
         let _ = client.write_all(reply("403 Forbidden").as_bytes()).await;
@@ -583,10 +624,10 @@ async fn main() -> Result<(), BoxError> {
             let l = listen().await;
             eprintln!("proxy listening on {}", l.local_addr()?);
             loop {
-                let (s, peer) = l.accept().await?;
+                let (s, _) = l.accept().await?;
                 let cfg = cfg.clone();
                 tokio::spawn(async move {
-                    let svc = service_fn(move |req| proxy(cfg.clone(), peer, req));
+                    let svc = service_fn(move |req| proxy(cfg.clone(), req));
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(s), svc)
                         .await;
@@ -647,7 +688,7 @@ async fn main() -> Result<(), BoxError> {
                 deny: std::env::var("EGRESS_DENY")
                     .unwrap_or_default()
                     .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
+                    .filter_map(|s| Cidr::parse(s.trim()))
                     .collect(),
                 ports: std::env::var("EGRESS_PORTS")
                     .unwrap_or_else(|_| "443".into())
@@ -702,6 +743,64 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_headers_dropped() {
+        let mut h = HeaderMap::new();
+        for n in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-forwarded-server",
+            "x-forwarded-ssl",
+            "forwarded",
+            "x-real-ip",
+            "tracestate",
+            "baggage",
+        ] {
+            h.insert(
+                HeaderName::from_static(n),
+                HeaderValue::from_static("forged"),
+            );
+        }
+        h.insert("x-app", HeaderValue::from_static("kept"));
+        clean_request(&mut h);
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert_eq!(h.get("x-app").unwrap(), "kept");
+    }
+
+    #[test]
+    fn egress_deny_list() {
+        let deny: Vec<Cidr> = ["203.0.113.7", "2001:db8:7:1::/64", "198.51.100.0/24"]
+            .iter()
+            .map(|s| Cidr::parse(s).unwrap())
+            .collect();
+        let denied = |s: &str| deny.iter().any(|d| d.contains(s.parse().unwrap()));
+        assert!(denied("203.0.113.7"));
+        assert!(denied("::ffff:203.0.113.7"), "mapped form of a denied IPv4");
+        assert!(denied("2001:db8:7:1::1"));
+        assert!(denied("2001:db8:7:1:ffff::9"));
+        assert!(denied("198.51.100.200"));
+        assert!(!denied("203.0.113.8"));
+        assert!(!denied("2001:db8:7:2::1"));
+        assert!(
+            Cidr::parse("0.0.0.0/0")
+                .unwrap()
+                .contains("8.8.8.8".parse().unwrap())
+        );
+        assert!(
+            Cidr::parse("::/0")
+                .unwrap()
+                .contains("2606::1".parse().unwrap())
+        );
+        assert!(Cidr::parse("1.2.3.4/33").is_none());
+        assert_eq!(
+            canonical("::ffff:203.0.113.7".parse().unwrap()),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
     fn response_cleaning() {
         let mut h = HeaderMap::new();
         for c in [
@@ -746,7 +845,22 @@ mod tests {
         ] {
             assert!(!is_public(bad.parse().unwrap()), "{bad}");
         }
+        for bad in [
+            "::a9fe:a9fe",          // IPv4-compatible
+            "64:ff9b:1::a9fe:a9fe", // NAT64 local use
+            "2001::1",              // Teredo
+            "2001:2::1",            // benchmarking
+            "100::1",               // discard
+            "2002:a9fe:a9fe::1",    // 6to4
+            "2001:db8::1",
+            "3fff::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public(bad.parse().unwrap()), "{bad}");
+        }
         assert!(is_public("1.1.1.1".parse().unwrap()));
+        assert!(is_public("2606:4700::1111".parse().unwrap()));
+        assert!(is_public("::ffff:1.1.1.1".parse().unwrap()));
         assert!(host_allowed(&["*.example.com".into()], "a.example.com"));
         assert!(!host_allowed(&["*.example.com".into()], "example.com.evil"));
     }

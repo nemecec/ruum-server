@@ -20,7 +20,9 @@ It prints `PASS`, `FAIL` or `SKIP` per check and exits non-zero on a `FAIL`. It 
 for the egress checks.
 
 Everything the script makes is named `s3w1s-*`: containers, networks, images, the Garage bucket
-`s3w1s-static` and the Garage key `s3w1s-key`. It removes them at the end of every run. The
+`s3w1s-static` and the Garage key `s3w1s-key`. It removes them at the end of every run (also when
+it fails), together with the images it pulled itself (the Node, Ubuntu and BuildKit images when
+they were not on the host before). The
 user-token key and the Garage secret live in `~/s3w1s-work` (mode 700) during a run, and the script
 never prints them. Hostile probes run only from the script's own containers, only as TCP connects
 and one HTTP GET to the metadata address, and never target staging or the SSH tunnel.
@@ -44,11 +46,17 @@ and one HTTP GET to the metadata address, and never target staging or the SSH tu
    `-o com.docker.network.bridge.inhibit_ipv4=true`, no Docker socket) cannot reach the
    platform Postgres, the data cluster, SpiceDB, OpenBao, NATS, Garage, the metadata address, the
    Docker socket, the host or another app's network, and reaches the internet only through the
-   egress proxy (`gw egress`), which refuses private, link-local and platform addresses.
+   egress proxy (`gw egress`), which refuses private, link-local and platform addresses and the
+   host's public addresses (`EGRESS_DENY`: addresses or CIDR prefixes, checked on the IPv4 form of
+   an IPv4-mapped IPv6 address). It also probes the host over IPv6 (the bridge's link-local address
+   and the host's public IPv6 address) and records whether IPv6 is on inside the sandbox. A target
+   that has no address (a container that is down) is a `SKIP` line, not dropped.
 2. **Gateway headers.** The gateway removes every incoming `Ruum-*` header (also `Ruum_User`), the
-   gateway cookies, partner keys, `traceparent` and `X-Forwarded-*`, adds a fresh signed
-   `Ruum-User` (EdDSA, 60 s), and drops an app's `Set-Cookie` for any `ruum` name. The app checks
-   the token as the SDK would; a token for app A fails app B's check.
+   gateway cookies, partner keys, `traceparent`, `tracestate`, `baggage`, `Forwarded`, `X-Real-IP`
+   and every `X-Forwarded-*` name, adds a fresh signed `Ruum-User` (EdDSA, 60 s), and drops an
+   app's `Set-Cookie` for any `ruum` name. It adds no `X-Forwarded-For`: apps do not get the
+   visitor's IP address. The app checks the token as the SDK would; a token for app A fails app B's
+   check.
 3. **Cold start.** Median and p95 of 20 starts of a stopped container until the first HTTP answer.
 4. **Static files.** A static archive, unpacked into Garage under the deployment's prefix, served
    byte for byte through the gateway; no path reaches another prefix.

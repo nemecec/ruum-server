@@ -74,8 +74,16 @@ cleanup() {
   garage key delete --yes "$P-key" >/dev/null
   rm -rf "$WORK"
 }
+# Images this run pulled (they were not on the host before), removed at the end with its own.
+PULLED=()
+pull() { # image
+  docker image inspect "$1" >/dev/null 2>&1 && return 0
+  docker pull -q "$1" >/dev/null 2>&1 && PULLED+=("$1")
+}
 clean_images() {
   docker images -q --filter "reference=$P-*" | sort -u | xargs -r docker rmi -f >/dev/null 2>&1
+  [[ ${#PULLED[@]} -eq 0 ]] || docker rmi "${PULLED[@]}" >/dev/null 2>&1
+  PULLED=()
   docker builder prune -f --filter "label=ruum.app=$P" >/dev/null 2>&1
 }
 
@@ -90,7 +98,7 @@ POINTS=("$@")
 [[ ${#POINTS[@]} -gt 0 ]] || POINTS=(2 4 1 3 5 r)
 want() { local p; for p in "${POINTS[@]}"; do [[ $p == "$1" ]] && return 0; done; return 1; }
 
-trap 'cleanup' EXIT
+trap 'cleanup; clean_images' EXIT
 cleanup
 mkdir -p "$WORK"
 chmod 700 "$WORK"
@@ -98,7 +106,7 @@ chmod 700 "$WORK"
 section "set-up"
 df -h / | awk 'NR==2 {print "      disk free: " $4}'
 (cd "$HERE/gw" && cargo build --release --locked -q) || { echo "gateway build failed" >&2; exit 2; }
-docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || docker pull -q "$NODE_IMAGE" >/dev/null
+pull "$NODE_IMAGE"
 note "node image: $(docker image inspect "$NODE_IMAGE" -f '{{index .RepoDigests 0}}')"
 docker build -q -t "$P-app:1" --label ruum.app=$P "$HERE/app" >/dev/null || { echo "app image failed" >&2; exit 2; }
 
@@ -163,9 +171,10 @@ point2() {
   check "2.4 the app sees exactly one Ruum-User, the gateway's, and no ruum_* header" \
     jqe '.ruum_user_count == 1 and .ruum_user.valid == true and
       ([.raw_headers[] | select(.[0] | ascii_downcase | test("^ruum_"))] | length == 0)' <<<"$out"
-  check "2.5 an incoming traceparent and X-Forwarded-For are replaced" \
+  check "2.5 an incoming traceparent is replaced; no X-Forwarded-For reaches the app (the visitor's IP is not passed)" \
     jqe '([.raw_headers[] | select(.[1] | test("0af7651916cd43dd|10\\.9\\.9\\.9"))] | length == 0)
-      and ([.raw_headers[] | select(.[0] | ascii_downcase == "traceparent")] | length == 1)' <<<"$out"
+      and ([.raw_headers[] | select(.[0] | ascii_downcase == "traceparent")] | length == 1)
+      and ([.raw_headers[] | select(.[0] | ascii_downcase == "x-forwarded-for")] | length == 0)' <<<"$out"
 
   out="$(curl -fsS "$G/" -H 'Cookie: __Host-ruum_app=SESSION; a=1; __Host-ruum_visit=VISIT; b=2; ruum_x=3')"
   check "2.6 the gateway cookies leave Cookie; the app's own cookies stay" \
@@ -173,6 +182,14 @@ point2() {
   out="$(curl -fsS "$G/" -H 'Authorization: Bearer ruum_appkey_0123456789')"
   check "2.7 a partner key in Authorization never reaches the app" \
     jqe '[.raw_headers[] | select(.[0] | ascii_downcase == "authorization")] | length == 0' <<<"$out"
+
+  out="$(curl -fsS "$G/" -H 'X-Forwarded-Host: forged.example' -H 'X-Forwarded-Port: 8443' \
+    -H 'X-Forwarded-Prefix: /forged' -H 'X-Forwarded-Proto: http' -H 'X-Forwarded-Server: forged' \
+    -H 'Forwarded: for=10.9.9.9;host=forged.example' -H 'X-Real-IP: 10.9.9.9' \
+    -H 'tracestate: forged=1' -H 'baggage: forged=1')"
+  check "2.12 X-Forwarded-* (any suffix), Forwarded, X-Real-IP, tracestate and baggage never reach the app" \
+    jqe '[.raw_headers[] | select((.[0] | ascii_downcase | test("^(x-forwarded-.*|forwarded|x-real-ip|tracestate|baggage)$"))
+      or (.[1] | test("forged|10\\.9\\.9\\.9")))] | length == 0' <<<"$out"
 
   local hdr
   hdr="$(curl -fsS -D - -o /dev/null "$G/cookies" | tr -d '\r')"
@@ -284,9 +301,12 @@ point4() {
 # The egress proxy: the spike gateway binary in `egress` mode, in a container with the driver's
 # flags, on an outside network and on the app networks it serves.
 HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {sub(/\/.*/, "", $4); print $4; exit}')"
+# The host's global IPv6 address with its prefix (for example x:y::1/64), if it has one.
+HOST_IP6_NET="$(ip -6 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {print $4; exit}')"
+HOST_IP6="${HOST_IP6_NET%/*}"
 EGRESS_IMAGE="${S2_EGRESS_IMAGE:-ubuntu:24.04}" # the same glibc as the host that built the binary
 egress_up() { # app networks...
-  docker image inspect "$EGRESS_IMAGE" >/dev/null 2>&1 || docker pull -q "$EGRESS_IMAGE" >/dev/null
+  pull "$EGRESS_IMAGE"
   docker network inspect "$P-outside" >/dev/null 2>&1 ||
     docker network create --label ruum.app=$P "$P-outside" >/dev/null
   if ! docker inspect "$P-egress" >/dev/null 2>&1; then
@@ -294,18 +314,27 @@ egress_up() { # app networks...
       --security-opt no-new-privileges --user 10001:10001 --memory 128m --cpus 1 --pids-limit 64 \
       --label ruum.app=$P -v "$GW:/gw:ro" -e GW_LISTEN=0.0.0.0:3128 -e EGRESS_PORTS=443 \
       -e EGRESS_ALLOW="registry.npmjs.org,localhost,169.254.169.254.nip.io,$HOST_IP.nip.io" \
-      -e EGRESS_DENY="$HOST_IP" "$EGRESS_IMAGE" /gw egress >/dev/null
+      -e EGRESS_DENY="$HOST_IP${HOST_IP6_NET:+,$HOST_IP6_NET}" "$EGRESS_IMAGE" /gw egress >/dev/null
   fi
   local n
   for n in "$@"; do docker network connect "$P-$n" "$P-egress" 2>/dev/null; done
 }
 EGRESS_REFUSED='["example.org:443","registry.npmjs.org:22","localhost:443","169.254.169.254.nip.io:443","169.254.169.254:443","'"$HOST_IP"'.nip.io:443","172.18.0.2:5432"]'
 
-# The targets an app or a build must never reach, as JSON for the probe. Only dev stack containers,
-# the host's own addresses and the spike's own containers; never staging or the SSH tunnel.
-probe_targets() { # app network, other app container, other app network
-  local lines=() c n ip gw
-  add() { [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && lines+=("$1|$2|$3"); } # skips "" and "invalid IP"
+# The targets an app or a build must never reach, as JSON for the probe, in TARGETS. Only dev stack
+# containers, the host's own addresses and the spike's own containers; never staging or the SSH
+# tunnel. An expected target without an address (a container that is down, a network without a
+# gateway) is a counted SKIP line, never dropped silently.
+probe_targets() { # check prefix, app network, other app container, other app network
+  local pre=$1 net=$2 lines=() gw gwname subnet holder bridge ll
+  shift
+  add() { # name address port
+    if [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $2 =~ ^[0-9a-fA-F]*:[0-9a-fA-F:.]+(%[A-Za-z0-9_.-]+)?$ ]]; then
+      lines+=("$1|$2|$3")
+    else
+      skip "$pre.target $1" "no address"
+    fi
+  }
   add "platform Postgres (ruum-postgres-1)" "$(ip_of ruum-postgres-1 ruum_default)" 5432
   add "data cluster Postgres (ruum-postgres-data-1)" "$(ip_of ruum-postgres-data-1 ruum_data)" 5432
   add "SpiceDB gRPC (ruum-spicedb-1)" "$(ip_of ruum-spicedb-1 ruum_default)" 50051
@@ -318,9 +347,36 @@ probe_targets() { # app network, other app container, other app network
   if [[ -n ${BUILDBOX_NAME:-} ]]; then
     add "agent Postgres on the default bridge (pg-$BUILDBOX_NAME)" "$(ip_of "pg-$BUILDBOX_NAME" bridge)" 5432
   fi
-  gw="$(docker network inspect "$P-$1" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
-  add "host through the app network's gateway, sshd" "$gw" 22
-  add "host through the app network's gateway, platform Postgres port" "$gw" 5434
+  # The host through the app network's bridge. With inhibit_ipv4 Docker reports no gateway; the
+  # host would hold the subnet's first host address, so that address is the target.
+  gw="$(docker network inspect "$P-$net" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+  gwname="gateway"
+  if [[ ! $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then # Docker prints "invalid IP" for none
+    subnet="$(docker network inspect "$P-$net" -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')"
+    gw="$(python3 -c 'import ipaddress, sys; print(next(ipaddress.ip_network(sys.argv[1], strict=False).hosts()))' "$subnet" 2>/dev/null)"
+    gwname="would-be gateway $gw (no gateway with inhibit_ipv4; first host of $subnet)"
+    holder="$(docker network inspect "$P-$net" -f '{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' | tr ' ' '\n' | grep "=$gw/" | cut -d= -f1)"
+    [[ -z $holder ]] || note "INFO the would-be gateway address $gw is held by the container $holder"
+  fi
+  add "host through the app network's $gwname, sshd" "$gw" 22
+  add "host through the app network's $gwname, platform Postgres port" "$gw" 5434
+  # IPv6: a bridge gets a link-local address even without an IPv4 address.
+  bridge="$(docker network inspect "$P-$net" -f '{{index .Options "com.docker.network.bridge.name"}}' 2>/dev/null)"
+  [[ -n $bridge && $bridge != "<no value>" ]] || bridge="br-$(docker network inspect "$P-$net" -f '{{.Id}}' | cut -c1-12)"
+  # The finding itself, on the host: the bridge has no IPv4 address, so no host service listens on
+  # it. (With inhibit_ipv4 Docker gives the subnet's first address to a container, so a probe of
+  # that address alone would not show it.)
+  local v4
+  v4="$(ip -4 -o addr show dev "$bridge" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
+  check "$pre.v4 the host has no IPv4 address on the app bridge $bridge${v4:+ (has: $v4)}" test -z "$v4"
+  ll="$(ip -6 -o addr show dev "$bridge" scope link 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')"
+  note "IPv6 of the app bridge $bridge: disable_ipv6=$(cat "/proc/sys/net/ipv6/conf/$bridge/disable_ipv6" 2>/dev/null || echo '?'), link-local ${ll:-none}"
+  if [[ -n $ll ]]; then
+    add "host through the app bridge's IPv6 link-local address, sshd" "$ll%eth0" 22
+  else
+    pass "$pre.v6 the app bridge $bridge has no IPv6 link-local address (no IPv6 path to the host through it)"
+  fi
+  add "host public IPv6 address, sshd" "$HOST_IP6" 22
   add "host through ruum_default's gateway, sshd" "$(docker network inspect ruum_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)" 22
   add "host through docker0, sshd" 172.17.0.1 22
   add "host through docker0, platform Postgres port" 172.17.0.1 5434
@@ -329,7 +385,7 @@ probe_targets() { # app network, other app container, other app network
   add "internet direct 1.1.1.1:443" 1.1.1.1 443
   add "internet direct 8.8.8.8:53" 8.8.8.8 53
   [[ -n ${2:-} ]] && add "another app ($2)" "$(ip_of "$P-$2" "$P-$3")" 8080
-  printf '%s\n' "${lines[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {name: .[0], host: .[1], port: (.[2] | tonumber)})'
+  TARGETS="$(printf '%s\n' "${lines[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {name: .[0], host: .[1], port: (.[2] | tonumber)})')"
 }
 
 # Checks of a probe result: nothing reached except the allowed egress target.
@@ -359,7 +415,8 @@ point1() { # [tag: r for runsc]
   local eip targets
   eip="$(ip_of "$P-egress" "$P-p1$t-a")"
   [[ -n $eip ]] || { fail "1$t egress proxy on the app network"; return; }
-  targets="$(probe_targets p1$t-a p1$t-other p1$t-b)"
+  probe_targets "1$t" p1$t-a p1$t-other p1$t-b
+  targets=$TARGETS
   note "targets: $(jq -r 'map("\(.host):\(.port)") | join(" ")' <<<"$targets")"
   mkdir -p "$WORK/p1$t" && chmod 777 "$WORK/p1$t"
   docker run --rm --name "$P-probe-p1$t" --network "$P-p1$t-a" "${DRIVER_FLAGS[@]}" \
@@ -367,6 +424,7 @@ point1() { # [tag: r for runsc]
     -e PROBE_TARGETS="$targets" -e EGRESS="$eip:3128" -e EGRESS_ALLOWED='["registry.npmjs.org:443"]' \
     -e EGRESS_REFUSED="$EGRESS_REFUSED" "$NODE_IMAGE" node /probe/probe.js
   probe_checks "1$t.p" "$WORK/p1$t/result.json"
+  note "IPv6 inside the app container: $(jq -r '.self.ipv6 | to_entries | map("\(.key)=\(.value)") | join(" ")' "$WORK/p1$t/result.json" 2>/dev/null)"
   local cfg
   cfg="$(docker inspect "$P-p1$t-other" -f '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.Config.User}} {{.HostConfig.Memory}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}} {{.HostConfig.Privileged}} {{len .Mounts}}')"
   note "app container: $cfg"
@@ -478,7 +536,8 @@ point5() {
   egress_up build
   local eip targets rc
   eip="$(ip_of "$P-egress" "$P-build")"
-  targets="$(probe_targets build p5-other p5-other)"
+  probe_targets 5 build p5-other p5-other
+  targets=$TARGETS
   mkdir -p "$WORK/p5" && chmod 777 "$WORK/p5"
   # The fixed node22 recipe, step 1: npm ci as a sandbox job (the driver's flags, a tmpfs work
   # folder, a time limit, no secrets, egress only through the proxy).
@@ -513,7 +572,7 @@ point5() {
   fi
   # Rootless BuildKit under the same flags (for the record; the recipe above does not need it).
   local bk="${S2_BUILDKIT_IMAGE:-moby/buildkit:v0.23.2-rootless}" out
-  docker image inspect "$bk" >/dev/null 2>&1 || docker pull -q "$bk" >/dev/null 2>&1
+  pull "$bk"
   mkdir -p "$WORK/p5/bkctx" && printf 'FROM scratch\nCOPY a /a\n' >"$WORK/p5/bkctx/Dockerfile" && echo a >"$WORK/p5/bkctx/a"
   out="$(timeout 120 docker run --rm --name "$P-buildkit" --network "$P-build" \
     --read-only --cap-drop ALL --security-opt no-new-privileges --user 1000:1000 \
