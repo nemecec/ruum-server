@@ -1281,3 +1281,97 @@ value when nothing guards it.
 **Changes.** `crates/ruum-dbengine/src/postgres/lens.rs` (`build_views`, `rebuild_view`,
 `rebuilt_view_sql`, `build_order`, `policy_edges`, `code_relations`, `refusal_lens_sql`),
 `allow.rs` (`bad_types_cte`); the tests and mutations above; design 8.5; 0004-38 (d).
+
+## 40. The `up` of a migration approval: in full only to people with `manage` (backlog 2026-11-10-run8 S-29, review-A-2 F-1)
+
+Status: `provisional` (design 18.9). Architect panel (architect, security and privacy hats in one
+agent), 2026-11-12. Evidence: `ruum-server-wt/panel/review-A-2.md` F-1 and `retro-s2a2.md`.
+Work order for the card: `ruum-server-wt/panel/a2-card.md`.
+
+**Problem.** A migration approval stores the migration's `up` in `DatabaseApproval.statement`, and
+`getDatabaseApproval`, `listDatabaseApprovals` and `listPendingDatabaseApprovals` show it to
+everyone with `view` on the database (agents: their own requests). An `up` can hold real values:
+`INSERT ... VALUES ('Mari Tamm', ...)`, a `DEFAULT`, a `CHECK`, the body of a function, a comment.
+An agent with a `read_personal` grant can write such values into its `up`. A person without
+`manage`, or another session of the agent after the grant has ended, then reads them. That is a
+path around the 8.5 filter. A statement approval does not have the problem: it already stores the
+normalized text (literals replaced), and its parameters are hidden markers (0004-24). The
+migration history (`DatabaseMigration`) holds only the checksum of `up`, so the approval is the
+only place that shows it.
+
+The two options of the backlog item:
+
+1. Show the `up` only to the people who decide.
+2. Show the `up` with every literal as a marker.
+
+Option 1 alone gives viewers nothing, and the agent and its user lose sight of what waits.
+Option 2 alone takes the real text away from the person who must read it before it touches real
+data (the reason why an agent's migration waits for a person). So both are taken, split by the
+reader.
+
+**Decision.**
+
+- (a) **The full `up` only to readers who see real values anyway.** The `statement` of an approval
+  with `subject: migration` holds the `up` as sent only when the caller is a person (a user actor)
+  with `manage` on the approval's database, checked when the response is made. These are exactly
+  the people who may decide a migration: its needed role is `manage`, and every person with
+  `manage` may decide a statement or a migration (`person_may_decide`). A person with `manage` is
+  not masked (8.5), so the text shows them nothing that the database does not show.
+- (b) **Everyone else gets the normalized `up`.** People without `manage`, every agent (also the
+  agent that sent it, also with `read_personal`, which never sees secrets) and every MCP tool get
+  the `up` normalized by the query layer's normalizer (`rules::analyze(engine, up).normalized`):
+  every literal becomes `$L1`, `$L2`, ... (strings, dollar-quoted function bodies, numbers, and on
+  SQLite double-quoted names), every comment is removed, and runs of whitespace become one space.
+  The statement path uses the same normalizer. If the normalizer cannot parse the text it gives
+  the fixed text `<unparsed statement>`, never the raw `up` (fail closed). A stored `up` always
+  parses, because `request_migration` refuses an `up` that `planned_columns` cannot parse.
+- (c) **The same rule in every response.** The rule applies in one place, the service function
+  that every read of an approval goes through: get, list, the waiting list and the response of
+  `decideDatabaseApproval`. On the waiting list, `manage` is checked per database. The
+  `database.approval_decided` event and `review_url` already hold IDs, enums and counts only, and
+  they stay so.
+- (d) **The store keeps the `up` as sent.** The person who decides must read the real text, and
+  the binding does not change: `statement_hash` (keyed, over the name and `up` as sent) is what
+  `take_migration` compares. No migration of the platform schema is needed.
+- (e) **Not covered, stated.** Names are not values: `migration_name`, table names and column
+  names in `up` and in `planned_columns` stay visible to viewers. After the migration runs, the
+  same names are in the catalog and in `listDatabaseColumns` for every viewer. A covert channel
+  through names that an agent chooses is not a path that the 8.5 filter closes anywhere. This is
+  not new with approvals.
+- (f) **Contract (text only).** The description of `DatabaseApproval.statement` says this:
+  "The statement, normalized (every literal replaced by `$L1`, `$L2`, ..., comments removed);
+  for a migration, the `up` as sent to a person with `manage` on the database and normalized for
+  everyone else (decision 0004-40); `null` for a grant request." This changes no schema and no
+  type. It is a text change, and it lands together with the code of card A-2.
+- (g) **Follow-up (pipeline, with the sweeper of backlog 2026-11-10-run8 P-36).** When an approval
+  reaches a final status (`denied`, `used` or `expired`), the store replaces the stored `up` by its
+  normalized text. Then the platform database and its backups do not keep real values after the
+  decision. This is not needed before A-2 merges: after (a) and (b), only readers who see the live
+  data unmasked can read the stored text.
+- (h) **Card text of A-2 (backlog P-35), confirmed.** The builder followed the contract, and the
+  contract stands. A pending approval expires after 24 hours. An approved one expires 15 minutes
+  after the decision if it is not used. An approved grant request is final. An agent's
+  `data_classes` in a migration are stored as suggestions (`suggested_class`), never refused. Only
+  the `classes` of a decision need a person with `manage`, and an agent cannot decide
+  (`user_required`). `docs/STEP2.md` card A-2 says so.
+- (i) **The `classes` of a decision (review-A-2 F-6).** `classes: []` is refused with `422`
+  (`/classes`), as `minItems: 1` says. A decision without classes leaves `classes` out.
+
+**Consequences.** An agent cannot read back the literals of its own `up` from the approval. It
+keeps the text that it sent, and it must send that text again, byte for byte, with `approval_id`.
+U-2 shows the decider the full `up`. A viewer without `manage` sees the normalized text with a
+note that the values are hidden and that a person with `manage` decides.
+
+**Tests.** A service-level test of card A-2, on memory and Postgres: an agent's migration
+approval whose `up` holds a string literal, a number, a dollar-quoted function body and a comment.
+It is read through get and list by (1) the agent that asked, (2) a person with `view` only and
+(3) a person with `manage`, and through the waiting list by (1) and (3) (a person with `view` only
+may not decide it, so it is not on their list). (1) and (2) see no literal and no comment text (and
+`$L1` is present); (3) sees the `up` byte-equal to what was sent. The response of a decision by
+(3) shows the full `up`. A unit test: a text that does not parse gives `<unparsed statement>`. A
+mutation `databases-approvals-migration-up-raw` that shows the stored `up` to every reader must
+fail that test. For (i): one API case that sends `classes: []` and gets `422`.
+
+**Changes.** `crates/ruum-core/src/databases/access/approvals/mod.rs` (the read path and the
+decision), the description of `DatabaseApproval.statement` in `contracts/openapi.yaml`, the card
+text of A-2 in `docs/STEP2.md`, the tests and the mutation above. All of this is in card A-2.
