@@ -1723,6 +1723,56 @@ without code (decided 2026-11-09, provisional):
 - **Sharing**: themes are signed and published like extensions, through the same registry. The
   default brand, **Graphite** (decision 0005 B-5), is built as the first theme package.
 
+### 12.7 Updates without downtime (decision 42)
+
+An update must not interrupt people. Staging started with one replica of each service and the
+`Recreate` strategy (a few seconds of errors per deploy, and the edge fetches new certificates on
+every restart); this section is the target before real users.
+
+**The schema rule: the previous release runs on the new schema.**
+
+- Every migration keeps the previous release of ruum-server working. So the rollout can run old
+  and new pods side by side, and going back one release never needs a down migration.
+- Changes that break old code are split over releases (expand, then contract):
+  - add a column or table: in one release; old code ignores it. A new `NOT NULL` column gets a
+    default, or is filled in the same migration;
+  - rename or change a type: release N adds the new column and writes both; release N+1 reads the
+    new one; release N+2 drops the old one;
+  - drop a column or table: only when the release before no longer reads or writes it;
+  - constraints and indexes on large tables: `CREATE INDEX CONCURRENTLY`, constraints added
+    `NOT VALID` and validated later, so no long lock.
+- Migrations only go forward. A migration that drops data (the contract step) needs the
+  backup before it, and is reviewed as risky (section 18).
+- **CI checks the rule**: the test suite of the previous release (the commit live on staging, or the
+  last tag) runs against the database after the new migrations. A failure blocks the merge.
+  Agents that write migrations get the rule in their brief; reviewers check the split.
+
+**The rollout.**
+
+- Migrations run as their own step before the rollout (a Kubernetes Job with the new image), under
+  a Postgres advisory lock, not at server start. If the step fails, the rollout does not start and
+  the old release keeps serving.
+- ruum-server runs at least two replicas with a rolling update (`maxUnavailable: 0`), a readiness
+  check, a short drain at shutdown (stop taking new requests, finish open ones, close WebDAV and
+  streaming connections cleanly), and a disruption budget.
+- The edge keeps its certificates in persistent storage (a Kubernetes secret, or certificates
+  from cert-manager), never re-issued on restart, and runs two replicas behind the load balancer.
+- Going back one release is the same rollout with the older commit (`deploy.sh --rollback`); the
+  schema rule makes it safe.
+
+**The web app in open tabs.**
+
+- Each build of the web app has a version (the commit). The server returns the version of the
+  live web app in a response header on every API call, and at `/v1/version`.
+- When a tab sees a newer version, it shows a small notice: "A new version of Ruum is ready" with a
+  **Reload** button. Nothing is forced while the person is typing or uploading; the tab reloads by
+  itself at the next page change, and drafts are kept in local storage.
+- The previous release's script and style files stay on the edge for a week (file names carry a
+  content hash), so a tab that loads a part of the app late does not break.
+- A forced reload only when the API cannot serve the old app any more: the server answers
+  `426 client_outdated` for a client older than its minimum version, and the app then saves
+  drafts and reloads. The schema rule and API versioning (section 7) make this rare.
+
 ## 13. Hetzner
 
 Hetzner is a good fit for the start: low prices, traffic included in dedicated servers, cheap large
@@ -1905,6 +1955,10 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
     Several verified email addresses per account (code to the address, one primary), and "Add a
     way to sign in" by the signed-in person; Zitadel creates accounts automatically, and accounts
     are joined only by that signed-in action.*
+42. **Updates without downtime** (section 12.7). *Decided 2026-11-12: every migration keeps the
+    previous release working (expand, then contract), checked in CI with the previous release's
+    tests; migrations as a step before a rolling update; open tabs get a reload notice, forced
+    only for a client the API no longer supports.*
 
 ## 18. How to build Ruum with a swarm of AI agents
 
