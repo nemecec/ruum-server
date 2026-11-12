@@ -235,6 +235,13 @@ const WAIT_EXPORT: Wait = Wait {
              operation); contract gap recorded for the panel",
 };
 
+const WAIT_A2W: Wait = Wait {
+    card: "A-2w",
+    reason: "an agent's destructive statement through queryDatabase answers 501 until the \
+             statement path of card A-2w is built (query/mod.rs); the case needs its 202 \
+             with an approval",
+};
+
 /// Why a case stopped early.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stop {
@@ -499,7 +506,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_A2W],
             cases::approval_params_hidden,
         ),
         c(
@@ -926,7 +933,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_A2W],
             cases::poracle_approval_param,
         ),
         c(
