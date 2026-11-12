@@ -1618,6 +1618,10 @@ async fn labels_of_whole_rows_and_estimates_of_plans() {
         )
         .await;
     assert_eq!(r.columns[0].data_class, DataClass::Personal);
+    // Review-Q-2-s21-2 N-1: a catalog value is not behind the lens and arrives as it is; it is
+    // never labelled as a pseudonym.
+    assert_eq!(r.columns[0].masking, Masking::None);
+    assert_eq!(r.rows[0][0], json!("people"));
     // EXPLAIN with costs after ANALYZE of a skewed table.
     let a = pg.alice();
     for s in [
@@ -1674,7 +1678,7 @@ async fn agent_statements_that_write_no_row_run_read_only() {
         let r = pg
             .ok(
                 &who,
-                write("select current_setting('transaction_read_only')"),
+                write("select setting from pg_settings where name = 'transaction_read_only'"),
             )
             .await;
         assert_eq!(
@@ -1686,8 +1690,8 @@ async fn agent_statements_that_write_no_row_run_read_only() {
             .ok(
                 &who,
                 write(
-                    "update orders set amount = amount where id = 1 \
-                     returning current_setting('transaction_read_only')",
+                    "update orders set amount = amount where id = 1 returning \
+                     (select setting from pg_settings where name = 'transaction_read_only')",
                 ),
             )
             .await;

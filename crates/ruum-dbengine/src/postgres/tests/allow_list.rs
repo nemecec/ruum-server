@@ -109,13 +109,26 @@ async fn statements_may_call_only_the_allowed_functions() {
         let r = read(
             &f,
             kind,
-            "SELECT upper(body), n + 1, now() IS NOT NULL, current_setting('work_mem') IS NOT NULL, \
+            "SELECT upper(body), n + 1, now() IS NOT NULL, \
                     random() < 2, clock_timestamp() IS NOT NULL, gen_random_uuid() IS NOT NULL, \
                     (SELECT count(*) FROM (SELECT pg_sleep(0)) s) \
                FROM t WHERE id = 1",
         )
         .await;
         assert!(r.is_ok(), "{}: {r:?}", kind.as_str());
+        // The readers of a session setting (`current_setting`, review-Q-2-s21-2 suggestion 4):
+        // only the kinds that see every value keep them.
+        for sql in [
+            "SELECT current_setting('work_mem')",
+            "SELECT current_setting('ruum.v', true)",
+        ] {
+            let r = read(&f, kind, sql).await;
+            if kind == RoleKind::SecretRead {
+                assert!(r.is_ok(), "{} {sql}: {r:?}", kind.as_str());
+            } else {
+                assert!(denied(&r), "{} {sql}: {r:?}", kind.as_str());
+            }
+        }
     }
     // The sequence of an insert's default stays usable by the kinds that write (`nextval` is one
     // of the named volatile functions).
@@ -124,7 +137,10 @@ async fn statements_may_call_only_the_allowed_functions() {
         assert!(r.is_ok(), "{}: {r:?}", kind.as_str());
     }
     // The owner kind keeps every function (migrations made with pg_dump call set_config).
-    for sql in CHANNELS {
+    for sql in CHANNELS
+        .iter()
+        .chain(&["SELECT current_setting('work_mem')"])
+    {
         let r = write(&f, RoleKind::Owner, sql).await;
         assert!(
             !denied(&r),
@@ -960,6 +976,50 @@ async fn a_database_where_a_role_may_run_a_revoked_function_is_refused() {
     setup::check_volatile_revoked(&mut conn, &roles)
         .await
         .expect("passes again");
+    // `current_setting` (review-Q-2-s21-2 suggestion 4): `secret_read` and `mask` hold it, a
+    // read, write or masked kind may not.
+    const READER: &str = "pg_catalog.current_setting(text, boolean)";
+    for kind in [RoleKind::SecretRead, RoleKind::Mask] {
+        let role = role_name(&f.created, kind);
+        let held = psql(
+            &mut conn,
+            &format!("SELECT has_function_privilege('{role}', '{READER}', 'execute')"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held, "t", "{} keeps current_setting", kind.as_str());
+    }
+    for kind in [
+        RoleKind::Read,
+        RoleKind::Write,
+        RoleKind::MaskedRead,
+        RoleKind::MaskedWrite,
+    ] {
+        let role = role_name(&f.created, kind);
+        psql(
+            &mut conn,
+            &format!("GRANT EXECUTE ON FUNCTION {READER} TO \"{role}\""),
+        )
+        .await
+        .unwrap();
+        let err = setup::check_volatile_revoked(&mut conn, &roles)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Internal(m) if m.contains("current_setting")),
+            "{}: {err:?}",
+            kind.as_str()
+        );
+        psql(
+            &mut conn,
+            &format!("REVOKE EXECUTE ON FUNCTION {READER} FROM \"{role}\""),
+        )
+        .await
+        .unwrap();
+        setup::check_volatile_revoked(&mut conn, &roles)
+            .await
+            .expect("passes again");
+    }
     close(conn).await;
 }
 

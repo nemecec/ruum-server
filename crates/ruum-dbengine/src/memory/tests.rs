@@ -31,6 +31,7 @@ conformance_cases!(
     branch,
     restore_point,
     export,
+    tenant_code,
 );
 
 #[tokio::test]

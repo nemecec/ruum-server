@@ -442,9 +442,21 @@ async fn a_pooled_connection_holds_no_session_option() {
     };
     let f = Fixture::new(&engine).await;
     f.seed_users().await;
-    const SHOW: &str = "SELECT current_setting('statement_timeout') || '|' || current_user || '|' \
-        || current_setting('search_path') || '|' || current_setting('TimeZone') || '|' \
-        || current_setting('transaction_read_only')";
+    // `SHOW`, one option at a time: the kinds other than `owner` may not run `current_setting`
+    // (review-Q-2-s21-2 suggestion 4).
+    async fn shown(conn: &mut PgConnection) -> String {
+        let mut out = Vec::new();
+        for sql in [
+            "SHOW statement_timeout",
+            "SELECT current_user",
+            "SHOW search_path",
+            "SHOW TimeZone",
+            "SHOW transaction_read_only",
+        ] {
+            out.push(psql(conn, sql).await.unwrap());
+        }
+        out.join("|")
+    }
     const SET_ALL: &str = "SELECT set_config('statement_timeout', '123s', false), \
                     set_config('search_path', 'pg_catalog', false), \
                     set_config('TimeZone', 'Pacific/Chatham', false), \
@@ -487,10 +499,10 @@ async fn a_pooled_connection_holds_no_session_option() {
                 lease.backend_pid, pid,
                 "the connection went back to the pool"
             );
-            let pooled = psql(lease.conn(), SHOW).await.unwrap();
+            let pooled = shown(lease.conn()).await;
             lease.release(&engine).await;
             let mut fresh = session(&engine, f.db(), kind).await;
-            let clean = psql(&mut fresh, SHOW).await.unwrap();
+            let clean = shown(&mut fresh).await;
             close(fresh).await;
             assert_eq!(pooled, clean, "{} {sql}", kind.as_str());
             assert!(!pooled.contains("Chatham") && !pooled.contains("123s"));
@@ -552,12 +564,7 @@ async fn set_config_runs_for_no_kind_but_owner() {
         .await
         .expect("copy");
     let base = f
-        .run(
-            RoleKind::Read,
-            StatementMode::Read,
-            "SELECT current_setting('work_mem')",
-            vec![],
-        )
+        .run(RoleKind::Read, StatementMode::Read, "SHOW work_mem", vec![])
         .await
         .unwrap()
         .rows;
@@ -581,13 +588,7 @@ async fn set_config_runs_for_no_kind_but_owner() {
                 }
             }
             let now = f
-                .run_on(
-                    &db,
-                    kind,
-                    StatementMode::Read,
-                    "SELECT current_setting('work_mem')",
-                    vec![],
-                )
+                .run_on(&db, kind, StatementMode::Read, "SHOW work_mem", vec![])
                 .await
                 .unwrap()
                 .rows;
@@ -752,12 +753,7 @@ async fn a_role_that_changed_its_settings_or_password_is_reset() {
         let pool = engine.pool(&state, kind);
         pool.close_all().await;
         let out = f
-            .run(
-                kind,
-                StatementMode::Read,
-                "SELECT current_setting('TimeZone')",
-                vec![],
-            )
+            .run(kind, StatementMode::Read, "SHOW TimeZone", vec![])
             .await
             .unwrap();
         assert_ne!(

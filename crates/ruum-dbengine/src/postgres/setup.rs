@@ -223,6 +223,11 @@ pub(crate) fn grants_sql(roles: &[EngineRole]) -> String {
              from pg_catalog.pg_proc p where {revoked}; \
            if f is not null then \
              execute pg_catalog.format('grant execute on function %s to %I', f, {owner_name}); \
+           end if; \
+           select pg_catalog.string_agg(p.oid::pg_catalog.regprocedure::pg_catalog.text, ', ') into f \
+             from pg_catalog.pg_proc p where {readers}; \
+           if f is not null then \
+             execute pg_catalog.format('grant execute on function %s to %I, %I', f, {secret_read_name}, {mask_name}); \
            end if; end $revoked$;\n\
          grant usage, create on schema public to {owner};\n\
          grant usage on schema public to {secret_read}, {mask};\n\
@@ -230,6 +235,9 @@ pub(crate) fn grants_sql(roles: &[EngineRole]) -> String {
          grant usage on schema extensions to {logins}, {mask};\n",
         owner = r(RoleKind::Owner),
         owner_name = lens::literal(role_of(roles, RoleKind::Owner)),
+        readers = allow::setting_readers_condition(),
+        secret_read_name = lens::literal(role_of(roles, RoleKind::SecretRead)),
+        mask_name = lens::literal(role_of(roles, RoleKind::Mask)),
         secret_read = r(RoleKind::SecretRead),
         mask = r(RoleKind::Mask),
         lens = lens_schema_grants_sql(roles),
@@ -266,9 +274,17 @@ pub(crate) async fn check_volatile_revoked(
         .filter(|r| r.kind != RoleKind::Owner)
         .map(|r| r.role_name.clone())
         .collect();
+    // `secret_read` and `mask` see every value, so they keep the setting readers.
+    let readers_ok: Vec<String> = roles
+        .iter()
+        .filter(|r| matches!(r.kind, RoleKind::SecretRead | RoleKind::Mask))
+        .map(|r| r.role_name.clone())
+        .collect();
     let revoked = allow::revoked_condition();
+    let readers = allow::setting_readers_condition();
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "with f as (select p.oid, p.oid::pg_catalog.regprocedure::pg_catalog.text as name
+        "with f as (select p.oid, p.oid::pg_catalog.regprocedure::pg_catalog.text as name,
+                           ({readers}) as reader
                       from pg_catalog.pg_proc p where {revoked})
          select coalesce((select pg_catalog.string_agg(f.name, ', ' order by f.name) from f
                            where exists (select 1 from pg_catalog.pg_proc p,
@@ -276,11 +292,14 @@ pub(crate) async fn check_volatile_revoked(
                              where p.oid operator(pg_catalog.=) f.oid and a.grantee operator(pg_catalog.=) 0)), '') as public,
                 coalesce((select pg_catalog.string_agg(r operator(pg_catalog.||) ': ' operator(pg_catalog.||) f.name, ', ' order by r, f.name)
                             from pg_catalog.unnest($1::text[]) r, f
-                           where pg_catalog.has_function_privilege(r, f.oid, 'execute')), '') as kinds,
-                exists (select 1 from f where f.name operator(pg_catalog.=) 'set_config(text,text,boolean)') as found"
+                           where pg_catalog.has_function_privilege(r, f.oid, 'execute')
+                             and not (f.reader and r operator(pg_catalog.=) any ($2::text[]))), '') as kinds,
+                exists (select 1 from f where f.name operator(pg_catalog.=) 'set_config(text,text,boolean)')
+                  and exists (select 1 from f where f.name operator(pg_catalog.=) 'current_setting(text)') as found"
     )))
     .persistent(false)
     .bind(&others)
+    .bind(&readers_ok)
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| internal("check the rights on the volatile functions", e))?;
