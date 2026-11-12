@@ -1335,13 +1335,14 @@ architecture office (decision 0007 says "reusable by every office").
   realistic case is a **base version** that the downstream customises. Both are the same fork;
   they differ only in how many changes the downstream made.
 - Git does the work behind the scenes: the upstream publishes versions as tags on a release
-  branch; the fork **pulls** a new version as a merge into its own repo, through a draft and a
-  preview (section 10), like any other change. The plugins of 5.3 and 5.4 give the diffs of
-  non-code files.
-- **Agents do the merging**: when a new upstream version is available, an agent reviews the
-  changes, applies them on a draft, resolves conflicts with the downstream's customisations, runs
-  the tests and the migrations on a database branch, and writes a summary of what changed and what
-  it had to decide. The person (or the downstream's developer) approves the draft.
+  branch, and a new version reaches the fork as a merge into its repo on a draft with a preview
+  (section 10). The plugins of 5.3 and 5.4 give the diffs of non-code files. People never run the
+  merge and never see git unless they want to.
+- **Agents do the merging**: when a new upstream version is available, the downstream's update
+  agent reviews the changes, merges them on a draft, resolves conflicts with the customisations,
+  runs the tests and the migrations on a database branch, and writes a summary in plain words:
+  what changed, what it had to decide, what to look at in the preview. The person's only task is
+  to approve (or to ask the agent for changes).
 - **Unlink**: a downstream that has changed so much that updates are too painful can remove the
   link. The only effect: Ruum stops showing updates from the upstream (security updates included,
   and the UI says so clearly). Nothing is deleted; the link can be added again later.
@@ -1371,6 +1372,24 @@ them when they customise:
   downstream's rights.
 Changes outside the extension points are allowed; they only make merges harder, and the update
 agent says which customisations caused conflicts.
+
+**Agents talk both ways: proposals between upstream and downstream.** Each app has an agent on the
+upstream side and each fork an agent on the downstream side, with a channel between them (a
+thread on the upstream link, kept as part of both projects' history):
+- **Downstream to upstream** (the pull request model, with agents doing the coding discussion): a
+  downstream agent proposes a change it made that is useful to everyone, a fix, or a new extension
+  point it needed. The upstream agent reviews it, asks questions, adapts it; the upstream's people
+  approve it into a new version. The downstream then drops its own copy of the change at the next
+  update.
+- **Upstream to downstream**: the upstream agent proposes a refactoring of a fork's customisation
+  (for example "move this edit into the new hook, so future updates merge cleanly"), or warns
+  before a version that will conflict. The downstream agent evaluates it and applies it on a draft;
+  the downstream's people approve it like an update.
+- Proposals carry code, schema and descriptions only, never the downstream's data, logs or
+  secrets (8.5). Each side shares only what it chooses; a fork with "select users" or "private"
+  customisations can keep them out of the channel.
+- People see a short summary of every thread and decide on the outcome; the agents' discussion
+  stays readable for review. Either side can close the channel; unlinking closes it.
 
 **Visibility** (who can find and fork the app):
 
@@ -2040,9 +2059,11 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
     tests; migrations as a step before a rolling update; open tabs get a reload notice, forced
     only for a client the API no longer supports.*
 43. **Sharing apps between tenants** (section 9.13). *Provisional 2026-11-12: every installation
-    is a fork with an upstream link; updates are pulled through git and merged by agents, and
-    always approved downstream (later delegable to an agent), never pushed; unlink stops update
-    notices; seven visibility levels and three price models with trials.*
+    is a fork with an upstream link; updates arrive through git, merged by agents, and are
+    always approved downstream (later delegable to an agent), never pushed; agents on both sides
+    exchange proposals (downstream to upstream like pull requests, upstream refactoring proposals
+    to forks); unlink stops update notices; seven visibility levels and three price models with
+    trials.*
 44. **Billing** (section 21.7). *Provisional 2026-11-12: Ruum bills its tenants before the first
     paying users; paid apps are sold by Ruum on the same bill, with an earnings ledger and payouts
     to developers through Stripe Connect; no billing of a tenant's own customers.*
