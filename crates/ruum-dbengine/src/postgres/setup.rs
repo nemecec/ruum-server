@@ -551,17 +551,18 @@ async fn read_key_pads(conn: &mut PgConnection, mask: &str) -> Result<KeyPads, E
     })
 }
 
-/// The objects outside the lens schemas that depend on an object inside them. Only tenant code
-/// in step 2 of a masked copy could make one (the copy's owner then holds `USAGE` on
-/// `ruum_mask`; review-masking-1 F2). A rebuild refuses to go on while one exists, so it never
-/// drops a tenant object and no tenant object keeps a reference into `ruum_mask`.
+/// The objects outside the lens schemas that depend on an object inside them (`ruum_copy`, the
+/// entry points of step 2 of a masked copy, counts as a lens schema). Only tenant code in step 2
+/// of a masked copy could make one (the copy's owner then may call the pseudonym functions
+/// through `ruum_copy`; review-masking-1 F2). A rebuild refuses to go on while one exists, so it
+/// never drops a tenant object and no tenant object keeps a reference into `ruum_mask`.
 pub(crate) async fn foreign_lens_dependents(
     conn: &mut PgConnection,
 ) -> Result<Vec<String>, EngineError> {
     let rows = sqlx::query(
         "with lens as (
            select oid from pg_catalog.pg_namespace
-            where nspname in ('ruum_mask', 'ruum_masked', 'ruum_nosecret')),
+            where nspname in ('ruum_mask', 'ruum_masked', 'ruum_nosecret', 'ruum_copy')),
          inside as (
            select 'pg_catalog.pg_class'::pg_catalog.regclass as cls, c.oid
              from pg_catalog.pg_class c where c.relnamespace in (select oid from lens)
