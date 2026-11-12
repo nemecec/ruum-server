@@ -688,6 +688,19 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         return Ok(());
     }
     let types = lens::pseudonym_types(conn).await?;
+    // The views and materialized views of the tenant that read a masked column, also through
+    // other views: dropped now and made again over the masked tables after (backlog 2026-11-09
+    // S-8; a view blocks the `ALTER COLUMN TYPE` of a personal column).
+    let views = dependent_views(conn, plan).await?;
+    for v in views.iter().rev() {
+        run(
+            conn,
+            "drop a view that reads a masked column",
+            format!("drop {} {}", v.kind_word(), v.name),
+        )
+        .await
+        .map_err(|e| v.refusal(e))?;
+    }
     let mut fks: Vec<(String, String, String)> = Vec::new();
     for (column, how) in &plan.columns {
         if column.schema != "public" {
@@ -816,6 +829,9 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
             }
         }
     }
+    for v in &views {
+        v.make_again(conn).await?;
+    }
     for (name, on, def) in fks {
         run(conn, "savepoint", "savepoint ruum_fk".to_string()).await?;
         let added = run(
@@ -832,6 +848,207 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         run(conn, "end the savepoint", end.to_string()).await?;
     }
     Ok(())
+}
+
+/// A view or materialized view of the tenant that a masked copy drops and makes again
+/// ([`dependent_views`]).
+struct DependentView {
+    /// `public.name`, quoted.
+    name: String,
+    materialized: bool,
+    /// The definition as `pg_get_viewdef` prints it in the owner's session.
+    definition: String,
+    /// `WITH (...)` options (`security_barrier`, `security_invoker`, `check_option`).
+    options: Vec<String>,
+    comment: Option<String>,
+    /// The indexes of a materialized view (`pg_get_indexdef`).
+    indexes: Vec<String>,
+}
+
+impl DependentView {
+    fn kind_word(&self) -> &'static str {
+        if self.materialized {
+            "materialized view"
+        } else {
+            "view"
+        }
+    }
+
+    fn refusal(&self, e: EngineError) -> EngineError {
+        EngineError::Unsupported(format!(
+            "a masked copy changes the columns that the {} {} reads, and cannot drop it and make it \
+             again: {e}",
+            self.kind_word(),
+            self.name
+        ))
+    }
+
+    /// Makes the view again over the masked tables. A view whose definition does not fit the
+    /// masked columns (for example arithmetic on a personal number, which is now a pseudonym)
+    /// refuses the copy. A materialized view is filled from the masked tables, or left
+    /// unpopulated when its query fails on them: it never keeps a value of the source.
+    async fn make_again(&self, conn: &mut PgConnection) -> Result<(), EngineError> {
+        let with = if self.options.is_empty() {
+            String::new()
+        } else {
+            format!(" with ({})", self.options.join(", "))
+        };
+        let definition = self.definition.trim().trim_end_matches(';');
+        if self.materialized {
+            run(conn, "savepoint", "savepoint ruum_view".to_string()).await?;
+            let filled = run(
+                conn,
+                "make a materialized view again",
+                format!(
+                    "create materialized view {}{with} as {definition} with data",
+                    self.name
+                ),
+            )
+            .await;
+            if filled.is_ok() {
+                run(
+                    conn,
+                    "end the savepoint",
+                    "release savepoint ruum_view".into(),
+                )
+                .await?;
+            } else {
+                run(
+                    conn,
+                    "end the savepoint",
+                    "rollback to savepoint ruum_view".into(),
+                )
+                .await?;
+                run(
+                    conn,
+                    "make a materialized view again, unpopulated",
+                    format!(
+                        "create materialized view {}{with} as {definition} with no data",
+                        self.name
+                    ),
+                )
+                .await
+                .map_err(|e| self.refusal(e))?;
+            }
+            for index in &self.indexes {
+                run(
+                    conn,
+                    "make an index of a materialized view again",
+                    index.clone(),
+                )
+                .await
+                .map_err(|e| self.refusal(e))?;
+            }
+        } else {
+            run(
+                conn,
+                "make a view again",
+                format!("create view {}{with} as {definition}", self.name),
+            )
+            .await
+            .map_err(|e| self.refusal(e))?;
+        }
+        if let Some(comment) = &self.comment {
+            run(
+                conn,
+                "comment on a view again",
+                format!(
+                    "comment on {} {} is {}",
+                    self.kind_word(),
+                    self.name,
+                    lens::literal(comment)
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// The views and materialized views of the database's own schema that read a column of `plan`,
+/// directly or through other views, in the order in which they can be made (every view after
+/// the views it reads). A view with a trigger or a rule of its own (other than `_RETURN`) would
+/// lose it, so it refuses the copy (backlog 2026-11-09 S-8).
+async fn dependent_views(
+    conn: &mut PgConnection,
+    plan: &MaskPlan,
+) -> Result<Vec<DependentView>, EngineError> {
+    let (tables, columns): (Vec<String>, Vec<String>) = plan
+        .columns
+        .iter()
+        .filter(|(c, _)| c.schema == "public")
+        .map(|(c, _)| (format!("public.{}", ident(&c.table)), c.column.clone()))
+        .unzip();
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "with recursive start as (
+           select a.attrelid as rel, a.attnum as att
+             from rows from (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[])) as m(t, c)
+             join pg_catalog.pg_attribute a
+               on a.attrelid = pg_catalog.to_regclass(m.t) and a.attname = m.c
+              and a.attnum > 0 and not a.attisdropped),
+         deps(oid, depth) as (
+           select r.ev_class, 1
+             from pg_catalog.pg_depend d
+             join pg_catalog.pg_rewrite r on r.oid = d.objid
+             join start s on d.refobjid = s.rel and d.refobjsubid = s.att
+            where d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+              and d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+              and r.ev_class <> d.refobjid
+           union
+           select r.ev_class, deps.depth + 1
+             from pg_catalog.pg_depend d
+             join pg_catalog.pg_rewrite r on r.oid = d.objid
+             join deps on d.refobjid = deps.oid
+            where d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+              and d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+              and r.ev_class <> deps.oid
+              and deps.depth < 100)
+         select pg_catalog.format('%I.%I', n.nspname, c.relname) as name,
+                c.relkind = 'm' as materialized,
+                pg_catalog.pg_get_viewdef(c.oid) as definition,
+                coalesce(c.reloptions, '{}'::text[]) as options,
+                pg_catalog.obj_description(c.oid, 'pg_class') as comment,
+                coalesce((select pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid) order by i.indexrelid)
+                            from pg_catalog.pg_index i where i.indrelid = c.oid), '{}'::text[]) as indexes,
+                (n.nspname <> 'public'
+                 or exists (select 1 from pg_catalog.pg_trigger t where t.tgrelid = c.oid)
+                 or exists (select 1 from pg_catalog.pg_rewrite w
+                             where w.ev_class = c.oid and w.rulename <> '_RETURN')) as refused
+           from deps
+           join pg_catalog.pg_class c on c.oid = deps.oid
+           join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+          where c.relkind in ('v', 'm')
+          group by c.oid, n.nspname, c.relname, c.relkind, c.reloptions
+          order by max(deps.depth), c.oid",
+    )
+    .persistent(false)
+    .bind(&tables)
+    .bind(&columns)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| internal("list the views that read a masked column", e))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get("name");
+        if row.get::<bool, _>("refused") {
+            return Err(EngineError::Unsupported(format!(
+                "a masked copy changes the columns that the view {name} reads, and that view has \
+                 a trigger or a rule of its own (or is outside the database's schema)"
+            )));
+        }
+        out.push(DependentView {
+            name,
+            materialized: row.get("materialized"),
+            definition: row.get("definition"),
+            options: row.get("options"),
+            comment: row.get("comment"),
+            indexes: row.get("indexes"),
+        });
+    }
+    Ok(out)
 }
 
 /// `copy_database`: a `TEMPLATE` copy of `source` after its drain.
