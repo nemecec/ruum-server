@@ -17,11 +17,19 @@ pub enum Step {
     Write(String),
     /// `stderr:<text>`: writes the text and a line end to standard error.
     Stderr(String),
-    /// `env:<NAME>`: writes `NAME=<value>` and a line end (an empty value when unset).
+    /// `stderr-write:<text>`: writes the text to standard error without a line end (one write).
+    StderrWrite(String),
+    /// `env:<NAME>`: writes `NAME=<value>` and a line end (an empty value when unset). The
+    /// variables include the ones the platform sets, such as `RUUM_TOKEN_FILE`.
     Env(String),
-    /// `token`: writes the current workload token, as the platform gives it to the workload,
-    /// and a line end.
+    /// `token`: reads the file named by `RUUM_TOKEN_FILE` ([`super::TOKEN_FILE`]) at this step
+    /// and writes its content (the current workload token) and a line end.
     Token,
+    /// `token-sha`: reads the token file like `token` and writes `token-sha:`, the first 16 hex
+    /// characters of the SHA-256 of the token ([`token_sha`]), and a line end. The suite tells
+    /// the old token from the new one by it without logging either. A short hash of a
+    /// high-entropy token is not a secret.
+    TokenSha,
     /// `sleep:<ms>`: waits.
     Sleep(Duration),
     /// `exit:<code>`: exits with the code.
@@ -40,6 +48,13 @@ pub enum Step {
 /// The line that [`Step::Disk`] writes when the disk is full.
 pub const DISK_FULL: &str = "disk:full";
 
+/// The line that [`Step::TokenSha`] writes for a token.
+pub fn token_sha(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    format!("token-sha:{}", &hash[..16])
+}
+
 impl Step {
     /// The command line argument of the step.
     pub fn arg(&self) -> String {
@@ -47,8 +62,10 @@ impl Step {
             Step::Print(t) => format!("print:{t}"),
             Step::Write(t) => format!("write:{t}"),
             Step::Stderr(t) => format!("stderr:{t}"),
+            Step::StderrWrite(t) => format!("stderr-write:{t}"),
             Step::Env(n) => format!("env:{n}"),
             Step::Token => "token".to_owned(),
+            Step::TokenSha => "token-sha".to_owned(),
             Step::Sleep(d) => format!("sleep:{}", d.as_millis()),
             Step::Exit(c) => format!("exit:{c}"),
             Step::Serve => "serve".to_owned(),
@@ -68,8 +85,10 @@ impl Step {
             ("print", Some(t)) => Step::Print(t.to_owned()),
             ("write", Some(t)) => Step::Write(t.to_owned()),
             ("stderr", Some(t)) => Step::Stderr(t.to_owned()),
+            ("stderr-write", Some(t)) => Step::StderrWrite(t.to_owned()),
             ("env", Some(n)) if !n.is_empty() => Step::Env(n.to_owned()),
             ("token", None) => Step::Token,
+            ("token-sha", None) => Step::TokenSha,
             ("sleep", Some(ms)) => Step::Sleep(Duration::from_millis(ms.parse().ok()?)),
             ("exit", Some(c)) => Step::Exit(c.parse().ok()?),
             ("serve", None) => Step::Serve,

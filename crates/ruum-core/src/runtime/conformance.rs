@@ -11,7 +11,7 @@
 //! variable is set** ([`Report::assert_ok`]; backlog T-26), so a CI run never passes a case
 //! silently.
 
-use super::program::{self, DISK_FULL, Step};
+use super::program::{self, DISK_FULL, Step, token_sha};
 use super::redact::REDACTED;
 use super::*;
 use crate::ids::{NodeId, TenantId};
@@ -43,13 +43,25 @@ pub trait DriverFixture: Send + Sync {
     fn driver(&self) -> Arc<dyn RuntimeDriver>;
     /// The sink the driver reports usage to.
     fn usage(&self) -> Arc<MemoryUsage>;
-    /// An OCI image whose entry point runs the conformance program given as arguments.
-    async fn program_image(&self) -> Result<ImageRef, String>;
+    /// An OCI image whose entry point runs the conformance program given as arguments, in the
+    /// registry repository of the identity's tenant and app: the fixture pushes it there. The
+    /// suite asks for each identity it starts (a fixture may cache per tenant and app), and
+    /// never for an identity whose start must fail with `image_not_found`.
+    async fn program_image(&self, identity: &WorkloadIdentity) -> Result<ImageRef, String>;
     fn timing(&self) -> Timing;
     /// A reason to skip the named case, when the driver cannot run it.
     fn skip(&self, _case: &str) -> Option<String> {
         None
     }
+}
+
+/// The times of the build timeout case.
+#[derive(Clone, Copy, Debug)]
+pub struct BuildTiming {
+    /// The timeout of the slow build.
+    pub timeout: Duration,
+    /// How long after the timeout the builder may take to end the build and answer.
+    pub wait: Duration,
 }
 
 /// What the builder suite needs beyond the trait.
@@ -63,6 +75,18 @@ pub trait BuilderFixture: Send + Sync {
     fn archive(&self) -> Bytes;
     /// An archive whose build runs and fails.
     fn failing_archive(&self) -> Bytes;
+    /// An archive whose build runs longer than [`BuildTiming::timeout`] (a postinstall script
+    /// that sleeps).
+    fn slow_archive(&self) -> Bytes;
+    /// The times of the timeout case.
+    fn build_timing(&self) -> BuildTiming;
+    /// An archive whose build succeeds and writes to the build log the line `env-dump:begin`,
+    /// its whole environment (one `NAME=value` line each) and the content of every credential
+    /// file it can read, then the line `env-dump:end`.
+    fn env_dump_archive(&self) -> Bytes;
+    /// Values the fixture planted in the builder's own environment and credentials (for
+    /// example the registry push credential). No build may see one.
+    fn canaries(&self) -> Vec<String>;
     fn skip(&self, _case: &str) -> Option<String> {
         None
     }
@@ -161,12 +185,11 @@ macro_rules! check {
     };
 }
 
-/// The context of one driver case: the fixture, the program image, and the instances the case
-/// started (stopped after the case).
+/// The context of one driver case: the fixture, and the instances the case started (stopped
+/// after the case).
 struct Ctx<'a> {
     f: &'a dyn DriverFixture,
     driver: Arc<dyn RuntimeDriver>,
-    image: ImageRef,
     timing: Timing,
     started: std::sync::Mutex<Vec<(TenantId, InstanceId)>>,
 }
@@ -311,8 +334,39 @@ fn secret_text(label: &str) -> String {
     )
 }
 
+/// The token lines (`token-sha:...`) of a log.
+fn token_shas(logs: &[LogLine]) -> Vec<&str> {
+    logs.iter()
+        .map(|l| l.text.as_str())
+        .filter(|t| t.starts_with("token-sha:"))
+        .collect()
+}
+
 impl Ctx<'_> {
-    fn service(&self, identity: WorkloadIdentity, steps: &[Step]) -> WorkloadSpec {
+    /// The program image in the repository of the identity's tenant and app.
+    async fn image(&self, identity: &WorkloadIdentity) -> Result<ImageRef, CaseError> {
+        self.f
+            .program_image(identity)
+            .await
+            .map_err(|e| fail(format!("the fixture has no program image: {e}")))
+    }
+
+    /// A service spec with the program image of its own app.
+    async fn service(
+        &self,
+        identity: WorkloadIdentity,
+        steps: &[Step],
+    ) -> Result<WorkloadSpec, CaseError> {
+        let image = self.image(&identity).await?;
+        Ok(self.service_with(identity, steps, image))
+    }
+
+    fn service_with(
+        &self,
+        identity: WorkloadIdentity,
+        steps: &[Step],
+        image: ImageRef,
+    ) -> WorkloadSpec {
         WorkloadSpec {
             identity,
             kind: WorkloadKind::Service(ServiceSpec {
@@ -324,7 +378,7 @@ impl Ctx<'_> {
                 }),
                 idle_timeout: None,
             }),
-            image: self.image.clone(),
+            image,
             command: program::command(steps),
             env: Vec::new(),
             previous_secrets: Vec::new(),
@@ -334,16 +388,25 @@ impl Ctx<'_> {
         }
     }
 
-    fn job(&self, identity: WorkloadIdentity, steps: &[Step], timeout: Duration) -> WorkloadSpec {
-        WorkloadSpec {
+    async fn job(
+        &self,
+        identity: WorkloadIdentity,
+        steps: &[Step],
+        timeout: Duration,
+    ) -> Result<WorkloadSpec, CaseError> {
+        Ok(WorkloadSpec {
             kind: WorkloadKind::Job(JobSpec { timeout }),
-            ..self.service(identity, steps)
-        }
+            ..self.service(identity, steps).await?
+        })
     }
 
     /// A job with a timeout long enough for any short program.
-    fn quick_job(&self, identity: WorkloadIdentity, steps: &[Step]) -> WorkloadSpec {
-        self.job(identity, steps, self.timing.wait)
+    async fn quick_job(
+        &self,
+        identity: WorkloadIdentity,
+        steps: &[Step],
+    ) -> Result<WorkloadSpec, CaseError> {
+        self.job(identity, steps, self.timing.wait).await
     }
 }
 
@@ -377,9 +440,11 @@ macro_rules! cases {
 /// The names of the driver cases, in run order.
 pub const DRIVER_CASES: &[&str] = &[
     "start_service",
+    "other_tenant_cannot_act",
     "start_static",
     "invalid_spec_refused",
     "unknown_image_refused",
+    "image_of_another_app_refused",
     "stop",
     "scale_to_zero_and_wake",
     "touch_keeps_service_awake",
@@ -401,9 +466,11 @@ pub const DRIVER_CASES: &[&str] = &[
 
 const DRIVER_CASE_FNS: &[(&str, DriverCase)] = cases![
     start_service,
+    other_tenant_cannot_act,
     start_static,
     invalid_spec_refused,
     unknown_image_refused,
+    image_of_another_app_refused,
     stop,
     scale_to_zero_and_wake,
     touch_keeps_service_awake,
@@ -437,24 +504,13 @@ pub async fn run_cases(f: &dyn DriverFixture, names: &[&str]) -> Report {
         subject: driver.name().to_owned(),
         cases: Vec::new(),
     };
-    let image = match f.program_image().await {
-        Ok(i) => Some(i),
-        Err(e) => {
-            report.cases.push(CaseReport {
-                name: "program_image",
-                outcome: Outcome::Failed(format!("the fixture has no program image: {e}")),
-            });
-            None
-        }
-    };
     for (name, case) in DRIVER_CASE_FNS.iter().filter(|(n, _)| names.contains(n)) {
         let outcome = if let Some(reason) = f.skip(name) {
             Outcome::Skipped(reason)
-        } else if let Some(image) = &image {
+        } else {
             let ctx = Ctx {
                 f,
                 driver: driver.clone(),
-                image: image.clone(),
                 timing: f.timing(),
                 started: std::sync::Mutex::new(Vec::new()),
             };
@@ -466,8 +522,6 @@ pub async fn run_cases(f: &dyn DriverFixture, names: &[&str]) -> Report {
                 Ok(Err(CaseError::Fail(m))) => Outcome::Failed(m),
                 Err(_) => Outcome::Failed("the case panicked".to_owned()),
             }
-        } else {
-            Outcome::Failed("no program image".to_owned())
         };
         report.cases.push(CaseReport { name, outcome });
     }
@@ -478,7 +532,7 @@ pub async fn run_cases(f: &dyn DriverFixture, names: &[&str]) -> Report {
 /// gave. Another tenant cannot see it.
 async fn start_service(c: &Ctx<'_>) -> CaseResult {
     let id = new_identity(Environment::Live);
-    let s = c.start(c.service(id, &[Step::Serve])).await?;
+    let s = c.start(c.service(id, &[Step::Serve]).await?).await?;
     check!(
         s.identity == id,
         "the status has another identity: {:?}",
@@ -519,6 +573,99 @@ async fn start_service(c: &Ctx<'_>) -> CaseResult {
     Ok(())
 }
 
+/// `touch`, `wake` and `rotate_token` of another tenant are `instance_not_found` and change
+/// nothing: a scaled-to-zero instance stays scaled to zero (another tenant cannot start it and
+/// charge it), and a running instance keeps its token (another tenant cannot put in its own).
+async fn other_tenant_cannot_act(c: &Ctx<'_>) -> CaseResult {
+    let other = TenantId::new();
+    let mut spec = c
+        .service(
+            new_identity(Environment::Live),
+            &[Step::Print("boot".into()), Step::Serve],
+        )
+        .await?;
+    if let WorkloadKind::Service(s) = &mut spec.kind {
+        s.idle_timeout = Some(c.timing.idle_timeout);
+    }
+    let s = c.start(spec).await?;
+    c.wait_line(&s, "boot").await?;
+    c.wait_for(&s, "scaled to zero", c.timing.idle_timeout, |x| {
+        x.state == InstanceState::ScaledToZero
+    })
+    .await?;
+    expect_err(
+        c.driver.wake(other, s.id).await,
+        "instance_not_found",
+        "wake for another tenant",
+    )?;
+    expect_err(
+        c.driver.touch(other, s.id).await,
+        "instance_not_found",
+        "touch for another tenant",
+    )?;
+    expect_err(
+        c.driver.rotate_token(other, s.id, token()).await,
+        "instance_not_found",
+        "rotate_token for another tenant",
+    )?;
+    let still = c.status(&s).await?;
+    check!(
+        still.state == InstanceState::ScaledToZero,
+        "a call of another tenant changed the instance: {}",
+        still.state.name()
+    );
+    let logs = c.logs(&s).await?;
+    check!(
+        logs.iter().filter(|l| l.text == "boot").count() == 1,
+        "a call of another tenant started the program again: {:?}",
+        texts(&logs)
+    );
+
+    let pause = Duration::from_millis(300).max(c.timing.health_interval * 3);
+    let spec = c
+        .service(
+            new_identity(Environment::Live),
+            &[
+                Step::TokenSha,
+                Step::Sleep(pause),
+                Step::TokenSha,
+                Step::Token,
+                Step::Print("after".into()),
+                Step::Serve,
+            ],
+        )
+        .await?;
+    let old = spec.workload_token.expose().to_owned();
+    let s = c.start(spec).await?;
+    expect_err(
+        c.driver.rotate_token(other, s.id, token()).await,
+        "instance_not_found",
+        "rotate_token for another tenant",
+    )?;
+    expect_err(
+        c.driver.touch(other, s.id).await,
+        "instance_not_found",
+        "touch for another tenant",
+    )?;
+    let logs = c.wait_line(&s, "after").await?;
+    let want = token_sha(&old);
+    let shas = token_shas(&logs);
+    check!(
+        shas == [want.as_str(), want.as_str()],
+        "a refused rotation changed the token: {shas:?}, the old token is {want}"
+    );
+    check!(
+        !logs.iter().any(|l| l.text.contains(&old)),
+        "the log holds the token"
+    );
+    check!(
+        logs.iter().any(|l| l.text == REDACTED),
+        "the token line is not redacted: {:?}",
+        texts(&logs)
+    );
+    Ok(())
+}
+
 fn static_image() -> StaticImage {
     StaticImage::new(vec![
         StaticFile {
@@ -537,7 +684,7 @@ fn static_image() -> StaticImage {
 /// A static image runs no code: running, healthy, no network, no routes, no logs. It cannot be
 /// a job, and it gets no routes.
 async fn start_static(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.service(new_identity(Environment::Live), &[]);
+    let mut spec = c.service(new_identity(Environment::Live), &[]).await?;
     spec.image = ImageRef::Static(static_image());
     spec.routes = Vec::new();
     let s = c.start(spec.clone()).await?;
@@ -558,7 +705,7 @@ async fn start_static(c: &Ctx<'_>) -> CaseResult {
     check!(s.applied.routes.is_empty(), "a static instance has routes");
     check!(c.logs(&s).await?.is_empty(), "a static instance has logs");
 
-    let mut job = c.quick_job(new_identity(Environment::Live), &[]);
+    let mut job = c.quick_job(new_identity(Environment::Live), &[]).await?;
     job.image = spec.image.clone();
     job.routes = Vec::new();
     expect_err(
@@ -588,7 +735,9 @@ async fn start_static(c: &Ctx<'_>) -> CaseResult {
 
 /// Specs that break the shared rules are refused before anything starts.
 async fn invalid_spec_refused(c: &Ctx<'_>) -> CaseResult {
-    let base = c.service(new_identity(Environment::Live), &[Step::Serve]);
+    let base = c
+        .service(new_identity(Environment::Live), &[Step::Serve])
+        .await?;
     let mut bad_name = base.clone();
     bad_name.env = vec![EnvVar::plain("1BAD", "x")];
     expect_err(
@@ -617,18 +766,84 @@ async fn invalid_spec_refused(c: &Ctx<'_>) -> CaseResult {
         "invalid_spec",
         "a route listed twice",
     )?;
-    let mut no_token = base;
+    let mut no_token = base.clone();
     no_token.workload_token = SecretValue::new("");
     expect_err(
         c.driver.start(no_token).await,
         "invalid_spec",
         "an empty workload token",
+    )?;
+    let mut port = base.clone();
+    if let WorkloadKind::Service(s) = &mut port.kind {
+        s.port = 0;
+    }
+    expect_err(c.driver.start(port).await, "invalid_spec", "port 0")?;
+    for (path, what) in [
+        ("health", "a health path without /"),
+        ("/a b", "a health path with a space"),
+        ("/a\r\nHost: evil", "a health path with a line end"),
+        ("/a\tb", "a health path with a tab"),
+        ("/\u{7f}", "a health path with DEL"),
+    ] {
+        let mut bad = base.clone();
+        if let WorkloadKind::Service(s) = &mut bad.kind
+            && let Some(h) = &mut s.health
+        {
+            h.path = path.to_owned();
+        }
+        expect_err(c.driver.start(bad).await, "invalid_spec", what)?;
+    }
+    let mut long = base.clone();
+    if let WorkloadKind::Service(s) = &mut long.kind
+        && let Some(h) = &mut s.health
+    {
+        h.path = format!("/{}", "a".repeat(MAX_HEALTH_PATH_BYTES));
+    }
+    expect_err(
+        c.driver.start(long).await,
+        "invalid_spec",
+        "a health path over the length cap",
+    )?;
+    let mut overflow = base.clone();
+    if let WorkloadKind::Service(s) = &mut overflow.kind
+        && let Some(h) = &mut s.health
+    {
+        h.interval = Duration::MAX;
+        h.failure_threshold = 2;
+    }
+    expect_err(
+        c.driver.start(overflow).await,
+        "invalid_spec",
+        "a health interval times threshold that overflows",
+    )?;
+    let mut nul_arg = base.clone();
+    nul_arg.command.push("print:a\0b".to_owned());
+    expect_err(
+        c.driver.start(nul_arg).await,
+        "invalid_spec",
+        "a NUL byte in a command argument",
+    )?;
+    let mut nul_env = base.clone();
+    nul_env.env = vec![EnvVar::plain("A", "x\0y")];
+    expect_err(
+        c.driver.start(nul_env).await,
+        "invalid_spec",
+        "a NUL byte in an environment value",
+    )?;
+    let mut token_file = base;
+    token_file.env = vec![EnvVar::plain(TOKEN_FILE_ENV, "/tmp/mine")];
+    expect_err(
+        c.driver.start(token_file).await,
+        "invalid_spec",
+        "a spec that sets RUUM_TOKEN_FILE",
     )
 }
 
 /// An OCI image that is not in the registry is refused.
 async fn unknown_image_refused(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.service(new_identity(Environment::Live), &[Step::Serve]);
+    let mut spec = c
+        .service(new_identity(Environment::Live), &[Step::Serve])
+        .await?;
     spec.image = ImageRef::Oci(OciDigest::of(Uuid::now_v7().as_bytes()));
     expect_err(
         c.driver.start(spec).await,
@@ -637,15 +852,65 @@ async fn unknown_image_refused(c: &Ctx<'_>) -> CaseResult {
     )
 }
 
-/// A stopped instance stops; a second stop does nothing.
-async fn stop(c: &Ctx<'_>) -> CaseResult {
-    let s = c
-        .start(c.service(new_identity(Environment::Live), &[Step::Serve]))
+/// An image resolves only in the repository of the workload's tenant and app: the live and the
+/// preview of the app that owns it start it, another app of the tenant and another tenant get
+/// `image_not_found`, also when they name its digest.
+async fn image_of_another_app_refused(c: &Ctx<'_>) -> CaseResult {
+    let tenant = TenantId::new();
+    let app = NodeId::new();
+    let owner = identity(tenant, app, Environment::Live);
+    let image = c.image(&owner).await?;
+    c.start(c.service_with(owner, &[Step::Serve], image.clone()))
         .await?;
-    c.wait_for(&s, "running", Duration::ZERO, |x| {
-        x.state == InstanceState::Running
-    })
+    c.start(c.service_with(
+        identity(tenant, app, Environment::Preview),
+        &[Step::Serve],
+        image.clone(),
+    ))
     .await?;
+    expect_err(
+        c.driver
+            .start(c.service_with(
+                identity(tenant, NodeId::new(), Environment::Live),
+                &[Step::Serve],
+                image.clone(),
+            ))
+            .await,
+        "image_not_found",
+        "the image of another app of the tenant",
+    )?;
+    expect_err(
+        c.driver
+            .start(c.service_with(
+                identity(TenantId::new(), app, Environment::Live),
+                &[Step::Serve],
+                image,
+            ))
+            .await,
+        "image_not_found",
+        "the image of another tenant",
+    )
+}
+
+/// A stopped instance stops; a second stop does nothing, and the program does not go on after
+/// the stop.
+async fn stop(c: &Ctx<'_>) -> CaseResult {
+    let pause = Duration::from_millis(200).max(c.timing.health_interval * 3);
+    let s = c
+        .start(
+            c.service(
+                new_identity(Environment::Live),
+                &[
+                    Step::Print("up".into()),
+                    Step::Sleep(pause),
+                    Step::Print("late".into()),
+                    Step::Serve,
+                ],
+            )
+            .await?,
+        )
+        .await?;
+    c.wait_line(&s, "up").await?;
     c.driver
         .stop(s.identity.tenant, s.id)
         .await
@@ -663,29 +928,58 @@ async fn stop(c: &Ctx<'_>) -> CaseResult {
         Err(e) => check!(e.code() == "instance_not_found", "a second stop: {e}"),
     }
     match c.driver.wake(s.identity.tenant, s.id).await {
-        Ok(_) => Err(fail("a stopped instance woke up")),
+        Ok(_) => return Err(fail("a stopped instance woke up")),
         Err(e) => {
             check!(
                 matches!(e.code(), "invalid_state" | "instance_not_found"),
                 "wake after stop: {e}"
             );
-            Ok(())
         }
     }
+    // The program would print "late" after the pause if it still ran.
+    tokio::time::sleep(pause * 2).await;
+    if let Ok(logs) = c.driver.logs(s.identity.tenant, s.id, None, 1000).await {
+        check!(
+            !logs.iter().any(|l| l.text == "late"),
+            "the program went on after the stop: {:?}",
+            texts(&logs)
+        );
+    }
+    Ok(())
 }
 
 /// A service with an idle timeout scales to zero after it, and a wake starts it again (a cold
-/// start: the program runs again from the start).
+/// start: the program runs again from the start). The cold start keeps the security of the
+/// first start: the same routes and limits, a network, the secret delivered and redacted, and
+/// the token of the last rotation (redacted, with the old one).
 async fn scale_to_zero_and_wake(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.service(
-        new_identity(Environment::Live),
-        &[Step::Print("boot".into()), Step::Serve],
-    );
+    let secret = secret_text("cold");
+    let mut spec = c
+        .service(
+            new_identity(Environment::Live),
+            &[
+                Step::Print("boot".into()),
+                Step::Env("COLD_KEY".into()),
+                Step::TokenSha,
+                Step::Token,
+                Step::Serve,
+            ],
+        )
+        .await?;
     if let WorkloadKind::Service(s) = &mut spec.kind {
         s.idle_timeout = Some(c.timing.idle_timeout);
     }
+    spec.env = vec![EnvVar::secret("COLD_KEY", SecretValue::new(secret.clone()))];
+    let old = spec.workload_token.expose().to_owned();
     let s = c.start(spec).await?;
-    c.wait_line(&s, "boot").await?;
+    c.wait_line(&s, &token_sha(&old)).await?;
+    let before = c.status(&s).await?.applied;
+    let new = token();
+    let new_text = new.expose().to_owned();
+    c.driver
+        .rotate_token(s.identity.tenant, s.id, new)
+        .await
+        .map_err(|e| fail(format!("rotate_token failed: {e}")))?;
     c.wait_for(&s, "scaled to zero", c.timing.idle_timeout, |x| {
         x.state == InstanceState::ScaledToZero
     })
@@ -700,23 +994,60 @@ async fn scale_to_zero_and_wake(c: &Ctx<'_>) -> CaseResult {
         "after wake the state is {}",
         woke.state.name()
     );
-    c.wait_for(&s, "running and healthy after wake", Duration::ZERO, |x| {
-        x.state == InstanceState::Running && x.health == Health::Healthy
-    })
-    .await?;
-    let deadline = Instant::now() + c.timing.wait;
-    loop {
-        let logs = c.logs(&s).await?;
-        if logs.iter().filter(|l| l.text == "boot").count() >= 2 {
-            break;
+    let after = c
+        .wait_for(&s, "running and healthy after wake", Duration::ZERO, |x| {
+            x.state == InstanceState::Running && x.health == Health::Healthy
+        })
+        .await?
+        .applied;
+    check!(
+        sorted(&after.routes) == sorted(&before.routes),
+        "the routes changed at the cold start: {:?}, then {:?}",
+        before.routes,
+        after.routes
+    );
+    check!(
+        after.limits == before.limits,
+        "the limits changed at the cold start: {:?}, then {:?}",
+        before.limits,
+        after.limits
+    );
+    check!(
+        after.network.is_some(),
+        "the instance has no network after the cold start"
+    );
+    let logs = c.wait_line(&s, &token_sha(&new_text)).await?;
+    check!(
+        logs.iter().filter(|l| l.text == "boot").count() == 2,
+        "the program did not start again after wake: {:?}",
+        texts(&logs)
+    );
+    let shas = token_shas(&logs);
+    let want = [token_sha(&old), token_sha(&new_text)];
+    check!(
+        shas == [want[0].as_str(), want[1].as_str()],
+        "the cold start did not get the rotated token: {shas:?}, want {want:?}"
+    );
+    for l in &logs {
+        for (what, v) in [
+            ("the secret", &secret),
+            ("the old token", &old),
+            ("the new token", &new_text),
+        ] {
+            check!(
+                !l.text.contains(v.as_str()),
+                "the log holds {what}: line {}",
+                l.seq
+            );
         }
-        check!(
-            Instant::now() < deadline,
-            "the program did not start again after wake: {:?}",
-            texts(&logs)
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let key = format!("COLD_KEY={REDACTED}");
+    check!(
+        logs.iter().filter(|l| l.text == key).count() == 2
+            && logs.iter().filter(|l| l.text == REDACTED).count() == 2,
+        "the secret or the token is not delivered and redacted in each run: {:?}",
+        texts(&logs)
+    );
     // It scales to zero again after the next idle time.
     c.wait_for(&s, "scaled to zero again", c.timing.idle_timeout, |x| {
         x.state == InstanceState::ScaledToZero
@@ -727,7 +1058,9 @@ async fn scale_to_zero_and_wake(c: &Ctx<'_>) -> CaseResult {
 
 /// Requests (touch) keep a service awake past its idle timeout.
 async fn touch_keeps_service_awake(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.service(new_identity(Environment::Live), &[Step::Serve]);
+    let mut spec = c
+        .service(new_identity(Environment::Live), &[Step::Serve])
+        .await?;
     if let WorkloadKind::Service(s) = &mut spec.kind {
         s.idle_timeout = Some(c.timing.idle_timeout);
     }
@@ -756,10 +1089,13 @@ async fn touch_keeps_service_awake(c: &Ctx<'_>) -> CaseResult {
 /// A job runs to completion with its exit code; a finished job cannot be woken.
 async fn job_completes(c: &Ctx<'_>) -> CaseResult {
     let ok = c
-        .start(c.quick_job(
-            new_identity(Environment::Live),
-            &[Step::Print("working".into()), Step::Exit(0)],
-        ))
+        .start(
+            c.quick_job(
+                new_identity(Environment::Live),
+                &[Step::Print("working".into()), Step::Exit(0)],
+            )
+            .await?,
+        )
         .await?;
     check!(ok.kind == "job", "the kind is {}", ok.kind);
     let exit = c.wait_exit(&ok, Duration::ZERO).await?;
@@ -777,7 +1113,10 @@ async fn job_completes(c: &Ctx<'_>) -> CaseResult {
     )?;
 
     let failed = c
-        .start(c.quick_job(new_identity(Environment::Live), &[Step::Exit(3)]))
+        .start(
+            c.quick_job(new_identity(Environment::Live), &[Step::Exit(3)])
+                .await?,
+        )
         .await?;
     let exit = c.wait_exit(&failed, Duration::ZERO).await?;
     check!(
@@ -786,10 +1125,13 @@ async fn job_completes(c: &Ctx<'_>) -> CaseResult {
     );
 
     let fell_off = c
-        .start(c.quick_job(
-            new_identity(Environment::Live),
-            &[Step::Print("done".into())],
-        ))
+        .start(
+            c.quick_job(
+                new_identity(Environment::Live),
+                &[Step::Print("done".into())],
+            )
+            .await?,
+        )
         .await?;
     let exit = c.wait_exit(&fell_off, Duration::ZERO).await?;
     check!(
@@ -803,20 +1145,32 @@ async fn job_completes(c: &Ctx<'_>) -> CaseResult {
 async fn job_times_out(c: &Ctx<'_>) -> CaseResult {
     let t = c.timing.job_timeout;
     let s = c
-        .start(c.job(
-            new_identity(Environment::Live),
-            &[
-                Step::Print("start".into()),
-                Step::Sleep(t * 20),
-                Step::Exit(0),
-            ],
-            t,
-        ))
+        .start(
+            c.job(
+                new_identity(Environment::Live),
+                &[
+                    Step::Print("start".into()),
+                    Step::Sleep(t * 3),
+                    Step::Print("late".into()),
+                    Step::Exit(0),
+                ],
+                t,
+            )
+            .await?,
+        )
         .await?;
     let exit = c.wait_exit(&s, t).await?;
     check!(
         exit.reason == ExitReason::TimedOut,
         "a job past its timeout ended with {exit:?}"
+    );
+    // The program would print "late" after its sleep if it still ran.
+    tokio::time::sleep(t * 4).await;
+    let logs = c.logs(&s).await?;
+    check!(
+        !logs.iter().any(|l| l.text == "late"),
+        "the job went on after its timeout: {:?}",
+        texts(&logs)
     );
     Ok(())
 }
@@ -830,7 +1184,7 @@ async fn logs_in_order(c: &Ctx<'_>) -> CaseResult {
     steps.push(Step::Stderr("on-stderr".into()));
     steps.push(Step::Exit(0));
     let id = new_identity(Environment::Preview);
-    let s = c.start(c.quick_job(id, &steps)).await?;
+    let s = c.start(c.quick_job(id, &steps).await?).await?;
     c.wait_exit(&s, Duration::ZERO).await?;
     let logs = c.logs(&s).await?;
     let out: Vec<&str> = logs
@@ -895,17 +1249,19 @@ async fn logs_in_order(c: &Ctx<'_>) -> CaseResult {
 async fn secrets_redacted(c: &Ctx<'_>) -> CaseResult {
     let current = secret_text("cur");
     let previous = secret_text("prev");
-    let mut spec = c.quick_job(
-        new_identity(Environment::Live),
-        &[
-            Step::Env("API_KEY".into()),
-            Step::Env("MODE".into()),
-            Step::Print(format!("old={previous};")),
-            Step::Token,
-            Step::Stderr(format!("err {current} err")),
-            Step::Exit(0),
-        ],
-    );
+    let mut spec = c
+        .quick_job(
+            new_identity(Environment::Live),
+            &[
+                Step::Env("API_KEY".into()),
+                Step::Env("MODE".into()),
+                Step::Print(format!("old={previous};")),
+                Step::Token,
+                Step::Stderr(format!("err {current} err")),
+                Step::Exit(0),
+            ],
+        )
+        .await?;
     let tok = spec.workload_token.expose().to_owned();
     spec.env = vec![
         EnvVar::secret("API_KEY", SecretValue::new(current.clone())),
@@ -944,21 +1300,30 @@ async fn secrets_redacted(c: &Ctx<'_>) -> CaseResult {
     Ok(())
 }
 
-/// A secret value written in two pieces is still redacted.
+/// A secret value written in two pieces is still redacted: a current value on standard output,
+/// a previous value on standard error.
 async fn secret_split_across_writes_redacted(c: &Ctx<'_>) -> CaseResult {
     let value = secret_text("split");
     let (a, b) = value.split_at(value.len() / 2);
-    let mut spec = c.quick_job(
-        new_identity(Environment::Live),
-        &[
-            Step::Write(format!("abc{a}")),
-            Step::Sleep(Duration::from_millis(30)),
-            Step::Print(format!("{b}xyz")),
-            Step::Write(format!("tail{a}")),
-            Step::Exit(0),
-        ],
-    );
+    let previous = secret_text("prevsplit");
+    let (pa, pb) = previous.split_at(previous.len() / 3);
+    let mut spec = c
+        .quick_job(
+            new_identity(Environment::Live),
+            &[
+                Step::Write(format!("abc{a}")),
+                Step::Sleep(Duration::from_millis(30)),
+                Step::Print(format!("{b}xyz")),
+                Step::StderrWrite(format!("e1{pa}")),
+                Step::Sleep(Duration::from_millis(30)),
+                Step::Stderr(format!("{pb}e2")),
+                Step::Write(format!("tail{a}")),
+                Step::Exit(0),
+            ],
+        )
+        .await?;
     spec.env = vec![EnvVar::secret("SPLIT", SecretValue::new(value.clone()))];
+    spec.previous_secrets = vec![SecretValue::new(previous.clone())];
     let s = c.start(spec).await?;
     c.wait_exit(&s, Duration::ZERO).await?;
     let logs = c.logs(&s).await?;
@@ -972,6 +1337,16 @@ async fn secret_split_across_writes_redacted(c: &Ctx<'_>) -> CaseResult {
         !logs.iter().any(|l| l.text.contains(&value)),
         "the log holds the value"
     );
+    let want_err = format!("e1{REDACTED}e2");
+    check!(
+        logs.iter()
+            .any(|l| l.stream == LogStream::Stderr && l.text == want_err),
+        "the split previous value on standard error is not redacted: {t:?}"
+    );
+    check!(
+        !logs.iter().any(|l| l.text.contains(&previous)),
+        "the log holds the previous value"
+    );
     let tail = format!("tail{a}");
     check!(
         t.contains(&tail.as_str()),
@@ -980,21 +1355,29 @@ async fn secret_split_across_writes_redacted(c: &Ctx<'_>) -> CaseResult {
     Ok(())
 }
 
-/// After a token renewal, neither the new nor the old token appears in the log.
+/// The token is the file of the contract (`RUUM_TOKEN_FILE`), and a renewal reaches the running
+/// process: the program reads the new token at its next read. Neither the new nor the old token
+/// appears in the log.
 async fn rotated_token_redacted(c: &Ctx<'_>) -> CaseResult {
     let pause = Duration::from_millis(300).max(c.timing.health_interval * 3);
-    let spec = c.service(
-        new_identity(Environment::Live),
-        &[
-            Step::Token,
-            Step::Sleep(pause),
-            Step::Token,
-            Step::Print("after".into()),
-            Step::Serve,
-        ],
-    );
+    let spec = c
+        .service(
+            new_identity(Environment::Live),
+            &[
+                Step::Env(TOKEN_FILE_ENV.into()),
+                Step::TokenSha,
+                Step::Token,
+                Step::Sleep(pause),
+                Step::TokenSha,
+                Step::Token,
+                Step::Print("after".into()),
+                Step::Serve,
+            ],
+        )
+        .await?;
     let old = spec.workload_token.expose().to_owned();
     let s = c.start(spec).await?;
+    c.wait_line(&s, &token_sha(&old)).await?;
     let new = token();
     let new_text = new.expose().to_owned();
     c.driver
@@ -1002,6 +1385,12 @@ async fn rotated_token_redacted(c: &Ctx<'_>) -> CaseResult {
         .await
         .map_err(|e| fail(format!("rotate_token failed: {e}")))?;
     let logs = c.wait_line(&s, "after").await?;
+    let file = format!("{TOKEN_FILE_ENV}={TOKEN_FILE}");
+    check!(
+        logs.iter().any(|l| l.text == file),
+        "the token file is not {TOKEN_FILE}: {:?}",
+        texts(&logs)
+    );
     for l in &logs {
         check!(!l.text.contains(&old), "the log holds the old token");
         check!(!l.text.contains(&new_text), "the log holds the new token");
@@ -1012,13 +1401,22 @@ async fn rotated_token_redacted(c: &Ctx<'_>) -> CaseResult {
         "expected two redacted tokens, got {:?}",
         texts(&logs)
     );
+    let shas = token_shas(&logs);
+    let want = [token_sha(&old), token_sha(&new_text)];
+    check!(
+        shas == [want[0].as_str(), want[1].as_str()],
+        "the running process did not get the new token: {shas:?}, want {want:?}"
+    );
     Ok(())
 }
 
 /// A failing health check marks the instance unhealthy.
 async fn health_failing_marks_unhealthy(c: &Ctx<'_>) -> CaseResult {
     let s = c
-        .start(c.service(new_identity(Environment::Live), &[Step::Unhealthy]))
+        .start(
+            c.service(new_identity(Environment::Live), &[Step::Unhealthy])
+                .await?,
+        )
         .await?;
     c.wait_for(&s, "unhealthy", c.timing.health_interval * 4, |x| {
         x.health == Health::Unhealthy
@@ -1029,7 +1427,9 @@ async fn health_failing_marks_unhealthy(c: &Ctx<'_>) -> CaseResult {
 
 /// The applied limits are exactly the requested ones, for services and jobs.
 async fn limits_recorded(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.service(new_identity(Environment::Live), &[Step::Serve]);
+    let mut spec = c
+        .service(new_identity(Environment::Live), &[Step::Serve])
+        .await?;
     spec.limits = Limits {
         cpu_millis: 500,
         memory_bytes: 96 * 1024 * 1024,
@@ -1049,7 +1449,10 @@ async fn limits_recorded(c: &Ctx<'_>) -> CaseResult {
         s.applied.limits
     );
     let j = c
-        .start(c.quick_job(new_identity(Environment::Live), &[Step::Exit(0)]))
+        .start(
+            c.quick_job(new_identity(Environment::Live), &[Step::Exit(0)])
+                .await?,
+        )
         .await?;
     check!(
         j.applied.limits == limits(),
@@ -1061,15 +1464,17 @@ async fn limits_recorded(c: &Ctx<'_>) -> CaseResult {
 
 /// A program that goes over its memory limit is ended as out of memory.
 async fn memory_limit_enforced(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.quick_job(
-        new_identity(Environment::Live),
-        &[
-            Step::Alloc(48 * 1024 * 1024),
-            Step::Alloc(48 * 1024 * 1024),
-            Step::Sleep(Duration::from_millis(200)),
-            Step::Exit(0),
-        ],
-    );
+    let mut spec = c
+        .quick_job(
+            new_identity(Environment::Live),
+            &[
+                Step::Alloc(48 * 1024 * 1024),
+                Step::Alloc(48 * 1024 * 1024),
+                Step::Sleep(Duration::from_millis(200)),
+                Step::Exit(0),
+            ],
+        )
+        .await?;
     spec.limits.memory_bytes = 64 * 1024 * 1024;
     let s = c.start(spec).await?;
     let exit = c.wait_exit(&s, Duration::ZERO).await?;
@@ -1077,10 +1482,12 @@ async fn memory_limit_enforced(c: &Ctx<'_>) -> CaseResult {
         exit.reason == ExitReason::OutOfMemory,
         "a job over its memory limit ended with {exit:?}"
     );
-    let mut within = c.quick_job(
-        new_identity(Environment::Live),
-        &[Step::Alloc(8 * 1024 * 1024), Step::Exit(0)],
-    );
+    let mut within = c
+        .quick_job(
+            new_identity(Environment::Live),
+            &[Step::Alloc(8 * 1024 * 1024), Step::Exit(0)],
+        )
+        .await?;
     within.limits.memory_bytes = 64 * 1024 * 1024;
     let s = c.start(within).await?;
     let exit = c.wait_exit(&s, Duration::ZERO).await?;
@@ -1093,15 +1500,17 @@ async fn memory_limit_enforced(c: &Ctx<'_>) -> CaseResult {
 
 /// A program that writes more than its disk limit gets a full disk.
 async fn disk_limit_enforced(c: &Ctx<'_>) -> CaseResult {
-    let mut spec = c.quick_job(
-        new_identity(Environment::Live),
-        &[
-            Step::Disk(12 * 1024 * 1024),
-            Step::Disk(12 * 1024 * 1024),
-            Step::Print("wrote".into()),
-            Step::Exit(0),
-        ],
-    );
+    let mut spec = c
+        .quick_job(
+            new_identity(Environment::Live),
+            &[
+                Step::Disk(12 * 1024 * 1024),
+                Step::Disk(12 * 1024 * 1024),
+                Step::Print("wrote".into()),
+                Step::Exit(0),
+            ],
+        )
+        .await?;
     spec.limits.disk_bytes = 16 * 1024 * 1024;
     let s = c.start(spec).await?;
     let exit = c.wait_exit(&s, Duration::ZERO).await?;
@@ -1127,7 +1536,9 @@ async fn network_routes_exact(c: &Ctx<'_>) -> CaseResult {
         vec![Route::InternalGateway],
         vec![Route::Pooler, Route::InternalGateway, Route::EgressProxy],
     ] {
-        let mut spec = c.service(new_identity(Environment::Live), &[Step::Serve]);
+        let mut spec = c
+            .service(new_identity(Environment::Live), &[Step::Serve])
+            .await?;
         spec.routes = routes.clone();
         let s = c.start(spec).await?;
         let s = c
@@ -1152,19 +1563,28 @@ async fn network_routes_exact(c: &Ctx<'_>) -> CaseResult {
 async fn apps_never_share_a_network(c: &Ctx<'_>) -> CaseResult {
     let tenant = TenantId::new();
     let a = c
-        .start(c.service(
-            identity(tenant, NodeId::new(), Environment::Live),
-            &[Step::Serve],
-        ))
+        .start(
+            c.service(
+                identity(tenant, NodeId::new(), Environment::Live),
+                &[Step::Serve],
+            )
+            .await?,
+        )
         .await?;
     let b = c
-        .start(c.service(
-            identity(tenant, NodeId::new(), Environment::Live),
-            &[Step::Serve],
-        ))
+        .start(
+            c.service(
+                identity(tenant, NodeId::new(), Environment::Live),
+                &[Step::Serve],
+            )
+            .await?,
+        )
         .await?;
     let other = c
-        .start(c.service(new_identity(Environment::Live), &[Step::Serve]))
+        .start(
+            c.service(new_identity(Environment::Live), &[Step::Serve])
+                .await?,
+        )
         .await?;
     let nets: Vec<Option<NetworkId>> = vec![
         c.status(&a).await?.applied.network,
@@ -1190,10 +1610,16 @@ async fn preview_and_live_are_separate(c: &Ctx<'_>) -> CaseResult {
     let live_id = identity(tenant, app, Environment::Live);
     let preview_id = identity(tenant, app, Environment::Preview);
     let live = c
-        .start(c.service(live_id, &[Step::Print("hello".into()), Step::Serve]))
+        .start(
+            c.service(live_id, &[Step::Print("hello".into()), Step::Serve])
+                .await?,
+        )
         .await?;
     let preview = c
-        .start(c.service(preview_id, &[Step::Print("hello".into()), Step::Serve]))
+        .start(
+            c.service(preview_id, &[Step::Print("hello".into()), Step::Serve])
+                .await?,
+        )
         .await?;
     check!(live.id != preview.id, "one instance for live and preview");
     let live = c
@@ -1248,7 +1674,7 @@ async fn preview_and_live_are_separate(c: &Ctx<'_>) -> CaseResult {
 /// Each run reports its instance time and memory, with the identity of the instance.
 async fn usage_reported(c: &Ctx<'_>) -> CaseResult {
     let id = new_identity(Environment::Preview);
-    let s = c.start(c.service(id, &[Step::Serve])).await?;
+    let s = c.start(c.service(id, &[Step::Serve]).await?).await?;
     c.wait_for(&s, "running", Duration::ZERO, |x| {
         x.state == InstanceState::Running
     })
@@ -1259,10 +1685,13 @@ async fn usage_reported(c: &Ctx<'_>) -> CaseResult {
         .await
         .map_err(|e| fail(format!("stop failed: {e}")))?;
     let job = c
-        .start(c.quick_job(
-            new_identity(Environment::Live),
-            &[Step::Sleep(Duration::from_millis(30)), Step::Exit(0)],
-        ))
+        .start(
+            c.quick_job(
+                new_identity(Environment::Live),
+                &[Step::Sleep(Duration::from_millis(30)), Step::Exit(0)],
+            )
+            .await?,
+        )
         .await?;
     c.wait_exit(&job, Duration::ZERO).await?;
     let usage = c.f.usage();
@@ -1311,6 +1740,8 @@ type BuilderCase = for<'a> fn(&'a dyn BuilderFixture) -> BoxFuture<'a, CaseResul
 pub const BUILDER_CASES: &[&str] = &[
     "build_makes_oci_image",
     "build_failure_is_typed",
+    "build_times_out",
+    "build_sees_no_platform_secrets",
     "build_unknown_runtime_refused",
     "build_invalid_input_refused",
     "build_gets_only_egress_and_its_limits",
@@ -1322,6 +1753,10 @@ const BUILDER_CASE_FNS: &[(&str, BuilderCase)] = &[
     }),
     ("build_failure_is_typed", |f| {
         Box::pin(build_failure_is_typed(f))
+    }),
+    ("build_times_out", |f| Box::pin(build_times_out(f))),
+    ("build_sees_no_platform_secrets", |f| {
+        Box::pin(build_sees_no_platform_secrets(f))
     }),
     ("build_unknown_runtime_refused", |f| {
         Box::pin(build_unknown_runtime_refused(f))
@@ -1336,12 +1771,17 @@ const BUILDER_CASE_FNS: &[(&str, BuilderCase)] = &[
 
 /// Runs every builder case and returns the report.
 pub async fn run_builder(f: &dyn BuilderFixture) -> Report {
+    run_builder_cases(f, BUILDER_CASES).await
+}
+
+/// Runs the named builder cases only (for debugging a builder; CI runs [`run_builder`]).
+pub async fn run_builder_cases(f: &dyn BuilderFixture, names: &[&str]) -> Report {
     let mut report = Report {
         suite: "runtime builder conformance",
         subject: f.builder().name().to_owned(),
         cases: Vec::new(),
     };
-    for (name, case) in BUILDER_CASE_FNS {
+    for (name, case) in BUILDER_CASE_FNS.iter().filter(|(n, _)| names.contains(n)) {
         let outcome = if let Some(reason) = f.skip(name) {
             Outcome::Skipped(reason)
         } else {
@@ -1406,6 +1846,57 @@ async fn build_failure_is_typed(f: &dyn BuilderFixture) -> CaseResult {
             .any(|r| matches!(r, RuntimeUsage::Build { identity, .. } if *identity == id)),
         "no build usage for the failed build"
     );
+    Ok(())
+}
+
+/// A build that runs longer than its timeout is ended: `build_timed_out` within the timeout
+/// and the fixture's wait, and its time is reported.
+async fn build_times_out(f: &dyn BuilderFixture) -> CaseResult {
+    let t = f.build_timing();
+    let mut input = build_input(f, f.slow_archive());
+    input.timeout = t.timeout;
+    let id = input.identity;
+    let builder = f.builder();
+    let r = tokio::time::timeout(t.timeout + t.wait, builder.build(input))
+        .await
+        .map_err(|_| {
+            fail(format!(
+                "the build still ran {:?} after its timeout of {:?}",
+                t.wait, t.timeout
+            ))
+        })?;
+    expect_err(r, "build_timed_out", "a build past its timeout")?;
+    let records = f.usage().records();
+    check!(
+        records
+            .iter()
+            .any(|r| matches!(r, RuntimeUsage::Build { identity, .. } if *identity == id)),
+        "no build usage for the timed-out build"
+    );
+    Ok(())
+}
+
+/// A build sees nothing of the builder's own environment and credentials: none of the values
+/// the fixture planted appears in the build's own report of its environment.
+async fn build_sees_no_platform_secrets(f: &dyn BuilderFixture) -> CaseResult {
+    let canaries = f.canaries();
+    check!(!canaries.is_empty(), "the fixture planted no canaries");
+    let out = f
+        .builder()
+        .build(build_input(f, f.env_dump_archive()))
+        .await
+        .map_err(|e| fail(format!("the build failed: {e}")))?;
+    let lines: Vec<&str> = out.logs.iter().map(|l| l.text.as_str()).collect();
+    check!(
+        lines.contains(&"env-dump:begin") && lines.contains(&"env-dump:end"),
+        "the build log has no environment report: {lines:?}"
+    );
+    for (i, canary) in canaries.iter().enumerate() {
+        check!(
+            !lines.iter().any(|l| l.contains(canary.as_str())),
+            "the build saw canary {i} of the builder's own secrets"
+        );
+    }
     Ok(())
 }
 

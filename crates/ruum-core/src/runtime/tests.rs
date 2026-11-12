@@ -1,8 +1,10 @@
 //! Tests of the runtime border: the conformance suites on the in-memory driver and builder,
 //! proof that the suite notices a broken driver, and the unit tests of the parts.
 
-use super::conformance::{self, BuilderFixture, DriverFixture, Outcome, Timing};
-use super::memory::{FAILING_ARCHIVE_MARKER, Faults};
+use super::conformance::{self, BuildTiming, BuilderFixture, DriverFixture, Outcome, Timing};
+use super::memory::{
+    BuilderFaults, ENV_DUMP_ARCHIVE_MARKER, FAILING_ARCHIVE_MARKER, Faults, SLOW_ARCHIVE_MARKER,
+};
 use super::program::{self, Step};
 use super::redact::{LineRedactor, MAX_LINE_BYTES, REDACTED, redact};
 use super::*;
@@ -16,26 +18,36 @@ struct Memory {
     usage: Arc<MemoryUsage>,
     driver: Arc<MemoryDriver>,
     builder: Arc<MemoryBuilder>,
+    canaries: Vec<String>,
     skip: Option<&'static str>,
 }
 
 impl Memory {
     fn new() -> Self {
-        Self::with_faults(Faults::default())
+        Self::with_faults(Faults::default(), BuilderFaults::default())
     }
 
-    fn with_faults(faults: Faults) -> Self {
+    fn with_faults(faults: Faults, builder_faults: BuilderFaults) -> Self {
         let registry = MemoryRegistry::new();
         let usage = Arc::new(MemoryUsage::new());
+        let canaries = vec![
+            format!("canary-registry-{}", Uuid::now_v7().simple()),
+            format!("canary-host-{}", Uuid::now_v7().simple()),
+        ];
         Self {
             driver: Arc::new(MemoryDriver::with_faults(
                 registry.clone(),
                 usage.clone(),
                 faults,
             )),
-            builder: Arc::new(MemoryBuilder::new(registry.clone(), usage.clone())),
+            builder: Arc::new(
+                MemoryBuilder::new(registry.clone(), usage.clone())
+                    .with_own_secrets(canaries.iter().map(SecretValue::new).collect())
+                    .with_faults(builder_faults),
+            ),
             registry,
             usage,
+            canaries,
             skip: None,
         }
     }
@@ -51,18 +63,13 @@ impl DriverFixture for Memory {
         self.usage.clone()
     }
 
-    async fn program_image(&self) -> Result<ImageRef, String> {
-        // The in-memory driver runs the conformance program in any image it has; the image
+    async fn program_image(&self, identity: &WorkloadIdentity) -> Result<ImageRef, String> {
+        // The in-memory driver runs the conformance program in any image of the app; the image
         // comes from the in-memory builder, so build and start meet here.
         let out = self
             .builder
             .build(BuildInput {
-                identity: WorkloadIdentity {
-                    tenant: TenantId::new(),
-                    app: NodeId::new(),
-                    deployment: Uuid::now_v7(),
-                    environment: Environment::Live,
-                },
+                identity: *identity,
                 runtime: "node22".to_owned(),
                 archive: Bytes::from_static(b"the conformance program"),
                 limits: Limits {
@@ -112,6 +119,29 @@ impl BuilderFixture for Memory {
         let mut a = b"an app archive whose build fails: ".to_vec();
         a.extend_from_slice(FAILING_ARCHIVE_MARKER);
         Bytes::from(a)
+    }
+
+    fn slow_archive(&self) -> Bytes {
+        let mut a = b"an app archive whose build is slow: ".to_vec();
+        a.extend_from_slice(SLOW_ARCHIVE_MARKER);
+        Bytes::from(a)
+    }
+
+    fn build_timing(&self) -> BuildTiming {
+        BuildTiming {
+            timeout: Duration::from_millis(50),
+            wait: Duration::from_secs(3),
+        }
+    }
+
+    fn env_dump_archive(&self) -> Bytes {
+        let mut a = b"an app archive that reports its environment: ".to_vec();
+        a.extend_from_slice(ENV_DUMP_ARCHIVE_MARKER);
+        Bytes::from(a)
+    }
+
+    fn canaries(&self) -> Vec<String> {
+        self.canaries.clone()
     }
 }
 
@@ -168,7 +198,7 @@ async fn a_skip_fails_when_ci_is_set() {
 
 /// Runs the named cases against a driver with a fault and returns the failed ones.
 async fn failed_with(faults: Faults, cases: &[&str]) -> Vec<&'static str> {
-    let f = Memory::with_faults(faults);
+    let f = Memory::with_faults(faults, BuilderFaults::default());
     let report = conformance::run_cases(&f, cases).await;
     report
         .cases
@@ -251,6 +281,83 @@ async fn the_suite_notices_missing_limits() {
     )
     .await;
     assert_eq!(failed, ["job_times_out", "memory_limit_enforced"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_suite_notices_tenant_blind_calls() {
+    let failed = failed_with(
+        Faults {
+            tenant_blind_calls: true,
+            ..Faults::default()
+        },
+        &["other_tenant_cannot_act"],
+    )
+    .await;
+    assert_eq!(failed, ["other_tenant_cannot_act"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_suite_notices_a_global_registry() {
+    let failed = failed_with(
+        Faults {
+            global_registry: true,
+            ..Faults::default()
+        },
+        &["image_of_another_app_refused"],
+    )
+    .await;
+    assert_eq!(failed, ["image_of_another_app_refused"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_suite_notices_a_cold_start_that_adds_a_route() {
+    let failed = failed_with(
+        Faults {
+            wake_adds_route: true,
+            ..Faults::default()
+        },
+        &["scale_to_zero_and_wake"],
+    )
+    .await;
+    assert_eq!(failed, ["scale_to_zero_and_wake"]);
+}
+
+/// Runs the named builder cases against a builder with a fault and returns the failed ones.
+async fn builder_failed_with(faults: BuilderFaults, cases: &[&str]) -> Vec<&'static str> {
+    let f = Memory::with_faults(Faults::default(), faults);
+    let report = conformance::run_builder_cases(&f, cases).await;
+    report
+        .cases
+        .iter()
+        .filter(|c| matches!(c.outcome, Outcome::Failed(_)))
+        .map(|c| c.name)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_suite_notices_a_builder_that_leaks_its_secrets() {
+    let failed = builder_failed_with(
+        BuilderFaults {
+            leak_host_secrets: true,
+            ..BuilderFaults::default()
+        },
+        &["build_sees_no_platform_secrets"],
+    )
+    .await;
+    assert_eq!(failed, ["build_sees_no_platform_secrets"]);
+}
+
+#[tokio::test]
+async fn the_suite_notices_a_builder_without_a_timeout() {
+    let failed = builder_failed_with(
+        BuilderFaults {
+            no_timeout: true,
+            ..BuilderFaults::default()
+        },
+        &["build_times_out"],
+    )
+    .await;
+    assert_eq!(failed, ["build_times_out"]);
 }
 
 // ------------------------------------------------------------------------------ the trait
@@ -406,8 +513,10 @@ fn program_steps_read_back() {
         Step::Print("a: b".into()),
         Step::Write("x".into()),
         Step::Stderr("e".into()),
+        Step::StderrWrite("e2".into()),
         Step::Env("NAME".into()),
         Step::Token,
+        Step::TokenSha,
         Step::Sleep(Duration::from_millis(15)),
         Step::Exit(-1),
         Step::Serve,
@@ -418,22 +527,34 @@ fn program_steps_read_back() {
     let cmd = program::command(&steps);
     let back: Vec<Step> = cmd.iter().map(|a| Step::parse(a).unwrap()).collect();
     assert_eq!(back, steps);
-    for bad in ["", "nope", "sleep:x", "exit", "env:", "serve:1"] {
+    for bad in [
+        "",
+        "nope",
+        "sleep:x",
+        "exit",
+        "env:",
+        "serve:1",
+        "token-sha:1",
+    ] {
         assert!(Step::parse(bad).is_none(), "{bad}");
     }
+    let sha = program::token_sha("a-token");
+    assert!(sha.starts_with("token-sha:") && sha.len() == "token-sha:".len() + 16);
+    assert_ne!(sha, program::token_sha("another-token"));
 }
 
 #[tokio::test]
 async fn the_memory_driver_refuses_an_unknown_step() {
     let f = Memory::new();
-    let image = f.program_image().await.unwrap();
+    let identity = WorkloadIdentity {
+        tenant: TenantId::new(),
+        app: NodeId::new(),
+        deployment: Uuid::now_v7(),
+        environment: Environment::Live,
+    };
+    let image = f.program_image(&identity).await.unwrap();
     let spec = WorkloadSpec {
-        identity: WorkloadIdentity {
-            tenant: TenantId::new(),
-            app: NodeId::new(),
-            deployment: Uuid::now_v7(),
-            environment: Environment::Live,
-        },
+        identity,
         kind: WorkloadKind::Job(JobSpec {
             timeout: Duration::from_secs(1),
         }),
@@ -451,10 +572,14 @@ async fn the_memory_driver_refuses_an_unknown_step() {
     };
     let err = f.driver.start(spec).await.unwrap_err();
     assert_eq!(err.code(), "invalid_spec");
-    assert!(
-        f.registry
-            .contains(&OciDigest::of(b"the conformance program"))
-    );
+    let digest = OciDigest::of(b"the conformance program");
+    assert!(f.registry.contains(&identity, &digest));
+    // The repository is the app's: another app of the tenant does not have the image.
+    let other_app = WorkloadIdentity {
+        app: NodeId::new(),
+        ..identity
+    };
+    assert!(!f.registry.contains(&other_app, &digest));
 }
 
 // ------------------------------------------------------------------------------ redaction
@@ -554,4 +679,143 @@ fn a_long_line_is_let_out_in_redacted_pieces() {
     out.extend(texts(r.finish(at())));
     assert!(out.len() > 1, "a long line was never let out");
     assert!(out.iter().all(|l| !l.contains(secret)));
+}
+
+#[test]
+fn an_added_value_split_at_every_byte_is_redacted() {
+    let new = "renewed-token-0123456789";
+    let text = format!("a {new} b\n");
+    for split in 1..text.len() {
+        let mut r = LineRedactor::new(["first-token"]);
+        let mut lines = texts(r.push(&text[..split], at()));
+        r.add(new);
+        lines.extend(texts(r.push(&text[split..], at())));
+        lines.extend(texts(r.finish(at())));
+        assert_eq!(lines, vec![format!("a {REDACTED} b")], "split at {split}");
+    }
+}
+
+#[test]
+fn a_multibyte_value_split_at_every_byte_is_redacted() {
+    let secret = "pässwörd-€-日本";
+    let text = format!("x {secret} y\n");
+    let bytes = text.as_bytes();
+    for split in 1..bytes.len() {
+        let mut r = LineRedactor::new([secret]);
+        let mut lines = texts(r.push_bytes(&bytes[..split], at()));
+        lines.extend(texts(r.push_bytes(&bytes[split..], at())));
+        lines.extend(texts(r.finish(at())));
+        assert_eq!(lines, vec![format!("x {REDACTED} y")], "split at {split}");
+    }
+    // Bytes that are not UTF-8 become U+FFFD and do not stop the output.
+    let mut r = LineRedactor::new([secret]);
+    let lines = texts(r.push_bytes(b"a\xffb\n", at()));
+    assert_eq!(lines, vec!["a\u{FFFD}b".to_owned()]);
+    // An unfinished character at the end comes out at finish.
+    assert!(r.push_bytes(&"é".as_bytes()[..1], at()).is_empty());
+    assert_eq!(texts(r.finish(at())), vec!["\u{FFFD}".to_owned()]);
+}
+
+#[test]
+fn a_value_the_marker_rebuilds_hides_the_line() {
+    // "secret>xx" becomes "<hidden secret>x", which holds "secret>x" again.
+    let value = "secret>x";
+    assert_eq!(redact("a secret>x b", &[value]), format!("a {REDACTED} b"));
+    assert_eq!(redact("a secret>xx b", &[value]), REDACTED);
+    let mut r = LineRedactor::new([value]);
+    let mut lines = texts(r.push("ok\nsecret>xx\n", at()));
+    lines.extend(texts(r.finish(at())));
+    assert_eq!(lines, vec!["ok".to_owned(), REDACTED.to_owned()]);
+}
+
+#[test]
+fn one_byte_writes_without_a_line_end_cost_linear_time() {
+    // A hostile app writes 256 KiB one byte at a time, with no line end, while 50 values are
+    // redacted. The redactor must stay linear (each push scanned the whole held-back line
+    // again before review R-1 item 3, which was quadratic).
+    let values: Vec<String> = (0..50)
+        .map(|i| format!("v{i:02}-{}", Uuid::now_v7().simple()))
+        .collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    let mut text = String::new();
+    let mut i = 0;
+    while text.len() < 256 * 1024 {
+        text.push_str(&"x".repeat(997));
+        text.push_str(&values[i % values.len()]);
+        i += 1;
+    }
+    let mut r = LineRedactor::new(refs.iter().copied());
+    let begun = std::time::Instant::now();
+    let mut out = Vec::new();
+    for b in text.as_bytes() {
+        out.extend(texts(r.push(std::str::from_utf8(&[*b]).unwrap(), at())));
+    }
+    out.extend(texts(r.finish(at())));
+    let took = begun.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "256 KiB in one-byte writes took {took:?}"
+    );
+    assert!(out.len() > 1, "the long line was never let out");
+    assert_eq!(out.concat(), redact(&text, &refs));
+    assert!(
+        values
+            .iter()
+            .all(|v| out.iter().all(|l| !l.contains(v.as_str())))
+    );
+}
+
+#[test]
+fn streaming_redaction_matches_whole_text_redaction() {
+    // Random texts and values over a small alphabet (with line ends, so values can hold them),
+    // cut into random pieces, with a value added by `add` now and then: the lines must be
+    // those of redacting the whole text at once. The marker holds no `a` or `b`, so it never
+    // rebuilds a value here.
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let alphabet = ['a', 'b', 'a', 'b', '\n'];
+    for round in 0..3000 {
+        let mut word = |len: u64| -> String {
+            (0..len)
+                .map(|_| alphabet[next(alphabet.len() as u64) as usize])
+                .collect()
+        };
+        let values: Vec<String> = (0..1 + round % 4)
+            .map(|_| word(1 + (round as u64 * 7 + 3) % 6))
+            .filter(|v| v != "\n")
+            .collect();
+        let added = word(2 + round as u64 % 5);
+        let text = word(5 + round as u64 % 60);
+        let add_at = if round % 3 == 0 { Some(0) } else { None };
+        let mut refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        if add_at.is_some() {
+            refs.push(added.as_str());
+        }
+        let whole = redact(&text, &refs);
+        let whole = whole.strip_suffix('\n').unwrap_or(&whole);
+        let want: Vec<String> = if text.is_empty() {
+            Vec::new()
+        } else {
+            whole.split('\n').map(str::to_owned).collect()
+        };
+        let mut r = LineRedactor::new(values.iter().map(String::as_str));
+        if add_at.is_some() {
+            r.add(&added);
+        }
+        let mut lines = Vec::new();
+        let mut at_byte = 0;
+        while at_byte < text.len() {
+            let n = 1 + next(5) as usize;
+            let end = (at_byte + n).min(text.len());
+            lines.extend(texts(r.push(&text[at_byte..end], at())));
+            at_byte = end;
+        }
+        lines.extend(texts(r.finish(at())));
+        assert_eq!(lines, want, "round {round}: text {text:?}, values {refs:?}");
+    }
 }
