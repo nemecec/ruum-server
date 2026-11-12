@@ -202,6 +202,9 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         DatabaseGrantRevoked => None,
         // Only a person decides an approval (card A-2); an agent never wrote one.
         DatabaseApprovalDecided => None,
+        // `app.settings_changed` names the new values only, so there is no old value to set
+        // back (card W-1); an agent can only lower the settings anyway.
+        AppSettingsChanged => None,
     }
 }
 

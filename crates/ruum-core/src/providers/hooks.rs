@@ -39,9 +39,7 @@ impl TypedHooks for RegistryHooks {
         if !self.registry.wants_hook(type_name, hook) {
             return None;
         }
-        self.registry
-            .provider_id_for_type(type_name)
-            .map(str::to_string)
+        self.registry.provider_id_for_type(type_name)
     }
 
     async fn check_new_typed(&self, ctx: &Context, type_name: &str) -> Result<()> {

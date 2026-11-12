@@ -14,11 +14,21 @@
 use super::{Feature, HookKind, Provider, ProviderDescriptor, TypeDescriptor, bad_request};
 use crate::error::Result;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// The registered providers, by provider ID and by node type.
+///
+/// The registry is shared (`Arc`) by the node store's hooks, the delivery worker and the
+/// reconciler, and areas built after it register their first-party provider into the same
+/// registry ([`ProviderRegistry::register_shared`], card W-1: `ruum.webapp` after
+/// `ruum.database`), so the rows sit behind a lock.
 #[derive(Default)]
 pub struct ProviderRegistry {
+    inner: RwLock<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
     providers: BTreeMap<String, Registered>,
     /// node type -> provider ID
     types: BTreeMap<String, String>,
@@ -29,15 +39,8 @@ struct Registered {
     descriptor: ProviderDescriptor,
 }
 
-impl ProviderRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers a first-party provider (in the server process). Fails with `bad_request` when
-    /// the descriptor breaks a rule of the contract, the provider ID is taken, or a type
-    /// belongs to another provider. Nothing changes on failure.
-    pub fn register(&mut self, provider: Arc<dyn Provider>) -> Result<()> {
+impl Inner {
+    fn add(&mut self, provider: Arc<dyn Provider>, replace: bool) -> Result<()> {
         let descriptor = provider.descriptor();
         check_descriptor(&descriptor)?;
         if descriptor.base_url.is_some() {
@@ -46,18 +49,25 @@ impl ProviderRegistry {
                 descriptor.id
             )));
         }
-        if self.providers.contains_key(&descriptor.id) {
+        if self.providers.contains_key(&descriptor.id) && !replace {
             return Err(bad_request(format!(
                 "provider {} is already registered",
                 descriptor.id
             )));
         }
         for t in &descriptor.types {
-            if let Some(owner) = self.types.get(&t.type_name) {
+            if let Some(owner) = self.types.get(&t.type_name)
+                && *owner != descriptor.id
+            {
                 return Err(bad_request(format!(
                     "type {} already belongs to provider {owner}",
                     t.type_name
                 )));
+            }
+        }
+        if let Some(old) = self.providers.remove(&descriptor.id) {
+            for t in &old.descriptor.types {
+                self.types.remove(&t.type_name);
             }
         }
         for t in &descriptor.types {
@@ -74,28 +84,7 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// The provider with this ID.
-    pub fn provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
-        self.providers.get(id).map(|r| r.provider.clone())
-    }
-
-    /// The descriptor of the provider with this ID, as it was registered.
-    pub fn descriptor(&self, id: &str) -> Option<&ProviderDescriptor> {
-        self.providers.get(id).map(|r| &r.descriptor)
-    }
-
-    /// The provider that owns a node type.
-    pub fn for_type(&self, type_name: &str) -> Option<Arc<dyn Provider>> {
-        self.types.get(type_name).and_then(|id| self.provider(id))
-    }
-
-    /// The ID of the provider that owns a node type.
-    pub fn provider_id_for_type(&self, type_name: &str) -> Option<&str> {
-        self.types.get(type_name).map(String::as_str)
-    }
-
-    /// The type descriptor of a node type.
-    pub fn type_descriptor(&self, type_name: &str) -> Option<&TypeDescriptor> {
+    fn type_descriptor(&self, type_name: &str) -> Option<&TypeDescriptor> {
         let id = self.types.get(type_name)?;
         self.providers
             .get(id)?
@@ -103,43 +92,117 @@ impl ProviderRegistry {
             .type_descriptor(type_name)
     }
 
+    fn registered_for(&self, type_name: &str) -> Option<&Registered> {
+        self.types
+            .get(type_name)
+            .and_then(|id| self.providers.get(id))
+    }
+}
+
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Registers a first-party provider (in the server process). Fails with `bad_request` when
+    /// the descriptor breaks a rule of the contract, the provider ID is taken, or a type
+    /// belongs to another provider. Nothing changes on failure.
+    pub fn register(&mut self, provider: Arc<dyn Provider>) -> Result<()> {
+        self.inner
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(provider, false)
+    }
+
+    /// Registers a first-party provider into a registry that is already shared, under the
+    /// rules of [`ProviderRegistry::register`], except that a provider with the same ID is
+    /// replaced (an area installed again over new stores). Nothing changes on failure.
+    pub fn register_shared(&self, provider: Arc<dyn Provider>) -> Result<()> {
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(provider, true)
+    }
+
+    /// The provider with this ID.
+    pub fn provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
+        self.read().providers.get(id).map(|r| r.provider.clone())
+    }
+
+    /// The descriptor of the provider with this ID, as it was registered.
+    pub fn descriptor(&self, id: &str) -> Option<ProviderDescriptor> {
+        self.read().providers.get(id).map(|r| r.descriptor.clone())
+    }
+
+    /// The provider that owns a node type.
+    pub fn for_type(&self, type_name: &str) -> Option<Arc<dyn Provider>> {
+        self.read()
+            .registered_for(type_name)
+            .map(|r| r.provider.clone())
+    }
+
+    /// The ID of the provider that owns a node type.
+    pub fn provider_id_for_type(&self, type_name: &str) -> Option<String> {
+        self.read().types.get(type_name).cloned()
+    }
+
+    /// The type descriptor of a node type.
+    pub fn type_descriptor(&self, type_name: &str) -> Option<TypeDescriptor> {
+        self.read().type_descriptor(type_name).cloned()
+    }
+
     /// The only child types a node of this type may have. Empty for an unknown type.
-    pub fn child_types(&self, type_name: &str) -> &[String] {
-        self.type_descriptor(type_name)
-            .map(|t| t.child_types.as_slice())
-            .unwrap_or(&[])
+    pub fn child_types(&self, type_name: &str) -> Vec<String> {
+        self.read()
+            .type_descriptor(type_name)
+            .map(|t| t.child_types.clone())
+            .unwrap_or_default()
     }
 
     /// True when a node of type `child` may be a child of a node of type `parent`.
     pub fn allows_child(&self, parent: &str, child: &str) -> bool {
-        self.child_types(parent).iter().any(|c| c == child)
+        self.read()
+            .type_descriptor(parent)
+            .is_some_and(|t| t.child_types.iter().any(|c| c == child))
     }
 
     /// True when the provider of this type wants the hook. The platform sends no delivery of
     /// a hook the provider did not ask for.
     pub fn wants_hook(&self, type_name: &str, hook: HookKind) -> bool {
-        self.types
-            .get(type_name)
-            .and_then(|id| self.providers.get(id))
+        self.read()
+            .registered_for(type_name)
             .is_some_and(|r| r.descriptor.wants_hook(hook))
     }
 
     /// True when the provider of this type has the feature.
     pub fn has_feature(&self, type_name: &str, feature: Feature) -> bool {
-        self.types
-            .get(type_name)
-            .and_then(|id| self.providers.get(id))
+        self.read()
+            .registered_for(type_name)
             .is_some_and(|r| r.descriptor.has_feature(feature))
     }
 
     /// The registered provider IDs, sorted.
-    pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
-        self.providers.keys().map(String::as_str)
+    pub fn provider_ids(&self) -> std::vec::IntoIter<String> {
+        self.read()
+            .providers
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// The registered node types, sorted.
-    pub fn type_names(&self) -> impl Iterator<Item = &str> {
-        self.types.keys().map(String::as_str)
+    pub fn type_names(&self) -> std::vec::IntoIter<String> {
+        self.read()
+            .types
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
@@ -252,7 +315,10 @@ mod tests {
         r.register(memory()).unwrap();
         let id = MemoryProvider::ID;
         assert!(r.provider(id).is_some());
-        assert_eq!(r.provider_id_for_type(MemoryProvider::TYPE), Some(id));
+        assert_eq!(
+            r.provider_id_for_type(MemoryProvider::TYPE).as_deref(),
+            Some(id)
+        );
         assert!(r.for_type(MemoryProvider::TYPE).is_some());
         assert!(r.for_type("database").is_none());
         assert!(r.allows_child(MemoryProvider::TYPE, MemoryProvider::CHILD_TYPE));
@@ -275,6 +341,22 @@ mod tests {
         other.id = "other.provider".into();
         let err = check_and_register(&mut r, other).unwrap_err();
         assert!(err.to_string().contains("already belongs"), "{err}");
+    }
+
+    /// A shared registry takes a provider later; the same ID replaces, a taken type does not.
+    #[test]
+    fn registers_into_a_shared_registry() {
+        let r = Arc::new(ProviderRegistry::new());
+        r.register_shared(memory()).unwrap();
+        r.register_shared(memory()).unwrap();
+        assert_eq!(r.provider_ids().count(), 1);
+        assert!(r.for_type(MemoryProvider::TYPE).is_some());
+        let mut other = memory().descriptor();
+        other.id = "other.provider".into();
+        let p = MemoryProvider::with_descriptor(Arc::new(MemoryPlatform::new()), other);
+        let err = r.register_shared(Arc::new(p)).unwrap_err();
+        assert!(err.to_string().contains("already belongs"), "{err}");
+        assert_eq!(r.provider_ids().count(), 1);
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub enum EventType {
     DatabaseGrantRevoked,
     #[serde(rename = "database.approval_decided")]
     DatabaseApprovalDecided,
+    #[serde(rename = "app.settings_changed")]
+    AppSettingsChanged,
 }
 
 impl EventType {
@@ -107,6 +109,7 @@ impl EventType {
         EventType::DatabaseGrantCreated,
         EventType::DatabaseGrantRevoked,
         EventType::DatabaseApprovalDecided,
+        EventType::AppSettingsChanged,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -135,6 +138,7 @@ impl EventType {
             DatabaseGrantCreated => "database.grant_created",
             DatabaseGrantRevoked => "database.grant_revoked",
             DatabaseApprovalDecided => "database.approval_decided",
+            AppSettingsChanged => "app.settings_changed",
         }
     }
 
@@ -456,7 +460,10 @@ mod tests {
                     || *e == EventType::DatabaseApprovalDecided
                     // Only a person confirms classes (`confirmColumnClasses` is users only), so
                     // `undoAgent` never meets this entry among an agent's changes.
-                    || *e == EventType::DatabaseColumnsConfirmed,
+                    || *e == EventType::DatabaseColumnsConfirmed
+                    // The entry names the new settings only (its schema), so there is nothing
+                    // to set back; an agent can only lower settings anyway.
+                    || *e == EventType::AppSettingsChanged,
                 "{e:?} has no inverse"
             );
         }

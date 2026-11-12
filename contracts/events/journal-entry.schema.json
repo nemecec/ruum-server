@@ -1094,7 +1094,6 @@
         "app.deployed",
         "app.deployment_failed",
         "app.rolled_back",
-        "app.settings_changed",
         "app.binding_granted",
         "app.binding_revoked",
         "app.role_granted",

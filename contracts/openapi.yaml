@@ -4574,7 +4574,6 @@ paths:
       tags: [apps]
       operationId: createApp
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: Create a web app node
       description: |
         Creates a typed node of type `webapp` (provider `ruum.webapp`, design sections 7.1 and
@@ -4634,7 +4633,6 @@ paths:
       tags: [apps]
       operationId: getApp
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: Get a web app with its status
       description: |
         The node, the settings, the live deployment (its manifest, resolved bindings and
@@ -4665,7 +4663,6 @@ paths:
       tags: [apps]
       operationId: updateAppSettings
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: Change the settings of a web app
       description: |
         Changes the settings that are not in the archive: `access`, the telemetry mode (`privacy`
@@ -4714,7 +4711,6 @@ paths:
       tags: [apps]
       operationId: listAppDeployments
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: List the deployments of a web app
       description: |
         Previews and live deployments, newest first. Needs `view`. Each live deployment is a
@@ -4827,7 +4823,6 @@ paths:
       tags: [apps]
       operationId: getAppDeployment
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: One deployment with its stages and check result
       description: |
         The stages, the resolved bindings, the migrations it ran, the result of the post-deploy
