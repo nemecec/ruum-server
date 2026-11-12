@@ -9968,7 +9968,7 @@ components:
         statement:
           x-ruum-content-trust: untrusted
           type: [string, 'null']
-          description: 'The statement, or the migration''s `up`; `null` for a grant request.'
+          description: 'The statement, normalized (every literal replaced by `$L1`, `$L2`, ..., comments removed); for a migration, the `up` as sent to a person with `manage` on the database and normalized for everyone else (decision 0004-40); `null` for a grant request.'
         migration_name:
           x-ruum-content-trust: untrusted
           type: [string, 'null']

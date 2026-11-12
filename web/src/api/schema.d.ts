@@ -6323,7 +6323,7 @@ export interface components {
             node_id: components["schemas"]["Uuid"];
             subject: components["schemas"]["ApprovalSubject"];
             status: components["schemas"]["ApprovalStatus"];
-            /** @description The statement, or the migration's `up`; `null` for a grant request. */
+            /** @description The statement, normalized (every literal replaced by `$L1`, `$L2`, ..., comments removed); for a migration, the `up` as sent to a person with `manage` on the database and normalized for everyone else (decision 0004-40); `null` for a grant request. */
             statement: string | null;
             /** @description The name of the migration (`subject: migration`), else `null`. */
             migration_name: string | null;

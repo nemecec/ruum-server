@@ -359,6 +359,32 @@ fn status_reads_expired_past_its_time_except_an_approved_grant() {
     assert_eq!(d.status_at(later), ApprovalStatus::Denied);
 }
 
+/// Decision 0004-40 b: a migration `up` that does not parse is never shown raw, and nor is
+/// one whose engine is not known; a manager reads it as stored; a statement approval is not
+/// changed.
+#[test]
+fn a_migration_up_that_does_not_parse_is_shown_as_unparsed() {
+    let at = crate::now();
+    let raw = "create tabel plants ('Mari Tamm'";
+    for engine in [Some(EngineKind::Postgres), Some(EngineKind::Sqlite), None] {
+        let mut a = sample(ApprovalSubject::Migration, ApprovalStatus::Pending, at);
+        a.statement = Some(raw.into());
+        shown_statement(&mut a, engine, false);
+        assert_eq!(a.statement.as_deref(), Some("<unparsed statement>"));
+    }
+    let mut a = sample(ApprovalSubject::Migration, ApprovalStatus::Pending, at);
+    a.statement = Some(raw.into());
+    shown_statement(&mut a, Some(EngineKind::Postgres), true);
+    assert_eq!(a.statement.as_deref(), Some(raw));
+    let mut a = sample(ApprovalSubject::Migration, ApprovalStatus::Pending, at);
+    a.statement = Some("create table t (a text default 'Mari Tamm')".into());
+    shown_statement(&mut a, None, false);
+    assert_eq!(a.statement.as_deref(), Some("<unparsed statement>"));
+    let mut a = sample(ApprovalSubject::Statement, ApprovalStatus::Pending, at);
+    shown_statement(&mut a, Some(EngineKind::Sqlite), false);
+    assert_eq!(a.statement.as_deref(), Some("delete from t"));
+}
+
 #[test]
 fn the_view_shows_markers_and_no_hash() {
     let now = crate::now();
@@ -1481,6 +1507,183 @@ async fn statements_and_migrations_wait_for_a_person() {
         took.planned_columns[0].decided_class,
         Some(DataClass::Personal)
     );
+}
+
+/// A database under the team's root with `engine`, ready; Bob gets `view` on it only.
+async fn database_with_viewer(w: &World, name: &str, engine: EngineKind) -> NodeId {
+    let a = ctx(w.team.id, w.alice);
+    let manifest = match engine {
+        EngineKind::Postgres => {
+            json!({ "engine": "postgres", "version": "17", "plan": "shared-small" })
+        }
+        EngineKind::Sqlite => json!({ "engine": "sqlite", "version": "3", "plan": "shared-small" }),
+    };
+    let id =
+        w.s.databases
+            .create(
+                &a,
+                CreateDatabase {
+                    parent_id: w.team.root_node_id,
+                    name: name.into(),
+                    manifest,
+                    source: None,
+                    on_conflict: OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .node
+            .id;
+    assert_eq!(
+        settled(&w.s, &a, id).await.status.state,
+        ProviderState::Ready
+    );
+    w.s.sharing
+        .add_grant(&a, id, Grantee::User { id: w.bob }, Role::View)
+        .await
+        .unwrap();
+    id
+}
+
+/// The marker texts of a migration `up`, one per kind of literal and the comment.
+const UP_MARKERS: [&str; 5] = [
+    "MarkerString",
+    "424242",
+    "MarkerFunctionBody",
+    "MarkerComment",
+    "MarkerInsert",
+];
+
+fn marker_up(engine: EngineKind) -> String {
+    match engine {
+        EngineKind::Postgres => "create table plants (id int primary key, \
+             name text default 'MarkerString', qty int default 424242);\n\
+             -- MarkerComment\n\
+             create function plant_note() returns text as $$ select 'MarkerFunctionBody' $$ \
+             language sql;\n\
+             insert into plants (id, name) values (7, 'MarkerInsert');"
+            .to_string(),
+        EngineKind::Sqlite => "create table plants (id integer primary key, \
+             name text default 'MarkerString', qty integer default 424242);\n\
+             -- MarkerComment\n\
+             insert into plants (id, name) values (7, 'MarkerInsert');"
+            .to_string(),
+    }
+}
+
+/// `true` when `a` shows the `up` normalized: no marker text anywhere in the view, and `$L1`.
+fn shows_normalized(a: &DatabaseApproval) -> bool {
+    let text = a.view("https://ruum.localhost", crate::now()).to_string();
+    let statement = a.statement.clone().unwrap_or_default();
+    UP_MARKERS.iter().all(|m| !text.contains(m)) && statement.contains("$L1")
+}
+
+/// Decision 0004-40 (backlog S-29): the `up` of an agent's migration approval is shown as sent
+/// only to a person with `manage` (Alice); the agent that asked and a person with `view` only
+/// (Bob) read it normalized, through get, list and the waiting list; the response of Alice's
+/// decision shows it in full. On both engines (a dollar-quoted function body on Postgres).
+#[tokio::test]
+async fn a_migration_up_is_shown_in_full_only_to_managers() {
+    let w = world().await;
+    let s = &w.s;
+    let db = &s.databases;
+    let alice = ctx(w.team.id, w.alice);
+    let bob = ctx(w.team.id, w.bob);
+    let alices = agent_of(&w, w.alice, Role::Manage, None).await;
+    let ac = agent_ctx(&alices);
+    for engine in [EngineKind::Postgres, EngineKind::Sqlite] {
+        let node =
+            database_with_viewer(&w, &format!("garden-{engine:?}").to_lowercase(), engine).await;
+        let row = db.deps().store.get(w.team.id, node).await.unwrap().unwrap();
+        let up = marker_up(engine);
+        let (m, _) = db
+            .request_migration(&ac, &row, "0002_add_plants", &up, &HashMap::new())
+            .await
+            .unwrap();
+        // The store keeps the `up` as sent (0004-40 d); the agent's answer is normalized.
+        let stored = db
+            .deps()
+            .approvals
+            .get(w.team.id, node, m.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.statement.as_deref(), Some(up.as_str()));
+        assert!(
+            shows_normalized(&m),
+            "{engine:?}: request answer {:?}",
+            m.statement
+        );
+
+        // (1) the agent that asked and (2) a person with view only: normalized.
+        for (who, c) in [("agent", &ac), ("viewer", &bob)] {
+            let got = db.get_approval(c, node, m.id).await.unwrap();
+            assert!(
+                shows_normalized(&got),
+                "{engine:?}: get as {who}: {:?}",
+                got.statement
+            );
+            let page = db
+                .list_approvals(c, node, None, PageRequest::default())
+                .await
+                .unwrap();
+            let listed = page.items.iter().find(|a| a.id == m.id).expect("listed");
+            assert!(
+                shows_normalized(listed),
+                "{engine:?}: list as {who}: {:?}",
+                listed.statement
+            );
+        }
+        let waiting = db
+            .list_pending_approvals(&ac, None, PageRequest::default())
+            .await
+            .unwrap();
+        let mine = waiting.items.iter().find(|a| a.id == m.id).expect("waits");
+        assert!(
+            shows_normalized(mine),
+            "{engine:?}: waiting list as agent: {:?}",
+            mine.statement
+        );
+        // A person with view only may not decide a migration: not on their list.
+        let bobs_list = db
+            .list_pending_approvals(&bob, None, PageRequest::default())
+            .await
+            .unwrap();
+        assert!(bobs_list.items.iter().all(|a| a.id != m.id));
+
+        // (3) a person with manage: the `up` byte-equal to what was sent.
+        let got = db.get_approval(&alice, node, m.id).await.unwrap();
+        assert_eq!(got.statement.as_deref(), Some(up.as_str()));
+        let page = db
+            .list_approvals(&alice, node, None, PageRequest::default())
+            .await
+            .unwrap();
+        let listed = page.items.iter().find(|a| a.id == m.id).expect("listed");
+        assert_eq!(listed.statement.as_deref(), Some(up.as_str()));
+        let waiting = db
+            .list_pending_approvals(&alice, None, PageRequest::default())
+            .await
+            .unwrap();
+        let theirs = waiting.items.iter().find(|a| a.id == m.id).expect("waits");
+        assert_eq!(theirs.statement.as_deref(), Some(up.as_str()));
+
+        // The response of Alice's decision shows the full `up`; afterwards the agent still
+        // reads it normalized.
+        let decided = db
+            .decide_approval(
+                &alice,
+                &*s.agents,
+                node,
+                m.id,
+                decide_req(DecisionKind::Approve, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decided.value.statement.as_deref(), Some(up.as_str()));
+        let after = db.get_approval(&ac, node, m.id).await.unwrap();
+        assert!(shows_normalized(&after), "{engine:?}: after the decision");
+    }
 }
 
 /// `listPendingDatabaseApprovals` and `listDatabaseApprovals` on the in-memory services.
