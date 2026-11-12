@@ -288,6 +288,49 @@ alternative, but thousands of realms are hard to run; its newer "organizations" 
   for MCP clients), personal access tokens with scopes, and token exchange (RFC 8693) when an app
   calls the platform on behalf of a user.
 
+#### 4.2.1 Emails and sign-in methods of one account (decision 41)
+
+One person, one account, however many addresses and sign-in methods they use. Without this, a
+person who signs in once with Google (a Gmail address) and once with Microsoft (a work address)
+gets two separate accounts, and a share to the work address never reaches the Gmail account
+(seen in the first staging sign-in test, 2026-11-12).
+
+**Several verified emails per account.**
+
+- An account has one or more email addresses. Each has a state: `verified` or `pending`. One
+  verified address is the **primary**; notifications go there.
+- To add an address, the signed-in person enters it; Ruum sends a one-time code (or link) to that
+  address, valid for 15 minutes, five attempts. The address is verified when the code comes back
+  from the same signed-in session. A trusted provider's verified email (Google, an employer IdP
+  with a verified domain) is verified without a code.
+- A verified address belongs to at most one account. If another account already verified it, the
+  person is told so and nothing changes; the two people can merge accounts only by signing in to
+  both (a later feature). Pending addresses never block anyone.
+- Shares, invitations and email grants to any verified address of an account reach that account
+  (the binding rule of `crates/ruum-core/src/identity` is per address, not per account).
+- Removing an address: allowed while another verified address remains; it does not remove access
+  that was already granted to the account. Removing the primary needs another primary first.
+- The person sees every address and its state in the account settings; adding and removing are
+  audit events, and Ruum emails the primary address when an address is added.
+
+**"Add a way to sign in".**
+
+- In the account settings, the signed-in person chooses **Add a way to sign in** (Google,
+  Microsoft, a passkey, later Apple and the employer's SSO). Ruum starts a sign-in with that
+  provider in "link" mode; when it comes back, the new identity joins the current account.
+- Linking needs a fresh sign-in to the current account (within the last 10 minutes), so a stolen
+  session alone cannot add an attacker's identity.
+- An identity that already belongs to another account is not moved; the person is told which
+  provider it is and nothing changes.
+- The provider's email, if verified by a trusted provider, is added as a verified address; an
+  unverified provider email is added as `pending` (the person can verify it with a code).
+- Removing a sign-in method: allowed while at least one other remains. Adding and removing are
+  audit events, and Ruum emails the primary address.
+- This replaces Zitadel's "External User Not Found" page with Link and Register: a sign-in from an
+  unknown identity creates the account automatically (Zitadel's auto-creation), and joining
+  accounts happens only through this signed-in action. The rule above stays: never link by an
+  email that no trusted provider and no code verified.
+
 ### 4.3 Plans and limits
 
 A first proposal. The numbers are configuration, not code, so they can change at any time. They are
@@ -1858,6 +1901,10 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
     then OpenAI Codex inside Ruum soon after, for non-technical ChatGPT users.*
 40. **Default federation policy** (section 7.5). *Decided 2026-11-06: off for team tenants until an
     admin turns it on; personal accounts can turn it on themselves.*
+41. **Several emails and sign-in methods per account** (section 4.2.1). *Decided 2026-11-12: yes.
+    Several verified email addresses per account (code to the address, one primary), and "Add a
+    way to sign in" by the signed-in person; Zitadel creates accounts automatically, and accounts
+    are joined only by that signed-in action.*
 
 ## 18. How to build Ruum with a swarm of AI agents
 
