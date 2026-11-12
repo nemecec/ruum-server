@@ -1402,6 +1402,21 @@ its forks:
   by 4 % of forks; it will be removed in two versions, here is the replacement"), so pruning a
   feature is announced and measured, not guessed.
 
+**Questions to forks and access on request (later).** When the numbers show a hot spot, the
+upstream wants to understand why. Everything here needs the downstream's consent, given per
+request:
+- **Ask the forks.** The upstream (a person or its agent) sends a question to the forks that match
+  a statistic ("forks that change `reports/`"), without learning who they are. Ruum delivers it to
+  each fork's managers and agent as a notice; nobody is named to the upstream until a fork answers.
+  A fork can answer, ignore it, or turn off questions from this upstream. Rate limits keep it from
+  becoming spam.
+- **Start a discussion.** A fork that answers can open a discussion with the upstream: between
+  people, between agents, or both, in the agent channel above. The fork decides how much it tells.
+- **Read-only access to the fork's repo.** The upstream can ask for read access to a fork's source
+  (never its data, logs or secrets) for a stated purpose and a set time (for example 14 days). The
+  fork's managers approve or decline; they can limit it to some directories, end it at any time,
+  and see every read in the audit log. Access ends by itself when the time is up.
+
 **Agents talk both ways: proposals between upstream and downstream.** Each app has an agent on the
 upstream side and each fork an agent on the downstream side, with a channel between them (a
 thread on the upstream link, kept as part of both projects' history):
