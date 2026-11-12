@@ -108,8 +108,8 @@ fn log_visibility_follows_the_caller() {
 #[test]
 fn engine_errors_are_sanitized_without_manage() {
     let problem = |e: EngineError, manage: bool| match engine_problem(e, manage) {
-        QueryError::Problem(p) => p,
-        QueryError::Core(e) => panic!("not a problem: {e}"),
+        Error::Api(p) => p,
+        e => panic!("not a problem: {e}"),
     };
     // A value in the engine's primary text (22P02) never reaches a caller without manage.
     let e = || EngineError::Sql {
@@ -395,11 +395,7 @@ impl Q {
         ctx(self.w.team.id, self.carol)
     }
 
-    async fn run(
-        &self,
-        c: &Context,
-        req: QueryRequest,
-    ) -> std::result::Result<QueryResult, QueryError> {
+    async fn run(&self, c: &Context, req: QueryRequest) -> std::result::Result<QueryResult, Error> {
         query(&self.w.s.databases, c, self.db, req).await
     }
 
@@ -418,11 +414,11 @@ impl Q {
 }
 
 /// The status and code of a failed call.
-fn failure(r: std::result::Result<QueryResult, QueryError>) -> (u16, String, Option<String>) {
+fn failure(r: std::result::Result<QueryResult, Error>) -> (u16, String, Option<String>) {
     match r {
         Ok(v) => panic!("the call succeeded: {v:?}"),
-        Err(QueryError::Problem(p)) => (p.code.http_status(), p.code.as_str().to_string(), p.hint),
-        Err(QueryError::Core(e)) => (e.http_status(), e.to_api().code.as_str().into(), None),
+        Err(Error::Api(p)) => (p.code.http_status(), p.code.as_str().to_string(), p.hint),
+        Err(e) => (e.http_status(), e.to_api().code.as_str().into(), None),
     }
 }
 
@@ -484,7 +480,7 @@ async fn people_read_and_write_by_their_role() {
         .run(&q.bob(), write("alter table plants add column notes text"))
         .await;
     match ddl {
-        Err(QueryError::Problem(p)) => {
+        Err(Error::Api(p)) => {
             assert_eq!(
                 (p.code.as_str(), p.sqlstate.as_deref()),
                 ("query_failed", Some("42501"))
@@ -815,14 +811,14 @@ async fn errors_are_sanitized_for_people_without_manage() {
     let q = setup().await;
     let dup = write("insert into plants (id, name) values (1, 'dup-value')");
     match q.run(&q.bob(), dup.clone()).await {
-        Err(QueryError::Problem(p)) => {
+        Err(Error::Api(p)) => {
             assert_eq!(p.sqlstate.as_deref(), Some("23505"));
             assert_eq!(p.message, "a unique constraint was violated: plants.id");
         }
         other => panic!("{other:?}"),
     }
     match q.run(&q.alice(), dup).await {
-        Err(QueryError::Problem(p)) => {
+        Err(Error::Api(p)) => {
             assert!(
                 p.message.contains("UNIQUE constraint failed"),
                 "{}",
@@ -870,7 +866,7 @@ async fn a_database_that_is_not_ready_answers_503_except_to_the_owner_kind() {
         .unwrap();
     for c in [q.carol(), q.alice()] {
         match query(&svc, &c, q.db, sql("select count(*) from plants")).await {
-            Err(QueryError::Problem(p)) => {
+            Err(Error::Api(p)) => {
                 assert_eq!(
                     (p.code.http_status(), p.code.as_str()),
                     (503, "database_not_ready")
@@ -882,7 +878,7 @@ async fn a_database_that_is_not_ready_answers_503_except_to_the_owner_kind() {
         }
     }
     match schema(&svc, &q.carol(), q.db).await {
-        Err(QueryError::Problem(p)) => assert_eq!(p.code.as_str(), "database_not_ready"),
+        Err(Error::Api(p)) => assert_eq!(p.code.as_str(), "database_not_ready"),
         other => panic!("{other:?}"),
     }
     // The owner kind (a write by a person with manage) runs.
@@ -1300,7 +1296,7 @@ async fn postgres_engine_masks_secrets_for_viewers_and_takes_a_managers_retype()
             (bot.clone(), sql(text)),
         ] {
             let r = run(who, req).await;
-            let Err(QueryError::Problem(p)) = r else {
+            let Err(Error::Api(p)) = r else {
                 panic!("{text}: {r:?}");
             };
             assert_eq!(
