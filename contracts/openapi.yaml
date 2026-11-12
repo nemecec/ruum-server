@@ -9014,12 +9014,14 @@ components:
             key is the column's name today; the platform keeps the class with the column's
             identity, and a rename or retype removes the key (the column is unconfirmed again).
           propertyNames:
+            x-ruum-content-trust: untrusted
             type: string
             minLength: 5
             maxLength: 400
           additionalProperties:
             $ref: '#/components/schemas/DataClass'
         migrations:
+          x-ruum-content-trust: untrusted
           type: string
           maxLength: 1024
           description: The folder of declared migrations, relative to the node's parent.
@@ -10015,6 +10017,7 @@ components:
             - $ref: '#/components/schemas/Timestamp'
             - type: 'null'
         comment:
+          x-ruum-content-trust: untrusted
           type: [string, 'null']
         expires_at:
           $ref: '#/components/schemas/Timestamp'

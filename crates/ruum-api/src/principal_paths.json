@@ -1,0 +1,2788 @@
+{
+ "openapi_sha256": "62b53faf5f0d26088afb3d17155801378a209adb8f04f3b422e5231cdd094d65",
+ "operations": [
+  {
+   "method": "GET",
+   "path": "/v1/agents/{agent_id}/activity",
+   "operation": "listAgentActivity",
+   "refs": [
+    [
+     "items",
+     "*",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/agents/{agent_id}/undo",
+   "operation": "undoAgent",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "reverted",
+     "*",
+     "changed_by",
+     "actor"
+    ],
+    [
+     "skipped",
+     "*",
+     "changed_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "reverted",
+     "*",
+     "changed_by"
+    ],
+    [
+     "skipped",
+     "*",
+     "changed_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/api-keys",
+   "operation": "listAppApiKeys",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps/{node_id}/api-keys",
+   "operation": "createAppApiKey",
+   "refs": [
+    [
+     "key",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "key",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps/{node_id}/approvals/{approval_id}/decision",
+   "operation": "decideAppApproval",
+   "refs": [
+    [
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/approvals/{approval_id}",
+   "operation": "getAppApproval",
+   "refs": [
+    [
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/approvals",
+   "operation": "listAppApprovals",
+   "refs": [
+    [
+     "items",
+     "*",
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps/{node_id}/deployments/{deployment_id}/publish",
+   "operation": "publishAppDeployment",
+   "refs": [
+    [
+     "approval",
+     "requested_by",
+     "actor"
+    ],
+    [
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "approval",
+     "requested_by"
+    ],
+    [
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/deployments/{deployment_id}",
+   "operation": "getAppDeployment",
+   "refs": [
+    [
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/deployments",
+   "operation": "listAppDeployments",
+   "refs": [
+    [
+     "items",
+     "*",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "items",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps/{node_id}/deployments",
+   "operation": "createAppDeployment",
+   "refs": [
+    [
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/role-grants",
+   "operation": "listAppRoleGrants",
+   "refs": [
+    [
+     "items",
+     "*",
+     "granted_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "granted_by"
+    ]
+   ],
+   "grantees": [
+    [
+     "items",
+     "*",
+     "grantee"
+    ]
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps/{node_id}/role-grants",
+   "operation": "addAppRoleGrant",
+   "refs": [
+    [
+     "granted_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "granted_by"
+    ]
+   ],
+   "grantees": [
+    [
+     "grantee"
+    ]
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps/{node_id}/secrets/{secret_name}/rotate",
+   "operation": "rotateAppSecret",
+   "refs": [
+    [
+     "set_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "set_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}/secrets",
+   "operation": "listAppSecrets",
+   "refs": [
+    [
+     "items",
+     "*",
+     "set_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "set_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PATCH",
+   "path": "/v1/apps/{node_id}/settings",
+   "operation": "updateAppSettings",
+   "refs": [
+    [
+     "app",
+     "live_deployment",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "app",
+     "live_deployment",
+     "created_by",
+     "actor"
+    ],
+    [
+     "app",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "app",
+     "node",
+     "updated_by",
+     "actor"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "created_by",
+     "actor"
+    ],
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "app",
+     "live_deployment",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "app",
+     "live_deployment",
+     "created_by"
+    ],
+    [
+     "app",
+     "node",
+     "created_by"
+    ],
+    [
+     "app",
+     "node",
+     "updated_by"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "created_by"
+    ],
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/apps/{node_id}",
+   "operation": "getApp",
+   "refs": [
+    [
+     "live_deployment",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "live_deployment",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ],
+    [
+     "previews",
+     "*",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "previews",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "live_deployment",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "live_deployment",
+     "created_by"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ],
+    [
+     "previews",
+     "*",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "previews",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/apps",
+   "operation": "createApp",
+   "refs": [
+    [
+     "app",
+     "live_deployment",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "app",
+     "live_deployment",
+     "created_by",
+     "actor"
+    ],
+    [
+     "app",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "app",
+     "node",
+     "updated_by",
+     "actor"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "bindings",
+     "*",
+     "granted_by",
+     "actor"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "created_by",
+     "actor"
+    ],
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "app",
+     "live_deployment",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "app",
+     "live_deployment",
+     "created_by"
+    ],
+    [
+     "app",
+     "node",
+     "created_by"
+    ],
+    [
+     "app",
+     "node",
+     "updated_by"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "bindings",
+     "*",
+     "granted_by"
+    ],
+    [
+     "app",
+     "previews",
+     "*",
+     "created_by"
+    ],
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/changes",
+   "operation": "listChanges",
+   "refs": [
+    [
+     "items",
+     "*",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/database-approvals",
+   "operation": "listPendingDatabaseApprovals",
+   "refs": [
+    [
+     "items",
+     "*",
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/access-grant-requests",
+   "operation": "requestDatabaseAccessGrant",
+   "refs": [
+    [
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/databases/{node_id}/access-grants/{grant_id}",
+   "operation": "revokeDatabaseAccessGrant",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "grant",
+     "revoked_by"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/access-grants",
+   "operation": "listDatabaseAccessGrants",
+   "refs": [
+    [
+     "items",
+     "*",
+     "revoked_by"
+    ]
+   ],
+   "obo": [],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/access-grants",
+   "operation": "createDatabaseAccessGrant",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "grant",
+     "revoked_by"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/approvals/{approval_id}/decision",
+   "operation": "decideDatabaseApproval",
+   "refs": [
+    [
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/approvals/{approval_id}",
+   "operation": "getDatabaseApproval",
+   "refs": [
+    [
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/approvals",
+   "operation": "listDatabaseApprovals",
+   "refs": [
+    [
+     "items",
+     "*",
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/branches",
+   "operation": "listDatabaseBranches",
+   "refs": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/branches",
+   "operation": "createDatabaseBranch",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "database",
+     "node",
+     "created_by"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/columns/confirm",
+   "operation": "confirmColumnClasses",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "database",
+     "node",
+     "created_by"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/columns/suggestions",
+   "operation": "suggestColumnClasses",
+   "refs": [
+    [
+     "items",
+     "*",
+     "suggestion",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "suggestion",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/columns",
+   "operation": "listDatabaseColumns",
+   "refs": [
+    [
+     "items",
+     "*",
+     "suggestion",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "suggestion",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/databases/{node_id}/manifest",
+   "operation": "updateDatabaseManifest",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "database",
+     "node",
+     "created_by"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/migrations",
+   "operation": "listDatabaseMigrations",
+   "refs": [
+    [
+     "items",
+     "*",
+     "by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "new_columns",
+     "*",
+     "suggestion",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "by"
+    ],
+    [
+     "items",
+     "*",
+     "new_columns",
+     "*",
+     "suggestion",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/migrations",
+   "operation": "applyDatabaseMigration",
+   "refs": [
+    [
+     "approval",
+     "requested_by",
+     "actor"
+    ],
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "migration",
+     "by",
+     "actor"
+    ],
+    [
+     "migration",
+     "new_columns",
+     "*",
+     "suggestion",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "approval",
+     "requested_by"
+    ],
+    [
+     "change"
+    ],
+    [
+     "migration",
+     "by"
+    ],
+    [
+     "migration",
+     "new_columns",
+     "*",
+     "suggestion",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/queries",
+   "operation": "listDatabaseQueries",
+   "refs": [
+    [
+     "items",
+     "*",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/query",
+   "operation": "queryDatabase",
+   "refs": [
+    [
+     "approval",
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "approval",
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}/restore-points",
+   "operation": "listDatabaseRestorePoints",
+   "refs": [
+    [
+     "items",
+     "*",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/restore-points",
+   "operation": "createDatabaseRestorePoint",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "restore_point",
+     "by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "restore_point",
+     "by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases/{node_id}/restore",
+   "operation": "restoreDatabase",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "database",
+     "node",
+     "created_by"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/databases/{node_id}",
+   "operation": "getDatabase",
+   "refs": [
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/databases",
+   "operation": "createDatabase",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "database",
+     "node",
+     "created_by"
+    ],
+    [
+     "database",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/issues/{node_id}/reveal-requests",
+   "operation": "createIssueRevealRequest",
+   "refs": [
+    [
+     "requested_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "requested_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/issues/{node_id}",
+   "operation": "getIssue",
+   "refs": [
+    [
+     "content",
+     "assignee"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PATCH",
+   "path": "/v1/issues/{node_id}",
+   "operation": "updateIssue",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "issue",
+     "content",
+     "assignee"
+    ],
+    [
+     "issue",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "issue",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "issue",
+     "node",
+     "created_by"
+    ],
+    [
+     "issue",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/issues",
+   "operation": "listIssues",
+   "refs": [
+    [
+     "items",
+     "*",
+     "content",
+     "assignee"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/issues",
+   "operation": "createIssue",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "issue",
+     "content",
+     "assignee"
+    ],
+    [
+     "issue",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "issue",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "issue",
+     "node",
+     "created_by"
+    ],
+    [
+     "issue",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/me",
+   "operation": "getMe",
+   "refs": [
+    [
+     "actor"
+    ]
+   ],
+   "obo": [
+    []
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/children",
+   "operation": "listChildren",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/nodes/{node_id}/content",
+   "operation": "putContent",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ],
+    [
+     "version",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ],
+    [
+     "version"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/copy",
+   "operation": "copyNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/nodes/{node_id}/grants/{grant_id}",
+   "operation": "removeGrant",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PATCH",
+   "path": "/v1/nodes/{node_id}/grants/{grant_id}",
+   "operation": "updateGrant",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "grant",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "grant",
+     "created_by"
+    ]
+   ],
+   "grantees": [
+    [
+     "grant",
+     "grantee"
+    ]
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/grants",
+   "operation": "listGrants",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": [
+    [
+     "items",
+     "*",
+     "grantee"
+    ]
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/grants",
+   "operation": "addGrant",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "grant",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "grant",
+     "created_by"
+    ]
+   ],
+   "grantees": [
+    [
+     "grant",
+     "grantee"
+    ]
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/move",
+   "operation": "moveNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/rename",
+   "operation": "renameNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/restore",
+   "operation": "restoreNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/share-links",
+   "operation": "listShareLinks",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/share-links",
+   "operation": "createShareLink",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "share_link",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "share_link",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PATCH",
+   "path": "/v1/nodes/{node_id}/sharing",
+   "operation": "updateNodeSharing",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/nodes/{node_id}/tags/{tag_id}",
+   "operation": "detachTag",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/nodes/{node_id}/tags/{tag_id}",
+   "operation": "attachTag",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/tags",
+   "operation": "listNodeTags",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/trash",
+   "operation": "trashNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/nodes/{node_id}/versions/{version_id}/label",
+   "operation": "setVersionLabel",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "version",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "version"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/{node_id}/versions/{version_id}/restore",
+   "operation": "restoreVersion",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "version",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "version"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/versions/{version_id}",
+   "operation": "getVersion",
+   "refs": [
+    [
+     "actor"
+    ]
+   ],
+   "obo": [
+    []
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}/versions",
+   "operation": "listVersions",
+   "refs": [
+    [
+     "items",
+     "*",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/nodes/{node_id}",
+   "operation": "purgeNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/{node_id}",
+   "operation": "getNode",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ],
+    [
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ],
+    [
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/by-path/{path}",
+   "operation": "getNodeByPath",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ],
+    [
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ],
+    [
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes/move",
+   "operation": "moveNodes",
+   "refs": [
+    [
+     "items",
+     "*",
+     "change",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "change"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/nodes/root",
+   "operation": "getRoot",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ],
+    [
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ],
+    [
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/nodes",
+   "operation": "createNode",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/projects/{node_id}/publication",
+   "operation": "getProjectPublication",
+   "refs": [
+    [
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PUT",
+   "path": "/v1/projects/{node_id}/publication",
+   "operation": "updateProjectPublication",
+   "refs": [
+    [
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/search",
+   "operation": "searchNodes",
+   "refs": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "DELETE",
+   "path": "/v1/share-links/{link_id}",
+   "operation": "revokeShareLink",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/share-links/resolve",
+   "operation": "resolveShareLink",
+   "refs": [
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/shared-with-me",
+   "operation": "listSharedWithMe",
+   "refs": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "shared_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "node",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by"
+    ],
+    [
+     "items",
+     "*",
+     "shared_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/tags/{tag_id}/nodes",
+   "operation": "listNodesByTag",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/tags/{tag_id}/nodes",
+   "operation": "attachTagToNodes",
+   "refs": [
+    [
+     "items",
+     "*",
+     "change",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "change"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "node",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/tags/{tag_id}",
+   "operation": "getTag",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "PATCH",
+   "path": "/v1/tags/{tag_id}",
+   "operation": "updateTag",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "tag",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "tag",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/tags",
+   "operation": "listTags",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/tags",
+   "operation": "createTag",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "tag",
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "tag",
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/template-setups/{setup_id}",
+   "operation": "getTemplateSetup",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/templates/{template_id}/instantiate",
+   "operation": "instantiateTemplate",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/templates",
+   "operation": "createTemplate",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/tenants/{tenant_id}/audit",
+   "operation": "listAudit",
+   "refs": [
+    [
+     "items",
+     "*",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/tenants/{tenant_id}/invitations",
+   "operation": "listInvitations",
+   "refs": [
+    [
+     "items",
+     "*",
+     "invited_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "invited_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/tenants/{tenant_id}/invitations",
+   "operation": "createInvitation",
+   "refs": [
+    [
+     "invited_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "invited_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/trash/empty",
+   "operation": "emptyTrash",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/trash",
+   "operation": "listTrash",
+   "refs": [
+    [
+     "items",
+     "*",
+     "created_by",
+     "actor"
+    ],
+    [
+     "items",
+     "*",
+     "updated_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "items",
+     "*",
+     "created_by"
+    ],
+    [
+     "items",
+     "*",
+     "updated_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/uploads/{upload_id}/complete",
+   "operation": "completeUpload",
+   "refs": [
+    [
+     "change",
+     "actor"
+    ],
+    [
+     "node",
+     "created_by",
+     "actor"
+    ],
+    [
+     "node",
+     "updated_by",
+     "actor"
+    ],
+    [
+     "version",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "change"
+    ],
+    [
+     "node",
+     "created_by"
+    ],
+    [
+     "node",
+     "updated_by"
+    ],
+    [
+     "version"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "GET",
+   "path": "/v1/uploads/{upload_id}",
+   "operation": "getUpload",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  },
+  {
+   "method": "POST",
+   "path": "/v1/uploads",
+   "operation": "createUpload",
+   "refs": [
+    [
+     "created_by",
+     "actor"
+    ]
+   ],
+   "obo": [
+    [
+     "created_by"
+    ]
+   ],
+   "grantees": []
+  }
+ ]
+}
