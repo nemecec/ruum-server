@@ -51,9 +51,12 @@ const UNTRUSTED_FIELDS: &[&str] = &[
     "ColumnRef.table",
     "DatabaseAccessGrant.agent_display_name",
     "DatabaseAccessGrant.reason", // the agent's reason of an approved request
+    "DatabaseApproval.comment",   // people write it; marked too (backlog 2026-11-09 S-15)
     "DatabaseApproval.migration_name",
     "DatabaseApproval.statement",
-    "DatabaseColumn.type",     // can be a tenant-defined type name
+    "DatabaseColumn.type", // can be a tenant-defined type name
+    "DatabaseManifest.data_classes.propertyNames", // column names (backlog 2026-11-09 S-15)
+    "DatabaseManifest.migrations",
     "DatabaseMigration.error", // quotes identifiers
     "DatabaseMigration.name",
     "DatabaseQueryLogEntry.statement",
