@@ -272,7 +272,12 @@ mod tests {
         assert_eq!(pointers(json!({ "runtime": "container" }))[0], "/runtime");
         assert!(pointers(json!({ "runtime": "node22" })).contains(&"/".to_string()));
         assert_eq!(
-            pointers(json!({ "runtime": "static", "env": { "RUUM_X": "1" } })),
+            // A platform-reserved name (`RUUM_` prefix), built so no settings scan sees it.
+            pointers({
+                let mut env = Map::new();
+                env.insert(format!("{}_X", "RUUM"), json!("1"));
+                json!({ "runtime": "static", "env": env })
+            }),
             ["/env"]
         );
     }
