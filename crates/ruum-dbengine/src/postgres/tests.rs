@@ -189,6 +189,57 @@ pub(super) async fn psql(conn: &mut PgConnection, sql: &str) -> Result<String, S
     Ok(out.join("\n"))
 }
 
+/// Runs a script as the superuser of the data cluster, in database `db` (`docker exec` into the
+/// container `DBHOST_CHECK_CONTAINER`, as `scripts/dbhost_check.sh` does), and returns the
+/// output of `psql -At`. Only a superuser can make a foreign data wrapper, an event trigger or a
+/// type with functions of its own, so the tests of those clauses need it. `None` (skip) when the
+/// container is not set, except in CI and with `RUUM_DBENGINE_REQUIRE_POSTGRES`, where it fails.
+pub(super) fn superuser(db: &str, sql: &str) -> Option<String> {
+    use std::io::Write;
+    let Some(container) = std::env::var_os("DBHOST_CHECK_CONTAINER") else {
+        assert!(
+            !required(),
+            "DBHOST_CHECK_CONTAINER is not set: this test needs the superuser of the data cluster"
+        );
+        eprintln!("skipped: DBHOST_CHECK_CONTAINER is not set");
+        return None;
+    };
+    let mut child = std::process::Command::new("docker")
+        .arg("exec")
+        .arg("-i")
+        .arg(container)
+        .args([
+            "psql",
+            "-X",
+            "-q",
+            "-At",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            "postgres",
+            "-d",
+        ])
+        .arg(db)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("docker exec");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(sql.as_bytes())
+        .expect("write the script");
+    let out = child.wait_with_output().expect("psql as the superuser");
+    assert!(
+        out.status.success(),
+        "psql as the superuser failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// A connection of `ruum_dbhost` to the database (inspection only).
 pub(super) async fn dbhost(engine: &PostgresEngine, db: &DatabaseRef) -> PgConnection {
     engine.dbhost(&db.engine_name).await.expect("dbhost")

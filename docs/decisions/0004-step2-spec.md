@@ -936,9 +936,15 @@ in step 2 of a masked copy. As `mask` it could read the key and change `ruum_mas
   another role. A change that code as `mask` made, and the objects of the code from before
   this fix, do not survive the next build; a restore point from before the fix comes back
   repaired (review-masking-2 F-1). A build refuses to go on when an object outside the lens
-  schemas depends on an object inside them: only tenant code in step 2 of a masked copy, while
-  the copy's owner holds `USAGE` on `ruum_mask`, could make one, so such a copy is refused
-  (review-masking-1 F2). The role kinds are frozen (item 34), so no new role kind was added:
+  schemas depends on an object inside them: only tenant code in step 2 of a masked copy could
+  make one, so such a copy is refused (review-masking-1 F2). Since backlog 2026-11-09 S-9 the
+  copy's owner holds no right on `ruum_mask` in step 2: `mask` makes one `SECURITY DEFINER`
+  wrapper per pseudonym function in the schema `ruum_copy`, which holds no relation, the owner
+  gets `USAGE` on `ruum_copy` and `EXECUTE` on the wrappers only, and step 3 drops `ruum_copy`
+  after the check (`copy.rs` `make_copy_entry_points`; tests `tenant_types.rs`
+  `step_2_of_a_masked_copy_has_no_right_on_ruum_mask` and
+  `a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas`; mutation
+  `dbengine-mask-copy-owner-usage`). The role kinds are frozen (item 34), so no new role kind was added:
   `mask` stays the owner of the functions, the key and the views. A role that lens sessions
   never run as, as the owner of the functions and the key (review-dbhost-2), needs a later
   decision.

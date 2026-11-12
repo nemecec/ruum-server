@@ -221,7 +221,9 @@ async fn pseudonym_other_refuses_a_tenant_type_before_it_converts() {
     let f = tenant_types_source(&engine, &other.created).await;
     let owner = role_name(&f.created, RoleKind::Owner);
     let mask = role_name(&f.created, RoleKind::Mask);
-    // The rights of step 2 of a masked copy (copy.rs `pseudonyms_for_owner`).
+    // A role that may call `pseudonym_other` directly (stricter than step 2 of a masked copy,
+    // whose owner reaches it only through the wrappers of `ruum_copy`, copy.rs
+    // `make_copy_entry_points`).
     let rights = |verb: &str, to: &str| {
         format!(
             "{verb} usage on schema ruum_mask {to} {o}; set role {m}; \
@@ -588,30 +590,35 @@ async fn the_state_from_before_the_fix_does_not_survive_a_build_or_a_restore() {
     .await;
 }
 
-/// Tenant code in step 2 of a masked copy runs as the copy's owner, which then holds `USAGE` on
-/// `ruum_mask`. An object it makes there that points into `ruum_mask` would keep working
-/// afterwards. Step 3 refuses the copy instead (review-masking-1 F2).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_masked_copy_refuses_an_object_that_points_into_ruum_mask() {
-    let Some(engine) = engine().await else { return };
-    let f = Fixture::new(&engine).await;
+/// The source of the two tests below: an enum `mood` with an implicit cast to `text` whose
+/// function runs `plant` (the tenant's code) and records what it saw in `seen`; a table `t` with
+/// the secret column `sec` of that type and one row. Step 2 of a masked copy runs
+/// `sec::text <> ''`, so the cast runs as the copy's owner (review-masking-1 F2).
+async fn planting_source<'e>(engine: &'e PostgresEngine, plant: &str) -> Fixture<'e> {
+    let f = Fixture::new(engine).await;
     let sync = ClassSync {
         personal: vec![],
         secret: vec!["sec"],
     };
     let request = MigrationRequest {
-        up: "CREATE TYPE public.mood AS ENUM ('happy', 'sad');
+        up: format!(
+            "CREATE TYPE public.mood AS ENUM ('happy', 'sad');
+             CREATE TABLE public.seen (what text);
              CREATE FUNCTION public.plant(public.mood) RETURNS text LANGUAGE plpgsql AS $f$
+             DECLARE planted text := 'planted';
              BEGIN
                BEGIN
-                 EXECUTE 'CREATE VIEW public.k AS SELECT id FROM ruum_mask.key';
-               EXCEPTION WHEN OTHERS THEN NULL;
+                 EXECUTE {plant};
+               EXCEPTION WHEN OTHERS THEN planted := 'denied';
                END;
+               INSERT INTO public.seen VALUES (
+                 pg_catalog.has_schema_privilege('ruum_mask', 'USAGE')::text || '|' || planted);
                RETURN 'planted';
              END $f$;
              CREATE CAST (public.mood AS text) WITH FUNCTION public.plant(public.mood) AS IMPLICIT;
-             CREATE TABLE t (id integer PRIMARY KEY, sec public.mood);"
-            .into(),
+             CREATE TABLE t (id integer PRIMARY KEY, sec public.mood);",
+            plant = lens::literal(plant)
+        ),
         timeout: Duration::from_secs(10),
         dry_run: false,
     };
@@ -627,6 +634,14 @@ async fn a_masked_copy_refuses_an_object_that_points_into_ruum_mask() {
     )
     .await
     .expect("a row");
+    f
+}
+
+/// A masked copy of [`planting_source`] with `sec` as `NULL`.
+async fn masked_copy_of_planting(
+    engine: &PostgresEngine,
+    f: &Fixture<'_>,
+) -> Result<CreatedDatabase, EngineError> {
     let plan = MaskPlan {
         columns: vec![(
             ColumnRef {
@@ -638,7 +653,7 @@ async fn a_masked_copy_refuses_an_object_that_points_into_ruum_mask() {
         )],
     };
     let (key, _) = conformance::test_key();
-    let err = engine
+    engine
         .copy_database(
             f.db(),
             &f.key,
@@ -646,6 +661,64 @@ async fn a_masked_copy_refuses_an_object_that_points_into_ruum_mask() {
             &CopyData::Masked(plan),
             &key,
         )
+        .await
+}
+
+/// Tenant code in step 2 of a masked copy runs as the copy's owner, which holds no right on
+/// `ruum_mask` (backlog 2026-11-09 S-9, review-masking-1 F2): `has_schema_privilege` is false
+/// while the code runs, and a view over `ruum_mask.key` cannot be made. The copy goes through,
+/// with no such view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_2_of_a_masked_copy_has_no_right_on_ruum_mask() {
+    let Some(engine) = engine().await else { return };
+    let f = planting_source(
+        &engine,
+        "CREATE VIEW public.k AS SELECT id FROM ruum_mask.key",
+    )
+    .await;
+    let copy = masked_copy_of_planting(&engine, &f)
+        .await
+        .expect("the copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select string_agg(distinct what, ',') || '/' || (to_regclass('public.k') is null)::text \
+               from public.seen",
+        )
+        .await
+        .unwrap(),
+        "false|denied/true",
+        "the owner had no USAGE on ruum_mask in step 2, and no view over the key was made"
+    );
+    close(owner).await;
+    let mut host = dbhost(&engine, &copy.database).await;
+    assert_eq!(
+        psql(
+            &mut host,
+            "select (to_regnamespace('ruum_copy') is null)::text",
+        )
+        .await
+        .unwrap(),
+        "true",
+        "the entry points of step 2 are gone"
+    );
+    close(host).await;
+}
+
+/// Tenant code in step 2 of a masked copy may call the pseudonym functions through the entry
+/// points of `ruum_copy`. An object it makes there that points at an entry point would keep a
+/// reference into the platform's schemas, so step 3 refuses the copy instead (review-masking-1
+/// F2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_refuses_an_object_that_points_into_the_lens_schemas() {
+    let Some(engine) = engine().await else { return };
+    let f = planting_source(
+        &engine,
+        "CREATE VIEW public.k AS SELECT ruum_copy.pseudonym('x'::text) AS p",
+    )
+    .await;
+    let err = masked_copy_of_planting(&engine, &f)
         .await
         .expect_err("the copy is refused");
     let err = format!("{err:?}");
