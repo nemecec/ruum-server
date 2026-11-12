@@ -105,7 +105,7 @@ impl SlugProblem {
             }
             SlugProblem::DashAtEnd => "a slug does not start or end with a dash".into(),
             SlugProblem::DoubleDash => "a slug has no double dash".into(),
-            SlugProblem::Punycode => "a slug does not start with xn--".into(),
+            SlugProblem::Punycode => "a slug does not start with xn-".into(),
             SlugProblem::Underscore => "a slug does not start with an underscore".into(),
             SlugProblem::Reserved => "this slug is reserved".into(),
         }
@@ -129,7 +129,8 @@ pub fn check(slug: &str, kind: SlugKind) -> Result<(), SlugProblem> {
     if slug.len() > kind.max() {
         return Err(SlugProblem::TooLong);
     }
-    if slug.starts_with("xn--") {
+    // `xn-` and not only `xn--`: the SQL checks of 0011 refuse every `xn-` prefix.
+    if slug.starts_with("xn-") {
         return Err(SlugProblem::Punycode);
     }
     if slug.contains("--") {
@@ -208,6 +209,10 @@ pub fn candidates(name: &str, kind: SlugKind, n: usize) -> Vec<String> {
     };
     if base.is_empty() {
         base = fallback.to_string();
+    }
+    // A name that starts with `xn-` keeps its letters without the punycode look (`xnplants`).
+    while base.starts_with("xn-") {
+        base = format!("xn{}", &base[3..]);
     }
     let mut out = Vec::new();
     if is_valid(&base, kind) {
@@ -349,6 +354,7 @@ mod tests {
         assert_eq!(check("a.bc", SlugKind::App), Err(SlugProblem::BadCharacter));
         assert_eq!(check("a_bc", SlugKind::App), Err(SlugProblem::BadCharacter));
         assert!(is_valid("x-n-abc", SlugKind::App));
+        assert_eq!(check("xn-abc", SlugKind::App), Err(SlugProblem::Punycode));
         assert!(is_valid("plan-ner-2", SlugKind::App));
         // The SQL checks of 0011 hold for every valid slug of these examples.
         assert!(is_valid("a1b", SlugKind::App));
@@ -370,7 +376,8 @@ mod tests {
         assert_eq!(candidates("id", SlugKind::Tenant, 1), ["id-2"]);
         assert_eq!(candidates("_x", SlugKind::App, 1), ["x-2"]);
         assert_eq!(candidates("日本", SlugKind::App, 1), ["app-2"]);
-        assert_eq!(candidates("xn--evil", SlugKind::App, 1), ["xn-evil"]);
+        assert_eq!(candidates("xn--evil", SlugKind::App, 1), ["xnevil"]);
+        assert_eq!(candidates("xn--a--b-", SlugKind::Tenant, 1), ["xna-b"]);
         let long = candidates(&"a".repeat(80), SlugKind::App, 2);
         assert_eq!(long[0].len(), 53);
         assert_eq!(long[1].len(), 53);

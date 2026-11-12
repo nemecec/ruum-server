@@ -345,6 +345,23 @@ fn refuse_share_link(ctx: &Context) -> Result<()> {
     }
 }
 
+/// An agent whose scope (`max_role`) is below `edit` gets `403 permission_denied` from
+/// `createApp`, like any caller without `edit` on the folder (T-4a case
+/// `an_agent_creates_apps_with_its_user_right_and_scope`). Both codes are 403 in the contract;
+/// a `404` (outside the scope) stays a `404`.
+fn scope_as_permission(e: Error) -> Error {
+    match e {
+        Error::Api(a) if a.code == ErrorCode::ScopeExceeded => Error::Api(
+            ApiError::new(
+                ErrorCode::PermissionDenied,
+                "the agent's scope does not allow creating an app here",
+            )
+            .with_hint("ask the user to widen the agent's scope to edit, or to do it themselves"),
+        ),
+        other => other,
+    }
+}
+
 fn not_an_app() -> Error {
     Error::not_found("app")
 }
@@ -502,7 +519,9 @@ impl AppService {
     pub async fn create(&self, ctx: &Context, req: CreateApp) -> Result<Written<App>> {
         refuse_share_link(ctx)?;
         let d = &self.deps;
-        authz::require(&*d.authz, &*d.nodes, ctx, req.parent_id, Role::Edit).await?;
+        authz::require(&*d.authz, &*d.nodes, ctx, req.parent_id, Role::Edit)
+            .await
+            .map_err(scope_as_permission)?;
         let role = self.tenant_role(ctx).await?;
         self.check_guest_policy(ctx, role).await?;
         let input = req.settings.clone().unwrap_or_default();

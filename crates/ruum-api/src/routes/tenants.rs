@@ -112,7 +112,25 @@ pub async fn create_tenant(
         .tenants
         .create_team(&who.actor, body.name)
         .await?;
-    Ok((StatusCode::CREATED, Json(json!(t))))
+    Ok((
+        StatusCode::CREATED,
+        Json(with_app_approval(&state, &t).await?),
+    ))
+}
+
+/// The `Tenant` JSON with `app_approval` (read-only, what a Ruum platform admin approved for
+/// the tenant: card W-1, decision 0006-12; both off until the admin console turns them on).
+async fn with_app_approval(
+    state: &AppState,
+    t: &ruum_core::tenants::Tenant,
+) -> Result<Value, HttpError> {
+    let a = state.services.apps.store().tenant_settings(t.id).await?;
+    let mut v = json!(t);
+    v["app_approval"] = json!({
+        "public_apps": a.as_ref().is_some_and(|a| a.public_apps_approved),
+        "custom_domains": a.as_ref().is_some_and(|a| a.custom_domains_approved),
+    });
+    Ok(v)
 }
 
 /// Get a tenant. `GET /v1/tenants/{tenant_id}` (operationId `getTenant`).
@@ -123,7 +141,8 @@ pub async fn get_tenant(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let ctx = ctx_of(&state, &who, &tenant_id, &headers).await?;
-    Ok(Json(json!(state.services.tenants.get(&ctx).await?)))
+    let t = state.services.tenants.get(&ctx).await?;
+    Ok(Json(with_app_approval(&state, &t).await?))
 }
 
 #[derive(Deserialize)]
@@ -152,7 +171,7 @@ pub async fn update_tenant(
         .tenants
         .update(&ctx, body.name, body.policy)
         .await?;
-    Ok(Json(json!(t)))
+    Ok(Json(with_app_approval(&state, &t).await?))
 }
 
 /// List members and guests. `GET /v1/tenants/{tenant_id}/members` (operationId `listMembers`).
