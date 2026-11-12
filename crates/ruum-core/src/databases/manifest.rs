@@ -454,6 +454,18 @@ mod tests {
         let mut changed = json.clone();
         changed["properties"]["engine"]["enum"] = json!(["postgres"]);
         assert_ne!(shape(&changed, None), a);
+        // The marks of decision 0005 B-3 are part of the comparison (backlog 2026-11-09 S-15):
+        // a field marked untrusted in one file only is a difference.
+        for path in [&["migrations"][..], &["data_classes", "propertyNames"][..]] {
+            let mut changed = json.clone();
+            let mut at = &mut changed["properties"];
+            for key in path {
+                at = &mut at[*key];
+            }
+            assert_eq!(at["x-ruum-content-trust"], json!("untrusted"), "{path:?}");
+            at.as_object_mut().unwrap().remove("x-ruum-content-trust");
+            assert_ne!(shape(&changed, None), a, "{path:?}");
+        }
     }
 
     /// The validation keywords of a schema, without annotations. Two forms that say the same are

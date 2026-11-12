@@ -28,6 +28,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+hex.workspace = true
+sha2.workspace = true
 http-body-util.workspace = true
 jsonschema.workspace = true
 # `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.
