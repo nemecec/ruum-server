@@ -27,6 +27,12 @@
 
 pub mod agents;
 pub mod api;
+pub mod apps;
+pub mod apps_archive;
+pub mod apps_deploy;
+pub mod apps_publish;
+pub mod apps_roles;
+pub mod apps_settings;
 pub mod d1;
 pub mod guests;
 pub mod nodes;
