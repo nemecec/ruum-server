@@ -140,7 +140,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Tenant isolation and permission matrix (in-memory services)
-        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_query_api --test privacy --locked -- --nocapture
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_query_api --test apps_settings --test apps_deployments --test apps_publish --test apps_roles --test apps_meta --test privacy --locked -- --nocapture
       # The data cluster (as in the unit job): the privacy suite runs its Postgres cases on the
       # Postgres engine (card Q-2); without it they fail in CI, never skip.
       - name: Start the data cluster (postgres-data)
@@ -163,7 +163,7 @@ jobs:
           RUUM_SUITE_BACKEND: postgres
           DATABASE_URL: postgres://ruum_suite:ruum_suite@localhost:5432/ruum
           RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
-        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_query_api --test privacy --locked -- --nocapture
+        run: cargo test -p ruum-testkit --no-fail-fast --test isolation --test permissions --test databases_d1 --test databases_guests --test databases_agents --test databases_nodes --test databases_statements --test databases_classes_api --test databases_grants_api --test databases_query_api --test apps_settings --test apps_deployments --test apps_publish --test apps_roles --test apps_meta --test privacy --locked -- --nocapture
 
   cargo-deny:
     name: cargo-deny

@@ -199,6 +199,29 @@ answers, else the memory engine. The CI suite jobs run the five groups on memory
 (without the data cluster); the unit job runs `databases_meta`. A card that builds an operation
 removes its `planned` mark, and its cases then run with no change to these files.
 
+## The app acceptance cases (milestone M1)
+
+`crates/ruum-testkit/tests/apps_*.rs` (card T-4a) are the acceptance cases of the 12 operations
+of milestone M1 of step 3: `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`,
+`getAppDeployment` (W-1), `createAppDeployment` of a static app (W-2), `publishAppDeployment` for
+people and the app branch of `restoreVersion` (W-3a), and the four app role operations (B-2).
+They follow the rules of the database cases above. Each binary is one group: `apps_settings`
+(slugs, `access: public`, telemetry settings, who may create), `apps_deployments` (folder and
+file sources, the direct `422` and `403`, drafts, hostile archives, secrets), `apps_publish` and
+`apps_roles`. `apps_meta` checks the cases and the hand-written archives.
+
+The app cases keep their own pending list, `PENDING` in `tests/common/apps.rs`: a case that waits
+for another card (B-1, D-2) or for an answer to a contract question names it there. The archives
+(`tests/common/apps_archive.rs`: `.tar.gz`, `.zip`, zip and tar slip, links, device files, a
+4 MiB archive that expands to 4 GiB) are written by hand, so the test kit needs no new
+dependency. To check them with `gzip -t`, `tar -tvzf` and `unzip -l`:
+
+```sh
+RUUM_ARCHIVE_DIR=/tmp/ruum-archives cargo test -p ruum-testkit --test apps_meta -- --ignored dump_archives
+RUUM_SUITE_BACKEND=postgres RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testkit \
+  --test apps_settings --test apps_deployments --test apps_publish --test apps_roles -- --nocapture
+```
+
 ## The privacy suite
 
 `crates/ruum-testkit/src/privacy.rs` (card T-2) checks design 8.5: an agent never sees a raw
