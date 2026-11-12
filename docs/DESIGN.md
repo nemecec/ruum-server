@@ -1319,6 +1319,54 @@ bound to that app and replaces a match with the hidden-value marker before stora
 security issue, marks the secret **exposed**, and rotates it automatically where the provider allows, or asks
 the owner to rotate it.
 
+### 9.13 Sharing apps between tenants (decision 43, provisional)
+
+A tenant that built an app can share it with other tenants, and they can adapt it to their needs
+without losing the vendor's updates. First case: the work management app built for TajuRuum in
+step 3, installed by another landscape architecture office (decision 0007 says "reusable by every
+office").
+
+**Install, not copy.**
+
+- The vendor **publishes** a version of a project as an app package: the code, the database
+  manifests and migrations, the roles (9.3), the bindings it needs, the extension points (below),
+  and a changelog. Versions are immutable; channels (`stable`, `beta`) point at versions.
+- Another tenant **installs** it: Ruum creates an app node in that tenant with its own database,
+  its own files and its own bindings. The installing tenant owns all of its data; the vendor sees
+  none of it unless the tenant grants access (for support, 8.5 rules apply).
+- **Updates**: the installing tenant chooses automatic updates within a channel or review each
+  version. An update runs the package's migrations under the schema rule (12.7), so the tenant
+  can go back one version.
+- A **copy** (fork, "remix" from 9.9) is the other path: the tenant gets the source and owns it,
+  and gets no updates. The UI says which one a tenant has.
+- The vendor can withdraw a version (no new installs) or, for a security fault, push a fix to every
+  installation in the channel; it cannot delete a tenant's installation or its data.
+
+**Customisations on top: extension points, not edits.**
+
+- The package declares what an installing tenant can add without touching the vendor's code:
+  - extra fields on the app's tables and extra tables (in the tenant's own schema next to the
+    app's, never in it);
+  - own views, reports and dashboards;
+  - own automations (9.11) on the app's events;
+  - own roles mapped to the app's roles, translations and the theme (12.6);
+  - hooks the vendor names (for example "before an invoice is sent"), run as the tenant's code
+    with the tenant's rights.
+- Customisations live in the installing tenant's project, are versioned and reviewed like any
+  change, and survive updates. An update that would break one (a removed hook or field) is shown
+  before it runs, and the tenant decides.
+- Deeper changes need a copy. This keeps every installation on the vendor's upgrade path.
+
+**Access and licences.** An app package is private to named tenants, listed in the tenant's own
+catalogue, or public in a gallery (later, with review). It is free or paid (21.7, level 2). A
+public package follows the public project rules of 9.9: its source and database are read-only for
+others, its secrets never shown.
+
+**Data between tenants.** An installed app runs inside the installing tenant. Calls between the
+vendor's own service and the installation go through apps calling apps (9.10) with an explicit
+grant, never through shared tables.
+
+
 ## 10. Source code and builds
 
 Store code in **Git**, even if the user never sees Git. Do not invent a new version control system.
@@ -1870,6 +1918,12 @@ drawing diff in step 6; DOCX/XLSX redlines and three-way merge with the sync cli
 
 **After restricted folders:** public projects (section 9.9).
 
+**App sharing and billing (decisions 43 and 44, provisional):** installing an app from one tenant
+into another (section 9.13) starts in step 3 with the TajuRuum work management app; Ruum billing
+for tenants (section 21.7, level 1) comes before the first paying users; paid apps through Stripe
+Connect (level 2) with the app gallery; billing for a tenant's own customers (level 3) when a
+customer needs it.
+
 ### Backlog (not scheduled)
 
 - **Remix** of public projects (section 9.9).
@@ -1959,6 +2013,12 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
     previous release working (expand, then contract), checked in CI with the previous release's
     tests; migrations as a step before a rolling update; open tabs get a reload notice, forced
     only for a client the API no longer supports.*
+43. **Sharing apps between tenants** (section 9.13). *Provisional 2026-11-12: install with updates,
+    customisation through declared extension points, a copy only for deeper changes; first case
+    the TajuRuum work management app for another office.*
+44. **Billing** (section 21.7). *Provisional 2026-11-12: three levels. Ruum bills tenants before
+    the first paying users; paid apps through Stripe Connect with app sharing; billing for a
+    tenant's own customers later, when a customer needs it.*
 
 ## 18. How to build Ruum with a swarm of AI agents
 
@@ -2333,6 +2393,31 @@ customer uses, plus a published markup that covers fixed costs.
   building it in agent tokens.
 - The capacity and cost agent looks for savings and reports cost per feature and per agent run in the
   weekly digest.
+
+### 21.7 Billing (decision 44, provisional)
+
+Billing comes in three levels. Each one is a separate product step.
+
+1. **Ruum bills its tenants** (before the first paying users): plans and usage from 21.4, invoices
+   with EU VAT (reverse charge for businesses with a valid VAT number, OSS for consumers), card and
+   SEPA payment through Stripe Billing, receipts in the tenant's Ruum files, dunning (reminders,
+   then read-only, never deletion without notice). Ruum is the seller.
+2. **Vendors charge for their apps through Ruum** (with app sharing, 9.13): a vendor tenant sets a
+   price for its app package (per installation, per seat or per use); the installing tenant sees it
+   on its Ruum bill; Ruum pays the vendor out through **Stripe Connect**, minus a published fee.
+   Stripe Connect does the identity checks of vendors and the payouts, so Ruum does not hold other
+   people's money.
+3. **A tenant (or a linked service) bills its own customers through Ruum**: subscriptions,
+   invoices and payment links for the tenant's customers, who need no Ruum account. The tenant is
+   the seller (its own Stripe Connect account and its own VAT); Ruum provides the software and
+   takes a fee. This is a product of its own (invoice numbering, VAT rules per country, credit
+   notes, accounting exports); built when a customer needs it, as an app on the platform where
+   possible.
+
+Rules for all levels: card data never touches Ruum (Stripe's hosted pages and elements);
+billing events are audit events; a tenant's billing data follows the data classes (8.5), and
+agents see amounts and states, never payment details. Stripe test mode is set up for staging.
+
 
 ## 22. Support
 
