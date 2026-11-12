@@ -323,3 +323,24 @@ milestone M2, except where named.
   database pooler image (PgBouncer or pgcat) are approved; each card names the exact version.
 - **E-1** (Public Suffix List request) and **E-4** (npm publishing) stay open until the first public app and a stable
   API.
+
+## G. Spike S-2 result (2026-11-12)
+
+Card S-2 of `docs/STEP3.md`; scripts in `spikes/step3-sandbox/` (`run.sh` re-runs every point). Build
+server: Docker 29.1.3 with `runc`, Ubuntu 24.04, kernel 6.8. Plain Docker results stand on their own;
+runsc is not run. Answers 3 and 5 of section B stay as they are; the points below add what the cards
+must do.
+
+| Point | Result | What the design and the cards take from it |
+|---|---|---|
+| 2. Gateway headers and token | **Passed** (11 checks) | G-1a strips header names that start with `ruum-` **or `ruum_`** (CGI, WSGI and PHP read `Ruum_User` as `Ruum-User`), strips hop-by-hop headers and the names listed in `Connection` before it adds its own, merges several `Cookie` headers, and matches cookie names case-insensitively after a `__Host-` or `__Secure-` prefix. It also drops `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `tracestate` and `baggage` from the internet. Inside the contract's rules; no contract change. |
+| 4. Static archive from Garage | **Passed** (8 checks) | The key is always `<deployment prefix>/<path>`; a path segment that is empty, `.`, `..`, or has `%`, `\` or a control byte is refused, not decoded. |
+| 1. Sandbox network (plain Docker, the driver's flags) | **Passed with one change** (36 checks) | **An `internal: true` network is not enough.** The host has an address on every bridge, so an app reached the host's `sshd` through its network's gateway. The Docker driver creates each app network with `-o com.docker.network.bridge.inhibit_ipv4=true` (no host address on the bridge; no root needed); then nothing outside the network was reachable. So the gateway, the runtime API, the egress proxy and the pooler are containers attached to the app network (as "Infrastructure work" 2 says), never host processes. Internal networks resolve no external names, so the egress proxy is the only way out. The egress proxy must also deny the host's public addresses (`EGRESS_DENY`): a name such as `<host IP>.nip.io` resolves to a public address. |
+| 3. Cold start (runc) | **Passed**: start of a stopped container to the first answer, median 0.25 to 0.32 s, p95 0.27 to 0.38 s (20 starts each, four runs); a new container (`docker run`) median 0.31 to 0.48 s, p95 0.32 to 0.53 s | Decision 25 (3 s) holds with a wide margin for runc. runsc numbers wait for runsc. |
+| 5. Hostile build | **Passed with the fallback** (37 checks) | Rootless BuildKit does **not** start under the driver's flags (`rootlesskit: fork/exec /proc/self/exe: operation not permitted`: no user namespaces without capabilities under the default seccomp profile and the host's AppArmor rule). The build runs as **sandbox jobs** (the fixed `node22` recipe): `npm ci` in a job with the driver's flags, a tmpfs work folder, a time limit, no secrets, `HTTPS_PROXY` to the egress proxy; the hostile `postinstall` reached none of the targets; the output is a plain tar layer that runs in a sandbox. R-2b builds this recipe (append the layer to the pinned base image without a daemon). Railpack with rootless BuildKit needs a sandbox that allows user namespaces (runsc, or a runtime class on staging); revisit with runsc. |
+| runsc (gVisor) | **Not run**: needs a person | Installing runsc and registering it with Docker needs root on the build server (commands in `spikes/step3-sandbox/README.md`, "runsc"). The `runsc` option of the Docker driver and its conformance run wait for that. |
+
+Not checked by the spike: Docker's daemon-wide user namespace remapping (needs root; the spike runs
+apps as user 10001 instead), Docker Desktop on macOS (the `inhibit_ipv4` behaviour may differ there;
+backlog T-26 covers sandbox suite skips), and Node's own `fetch` through `HTTPS_PROXY` (the SDK and
+R-2a must check that apps can use the proxy).

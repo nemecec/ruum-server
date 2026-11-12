@@ -1,0 +1,12 @@
+{
+  "name": "s2-hostile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Spike S-2 point 5: a hostile package. Its postinstall tries the metadata address, the platform Postgres, the Docker socket and more.",
+  "dependencies": {
+    "ms": "2.1.3"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}

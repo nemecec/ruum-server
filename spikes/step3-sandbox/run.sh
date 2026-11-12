@@ -107,9 +107,18 @@ openssl genpkey -algorithm ed25519 -out "$WORK/user-token.pem" 2>/dev/null
 openssl pkey -in "$WORK/user-token.pem" -pubout -out "$WORK/user-token.pub" 2>/dev/null
 chmod 600 "$WORK/user-token.pem"
 PUBKEY="$(cat "$WORK/user-token.pub")"
+RUNSC_RUNTIME=""
+docker info --format '{{json .Runtimes}}' | grep -q '"runsc"' && RUNSC_RUNTIME=runsc
 
-# One internal network per app (internal: true: no route out, no port publishing).
-net() { docker network create --internal --label ruum.app=$P "$P-$1" >/dev/null; }
+# One internal network per app (internal: true: no route out, no port publishing). APP_NET_OPTS is
+# the finding of point 1: without inhibit_ipv4 the host has an address on every bridge, and an app
+# reaches every host service that listens on all addresses (sshd) through its gateway.
+APP_NET_OPTS=(-o com.docker.network.bridge.inhibit_ipv4=true)
+net() { # name [docker network create options...]
+  local name=$1
+  shift
+  docker network create --internal --label ruum.app=$P "$@" "$P-$name" >/dev/null
+}
 
 app() { # name network audience [extra docker args...]
   local name=$1 network=$2 aud=$3
@@ -216,9 +225,8 @@ setup_garage() {
   id="$(awk -F': *' '/^Key ID:/ {print $2}' <<<"$info")"
   secret="$(awk -F': *' '/^Secret key:/ {print $2}' <<<"$info")"
   [[ -n $id && -n $secret ]] || return 1
-  umask 077
-  printf 'S3_ENDPOINT=http://127.0.0.1:3900\nS3_BUCKET=%s\nS3_ACCESS_KEY_ID=%s\nS3_SECRET_ACCESS_KEY=%s\n' \
-    "$P-static" "$id" "$secret" >"$WORK/s3.env"
+  (umask 077 && printf 'S3_ENDPOINT=http://127.0.0.1:3900\nS3_BUCKET=%s\nS3_ACCESS_KEY_ID=%s\nS3_SECRET_ACCESS_KEY=%s\n' \
+    "$P-static" "$id" "$secret" >"$WORK/s3.env")
 }
 
 point4() {
@@ -272,8 +280,282 @@ point4() {
     grep -qi "^content-security-policy: frame-ancestors .none." <<<"$h"' <<<"$hdr"
 }
 
+# ------------------------------------------------------------------------------------------------
+# The egress proxy: the spike gateway binary in `egress` mode, in a container with the driver's
+# flags, on an outside network and on the app networks it serves.
+HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {sub(/\/.*/, "", $4); print $4; exit}')"
+EGRESS_IMAGE="${S2_EGRESS_IMAGE:-ubuntu:24.04}" # the same glibc as the host that built the binary
+egress_up() { # app networks...
+  docker image inspect "$EGRESS_IMAGE" >/dev/null 2>&1 || docker pull -q "$EGRESS_IMAGE" >/dev/null
+  docker network inspect "$P-outside" >/dev/null 2>&1 ||
+    docker network create --label ruum.app=$P "$P-outside" >/dev/null
+  if ! docker inspect "$P-egress" >/dev/null 2>&1; then
+    docker run -d --name "$P-egress" --network "$P-outside" --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --user 10001:10001 --memory 128m --cpus 1 --pids-limit 64 \
+      --label ruum.app=$P -v "$GW:/gw:ro" -e GW_LISTEN=0.0.0.0:3128 -e EGRESS_PORTS=443 \
+      -e EGRESS_ALLOW="registry.npmjs.org,localhost,169.254.169.254.nip.io,$HOST_IP.nip.io" \
+      -e EGRESS_DENY="$HOST_IP" "$EGRESS_IMAGE" /gw egress >/dev/null
+  fi
+  local n
+  for n in "$@"; do docker network connect "$P-$n" "$P-egress" 2>/dev/null; done
+}
+EGRESS_REFUSED='["example.org:443","registry.npmjs.org:22","localhost:443","169.254.169.254.nip.io:443","169.254.169.254:443","'"$HOST_IP"'.nip.io:443","172.18.0.2:5432"]'
+
+# The targets an app or a build must never reach, as JSON for the probe. Only dev stack containers,
+# the host's own addresses and the spike's own containers; never staging or the SSH tunnel.
+probe_targets() { # app network, other app container, other app network
+  local lines=() c n ip gw
+  add() { [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && lines+=("$1|$2|$3"); } # skips "" and "invalid IP"
+  add "platform Postgres (ruum-postgres-1)" "$(ip_of ruum-postgres-1 ruum_default)" 5432
+  add "data cluster Postgres (ruum-postgres-data-1)" "$(ip_of ruum-postgres-data-1 ruum_data)" 5432
+  add "SpiceDB gRPC (ruum-spicedb-1)" "$(ip_of ruum-spicedb-1 ruum_default)" 50051
+  add "SpiceDB HTTP (ruum-spicedb-1)" "$(ip_of ruum-spicedb-1 ruum_default)" 8443
+  add "OpenBao (ruum-openbao-1)" "$(ip_of ruum-openbao-1 ruum_default)" 8200
+  add "NATS (ruum-nats-1)" "$(ip_of ruum-nats-1 ruum_default)" 4222
+  add "Garage S3 (ruum-garage-1)" "$(ip_of ruum-garage-1 ruum_default)" 3900
+  add "Zitadel (ruum-zitadel-1)" "$(ip_of ruum-zitadel-1 ruum_default)" 8080
+  add "Caddy (ruum-caddy-1)" "$(ip_of ruum-caddy-1 ruum_default)" 443
+  if [[ -n ${BUILDBOX_NAME:-} ]]; then
+    add "agent Postgres on the default bridge (pg-$BUILDBOX_NAME)" "$(ip_of "pg-$BUILDBOX_NAME" bridge)" 5432
+  fi
+  gw="$(docker network inspect "$P-$1" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+  add "host through the app network's gateway, sshd" "$gw" 22
+  add "host through the app network's gateway, platform Postgres port" "$gw" 5434
+  add "host through ruum_default's gateway, sshd" "$(docker network inspect ruum_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)" 22
+  add "host through docker0, sshd" 172.17.0.1 22
+  add "host through docker0, platform Postgres port" 172.17.0.1 5434
+  add "host public address, sshd" "$HOST_IP" 22
+  add "metadata address TCP 80" 169.254.169.254 80
+  add "internet direct 1.1.1.1:443" 1.1.1.1 443
+  add "internet direct 8.8.8.8:53" 8.8.8.8 53
+  [[ -n ${2:-} ]] && add "another app ($2)" "$(ip_of "$P-$2" "$P-$3")" 8080
+  printf '%s\n' "${lines[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {name: .[0], host: .[1], port: (.[2] | tonumber)})'
+}
+
+# Checks of a probe result: nothing reached except the allowed egress target.
+probe_checks() { # prefix result.json
+  local pre=$1 f=$2 k d i=0
+  [[ -s $f ]] || { fail "$pre the probe ran"; return; }
+  while IFS=$'\t' read -r k d; do
+    i=$((i + 1))
+    case $k in
+      "egress allowed "*) check "$pre.$i $k is reached through the egress proxy ($d)" jqe ".\"$k\".reached == true" <"$f" ;;
+      *) check "$pre.$i $k: not reached ($d)" jqe ".\"$k\".reached == false" <"$f" ;;
+    esac
+  done < <(jq -r 'to_entries[] | select(.key != "self") | [.key, .value.detail] | @tsv' "$f")
+  check "$pre.self runs as a non-root user with no capabilities" jqe '.self.uid != 0 and .self.cap_eff == "0000000000000000" and .self.cap_bnd == "0000000000000000"' <"$f"
+  check "$pre.self has no_new_privs and a seccomp filter (mode 2)" jqe '.self.no_new_privs == "1" and .self.seccomp == "2"' <"$f"
+  check "$pre.self has a read-only root and no Docker socket" jqe '.self.root_writable == false and .self.docker_socket == false' <"$f"
+  check "$pre.self has no secret-like environment variables" jqe '.self.env_keys == []' <"$f"
+}
+
+point1() { # [tag: r for runsc]
+  local t=${1:-}
+  section "point 1${t:+ ($t)}: a Node app in plain Docker with the driver's flags reaches nothing but the egress proxy"
+  net p1$t-a "${APP_NET_OPTS[@]}"
+  net p1$t-b "${APP_NET_OPTS[@]}"
+  app p1$t-other p1$t-b "$AUD_B"
+  egress_up p1$t-a p1$t-b
+  local eip targets
+  eip="$(ip_of "$P-egress" "$P-p1$t-a")"
+  [[ -n $eip ]] || { fail "1$t egress proxy on the app network"; return; }
+  targets="$(probe_targets p1$t-a p1$t-other p1$t-b)"
+  note "targets: $(jq -r 'map("\(.host):\(.port)") | join(" ")' <<<"$targets")"
+  mkdir -p "$WORK/p1$t" && chmod 777 "$WORK/p1$t"
+  docker run --rm --name "$P-probe-p1$t" --network "$P-p1$t-a" "${DRIVER_FLAGS[@]}" \
+    -v "$HERE/probe:/probe:ro" -v "$WORK/p1$t:/out" -e PROBE_OUT=/out/result.json \
+    -e PROBE_TARGETS="$targets" -e EGRESS="$eip:3128" -e EGRESS_ALLOWED='["registry.npmjs.org:443"]' \
+    -e EGRESS_REFUSED="$EGRESS_REFUSED" "$NODE_IMAGE" node /probe/probe.js
+  probe_checks "1$t.p" "$WORK/p1$t/result.json"
+  local cfg
+  cfg="$(docker inspect "$P-p1$t-other" -f '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.Config.User}} {{.HostConfig.Memory}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}} {{.HostConfig.Privileged}} {{len .Mounts}}')"
+  note "app container: $cfg"
+  check "1$t.cfg the app container has the driver's flags (read-only, cap-drop ALL, no-new-privileges, user, limits, no mounts)" \
+    test "$cfg" = "true [ALL] [no-new-privileges] 10001:10001 268435456 1000000000 128 false 0"
+  # For the record: the same probe on a plain internal network (no inhibit_ipv4).
+  net p1$t-plain
+  local gw
+  gw="$(docker network inspect "$P-p1$t-plain" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+  mkdir -p "$WORK/p1$t-plain" && chmod 777 "$WORK/p1$t-plain"
+  docker run --rm --network "$P-p1$t-plain" "${DRIVER_FLAGS[@]}" -v "$HERE/probe:/probe:ro" \
+    -v "$WORK/p1$t-plain:/out" -e PROBE_OUT=/out/result.json \
+    -e PROBE_TARGETS="[{\"name\":\"sshd\",\"host\":\"$gw\",\"port\":22},{\"name\":\"pg\",\"host\":\"$gw\",\"port\":5434}]" \
+    "$NODE_IMAGE" node /probe/probe.js
+  note "INFO plain internal network (no inhibit_ipv4), host through its gateway $gw: sshd $(jq -r .sshd.detail "$WORK/p1$t-plain/result.json"), port 5434 $(jq -r .pg.detail "$WORK/p1$t-plain/result.json")"
+  local log
+  log="$(docker logs "$P-egress" 2>&1)"
+  check "1$t.log the egress proxy logs host, port, status and bytes, and no path" bash -c '
+    l=$(cat); grep -q "host=registry.npmjs.org port=443 status=200 bytes_up=[0-9]* bytes_down=[0-9]*" <<<"$l" &&
+    grep -q "host=example.org port=443 status=403" <<<"$l" && ! grep -q "GET\|HEAD /" <<<"$l"' <<<"$log"
+}
+
+# ------------------------------------------------------------------------------------------------
+point3() {
+  section "point 3: cold start of a small Node app from a stopped container (decision 25: 3 s)"
+  net p3
+  local runtime results
+  for runtime in runc ${RUNSC_RUNTIME:-}; do
+    docker rm -f "$P-cold" >/dev/null 2>&1
+    docker create --name "$P-cold" --network "$P-p3" --runtime "$runtime" "${DRIVER_FLAGS[@]}" \
+      -e RUUM_ISSUER="$ISS" -e RUUM_AUDIENCE="$AUD_A" -e RUUM_ENV=live "$P-app:1" >/dev/null
+    results="$(python3 - "$P-cold" "${S2_COLD_RUNS:-20}" <<'PY'
+import json, socket, statistics, subprocess, sys, time
+name, runs = sys.argv[1], int(sys.argv[2])
+def ip():
+    return subprocess.check_output(["docker", "inspect", "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name]).decode().strip()
+def ready(addr, deadline):
+    while time.monotonic() < deadline:
+        try:
+            s = socket.create_connection((addr, 8080), timeout=0.2)
+            s.sendall(b"GET /healthz HTTP/1.0\r\n\r\n")
+            d = s.recv(64)
+            s.close()
+            if d.startswith(b"HTTP/1.1 200"):
+                return True
+        except OSError:
+            pass
+        time.sleep(0.005)
+    return False
+times = []
+for _ in range(runs):
+    subprocess.run(["docker", "stop", "-t", "0", name], capture_output=True)
+    t0 = time.monotonic()
+    subprocess.run(["docker", "start", name], check=True, capture_output=True)
+    ok = ready(ip(), t0 + 10)
+    times.append(time.monotonic() - t0 if ok else 99.0)
+times.sort()
+p95 = times[min(len(times) - 1, int(round(0.95 * len(times))) - 1)]
+print(json.dumps({"runs": runs, "median": round(statistics.median(times), 3), "p95": round(p95, 3),
+                  "min": round(times[0], 3), "max": round(times[-1], 3)}))
+PY
+)"
+    note "$runtime start from stopped: $results"
+    check "3.$runtime p95 of $(jq -r .runs <<<"$results") starts from a stopped container is under 3 s" \
+      jqe '.p95 < 3' <<<"$results"
+    echo "$runtime $results" >>"$WORK/cold.txt"
+  done
+  docker rm -f "$P-cold" >/dev/null 2>&1
+  # For comparison: a new container each time (create, start, first answer, remove).
+  results="$(python3 - "$P" "$P-p3" "$P-app:1" "${S2_COLD_RUNS:-20}" "${DRIVER_FLAGS[@]}" <<'PY'
+import json, socket, statistics, subprocess, sys, time
+p, network, image, runs, flags = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:]
+times = []
+for i in range(runs):
+    name = f"{p}-coldrun-{i}"
+    t0 = time.monotonic()
+    subprocess.run(["docker", "run", "-d", "--name", name, "--network", network, *flags, image],
+                   check=True, capture_output=True)
+    addr = subprocess.check_output(["docker", "inspect", "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name]).decode().strip()
+    ok = False
+    while time.monotonic() < t0 + 10 and not ok:
+        try:
+            s = socket.create_connection((addr, 8080), timeout=0.2)
+            s.sendall(b"GET /healthz HTTP/1.0\r\n\r\n")
+            ok = s.recv(64).startswith(b"HTTP/1.1 200")
+            s.close()
+        except OSError:
+            time.sleep(0.005)
+    times.append(time.monotonic() - t0 if ok else 99.0)
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+times.sort()
+p95 = times[min(len(times) - 1, int(round(0.95 * len(times))) - 1)]
+print(json.dumps({"runs": runs, "median": round(statistics.median(times), 3), "p95": round(p95, 3),
+                  "min": round(times[0], 3), "max": round(times[-1], 3)}))
+PY
+)"
+  note "runc new container (docker run): $results"
+  echo "runc-new $results" >>"$WORK/cold.txt"
+}
+
+# ------------------------------------------------------------------------------------------------
+point5() {
+  section "point 5: a hostile package.json builds in a sandbox job and reaches nothing"
+  net build "${APP_NET_OPTS[@]}"
+  net p5-other "${APP_NET_OPTS[@]}"
+  app p5-other p5-other "$AUD_B"
+  egress_up build
+  local eip targets rc
+  eip="$(ip_of "$P-egress" "$P-build")"
+  targets="$(probe_targets build p5-other p5-other)"
+  mkdir -p "$WORK/p5" && chmod 777 "$WORK/p5"
+  # The fixed node22 recipe, step 1: npm ci as a sandbox job (the driver's flags, a tmpfs work
+  # folder, a time limit, no secrets, egress only through the proxy).
+  timeout 300 docker run --rm --name "$P-build-job" --network "$P-build" \
+    --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
+    --memory 512m --memory-swap 512m --cpus 2 --pids-limit 256 --label ruum.app=$P \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
+    --tmpfs /work:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001 \
+    -v "$HERE/hostile:/src:ro" -v "$HERE/probe:/probe:ro" -v "$WORK/p5:/out" \
+    -e HOME=/tmp -e npm_config_cache=/tmp/npm-cache -e npm_config_update_notifier=false \
+    -e HTTPS_PROXY="http://$eip:3128" -e https_proxy="http://$eip:3128" \
+    -e PROBE_TARGETS="$targets" -e EGRESS="$eip:3128" -e EGRESS_ALLOWED='[]' \
+    -e EGRESS_REFUSED="$EGRESS_REFUSED" \
+    "$NODE_IMAGE" sh -c 'cp -r /src/. /work/ && cd /work && npm ci --no-audit --no-fund --foreground-scripts \
+      && tar -C /work -cf /out/layer.tar package.json node_modules' >"$WORK/p5/npm.log" 2>&1
+  rc=$?
+  check "5.1 npm ci of the hostile package succeeds in the sandbox job (exit $rc)" test $rc = 0
+  [[ $rc == 0 ]] || sed 's/^/      npm: /' "$WORK/p5/npm.log" | tail -20
+  check "5.2 the dependency came through the egress proxy" bash -c "docker logs '$P-egress' 2>&1 | grep -q 'host=registry.npmjs.org port=443 status=200'"
+  check "5.3 the postinstall ran and wrote its probe result" test -s "$WORK/p5/postinstall.json"
+  probe_checks 5.p "$WORK/p5/postinstall.json"
+  # Step 2 of the recipe: the layer is a plain tar; the app runs from it in a sandbox.
+  if [[ -s $WORK/p5/layer.tar ]]; then
+    note "layer: $(sha256sum "$WORK/p5/layer.tar" | cut -c1-71) ($(stat -c %s "$WORK/p5/layer.tar") bytes)"
+    mkdir -p "$WORK/p5/app" && tar -C "$WORK/p5/app" -xf "$WORK/p5/layer.tar"
+    check "5.4 the built layer runs in a sandbox (require('ms'))" bash -c "
+      [[ \$(docker run --rm --network none ${DRIVER_FLAGS[*]} -v '$WORK/p5/app:/app:ro' -w /app '$NODE_IMAGE' \
+        node -e \"process.stdout.write(String(require('ms')('2h')))\") == 7200000 ]]"
+    [[ ${#FAILED[@]} -gt 0 && ${FAILED[${#FAILED[@]}-1]} == 5.4* ]] && { tar -tvf "$WORK/p5/layer.tar" | head -8; ls -la "$WORK/p5/app" "$WORK/p5/app/node_modules"; } | sed 's/^/      /'
+  else
+    fail "5.4 the built layer runs in a sandbox" "no layer"
+  fi
+  # Rootless BuildKit under the same flags (for the record; the recipe above does not need it).
+  local bk="${S2_BUILDKIT_IMAGE:-moby/buildkit:v0.23.2-rootless}" out
+  docker image inspect "$bk" >/dev/null 2>&1 || docker pull -q "$bk" >/dev/null 2>&1
+  mkdir -p "$WORK/p5/bkctx" && printf 'FROM scratch\nCOPY a /a\n' >"$WORK/p5/bkctx/Dockerfile" && echo a >"$WORK/p5/bkctx/a"
+  out="$(timeout 120 docker run --rm --name "$P-buildkit" --network "$P-build" \
+    --read-only --cap-drop ALL --security-opt no-new-privileges --user 1000:1000 \
+    --memory 512m --cpus 2 --pids-limit 256 --label ruum.app=$P \
+    --tmpfs /tmp:rw,size=64m --tmpfs /home/user/.local:rw,size=256m,uid=1000,gid=1000 \
+    --tmpfs /run/user/1000:rw,size=16m,uid=1000,gid=1000 \
+    -e BUILDKITD_FLAGS=--oci-worker-no-process-sandbox -v "$WORK/p5/bkctx:/ctx:ro" \
+    --entrypoint sh "$bk" -c 'mkdir -p ~/.local/tmp ~/.local/share/buildkit && exec buildctl-daemonless.sh \
+      build --frontend dockerfile.v0 --local context=/ctx --local dockerfile=/ctx \
+      --output type=tar,dest=/tmp/out.tar' 2>&1)"
+  BUILDKIT_RC=$?
+  BUILDKIT_OUT="$(tail -3 <<<"$out" | tr '\n' ' ' | cut -c1-300)"
+  note "INFO rootless BuildKit with the driver's flags: exit $BUILDKIT_RC: $BUILDKIT_OUT"
+}
+
+# ------------------------------------------------------------------------------------------------
+pointr() {
+  section "runsc (gVisor)"
+  if [[ -n ${RUNSC_RUNTIME:-} ]]; then
+    note "Docker knows the runsc runtime; point 1 again under runsc (point 3 measured it too)"
+    local saved=("${DRIVER_FLAGS[@]}")
+    DRIVER_FLAGS+=(--runtime runsc)
+    point1 r
+    DRIVER_FLAGS=("${saved[@]}")
+  elif [[ -x $HOME/bin/runsc ]]; then
+    local out
+    if out="$("$HOME/bin/runsc" --rootless --network=none do /bin/true 2>&1)"; then
+      pass "r.1 runsc --rootless do runs a process"
+    else
+      skip "r.1 runsc --rootless" "fails: $(tail -1 <<<"$out" | cut -c1-200)"
+    fi
+  else
+    skip "r runsc checks" "runsc is not installed and needs root; see README.md, 'runsc'"
+  fi
+}
+
 want 2 && point2
 want 4 && point4
+want 1 && point1
+want 3 && point3
+want 5 && point5
+want r && pointr
 
 section "result"
 printf 'PASS %d  FAIL %d  SKIP %d\n' "$PASS" "$FAIL" "$SKIP"
