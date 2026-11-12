@@ -18,6 +18,11 @@ pub struct AppPlanLimits {
     pub max_instances: u32,
     /// How long logs, metrics, traces and error events are kept.
     pub telemetry_days: u32,
+    /// The plan allows an app that never scales to zero (`resources.min_instances` above 0):
+    /// "always on" is an option of the team plan only (design 4.3). Not in the contract's
+    /// `AppPlanLimits`, so it is not serialized.
+    #[serde(skip)]
+    pub always_on: bool,
 }
 
 impl AppPlanLimits {
@@ -31,6 +36,7 @@ impl AppPlanLimits {
                 memory_mb: 256,
                 max_instances: 1,
                 telemetry_days: 7,
+                always_on: false,
             },
             Plan::Personal => Self {
                 apps: Some(10),
@@ -39,6 +45,7 @@ impl AppPlanLimits {
                 memory_mb: 512,
                 max_instances: 2,
                 telemetry_days: 14,
+                always_on: false,
             },
             Plan::Team => Self {
                 apps: Some(50),
@@ -47,6 +54,7 @@ impl AppPlanLimits {
                 memory_mb: 1024,
                 max_instances: 5,
                 telemetry_days: 30,
+                always_on: true,
             },
         }
     }

@@ -149,22 +149,28 @@ impl AppStore for MemoryAppStore {
         &self,
         ctx: &Context,
         node: NodeId,
+        expected: &AppSettings,
         settings: &AppSettings,
         data: Value,
-    ) -> Result<(AppRow, ChangeInfo)> {
-        let row = {
-            let mut st = self.st();
-            let row = st
-                .apps
-                .get_mut(&(ctx.tenant, node))
-                .ok_or_else(|| Error::not_found("app"))?;
-            row.settings = *settings;
-            row.updated_at = crate::now();
-            row.clone()
-        };
+    ) -> Result<Option<(AppRow, ChangeInfo)>> {
+        // The compare, the write and the journal entry happen under one lock, so two updates
+        // cannot write in one order and journal in the other; a failed append puts the old row
+        // back (as the rollback of the Postgres transaction).
+        let mut st = self.st();
+        let row = st
+            .apps
+            .get_mut(&(ctx.tenant, node))
+            .ok_or_else(|| Error::not_found("app"))?;
+        if row.settings != *expected {
+            return Ok(None);
+        }
+        let before = row.clone();
+        row.settings = *settings;
+        row.updated_at = crate::now();
+        let row = row.clone();
         let change = match &self.journal {
             Some(j) => {
-                let e = j.append(
+                let appended = j.append(
                     ctx,
                     NewEntry {
                         node_id: Some(node),
@@ -172,7 +178,14 @@ impl AppStore for MemoryAppStore {
                         event: EventType::AppSettingsChanged,
                         data,
                     },
-                )?;
+                );
+                let e = match appended {
+                    Ok(e) => e,
+                    Err(err) => {
+                        st.apps.insert((ctx.tenant, node), before);
+                        return Err(err);
+                    }
+                };
                 ChangeInfo {
                     seq: Some(e.seq),
                     actor: ctx.actor,
@@ -185,7 +198,7 @@ impl AppStore for MemoryAppStore {
                 at: row.updated_at,
             },
         };
-        Ok((row, change))
+        Ok(Some((row, change)))
     }
 
     async fn remove_app(&self, tenant: TenantId, node: NodeId) -> Result<()> {

@@ -360,10 +360,24 @@ impl AppStore for PgAppStore {
         &self,
         ctx: &Context,
         node: NodeId,
+        expected: &AppSettings,
         settings: &AppSettings,
         data: Value,
-    ) -> Result<(AppRow, ChangeInfo)> {
+    ) -> Result<Option<(AppRow, ChangeInfo)>> {
         let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        // Lock the row and compare: a write based on an old copy writes nothing.
+        let current: Value = sqlx::query_scalar(
+            "select settings from apps where tenant_id = $1 and node_id = $2 for update",
+        )
+        .bind(ctx.tenant)
+        .bind(node)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::not_found("app"))?;
+        if AppSettings::from_stored(&current) != *expected {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         let stored = serde_json::to_value(settings)
             .map_err(|e| Error::Internal(format!("settings: {e}")))?;
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -390,14 +404,14 @@ impl AppStore for PgAppStore {
         )
         .await?;
         tx.commit().await?;
-        Ok((
+        Ok(Some((
             row,
             ChangeInfo {
                 seq: Some(e.seq),
                 actor: ctx.actor,
                 at: e.at,
             },
-        ))
+        )))
     }
 
     async fn remove_app(&self, tenant: TenantId, node: NodeId) -> Result<()> {

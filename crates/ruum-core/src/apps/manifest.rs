@@ -5,7 +5,8 @@
 //! these provider rules:
 //!
 //! - The plan caps the resources (`AppPlanLimits`): `resources.memory_mb` and
-//!   `resources.max_instances` at most the plan's.
+//!   `resources.max_instances` at most the plan's; `resources.min_instances` above 0 (always on)
+//!   only on a plan that allows it (design 4.3: free and personal scale to zero).
 //! - A name is in `env` or in `secrets`, never in both.
 //! - At most one role has `default: true`, at most one has `grants_roles: true`.
 //! - `preview_scopes` of an API is a subset of its `scopes`; `granted_by` names a role of the
@@ -65,15 +66,16 @@ pub fn validate(manifest: &Value, plan: &AppPlanLimits) -> ValidationResult {
                     pointer
                 },
                 "schema",
-                e.to_string(),
+                // The masked text names the rule, not the value (an `env` value can be a
+                // token pasted by mistake), as in the database manifest.
+                e.masked().to_string(),
             )
         })
         .collect();
     if problems.is_empty() {
         provider_rules(manifest, plan, &mut problems);
     }
-    // The schema's messages can quote values of the manifest (an `env` value); keep the first
-    // problems only, so an answer stays small.
+    // Keep the first problems only, so an answer stays small.
     problems.truncate(20);
     ValidationResult {
         valid: problems.is_empty(),
@@ -113,6 +115,18 @@ fn provider_rules(m: &Value, plan: &AppPlanLimits, problems: &mut Vec<Problem>) 
             "/resources/max_instances",
             "plan_limit",
             format!("the plan allows at most {} instances", plan.max_instances),
+        ));
+    }
+    if !plan.always_on
+        && resources
+            .get("min_instances")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+    {
+        problems.push(problem(
+            "/resources/min_instances",
+            "plan_limit",
+            "the plan scales apps to zero; min_instances above 0 (always on) needs the team plan",
         ));
     }
     if let Some(n) = resources.get("min_instances").and_then(Value::as_u64)
@@ -339,6 +353,32 @@ mod tests {
         let e = problems_error(&r.problems);
         assert_eq!(e.to_api().hint.as_deref(), Some("/resources/memory_mb"));
         assert_eq!(e.http_status(), 422);
+        // Free and personal scale to zero; always on is a team option.
+        let always_on = json!({ "runtime": "node22", "start": "node s.js",
+            "resources": { "min_instances": 1, "max_instances": 1 } });
+        for plan in [Plan::Free, Plan::Personal] {
+            let p: Vec<_> = validate(&always_on, &AppPlanLimits::of(plan))
+                .problems
+                .into_iter()
+                .map(|p| p.pointer)
+                .collect();
+            assert_eq!(p, ["/resources/min_instances"], "{plan:?}");
+        }
+        assert!(validate(&always_on, &team()).valid);
+    }
+
+    #[test]
+    fn schema_messages_do_not_quote_values() {
+        // A token pasted into an `env` value where the schema wants a string.
+        let leaked = "pasted-value-that-must-not-be-echoed";
+        let m = json!({ "runtime": "static", "env": { "A": [leaked] } });
+        let r = validate(&m, &team());
+        assert!(!r.valid);
+        for p in &r.problems {
+            assert!(!p.message.contains(leaked), "{}", p.message);
+        }
+        let e = problems_error(&r.problems);
+        assert!(!e.to_api().message.contains(leaked));
     }
 
     #[test]

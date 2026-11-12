@@ -172,7 +172,13 @@ pub(crate) async fn apps_stay_in_their_tenant(h: &dyn Harness) {
     };
     let data = settings_changed_data(&["raw_copy_days"], &changed);
     let e = s
-        .update_settings(&ctx(b, ub), na, &changed, data.clone())
+        .update_settings(
+            &ctx(b, ub),
+            na,
+            &AppSettings::default(),
+            &changed,
+            data.clone(),
+        )
         .await
         .unwrap_err();
     assert_eq!(e.http_status(), 404);
@@ -186,12 +192,32 @@ pub(crate) async fn apps_stay_in_their_tenant(h: &dyn Harness) {
         0
     );
     let (after, change) = s
-        .update_settings(&ctx(a, ua), na, &changed, data)
+        .update_settings(
+            &ctx(a, ua),
+            na,
+            &AppSettings::default(),
+            &changed,
+            data.clone(),
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the stored settings are the expected ones");
     assert_eq!(after.settings.raw_copy_days, 7);
     assert!(change.seq.is_some(), "the change has a journal entry");
     assert_eq!(change.actor, Actor::user(ua));
+    // A write based on an old copy (the defaults) does not overwrite the newer settings.
+    let stale = AppSettings {
+        telemetry_mode: crate::apps::settings::TelemetryMode::Full,
+        ..AppSettings::default()
+    };
+    assert!(
+        s.update_settings(&ctx(a, ua), na, &AppSettings::default(), &stale, data)
+            .await
+            .unwrap()
+            .is_none(),
+        "a compare-and-swap with an old copy writes nothing"
+    );
+    assert_eq!(s.get_app(a, na).await.unwrap().unwrap().settings, changed);
     // B's removal of A's node changes nothing.
     s.remove_app(b, na).await.unwrap();
     assert!(s.get_app(a, na).await.unwrap().is_some());

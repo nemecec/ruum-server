@@ -262,6 +262,16 @@ async fn create_and_get_an_app() {
     assert!(p.use_app && p.deploy && p.publish && p.configure);
     let v = serde_json::to_value(&app).unwrap();
     assert_eq!(v["my_permissions"]["use"], true);
+    // An agent never uses a live app in step 3 (a live host refuses agent tokens), so `use`
+    // is false for it, also with manage; the rest follows its role (review W-1, 3).
+    let agent = w.agent(w.member, Role::Manage).await;
+    let seen = w.s.apps.get(&agent, app.node.id).await.unwrap();
+    let p = seen.my_permissions.unwrap();
+    assert!(!p.use_app && p.deploy && p.publish && p.configure);
+    assert_eq!(
+        serde_json::to_value(&seen).unwrap()["my_permissions"]["use"],
+        false
+    );
     for key in [
         "node",
         "settings",
@@ -602,6 +612,48 @@ async fn copy_makes_a_new_app_and_trash_suspends() {
     assert_eq!(row.settings.access, settings::Access::Platform);
     assert_eq!(row.settings.raw_copy_days, 3);
     assert!(row.live_deployment_id.is_none());
+    // The source became public at create, so its report widget is off (decision 0006-19).
+    assert!(!app.settings.report_widget.enabled);
+    // A copy made by an agent starts with the default telemetry and raw copy: those are a
+    // person's choice (review W-1, 2).
+    w.s.apps
+        .update_settings(
+            &w.o(),
+            app.node.id,
+            serde_json::from_value(json!({ "telemetry_mode": "full" })).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let agent = w.agent(w.owner, Role::Manage).await;
+    let by_agent =
+        w.s.nodes
+            .copy(
+                &agent,
+                app.node.id,
+                CopyRequest {
+                    parent_id: w.folder,
+                    name: Some("Planner agent copy".into()),
+                    on_conflict: OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+    w.deliver().await;
+    let agent_row =
+        w.s.apps
+            .store()
+            .get_app(w.team.id, by_agent.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(agent_row.settings.access, settings::Access::Platform);
+    assert_eq!(
+        agent_row.settings.telemetry_mode,
+        settings::TelemetryMode::Privacy
+    );
+    assert_eq!(agent_row.settings.raw_copy_days, 0);
     // The intent of a preview from the source's live archive is recorded (card W-2 makes it).
     let typed =
         w.s.typed_nodes

@@ -79,6 +79,8 @@ pub const NODE_TYPE: &str = "webapp";
 pub const PROVIDER_ID: &str = "ruum.webapp";
 /// The longest long poll of `wait` (`Wait.maximum` of the contract).
 pub const MAX_WAIT: Duration = Duration::from_secs(30);
+/// How often `updateAppSettings` reads again after a concurrent change before it answers `412`.
+const UPDATE_TRIES: usize = 3;
 
 // ---------------------------------------------------------------------------- requests
 
@@ -117,10 +119,12 @@ pub struct AppPermissions {
 }
 
 impl AppPermissions {
-    pub fn of(role: Option<Role>, can_share: bool) -> Self {
+    /// The permissions of a caller with `role` on the app. `use` is false for an agent: a live
+    /// host refuses agent tokens in step 3 (the permission table of `docs/STEP3.md`, review S1).
+    pub fn of(role: Option<Role>, can_share: bool, is_agent: bool) -> Self {
         let at_least = |r: Role| role.is_some_and(|m| m >= r);
         Self {
-            use_app: at_least(Role::View),
+            use_app: !is_agent && at_least(Role::View),
             deploy: at_least(Role::Edit),
             publish: at_least(Role::Edit),
             read_telemetry: at_least(Role::Edit),
@@ -661,29 +665,55 @@ impl AppService {
         if if_revision.is_some_and(|r| r != node.revision) {
             return Err(crate::nodes::rules::precondition_failed());
         }
-        let row = d.store.get_app(ctx.tenant, id).await?.ok_or_else(|| {
+        let role = self.tenant_role(ctx).await?;
+        let who = Changer {
+            is_agent: ctx.actor.is_agent(),
+            tenant_role: role,
+            public_apps_approved: false,
+        };
+        // Read, check and write with a compare-and-swap: when another change lands between the
+        // read and the write, read again and run the rules again on the newer row, so a write
+        // based on an old copy never puts back a value the rules refuse (review W-1, 1).
+        let mut change = None;
+        for _ in 0..UPDATE_TRIES {
+            let row = d.store.get_app(ctx.tenant, id).await?.ok_or_else(|| {
+                Error::Api(
+                    ApiError::new(ErrorCode::Conflict, "the app is still being set up")
+                        .with_hint("try again in a few seconds"),
+                )
+            })?;
+            let approved = d
+                .store
+                .tenant_settings(ctx.tenant)
+                .await?
+                .is_some_and(|t| t.public_apps_approved);
+            let next = settings::apply(
+                &row.settings,
+                &input,
+                Changer {
+                    public_apps_approved: approved,
+                    ..who
+                },
+            )?;
+            let data = store::settings_changed_data(&input.names(), &next);
+            if let Some((_, c)) = d
+                .store
+                .update_settings(ctx, id, &row.settings, &next, data)
+                .await?
+            {
+                change = Some(c);
+                break;
+            }
+        }
+        let change = change.ok_or_else(|| {
             Error::Api(
-                ApiError::new(ErrorCode::Conflict, "the app is still being set up")
-                    .with_hint("try again in a few seconds"),
+                ApiError::new(
+                    ErrorCode::PreconditionFailed,
+                    "the settings were changed by someone else at the same time",
+                )
+                .with_hint("read the app again and repeat the change"),
             )
         })?;
-        let role = self.tenant_role(ctx).await?;
-        let approved = d
-            .store
-            .tenant_settings(ctx.tenant)
-            .await?
-            .is_some_and(|t| t.public_apps_approved);
-        let next = settings::apply(
-            &row.settings,
-            &input,
-            Changer {
-                is_agent: ctx.actor.is_agent(),
-                tenant_role: role,
-                public_apps_approved: approved,
-            },
-        )?;
-        let data = store::settings_changed_data(&input.names(), &next);
-        let (_, change) = d.store.update_settings(ctx, id, &next, data).await?;
         let node = d.nodes.get(ctx, id).await?;
         let app = self.view(ctx, node).await?;
         Ok(Written { value: app, change })
@@ -815,9 +845,13 @@ impl AppService {
             Vec::new()
         };
         let status = app_status(&node, row.as_ref(), typed.as_ref(), live.is_some());
-        let my_permissions = node
-            .my_role
-            .map(|r| AppPermissions::of(Some(r), node.my_can_share.unwrap_or(false)));
+        let my_permissions = node.my_role.map(|r| {
+            AppPermissions::of(
+                Some(r),
+                node.my_can_share.unwrap_or(false),
+                ctx.actor.is_agent(),
+            )
+        });
         Ok(App {
             settings: row.as_ref().map(|r| r.settings).unwrap_or_default(),
             slug: urls.app_slug.clone(),
