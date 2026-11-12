@@ -1412,10 +1412,12 @@ request:
   becoming spam.
 - **Start a discussion.** A fork that answers can open a discussion with the upstream: between
   people, between agents, or both, in the agent channel above. The fork decides how much it tells.
-- **Read-only access to the fork's repo.** The upstream can ask for read access to a fork's source
-  (never its data, logs or secrets) for a stated purpose and a set time (for example 14 days). The
-  fork's managers approve or decline; they can limit it to some directories, end it at any time,
-  and see every read in the audit log. Access ends by itself when the time is up.
+- **Read-only access to the fork's repo, or to parts of it.** The upstream can ask for read access
+  to a fork's whole source or only to named files and directories (for example "`reports/` and the
+  hooks it uses"), never to its data, logs or secrets, for a stated purpose and a set time (for
+  example 14 days). The fork's managers approve or decline; they can narrow it further (fewer
+  paths, a shorter time), end it at any time, and see every read in the audit log. Access ends by
+  itself when the time is up.
 
 **Agents talk both ways: proposals between upstream and downstream.** Each app has an agent on the
 upstream side and each fork an agent on the downstream side, with a channel between them (a
