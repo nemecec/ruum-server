@@ -111,6 +111,9 @@ jobs:
         env:
           DATABASE_URL: postgres://ruum_test:ruum_test@localhost:5432/ruum
           RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
+          # The superuser of the data cluster (docker exec), for the engine tests of foreign
+          # tables, event triggers and type functions, which only a superuser can make.
+          DBHOST_CHECK_CONTAINER: postgres-data
           RUUM_PG_DUMP: /usr/lib/postgresql/17/bin/pg_dump
         run: |
           cargo test --workspace --exclude ruum-testkit --locked

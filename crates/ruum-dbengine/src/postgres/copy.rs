@@ -425,7 +425,7 @@ async fn hand_over(
         .await?;
         setup::install_functions(&mut conn, new_roles, first_key).await?;
         if masked {
-            pseudonyms_for_owner(&mut conn, &new_mask, &new_owner, true).await?;
+            make_copy_entry_points(&mut conn, &new_mask, &new_owner).await?;
         }
         run(&mut conn, "commit", "commit".to_string()).await
     }
@@ -451,7 +451,7 @@ async fn hand_over(
     let result = async {
         run(&mut conn, "begin", "begin".to_string()).await?;
         if masked {
-            pseudonyms_for_owner(&mut conn, &new_mask, &new_owner, false).await?;
+            drop_copy_entry_points(&mut conn).await?;
         }
         setup::rebuild_lens(&mut conn, new_roles, key).await?;
         // The copy took the rights of its source; the old owner's grant went in step 1.
@@ -464,51 +464,95 @@ async fn hand_over(
     setup::grant_connect(engine, name, new_roles).await
 }
 
-/// Lets the copy's `owner` compute pseudonyms for the length of the masking (`USAGE` on
-/// `ruum_mask`, `EXECUTE` on `pseudonym` and `pseudonym_other` only), or takes that back.
-async fn pseudonyms_for_owner(
+/// The schema of the entry points of step 2 of a masked copy (backlog 2026-11-09 S-9). It holds
+/// no relation: only the wrappers of the pseudonym functions.
+pub(crate) const COPY_SCHEMA: &str = "ruum_copy";
+
+/// Lets the copy's `owner` compute pseudonyms for the length of the masking, without any right
+/// on `ruum_mask` (backlog 2026-11-09 S-9, review-masking-1 F2, the "better" option): `mask`
+/// makes one `SECURITY DEFINER` wrapper per pseudonym function (`pseudonym` for each type,
+/// `pseudonym_other`) in the schema [`COPY_SCHEMA`], which holds no relation, and the owner gets
+/// `USAGE` on that schema and `EXECUTE` on the wrappers only. Tenant code that runs in step 2 as
+/// the owner can so neither name `ruum_mask.key` nor any other object of `ruum_mask`; an object
+/// it makes over a wrapper makes step 3 refuse the copy ([`drop_copy_entry_points`]).
+async fn make_copy_entry_points(
     conn: &mut PgConnection,
     mask: &str,
     owner: &str,
-    grant: bool,
 ) -> Result<(), EngineError> {
-    let owner = ident(owner);
-    let (verb, to) = if grant {
-        ("grant", "to")
-    } else {
-        ("revoke", "from")
-    };
+    let (mask_id, owner_id) = (ident(mask), ident(owner));
     run(
         conn,
-        "change the owner's right on ruum_mask",
-        format!("{verb} usage on schema ruum_mask {to} {owner}"),
+        "make the schema of the copy's entry points",
+        format!(
+            "create schema {COPY_SCHEMA};\n\
+             revoke all on schema {COPY_SCHEMA} from public;\n\
+             grant usage, create on schema {COPY_SCHEMA} to {mask_id};"
+        ),
     )
     .await?;
-    run(
-        conn,
-        "become mask",
-        format!("set local role {}", ident(mask)),
-    )
-    .await?;
+    run(conn, "become mask", format!("set local role {mask_id}")).await?;
     let rows = sqlx::query(
-        "select p.oid::pg_catalog.regprocedure::text from pg_catalog.pg_proc p
+        "select p.proname::text, pg_catalog.pg_get_function_identity_arguments(p.oid)
+           from pg_catalog.pg_proc p
           where p.pronamespace = 'ruum_mask'::pg_catalog.regnamespace
-            and p.proname in ('pseudonym', 'pseudonym_other')",
+            and p.proname in ('pseudonym', 'pseudonym_other')
+          order by 1, 2",
     )
     .persistent(false)
     .fetch_all(&mut *conn)
     .await
     .map_err(|e| internal("list the pseudonym functions", e))?;
+    if rows.is_empty() {
+        return Err(EngineError::Internal(
+            "the copy has no pseudonym functions".to_string(),
+        ));
+    }
     for row in rows {
-        let function: String = row.get(0);
+        let (name, args): (String, String) = (row.get(0), row.get(1));
+        // `args` is `v <type>` (one argument), as `lens::functions_sql` makes them.
         run(
             conn,
-            "change the owner's right on a pseudonym function",
-            format!("{verb} execute on function {function} {to} {owner}"),
+            "make an entry point of the copy",
+            format!(
+                "create function {COPY_SCHEMA}.{name}({args}) returns text language sql stable strict \
+                   security definer set search_path = pg_catalog, pg_temp \
+                   as $f$ select ruum_mask.{name}($1) $f$;\n\
+                 revoke all on function {COPY_SCHEMA}.{name}({args}) from public;\n\
+                 grant execute on function {COPY_SCHEMA}.{name}({args}) to {owner_id};"
+            ),
         )
         .await?;
     }
-    run(conn, "leave mask", "reset role".to_string()).await
+    run(conn, "leave mask", "reset role".to_string()).await?;
+    run(
+        conn,
+        "open the entry points to the copy's owner",
+        format!(
+            "revoke create on schema {COPY_SCHEMA} from {mask_id};\n\
+             grant usage on schema {COPY_SCHEMA} to {owner_id};"
+        ),
+    )
+    .await
+}
+
+/// Step 3 of a masked copy: refuses the copy when tenant code of step 2 left an object that
+/// depends on an entry point or on another object of the lens schemas, then drops the schema of
+/// the entry points (nothing of the tenant goes with it).
+async fn drop_copy_entry_points(conn: &mut PgConnection) -> Result<(), EngineError> {
+    let foreign = setup::foreign_lens_dependents(conn).await?;
+    if !foreign.is_empty() {
+        return Err(EngineError::Internal(format!(
+            "objects outside the Ruum schemas depend on the lens schemas: {}",
+            foreign.join("; ")
+        )));
+    }
+    run(
+        conn,
+        "drop the schema of the copy's entry points",
+        format!("drop schema if exists {COPY_SCHEMA} cascade"),
+    )
+    .await
 }
 
 /// Step 2 of a hand-over, in a session of the copy's `owner` (it owns every table and holds
@@ -739,7 +783,7 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
                     format!(
                         "alter table {table} alter column {col} drop default;\n\
                          alter table {table} alter column {col} type text using {}",
-                        lens::pseudonym_call(&col, base)
+                        lens::pseudonym_call_in(COPY_SCHEMA, &col, base)
                     ),
                 )
                 .await?;
