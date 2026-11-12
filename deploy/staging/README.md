@@ -259,7 +259,17 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   for `RUUM_SHUTDOWN_GRACE_SECONDS` (35 s, longer than the 30 s long poll); longer WebDAV
   transfers and downloads are cut and the client retries.
 - An older commit than the deployed one needs `--rollback`: the same path; its migration step
-  has nothing to do.
+  has nothing to do. **The rollback floor is backlog O-25** (the commit that added the migration
+  step and the edge's certificate storage). An older commit has no `ruum-server migrate` (its
+  Job would fail on a usage error) and its edge image has no `kubernetes_secret` storage module
+  (Caddy would not load the Caddyfile). `deploy.sh` refuses such a commit before it touches the
+  cluster (`ops/release-floor.sh`). To go back further, revert on main and deploy the revert.
+- ruum-server keeps two limits in memory, per process. The ask limit of on-demand TLS
+  (`server.tlsAskNewHostsPerHour`, 20) is for all replicas together: the chart gives each
+  replica its share (20 / 2 = 10). The surge pod of a rollout adds one share for a short time,
+  and a host that one replica allowed counts again on another. The rate limits of
+  `ruum_api::limits` are per process, so N replicas allow N times as much. Shared counters are
+  backlog O-28.
 - Before the first deploy with these steps, apply the platform (`k8s/apply.sh`): it adds the
   deployer's rights for Jobs and DaemonSets, the edge's ServiceAccount and Role, and the network
   policy rule that lets the migration Job reach Postgres. `deploy-chart.sh` stops when the
@@ -323,7 +333,7 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads, except the edge's (Secrets and Leases of `edge` only, for the certificate storage, backlog O-26). |
 | S-2 | The admin credentials only on the person's Mac (`~/.config/ruum`), never on the build server; namespaced `deployer` ServiceAccount for deploys. |
 | S-3 | One Secret per consumer; `secrets-push.sh` fixed list, refuses forbidden names; tests. |
-| S-4 | Certificates in Secrets of the `edge` namespace, readable only by the edge's ServiceAccount (backlog O-26); no Hetzner key in the edge. |
+| S-4 | Certificates, ACME account keys and challenge tokens in Secrets of the `edge` namespace (backlog O-26); only the edge's ServiceAccount `ruum-edge` has a Role on them; no Hetzner key in the edge. **Not only the edge can read them:** the deployer manages the edge DaemonSet and may create pods in `edge`, so it can start a pod as `ruum-edge` and read every certificate private key and the ACME account key. This weakens stgsec S-11 for the TLS keys only: the database password and the token signing key stay out of the deployer's reach. Backlog O-29 takes it to the next security review. |
 | S-5 | rclone crypt for the blob copy; provider-side encryption stated for CNPG; HTTPS endpoints only. |
 | S-6 | Generated secrets in `secrets.env` (`secrets-init.sh`); `--restore-from`. |
 | S-7 | Deploy by digest; provenance attestation checked; Trivy scans vulnerabilities and secrets in the layers before the push. |

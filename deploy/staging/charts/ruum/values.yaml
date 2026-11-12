@@ -42,7 +42,11 @@ server:
   resources:
     requests: { cpu: 100m, memory: 200Mi }
     limits: { memory: 512Mi }
-  # New content hosts per hour that may get a certificate (the ask endpoint, review 1 B-5).
+  # New content hosts per hour that may get a certificate (the ask endpoint, review 1 B-5), for
+  # all replicas together. ruum-server counts in memory, per process, so server.yaml gives each
+  # replica tlsAskNewHostsPerHour / replicas (at least 1). During a rollout the surge pod adds
+  # one more share, and a host allowed by one replica counts again on another. A shared counter
+  # is backlog O-28.
   tlsAskNewHostsPerHour: 20
 
 edge:

@@ -15,6 +15,9 @@
 {{- if lt (int .Values.server.replicas) 2 }}
 {{- fail "server.replicas must be at least 2 (design 12.7)" }}
 {{- end }}
+{{- /* The ask limit is counted in each process (review of O-25, change 4; backlog O-28): each
+       replica gets its share, so all of them together allow about tlsAskNewHostsPerHour. */}}
+{{- $askPerReplica := max 1 (div (int .Values.server.tlsAskNewHostsPerHour) (int .Values.server.replicas)) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -76,7 +79,7 @@ spec:
             - { name: RUUM_BIND, value: "0.0.0.0:8491" }
             - { name: RUUM_DAV_BIND, value: "0.0.0.0:8492" }
             - { name: RUUM_INTERNAL_BIND, value: "0.0.0.0:8493" }
-            - { name: RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR, value: {{ .Values.server.tlsAskNewHostsPerHour | quote }} }
+            - { name: RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR, value: {{ $askPerReplica | quote }} }
             - { name: RUUM_PUBLIC_URL, value: "https://{{ .Values.hosts.public }}" }
             - { name: RUUM_DAV_URL, value: "https://{{ .Values.hosts.dav }}/" }
             - { name: RUUM_CONTENT_URL, value: "https://{{ .Values.hosts.content }}" }
