@@ -1378,13 +1378,24 @@ edits, and to show which features matter, Ruum gives the upstream aggregated sta
 its forks:
 - What is counted: only what the app declares in its package. Which configuration options are
   on, which extension points and hooks are used, which version and channel the forks run, how
-  many forks have unlinked or customise outside the extension points (a yes or no per fork, never
-  the code), and the share of forks that use each declared feature (for example "92 % have
-  time tracking on, 4 % use the old report").
+  many forks have unlinked, and the share of forks that use each declared feature (for example
+  "92 % have time tracking on, 4 % use the old report").
+- **The scope of changes outside the extension points**, as numbers only, never code:
+  - per file and per directory **of the upstream's own tree**: the share of forks that changed it,
+    and the lines added, changed and deleted (median and spread across those forks), so the
+    upstream sees hot spots ("`reports/` is changed in 60 % of forks, median 120 lines: it needs
+    an extension point");
+  - files that forks added: totals only (how many files and lines, per top-level directory of the
+    upstream's tree), never their names or paths below that, since names can reveal what a fork
+    does;
+  - counted against the version each fork is on, after merges, so an update does not show up as
+    a change.
 - What is never counted: the forks' data, users, content, code or names, and usage events of
   people.
 - Aggregation: the upstream sees numbers across forks only, never per fork, and a number appears
-  only when at least 5 forks contribute to it (smaller groups show "fewer than 5").
+  only when at least 5 forks contribute to it (smaller groups show "fewer than 5"). Line counts
+  are rounded into ranges (for example 1-10, 11-50, 51-200, more), so a number cannot point to one
+  fork.
 - The downstream sees exactly what its fork contributes (in the app's settings), and can turn it
   off; it is on by default for these declared counts. A paid app's licence cannot require it.
 - The upstream agent uses the numbers in its release notes and proposals ("the old report is used
