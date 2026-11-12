@@ -517,11 +517,10 @@ async fn sqlite_double_quoted_words_leave_no_value_in_the_log() {
 }
 
 /// Review Q-1, R-3, engine part: with DQS off (`SQLITE_DBCONFIG_DQS_DML` and `_DDL` = 0) a
-/// double-quoted word is a name only, so a word that names no column fails. Planned: the SQLite
-/// connections belong to the engine cards (the memory engine now, E-3 for files; Q-3), which
-/// are outside card Q-1's files. The card that turns DQS off removes the `ignore`.
+/// double-quoted word is a name only, so a word that names no column fails. The memory engine
+/// turns DQS off on every connection (backlog 2026-11-08 S-7); the SQLite engine of card E-3
+/// must do the same.
 #[tokio::test]
-#[ignore = "planned: DQS off on every SQLite connection (memory engine, E-3, Q-3)"]
 async fn sqlite_double_quoted_words_are_names_only() {
     let t = world().await;
     for sql in [
