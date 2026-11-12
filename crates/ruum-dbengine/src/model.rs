@@ -335,6 +335,13 @@ pub enum CopyData {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MaskPlan {
     pub columns: Vec<(ColumnRef, MaskAs)>,
+    /// Every column of the tables of the database's own schema in the catalog that the plan was
+    /// made from, also the `normal` ones. The platform reads that catalog before the engine
+    /// drains the source, so a migration can add a column in between. When this is set, the
+    /// engine refuses the copy with [`crate::EngineError::NotReady`] (try again) if the copy
+    /// has a column of its own schema that is not in the list (review FU-1-3 of Kimi). `None`
+    /// skips the check (unit tests that build a plan by hand).
+    pub planned_from: Option<Vec<ColumnRef>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

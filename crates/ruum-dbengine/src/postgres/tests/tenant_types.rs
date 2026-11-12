@@ -124,18 +124,20 @@ async fn tenant_types_source<'e>(
     f
 }
 
-/// Reads `t` through the masked lens in a new session, whose setting `ruum_test.hit` starts
-/// empty (the masked reader may not run `set_config`, nor `current_setting`: it sets and reads
-/// the mark with `SET` and `SHOW`). Returns the rows and the setting afterwards.
+/// Reads `t` through the masked lens in a new session, which starts without the setting
+/// `ruum_test.hit` (the masked reader may not run `set_config`, nor `current_setting`: it reads
+/// the mark with `SHOW`, and defines it empty with `SET` before the read). Returns the rows and
+/// the setting afterwards.
 async fn masked_rows(engine: &PostgresEngine, db: &DatabaseRef) -> (Vec<String>, String) {
     let mut s = session(engine, db, RoleKind::MaskedRead).await;
-    assert_eq!(
-        psql(&mut s, "set ruum_test.hit = ''; show ruum_test.hit")
-            .await
-            .unwrap(),
-        "",
-        "a new session starts with no mark"
+    let fresh = psql(&mut s, "show ruum_test.hit")
+        .await
+        .expect_err("a new session starts with no mark");
+    assert!(
+        fresh.contains("unrecognized configuration parameter"),
+        "a new session starts with no mark: {fresh}"
     );
+    psql(&mut s, "set ruum_test.hit = ''").await.unwrap();
     let rows = psql(
         &mut s,
         &format!("select {} from t order by id", VALUE_COLUMNS.join(", ")),
@@ -314,6 +316,7 @@ async fn hand_overs_of_a_database_with_tenant_types_grant_nothing() {
             .iter()
             .map(|c| (col(c), MaskAs::Pseudonym))
             .collect(),
+        planned_from: None,
     };
     for data in [CopyData::Full, CopyData::SchemaOnly, CopyData::Masked(plan)] {
         let (key, _) = conformance::test_key();
@@ -651,6 +654,7 @@ async fn masked_copy_of_planting(
             },
             MaskAs::Null,
         )],
+        planned_from: None,
     };
     let (key, _) = conformance::test_key();
     engine
@@ -812,6 +816,7 @@ async fn the_guards_hide_a_domain_over_a_built_in_type_on_their_own() {
             },
             MaskAs::Pseudonym,
         )],
+        planned_from: None,
     };
     let (key, _) = conformance::test_key();
     let copy = engine
