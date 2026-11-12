@@ -1,6 +1,7 @@
 // Spike S-2: the probe of points 1 and 5. It runs inside a sandbox and tries to reach what an app
 // (or a build) must never reach. It only opens TCP connections (and closes them at once), sends one
-// HTTP GET to the metadata address, resolves names, and looks for the Docker socket. It reads no
+// HTTP GET to the metadata address, resolves names, and looks for the Docker socket. It records
+// whether IPv6 is on inside the sandbox. It reads no
 // data and sends no credentials. Input: PROBE_TARGETS (JSON [{name, host, port}]), EGRESS
 // ("ip:port" of the egress proxy), EGRESS_ALLOWED and EGRESS_REFUSED (JSON ["host:port"]).
 // Output: one JSON object on stdout (or in PROBE_OUT): {name: {reached: bool, detail}}.
@@ -114,6 +115,15 @@ function self() {
     root_writable: rootWritable,
     docker_socket: ['/var/run/docker.sock', '/run/docker.sock'].some((p) => fs.existsSync(p)),
     env_keys: Object.keys(process.env).filter((k) => /SECRET|TOKEN|PASSWORD|KEY|DATABASE_URL/i.test(k)),
+    ipv6: Object.fromEntries(
+      ['all', 'default', 'eth0'].map((i) => {
+        try {
+          return [`disable_ipv6.${i}`, fs.readFileSync(`/proc/sys/net/ipv6/conf/${i}/disable_ipv6`, 'utf8').trim()];
+        } catch (e) {
+          return [`disable_ipv6.${i}`, e.code || 'unreadable'];
+        }
+      }),
+    ),
   };
 }
 
