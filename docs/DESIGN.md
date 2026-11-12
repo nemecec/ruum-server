@@ -1373,6 +1373,24 @@ them when they customise:
 Changes outside the extension points are allowed; they only make merges harder, and the update
 agent says which customisations caused conflicts.
 
+**Usage statistics for the upstream.** To reward configuration and extension points over code
+edits, and to show which features matter, Ruum gives the upstream aggregated statistics about
+its forks:
+- What is counted: only what the app declares in its package. Which configuration options are
+  on, which extension points and hooks are used, which version and channel the forks run, how
+  many forks have unlinked or customise outside the extension points (a yes or no per fork, never
+  the code), and the share of forks that use each declared feature (for example "92 % have
+  time tracking on, 4 % use the old report").
+- What is never counted: the forks' data, users, content, code or names, and usage events of
+  people.
+- Aggregation: the upstream sees numbers across forks only, never per fork, and a number appears
+  only when at least 5 forks contribute to it (smaller groups show "fewer than 5").
+- The downstream sees exactly what its fork contributes (in the app's settings), and can turn it
+  off; it is on by default for these declared counts. A paid app's licence cannot require it.
+- The upstream agent uses the numbers in its release notes and proposals ("the old report is used
+  by 4 % of forks; it will be removed in two versions, here is the replacement"), so pruning a
+  feature is announced and measured, not guessed.
+
 **Agents talk both ways: proposals between upstream and downstream.** Each app has an agent on the
 upstream side and each fork an agent on the downstream side, with a channel between them (a
 thread on the upstream link, kept as part of both projects' history):
