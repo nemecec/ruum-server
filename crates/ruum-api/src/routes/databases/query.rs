@@ -19,7 +19,7 @@ use axum::extract::{Json, Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ruum_core::databases::engine::StatementMode;
-use ruum_core::databases::query::{self, ListQueries, QueryError, QueryRequest};
+use ruum_core::databases::query::{self, ListQueries, QueryRequest};
 use ruum_core::{ApiError, Cursor, Error, ErrorCode, PageRequest};
 use serde::Deserialize;
 use serde_json::json;
@@ -35,10 +35,10 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-fn answer(e: QueryError) -> Response {
+fn answer(e: Error) -> Response {
     match e {
-        QueryError::Core(e) => HttpError(e).into_response(),
-        QueryError::Problem(p) => crate::error::render(p),
+        Error::Api(p) => crate::error::render(p),
+        e => HttpError(e).into_response(),
     }
 }
 

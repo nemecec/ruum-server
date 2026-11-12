@@ -3674,11 +3674,13 @@ paths:
         name (see "Table names"); writes to and schema changes of the system catalog (on
         Postgres a relation in `pg_catalog`, `information_schema` or another `pg_*` schema, or
         an unqualified name that starts with `pg_`, such as `UPDATE pg_settings`, also inside
-        `WITH` and `EXPLAIN`; on SQLite `sqlite_schema` and `sqlite_master`; reads of the
-        catalog run); and on SQLite `ATTACH`, `DETACH`, `VACUUM`, `load_extension`
-        and every `PRAGMA` outside the read-only allow-list. These checks are a first line only:
-        the engine sessions are built so that such a statement cannot reach another role, file
-        or database even if it runs.
+        `WITH`, `EXPLAIN` and the query of `CREATE TABLE ... AS` and `CREATE VIEW ... AS`; on
+        SQLite `sqlite_schema` and `sqlite_master`; reads of the catalog run); and on SQLite
+        `ATTACH`, `DETACH`, `VACUUM`, `load_extension` and every `PRAGMA` outside the read-only
+        allow-list. These checks are a first line only: they read names, not the relations that
+        the names resolve to (a view of the database's own over `pg_settings` is not a catalog
+        name), and the engine sessions are built so that such a statement cannot reach another
+        role, file or database even if it runs.
 
         **People** see `normal` and `personal` values as they are. `secret` values need `manage`
         (others read them masked, with the same rules as agents), so a viewer never reads a

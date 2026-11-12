@@ -77,6 +77,9 @@ pub struct ProviderDeps {
     /// database follows at once (review-Q-2-1 F-2): `updateDatabaseManifest` and
     /// `restoreVersion` both reach the database through `applyManifest`.
     pub masking: Arc<dyn crate::privacy::MaskingRules>,
+    /// The column store of card K-1: a masked copy takes each column's class as the lens does,
+    /// the stricter of the store and the manifest (backlog 2026-11-09 S-18).
+    pub columns: Arc<dyn super::classes::ColumnStore>,
 }
 
 /// The provider.
@@ -383,7 +386,15 @@ impl Inner {
                     .await
                     .map_err(engine_error)?;
                 let manifest = self.head_manifest(tenant, source).await?;
-                CopyData::Masked(mask_plan(&catalog, src.engine, &manifest))
+                let classes = super::query::class_map_from(
+                    &*self.deps.columns,
+                    tenant,
+                    source,
+                    src.engine,
+                    &manifest,
+                )
+                .await?;
+                CopyData::Masked(mask_plan(&catalog, src.engine, &classes))
             }
         };
         let created = engine
@@ -528,10 +539,14 @@ fn engine_error(e: EngineError) -> Error {
 }
 
 /// What a masked copy changes (decision 0004-25), the same columns as the lens masks: each
-/// column of a table of the database's own schema by its class in `manifest` (`data_classes`),
-/// `personal` when it has none. `personal` becomes a pseudonym, `secret` becomes `NULL`.
-pub fn mask_plan(catalog: &Catalog, engine: EngineKind, manifest: &serde_json::Value) -> MaskPlan {
-    let classes = super::query::manifest_classes(manifest);
+/// column of a table of the database's own schema by the class the lens gives it (`classes`:
+/// the stricter of the column store and the manifest's `data_classes`, backlog 2026-11-09
+/// S-18), `personal` when it has none. `personal` becomes a pseudonym, `secret` becomes `NULL`.
+pub fn mask_plan(
+    catalog: &Catalog,
+    engine: EngineKind,
+    classes: &super::query::postgres_mask::ClassMap,
+) -> MaskPlan {
     let schema = super::query::own_schema(engine);
     let mut columns = Vec::new();
     for t in catalog
@@ -540,8 +555,10 @@ pub fn mask_plan(catalog: &Catalog, engine: EngineKind, manifest: &serde_json::V
         .filter(|t| t.schema == schema && t.kind == RelationKind::Table)
     {
         for c in &t.columns {
-            let key = super::query::class_key(&t.schema, &t.name, &c.name);
-            let how = match classes.get(&key).copied().unwrap_or(DataClass::Personal) {
+            let how = match classes
+                .class(&t.name, &c.name)
+                .unwrap_or(DataClass::Personal)
+            {
                 DataClass::Personal => MaskAs::Pseudonym,
                 DataClass::Secret => MaskAs::Null,
                 DataClass::Normal => continue,
@@ -1100,7 +1117,7 @@ mod tests {
             schema: schema.into(),
             name: name.into(),
             kind,
-            columns: vec![col("email"), col("token"), col("latin")],
+            columns: vec![col("email"), col("token"), col("latin"), col("note")],
             primary_key: vec![],
             foreign_keys: vec![],
         };
@@ -1111,11 +1128,31 @@ mod tests {
                 table("other", "people", RelationKind::Table),
             ],
         };
-        let manifest = json!({ "data_classes": {
+        let manifest = super::super::query::manifest_classes(&json!({ "data_classes": {
             "public.people.token": "secret",
             "public.people.latin": "normal",
-        }});
-        let plan = mask_plan(&catalog, EngineKind::Postgres, &manifest);
+            "public.people.note": "normal",
+        }}));
+        // The column store: `latin` confirmed `normal`, `email` and `token` unconfirmed, and
+        // `note` held `personal` by the store while the manifest calls it `normal` (a drift,
+        // backlog 2026-11-09 S-18): the stricter class wins, as in the lens.
+        let row = |c: &str, class| {
+            (
+                "public".to_string(),
+                "people".to_string(),
+                c.to_string(),
+                class,
+            )
+        };
+        let store = vec![
+            row("email", DataClass::Personal),
+            row("token", DataClass::Personal),
+            row("latin", DataClass::Normal),
+            row("note", DataClass::Personal),
+        ];
+        let classes =
+            super::super::query::postgres_mask::class_map(EngineKind::Postgres, &store, &manifest);
+        let plan = mask_plan(&catalog, EngineKind::Postgres, &classes);
         let got: Vec<(String, MaskAs)> = plan
             .columns
             .iter()
@@ -1126,6 +1163,7 @@ mod tests {
             vec![
                 ("public.people.email".to_string(), MaskAs::Pseudonym),
                 ("public.people.token".to_string(), MaskAs::Null),
+                ("public.people.note".to_string(), MaskAs::Pseudonym),
             ]
         );
     }

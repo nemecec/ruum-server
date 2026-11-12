@@ -100,11 +100,7 @@ impl Pg {
         }
     }
 
-    async fn run(
-        &self,
-        c: &Context,
-        r: QueryRequest,
-    ) -> std::result::Result<QueryResult, QueryError> {
+    async fn run(&self, c: &Context, r: QueryRequest) -> std::result::Result<QueryResult, Error> {
         query_at(&self.w.s.databases, c, self.db, r, "https://ruum.test").await
     }
 
@@ -121,10 +117,8 @@ impl Pg {
         let text = r.sql.clone();
         match self.run(c, r).await {
             Ok(v) => panic!("{text} succeeded: {:?}", v.rows),
-            Err(QueryError::Problem(p)) => {
-                (p.code.http_status(), p.code.as_str().to_string(), p.hint)
-            }
-            Err(QueryError::Core(e)) => (e.http_status(), e.to_api().code.as_str().into(), None),
+            Err(Error::Api(p)) => (p.code.http_status(), p.code.as_str().to_string(), p.hint),
+            Err(e) => (e.http_status(), e.to_api().code.as_str().into(), None),
         }
     }
 
@@ -739,7 +733,7 @@ async fn agent_writes_need_a_grant_and_never_touch_a_restricted_column() {
     let r = pg
         .run(&agent, write("update people set score = -1 where id = 1"))
         .await;
-    let Err(QueryError::Problem(p)) = r else {
+    let Err(Error::Api(p)) = r else {
         panic!("{r:?}")
     };
     assert_eq!(
@@ -1534,8 +1528,8 @@ async fn masked_sessions_never_run_tenant_code_on_live() {
 async fn errors_raised_by_tenant_code_name_nothing() {
     let Some(pg) = setup().await else { return };
     let a = pg.alice();
-    let message = |r: std::result::Result<QueryResult, QueryError>| match r {
-        Err(QueryError::Problem(p)) => (p.sqlstate.clone(), p.message.clone()),
+    let message = |r: std::result::Result<QueryResult, Error>| match r {
+        Err(Error::Api(p)) => (p.sqlstate.clone(), p.message.clone()),
         other => panic!("{other:?}"),
     };
     // The engine's own errors still name their objects (no tenant code yet, so Bob writes).

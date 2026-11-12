@@ -1653,6 +1653,7 @@ pub fn build(
         typed: parts.typed.clone(),
         platform,
         masking: masking.clone(),
+        columns: parts.columns.clone(),
     }));
     let mut registry = crate::providers::ProviderRegistry::new();
     registry.register(provider.clone())?;

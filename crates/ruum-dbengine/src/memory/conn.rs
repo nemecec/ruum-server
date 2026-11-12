@@ -28,6 +28,12 @@ pub(crate) fn open(guard: &Arc<Guard>) -> Result<Connection, EngineError> {
         .map_err(internal)?;
     conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(internal)?;
+    // No double-quoted strings (DQS): a double-quoted word is a name only, so `select "Alice"`
+    // fails instead of giving the string (review Q-1, R-3; backlog 2026-11-08 S-7).
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
+        .map_err(internal)?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)
+        .map_err(internal)?;
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON;")
         .map_err(internal)?;
     Ok(conn)
