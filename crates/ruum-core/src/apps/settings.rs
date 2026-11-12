@@ -11,6 +11,9 @@
 //!   `full` and never raises `raw_copy_days` (full telemetry and the raw copy are a person's
 //!   choice, design 9.6, review R9). An agent may lower both, and may change the report widget
 //!   and the automatic rollback.
+//! - The report widget is off for a public app until a person turns it on (decision 0006-19):
+//!   when an app becomes public, `report_widget.enabled` turns false unless the same request
+//!   sets it.
 //!
 //! `createApp` takes the same settings and goes through the same rules from the defaults.
 
@@ -312,6 +315,17 @@ pub fn apply(current: &AppSettings, input: &SettingsInput, who: Changer) -> Resu
         if !matches!(who.tenant_role, Some(MemberRole::Owner | MemberRole::Admin)) {
             return Err(tenant_admin_required());
         }
+        // The report widget is off for a public app until a person turns it on (decision
+        // 0006-19): an app that becomes public turns it off, unless the same request (made by
+        // a person, the only one who sets `access`) turns it on.
+        if input
+            .report_widget
+            .as_ref()
+            .and_then(|w| w.enabled)
+            .is_none()
+        {
+            next.report_widget.enabled = false;
+        }
     }
     Ok(next)
 }
@@ -395,6 +409,14 @@ mod tests {
             let s = apply(&cur, &public, person(role, true)).unwrap();
             assert_eq!(s.access, Access::Public);
         }
+        // An app that becomes public has its report widget off, unless the same request
+        // turns it on (decision 0006-19).
+        let s = apply(&cur, &public, person(MemberRole::Owner, true)).unwrap();
+        assert!(!s.report_widget.enabled);
+        let with_widget =
+            input(json!({ "access": "public", "report_widget": { "enabled": true } }));
+        let s = apply(&cur, &with_widget, person(MemberRole::Owner, true)).unwrap();
+        assert!(s.report_widget.enabled);
         // Keeping an app public (another field) needs no new decision.
         let already = AppSettings {
             access: Access::Public,

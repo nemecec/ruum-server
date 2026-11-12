@@ -7,7 +7,9 @@
 //!
 //! - `copied`: a new app for the copy (the platform made the node and its `typed_nodes` row): a
 //!   free slug from the source's slug, the source's settings with `access: platform` (making a
-//!   copy public is a new decision of a person), no deployment. A preview of the source's live
+//!   copy public is a new decision of a person), and, when the copier is not a person,
+//!   `telemetry_mode` and `raw_copy_days` at their defaults (also a person's choice), no
+//!   deployment. A preview of the source's live
 //!   archive comes with card W-2: the provider records that intent in the status detail
 //!   (`copy_of`, `preview_from`), with no runtime call.
 //! - `trashed`: the app is `suspended` (reason `trashed`); the gateway answers a status page.
@@ -179,6 +181,14 @@ impl WebAppProvider {
         };
         let mut settings = src.settings;
         settings.access = super::settings::Access::Platform;
+        // Full telemetry and the raw copy are a person's choice for an app and its end users
+        // (design 9.6, review R9). An agent cannot make an app with them through `createApp`,
+        // so a copy that a person did not make starts with the defaults (review W-1, 2).
+        if hook.by.actor.kind != ProviderPrincipalKind::User {
+            let defaults = super::settings::AppSettings::default();
+            settings.telemetry_mode = defaults.telemetry_mode;
+            settings.raw_copy_days = defaults.raw_copy_days;
+        }
         let mut done = None;
         for slug in slugs::candidates(&src.slug, SlugKind::App, 200) {
             if self.store.slug_state(tenant, &slug, target).await? != SlugState::Free {
@@ -235,11 +245,13 @@ fn actor_of(by: ActorPair) -> Actor {
     }
 }
 
+/// The plan of a validation request. A missing or unknown plan gets the smallest limits (fail
+/// closed), never the largest.
 fn plan_of(s: Option<&str>) -> Plan {
     match s {
-        Some("free") => Plan::Free,
+        Some("team") => Plan::Team,
         Some("personal") => Plan::Personal,
-        _ => Plan::Team,
+        _ => Plan::Free,
     }
 }
 

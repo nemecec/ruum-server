@@ -307,15 +307,21 @@ pub trait AppStore: Send + Sync {
     /// The number of app rows of the tenant (apps in the trash count; purged ones do not).
     async fn count_apps(&self, tenant: TenantId) -> Result<u32>;
 
-    /// Stores new settings and writes `app.settings_changed` (with `data`) in the same unit.
+    /// Stores new settings and writes `app.settings_changed` (with `data`) in the same unit,
+    /// only when the stored settings are still `expected` (a compare-and-swap under a row lock).
+    /// `Ok(None)` when they changed since the caller read them: nothing is written, and the
+    /// caller reads the row again and runs the settings rules again on it. Without this, a
+    /// write based on an old copy could put back a value that the rules refuse on the current
+    /// row (an agent restoring `telemetry_mode: full`, or a member restoring `access: public`).
     /// `not_found` for an app of another tenant.
     async fn update_settings(
         &self,
         ctx: &Context,
         node: NodeId,
+        expected: &AppSettings,
         settings: &AppSettings,
         data: Value,
-    ) -> Result<(AppRow, ChangeInfo)>;
+    ) -> Result<Option<(AppRow, ChangeInfo)>>;
 
     /// Deletes the rows of a purged app (its deployments and the app row). Its slug stays used.
     async fn remove_app(&self, tenant: TenantId, node: NodeId) -> Result<()>;
