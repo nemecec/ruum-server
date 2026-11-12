@@ -247,9 +247,10 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     assert_eq!(names, expected);
     // 50 step 1 tools, the three database tools of card D-1, the two of card K-1
     // (confirmColumnClasses is users only: no tool), the two grant tools of card A-1
-    // (`createDatabaseAccessGrant` is users only, so it has no tool), the three of card Q-1 and
-    // the four approval tools of card A-2 (`decideDatabaseApproval` is users only: no tool).
-    assert_eq!(names.len(), 64);
+    // (`createDatabaseAccessGrant` is users only, so it has no tool), the three of card Q-1,
+    // the four approval tools of card A-2 (`decideDatabaseApproval` is users only: no tool) and
+    // the two branch tools of card D-3a.
+    assert_eq!(names.len(), 66);
     for t in [
         "create_database",
         "get_database",
@@ -261,6 +262,8 @@ async fn initialize_and_list_every_tool_of_the_contract() {
         "get_database_schema",
         "query_database",
         "list_database_queries",
+        "list_database_branches",
+        "create_database_branch",
     ] {
         assert!(names.contains(&t), "{t} is offered");
     }
