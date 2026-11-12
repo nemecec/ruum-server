@@ -630,12 +630,6 @@ pub trait ColumnStore: Send + Sync {
     /// Every row of the database (live and dropped), sorted by schema, table and column.
     async fn list(&self, tenant: TenantId, node: NodeId) -> Result<Vec<ColumnRow>>;
 
-    /// Writes `rows` as the whole set of rows of a database that has none yet: the rows that a
-    /// new branch copies from its source (card D-3a; decision 0004-28). Under the database's
-    /// row lock, like [`Self::sync`]. A database without a `databases` row is `404`; a database
-    /// that has rows already is `409 conflict` (a sync came first), and nothing is written.
-    async fn seed(&self, tenant: TenantId, node: NodeId, rows: &[ColumnRow]) -> Result<()>;
-
     /// Stores `suggestion` as the newest suggestion of each live column of `columns`. A column
     /// that is not live is `422 validation_failed`, and nothing is written.
     async fn suggest(
@@ -665,7 +659,8 @@ pub trait ColumnStore: Send + Sync {
     async fn databases(&self) -> Result<Vec<(TenantId, NodeId)>>;
 }
 
-/// `409 conflict`: [`ColumnStore::seed`] of a database that has rows already.
+/// `409 conflict`: the column rows of a new branch for a database that has rows already
+/// ([`super::DatabaseStore::insert_branch`]).
 pub fn seeded_already() -> Error {
     Error::api(
         ErrorCode::Conflict,
@@ -722,6 +717,18 @@ impl MemoryColumnStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(TenantId, NodeId), Vec<ColumnRow>>> {
         self.rows.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Writes `rows` as the whole set of rows of a database that has none: the rows of a new
+    /// branch. Only [`super::MemoryDatabaseStore`] calls it, under its own lock, in
+    /// `insert_branch`. `409 conflict` when the database has rows, and nothing is written.
+    pub(crate) fn put_new(&self, tenant: TenantId, node: NodeId, rows: &[ColumnRow]) -> Result<()> {
+        let mut all = self.lock();
+        if all.get(&(tenant, node)).is_some_and(|r| !r.is_empty()) {
+            return Err(seeded_already());
+        }
+        all.insert((tenant, node), rows.to_vec());
+        Ok(())
+    }
 }
 
 fn find_live<'a>(rows: &'a mut [ColumnRow], c: &ColumnRef) -> Option<&'a mut ColumnRow> {
@@ -750,15 +757,6 @@ impl ColumnStore for MemoryColumnStore {
             .get(&(tenant, node))
             .cloned()
             .unwrap_or_default())
-    }
-
-    async fn seed(&self, tenant: TenantId, node: NodeId, rows: &[ColumnRow]) -> Result<()> {
-        let mut all = self.lock();
-        if all.get(&(tenant, node)).is_some_and(|r| !r.is_empty()) {
-            return Err(seeded_already());
-        }
-        all.insert((tenant, node), rows.to_vec());
-        Ok(())
     }
 
     async fn suggest(

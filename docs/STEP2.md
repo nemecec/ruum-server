@@ -939,7 +939,14 @@ Done when:   a failing migration leaves the database as before (422 migration_fa
              SCHEMA` and `CREATE EXTENSION` in `up` fail on the engine rights (422
              migration_failed, the database as before; decision 0004-35); a migration that retypes or drops a column
              read by a lens view works (the views are dropped first and rebuilt after, also
-             after a failure; decision 0004-34 f).
+             after a failure; decision 0004-34 f); a migration and a branch of the same database
+             never overlap: the migration holds the source's database row lock while it runs,
+             and a branch takes the same lock from before its engine copy until its `databases`
+             row and its copies of the applied migration rows are written (or reads the applied
+             names under that lock), so a branch never records a migration as applied whose
+             schema change is not in its copy (review D-3a 6; `TODO(D-2)` at
+             `copy_applied_migrations` in `databases/mod.rs`); a test applies a migration while
+             a branch is made.
 After:       D-1, K-1, A-2, C-2
 ```
 
@@ -970,6 +977,20 @@ Done when:   a masked branch holds pseudonyms for personal columns (non-text one
              window of a branch starts at its ready time.
 After:       D-1, Q-2, Q-4, A-1, C-2
 ```
+
+D-3 is built in two parts (`docs/STEP3.md`, "Step 2 cards this step waits for"). **D-3a**
+builds `schema_only` branches: both operations, the branch's own key, the copied
+column and migration rows, and the `template` mark that counts a branch as a branch from its
+first moment. **D-3b** builds the rest of the done-when above, and also:
+
+- the journal entry `database.branch_created`: the contract of `createDatabaseBranch` names it,
+  and D-3a does not write it yet (an `EventType`, a journal handle in `DatabaseDeps`, the
+  `undo_action`, and the type out of `planned_types`; review D-3a 5);
+- `masked` and `full` data (until then `422 validation_failed`, hint `/data: schema_only`),
+  and the removal of `WAIT_MASKED_BRANCH` in the test kit;
+- the masked acceptance cases in `crates/ruum-testkit/tests/common/{guests,nodes,agents}.rs`
+  also need `applyDatabaseMigration`: D-3b lands before D-2, or those cases wait for D-3b.
+
 
 ```markdown
 ID:          D-4

@@ -160,10 +160,8 @@ pub async fn install_databases(
             )),
             store: handles.databases.clone(),
             typed: handles.typed.clone(),
-            columns: Arc::new(databases::classes::MemoryColumnStore::new(
-                handles.nodes.clone(),
-                handles.journal.clone(),
-            )),
+            // The column store of the database store: a branch writes both under one lock.
+            columns: handles.databases.columns(),
             masking: Arc::new(ruum_core::privacy::AllMaskingRules::new(vec![])),
             grants: Arc::new(databases::access::grants::MemoryGrantStore::new(
                 handles.nodes.clone(),

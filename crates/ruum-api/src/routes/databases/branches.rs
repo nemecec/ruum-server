@@ -58,6 +58,10 @@ pub async fn list_database_branches(
 
 /// Make a branch of a database. `POST /v1/databases/{node_id}/branches` (operationId
 /// `createDatabaseBranch`).
+///
+/// Gap to the contract until card D-3b: the contract says the call writes `node.created`,
+/// `version.created` and `database.branch_created`. D-3a writes the first two only; the
+/// `database.branch_created` entry comes with D-3b (review D-3a 5).
 pub async fn create_database_branch(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
