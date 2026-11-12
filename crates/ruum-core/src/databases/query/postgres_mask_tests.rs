@@ -1686,20 +1686,16 @@ async fn agent_statements_that_write_no_row_run_read_only() {
             json!("on"),
             "{name}: no row written: read-only"
         );
+        // A row write runs in a writable transaction: a read-only one refuses the `UPDATE`
+        // (`read_only_query`). (These kinds may not call `current_setting` any more, and a
+        // column of `pg_settings` in `RETURNING` counts as a personal column of the write.)
         let r = pg
             .ok(
                 &who,
-                write(
-                    "update orders set amount = amount where id = 1 returning \
-                     (select setting from pg_settings where name = 'transaction_read_only')",
-                ),
+                write("update orders set amount = amount where id = 1 returning id"),
             )
             .await;
-        assert_eq!(
-            r.rows[0][0],
-            json!("off"),
-            "{name}: a row write is writable"
-        );
+        assert_eq!(r.rows[0][0], json!(1), "{name}: a row write is writable");
     }
     pg.drop().await;
 }
