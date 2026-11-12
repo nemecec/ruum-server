@@ -21,6 +21,7 @@ RUUM_DAV_URL required
 RUUM_INTERNAL_BIND required
 RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR optional
 RUUM_REQUEST_TIMEOUT_SECONDS optional
+RUUM_SHUTDOWN_GRACE_SECONDS optional
 
 # Platform database (config.rs)
 DATABASE_URL required

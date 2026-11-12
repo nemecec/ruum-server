@@ -214,7 +214,15 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
 
 ## Edge and certificates
 
-- Caddy, one replica, certificates in an emptyDir, never in a bucket that ruum-server can read.
+- Caddy as a DaemonSet, one edge on every node (backlog O-26, design 12.7). Certificates, ACME
+  accounts and challenge tokens are in Kubernetes Secrets of the `edge` namespace (the Caddy
+  module `deploy/images/caddy-secret-storage`, locks as Leases), never in a bucket that
+  ruum-server can read. A restart loads them and issues nothing; any edge answers the HTTP-01
+  challenge that another one started. The ServiceAccount `ruum-edge` may touch only the Secrets
+  and Leases of `edge` (`charts/platform/templates/edge-rbac.yaml`).
+- An edge update starts the new pod on a node before it stops the old one (maxSurge 1,
+  maxUnavailable 0), so every node keeps a ready edge for the load balancer's TCP check
+  (`externalTrafficPolicy: Local`). Stopping: a 5 s pause, then Caddy's `grace_period` of 30 s.
 - The ACME CA is never production Let's Encrypt, so staging never spends production's quota:
   `letsencrypt-staging` during bring-up (untrusted by browsers; HSTS max-age 300 then), `zerossl`
   for the sign-in test (`deploy.sh <sha> --acme zerossl`). CAA allows `letsencrypt.org` and
@@ -234,17 +242,36 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   40 hex, issuer from a fixed list, a plain email), checks that the tag `<commit>` is that
   digest, verifies the attestation again with `cosign`, and gives helm a values file, never
   `--set` (code review F-3).
-- Migrations follow **expand and contract**: a release only adds; a removal comes one release
-  later. A failed rollout rolls the image back (`--rollback-on-failure`, Helm 4) but not the
-  schema, so the previous image must work on the new schema. `deploy.sh` takes an on-demand CNPG
-  backup before a release with new migrations.
-- An older commit than the deployed one needs `--rollback`.
+- Migrations follow **expand and contract** (design 12.7, decision 42): a release only adds; a
+  removal comes one release later. Old and new pods serve side by side in a rollout, and a
+  failed rollout rolls the image back (`--rollback-on-failure`, Helm 4) but not the schema, so
+  the previous image must work on the new schema. `deploy.sh` takes an on-demand CNPG backup
+  before a release with new migrations.
+- **Migrations are their own step** (backlog O-25): `ops/deploy-chart.sh` renders the Job of
+  `charts/ruum/templates/migrate-job.yaml` with the new server image, which runs
+  `ruum-server migrate` under a Postgres advisory lock, and waits for it. If it fails, nothing is
+  rolled out and the old release keeps serving; the Job log is printed, and the Job stays for a
+  week. The serving pods run with `RUUM_MIGRATE=false` and do not start on a database that lacks
+  a migration of their release.
+- **Rolling update**: ruum-server runs two replicas spread over the nodes, `maxUnavailable: 0`,
+  a disruption budget of one, a readiness check every 5 s. Stopping: a 10 s `preStop` pause
+  (the pod leaves the Service first), then SIGTERM: no new connections, open requests may finish
+  for `RUUM_SHUTDOWN_GRACE_SECONDS` (35 s, longer than the 30 s long poll); longer WebDAV
+  transfers and downloads are cut and the client retries.
+- An older commit than the deployed one needs `--rollback`: the same path; its migration step
+  has nothing to do.
+- Before the first deploy with these steps, apply the platform (`k8s/apply.sh`): it adds the
+  deployer's rights for Jobs and DaemonSets, the edge's ServiceAccount and Role, and the network
+  policy rule that lets the migration Job reach Postgres. `deploy-chart.sh` stops when the
+  deployer cannot create Jobs. That first deploy replaces the edge Deployment with the DaemonSet
+  (a short gap once) and issues the certificates once more into the new storage.
 
 ## Capacity (N-1)
 
 The sum of the memory requests must fit on two nodes, or a node upgrade hangs. Requests in the
-charts: Postgres 2 x 512 MiB, Zitadel 384 MiB, ruum-server 200 MiB, SpiceDB 128 MiB, operators
-about 300 MiB, NATS 64 MiB, edge 64 MiB, Mailpit 32 MiB: about 2.2 GiB plus the system pods,
+charts: Postgres 2 x 512 MiB, Zitadel 384 MiB, ruum-server 2 x 200 MiB, SpiceDB 128 MiB,
+operators about 300 MiB, NATS 64 MiB, edge 3 x 64 MiB, Mailpit 32 MiB: about 2.5 GiB plus the
+system pods,
 against about 6.5 GiB allocatable on two cx23. `ops/check-capacity.sh` measures it on the live
 cluster; run it in the first week with one node cordoned. If it does not fit, set
 `NODE_COUNT=4` before the first upgrade.
@@ -293,10 +320,10 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | Mac only (2026-11-11) | `lib.sh`, `steps.sh`, `tools-image.sh`, `tool.sh`: every step on the Mac in the tools container; no ruum-ops, no credential on the build server; `STG_ADMIN_CIDRS` exactly one IPv4 /32 (`check-plan.sh`, the `admin_cidrs` validation in `tofu/cluster`). |
 | Admin tunnel (2026-11-11) | The firewall source is the build server's /32 from the Hetzner API (no Mac address detection); `tunnel.sh`, `lib.sh stg_tunnel_up`, `tunnel-relay.sh`, `ops/tunnel-setup.sh`, `ops/buildbox-tunnel-user.sh`: an SSH local forward as `ruumtunnel`, restricted to the node API ports; the credentials stay on the Mac. |
 | Kimi review (2026-11-11) | `check-plan.sh` refuses every `hcloud_firewall_attachment` change (deletes included), an in-place change of an existing server's `firewall_ids`, a server firewall ID unknown at plan time when the plan creates no firewall, `apply_to` that is cleared or loses a server, and `apply_to` on a replaced firewall. `lib.sh` names the control socket after a fingerprint of the build server, host key, key and forwards, closes other tunnels, and checks every forward before use; `tunnel-setup.sh` always tests a new tunnel. `buildbox-tunnel-user.sh` rolls back the key file and drop-in on any failure. `tunnel-relay.sh` runs the command only when every relay listens. |
-| S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads. |
+| S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads, except the edge's (Secrets and Leases of `edge` only, for the certificate storage, backlog O-26). |
 | S-2 | The admin credentials only on the person's Mac (`~/.config/ruum`), never on the build server; namespaced `deployer` ServiceAccount for deploys. |
 | S-3 | One Secret per consumer; `secrets-push.sh` fixed list, refuses forbidden names; tests. |
-| S-4 | Certificates in the edge's emptyDir; no Hetzner key in the edge. |
+| S-4 | Certificates in Secrets of the `edge` namespace, readable only by the edge's ServiceAccount (backlog O-26); no Hetzner key in the edge. |
 | S-5 | rclone crypt for the blob copy; provider-side encryption stated for CNPG; HTTPS endpoints only. |
 | S-6 | Generated secrets in `secrets.env` (`secrets-init.sh`); `--restore-from`. |
 | S-7 | Deploy by digest; provenance attestation checked; Trivy scans vulnerabilities and secrets in the layers before the push. |

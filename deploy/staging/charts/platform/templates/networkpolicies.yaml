@@ -38,6 +38,11 @@ spec:
             matchLabels: { kubernetes.io/metadata.name: ruum }
           podSelector:
             matchLabels: { app: ruum-server }
+        # The migration Job before each rollout (charts/ruum migrate-job.yaml, backlog O-25).
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ruum }
+          podSelector:
+            matchLabels: { app: ruum-migrate }
         - namespaceSelector:
             matchLabels: { kubernetes.io/metadata.name: auth }
         - namespaceSelector:

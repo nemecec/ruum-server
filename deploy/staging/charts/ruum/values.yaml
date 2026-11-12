@@ -5,6 +5,10 @@ images:
   edge: ""
 # The commit of the images, recorded in the release (and in the ConfigMap ruum-release).
 commit: ""
+# Only deploy-chart.sh sets it, in a values file of its own: render the migration Job
+# (migrate-job.yaml) instead of the release. Never set for `helm upgrade`.
+migrationJob: false
+migrationJobName: ""
 
 hosts:
   public: staging.ruum.space
@@ -29,6 +33,12 @@ adminSources: []
 proxyProtocolFrom: 10.20.1.0/24
 
 server:
+  # At least two (design 12.7); the chart refuses fewer.
+  replicas: 2
+  # The pause before SIGTERM, and the drain after it (RUUM_SHUTDOWN_GRACE_SECONDS; longer than
+  # the longest long poll, 30 seconds). terminationGracePeriodSeconds is their sum plus 10.
+  preStopSeconds: 10
+  shutdownGraceSeconds: 35
   resources:
     requests: { cpu: 100m, memory: 200Mi }
     limits: { memory: 512Mi }
@@ -36,6 +46,10 @@ server:
   tlsAskNewHostsPerHour: 20
 
 edge:
+  # A DaemonSet: one edge on every node (design 12.7, backlog O-26; see edge.yaml).
+  # The pause before SIGTERM and Caddy's grace_period for open connections.
+  preStopSeconds: 5
+  shutdownGraceSeconds: 30
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { memory: 256Mi }

@@ -11,7 +11,13 @@
 #   3. each digest has a provenance attestation from images.yml on refs/heads/main;
 #   4. a commit older than the deployed one is refused unless --rollback;
 #   5. new migrations since the deployed commit: an on-demand CNPG backup first;
-#   6. helm upgrade --rollback-on-failure with image@sha256:..., then the smoke checks.
+#   6. the migration step: a Job with the new server image runs `ruum-server migrate` under an
+#      advisory lock; if it fails, nothing is rolled out (design 12.7, backlog O-25);
+#   7. the rolling update: helm upgrade --rollback-on-failure --wait with image@sha256:...
+#      (ruum-server: two or more replicas, maxUnavailable 0; the edge: a DaemonSet that starts
+#      the new pod on a node before it stops the old one), then the smoke checks.
+# --rollback is the same path with an older commit: its migration step finds nothing to do
+# (the schema rule keeps the older release working on the newer schema).
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -84,7 +90,7 @@ else
   stg_log "no deployed commit yet (first deploy)"
 fi
 
-stg_log "6. rollout of $sha"
+stg_log "6. migration step, then 7. rolling update of $sha (ops/deploy-chart.sh)"
 printf '__END__\n' | stg_run rw deploy "$sha" "${refs[0]}" "${refs[1]}" ${backup[@]+"${backup[@]}"} ${acme[@]+"${acme[@]}"}
 stg_audit deploy "$sha"
 bash "$STG_HERE/ops/smoke.sh"

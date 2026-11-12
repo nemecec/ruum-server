@@ -1,0 +1,40 @@
+# The certificate storage of the edge (backlog O-26): Caddy keeps certificates, ACME accounts
+# and challenge tokens in Secrets of the edge namespace and locks with Leases there (the module
+# deploy/images/caddy-secret-storage). Here, not in charts/ruum: the deployer has no access to
+# Secrets, and Kubernetes does not let it grant what it does not hold.
+#
+# The edge namespace has no other Secrets, so the token reaches only the edge's own
+# certificates. Nothing outside the namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ruum-edge
+  namespace: edge
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ruum-edge-cert-storage
+  namespace: edge
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, create, update, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ruum-edge-cert-storage
+  namespace: edge
+subjects:
+  - kind: ServiceAccount
+    name: ruum-edge
+    namespace: edge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ruum-edge-cert-storage

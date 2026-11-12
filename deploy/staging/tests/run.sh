@@ -32,7 +32,13 @@
 # - with helm: lint and render both charts, digests required, never production Let's Encrypt;
 #   the ruum-server env of the chart and of ruum-server-env matches what the server reads
 #   (tests/server-env.sh against crates/ruum-server/env-names.txt);
-# - with docker: the rendered Caddyfile adapts (caddy adapt --validate);
+# - updates without downtime (backlog O-25, O-26): ruum-server two replicas, rolling update with
+#   maxUnavailable 0, RUUM_MIGRATE=false, preStop pause, drain, disruption budget; the migration
+#   Job (only when deploy-chart.sh asks for it; ruum-server migrate; not behind the Service; only
+#   DATABASE_URL); the edge DaemonSet with surge, certificates in Kubernetes Secrets, the edge's
+#   namespaced rights; the deployer may run Jobs in ruum; deploy-chart.sh migrates first;
+# - with docker: the rendered Caddyfile adapts (caddy adapt --validate; without the storage
+#   block, which only the edge image has);
 # - with tofu: fmt and validate of both roots; with tofu and talosctl: the machine config of
 #   every node, rendered by the Talos provider, passes talosctl validate (tests/talos-validate.sh).
 # helm and tofu come from PATH (CI: setup.sh) or, when they are not there and Docker is, from the
@@ -573,6 +579,74 @@ if has helm; then
   expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200
   grep -q "serverName: pg-202611111200" "$TMP/out" && grep -q "recovery:" "$TMP/out" && ok "restore mode bootstraps from the old generation" || bad "restore mode"
   expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform"
+  # Updates without downtime (design 12.7, backlog O-25 and O-26).
+  echo "== updates without downtime (O-25, O-26)"
+  has_line() { grep -qF -- "$2" "$1"; }
+  want() { # want <file> <description> <fixed string>
+    if has_line "$1" "$3"; then ok "$2"; else bad "$2 (no '$3')"; fi
+  }
+  expect 0 "render the ruum-server templates" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --show-only templates/server.yaml
+  cp "$TMP/out" "$TMP/server.yaml"
+  want "$TMP/server.yaml" "ruum-server runs two replicas" "replicas: 2"
+  want "$TMP/server.yaml" "ruum-server uses a rolling update" "type: RollingUpdate"
+  want "$TMP/server.yaml" "the rolling update never goes below the replicas (maxUnavailable 0)" "maxUnavailable: 0"
+  has_line "$TMP/server.yaml" "Recreate" && bad "ruum-server still uses Recreate" || ok "no Recreate strategy for ruum-server"
+  want "$TMP/server.yaml" "the serving pods do not migrate (RUUM_MIGRATE=false)" '{ name: RUUM_MIGRATE, value: "false" }'
+  want "$TMP/server.yaml" "the server drains for RUUM_SHUTDOWN_GRACE_SECONDS" '{ name: RUUM_SHUTDOWN_GRACE_SECONDS, value: "35" }'
+  want "$TMP/server.yaml" "a preStop pause takes the pod out of the Service before SIGTERM" "sleep: { seconds: 10 }"
+  want "$TMP/server.yaml" "ruum-server has a disruption budget" "kind: PodDisruptionBudget"
+  want "$TMP/server.yaml" "the disruption budget keeps one server" "minAvailable: 1"
+  want "$TMP/server.yaml" "ruum-server pods spread over the nodes" "topologyKey: kubernetes.io/hostname"
+  tg="$(awk '/terminationGracePeriodSeconds:/ {print $2; exit}' "$TMP/server.yaml")"
+  [[ "$tg" =~ ^[0-9]+$ && "$tg" -gt 45 ]] && ok "terminationGracePeriodSeconds ($tg) is longer than the pause plus the drain (45)" ||
+    bad "terminationGracePeriodSeconds '${tg:-none}' is not longer than the pause plus the drain"
+  expect 1 "charts/ruum refuses one server replica" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set server.replicas=1
+  grep -q "kind: Job" "$TMP/ruum.yaml" && bad "the release renders the migration Job" || ok "the release itself has no migration Job (deploy-chart.sh runs it first)"
+  J=(--set "images.server=$d" --set "images.edge=$e" --set-string commit=0123456789abcdef0123456789abcdef01234567 --set migrationJob=true)
+  expect 0 "render the migration Job" helm template ruum "$STG/charts/ruum" "${J[@]}" --set-string migrationJobName=ruum-migrate-0123456789ab-202611121200 --show-only templates/migrate-job.yaml
+  cp "$TMP/out" "$TMP/job.yaml"
+  want "$TMP/job.yaml" "the migration step is a Job" "kind: Job"
+  want "$TMP/job.yaml" "the Job runs ruum-server migrate" "args: [migrate]"
+  want "$TMP/job.yaml" "the Job runs the new server image by digest" "image: $d"
+  want "$TMP/job.yaml" "a failed migration is not retried (backoffLimit 0)" "backoffLimit: 0"
+  want "$TMP/job.yaml" "the Job pods carry app: ruum-migrate" "labels: { app: ruum-migrate }"
+  has_line "$TMP/job.yaml" "app: ruum-server" && bad "the Job pods carry app: ruum-server (the Service would send them traffic)" || ok "the Job pods are not behind the ruum-server Service"
+  want "$TMP/job.yaml" "the Job reads only DATABASE_URL of ruum-server-env" "secretKeyRef: { name: ruum-server-env, key: DATABASE_URL }"
+  has_line "$TMP/job.yaml" "envFrom" && bad "the Job takes every key of ruum-server-env" || ok "the Job takes no other secret"
+  expect 1 "charts/ruum refuses a migration Job name outside the pattern" helm template ruum "$STG/charts/ruum" "${J[@]}" --set-string 'migrationJobName=x;y' --show-only templates/migrate-job.yaml
+  expect 1 "charts/ruum refuses a migration Job without a name" helm template ruum "$STG/charts/ruum" "${J[@]}" --show-only templates/migrate-job.yaml
+  expect 0 "render the edge templates" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --show-only templates/edge.yaml
+  cp "$TMP/out" "$TMP/edge.yaml"
+  want "$TMP/edge.yaml" "the edge is a DaemonSet (an edge on every node behind the load balancer)" "kind: DaemonSet"
+  has_line "$TMP/edge.yaml" "kind: Deployment" && bad "the edge is still a Deployment" || ok "no edge Deployment"
+  want "$TMP/edge.yaml" "an edge update starts the new pod first (maxSurge 1)" "maxSurge: 1"
+  want "$TMP/edge.yaml" "an edge update never stops a node's edge first (maxUnavailable 0)" "maxUnavailable: 0"
+  want "$TMP/edge.yaml" "the edge runs as the ServiceAccount ruum-edge" "serviceAccountName: ruum-edge"
+  want "$TMP/edge.yaml" "the edge has a preStop pause" "sleep: { seconds: 5 }"
+  want "$TMP/edge.yaml" "certificates are in Kubernetes Secrets (storage kubernetes_secret)" "storage kubernetes_secret {"
+  want "$TMP/edge.yaml" "the certificate storage is the edge namespace" "namespace edge"
+  want "$TMP/edge.yaml" "Caddy drains open connections for 30 s" "grace_period 30s"
+  has_line "$TMP/edge.yaml" "file_system" && bad "the edge still keeps certificates in a file system" || ok "no file system storage for certificates"
+  expect 0 "render the platform for the edge and deployer rights" helm template platform "$STG/charts/platform" --set generation=202611111200
+  cp "$TMP/out" "$TMP/platform.yaml"
+  awk '/^# Source: [a-z-]*\/templates\/edge-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/edge-rbac.yaml"
+  want "$TMP/edge-rbac.yaml" "the platform makes the ServiceAccount ruum-edge" "name: ruum-edge"
+  if grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/edge-rbac.yaml"; then bad "the edge gets cluster-wide rights"; else ok "the edge's rights are namespaced"; fi
+  [[ "$(grep -cE '^  namespace: edge$' "$TMP/edge-rbac.yaml")" == 3 ]] && ok "the edge's ServiceAccount, Role and RoleBinding are in edge" || bad "edge-rbac.yaml objects outside the edge namespace"
+  [[ "$(grep -E 'resources: \[' "$TMP/edge-rbac.yaml" | tr -d ' ' | sort | tr '\n' ' ')" == "resources:[leases] resources:[secrets] " ]] &&
+    ok "the edge may touch only Secrets and Leases" || bad "the edge Role names other resources: $(grep -E 'resources:' "$TMP/edge-rbac.yaml" | tr '\n' ' ')"
+  awk '/^  name: pg-clients$/ {on=1} on && /^---/ {exit} on' "$TMP/platform.yaml" | grep -qF "matchLabels: { app: ruum-migrate }" &&
+    ok "the network policy lets the migration Job reach Postgres" || bad "the migration Job cannot reach Postgres (pg-clients)"
+  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
+    awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: ruum\n/' | grep -qF "resources: [jobs]" &&
+    ok "the deployer may run Jobs in ruum" || bad "the deployer cannot run the migration Job in ruum"
+  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
+    awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: edge\n/' | grep -qF "jobs" &&
+    bad "the deployer may run Jobs in edge" || ok "the deployer runs Jobs only in ruum"
+  jl="$(grep -nF -- '--show-only templates/migrate-job.yaml' "$dc" | head -1 | cut -d: -f1)"
+  hl="$(grep -nE '^helm upgrade' "$dc" | head -1 | cut -d: -f1)"
+  [[ -n "$jl" && -n "$hl" && "$jl" -lt "$hl" ]] && ok "deploy-chart.sh runs the migration Job before the rollout" || bad "deploy-chart.sh: the migration Job is not before helm upgrade"
+  grep -qF 'not rolling out, the old release keeps serving' "$dc" && ok "deploy-chart.sh stops when the migration step fails" || bad "deploy-chart.sh rolls out after a failed migration step"
   # The Zitadel chart from its repository (network; skipped when it cannot be fetched).
   if helm template zitadel zitadel --repo https://charts.zitadel.com --version "$ZITADEL_CHART_VERSION" \
     --namespace auth -f "$ZV" >"$TMP/zitadel.yaml" 2>"$TMP/zitadel.err"; then
@@ -590,6 +664,11 @@ if has helm; then
   if [[ $have_docker == 1 ]]; then
     echo "== Caddyfile (caddy adapt --validate)"
     awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum.yaml" >"$TMP/Caddyfile"
+    # The stock image has no kubernetes_secret storage module (the edge image builds it in and
+    # adapts it there, deploy/images/ruum-edge.Dockerfile); drop that block here.
+    awk '/^\tstorage kubernetes_secret \{/ {skip=1; next} skip && /^\t\}/ {skip=0; next} !skip' "$TMP/Caddyfile" >"$TMP/Caddyfile.stock"
+    mv "$TMP/Caddyfile.stock" "$TMP/Caddyfile"
+    grep -q kubernetes_secret "$TMP/Caddyfile" && bad "the storage block is still in the Caddyfile for the stock image"
     expect 0 "the rendered Caddyfile adapts" docker run --rm -v "$TMP/Caddyfile:/etc/caddy/Caddyfile:ro" "caddy:$CADDY_VERSION-alpine" caddy adapt --config /etc/caddy/Caddyfile --validate
     # Every server, port 80 (8080) included, reads the load balancer's PROXY header: a server
     # that automatic HTTPS adds at runtime would not, and port 80 would answer 400.

@@ -32,7 +32,9 @@ pub struct Config {
     pub database_url: Option<String>,
     /// `RUUM_DB_MAX_CONNECTIONS`
     pub db_max_connections: u32,
-    /// `RUUM_MIGRATE` (`true` or `false`): run migrations at start.
+    /// `RUUM_MIGRATE` (`true` or `false`): run migrations at start. A cluster turns it off and
+    /// runs `ruum-server migrate` as its own step before the rollout (design 12.7); the server
+    /// then only checks that the database has every migration of its release.
     pub migrate: bool,
     /// `RUUM_MIGRATIONS_DIR`
     pub migrations_dir: PathBuf,
@@ -61,6 +63,9 @@ pub struct Config {
     /// `RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR`: new content hosts that may get a certificate per hour
     /// (default 20).
     pub tls_ask_new_hosts_per_hour: usize,
+    /// `RUUM_SHUTDOWN_GRACE_SECONDS`: after SIGTERM, how long open requests may finish
+    /// (default 35, longer than the longest long poll; `shutdown.rs`).
+    pub shutdown_grace: std::time::Duration,
     /// `RUUM_SIGNUP_ALLOWED_EMAILS` and `RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS`: the allow-list of
     /// a closed server (`ruum_api::signup`). `None` when neither is set: open.
     pub signup: Option<ruum_api::signup::EmailAllowList>,
@@ -118,6 +123,12 @@ impl Config {
                 .transpose()
                 .context("RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR must be a number")?
                 .unwrap_or(20),
+            shutdown_grace: var("RUUM_SHUTDOWN_GRACE_SECONDS")
+                .map(|v| v.parse::<u64>())
+                .transpose()
+                .context("RUUM_SHUTDOWN_GRACE_SECONDS must be a number")?
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(crate::shutdown::DEFAULT_GRACE),
             signup: ruum_api::signup::EmailAllowList::from_settings(
                 var("RUUM_SIGNUP_ALLOWED_EMAILS").as_deref(),
                 var("RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS").as_deref(),
