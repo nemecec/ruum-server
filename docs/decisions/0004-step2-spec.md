@@ -1070,7 +1070,9 @@ behind a view in a row write). A list of paths is never complete.
   closes review-Q-2-s21-2 R-1 (a tenant function that writes a session setting) and R-2 and
   review-Q-2-harden H-1 (built-in functions that take a lock, set a seed or use a sequence).
   The functions that the statement calls itself are held by the cluster: the set-up revokes
-  `EXECUTE` on every `VOLATILE` function of `pg_catalog` from `PUBLIC`, except `nextval`,
+  `EXECUTE` on `current_setting` (since card FU-1; the engine gives it back to `owner`,
+  `secret_read` and `mask` only) and on every `VOLATILE` function of `pg_catalog` from `PUBLIC`,
+  except `nextval`,
   `currval`, `lastval`, `gen_random_uuid`, `uuidv7`, `clock_timestamp`, `timeofday`, `random`,
   the `pg_sleep` family and `pg_cancel_backend` / `pg_terminate_backend` (none of them carries a
   value from one expression to another; the last two end only sessions of the caller's own
@@ -1132,9 +1134,12 @@ view (masked sessions reach tenant code only in reads). Mutations: `databases-qu
 `dbengine-masked-write-side-effects` (the check before), `dbengine-tenant-code-post-check`,
 `dbengine-tenant-code-write-kind`, `dbengine-tenant-code-functions`,
 `dbengine-tenant-code-triggers`, `dbengine-tenant-code-disabled`, `dbengine-side-effects-rules`,
-`dbengine-tenant-code-policies`. The clauses for relations and event triggers have no mutation:
-a test cannot make a foreign table (no allow-listed foreign data wrapper) or an event trigger
-(superuser only).
+`dbengine-tenant-code-policies`. The clauses for relations and event triggers are tested by
+execution since card FU-1 (STATUS "Next cards" 0): the test uses the superuser of the data cluster
+(`docker exec` into `DBHOST_CHECK_CONTAINER`) to make a foreign table and an event trigger of the
+owner (`tenant_code.rs` `a_foreign_table_counts_as_tenant_code_and_stops_masked_writes`,
+`an_event_trigger_of_the_owner_counts_as_tenant_code_and_stops_masked_writes`; mutations
+`dbengine-tenant-code-relations`, `dbengine-tenant-code-event-triggers`).
 
 **Changes.** `crates/ruum-dbengine/src/postgres/depends.rs` (`TENANT_CODE_SQL` replaces
 `SIDE_EFFECTS_SQL`), `session.rs`, `mod.rs`, `lib.rs` (`DatabaseEngine::tenant_code_on_live`
@@ -1235,10 +1240,11 @@ functions and types is never complete; the cure is to give such code nothing rea
   `subtype_diff` is a tenant function (`unvetted_types`), with the mutation
   `dbengine-allow-list-type-functions`. A hostile type that discloses without the guard cannot be
   made (a base type needs a superuser), so these tests prove the clause, not an attack. The
-  slots of `pg_type` are in one clause and are not tested one by one: the modifier, analyze and
-  subscript slots have no test of their own (`citext` has none of them; the types of pgvector and
-  PostGIS have some, but no test uses them). They are best-effort defence in depth; the rebuild
-  is the protection.
+  slots of `pg_type` are in one clause; since card FU-1 each slot (and the canonical and
+  subtype-difference slots of `pg_range`) has a test of its own: the superuser of the data cluster
+  points one slot of a tenant's type at a tenant function at a time
+  (`tenant_code.rs` `each_function_slot_of_a_type_is_checked`; mutations
+  `dbengine-allow-list-type-slot-*`). They stay defence in depth; the rebuild is the protection.
 - (f) **What stays.** The allow-list, the domain, index and type guards, the revoked volatile
   functions, the reset of the pooled connection and the write checks of 0004-38 stay as defence in
   depth.

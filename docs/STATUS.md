@@ -784,6 +784,7 @@ backlog 2026-11-10-run8 S-29 (the raw `up` of a migration approval).
    personal column; no `USAGE` on `ruum_mask` for the copy's owner; names only in
    `PrincipalRef` fields; the remaining untrusted marks; rule 10 walks the query of
    `CREATE TABLE ... AS` and `CREATE VIEW ... AS`; one line on "names, not relations".
+   Items 0 and 1 are built on `f/fu-1` (card FU-1, review pending; `panel/impl-fu1.md`).
 2. **Flaky tests and connection drops** (2026-11-09 T-12, T-18 to T-20; 2026-11-08 T-4 to
    T-6): first the list of known flaky tests in `docs/TESTING.md` (T-6, raised: three new ones
    in run 6, among them `oauth.e2e.ts`, which failed in 2 of 4 full browser runs of this
