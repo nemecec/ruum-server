@@ -634,6 +634,130 @@ fn touch_sql(a: usize, b: usize, c: usize) -> String {
     )
 }
 
+impl PgNodeStore {
+    /// [`NodeStore::create_typed`] (`typed_parent` false: the parent is a folder) and
+    /// [`NodeStore::create_typed_child`] (`typed_parent` true: the parent is a typed node).
+    async fn create_typed_in(
+        &self,
+        ctx: &Context,
+        req: NewTyped,
+        typed_parent: bool,
+    ) -> Result<Written<Node>> {
+        let name = validate_name(&req.name)?;
+        let owner = rules::owner_of(ctx)?;
+        self.require(ctx, req.parent_id, Role::Edit).await?;
+        let parent = self.live(ctx, req.parent_id).await?;
+        let want = if typed_parent {
+            NodeKind::Typed
+        } else {
+            NodeKind::Folder
+        };
+        if parent.node.kind != want {
+            return Err(rules::invalid(if typed_parent {
+                "the parent is not a typed node"
+            } else {
+                "the parent is not a folder"
+            }));
+        }
+        let (bytes, hash) = typed_manifest_bytes(&req.manifest);
+        let mut t = self.begin(ctx).await?;
+        load_live(&mut t.tx, ctx.tenant, req.parent_id).await?;
+        let name = pick_name(
+            &mut t.tx,
+            ctx.tenant,
+            req.parent_id,
+            None,
+            &name,
+            NodeKind::Typed,
+            req.on_conflict,
+        )
+        .await?;
+        let now = crate::now();
+        let version = VersionId::new();
+        let node = Node {
+            id: NodeId::new(),
+            tenant_id: ctx.tenant,
+            parent_id: Some(req.parent_id),
+            name,
+            kind: NodeKind::Typed,
+            node_type: Some(req.node_type.clone()),
+            link_kind: None,
+            link_target: None,
+            head_version: Some(version),
+            owner_id: owner,
+            size_bytes: 0,
+            revision: 1,
+            trashed_at: None,
+            created_at: now,
+            updated_at: now,
+            created_by: ctx.actor,
+            updated_by: ctx.actor,
+            my_role: None,
+            my_can_share: None,
+            editors_can_share: None,
+            editors_can_share_effective: None,
+        };
+        // The node (its head version is checked at the commit), its first manifest version and
+        // its `typed_nodes` row: one transaction, as the deferred trigger
+        // `nodes_typed_row_check` needs.
+        Self::insert(&mut t, &node).await?;
+        sqlx::query(
+            "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
+             content_hash, content_type, actor_kind, actor, on_behalf_of, created_at, updated_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, 'application/json', $8, $9, $10, $11, $11)",
+        )
+        .bind(version.0)
+        .bind(ctx.tenant.0)
+        .bind(node.id.0)
+        .bind(&bytes)
+        .bind(TYPED_MANIFEST_ENCODING)
+        .bind(bytes.len() as i64)
+        .bind(hash.to_vec())
+        .bind(ctx.actor.actor.kind)
+        .bind(ctx.actor.actor.id.0)
+        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+        .bind(now)
+        .execute(&mut *t.tx)
+        .await?;
+        crate::providers::postgres::insert_typed_node(
+            &mut t.tx,
+            &crate::providers::store::NewTypedNode {
+                tenant_id: ctx.tenant,
+                node_id: node.id,
+                provider: req.provider.clone(),
+                type_name: req.node_type.clone(),
+                desired_version: version,
+            },
+        )
+        .await?;
+        Self::journal(
+            &mut t,
+            ctx,
+            node.id,
+            Some(node.revision),
+            EventType::NodeCreated,
+            rules::created_data(&node, None),
+        )
+        .await?;
+        let change = Self::journal(
+            &mut t,
+            ctx,
+            node.id,
+            Some(node.revision),
+            EventType::VersionCreated,
+            typed_version_created_data(version, None, bytes.len(), &hash),
+        )
+        .await?;
+        t.updates.extend(rules::created_tuples(&node));
+        self.commit(ctx, t).await?;
+        let node = self.row(ctx, node.id).await?.node;
+        Ok(Written {
+            value: self.out(ctx, node).await?,
+            change,
+        })
+    }
+}
+
 #[async_trait]
 impl NodeStore for PgNodeStore {
     fn set_typed_hooks(&self, hooks: Arc<dyn TypedHooks>) {
@@ -735,109 +859,11 @@ impl NodeStore for PgNodeStore {
     }
 
     async fn create_typed(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
-        let name = validate_name(&req.name)?;
-        let owner = rules::owner_of(ctx)?;
-        self.require(ctx, req.parent_id, Role::Edit).await?;
-        let parent = self.live(ctx, req.parent_id).await?;
-        if parent.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the parent is not a folder"));
-        }
-        let (bytes, hash) = typed_manifest_bytes(&req.manifest);
-        let mut t = self.begin(ctx).await?;
-        load_live(&mut t.tx, ctx.tenant, req.parent_id).await?;
-        let name = pick_name(
-            &mut t.tx,
-            ctx.tenant,
-            req.parent_id,
-            None,
-            &name,
-            NodeKind::Typed,
-            req.on_conflict,
-        )
-        .await?;
-        let now = crate::now();
-        let version = VersionId::new();
-        let node = Node {
-            id: NodeId::new(),
-            tenant_id: ctx.tenant,
-            parent_id: Some(req.parent_id),
-            name,
-            kind: NodeKind::Typed,
-            node_type: Some(req.node_type.clone()),
-            link_kind: None,
-            link_target: None,
-            head_version: Some(version),
-            owner_id: owner,
-            size_bytes: 0,
-            revision: 1,
-            trashed_at: None,
-            created_at: now,
-            updated_at: now,
-            created_by: ctx.actor,
-            updated_by: ctx.actor,
-            my_role: None,
-            my_can_share: None,
-            editors_can_share: None,
-            editors_can_share_effective: None,
-        };
-        // The node (its head version is checked at the commit), its first manifest version and
-        // its `typed_nodes` row: one transaction, as the deferred trigger
-        // `nodes_typed_row_check` needs.
-        Self::insert(&mut t, &node).await?;
-        sqlx::query(
-            "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
-             content_hash, content_type, actor_kind, actor, on_behalf_of, created_at, updated_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, 'application/json', $8, $9, $10, $11, $11)",
-        )
-        .bind(version.0)
-        .bind(ctx.tenant.0)
-        .bind(node.id.0)
-        .bind(&bytes)
-        .bind(TYPED_MANIFEST_ENCODING)
-        .bind(bytes.len() as i64)
-        .bind(hash.to_vec())
-        .bind(ctx.actor.actor.kind)
-        .bind(ctx.actor.actor.id.0)
-        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
-        .bind(now)
-        .execute(&mut *t.tx)
-        .await?;
-        crate::providers::postgres::insert_typed_node(
-            &mut t.tx,
-            &crate::providers::store::NewTypedNode {
-                tenant_id: ctx.tenant,
-                node_id: node.id,
-                provider: req.provider.clone(),
-                type_name: req.node_type.clone(),
-                desired_version: version,
-            },
-        )
-        .await?;
-        Self::journal(
-            &mut t,
-            ctx,
-            node.id,
-            Some(node.revision),
-            EventType::NodeCreated,
-            rules::created_data(&node, None),
-        )
-        .await?;
-        let change = Self::journal(
-            &mut t,
-            ctx,
-            node.id,
-            Some(node.revision),
-            EventType::VersionCreated,
-            typed_version_created_data(version, None, bytes.len(), &hash),
-        )
-        .await?;
-        t.updates.extend(rules::created_tuples(&node));
-        self.commit(ctx, t).await?;
-        let node = self.row(ctx, node.id).await?.node;
-        Ok(Written {
-            value: self.out(ctx, node).await?,
-            change,
-        })
+        self.create_typed_in(ctx, req, false).await
+    }
+
+    async fn create_typed_child(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
+        self.create_typed_in(ctx, req, true).await
     }
 
     async fn get(&self, ctx: &Context, id: NodeId) -> Result<Node> {

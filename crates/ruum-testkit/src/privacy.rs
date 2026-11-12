@@ -229,6 +229,13 @@ pub struct Wait {
     pub reason: &'static str,
 }
 
+/// Masked branches (`createDatabaseBranch` with `data: masked`): card D-3a builds only
+/// `schema_only` branches and answers `422` for `masked`; card D-3b removes this entry.
+const WAIT_MASKED_BRANCH: Wait = Wait {
+    card: "D-3b",
+    reason: "masked branches (D-3a builds schema_only branches only)",
+};
+
 const WAIT_EXPORT: Wait = Wait {
     card: "panel",
     reason: "no public operation starts a database export (exportTypedNode is a provider \
@@ -510,7 +517,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_MASKED_BRANCH],
             cases::branch_masked,
         ),
         c(
@@ -622,7 +629,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_MASKED_BRANCH],
             cases::write_update_set,
         ),
         c(
@@ -633,7 +640,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_MASKED_BRANCH],
             cases::write_insert_select,
         ),
         c(
@@ -644,7 +651,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_MASKED_BRANCH],
             cases::write_returning,
         ),
         // ---------------------------------------------------------------- renames
@@ -937,7 +944,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_MASKED_BRANCH],
             cases::poracle_masked_branch,
         ),
         c(
@@ -959,7 +966,7 @@ pub fn cases() -> Vec<Case> {
             BOTH,
             MEMORY_LENS,
             FILTER,
-            &[],
+            &[WAIT_MASKED_BRANCH],
             cases::poracle_copy_keeps_key,
         ),
         // ---------------------------------------------------------------- exports

@@ -125,7 +125,7 @@ members with a lower content role (decision 0003-1): that role on the whole team
 | `listDatabaseMigrations` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
 | `applyDatabaseMigration` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | ok | 403 | 403/404 | 403 | 403 | live database: Needs manage; an agent also needs write_live and an approval (no agent of the fixture has manage on the database) |
 | `listDatabaseBranches` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
-| `createDatabaseBranch` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | masked branch: Needs edit; guests and agents of guests need guests_create_resources (default false: 403) |
+| `createDatabaseBranch` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | 403 | 403 | 403 | 403/404 | 403 | 403 | schema_only branch (masked: the same rule): Needs edit; guests and agents of guests need guests_create_resources (default false: 403) |
 | `listDatabaseRestorePoints` | 401 | ok | ok | ok | ok | ok | ok | 404 | ok | ok | ok | ok | ok | 403/404 | ok | 403 | Needs view on the database |
 | `createDatabaseRestorePoint` | 401 | ok | ok | ok | 403 | 403 | ok | 404 | 403 | 403 | ok | ok | 403 | 403/404 | 403 | 403 | Needs edit on the database |
 | `restoreDatabase` | 401 | ok | ok | ok | 403 | 403 | 403 | 404 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | 403 | users only; Needs manage; new_node by a guest needs guests_create_resources |

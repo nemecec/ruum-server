@@ -343,7 +343,7 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         "listDatabaseBranches" => RequestSpec::get(db("/branches")).tenant(tid),
         "createDatabaseBranch" => RequestSpec::post(db("/branches"))
             .tenant(tid)
-            .json(json!({ "name": "garden preview", "data": "masked" })),
+            .json(json!({ "name": "garden preview", "data": "schema_only" })),
         "listDatabaseRestorePoints" => RequestSpec::get(db("/restore-points")).tenant(tid),
         "createDatabaseRestorePoint" => RequestSpec::post(db("/restore-points"))
             .tenant(tid)

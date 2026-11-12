@@ -566,6 +566,112 @@ impl RootCreated for MemoryNodeStore {
     }
 }
 
+impl MemoryNodeStore {
+    /// [`NodeStore::create_typed`] (`typed_parent` false: the parent is a folder) and
+    /// [`NodeStore::create_typed_child`] (`typed_parent` true: the parent is a typed node).
+    async fn create_typed_in(
+        &self,
+        ctx: &Context,
+        req: NewTyped,
+        typed_parent: bool,
+    ) -> Result<Written<Node>> {
+        let name = validate_name(&req.name)?;
+        let owner = rules::owner_of(ctx)?;
+        let typed = self
+            .typed
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::Internal("nodes: no typed node store".into()))?;
+        self.require(ctx, req.parent_id, Role::Edit).await?;
+        let parent = self.live(ctx.tenant, req.parent_id)?;
+        let want = if typed_parent {
+            NodeKind::Typed
+        } else {
+            NodeKind::Folder
+        };
+        if parent.node.kind != want {
+            return Err(rules::invalid(if typed_parent {
+                "the parent is not a typed node"
+            } else {
+                "the parent is not a folder"
+            }));
+        }
+        let (bytes, hash) = typed_manifest_bytes(&req.manifest);
+        let _w = self.writes.lock().await;
+        let (node, change) = {
+            let mut st = self.st();
+            st.live(ctx.tenant, req.parent_id)?;
+            let taken = st.taken(ctx.tenant, req.parent_id, None);
+            let name = rules::pick_name(&name, NodeKind::Typed, req.on_conflict, &taken)?;
+            let now = crate::now();
+            let version = VersionId::new();
+            let node = Node {
+                id: NodeId::new(),
+                tenant_id: ctx.tenant,
+                parent_id: Some(req.parent_id),
+                name,
+                kind: NodeKind::Typed,
+                node_type: Some(req.node_type.clone()),
+                link_kind: None,
+                link_target: None,
+                head_version: Some(version),
+                owner_id: owner,
+                size_bytes: 0,
+                revision: 1,
+                trashed_at: None,
+                created_at: now,
+                updated_at: now,
+                created_by: ctx.actor,
+                updated_by: ctx.actor,
+                my_role: None,
+                my_can_share: None,
+                editors_can_share: None,
+                editors_can_share_effective: None,
+            };
+            // The `typed_nodes` row and the first manifest version, then the node: one unit.
+            typed.insert(
+                NewTypedNode {
+                    tenant_id: ctx.tenant,
+                    node_id: node.id,
+                    provider: req.provider.clone(),
+                    type_name: req.node_type.clone(),
+                    desired_version: version,
+                },
+                req.manifest.clone(),
+                ctx.actor.into(),
+            )?;
+            st.rows.insert(
+                node.id,
+                Row {
+                    node: node.clone(),
+                    trash_root: None,
+                    purge_after: None,
+                },
+            );
+            self.append(
+                ctx,
+                node.id,
+                Some(node.revision),
+                EventType::NodeCreated,
+                rules::created_data(&node, None),
+            )?;
+            let change = self.append(
+                ctx,
+                node.id,
+                Some(node.revision),
+                EventType::VersionCreated,
+                typed_version_created_data(version, None, bytes.len(), &hash),
+            )?;
+            (node, change)
+        };
+        self.relate(rules::created_tuples(&node)).await?;
+        Ok(Written {
+            value: self.out(ctx, node).await?,
+            change,
+        })
+    }
+}
+
 #[async_trait]
 impl NodeStore for MemoryNodeStore {
     fn set_typed_hooks(&self, hooks: Arc<dyn TypedHooks>) {
@@ -667,91 +773,11 @@ impl NodeStore for MemoryNodeStore {
     }
 
     async fn create_typed(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
-        let name = validate_name(&req.name)?;
-        let owner = rules::owner_of(ctx)?;
-        let typed = self
-            .typed
-            .get()
-            .cloned()
-            .ok_or_else(|| Error::Internal("nodes: no typed node store".into()))?;
-        self.require(ctx, req.parent_id, Role::Edit).await?;
-        let parent = self.live(ctx.tenant, req.parent_id)?;
-        if parent.node.kind != NodeKind::Folder {
-            return Err(rules::invalid("the parent is not a folder"));
-        }
-        let (bytes, hash) = typed_manifest_bytes(&req.manifest);
-        let _w = self.writes.lock().await;
-        let (node, change) = {
-            let mut st = self.st();
-            st.live(ctx.tenant, req.parent_id)?;
-            let taken = st.taken(ctx.tenant, req.parent_id, None);
-            let name = rules::pick_name(&name, NodeKind::Typed, req.on_conflict, &taken)?;
-            let now = crate::now();
-            let version = VersionId::new();
-            let node = Node {
-                id: NodeId::new(),
-                tenant_id: ctx.tenant,
-                parent_id: Some(req.parent_id),
-                name,
-                kind: NodeKind::Typed,
-                node_type: Some(req.node_type.clone()),
-                link_kind: None,
-                link_target: None,
-                head_version: Some(version),
-                owner_id: owner,
-                size_bytes: 0,
-                revision: 1,
-                trashed_at: None,
-                created_at: now,
-                updated_at: now,
-                created_by: ctx.actor,
-                updated_by: ctx.actor,
-                my_role: None,
-                my_can_share: None,
-                editors_can_share: None,
-                editors_can_share_effective: None,
-            };
-            // The `typed_nodes` row and the first manifest version, then the node: one unit.
-            typed.insert(
-                NewTypedNode {
-                    tenant_id: ctx.tenant,
-                    node_id: node.id,
-                    provider: req.provider.clone(),
-                    type_name: req.node_type.clone(),
-                    desired_version: version,
-                },
-                req.manifest.clone(),
-                ctx.actor.into(),
-            )?;
-            st.rows.insert(
-                node.id,
-                Row {
-                    node: node.clone(),
-                    trash_root: None,
-                    purge_after: None,
-                },
-            );
-            self.append(
-                ctx,
-                node.id,
-                Some(node.revision),
-                EventType::NodeCreated,
-                rules::created_data(&node, None),
-            )?;
-            let change = self.append(
-                ctx,
-                node.id,
-                Some(node.revision),
-                EventType::VersionCreated,
-                typed_version_created_data(version, None, bytes.len(), &hash),
-            )?;
-            (node, change)
-        };
-        self.relate(rules::created_tuples(&node)).await?;
-        Ok(Written {
-            value: self.out(ctx, node).await?,
-            change,
-        })
+        self.create_typed_in(ctx, req, false).await
+    }
+
+    async fn create_typed_child(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
+        self.create_typed_in(ctx, req, true).await
     }
 
     async fn get(&self, ctx: &Context, id: NodeId) -> Result<Node> {
