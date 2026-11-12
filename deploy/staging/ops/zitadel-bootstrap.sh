@@ -157,13 +157,15 @@ smtp_check() {
   return "$drift"
 }
 
-# Zitadel sends one test email through the provider (TestEmailProviderSMTPById). Only on request.
+# Zitadel sends one test email through the provider. Only on request. Zitadel 4.19.5 lists
+# TestEmailProviderSMTPById (/admin/v1/email/smtp/{id}/_test) but answers 501 "not implemented";
+# the older TestSMTPConfigById (/admin/v1/smtp/{id}/_test) works on the same provider ID.
 test_email() {
   local to="$1" id
   [[ "$to" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "usage: zitadel-bootstrap.sh test-email ADDRESS"
   id="$(smtp_provider | jq -r '.id // empty')"
   [[ "$id" =~ ^[0-9]{1,32}$ ]] || die "no SMTP provider for $SMTP_HOST (run zitadel-bootstrap.sh smtp first)"
-  jq -n --arg to "$to" '{receiverAddress: $to}' | zapi POST "/admin/v1/email/smtp/$id/_test" >/dev/null
+  jq -n --arg to "$to" '{receiverAddress: $to}' | zapi POST "/admin/v1/smtp/$id/_test" >/dev/null
   log "Zitadel sent a test email to $to through $SMTP_HOST"
 }
 
