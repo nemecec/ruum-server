@@ -54,6 +54,7 @@
       "description": "The CONFIRMED data class of each column (section 8.5). The key is `<schema>.<table>.<column>` (SQLite: `main.<table>.<column>`), with each part quoted as in SQL when it contains a dot or a quote. A column that is not listed counts as `personal` (fail safe). Only a person changes this map: `confirmColumnClasses` writes a new manifest version, and `updateDatabaseManifest` from an agent may not change it (agents suggest classes with `suggestColumnClasses` or in a migration). The key is the column's name today, but the platform keeps the class with the column's identity: a rename, a retype, a table swap or a drop and add of the same name removes the key, and the column is unconfirmed again.",
       "type": "object",
       "propertyNames": {
+        "x-ruum-content-trust": "untrusted",
         "type": "string",
         "minLength": 5,
         "maxLength": 400
@@ -62,6 +63,7 @@
       "default": {}
     },
     "migrations": {
+      "x-ruum-content-trust": "untrusted",
       "description": "Where the declared migrations live (decision 19), as a path relative to the database node's parent folder, for example `migrations/`. The platform runs them in name order at deploy time and rolls back the one that fails. Optional in step 2: migrations can also be sent with `applyDatabaseMigration`.",
       "type": "string",
       "maxLength": 1024

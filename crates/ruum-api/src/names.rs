@@ -19,10 +19,15 @@
 //!   crosses tenants.
 //! - The email of a user grantee is filled only when the handler allowed it
 //!   ([`allow_grantee_emails`]): callers who may share the node and may list the members.
-//! - Data of a database is never read nor changed: in an object marked `content_trust:
-//!   untrusted` (a `QueryResult`), the `rows` are skipped ([`untrusted_data`]). A row can hold
-//!   any JSON, so without this a caller could build `{"kind": "user", "id": ...}` (and a
-//!   `tenant_id`) in a query and read the name of any user (backlog S-3).
+//! - Names go only where the contract types a field as a principal (backlog 2026-11-09 S-11):
+//!   a `PrincipalRef`, an object with `on_behalf_of_display_name` next to its `on_behalf_of`,
+//!   and a `GranteeUser`. The positions of each operation's answer come from
+//!   `contracts/openapi.yaml` (`principal_paths.json`, made by
+//!   `scripts/gen-principal-paths.mjs`); a field marked `x-ruum-content-trust: untrusted` is
+//!   never entered. So user-made JSON (the rows of a query, a manifest, the `data` of an audit
+//!   entry, the properties of a typed node) never gets a name, even when it is shaped like
+//!   `{"kind": "user", "id": ...}` with a `tenant_id` (backlog S-3). An answer of a path that
+//!   the contract does not have gets no names.
 
 use crate::state::AppState;
 use axum::body::Body;
@@ -32,9 +37,10 @@ use axum::middleware::Next;
 use axum::response::Response;
 use ruum_core::tenants::PrincipalName;
 use ruum_core::{Context, PrincipalKind, TenantId};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,11 +84,73 @@ pub fn allow_grantee_emails() {
     update(|s| s.grantee_emails = true);
 }
 
+/// The positions of the principals in the answer of one operation (`principal_paths.json`).
+/// A position is a list of steps: a property name, or `*` for every item of an array and every
+/// value of a map.
+#[derive(Debug, Default, Deserialize)]
+struct Positions {
+    method: String,
+    path: String,
+    /// `PrincipalRef` objects.
+    refs: Vec<Vec<String>>,
+    /// Objects with `on_behalf_of` and `on_behalf_of_display_name`.
+    obo: Vec<Vec<String>>,
+    /// `GranteeUser` objects.
+    grantees: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct PrincipalPaths {
+    #[cfg_attr(not(test), allow(dead_code))]
+    openapi_sha256: String,
+    operations: Vec<Positions>,
+}
+
+static PRINCIPAL_PATHS: LazyLock<PrincipalPaths> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("principal_paths.json"))
+        .expect("principal_paths.json is the output of scripts/gen-principal-paths.mjs")
+});
+
+/// The positions of the operation that answers `method` and `path` (a path template of the
+/// contract; a literal segment wins over a `{parameter}`), or `None`.
+fn positions_for(method: &str, path: &str) -> Option<&'static Positions> {
+    let segments: Vec<&str> = path.split('/').collect();
+    PRINCIPAL_PATHS
+        .operations
+        .iter()
+        .filter(|o| o.method.eq_ignore_ascii_case(method))
+        .filter_map(|o| {
+            let template: Vec<&str> = o.path.split('/').collect();
+            if template.len() != segments.len() {
+                return None;
+            }
+            let mut literal = 0;
+            for (t, s) in template.iter().zip(&segments) {
+                if t.starts_with('{') && t.ends_with('}') {
+                    if s.is_empty() {
+                        return None;
+                    }
+                } else if t == s {
+                    literal += 1;
+                } else {
+                    return None;
+                }
+            }
+            Some((literal, o))
+        })
+        .max_by_key(|(literal, _)| *literal)
+        .map(|(_, o)| o)
+}
+
 /// The middleware: runs the request with a fresh scope, then fills the names into a JSON answer.
 pub async fn fill_names(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let positions = positions_for(req.method().as_str(), req.uri().path());
     let scope = Arc::new(Mutex::new(Scope::default()));
     let res = SCOPE.scope(scope.clone(), next.run(req)).await;
     let scope = scope.lock().map(|s| *s).unwrap_or_default();
+    let Some(positions) = positions else {
+        return res;
+    };
     if !scope.signed_in || !res.status().is_success() || !is_json(&res) {
         return res;
     }
@@ -98,7 +166,7 @@ pub async fn fill_names(State(state): State<AppState>, req: Request, next: Next)
         return Response::from_parts(parts, Body::from(bytes));
     };
     let mut wanted: HashMap<TenantId, HashSet<Uuid>> = HashMap::new();
-    walk(&value, scope.tenant, &mut |t, id| {
+    walk(&value, positions, scope.tenant, &mut |t, id| {
         wanted.entry(t).or_default().insert(id);
     });
     if wanted.is_empty() {
@@ -113,7 +181,13 @@ pub async fn fill_names(State(state): State<AppState>, req: Request, next: Next)
             Err(e) => tracing::warn!(error = %e, tenant = %t, "names: lookup failed"),
         }
     }
-    fill(&mut value, scope.tenant, &names, scope.grantee_emails);
+    fill(
+        &mut value,
+        positions,
+        scope.tenant,
+        &names,
+        scope.grantee_emails,
+    );
     let Ok(out) = serde_json::to_vec(&value) else {
         return Response::from_parts(parts, Body::from(bytes));
     };
@@ -177,87 +251,132 @@ fn user_grantee(obj: &Map<String, Value>) -> Option<Uuid> {
     uuid_of(obj.get("id"))
 }
 
-/// Whether the value of `key` in `obj` is data of a database, which no name goes into: the
-/// `rows` of an object marked `content_trust: untrusted` (`QueryResult`).
-fn untrusted_data(obj: &Map<String, Value>, key: &str) -> bool {
-    key == "rows" && obj.get("content_trust").and_then(Value::as_str) == Some("untrusted")
-}
-
-fn walk(v: &Value, tenant: Option<TenantId>, found: &mut dyn FnMut(TenantId, Uuid)) {
-    match v {
-        Value::Array(items) => items.iter().for_each(|i| walk(i, tenant, found)),
-        Value::Object(obj) => {
-            let tenant = tenant_of(obj, tenant);
-            if let Some(t) = tenant {
-                if let Some(id) = principal_ref(obj) {
-                    found(t, id);
-                }
-                if let Some(id) = uuid_of(obj.get("on_behalf_of")) {
-                    found(t, id);
-                }
-                if let Some(id) = obj
-                    .get("grantee")
-                    .and_then(Value::as_object)
-                    .and_then(user_grantee)
-                {
-                    found(t, id);
-                }
+/// Calls `f` with every object at `steps` below `v`, and the tenant of its principals (the
+/// `tenant_id` of the nearest enclosing typed object, [`tenant_of`]).
+fn visit<'a>(
+    v: &'a Value,
+    steps: &[String],
+    tenant: Option<TenantId>,
+    f: &mut dyn FnMut(&'a Map<String, Value>, Option<TenantId>),
+) {
+    match (steps.split_first(), v) {
+        (None, Value::Object(obj)) => f(obj, tenant_of(obj, tenant)),
+        (Some((step, rest)), Value::Array(items)) if step == "*" => {
+            items.iter().for_each(|i| visit(i, rest, tenant, f));
+        }
+        // A map (`additionalProperties`): its keys are data, so its own fields set no tenant.
+        (Some((step, rest)), Value::Object(obj)) if step == "*" => {
+            obj.values().for_each(|c| visit(c, rest, tenant, f));
+        }
+        (Some((step, rest)), Value::Object(obj)) => {
+            if let Some(c) = obj.get(step) {
+                visit(c, rest, tenant_of(obj, tenant), f);
             }
-            obj.iter()
-                .filter(|(k, _)| !untrusted_data(obj, k))
-                .for_each(|(_, c)| walk(c, tenant, found));
         }
         _ => {}
     }
 }
 
+/// What [`visit_mut`] calls for each object it reaches.
+type Change<'f> = &'f mut dyn FnMut(&mut Map<String, Value>, Option<TenantId>);
+
+/// [`visit`] for a change.
+fn visit_mut(v: &mut Value, steps: &[String], tenant: Option<TenantId>, f: Change<'_>) {
+    match (steps.split_first(), v) {
+        (None, Value::Object(obj)) => {
+            let t = tenant_of(obj, tenant);
+            f(obj, t)
+        }
+        (Some((step, rest)), Value::Array(items)) if step == "*" => {
+            items.iter_mut().for_each(|i| visit_mut(i, rest, tenant, f));
+        }
+        (Some((step, rest)), Value::Object(obj)) if step == "*" => {
+            obj.values_mut().for_each(|c| visit_mut(c, rest, tenant, f));
+        }
+        (Some((step, rest)), Value::Object(obj)) => {
+            let t = tenant_of(obj, tenant);
+            if let Some(c) = obj.get_mut(step) {
+                visit_mut(c, rest, t, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The principals at the positions of an answer.
+fn walk(
+    v: &Value,
+    positions: &Positions,
+    tenant: Option<TenantId>,
+    found: &mut dyn FnMut(TenantId, Uuid),
+) {
+    for steps in &positions.refs {
+        visit(v, steps, tenant, &mut |obj, t| {
+            if let (Some(t), Some(id)) = (t, principal_ref(obj)) {
+                found(t, id);
+            }
+        });
+    }
+    for steps in &positions.obo {
+        visit(v, steps, tenant, &mut |obj, t| {
+            if let (Some(t), Some(id)) = (t, uuid_of(obj.get("on_behalf_of"))) {
+                found(t, id);
+            }
+        });
+    }
+    for steps in &positions.grantees {
+        visit(v, steps, tenant, &mut |obj, t| {
+            if let (Some(t), Some(id)) = (t, user_grantee(obj)) {
+                found(t, id);
+            }
+        });
+    }
+}
+
 fn fill(
     v: &mut Value,
+    positions: &Positions,
     tenant: Option<TenantId>,
     names: &HashMap<(TenantId, Uuid), PrincipalName>,
     grantee_emails: bool,
 ) {
-    match v {
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|i| fill(i, tenant, names, grantee_emails)),
-        Value::Object(obj) => {
-            let tenant = tenant_of(obj, tenant);
-            if let Some(t) = tenant {
-                if let Some(n) = principal_ref(obj).and_then(|id| names.get(&(t, id))) {
-                    obj.insert("display_name".into(), n.display_name.clone().into());
-                }
-                if let Some(n) = uuid_of(obj.get("on_behalf_of")).and_then(|id| names.get(&(t, id)))
-                {
-                    obj.insert(
-                        "on_behalf_of_display_name".into(),
-                        n.display_name.clone().into(),
-                    );
-                }
-                if let Some(g) = obj.get_mut("grantee").and_then(Value::as_object_mut)
-                    && let Some(n) = user_grantee(g).and_then(|id| names.get(&(t, id)))
-                {
-                    g.insert("display_name".into(), n.display_name.clone().into());
-                    match (&n.email, grantee_emails) {
-                        (Some(e), true) => {
-                            g.insert("email".into(), e.clone().into());
-                        }
-                        _ => {
-                            g.remove("email");
-                        }
+    for steps in &positions.refs {
+        visit_mut(v, steps, tenant, &mut |obj, t| {
+            if let Some(t) = t
+                && let Some(n) = principal_ref(obj).and_then(|id| names.get(&(t, id)))
+            {
+                obj.insert("display_name".into(), n.display_name.clone().into());
+            }
+        });
+    }
+    for steps in &positions.obo {
+        visit_mut(v, steps, tenant, &mut |obj, t| {
+            if let Some(t) = t
+                && let Some(n) = uuid_of(obj.get("on_behalf_of")).and_then(|id| names.get(&(t, id)))
+            {
+                obj.insert(
+                    "on_behalf_of_display_name".into(),
+                    n.display_name.clone().into(),
+                );
+            }
+        });
+    }
+    for steps in &positions.grantees {
+        visit_mut(v, steps, tenant, &mut |g, t| {
+            if let Some(t) = t
+                && let Some(n) = user_grantee(g).and_then(|id| names.get(&(t, id)))
+            {
+                g.insert("display_name".into(), n.display_name.clone().into());
+                match (&n.email, grantee_emails) {
+                    (Some(e), true) => {
+                        g.insert("email".into(), e.clone().into());
+                    }
+                    _ => {
+                        g.remove("email");
                     }
                 }
             }
-            let skip: Vec<String> = obj
-                .keys()
-                .filter(|k| untrusted_data(obj, k))
-                .cloned()
-                .collect();
-            obj.iter_mut()
-                .filter(|(k, _)| !skip.contains(k))
-                .for_each(|(_, c)| fill(c, tenant, names, grantee_emails));
-        }
-        _ => {}
+        });
     }
 }
 
@@ -274,10 +393,25 @@ mod tests {
         }
     }
 
+    fn steps(list: &[&[&str]]) -> Vec<Vec<String>> {
+        list.iter()
+            .map(|p| p.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
     #[test]
     fn fills_refs_obo_and_grantees_in_their_tenant() {
         let (t1, t2) = (TenantId(Uuid::now_v7()), TenantId(Uuid::now_v7()));
         let [alice, bot, bob, carol, dave] = [(); 5].map(|_| Uuid::now_v7());
+        let positions = Positions {
+            refs: steps(&[
+                &["items", "*", "actor"],
+                &["items", "*", "shared_by", "actor"],
+            ]),
+            obo: steps(&[&["items", "*"], &["items", "*", "shared_by"]]),
+            grantees: steps(&[&["items", "*", "grantee"]]),
+            ..Positions::default()
+        };
         let mut v = json!({
             "items": [
                 {"actor": {"kind": "agent", "id": bot}, "on_behalf_of": alice, "data": {}},
@@ -291,7 +425,7 @@ mod tests {
             ]
         });
         let mut seen = Vec::new();
-        walk(&v, Some(t1), &mut |t, id| seen.push((t, id)));
+        walk(&v, &positions, Some(t1), &mut |t, id| seen.push((t, id)));
         assert_eq!(seen.len(), 5, "{seen:?}");
         assert!(seen.contains(&(t2, carol)) && seen.contains(&(t2, dave)));
         let names = HashMap::from([
@@ -302,7 +436,7 @@ mod tests {
             // Carol is known only in t1; the item of t2 must not take that name.
             ((t1, carol), name("Carol of t1", None)),
         ]);
-        fill(&mut v, Some(t1), &names, false);
+        fill(&mut v, &positions, Some(t1), &names, false);
         let i = &v["items"];
         assert_eq!(i[0]["actor"]["display_name"], "Kadri Kask");
         assert_eq!(i[0]["on_behalf_of_display_name"], "Alice");
@@ -316,54 +450,137 @@ mod tests {
         );
         assert_eq!(i[4]["shared_by"]["actor"]["display_name"], "Dave");
         assert!(i[5].get("display_name").is_none());
-        fill(&mut v, Some(t1), &names, true);
+        fill(&mut v, &positions, Some(t1), &names, true);
         assert_eq!(v["items"][2]["grantee"]["email"], "bob@x");
     }
 
-    /// Backlog S-3: a query result's rows are data. A guest who builds principal-shaped objects
-    /// in a query (also with `on_behalf_of`, a grantee, or the `tenant_id` of another tenant)
-    /// gets no name, and the rows come back unchanged. The `by` of a log entry next to it is
-    /// still named.
+    /// Principal-shaped JSON that the contract does not type as a principal: the rows of a query
+    /// (backlog S-3), the manifest of a database, the `data` of an audit entry (backlog
+    /// 2026-11-09 S-11). Also with `on_behalf_of`, a grantee or the `tenant_id` of another
+    /// tenant, nothing in it is named, and it comes back unchanged; the typed fields next to it
+    /// are named.
     #[test]
-    fn query_rows_are_never_named() {
+    fn names_go_only_where_the_contract_types_a_principal() {
         let (t1, t2) = (TenantId(Uuid::now_v7()), TenantId(Uuid::now_v7()));
         let [alice, bob, carol] = [(); 3].map(|_| Uuid::now_v7());
-        let rows = json!([
-            [{"kind": "user", "id": alice}, {"kind": "agent", "id": bob}],
-            [{"actor": {"kind": "user", "id": alice}, "on_behalf_of": bob}],
-            [{"grantee": {"type": "user", "id": alice}}],
-            [{"tenant_id": t2.0, "kind": "user", "id": carol}],
-            [{"node": {"tenant_id": t2.0}, "actor": {"kind": "user", "id": carol}}],
-            [[{"kind": "user", "id": alice}]],
-            [{"$ruum": "literal", "value": {"kind": "user", "id": alice}}],
+        let shaped = json!([
+            {"kind": "user", "id": alice},
+            {"actor": {"kind": "user", "id": alice}, "on_behalf_of": alice},
+            {"grantee": {"type": "user", "id": alice}},
+            {"tenant_id": t2.0, "kind": "user", "id": carol},
+            {"node": {"tenant_id": t2.0}, "actor": {"kind": "user", "id": carol}},
+            [{"kind": "user", "id": alice}],
+            {"$ruum": "literal", "value": {"kind": "user", "id": alice}},
         ]);
-        let mut v = json!({
-            "query_id": Uuid::now_v7(), "mode": "read", "columns": [],
-            "rows": rows.clone(), "row_count": 7, "content_trust": "untrusted",
-            "log": {"by": {"kind": "user", "id": bob}},
-        });
-        let mut seen = Vec::new();
-        walk(&v, Some(t1), &mut |t, id| seen.push((t, id)));
-        assert_eq!(seen, [(t1, bob)], "only the log entry's actor");
         let names = HashMap::from([
             ((t1, alice), name("Alice", Some("alice@x"))),
             ((t1, bob), name("Bob", None)),
             ((t2, carol), name("Carol of t2", None)),
         ]);
-        fill(&mut v, Some(t1), &names, true);
-        assert_eq!(v["rows"], rows, "the rows are unchanged");
-        assert_eq!(v["log"]["by"]["display_name"], "Bob");
-        // An answer that is not marked untrusted keeps the rule for `rows` of its own.
-        let mut other = json!({"rows": [{"kind": "user", "id": alice}]});
-        fill(&mut other, Some(t1), &names, false);
-        assert_eq!(other["rows"][0]["display_name"], "Alice");
+        let node = Uuid::now_v7();
+        let ref_of = |id: Uuid| json!({"kind": "user", "id": id});
+        let cases = [
+            (
+                "POST",
+                format!("/v1/databases/{node}/query"),
+                json!({
+                    "query_id": Uuid::now_v7(), "mode": "read", "columns": [],
+                    "rows": [shaped.clone()], "row_count": 1, "content_trust": "untrusted",
+                }),
+                vec![],
+            ),
+            (
+                "GET",
+                format!("/v1/tenants/{}/audit", t1.0),
+                json!({"items": [{
+                    "id": Uuid::now_v7(), "action": "x", "actor": ref_of(bob), "on_behalf_of": null,
+                    "target_type": "node", "target_id": node, "data": {"who": shaped.clone()},
+                }]}),
+                vec![(t1, bob)],
+            ),
+            (
+                "GET",
+                format!("/v1/databases/{node}"),
+                json!({
+                    "node": {"id": node, "created_by": {"actor": ref_of(bob), "on_behalf_of": null}},
+                    "manifest": {"data_classes": {}, "x": shaped.clone()},
+                }),
+                vec![(t1, bob)],
+            ),
+        ];
+        for (method, path, mut v, want) in cases {
+            let positions = positions_for(method, &path).expect("an operation of the contract");
+            let mut seen = Vec::new();
+            walk(&v, positions, Some(t1), &mut |t, id| seen.push((t, id)));
+            assert_eq!(seen, want, "{method} {path}");
+            let before = v.to_string();
+            fill(&mut v, positions, Some(t1), &names, true);
+            let after = v.to_string();
+            assert!(
+                !after.contains("Alice") && !after.contains("Carol"),
+                "{method} {path}: {after}"
+            );
+            if want.is_empty() {
+                assert_eq!(after, before, "{method} {path}: unchanged");
+            } else {
+                assert!(after.contains("Bob"), "{method} {path}: {after}");
+            }
+        }
+    }
+
+    /// An answer of a path that the contract does not have gets no names; a literal segment of a
+    /// path wins over a `{parameter}`.
+    #[test]
+    fn paths_match_the_contract() {
+        assert!(positions_for("GET", "/v1/no-such-thing").is_none());
+        assert!(positions_for("PATCH", "/v1/nodes/x/y/z/w").is_none());
+        let p = positions_for("GET", &format!("/v1/nodes/{}", Uuid::now_v7())).unwrap();
+        assert_eq!(p.path, "/v1/nodes/{node_id}");
+        for o in &PRINCIPAL_PATHS.operations {
+            let path = o.path.replace(['{', '}'], "");
+            let concrete: String = path
+                .split('/')
+                .zip(o.path.split('/'))
+                .map(|(c, t)| if t.starts_with('{') { "p" } else { c })
+                .collect::<Vec<_>>()
+                .join("/");
+            let found = positions_for(&o.method, &concrete).unwrap();
+            assert_eq!(found.method, o.method);
+            assert_eq!(
+                found.path.split('/').count(),
+                o.path.split('/').count(),
+                "{} {}",
+                o.method,
+                o.path
+            );
+        }
+    }
+
+    /// `principal_paths.json` is the output of `scripts/gen-principal-paths.mjs` for the current
+    /// contract.
+    #[test]
+    fn principal_paths_are_up_to_date() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            PRINCIPAL_PATHS.openapi_sha256,
+            hex::encode(Sha256::digest(
+                include_str!("../../../contracts/openapi.yaml").as_bytes()
+            )),
+            "contracts/openapi.yaml changed: run `node crates/ruum-api/scripts/gen-principal-paths.mjs` \
+             from the repository root"
+        );
     }
 
     #[test]
     fn nothing_without_a_tenant() {
         let mut found = 0;
+        let positions = Positions {
+            refs: steps(&[&["actor"]]),
+            ..Positions::default()
+        };
         walk(
             &json!({"actor": {"kind": "user", "id": Uuid::now_v7()}}),
+            &positions,
             None,
             &mut |_, _| found += 1,
         );
