@@ -42,7 +42,26 @@
 //!
 //! [`ImageRef`] has two kinds: `static` (a content-addressed file tree in the blob store; the
 //! driver runs no code for it, the gateway serves the files) and `oci` (a digest in the local
-//! registry, made by a [`Builder`]).
+//! registry, made by a [`Builder`]). The registry has one repository per tenant and app: a
+//! builder pushes to the repository of [`builder::BuildInput::identity`], and a driver looks a
+//! digest up only in the repository of [`WorkloadSpec::identity`] (tenant and app; the live and
+//! the preview deployments of one app share it). The digest of another app's image is
+//! [`RuntimeError::ImageNotFound`], also when the driver could reach it.
+//!
+//! # The workload token
+//!
+//! The driver mounts the workload token as a file at [`TOKEN_FILE`] and sets the variable
+//! [`TOKEN_FILE_ENV`] to that path (`contracts/apps/runtime.openapi.yaml`, "The app's
+//! credential"). The token is never an environment variable: [`RuntimeDriver::rotate_token`]
+//! rewrites the file in place, so a running process reads the new token at its next read.
+//!
+//! # Logs and privacy
+//!
+//! The text of a log line comes from the app, so it is `personal` data until the log processor
+//! classifies and pseudonymizes it (design 8.5, decisions 0004 and 0005). The driver's buffer is
+//! short-lived: only the log shipper or the processor reads it ([`RuntimeDriver::logs`]), and no
+//! operation or UI path reads driver logs past the processor. A driver bounds the buffer (a ring
+//! per instance); the oldest lines go first, so `seq` can start with a gap.
 //!
 //! # Usage
 //!
@@ -61,6 +80,17 @@ mod tests;
 
 pub use builder::{BUILD_ROUTES, BuildInput, BuildLogLine, BuildOutput, Builder};
 pub use memory::{MemoryBuilder, MemoryDriver, MemoryRegistry};
+
+/// Where the driver mounts the workload token inside the sandbox
+/// (`contracts/apps/runtime.openapi.yaml`).
+pub const TOKEN_FILE: &str = "/var/run/ruum/token";
+
+/// The environment variable that holds [`TOKEN_FILE`]. The platform sets it; a spec that sets it
+/// is [`RuntimeError::InvalidSpec`].
+pub const TOKEN_FILE_ENV: &str = "RUUM_TOKEN_FILE";
+
+/// The longest health check path [`WorkloadSpec::validate`] accepts, in bytes.
+pub const MAX_HEALTH_PATH_BYTES: usize = 1024;
 
 use crate::blobs::Hash;
 use crate::ids::{NodeId, TenantId};
@@ -239,6 +269,7 @@ impl Limits {
 /// The health check of a service: an HTTP `GET` of `path` on the service port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HealthCheck {
+    /// Starts with `/`; printable ASCII without spaces; at most [`MAX_HEALTH_PATH_BYTES`].
     pub path: String,
     pub interval: Duration,
     /// The number of failed checks in a row that make the instance unhealthy.
@@ -248,7 +279,7 @@ pub struct HealthCheck {
 /// A long-running HTTP service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceSpec {
-    /// The port the service listens on inside the sandbox.
+    /// The port the service listens on inside the sandbox (not 0).
     pub port: u16,
     pub health: Option<HealthCheck>,
     /// Scale to zero after this much time without a request ([`RuntimeDriver::touch`]);
@@ -256,7 +287,9 @@ pub struct ServiceSpec {
     pub idle_timeout: Option<Duration>,
 }
 
-/// A run-to-completion job (jobs, the O-4 browser check).
+/// A run-to-completion job (jobs, the O-4 browser check). A preview may run a job (the O-4
+/// check runs against previews); "previews run no scheduled jobs" (rule 6) is the scheduler's
+/// rule (card R-5), not the driver's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobSpec {
     /// The job ends with [`ExitReason::TimedOut`] when it runs longer.
@@ -365,6 +398,9 @@ impl StaticImage {
 }
 
 /// A digest of an OCI image in the local registry: `sha256:` and 64 lowercase hex characters.
+///
+/// A digest is not a capability: it is a content hash, so it can be guessed or can leak. A driver
+/// resolves it only in the repository of the spec's tenant and app (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct OciDigest(String);
@@ -420,7 +456,8 @@ impl fmt::Display for OciDigest {
 pub enum ImageRef {
     /// Files served by the gateway; no code runs.
     Static(StaticImage),
-    /// An OCI image in the local registry (made by a [`Builder`]).
+    /// An OCI image in the local registry (made by a [`Builder`]), in the repository of the
+    /// spec's tenant and app.
     Oci(OciDigest),
 }
 
@@ -448,7 +485,8 @@ pub struct WorkloadSpec {
     /// but the driver redacts them from the logs too.
     pub previous_secrets: Vec<SecretValue>,
     /// The workload token (the identity of the instance at the runtime API). The driver mounts
-    /// it and redacts it from the logs.
+    /// it as the file [`TOKEN_FILE`], sets [`TOKEN_FILE_ENV`] to its path, and redacts it from
+    /// the logs. It is never an environment variable.
     pub workload_token: SecretValue,
     pub limits: Limits,
     /// The routes of rule 2. Empty for a static image.
@@ -456,9 +494,17 @@ pub struct WorkloadSpec {
 }
 
 impl WorkloadSpec {
-    /// The checks every driver makes before it starts anything. A driver may add its own.
+    /// The checks every driver makes before it starts anything. A driver may add its own. The
+    /// spec comes from the manifest, which the app's author controls, so every value that
+    /// reaches a process, a probe or the Docker API is checked here.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         self.limits.validate()?;
+        if self.command.iter().any(|a| a.contains('\0')) {
+            return Err(RuntimeError::invalid(
+                "command",
+                "an argument holds a NUL byte",
+            ));
+        }
         let mut names = HashSet::new();
         for var in &self.env {
             let mut chars = var.name.chars();
@@ -478,6 +524,22 @@ impl WorkloadSpec {
                     format!("{} is set twice", var.name),
                 ));
             }
+            if var.name == TOKEN_FILE_ENV {
+                return Err(RuntimeError::invalid(
+                    "env",
+                    format!("{TOKEN_FILE_ENV} is set by the platform"),
+                ));
+            }
+            let value = match &var.value {
+                EnvValue::Plain(v) => v.as_str(),
+                EnvValue::Secret(v) => v.expose(),
+            };
+            if value.contains('\0') {
+                return Err(RuntimeError::invalid(
+                    "env",
+                    format!("the value of {} holds a NUL byte", var.name),
+                ));
+            }
         }
         let mut routes = HashSet::new();
         for r in &self.routes {
@@ -493,6 +555,9 @@ impl WorkloadSpec {
         }
         match &self.kind {
             WorkloadKind::Service(s) => {
+                if s.port == 0 {
+                    return Err(RuntimeError::invalid("kind.port", "must not be 0"));
+                }
                 if let Some(h) = &s.health {
                     if h.interval.is_zero() || h.failure_threshold == 0 {
                         return Err(RuntimeError::invalid(
@@ -500,10 +565,30 @@ impl WorkloadSpec {
                             "the interval and the failure threshold must be above zero",
                         ));
                     }
+                    if h.interval.checked_mul(h.failure_threshold).is_none() {
+                        return Err(RuntimeError::invalid(
+                            "kind.health",
+                            "the interval times the failure threshold is too long",
+                        ));
+                    }
                     if !h.path.starts_with('/') {
                         return Err(RuntimeError::invalid(
                             "kind.health.path",
                             "must start with /",
+                        ));
+                    }
+                    if h.path.len() > MAX_HEALTH_PATH_BYTES {
+                        return Err(RuntimeError::invalid(
+                            "kind.health.path",
+                            format!("must be at most {MAX_HEALTH_PATH_BYTES} bytes"),
+                        ));
+                    }
+                    // The path goes into an HTTP request line: no spaces, no control characters,
+                    // no line ends.
+                    if !h.path.bytes().all(|b| b.is_ascii_graphic()) {
+                        return Err(RuntimeError::invalid(
+                            "kind.health.path",
+                            "must be printable ASCII without spaces",
                         ));
                     }
                 }
@@ -728,7 +813,9 @@ pub enum RuntimeError {
     /// The builder has no such runtime.
     #[error("the builder has no runtime {runtime}")]
     UnsupportedRuntime { runtime: String },
-    /// The build ran and failed.
+    /// The build ran and failed. `reason` is text from untrusted build output: a builder bounds
+    /// its length ([`builder::MAX_BUILD_FAILED_REASON_BYTES`]) and redacts its own credentials
+    /// (the registry push credential) from it; a UI escapes it where it shows it.
     #[error("the build failed: {reason}")]
     BuildFailed { reason: String },
     /// The build ran longer than its timeout.
@@ -804,8 +891,11 @@ impl RuntimeError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuntimeUsage {
-    /// One run of an instance ended (stop, scale to zero, exit): how long it ran and its memory
-    /// limit.
+    /// Instance time: how long a run of an instance ran and its memory limit. A driver sends
+    /// one at the end of each run (stop, scale to zero, exit). It may also send interim records
+    /// while a run goes on (each with the time since the last record of that run), so a service
+    /// that never scales to zero is charged before it stops and a platform crash loses little;
+    /// the meters add the records up.
     Instance {
         identity: WorkloadIdentity,
         instance: InstanceId,
@@ -862,6 +952,10 @@ pub trait RuntimeDriver: Send + Sync {
     /// Checks the spec ([`WorkloadSpec::validate`]) and starts an instance. A service runs until
     /// it is stopped or scales to zero; a job runs until it ends or times out. Returns the first
     /// status (state `starting` or `running`).
+    ///
+    /// `start` is not idempotent: each call starts a new instance. A caller that retries after a
+    /// timeout (W-2) keeps the instance ID it got before it reports success, and stops an
+    /// instance it does not keep.
     async fn start(&self, spec: WorkloadSpec) -> Result<InstanceStatus, RuntimeError>;
 
     async fn status(
@@ -874,7 +968,9 @@ pub trait RuntimeDriver: Send + Sync {
     /// logs stay readable while the driver keeps the instance.
     async fn stop(&self, tenant: TenantId, instance: InstanceId) -> Result<(), RuntimeError>;
 
-    /// Records a request to a service (the gateway calls it), which restarts its idle timer.
+    /// Records a request to a service (the gateway calls it), which restarts its idle timer. On
+    /// a service that scaled to zero it returns `Ok` and does not start it: the gateway calls
+    /// [`RuntimeDriver::wake`] for that.
     async fn touch(&self, tenant: TenantId, instance: InstanceId) -> Result<(), RuntimeError>;
 
     /// Starts a service that scaled to zero again (a cold start) and returns when it runs; the
@@ -887,7 +983,9 @@ pub trait RuntimeDriver: Send + Sync {
     ) -> Result<InstanceStatus, RuntimeError>;
 
     /// The log lines of an instance after the position `after` (all when `None`), in order, at
-    /// most `limit`. The lines are redacted and carry the instance identity.
+    /// most `limit`. The lines are redacted and carry the instance identity. Only the log
+    /// shipper or the log processor calls this (see "Logs and privacy" in the module docs); the
+    /// buffer is bounded, so the first line can have a `seq` above `after + 1`.
     async fn logs(
         &self,
         tenant: TenantId,
@@ -896,8 +994,9 @@ pub trait RuntimeDriver: Send + Sync {
         limit: usize,
     ) -> Result<Vec<LogLine>, RuntimeError>;
 
-    /// Gives a running instance a new workload token (renewal). The driver keeps redacting the
-    /// old token too.
+    /// Gives an instance a new workload token (renewal): the driver rewrites [`TOKEN_FILE`] in
+    /// place, so the running process reads the new token at its next read, and a cold start
+    /// after a scale to zero gets the new token too. The driver keeps redacting the old token.
     async fn rotate_token(
         &self,
         tenant: TenantId,

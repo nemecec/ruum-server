@@ -5,24 +5,33 @@
 //! They keep the rules of the trait that a driver can keep without a sandbox: limits are
 //! recorded and the memory, disk and time limits are enforced on the program's own counters;
 //! routes are recorded exactly; each app, environment and deployment gets its own network ID;
-//! log lines are redacted before they are stored.
+//! log lines are redacted before they are stored; images resolve only in the repository of
+//! their tenant and app.
+//!
+//! It is for tests: one lock guards every instance (the redaction of a write runs under it; its
+//! cost is linear in the output, see [`super::redact`]), the log of an instance is a ring of
+//! [`MAX_LOG_LINES`] lines, and an instance stays in memory until the driver is dropped.
 
-use super::program::{DISK_FULL, Step};
+use super::program::{DISK_FULL, Step, token_sha};
 use super::redact::LineRedactor;
 use super::*;
 use crate::ids::{NodeId, TenantId};
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
 // ------------------------------------------------------------------------------ registry
 
-/// The images the in-memory builder made; the in-memory driver starts only these.
+/// The most log lines the in-memory driver keeps per instance; older lines go first.
+pub const MAX_LOG_LINES: usize = 10_000;
+
+/// The images the in-memory builder made, one repository per tenant and app; the in-memory
+/// driver starts only these, and only for the same tenant and app.
 #[derive(Default)]
 pub struct MemoryRegistry {
-    images: Mutex<HashSet<OciDigest>>,
+    images: Mutex<HashSet<(TenantId, NodeId, OciDigest)>>,
 }
 
 impl MemoryRegistry {
@@ -30,15 +39,31 @@ impl MemoryRegistry {
         Arc::new(Self::default())
     }
 
-    pub fn push(&self, digest: &OciDigest) {
+    /// Pushes the image to the repository of the identity's tenant and app.
+    pub fn push(&self, identity: &WorkloadIdentity, digest: &OciDigest) {
+        self.images.lock().expect("registry lock").insert((
+            identity.tenant,
+            identity.app,
+            digest.clone(),
+        ));
+    }
+
+    /// True when the repository of the identity's tenant and app holds the image.
+    pub fn contains(&self, identity: &WorkloadIdentity, digest: &OciDigest) -> bool {
+        self.images.lock().expect("registry lock").contains(&(
+            identity.tenant,
+            identity.app,
+            digest.clone(),
+        ))
+    }
+
+    /// True when any repository holds the image (only for the `global_registry` test fault).
+    fn contains_anywhere(&self, digest: &OciDigest) -> bool {
         self.images
             .lock()
             .expect("registry lock")
-            .insert(digest.clone());
-    }
-
-    pub fn contains(&self, digest: &OciDigest) -> bool {
-        self.images.lock().expect("registry lock").contains(digest)
+            .iter()
+            .any(|(_, _, d)| d == digest)
     }
 }
 
@@ -47,6 +72,24 @@ impl MemoryRegistry {
 /// An archive that holds these bytes fails to build in the in-memory builder.
 pub const FAILING_ARCHIVE_MARKER: &[u8] = b"ruum-memory-builder:fail";
 
+/// An archive that holds these bytes builds for a minute in the in-memory builder.
+pub const SLOW_ARCHIVE_MARKER: &[u8] = b"ruum-memory-builder:slow";
+
+/// An archive that holds these bytes writes the build's environment to the build log.
+pub const ENV_DUMP_ARCHIVE_MARKER: &[u8] = b"ruum-memory-builder:env";
+
+/// The environment of a build in the in-memory builder: nothing of the builder's own.
+const BUILD_ENV: &[(&str, &str)] = &[("HOME", "/build"), ("PATH", "/usr/bin:/bin")];
+
+/// Faults the tests switch on to show that the builder suite notices a broken builder.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BuilderFaults {
+    /// Lets the builder's own secrets into the build environment.
+    pub leak_host_secrets: bool,
+    /// Ignores the build timeout.
+    pub no_timeout: bool,
+}
+
 /// The runtimes the in-memory builder accepts.
 pub const MEMORY_RUNTIMES: &[&str] = &["node22"];
 
@@ -54,11 +97,33 @@ pub const MEMORY_RUNTIMES: &[&str] = &["node22"];
 pub struct MemoryBuilder {
     registry: Arc<MemoryRegistry>,
     usage: Arc<dyn RuntimeUsageSink>,
+    /// The builder's own secrets (a real builder's registry push credential); no build sees
+    /// them.
+    own_secrets: Vec<SecretValue>,
+    faults: BuilderFaults,
 }
 
 impl MemoryBuilder {
     pub fn new(registry: Arc<MemoryRegistry>, usage: Arc<dyn RuntimeUsageSink>) -> Self {
-        Self { registry, usage }
+        Self {
+            registry,
+            usage,
+            own_secrets: Vec::new(),
+            faults: BuilderFaults::default(),
+        }
+    }
+
+    /// Gives the builder secrets of its own, which it keeps out of every build (the
+    /// conformance suite plants them as canaries).
+    pub fn with_own_secrets(mut self, secrets: Vec<SecretValue>) -> Self {
+        self.own_secrets = secrets;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_faults(mut self, faults: BuilderFaults) -> Self {
+        self.faults = faults;
+        self
     }
 }
 
@@ -89,21 +154,48 @@ impl Builder for MemoryBuilder {
             input.archive.len(),
             input.runtime
         ))];
+        if contains(&input.archive, ENV_DUMP_ARCHIVE_MARKER) {
+            logs.push(line("env-dump:begin".to_owned()));
+            for (k, v) in BUILD_ENV {
+                logs.push(line(format!("{k}={v}")));
+            }
+            if self.faults.leak_host_secrets {
+                for (i, s) in self.own_secrets.iter().enumerate() {
+                    logs.push(line(format!("BUILDER_SECRET_{i}={}", s.expose())));
+                }
+            }
+            logs.push(line("env-dump:end".to_owned()));
+        }
         // A build takes some time; the usage record must not be zero.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        let work = if contains(&input.archive, SLOW_ARCHIVE_MARKER) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(2)
+        };
+        let timed_out = if self.faults.no_timeout {
+            tokio::time::sleep(work).await;
+            false
+        } else {
+            tokio::time::timeout(input.timeout, tokio::time::sleep(work))
+                .await
+                .is_err()
+        };
         let failed = contains(&input.archive, FAILING_ARCHIVE_MARKER);
         let took = begun.elapsed();
         self.usage.record(RuntimeUsage::Build {
             identity: input.identity,
             took,
         });
+        if timed_out {
+            return Err(RuntimeError::BuildTimedOut);
+        }
         if failed {
             return Err(RuntimeError::BuildFailed {
                 reason: "the build script exited with code 1".to_owned(),
             });
         }
         let digest = OciDigest::of(&input.archive);
-        self.registry.push(&digest);
+        self.registry.push(&input.identity, &digest);
         logs.push(line(format!("image {digest}")));
         Ok(BuildOutput {
             image: ImageRef::Oci(digest),
@@ -132,6 +224,12 @@ pub(crate) struct Faults {
     pub no_job_timeout: bool,
     /// Ignores the memory limit.
     pub no_memory_limit: bool,
+    /// Starts an image of any tenant and app.
+    pub global_registry: bool,
+    /// Lets `touch`, `wake` and `rotate_token` act on another tenant's instance.
+    pub tenant_blind_calls: bool,
+    /// Adds the pooler to the applied routes at a wake.
+    pub wake_adds_route: bool,
 }
 
 /// The in-memory driver.
@@ -161,7 +259,7 @@ struct Inst {
     health: Health,
     applied: Applied,
     started_at: OffsetDateTime,
-    logs: Vec<LogLine>,
+    logs: VecDeque<LogLine>,
     next_seq: u64,
     out: LineRedactor,
     err: LineRedactor,
@@ -190,7 +288,10 @@ impl Inst {
 
     fn append(&mut self, id: InstanceId, stream: LogStream, lines: Vec<(OffsetDateTime, String)>) {
         for (at, text) in lines {
-            self.logs.push(LogLine {
+            if self.logs.len() >= MAX_LOG_LINES {
+                self.logs.pop_front();
+            }
+            self.logs.push_back(LogLine {
                 seq: self.next_seq,
                 at,
                 instance: id,
@@ -370,22 +471,32 @@ impl Inner {
                 Step::Stderr(t) => self.with(id, generation, |i| {
                     i.write(id, LogStream::Stderr, &format!("{t}\n"))
                 })?,
+                Step::StderrWrite(t) => {
+                    self.with(id, generation, |i| i.write(id, LogStream::Stderr, &t))?
+                }
                 Step::Env(name) => self.with(id, generation, |i| {
-                    let value = i
-                        .spec
-                        .env
-                        .iter()
-                        .find(|v| v.name == name)
-                        .map(|v| match &v.value {
-                            EnvValue::Plain(p) => p.clone(),
-                            EnvValue::Secret(s) => s.expose().to_owned(),
-                        })
-                        .unwrap_or_default();
+                    let value = if name == TOKEN_FILE_ENV {
+                        TOKEN_FILE.to_owned()
+                    } else {
+                        i.spec
+                            .env
+                            .iter()
+                            .find(|v| v.name == name)
+                            .map(|v| match &v.value {
+                                EnvValue::Plain(p) => p.clone(),
+                                EnvValue::Secret(s) => s.expose().to_owned(),
+                            })
+                            .unwrap_or_default()
+                    };
                     i.write(id, LogStream::Stdout, &format!("{name}={value}\n"));
                 })?,
                 Step::Token => self.with(id, generation, |i| {
                     let token = i.spec.workload_token.expose().to_owned();
                     i.write(id, LogStream::Stdout, &format!("{token}\n"));
+                })?,
+                Step::TokenSha => self.with(id, generation, |i| {
+                    let line = token_sha(i.spec.workload_token.expose());
+                    i.write(id, LogStream::Stdout, &format!("{line}\n"));
                 })?,
                 Step::Sleep(d) => tokio::time::sleep(d).await,
                 Step::Exit(code) => return Some(ExitStatus::completed(code)),
@@ -403,7 +514,7 @@ impl Inner {
                         WorkloadKind::Job(_) => None,
                     })?;
                     if let Some(h) = check {
-                        tokio::time::sleep(h.interval * h.failure_threshold).await;
+                        tokio::time::sleep(h.interval.saturating_mul(h.failure_threshold)).await;
                         self.with(id, generation, |i| i.health = Health::Unhealthy)?;
                     }
                     std::future::pending::<()>().await;
@@ -441,6 +552,23 @@ impl Inner {
             _ => Err(RuntimeError::NotFound { instance: id }),
         }
     }
+
+    /// [`Inner::get`] for `touch`, `wake` and `rotate_token`, which the `tenant_blind_calls`
+    /// fault breaks.
+    fn get_for_call<'s>(
+        &self,
+        st: &'s mut State,
+        tenant: TenantId,
+        id: InstanceId,
+    ) -> Result<&'s mut Inst, RuntimeError> {
+        if self.faults.tenant_blind_calls {
+            return st
+                .instances
+                .get_mut(&id)
+                .ok_or(RuntimeError::NotFound { instance: id });
+        }
+        Self::get(st, tenant, id)
+    }
 }
 
 #[async_trait]
@@ -453,7 +581,12 @@ impl RuntimeDriver for MemoryDriver {
         spec.validate()?;
         let runs_code = match &spec.image {
             ImageRef::Oci(d) => {
-                if !self.inner.registry.contains(d) {
+                let found = if self.inner.faults.global_registry {
+                    self.inner.registry.contains_anywhere(d)
+                } else {
+                    self.inner.registry.contains(&spec.identity, d)
+                };
+                if !found {
                     return Err(RuntimeError::ImageNotFound {
                         image: d.to_string(),
                     });
@@ -522,7 +655,7 @@ impl RuntimeDriver for MemoryDriver {
             health: Health::Unknown,
             applied,
             started_at: crate::now(),
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             next_seq: 1,
             generation: 0,
             program: None,
@@ -564,7 +697,7 @@ impl RuntimeDriver for MemoryDriver {
 
     async fn touch(&self, tenant: TenantId, instance: InstanceId) -> Result<(), RuntimeError> {
         let mut st = self.inner.lock();
-        let inst = Inner::get(&mut st, tenant, instance)?;
+        let inst = self.inner.get_for_call(&mut st, tenant, instance)?;
         match inst.state {
             InstanceState::Running | InstanceState::ScaledToZero
                 if matches!(inst.spec.kind, WorkloadKind::Service(_)) =>
@@ -582,13 +715,20 @@ impl RuntimeDriver for MemoryDriver {
         instance: InstanceId,
     ) -> Result<InstanceStatus, RuntimeError> {
         let mut st = self.inner.lock();
-        let inst = Inner::get(&mut st, tenant, instance)?;
+        let inst = self.inner.get_for_call(&mut st, tenant, instance)?;
         if !matches!(inst.spec.kind, WorkloadKind::Service(_)) {
             return Err(RuntimeError::state("wake", &inst.state));
         }
         match inst.state {
             InstanceState::Running => inst.last_activity = Instant::now(),
-            InstanceState::ScaledToZero => self.inner.spawn_run(instance, inst),
+            InstanceState::ScaledToZero => {
+                if self.inner.faults.wake_adds_route
+                    && !inst.applied.routes.contains(&Route::Pooler)
+                {
+                    inst.applied.routes.push(Route::Pooler);
+                }
+                self.inner.spawn_run(instance, inst)
+            }
             s => return Err(RuntimeError::state("wake", &s)),
         }
         Ok(inst.status(instance))
@@ -623,7 +763,7 @@ impl RuntimeDriver for MemoryDriver {
             return Err(RuntimeError::invalid("workload_token", "must not be empty"));
         }
         let mut st = self.inner.lock();
-        let inst = Inner::get(&mut st, tenant, instance)?;
+        let inst = self.inner.get_for_call(&mut st, tenant, instance)?;
         match inst.state {
             InstanceState::Starting | InstanceState::Running | InstanceState::ScaledToZero => {}
             s => return Err(RuntimeError::state("rotate the token of", &s)),
