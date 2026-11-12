@@ -545,3 +545,148 @@ async fn dbhost_sessions_search_pg_catalog_only() {
         "a ruum_dbhost session to the admin database"
     );
 }
+
+/// A masked copy of a database whose views read masked columns (backlog 2026-11-09 S-8): a
+/// view over a personal column blocked the `ALTER COLUMN TYPE` of the copy. The copy drops the
+/// views and materialized views that read a masked column (also through another view) and makes
+/// them again over the masked tables, with their options, comments and indexes. A materialized
+/// view is filled from the masked tables, so it keeps no value of the source. A view that does
+/// not fit the masked columns (arithmetic on a personal number) refuses the copy with a clear
+/// error, and the source keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_makes_views_over_masked_columns_again() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec!["email", "age"],
+        secret: vec!["token"],
+    };
+    let up = |extra: &str| {
+        MigrationRequest {
+        up: format!(
+            "CREATE TABLE people (id integer PRIMARY KEY, email text, age integer, token text);
+             CREATE VIEW v1 AS SELECT id, email FROM people;
+             CREATE VIEW v2 AS SELECT id, upper(email) AS e FROM v1;
+             CREATE VIEW vb WITH (security_barrier = true) AS SELECT id, age FROM people WHERE id > 0;
+             COMMENT ON VIEW v1 IS 'emails';
+             CREATE MATERIALIZED VIEW mv AS SELECT id, email, token FROM people;
+             CREATE UNIQUE INDEX mv_id ON mv (id);
+             COMMENT ON MATERIALIZED VIEW mv IS 'snapshot';
+             CREATE VIEW plain AS SELECT id FROM people;
+             CREATE MATERIALIZED VIEW mvs AS SELECT id, token FROM people;
+             {extra}"
+        ),
+        timeout: Duration::from_secs(10),
+        dry_run: false,
+    }
+    };
+    engine
+        .apply_migration(f.db(), &f.key, &up(""), &sync)
+        .await
+        .expect("migration");
+    for sql in [
+        "INSERT INTO people VALUES (1, 'alice@example.com', 41, 'tok_alice')",
+        "REFRESH MATERIALIZED VIEW mv",
+        "REFRESH MATERIALIZED VIEW mvs",
+    ] {
+        f.run(RoleKind::Owner, StatementMode::Write, sql, vec![])
+            .await
+            .expect(sql);
+    }
+    let column = |table: &str, column: &str| ColumnRef {
+        schema: "public".into(),
+        table: table.into(),
+        column: column.into(),
+    };
+    let plan = MaskPlan {
+        columns: vec![
+            (column("people", "email"), MaskAs::Pseudonym),
+            (column("people", "age"), MaskAs::Pseudonym),
+            (column("people", "token"), MaskAs::Null),
+        ],
+    };
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan.clone()),
+            &key,
+        )
+        .await
+        .expect("the masked copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    let out = psql(
+        &mut owner,
+        "select (select email from v1) || '|' || (select e from v2) || '|' || \
+                (select age from vb) || '|' || \
+                (select coalesce(token, '-') || ',' || email from mv) || '|' || \
+                obj_description('v1'::regclass, 'pg_class') || ',' || \
+                obj_description('mv'::regclass, 'pg_class') || '|' || \
+                (select count(*) from pg_index where indrelid = 'mv'::regclass)::text || '|' || \
+                array_to_string((select reloptions from pg_class where oid = 'vb'::regclass), ',') || '|' || \
+                (select count(*) from plain)::text || '|' || \
+                (select coalesce(token, '-') from mvs)",
+    )
+    .await
+    .unwrap();
+    close(owner).await;
+    let parts: Vec<&str> = out.split('|').collect();
+    assert_eq!(parts.len(), 9, "{out}");
+    assert!(parts[0].starts_with("p_"), "v1 shows the pseudonym: {out}");
+    assert_eq!(
+        parts[1],
+        parts[0].to_uppercase(),
+        "v2 reads v1 again: {out}"
+    );
+    assert!(parts[2].starts_with("p_"), "vb shows the pseudonym: {out}");
+    assert_eq!(
+        parts[3],
+        format!("-,{}", parts[0]),
+        "the materialized view holds the masked values, not the source's: {out}"
+    );
+    assert_eq!(parts[4], "emails,snapshot", "{out}");
+    assert_eq!(parts[5], "1", "the index of the materialized view: {out}");
+    assert_eq!(parts[6], "security_barrier=true", "{out}");
+    assert_eq!(parts[7], "1", "{out}");
+    assert_eq!(
+        parts[8], "-",
+        "a materialized view over a secret column only holds no secret of the source: {out}"
+    );
+    assert!(!out.contains("alice") && !out.contains("tok_"), "{out}");
+
+    // A view that does not fit the masked columns refuses the copy with a clear error.
+    let g = Fixture::new(&engine).await;
+    engine
+        .apply_migration(
+            g.db(),
+            &g.key,
+            &up("CREATE VIEW older AS SELECT id, age + 1 AS next_age FROM people;"),
+            &sync,
+        )
+        .await
+        .expect("migration");
+    let err = engine
+        .copy_database(
+            g.db(),
+            &g.key,
+            &conformance::new_database(g.db().tenant_id),
+            &CopyData::Masked(plan),
+            &key,
+        )
+        .await
+        .expect_err("the copy is refused");
+    assert!(
+        matches!(&err, EngineError::Unsupported(m) if m.contains("public.older")),
+        "{err:?}"
+    );
+    g.run(
+        RoleKind::Owner,
+        StatementMode::Read,
+        "SELECT count(*) FROM older",
+        vec![],
+    )
+    .await
+    .expect("the source keeps working");
+}

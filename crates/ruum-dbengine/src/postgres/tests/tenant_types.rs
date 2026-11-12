@@ -22,8 +22,8 @@ const HIDDEN: &str = lens::SECRET_CONSTANT;
 
 /// The migration of the tenant: types of every kind, with casts to `text`, an implicit cast
 /// from a built-in type to a tenant type, an operator, a domain with a check, a view and
-/// default privileges. (The view reads `id` only: a masked copy retypes a personal column, which
-/// fails while a tenant view reads it; that is a separate gap.)
+/// default privileges. (The view reads `id` only; a view over a retyped personal column is the
+/// case of `hostile_copy::a_masked_copy_makes_views_over_masked_columns_again`, backlog S-8.)
 fn tenant_types_up(grants: &str) -> String {
     format!(
         "CREATE FUNCTION public.hit(entry text) RETURNS void LANGUAGE sql SECURITY DEFINER AS $f$
