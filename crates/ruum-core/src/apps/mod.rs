@@ -235,15 +235,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// The defaults, with `RUUM_APPS_DOMAIN` when it is set.
+    /// The settings of a server. The apps domain stays the default until the gateway card
+    /// (G-1a) adds its setting to the server settings and the staging chart together.
     pub fn from_env() -> Self {
-        let mut c = Self::default();
-        if let Ok(d) = std::env::var("RUUM_APPS_DOMAIN")
-            && !d.trim().is_empty()
-        {
-            c.apps_domain = d.trim().to_string();
-        }
-        c
+        Self::default()
     }
 }
 
