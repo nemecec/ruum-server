@@ -371,6 +371,17 @@ pub trait NodeStore: Send + Sync {
             "this node store makes no typed nodes".into(),
         ))
     }
+    /// Creates a typed node as a child of the typed node `req.parent_id`, with the rules of
+    /// [`Self::create_typed`] otherwise: a database branch is a child of its database
+    /// (decision 0004-18). Needs `edit` on the parent. Only a type's own operation calls it
+    /// (`createDatabaseBranch`); the caller checks that the parent's type lists the child type
+    /// (`TypeDescriptor.child_types`). A parent that is not a typed node is `422`.
+    async fn create_typed_child(&self, ctx: &Context, req: NewTyped) -> Result<Written<Node>> {
+        let _ = (ctx, req);
+        Err(crate::error::Error::Internal(
+            "this node store makes no typed nodes".into(),
+        ))
+    }
     async fn get(&self, ctx: &Context, id: NodeId) -> Result<Node>;
     /// Resolves a path from the tenant root. Trashed nodes are not found.
     async fn get_by_path(&self, ctx: &Context, path: &str) -> Result<Node>;

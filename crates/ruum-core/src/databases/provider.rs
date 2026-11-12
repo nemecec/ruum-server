@@ -22,9 +22,15 @@
 //!   then the lens of the copy from its manifest, the rows, and `ready` (or `failed` with a
 //!   fixed text). A masked copy masks what the lens masks: each column of a table of the
 //!   database's own schema by its class in the source's head manifest, `personal` when it has
-//!   none; `personal` becomes a pseudonym, `secret` becomes `NULL`. A `Source::Copy`,
-//!   `Source::Branch` or `Source::Template` of `createTypedNode` is still refused with `422`
-//!   (branches are card D-3), so no data goes anywhere except through the hook.
+//!   none; `personal` becomes a pseudonym, `secret` becomes `NULL`. A `Source::Copy` or
+//!   `Source::Template` of `createTypedNode` is still refused with `422`, so no data goes
+//!   anywhere except through the hook and a branch.
+//! - Branches (card D-3a): `createTypedNode` with `Source::Branch` and `schema_only` data
+//!   answers `202` at once and makes the branch in a task ([`super::branches`]); `masked` and
+//!   `full` branches are refused with `422` until card D-3b. A `Source::Empty` create of a node
+//!   whose manifest names a `template` (a branch whose create the reconciler sends again after
+//!   a restart, without its source) is refused with `422`, so the branch ends `failed` and
+//!   never becomes an empty live database.
 //! - `trashed`: the database stops serving (`suspended`, reason `in_trash`; the content stays).
 //!   `restored`: it serves again (`ready`). Both answer `200` for a node the provider never
 //!   made.
@@ -77,7 +83,15 @@ pub struct ProviderDeps {
     /// database follows at once (review-Q-2-1 F-2): `updateDatabaseManifest` and
     /// `restoreVersion` both reach the database through `applyManifest`.
     pub masking: Arc<dyn crate::privacy::MaskingRules>,
+    /// The `database_columns` rows: a branch gets copies of its source's (card D-3a).
+    pub columns: Arc<dyn super::classes::ColumnStore>,
 }
+
+/// The `reason` of a branch that could not be made.
+pub const REASON_BRANCH_FAILED: &str = "branch_failed";
+/// The text of a branch that could not be made. No engine text (decision 0004-8).
+pub const MESSAGE_BRANCH_FAILED: &str =
+    "The branch could not be made. Make the branch again, or ask for help.";
 
 /// The provider.
 pub struct DatabaseProvider {
@@ -353,6 +367,72 @@ impl Inner {
         }
     }
 
+    /// Makes the branch `target` of `source` (card D-3a, [`super::branches::make_branch`]) and
+    /// reports the outcome.
+    async fn branch(
+        self: Arc<Self>,
+        delivery: DeliveryId,
+        req: CreateTypedNodeRequest,
+        source: NodeId,
+        data: DataCopy,
+    ) {
+        let tenant = req.tenant_id;
+        let target = req.node_id;
+        let outcome =
+            super::branches::make_branch(&self.deps, tenant, source, target, req.version_id, data)
+                .await;
+        let generation = match self.next_generation(tenant, target).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(%tenant, node = %target, error = %error_text(&e), "no generation");
+                return;
+            }
+        };
+        let status = match outcome {
+            Ok(key) => {
+                let status = status(
+                    target,
+                    ProviderState::Ready,
+                    generation,
+                    Some(req.version_id),
+                );
+                self.lock().insert(
+                    (tenant, target),
+                    Live {
+                        status: status.clone(),
+                        key: Some(key),
+                    },
+                );
+                status
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %tenant,
+                    node = %target,
+                    error = %error_text(&e),
+                    "the branch of a database could not be made"
+                );
+                let mut s = status(target, ProviderState::Failed, generation, None);
+                s.reason = Some(REASON_BRANCH_FAILED.into());
+                s.message = Some(MESSAGE_BRANCH_FAILED.into());
+                self.set(tenant, &s);
+                s
+            }
+        };
+        if let Err(e) = self
+            .deps
+            .platform
+            .report_status(StatusReport {
+                status,
+                tenant_id: tenant,
+                delivery_id: Some(delivery),
+            })
+            .await
+        {
+            tracing::info!(%tenant, node = %target, error = %error_text(&e), "a status report was not stored");
+        }
+    }
+
     /// The engine work of a copy: the source's key, the engine copy with `data`, the lens of
     /// the copy, the rows. Returns the key.
     async fn make_copy(
@@ -596,10 +676,22 @@ impl Provider for DatabaseProvider {
         if req.type_name != NODE_TYPE {
             return Err(bad_request(format!("unknown type {}", req.type_name)));
         }
-        // D-1 makes no copy: refuse, so no data (real or masked) goes anywhere.
-        if !matches!(req.source, Source::Empty) {
-            return Err(copies_not_available());
-        }
+        // Only an empty database and a `schema_only` branch (card D-3a): refuse the rest, so no
+        // data (real or masked) goes anywhere.
+        let branch_of = match &req.source {
+            Source::Empty => {
+                if req.manifest.get("template").is_some() {
+                    return Err(super::branches::branch_source_lost());
+                }
+                None
+            }
+            Source::Branch {
+                node_id,
+                data: DataCopy::SchemaOnly,
+            } => Some(*node_id),
+            Source::Branch { .. } => return Err(super::branches::data_not_available()),
+            _ => return Err(copies_not_available()),
+        };
         let spec = EngineSpec::of(&req.manifest)?;
         let (tenant, node) = (req.tenant_id, req.node_id);
         if let Some(l) = self.inner.lock().get(&(tenant, node)) {
@@ -621,7 +713,19 @@ impl Provider for DatabaseProvider {
         let generation = self.inner.next_generation(tenant, node).await?;
         let s = status(node, ProviderState::Provisioning, generation, None);
         self.inner.set(tenant, &s);
-        tokio::spawn(self.inner.clone().provision(delivery, req, spec));
+        match branch_of {
+            Some(source) => {
+                tokio::spawn(self.inner.clone().branch(
+                    delivery,
+                    req,
+                    source,
+                    DataCopy::SchemaOnly,
+                ));
+            }
+            None => {
+                tokio::spawn(self.inner.clone().provision(delivery, req, spec));
+            }
+        }
         Ok(Reply::Started(s))
     }
 

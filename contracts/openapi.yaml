@@ -4045,7 +4045,6 @@ paths:
       tags: [databases]
       operationId: listDatabaseBranches
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: The branches of a database
       description: The live child databases of this database. Needs `view`.
       parameters:
@@ -4066,7 +4065,6 @@ paths:
       tags: [databases]
       operationId: createDatabaseBranch
       x-ruum-area: databases
-      x-ruum-status: planned
       summary: Make a branch of a database
       description: |
         A copy of the database for tests, previews, or for an agent to try a migration (section

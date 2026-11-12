@@ -227,6 +227,19 @@ impl ColumnStore for PgColumnStore {
         Ok(rows)
     }
 
+    async fn seed(&self, tenant: TenantId, node: NodeId, rows: &[ColumnRow]) -> Result<()> {
+        let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
+        lock_database(&mut tx, tenant, node).await?;
+        if !read_rows(&mut tx, tenant, node).await?.is_empty() {
+            return Err(super::seeded_already());
+        }
+        for r in rows {
+            insert_row(&mut tx, tenant, node, r).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn suggest(
         &self,
         tenant: TenantId,

@@ -79,8 +79,6 @@ pub const PLANNED_OPERATIONS: &[&str] = &[
     // Step 2 (databases, docs/STEP2.md).
     "listDatabaseMigrations",
     "applyDatabaseMigration",
-    "listDatabaseBranches",
-    "createDatabaseBranch",
     "listDatabaseRestorePoints",
     "createDatabaseRestorePoint",
     "restoreDatabase",

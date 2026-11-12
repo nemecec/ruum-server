@@ -825,6 +825,49 @@ fn database_row(r: &sqlx::postgres::PgRow) -> Result<DatabaseRow> {
     })
 }
 
+/// A branch gets copies of its source's applied `database_migrations` rows as of the copy
+/// (card D-3a, decision 0004-17), so it never runs a migration of its source again. Each copy
+/// gets a new ID; its restore point stays with the source (`NULL`).
+async fn copy_applied_migrations(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    source: NodeId,
+    branch: NodeId,
+) -> Result<()> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "select name, checksum, up_sql, data_classes, error, actor_kind, actor, on_behalf_of, at \
+         from database_migrations where tenant_id = $1 and node_id = $2 and status = 'applied' \
+         order by at, name",
+    )
+    .bind(tenant)
+    .bind(source)
+    .fetch_all(&mut *conn)
+    .await?;
+    for r in rows {
+        sqlx::query(
+            "insert into database_migrations (id, tenant_id, node_id, name, checksum, up_sql, \
+             data_classes, status, error, restore_point_id, actor_kind, actor, on_behalf_of, at) \
+             values ($1, $2, $3, $4, $5, $6, $7, 'applied', $8, null, $9, $10, $11, $12)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(tenant)
+        .bind(branch)
+        .bind(r.try_get::<String, _>("name")?)
+        .bind(r.try_get::<Vec<u8>, _>("checksum")?)
+        .bind(r.try_get::<String, _>("up_sql")?)
+        .bind(r.try_get::<Value, _>("data_classes")?)
+        .bind(r.try_get::<Option<String>, _>("error")?)
+        .bind(r.try_get::<PrincipalKind, _>("actor_kind")?)
+        .bind(r.try_get::<uuid::Uuid, _>("actor")?)
+        .bind(r.try_get::<Option<uuid::Uuid>, _>("on_behalf_of")?)
+        .bind(r.try_get::<OffsetDateTime, _>("at")?)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl DatabaseStore for PgDatabaseStore {
     fn approvals(
@@ -1049,8 +1092,9 @@ impl DatabaseStore for PgDatabaseStore {
         let mut tx = crate::journal::postgres::begin_tenant(&self.pool, row.tenant_id).await?;
         let done = sqlx::query(
             "insert into databases (tenant_id, node_id, engine, engine_version, cluster, \
-             engine_name, branch_of, branch_data, key_node_id, extensions, size_bytes) \
-             values ($1, $2, $3::database_engine, $4, $5, $6, $7, $8::data_copy, $9, $10, $11) \
+             engine_name, branch_of, branch_data, key_node_id, extensions, size_bytes, branch_at) \
+             values ($1, $2, $3::database_engine, $4, $5, $6, $7, $8::data_copy, $9, $10, $11, \
+             case when $7::uuid is not null then now() end) \
              on conflict do nothing",
         )
         .bind(row.tenant_id)
@@ -1085,6 +1129,9 @@ impl DatabaseStore for PgDatabaseStore {
             .bind(&role.role_name)
             .execute(&mut *tx)
             .await?;
+        }
+        if let Some(source) = row.branch_of {
+            copy_applied_migrations(&mut tx, row.tenant_id, source, row.node_id).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1680,6 +1727,7 @@ pub fn build(
         typed: parts.typed.clone(),
         platform,
         masking: masking.clone(),
+        columns: parts.columns.clone(),
     }));
     let mut registry = crate::providers::ProviderRegistry::new();
     registry.register(provider.clone())?;
