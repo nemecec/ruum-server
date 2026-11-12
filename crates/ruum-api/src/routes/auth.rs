@@ -16,16 +16,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use ruum_core::audit::events;
 use ruum_core::identity::{
-    CSRF_COOKIE, LOGIN_COOKIE, LoginStart, SESSION_COOKIE, SESSION_DAYS, secret,
+    CSRF_COOKIE, LOGIN_COOKIE, LOGIN_COOKIE_PREFIX, LoginStart, SESSION_COOKIE, SESSION_DAYS,
+    secret,
 };
 use ruum_core::{ApiError, AppPasswordId, Error, ErrorCode, PrincipalKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// How long the sign-in state cookie lives.
 const LOGIN_SECONDS: i64 = 600;
+/// The most sign-in flows that one browser keeps at a time. The login route clears the oldest
+/// flow cookies above this number, so a browser does not collect them.
+const LOGIN_FLOWS_MAX: usize = 5;
+/// The path of the sign-in state cookies.
+const LOGIN_COOKIE_PATH: &str = "/v1/auth";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -94,6 +100,88 @@ fn valid_return_to(r: &str) -> bool {
             && !r.chars().any(|c| c.is_control()))
 }
 
+/// The sealed content of a sign-in flow cookie: the start of the login and when it began.
+#[derive(Serialize, Deserialize)]
+struct LoginFlow {
+    #[serde(flatten)]
+    start: LoginStart,
+    /// Unix time in milliseconds. It orders the flows for [`LOGIN_FLOWS_MAX`].
+    #[serde(default)]
+    issued_ms: i64,
+}
+
+/// The name of the cookie of the sign-in flow with this `state`: the prefix and 16 hex of SHA-256
+/// over a fixed label and the state. The callback finds its own flow by the `state` parameter,
+/// so a second sign-in in another tab does not replace the first one's state (backlog A-30).
+fn login_cookie_name(state: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = secret::sha256(&format!("ruum-login-flow\0{state}"));
+    let mut name = String::from(LOGIN_COOKIE_PREFIX);
+    for b in &digest[..8] {
+        let _ = write!(name, "{b:02x}");
+    }
+    name
+}
+
+/// Whether `name` has the form of a sign-in flow cookie name.
+fn is_login_cookie_name(name: &str) -> bool {
+    name.strip_prefix(LOGIN_COOKIE_PREFIX)
+        .is_some_and(|k| k.len() == 16 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The cookies of the request, as name and value, in the order the browser sent them.
+fn request_cookies(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|kv| kv.trim().split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
+/// Opens a sealed sign-in flow. `None` when the seal is not valid or has expired.
+fn open_login_flow(state: &AppState, sealed: &str) -> Option<LoginFlow> {
+    state
+        .services
+        .tokens
+        .open("login", sealed)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
+/// The `Set-Cookie` values that clear sign-in cookies before a new flow starts: the legacy
+/// `ruum_login` cookie, flow cookies that are not valid, have expired or carry the state of
+/// another name, and the oldest valid flows, so that with the new flow at most
+/// [`LOGIN_FLOWS_MAX`] remain.
+fn login_cookies_to_clear(state: &AppState, headers: &HeaderMap) -> Vec<String> {
+    let mut clear: Vec<String> = Vec::new();
+    let mut live: Vec<(i64, String)> = Vec::new();
+    for (name, value) in request_cookies(headers) {
+        if clear.contains(&name) || live.iter().any(|(_, n)| *n == name) {
+            continue;
+        }
+        if name == LOGIN_COOKIE {
+            clear.push(name);
+        } else if is_login_cookie_name(&name) {
+            match open_login_flow(state, &value) {
+                Some(flow) if login_cookie_name(&flow.start.state) == name => {
+                    live.push((flow.issued_ms, name));
+                }
+                _ => clear.push(name),
+            }
+        }
+    }
+    live.sort();
+    let excess = live.len().saturating_sub(LOGIN_FLOWS_MAX - 1);
+    clear.extend(live.into_iter().take(excess).map(|(_, name)| name));
+    clear
+        .iter()
+        .map(|name| set_cookie(state, name, "", LOGIN_COOKIE_PATH, 0, true))
+        .collect()
+}
+
 #[derive(Deserialize)]
 pub struct LoginQuery {
     return_to: Option<String>,
@@ -101,8 +189,13 @@ pub struct LoginQuery {
 }
 
 /// Start OIDC sign-in. `GET /v1/auth/login` (operationId `loginStart`).
+///
+/// Each flow gets its own state cookie (`ruum_login_<hash of the state>`), so sign-ins in
+/// parallel tabs do not replace each other. The route also clears stale flow cookies and the
+/// oldest ones above [`LOGIN_FLOWS_MAX`].
 pub async fn login_start(
     State(state): State<AppState>,
+    headers: HeaderMap,
     QueryParams(q): QueryParams<LoginQuery>,
 ) -> ApiResult<Response> {
     let return_to = q.return_to.unwrap_or_else(|| "/".into());
@@ -125,20 +218,27 @@ pub async fn login_start(
         .oidc
         .start_login(Some(return_to), q.idp)
         .await?;
+    let flow = LoginFlow {
+        start,
+        issued_ms: i64::try_from(ruum_core::now().unix_timestamp_nanos() / 1_000_000)
+            .unwrap_or(i64::MAX),
+    };
     let sealed = state.services.tokens.seal(
         "login",
-        &serde_json::to_value(&start).map_err(|e| Error::Internal(e.to_string()))?,
+        &serde_json::to_value(&flow).map_err(|e| Error::Internal(e.to_string()))?,
         LOGIN_SECONDS,
     )?;
-    let c = set_cookie(
+    let name = login_cookie_name(&flow.start.state);
+    let mut cookies = login_cookies_to_clear(&state, &headers);
+    cookies.push(set_cookie(
         &state,
-        LOGIN_COOKIE,
+        &name,
         &sealed,
-        "/v1/auth",
+        LOGIN_COOKIE_PATH,
         LOGIN_SECONDS,
         true,
-    );
-    redirect(&start.authorize_url, &[c])
+    ));
+    redirect(&flow.start.authorize_url, &cookies)
 }
 
 #[derive(Deserialize)]
@@ -158,6 +258,10 @@ fn login_refused(reason: &'static str, error: HttpError) -> HttpError {
 
 /// OIDC callback. `GET /v1/auth/callback` (operationId `loginCallback`).
 ///
+/// The callback reads only the state cookie of its own flow, named by the `state` parameter
+/// ([`login_cookie_name`]). Success or refusal ends the flow: the response clears that cookie,
+/// and the legacy `ruum_login` cookie, when the request carries them. Other flows' cookies stay.
+///
 /// A sign-in writes `auth.login` (IP, user agent, the `sessions.id` of the new session) in the
 /// user's home tenant, and nowhere else (decision 0003-4); other tenants get their row at the
 /// first use of the session there ([`crate::auth::note_session_use`]). The write is
@@ -166,6 +270,35 @@ pub async fn login_callback(
     State(state): State<AppState>,
     headers: HeaderMap,
     QueryParams(q): QueryParams<CallbackQuery>,
+) -> Response {
+    let flow_cookie = q
+        .state
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(login_cookie_name);
+    let mut res = match finish_callback(&state, &headers, q, flow_cookie.as_deref()).await {
+        Ok(res) => res,
+        Err(e) => e.into_response(),
+    };
+    let sent = request_cookies(&headers);
+    for name in flow_cookie.iter().map(String::as_str).chain([LOGIN_COOKIE]) {
+        if sent.iter().any(|(n, _)| n == name)
+            && let Ok(v) =
+                HeaderValue::from_str(&set_cookie(&state, name, "", LOGIN_COOKIE_PATH, 0, true))
+        {
+            res.headers_mut().append(SET_COOKIE, v);
+        }
+    }
+    res
+}
+
+/// The callback without the clearing of the flow cookie. `flow_cookie` is the name of the state
+/// cookie of the flow that the `state` parameter names.
+async fn finish_callback(
+    state: &AppState,
+    headers: &HeaderMap,
+    q: CallbackQuery,
+    flow_cookie: Option<&str>,
 ) -> ApiResult<Response> {
     if let Some(e) = q.error {
         return Err(login_refused(
@@ -179,21 +312,21 @@ pub async fn login_callback(
             )),
         ));
     }
-    let sealed = cookie(&headers, LOGIN_COOKIE).ok_or_else(|| {
-        login_refused(
-            "state_missing",
-            bad_request(
-                "the sign-in state cookie is missing",
-                "start the sign-in again at /v1/auth/login",
-            ),
-        )
-    })?;
-    let start: LoginStart = state
-        .services
-        .tokens
-        .open("login", &sealed)
-        .ok()
-        .and_then(|v| serde_json::from_value(v).ok())
+    // No state parameter, or no cookie for the flow it names (a sign-in that ran out of time,
+    // was finished already, began in another browser, or a state that was changed on the way).
+    let sealed = flow_cookie
+        .and_then(|name| cookie(headers, name))
+        .ok_or_else(|| {
+            login_refused(
+                "state_missing",
+                bad_request(
+                    "the sign-in state cookie is missing",
+                    "start the sign-in again at /v1/auth/login",
+                ),
+            )
+        })?;
+    let start: LoginStart = open_login_flow(state, &sealed)
+        .map(|flow| flow.start)
         .ok_or_else(|| {
             login_refused(
                 "state_invalid",
@@ -294,9 +427,8 @@ pub async fn login_callback(
     redirect(
         &return_to,
         &[
-            set_cookie(&state, SESSION_COOKIE, &session_secret, "/", max_age, true),
-            set_cookie(&state, CSRF_COOKIE, &csrf, "/", max_age, false),
-            set_cookie(&state, LOGIN_COOKIE, "", "/v1/auth", 0, true),
+            set_cookie(state, SESSION_COOKIE, &session_secret, "/", max_age, true),
+            set_cookie(state, CSRF_COOKIE, &csrf, "/", max_age, false),
         ],
     )
 }
@@ -611,6 +743,20 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
+    /// The sign-in flow cookie that a login response sets, as `name=value` for a `Cookie` header.
+    pub(crate) fn login_cookie(res: &Res) -> String {
+        res.headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|c| {
+                c.starts_with(ruum_core::identity::LOGIN_COOKIE_PREFIX) && !c.contains("Max-Age=0")
+            })
+            .map(|c| c.split(';').next().unwrap().to_string())
+            .next()
+            .expect("a sign-in flow cookie")
+    }
+
     /// Signs in through the fake provider and returns the session and CSRF cookie values.
     pub(crate) async fn sign_in(
         app: &axum::Router,
@@ -634,7 +780,7 @@ pub(crate) mod tests {
             .unwrap()
             .1
             .into_owned();
-        let login_cookie = cookie_value(&start, "ruum_login");
+        let login_cookie = login_cookie(&start);
         oidc.add_login(
             "code-1",
             VerifiedLogin {
@@ -651,7 +797,7 @@ pub(crate) mod tests {
             app,
             Method::GET,
             "/v1/auth/callback?code=code-1&state=wrong",
-            &[("cookie", &format!("ruum_login={login_cookie}"))],
+            &[("cookie", &login_cookie)],
             None,
         )
         .await;
@@ -660,7 +806,7 @@ pub(crate) mod tests {
             app,
             Method::GET,
             &format!("/v1/auth/callback?code=code-1&state={state}"),
-            &[("cookie", &format!("ruum_login={login_cookie}"))],
+            &[("cookie", &login_cookie)],
             None,
         )
         .await;
@@ -679,6 +825,271 @@ pub(crate) mod tests {
             cookie_value(&cb, "ruum_session"),
             cookie_value(&cb, "ruum_csrf"),
         )
+    }
+
+    /// A browser's cookie jar for the sign-in tests: it applies `Set-Cookie` headers in order.
+    #[derive(Default)]
+    struct Jar(std::collections::BTreeMap<String, String>);
+
+    impl Jar {
+        fn apply(&mut self, res: &Res) {
+            for c in res.headers.get_all("set-cookie").iter() {
+                let c = c.to_str().unwrap();
+                let (name, value) = c.split(';').next().unwrap().split_once('=').unwrap();
+                if c.contains("Max-Age=0") {
+                    self.0.remove(name);
+                } else {
+                    self.0.insert(name.to_string(), value.to_string());
+                }
+            }
+        }
+
+        fn header(&self) -> String {
+            self.0
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+
+        fn login_flows(&self) -> Vec<String> {
+            self.0
+                .keys()
+                .filter(|k| k.starts_with("ruum_login_"))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// The names of the cookies that a response clears.
+    fn cleared(res: &Res) -> Vec<String> {
+        res.headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|c| c.contains("Max-Age=0"))
+            .map(|c| c.split('=').next().unwrap().to_string())
+            .collect()
+    }
+
+    /// Starts a sign-in with the cookies of `jar`, applies the response to it and returns the
+    /// state of the new flow.
+    async fn start_flow(app: &axum::Router, jar: &mut Jar) -> String {
+        let cookie = jar.header();
+        let headers: Vec<(&str, &str)> = if cookie.is_empty() {
+            vec![]
+        } else {
+            vec![("cookie", &cookie)]
+        };
+        let start = call(app, Method::GET, "/v1/auth/login", &headers, None).await;
+        assert_eq!(start.status, StatusCode::FOUND);
+        let set: Vec<&str> = start
+            .headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        let flow = set
+            .iter()
+            .find(|c| c.starts_with("ruum_login_") && !c.contains("Max-Age=0"))
+            .expect("a flow cookie");
+        for attr in [
+            "Path=/v1/auth",
+            "Max-Age=600",
+            "SameSite=Lax",
+            "HttpOnly",
+            "Secure",
+        ] {
+            assert!(flow.contains(attr), "{flow} lacks {attr}");
+        }
+        jar.apply(&start);
+        let location = start.headers["location"].to_str().unwrap().to_string();
+        url::Url::parse(&location)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .into_owned()
+    }
+
+    async fn finish_flow(
+        app: &axum::Router,
+        oidc: &MemoryOidcClient,
+        jar: &mut Jar,
+        code: &str,
+        state: &str,
+    ) -> Res {
+        oidc.add_login(
+            code,
+            VerifiedLogin {
+                issuer: MemoryOidcClient::ISSUER.into(),
+                subject: format!("sub-{code}"),
+                email: Some(format!("{code}@example.test")),
+                email_verified: true,
+                name: None,
+                id_token: None,
+            },
+        );
+        let res = call(
+            app,
+            Method::GET,
+            &format!("/v1/auth/callback?code={code}&state={state}"),
+            &[("cookie", &jar.header())],
+            None,
+        )
+        .await;
+        jar.apply(&res);
+        res
+    }
+
+    /// Two sign-ins started in two tabs both finish, in either order, and each callback clears
+    /// only its own flow cookie (backlog A-30).
+    #[tokio::test]
+    async fn parallel_sign_ins_finish_in_either_order() {
+        let (app, oidc, _) = app();
+        for first_wins in [true, false] {
+            let mut jar = Jar::default();
+            let a = start_flow(&app, &mut jar).await;
+            let b = start_flow(&app, &mut jar).await;
+            let (name_a, name_b) = (super::login_cookie_name(&a), super::login_cookie_name(&b));
+            assert_ne!(name_a, name_b);
+            assert_eq!(jar.login_flows().len(), 2);
+            let order = if first_wins {
+                [(a.as_str(), &name_a), (b.as_str(), &name_b)]
+            } else {
+                [(b.as_str(), &name_b), (a.as_str(), &name_a)]
+            };
+            for (i, (st, name)) in order.into_iter().enumerate() {
+                let code = format!("par-{first_wins}-{i}");
+                let res = finish_flow(&app, &oidc, &mut jar, &code, st).await;
+                assert_eq!(res.status, StatusCode::FOUND, "{:?}", res.body);
+                assert_eq!(cleared(&res), vec![name.clone()]);
+                assert!(!cookie_value(&res, "ruum_session").is_empty());
+            }
+            assert!(jar.login_flows().is_empty());
+        }
+    }
+
+    /// A callback whose state names no flow cookie is refused (`state_missing`) and leaves the
+    /// cookies of other flows alone; a missing state too.
+    #[tokio::test]
+    async fn a_callback_with_an_unknown_state_touches_no_other_flow() {
+        let (app, oidc, _) = app();
+        let mut jar = Jar::default();
+        let a = start_flow(&app, &mut jar).await;
+        for uri in [
+            "/v1/auth/callback?code=x&state=unknown",
+            "/v1/auth/callback?code=x",
+            "/v1/auth/callback?error=access_denied&state=unknown",
+        ] {
+            let res = call(&app, Method::GET, uri, &[("cookie", &jar.header())], None).await;
+            assert!(res.status.is_client_error(), "{uri}: {}", res.status);
+            assert!(cleared(&res).is_empty(), "{uri}");
+        }
+        let res = finish_flow(&app, &oidc, &mut jar, "unknown-then-ok", &a).await;
+        assert_eq!(res.status, StatusCode::FOUND);
+    }
+
+    /// A refused callback of a flow (here the provider's error) ends that flow: its cookie is
+    /// cleared, the other flow's cookie stays.
+    #[tokio::test]
+    async fn a_refused_callback_clears_its_flow_cookie_only() {
+        let (app, _, _) = app();
+        let mut jar = Jar::default();
+        let a = start_flow(&app, &mut jar).await;
+        let b = start_flow(&app, &mut jar).await;
+        let res = call(
+            &app,
+            Method::GET,
+            &format!("/v1/auth/callback?error=access_denied&state={a}"),
+            &[("cookie", &jar.header())],
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(cleared(&res), vec![super::login_cookie_name(&a)]);
+        jar.apply(&res);
+        assert_eq!(jar.login_flows(), vec![super::login_cookie_name(&b)]);
+    }
+
+    /// The state cannot pick another flow's cookie in a useful way: a changed state names no
+    /// cookie, and a flow's sealed state under the cookie name of another state is refused
+    /// (`state_mismatch`) and its code is never used.
+    #[tokio::test]
+    async fn a_changed_state_cannot_use_another_flows_cookie() {
+        let (app, oidc, _) = app();
+        let mut jar = Jar::default();
+        let a = start_flow(&app, &mut jar).await;
+        let b = start_flow(&app, &mut jar).await;
+        let (name_a, name_b) = (super::login_cookie_name(&a), super::login_cookie_name(&b));
+        let sealed_b = jar.0[&name_b].clone();
+        oidc.add_login(
+            "swap",
+            VerifiedLogin {
+                issuer: MemoryOidcClient::ISSUER.into(),
+                subject: "swap".into(),
+                email: Some("swap@example.test".into()),
+                email_verified: true,
+                name: None,
+                id_token: None,
+            },
+        );
+        // B's sealed state, stored under A's name, with A's state.
+        let res = call(
+            &app,
+            Method::GET,
+            &format!("/v1/auth/callback?code=swap&state={a}"),
+            &[("cookie", &format!("{name_a}={sealed_b}"))],
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert_eq!(cookie_value(&res, "ruum_session"), "");
+        // A changed state of B names no cookie.
+        let changed = format!("{b}x");
+        let res = call(
+            &app,
+            Method::GET,
+            &format!("/v1/auth/callback?code=swap&state={changed}"),
+            &[("cookie", &jar.header())],
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
+        assert!(cleared(&res).is_empty());
+        // The code was not spent: B still finishes with it.
+        let res = finish_flow(&app, &oidc, &mut jar, "swap", &b).await;
+        assert_eq!(res.status, StatusCode::FOUND, "{:?}", res.body);
+    }
+
+    /// The login route keeps at most five flows: it clears the oldest flow cookies, flow
+    /// cookies that do not open, and the legacy `ruum_login` cookie.
+    #[tokio::test]
+    async fn the_login_route_caps_the_sign_in_flows() {
+        let (app, oidc, _) = app();
+        let mut jar = Jar::default();
+        jar.0.insert("ruum_login".into(), "legacy".into());
+        jar.0
+            .insert("ruum_login_00000000000000ff".into(), "not-sealed".into());
+        let mut states = Vec::new();
+        for _ in 0..7 {
+            states.push(start_flow(&app, &mut jar).await);
+            // Distinct issue times (milliseconds).
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        assert!(!jar.0.contains_key("ruum_login"));
+        let mut kept: Vec<String> = states[2..]
+            .iter()
+            .map(|s| super::login_cookie_name(s))
+            .collect();
+        kept.sort();
+        assert_eq!(jar.login_flows(), kept);
+        // The newest flows still finish; the oldest ones are gone.
+        let res = finish_flow(&app, &oidc, &mut jar, "cap-new", &states[6]).await;
+        assert_eq!(res.status, StatusCode::FOUND);
+        let res = finish_flow(&app, &oidc, &mut jar, "cap-old", &states[0]).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1470,7 +1881,7 @@ pub(crate) mod tests {
             .unwrap()
             .1
             .into_owned();
-        let login_cookie = cookie_value(&start, "ruum_login");
+        let login_cookie = login_cookie(&start);
         oidc.add_login(
             "code-9",
             VerifiedLogin {
@@ -1486,7 +1897,7 @@ pub(crate) mod tests {
             &app,
             Method::GET,
             &format!("/v1/auth/callback?code=code-9&state={st}"),
-            &[("cookie", &format!("ruum_login={login_cookie}"))],
+            &[("cookie", &login_cookie)],
             None,
         )
         .await;

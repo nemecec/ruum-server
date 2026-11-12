@@ -96,7 +96,8 @@ export interface paths {
         /**
          * Start OIDC sign-in
          * @description Redirects the browser to Zitadel (authorization code flow with PKCE). The server keeps the
-         *     state, nonce and PKCE verifier in the short-lived cookie `ruum_login`.
+         *     state, nonce and PKCE verifier in a short-lived cookie of this sign-in flow,
+         *     `ruum_login_<hash of the state>`, so parallel sign-ins do not replace each other.
          */
         get: operations["loginStart"];
         put?: never;
@@ -7561,7 +7562,7 @@ export interface operations {
             302: {
                 headers: {
                     Location?: string;
-                    /** @description The `ruum_login` state cookie. */
+                    /** @description The `ruum_login_<hash>` state cookie of the flow; it can also clear stale flow cookies. */
                     "Set-Cookie"?: string;
                     [name: string]: unknown;
                 };

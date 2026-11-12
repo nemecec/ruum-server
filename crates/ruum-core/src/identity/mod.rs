@@ -61,8 +61,13 @@ pub fn csrf_token(session_secret: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-/// The name of the short-lived cookie that holds the state of a sign-in.
+/// The name of the single sign-in state cookie of earlier releases. The server no longer sets
+/// it; the sign-in routes clear it when a browser still sends it.
 pub const LOGIN_COOKIE: &str = "ruum_login";
+/// The prefix of the short-lived cookies that hold the state of a sign-in: one cookie per sign-in
+/// flow, named by a hash of the flow's `state`, so parallel sign-ins in two tabs do not replace
+/// each other's state.
+pub const LOGIN_COOKIE_PREFIX: &str = "ruum_login_";
 /// How long a web session lives without use.
 pub const SESSION_DAYS: i64 = 30;
 /// How often a session row records its last use, at most.

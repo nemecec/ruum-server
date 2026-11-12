@@ -220,7 +220,7 @@ mod http_tests {
             .unwrap()
             .1
             .into_owned();
-        let login_cookie = cookie_of(&start, "ruum_login");
+        let login_cookie = crate::routes::auth::tests::login_cookie(&start);
         oidc.add_login(
             code,
             VerifiedLogin {
@@ -236,7 +236,7 @@ mod http_tests {
             app,
             Method::GET,
             &format!("/v1/auth/callback?code={code}&state={state}"),
-            &[("cookie", &format!("ruum_login={login_cookie}"))],
+            &[("cookie", &login_cookie)],
             None,
         )
         .await
