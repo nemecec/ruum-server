@@ -1,7 +1,20 @@
-# The edge (plan 5.7): Caddy with the web UI in /srv. One replica: certificates live in an
-# emptyDir (never in the tenant blob bucket, review 1 S-4 / stgsec M-8), so a second replica
-# would issue its own and could miss HTTP-01 challenges. The ACME CA is never production Let's
-# Encrypt (review 2 R-3), so a restart costs no production quota.
+# The edge (plan 5.7): Caddy with the web UI in /srv. Updates without downtime (design 12.7,
+# backlog O-26):
+# - certificates live in Kubernetes Secrets of the edge namespace (the Caddy module
+#   deploy/images/caddy-secret-storage; never in the tenant blob bucket, review 1 S-4 / stgsec
+#   M-8): a restart loads them and issues nothing, and every edge pod answers the HTTP-01
+#   challenges of the others. The ServiceAccount ruum-edge and its Role (Secrets and Leases of
+#   this namespace only) are in charts/platform, because the deployer has no access to Secrets.
+# - a DaemonSet, one edge on every node (three on staging, so at least two serve at any time):
+#   the Service uses externalTrafficPolicy Local and the load balancer's TCP check finds the
+#   nodes with an edge. With a Deployment of two, the node that loses its edge in a rollout
+#   would keep getting connections until the check (3 x 10 s) marks it down. The DaemonSet
+#   update starts the new pod on the same node first (maxSurge 1, maxUnavailable 0), so each
+#   node keeps a ready edge through a rollout.
+# - shutdown: a pause before SIGTERM, then Caddy's grace_period for open connections.
+# The ACME CA is never production Let's Encrypt (review 2 R-3).
+{{- $grace := int .Values.edge.shutdownGraceSeconds }}
+{{- $pause := int .Values.edge.preStopSeconds }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,15 +25,18 @@ data:
     {{- include "ruum.caddyfile" . | nindent 4 }}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: ruum-edge
   namespace: edge
   labels: { app: ruum-edge }
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 5
   selector:
     matchLabels: { app: ruum-edge }
   template:
@@ -30,7 +46,14 @@ spec:
         ruum.space/caddyfile: {{ include "ruum.caddyfile" . | sha256sum | trunc 16 }}
         ruum.space/commit: {{ .Values.commit | quote }}
     spec:
-      automountServiceAccountToken: false
+      # The token reaches only the Secrets and Leases of this namespace (charts/platform,
+      # edge-rbac.yaml): the certificate storage.
+      serviceAccountName: ruum-edge
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: {{ add $pause $grace 10 }}
+      tolerations:
+        # Staging schedules workloads on its control-plane nodes too.
+        - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -44,12 +67,18 @@ spec:
           env:
             - { name: XDG_DATA_HOME, value: /data }
             - { name: XDG_CONFIG_HOME, value: /config }
+            # The holder name of the storage locks (Leases).
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
           ports:
             - { name: http, containerPort: 8080 }
             - { name: https, containerPort: 8443 }
           readinessProbe:
             tcpSocket: { port: https }
-            periodSeconds: 10
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              sleep: { seconds: {{ $pause }} }
           resources:
             {{- toYaml .Values.edge.resources | nindent 12 }}
           {{- include "ruum.restricted" . | nindent 10 }}
@@ -67,8 +96,8 @@ spec:
 ---
 # NodePorts behind the load balancer (tofu/cluster: 80 -> 30080, 443 -> 30443, proxy protocol).
 # externalTrafficPolicy Local keeps the source address (the LB, 10.20.1.5), which the proxy
-# protocol allow-list and the network policy expect; the LB health check finds the node that
-# runs the edge.
+# protocol allow-list and the network policy expect; the LB health check finds the nodes that
+# run an edge (all of them, see the DaemonSet above).
 apiVersion: v1
 kind: Service
 metadata:

@@ -1,7 +1,20 @@
 {{- include "ruum.checkCommit" . }}
-# ruum-server (plan 5.8). One replica, so the start-up migration is safe (RUUM_MIGRATE=true).
+# ruum-server (plan 5.8). Updates without downtime (design 12.7, backlog O-25):
+# - migrations run before the rollout in the Job of migrate-job.yaml (deploy-chart.sh), under
+#   an advisory lock; the serving pods run with RUUM_MIGRATE=false and refuse to start on a
+#   database without their release's migrations;
+# - at least two replicas, a rolling update that never goes below them (maxUnavailable 0),
+#   spread over the nodes, and a disruption budget;
+# - shutdown: the preStop pause takes the pod out of the Service before SIGTERM; then the
+#   server takes no new connections and lets open requests finish (RUUM_SHUTDOWN_GRACE_SECONDS).
 # Migrations follow expand and contract (README "Deploy"): the previous image must work on the
-# new schema, because a failed rollout rolls the image back but not the schema (review 2 U-3).
+# new schema, because old and new pods serve side by side and a failed rollout rolls the image
+# back but not the schema (review 2 U-3).
+{{- $grace := int .Values.server.shutdownGraceSeconds }}
+{{- $pause := int .Values.server.preStopSeconds }}
+{{- if lt (int .Values.server.replicas) 2 }}
+{{- fail "server.replicas must be at least 2 (design 12.7)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -11,9 +24,13 @@ metadata:
   annotations:
     ruum.space/commit: {{ .Values.commit | quote }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.server.replicas }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 5
   selector:
     matchLabels: { app: ruum-server }
   template:
@@ -23,6 +40,14 @@ spec:
         ruum.space/commit: {{ .Values.commit | quote }}
     spec:
       automountServiceAccountToken: false
+      # The preStop pause, the drain and a margin (design 12.7).
+      terminationGracePeriodSeconds: {{ add $pause $grace 10 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: ruum-server }
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -64,8 +89,10 @@ spec:
               valueFrom: { secretKeyRef: { name: ruum-oidc, key: idp-google } }
             - name: RUUM_OIDC_IDP_MICROSOFT
               valueFrom: { secretKeyRef: { name: ruum-oidc, key: idp-microsoft } }
-            - { name: RUUM_MIGRATE, value: "true" }
+            # The migration Job runs the migrations (migrate-job.yaml); the server only checks them.
+            - { name: RUUM_MIGRATE, value: "false" }
             - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
+            - { name: RUUM_SHUTDOWN_GRACE_SECONDS, value: {{ $grace | quote }} }
             # The server talks to SpiceDB's HTTP gateway, not gRPC (ruum_core::authz::spicedb).
             - { name: RUUM_SPICEDB_HTTP_URL, value: "http://spicedb.authz.svc.cluster.local:8443" }
             - { name: RUUM_S3_ENDPOINT, value: "https://hel1.your-objectstorage.com" }
@@ -83,7 +110,14 @@ spec:
             - { name: internal, containerPort: 8493 }
           readinessProbe:
             httpGet: { path: /healthz, port: platform }
-            periodSeconds: 10
+            periodSeconds: 5
+            failureThreshold: 2
+          # A pause before SIGTERM: Kubernetes takes the terminating pod out of the Service at
+          # once, and the pause lets kube-proxy and the edge stop sending new requests to it.
+          # The image has no shell, so the pause is the kubelet's own sleep action.
+          lifecycle:
+            preStop:
+              sleep: { seconds: {{ $pause }} }
           livenessProbe:
             httpGet: { path: /healthz, port: platform }
             periodSeconds: 30
@@ -106,6 +140,17 @@ spec:
           emptyDir: { sizeLimit: 2Gi }
         - name: tmp
           emptyDir: { sizeLimit: 256Mi }
+---
+# Voluntary disruptions (a node drain, a Kubernetes upgrade) leave at least one server.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ruum-server
+  namespace: ruum
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: ruum-server }
 ---
 apiVersion: v1
 kind: Service

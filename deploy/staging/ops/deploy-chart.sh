@@ -10,6 +10,14 @@
 #   - each digest has a provenance attestation of images.yml on refs/heads/main (cosign);
 #   - the values go to helm in a values file (JSON), never through --set, so no value can add
 #     another key (helm splits --set on commas).
+# Then (design 12.7, backlog O-25):
+#   1. with new migrations (--backup), an on-demand CNPG backup;
+#   2. the migration step: the Job of charts/ruum migrate-job.yaml with the new server image
+#      runs `ruum-server migrate` under an advisory lock; when it fails, the rollout does not
+#      start and the old release keeps serving (old and new releases both run on the new
+#      schema: expand, then contract);
+#   3. the rolling update (helm upgrade --wait): new pods next to the old ones, never fewer
+#      ready than before.
 #
 #   deploy-chart.sh <commit> <server-ref@sha256:...> <edge-ref@sha256:...> [--backup] [--acme ISSUER] [--acme-email EMAIL] [--validate-only]
 set -euo pipefail
@@ -84,16 +92,40 @@ YAML
   [[ "$phase" == completed ]] || die "the backup did not finish in 20 minutes; not deploying"
 fi
 
-# The values as JSON (valid YAML), built by jq from validated strings.
-values="$(mktemp "$WORK/deploy-values.XXXXXX.json")"
-trap 'rm -f "$values"' EXIT
+tmp="$(mktemp -d "$WORK/deploy.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+
+# 2. The migration step (design 12.7, backlog O-25), before the rollout.
+kubectl auth can-i create jobs.batch -n ruum >/dev/null 2>&1 ||
+  die "the deployer may not create Jobs in ruum; apply the platform first (k8s/apply.sh, backlog O-25)"
+job="ruum-migrate-${commit:0:12}-$(date -u +%Y%m%d%H%M)"
+jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg job "$job" '
+  { images: { server: $server, edge: $edge }, commit: $commit, migrationJob: true, migrationJobName: $job }
+' >"$tmp/job-values.json"
+helm template ruum "$STG/charts/ruum" --namespace ruum --values "$tmp/job-values.json" \
+  --show-only templates/migrate-job.yaml >"$tmp/job.yaml"
+echo "==> migration step $job (ruum-server migrate, image ${server#*@})" >&2
+kubectl -n ruum create -f "$tmp/job.yaml" >/dev/null
+state=""
+for _ in $(seq 1 200); do
+  state="$(kubectl -n ruum get job "$job" -o jsonpath='{.status.succeeded}/{.status.failed}' 2>/dev/null || true)"
+  [[ "$state" == 1/* || "$state" == */1 ]] && break
+  sleep 5
+done
+kubectl -n ruum logs "job/$job" --tail 50 >&2 || true
+[[ "$state" == 1/* ]] || die "the migration step $job did not succeed (${state:-no status}); not rolling out, the old release keeps serving"
+echo "==> migrations are up to date; rolling update" >&2
+
+# 3. The values as JSON (valid YAML), built by jq from validated strings.
+values="$tmp/values.json"
 jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg acme "$acme" --arg email "$acme_email" '
   { images: { server: $server, edge: $edge }, commit: $commit }
   + (if $acme != "" then { acme: ({ issuer: $acme } + (if $email != "" then { email: $email } else {} end)) } else {} end)
 ' >"$values"
 
 # --rollback-on-failure is Helm 4's name for --atomic (review 2 U-4): a failed rollout rolls
-# the release back by itself (DESIGN 19.1 layer 1).
+# the release back by itself (DESIGN 19.1 layer 1). The schema stays: the previous release
+# runs on it (design 12.7). --wait waits for the rolling update of ruum-server and the edge.
 helm upgrade --install ruum "$STG/charts/ruum" --namespace ruum \
   --reset-then-reuse-values \
   --values "$values" \

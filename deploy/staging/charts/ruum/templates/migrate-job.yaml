@@ -1,0 +1,63 @@
+{{- /*
+The migration step before the rollout (design 12.7, backlog O-25). deploy-chart.sh renders only
+this template (helm template --show-only, with migrationJob and migrationJobName in a values file
+of its own), creates the Job with the new image, waits for it, and starts the rollout only when it
+succeeded. `helm upgrade` never renders it (migrationJob is false there).
+
+`ruum-server migrate` takes the advisory lock, applies the pending migrations and exits. A failed
+Job is not retried (backoffLimit 0): the old release keeps serving, and the person looks at the
+log. The pods carry app: ruum-migrate, not app: ruum-server, so the Service never sends them
+traffic; the platform's network policy lets ruum-migrate reach Postgres.
+*/ -}}
+{{- if .Values.migrationJob }}
+{{- include "ruum.checkCommit" . }}
+{{- if not (regexMatch "^ruum-migrate-[0-9a-f]{12}-[0-9]{12}$" (.Values.migrationJobName | default "")) }}
+{{- fail "migrationJobName must be ruum-migrate-<12 hex>-<YYYYmmddHHMM>" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Values.migrationJobName }}
+  namespace: ruum
+  labels: { app: ruum-migrate }
+  annotations:
+    ruum.space/commit: {{ .Values.commit | quote }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: { app: ruum-migrate }
+      annotations:
+        ruum.space/commit: {{ .Values.commit | quote }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          image: {{ include "ruum.byDigest" .Values.images.server }}
+          args: [migrate]
+          env:
+            - { name: RUST_LOG, value: "info" }
+            # Only the database URL of ruum-server-env: the step needs no other secret.
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: ruum-server-env, key: DATABASE_URL } }
+            - { name: RUUM_DB_MAX_CONNECTIONS, value: "2" }
+            - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          {{- include "ruum.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: pg-ca, mountPath: /pg-ca, readOnly: true }
+      volumes:
+        - name: pg-ca
+          secret: { secretName: pg-ca, items: [{ key: ca.crt, path: ca.crt }] }
+{{- end }}

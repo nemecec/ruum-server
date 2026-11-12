@@ -25,8 +25,11 @@ metadata:
   namespace: {{ . }}
 rules:
   - apiGroups: [apps]
-    resources: [deployments, replicasets]
+    resources: [deployments, replicasets, daemonsets]
     verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [controllerrevisions]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [services, configmaps, pods, pods/log, events, serviceaccounts]
     verbs: [get, list, watch, create, update, patch, delete]
@@ -39,6 +42,12 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, update, patch, delete]
+{{- if eq . "ruum" }}
+  # The migration step before each rollout (design 12.7, backlog O-25; deploy-chart.sh).
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, delete]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

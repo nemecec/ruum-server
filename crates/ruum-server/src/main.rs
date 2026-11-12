@@ -4,10 +4,15 @@
 //!
 //! `ruum-server seed-dev <file>` instead makes test users, a tenant and credentials on a laptop
 //! stack and exits (see `seed.rs`).
+//!
+//! `ruum-server migrate` runs the pending migrations under an advisory lock and exits: the
+//! migration step before a rollout (design 12.7, see `migrate.rs`).
 
 mod app;
 mod config;
+mod migrate;
 mod seed;
+mod shutdown;
 mod wiring;
 
 use anyhow::Context as _;
@@ -36,11 +41,14 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let seed_out = match args.as_slice() {
-        [] => None,
-        [cmd, out] if cmd == "seed-dev" => Some(out.clone()),
-        _ => anyhow::bail!("usage: ruum-server [seed-dev <file>]"),
-    };
+    let mut seed_out = None;
+    let mut migrate_only = false;
+    match args.as_slice() {
+        [] => {}
+        [cmd, out] if cmd == "seed-dev" => seed_out = Some(out.clone()),
+        [cmd] if cmd == "migrate" => migrate_only = true,
+        _ => anyhow::bail!("usage: ruum-server [seed-dev <file> | migrate]"),
+    }
 
     let pool = if let Some(url) = &config.database_url {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -48,14 +56,21 @@ async fn main() -> anyhow::Result<()> {
             .connect(url)
             .await
             .context("connect to DATABASE_URL")?;
-        if config.migrate {
-            let migrator = sqlx::migrate::Migrator::new(config.migrations_dir.as_path())
-                .await
-                .context("read migrations")?;
-            migrator.run(&pool).await.context("run migrations")?;
-            tracing::info!("migrations are up to date");
+        let migrator = migrate::load(&config.migrations_dir).await?;
+        if migrate_only || config.migrate {
+            let applied = migrate::run(&pool, &migrator, migrate::LOCK_WAIT).await?;
+            tracing::info!(applied, "migrations are up to date");
+            if migrate_only {
+                return Ok(());
+            }
+        } else {
+            // A serving pod of a rollout (RUUM_MIGRATE=false): the migration Job ran first.
+            migrate::check(&pool, &migrator).await?;
+            tracing::info!("the database has every migration of this release");
         }
         Some(pool)
+    } else if migrate_only {
+        anyhow::bail!("ruum-server migrate needs DATABASE_URL");
     } else {
         tracing::warn!("DATABASE_URL is not set; using in-memory services");
         None
@@ -119,13 +134,25 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {} (RUUM_DAV_BIND)", config.dav_bind))?;
     tracing::info!(addr = %config.bind, "ruum-server listening");
     tracing::info!(addr = %config.dav_bind, url = %config.dav_url, "WebDAV host listening");
+    // One stop signal for every listener (SIGTERM from Kubernetes, or Ctrl-C).
+    let (stop_handle, stop) = shutdown::stop_pair();
+    let grace = config.shutdown_grace;
+    tokio::spawn(async move {
+        shutdown::signal().await;
+        tracing::info!(
+            grace_seconds = grace.as_secs(),
+            "shutting down: no new connections; open requests may finish"
+        );
+        stop_handle.stop();
+    });
     // The peer address is the key of the rate limits (`ruum_api::limits`).
     let platform = axum::serve(
         listener,
         platform.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown());
-    let dav = axum::serve(dav_listener, dav.into_make_service()).with_graceful_shutdown(shutdown());
+    .with_graceful_shutdown(stop.clone().stopped());
+    let dav = axum::serve(dav_listener, dav.into_make_service())
+        .with_graceful_shutdown(stop.clone().stopped());
     // The internal listener (the edge's on-demand TLS `ask`, review 1 B-6), when configured.
     let internal = match &config.internal_bind {
         Some(bind) => {
@@ -142,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Some(
                 axum::serve(listener, router.into_make_service())
-                    .with_graceful_shutdown(shutdown()),
+                    .with_graceful_shutdown(stop.clone().stopped()),
             )
         }
         None => None,
@@ -153,11 +180,15 @@ async fn main() -> anyhow::Result<()> {
             None => Ok(()),
         }
     };
-    tokio::try_join!(platform, dav, internal)?;
+    let servers = async move { tokio::try_join!(platform, dav, internal).map(|_| ()) };
+    match shutdown::drain(servers, stop, grace).await? {
+        shutdown::Drained::Ended | shutdown::Drained::Clean => {
+            tracing::info!("every connection is closed; bye")
+        }
+        shutdown::Drained::TimedOut => tracing::warn!(
+            grace_seconds = grace.as_secs(),
+            "connections still open at the end of the grace time; closing them"
+        ),
+    }
     Ok(())
-}
-
-async fn shutdown() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutting down");
 }

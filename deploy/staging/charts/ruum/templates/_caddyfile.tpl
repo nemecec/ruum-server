@@ -7,7 +7,14 @@
 	email {{ . }}
 	{{- end }}
 	acme_ca {{ include "ruum.acmeCA" . }}
-	storage file_system /data/caddy
+	# Certificates, ACME accounts and challenge tokens in Kubernetes Secrets of the edge
+	# namespace (backlog O-26): a restart never issues again, and every edge pod answers the
+	# HTTP-01 challenges of the others. Module: deploy/images/caddy-secret-storage.
+	storage kubernetes_secret {
+		namespace edge
+	}
+	# After SIGTERM: no new connections, open ones may finish (design 12.7).
+	grace_period {{ int .Values.edge.shutdownGraceSeconds }}s
 	on_demand_tls {
 		ask http://ruum-server-internal.ruum.svc.cluster.local:8493/internal/tls-ask
 	}
