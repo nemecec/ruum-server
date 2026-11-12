@@ -230,6 +230,7 @@ pub async fn run_all(engine: &dyn DatabaseEngine) {
     branch(engine).await;
     restore_point(engine).await;
     export(engine).await;
+    tenant_code(engine).await;
 }
 
 /// A new database has neutral names, one role per kind, and an empty catalog.
@@ -1280,5 +1281,39 @@ pub async fn export(engine: &dyn DatabaseEngine) {
     assert!(
         !bytes.windows(f.key_bytes.len()).any(|w| w == f.key_bytes),
         "the export holds the key bytes"
+    );
+}
+
+/// An engine with a lens answers `tenant_code_on_live` itself (decision 0004-38; review-Q-2-s21-2
+/// N-2): the trait's default (`false`) is right only for an engine that shows an agent no value
+/// at all. A database without tenant code answers `false`; after a migration that adds a
+/// trigger, an engine with a lens answers `true`. So an engine that keeps the default while it
+/// has a lens (the SQLite engine of card E-3, Q-3) fails here.
+pub async fn tenant_code(engine: &dyn DatabaseEngine) {
+    let f = Fixture::new(engine).await;
+    f.seed_users().await;
+    assert!(
+        !engine.tenant_code_on_live(f.db()).await.unwrap(),
+        "a database without tenant code"
+    );
+    if !engine.has_lens() {
+        return;
+    }
+    let up = match engine.kind() {
+        EngineKind::Postgres => {
+            "CREATE TABLE audit (what text); \
+             CREATE FUNCTION log_users() RETURNS trigger LANGUAGE plpgsql AS \
+               $$ BEGIN INSERT INTO audit VALUES ('x'); RETURN NEW; END $$; \
+             CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_users();"
+        }
+        EngineKind::Sqlite => {
+            "CREATE TABLE audit (what text); \
+             CREATE TRIGGER log_users AFTER INSERT ON users BEGIN INSERT INTO audit VALUES ('x'); END;"
+        }
+    };
+    f.migrate(up).await.expect("a migration with a trigger");
+    assert!(
+        engine.tenant_code_on_live(f.db()).await.unwrap(),
+        "an engine with a lens finds the tenant's trigger (it must not keep the trait's default)"
     );
 }

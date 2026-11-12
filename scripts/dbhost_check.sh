@@ -136,6 +136,8 @@ su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, 
 fact "template1: PUBLIC may not run set_config (review Q-1, S-1)" '[[ $OUT == 0 ]]'
 su_sql template1 "select has_function_privilege('ruum_dbhost', '$SETCFG', 'execute with grant option')"
 fact "template1: ruum_dbhost holds EXECUTE on set_config WITH GRANT OPTION" '[[ $OUT == t ]]'
+su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where p.pronamespace = 'pg_catalog'::regnamespace and p.proname = 'current_setting' and a.grantee = 0"
+fact "template1: PUBLIC may not run current_setting (review-Q-2-s21-2 suggestion 4)" '[[ $OUT == 0 ]]'
 KEEP_VOLATILE="'nextval','currval','lastval','gen_random_uuid','uuidv7','clock_timestamp','timeofday','random','pg_sleep','pg_sleep_for','pg_sleep_until','pg_cancel_backend','pg_terminate_backend'"
 su_sql template1 "select count(*) from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a where p.pronamespace = 'pg_catalog'::regnamespace and p.prokind = 'f' and p.provolatile = 'v' and p.proname not in ($KEEP_VOLATILE) and a.grantee = 0"
 fact "template1: PUBLIC may not run a volatile function of pg_catalog, except the named few (review-Q-2-harden H-1)" '[[ $OUT == 0 ]]'
@@ -273,6 +275,10 @@ for k in $LOGIN_KINDS; do
   err "($k) advisory lock" "A_$k" "$DBA" "select pg_advisory_lock(1)" 'permission denied for function pg_advisory_lock'
   err "($k) large object" "A_$k" "$DBA" "select lo_from_bytea(0, 'a'::bytea)" 'permission denied for function lo_from_bytea'
   ok "($k) random() stays" "A_$k" "$DBA" "select random() < 2" t
+done
+echo "== current_setting (review-Q-2-s21-2 suggestion 4): never the read, write and masked kinds"
+for k in read write masked_read masked_write; do
+  err "($k) current_setting" "A_$k" "$DBA" "select current_setting('work_mem')" 'permission denied for function current_setting'
 done
 ok "(owner) runs setseed" A_owner "$DBA" "select count(*) from (select setseed(0.5)) s" 1
 
