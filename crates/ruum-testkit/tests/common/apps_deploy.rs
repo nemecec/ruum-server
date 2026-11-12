@@ -273,7 +273,7 @@ pub fn cases() -> Vec<Case> {
             "a static preview from a folder: 202 with environment preview and source kind \
              folder; it reaches ready with the in-memory driver; source.files names each file \
              version with its path and source.version_id is null; the stages build and test are \
-             skipped, unpack, validate and bindings done; the address is \
+             skipped, unpack and validate done (bindings done or skipped); the address is \
              <8 base32>--<slug>.<tenant>...; getApp lists it in previews",
             |cx| {
                 let (app, s) = app_and_site(&cx, "folder app", STATIC_MANIFEST).await?;
@@ -325,9 +325,15 @@ pub fn cases() -> Vec<Case> {
                 for name in ["build", "test"] {
                     check!(stage(name) == "skipped", "stage {name}: {}", d["stages"]);
                 }
-                for name in ["unpack", "validate", "bindings"] {
+                for name in ["unpack", "validate"] {
                     check!(stage(name) == "done", "stage {name}: {}", d["stages"]);
                 }
+                // No binding: the contract does not say whether the stage is done or skipped.
+                check!(
+                    stage("bindings") == "done" || stage("bindings") == "skipped",
+                    "stage bindings: {}",
+                    d["stages"]
+                );
                 let url = str_at(&d, "/url")?;
                 if let Some(p) = preview_url_problem(&url, &slug) {
                     fail!("{p}");
