@@ -1020,6 +1020,43 @@ async fn a_database_where_a_role_may_run_a_revoked_function_is_refused() {
             .await
             .expect("passes again");
     }
+    // Expand, then contract (design 12.7, review FU-1-4 of Kimi): a database of the cluster
+    // set-up before card FU-1, where `PUBLIC` still holds `current_setting`, keeps working (the
+    // previous release needs it). Any other revoked function held by `PUBLIC` still refuses it.
+    psql(
+        &mut conn,
+        &format!("GRANT EXECUTE ON FUNCTION {READER} TO PUBLIC"),
+    )
+    .await
+    .unwrap();
+    setup::check_volatile_revoked(&mut conn, &roles)
+        .await
+        .expect("PUBLIC holding current_setting is the set-up before the contract step");
+    psql(
+        &mut conn,
+        &format!("GRANT EXECUTE ON FUNCTION {FUNCTION} TO PUBLIC"),
+    )
+    .await
+    .unwrap();
+    let err = setup::check_volatile_revoked(&mut conn, &roles)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Internal(m) if m.contains("PUBLIC") && m.contains("setseed")),
+        "{err:?}"
+    );
+    psql(
+        &mut conn,
+        &format!(
+            "REVOKE EXECUTE ON FUNCTION {FUNCTION} FROM PUBLIC; \
+             REVOKE EXECUTE ON FUNCTION {READER} FROM PUBLIC"
+        ),
+    )
+    .await
+    .unwrap();
+    setup::check_volatile_revoked(&mut conn, &roles)
+        .await
+        .expect("passes again");
     close(conn).await;
 }
 

@@ -129,6 +129,7 @@ fn plan() -> MaskPlan {
             (col("kept", "secret"), MaskAs::Null),
             (col("locked", "secret"), MaskAs::Null),
         ],
+        planned_from: None,
     }
 }
 
@@ -288,6 +289,7 @@ async fn a_masked_copy_builds_foreign_keys_again_or_leaves_them_out() {
             (col("users", "email"), MaskAs::Pseudonym),
             (col("orders", "user_email"), MaskAs::Pseudonym),
         ],
+        planned_from: None,
     };
     let (key, _) = conformance::test_key();
     let copy = engine
@@ -462,6 +464,7 @@ async fn platform_steps_run_no_tenant_operator() {
             (col("secret"), MaskAs::Null),
             (col("personal"), MaskAs::Pseudonym),
         ],
+        planned_from: None,
     };
     for data in [
         CopyData::Full,
@@ -574,6 +577,10 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
              COMMENT ON MATERIALIZED VIEW mv IS 'snapshot';
              CREATE VIEW plain AS SELECT id FROM people;
              CREATE MATERIALIZED VIEW mvs AS SELECT id, token FROM people;
+             CREATE FUNCTION emails() RETURNS SETOF text LANGUAGE sql STABLE
+               AS $f$ SELECT email FROM public.people $f$;
+             CREATE MATERIALIZED VIEW mv_row AS SELECT p::text AS r FROM people p;
+             CREATE MATERIALIZED VIEW mv_fn AS SELECT e FROM public.emails() e;
              {extra}"
         ),
         timeout: Duration::from_secs(10),
@@ -588,11 +595,24 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
         "INSERT INTO people VALUES (1, 'alice@example.com', 41, 'tok_alice')",
         "REFRESH MATERIALIZED VIEW mv",
         "REFRESH MATERIALIZED VIEW mvs",
+        "REFRESH MATERIALIZED VIEW mv_row",
+        "REFRESH MATERIALIZED VIEW mv_fn",
     ] {
         f.run(RoleKind::Owner, StatementMode::Write, sql, vec![])
             .await
             .expect(sql);
     }
+    // Two materialized views that `pg_depend` does not tie to a masked column (review FU-1
+    // required change 1): a whole-row reference, and a read inside a function.
+    const HIDDEN_DEPENDENCIES: &str =
+        "select (select r from mv_row) || '|' || (select e from mv_fn)";
+    let mut source = session(&engine, f.db(), RoleKind::Owner).await;
+    let before = psql(&mut source, HIDDEN_DEPENDENCIES).await.unwrap();
+    close(source).await;
+    assert!(
+        before.contains("alice@example.com") && before.contains("tok_alice"),
+        "the source's materialized views hold the values: {before}"
+    );
     let column = |table: &str, column: &str| ColumnRef {
         schema: "public".into(),
         table: table.into(),
@@ -604,6 +624,7 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
             (column("people", "age"), MaskAs::Pseudonym),
             (column("people", "token"), MaskAs::Null),
         ],
+        planned_from: None,
     };
     let (key, _) = conformance::test_key();
     let copy = engine
@@ -617,6 +638,16 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
         .await
         .expect("the masked copy goes through");
     let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    let hidden = psql(&mut owner, HIDDEN_DEPENDENCIES).await.unwrap();
+    assert!(
+        !hidden.contains("alice") && !hidden.contains("tok_"),
+        "every materialized view is made again from the masked tables: {hidden}"
+    );
+    assert_eq!(
+        hidden.matches("p_").count(),
+        3,
+        "filled with the pseudonyms of email and age: {hidden}"
+    );
     let out = psql(
         &mut owner,
         "select (select email from v1) || '|' || (select e from v2) || '|' || \
@@ -689,4 +720,211 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
     )
     .await
     .expect("the source keeps working");
+}
+
+/// The column statistics of a masked copy hold no value of the source (review FU-1 required
+/// change 2). The copy is a `TEMPLATE` copy, so it starts with the source's `pg_statistic`
+/// and `pg_statistic_ext_data`; `UPDATE ... SET NULL` of a secret column does not change them,
+/// and `pg_stats` shows them to the copy's owner. Step 2 analyzes the masked tables again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_keeps_no_statistics_of_the_source() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec!["email"],
+        secret: vec!["token"],
+    };
+    engine
+        .apply_migration(
+            f.db(),
+            &f.key,
+            &MigrationRequest {
+                up: "CREATE TABLE people (id integer PRIMARY KEY, email text, grp integer, token text);
+                     CREATE STATISTICS people_grp_token (mcv) ON grp, token FROM people;"
+                    .into(),
+                timeout: Duration::from_secs(10),
+                dry_run: false,
+            },
+            &sync,
+        )
+        .await
+        .expect("migration");
+    const STATS: &str = "select coalesce((select string_agg(coalesce(most_common_vals::text, '') \
+                           || coalesce(histogram_bounds::text, ''), ' ') \
+                           from pg_stats where schemaname = 'public'), '') || ' ' || \
+                         coalesce((select string_agg(coalesce(most_common_vals::text, ''), ' ') \
+                           from pg_stats_ext where schemaname = 'public'), '')";
+    let mut source = session(&engine, f.db(), RoleKind::Owner).await;
+    psql(
+        &mut source,
+        "INSERT INTO people SELECT g, 'user' || g || '@example.com', g % 10, \
+           'tok_secret_' || (g % 10) FROM generate_series(1, 200) g; \
+         ANALYZE people",
+    )
+    .await
+    .unwrap();
+    let before = psql(&mut source, STATS).await.unwrap();
+    close(source).await;
+    assert!(
+        before.contains("tok_secret_") && before.contains("@example.com"),
+        "the source has statistics of its values: {before}"
+    );
+    let column = |name: &str| ColumnRef {
+        schema: "public".into(),
+        table: "people".into(),
+        column: name.into(),
+    };
+    let plan = MaskPlan {
+        columns: vec![
+            (column("email"), MaskAs::Pseudonym),
+            (column("token"), MaskAs::Null),
+        ],
+        planned_from: None,
+    };
+    let (key, _) = conformance::test_key();
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan),
+            &key,
+        )
+        .await
+        .expect("the masked copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    let after = psql(&mut owner, STATS).await.unwrap();
+    close(owner).await;
+    assert!(
+        !after.contains("tok_") && !after.contains("example.com"),
+        "no statistic of the copy holds a value of the source: {after}"
+    );
+    assert!(
+        after.contains("p_"),
+        "the statistics are of the masked rows: {after}"
+    );
+}
+
+/// A masked copy whose source got a column after the platform read the catalog of the plan is
+/// refused (review FU-1-3 of Kimi): the plan does not name the column, so it would be copied in
+/// clear. The copy fails with `NotReady` (try again); with the column in the plan's catalog, the
+/// copy goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_refuses_a_column_that_its_plan_does_not_know() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let sync = ClassSync {
+        personal: vec!["email"],
+        secret: vec![],
+    };
+    engine
+        .apply_migration(
+            f.db(),
+            &f.key,
+            &MigrationRequest {
+                up: "CREATE TABLE people (id integer PRIMARY KEY, email text, phone text);".into(),
+                timeout: Duration::from_secs(10),
+                dry_run: false,
+            },
+            &sync,
+        )
+        .await
+        .expect("migration");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO people VALUES (1, 'alice@example.com', '+372 5555 0101')",
+        vec![],
+    )
+    .await
+    .expect("a row");
+    let column = |name: &str| ColumnRef {
+        schema: "public".into(),
+        table: "people".into(),
+        column: name.into(),
+    };
+    // The catalog of the plan was read before `phone` existed.
+    let stale = MaskPlan {
+        columns: vec![(column("email"), MaskAs::Pseudonym)],
+        planned_from: Some(vec![column("id"), column("email")]),
+    };
+    let (key, _) = conformance::test_key();
+    let err = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(stale),
+            &key,
+        )
+        .await
+        .expect_err("the copy is refused");
+    assert!(matches!(err, EngineError::NotReady), "{err:?}");
+    let fresh = MaskPlan {
+        columns: vec![(column("email"), MaskAs::Pseudonym)],
+        planned_from: Some(vec![column("id"), column("email"), column("phone")]),
+    };
+    engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(fresh),
+            &key,
+        )
+        .await
+        .expect("a plan that knows every column goes through");
+}
+
+/// A copy of a database that holds an enabled event trigger is refused before the hand-over's
+/// first DDL statement (review FU-1-2 of Kimi): the trigger would run with the rights of
+/// `ruum_dbhost`. Only a superuser can make one, so the test's superuser does. Disabled, the
+/// trigger does not block the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_a_database_with_an_event_trigger_is_refused() {
+    let Some(engine) = engine().await else { return };
+    let f = Fixture::new(&engine).await;
+    let db = f.db().engine_name.clone();
+    let Some(_) = superuser(
+        &db,
+        "CREATE SCHEMA ruum_test_su;
+         CREATE FUNCTION ruum_test_su.evt() RETURNS event_trigger LANGUAGE plpgsql AS
+           $$ BEGIN END $$;
+         CREATE EVENT TRIGGER ruum_test_evt ON ddl_command_start
+           EXECUTE FUNCTION ruum_test_su.evt();",
+    ) else {
+        return;
+    };
+    let (key, _) = conformance::test_key();
+    for data in [CopyData::Full, CopyData::SchemaOnly] {
+        let err = engine
+            .copy_database(
+                f.db(),
+                &f.key,
+                &conformance::new_database(f.db().tenant_id),
+                &data,
+                &key,
+            )
+            .await
+            .expect_err("the copy is refused");
+        assert!(
+            matches!(&err, EngineError::Unsupported(m) if m.contains("ruum_test_evt")),
+            "{data:?}: {err:?}"
+        );
+    }
+    superuser(&db, "ALTER EVENT TRIGGER ruum_test_evt DISABLE;");
+    engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Full,
+            &key,
+        )
+        .await
+        .expect("a disabled event trigger does not block the copy");
+    superuser(
+        &db,
+        "DROP EVENT TRIGGER ruum_test_evt; DROP SCHEMA ruum_test_su CASCADE;",
+    );
 }

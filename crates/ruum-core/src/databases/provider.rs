@@ -542,6 +542,8 @@ fn engine_error(e: EngineError) -> Error {
 /// column of a table of the database's own schema by the class the lens gives it (`classes`:
 /// the stricter of the column store and the manifest's `data_classes`, backlog 2026-11-09
 /// S-18), `personal` when it has none. `personal` becomes a pseudonym, `secret` becomes `NULL`.
+/// The plan also lists every column of those tables (`planned_from`), so the engine refuses a
+/// copy whose source got a column after this catalog was read (review FU-1-3 of Kimi).
 pub fn mask_plan(
     catalog: &Catalog,
     engine: EngineKind,
@@ -549,12 +551,18 @@ pub fn mask_plan(
 ) -> MaskPlan {
     let schema = super::query::own_schema(engine);
     let mut columns = Vec::new();
+    let mut planned_from = Vec::new();
     for t in catalog
         .tables
         .iter()
         .filter(|t| t.schema == schema && t.kind == RelationKind::Table)
     {
         for c in &t.columns {
+            planned_from.push(ColumnRef {
+                schema: t.schema.clone(),
+                table: t.name.clone(),
+                column: c.name.clone(),
+            });
             let how = match classes
                 .class(&t.name, &c.name)
                 .unwrap_or(DataClass::Personal)
@@ -573,7 +581,10 @@ pub fn mask_plan(
             ));
         }
     }
-    MaskPlan { columns }
+    MaskPlan {
+        columns,
+        planned_from: Some(planned_from),
+    }
 }
 
 fn copies_not_available() -> Error {
@@ -1164,6 +1175,24 @@ mod tests {
                 ("public.people.email".to_string(), MaskAs::Pseudonym),
                 ("public.people.token".to_string(), MaskAs::Null),
                 ("public.people.note".to_string(), MaskAs::Pseudonym),
+            ]
+        );
+        // Every column of the own tables, also the normal ones, so the engine can refuse a
+        // copy whose source got a column after this catalog (review FU-1-3 of Kimi).
+        let from: Vec<String> = plan
+            .planned_from
+            .as_deref()
+            .expect("the plan names the catalog it was made from")
+            .iter()
+            .map(|c| format!("{}.{}.{}", c.schema, c.table, c.column))
+            .collect();
+        assert_eq!(
+            from,
+            vec![
+                "public.people.email",
+                "public.people.token",
+                "public.people.latin",
+                "public.people.note",
             ]
         );
     }

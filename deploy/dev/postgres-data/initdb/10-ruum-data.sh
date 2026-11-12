@@ -21,7 +21,14 @@
 #   hand it to a reader; the engine gives it back to the owner, secret_read and mask kinds.
 #   Postgres checks the right of a function in a view against the reader, so this holds
 #   inside views too. Only a superuser can take a right on a pg_catalog function from PUBLIC. The
-#   engine refuses a database where PUBLIC may still run one.
+#   engine refuses a database where PUBLIC may still run one (but current_setting, see below).
+# - current_setting is the contract step of an expand-then-contract change (design 12.7,
+#   decision 42; review FU-1-4): the release before card FU-1 needs it for every mask kind it
+#   makes, and the engine of FU-1 accepts a database where PUBLIC still holds it (with a
+#   warning). So on a cluster that still serves the previous release, run this script with
+#   RUUM_DATA_KEEP_SETTING_READERS=1 (PUBLIC keeps current_setting where it still has it), and
+#   once more without it after the previous release is gone. The laptop stack, CI and the build
+#   server run the server of the same tree, so they run it without.
 set -euo pipefail
 
 # The volatile functions: revoked from PUBLIC, given to ruum_dbhost WITH GRANT OPTION. The list
@@ -30,6 +37,9 @@ KEEP_VOLATILE='{nextval,currval,lastval,gen_random_uuid,uuidv7,clock_timestamp,t
 # The readers of a session setting (SETTING_READERS in allow.rs): not volatile, but revoked with
 # the volatile functions; the engine gives them back to the owner, secret_read and mask kinds.
 SETTING_READERS='{current_setting}'
+if [[ ${RUUM_DATA_KEEP_SETTING_READERS:-} == 1 ]]; then
+  SETTING_READERS='{}'
+fi
 REVOKED_WHERE="p.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace
               AND p.prokind OPERATOR(pg_catalog.=) 'f'::pg_catalog.\"char\"
               AND ((p.provolatile OPERATOR(pg_catalog.=) 'v'::pg_catalog.\"char\"
@@ -69,7 +79,8 @@ BEGIN
       FROM pg_catalog.pg_proc p WHERE $READERS_WHERE;
     FOR r IN SELECT m.role_name FROM ruum_meta.roles m
               JOIN pg_catalog.pg_roles g ON g.rolname OPERATOR(pg_catalog.=) m.role_name
-             WHERE m.kind OPERATOR(pg_catalog.=) ANY ('{secret_read,mask}'::pg_catalog.text[]) LOOP
+             WHERE f IS NOT NULL
+               AND m.kind OPERATOR(pg_catalog.=) ANY ('{secret_read,mask}'::pg_catalog.text[]) LOOP
       EXECUTE 'SET LOCAL ROLE ruum_dbhost';
       EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s TO %I', f, r);
       EXECUTE 'RESET ROLE';
