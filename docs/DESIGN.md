@@ -1321,50 +1321,77 @@ the owner to rotate it.
 
 ### 9.13 Sharing apps between tenants (decision 43, provisional)
 
-A tenant that built an app can share it with other tenants, and they can adapt it to their needs
-without losing the vendor's updates. First case: the work management app built for TajuRuum in
-step 3, installed by another landscape architecture office (decision 0007 says "reusable by every
-office").
+A tenant that built an app can share it, and others can start from it and adapt it to their needs.
+First case: the work management app built for TajuRuum in step 3, used by another landscape
+architecture office (decision 0007 says "reusable by every office").
 
-**Install, not copy.**
+**A fork with an upstream link: one journey, not two kinds.**
 
-- The vendor **publishes** a version of a project as an app package: the code, the database
-  manifests and migrations, the roles (9.3), the bindings it needs, the extension points (below),
-  and a changelog. Versions are immutable; channels (`stable`, `beta`) point at versions.
-- Another tenant **installs** it: Ruum creates an app node in that tenant with its own database,
-  its own files and its own bindings. The installing tenant owns all of its data; the vendor sees
-  none of it unless the tenant grants access (for support, 8.5 rules apply).
-- **Updates**: the installing tenant chooses automatic updates within a channel or review each
-  version. An update runs the package's migrations under the schema rule (12.7), so the tenant
-  can go back one version.
-- A **copy** (fork, "remix" from 9.9) is the other path: the tenant gets the source and owns it,
-  and gets no updates. The UI says which one a tenant has.
-- The vendor can withdraw a version (no new installs) or, for a security fault, push a fix to every
-  installation in the channel; it cannot delete a tenant's installation or its data.
+- Every installation is a **fork**: the installing tenant gets its own project with the app's
+  source in its own repo (section 10), its own database, files and bindings. The original is the
+  **upstream**; the fork keeps a link to it. The installing tenant owns all of its data; the
+  upstream sees none of it unless the tenant grants access (8.5 rules apply).
+- In the ideal case the downstream changes nothing and takes every update as it is. The
+  realistic case is a **base version** that the downstream customises. Both are the same fork;
+  they differ only in how many changes the downstream made.
+- Git does the work behind the scenes: the upstream publishes versions as tags on a release
+  branch; the fork **pulls** a new version as a merge into its own repo, through a draft and a
+  preview (section 10), like any other change. The plugins of 5.3 and 5.4 give the diffs of
+  non-code files.
+- **Agents do the merging**: when a new upstream version is available, an agent reviews the
+  changes, applies them on a draft, resolves conflicts with the downstream's customisations, runs
+  the tests and the migrations on a database branch, and writes a summary of what changed and what
+  it had to decide. The person (or the downstream's developer) approves the draft.
+- **Unlink**: a downstream that has changed so much that updates are too painful can remove the
+  link. The only effect: Ruum stops showing updates from the upstream (security updates included,
+  and the UI says so clearly). Nothing is deleted; the link can be added again later.
 
-**Customisations on top: extension points, not edits.**
+**The upstream never pushes.** It only makes versions available.
 
-- The package declares what an installing tenant can add without touching the vendor's code:
-  - extra fields on the app's tables and extra tables (in the tenant's own schema next to the
-    app's, never in it);
-  - own views, reports and dashboards;
-  - own automations (9.11) on the app's events;
-  - own roles mapped to the app's roles, translations and the theme (12.6);
-  - hooks the vendor names (for example "before an invoice is sent"), run as the tenant's code
-    with the tenant's rights.
-- Customisations live in the installing tenant's project, are versioned and reviewed like any
-  change, and survive updates. An update that would break one (a removed hook or field) is shown
-  before it runs, and the tenant decides.
-- Deeper changes need a copy. This keeps every installation on the vendor's upgrade path.
+- Every update needs an explicit approval downstream. Security updates are marked and shown more
+  prominently (a notice to the project's managers, a badge until applied), but they are not
+  applied without approval.
+- Later, the downstream can delegate the approval to an agent within limits it sets (for
+  example "patch versions and security fixes, if all tests pass and no customisation conflicts").
+  The agent then applies updates on its own.
+- Every update, by a person or an agent, is in the project's history and audit log: the upstream
+  version, the merge, the conflicts and how they were resolved, the test results, who approved.
+  So a fault after an update can be traced and the update reverted.
+- The upstream can withdraw a version (no new forks from it, and downstreams see a warning); it
+  cannot change or delete anything in a downstream.
 
-**Access and licences.** An app package is private to named tenants, listed in the tenant's own
-catalogue, or public in a gallery (later, with review). It is free or paid (21.7, level 2). A
-public package follows the public project rules of 9.9: its source and database are read-only for
-others, its secrets never shown.
+**Build the base app for extension.** Updates are less painful when customisations sit beside the
+upstream's code, not inside it. So a base app declares extension points, and the agents prefer
+them when they customise:
+- extra fields on the app's tables and extra tables, in the downstream's own schema next to the
+  app's;
+- own views, reports and dashboards; own automations (9.11) on the app's events;
+- own roles mapped to the app's roles, translations and the theme (12.6);
+- named hooks (for example "before an invoice is sent"), run as the downstream's code with the
+  downstream's rights.
+Changes outside the extension points are allowed; they only make merges harder, and the update
+agent says which customisations caused conflicts.
 
-**Data between tenants.** An installed app runs inside the installing tenant. Calls between the
-vendor's own service and the installation go through apps calling apps (9.10) with an explicit
-grant, never through shared tables.
+**Visibility** (who can find and fork the app):
+
+| Visibility | Who can fork it | Listed |
+|---|---|---|
+| public, listed | anyone | in Ruum's public app directory (with review) |
+| public, unlisted | anyone with the link | no |
+| select tenants | invited tenants only | in the invited tenants' catalogues |
+| tenant, listed | every member of the owner tenant | in the tenant's own directory |
+| tenant, unlisted | members of the owner tenant with the link | no |
+| select users | invited people only | no |
+| private | the owners | no |
+
+**Price** (separate from visibility): free, a one-time fee, or a subscription (per tenant, per seat
+or by use). A **trial** can have its own terms (free or cheaper, for a set time), then the main
+price. Paid apps are sold through Ruum (21.7).
+
+**Data between tenants.** A fork runs inside the downstream tenant. Calls between the upstream's
+own service and a fork go through apps calling apps (9.10) with an explicit grant, never through
+shared tables. Public apps follow the public project rules of 9.9: source and database read-only
+for others, secrets never shown.
 
 
 ## 10. Source code and builds
@@ -1918,11 +1945,10 @@ drawing diff in step 6; DOCX/XLSX redlines and three-way merge with the sync cli
 
 **After restricted folders:** public projects (section 9.9).
 
-**App sharing and billing (decisions 43 and 44, provisional):** installing an app from one tenant
-into another (section 9.13) starts in step 3 with the TajuRuum work management app; Ruum billing
-for tenants (section 21.7, level 1) comes before the first paying users; paid apps through Stripe
-Connect (level 2) with the app gallery; billing for a tenant's own customers (level 3) when a
-customer needs it.
+**App sharing and billing (decisions 43 and 44, provisional):** forking an app from one tenant
+into another with upstream updates (section 9.13) starts in step 3 with the TajuRuum work
+management app; Ruum billing for tenants (section 21.7, level 1) comes before the first paying
+users; paid apps sold through Ruum (level 2) with the app directory.
 
 ### Backlog (not scheduled)
 
@@ -2013,12 +2039,13 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
     previous release working (expand, then contract), checked in CI with the previous release's
     tests; migrations as a step before a rolling update; open tabs get a reload notice, forced
     only for a client the API no longer supports.*
-43. **Sharing apps between tenants** (section 9.13). *Provisional 2026-11-12: install with updates,
-    customisation through declared extension points, a copy only for deeper changes; first case
-    the TajuRuum work management app for another office.*
-44. **Billing** (section 21.7). *Provisional 2026-11-12: three levels. Ruum bills tenants before
-    the first paying users; paid apps through Stripe Connect with app sharing; billing for a
-    tenant's own customers later, when a customer needs it.*
+43. **Sharing apps between tenants** (section 9.13). *Provisional 2026-11-12: every installation
+    is a fork with an upstream link; updates are pulled through git and merged by agents, and
+    always approved downstream (later delegable to an agent), never pushed; unlink stops update
+    notices; seven visibility levels and three price models with trials.*
+44. **Billing** (section 21.7). *Provisional 2026-11-12: Ruum bills its tenants before the first
+    paying users; paid apps are sold by Ruum on the same bill, with an earnings ledger and payouts
+    to developers through Stripe Connect; no billing of a tenant's own customers.*
 
 ## 18. How to build Ruum with a swarm of AI agents
 
@@ -2396,27 +2423,33 @@ customer uses, plus a published markup that covers fixed costs.
 
 ### 21.7 Billing (decision 44, provisional)
 
-Billing comes in three levels. Each one is a separate product step.
+Goal: less friction for tenants and app developers. A developer can charge for an app without
+setting up their own billing (no Stripe integration, no invoices, no VAT handling), and a tenant
+gets **one consolidated bill** from Ruum for Ruum itself and every paid app.
 
 1. **Ruum bills its tenants** (before the first paying users): plans and usage from 21.4, invoices
    with EU VAT (reverse charge for businesses with a valid VAT number, OSS for consumers), card and
    SEPA payment through Stripe Billing, receipts in the tenant's Ruum files, dunning (reminders,
-   then read-only, never deletion without notice). Ruum is the seller.
-2. **Vendors charge for their apps through Ruum** (with app sharing, 9.13): a vendor tenant sets a
-   price for its app package (per installation, per seat or per use); the installing tenant sees it
-   on its Ruum bill; Ruum pays the vendor out through **Stripe Connect**, minus a published fee.
-   Stripe Connect does the identity checks of vendors and the payouts, so Ruum does not hold other
-   people's money.
-3. **A tenant (or a linked service) bills its own customers through Ruum**: subscriptions,
-   invoices and payment links for the tenant's customers, who need no Ruum account. The tenant is
-   the seller (its own Stripe Connect account and its own VAT); Ruum provides the software and
-   takes a fee. This is a product of its own (invoice numbering, VAT rules per country, credit
-   notes, accounting exports); built when a customer needs it, as an app on the platform where
-   possible.
+   then read-only, never deletion without notice).
+2. **Paid apps through Ruum, with Ruum as the seller** (the app store model):
+   - The installing tenant buys from Ruum. App charges (one-time, subscription, trial, by use
+     from Ruum's meters) are lines on the same Ruum bill; Ruum handles VAT, receipts, refunds and
+     chargebacks.
+   - Ruum keeps an **earnings ledger** per developer: sales, Ruum's published fee, refunds, the
+     balance, and where the money comes from (per app, per tenant, per plan) with dashboards.
+   - **Payouts** go through Stripe Connect. A developer needs a connected account only to receive
+     money: a short Stripe-hosted onboarding (identity and a bank account), which regulation makes
+     unavoidable for anyone who is paid. No Stripe integration and no billing code on their side;
+     they can sell from day one and connect the account when the first payout is due.
+   - Ruum pays developers as its suppliers (self-billing statements); the lawyer agent checks the
+     terms, the merchant-of-record duties and how long earnings may wait before payout, before
+     launch.
 
-Rules for all levels: card data never touches Ruum (Stripe's hosted pages and elements);
+Rules for both levels: card data never touches Ruum (Stripe's hosted pages and elements);
 billing events are audit events; a tenant's billing data follows the data classes (8.5), and
 agents see amounts and states, never payment details. Stripe test mode is set up for staging.
+
+Not planned: billing a tenant's own customers through Ruum (decided by the person, 2026-11-12).
 
 
 ## 22. Support
