@@ -503,3 +503,224 @@ async fn the_catalog_places_that_hold_code_are_known() {
         "a catalog place of expressions is new or gone: decide its clause of the tenant-code check"
     );
 }
+
+// ------------------------------------------------------------- clauses that need a superuser
+
+/// A masked write of `masked_write` and of `write` is refused by the engine with
+/// `tenant_code_on_live`, and changes nothing; `owner` still writes.
+async fn masked_writes_are_refused(engine: &PostgresEngine, f: &Fixture<'_>, label: &str) {
+    let before = state_of(engine, f).await;
+    for kind in [RoleKind::MaskedWrite, RoleKind::Write] {
+        let r = engine
+            .execute(
+                &f.role(kind),
+                &f.key,
+                &update("UPDATE t SET n = n + 1 WHERE id = 1"),
+            )
+            .await;
+        assert!(
+            matches!(&r, Err(EngineError::StatementNotAllowed(m)) if m == "tenant_code_on_live"),
+            "{label}: {kind:?}: {r:?}"
+        );
+    }
+    assert_eq!(
+        state_of(engine, f).await,
+        before,
+        "{label}: nothing changed"
+    );
+    assert!(
+        engine.tenant_code_on_live(f.db()).await.unwrap(),
+        "{label}: tenant_code_on_live"
+    );
+}
+
+/// The `relations` clause by execution (decision 0004-38 (b); STATUS "Next cards" 0): a foreign
+/// table of the tenant is tenant code (a write to it goes to another server). Only a superuser
+/// can make a foreign data wrapper, so the superuser makes one without a handler, a server and a
+/// foreign table, and gives the table to the database's `owner`. The check finds the
+/// `relations` clause alone, the engine refuses masked writes, and after the drop both are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_table_counts_as_tenant_code_and_stops_masked_writes() {
+    let Some(engine) = engine().await else { return };
+    let f = plain_fixture(&engine, &[]).await;
+    let db = f.db().engine_name.clone();
+    let owner = lens::ident(&role_name(&f.created, RoleKind::Owner));
+    let Some(_) = superuser(
+        &db,
+        &format!(
+            "CREATE FOREIGN DATA WRAPPER ruum_test_fdw;
+             CREATE SERVER ruum_test_srv FOREIGN DATA WRAPPER ruum_test_fdw;
+             CREATE FOREIGN TABLE public.remote (id integer) SERVER ruum_test_srv;
+             ALTER FOREIGN TABLE public.remote OWNER TO {owner};"
+        ),
+    ) else {
+        return;
+    };
+    let c = found(&engine, &f).await;
+    assert_eq!(
+        c,
+        TenantCode {
+            relations: true,
+            ..TenantCode::default()
+        },
+        "the foreign table sets the relations clause alone"
+    );
+    masked_writes_are_refused(&engine, &f, "a foreign table").await;
+    superuser(
+        &db,
+        "DROP FOREIGN TABLE public.remote; DROP SERVER ruum_test_srv; \
+         DROP FOREIGN DATA WRAPPER ruum_test_fdw;",
+    );
+    assert_eq!(found(&engine, &f).await, TenantCode::default(), "dropped");
+    engine
+        .execute(
+            &f.role(RoleKind::MaskedWrite),
+            &f.key,
+            &update("UPDATE t SET n = n + 1 WHERE id = 1"),
+        )
+        .await
+        .expect("a masked write runs again");
+}
+
+/// The `event_triggers` clause by execution (decision 0004-38 (b); STATUS "Next cards" 0): an
+/// event trigger owned by the database's `owner`. Postgres lets only a superuser own an event
+/// trigger, so the test makes the owner a superuser for the moment of the `ALTER ... OWNER`
+/// (as a later grant would) and takes it back. The trigger's function lives in a schema of the
+/// superuser, so the `functions` clause stays `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_event_trigger_of_the_owner_counts_as_tenant_code_and_stops_masked_writes() {
+    let Some(engine) = engine().await else { return };
+    let f = plain_fixture(&engine, &[]).await;
+    let db = f.db().engine_name.clone();
+    let owner = lens::ident(&role_name(&f.created, RoleKind::Owner));
+    let Some(_) = superuser(
+        &db,
+        &format!(
+            "CREATE SCHEMA ruum_test_su;
+             CREATE FUNCTION ruum_test_su.evt() RETURNS event_trigger LANGUAGE plpgsql AS
+               $$ BEGIN END $$;
+             CREATE EVENT TRIGGER ruum_test_evt ON ddl_command_start
+               EXECUTE FUNCTION ruum_test_su.evt();
+             ALTER ROLE {owner} SUPERUSER;
+             ALTER EVENT TRIGGER ruum_test_evt OWNER TO {owner};
+             ALTER ROLE {owner} NOSUPERUSER;"
+        ),
+    ) else {
+        return;
+    };
+    let c = found(&engine, &f).await;
+    assert_eq!(
+        c,
+        TenantCode {
+            event_triggers: true,
+            ..TenantCode::default()
+        },
+        "the event trigger sets the event_triggers clause alone"
+    );
+    masked_writes_are_refused(&engine, &f, "an event trigger").await;
+    superuser(
+        &db,
+        "DROP EVENT TRIGGER ruum_test_evt; DROP SCHEMA ruum_test_su CASCADE;",
+    );
+    assert_eq!(found(&engine, &f).await, TenantCode::default(), "dropped");
+}
+
+/// Each function slot of a type (decision 0004-39 (e); STATUS "Next cards" 0): a type whose
+/// input, output, receive, send, modifier input or output, analyze or subscript function, or
+/// (for a range) canonical or subtype-difference function, is not built in is unvetted
+/// (`bad_types`), slot by slot. A tenant cannot make such a type (a base type needs a
+/// superuser), so the superuser points one slot of a tenant's type at a tenant function at a
+/// time, and puts it back. This proves each slot of the clause, not an attack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_function_slot_of_a_type_is_checked() {
+    let Some(engine) = engine().await else { return };
+    let f = plain_fixture(&engine, &[]).await;
+    as_owner(
+        &engine,
+        &f,
+        "CREATE TYPE slot_e AS ENUM ('a'); CREATE TYPE slot_r AS RANGE (SUBTYPE = float8); \
+         CREATE FUNCTION slot_fn(x integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN x",
+    )
+    .await;
+    let db = f.db().engine_name.clone();
+    let unvetted = |ty: &'static str| {
+        let engine = &engine;
+        let f = &f;
+        async move {
+            let mut conn = dbhost(engine, f.db()).await;
+            let out: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "with recursive {} select exists (select 1 from bad_types b \
+                  where b.oid operator(pg_catalog.=) pg_catalog.to_regtype($2))",
+                crate::postgres::allow::ctes(1)
+            )))
+            .persistent(false)
+            .bind(crate::postgres::allow::row_functions())
+            .bind(ty)
+            .fetch_one(&mut conn)
+            .await
+            .expect("bad_types");
+            close(conn).await;
+            out
+        }
+    };
+    if superuser(&db, "SELECT 1").is_none() {
+        return;
+    }
+    assert!(!unvetted("public.slot_e").await, "control: the enum");
+    assert!(!unvetted("public.slot_r").await, "control: the range");
+    for slot in [
+        "typinput",
+        "typoutput",
+        "typreceive",
+        "typsend",
+        "typmodin",
+        "typmodout",
+        "typanalyze",
+        "typsubscript",
+    ] {
+        let old = superuser(
+            &db,
+            &format!("SELECT {slot}::oid FROM pg_type WHERE oid = 'public.slot_e'::regtype"),
+        )
+        .unwrap();
+        superuser(
+            &db,
+            &format!(
+                "UPDATE pg_type SET {slot} = 'public.slot_fn'::regproc \
+                  WHERE oid = 'public.slot_e'::regtype"
+            ),
+        );
+        assert!(unvetted("public.slot_e").await, "{slot}: unvetted");
+        superuser(
+            &db,
+            &format!(
+                "UPDATE pg_type SET {slot} = {old}::oid::regproc \
+                  WHERE oid = 'public.slot_e'::regtype"
+            ),
+        );
+        assert!(!unvetted("public.slot_e").await, "{slot}: put back");
+    }
+    for slot in ["rngcanonical", "rngsubdiff"] {
+        let old = superuser(
+            &db,
+            &format!("SELECT {slot}::oid FROM pg_range WHERE rngtypid = 'public.slot_r'::regtype"),
+        )
+        .unwrap();
+        superuser(
+            &db,
+            &format!(
+                "UPDATE pg_range SET {slot} = 'public.slot_fn'::regproc \
+                  WHERE rngtypid = 'public.slot_r'::regtype"
+            ),
+        );
+        assert!(unvetted("public.slot_r").await, "{slot}: unvetted");
+        superuser(
+            &db,
+            &format!(
+                "UPDATE pg_range SET {slot} = {old}::oid::regproc \
+                  WHERE rngtypid = 'public.slot_r'::regtype"
+            ),
+        );
+        assert!(!unvetted("public.slot_r").await, "{slot}: put back");
+    }
+}

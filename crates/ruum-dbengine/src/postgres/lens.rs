@@ -278,10 +278,17 @@ on conflict (id) do update set ipad = excluded.ipad, opad = excluded.opad";
 /// The SQL call that pseudonymizes the column expression `expr` of the built-in base type
 /// `base_oid`. The caller has checked the type with [`pseudonym_types`].
 pub(crate) fn pseudonym_call(expr: &str, base_oid: u32) -> String {
+    pseudonym_call_in("ruum_mask", expr, base_oid)
+}
+
+/// [`pseudonym_call`] with the functions of `schema`: `ruum_mask`, or the entry points of step 2
+/// of a masked copy (`ruum_copy`, backlog 2026-11-09 S-9), which have the same names and
+/// argument types.
+pub(crate) fn pseudonym_call_in(schema: &str, expr: &str, base_oid: u32) -> String {
     match base_oid {
-        oid::TEXT => format!("ruum_mask.pseudonym({expr})"),
+        oid::TEXT => format!("{schema}.pseudonym({expr})"),
         oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR => {
-            format!("ruum_mask.pseudonym(({expr})::text)")
+            format!("{schema}.pseudonym(({expr})::text)")
         }
         oid::INT2
         | oid::INT4
@@ -295,9 +302,9 @@ pub(crate) fn pseudonym_call(expr: &str, base_oid: u32) -> String {
         | oid::BYTEA
         | oid::BOOL
         | oid::UUID => {
-            format!("ruum_mask.pseudonym({expr})")
+            format!("{schema}.pseudonym({expr})")
         }
-        _ => format!("ruum_mask.pseudonym_other({expr})"),
+        _ => format!("{schema}.pseudonym_other({expr})"),
     }
 }
 
