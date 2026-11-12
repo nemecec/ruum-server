@@ -90,12 +90,7 @@ pub const PLANNED_OPERATIONS: &[&str] = &[
     "getDatabaseApproval",
     "decideDatabaseApproval",
     // Step 3 (web apps, issues, templates; docs/STEP3.md).
-    "createApp",
-    "getApp",
-    "updateAppSettings",
-    "listAppDeployments",
     "createAppDeployment",
-    "getAppDeployment",
     "publishAppDeployment",
     "compareAppDeployment",
     "listAppSecrets",

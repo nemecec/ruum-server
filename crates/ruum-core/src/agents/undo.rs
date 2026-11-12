@@ -407,7 +407,7 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
                 .change
         }
         // `undo_action` gives `None`: skipped as irreversible before this point.
-        DatabaseGrantRevoked => return Ok(None),
+        DatabaseGrantRevoked | AppSettingsChanged => return Ok(None),
     };
     Ok(Some(change))
 }

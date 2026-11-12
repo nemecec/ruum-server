@@ -72,6 +72,8 @@ pub struct Services {
     pub providers: Arc<ProviderRegistry>,
     /// `createDatabase`, `getDatabase`, `updateDatabaseManifest`.
     pub databases: Arc<DatabaseService>,
+    /// The provider `ruum.webapp` and the app operations of card W-1 (`crate::apps::install`).
+    pub apps: Arc<crate::apps::AppService>,
 }
 
 /// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
@@ -186,6 +188,15 @@ impl Services {
         let (providers, databases) =
             build_databases(nodes.clone(), authz.clone(), tenants.clone(), &parts)
                 .expect("the database provider registers");
+        let apps = crate::apps::build(
+            nodes.clone(),
+            authz.clone(),
+            tenants.clone(),
+            typed.clone(),
+            &providers,
+            crate::apps::AppParts::memory(Some(journal.clone())),
+        )
+        .expect("the web app provider registers");
         let handles = MemoryHandles {
             authz: authz.clone(),
             journal: journal.clone(),
@@ -219,6 +230,7 @@ impl Services {
             typed_nodes: typed,
             providers,
             databases,
+            apps,
         };
         (services, handles)
     }

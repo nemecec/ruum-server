@@ -445,6 +445,8 @@ impl Pg {
             queries: Arc::new(databases::query::PgQueryLog::new(pool.clone())),
         };
         databases::install(&mut s, parts).expect("install the database area");
+        ruum_core::apps::install(&mut s, ruum_core::apps::AppParts::postgres(pool.clone()))
+            .expect("install the apps area");
         s
     }
 

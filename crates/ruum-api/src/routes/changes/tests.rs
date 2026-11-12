@@ -167,6 +167,9 @@ fn sample(event: EventType, user: UserId) -> Value {
         EventType::DatabaseGrantRevoked => json!({
             "grant_id": id(), "kind": "read_personal", "agent_id": id(), "cause": "revoked"
         }),
+        EventType::AppSettingsChanged => json!({
+            "changed": ["telemetry_mode"], "access": "platform", "telemetry_mode": "privacy"
+        }),
     }
 }
 

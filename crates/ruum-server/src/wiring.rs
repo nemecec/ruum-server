@@ -99,7 +99,8 @@ pub async fn services_with(
     // The identity, tenants and agents area: token key, OIDC, mail, plans, Postgres stores. It
     // takes `services.authz`, so it runs after the engine is chosen.
     install(&mut services, identity, pool.clone()).context("set up the identity area")?;
-    install_databases(&mut services, pool, &handles).await?;
+    install_databases(&mut services, pool.clone(), &handles).await?;
+    install_apps(&mut services, pool, &handles)?;
     Ok(services)
 }
 
@@ -174,6 +175,26 @@ pub async fn install_databases(
         },
     };
     databases::install(services, parts).context("set up the database area")?;
+    Ok(())
+}
+
+/// The apps area of the server (card W-1): the provider `ruum.webapp` next to `ruum.database`
+/// in the shared registry, over the Postgres store with a pool, the memory store without.
+/// Runs after the database area.
+pub fn install_apps(
+    services: &mut Services,
+    pool: Option<sqlx::PgPool>,
+    handles: &MemoryHandles,
+) -> anyhow::Result<()> {
+    let parts = match pool {
+        Some(pool) => ruum_core::apps::AppParts::postgres(pool),
+        None => {
+            let mut p = ruum_core::apps::AppParts::memory(Some(handles.journal.clone()));
+            p.config = ruum_core::apps::AppConfig::from_env();
+            p
+        }
+    };
+    ruum_core::apps::install(services, parts).context("set up the apps area")?;
     Ok(())
 }
 
