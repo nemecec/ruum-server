@@ -1406,8 +1406,10 @@ its forks:
 upstream wants to understand why. Everything here needs the downstream's consent, given per
 request:
 - **Ask the forks.** The upstream (a person or its agent) sends a question to the forks that match
-  a statistic ("forks that change `reports/`"), without learning who they are. Ruum delivers it to
-  each fork's managers and agent as a notice; nobody is named to the upstream until a fork answers.
+  a statistic ("forks that change `reports/`"), without learning who they are. In each fork the
+  question appears next to the project's issues (9.7), as an item of its own kind ("question from
+  upstream"), so the fork's people and agent handle it where they handle other work; nobody is
+  named to the upstream until a fork answers.
   A fork can answer, ignore it, or turn off questions from this upstream. Rate limits keep it from
   becoming spam.
 - **Start a discussion.** A fork that answers can open a discussion with the upstream: between
@@ -1451,6 +1453,28 @@ thread on the upstream link, kept as part of both projects' history):
 | tenant, unlisted | members of the owner tenant with the link | no |
 | select users | invited people only | no |
 | private | the owners | no |
+
+**Source visibility of forks follows the upstream's licence.** A git repo can always be copied, so
+Ruum does not try to block a fork from going private; the licence is the real rule, and Ruum makes
+it easy to follow:
+- The upstream chooses a licence when it publishes (required before a public listing):
+  - **permissive** (MIT, Apache 2.0): forks may be private. A fork of a public app starts public;
+    making it private is one step, with no approval;
+  - **copyleft** (AGPL, the usual choice for web apps): whoever runs a changed copy for other
+    people must offer them its source. Ruum does not block a private fork, but says what the
+    licence asks, and for a fork used by people outside its tenant it adds a "source" link to the
+    fork's code;
+  - **copyleft with a paid commercial licence** (dual licensing): the upstream sells, through
+    Ruum's paid apps (21.7), a licence that lets forks keep their changes private. The upstream
+    decides and is paid, not Ruum.
+- **Extensions are private by default.** Code written against the extension points lives in its
+  own part of the fork and is not published, even when the rest of the fork is public.
+- What Ruum enforces: the licence choice before a public listing, private-by-default extensions,
+  a clear notice when a fork's visibility does not match the licence, and a way for the upstream
+  to report a fork that breaks its licence (handled like other abuse reports).
+- Code visibility is separate from data. A fork's databases and files follow their own sharing
+  settings (section 3); making the code public never makes data public, and a database can be
+  shared publicly on its own (for example a public catalogue) whatever the code's visibility.
 
 **Price** (separate from visibility): free, a one-time fee, or a subscription (per tenant, per seat
 or by use). A **trial** can have its own terms (free or cheaper, for a set time), then the main
