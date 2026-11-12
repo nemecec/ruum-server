@@ -14,6 +14,7 @@ pub mod paging;
 pub mod services;
 
 pub mod agents;
+pub mod apps;
 pub mod audit;
 pub mod authz;
 pub mod blobs;
@@ -28,6 +29,7 @@ pub mod search;
 pub mod sharing;
 pub mod tags;
 pub mod tenants;
+pub mod usage;
 pub mod versions;
 
 pub use actor::{Actor, Context, PrincipalKind, PrincipalRef};

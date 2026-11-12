@@ -11,7 +11,7 @@
 //! │   ├── Archive/          (S)  editors_can_share = false (editors keep edit, lose share)
 //! │   ├── <prefix>-garden   (D)  a database node (SQLite 3), made by `member` (card D-1), with
 //! │   │                          the table `plants` (id, latin_name, common_name; two rows)
-//! │   ├── <prefix>-planner  (W)  a web app node (step 3, planned; docs/STEP3.md "Fixtures")
+//! │   ├── <prefix>-planner  (W)  a web app node, made by `member` (card W-1), one live deployment
 //! │   ├── <prefix>-bug      (I)  an issue node (step 3, planned)
 //! │   ├── <prefix>-kit      (K)  a project template folder (step 3, planned)
 //! │   └── <prefix>-old.txt  (Y)  in the trash (its old parent is Projects)
@@ -39,10 +39,11 @@
 //! hours (card A-1). The pending request of `agent` on it is a placeholder ID until A-2 seeds it
 //! (it keeps the field name).
 //!
-//! Step 3 (planned; docs/STEP3.md, section "Fixtures"): the IDs of the web app W, its deployment,
-//! role grant, domain, API key, approval and trace, the issue I with its receipt token, the
-//! template K and its setup are placeholders until the cards that build their operations seed
-//! them (they keep the field names). The seeded W is made by `member` and has one live
+//! Step 3 (docs/STEP3.md, section "Fixtures"): card W-1 seeds the web app W (made by `member`
+//! through `createApp`), its live deployment (through the store) and both approvals of the
+//! tenant. The IDs of W's role grant, domain, API key, approval and trace, the issue I with its
+//! receipt token, the template K and its setup are placeholders until the cards that build
+//! their operations seed them (they keep the field names). The seeded W has one live
 //! deployment whose manifest declares the roles `member` (default) and `approver`, the entered
 //! secret `STRIPE_KEY` and the generated secret `SESSION_KEY`, an external API `orders` with the
 //! scopes `orders.read` and `orders.write`, and a binding `db` with role `edit` on D. Both tenants
@@ -1162,6 +1163,110 @@ mod seed {
         .await
         {
             t.old = old.value.id;
+        }
+
+        // The web app W `<prefix>-planner`, made by `member` through `createApp` (card W-1),
+        // the platform admin's approval of public apps and custom domains for the tenant, and
+        // W's live deployment through the store (its manifest of docs/STEP3.md "Fixtures").
+        let (s2, c, req) = (
+            s.clone(),
+            member_ctx.clone(),
+            ruum_core::apps::CreateApp {
+                parent_id: t.projects,
+                name: t.app_name.clone(),
+                settings: None,
+                on_conflict: OnConflict::Fail,
+            },
+        );
+        if let Some(w) = step("web app", async move { s2.apps.create(&c, req).await }).await {
+            t.app = w.value.node.id;
+        }
+        let s2 = s.clone();
+        step("app approvals", async move {
+            s2.apps
+                .set_tenant_approval(
+                    tid,
+                    ruum_core::apps::store::ApprovalChange {
+                        public_apps: Some(true),
+                        custom_domains: Some(true),
+                        by: "fixtures@ruum.test".into(),
+                    },
+                )
+                .await
+        })
+        .await;
+        let (s2, c) = (s.clone(), member_ctx.clone());
+        let (app, deployment, database, plan, v1) =
+            (t.app, t.app_deployment, t.database, t.plan, t.v1);
+        if let Some(d) = step("app live deployment", async move {
+            use ruum_core::apps::store::{
+                Archive, DeploymentSource, DeploymentState, Environment, NewDeployment,
+            };
+            let manifest = serde_json::json!({
+                "runtime": "node22",
+                "start": "node server.js",
+                "bindings": { "db": { "node": format!("node:{database}"), "role": "edit" } },
+                "secrets": {
+                    "STRIPE_KEY": { "entered": true },
+                    "SESSION_KEY": { "generate": "random-32-bytes" },
+                },
+                "roles": {
+                    "member": { "description": "Can use the planner", "default": true },
+                    "approver": { "description": "Can approve orders" },
+                },
+                "apis": { "orders": {
+                    "visibility": "external",
+                    "protocol": "http",
+                    "spec": "openapi/orders.yaml",
+                    "scopes": ["orders.read", "orders.write"],
+                    "preview_scopes": ["orders.read"],
+                } },
+            });
+            let check = ruum_core::apps::manifest::validate(
+                &manifest,
+                &ruum_core::apps::plan::AppPlanLimits::of(ruum_core::tenants::Plan::Team),
+            );
+            if !check.valid {
+                return Err(ruum_core::Error::Internal(format!(
+                    "the fixture manifest is not valid: {:?}",
+                    check.problems
+                )));
+            }
+            let archive = format!("{deployment} archive");
+            s2.apps
+                .store()
+                .insert_deployment(
+                    &c,
+                    NewDeployment {
+                        id: deployment,
+                        app_node_id: app,
+                        environment: Environment::Live,
+                        state: DeploymentState::Live,
+                        short_id: ruum_core::apps::slugs::short_id(),
+                        label: Some("first release".into()),
+                        draft: None,
+                        source: DeploymentSource {
+                            kind: "file".into(),
+                            node_id: Some(plan),
+                            version_id: Some(v1),
+                            files: None,
+                        },
+                        archive: Archive {
+                            content_hash: *blake3::hash(archive.as_bytes()).as_bytes(),
+                            size: archive.len() as i64,
+                            chunks: Vec::new(),
+                        },
+                        manifest: Some(manifest),
+                        stages: serde_json::json!([]),
+                        published_from: None,
+                        expires_at: None,
+                    },
+                )
+                .await
+        })
+        .await
+        {
+            t.app_deployment = d.id;
         }
 
         // The tag T, made by the member, on the plan.

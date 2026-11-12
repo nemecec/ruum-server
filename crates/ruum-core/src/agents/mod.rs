@@ -200,6 +200,9 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         // new grant needs the agent's user and a new restore point.
         DatabaseGrantCreated => Some("end the grant"),
         DatabaseGrantRevoked => None,
+        // `app.settings_changed` names the new values only, so there is no old value to set
+        // back (card W-1); an agent can only lower the settings anyway.
+        AppSettingsChanged => None,
     }
 }
 
