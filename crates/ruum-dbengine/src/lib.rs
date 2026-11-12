@@ -80,7 +80,9 @@ pub trait DatabaseEngine: Send + Sync {
     /// value into a column the writer may read (review-Q-2-2 P-1, review-Q-2-3 R-1). The query
     /// layer refuses such writes with an answer; the engine refuses them again in the request's
     /// own transaction, before and after the statement. An engine without a lens shows an agent
-    /// no value at all, so the default is `false`.
+    /// no value at all, so the default is `false`. An engine with a lens ([`Self::has_lens`])
+    /// must answer itself: the conformance case [`conformance::tenant_code`] fails for one that
+    /// keeps the default (review-Q-2-s21-2 N-2).
     async fn tenant_code_on_live(&self, db: &DatabaseRef) -> Result<bool, EngineError> {
         let _ = db;
         Ok(false)

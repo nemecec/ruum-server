@@ -1399,8 +1399,17 @@ fn shape(
                 Some(_) => DataClass::Personal,
                 None => by_item.get(i).copied().unwrap_or(DataClass::Personal),
             };
+            // A plain column of another schema (the system catalogs, `extensions`) is not behind
+            // the lens: its value arrives as the engine read it. It keeps the class `personal`
+            // (the platform has no class for it), but no marker and no `masking` label is put
+            // on it, so a client never takes a raw value for a pseudonym (review-Q-2-s21-2 N-1).
+            let outside = c.source.as_ref().is_some_and(|s| s.schema != own);
             facts.push(postgres_mask::ColumnFacts {
-                class: data_class,
+                class: if outside {
+                    DataClass::Normal
+                } else {
+                    data_class
+                },
                 // Only a column of the database's own schema is behind the lens.
                 has_source: c.source.as_ref().is_some_and(|s| s.schema == own),
             });
@@ -1428,6 +1437,11 @@ fn shape(
     } else {
         let marked = postgres_mask::mark_result(view.lens, &facts, &mut rows);
         for (c, m) in columns.iter_mut().zip(marked) {
+            if c.source.as_ref().is_some_and(|s| s.schema != own) {
+                // Review-Q-2-s21-2 N-1: the class stays, the values are not masked.
+                c.masking = Masking::None;
+                continue;
+            }
             c.data_class = m.class;
             c.masking = match m.masking {
                 None => Masking::None,

@@ -50,7 +50,9 @@
 //! 2. **The statement itself.** The cluster set-up revokes `EXECUTE` on every `VOLATILE` function
 //!    of `pg_catalog` from `PUBLIC`, except the few in [`STATEMENT_VOLATILE`] (they carry no
 //!    state that a secret can reach). Postgres marks a function `IMMUTABLE` or `STABLE` only when
-//!    it cannot write, so the rest cannot be a channel. Postgres checks `EXECUTE` against the
+//!    it cannot write, so the rest cannot be a channel. The readers of a session setting
+//!    ([`SETTING_READERS`]: `current_setting`) are revoked too, and given back only to the kinds
+//!    that see every value: code that wrote a setting cannot hand it to a reader that way. Postgres checks `EXECUTE` against the
 //!    role of the session also for a function that a view calls, and for a function that runs a
 //!    query given as text, so the line holds on every path. The `owner` kind gets the revoked
 //!    functions back ([`crate::postgres::setup::grants_sql`]); the engine refuses a database
@@ -355,6 +357,14 @@ pub(crate) const STATEMENT_VOLATILE: &[&str] = &[
     "pg_terminate_backend",
 ];
 
+/// Built-in functions that are not `VOLATILE` but read a session setting: a custom setting
+/// (`ruum.x`) that code wrote is a value a reader must not get back (review-Q-2-s21-2 R-1 and
+/// suggestion 4; STATUS "Next cards" 0). The cluster set-up revokes them from `PUBLIC` with the
+/// volatile functions; the engine gives them back to the kinds that see every value (`owner`,
+/// `secret_read`) and to `mask`, never to `read`, `write`, `masked_read` or `masked_write`.
+/// The cluster set-up carries the same list; keep both the same.
+pub(crate) const SETTING_READERS: &[&str] = &["current_setting"];
+
 /// [`ROW_FUNCTIONS`] as the owned list that the queries bind.
 pub(crate) fn row_functions() -> Vec<String> {
     ROW_FUNCTIONS.iter().map(|s| (*s).to_string()).collect()
@@ -362,15 +372,28 @@ pub(crate) fn row_functions() -> Vec<String> {
 
 /// The SQL condition, on `pg_catalog.pg_proc p`, of the functions that the cluster set-up revokes
 /// from `PUBLIC` (rule 2): `VOLATILE` functions of `pg_catalog` that are not in
-/// [`STATEMENT_VOLATILE`]. Aggregates, window functions and procedures are left out: none of
-/// them is `VOLATILE` and callable without a statement kind that the rules refuse.
+/// [`STATEMENT_VOLATILE`], and the setting readers ([`SETTING_READERS`]). Aggregates, window
+/// functions and procedures are left out: none of them is `VOLATILE` and callable without a
+/// statement kind that the rules refuse.
 pub(crate) fn revoked_condition() -> String {
     let ok = STATEMENT_VOLATILE.join(",");
+    let readers = SETTING_READERS.join(",");
     format!(
         "p.pronamespace operator(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
          and p.prokind operator(pg_catalog.=) 'f'::pg_catalog.\"char\" \
-         and p.provolatile operator(pg_catalog.=) 'v'::pg_catalog.\"char\" \
-         and p.proname::pg_catalog.text operator(pg_catalog.<>) all ('{{{ok}}}'::pg_catalog.text[])"
+         and ((p.provolatile operator(pg_catalog.=) 'v'::pg_catalog.\"char\" \
+               and p.proname::pg_catalog.text operator(pg_catalog.<>) all ('{{{ok}}}'::pg_catalog.text[])) \
+              or p.proname::pg_catalog.text operator(pg_catalog.=) any ('{{{readers}}}'::pg_catalog.text[]))"
+    )
+}
+
+/// The SQL condition, on `pg_catalog.pg_proc p`, of the setting readers ([`SETTING_READERS`]).
+pub(crate) fn setting_readers_condition() -> String {
+    let readers = SETTING_READERS.join(",");
+    format!(
+        "p.pronamespace operator(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
+         and p.prokind operator(pg_catalog.=) 'f'::pg_catalog.\"char\" \
+         and p.proname::pg_catalog.text operator(pg_catalog.=) any ('{{{readers}}}'::pg_catalog.text[])"
     )
 }
 

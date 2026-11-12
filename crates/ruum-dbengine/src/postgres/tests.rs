@@ -76,6 +76,7 @@ conformance_cases!(
     branch,
     restore_point,
     export,
+    tenant_code,
 );
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

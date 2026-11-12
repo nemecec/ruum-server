@@ -17,7 +17,9 @@
 #   when it cannot write, so what stays cannot carry a value from one expression to another.
 #   What is revoked: set_config, setseed, the advisory lock functions, the large object
 #   functions, pg_notify, the functions that run a query given as text (query_to_xml, ts_stat) and
-#   the like. Postgres checks the right of a function in a view against the reader, so this holds
+#   the like. current_setting (STABLE) is revoked too, so code that wrote a custom setting cannot
+#   hand it to a reader; the engine gives it back to the owner, secret_read and mask kinds.
+#   Postgres checks the right of a function in a view against the reader, so this holds
 #   inside views too. Only a superuser can take a right on a pg_catalog function from PUBLIC. The
 #   engine refuses a database where PUBLIC may still run one.
 set -euo pipefail
@@ -25,10 +27,17 @@ set -euo pipefail
 # The volatile functions: revoked from PUBLIC, given to ruum_dbhost WITH GRANT OPTION. The list
 # of the functions that stay is the one in allow.rs (STATEMENT_VOLATILE).
 KEEP_VOLATILE='{nextval,currval,lastval,gen_random_uuid,uuidv7,clock_timestamp,timeofday,random,pg_sleep,pg_sleep_for,pg_sleep_until,pg_cancel_backend,pg_terminate_backend}'
+# The readers of a session setting (SETTING_READERS in allow.rs): not volatile, but revoked with
+# the volatile functions; the engine gives them back to the owner, secret_read and mask kinds.
+SETTING_READERS='{current_setting}'
 REVOKED_WHERE="p.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace
               AND p.prokind OPERATOR(pg_catalog.=) 'f'::pg_catalog.\"char\"
-              AND p.provolatile OPERATOR(pg_catalog.=) 'v'::pg_catalog.\"char\"
-              AND p.proname::pg_catalog.text OPERATOR(pg_catalog.<>) ALL ('$KEEP_VOLATILE'::pg_catalog.text[])"
+              AND ((p.provolatile OPERATOR(pg_catalog.=) 'v'::pg_catalog.\"char\"
+                    AND p.proname::pg_catalog.text OPERATOR(pg_catalog.<>) ALL ('$KEEP_VOLATILE'::pg_catalog.text[]))
+                   OR p.proname::pg_catalog.text OPERATOR(pg_catalog.=) ANY ('$SETTING_READERS'::pg_catalog.text[]))"
+READERS_WHERE="p.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace
+              AND p.prokind OPERATOR(pg_catalog.=) 'f'::pg_catalog.\"char\"
+              AND p.proname::pg_catalog.text OPERATOR(pg_catalog.=) ANY ('$SETTING_READERS'::pg_catalog.text[])"
 REVOKE_SQL=$(cat <<SQL
 DO \$volatile\$
 DECLARE f pg_catalog.text;
@@ -52,6 +61,15 @@ BEGIN
     FOR r IN SELECT m.role_name FROM ruum_meta.roles m
               JOIN pg_catalog.pg_roles g ON g.rolname OPERATOR(pg_catalog.=) m.role_name
              WHERE m.kind OPERATOR(pg_catalog.=) 'owner' LOOP
+      EXECUTE 'SET LOCAL ROLE ruum_dbhost';
+      EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s TO %I', f, r);
+      EXECUTE 'RESET ROLE';
+    END LOOP;
+    SELECT pg_catalog.string_agg(p.oid::pg_catalog.regprocedure::pg_catalog.text, ', ') INTO f
+      FROM pg_catalog.pg_proc p WHERE $READERS_WHERE;
+    FOR r IN SELECT m.role_name FROM ruum_meta.roles m
+              JOIN pg_catalog.pg_roles g ON g.rolname OPERATOR(pg_catalog.=) m.role_name
+             WHERE m.kind OPERATOR(pg_catalog.=) ANY ('{secret_read,mask}'::pg_catalog.text[]) LOOP
       EXECUTE 'SET LOCAL ROLE ruum_dbhost';
       EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s TO %I', f, r);
       EXECUTE 'RESET ROLE';
