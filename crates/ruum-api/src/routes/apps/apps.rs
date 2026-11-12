@@ -134,8 +134,8 @@ pub struct WaitQuery {
 }
 
 /// One deployment. `GET /v1/apps/{node_id}/deployments/{deployment_id}` (operationId
-/// `getAppDeployment`). `wait` holds the answer up to that many seconds (at most 30; a larger
-/// value is capped) until the state changes.
+/// `getAppDeployment`). `wait` holds the answer up to that many seconds (0 to 30, else `422`;
+/// the service caps the hold at 30 s too) until the state changes.
 pub async fn get_app_deployment(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
@@ -150,8 +150,11 @@ pub async fn get_app_deployment(
     })?;
     let wait = match q.wait {
         None => Duration::ZERO,
-        Some(w) if w < 0 => return Err(invalid("wait is 0 to 30 seconds", "wait").into()),
-        Some(w) => Duration::from_secs(w as u64).min(MAX_WAIT),
+        // `Wait` is 0 to 30 in the contract: a value outside is a bad parameter (422).
+        Some(w) if !(0..=MAX_WAIT.as_secs() as i64).contains(&w) => {
+            return Err(invalid("wait is 0 to 30 seconds", "wait").into());
+        }
+        Some(w) => Duration::from_secs(w as u64),
     };
     let d = state
         .services
