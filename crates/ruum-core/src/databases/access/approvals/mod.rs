@@ -33,7 +33,8 @@
 //! as raw values and never as pseudonyms. `statement_hash` binds the exact statement and its
 //! parameters with a keyed hash (BLAKE3, a key derived from the tenant key), so the agent sends
 //! the values again and nothing of them is stored. Every approval has a `review_url` with IDs
-//! only (C-16).
+//! only (C-16). The `up` of a migration is shown as sent only to a person with `manage` on the
+//! database; everyone else reads it normalized ([`shown_statement`], decision 0004-40).
 
 pub mod memory;
 pub mod postgres;
@@ -246,8 +247,8 @@ pub struct DatabaseApproval {
     /// `expired` without a write.
     pub status: ApprovalStatus,
     pub migration_name: Option<String>,
-    /// The normalized statement (no literals), or the migration's `up`; `None` for a grant
-    /// request.
+    /// The normalized statement (no literals), or the migration's `up` as sent; `None` for a
+    /// grant request. Responses show a migration's `up` through [`shown_statement`] only.
     pub statement: Option<String>,
     pub planned_columns: Vec<PlannedColumn>,
     pub grant_kind: Option<GrantKind>,
@@ -967,6 +968,35 @@ fn person_may_decide(a: &DatabaseApproval, user: UserId, role: Option<Role>) -> 
     decider && role >= a.needed_role()
 }
 
+/// Whether `ctx` reads the `up` of a migration approval as sent (decision 0004-40 a): a person
+/// (a user actor, not an agent) whose role on the approval's database is `manage` or higher.
+fn reads_full_up(ctx: &Context, role: Option<Role>) -> bool {
+    ctx.actor.is_user() && role.is_some_and(|r| r >= Role::Manage)
+}
+
+/// The `statement` of `a` as a reader may see it (decision 0004-40). Every response of an
+/// approval goes through here: `getDatabaseApproval`, `listDatabaseApprovals`,
+/// `listPendingDatabaseApprovals` and the response of `decideDatabaseApproval`.
+///
+/// For a migration, `full` (see [`reads_full_up`]) keeps the `up` as stored. Every other
+/// reader (people without `manage`, every agent, also the one that asked) gets the `up`
+/// normalized by the query layer's normalizer: every literal becomes `$L1`, `$L2`, ... and
+/// every comment is removed. Fail closed: a text that does not parse, or an unknown engine,
+/// gives [`UNPARSED`], never the raw `up`. A statement approval already stores the normalized
+/// text, and a grant request has no statement, so both stay as they are. The store keeps the
+/// `up` as sent (0004-40 d).
+pub(crate) fn shown_statement(a: &mut DatabaseApproval, engine: Option<EngineKind>, full: bool) {
+    if a.subject != ApprovalSubject::Migration || full {
+        return;
+    }
+    if let Some(up) = a.statement.as_mut() {
+        *up = match engine {
+            Some(engine) => rules::analyze(engine, up).normalized,
+            None => UNPARSED.to_string(),
+        };
+    }
+}
+
 impl DatabaseService {
     /// `requestDatabaseAccessGrant`: agents only (`403 permission_denied` for a person, `403
     /// user_required` for a share link), `view` on the database (else `404`), the limits of
@@ -1065,6 +1095,14 @@ impl DatabaseService {
             .is_some_and(|c| c.chars().count() > TEXT_MAX_CHARS)
         {
             return Err(validation("comment has at most 500 characters", "/comment"));
+        }
+        // The contract says `minItems: 1`: a decision without classes leaves `classes` out
+        // (decision 0004-40 i).
+        if req.classes.as_ref().is_some_and(Vec::is_empty) {
+            return Err(validation(
+                "classes needs at least one entry; leave it out for no classes",
+                "/classes",
+            ));
         }
         let classes = req.classes.unwrap_or_default();
         if classes.len() > CLASSES_MAX {
@@ -1198,6 +1236,8 @@ impl DatabaseService {
             .await?;
         self.fill_approval_names(ctx.tenant, std::slice::from_mut(&mut w.value))
             .await;
+        let engine = self.engine_of(ctx.tenant, node).await;
+        shown_statement(&mut w.value, engine, reads_full_up(ctx, role));
         Ok(w)
     }
 
@@ -1224,6 +1264,8 @@ impl DatabaseService {
         };
         let now = crate::now();
         let mut roles: HashMap<NodeId, Option<Role>> = HashMap::new();
+        // The engine per database, for the `up` of a migration (decision 0004-40).
+        let mut engines: HashMap<NodeId, Option<EngineKind>> = HashMap::new();
         let mut out: Vec<DatabaseApproval> = Vec::new();
         let mut cursor = page.cursor.clone();
         loop {
@@ -1239,7 +1281,7 @@ impl DatabaseService {
                     now,
                 )
                 .await?;
-            for a in batch.items {
+            for mut a in batch.items {
                 let role = match roles.get(&a.node_id) {
                     Some(r) => *r,
                     None => {
@@ -1263,6 +1305,17 @@ impl DatabaseService {
                         items: out,
                         next_cursor: next,
                     });
+                }
+                if a.subject == ApprovalSubject::Migration {
+                    let engine = match engines.get(&a.node_id) {
+                        Some(e) => *e,
+                        None => {
+                            let e = self.engine_of(ctx.tenant, a.node_id).await;
+                            engines.insert(a.node_id, e);
+                            e
+                        }
+                    };
+                    shown_statement(&mut a, engine, reads_full_up(ctx, role));
                 }
                 out.push(a);
             }
@@ -1300,6 +1353,7 @@ impl DatabaseService {
             .list(ctx.tenant, filter, page, crate::now())
             .await?;
         self.fill_approval_names(ctx.tenant, &mut p.items).await;
+        self.show_statements(ctx, node, &mut p.items).await?;
         Ok(p)
     }
 
@@ -1323,6 +1377,8 @@ impl DatabaseService {
             .ok_or_else(approval_not_found)?;
         self.fill_approval_names(ctx.tenant, std::slice::from_mut(&mut a))
             .await;
+        self.show_statements(ctx, node, std::slice::from_mut(&mut a))
+            .await?;
         Ok(a)
     }
 
@@ -1449,7 +1505,14 @@ impl DatabaseService {
             reasons: vec![ApprovalReason::Migration],
             estimated_rows: None,
         };
-        self.deps().approvals.request(ctx, new, crate::now()).await
+        let (mut a, created) = self
+            .deps()
+            .approvals
+            .request(ctx, new, crate::now())
+            .await?;
+        // The caller is an agent: it reads the normalized `up` (decision 0004-40 b).
+        shown_statement(&mut a, Some(db.engine), false);
+        Ok((a, created))
     }
 
     /// For D-2: uses the approval of the migration `name` with `up` once, with the rules of
@@ -1514,6 +1577,45 @@ impl DatabaseService {
                     "the database could not record a restore point; try again",
                 )
             })
+    }
+
+    /// The engine of a database, or `None` when its row is not found.
+    async fn engine_of(&self, tenant: TenantId, node: NodeId) -> Option<EngineKind> {
+        match self.deps().store.get(tenant, node).await {
+            Ok(row) => row.map(|r| r.engine),
+            Err(e) => {
+                tracing::warn!(%tenant, %node, error = %e, "approvals: the database row failed");
+                None
+            }
+        }
+    }
+
+    /// The `statement` of each approval of one database as `ctx` may read it (decision
+    /// 0004-40): one `manage` check and one engine lookup per call, only when a migration is
+    /// among `items`.
+    async fn show_statements(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        items: &mut [DatabaseApproval],
+    ) -> Result<()> {
+        if !items
+            .iter()
+            .any(|a| a.subject == ApprovalSubject::Migration)
+        {
+            return Ok(());
+        }
+        let full = if ctx.actor.is_user() {
+            let d = self.deps();
+            reads_full_up(ctx, authz::role_on(&*d.authz, &*d.nodes, ctx, node).await?)
+        } else {
+            false
+        };
+        let engine = self.engine_of(ctx.tenant, node).await;
+        for a in items {
+            shown_statement(a, engine, full);
+        }
+        Ok(())
     }
 
     /// The caller's role on a database node it can see, else `None` (a node it cannot see, in

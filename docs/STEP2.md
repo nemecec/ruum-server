@@ -1087,7 +1087,10 @@ Done when:   DROP, TRUNCATE, DELETE/UPDATE without WHERE from an agent never run
              lists what the caller may decide (agents: their own) and leaves out databases the
              caller cannot see; two racing grant requests of one agent for one database and kind
              make one row (a row lock until 0004 gets the partial unique index, decision
-             0004-35).
+             0004-35); a pending approval expires after 24 hours and an approved one 15 minutes
+             after the decision if unused (an approved grant request is final); an agent's
+             `data_classes` in a migration are stored as suggestions, and only a person with
+             `manage` confirms classes in a decision (0004-40 h).
 Precondition: the sqlparser dependency is approved (open question 9).
 After:       Q-1, A-1, K-1, C-2
 ```
