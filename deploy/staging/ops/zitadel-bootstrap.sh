@@ -3,9 +3,12 @@
 # kubeconfig. It talks to Zitadel through `kubectl port-forward` (in-cluster), with the machine
 # user's PAT from the Secret auth/iam-admin-pat; the PAT never leaves this process.
 #
-#   zitadel-bootstrap.sh apply   login policy, OIDC app (client ID -> ruum/ruum-oidc), Google, Microsoft
+#   zitadel-bootstrap.sh apply   login policy, OIDC app, Google, Microsoft; writes the Secret
+#                                ruum/ruum-oidc: client-id, idp-google, idp-microsoft (the IdP IDs
+#                                for the sign-in hint, RUUM_OIDC_IDP_*)
 #   zitadel-bootstrap.sh check   report drift: password login, registration, auto linking,
-#                                Microsoft email trust, human users, the PAT's expiry
+#                                Microsoft email trust, IdP IDs in ruum/ruum-oidc, human users,
+#                                the PAT's expiry
 #
 # The Google and Microsoft keys come in the environment (steps.sh reads them from stdin) and go
 # to curl on stdin; they are never printed or stored outside Zitadel's database.
@@ -50,7 +53,10 @@ idp_id() {
     zapi POST /admin/v1/idps/templates/_search | jq -r '.result[0]?.id // empty'
 }
 
-upsert_idp() { # KIND NAME BODY
+# upsert_idp KIND NAME BODY: finds the provider by name or adds it, and puts it in the login
+# policy. Sets IDP_ID (a global, so that `set -e` still stops the script on an error inside).
+IDP_ID=
+upsert_idp() {
   local kind="$1" name="$2" body="$3" id
   id="$(idp_id "$name")"
   if [[ -z "$id" ]]; then
@@ -63,6 +69,13 @@ upsert_idp() { # KIND NAME BODY
   if ! echo '{}' | zapi POST /admin/v1/policies/login/idps/_search | jq -e --arg id "$id" '.result // [] | any(.idpId == $id)' >/dev/null; then
     jq -n --arg id "$id" '{idpId: $id}' | zapi POST /admin/v1/policies/login/idps >/dev/null
   fi
+  [[ "$id" =~ ^[0-9]{1,32}$ ]] || die "the provider $name has no valid ID"
+  IDP_ID="$id"
+}
+
+# The IdP ID of a key of ruum/ruum-oidc (empty when the Secret or the key is missing).
+oidc_key() {
+  kubectl -n ruum get secret ruum-oidc -o "jsonpath={.data.$1}" 2>/dev/null | base64 -d || true
 }
 
 apply() {
@@ -82,7 +95,7 @@ apply() {
   project="$(echo '{"queries":[{"nameQuery":{"name":"Ruum","method":"TEXT_QUERY_METHOD_EQUALS"}}]}' |
     zapi POST /management/v1/projects/_search | jq -r '.result[0].id // empty')"
   [[ -n "$project" ]] || project="$(echo '{"name":"Ruum","projectRoleAssertion":true}' | zapi POST /management/v1/projects | jq -r .id)"
-  client="$(kubectl -n ruum get secret ruum-oidc -o jsonpath='{.data.client-id}' 2>/dev/null | base64 -d || true)"
+  client="$(oidc_key client-id)"
   if [[ -z "$client" ]]; then
     app="$(jq -n --arg pub "$PUBLIC" '{
         name: "ruum-web",
@@ -105,15 +118,25 @@ apply() {
 
   [[ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" && -n "${GOOGLE_OAUTH_CLIENT_SECRET:-}" ]] || die "Google keys are missing"
   [[ -n "${MS_OAUTH_CLIENT_ID:-}" && -n "${MS_OAUTH_CLIENT_SECRET:-}" ]] || die "Microsoft keys are missing"
+  local google microsoft
   upsert_idp google Google "$(CLIENT_ID="$GOOGLE_OAUTH_CLIENT_ID" CLIENT_SECRET="$GOOGLE_OAUTH_CLIENT_SECRET" \
     jq -n --argjson opts "$OPTIONS" '{name: "Google", clientId: env.CLIENT_ID, clientSecret: env.CLIENT_SECRET,
       scopes: ["openid", "email", "profile"], providerOptions: $opts}')"
+  google="$IDP_ID"
   # Microsoft `common`: the email of a work account is set by its tenant admin and nobody checks
   # it (nOAuth), so Zitadel must not trust it (emailVerified false, review 2 section 7).
   upsert_idp azure Microsoft "$(CLIENT_ID="$MS_OAUTH_CLIENT_ID" CLIENT_SECRET="$MS_OAUTH_CLIENT_SECRET" \
     jq -n --argjson opts "$OPTIONS" '{name: "Microsoft", clientId: env.CLIENT_ID, clientSecret: env.CLIENT_SECRET,
       tenant: {tenantType: "AZURE_AD_TENANT_TYPE_COMMON"}, emailVerified: false,
       scopes: ["openid", "email", "profile", "User.Read"], providerOptions: $opts}')"
+  microsoft="$IDP_ID"
+  # The IdP IDs let ruum-server send /v1/auth/login?idp=google|microsoft straight to the provider
+  # (the Zitadel scope urn:zitadel:iam:org:idp:id:<id>). The chart requires both keys. On a re-run
+  # the providers are found by name, so the IDs stay the same.
+  printf 'client-id=%s\nidp-google=%s\nidp-microsoft=%s\n' "$client" "$google" "$microsoft" |
+    kubectl create secret generic ruum-oidc -n ruum --from-env-file=/dev/stdin --dry-run=client -o yaml |
+    kubectl apply -f - >/dev/null
+  log "IdP IDs of Google and Microsoft in ruum/ruum-oidc (restart ruum-server to read new ones)"
   check
 }
 
@@ -129,6 +152,15 @@ check() {
       if [[ "$name" == Microsoft && "$verified" == true ]]; then echo "DRIFT: Microsoft emails are trusted as verified"; exit 1; fi
       echo "provider $name: no automatic linking${verified:+, email verified=$verified}"
     done || drift=1
+  local name key want have
+  for name in Google Microsoft; do
+    key="idp-$(tr '[:upper:]' '[:lower:]' <<<"$name")"
+    want="$(idp_id "$name")"
+    have="$(oidc_key "$key")"
+    if [[ -z "$want" ]]; then echo "DRIFT: no provider $name"; drift=1
+    elif [[ "$have" != "$want" ]]; then echo "DRIFT: ruum/ruum-oidc $key is not the ID of the provider $name"; drift=1
+    else echo "provider $name: its ID is in ruum/ruum-oidc $key"; fi
+  done
   humans="$(echo '{"queries":[{"typeQuery":{"type":"TYPE_HUMAN"}}]}' | zapi POST /management/v1/users/_search | jq '.result // [] | length')"
   echo "human users: $humans (before the person's test this must be 0; after it, only users that the providers created)"
   echo "machine PAT expiry: $(kubectl -n "$NS" get secret iam-admin-pat -o jsonpath='{.metadata.creationTimestamp}') + 90 days (record it in the digest)"

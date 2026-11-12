@@ -58,6 +58,12 @@ spec:
             - { name: RUUM_OIDC_ISSUER, value: "https://{{ .Values.hosts.auth }}" }
             - name: RUUM_OIDC_CLIENT_ID
               valueFrom: { secretKeyRef: { name: ruum-oidc, key: client-id } }
+            # The Zitadel IdP IDs for /v1/auth/login?idp=google|microsoft (zitadel-bootstrap.sh
+            # writes them). Not optional: without them the sign-in stops at Zitadel's choice page.
+            - name: RUUM_OIDC_IDP_GOOGLE
+              valueFrom: { secretKeyRef: { name: ruum-oidc, key: idp-google } }
+            - name: RUUM_OIDC_IDP_MICROSOFT
+              valueFrom: { secretKeyRef: { name: ruum-oidc, key: idp-microsoft } }
             - { name: RUUM_MIGRATE, value: "true" }
             - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
             # The server talks to SpiceDB's HTTP gateway, not gRPC (ruum_core::authz::spicedb).

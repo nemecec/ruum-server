@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pool) = &sweep_pool {
         tokio::spawn(ruum_core::identity::sweep::run(pool.clone(), SWEEP_EVERY));
         // The mail outbox worker: share and invitation emails (decision 0003-3).
-        let settings = ruum_core::identity::setup::IdentitySettings::from_env(&config.public_url);
+        let settings = ruum_core::identity::setup::IdentitySettings::from_env(&config.public_url)?;
         let mailer = ruum_core::identity::setup::mailer(&settings)?;
         tokio::spawn(ruum_core::mailing::outbox::run_worker(
             pool.clone(),

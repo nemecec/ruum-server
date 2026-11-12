@@ -167,7 +167,7 @@ check the files).
 | `auth/zitadel-masterkey`, `auth/zitadel-db` | master key, DSN | Zitadel |
 | `authz/spicedb` | preshared key, DSN | SpiceDB |
 | `ruum/ruum-server-env` | DSN, Hetzner S3 key, SpiceDB key, token and content keys, allow-list | ruum-server |
-| `ruum/ruum-oidc` | OIDC client ID (made by `ops/zitadel-bootstrap.sh`) | ruum-server |
+| `ruum/ruum-oidc` | OIDC client ID (`client-id`) and the Zitadel IdP IDs of Google and Microsoft (`idp-google`, `idp-microsoft`, for `RUUM_OIDC_IDP_*`), made by `ops/zitadel-bootstrap.sh` | ruum-server |
 | `ops/blob-copy` | Hetzner S3 key, backup writer key, rclone crypt password and salt | the nightly copy |
 | `nats/nats-auth` | the ruum user's password | NATS |
 
@@ -217,7 +217,8 @@ cluster; run it in the first week with one node cordoned. If it does not fit, se
 
 ## Recreate
 
-A recreate makes a new Zitadel instance: new OIDC client ID, no users. The person repeats the
+A recreate makes a new Zitadel instance: new OIDC client ID and IdP IDs (the bootstrap writes them to
+`ruum/ruum-oidc`), no users. The person repeats the
 sign-in test. Postgres starts a new backup path (`pg-<generation>`, a tofu output), so the kept
 backup bucket never blocks archiving; `--restore-from` reads an older path.
 

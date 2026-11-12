@@ -45,7 +45,7 @@ use std::time::Duration;
 const OUTBOX_EVERY: Duration = Duration::from_secs(5);
 
 pub async fn services(public_url: &str, pool: Option<sqlx::PgPool>) -> anyhow::Result<Services> {
-    services_with(pool, &IdentitySettings::from_env(public_url)).await
+    services_with(pool, &IdentitySettings::from_env(public_url)?).await
 }
 
 /// [`services`] with explicit identity settings (tests run two servers with one token key).

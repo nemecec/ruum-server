@@ -196,6 +196,18 @@ pub struct OidcSettings {
     pub client_secret: Option<String>,
     pub redirect_uri: String,
     pub scopes: Vec<String>,
+    /// The Zitadel IdP ID for a sign-in hint (`google`, `microsoft`). With an ID for the hint,
+    /// the authorization request asks Zitadel to go straight to that provider; without one,
+    /// Zitadel shows its own choice of providers. Each ID is checked with [`zitadel_idp_id`].
+    #[serde(default)]
+    pub idp_ids: std::collections::BTreeMap<String, String>,
+}
+
+/// Checks a Zitadel resource ID (for example an IdP ID): 1 to 32 ASCII digits. The ID goes into
+/// a scope of the authorization request, so nothing else may pass.
+pub fn zitadel_idp_id(id: &str) -> Option<&str> {
+    let id = id.trim();
+    (!id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
 }
 
 /// The start of a login: where to send the browser, and the state to keep until the callback.

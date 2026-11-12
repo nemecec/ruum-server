@@ -510,6 +510,17 @@ if has helm; then
   expect 1 "server-env.sh refuses a test-only setting in the chart" bash "$se" "$TMP/ruum-drift.yaml"
   sed 's/RUUM_SPICEDB_PRESHARED_KEY=/RUUM_SPICEDB_KEY=/' "$STG/k8s/apply.sh" >"$TMP/apply-drift.sh"
   expect 1 "server-env.sh refuses an unknown key in ruum-server-env" bash "$se" "$TMP/ruum.yaml" "$TMP/apply-drift.sh"
+  # The sign-in hint: the IdP IDs come from ruum/ruum-oidc, required (never optional), and the
+  # bootstrap writes exactly those keys.
+  for k in google microsoft; do
+    n="RUUM_OIDC_IDP_$(tr '[:lower:]' '[:upper:]' <<<"$k")"
+    if grep -A1 -E "name: $n\$" "$TMP/ruum.yaml" | grep -qE "secretKeyRef: \{ name: ruum-oidc, key: idp-$k \}"; then
+      ok "charts/ruum takes $n from ruum-oidc idp-$k"
+    else bad "charts/ruum does not take $n from ruum-oidc idp-$k"; fi
+    grep -qF "idp-$k=%s" "$STG/ops/zitadel-bootstrap.sh" &&
+      ok "zitadel-bootstrap.sh writes idp-$k to ruum-oidc" || bad "zitadel-bootstrap.sh does not write idp-$k to ruum-oidc"
+  done
+  grep -E 'ruum-oidc' "$TMP/ruum.yaml" | grep -q 'optional' && bad "charts/ruum reads ruum-oidc as optional" || ok "charts/ruum requires every key of ruum-oidc"
   mkdir -p "$TMP/crates/ruum-core/src"
   { grep -vE '^[[:space:]]*(#|$)' "$ROOT/crates/ruum-server/env-names.txt" | cut -d' ' -f1; echo RUUM_NEW_SETTING; } |
     sed 's/.*/"&"/' >"$TMP/crates/ruum-core/src/lib.rs"

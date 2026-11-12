@@ -9,6 +9,7 @@
 //! | `RUUM_TOKEN_SIGNING_KEY` | The Ed25519 seed (32 bytes, base64url) of the token key. Without it the server makes a new key at start, so tokens end at a restart. |
 //! | `RUUM_OIDC_ISSUER`, `RUUM_OIDC_CLIENT_ID`, `RUUM_OIDC_CLIENT_SECRET` | The OIDC client (Zitadel). Without issuer and client ID, sign-in uses the fake provider of the in-memory services. |
 //! | `RUUM_OIDC_REDIRECT_URI` | The callback; default `<RUUM_PUBLIC_URL>/v1/auth/callback`. |
+//! | `RUUM_OIDC_IDP_GOOGLE`, `RUUM_OIDC_IDP_MICROSOFT` | The Zitadel IdP ID (digits) of Google and Microsoft. With it, `/v1/auth/login?idp=google` (or `microsoft`) goes straight to that provider; without it, Zitadel shows its choice. A value that is not an ID stops the server at start. |
 //! | `SMTP_URL` | `smtp://host:port` of the mail relay (Mailpit on the laptop). Without it mails stay in memory. |
 //! | `RUUM_MAIL_FROM` | The sender address; default `no-reply@<host of RUUM_PUBLIC_URL>`. |
 //! | `RUUM_PLAN_LIMITS` | The plan table as JSON (`tenants::PlanTable`); default the numbers of design section 4.3. Each plan may hold `databases` (C-21): `{"postgres": {"count": 1, "size_bytes": 262144000}, "sqlite": {...}, "branches": null}`, where `null` is no limit; `count` and `branches` are per member on `team`. A plan without `databases` keeps the defaults of section 4.3. |
@@ -16,7 +17,7 @@
 use super::memory::MemoryOidcClient;
 use super::oidc::HttpOidcClient;
 use super::postgres::{PgArea, PgIdempotencyStore, PgIdentityStore};
-use super::{JwtTokenIssuer, OidcSettings, TokenIssuer};
+use super::{JwtTokenIssuer, OidcSettings, TokenIssuer, zitadel_idp_id};
 use crate::agents::postgres::{PgAgentStore, PgOAuthServer};
 use crate::error::{Error, Result};
 use crate::services::Services;
@@ -24,6 +25,29 @@ use crate::tenants::mail::{Mailer, MemoryMailer, SmtpMailer};
 use crate::tenants::postgres::PgTenantStore;
 use crate::tenants::{PlanTable, configure_plans};
 use std::sync::Arc;
+
+/// The sign-in hints that can name a Zitadel IdP, with the setting that holds its ID.
+pub const IDP_HINT_SETTINGS: &[(&str, &str)] = &[
+    ("google", "RUUM_OIDC_IDP_GOOGLE"),
+    ("microsoft", "RUUM_OIDC_IDP_MICROSOFT"),
+];
+
+/// Reads the IdP IDs of [`IDP_HINT_SETTINGS`] with `get`. A value that is not a Zitadel ID is an
+/// error.
+fn idp_ids(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut ids = std::collections::BTreeMap::new();
+    for (hint, name) in IDP_HINT_SETTINGS {
+        if let Some(v) = get(name) {
+            let id = zitadel_idp_id(&v).ok_or_else(|| {
+                Error::Internal(format!("{name} must be a Zitadel IdP ID (digits only)"))
+            })?;
+            ids.insert((*hint).to_string(), id.to_string());
+        }
+    }
+    Ok(ids)
+}
 
 /// The settings of the area.
 #[derive(Clone, Debug, Default)]
@@ -42,8 +66,9 @@ fn var(name: &str) -> Option<String> {
 }
 
 impl IdentitySettings {
-    /// Reads the settings of the table above. `public_url` is `RUUM_PUBLIC_URL`.
-    pub fn from_env(public_url: &str) -> Self {
+    /// Reads the settings of the table above. `public_url` is `RUUM_PUBLIC_URL`. An IdP ID that
+    /// is not valid is an error.
+    pub fn from_env(public_url: &str) -> Result<Self> {
         let public_url = public_url.trim_end_matches('/').to_string();
         let oidc = match (var("RUUM_OIDC_ISSUER"), var("RUUM_OIDC_CLIENT_ID")) {
             (Some(issuer), Some(client_id)) => Some(OidcSettings {
@@ -53,17 +78,18 @@ impl IdentitySettings {
                 redirect_uri: var("RUUM_OIDC_REDIRECT_URI")
                     .unwrap_or_else(|| format!("{public_url}/v1/auth/callback")),
                 scopes: vec!["openid".into(), "email".into(), "profile".into()],
+                idp_ids: idp_ids(var)?,
             }),
             _ => None,
         };
-        Self {
+        Ok(Self {
             public_url,
             token_signing_key: var("RUUM_TOKEN_SIGNING_KEY"),
             oidc,
             smtp_url: var("SMTP_URL"),
             mail_from: var("RUUM_MAIL_FROM"),
             plan_limits: var("RUUM_PLAN_LIMITS"),
-        }
+        })
     }
 }
 
@@ -145,4 +171,48 @@ pub fn install(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn idp_ids_are_read_per_hint() {
+        let ids = idp_ids(get(&[
+            ("RUUM_OIDC_IDP_GOOGLE", "312345678901234567"),
+            ("RUUM_OIDC_IDP_MICROSOFT", " 312345678901234568 "),
+        ]))
+        .unwrap();
+        assert_eq!(ids["google"], "312345678901234567");
+        assert_eq!(ids["microsoft"], "312345678901234568");
+        let only = idp_ids(get(&[("RUUM_OIDC_IDP_GOOGLE", "1")])).unwrap();
+        assert_eq!(only.len(), 1);
+        assert!(idp_ids(get(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_idp_id_that_is_not_digits_stops_the_start() {
+        for bad in ["abc", "123 openid", "12%2034", "1-2", "\u{0661}"] {
+            let e = idp_ids(get(&[("RUUM_OIDC_IDP_MICROSOFT", bad)])).unwrap_err();
+            assert!(
+                e.to_string().contains("RUUM_OIDC_IDP_MICROSOFT"),
+                "{bad}: {e}"
+            );
+        }
+        assert!(idp_ids(get(&[("RUUM_OIDC_IDP_GOOGLE", &"9".repeat(33))])).is_err());
+    }
 }

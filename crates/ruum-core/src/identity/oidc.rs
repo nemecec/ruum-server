@@ -8,9 +8,13 @@
 //! `https://ruum.localhost/v1/auth/callback`. A confidential client sends its secret
 //! (`RUUM_OIDC_CLIENT_SECRET`) with HTTP Basic at the token endpoint.
 //!
-//! The `idp` hint (Google, Microsoft, passkey) is not sent yet: Zitadel shows its own choice of
-//! providers on its login page. When the providers are set up in Zitadel, the hint becomes the
-//! scope `urn:zitadel:iam:org:idp:id:<id>`.
+//! The `idp` hint `google` or `microsoft` becomes the reserved Zitadel scope
+//! `urn:zitadel:iam:org:idp:id:<id>` when the settings hold an IdP ID for it
+//! (`RUUM_OIDC_IDP_GOOGLE`, `RUUM_OIDC_IDP_MICROSOFT`): Zitadel then sends the browser straight to
+//! that provider (<https://zitadel.com/docs/apis/openidoauth/scopes>, "Reserved Scopes"). The
+//! providers of staging are instance providers in the default login policy
+//! (`deploy/staging/ops/zitadel-bootstrap.sh`), so no organization scope is needed. Without an ID,
+//! and for `passkey`, Zitadel shows its own choice on its login page.
 
 use super::{LoginStart, OidcClient, OidcSettings, VerifiedLogin, secret, unauthenticated};
 use crate::error::{Error, Result};
@@ -217,12 +221,31 @@ fn unavailable(m: &str) -> Error {
     )
 }
 
+/// The `scope` of the authorization request: the configured scopes (default
+/// `openid email profile`), and the Zitadel IdP scope when `idp_hint` has a configured IdP ID.
+/// The ID is checked again here, so a bad setting never reaches the URL.
+fn login_scopes(settings: &OidcSettings, idp_hint: Option<&str>) -> String {
+    let mut scopes = if settings.scopes.is_empty() {
+        "openid email profile".to_string()
+    } else {
+        settings.scopes.join(" ")
+    };
+    if let Some(id) = idp_hint
+        .and_then(|h| settings.idp_ids.get(h))
+        .and_then(|id| super::zitadel_idp_id(id))
+    {
+        scopes.push_str(" urn:zitadel:iam:org:idp:id:");
+        scopes.push_str(id);
+    }
+    scopes
+}
+
 #[async_trait]
 impl OidcClient for HttpOidcClient {
     async fn start_login(
         &self,
         return_to: Option<String>,
-        _idp_hint: Option<String>,
+        idp_hint: Option<String>,
     ) -> Result<LoginStart> {
         let d = self.discovery().await?;
         let state = secret::random_secret("");
@@ -230,11 +253,7 @@ impl OidcClient for HttpOidcClient {
         let pkce_verifier = secret::random_secret("");
         let mut url = url::Url::parse(&d.authorization_endpoint)
             .map_err(|e| Error::Internal(format!("authorization endpoint: {e}")))?;
-        let scopes = if self.settings.scopes.is_empty() {
-            "openid email profile".to_string()
-        } else {
-            self.settings.scopes.join(" ")
-        };
+        let scopes = login_scopes(&self.settings, idp_hint.as_deref());
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.settings.client_id)
@@ -366,5 +385,104 @@ mod algorithm_tests {
         let two = set(serde_json::json!([rsa_key("a", None), rsa_key("b", None)]));
         assert!(pick_key(&two, None, Algorithm::RS256).is_none());
         assert!(pick_key(&two, Some("b"), Algorithm::PS256).is_some());
+    }
+}
+
+#[cfg(test)]
+mod login_url_tests {
+    use super::*;
+
+    const GOOGLE: &str = "312345678901234567";
+    const MICROSOFT: &str = "312345678901234568";
+
+    fn settings(ids: &[(&str, &str)]) -> OidcSettings {
+        OidcSettings {
+            issuer: "https://auth.example".into(),
+            client_id: "ruum-web".into(),
+            client_secret: None,
+            redirect_uri: "https://ruum.example/v1/auth/callback".into(),
+            scopes: vec!["openid".into(), "email".into(), "profile".into()],
+            idp_ids: ids
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Starts a login against a stub discovery document and returns the `scope` parameter of the
+    /// authorization URL, with the URL's checked host and path.
+    async fn scope_of(s: OidcSettings, hint: Option<&str>) -> String {
+        let client = HttpOidcClient::new(s, None).unwrap();
+        client
+            .discovery
+            .set(Discovery {
+                issuer: "https://auth.example".into(),
+                authorization_endpoint: "https://auth.example/oauth/v2/authorize".into(),
+                token_endpoint: "https://auth.example/oauth/v2/token".into(),
+                jwks_uri: "https://auth.example/oauth/v2/keys".into(),
+                end_session_endpoint: None,
+                id_token_signing_alg_values_supported: vec![],
+            })
+            .unwrap();
+        let start = client
+            .start_login(None, hint.map(str::to_string))
+            .await
+            .unwrap();
+        let url = url::Url::parse(&start.authorize_url).unwrap();
+        assert_eq!(url.host_str(), Some("auth.example"));
+        assert_eq!(url.path(), "/oauth/v2/authorize");
+        let scopes: Vec<String> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(scopes.len(), 1, "one scope parameter");
+        scopes.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_configured_hint_adds_the_zitadel_idp_scope() {
+        let both = settings(&[("google", GOOGLE), ("microsoft", MICROSOFT)]);
+        assert_eq!(
+            scope_of(both.clone(), Some("google")).await,
+            format!("openid email profile urn:zitadel:iam:org:idp:id:{GOOGLE}")
+        );
+        assert_eq!(
+            scope_of(both, Some("microsoft")).await,
+            format!("openid email profile urn:zitadel:iam:org:idp:id:{MICROSOFT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_id_zitadel_shows_its_choice() {
+        let google_only = settings(&[("google", GOOGLE)]);
+        assert_eq!(
+            scope_of(google_only.clone(), Some("microsoft")).await,
+            "openid email profile"
+        );
+        assert_eq!(
+            scope_of(google_only.clone(), Some("passkey")).await,
+            "openid email profile"
+        );
+        assert_eq!(scope_of(google_only, None).await, "openid email profile");
+        assert_eq!(
+            scope_of(settings(&[]), Some("google")).await,
+            "openid email profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_is_not_digits_never_reaches_the_url() {
+        // from_env refuses such a value; the client checks again.
+        for bad in [
+            "1 openid offline_access",
+            "1&prompt=none",
+            "1%20x",
+            "urn:zitadel:iam:org:project:id:zitadel:aud",
+            "",
+        ] {
+            let scope = scope_of(settings(&[("google", bad)]), Some("google")).await;
+            assert_eq!(scope, "openid email profile", "{bad:?}");
+        }
     }
 }
