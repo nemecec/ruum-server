@@ -24,6 +24,7 @@ pub mod mailing;
 pub mod nodes;
 pub mod privacy;
 pub mod providers;
+pub mod runtime;
 pub mod search;
 pub mod sharing;
 pub mod tags;
