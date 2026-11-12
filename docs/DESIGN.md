@@ -1381,13 +1381,16 @@ thread on the upstream link, kept as part of both projects' history):
   point it needed. The upstream agent reviews it, asks questions, adapts it; the upstream's people
   approve it into a new version. The downstream then drops its own copy of the change at the next
   update.
-- **Upstream to downstream**: the upstream agent proposes a refactoring of a fork's customisation
-  (for example "move this edit into the new hook, so future updates merge cleanly"), or warns
-  before a version that will conflict. The downstream agent evaluates it and applies it on a draft;
-  the downstream's people approve it like an update.
-- Proposals carry code, schema and descriptions only, never the downstream's data, logs or
-  secrets (8.5). Each side shares only what it chooses; a fork with "select users" or "private"
-  customisations can keep them out of the channel.
+- **Upstream to downstream**: the upstream agent answers a proposal with a refactoring of the
+  code in it (for example "this belongs in the new hook; here is the change, so future updates
+  merge cleanly"). The downstream agent evaluates it and applies it on a draft; the downstream's
+  people approve it like an update.
+- **The upstream sees only what the downstream sent.** The upstream agent has no access to the
+  fork's source code, schema, data, logs or secrets; it works only on the code and descriptions in
+  a proposal (8.5). So conflict checks run downstream: before a version is released, the upstream
+  publishes it to the release channel as a pre-release, and each fork's agent checks it against its
+  own code and, if it likes, reports in the channel which parts of the upstream's change are hard
+  for it (described in its own words, with only the code it chooses to share).
 - People see a short summary of every thread and decide on the outcome; the agents' discussion
   stays readable for review. Either side can close the channel; unlinking closes it.
 
