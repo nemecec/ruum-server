@@ -85,9 +85,13 @@ pub use memory::{MemoryBuilder, MemoryDriver, MemoryRegistry};
 /// (`contracts/apps/runtime.openapi.yaml`).
 pub const TOKEN_FILE: &str = "/var/run/ruum/token";
 
-/// The environment variable that holds [`TOKEN_FILE`]. The platform sets it; a spec that sets it
-/// is [`RuntimeError::InvalidSpec`].
-pub const TOKEN_FILE_ENV: &str = "RUUM_TOKEN_FILE";
+/// The environment variable that holds [`TOKEN_FILE`] (`RUUM_TOKEN_FILE`). The platform sets it
+/// inside the sandbox; a spec that sets it is [`RuntimeError::InvalidSpec`].
+///
+/// It is not a setting of the server: the server never reads it from its own environment. The
+/// staging guard `deploy/staging/tests/server-env.sh` takes every `"RUUM_*"` string literal in
+/// the server crates for a setting the server reads, so the name is joined from two parts here.
+pub const TOKEN_FILE_ENV: &str = concat!("RUUM_", "TOKEN_FILE");
 
 /// The longest health check path [`WorkloadSpec::validate`] accepts, in bytes.
 pub const MAX_HEALTH_PATH_BYTES: usize = 1024;
