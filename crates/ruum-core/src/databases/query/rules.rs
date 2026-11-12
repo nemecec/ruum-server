@@ -38,8 +38,12 @@
 //!     be in `pg_catalog`, `information_schema` or a `pg_*` schema (`pg_toast`, `pg_temp`, ...),
 //!     and an unqualified one may not start with `pg_`: Postgres looks in `pg_catalog` first,
 //!     so `UPDATE pg_settings` is `set_config` under another name (`pg_settings` has a rewrite
-//!     rule that calls it). On SQLite, the target may not be `sqlite_schema`, `sqlite_master` or
-//!     their `temp` forms. Reads of the catalog still run.
+//!     rule that calls it). The query of `CREATE TABLE ... AS` and `CREATE VIEW ... AS` is
+//!     walked too (backlog 2026-11-09 S-16). On SQLite, the target may not be `sqlite_schema`,
+//!     `sqlite_master` or their `temp` forms. Reads of the catalog still run. The rule checks
+//!     names, not resolved relations: a manager can make `create view s as select * from
+//!     pg_settings` and an editor can then `update s ...`; the engine's revoke of `set_config`
+//!     holds that line (backlog 2026-11-09 S-17).
 //!
 //! `set_config` inside a function body or a `DO` block is out of the parser's reach: the engine
 //! holds that line (card E-2). A `DO` block does not parse, so it is refused here anyway.
@@ -589,16 +593,19 @@ impl Targets {
         }
     }
 
+    /// The write targets of a query: its data-modifying `WITH` parts and `SELECT ... INTO`.
+    fn query(&mut self, q: &Query) {
+        for s in modifying_statements(q) {
+            self.statement(s);
+        }
+        self.into(&q.body);
+    }
+
     /// Write targets (also of nested data-modifying statements and of `EXPLAIN`) and the
     /// objects of schema changes.
     fn statement(&mut self, statement: &Statement) {
         match statement {
-            Statement::Query(q) => {
-                for s in modifying_statements(q) {
-                    self.statement(s);
-                }
-                self.into(&q.body);
-            }
+            Statement::Query(q) => self.query(q),
             Statement::Insert(i) => {
                 if let TableObject::TableName(n) = &i.table {
                     self.name(n);
@@ -629,8 +636,18 @@ impl Targets {
                 }
             }
             Statement::Explain { statement, .. } => self.statement(statement),
-            Statement::CreateTable(c) => self.name(&c.name),
-            Statement::CreateView(c) => self.name(&c.name),
+            // The query of `CREATE TABLE ... AS` and `CREATE VIEW ... AS` can hold a
+            // data-modifying `WITH` (backlog 2026-11-09 S-16).
+            Statement::CreateTable(c) => {
+                self.name(&c.name);
+                if let Some(q) = &c.query {
+                    self.query(q);
+                }
+            }
+            Statement::CreateView(c) => {
+                self.name(&c.name);
+                self.query(&c.query);
+            }
             Statement::CreateIndex(c) => {
                 self.name(&c.table_name);
                 if let Some(n) = &c.name {
@@ -1139,6 +1156,13 @@ mod tests {
             "explain update pg_settings set setting = '0'",
             "insert into plants (id) with x as (delete from pg_description returning 1) \
              select 1 from x",
+            // The query of CREATE TABLE ... AS and CREATE VIEW ... AS (backlog 2026-11-09 S-16).
+            "create table copy as with x as (update pg_settings set setting = '0' \
+             where name = 'work_mem' returning name) select * from x",
+            "create table copy as with x as (delete from pg_catalog.pg_description returning 1) \
+             select * from x with no data",
+            "create view v as with x as (update pg_settings set setting = '0' returning name) \
+             select * from x",
             // Other catalog schemas.
             "insert into information_schema.sql_features (feature_id) values ('x')",
             "update pg_toast.pg_toast_1 set chunk_seq = 0",
@@ -1199,6 +1223,8 @@ mod tests {
         }
         for sql in [
             "create view plant_settings as select * from pg_settings",
+            "create table plant_copy as select relname from pg_class",
+            "create view plant_list as with x as (select name from plants) select * from x",
             "comment on column plants.pg_note is 'x'",
             "create index plants_name on plants (name)",
         ] {

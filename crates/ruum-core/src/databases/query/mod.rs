@@ -196,48 +196,23 @@ fn query_failed_error(sqlstate: String, message: String) -> Problem {
     ApiError::new(ErrorCode::QueryFailed, message).with_sqlstate(sqlstate)
 }
 
-/// An error of the query API: a step 1 error, or a [`Problem`].
-#[derive(Debug)]
-pub enum QueryError {
-    Core(Error),
-    Problem(Problem),
+/// The error code of an answer, for the query log. The query API answers with the shared
+/// [`Error`]: a [`Problem`] is `Error::Api` (backlog 2026-11-09 P-15).
+fn log_code(e: &Error) -> String {
+    e.to_api().code.as_str().to_string()
 }
 
-impl From<Error> for QueryError {
-    fn from(e: Error) -> Self {
-        QueryError::Core(e)
-    }
-}
-
-impl From<Problem> for QueryError {
-    fn from(p: Problem) -> Self {
-        QueryError::Problem(p)
+fn log_outcome(e: &Error) -> QueryOutcome {
+    match e {
+        Error::Api(p) if p.code == ErrorCode::StatementTimeout => QueryOutcome::Timeout,
+        _ => QueryOutcome::Error,
     }
 }
 
-impl QueryError {
-    /// The error code of the answer, for the query log.
-    fn code(&self) -> String {
-        match self {
-            QueryError::Core(e) => e.to_api().code.as_str().to_string(),
-            QueryError::Problem(p) => p.code.as_str().to_string(),
-        }
-    }
-
-    fn outcome(&self) -> QueryOutcome {
-        match self {
-            QueryError::Problem(p) if p.code == ErrorCode::StatementTimeout => {
-                QueryOutcome::Timeout
-            }
-            _ => QueryOutcome::Error,
-        }
-    }
-
-    fn sqlstate(&self) -> Option<String> {
-        match self {
-            QueryError::Problem(p) => p.sqlstate.clone(),
-            QueryError::Core(_) => None,
-        }
+fn log_sqlstate(e: &Error) -> Option<String> {
+    match e {
+        Error::Api(p) => p.sqlstate.clone(),
+        _ => None,
     }
 }
 
@@ -438,7 +413,7 @@ pub async fn agent_access(
     row: Option<&DatabaseRow>,
     mode: StatementMode,
     public_url: &str,
-) -> std::result::Result<AgentAccess, QueryError> {
+) -> Result<AgentAccess> {
     use super::access::grants::{self, GrantKind};
     let d = svc.deps();
     let agent = crate::ids::AgentId(ctx.actor.actor.id.0);
@@ -773,7 +748,7 @@ fn is_sqlstate(code: &str) -> bool {
 }
 
 /// The answer of an engine error. `manage`: the caller may read the engine's text.
-fn engine_problem(e: EngineError, manage: bool) -> QueryError {
+fn engine_problem(e: EngineError, manage: bool) -> Error {
     // `in_routine`: tenant code (a trigger, a function, a `RAISE`) may have written the text and
     // chosen the SQLSTATE, with the values of the real row, so no part of it is shown
     // (review-Q-2-2 P-2).
@@ -793,7 +768,7 @@ fn engine_problem(e: EngineError, manage: bool) -> QueryError {
                 format!("{fixed}: {}", names.join(", "))
             }
         };
-        QueryError::Problem(query_failed_error(sqlstate, message))
+        Error::Api(query_failed_error(sqlstate, message))
     };
     match e {
         EngineError::ReadOnly => read_only_error().into(),
@@ -843,7 +818,7 @@ fn engine_problem(e: EngineError, manage: bool) -> QueryError {
              types (cast a row or a value of an unusual type to text)",
         )
         .into(),
-        other => QueryError::Core(Error::Internal(format!("engine: {other}"))),
+        other => Error::Internal(format!("engine: {other}")),
     }
 }
 
@@ -1003,9 +978,9 @@ async fn wait_ready(
     id: NodeId,
     trashed: bool,
     owner: bool,
-) -> std::result::Result<DatabaseRow, QueryError> {
+) -> Result<DatabaseRow> {
     if trashed {
-        return Err(in_trash().into());
+        return Err(in_trash());
     }
     let d = svc.deps();
     let deadline = Instant::now() + d.queries.not_ready_wait;
@@ -1020,8 +995,7 @@ async fn wait_ready(
                 return Err(Error::Api(
                     ApiError::new(ErrorCode::Conflict, "the database does not answer queries")
                         .with_hint("see the status of the database (getDatabase)"),
-                )
-                .into());
+                ));
             }
         };
         if serving && let Some(row) = d.store.get(tenant, id).await? {
@@ -1040,7 +1014,7 @@ pub async fn query(
     ctx: &Context,
     id: NodeId,
     req: QueryRequest,
-) -> std::result::Result<QueryResult, QueryError> {
+) -> Result<QueryResult> {
     query_at(svc, ctx, id, req, "").await
 }
 
@@ -1052,7 +1026,7 @@ pub async fn query_at(
     id: NodeId,
     req: QueryRequest,
     public_url: &str,
-) -> std::result::Result<QueryResult, QueryError> {
+) -> Result<QueryResult> {
     let t = target(svc, ctx, id).await?;
     let mode = req.mode.unwrap_or(StatementMode::Read);
     let engine = engine_kind(&t);
@@ -1152,7 +1126,7 @@ async fn run(
     req: &QueryRequest,
     verdict: std::result::Result<rules::StatementKind, rules::Refusal>,
     public_url: &str,
-) -> std::result::Result<Ran, QueryError> {
+) -> Result<Ran> {
     let d = svc.deps();
     let is_agent = ctx.actor.is_agent();
     let manage = !is_agent && t.role >= Some(Role::Manage);
@@ -1357,7 +1331,19 @@ async fn class_map_of(
     engine: EngineKind,
     manifest: &serde_json::Value,
 ) -> Result<postgres_mask::ClassMap> {
-    let rows = svc.deps().columns.list(tenant, id).await?;
+    class_map_from(&*svc.deps().columns, tenant, id, engine, manifest).await
+}
+
+/// [`class_map_of`] over a column store: the lens and a masked copy take each column's class
+/// the same way (backlog 2026-11-09 S-18).
+pub(crate) async fn class_map_from(
+    columns: &dyn super::classes::ColumnStore,
+    tenant: TenantId,
+    id: NodeId,
+    engine: EngineKind,
+    manifest: &serde_json::Value,
+) -> Result<postgres_mask::ClassMap> {
+    let rows = columns.list(tenant, id).await?;
     let store: Vec<(String, String, String, DataClass)> = rows
         .iter()
         .filter(|r| r.is_live())
@@ -1471,7 +1457,7 @@ async fn write_log(
     id: NodeId,
     query_id: Uuid,
     draft: LogDraft,
-    result: &std::result::Result<Ran, QueryError>,
+    result: &Result<Ran>,
     elapsed: Duration,
 ) -> Result<()> {
     let (outcome, error_code, sqlstate, row_count, rows_affected, truncated, grant_id) =
@@ -1486,9 +1472,9 @@ async fn write_log(
                 r.grant_id,
             ),
             Err(e) => (
-                e.outcome(),
-                Some(e.code()),
-                e.sqlstate(),
+                log_outcome(e),
+                Some(log_code(e)),
+                log_sqlstate(e),
                 None,
                 None,
                 false,
@@ -1519,11 +1505,7 @@ async fn write_log(
 }
 
 /// `getDatabaseSchema`. See the module docs.
-pub async fn schema(
-    svc: &DatabaseService,
-    ctx: &Context,
-    id: NodeId,
-) -> std::result::Result<DatabaseSchema, QueryError> {
+pub async fn schema(svc: &DatabaseService, ctx: &Context, id: NodeId) -> Result<DatabaseSchema> {
     let t = target(svc, ctx, id).await?;
     let row = wait_ready(svc, ctx.tenant, id, t.trashed, false).await?;
     let engine = svc
@@ -1535,8 +1517,8 @@ pub async fn schema(
         .catalog(&row.database_ref())
         .await
         .map_err(|e| match e {
-            EngineError::NotReady => QueryError::Problem(not_ready_error()),
-            other => QueryError::Core(Error::Internal(format!("catalog: {other}"))),
+            EngineError::NotReady => Error::Api(not_ready_error()),
+            other => Error::Internal(format!("catalog: {other}")),
         })?;
     let mut answer = schema_of(row.engine, &catalog, &t.manifest);
     // The class the lens applies (card Q-2): the stricter of the column store and the manifest.
