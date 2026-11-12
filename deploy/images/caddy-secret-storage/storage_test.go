@@ -136,6 +136,27 @@ func TestListStatDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteRefusesTheRoot(t *testing.T) {
+	ctx := context.Background()
+	s := newStorage(t)
+	keys := []string{"certificates/ca/a.example/a.example.crt", "acme/ca/users/ops/ops.json"}
+	for _, k := range keys {
+		if err := s.Store(ctx, k, []byte(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, root := range []string{"", "/", "//"} {
+		if err := s.Delete(ctx, root); !errors.Is(err, errDeleteRoot) {
+			t.Fatalf("Delete(%q) = %v, want errDeleteRoot", root, err)
+		}
+	}
+	for _, k := range keys {
+		if !s.Exists(ctx, k) {
+			t.Fatalf("Delete of the root removed %q", k)
+		}
+	}
+}
+
 func TestLockIsExclusive(t *testing.T) {
 	ctx := context.Background()
 	a := newStorage(t)

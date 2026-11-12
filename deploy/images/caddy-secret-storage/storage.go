@@ -284,10 +284,18 @@ func under(keys []string, prefix string) []string {
 	return out
 }
 
+// errDeleteRoot is the answer of Delete for the root ("", "/"): one call must never remove all
+// the TLS state (certificates, ACME accounts) of the edge. List and Stat accept the root,
+// because certmagic lists from there.
+var errDeleteRoot = errors.New("refusing to delete the storage root")
+
 // Delete removes key and, when key is a directory, every key below it. A key that is already
-// gone is not an error.
+// gone is not an error. The root is refused (errDeleteRoot).
 func (s *Storage) Delete(ctx context.Context, key string) error {
 	key = cleanKey(key)
+	if key == "" {
+		return errDeleteRoot
+	}
 	secrets := s.client.CoreV1().Secrets(s.Namespace)
 	names := []string{secretName(key)}
 	all, err := s.keys(ctx)

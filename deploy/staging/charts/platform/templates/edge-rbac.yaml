@@ -5,6 +5,12 @@
 #
 # The edge namespace has no other Secrets, so the token reaches only the edge's own
 # certificates. Nothing outside the namespace.
+#
+# Who else can read these keys: the deployer manages the edge DaemonSet and may create pods in
+# edge (deployer-rbac.yaml), so it can run a pod as ruum-edge and read every certificate private
+# key and the ACME account key. This weakens stgsec S-11 for the TLS keys only (the database
+# password and the token key stay out of its reach). README S-4; backlog O-29 (next security
+# review).
 apiVersion: v1
 kind: ServiceAccount
 metadata:

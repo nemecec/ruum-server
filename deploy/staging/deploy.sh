@@ -17,12 +17,16 @@
 #      (ruum-server: two or more replicas, maxUnavailable 0; the edge: a DaemonSet that starts
 #      the new pod on a node before it stops the old one), then the smoke checks.
 # --rollback is the same path with an older commit: its migration step finds nothing to do
-# (the schema rule keeps the older release working on the newer schema).
+# (the schema rule keeps the older release working on the newer schema). The floor: no commit
+# before backlog O-25 (the migration step and the edge's certificate storage). Such a commit has
+# no `ruum-server migrate` and no storage module, so deploy.sh refuses it (ops/release-floor.sh).
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 # shellcheck source=ops/image-check.sh
 . "$STG_HERE/ops/image-check.sh"
+# shellcheck source=ops/release-floor.sh
+. "$STG_HERE/ops/release-floor.sh"
 
 REPO="${RUUM_REPO:-nemecec/ruum-server}"
 sha="${1:-}"
@@ -51,6 +55,8 @@ git -C "$STG_ROOT" fetch -q origin main
 sha="$(git -C "$STG_ROOT" rev-parse --verify "$sha^{commit}")"
 [[ "$sha" =~ $RUUM_COMMIT_RE ]] || stg_die "$sha is not a full commit SHA"
 git -C "$STG_ROOT" merge-base --is-ancestor "$sha" origin/main || stg_die "$sha is not on origin/main"
+ruum_release_floor_ok "$STG_ROOT" "$sha" ||
+  stg_die "$sha is older than backlog O-25: it has no migration step (ruum-server migrate) and no edge certificate storage, so this deploy path cannot run it. Deploy O-25 or a later commit."
 
 stg_log "1. ci passed for $sha on a push to main"
 ok="$(gh run list -R "$REPO" --workflow ci.yml --commit "$sha" --json conclusion,event,headBranch \

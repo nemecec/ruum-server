@@ -647,6 +647,10 @@ if has helm; then
   hl="$(grep -nE '^helm upgrade' "$dc" | head -1 | cut -d: -f1)"
   [[ -n "$jl" && -n "$hl" && "$jl" -lt "$hl" ]] && ok "deploy-chart.sh runs the migration Job before the rollout" || bad "deploy-chart.sh: the migration Job is not before helm upgrade"
   grep -qF 'not rolling out, the old release keeps serving' "$dc" && ok "deploy-chart.sh stops when the migration step fails" || bad "deploy-chart.sh rolls out after a failed migration step"
+  # The ask limit is per process: each replica gets its share (review of O-25, change 4).
+  want "$TMP/server.yaml" "each of two replicas gets half of the ask limit (20 / 2)" '{ name: RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR, value: "10" }'
+  expect 0 "render ruum-server with three replicas and an ask limit of 2" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set server.replicas=3 --set server.tlsAskNewHostsPerHour=2 --show-only templates/server.yaml
+  has_line "$TMP/out" '{ name: RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR, value: "1" }' && ok "the ask limit per replica is at least 1" || bad "the ask limit per replica fell below 1"
   # The Zitadel chart from its repository (network; skipped when it cannot be fetched).
   if helm template zitadel zitadel --repo https://charts.zitadel.com --version "$ZITADEL_CHART_VERSION" \
     --namespace auth -f "$ZV" >"$TMP/zitadel.yaml" 2>"$TMP/zitadel.err"; then
@@ -754,6 +758,29 @@ case $? in
     ;;
   *) bad "tunnel-relay.sh good path"; cat "$TMP/out" ;;
 esac
+
+# The rollback floor of deploy.sh (review of O-25, change 1): a commit without the migration step
+# or the edge storage module is refused.
+echo "== deploy.sh release floor (O-25)"
+if command -v git >/dev/null; then
+  RF="$TMP/floor"
+  mkdir -p "$RF" && git -C "$RF" init -q && git -C "$RF" config user.email t@example.invalid && git -C "$RF" config user.name t
+  mkdir -p "$RF/crates/ruum-server/src" "$RF/deploy/images/caddy-secret-storage"
+  echo old >"$RF/crates/ruum-server/src/main.rs" && git -C "$RF" add -A && git -C "$RF" commit -qm old
+  old_sha="$(git -C "$RF" rev-parse HEAD)"
+  echo m >"$RF/crates/ruum-server/src/migrate.rs" && git -C "$RF" add -A && git -C "$RF" commit -qm half
+  half_sha="$(git -C "$RF" rev-parse HEAD)"
+  echo s >"$RF/deploy/images/caddy-secret-storage/storage.go" && git -C "$RF" add -A && git -C "$RF" commit -qm o25
+  new_sha="$(git -C "$RF" rev-parse HEAD)"
+  floor() { bash -c ". '$STG/ops/release-floor.sh' && ruum_release_floor_ok \"\$1\" \"\$2\"" _ "$@"; }
+  expect 0 "the release floor accepts a commit with the migration step and the edge storage" floor "$RF" "$new_sha"
+  expect 1 "the release floor refuses a commit before O-25" floor "$RF" "$old_sha"
+  expect 1 "the release floor refuses a commit without the edge storage module" floor "$RF" "$half_sha"
+  if git -C "$ROOT" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    expect 0 "the release floor accepts this checkout's HEAD" floor "$ROOT" HEAD
+  fi
+  grep -qF 'ruum_release_floor_ok "$STG_ROOT" "$sha"' "$STG/deploy.sh" && ok "deploy.sh checks the release floor" || bad "deploy.sh does not check the release floor"
+fi
 
 if [[ $failed == 0 ]]; then echo "staging tests: all passed"; else echo "staging tests: FAILED"; fi
 exit "$failed"
