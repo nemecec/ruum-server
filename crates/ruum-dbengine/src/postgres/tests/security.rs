@@ -1025,6 +1025,7 @@ async fn a_masked_branch_masks_with_the_source_key_and_holds_its_own() {
             (col("born"), MaskAs::Pseudonym),
             (col("token"), MaskAs::Null),
         ],
+        planned_from: None,
     };
     let branch = engine
         .copy_database(
