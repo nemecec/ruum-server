@@ -1,0 +1,26 @@
+[package]
+name = "s2-gw"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike S-2: a throwaway gateway (header and cookie cleaning, Ruum-User, static files from Garage) and egress proxy."
+
+# Its own workspace: the spike is not a member of the Ruum workspace. Every crate below is in the
+# Ruum workspace's Cargo.lock at the same version (Cargo.lock here was trimmed from it).
+[workspace]
+
+[dependencies]
+tokio = { version = "1.54", features = ["full"] }
+hyper = { version = "1.12", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1.5"
+bytes = "1"
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+object_store = { version = "0.14.2", features = ["aws"] }
+serde_json = "1"
+uuid = { version = "1.29", features = ["v4", "v7"] }
+futures = "0.3"
+
+[profile.release]
+debug = false
+incremental = false
