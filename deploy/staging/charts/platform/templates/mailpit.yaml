@@ -1,6 +1,7 @@
-# Mailpit: the only SMTP target of staging (Zitadel and ruum-server). No mail leaves the
-# cluster. ClusterIP only, no edge route: the UI is reachable only by `kubectl port-forward`
-# (review stgsec S-12).
+# Mailpit: the SMTP target of ruum-server on staging (as on the laptop). No mail leaves the
+# cluster from here. Zitadel sends through Scaleway Transactional Email since backlog O-20
+# (k8s/values/zitadel.yaml); its old Mailpit provider stays in Zitadel, inactive. ClusterIP only,
+# no edge route: the UI is reachable only by `kubectl port-forward` (review stgsec S-12).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

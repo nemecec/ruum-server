@@ -57,6 +57,10 @@ fi
 # creates it; the agents never put the full Scaleway key into the cluster.
 missing_platform="$(stg_missing SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY)"
 missing_signup="$(stg_missing STG_ALLOWED_EMAILS)"
+# Zitadel's outgoing email (backlog O-20): the SMTP key of the Scaleway IAM application
+# ruum-staging-smtp (TransactionalEmailEmailSmtpCreate only); the user is the project ID. The
+# person creates it (docs/setup/ACCOUNTS.md, step 3); secrets-init.sh never generates it.
+missing_smtp="$(stg_missing SCW_SMTP_SECRET_KEY SCW_DEFAULT_PROJECT_ID)"
 
 plan_file="$(mktemp)"
 stg_on_exit 'rm -f "$plan_file"'
@@ -87,10 +91,18 @@ set -e
   else
     echo "sign-up allow-list: present"
   fi
+  if [[ -n "$missing_smtp" ]]; then
+    echo "STOP: the SMTP key is missing: $(echo $missing_smtp)."
+    echo "  Zitadel sends email (the Microsoft email check) through Scaleway Transactional Email with the API key"
+    echo "  of the IAM application 'ruum-staging-smtp' (TransactionalEmailEmailSmtpCreate on project ruum-staging"
+    echo "  only). The person creates it (docs/setup/ACCOUNTS.md, step 3). --apply refuses until then."
+  else
+    echo "SMTP key: present"
+  fi
 } | if [[ -n "$out" ]]; then tee "$out"; else cat; fi
 
 [[ $rc -eq 0 ]] || { stg_audit plan "refused rc=$rc"; exit "$rc"; }
-if [[ $infra_only == 0 && ( -n "$missing_platform" || -n "$missing_signup" ) ]]; then
+if [[ $infra_only == 0 && ( -n "$missing_platform" || -n "$missing_signup" || -n "$missing_smtp" ) ]]; then
   stg_audit plan "stopped: missing names"
   exit 4
 fi
@@ -115,7 +127,7 @@ stg_audit apply "platform ok"
 stg_log "backups: WAL push and a base backup into the COMPLIANCE-locked bucket (code review F-7)"
 printf '__END__\n' | stg_run rw check-backup
 stg_audit apply "backup check ok"
-stg_log "Zitadel: OIDC app, Google, Microsoft, login policy"
+stg_log "Zitadel: OIDC app, Google, Microsoft, login policy, SMTP provider"
 stg_secret_stream GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET |
   stg_run rw zitadel-bootstrap apply
 stg_audit apply "zitadel ok"

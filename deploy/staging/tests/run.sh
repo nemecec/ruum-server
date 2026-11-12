@@ -24,6 +24,10 @@
 # - price.sh prices the plan and refuses above the budget;
 # - the secret lists: nothing forbidden goes to the cluster, the two lists agree;
 # - one Zitadel and SpiceDB pin for the laptop and staging (review 2 U-5);
+# - Zitadel's SMTP (backlog O-20): Scaleway on 587 with TLS, the login from auth/zitadel-smtp
+#   (no password in the values), the verified sender domain, the same values in the bootstrap,
+#   the SMTP key comes from the person (not secrets-init.sh) and up.sh stops without it; with
+#   helm and the chart repository: the rendered Zitadel setup job and deployment read it;
 # - check-plan.sh --repo; up.sh --apply refuses without RUUM_STAGING_APPLY=yes;
 # - with helm: lint and render both charts, digests required, never production Let's Encrypt;
 #   the ruum-server env of the chart and of ruum-server-env matches what the server reads
@@ -78,7 +82,7 @@ expect 3 "refuses an unknown resource type" bash "$STG/check-plan.sh" "$(mutate 
 expect 3 "refuses a non-staging bucket" bash "$STG/check-plan.sh" "$(mutate bucket '(.resource_changes[] | select(.type == "minio_s3_bucket") | .change.after.bucket) = "ruum-prod-blobs"')"
 expect 3 "refuses deleting a backup bucket" bash "$STG/check-plan.sh" "$(mutate bdel '.resource_changes += [{"address":"scaleway_object_bucket.backup[\"pg_backup\"]","mode":"managed","type":"scaleway_object_bucket","change":{"actions":["delete"],"before":{"name":"ruum-staging-pg-backup","tags":{"env":"staging","managed-by":"tofu"}},"after":null}}]')"
 expect 1 "refuses a plan JSON that holds the variables" bash "$STG/check-plan.sh" "$(mutate vars '. + {"variables":{"scrub_probe_0":{"value":"SCRUB-PROBE-0"}}}')"
-expect 0 "check-plan --repo: no HCLOUD_TOKEN or Stripe key in cluster or CI files" bash "$STG/check-plan.sh" --repo
+expect 0 "check-plan --repo: no HCLOUD_TOKEN, Stripe key or full Scaleway key in cluster or CI files" bash "$STG/check-plan.sh" --repo
 
 echo "== check-plan.sh: code review F-4"
 cp="$STG/check-plan.sh"
@@ -468,6 +472,36 @@ step_names="$(sed -n 's/^CLUSTER_SECRET_NAMES="\(.*\)"$/\1/p' "$STG/steps.sh" | 
 if [[ "$(sort <<<"$list")" == "$step_names" ]]; then ok "secrets-push.sh and steps.sh list the same cluster names"; else bad "secrets-push.sh and steps.sh lists differ"; fi
 if grep -rqE 'STRIPE_|HCLOUD_TOKEN' "$STG/k8s/apply.sh"; then bad "k8s/apply.sh names HCLOUD_TOKEN or a Stripe key"; else ok "k8s/apply.sh never puts HCLOUD_TOKEN or a Stripe key into a Secret"; fi
 
+echo "== Zitadel SMTP (backlog O-20)"
+ZV="$STG/k8s/values/zitadel.yaml"
+ZB="$STG/ops/zitadel-bootstrap.sh"
+# The SMTPConfiguration block of the values (until the next key at its indent or less).
+zsmtp="$(awk '/^      SMTPConfiguration:/ {on=1; next} on && /^ {0,6}[^ #]/ {on=0} on' "$ZV")"
+zval() { sed -n "s/^ *$1: *//p" <<<"$zsmtp" | head -n 1; }
+zb() { sed -n "s/^$1=//p" "$ZB" | tr -d "'\""; }
+[[ "$(zval Host)" == smtp.tem.scaleway.com:587 ]] && ok "Zitadel SMTP host is Scaleway Transactional Email on 587" || bad "Zitadel SMTP host is '$(zval Host)'"
+[[ "$(zval TLS)" == true ]] && ok "Zitadel SMTP TLS is on (STARTTLS on 587)" || bad "Zitadel SMTP TLS is '$(zval TLS)'"
+[[ "$(zval From)" == *@notify.staging.ruum.space ]] && ok "the sender is in the verified domain notify.staging.ruum.space" || bad "the sender '$(zval From)' is not in notify.staging.ruum.space"
+grep -qiE 'password|user' <<<"$zsmtp" && bad "the values hold an SMTP user or password" || ok "no SMTP user or password literal in the values"
+grep -v "^ *#" "$ZV" | grep -qi mailpit && bad "Zitadel still names Mailpit" || ok "Zitadel does not use Mailpit"
+for k in user password; do
+  n="ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_$(tr '[:lower:]' '[:upper:]' <<<"$k")"
+  grep -A4 -E "name: $n\$" "$ZV" | tr -d ' \n' | grep -qF "secretKeyRef:name:zitadel-smtpkey:$k" &&
+    ok "the values take $n from the Secret zitadel-smtp key $k" || bad "the values do not take $n from zitadel-smtp $k"
+done
+[[ "$(zb SMTP_HOST)" == "$(zval Host)" && "$(zb SMTP_FROM)" == "$(zval From)" && "$(zb SMTP_FROM_NAME)" == "$(zval FromName)" ]] &&
+  ok "zitadel-bootstrap.sh sets the same host, sender and name as the values" || bad "zitadel-bootstrap.sh and the values differ in the SMTP host or sender"
+grep -qF '/admin/v1/email/$id/_activate' "$ZB" && grep -qF 'smtp_check || drift=1' "$ZB" &&
+  ok "zitadel-bootstrap.sh activates the provider and check reports its drift" || bad "zitadel-bootstrap.sh does not activate or check the SMTP provider"
+grep -qxF "printf 'user=%s\\npassword=%s\\n' \"\$SCW_DEFAULT_PROJECT_ID\" \"\$SCW_SMTP_SECRET_KEY\" | secret auth zitadel-smtp" "$STG/k8s/apply.sh" &&
+  ok "k8s/apply.sh writes auth/zitadel-smtp from the project ID and SCW_SMTP_SECRET_KEY" || bad "k8s/apply.sh does not write auth/zitadel-smtp"
+[[ "$(grep -c 'zitadel-smtp' "$STG/k8s/apply.sh")" == 1 ]] && ok "zitadel-smtp is written in one namespace only" || bad "zitadel-smtp is written more than once"
+grep -q SCW_SMTP "$STG/secrets-init.sh" && bad "secrets-init.sh names the SMTP key (it comes from the person)" || ok "secrets-init.sh never generates the SMTP key"
+grep -qx SCW_SMTP_SECRET_KEY <<<"$list" && ! grep -qx SCW_SMTP_ACCESS_KEY <<<"$list" &&
+  ok "secrets-push.sh sends SCW_SMTP_SECRET_KEY (not the access key, which SMTP does not need)" || bad "secrets-push.sh SMTP names"
+grep -qF 'missing_smtp="$(stg_missing SCW_SMTP_SECRET_KEY SCW_DEFAULT_PROJECT_ID)"' "$STG/up.sh" && grep -qF -- '-n "$missing_smtp"' "$STG/up.sh" &&
+  ok "up.sh preflight stops when the SMTP key is missing" || bad "up.sh preflight does not check the SMTP key"
+
 echo "== pins (review 2 U-5)"
 # shellcheck source=../versions.env
 . "$STG/versions.env"
@@ -539,6 +573,20 @@ if has helm; then
   expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200
   grep -q "serverName: pg-202611111200" "$TMP/out" && grep -q "recovery:" "$TMP/out" && ok "restore mode bootstraps from the old generation" || bad "restore mode"
   expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform"
+  # The Zitadel chart from its repository (network; skipped when it cannot be fetched).
+  if helm template zitadel zitadel --repo https://charts.zitadel.com --version "$ZITADEL_CHART_VERSION" \
+    --namespace auth -f "$ZV" >"$TMP/zitadel.yaml" 2>"$TMP/zitadel.err"; then
+    n="$(grep -cE 'name: ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_(USER|PASSWORD)$' "$TMP/zitadel.yaml")"
+    [[ "$n" -ge 4 ]] && ok "the rendered Zitadel chart passes the SMTP user and password to the setup job and the deployment ($n)" ||
+      bad "the rendered Zitadel chart has $n SMTP env entries (want the setup job and the deployment)"
+    grep -A5 -E 'name: ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_PASSWORD$' "$TMP/zitadel.yaml" | grep -q 'name: zitadel-smtp' &&
+      ok "the rendered password comes from the Secret zitadel-smtp" || bad "the rendered password is not from zitadel-smtp"
+    grep -qE 'Host: smtp\.tem\.scaleway\.com:587' "$TMP/zitadel.yaml" && grep -qE 'From: no-reply@notify\.staging\.ruum\.space' "$TMP/zitadel.yaml" &&
+      ok "the rendered Zitadel config has the Scaleway host and the sender" || bad "the rendered Zitadel config lacks the Scaleway host or the sender"
+    grep -qiE 'mailpit' "$TMP/zitadel.yaml" && bad "the rendered Zitadel chart names Mailpit" || ok "the rendered Zitadel chart does not name Mailpit"
+  else
+    echo "== Zitadel chart render: skipped (charts.zitadel.com not reachable: $(head -c 200 "$TMP/zitadel.err"))"
+  fi
   if [[ $have_docker == 1 ]]; then
     echo "== Caddyfile (caddy adapt --validate)"
     awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum.yaml" >"$TMP/Caddyfile"

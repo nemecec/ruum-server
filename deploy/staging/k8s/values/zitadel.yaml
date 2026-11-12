@@ -4,7 +4,7 @@
 #   date from ZITADEL_PAT_EXPIRY; the digest records it).
 # - The built-in login (v1): no separate login container. Password login and registration are
 #   turned off by ops/zitadel-bootstrap.sh (login policy), which also adds Google and
-#   Microsoft without automatic linking.
+#   Microsoft without automatic linking, and sets the SMTP provider (Scaleway, see below).
 # - Database `zitadel` (owner `zitadel`) is made by CNPG; the init job only creates Zitadel's
 #   schema (command "zitadel"). TLS to Postgres is verified with the CNPG CA.
 replicaCount: 1
@@ -37,12 +37,22 @@ zitadel:
         AllowUsernamePassword: false
         AllowRegister: false
         AllowExternalIDP: true
+      # Outgoing email (backlog O-20): Scaleway Transactional Email, project ruum-staging, the
+      # verified sending domain notify.staging.ruum.space. Port 587: Hetzner blocks outgoing 25
+      # and 465 on new accounts. TLS true: Zitadel tries implicit TLS first and, when the server
+      # answers in plain text (587), upgrades with STARTTLS and checks the host name; with TLS
+      # false it would send the password unencrypted. User (the Scaleway project ID) and password
+      # (the SMTP key) come from the Secret auth/zitadel-smtp (env below), never from this file.
+      # DefaultInstance applies only when Zitadel creates an instance. For the instance that
+      # exists, ops/zitadel-bootstrap.sh sets the same provider through the admin API and
+      # activates it; `check` reports drift. Keep these values the same as SMTP_* there
+      # (tests/run.sh). Mailpit stays in the cluster but is not Zitadel's provider.
       SMTPConfiguration:
         SMTP:
-          Host: mailpit.ops.svc.cluster.local:1025
-        TLS: false
-        From: noreply@notify.staging.ruum.space
-        FromName: Ruum staging
+          Host: smtp.tem.scaleway.com:587
+        TLS: true
+        From: no-reply@notify.staging.ruum.space
+        FromName: Ruum (staging)
 login:
   enabled: false
 env:
@@ -51,6 +61,18 @@ env:
       secretKeyRef:
         name: zitadel-db
         key: dsn
+  # SMTP user and password of DefaultInstance.SMTPConfiguration (k8s/apply.sh writes the Secret
+  # from SCW_DEFAULT_PROJECT_ID and SCW_SMTP_SECRET_KEY).
+  - name: ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_USER
+    valueFrom:
+      secretKeyRef:
+        name: zitadel-smtp
+        key: user
+  - name: ZITADEL_DEFAULTINSTANCE_SMTPCONFIGURATION_SMTP_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: zitadel-smtp
+        key: password
 initJob:
   command: zitadel
 # Pod Security `restricted` on namespace auth (review 1 S-9). The chart uses these two for every

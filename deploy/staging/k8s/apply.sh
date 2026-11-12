@@ -21,7 +21,8 @@ k() { kubectl "$@"; }
 for n in SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY \
   STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD \
   STG_SPICEDB_PRESHARED_KEY STG_RUUM_TOKEN_SIGNING_KEY STG_RUUM_CONTENT_SIGNING_KEY \
-  STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS; do
+  STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS \
+  SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY; do
   [[ -n "${!n:-}" ]] || die "$n is missing (secrets-push.sh sends it)"
 done
 
@@ -66,6 +67,10 @@ done
 printf 'masterkey=%s\n' "$STG_ZITADEL_MASTERKEY" | secret auth zitadel-masterkey
 printf 'dsn=postgres://zitadel:%s@pg-rw.data.svc.cluster.local:5432/zitadel?sslmode=verify-full&sslrootcert=/db-ssl-ca-crt/ca.crt\n' \
   "$STG_PG_ZITADEL_PASSWORD" | secret auth zitadel-db
+# Zitadel's SMTP login at Scaleway Transactional Email (backlog O-20): the user is the project
+# ID, the password the secret key of the IAM application ruum-staging-smtp (permission
+# TransactionalEmailEmailSmtpCreate only), never the agents' full Scaleway key.
+printf 'user=%s\npassword=%s\n' "$SCW_DEFAULT_PROJECT_ID" "$SCW_SMTP_SECRET_KEY" | secret auth zitadel-smtp
 printf 'preshared-key=%s\ndatastore-uri=postgres://spicedb:%s@pg-rw.data.svc.cluster.local:5432/spicedb?sslmode=verify-full&sslrootcert=/pg-ca/ca.crt\n' \
   "$STG_SPICEDB_PRESHARED_KEY" "$STG_PG_SPICEDB_PASSWORD" | secret authz spicedb
 printf 'ruum-password=%s\n' "$STG_NATS_RUUM_PASSWORD" | secret nats nats-auth

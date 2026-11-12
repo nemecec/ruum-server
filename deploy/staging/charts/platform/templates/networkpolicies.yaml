@@ -1,6 +1,9 @@
 # Network policy (review 1 S-1), enforced by kube-network-policies next to Flannel. Each
 # namespace of Ruum denies all ingress by default; the rules below open only what a client
 # needs. Kubelet probes are not affected (kube-network-policies passes node-root traffic).
+# There is no egress policy: outgoing traffic is open, so Zitadel reaches Scaleway's SMTP on port
+# 587 (backlog O-20). The Hetzner firewall has inbound rules only. If an egress policy is added,
+# allow auth/zitadel to TCP 587 out (and DNS).
 {{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" }}
 {{- range $ns }}
 ---

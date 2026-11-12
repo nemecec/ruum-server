@@ -17,7 +17,8 @@
 #   kubeconfig     (rw)  write the kubeconfig with talosctl through the admin tunnel (0600)
 #   platform       (rw)  helmfile sync of the platform (needs the cluster secrets on stdin);
 #                        needs RUUM_STAGING_APPLY=yes
-#   zitadel-bootstrap (rw) OIDC app, Google and Microsoft, login policy; `check` reports drift
+#   zitadel-bootstrap (rw) OIDC app, Google and Microsoft, login policy, SMTP provider; `check`
+#                        reports drift
 #   check-backup   (rw)  WAL push and a base backup into the locked bucket work (bring-up check)
 #   deploy <commit> <server-ref> <edge-ref> [--backup] [--acme ISSUER --acme-email EMAIL] (rw)
 #                        helm upgrade of charts/ruum by digest (ops/deploy-chart.sh validates)
@@ -303,7 +304,7 @@ $hits"
 
 k() { kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"; }
 
-CLUSTER_SECRET_NAMES="SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD STG_SPICEDB_PRESHARED_KEY STG_RUUM_TOKEN_SIGNING_KEY STG_RUUM_CONTENT_SIGNING_KEY STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS STG_ALLOWED_UNVERIFIED_EMAILS STG_ACME_EMAIL"
+CLUSTER_SECRET_NAMES="SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD STG_SPICEDB_PRESHARED_KEY STG_RUUM_TOKEN_SIGNING_KEY STG_RUUM_CONTENT_SIGNING_KEY STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS STG_ALLOWED_UNVERIFIED_EMAILS STG_ACME_EMAIL SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY"
 
 case "$STEP" in
   admin-cidrs)

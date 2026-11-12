@@ -3,21 +3,35 @@
 # kubeconfig. It talks to Zitadel through `kubectl port-forward` (in-cluster), with the machine
 # user's PAT from the Secret auth/iam-admin-pat; the PAT never leaves this process.
 #
-#   zitadel-bootstrap.sh apply   login policy, OIDC app, Google, Microsoft; writes the Secret
-#                                ruum/ruum-oidc: client-id, idp-google, idp-microsoft (the IdP IDs
-#                                for the sign-in hint, RUUM_OIDC_IDP_*)
+#   zitadel-bootstrap.sh apply   login policy, OIDC app, Google, Microsoft, the SMTP provider;
+#                                writes the Secret ruum/ruum-oidc: client-id, idp-google,
+#                                idp-microsoft (the IdP IDs for the sign-in hint, RUUM_OIDC_IDP_*)
+#   zitadel-bootstrap.sh smtp    only the SMTP provider (needs no Google or Microsoft key)
 #   zitadel-bootstrap.sh check   report drift: password login, registration, auto linking,
-#                                Microsoft email trust, IdP IDs in ruum/ruum-oidc, human users,
-#                                the PAT's expiry
+#                                Microsoft email trust, IdP IDs in ruum/ruum-oidc, the active SMTP
+#                                provider, human users, the PAT's expiry
+#   zitadel-bootstrap.sh test-email ADDRESS
+#                                Zitadel sends one test email to ADDRESS through the SMTP provider
 #
 # The Google and Microsoft keys come in the environment (steps.sh reads them from stdin) and go
-# to curl on stdin; they are never printed or stored outside Zitadel's database.
+# to curl on stdin; they are never printed or stored outside Zitadel's database. The SMTP login
+# comes from the Secret auth/zitadel-smtp (k8s/apply.sh) and goes the same way.
 set -euo pipefail
 mode="${1:-check}"
 NS=auth
 HOST=auth.staging.ruum.space
 PUBLIC=https://staging.ruum.space
 PORT="${ZITADEL_LOCAL_PORT:-18080}"
+# Outgoing email (backlog O-20): Scaleway Transactional Email over SMTP, the same values as
+# DefaultInstance.SMTPConfiguration in k8s/values/zitadel.yaml (tests/run.sh compares them).
+# DefaultInstance applies only when Zitadel creates an instance, so the bootstrap sets the
+# provider of the instance that exists through the admin API (/admin/v1/email/...). Port 587:
+# Hetzner blocks outgoing 25 and 465 on new accounts. tls true: Zitadel tries implicit TLS and,
+# when the server answers in plain text, upgrades with STARTTLS and checks the host name.
+SMTP_HOST=smtp.tem.scaleway.com:587
+SMTP_FROM=no-reply@notify.staging.ruum.space
+SMTP_FROM_NAME='Ruum (staging)'
+SMTP_DESCRIPTION='Scaleway Transactional Email (staging)'
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -76,6 +90,81 @@ upsert_idp() {
 # The IdP ID of a key of ruum/ruum-oidc (empty when the Secret or the key is missing).
 oidc_key() {
   kubectl -n ruum get secret ruum-oidc -o "jsonpath={.data.$1}" 2>/dev/null | base64 -d || true
+}
+
+# A key of the Secret auth/zitadel-smtp (empty when the Secret or the key is missing).
+smtp_key() {
+  kubectl -n "$NS" get secret zitadel-smtp -o "jsonpath={.data.$1}" 2>/dev/null | base64 -d || true
+}
+
+# The JSON of the email provider for SMTP_HOST (the first), or nothing.
+smtp_provider() {
+  echo '{}' | zapi POST /admin/v1/email/_search |
+    jq -c --arg host "$SMTP_HOST" '[.result[]? | select(.smtp.host == $host)] | first // empty'
+}
+
+# Adds the provider, or updates it (the password too), and activates it. Activating it makes the
+# provider that was active before (Mailpit) inactive. Idempotent.
+smtp() {
+  local user password provider id body
+  user="$(smtp_key user)"
+  password="$(smtp_key password)"
+  [[ -n "$user" && -n "$password" ]] ||
+    die "no user or password in $NS/zitadel-smtp (secrets-push.sh platform writes it from SCW_DEFAULT_PROJECT_ID and SCW_SMTP_SECRET_KEY)"
+  body="$(SMTP_USER="$user" SMTP_PASSWORD="$password" jq -n \
+    --arg host "$SMTP_HOST" --arg from "$SMTP_FROM" --arg name "$SMTP_FROM_NAME" --arg desc "$SMTP_DESCRIPTION" \
+    '{senderAddress: $from, senderName: $name, tls: true, host: $host, user: env.SMTP_USER,
+      replyToAddress: "", description: $desc, plain: {password: env.SMTP_PASSWORD}}')"
+  provider="$(smtp_provider)"
+  if [[ -z "$provider" ]]; then
+    id="$(printf '%s' "$body" | zapi POST /admin/v1/email/smtp | jq -r '.id // empty')"
+    log "added the SMTP provider $SMTP_HOST"
+  else
+    id="$(jq -r .id <<<"$provider")"
+    [[ "$id" =~ ^[0-9]{1,32}$ ]] || die "the SMTP provider has no valid ID"
+    printf '%s' "$body" | zapi PUT "/admin/v1/email/smtp/$id" >/dev/null
+    log "updated the SMTP provider $SMTP_HOST"
+  fi
+  [[ "$id" =~ ^[0-9]{1,32}$ ]] || die "the SMTP provider has no valid ID"
+  if [[ "$(smtp_provider | jq -r '.state // empty')" != EMAIL_PROVIDER_ACTIVE ]]; then
+    echo '{}' | zapi POST "/admin/v1/email/$id/_activate" >/dev/null
+    log "activated the SMTP provider $SMTP_HOST (the one before is now inactive)"
+  fi
+}
+
+# Prints the state of the active email provider; returns 1 on drift.
+smtp_check() {
+  local active user drift=0
+  active="$(echo '{}' | zapi POST /admin/v1/email/_search | jq -c '[.result[]? | select(.state == "EMAIL_PROVIDER_ACTIVE")] | first // empty')"
+  if [[ -z "$active" ]]; then
+    echo "DRIFT: no active email provider (Zitadel sends no email)"
+    return 1
+  fi
+  user="$(smtp_key user)"
+  jq -e --arg h "$SMTP_HOST" '.smtp.host == $h' <<<"$active" >/dev/null ||
+    { echo "DRIFT: the active email provider is not $SMTP_HOST (it is $(jq -r '.smtp.host // .http.endpoint // "unknown"' <<<"$active"))"; drift=1; }
+  jq -e '.smtp.tls == true' <<<"$active" >/dev/null || { echo "DRIFT: the active email provider has TLS off"; drift=1; }
+  jq -e --arg f "$SMTP_FROM" '.smtp.senderAddress == $f' <<<"$active" >/dev/null ||
+    { echo "DRIFT: the sender is not $SMTP_FROM"; drift=1; }
+  jq -e --arg n "$SMTP_FROM_NAME" '.smtp.senderName == $n' <<<"$active" >/dev/null ||
+    { echo "DRIFT: the sender name is not '$SMTP_FROM_NAME'"; drift=1; }
+  jq -e '.smtp | has("plain")' <<<"$active" >/dev/null || { echo "DRIFT: the active email provider has no password login"; drift=1; }
+  if [[ -z "$user" ]]; then echo "DRIFT: no user in $NS/zitadel-smtp"; drift=1
+  elif ! jq -e --arg u "$user" '.smtp.user == $u' <<<"$active" >/dev/null; then
+    echo "DRIFT: the SMTP user is not the one in $NS/zitadel-smtp"; drift=1
+  fi
+  [[ $drift == 0 ]] && echo "email: $SMTP_HOST is active, sender $SMTP_FROM_NAME <$SMTP_FROM>"
+  return "$drift"
+}
+
+# Zitadel sends one test email through the provider (TestEmailProviderSMTPById). Only on request.
+test_email() {
+  local to="$1" id
+  [[ "$to" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "usage: zitadel-bootstrap.sh test-email ADDRESS"
+  id="$(smtp_provider | jq -r '.id // empty')"
+  [[ "$id" =~ ^[0-9]{1,32}$ ]] || die "no SMTP provider for $SMTP_HOST (run zitadel-bootstrap.sh smtp first)"
+  jq -n --arg to "$to" '{receiverAddress: $to}' | zapi POST "/admin/v1/email/smtp/$id/_test" >/dev/null
+  log "Zitadel sent a test email to $to through $SMTP_HOST"
 }
 
 apply() {
@@ -137,6 +226,7 @@ apply() {
     kubectl create secret generic ruum-oidc -n ruum --from-env-file=/dev/stdin --dry-run=client -o yaml |
     kubectl apply -f - >/dev/null
   log "IdP IDs of Google and Microsoft in ruum/ruum-oidc (restart ruum-server to read new ones)"
+  smtp
   check
 }
 
@@ -161,6 +251,7 @@ check() {
     elif [[ "$have" != "$want" ]]; then echo "DRIFT: ruum/ruum-oidc $key is not the ID of the provider $name"; drift=1
     else echo "provider $name: its ID is in ruum/ruum-oidc $key"; fi
   done
+  smtp_check || drift=1
   humans="$(echo '{"queries":[{"typeQuery":{"type":"TYPE_HUMAN"}}]}' | zapi POST /management/v1/users/_search | jq '.result // [] | length')"
   echo "human users: $humans (before the person's test this must be 0; after it, only users that the providers created)"
   echo "machine PAT expiry: $(kubectl -n "$NS" get secret iam-admin-pat -o jsonpath='{.metadata.creationTimestamp}') + 90 days (record it in the digest)"
@@ -169,6 +260,8 @@ check() {
 
 case "$mode" in
   apply) apply ;;
+  smtp) smtp && check ;;
   check) check ;;
-  *) die "usage: zitadel-bootstrap.sh apply|check" ;;
+  test-email) test_email "${2:-}" ;;
+  *) die "usage: zitadel-bootstrap.sh apply|smtp|check|test-email ADDRESS" ;;
 esac

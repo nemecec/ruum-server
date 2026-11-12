@@ -3,7 +3,8 @@
 #
 #   check-plan.sh <plan.json> [--allow-delete] [--allow-replace]
 #                                       check a plan (the scrubbed JSON of `tofu show -json`)
-#   check-plan.sh --repo                check the repository: no HCLOUD_TOKEN in any cluster file
+#   check-plan.sh --repo                check the repository: no HCLOUD_TOKEN, Stripe key or
+#                                       SCW_SECRET_KEY in any cluster file
 #
 # It refuses (exit 3) a plan that:
 #   - has any hcloud_zone resource, in any action (the zones are data sources only);
@@ -53,7 +54,14 @@ if [[ "${1:-}" == --repo ]]; then
     printf 'REFUSED: a Stripe key is named in a cluster file:\n%s\n' "$hits"
     exit 3
   fi
-  echo "check-plan --repo: OK (no HCLOUD_TOKEN or Stripe key in cluster or CI files)"
+  # The agents' full Scaleway key (Object Storage and email) never goes into the cluster; Zitadel's
+  # SMTP login is the narrow SCW_SMTP_SECRET_KEY (backlog O-20).
+  hits="$(grep -rIlw 'SCW_SECRET_KEY' "$HERE/k8s" "$HERE/charts" 2>/dev/null || true)"
+  if [[ -n "$hits" ]]; then
+    printf 'REFUSED: SCW_SECRET_KEY is named in a cluster file:\n%s\n' "$hits"
+    exit 3
+  fi
+  echo "check-plan --repo: OK (no HCLOUD_TOKEN, Stripe key or full Scaleway key in cluster or CI files)"
   exit 0
 fi
 

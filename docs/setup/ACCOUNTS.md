@@ -28,6 +28,7 @@ only report which names are present, never the values.
 | `HETZNER_S3_ACCESS_KEY`, `HETZNER_S3_SECRET_KEY` | Hetzner Object Storage credentials | 1 |
 | `HETZNER_DNS_TOKEN` | only if Hetzner DNS asks for its own token | 2 |
 | `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_ORGANIZATION_ID` | Scaleway API key, project and organisation (backups and email) | 3 |
+| `SCW_SMTP_ACCESS_KEY`, `SCW_SMTP_SECRET_KEY` | Scaleway SMTP key: Zitadel's outgoing email | 3 |
 | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | Google sign-in | 4 |
 | `MS_OAUTH_CLIENT_ID`, `MS_OAUTH_CLIENT_SECRET` | Microsoft sign-in | 5 |
 | `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY` | Stripe, test mode | 6 |
@@ -102,6 +103,20 @@ French, so the data stays in the EU. One account for two needs means fewer keys.
    through the Hetzner DNS API and start the check.
 6. A new Transactional Email project starts with a low sending limit. That is enough for staging.
    Before real users, ask Scaleway support to raise it (the agents will remind you).
+7. **SMTP key** (Zitadel's outgoing email, backlog O-20). A separate application, so that the key
+   in the cluster can only send email. Do the steps in this order:
+   1. **IAM → Applications → Create application** named `ruum-staging-smtp`. Do not attach a
+      policy in this dialog.
+   2. **IAM → Policies → Create policy**. Principal: the application `ruum-staging-smtp`. Then add
+      a rule: choose the **permission set first**, **TransactionalEmailEmailSmtpCreate** (not
+      TransactionalEmailEmailApiCreate, which is for the HTTP API only and does not allow SMTP),
+      then the **scope**: Project **ruum-staging**.
+   3. **IAM → API keys → Generate API key** for the application `ruum-staging-smtp`. When Scaleway
+      asks "Will this API key be used for Object Storage?", answer **No**.
+   4. Copy the access key and the secret key into `SCW_SMTP_ACCESS_KEY` and `SCW_SMTP_SECRET_KEY`.
+      The SMTP login is the project ID (`SCW_DEFAULT_PROJECT_ID`) as the user and
+      `SCW_SMTP_SECRET_KEY` as the password, on `smtp.tem.scaleway.com` port 587 (STARTTLS).
+      Never use `SCW_SECRET_KEY` for this: that key can also reach Object Storage.
 
 Nothing to do for backups beyond the key; the agents create the bucket in `nl-ams`, with object
 lock (write once) where available.

@@ -13,6 +13,8 @@ at the end). Nothing in this folder creates a cloud resource unless you run it w
 - CloudNativePG (primary and replica on local disks), WAL and daily base backups to Scaleway with
   the backup writer key; SpiceDB, Zitadel, NATS JetStream, Mailpit; Caddy as the edge (with the
   web UI); ruum-server.
+- Zitadel sends email through Scaleway Transactional Email (see "Email"); ruum-server still sends
+  to Mailpit inside the cluster.
 - About EUR 38 per month (the priced plan of `up.sh`); EUR 45.6 with a fourth node, the last step
   within EUR 50. `up.sh` refuses a plan above EUR 50.
 
@@ -147,11 +149,17 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 2. **Allow-list.** `STG_ALLOWED_EMAILS=you@example.com` in `secrets.env`: the addresses that may
    sign in to staging. Optional: `STG_ALLOWED_UNVERIFIED_EMAILS` for a Microsoft address (see
    "Sign-in test").
-3. **Zone delete protection.** Hetzner console, DNS: turn on delete protection for `ruum.space`
+3. **SMTP key.** The API key of the Scaleway IAM application `ruum-staging-smtp`, whose only
+   permission is `TransactionalEmailEmailSmtpCreate` on project `ruum-staging`
+   (`docs/setup/ACCOUNTS.md`, step 3). Put its secret key into `secrets.env` as
+   `SCW_SMTP_SECRET_KEY` (and the access key as `SCW_SMTP_ACCESS_KEY`, for the record; SMTP does
+   not use it). `up.sh` stops until `SCW_SMTP_SECRET_KEY` is present; `secrets-init.sh` never
+   generates it.
+4. **Zone delete protection.** Hetzner console, DNS: turn on delete protection for `ruum.space`
    and `ruumapps.net`. The code never manages the zones, but the token could delete them.
-4. **Docker Desktop** on the Mac, running. The first step builds the tools image (above).
+5. **Docker Desktop** on the Mac, running. The first step builds the tools image (above).
    The admin tunnel needs `host.docker.internal` (Docker Desktop has it).
-5. Optional: `STG_ACME_EMAIL` for ZeroSSL (the trusted CA for the sign-in test).
+6. Optional: `STG_ACME_EMAIL` for ZeroSSL (the trusted CA for the sign-in test).
 
 ## Secrets
 
@@ -165,6 +173,7 @@ check the files).
 | `data/pg-backup-s3` | backup writer key | CNPG (Barman Cloud plugin) |
 | `data/pg-role-{ruum,zitadel,spicedb}` | database passwords | CNPG managed roles |
 | `auth/zitadel-masterkey`, `auth/zitadel-db` | master key, DSN | Zitadel |
+| `auth/zitadel-smtp` | SMTP login at Scaleway: `user` (the project ID, `SCW_DEFAULT_PROJECT_ID`), `password` (`SCW_SMTP_SECRET_KEY`) | Zitadel (setup of a new instance), `ops/zitadel-bootstrap.sh` |
 | `authz/spicedb` | preshared key, DSN | SpiceDB |
 | `ruum/ruum-server-env` | DSN, Hetzner S3 key, SpiceDB key, token and content keys, allow-list | ruum-server |
 | `ruum/ruum-oidc` | OIDC client ID (`client-id`) and the Zitadel IdP IDs of Google and Microsoft (`idp-google`, `idp-microsoft`, for `RUUM_OIDC_IDP_*`), made by `ops/zitadel-bootstrap.sh` | ruum-server |
@@ -172,11 +181,35 @@ check the files).
 | `nats/nats-auth` | the ruum user's password | NATS |
 
 The Google and Microsoft keys go only into Zitadel's database (through the bootstrap), never into
-a Secret. The generated values (`STG_*`) are in `secrets.env` too, so a restore after the loss of
+a Secret. The SMTP key is in `auth/zitadel-smtp` and, encrypted, in Zitadel's database; never the
+agents' full Scaleway key (`check-plan.sh --repo` refuses `SCW_SECRET_KEY` in a cluster file). The generated values (`STG_*`) are in `secrets.env` too, so a restore after the loss of
 the whole cluster can read Zitadel's data.
 
 Backups: HTTPS in transit. At rest, CNPG backups have only Scaleway's provider-side encryption;
 the blob copy is encrypted by rclone crypt with a key that lives off the cluster.
+
+## Email
+
+Zitadel sends its email (the email check of a Microsoft sign-in, backlog O-20) through Scaleway
+Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (staging)
+<no-reply@notify.staging.ruum.space>`. The sending domain is verified in project `ruum-staging`
+(region `fr-par`) with SPF, DKIM, DMARC and MX in public DNS.
+
+- Port 587: Hetzner blocks outgoing ports 25 and 465 on new accounts. Scaleway also listens on 2587
+  (STARTTLS) and 2465 (implicit TLS). Zitadel's `tls: true` tries implicit TLS first and, when the
+  server answers in plain text, upgrades with STARTTLS and checks the host name; it logs a warning
+  "could not connect using normal tls" for each connection on 587. That warning is expected.
+- No egress network policy exists (only ingress policies), and the Hetzner firewall has inbound
+  rules only, so Zitadel reaches port 587 without a rule. If egress policies are added, allow
+  `auth/zitadel` to TCP 587 out (and DNS).
+- `DefaultInstance.SMTPConfiguration` in `k8s/values/zitadel.yaml` applies only when Zitadel creates
+  an instance. For the instance that exists, `ops/zitadel-bootstrap.sh` adds or updates the SMTP
+  provider through the admin API (`/admin/v1/email/smtp`) and activates it, which makes the old
+  Mailpit provider inactive. `zitadel-bootstrap.sh check` (also in `status.sh --checks`) reports
+  drift: no active provider, another host, TLS off, another sender or user.
+- Only the SMTP part: `deploy/staging/tool.sh bash deploy/staging/ops/zitadel-bootstrap.sh smtp`.
+  One test email: `... zitadel-bootstrap.sh test-email you@example.com`.
+- Mailpit stays deployed (ruum-server and laptop parity) but is not Zitadel's provider.
 
 ## Edge and certificates
 
@@ -227,9 +260,8 @@ backup bucket never blocks archiving; `--restore-from` reads an older path.
 Agents cannot sign in with a real Google or Microsoft account. When `status.sh --checks` shows
 that both providers redirect correctly, the person opens `https://staging.ruum.space` (with the
 ZeroSSL CA), signs in with Google, signs out, signs in with Microsoft. Microsoft emails are not
-trusted as verified (nOAuth), so Zitadel asks to verify the address once: the code goes to Mailpit
-(`deploy/staging/tool.sh --port 8025 kubectl -n ops port-forward --address 0.0.0.0 svc/mailpit 8025`
-on the Mac, then `http://127.0.0.1:8025`). Accounts are
+trusted as verified (nOAuth), so Zitadel asks to verify the address once: the code goes by email
+to that address, from `no-reply@notify.staging.ruum.space` (see "Email"; check the spam folder). Accounts are
 never linked automatically. After the test, staging and its backups (for the retention window)
 hold the person's name and email.
 
