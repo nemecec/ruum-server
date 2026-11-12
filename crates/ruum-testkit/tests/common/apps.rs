@@ -33,6 +33,11 @@ pub const PENDING: &[(&str, &str)] = &[
         "needs the deployer check of bindings: B-1 (and database bindings of previews: D-3a)",
     ),
     (
+        "agent_binding_outside_its_scope_is_refused",
+        "needs the deployer check of bindings (an agent: its user's right intersected with its \
+         scope): B-1",
+    ),
+    (
         "binding_to_another_tenants_node_fails_like_a_missing_node",
         "needs binding resolution: B-1",
     ),
@@ -285,6 +290,11 @@ pub fn from_file(file: &str) -> Value {
     json!({ "source": { "kind": "file", "node_id": file } })
 }
 
+/// The body of `createAppDeployment` from a given version of a file.
+pub fn from_file_version(file: &str, version: &str) -> Value {
+    json!({ "source": { "kind": "file", "node_id": file, "version_id": version } })
+}
+
 /// `getAppDeployment`, with `wait` seconds when given.
 pub fn get_deployment(
     cx: &Ctx,
@@ -501,6 +511,7 @@ pub async fn wait_state(
 ) -> Result<Value, Fail> {
     let start = Instant::now();
     loop {
+        let asked = Instant::now();
         let d = cx
             .ok(who, get_deployment(cx, app, dep, Some(10)), &[200])
             .await?;
@@ -515,6 +526,10 @@ pub async fn wait_state(
             start.elapsed() < DEPLOY_WITHIN,
             "deployment {dep} is {state:?}, not {states:?}, after {DEPLOY_WITHIN:?}"
         );
+        // An implementation that ignores `wait` must not be polled without a pause.
+        if asked.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -597,6 +612,34 @@ pub async fn new_release(
     go_live(cx, Who::Member, app, &str_at(&p, "/id")?).await
 }
 
+/// The IDs of the deployments of `app` (`listAppDeployments` as `member`, the first page).
+pub async fn deployment_ids(cx: &Ctx, app: &str) -> Result<Vec<String>, Fail> {
+    let page = cx
+        .ok(Who::Member, list_deployments(cx, app, ""), &[200])
+        .await?;
+    Ok(items(&page)
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Fails when `app` has a deployment that `before` does not list: a direct refusal leaves no
+/// `pending` or `failed` deployment that a later stage could pick up (`listAppDeployments`).
+pub async fn no_new_deployment(
+    cx: &Ctx,
+    app: &str,
+    before: &[String],
+    what: &str,
+) -> Result<(), Fail> {
+    let after = deployment_ids(cx, app).await?;
+    let new: Vec<&String> = after.iter().filter(|d| !before.contains(d)).collect();
+    check!(
+        new.is_empty(),
+        "{what}: the refusal left the deployments {new:?} behind"
+    );
+    Ok(())
+}
+
 /// Waits until `getApp` (as `member`) names `dep` as the live deployment.
 pub async fn wait_live_is(cx: &Ctx, app: &str, dep: &str) -> Result<Value, Fail> {
     let start = Instant::now();
@@ -657,6 +700,8 @@ pub fn fixture_secrets(cx: &Ctx) -> Vec<String> {
             }
         }
     }
+    // The entered secret value of the standard requests of the isolation suite.
+    v.push("sk_test_ruum_fixture".to_string());
     // A short value could match by chance; every real secret is longer.
     v.retain(|s| s.len() >= 12);
     v

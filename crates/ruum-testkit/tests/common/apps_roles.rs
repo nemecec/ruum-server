@@ -130,11 +130,12 @@ pub fn cases() -> Vec<Case> {
             ],
             "guest (no grant on any node) holding admin (grants_roles) gives approver to \
              guest_comment (201) and removes it again (204); guest_comment (comment, holds \
-             approver) and member_view (view, no share) get 403 for addAppRoleGrant \
-             (app_role#grant)",
+             approver) and member_view (view, no share) get 403 for addAppRoleGrant and for \
+             removeAppRoleGrant (app_role#grant); after member removes guest's admin grant, \
+             guest can no longer grant (403 or 404)",
             |cx| {
                 let live = live_app(&cx, cx.a().projects, "granted", ROLES_MANIFEST).await?;
-                grant(&cx, Who::Member, &live.id, "admin", Who::Guest).await?;
+                let admin = grant(&cx, Who::Member, &live.id, "admin", Who::Guest).await?;
                 let id = grant(&cx, Who::Guest, &live.id, "approver", Who::GuestComment).await?;
                 for who in [Who::GuestComment, Who::MemberView] {
                     cx.refused(
@@ -145,8 +146,35 @@ pub fn cases() -> Vec<Case> {
                     )
                     .await?;
                 }
+                for who in [Who::GuestComment, Who::MemberView] {
+                    cx.refused(
+                        who,
+                        remove_role_grant(&cx, &live.id, &id),
+                        403,
+                        &["permission_denied"],
+                    )
+                    .await?;
+                }
                 cx.ok(Who::Guest, remove_role_grant(&cx, &live.id, &id), &[204])
                     .await?;
+                cx.ok(
+                    Who::Member,
+                    remove_role_grant(&cx, &live.id, &admin),
+                    &[204],
+                )
+                .await?;
+                let res = cx
+                    .send(
+                        Who::Guest,
+                        add_role_grant(&cx, &live.id, "approver", Who::GuestComment),
+                    )
+                    .await?;
+                check!(
+                    matches!(res.status.as_u16(), 403 | 404),
+                    "a removed grants_roles grant still grants: {} {}",
+                    res.status,
+                    res.text()
+                );
                 Ok(())
             }
         ),

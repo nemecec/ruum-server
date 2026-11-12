@@ -6,6 +6,7 @@ use super::apps::*;
 use super::apps_archive::{self, TarEntry, TarKind, ZipEntry};
 use super::{Case, Ctx, Fail};
 use crate::{case, check, fail};
+use ruum_testkit::client::Response;
 use ruum_testkit::fixtures::Who;
 use serde_json::{Value, json};
 
@@ -32,46 +33,38 @@ async fn app_and_site(cx: &Ctx, name: &str, manifest: &str) -> Result<(String, S
     Ok((app_id(&app)?, s))
 }
 
-/// A hostile archive is refused: a direct `413` or `422` with an error code (the stage
-/// `unpack` runs before the answer), or, if the platform answers `202`, the deployment fails at
-/// `unpack` with a machine-readable error. It never becomes `ready`.
+/// A hostile archive is refused by a direct `413 payload_too_large` or `422
+/// validation_failed`: the stage `unpack` runs before the answer (`createAppDeployment`), so a
+/// `202` is wrong even when the deployment fails later. The refusal leaves no deployment behind
+/// (`listAppDeployments`).
 async fn refused_archive(cx: &Ctx, app: &str, file_name: &str, bytes: &[u8]) -> Result<(), Fail> {
     let (file, _) = write_file(cx, Who::Member, cx.a().projects, file_name, bytes).await?;
+    let before = deployment_ids(cx, app).await?;
     let res = cx
         .send(Who::Member, create_deployment(cx, app, from_file(&file)))
         .await?;
-    match res.status.as_u16() {
-        413 | 422 => {
-            check!(
-                res.error_code().is_some(),
-                "{file_name}: a {} without an error code: {}",
-                res.status,
-                res.text()
-            );
-            Ok(())
-        }
-        202 => {
-            let made = res.json().unwrap_or(Value::Null);
-            let dep = str_at(&made, "/id")?;
-            let d = wait_state(cx, Who::Member, app, &dep, &["failed", "ready"]).await?;
-            check!(d["state"] == "failed", "{file_name} was deployed: {d}");
-            let unpack = d["stages"]
-                .as_array()
-                .and_then(|s| s.iter().find(|x| x["name"] == "unpack"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            check!(
-                unpack["state"] == "failed" && unpack["error"]["code"].is_string(),
-                "{file_name}: the stage unpack did not fail with a machine-readable error: {}",
-                d["stages"]
-            );
-            Ok(())
-        }
-        other => fail!(
-            "{file_name}: got {other}, expected 413 or 422: {}",
-            res.text()
+    let code = res.error_code().unwrap_or_default();
+    check!(
+        matches!(
+            (res.status.as_u16(), code.as_str()),
+            (413, "payload_too_large") | (422, "validation_failed")
         ),
-    }
+        "{file_name}: got {} {code:?}, expected a direct 413 payload_too_large or 422 \
+         validation_failed (unpack runs before the answer): {}",
+        res.status,
+        res.text()
+    );
+    no_new_deployment(cx, app, &before, file_name).await
+}
+
+/// The status, error code and hint of an answer: two refusals that must not be told apart.
+fn shape(res: &Response) -> (u16, Option<String>, Value) {
+    let hint = res.json().map(|v| v["error"]["hint"].clone());
+    (
+        res.status.as_u16(),
+        res.error_code(),
+        hint.unwrap_or(Value::Null),
+    )
 }
 
 pub fn cases() -> Vec<Case> {
@@ -82,13 +75,15 @@ pub fn cases() -> Vec<Case> {
                 "createApp",
                 "createNode",
                 "putContent",
-                "createAppDeployment"
+                "createAppDeployment",
+                "listAppDeployments"
             ],
             "createAppDeployment answers 422 validation_failed before any 202 for an unknown \
              runtime (pointer /runtime), an env name with the RUUM_ prefix (pointer under /env), \
              a static app with start (a schema rule), two default roles (a provider rule, \
              pointer under /roles) and a folder without app.yaml; each with \
-             error.details.pointer where a key is wrong",
+             error.details.pointer where a key is wrong; afterwards listAppDeployments lists no \
+             deployment (a direct refusal leaves nothing behind)",
             |cx| {
                 let (app, s) = app_and_site(&cx, "bad manifests", "runtime: cobol\n").await?;
                 let manifest = &s.files[0].1;
@@ -138,7 +133,7 @@ pub fn cases() -> Vec<Case> {
                     &["validation_failed"],
                 )
                 .await?;
-                Ok(())
+                no_new_deployment(&cx, &app, &[], "a bad manifest").await
             }
         ),
         case!(
@@ -175,6 +170,243 @@ pub fn cases() -> Vec<Case> {
                 check!(
                     err["details"]["binding"] == "db",
                     "error.details.binding: {err}"
+                );
+                Ok(())
+            }
+        ),
+        case!(
+            "agent_binding_outside_its_scope_is_refused",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "listAppDeployments"
+            ],
+            "agent_out (scope Private, manage) deploys an app in Private with the binding db \
+             (view on the fixture database in Projects, which its user member may view but its \
+             scope does not reach): 403 permission_denied, hint binding_not_allowed, \
+             error.details.binding = db, before any 202 and with no deployment left (design \
+             9.4: an agent's right is its user's right intersected with its scope)",
+            |cx| {
+                let app = new_app(&cx, Who::Member, cx.a().private, "bot bound").await?;
+                let id = app_id(&app)?;
+                let yaml = format!(
+                    "runtime: static\nbindings:\n  db:\n    node: node:{}\n    role: view\n",
+                    cx.a().database
+                );
+                let s = site(&cx, Who::AgentOut, cx.a().private, "bot bound site", &yaml).await?;
+                let err = cx
+                    .refused(
+                        Who::AgentOut,
+                        create_deployment(&cx, &id, from_folder(&s.folder, None)),
+                        403,
+                        &["permission_denied"],
+                    )
+                    .await?;
+                super::api::hint_has(&err, "binding_not_allowed")?;
+                check!(
+                    err["details"]["binding"] == "db",
+                    "error.details.binding: {err}"
+                );
+                no_new_deployment(&cx, &id, &[], "a refused agent binding").await
+            }
+        ),
+        case!(
+            "deploy_source_needs_view_and_its_own_version",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "listAppDeployments"
+            ],
+            "createAppDeployment packs only a source that the caller can view, at a version of \
+             that node: guest_edit (edit on Projects, so on the app) deploying member's folder \
+             and archive in Private gets the same status, code and hint as for a random node \
+             ID; a file it can view with the version_id of the hidden file (as guest_edit and \
+             as member) gets the same answer as with a random version ID, a client error; a \
+             folder source with a version_id, the source kind build and the draft Draft_1 are \
+             422 validation_failed; no request leaves a deployment",
+            |cx| {
+                let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "sources").await?)?;
+                let tgz = apps_archive::tar_gz(&[
+                    ("app.yaml", STATIC_MANIFEST.as_bytes()),
+                    ("index.html", INDEX_HTML),
+                ]);
+                let hidden = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().private,
+                    "hidden site",
+                    STATIC_MANIFEST,
+                )
+                .await?;
+                let (hidden_file, hidden_version) =
+                    write_file(&cx, Who::Member, cx.a().private, "hidden.tar.gz", &tgz).await?;
+                let (open_file, _) =
+                    write_file(&cx, Who::Member, cx.a().projects, "open.tar.gz", &tgz).await?;
+                let open = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "open site",
+                    STATIC_MANIFEST,
+                )
+                .await?;
+                let missing = uuid::Uuid::now_v7().to_string();
+                for (kind, node) in [("folder", &hidden.folder), ("file", &hidden_file)] {
+                    let body = |id: &str| json!({ "source": { "kind": kind, "node_id": id } });
+                    let seen = cx
+                        .send(Who::GuestEdit, create_deployment(&cx, &app, body(node)))
+                        .await?;
+                    let none = cx
+                        .send(Who::GuestEdit, create_deployment(&cx, &app, body(&missing)))
+                        .await?;
+                    check!(
+                        seen.status.is_client_error(),
+                        "guest_edit deployed a {kind} it cannot view: {} {}",
+                        seen.status,
+                        seen.text()
+                    );
+                    check!(
+                        shape(&seen) == shape(&none),
+                        "a hidden {kind} and a missing one differ: {:?} and {:?}",
+                        shape(&seen),
+                        shape(&none)
+                    );
+                }
+                for who in [Who::GuestEdit, Who::Member] {
+                    let other = cx
+                        .send(
+                            who,
+                            create_deployment(
+                                &cx,
+                                &app,
+                                from_file_version(&open_file, &hidden_version),
+                            ),
+                        )
+                        .await?;
+                    let none = cx
+                        .send(
+                            who,
+                            create_deployment(&cx, &app, from_file_version(&open_file, &missing)),
+                        )
+                        .await?;
+                    check!(
+                        other.status.is_client_error(),
+                        "{}: a version of another file was accepted: {} {}",
+                        who.name(),
+                        other.status,
+                        other.text()
+                    );
+                    check!(
+                        shape(&other) == shape(&none),
+                        "{}: a version of another file and a missing version differ: {:?} and \
+                         {:?}",
+                        who.name(),
+                        shape(&other),
+                        shape(&none)
+                    );
+                }
+                let mut folder_version = from_folder(&open.folder, None);
+                folder_version["source"]["version_id"] = json!(open.files[0].2);
+                let build = json!({ "source": { "kind": "build", "node_id": open.folder } });
+                let draft = from_folder(&open.folder, Some("Draft_1"));
+                for body in [folder_version, build, draft] {
+                    cx.refused(
+                        Who::Member,
+                        create_deployment(&cx, &app, body),
+                        422,
+                        &["validation_failed"],
+                    )
+                    .await?;
+                }
+                no_new_deployment(&cx, &app, &[], "a refused source").await
+            }
+        ),
+        case!(
+            "viewers_see_no_stage_messages_check_or_previews",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "getApp"
+            ],
+            "a ready preview and a preview whose check route /missing.html does not exist \
+             (ready or failed): member (edit) sees the check result or a stage message of the \
+             second one; member_view (view) gets both from getAppDeployment with every \
+             stages[].message and check null or left out, and getApp with previews empty, \
+             while member's getApp lists the ready preview (getAppDeployment: the check result \
+             and stage messages need edit; App.previews: callers with edit only)",
+            |cx| {
+                let (app, s) = app_and_site(&cx, "details", STATIC_MANIFEST).await?;
+                let ready = preview(
+                    &cx,
+                    Who::Member,
+                    &app,
+                    from_folder(&s.folder, Some("plain")),
+                )
+                .await?;
+                let ready = str_at(&ready, "/id")?;
+                let broken = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "details broken",
+                    "runtime: static\ncheck:\n  routes: [/missing.html]\n",
+                )
+                .await?;
+                let made = cx
+                    .ok(
+                        Who::Member,
+                        create_deployment(&cx, &app, from_folder(&broken.folder, Some("broken"))),
+                        &[202],
+                    )
+                    .await?;
+                let broken = str_at(&made, "/id")?;
+                let d = wait_state(&cx, Who::Member, &app, &broken, &["ready", "failed"]).await?;
+                let has_message = |d: &Value| {
+                    d["stages"]
+                        .as_array()
+                        .is_some_and(|v| v.iter().any(|x| x["message"].is_string()))
+                };
+                check!(
+                    d["check"].is_object() || has_message(&d),
+                    "member (edit) sees neither a check result nor a stage message of a \
+                     deployment whose check route is missing: {d}"
+                );
+                for dep in [&ready, &broken] {
+                    let v = cx
+                        .ok(
+                            Who::MemberView,
+                            get_deployment(&cx, &app, dep, None),
+                            &[200],
+                        )
+                        .await?;
+                    check!(
+                        v["check"].is_null() && !has_message(&v),
+                        "member_view (view) sees the check result or a stage message of \
+                         {dep}: check {}, stages {}",
+                        v["check"],
+                        v["stages"]
+                    );
+                }
+                let a = cx.ok(Who::MemberView, get_app(&cx, &app), &[200]).await?;
+                check!(
+                    a["previews"].as_array().is_some_and(Vec::is_empty),
+                    "member_view (view) sees previews: {}",
+                    a["previews"]
+                );
+                let a = cx.ok(Who::Member, get_app(&cx, &app), &[200]).await?;
+                check!(
+                    a["previews"]
+                        .as_array()
+                        .is_some_and(|p| p.iter().any(|x| x["id"] == ready.as_str())),
+                    "member (edit) does not see the ready preview: {}",
+                    a["previews"]
                 );
                 Ok(())
             }
@@ -464,10 +696,11 @@ pub fn cases() -> Vec<Case> {
                 "createNode",
                 "putContent",
                 "createAppDeployment",
-                "getAppDeployment"
+                "listAppDeployments"
             ],
             "a .zip with app.yaml and an entry ../../outside.html, and one with an absolute \
-             path /etc/ruum.html, is refused at unpack",
+             path /etc/ruum.html, is refused at unpack \
+             (a direct 413 or 422, no deployment left)",
             |cx| {
                 let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "slip").await?)?;
                 for (file, evil) in [
@@ -490,10 +723,11 @@ pub fn cases() -> Vec<Case> {
                 "createNode",
                 "putContent",
                 "createAppDeployment",
-                "getAppDeployment"
+                "listAppDeployments"
             ],
             "a .tar.gz with app.yaml and an entry ../outside.html, and one with \
-             dist/../../outside.html, is refused at unpack",
+             dist/../../outside.html, is refused at unpack \
+             (a direct 413 or 422, no deployment left)",
             |cx| {
                 let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "tar slip").await?)?;
                 for (file, evil) in [
@@ -516,10 +750,11 @@ pub fn cases() -> Vec<Case> {
                 "createNode",
                 "putContent",
                 "createAppDeployment",
-                "getAppDeployment"
+                "listAppDeployments"
             ],
             "a .tar.gz with a symbolic link (index.html -> /etc/passwd), one with a hard link \
-             (to ../../secret), and a .zip with a symbolic link entry are refused at unpack",
+             (to ../../secret), and a .zip with a symbolic link entry are refused at unpack \
+             (a direct 413 or 422, no deployment left)",
             |cx| {
                 let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "links").await?)?;
                 let manifest = TarEntry::file("app.yaml", STATIC_MANIFEST.as_bytes());
@@ -551,10 +786,11 @@ pub fn cases() -> Vec<Case> {
                 "createNode",
                 "putContent",
                 "createAppDeployment",
-                "getAppDeployment"
+                "listAppDeployments"
             ],
             "a .tar.gz with a character device, one with a block device and one with a FIFO \
-             are refused at unpack",
+             are refused at unpack \
+             (a direct 413 or 422, no deployment left)",
             |cx| {
                 let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "devices").await?)?;
                 for (file, kind) in [
@@ -578,10 +814,10 @@ pub fn cases() -> Vec<Case> {
                 "createNode",
                 "putContent",
                 "createAppDeployment",
-                "getAppDeployment"
+                "listAppDeployments"
             ],
             "a valid .tar.gz of about 4 MiB that expands to a 4 GiB file is refused at unpack \
-             (size limits), not unpacked",
+             (size limits), not unpacked: a direct 413 or 422, no deployment left",
             |cx| {
                 let app = app_id(&new_app(&cx, Who::Member, cx.a().projects, "bomb").await?)?;
                 refused_archive(&cx, &app, "bomb.tar.gz", &apps_archive::bomb_tar_gz()).await

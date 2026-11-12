@@ -1,7 +1,7 @@
 //! Checks of the M1 app cases themselves (card T-4a): every case names its operations, every
 //! operation is in the contract, a case over a planned operation is reported as planned, every
 //! pending entry names its case and a card, each of the 12 M1 operations has a case, and the
-//! hand-written archives are well formed.
+//! hand-written archives are well formed (also as `gzip`, `tar` and Python's `zipfile` read them).
 
 mod common;
 
@@ -198,6 +198,149 @@ fn the_bomb_is_small_and_claims_four_gib() {
     let isize = u32::from_le_bytes(b[b.len() - 4..].try_into().expect("4 bytes"));
     let total = (512 * 2 + 512) as u64 + apps_archive::BOMB_BYTES + 1024;
     assert_eq!(isize, total as u32);
+}
+
+/// Runs a standard tool and returns its standard output; panics when it fails or is missing.
+fn tool(cmd: &str, args: &[&str]) -> String {
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("{cmd} is needed by this test (CI has it): {e}"));
+    assert!(
+        out.status.success(),
+        "{cmd} {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The hostile archives of the cases, read by tools that did not write them (`gzip -t`, `tar
+/// -tvzf`, Python's `zipfile`): each is well formed and holds the entry it is meant to hold, so
+/// a refusal in a case is for the hostile entry, not for broken framing. The bomb is decoded to
+/// its end by `gzip -t` (4 GiB, CRC and length).
+#[test]
+fn archives_decode_with_standard_tools() {
+    let dir = std::env::temp_dir().join(format!("ruum-t4a-archives-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the folder");
+    let m: &[u8] = b"runtime: static\n";
+    let i: &[u8] = b"<h1>x</h1>";
+    let manifest = || TarEntry::file("app.yaml", m);
+    // (file, archive, entries as (type letter of `tar -tv`, the start of the name column))
+    type Listed<'a> = Vec<(char, &'a str)>;
+    let tars: Vec<(&str, Vec<u8>, Listed)> = vec![
+        (
+            "site.tar.gz",
+            apps_archive::tar_gz(&[("app.yaml", m), ("index.html", i)]),
+            vec![('-', "app.yaml"), ('-', "index.html")],
+        ),
+        (
+            "slip.tar.gz",
+            apps_archive::tar_gz(&[("app.yaml", m), ("../outside.html", i)]),
+            vec![('-', "../outside.html")],
+        ),
+        (
+            "deep.tar.gz",
+            apps_archive::tar_gz(&[("app.yaml", m), ("dist/../../outside.html", i)]),
+            vec![('-', "dist/../../outside.html")],
+        ),
+        (
+            "symlink.tar.gz",
+            apps_archive::gzip(&apps_archive::tar(&[
+                manifest(),
+                TarEntry::special("index.html", TarKind::SymLink, "/etc/passwd"),
+            ])),
+            vec![('l', "index.html -> /etc/passwd")],
+        ),
+        (
+            "hardlink.tar.gz",
+            apps_archive::gzip(&apps_archive::tar(&[
+                manifest(),
+                TarEntry::special("index.html", TarKind::HardLink, "../../secret"),
+            ])),
+            // GNU tar lists the target without its leading ../ (it strips them).
+            vec![('h', "index.html link to ")],
+        ),
+        (
+            "devices.tar.gz",
+            apps_archive::gzip(&apps_archive::tar(&[
+                manifest(),
+                TarEntry::special("char", TarKind::CharDevice, ""),
+                TarEntry::special("block", TarKind::BlockDevice, ""),
+                TarEntry::special("fifo", TarKind::Fifo, ""),
+            ])),
+            vec![('c', "char"), ('b', "block"), ('p', "fifo")],
+        ),
+    ];
+    for (name, bytes, entries) in &tars {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write");
+        let path = path.to_str().expect("utf-8 path");
+        tool("gzip", &["-t", path]);
+        let listing = tool("tar", &["-tvzf", path]);
+        for (kind, entry) in entries {
+            assert!(
+                listing
+                    .lines()
+                    .any(|l| l.starts_with(*kind) && l.contains(&format!(" {entry}"))),
+                "{name}: tar does not list {kind} {entry:?}:\n{listing}"
+            );
+        }
+    }
+    let zips: Vec<(&str, Vec<u8>, &str, u32)> = vec![
+        (
+            "slip.zip",
+            apps_archive::zip(&[
+                ZipEntry::file("app.yaml", m),
+                ZipEntry::file("../../outside.html", i),
+            ]),
+            "../../outside.html",
+            0,
+        ),
+        (
+            "abs.zip",
+            apps_archive::zip(&[
+                ZipEntry::file("app.yaml", m),
+                ZipEntry::file("/etc/ruum.html", i),
+            ]),
+            "/etc/ruum.html",
+            0,
+        ),
+        (
+            "symlink.zip",
+            apps_archive::zip(&[
+                ZipEntry::file("app.yaml", m),
+                ZipEntry {
+                    name: "index.html",
+                    data: b"/etc/passwd",
+                    unix_mode: Some(0o120_777),
+                },
+            ]),
+            "index.html",
+            0o120_777,
+        ),
+    ];
+    let script = "import sys, zipfile\n\
+        z = zipfile.ZipFile(sys.argv[1])\n\
+        assert z.testzip() is None\n\
+        for e in z.infolist():\n    print(oct(e.external_attr >> 16), e.filename)\n";
+    for (name, bytes, entry, mode) in &zips {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write");
+        let listing = tool(
+            "python3",
+            &["-I", "-c", script, path.to_str().expect("utf-8 path")],
+        );
+        // Python's oct() and Rust's {:#o} agree: 0o0, 0o120777.
+        let want = format!("{mode:#o} {entry}");
+        assert!(
+            listing.lines().any(|l| l == want),
+            "{name}: zipfile does not list {want:?}:\n{listing}"
+        );
+    }
+    let bomb = dir.join("bomb.tar.gz");
+    std::fs::write(&bomb, apps_archive::bomb_tar_gz()).expect("write");
+    tool("gzip", &["-t", bomb.to_str().expect("utf-8 path")]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Writes every archive of the cases to `$RUUM_ARCHIVE_DIR`, so a person can check them with
