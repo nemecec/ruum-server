@@ -4,7 +4,7 @@ use super::*;
 use crate::actor::{Actor, PrincipalKind, PrincipalRef};
 use crate::databases::classes::{ConfirmItem, ConfirmRequest};
 use crate::databases::tests::{World, ctx, settled, world};
-use crate::databases::{CreateDatabase, DatabaseDeps, DatabaseSettings};
+use crate::databases::{CreateDatabase, DatabaseDeps, DatabaseSettings, DatabaseStore};
 use crate::providers::Provider;
 use crate::tenants::TenantPolicyChange;
 use crate::{Services, UserId};
@@ -557,6 +557,194 @@ fn the_branch_manifest_names_its_source() {
     assert_eq!(m["data_classes"]["public.t.a"], "normal");
 }
 
+/// Review D-3a 1: the memory store writes the `databases` row of a branch and its column rows
+/// under one lock. A second insert is `409`; a node that has column rows already is `409`, and
+/// no `databases` row is written.
+#[tokio::test]
+async fn the_row_and_the_columns_of_a_branch_are_written_together() {
+    let w = world().await;
+    let id = garden(&w).await;
+    let t = w.team.id;
+    let store = w.handles.databases.clone();
+    let columns = w.s.databases.deps().columns.clone();
+    let source = store.get(t, id).await.unwrap().unwrap();
+    let branch_row = |node: NodeId| DatabaseRow {
+        node_id: node,
+        branch_of: Some(id),
+        branch_data: Some(DataCopy::SchemaOnly),
+        key_node_id: Some(node),
+        ..source.clone()
+    };
+    // The source has column rows once a sync ran.
+    w.s.databases.sync_columns(t, id).await.unwrap();
+    let rows = columns.list(t, id).await.unwrap();
+    assert!(!rows.is_empty());
+    let b = NodeId::new();
+    DatabaseStore::insert_branch(&*store, &branch_row(b), &[], &rows)
+        .await
+        .unwrap();
+    assert!(store.get(t, b).await.unwrap().is_some());
+    assert_eq!(columns.list(t, b).await.unwrap().len(), rows.len());
+    assert_eq!(
+        code(DatabaseStore::insert_branch(&*store, &branch_row(b), &[], &[]).await).0,
+        409
+    );
+    assert_eq!(columns.list(t, b).await.unwrap().len(), rows.len());
+    // Column rows first (a sync that ran before): 409, and no row.
+    let c = NodeId::new();
+    columns
+        .sync(
+            t,
+            c,
+            &[LiveColumn {
+                column: rows[0].column.clone(),
+                data_type: rows[0].data_type.clone(),
+                identity: None,
+            }],
+            crate::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code(DatabaseStore::insert_branch(&*store, &branch_row(c), &[], &rows).await).0,
+        409
+    );
+    assert!(store.get(t, c).await.unwrap().is_none());
+    assert_eq!(columns.list(t, c).await.unwrap().len(), 1);
+}
+
+/// Review D-3a 1: catalog syncs of the branch while it is made never unconfirm its copied
+/// classes or strip them from its manifest, and the branch ends `ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn syncs_while_a_branch_is_made_change_nothing() {
+    let w = world().await;
+    let a = ctx(w.team.id, w.alice);
+    let id = garden(&w).await;
+    let s = w.s.databases.clone();
+    s.list_columns(&a, id, false, PageRequest::default())
+        .await
+        .unwrap();
+    s.confirm_columns(
+        &a,
+        "https://ruum.localhost",
+        id,
+        ConfirmRequest {
+            columns: vec![ConfirmItem {
+                schema: "main".into(),
+                table: "plants".into(),
+                column: "latin_name".into(),
+                class: ruum_dbengine::DataClass::Normal,
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    for round in 0..5 {
+        let b = s
+            .create_branch(&a, id, schema_only(&format!("race {round}")))
+            .await
+            .unwrap()
+            .value
+            .node
+            .id;
+        // Sync the branch in a loop until it is not provisioning any more.
+        let syncer = {
+            let s = s.clone();
+            let t = w.team.id;
+            tokio::spawn(async move {
+                for _ in 0..2000 {
+                    let _ = s.sync_columns(t, b).await;
+                    if s.deps().provider.holds_key(t, b) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let db = settled(&w.s, &a, b).await;
+        syncer.await.unwrap();
+        assert_eq!(db.status.state, ProviderState::Ready, "{:?}", db.status);
+        let db = s.get(&a, b).await.unwrap();
+        assert_eq!(
+            db.manifest["data_classes"]["main.plants.latin_name"], "normal",
+            "the copied class stays in the manifest"
+        );
+        let rows = s.deps().columns.list(w.team.id, b).await.unwrap();
+        let latin = rows
+            .iter()
+            .find(|r| r.column.column == "latin_name")
+            .unwrap();
+        assert!(latin.confirmed.is_some(), "still confirmed: {latin:?}");
+        let versions = s
+            .deps()
+            .store
+            .list_versions(
+                w.team.id,
+                b,
+                crate::versions::VersionFilter::default(),
+                PageRequest::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.items.len(), 1, "no manifest version by a sync");
+    }
+}
+
+/// Review D-3a 4: a branch counts as a branch while it is provisioning, and also when its
+/// create was lost (no `databases` row ever), never as one more engine database.
+#[tokio::test]
+async fn a_branch_without_its_row_counts_as_a_branch() {
+    let w = world().await;
+    let a = ctx(w.team.id, w.alice);
+    let id = garden(&w).await;
+    let d = w.s.databases.deps();
+    let before = d.store.usage(w.team.id).await.unwrap();
+    assert_eq!((before.branches, before.sqlite.count), (0, 1));
+    // A branch node whose copy never started (the create was lost): no row.
+    let typed = d.typed.get(w.team.id, id).await.unwrap().unwrap();
+    let source_manifest = d
+        .store
+        .manifest(w.team.id, typed.desired_version)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = branch_manifest(&source_manifest, id, typed.desired_version);
+    let lost = d
+        .nodes
+        .create_typed_child(
+            &a,
+            NewTyped {
+                parent_id: id,
+                name: "lost".into(),
+                node_type: NODE_TYPE.into(),
+                provider: PROVIDER_ID.into(),
+                manifest: manifest.clone(),
+                on_conflict: OnConflict::Fail,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    d.store
+        .created(&lost, lost.head_version.unwrap(), &manifest);
+    assert!(d.store.get(w.team.id, lost.id).await.unwrap().is_none());
+    let u = d.store.usage(w.team.id).await.unwrap();
+    assert_eq!((u.branches, u.sqlite.count), (1, 1), "{u:?}");
+    // A branch that was made: two branches, still one SQLite database.
+    let b =
+        w.s.databases
+            .create_branch(&a, id, schema_only("made"))
+            .await
+            .unwrap()
+            .value
+            .node
+            .id;
+    settled(&w.s, &a, b).await;
+    let u = d.store.usage(w.team.id).await.unwrap();
+    assert_eq!((u.branches, u.sqlite.count), (2, 1), "{u:?}");
+}
+
 // ------------------------------------------------------------------- the Postgres engine
 
 /// The Postgres engine of the data cluster, or `None` (the test is skipped; never in CI or
@@ -593,6 +781,66 @@ async fn settled_slow(s: &Services, c: &Context, id: NodeId) -> Database {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("database {id} is still provisioning after 60 s");
+}
+
+/// The `email` of the row `id` of `people`, read through the masked lens (as an agent without
+/// `read_personal` reads it) with the database's own key. The lens is built again from the
+/// database's manifest first (the interim sync), so a table made by `run_sql` is in it.
+async fn masked_email(s: &Services, tenant: TenantId, node: NodeId, id: i64) -> String {
+    let row = s
+        .databases
+        .deps()
+        .store
+        .get(tenant, node)
+        .await
+        .unwrap()
+        .unwrap();
+    let engine = s.database_engines.get(row.engine).unwrap().clone();
+    let key = s
+        .tenant_keys
+        .engine_key(tenant, row.key_node_id)
+        .await
+        .unwrap();
+    let typed = s
+        .databases
+        .deps()
+        .typed
+        .get(tenant, node)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest = s
+        .databases
+        .deps()
+        .store
+        .manifest(tenant, typed.desired_version)
+        .await
+        .unwrap()
+        .unwrap();
+    let sync = crate::databases::query::interim_catalog_sync(row.engine, &manifest);
+    engine
+        .sync_lens(&row.database_ref(), &key, &sync)
+        .await
+        .unwrap();
+    let out = engine
+        .execute(
+            &RoleRef::new(row.database_ref(), RoleKind::MaskedRead).unwrap(),
+            &key,
+            &StatementRequest {
+                sql: format!("SELECT email FROM people WHERE id = {id}"),
+                params: vec![],
+                mode: StatementMode::Read,
+                timeout: Duration::from_secs(30),
+                max_rows: 10,
+                max_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    match &out.rows[0][0] {
+        Cell::Text(t) => t.clone(),
+        other => panic!("not a pseudonym: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -704,6 +952,38 @@ async fn a_schema_only_branch_on_postgres() {
         s.get(&a, b).await.unwrap().unconfirmed_columns,
         s.get(&a, id).await.unwrap().unconfirmed_columns
     );
+    // Decision 0004-25 (review D-3a 3): the same personal value gives another pseudonym in
+    // the branch than in the source (its own key), and the same one on every read there.
+    run_sql(
+        &w.s,
+        w.team.id,
+        b,
+        &["insert into people (id, email) values (1, 'a@example.test')"],
+    )
+    .await;
+    let in_source = masked_email(&w.s, w.team.id, id, 1).await;
+    let in_branch = masked_email(&w.s, w.team.id, b, 1).await;
+    assert!(
+        crate::privacy::Pseudonym::parse(&in_source).is_some(),
+        "a masked read gives a pseudonym: {in_source}"
+    );
+    assert!(crate::privacy::Pseudonym::parse(&in_branch).is_some());
+    assert_ne!(in_source, in_branch, "the branch has a key of its own");
+    assert_eq!(
+        in_branch,
+        masked_email(&w.s, w.team.id, b, 1).await,
+        "stable across reads"
+    );
+    let branch_key =
+        w.s.tenant_keys
+            .database_key(w.team.id, Some(b))
+            .await
+            .unwrap();
+    let expected = crate::privacy::HmacPseudonymizer::new(branch_key)
+        .pseudonym_of_canonical("a@example.test")
+        .id()
+        .to_string();
+    assert_eq!(in_branch, expected, "the pseudonym of the branch's key");
     // Purge both: the engine databases go.
     let p = s.deps().provider.clone();
     for node in [b, id] {

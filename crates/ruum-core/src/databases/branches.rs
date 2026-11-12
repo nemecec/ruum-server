@@ -20,11 +20,16 @@
 //! [`make_branch`] (the provider's task): the engine copy of the source with `schema_only`
 //! data (Postgres drains the source first, decision 0004-27), the branch's own pseudonym key
 //! (`key_node_id` = the branch's node ID, decision 0004-25), the lens from the branch's
-//! manifest, the `databases` row (`branch_of`, `branch_data`, `branch_at`; the Postgres store
-//! copies the source's applied `database_migrations` rows in the same transaction), and copies
-//! of the source's `database_columns` rows whose identity comes from the branch's catalog,
-//! matched by schema, table and column name (decision 0004-28), so a catalog sync of the branch
-//! changes nothing and no confirmed column is unconfirmed again.
+//! manifest, then in one transaction ([`super::DatabaseStore::insert_branch`]) the `databases`
+//! row (`branch_of`, `branch_data`, `branch_at`), copies of the source's applied
+//! `database_migrations` rows, and copies of the source's `database_columns` rows whose
+//! identity comes from the branch's catalog, matched by schema, table and column name
+//! (decision 0004-28), so a catalog sync of the branch changes nothing and no confirmed column
+//! is unconfirmed again.
+//!
+//! Not written yet: the journal entry `database.branch_created`, which the contract of
+//! `createDatabaseBranch` names. D-3a writes `node.created` and `version.created` only; card
+//! D-3b adds the entry (its event type is still in `planned_types`; review D-3a 5).
 //!
 //! An agent writes on a `schema_only` branch without a grant: the core reads `branch_data`
 //! (`DatabasePermissions::with_grants`, the query API), the "draft branch" rule of section 8.5.
@@ -202,7 +207,6 @@ pub(super) async fn make_branch(
         )
         .await
         .map_err(engine_error)?;
-    let mut inserted = false;
     let rest = async {
         // The lens of the branch, from its manifest (the source's confirmed classes).
         let manifest = deps
@@ -233,27 +237,22 @@ pub(super) async fn make_branch(
             extensions: src.extensions.clone(),
             size_bytes,
         };
-        deps.store.insert(&row, &created.roles).await?;
-        inserted = true;
         let live = live_columns(&catalog, user_schema(src.engine));
-        let rows = branch_columns(
+        let columns = branch_columns(
             &deps.columns.list(tenant, source).await?,
             &live,
             version,
             crate::now(),
         );
-        deps.columns.seed(tenant, target, &rows).await
+        // One transaction: the `databases` row, the roles, the copied migration rows and the
+        // column rows (review D-3a 1). A catalog sync never sees the row without its columns,
+        // and a restart never leaves a row (`ready`) without them.
+        deps.store
+            .insert_branch(&row, &created.roles, &columns)
+            .await
     }
     .await;
     if let Err(e) = rest {
-        if inserted && let Err(d) = deps.store.delete(tenant, target).await {
-            tracing::warn!(
-                %tenant,
-                node = %target,
-                error = %crate::providers::store::error_text(&d),
-                "the row of a failed branch was not deleted"
-            );
-        }
         let _ = engine.drop_database(&created.database).await;
         return Err(e);
     }

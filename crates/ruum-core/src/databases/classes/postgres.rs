@@ -133,7 +133,9 @@ async fn read_rows(
     rows.iter().map(row_from).collect()
 }
 
-async fn insert_row(
+/// Writes one `database_columns` row in `conn`'s transaction (also the rows of a new branch,
+/// [`crate::databases::DatabaseStore::insert_branch`]).
+pub(crate) async fn insert_row(
     conn: &mut PgConnection,
     tenant: TenantId,
     node: NodeId,
@@ -225,19 +227,6 @@ impl ColumnStore for PgColumnStore {
         let rows = read_rows(&mut tx, tenant, node).await?;
         tx.commit().await?;
         Ok(rows)
-    }
-
-    async fn seed(&self, tenant: TenantId, node: NodeId, rows: &[ColumnRow]) -> Result<()> {
-        let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
-        lock_database(&mut tx, tenant, node).await?;
-        if !read_rows(&mut tx, tenant, node).await?.is_empty() {
-            return Err(super::seeded_already());
-        }
-        for r in rows {
-            insert_row(&mut tx, tenant, node, r).await?;
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     async fn suggest(

@@ -646,7 +646,7 @@ A-2, D-2 and D-3 have not started.
 | Step 3 needs | Step 2 card | Waits for | Used by |
 |---|---|---|---|
 | `schema_only` branches for previews | **D-3a** (proposed split of D-3: `schema_only` branches; after D-1, A-1, C-2; no masking, so no Q-2) | D-1, A-1, C-2 | W-2 (database bindings), L-2, M3 |
-| `masked` branches for previews | **D-3b** (the masked part of D-3) | Q-2 | previews with real-shaped data |
+| `masked` branches for previews | **D-3b** (the masked part of D-3, and the `database.branch_created` journal entry that D-3a leaves out) | Q-2 | previews with real-shaped data |
 | migrations at publish | D-2 | A-2 | W-3a |
 | the app role kinds of a binding | **D-5** (proposed: "app role kinds of a binding", `RoleRef` with a binding key, decision 0004-32, in `crates/ruum-core/src/databases/`) | D-1 | B-1 |
 

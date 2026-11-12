@@ -171,10 +171,8 @@ impl Services {
             )),
             store: database_store.clone(),
             typed: typed.clone(),
-            columns: Arc::new(crate::databases::classes::MemoryColumnStore::new(
-                nodes.clone(),
-                journal.clone(),
-            )),
+            // The column store of the database store: a branch writes both under one lock.
+            columns: database_store.columns(),
             masking: Arc::new(crate::privacy::RecordingMaskingRules::new()),
             grants: Arc::new(crate::databases::access::grants::MemoryGrantStore::new(
                 nodes.clone(),

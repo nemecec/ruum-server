@@ -413,6 +413,20 @@ pub trait DatabaseStore: Send + Sync {
     /// made the database). `conflict` when the node has a row.
     async fn insert(&self, row: &DatabaseRow, roles: &[EngineRole]) -> Result<()>;
 
+    /// Writes the `databases` row of a branch (`row.branch_of` set; `branch_at` = now), its
+    /// `database_roles` rows, copies of the source's applied `database_migrations` rows and
+    /// `columns` (the branch's `database_columns` rows, [`branches::branch_columns`]) in one
+    /// transaction (the memory store: under one lock). So no catalog sync ever sees the
+    /// `databases` row of a branch without its column rows (review D-3a 1): a sync either finds
+    /// no row (and does nothing) or finds every row. `conflict` when the node has a row or
+    /// column rows; then nothing is written.
+    async fn insert_branch(
+        &self,
+        row: &DatabaseRow,
+        roles: &[EngineRole],
+        columns: &[classes::ColumnRow],
+    ) -> Result<()>;
+
     /// Deletes the `databases` row and its roles; returns the row.
     async fn delete(&self, tenant: TenantId, node: NodeId) -> Result<Option<DatabaseRow>>;
 
@@ -420,7 +434,10 @@ pub trait DatabaseStore: Send + Sync {
     async fn list_tenant(&self, tenant: TenantId) -> Result<Vec<DatabaseRow>>;
 
     /// The database nodes of the tenant that are not purged, per engine (also those in the
-    /// trash and those still provisioning), and the branches apart (C-21).
+    /// trash and those still provisioning), and the branches apart (C-21). A node is a branch
+    /// when its manifest names a `template` (set when the branch node is made, review D-3a 4),
+    /// so a branch that is still provisioning, or that failed before its `databases` row was
+    /// written, counts as a branch and never as one more engine database.
     async fn usage(&self, tenant: TenantId) -> Result<DatabaseUsage>;
 }
 
@@ -432,6 +449,9 @@ pub struct MemoryDatabaseStore {
     nodes: Arc<crate::nodes::memory::MemoryNodeStore>,
     journal: Arc<crate::journal::memory::MemoryJournal>,
     typed: Arc<crate::providers::store::MemoryTypedNodeStore>,
+    /// The column store of the same memory services: [`DatabaseStore::insert_branch`] writes
+    /// a branch's column rows under this store's lock ([`Self::columns`]).
+    columns: Arc<classes::MemoryColumnStore>,
     inner: Mutex<MemDbInner>,
 }
 
@@ -443,6 +463,8 @@ struct MemDbInner {
     /// The database nodes and their engine (until purged).
     nodes: HashMap<(TenantId, NodeId), EngineKind>,
     rows: HashMap<(TenantId, NodeId), (DatabaseRow, Vec<EngineRole>)>,
+    /// The database nodes whose first manifest names a `template` (branches), until purged.
+    branches: std::collections::HashSet<(TenantId, NodeId)>,
 }
 
 impl MemoryDatabaseStore {
@@ -451,12 +473,23 @@ impl MemoryDatabaseStore {
         journal: Arc<crate::journal::memory::MemoryJournal>,
         typed: Arc<crate::providers::store::MemoryTypedNodeStore>,
     ) -> Self {
+        let columns = Arc::new(classes::MemoryColumnStore::new(
+            nodes.clone(),
+            journal.clone(),
+        ));
         Self {
             nodes,
             journal,
             typed,
+            columns,
             inner: Mutex::new(MemDbInner::default()),
         }
+    }
+
+    /// The column store that shares this store's branch writes; the memory services use it as
+    /// their `ColumnStore`.
+    pub fn columns(&self) -> Arc<classes::MemoryColumnStore> {
+        self.columns.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MemDbInner> {
@@ -504,6 +537,9 @@ impl DatabaseStore for MemoryDatabaseStore {
         );
         if let Some(e) = engine_of(manifest) {
             inner.nodes.insert((tenant, node.id), e);
+        }
+        if manifest.get("template").is_some() {
+            inner.branches.insert((tenant, node.id));
         }
     }
 
@@ -644,9 +680,39 @@ impl DatabaseStore for MemoryDatabaseStore {
         Ok(())
     }
 
+    async fn insert_branch(
+        &self,
+        row: &DatabaseRow,
+        roles: &[EngineRole],
+        columns: &[classes::ColumnRow],
+    ) -> Result<()> {
+        if row.branch_of.is_none() {
+            return Err(Error::Internal(
+                "insert_branch of a row without branch_of".into(),
+            ));
+        }
+        // Both locks, in the order database store, then column store (no path takes them the
+        // other way round): a sync reads the row through `get` and then writes the columns, so
+        // it sees either no row or the row with its columns.
+        let mut inner = self.lock();
+        let key = (row.tenant_id, row.node_id);
+        if inner.rows.contains_key(&key) {
+            return Err(Error::api(
+                ErrorCode::Conflict,
+                format!("database {} has a row", row.node_id),
+            ));
+        }
+        self.columns.put_new(row.tenant_id, row.node_id, columns)?;
+        inner.rows.insert(key, (row.clone(), roles.to_vec()));
+        inner.nodes.entry(key).or_insert(row.engine);
+        inner.branches.insert(key);
+        Ok(())
+    }
+
     async fn delete(&self, tenant: TenantId, node: NodeId) -> Result<Option<DatabaseRow>> {
         let mut inner = self.lock();
         inner.nodes.remove(&(tenant, node));
+        inner.branches.remove(&(tenant, node));
         Ok(inner.rows.remove(&(tenant, node)).map(|(r, _)| r))
     }
 
@@ -670,7 +736,7 @@ impl DatabaseStore for MemoryDatabaseStore {
                 continue;
             }
             let row = inner.rows.get(&(*t, *n)).map(|(r, _)| r);
-            if row.is_some_and(|r| r.branch_of.is_some()) {
+            if inner.branches.contains(&(*t, *n)) || row.is_some_and(|r| r.branch_of.is_some()) {
                 u.branches += 1;
                 continue;
             }
@@ -810,6 +876,14 @@ fn database_row(r: &sqlx::postgres::PgRow) -> Result<DatabaseRow> {
 /// A branch gets copies of its source's applied `database_migrations` rows as of the copy
 /// (card D-3a, decision 0004-17), so it never runs a migration of its source again. Each copy
 /// gets a new ID; its restore point stays with the source (`NULL`).
+///
+/// TODO(D-2): the rows are read when the branch's `databases` row is written, after the engine
+/// copy. A migration applied on the source in between is recorded here as applied, but its
+/// schema change is not in the copy. Nothing can apply a migration before D-2, so this holds
+/// today. D-2 must close the gap: it holds the source's migration lock (`lock_database` of the
+/// source) while a migration runs, and the branch takes the same lock from before the engine
+/// copy until this insert (or reads the applied names under it). See card D-2 in
+/// `docs/STEP2.md` (review D-3a 6).
 async fn copy_applied_migrations(
     conn: &mut sqlx::PgConnection,
     tenant: TenantId,
@@ -844,6 +918,56 @@ async fn copy_applied_migrations(
         .bind(r.try_get::<uuid::Uuid, _>("actor")?)
         .bind(r.try_get::<Option<uuid::Uuid>, _>("on_behalf_of")?)
         .bind(r.try_get::<OffsetDateTime, _>("at")?)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Writes the `databases` row (with `branch_at` = now for a branch) and its `database_roles`
+/// rows in `conn`'s transaction. `conflict` when the node has a row.
+async fn insert_database_row(
+    conn: &mut sqlx::PgConnection,
+    row: &DatabaseRow,
+    roles: &[EngineRole],
+) -> Result<()> {
+    let done = sqlx::query(
+        "insert into databases (tenant_id, node_id, engine, engine_version, cluster, \
+         engine_name, branch_of, branch_data, key_node_id, extensions, size_bytes, branch_at) \
+         values ($1, $2, $3::database_engine, $4, $5, $6, $7, $8::data_copy, $9, $10, $11, \
+         case when $7::uuid is not null then now() end) \
+         on conflict do nothing",
+    )
+    .bind(row.tenant_id)
+    .bind(row.node_id)
+    .bind(manifest::engine_name(row.engine))
+    .bind(&row.engine_version)
+    .bind(&row.cluster)
+    .bind(&row.engine_name)
+    .bind(row.branch_of)
+    .bind(row.branch_data.map(data_copy_name))
+    .bind(row.key_node_id)
+    .bind(&row.extensions)
+    .bind(row.size_bytes)
+    .execute(&mut *conn)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(Error::api(
+            ErrorCode::Conflict,
+            format!("database {} has a row", row.node_id),
+        ));
+    }
+    for role in roles {
+        sqlx::query(
+            "insert into database_roles (id, tenant_id, node_id, kind, binding_id, role_name) \
+             values ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(row.tenant_id)
+        .bind(row.node_id)
+        .bind(role.kind.as_str())
+        .bind(role.binding)
+        .bind(&role.role_name)
         .execute(&mut *conn)
         .await?;
     }
@@ -1065,48 +1189,27 @@ impl DatabaseStore for PgDatabaseStore {
 
     async fn insert(&self, row: &DatabaseRow, roles: &[EngineRole]) -> Result<()> {
         let mut tx = crate::journal::postgres::begin_tenant(&self.pool, row.tenant_id).await?;
-        let done = sqlx::query(
-            "insert into databases (tenant_id, node_id, engine, engine_version, cluster, \
-             engine_name, branch_of, branch_data, key_node_id, extensions, size_bytes, branch_at) \
-             values ($1, $2, $3::database_engine, $4, $5, $6, $7, $8::data_copy, $9, $10, $11, \
-             case when $7::uuid is not null then now() end) \
-             on conflict do nothing",
-        )
-        .bind(row.tenant_id)
-        .bind(row.node_id)
-        .bind(manifest::engine_name(row.engine))
-        .bind(&row.engine_version)
-        .bind(&row.cluster)
-        .bind(&row.engine_name)
-        .bind(row.branch_of)
-        .bind(row.branch_data.map(data_copy_name))
-        .bind(row.key_node_id)
-        .bind(&row.extensions)
-        .bind(row.size_bytes)
-        .execute(&mut *tx)
-        .await?;
-        if done.rows_affected() == 0 {
-            return Err(Error::api(
-                ErrorCode::Conflict,
-                format!("database {} has a row", row.node_id),
+        insert_database_row(&mut tx, row, roles).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_branch(
+        &self,
+        row: &DatabaseRow,
+        roles: &[EngineRole],
+        columns: &[classes::ColumnRow],
+    ) -> Result<()> {
+        let Some(source) = row.branch_of else {
+            return Err(Error::Internal(
+                "insert_branch of a row without branch_of".into(),
             ));
-        }
-        for role in roles {
-            sqlx::query(
-                "insert into database_roles (id, tenant_id, node_id, kind, binding_id, role_name) \
-                 values ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(uuid::Uuid::now_v7())
-            .bind(row.tenant_id)
-            .bind(row.node_id)
-            .bind(role.kind.as_str())
-            .bind(role.binding)
-            .bind(&role.role_name)
-            .execute(&mut *tx)
-            .await?;
-        }
-        if let Some(source) = row.branch_of {
-            copy_applied_migrations(&mut tx, row.tenant_id, source, row.node_id).await?;
+        };
+        let mut tx = crate::journal::postgres::begin_tenant(&self.pool, row.tenant_id).await?;
+        insert_database_row(&mut tx, row, roles).await?;
+        copy_applied_migrations(&mut tx, row.tenant_id, source, row.node_id).await?;
+        for c in columns {
+            classes::postgres::insert_row(&mut tx, row.tenant_id, row.node_id, c).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1163,7 +1266,9 @@ impl DatabaseStore for PgDatabaseStore {
         // The engine of a node that is still provisioning comes from its newest manifest.
         let rows = sqlx::query(
             "select coalesce(d.engine::text, convert_from(v.manifest, 'UTF8')::jsonb ->> 'engine') \
-             as engine, d.branch_of is not null as branch, count(*) as n, \
+             as engine, (d.branch_of is not null \
+             or (convert_from(v.manifest, 'UTF8')::jsonb -> 'template') is not null) as branch, \
+             count(*) as n, \
              coalesce(sum(d.size_bytes), 0)::bigint as size \
              from typed_nodes t \
              join versions v on v.tenant_id = t.tenant_id and v.id = t.desired_version \
@@ -2824,6 +2929,258 @@ mod tests {
             code(store.put_manifest(&c, node, &m, None, v2, None).await).0,
             409
         );
+    }
+
+    // ------------------------------------------------- a branch on the Postgres store (D-3a)
+
+    /// A branch node of `source` in the source's tenant: a typed child of the source whose
+    /// manifest names the source as `template`, with its `typed_nodes` row and no `databases`
+    /// row (as `createDatabaseBranch` leaves it while the copy runs).
+    async fn seed_pg_branch_node(
+        pool: &sqlx::PgPool,
+        t: TenantId,
+        source: NodeId,
+        source_version: VersionId,
+    ) -> (NodeId, VersionId, UserId) {
+        let (node, v) = (NodeId::new(), VersionId::new());
+        let manifest = json!({
+            "engine": "postgres", "version": "17", "plan": "shared-small",
+            "template": { "node_id": source, "version_id": source_version },
+        });
+        let (bytes, hash) = crate::nodes::typed_manifest_bytes(&manifest);
+        let mut tx = pool.begin().await.unwrap();
+        for sql in [
+            "set local ruum.system = 'on'",
+            "set constraints all deferred",
+        ] {
+            sqlx::query(sql).execute(&mut *tx).await.unwrap();
+        }
+        let owner: uuid::Uuid =
+            sqlx::query_scalar("select owner_id from nodes where tenant_id = $1 and id = $2")
+                .bind(t)
+                .bind(source)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        sqlx::query(
+            "insert into nodes (id, tenant_id, parent_id, name, kind, type, head_version, \
+             owner_id, created_kind, created_by, updated_kind, updated_by) \
+             values ($1, $2, $3, $4, 'typed', $5, $6, $7, 'user', $7, 'user', $7)",
+        )
+        .bind(node)
+        .bind(t)
+        .bind(source)
+        .bind(node.to_string())
+        .bind(NODE_TYPE)
+        .bind(v)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
+             content_hash, actor_kind, actor) values ($1, $2, $3, $4, 'typed_manifest_v1', $5, $6, \
+             'user', $7)",
+        )
+        .bind(v)
+        .bind(t)
+        .bind(node)
+        .bind(&bytes)
+        .bind(bytes.len() as i64)
+        .bind(hash.to_vec())
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        crate::providers::postgres::insert_typed_node(
+            &mut tx,
+            &crate::providers::store::NewTypedNode {
+                tenant_id: t,
+                node_id: node,
+                provider: PROVIDER_ID.into(),
+                type_name: NODE_TYPE.into(),
+                desired_version: v,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        (node, v, UserId(owner))
+    }
+
+    /// The `database_migrations` rows of a node: (id, name, status, restore_point_id, actor,
+    /// checksum), in name and status order.
+    #[allow(clippy::type_complexity)]
+    async fn pg_migrations(
+        pool: &sqlx::PgPool,
+        t: TenantId,
+        node: NodeId,
+    ) -> Vec<(
+        uuid::Uuid,
+        String,
+        String,
+        Option<uuid::Uuid>,
+        uuid::Uuid,
+        Vec<u8>,
+    )> {
+        let mut tx = crate::journal::postgres::begin_tenant(pool, t)
+            .await
+            .unwrap();
+        let rows = sqlx::query_as(
+            "select id, name, status::text, restore_point_id, actor, checksum \
+             from database_migrations where tenant_id = $1 and node_id = $2 \
+             order by name, status::text",
+        )
+        .bind(t)
+        .bind(node)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        rows
+    }
+
+    async fn pg_branch_at(
+        pool: &sqlx::PgPool,
+        t: TenantId,
+        node: NodeId,
+    ) -> Option<OffsetDateTime> {
+        let mut tx = crate::journal::postgres::begin_tenant(pool, t)
+            .await
+            .unwrap();
+        let at = sqlx::query_scalar(
+            "select branch_at from databases where tenant_id = $1 and node_id = $2",
+        )
+        .bind(t)
+        .bind(node)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        at
+    }
+
+    /// Review D-3a 2 and 4: `insert_branch` on the Postgres store writes the branch's
+    /// `databases` row (`branch_at` set), copies of the source's applied migration rows only
+    /// (a new ID each, no restore point) and the column rows, in one transaction; a second
+    /// insert is `409` and writes nothing; a branch counts as a branch also while it has no
+    /// row; a purge of the branch removes its rows and leaves the source's.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_store_writes_a_branch_in_one_transaction(pool: sqlx::PgPool) {
+        use classes::{ColumnStore, Confirmation, LiveColumn, plan};
+        let store = PgDatabaseStore::new(pool.clone());
+        let (t, source, sv) = seed_pg_database(&pool, "postgres").await;
+        store
+            .insert(&row(t, source, EngineKind::Postgres), &[])
+            .await
+            .unwrap();
+        let (branch, bv, user) = seed_pg_branch_node(&pool, t, source, sv).await;
+        // Provisioning (no `databases` row yet): a branch, not a second Postgres database.
+        let u = store.usage(t).await.unwrap();
+        assert_eq!((u.branches, u.postgres.count), (1, 1), "{u:?}");
+        // The source's migrations: one applied (with a restore point), one failed, one dry run.
+        let rp = uuid::Uuid::now_v7();
+        let mut tx = crate::journal::postgres::begin_tenant(&pool, t)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into database_restore_points (id, tenant_id, node_id, reason, at, \
+             actor_kind, actor) values ($1, $2, $3, 'before_migration', now(), 'user', $4)",
+        )
+        .bind(rp)
+        .bind(t)
+        .bind(source)
+        .bind(user.0)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        for (name, status, restore) in [
+            ("0001_people", "applied", Some(rp)),
+            ("0002_broken", "failed", None),
+            ("0002_broken", "dry_run", None),
+        ] {
+            sqlx::query(
+                "insert into database_migrations (id, tenant_id, node_id, name, checksum, up_sql, \
+                 data_classes, status, error, restore_point_id, actor_kind, actor, on_behalf_of) \
+                 values ($1, $2, $3, $4, $5, 'create table people (email text)', \
+                 '{\"public.people.email\": \"personal\"}'::jsonb, $6::migration_status, null, $7, \
+                 'user', $8, null)",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(t)
+            .bind(source)
+            .bind(name)
+            .bind(vec![7u8; 32])
+            .bind(status)
+            .bind(restore)
+            .bind(user.0)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let source_migrations = pg_migrations(&pool, t, source).await;
+        assert_eq!(source_migrations.len(), 3);
+        // The branch's column rows: one confirmed as of the branch's first version.
+        let now = crate::now();
+        let live = vec![LiveColumn {
+            column: ruum_dbengine::ColumnRef {
+                schema: "public".into(),
+                table: "people".into(),
+                column: "email".into(),
+            },
+            data_type: "text".into(),
+            identity: Some(ruum_dbengine::ColumnIdentity {
+                rel_oid: 16400,
+                attnum: 1,
+                type_oid: 25,
+                definition: None,
+            }),
+        }];
+        let mut columns = plan(&[], &live, now).rows;
+        columns[0].unconfirmed_reason = None;
+        columns[0].confirmed = Some(Confirmation {
+            class: ruum_dbengine::DataClass::Personal,
+            by: user,
+            at: now,
+            version: bv,
+        });
+        let mut b = row(t, branch, EngineKind::Postgres);
+        b.branch_of = Some(source);
+        b.branch_data = Some(crate::providers::DataCopy::SchemaOnly);
+        b.key_node_id = Some(branch);
+        store.insert_branch(&b, &[], &columns).await.unwrap();
+        assert!(pg_branch_at(&pool, t, branch).await.is_some());
+        assert!(pg_branch_at(&pool, t, source).await.is_none());
+        let copied = pg_migrations(&pool, t, branch).await;
+        assert_eq!(copied.len(), 1, "only the applied row: {copied:?}");
+        let applied = source_migrations.iter().find(|m| m.2 == "applied").unwrap();
+        assert_eq!(copied[0].1, "0001_people");
+        assert_eq!(copied[0].2, "applied");
+        assert_ne!(copied[0].0, applied.0, "a new ID");
+        assert_eq!(copied[0].3, None, "the restore point stays with the source");
+        assert_eq!(applied.3, Some(rp));
+        assert_eq!((copied[0].4, &copied[0].5), (user.0, &vec![7u8; 32]));
+        let cols = classes::postgres::PgColumnStore::new(pool.clone());
+        let stored = cols.list(t, branch).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        let c = stored[0].confirmed.as_ref().expect("confirmed");
+        assert_eq!(
+            (c.class, c.version),
+            (ruum_dbengine::DataClass::Personal, bv)
+        );
+        assert_eq!(stored[0].identity, live[0].identity);
+        // A second insert is 409, and nothing more is written.
+        assert_eq!(code(store.insert_branch(&b, &[], &columns).await).0, 409);
+        assert_eq!(pg_migrations(&pool, t, branch).await.len(), 1);
+        assert_eq!(cols.list(t, branch).await.unwrap().len(), 1);
+        let u = store.usage(t).await.unwrap();
+        assert_eq!((u.branches, u.postgres.count), (1, 1), "{u:?}");
+        // A purge of the branch removes its rows; the source keeps its own.
+        store.delete(t, branch).await.unwrap().unwrap();
+        assert!(pg_migrations(&pool, t, branch).await.is_empty());
+        assert!(cols.list(t, branch).await.unwrap().is_empty());
+        assert_eq!(pg_migrations(&pool, t, source).await.len(), 3);
     }
 
     // ------------------------------------------------------- the key on the Postgres engine
