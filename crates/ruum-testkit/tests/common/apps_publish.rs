@@ -244,10 +244,11 @@ pub fn cases() -> Vec<Case> {
                 "getApp",
                 "listVersions"
             ],
-            "member publishes the superseded first release again: 200, it is live again and a \
+            "member publishes the superseded first release again: 200, it (or a new \
+             deployment with its manifest, not the second release) is live again and a \
              new version is written (publishAppDeployment: a rollback; no migration runs)",
             |cx| {
-                let (v1, _v2) = two_releases(&cx, "back").await?;
+                let (v1, v2) = two_releases(&cx, "back").await?;
                 let before = items(
                     &cx.ok(Who::Member, list_versions(&cx, &v1.id), &[200])
                         .await?,
@@ -269,7 +270,15 @@ pub fn cases() -> Vec<Case> {
                     )
                     .await?;
                 let id = str_at(&p, "/id")?;
-                wait_state(&cx, Who::Member, &v1.id, &id, &["live"]).await?;
+                let back = wait_state(&cx, Who::Member, &v1.id, &id, &["live"]).await?;
+                // The first release, not any deployment: the same deployment, or a new one
+                // with its manifest.
+                check!(
+                    id == v1.deployment()
+                        || (v2["id"] != id.as_str() && back["manifest"] == v1.live["manifest"]),
+                    "the rollback made {id} live, which is not the first release {}: {back}",
+                    v1.deployment()
+                );
                 wait_live_is(&cx, &v1.id, &id).await?;
                 let after = items(
                     &cx.ok(Who::Member, list_versions(&cx, &v1.id), &[200])
@@ -280,6 +289,112 @@ pub fn cases() -> Vec<Case> {
                     after > before,
                     "a rollback wrote no version ({before} before, {after} after)"
                 );
+                Ok(())
+            }
+        ),
+        case!(
+            "ids_of_another_app_are_not_found",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "publishAppDeployment",
+                "addAppRoleGrant",
+                "removeAppRoleGrant",
+                "listAppRoleGrants",
+                "restoreVersion",
+                "getApp"
+            ],
+            "two live apps X and Y of member in one tenant: under Y's path, getAppDeployment \
+             and publishAppDeployment of X's live deployment and of X's ready preview, \
+             removeAppRoleGrant of X's role grant and restoreVersion of X's version are each \
+             404 not_found; afterwards the live deployments of X and Y, X's preview and the \
+             role grants of X and Y have not changed",
+            |cx| {
+                let x = live_app(&cx, cx.a().projects, "app x", ROLES_MANIFEST).await?;
+                let y = live_app(&cx, cx.a().projects, "app y", ROLES_MANIFEST).await?;
+                let next = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "app x next",
+                    STATIC_MANIFEST,
+                )
+                .await?;
+                let xp = preview(
+                    &cx,
+                    Who::Member,
+                    &x.id,
+                    from_folder(&next.folder, Some("next")),
+                )
+                .await?;
+                let xp = str_at(&xp, "/id")?;
+                let g = cx
+                    .ok(
+                        Who::Member,
+                        add_role_grant(&cx, &x.id, "approver", Who::Guest),
+                        &[201],
+                    )
+                    .await?;
+                let grant = str_at(&g, "/id")?;
+                for dep in [x.deployment(), xp.clone()] {
+                    cx.refused(
+                        Who::Member,
+                        get_deployment(&cx, &y.id, &dep, None),
+                        404,
+                        &["not_found"],
+                    )
+                    .await?;
+                    cx.refused(
+                        Who::Member,
+                        publish(&cx, &y.id, &dep, json!({})),
+                        404,
+                        &["not_found"],
+                    )
+                    .await?;
+                }
+                cx.refused(
+                    Who::Member,
+                    remove_role_grant(&cx, &y.id, &grant),
+                    404,
+                    &["not_found"],
+                )
+                .await?;
+                cx.refused(
+                    Who::Member,
+                    restore_version(&cx, &y.id, x.version()),
+                    404,
+                    &["not_found"],
+                )
+                .await?;
+                for app in [&x, &y] {
+                    let a = cx.ok(Who::Member, get_app(&cx, &app.id), &[200]).await?;
+                    check!(
+                        a["live_deployment"]["id"] == app.deployment().as_str(),
+                        "the live deployment of {} changed: {}",
+                        app.id,
+                        a["live_deployment"]
+                    );
+                }
+                let p = cx
+                    .ok(Who::Member, get_deployment(&cx, &x.id, &xp, None), &[200])
+                    .await?;
+                check!(p["state"] == "ready", "X's preview changed: {p}");
+                let xg = items(
+                    &cx.ok(Who::Member, list_role_grants(&cx, &x.id, ""), &[200])
+                        .await?,
+                );
+                check!(
+                    xg.iter().any(|g| g["id"] == grant.as_str()),
+                    "X's role grant is gone: {xg:?}"
+                );
+                let yg = items(
+                    &cx.ok(Who::Member, list_role_grants(&cx, &y.id, ""), &[200])
+                        .await?,
+                );
+                check!(yg.is_empty(), "Y got role grants: {yg:?}");
                 Ok(())
             }
         ),
