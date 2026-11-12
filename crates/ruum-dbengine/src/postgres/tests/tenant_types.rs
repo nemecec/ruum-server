@@ -125,17 +125,14 @@ async fn tenant_types_source<'e>(
 }
 
 /// Reads `t` through the masked lens in a new session, whose setting `ruum_test.hit` starts
-/// empty (the masked reader may not run `set_config`). Returns the rows and the setting
-/// afterwards.
+/// empty (the masked reader may not run `set_config`, nor `current_setting`: it sets and reads
+/// the mark with `SET` and `SHOW`). Returns the rows and the setting afterwards.
 async fn masked_rows(engine: &PostgresEngine, db: &DatabaseRef) -> (Vec<String>, String) {
     let mut s = session(engine, db, RoleKind::MaskedRead).await;
     assert_eq!(
-        psql(
-            &mut s,
-            "select pg_catalog.current_setting('ruum_test.hit', true)",
-        )
-        .await
-        .unwrap(),
+        psql(&mut s, "set ruum_test.hit = ''; show ruum_test.hit")
+            .await
+            .unwrap(),
         "",
         "a new session starts with no mark"
     );
@@ -145,12 +142,7 @@ async fn masked_rows(engine: &PostgresEngine, db: &DatabaseRef) -> (Vec<String>,
     )
     .await
     .unwrap();
-    let hit = psql(
-        &mut s,
-        "select pg_catalog.current_setting('ruum_test.hit', true)",
-    )
-    .await
-    .unwrap();
+    let hit = psql(&mut s, "show ruum_test.hit").await.unwrap();
     close(s).await;
     (rows.lines().map(str::to_string).collect(), hit)
 }
