@@ -174,6 +174,19 @@ fn sample(event: EventType, user: UserId) -> Value {
         EventType::AppSettingsChanged => json!({
             "changed": ["telemetry_mode"], "access": "platform", "telemetry_mode": "privacy"
         }),
+        EventType::AppDeployed => json!({
+            "deployment_id": id(), "environment": "live", "version_id": id(),
+            "previous_deployment_id": null, "kind": "publish", "migrations_applied": 0,
+            "approval_id": null
+        }),
+        EventType::AppDeploymentFailed => json!({
+            "deployment_id": id(), "environment": "preview", "stage": "image",
+            "reason": "image_failed"
+        }),
+        EventType::AppRolledBack => json!({
+            "from_deployment_id": id(), "to_deployment_id": id(), "reason": "manual",
+            "error_rate_before": null, "error_rate_after": null
+        }),
     }
 }
 

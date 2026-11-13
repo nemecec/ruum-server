@@ -716,11 +716,15 @@ impl PgContentStore {
         .execute(&mut *tx)
         .await?;
         let (policy, _, _) = Self::policy(&mut tx, tenant).await?;
-        let files: Vec<Uuid> =
-            sqlx::query_scalar("select distinct node_id from versions where tenant_id = $1")
-                .bind(tenant.0)
-                .fetch_all(&mut *tx)
-                .await?;
+        // App releases are not thinned: a deployment row names its version, and the release
+        // history is the rollback list (card W-2s).
+        let files: Vec<Uuid> = sqlx::query_scalar(
+            "select distinct node_id from versions where tenant_id = $1 \
+             and encoding <> 'app_release_v1'",
+        )
+        .bind(tenant.0)
+        .fetch_all(&mut *tx)
+        .await?;
         let now = crate::now();
         for f in files {
             Self::prune(&mut tx, tenant, NodeId(f), None, &policy, now).await?;
@@ -729,24 +733,64 @@ impl PgContentStore {
         self.collect_garbage(tenant, grace).await
     }
 
+    /// Every chunk that the tenant still uses (the mark of the garbage collection): the chunk
+    /// lists of file versions (`chunks_v1`), of open uploads, of app releases (`app_release_v1`:
+    /// the archive chunk list of the canonical JSON, decision 0006-2) and of the deployments
+    /// whose archive may still be deployed again (live deployments and their earlier releases,
+    /// and previews that have not ended: `app_deployments.archive_chunks`, card W-2s, P-60).
+    /// Versions of other encodings (`typed_manifest_v1`) hold no chunks. A list that does not
+    /// decode stops the collection (it never frees a chunk it could not read).
+    async fn live_chunks(conn: &mut PgConnection, tenant: TenantId) -> Result<HashSet<Hash>> {
+        let rows = sqlx::query(
+            "select encoding, manifest from versions where tenant_id = $1 \
+             union all select 'chunks_v1', manifest from uploads where tenant_id = $1 \
+             and status = 'open' and expires_at > now() \
+             union all select 'chunks_v1', archive_chunks from app_deployments \
+             where tenant_id = $1 and (environment = 'live' \
+             or state in ('pending', 'running', 'ready'))",
+        )
+        .bind(tenant.0)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut live: HashSet<Hash> = HashSet::new();
+        for r in rows {
+            let encoding: String = r.try_get(0)?;
+            let bytes: Vec<u8> = r.try_get(1)?;
+            let chunks = match encoding.as_str() {
+                "chunks_v1" if bytes.is_empty() => continue,
+                "chunks_v1" => bytes,
+                "app_release_v1" => {
+                    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                        Error::Internal(format!("an app release version is not JSON: {e}"))
+                    })?;
+                    let hex = v
+                        .pointer("/archive/chunks")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::Internal("an app release version has no chunk list".into())
+                        })?;
+                    let chunks = hex::decode(hex).map_err(|e| {
+                        Error::Internal(format!("the chunk list of an app release: {e}"))
+                    })?;
+                    if chunks.is_empty() {
+                        continue;
+                    }
+                    chunks
+                }
+                _ => continue,
+            };
+            let m = Manifest::decode(ManifestFormat::ChunksV1, &chunks)?;
+            live.extend(m.chunks.iter().map(|c| c.hash));
+        }
+        Ok(live)
+    }
+
     /// Garbage collection of the tenant's chunks (mark and sweep with a grace period; the rule
     /// is in [`super::gc`]).
     pub async fn collect_garbage(&self, tenant: TenantId, grace: Duration) -> Result<GcReport> {
         let cutoff = crate::now() - grace;
         let mut tx = journal::postgres::begin_tenant(&self.pool, tenant).await?;
-        let manifests: Vec<Vec<u8>> = sqlx::query_scalar(
-            "select manifest from versions where tenant_id = $1 \
-             union all select manifest from uploads where tenant_id = $1 and status = 'open' \
-             and expires_at > now()",
-        )
-        .bind(tenant.0)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut live: HashSet<Hash> = HashSet::new();
-        for m in manifests {
-            let m = Manifest::decode(ManifestFormat::ChunksV1, &m)?;
-            live.extend(m.chunks.iter().map(|c| c.hash));
-        }
+        let live = Self::live_chunks(&mut tx, tenant).await?;
         let candidates: Vec<Vec<u8>> = sqlx::query_scalar(
             "select hash from chunks where tenant_id = $1 and created_at < $2 \
              and coalesce(last_marked_at, created_at) < $2",

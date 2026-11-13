@@ -184,7 +184,7 @@ pub fn install_apps(
     pool: Option<sqlx::PgPool>,
     handles: &MemoryHandles,
 ) -> anyhow::Result<()> {
-    let parts = match pool {
+    let mut parts = match pool {
         Some(pool) => ruum_core::apps::AppParts::postgres(pool),
         None => {
             let mut p = ruum_core::apps::AppParts::memory(Some(handles.journal.clone()));
@@ -192,9 +192,21 @@ pub fn install_apps(
             p
         }
     };
+    // Static sites go to the bucket of the blob store when there is one (card W-2s); the
+    // runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
+    if let Some(s3) = ruum_core::blobs::object::S3Settings::from_env() {
+        let store = s3
+            .build()
+            .context("set up the object store of static sites")?;
+        parts.sites = ruum_core::apps::static_site::StaticSites::new(Arc::new(store));
+    }
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
+    tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
 }
+
+/// How often the preview sweeper ends expired previews.
+const PREVIEW_SWEEP_EVERY: Duration = Duration::from_secs(300);
 
 /// How often the delivery worker looks for due hook deliveries.
 const DELIVERY_EVERY: Duration = Duration::from_secs(5);

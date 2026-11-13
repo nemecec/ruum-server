@@ -205,6 +205,9 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         // `app.settings_changed` names the new values only, so there is no old value to set
         // back (card W-1); an agent can only lower the settings anyway.
         AppSettingsChanged => None,
+        // An agent's preview expires on its own and a failed deployment changed nothing; only a
+        // person publishes or rolls back (an agent's publish waits for a person, card W-2s).
+        AppDeployed | AppDeploymentFailed | AppRolledBack => None,
     }
 }
 

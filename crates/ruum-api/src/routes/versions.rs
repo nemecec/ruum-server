@@ -51,7 +51,7 @@ pub struct ListQuery {
 ///
 /// A file lists its content versions. A database node lists its manifest versions (read only,
 /// with the label and the actor of each; review-D-1 B-1), which `updateDatabaseManifest`
-/// writes.
+/// writes. A web app lists its releases (card W-2s).
 pub async fn list_versions(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
@@ -69,8 +69,12 @@ pub async fn list_versions(
     }
     .page()?;
     let databases = &state.services.databases;
+    let apps = &state.services.apps;
     let page = if databases.is_database(ctx.tenant, node).await? {
         databases.list_versions(&ctx, node, filter, page).await?
+    } else if apps.is_app(ctx.tenant, node).await? {
+        // A web app lists its releases (encoding `app_release_v1`, card W-2s).
+        apps.list_versions(&ctx, node, filter, page).await?
     } else {
         state
             .services
@@ -105,7 +109,9 @@ fn version_write(
 /// Restore a version. `POST /v1/nodes/{node_id}/versions/{version_id}/restore` (operationId `restoreVersion`).
 ///
 /// A database node restores a manifest version: a new version with the old manifest, through
-/// the rules of `updateDatabaseManifest` (card P-3).
+/// the rules of `updateDatabaseManifest` (card P-3). A web app restores a release: a rollback
+/// with the rules of `publishAppDeployment`; an agent gets `403`, hint `publishAppDeployment`
+/// (card W-2s).
 pub async fn restore_version(
     State(state): State<AppState>,
     RequestContext(ctx): RequestContext,
@@ -116,8 +122,12 @@ pub async fn restore_version(
     // A database node restores a manifest version through the manifest rules of its type
     // (card P-3, decision 0004-6); a file restores its content.
     let databases = &state.services.databases;
+    let apps = &state.services.apps;
     let w = if databases.is_database(ctx.tenant, node).await? {
         databases.restore_version(&ctx, node, version).await?
+    } else if apps.is_app(ctx.tenant, node).await? {
+        // A web app version is one live deployment: restoring it is a rollback (card W-2s).
+        apps.restore_version(&ctx, node, version).await?
     } else {
         state.services.versions.restore(&ctx, node, version).await?
     };

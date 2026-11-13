@@ -193,6 +193,10 @@ impl Services {
             typed.clone(),
             &providers,
             crate::apps::AppParts::memory(Some(journal.clone())),
+            crate::apps::AppContent {
+                transfers: content.clone(),
+                blobs: blobs.clone(),
+            },
         )
         .expect("the web app provider registers");
         let handles = MemoryHandles {
