@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Writes the kubeconfig of the ServiceAccount ruum/deployer (Helm in `ruum` and `edge` only,
-# charts/platform/templates/deployer-rbac.yaml) to ~/.config/ruum/staging/deployer.kubeconfig (0600, on
-# the Mac). deploy.sh uses it; the admin kubeconfig stays for up.sh, upgrades and destroy (review 1 S-2, review 2 O-1).
+# Writes the kubeconfig of the ServiceAccount ruum/deployer (since backlog O-34 it may only write
+# release requests for the deploy controller, charts/platform/templates/deployer-rbac.yaml) to
+# ~/.config/ruum/staging/deployer.kubeconfig (0600, on the Mac). deploy.sh uses it; the admin
+# kubeconfig stays for up.sh, upgrades and destroy (review 1 S-2, review 2 O-1).
 set -euo pipefail
 WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
 out="$WORK/deployer.kubeconfig"

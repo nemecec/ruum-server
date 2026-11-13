@@ -36,12 +36,19 @@
 #   maxUnavailable 0, RUUM_MIGRATE=false, preStop pause, drain, disruption budget; the migration
 #   Job (only when deploy-chart.sh asks for it; ruum-server migrate; not behind the Service; only
 #   DATABASE_URL); the edge DaemonSet with surge, certificates in Kubernetes Secrets, the edge's
-#   namespaced rights; the deployer may run Jobs in ruum; deploy-chart.sh migrates first;
+#   namespaced rights; the deploy controller runs the Jobs in ruum; deploy-chart.sh migrates first;
 # - the Kimi review of O-25: the migration Job reads the owner's DSN from ruum-migrate-db and the
 #   serving pods never do; ruum-server-env holds ruum_app's DSN, written after the grants; the
 #   grants (with docker: against postgres:17) give ruum_app data rights only and no write on
 #   _sqlx_migrations; --rollback goes only to the previous release (ruum-release `previous`);
 #   the deploy lock (a fake kubectl) and its place around the read, the migration and helm;
+# - the deploy controller (backlog O-34, decision 0008-2): the deployer may only write release
+#   requests (ops/rbac-check.sh on the rendered manifests, and each way it could get more is
+#   refused: a pod or Job in ruum, a Secret, pods/log, a ClusterRole, a wildcard...); the live
+#   check with a fake kubectl; ops/release-request.sh writes the request and follows its outcome
+#   (a fake kubectl); deploy-chart.sh runs only in the controller; the controller's chart and
+#   rights; with go or docker: the controller's own tests (it refuses an unsigned digest, a commit
+#   off main, an older commit without a rollback...);
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate; without the storage
 #   block, which only the edge image has);
 # - with tofu: fmt and validate of both roots; with tofu and talosctl: the machine config of
@@ -274,7 +281,9 @@ expect 1 "refuses an issuer outside the list" bash "$dc" "$C" "$SV" "$ED" --acme
 expect 1 "refuses an email with a comma" bash "$dc" "$C" "$SV" "$ED" --acme zerossl --acme-email "a@b.io,adminSources={0.0.0.0/0}" --validate-only
 expect 1 "refuses zerossl without an email" bash "$dc" "$C" "$SV" "$ED" --acme zerossl --validate-only
 grep -vE '^[[:space:]]*#' "$dc" | grep -qE -- '--set[ =]' && bad "deploy-chart.sh passes values with --set" || ok "deploy-chart.sh gives helm a values file, never --set"
-grep -q 'cosign_verify_provenance' "$dc" && ok "deploy-chart.sh verifies the provenance in the tools container" || bad "deploy-chart.sh skips the provenance check"
+grep -q 'cosign_verify_provenance' "$dc" && ok "deploy-chart.sh verifies the provenance again (in the deploy controller)" || bad "deploy-chart.sh skips the provenance check"
+expect 1 "deploy-chart.sh runs only in the deploy controller (backlog O-34)" env -u RUUM_DEPLOY_IN_CLUSTER -u KUBERNETES_SERVICE_HOST bash "$dc" "$C" "$SV" "$ED" --expect-deployed none
+grep -qF 'runs in the deploy controller' "$TMP/out" && ok "deploy-chart.sh says where it runs" || bad "deploy-chart.sh outside the controller: $(cat "$TMP/out")"
 
 echo "== the Mac only (decision of the person, 2026-11-11)"
 st="$STG/steps.sh"
@@ -549,7 +558,8 @@ if has helm; then
   d="ghcr.io/nemecec/ruum-server@sha256:$(printf '%064d' 0)"
   e="ghcr.io/nemecec/ruum-edge@sha256:$(printf '%064d' 1)"
   expect 0 "helm lint charts/ruum" helm lint "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e"
-  expect 0 "helm lint charts/platform" helm lint "$STG/charts/platform" --set generation=202611111200
+  PCI="ghcr.io/nemecec/ruum-deploy-controller@sha256:$(printf '%064d' 2)"
+  expect 0 "helm lint charts/platform" helm lint "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
   expect 0 "render charts/ruum by digest" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e"
   cp "$TMP/out" "$TMP/ruum.yaml"
   # The server and the chart agree on the settings (tests/server-env.sh, crates/ruum-server/env-names.txt).
@@ -584,12 +594,15 @@ if has helm; then
   expect 1 "charts/ruum refuses an odd acme email" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set acme.issuer=zerossl --set-string "acme.email=a b@c.io"
   expect 1 "charts/ruum refuses production Let's Encrypt" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set acme.issuer=letsencrypt
   expect 1 "charts/ruum refuses ZeroSSL without an email" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set acme.issuer=zerossl
-  expect 0 "render charts/platform" helm template platform "$STG/charts/platform" --set generation=202611111200
+  expect 0 "render charts/platform" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
   grep -q "serverName: pg-202611111200" "$TMP/out" && ok "the backup path carries the generation (review 2 R-2)" || bad "backup path generation"
   grep -q "retentionPolicy" "$TMP/out" && bad "barman retention is set (the in-cluster key must need no delete)" || ok "no barman retention (review 1 B-3)"
-  expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200
+  expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200 --set "deployController.image=$PCI"
   grep -q "serverName: pg-202611111200" "$TMP/out" && grep -q "recovery:" "$TMP/out" && ok "restore mode bootstraps from the old generation" || bad "restore mode"
-  expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform"
+  expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform" --set "deployController.image=$PCI"
+  expect 1 "charts/platform refuses a missing deploy controller image (O-34)" helm template platform "$STG/charts/platform" --set generation=202611111200
+  expect 1 "charts/platform refuses the controller by tag" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=ghcr.io/nemecec/ruum-deploy-controller:main"
+  expect 1 "charts/platform refuses a server image as the controller" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$d"
   # Updates without downtime (design 12.7, backlog O-25 and O-26).
   echo "== updates without downtime (O-25, O-26)"
   has_line() { grep -qF -- "$2" "$1"; }
@@ -650,7 +663,7 @@ if has helm; then
   want "$TMP/edge.yaml" "the certificate storage is the edge namespace" "namespace edge"
   want "$TMP/edge.yaml" "Caddy drains open connections for 30 s" "grace_period 30s"
   has_line "$TMP/edge.yaml" "file_system" && bad "the edge still keeps certificates in a file system" || ok "no file system storage for certificates"
-  expect 0 "render the platform for the edge and deployer rights" helm template platform "$STG/charts/platform" --set generation=202611111200
+  expect 0 "render the platform for the edge and deployer rights" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
   cp "$TMP/out" "$TMP/platform.yaml"
   awk '/^# Source: [a-z-]*\/templates\/edge-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/edge-rbac.yaml"
   want "$TMP/edge-rbac.yaml" "the platform makes the ServiceAccount ruum-edge" "name: ruum-edge"
@@ -660,26 +673,90 @@ if has helm; then
     ok "the edge may touch only Secrets and Leases" || bad "the edge Role names other resources: $(grep -E 'resources:' "$TMP/edge-rbac.yaml" | tr '\n' ' ')"
   awk '/^  name: pg-clients$/ {on=1} on && /^---/ {exit} on' "$TMP/platform.yaml" | grep -qF "matchLabels: { app: ruum-migrate }" &&
     ok "the network policy lets the migration Job reach Postgres" || bad "the migration Job cannot reach Postgres (pg-clients)"
-  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
-    awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: ruum\n/' | grep -qF "resources: [jobs]" &&
-    ok "the deployer may run Jobs in ruum" || bad "the deployer cannot run the migration Job in ruum"
-  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
-    awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: edge\n/' | grep -qF "jobs" &&
-    bad "the deployer may run Jobs in edge" || ok "the deployer runs Jobs only in ruum"
+  # Backlog O-34: the deploy controller runs the migration Job, the deployer does not.
+  awk '/^# Source: [a-z-]*\/templates\/deploy-controller.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/controller.yaml"
+  awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deploy-controller\n/ && /namespace: ruum\n/' "$TMP/controller.yaml" >"$TMP/controller-ruum.yaml"
+  grep -qF "resources: [jobs]" "$TMP/controller-ruum.yaml" &&
+    ok "the deploy controller may run the migration Job in ruum" || bad "the deploy controller cannot run the migration Job in ruum"
+  awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deploy-controller\n/ && /namespace: edge\n/' "$TMP/controller.yaml" | grep -qF "jobs" &&
+    bad "the deploy controller may run Jobs in edge" || ok "the deploy controller runs Jobs only in ruum"
+  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/deployer-rbac.yaml"
+  grep -qE 'jobs.*verbs: \[[^]]*create' "$TMP/deployer-rbac.yaml" && bad "the deployer may create Jobs" || ok "the deployer creates no Job (O-34)"
   awk '/^# Source: [a-z-]*\/templates\/cnpg.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/cnpg.yaml"
   grep -A4 -E '^ +- name: ruum_app$' "$TMP/cnpg.yaml" | grep -qF 'passwordSecret: { name: pg-role-ruum-app }' &&
     ok "CNPG manages the runtime role ruum_app" || bad "CNPG has no managed role ruum_app"
   grep -A4 -E '^ +- name: ruum_app$' "$TMP/cnpg.yaml" | grep -qE 'inRoles|superuser: true|createdb: true|createrole: true' &&
     bad "ruum_app gets a membership or a special right" || ok "ruum_app has no membership and no special right"
-  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
-    awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: ruum\n/' >"$TMP/deployer-ruum.yaml"
-  grep -B1 -A2 -F 'resourceNames: [ruum-deploy]' "$TMP/deployer-ruum.yaml" | grep -qF 'verbs: [get, update]' &&
-    ok "the deployer may read and update only the Lease ruum-deploy (the deploy lock)" || bad "the deployer has no rights on the deploy lock"
-  grep -qE 'resources: \[secrets\]' "$TMP/deployer-ruum.yaml" && bad "the deployer has a rule on Secrets" || ok "the deployer has no rule on Secrets"
+  grep -B1 -A2 -F 'resourceNames: [ruum-deploy]' "$TMP/controller-ruum.yaml" | grep -qF 'verbs: [get, update]' &&
+    ok "the deploy controller may read and update only the Lease ruum-deploy (the deploy lock)" || bad "the deploy controller has no rights on the deploy lock"
+  grep -qE 'resources: \[secrets\]' "$TMP/controller.yaml" && bad "the deploy controller has a rule on Secrets" || ok "the deploy controller has no rule on Secrets"
+  grep -qE '^ +- \{.*resources: \[[^]]*secrets' "$TMP/deployer-rbac.yaml" && bad "the deployer has a rule on Secrets" || ok "the deployer has no rule on Secrets"
   jl="$(grep -nF -- '--show-only templates/migrate-job.yaml' "$dc" | head -1 | cut -d: -f1)"
   hl="$(grep -nE '^helm upgrade' "$dc" | head -1 | cut -d: -f1)"
   [[ -n "$jl" && -n "$hl" && "$jl" -lt "$hl" ]] && ok "deploy-chart.sh runs the migration Job before the rollout" || bad "deploy-chart.sh: the migration Job is not before helm upgrade"
   grep -qF 'not rolling out, the old release keeps serving' "$dc" && ok "deploy-chart.sh stops when the migration step fails" || bad "deploy-chart.sh rolls out after a failed migration step"
+  # The deploy controller (backlog O-34, decision 0008-2): the deployer may only write release
+  # requests. ops/rbac-check.sh reads every binding of the deployer in the rendered manifests.
+  echo "== the deployer's rights (O-34, ops/rbac-check.sh static)"
+  rc="$STG/ops/rbac-check.sh"
+  cat "$TMP/platform.yaml" "$TMP/ruum.yaml" "$STG"/k8s/manifests/*.yaml >"$TMP/all.yaml"
+  expect 0 "the rendered manifests let the deployer only write release requests" bash "$rc" static "$TMP/all.yaml"
+  # Each way back to the Secrets is refused. rbac_mutant NAME DESCRIPTION SED: the deployer Role
+  # of ruum gets one more rule (or the file another change), and the check must fail.
+  rbac_mutant() {
+    sed "$3" "$TMP/all.yaml" >"$TMP/rbac-$1.yaml"
+    cmp -s "$TMP/all.yaml" "$TMP/rbac-$1.yaml" && { bad "rbac mutant $1 changed nothing"; return; }
+    expect 1 "rbac-check refuses $2" bash "$rc" static "$TMP/rbac-$1.yaml"
+  }
+  RUUM_RULE='/resourceNames: \[ruum-release\], verbs: \[get\] }/a\
+'
+  rbac_mutant pods "the deployer creating a pod in ruum" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [pods], verbs: [create] }"
+  rbac_mutant jobs "the deployer creating a Job in ruum" "${RUUM_RULE}  - { apiGroups: [batch], resources: [jobs], verbs: [get, create] }"
+  rbac_mutant deploys "the deployer patching a Deployment in ruum" "${RUUM_RULE}  - { apiGroups: [apps], resources: [deployments], verbs: [patch] }"
+  rbac_mutant cronjobs "the deployer creating a CronJob" "${RUUM_RULE}  - { apiGroups: [batch], resources: [cronjobs], verbs: [create] }"
+  rbac_mutant secrets "the deployer reading a Secret" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [secrets], verbs: [get] }"
+  rbac_mutant secretname "the deployer reading one Secret by name" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [secrets], resourceNames: [ruum-migrate-db], verbs: [get] }"
+  rbac_mutant podlog "the deployer reading pod logs" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [pods/log], verbs: [get] }"
+  rbac_mutant exec "the deployer exec into a pod" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [pods/exec], verbs: [create] }"
+  rbac_mutant ephemeral "the deployer adding an ephemeral container" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [pods/ephemeralcontainers], verbs: [patch] }"
+  rbac_mutant token "the deployer getting a ServiceAccount token" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [serviceaccounts/token], verbs: [create] }"
+  rbac_mutant wildcard "a wildcard verb" "${RUUM_RULE}  - { apiGroups: [apps], resources: [deployments], verbs: [\"*\"] }"
+  rbac_mutant helmrecords "the deployer reading every ConfigMap of ruum (Helm's release records)" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [configmaps], verbs: [list] }"
+  rbac_mutant cmwrite "the deployer changing ruum-release" "s/resourceNames: \[ruum-release\], verbs: \[get\]/resourceNames: [ruum-release], verbs: [get, update]/"
+  rbac_mutant requpdate "the deployer changing a release request (the controller's outcome)" "s/resources: \[configmaps\], verbs: \[create, get, list, watch\]/resources: [configmaps], verbs: [create, get, list, watch, update]/"
+  rbac_mutant lease "the deployer holding the deploy lock" "s/resourceNames: \[ruum-deploy\], verbs: \[get\] }/resourceNames: [ruum-deploy], verbs: [get, update] }/"
+  rbac_mutant multiline "a rule this check cannot read" "${RUUM_RULE}  - apiGroups: [batch]"
+  cat "$TMP/all.yaml" >"$TMP/rbac-cr.yaml"
+  printf -- '---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: deployer-edit\n  namespace: ruum\nsubjects:\n  - kind: ServiceAccount\n    name: deployer\n    namespace: ruum\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: edit\n' >>"$TMP/rbac-cr.yaml"
+  expect 1 "rbac-check refuses a RoleBinding of the deployer to a ClusterRole" bash "$rc" static "$TMP/rbac-cr.yaml"
+  cat "$TMP/all.yaml" >"$TMP/rbac-crb.yaml"
+  printf -- '---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: deployer-view\nsubjects:\n  - kind: ServiceAccount\n    name: deployer\n    namespace: ruum\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: view\n' >>"$TMP/rbac-crb.yaml"
+  expect 1 "rbac-check refuses a ClusterRoleBinding of the deployer" bash "$rc" static "$TMP/rbac-crb.yaml"
+  cat "$TMP/all.yaml" >"$TMP/rbac-grp.yaml"
+  printf -- '---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: all-sa\n  namespace: ruum\nsubjects:\n  - kind: Group\n    name: system:serviceaccounts:ruum\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: deploy-controller\n' >>"$TMP/rbac-grp.yaml"
+  expect 1 "rbac-check refuses a binding of every ServiceAccount of ruum (the deployer included) to the controller's Role" bash "$rc" static "$TMP/rbac-grp.yaml"
+  cat "$TMP/all.yaml" >"$TMP/rbac-flow.yaml"
+  printf -- '---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: flow\n  namespace: edge\nsubjects:\n  - { kind: ServiceAccount, name: deployer, namespace: ruum }\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: Role\n  name: ruum-edge-cert-storage\n' >>"$TMP/rbac-flow.yaml"
+  expect 1 "rbac-check refuses a subject it cannot read" bash "$rc" static "$TMP/rbac-flow.yaml"
+  # The controller: its own namespace and ServiceAccount, by digest, restricted, the only
+  # workload there with a token besides the edge.
+  want "$TMP/controller.yaml" "the deploy controller runs from the platform's digest" "image: $PCI"
+  want "$TMP/controller.yaml" "the deploy controller runs as its own ServiceAccount" "serviceAccountName: deploy-controller"
+  [[ "$(awk 'BEGIN{RS="---"} /kind: Deployment\n/' "$TMP/controller.yaml" | grep -cE '^  namespace: ruum-deploy$')" == 1 ]] &&
+    ok "the deploy controller runs in ruum-deploy" || bad "the deploy controller is not in ruum-deploy"
+  want "$TMP/controller.yaml" "one controller at a time (Recreate)" "strategy: { type: Recreate }"
+  want "$TMP/controller.yaml" "the controller's file system is read-only" "readOnlyRootFilesystem: true"
+  grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/controller.yaml" && bad "the deploy controller gets cluster-wide rights" || ok "the deploy controller's rights are namespaced"
+  [[ "$(grep -E '^  - kind: ' "$TMP/controller.yaml" | sort -u)" == "  - kind: ServiceAccount" &&
+     "$(grep -A1 -E '^  - kind: ServiceAccount$' "$TMP/controller.yaml" | grep -E '^    name: ' | sort -u)" == "    name: deploy-controller" ]] &&
+    ok "the controller's Roles are bound to the controller only" || bad "a controller Role is bound to another subject"
+  awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deploy-controller\n/ && /namespace: ruum-deploy\n/' "$TMP/controller.yaml" | grep -qF 'verbs: [get, list, watch, update, delete]' &&
+    ok "the controller reads the requests and writes their outcome" || bad "the controller cannot write the outcome of a request"
+  awk '/^  name: default-deny-ingress$/ {getline; print}' "$TMP/platform.yaml" | grep -qx '  namespace: ruum-deploy' &&
+    ok "ruum-deploy denies all ingress by default" || bad "ruum-deploy has no default deny"
+  grep -A1 -x '  name: ruum-deploy' "$STG/k8s/manifests/namespaces.yaml" | tail -1 | grep -q labels &&
+    grep -A3 -x '  name: ruum-deploy' "$STG/k8s/manifests/namespaces.yaml" | grep -qF 'pod-security.kubernetes.io/enforce: restricted' &&
+    ok "ruum-deploy enforces Pod Security restricted" || bad "ruum-deploy is not restricted"
   # The ask limit is per process: each replica gets its share (review of O-25, change 4).
   want "$TMP/server.yaml" "each of two replicas gets half of the ask limit (20 / 2)" '{ name: RUUM_TLS_ASK_NEW_HOSTS_PER_HOUR, value: "10" }'
   expect 0 "render ruum-server with three replicas and an ask limit of 2" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set server.replicas=3 --set server.tlsAskNewHostsPerHour=2 --show-only templates/server.yaml
@@ -885,6 +962,130 @@ lw="$(grep -nF 'ruum_lock_renew "$holder" || die "lost the deploy lock after the
 [[ -n "$lw" && "$lw" -gt "$lj" && "$lw" -lt "$lh" ]] && ok "deploy-chart.sh renews the lock before helm upgrade and stops when it lost it" || bad "deploy-chart.sh does not renew the lock before helm upgrade"
 grep -qF 'another deploy ran in between' "$dc" && ok "deploy-chart.sh refuses when the live release changed since deploy.sh checked it" || bad "deploy-chart.sh does not compare the live release"
 grep -qE '^trap cleanup EXIT' "$dc" && grep -qF 'ruum_lock_release "$holder"' "$dc" && ok "deploy-chart.sh releases the lock on exit" || bad "deploy-chart.sh does not release the lock"
+
+# The deploy controller (backlog O-34, decision 0008-2): deploy.sh writes a release request, the
+# controller checks and runs it. Without a cluster: fake kubectl binaries.
+echo "== release requests (ops/release-request.sh, O-34)"
+rr="$STG/ops/release-request.sh"
+expect 0 "release-request.sh builds a request" bash "$rr" "$C" "$SV" "$ED" --expect-deployed "$C" --rollback --acme zerossl --acme-email ops+stg@example.com --validate-only
+cp "$TMP/out" "$TMP/request.json"
+jq -e --arg c "$C" --arg s "$SV" --arg e "$ED" '.metadata.namespace == "ruum-deploy" and .metadata.labels["ruum.space/release-request"] == "true"
+  and .data == { commit: $c, server: $s, edge: $e, expectDeployed: $c, rollback: "previous", acme: "zerossl", acmeEmail: "ops+stg@example.com" }' \
+  "$TMP/request.json" >/dev/null && ok "the request holds only the commit, the digests, the live commit, the rollback mode and the ACME issuer" ||
+  bad "the release request: $(cat "$TMP/request.json")"
+expect 0 "release-request.sh: --rollback-older is the mode older" bash "$rr" "$C" "$SV" "$ED" --expect-deployed "$C" --rollback-older --validate-only
+jq -e '.data.rollback == "older"' "$TMP/out" >/dev/null && ok "rollback older" || bad "rollback older: $(cat "$TMP/out")"
+expect 1 "release-request.sh refuses a server image from another registry" bash "$rr" "$C" "evil.example/nemecec/ruum-server@sha256:$(printf '%064d' 0)" "$ED" --expect-deployed none --validate-only
+expect 1 "release-request.sh refuses the edge image in the server slot" bash "$rr" "$C" "$ED" "$ED" --expect-deployed none --validate-only
+expect 1 "release-request.sh refuses a short commit" bash "$rr" 0123456 "$SV" "$ED" --expect-deployed none --validate-only
+expect 1 "release-request.sh refuses a rollback without a live release" bash "$rr" "$C" "$SV" "$ED" --expect-deployed none --rollback --validate-only
+expect 1 "release-request.sh refuses production Let's Encrypt" bash "$rr" "$C" "$SV" "$ED" --expect-deployed none --acme letsencrypt --validate-only
+expect 1 "release-request.sh refuses an email with a comma" bash "$rr" "$C" "$SV" "$ED" --expect-deployed none --acme zerossl --acme-email "a@b.io,x=y" --validate-only
+FR="$TMP/fakereq"
+mkdir -p "$FR/bin"
+cat >"$FR/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+# A fake API server for one release request: the controller "takes" it on the second read and
+# writes FAKE_PHASE (or never, when FAKE_PHASE is empty).
+case "$*" in
+  "-n ruum-deploy create -f -") cat >"$FAKE_DIR/req.json"; echo 0 >"$FAKE_DIR/reads" ;;
+  "-n ruum-deploy get configmap "*" -o json")
+    [[ "$*" == *" $(jq -r .metadata.name "$FAKE_DIR/req.json") "* ]] || { echo "NotFound" >&2; exit 1; }
+    n=$(( $(cat "$FAKE_DIR/reads") + 1 )); echo "$n" >"$FAKE_DIR/reads"
+    if [[ $n -lt 2 || -z "$FAKE_PHASE" ]]; then cat "$FAKE_DIR/req.json"; exit 0; fi
+    jq --arg p "$FAKE_PHASE" '.metadata.annotations = { "ruum.space/phase": $p }
+      | .data.log = "checks passed\n==> rolling update" | .data.status = (if $p == "Succeeded" then "deployed" else "older than the live release" end)' "$FAKE_DIR/req.json" ;;
+  *) echo "fake kubectl: unexpected $*" >&2; exit 3 ;;
+esac
+FAKE
+chmod +x "$FR/bin/kubectl"
+req() { PATH="$FR/bin:$PATH" FAKE_DIR="$FR" RUUM_RELEASE_POLL_SECONDS=0 bash "$rr" "$C" "$SV" "$ED" --expect-deployed none "$@"; }
+FAKE_PHASE=Succeeded expect 0 "release-request.sh succeeds when the controller deployed the request" req
+grep -qF '==> rolling update' "$TMP/out" && ok "release-request.sh prints the controller's output" || bad "release-request.sh output: $(cat "$TMP/out")"
+FAKE_PHASE=Refused expect 1 "release-request.sh fails when the controller refused the request" req
+grep -qF 'refused the request: older than the live release' "$TMP/out" && ok "release-request.sh prints the refusal" || bad "release-request.sh refusal: $(cat "$TMP/out")"
+FAKE_PHASE=Failed expect 1 "release-request.sh fails when the deploy failed" req
+FAKE_PHASE='' RUUM_RELEASE_CLAIM_SECONDS=0 expect 1 "release-request.sh gives up when the controller does not take the request" req
+grep -qF 'did not take the request' "$TMP/out" && ok "release-request.sh says the controller did not take it" || bad "release-request.sh timeout: $(cat "$TMP/out")"
+grep -qF 'KUBECONFIG="$WORK/deployer.kubeconfig" bash "$HERE/ops/release-request.sh"' "$STG/steps.sh" &&
+  ok "steps.sh deploy writes the request with the deployer kubeconfig" || bad "steps.sh deploy does not use release-request.sh with the deployer kubeconfig"
+grep -qF 'deploy-chart.sh' "$STG/steps.sh" && bad "steps.sh still runs deploy-chart.sh on the Mac" || ok "steps.sh no longer runs deploy-chart.sh (the controller does)"
+grep -qE 'stg_run rw deploy .*--backup|backup=\(--backup\)' "$STG/deploy.sh" && bad "deploy.sh still decides the backup" || ok "deploy.sh leaves the backup to the controller"
+grep -qF 'stg_run rw platform --controller "$controller"' "$STG/secrets-push.sh" && grep -qF 'merge-base --is-ancestor "$controller" origin/main' "$STG/secrets-push.sh" &&
+  ok "the platform step installs the controller of a commit of main" || bad "secrets-push.sh does not pass a controller commit of main"
+grep -qF 'cosign_verify_provenance "$DEPLOY_CONTROLLER_IMAGE"' "$STG/k8s/apply.sh" && grep -qF 'bash "$STG/ops/rbac-check.sh" live' "$STG/k8s/apply.sh" &&
+  ok "apply.sh checks the controller's provenance and the live rights" || bad "apply.sh skips the controller's provenance or the live rights check"
+
+echo "== live rights check (ops/rbac-check.sh live, a fake kubectl)"
+FA="$TMP/fakeauth"
+mkdir -p "$FA/bin"
+cat >"$FA/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+# kubectl auth can-i VERB RESOURCE [--subresource S] (-n NS | --all-namespaces) --as AS: yes when
+# the line "AS NS VERB RESOURCE SUB" is in $FAKE_ALLOW.
+[[ "$1 $2" == "auth can-i" ]] || { echo "fake kubectl: unexpected $*" >&2; exit 3; }
+verb="$3" res="$4" sub="-" ns="-" as=""
+shift 4
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --subresource) sub="$2"; shift 2 ;;
+    -n) ns="$2"; shift 2 ;;
+    --all-namespaces) ns="*"; shift ;;
+    --as) as="$2"; shift 2 ;;
+    *) echo "fake kubectl: unexpected $1" >&2; exit 3 ;;
+  esac
+done
+if grep -qxF "$as $ns $verb $res $sub" "$FAKE_ALLOW"; then echo yes; else echo no; exit 1; fi
+FAKE
+chmod +x "$FA/bin/kubectl"
+D=system:serviceaccount:ruum:deployer K=system:serviceaccount:ruum-deploy:deploy-controller
+printf '%s\n' "$D ruum-deploy create configmaps -" "$D ruum get configmaps/ruum-release -" \
+  "$K ruum create jobs.batch -" "$K ruum update leases.coordination.k8s.io/ruum-deploy -" "$K ruum patch deployments.apps -" \
+  "$K edge patch daemonsets.apps -" "$K data create backups.postgresql.cnpg.io -" "$K ruum-deploy update configmaps -" >"$FA/allow"
+livecheck() { PATH="$FA/bin:$PATH" FAKE_ALLOW="$1" bash "$STG/ops/rbac-check.sh" live; }
+expect 0 "the live check passes when the deployer may only write release requests" livecheck "$FA/allow"
+for extra in "$D ruum create pods -" "$D ruum create jobs.batch -" "$D ruum get secrets -" "$D ruum get pods log" \
+  "$D edge patch daemonsets.apps -" "$D ruum-deploy update configmaps -" "$D ruum update leases.coordination.k8s.io -" \
+  "$D auth create pods -" "$D ruum create serviceaccounts token" "$D * create clusterrolebindings.rbac.authorization.k8s.io -" \
+  "$K ruum get secrets -" "$K ruum-deploy list secrets -"; do
+  { cat "$FA/allow"; echo "$extra"; } >"$FA/more"
+  expect 1 "the live check refuses: $extra" livecheck "$FA/more"
+done
+grep -vF "$K ruum create jobs.batch -" "$FA/allow" >"$FA/less"
+expect 1 "the live check fails when the controller cannot run the migration Job" livecheck "$FA/less"
+grep -vF "$D ruum-deploy create configmaps -" "$FA/allow" >"$FA/less"
+expect 1 "the live check fails when the deployer cannot write a request" livecheck "$FA/less"
+
+echo "== the deploy controller image (O-34)"
+DF="$ROOT/deploy/images/ruum-deploy-controller.Dockerfile"
+grep -qxF "FROM $TOOLS_BASE_IMAGE" "$DF" && ok "the controller image has the tools image's base (TOOLS_BASE_IMAGE, by digest)" ||
+  bad "the controller Dockerfile's base is not TOOLS_BASE_IMAGE of versions.env"
+grep -qF 'setup.sh kubectl helm cosign' "$DF" && ok "kubectl, helm and cosign come from setup.sh (versions.env, SHA-256)" || bad "the controller image does not use setup.sh"
+for f in deploy-chart.sh deploy-lock.sh image-check.sh release-floor.sh; do
+  grep -qF "deploy/staging/ops/$f" "$DF" || bad "the controller image lacks ops/$f"
+done
+grep -qF 'go test -count=1 ./...' "$DF" && ok "the image build runs the controller's tests" || bad "the image build skips the controller's tests"
+[[ "$(grep -cF 'image: [ruum-server, ruum-edge, ruum-deploy-controller]' "$ROOT/.github/workflows/images.yml")" == 2 ]] &&
+  ok "images.yml builds and attests the controller image" || bad "images.yml does not build the controller image"
+# The floor and the --rollback-older warning are the same in the controller and in ops/release-floor.sh.
+for f in $(bash -c ". '$STG/ops/release-floor.sh'; printf '%s\n' \"\${RUUM_RELEASE_FLOOR_FILES[@]}\""); do
+  grep -qF "\"$f\"" "$ROOT/deploy/images/deploy-controller/checks.go" || bad "the controller's floor lacks $f"
+done
+grep -qF "$(bash -c ". '$STG/ops/release-floor.sh'; printf '%s' \"\$RUUM_ROLLBACK_OLDER_WARNING\"")" "$ROOT/deploy/images/deploy-controller/checks.go" &&
+  ok "the controller prints the same --rollback-older warning" || bad "the controller's --rollback-older warning differs"
+GO_DIR="$ROOT/deploy/images/deploy-controller"
+if command -v go >/dev/null; then
+  echo "== deploy controller: go vet and go test"
+  expect 0 "the deploy controller's tests pass (go test)" bash -c "cd '$GO_DIR' && test -z \"\$(gofmt -l .)\" && go vet ./... && go test -count=1 ./..."
+elif [[ $have_docker == 1 ]]; then
+  echo "== deploy controller: go vet and go test (golang:1.26 in docker)"
+  # shellcheck disable=SC2016 # expanded in the container
+  expect 0 "the deploy controller's tests pass (go test)" docker run --rm -v "$GO_DIR:/src:ro" -w /src -e HOME=/tmp -e GOCACHE=/tmp/go-cache -e GOFLAGS=-buildvcs=false \
+    --user "$(id -u):$(id -g)" golang:1.26 sh -c 'test -z "$(gofmt -l .)" && go vet ./... && go test -count=1 ./...'
+  grep -E '^(ok|FAIL|---)' "$TMP/out" | sed 's/^/     /'
+else
+  echo "== deploy controller: go test skipped (no go, no docker; the image build runs it)"
+fi
 
 # The database roles (Kimi review of O-25, findings 1 and 5).
 echo "== database roles of ruum (owner for the migration Job, ruum_app for the serving pods)"
