@@ -205,6 +205,8 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         // `app.settings_changed` names the new values only, so there is no old value to set
         // back (card W-1); an agent can only lower the settings anyway.
         AppSettingsChanged => None,
+        AppRoleGranted => Some("remove the app role grant"),
+        AppRoleRevoked => Some("add the app role grant again"),
     }
 }
 

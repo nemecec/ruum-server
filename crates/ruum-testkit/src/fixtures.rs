@@ -41,7 +41,8 @@
 //!
 //! Step 3 (docs/STEP3.md, section "Fixtures"): card W-1 seeds the web app W (made by `member`
 //! through `createApp`), its live deployment (through the store) and both approvals of the
-//! tenant. The IDs of W's role grant, domain, API key, approval and trace, the issue I with its
+//! tenant; card B-2 seeds W's active roles and its `approver` grant to `guest_view` (through the
+//! role store). The IDs of W's domain, API key, approval and trace, the issue I with its
 //! receipt token, the template K and its setup are placeholders until the cards that build
 //! their operations seed them (they keep the field names). The seeded W has one live
 //! deployment whose manifest declares the roles `member` (default) and `approver`, the entered
@@ -1268,6 +1269,33 @@ mod seed {
         {
             t.app_deployment = d.id;
         }
+        // The active roles of W's live deployment (card B-2: the live-release hook of a
+        // publish; the fixture's deployment is seeded through the store) and the `approver`
+        // grant to `guest_view`, through the role store.
+        let (s2, c, app, grant, grantee) = (
+            s.clone(),
+            member_ctx.clone(),
+            t.app,
+            t.app_role_grant,
+            t.user_id(Who::GuestView),
+        );
+        step("app roles", async move {
+            s2.apps.sync_active_roles(tid, app).await?;
+            s2.apps
+                .roles()
+                .add(
+                    &c,
+                    &*s2.authz,
+                    ruum_core::apps::roles::NewRoleGrant {
+                        id: grant,
+                        app_id: app,
+                        role: "approver".into(),
+                        grantee: Grantee::User { id: grantee },
+                    },
+                )
+                .await
+        })
+        .await;
 
         // The tag T, made by the member, on the plan.
         let (s2, c, name, plan) = (s.clone(), member_ctx.clone(), t.tag_name.clone(), t.plan);

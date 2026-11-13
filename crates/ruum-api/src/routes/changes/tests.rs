@@ -174,6 +174,10 @@ fn sample(event: EventType, user: UserId) -> Value {
         EventType::AppSettingsChanged => json!({
             "changed": ["telemetry_mode"], "access": "platform", "telemetry_mode": "privacy"
         }),
+        EventType::AppRoleGranted | EventType::AppRoleRevoked => json!({
+            "role_grant_id": id(), "role": "approver",
+            "grantee": { "type": "user", "id": id() }
+        }),
     }
 }
 

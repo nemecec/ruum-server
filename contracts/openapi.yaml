@@ -5160,7 +5160,6 @@ paths:
       tags: [apps]
       operationId: listAppRoles
       x-ruum-area: roles
-      x-ruum-status: planned
       summary: List the app-defined roles
       description: |
         The roles of the live manifest (design 9.3) with their description, the `default` role
@@ -5187,7 +5186,6 @@ paths:
       tags: [apps]
       operationId: listAppRoleGrants
       x-ruum-area: roles
-      x-ruum-status: planned
       summary: List who holds which app role
       description: Needs `view` (as `listGrants`). Filter by `role`.
       parameters:
@@ -5212,7 +5210,6 @@ paths:
       tags: [apps]
       operationId: addAppRoleGrant
       x-ruum-area: roles
-      x-ruum-status: planned
       summary: Give an app role to a person, a group or the tenant
       description: |
         Writes `app_role:<app-node-id>/<role>#holder@<grantee>` (design 9.3). Allowed for a
@@ -5257,7 +5254,6 @@ paths:
       tags: [apps]
       operationId: removeAppRoleGrant
       x-ruum-area: roles
-      x-ruum-status: planned
       summary: Take an app role away
       description: |
         Same rule as `addAppRoleGrant`. The next request of the holder gets a token without the

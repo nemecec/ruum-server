@@ -258,6 +258,8 @@ pub struct AppDeps {
     pub provider: Arc<provider::WebAppProvider>,
     pub usage: Arc<dyn UsageSink>,
     pub config: AppConfig,
+    /// The app role grants (card B-2, [`roles`]).
+    pub roles: Arc<dyn roles::RoleStore>,
 }
 
 /// The parts of the apps area for [`install`].
@@ -265,12 +267,14 @@ pub struct AppParts {
     pub store: Arc<dyn AppStore>,
     pub usage: Arc<dyn UsageSink>,
     pub config: AppConfig,
+    pub roles: Arc<dyn roles::RoleStore>,
 }
 
 impl AppParts {
     /// The in-memory store (with the journal for `app.settings_changed`) and a counting sink.
     pub fn memory(journal: Option<Arc<crate::journal::memory::MemoryJournal>>) -> Self {
         Self {
+            roles: Arc::new(roles::memory::MemoryRoleStore::new(journal.clone())),
             store: Arc::new(store::memory::MemoryAppStore::new(journal)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::default(),
@@ -280,6 +284,7 @@ impl AppParts {
     /// The Postgres store and a counting sink (card I-8 stores meters).
     pub fn postgres(pool: sqlx::PgPool) -> Self {
         Self {
+            roles: Arc::new(roles::postgres::PgRoleStore::new(pool.clone())),
             store: Arc::new(store::postgres::PgAppStore::new(pool)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::from_env(),
@@ -331,6 +336,7 @@ pub fn build(
         provider,
         usage: parts.usage,
         config: parts.config,
+        roles: parts.roles,
     })))
 }
 

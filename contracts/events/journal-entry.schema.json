@@ -1096,8 +1096,6 @@
         "app.rolled_back",
         "app.binding_granted",
         "app.binding_revoked",
-        "app.role_granted",
-        "app.role_revoked",
         "app.secret_changed",
         "app.domain_added",
         "app.domain_removed",

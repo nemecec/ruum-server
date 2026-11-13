@@ -82,6 +82,10 @@ pub enum EventType {
     DatabaseApprovalDecided,
     #[serde(rename = "app.settings_changed")]
     AppSettingsChanged,
+    #[serde(rename = "app.role_granted")]
+    AppRoleGranted,
+    #[serde(rename = "app.role_revoked")]
+    AppRoleRevoked,
 }
 
 impl EventType {
@@ -110,6 +114,8 @@ impl EventType {
         EventType::DatabaseGrantRevoked,
         EventType::DatabaseApprovalDecided,
         EventType::AppSettingsChanged,
+        EventType::AppRoleGranted,
+        EventType::AppRoleRevoked,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -139,6 +145,8 @@ impl EventType {
             DatabaseGrantRevoked => "database.grant_revoked",
             DatabaseApprovalDecided => "database.approval_decided",
             AppSettingsChanged => "app.settings_changed",
+            AppRoleGranted => "app.role_granted",
+            AppRoleRevoked => "app.role_revoked",
         }
     }
 
