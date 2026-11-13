@@ -732,14 +732,14 @@ pub fn role<'a>(list: &'a [Value], name: &str) -> Option<&'a Value> {
 /// The manifest with three app roles: `member` (default), `approver`, and `admin`
 /// (`grants_roles`).
 pub const ROLES_MANIFEST: &str = "runtime: static\n\
-roles:\n  member:\n    description: Uses the plant list\n    default: true\n\
-  approver:\n    description: Approves orders\n\
-  admin:\n    description: Gives app roles\n    grants_roles: true\n";
+roles:\n  member:\n    description: Uses the plant list\n    default: true\n  \
+approver:\n    description: Approves orders\n  \
+admin:\n    description: Gives app roles\n    grants_roles: true\n";
 
 /// [`ROLES_MANIFEST`] without `admin`.
 pub const ROLES_MANIFEST_NO_ADMIN: &str = "runtime: static\n\
-roles:\n  member:\n    description: Uses the plant list\n    default: true\n\
-  approver:\n    description: Approves orders\n";
+roles:\n  member:\n    description: Uses the plant list\n    default: true\n  \
+approver:\n    description: Approves orders\n";
 
 /// The secrets of the fixture: credentials and bearer tokens of both tenants. No answer may
 /// hold one (design 9.9, card T-4a case 9). The values are never printed.
