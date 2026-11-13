@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Rolls out charts/ruum by digest, in the tools container on the Mac with the namespaced deployer
-# kubeconfig (review 2 O-1). Called by steps.sh deploy. deploy.sh (Mac) checks CI, the digests
-# and the provenance first with gh; this script checks again here with cosign (code review F-3),
-# so a call of steps.sh deploy that skips deploy.sh cannot deploy another image:
+# Rolls out charts/ruum by digest. Since backlog O-34 (decision 0008-2) it runs only in the deploy
+# controller (namespace ruum-deploy, deploy/images/deploy-controller), with the controller's own
+# ServiceAccount. The deployer no longer runs it: it may only write a release request
+# (ops/release-request.sh), and the controller checks that request itself (provenance, main,
+# floor, order against the live release) before it runs this script. This script checks again
+# (code review F-3), so a call that skips the controller's checks cannot deploy another image:
 #   - every argument is validated: the commit is 40 hex characters, the images are
 #     ghcr.io/nemecec/ruum-{server,edge}@sha256:<64 hex>, the issuer is from a fixed list, the
 #     email matches a strict pattern;
@@ -19,7 +21,8 @@
 #   2. the migration step: the Job of charts/ruum migrate-job.yaml with the new server image
 #      runs `ruum-server migrate` under an advisory lock; when it fails, the rollout does not
 #      start and the old release keeps serving (old and new releases both run on the new
-#      schema: expand, then contract);
+#      schema: expand, then contract). Its log lines start with "migrate| ": the controller
+#      keeps them in its own log (admin only) and out of the request that the deployer reads;
 #   3. the rolling update (helm upgrade --wait): new pods next to the old ones, never fewer
 #      ready than before.
 #
@@ -71,9 +74,13 @@ fi
 [[ $rollback == 0 || "$expect_deployed" != none ]] || die "a rollback needs a live release (--expect-deployed)"
 [[ $validate_only == 0 ]] || { echo "deploy-chart: arguments are valid"; exit 0; }
 
-WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
-export KUBECONFIG="$WORK/deployer.kubeconfig"
-# Helm keeps release records in ConfigMaps, so the deployer needs no access to Secrets.
+# Only in the deploy controller's pod (backlog O-34): kubectl and helm use its ServiceAccount.
+[[ "${RUUM_DEPLOY_IN_CLUSTER:-}" == 1 && -n "${KUBERNETES_SERVICE_HOST:-}" ]] ||
+  die "deploy-chart.sh runs in the deploy controller (namespace ruum-deploy); deploy.sh writes a release request for it (backlog O-34)"
+unset KUBECONFIG
+WORK="${RUUM_STAGING_WORK:-/tmp/work}"
+mkdir -p "$WORK"
+# Helm keeps release records in ConfigMaps, so the controller needs no access to Secrets.
 export HELM_DRIVER=configmap
 
 echo "==> provenance of both images (images.yml on refs/heads/main), checked with cosign" >&2
@@ -95,7 +102,7 @@ trap cleanup EXIT
 
 # 0. The deploy lock, then the live release again (Kimi review of O-25, findings 2 and 3).
 kubectl auth can-i update leases.coordination.k8s.io/ruum-deploy -n ruum >/dev/null 2>&1 ||
-  die "the deployer may not use Leases in ruum; apply the platform first (k8s/apply.sh)"
+  die "the deploy controller may not use Leases in ruum; apply the platform first (k8s/apply.sh)"
 rc=0
 ruum_lock_acquire "$holder" || rc=$?
 [[ $rc == 0 ]] || die "not deploying: $([[ $rc == 1 ]] && echo "another deploy runs (wait for it, or for the lease to expire)" || echo "the deploy lock failed")"
@@ -142,7 +149,7 @@ ruum_lock_renew "$holder" || die "lost the deploy lock after the backup; not mig
 
 # 2. The migration step (design 12.7, backlog O-25), before the rollout.
 kubectl auth can-i create jobs.batch -n ruum >/dev/null 2>&1 ||
-  die "the deployer may not create Jobs in ruum; apply the platform first (k8s/apply.sh, backlog O-25)"
+  die "the deploy controller may not create Jobs in ruum; apply the platform first (k8s/apply.sh, backlog O-34)"
 job="ruum-migrate-${commit:0:12}-$(date -u +%Y%m%d%H%M)"
 jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg job "$job" '
   { images: { server: $server, edge: $edge }, commit: $commit, migrationJob: true, migrationJobName: $job }
@@ -163,7 +170,7 @@ for _ in $(seq 1 200); do
   fi
   sleep 5
 done
-kubectl -n ruum logs "job/$job" --tail 50 >&2 || true
+kubectl -n ruum logs "job/$job" --tail 50 2>&1 | sed 's/^/migrate| /' >&2 || true
 [[ "$state" == 1/* ]] || die "the migration step $job did not succeed (${state:-no status}); not rolling out, the old release keeps serving"
 echo "==> migrations are up to date; rolling update" >&2
 ruum_lock_renew "$holder" || die "lost the deploy lock after the migration step; not rolling out (run deploy.sh again)"

@@ -124,7 +124,7 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
 | `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply, the talosconfig and the kubeconfig. |
 | `deploy/staging/ops/tunnel-setup.sh` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). |
-| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest, after the provenance check (with `gh` on the Mac, and again with `cosign` in the tools container); `--rollback` to go back to the previous release on purpose, `--rollback-older` (with a warning) to go back further; one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
+| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` (with a warning) to go back further; one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server and Zitadel. Not read-only (a temporary namespace, ephemeral containers). |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
@@ -177,7 +177,7 @@ check the files).
 | `auth/zitadel-smtp` | SMTP login at Scaleway: `user` (the project ID, `SCW_DEFAULT_PROJECT_ID`), `password` (`SCW_SMTP_SECRET_KEY`) | Zitadel (setup of a new instance), `ops/zitadel-bootstrap.sh` |
 | `authz/spicedb` | preshared key, DSN | SpiceDB |
 | `ruum/ruum-server-env` | DSN of `ruum_app` (data rights only: no DDL, read-only `_sqlx_migrations`), Hetzner S3 key, SpiceDB key, token and content keys, allow-list | ruum-server (serving pods) |
-| `ruum/ruum-migrate-db` | DSN of the owner `ruum` (DDL) | the migration Job only |
+| `ruum/ruum-migrate-db` | DSN of the owner `ruum` (DDL) | the migration Job only (created by the deploy controller; the deployer cannot reach it, backlog O-34) |
 | `ruum/ruum-oidc` | OIDC client ID (`client-id`) and the Zitadel IdP IDs of Google and Microsoft (`idp-google`, `idp-microsoft`, for `RUUM_OIDC_IDP_*`), made by `ops/zitadel-bootstrap.sh` | ruum-server |
 | `ops/blob-copy` | Hetzner S3 key, backup writer key, rclone crypt password and salt | the nightly copy |
 | `nats/nats-auth` | the ruum user's password | NATS |
@@ -239,20 +239,23 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
 
 - By digest only: the chart accepts only `ghcr.io/nemecec/ruum-{server,edge}@sha256:...`.
   `deploy.sh` checks CI, the digest and the provenance attestation of `images.yml` on
-  `refs/heads/main`. `ops/deploy-chart.sh` in the tools container validates every argument (commit
-  40 hex, issuer from a fixed list, a plain email), checks that the tag `<commit>` is that
-  digest, verifies the attestation again with `cosign`, and gives helm a values file, never
-  `--set` (code review F-3).
+  `refs/heads/main`, then writes a release request. The deploy controller checks the request by
+  itself ("The deploy controller"), and `ops/deploy-chart.sh` in the controller validates every
+  argument again (commit 40 hex, issuer from a fixed list, a plain email), checks that the tag
+  `<commit>` is that digest, verifies the attestation again with `cosign`, and gives helm a values
+  file, never `--set` (code review F-3).
 - Migrations follow **expand and contract** (design 12.7, decision 42): a release only adds; a
   removal comes one release later. Old and new pods serve side by side in a rollout, and a
   failed rollout rolls the image back (`--rollback-on-failure`, Helm 4) but not the schema, so
   the previous image must work on the new schema. `deploy.sh` takes an on-demand CNPG backup
   before a release with new migrations.
-- **Migrations are their own step** (backlog O-25): `ops/deploy-chart.sh` renders the Job of
+- **Migrations are their own step** (backlog O-25): `ops/deploy-chart.sh` (in the deploy
+  controller) renders the Job of
   `charts/ruum/templates/migrate-job.yaml` with the new server image, which runs
   `ruum-server migrate` under a Postgres advisory lock, and waits for it. If it fails, nothing is
-  rolled out and the old release keeps serving; the Job log is printed, and the Job stays for a
-  week. The serving pods run with `RUUM_MIGRATE=false` and do not start on a database that lacks
+  rolled out and the old release keeps serving; the Job log goes to the controller's log (admin:
+  `deploy/staging/tool.sh kubectl -n ruum-deploy logs deploy/deploy-controller`), not into the
+  request that the deployer reads, and the Job stays for a week. The serving pods run with `RUUM_MIGRATE=false` and do not start on a database that lacks
   a migration of their release.
 - **Rolling update**: ruum-server runs two replicas spread over the nodes, `maxUnavailable: 0`,
   a disruption budget of one, a readiness check every 5 s. Stopping: a 10 s `preStop` pause
@@ -276,13 +279,15 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   after the migration step; a deploy that lost it stops before its next step. A crashed deploy
   leaves the lock until it expires (or the admin clears `spec.holderIdentity`).
 - An older commit than the deployed one needs `--rollback`: the same path; its migration step
-  has nothing to do. **`--rollback` goes back one release only** (finding 2): the target must be
+  has nothing to do. The controller finds the order itself (GitHub's compare API) and refuses an
+  older commit without a rollback. **`--rollback` goes back one release only** (finding 2): the target must be
   the release that was live before the current one (`previous` in the ConfigMap `ruum-release`),
   because design 12.7 promises only that the previous release runs on the new schema. An older
   target needs `--rollback-older`, which prints a warning: check every migration since the target
   for a contract step that it still uses. The first deploy with this rule records `previous`; until
-  then a rollback needs `--rollback-older`. The chart, the migration Job and the platform always
-  come from the checkout that runs `deploy.sh`, not from the target commit. **The rollback floor is backlog O-25** (the commit that added the migration
+  then a rollback needs `--rollback-older`. The chart and the migration Job always come from the
+  deploy controller's image (the commit of main that the last platform step installed), and the
+  platform from the checkout that runs the platform step; never from the target commit. **The rollback floor is backlog O-25** (the commit that added the migration
   step and the edge's certificate storage). An older commit has no `ruum-server migrate` (its
   Job would fail on a usage error) and its edge image has no `kubernetes_secret` storage module
   (Caddy would not load the Caddyfile). `deploy.sh` refuses such a commit before it touches the
@@ -293,11 +298,94 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   and a host that one replica allowed counts again on another. The rate limits of
   `ruum_api::limits` are per process, so N replicas allow N times as much. Shared counters are
   backlog O-28.
-- Before the first deploy with these steps, apply the platform (`k8s/apply.sh`): it adds the
-  deployer's rights for Jobs and DaemonSets, the edge's ServiceAccount and Role, and the network
-  policy rule that lets the migration Job reach Postgres. `deploy-chart.sh` stops when the
-  deployer cannot create Jobs. That first deploy replaces the edge Deployment with the DaemonSet
-  (a short gap once) and issues the certificates once more into the new storage.
+- Before the first deploy with these steps, apply the platform (`k8s/apply.sh`): it installs the
+  deploy controller and its rights, the edge's ServiceAccount and Role, and the network policy
+  rule that lets the migration Job reach Postgres. `deploy-chart.sh` stops when the controller
+  cannot create Jobs.
+
+## The deploy controller (backlog O-34)
+
+Decision 0008-2 (option a). Before it, the deployer could create Pods, Jobs, Deployments and
+DaemonSets in `ruum` and `edge`, and a pod mounts any Secret of its namespace, so the deployer
+could read every Secret there (Kimi review of O-25, finding 1). Now:
+
+- **The controller** (`deploy/images/deploy-controller`, Go, standard library only) runs in its
+  own namespace `ruum-deploy` (Pod Security restricted, default deny ingress) as the
+  ServiceAccount `ruum-deploy/deploy-controller`, one pod (`Recreate`). Its image
+  `ghcr.io/nemecec/ruum-deploy-controller` is built, scanned and attested by `images.yml` like the
+  other two, with kubectl, helm and cosign from `setup.sh` (the pins of `versions.env`), the chart
+  `charts/ruum` and the deploy scripts. The platform step installs it by digest: `secrets-push.sh`
+  takes the checkout's commit (it must be on `origin/main`; `RUUM_DEPLOY_CONTROLLER_COMMIT`
+  picks another), and `k8s/apply.sh` resolves the tag and verifies the provenance with `cosign`
+  before anything changes.
+- **The deployer only writes release requests**: a ConfigMap in `ruum-deploy` with the label
+  `ruum.space/release-request=true` and the keys `commit`, `server`, `edge` (the two digests),
+  `expectDeployed` (the live commit `deploy.sh` read) and `rollback` (`none`, `previous` or
+  `older`), optionally `acme` and `acmeEmail` (`ops/release-request.sh`). It may create and read
+  them, never change or delete them. It reads `ruum/ruum-release` and the state of the workloads.
+  It creates no workload anywhere, uses no pod subresource (no `pods/log`, no exec), reads no
+  Secret, gets no token, holds no Lease and creates no CNPG Backup
+  (`charts/platform/templates/deployer-rbac.yaml`).
+- **The controller checks each request itself**, oldest first, one at a time: every field (the
+  patterns of `ops/image-check.sh`, no other key); for each image, the tag `<commit>` is that
+  digest, the provenance attestation of `images.yml` on `refs/heads/main` (`cosign`), and the
+  attested image's revision label is the commit; with GitHub's API (no token, at most five calls)
+  that the commit is on main, that it has the migration step and the edge storage (the O-25
+  floor), and its order against `expectDeployed`: an older commit needs a rollback, a newer one
+  must not ask for one; migrations in between (or a cut file list) mean an on-demand backup. A
+  request that waited more than five minutes before the controller saw it is refused, so an old
+  request never deploys by surprise.
+- **Then it runs `ops/deploy-chart.sh`** with its own ServiceAccount: the deploy lock, the live
+  release check, the rollback rule (previous release only unless `--rollback-older`), the backup,
+  the migration Job with the owner DSN of `ruum-migrate-db`, and `helm upgrade`. The rules of
+  "Deploy rules" are unchanged.
+- **The outcome** goes back into the request: the annotation `ruum.space/phase` (`Running`,
+  `Succeeded`, `Failed`, `Refused`), `data.status` and `data.log` (the last 300 lines of the
+  output, without the migration Job's log, credentials in URLs masked). `deploy.sh` prints it as
+  it comes. The controller deletes finished requests after a week.
+- **The checks of the rights**: `ops/rbac-check.sh static` reads every binding of the deployer in
+  the rendered manifests (CI, `tests/run.sh`: each way back to a Secret is refused: a pod, a Job,
+  a Deployment patch, `pods/log`, exec, an ephemeral container, a token, a Secret by name, a
+  wildcard, a ClusterRole, a group binding); `ops/rbac-check.sh live` asks the API server
+  (`kubectl auth can-i --as`) for the deployer in every namespace and for the controller, and
+  the platform step stops when an answer is wrong.
+- **What the controller can reach**: what the deployer could before (it creates the pods and
+  Jobs in `ruum` and `edge`, so through them it reaches the Secrets there). It runs only code
+  from an image of main, installed by digest by the admin, and takes nothing from a request but
+  the checked fields. Only the admin can change its Deployment, ServiceAccount or Roles.
+- **What the deployer can still choose**: which signed commit of main at or after the O-25 floor
+  runs, and `--rollback-older` (with its warning), as before. It cannot run anything else.
+
+### Moving live staging to the deploy controller (once, the orchestrator)
+
+The order keeps the live release serving at every step. Until step 6 passes, the deployer
+kubeconfig stays on the person's Mac only (decision 0008-2).
+
+1. Merge to main. Wait for `images.yml` to publish `ghcr.io/nemecec/ruum-deploy-controller:<sha>`
+   (`gh run list -R nemecec/ruum-server --workflow images.yml --branch main`).
+2. The package is new at GHCR: check that it is public, like `ruum-server` and `ruum-edge`
+   (`curl -s "https://ghcr.io/token?scope=repository:nemecec/ruum-deploy-controller:pull&service=ghcr.io"`
+   gives a token, and the manifest of the tag answers 200). If not, the person sets it to
+   public once (GitHub, the package's settings, "Change visibility"). The cluster pulls it
+   without credentials.
+3. On the Mac, in the main checkout: `git pull` (HEAD is now the merge commit, which has the
+   controller image).
+4. `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`: the platform step. It
+   checks the controller image's provenance, adds the namespace `ruum-deploy`, the controller,
+   its Roles, and the deployer's new Roles (the old deployer rights in `ruum`, `edge` and `data`
+   go), waits for the controller, and runs `ops/rbac-check.sh live`. It stops when any answer is
+   wrong. The live release keeps serving: nothing of `charts/ruum` changes in this step.
+5. Check: `deploy/staging/status.sh` shows the controller `Running`.
+6. `deploy/staging/deploy.sh <sha of main>`: the first deploy through the controller (a
+   redeploy of the live commit is fine). It prints the controller's checks and output and ends
+   with `deployed <sha>`, then the smoke checks.
+7. Only now may the deployer kubeconfig leave the Mac (an agent or CI), if the person wants that.
+
+Going back: run the platform step from a checkout before this change. It restores the old
+deployer rights (Pods, Jobs, Leases, Backups) and leaves `ruum-deploy` and the controller in
+place but unused (delete them with `deploy/staging/tool.sh kubectl delete namespace ruum-deploy`);
+`deploy.sh` of that checkout runs `deploy-chart.sh` on the Mac again. The deployer kubeconfig is
+then operator-only again (README S-4 of that checkout).
 
 ### Moving an existing staging to the two database roles (once)
 
@@ -331,8 +419,8 @@ step from a checkout before this change: it writes the owner's DSN back into `ru
 
 The sum of the memory requests must fit on two nodes, or a node upgrade hangs. Requests in the
 charts: Postgres 2 x 512 MiB, Zitadel 384 MiB, ruum-server 2 x 200 MiB, SpiceDB 128 MiB,
-operators about 300 MiB, NATS 64 MiB, edge 3 x 64 MiB, Mailpit 32 MiB: about 2.5 GiB plus the
-system pods,
+operators about 300 MiB, NATS 64 MiB, edge 3 x 64 MiB, deploy controller 64 MiB, Mailpit 32 MiB:
+about 2.6 GiB plus the system pods,
 against about 6.5 GiB allocatable on two cx23. `ops/check-capacity.sh` measures it on the live
 cluster; run it in the first week with one node cordoned. If it does not fit, set
 `NODE_COUNT=4` before the first upgrade.
@@ -381,10 +469,10 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | Mac only (2026-11-11) | `lib.sh`, `steps.sh`, `tools-image.sh`, `tool.sh`: every step on the Mac in the tools container; no ruum-ops, no credential on the build server; `STG_ADMIN_CIDRS` exactly one IPv4 /32 (`check-plan.sh`, the `admin_cidrs` validation in `tofu/cluster`). |
 | Admin tunnel (2026-11-11) | The firewall source is the build server's /32 from the Hetzner API (no Mac address detection); `tunnel.sh`, `lib.sh stg_tunnel_up`, `tunnel-relay.sh`, `ops/tunnel-setup.sh`, `ops/buildbox-tunnel-user.sh`: an SSH local forward as `ruumtunnel`, restricted to the node API ports; the credentials stay on the Mac. |
 | Kimi review (2026-11-11) | `check-plan.sh` refuses every `hcloud_firewall_attachment` change (deletes included), an in-place change of an existing server's `firewall_ids`, a server firewall ID unknown at plan time when the plan creates no firewall, `apply_to` that is cleared or loses a server, and `apply_to` on a replaced firewall. `lib.sh` names the control socket after a fingerprint of the build server, host key, key and forwards, closes other tunnels, and checks every forward before use; `tunnel-setup.sh` always tests a new tunnel. `buildbox-tunnel-user.sh` rolls back the key file and drop-in on any failure. `tunnel-relay.sh` runs the command only when every relay listens. |
-| S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads, except the edge's (Secrets and Leases of `edge` only, for the certificate storage, backlog O-26). |
-| S-2 | The admin credentials only on the person's Mac (`~/.config/ruum`), never on the build server; namespaced `deployer` ServiceAccount for deploys. |
+| S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads, except the edge's (Secrets and Leases of `edge` only, for the certificate storage, backlog O-26) and the deploy controller's (`ruum-deploy`, backlog O-34). |
+| S-2 | The admin credentials only on the person's Mac (`~/.config/ruum`), never on the build server; namespaced `deployer` ServiceAccount for deploys, which only writes release requests for the deploy controller (backlog O-34). |
 | S-3 | One Secret per consumer; `secrets-push.sh` fixed list, refuses forbidden names; tests. |
-| S-4 | Certificates, ACME account keys and challenge tokens in Secrets of the `edge` namespace (backlog O-26); only the edge's ServiceAccount `ruum-edge` has a Role on them; no Hetzner key in the edge. **The deployer can read every Secret of `ruum` and `edge`** (Kimi review of O-25, finding 1; an earlier version of this row said "TLS keys only", which was wrong). It has no `get secrets`, but it may create pods, Jobs, Deployments and DaemonSets in both namespaces and read pod logs, and a pod may mount any Secret of its namespace whatever its creator may read. So it can read `ruum-server-env` (the runtime DSN, the token and content signing keys, the S3 and SpiceDB keys), `ruum-migrate-db` (the owner's DSN), `ruum-oidc`, and every TLS and ACME key of `edge`. stgsec S-11 holds only in the sense that the deployer cannot reach the other namespaces (`data`, `auth`, `authz`, `nats`, `ops`) beyond creating CNPG Backups. **The deployer kubeconfig is operator-only**: it stays on the person's Mac like the admin kubeconfig, never on the build server, in CI or with an agent that should not see those secrets. What limits the damage: the serving pods' DSN is `ruum_app` (no DDL, read-only migration records), and the owner's DSN is in a Secret that the serving pods do not mount. Backlog O-29 (corrected) and O-34 (move the migration step and the rollout out of the deployer's reach). |
+| S-4 | Certificates, ACME account keys and challenge tokens in Secrets of the `edge` namespace (backlog O-26); only the edge's ServiceAccount `ruum-edge` has a Role on them; no Hetzner key in the edge. **Since backlog O-34 (decision 0008-2) the deployer cannot read a Secret through any path**: it may only create release requests (ConfigMaps in `ruum-deploy`) and read them, `ruum/ruum-release` and the state of the workloads; it creates no Pod, Job, Deployment, DaemonSet or other workload, uses no pod subresource, reads no Secret, gets no token ("The deploy controller"; `ops/rbac-check.sh` static in CI and live after every platform step). Before O-34 it could read every Secret of `ruum` and `edge` through pods it created (Kimi review of O-25, finding 1; backlog O-29 corrected). The deploy controller now holds those rights, in its own namespace, running only an image of main installed by digest. Until the move to the controller is done on live staging ("Moving live staging to the deploy controller"), the deployer kubeconfig stays on the person's Mac. |
 | S-5 | rclone crypt for the blob copy; provider-side encryption stated for CNPG; HTTPS endpoints only. |
 | S-6 | Generated secrets in `secrets.env` (`secrets-init.sh`); `--restore-from`. |
 | S-7 | Deploy by digest; provenance attestation checked; Trivy scans vulnerabilities and secrets in the layers before the push. |
@@ -466,3 +554,9 @@ PVC binds by itself when a node has the volume: the provisioner retries.
   slow image pull can need a second `up.sh --apply`.
 - Scaleway bucket policies that bind the backup key to the two buckets are not set (the key's
   permission sets and the compliance lock are the controls).
+- The deploy controller (backlog O-34): a controller pod that stops during a deploy (the platform
+  step, a node drain) kills its `deploy-chart.sh`; the next pod marks the request `Failed`, and
+  the deploy lock stays until it expires (30 minutes). Do not run the platform step while a deploy
+  runs. The controller uses GitHub's API without a token (60 calls per hour per address); a
+  failed call fails the request, and `deploy.sh` can run again. The controller's checks were run
+  against a throwaway k3s on the build server, not yet on live staging (the move above).
