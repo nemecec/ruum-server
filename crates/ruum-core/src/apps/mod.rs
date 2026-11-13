@@ -33,6 +33,7 @@ pub mod plan;
 pub mod provider;
 pub mod settings;
 pub mod slugs;
+pub mod static_site;
 pub mod store;
 
 pub mod apis;
@@ -338,6 +339,8 @@ pub struct AppService {
     deps: AppDeps,
     /// Wakes the long polls of this process when a deployment changes.
     changed: tokio::sync::Notify,
+    /// The hooks called when the live deployment changes (card B-2; empty by default).
+    hooks: std::sync::RwLock<Vec<Arc<dyn deployments::LiveReleaseHook>>>,
 }
 
 /// Share-link bearers call no app operation (`403 user_required`).
@@ -387,7 +390,20 @@ impl AppService {
         Self {
             deps,
             changed: tokio::sync::Notify::new(),
+            hooks: std::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// Registers a hook that is called on every change of a live deployment (see
+    /// [`deployments::LiveReleaseHook`]).
+    pub fn add_live_hook(&self, hook: Arc<dyn deployments::LiveReleaseHook>) {
+        self.hooks.write().expect("hook lock").push(hook);
+    }
+
+    /// The registered live hooks.
+    #[allow(dead_code)] // The publish of card W-2s calls it.
+    pub(crate) fn live_hooks(&self) -> Vec<Arc<dyn deployments::LiveReleaseHook>> {
+        self.hooks.read().expect("hook lock").clone()
     }
 
     pub fn deps(&self) -> &AppDeps {
