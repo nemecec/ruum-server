@@ -82,3 +82,13 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/warn: restricted
+---
+# The deploy controller (backlog O-34): nothing else runs here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ruum-deploy
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted

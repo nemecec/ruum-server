@@ -1,8 +1,9 @@
 {{- /*
-The migration step before the rollout (design 12.7, backlog O-25). deploy-chart.sh renders only
-this template (helm template --show-only, with migrationJob and migrationJobName in a values file
-of its own), creates the Job with the new image, waits for it, and starts the rollout only when it
-succeeded. `helm upgrade` never renders it (migrationJob is false there).
+The migration step before the rollout (design 12.7, backlog O-25). deploy-chart.sh (in the deploy
+controller, backlog O-34) renders only this template (helm template --show-only, with
+migrationJob and migrationJobName in a values file of its own), creates the Job with the new
+image, waits for it, and starts the rollout only when it succeeded. `helm upgrade` never renders
+it (migrationJob is false there).
 
 `ruum-server migrate` takes the advisory lock, applies the pending migrations and exits. A failed
 Job is not retried (backoffLimit 0): the old release keeps serving, and the person looks at the
@@ -11,8 +12,8 @@ traffic; the platform's network policy lets ruum-migrate reach Postgres.
 
 The Job logs in as the database owner ruum (Secret ruum/ruum-migrate-db, k8s/apply.sh); the
 serving pods log in as ruum_app, without DDL rights. Who can read ruum-migrate-db: the admin, and
-the deployer, because it may create Jobs and pods in ruum and read pod logs (README S-4, backlog
-O-34). So the deployer kubeconfig stays on the operator's Mac.
+the deploy controller (namespace ruum-deploy), which creates this Job; since backlog O-34 the
+deployer cannot (it may only write release requests, ops/rbac-check.sh).
 */ -}}
 {{- if .Values.migrationJob }}
 {{- include "ruum.checkCommit" . }}

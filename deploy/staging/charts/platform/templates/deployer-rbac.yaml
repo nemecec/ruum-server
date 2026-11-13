@@ -1,17 +1,18 @@
-# deploy.sh uses this ServiceAccount, not the admin kubeconfig (review 1 S-2, review 2 O-1):
-# Helm in `ruum` and `edge` only. ops/deployer-kubeconfig.sh writes its kubeconfig into the
-# person's work folder on the Mac.
+# The deployer (review 1 S-2, review 2 O-1; backlog O-34, decision 0008-2). deploy.sh uses this
+# ServiceAccount, never the admin kubeconfig; ops/deployer-kubeconfig.sh writes its kubeconfig
+# into the person's work folder on the Mac.
 #
-# What this ServiceAccount can reach (Kimi review of O-25, finding 1): it has no `get secrets`,
-# but it may create and change pods, Deployments, DaemonSets and Jobs in `ruum` and `edge`, and
-# read pod logs. A pod can mount any Secret of its namespace, and Kubernetes does not check that
-# the pod's creator may read that Secret. So the deployer can read EVERY Secret of `ruum`
-# (ruum-server-env: the runtime database DSN, the token and content signing keys, the S3 key, the
-# SpiceDB key; ruum-migrate-db: the database owner's DSN; ruum-oidc) and of `edge` (the TLS
-# private keys and the ACME account key). Treat the deployer kubeconfig like the admin
-# kubeconfig for these two namespaces: operator-only, on the person's Mac, never on the build
-# server or in CI (README S-4). It cannot reach `data`, `auth`, `authz`, `nats` or `ops` beyond
-# creating CNPG Backups. Backlog O-34 moves the migration step and the rollout out of its reach.
+# Since O-34 the deployer only writes release requests: ConfigMaps in ruum-deploy that the deploy
+# controller (deploy-controller.yaml) checks and runs. It creates nothing else anywhere and
+# changes nothing: no Pods, Jobs, Deployments, DaemonSets or any other workload, no pod
+# subresource (log, exec, attach, port-forward, ephemeral containers), no Secret, no ServiceAccount
+# or token, no Role, no Lease, no CNPG Backup, no ConfigMap outside ruum-deploy. So it cannot run a
+# pod that mounts a Secret, and it cannot read a Secret through any path. What it reads: the live
+# release (ConfigMap ruum/ruum-release), the state of the workloads, and its own requests.
+#
+# The rules are one line each, in this form: ops/rbac-check.sh reads them in CI (tests/run.sh)
+# and fails on any rule it cannot read; on the live cluster it asks the API server
+# (kubectl auth can-i --as) after every platform step.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -27,47 +28,41 @@ metadata:
   annotations:
     kubernetes.io/service-account.name: deployer
 type: kubernetes.io/service-account-token
-{{- range list "ruum" "edge" }}
+---
+# Release requests: create and read, never update or delete (the controller writes the outcome).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: ruum-deploy
+rules:
+  - { apiGroups: [""], resources: [configmaps], verbs: [create, get, list, watch] }
+  - { apiGroups: [""], resources: [pods, events], verbs: [get, list, watch] }
+  - { apiGroups: [apps], resources: [deployments, replicasets], verbs: [get, list, watch] }
+---
+# The live release and the state of the rollout, read-only. ConfigMaps only by name: Helm's
+# release records (sh.helm.release.v1.*) stay out of reach, read and write.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: ruum
+rules:
+  - { apiGroups: [""], resources: [configmaps], resourceNames: [ruum-release], verbs: [get] }
+  - { apiGroups: [""], resources: [pods, services, events], verbs: [get, list, watch] }
+  - { apiGroups: [apps], resources: [deployments, replicasets, daemonsets], verbs: [get, list, watch] }
+  - { apiGroups: [batch], resources: [jobs], verbs: [get, list, watch] }
+  - { apiGroups: [coordination.k8s.io], resources: [leases], resourceNames: [ruum-deploy], verbs: [get] }
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: deployer
-  namespace: {{ . }}
+  namespace: edge
 rules:
-  - apiGroups: [apps]
-    resources: [deployments, replicasets, daemonsets]
-    verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [apps]
-    resources: [controllerrevisions]
-    verbs: [get, list, watch]
-  - apiGroups: [""]
-    resources: [services, configmaps, pods, pods/log, events, serviceaccounts]
-    verbs: [get, list, watch, create, update, patch, delete]
-  # No Secrets through the API: deploy-chart.sh runs Helm with HELM_DRIVER=configmap, and the
-  # chart has no Secret of its own (k8s/apply.sh makes them). This does NOT keep the Secrets of
-  # this namespace from the deployer: pods it creates can mount them (see the top of this file).
-  - apiGroups: [networking.k8s.io]
-    resources: [networkpolicies]
-    verbs: [get, list, watch]
-  - apiGroups: [policy]
-    resources: [poddisruptionbudgets]
-    verbs: [get, list, watch, create, update, patch, delete]
-{{- if eq . "ruum" }}
-  # The migration step before each rollout (design 12.7, backlog O-25; deploy-chart.sh).
-  - apiGroups: [batch]
-    resources: [jobs]
-    verbs: [get, list, watch, create, delete]
-  # The deploy lock (Lease ruum/ruum-deploy, ops/deploy-lock.sh; Kimi review of O-25, finding 3).
-  # No delete: a release clears the holder with a compare-and-swap.
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    resourceNames: [ruum-deploy]
-    verbs: [get, update]
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    verbs: [create]
-{{- end }}
+  - { apiGroups: [""], resources: [pods, events], verbs: [get, list, watch] }
+  - { apiGroups: [apps], resources: [daemonsets], verbs: [get, list, watch] }
+{{- range list "ruum-deploy" "ruum" "edge" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -83,29 +78,3 @@ roleRef:
   kind: Role
   name: deployer
 {{- end }}
----
-# Before a release with new migrations, deploy.sh asks CNPG for an on-demand backup (review 2
-# U-3). The deployer may create and read Backup objects in `data`, nothing else there.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: deployer-backup
-  namespace: data
-rules:
-  - apiGroups: [postgresql.cnpg.io]
-    resources: [backups]
-    verbs: [get, list, watch, create]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: deployer-backup
-  namespace: data
-subjects:
-  - kind: ServiceAccount
-    name: deployer
-    namespace: ruum
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: deployer-backup

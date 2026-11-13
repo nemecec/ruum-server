@@ -56,6 +56,9 @@ releases:
           image: axllent/mailpit:{{ requiredEnv "MAILPIT_VERSION" }}
         blobCopy:
           image: rclone/rclone:{{ requiredEnv "RCLONE_VERSION" }}
+        # The deploy controller by digest (backlog O-34); apply.sh checked its provenance.
+        deployController:
+          image: {{ requiredEnv "DEPLOY_CONTROLLER_IMAGE" }}
 
   - name: nats
     namespace: nats
