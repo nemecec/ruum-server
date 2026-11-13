@@ -28,7 +28,8 @@ pub struct Config {
     /// `https://dav.ruum.space/`. Default: `https://dav.<host>/` for an https public URL, else
     /// `http://<RUUM_DAV_BIND>/`.
     pub dav_url: String,
-    /// `DATABASE_URL`. Without it the server uses in-memory services.
+    /// `DATABASE_URL`. Without it the server uses in-memory services, but only on a laptop
+    /// (`RUUM_MIGRATE` on): with `RUUM_MIGRATE=false` it refuses to start (see `migrate::plan`).
     pub database_url: Option<String>,
     /// `RUUM_DB_MAX_CONNECTIONS`
     pub db_max_connections: u32,
@@ -38,6 +39,10 @@ pub struct Config {
     pub migrate: bool,
     /// `RUUM_MIGRATIONS_DIR`
     pub migrations_dir: PathBuf,
+    /// `RUUM_DB_RUNTIME_ROLE`: the database role of the serving pods. After the migrations,
+    /// `ruum-server migrate` takes every write right on `_sqlx_migrations` from it and checks that
+    /// it has no DDL rights (`migrate::restrict_runtime_role`). Set only on the migration Job.
+    pub db_runtime_role: Option<String>,
     /// `RUUM_OIDC_ISSUER`: the Zitadel issuer URL.
     pub oidc_issuer: Option<String>,
     /// `RUUM_OIDC_CLIENT_ID`
@@ -103,6 +108,7 @@ impl Config {
             migrations_dir: var("RUUM_MIGRATIONS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("migrations")),
+            db_runtime_role: var("RUUM_DB_RUNTIME_ROLE"),
             oidc_issuer: var("RUUM_OIDC_ISSUER"),
             oidc_client_id: var("RUUM_OIDC_CLIENT_ID"),
             oidc_client_secret: var("RUUM_OIDC_CLIENT_SECRET"),

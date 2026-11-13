@@ -1,4 +1,7 @@
 {{- include "ruum.checkCommit" . }}
+{{- if and .Values.previousCommit (not (regexMatch "^[0-9a-f]{40}$" .Values.previousCommit)) }}
+{{- fail "previousCommit must be empty or 40 lowercase hex characters" }}
+{{- end }}
 # ruum-server (plan 5.8). Updates without downtime (design 12.7, backlog O-25):
 # - migrations run before the rollout in the Job of migrate-job.yaml (deploy-chart.sh), under
 #   an advisory lock; the serving pods run with RUUM_MIGRATE=false and refuse to start on a
@@ -70,7 +73,8 @@ spec:
           #   (decision 0007) and has no data cluster, so createDatabase answers 422 and no tenant
           #   key is made. Add them together with a data cluster.
           envFrom:
-            # DATABASE_URL, RUUM_S3_ACCESS_KEY_ID, RUUM_S3_SECRET_ACCESS_KEY,
+            # DATABASE_URL (the role ruum_app: data rights only, no DDL, read-only
+            # _sqlx_migrations; the owner's DSN is only in the migration Job), RUUM_S3_ACCESS_KEY_ID, RUUM_S3_SECRET_ACCESS_KEY,
             # RUUM_SPICEDB_PRESHARED_KEY, RUUM_TOKEN_SIGNING_KEY, RUUM_CONTENT_SIGNING_KEY,
             # RUUM_SIGNUP_ALLOWED_EMAILS, RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS (k8s/apply.sh).
             - secretRef: { name: ruum-server-env }
@@ -93,6 +97,7 @@ spec:
             - name: RUUM_OIDC_IDP_MICROSOFT
               valueFrom: { secretKeyRef: { name: ruum-oidc, key: idp-microsoft } }
             # The migration Job runs the migrations (migrate-job.yaml); the server only checks them.
+            # Without DATABASE_URL it refuses to start (no in-memory fallback in a cluster).
             - { name: RUUM_MIGRATE, value: "false" }
             - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
             - { name: RUUM_SHUTDOWN_GRACE_SECONDS, value: {{ $grace | quote }} }
@@ -184,5 +189,8 @@ metadata:
   namespace: ruum
 data:
   commit: {{ .Values.commit | quote }}
+  # The release that was live before this one: the only target of a plain `deploy.sh --rollback`
+  # (design 12.7 promises that the previous release runs on the new schema, nothing older).
+  previous: {{ .Values.previousCommit | quote }}
   server: {{ .Values.images.server | quote }}
   edge: {{ .Values.images.edge | quote }}

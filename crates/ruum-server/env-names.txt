@@ -28,6 +28,7 @@ DATABASE_URL required
 RUUM_DB_MAX_CONNECTIONS optional
 RUUM_MIGRATE optional
 RUUM_MIGRATIONS_DIR required
+RUUM_DB_RUNTIME_ROLE optional
 
 # Identity, tokens, mail, plans (ruum-core identity/setup.rs)
 RUUM_OIDC_ISSUER required

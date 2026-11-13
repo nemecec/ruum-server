@@ -5,10 +5,17 @@ images:
   edge: ""
 # The commit of the images, recorded in the release (and in the ConfigMap ruum-release).
 commit: ""
+# The commit that was live before this deploy (deploy-chart.sh reads it from ruum-release under
+# the deploy lock). Recorded in ruum-release as `previous`.
+previousCommit: ""
 # Only deploy-chart.sh sets it, in a values file of its own: render the migration Job
 # (migrate-job.yaml) instead of the release. Never set for `helm upgrade`.
 migrationJob: false
 migrationJobName: ""
+# The database role of the serving pods (k8s/apply.sh, cnpg.yaml). The migration Job logs in as
+# the owner ruum and takes the write rights on _sqlx_migrations from this role after each run.
+database:
+  runtimeRole: ruum_app
 
 hosts:
   public: staging.ruum.space

@@ -1,6 +1,17 @@
 # deploy.sh uses this ServiceAccount, not the admin kubeconfig (review 1 S-2, review 2 O-1):
 # Helm in `ruum` and `edge` only. ops/deployer-kubeconfig.sh writes its kubeconfig into the
 # person's work folder on the Mac.
+#
+# What this ServiceAccount can reach (Kimi review of O-25, finding 1): it has no `get secrets`,
+# but it may create and change pods, Deployments, DaemonSets and Jobs in `ruum` and `edge`, and
+# read pod logs. A pod can mount any Secret of its namespace, and Kubernetes does not check that
+# the pod's creator may read that Secret. So the deployer can read EVERY Secret of `ruum`
+# (ruum-server-env: the runtime database DSN, the token and content signing keys, the S3 key, the
+# SpiceDB key; ruum-migrate-db: the database owner's DSN; ruum-oidc) and of `edge` (the TLS
+# private keys and the ACME account key). Treat the deployer kubeconfig like the admin
+# kubeconfig for these two namespaces: operator-only, on the person's Mac, never on the build
+# server or in CI (README S-4). It cannot reach `data`, `auth`, `authz`, `nats` or `ops` beyond
+# creating CNPG Backups. Backlog O-34 moves the migration step and the rollout out of its reach.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -33,9 +44,9 @@ rules:
   - apiGroups: [""]
     resources: [services, configmaps, pods, pods/log, events, serviceaccounts]
     verbs: [get, list, watch, create, update, patch, delete]
-  # No Secrets: deploy-chart.sh runs Helm with HELM_DRIVER=configmap, and the chart has no
-  # Secret of its own (k8s/apply.sh makes them), so the deployer cannot read the database
-  # password or the token key (review stgsec S-11).
+  # No Secrets through the API: deploy-chart.sh runs Helm with HELM_DRIVER=configmap, and the
+  # chart has no Secret of its own (k8s/apply.sh makes them). This does NOT keep the Secrets of
+  # this namespace from the deployer: pods it creates can mount them (see the top of this file).
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
     verbs: [get, list, watch]
@@ -47,6 +58,15 @@ rules:
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, watch, create, delete]
+  # The deploy lock (Lease ruum/ruum-deploy, ops/deploy-lock.sh; Kimi review of O-25, finding 3).
+  # No delete: a release clears the holder with a compare-and-swap.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [ruum-deploy]
+    verbs: [get, update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

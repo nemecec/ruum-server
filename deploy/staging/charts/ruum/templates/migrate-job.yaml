@@ -8,9 +8,17 @@ succeeded. `helm upgrade` never renders it (migrationJob is false there).
 Job is not retried (backoffLimit 0): the old release keeps serving, and the person looks at the
 log. The pods carry app: ruum-migrate, not app: ruum-server, so the Service never sends them
 traffic; the platform's network policy lets ruum-migrate reach Postgres.
+
+The Job logs in as the database owner ruum (Secret ruum/ruum-migrate-db, k8s/apply.sh); the
+serving pods log in as ruum_app, without DDL rights. Who can read ruum-migrate-db: the admin, and
+the deployer, because it may create Jobs and pods in ruum and read pod logs (README S-4, backlog
+O-34). So the deployer kubeconfig stays on the operator's Mac.
 */ -}}
 {{- if .Values.migrationJob }}
 {{- include "ruum.checkCommit" . }}
+{{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" (.Values.database.runtimeRole | default "")) }}
+{{- fail "database.runtimeRole must be a plain Postgres role name" }}
+{{- end }}
 {{- if not (regexMatch "^ruum-migrate-[0-9a-f]{12}-[0-9]{12}$" (.Values.migrationJobName | default "")) }}
 {{- fail "migrationJobName must be ruum-migrate-<12 hex>-<YYYYmmddHHMM>" }}
 {{- end }}
@@ -46,9 +54,13 @@ spec:
           args: [migrate]
           env:
             - { name: RUST_LOG, value: "info" }
-            # Only the database URL of ruum-server-env: the step needs no other secret.
+            # The owner's DSN, from a Secret of its own that the serving pods do not mount (Kimi
+            # review of O-25, finding 5). The step needs no other secret.
             - name: DATABASE_URL
-              valueFrom: { secretKeyRef: { name: ruum-server-env, key: DATABASE_URL } }
+              valueFrom: { secretKeyRef: { name: ruum-migrate-db, key: DATABASE_URL } }
+            # After the migrations, the step takes every write right on _sqlx_migrations from the
+            # serving role and checks that it has no DDL rights (migrate.rs restrict_runtime_role).
+            - { name: RUUM_DB_RUNTIME_ROLE, value: {{ .Values.database.runtimeRole | quote }} }
             - { name: RUUM_DB_MAX_CONNECTIONS, value: "2" }
             - { name: RUUM_MIGRATIONS_DIR, value: /app/migrations }
           resources:

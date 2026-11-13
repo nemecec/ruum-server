@@ -3,14 +3,18 @@
 # deploy/images/caddy-secret-storage). Here, not in charts/ruum: the deployer has no access to
 # Secrets, and Kubernetes does not let it grant what it does not hold.
 #
-# The edge namespace has no other Secrets, so the token reaches only the edge's own
-# certificates. Nothing outside the namespace.
+# The edge namespace has no other Secrets today, so the token reaches only the edge's own
+# certificates. Nothing outside the namespace. The Role has no resourceNames: the module names
+# its Secrets and Leases after hashes of the storage keys, and `create` and `list` cannot be
+# limited by name. A Secret that someone later puts into `edge` is readable and writable by the
+# edge (backlog O-36).
 #
 # Who else can read these keys: the deployer manages the edge DaemonSet and may create pods in
-# edge (deployer-rbac.yaml), so it can run a pod as ruum-edge and read every certificate private
-# key and the ACME account key. This weakens stgsec S-11 for the TLS keys only (the database
-# password and the token key stay out of its reach). README S-4; backlog O-29 (next security
-# review).
+# edge (deployer-rbac.yaml), so it can run a pod as ruum-edge, or mount the Secrets in a pod of
+# its own, and read every certificate private key and the ACME account key. The same holds for
+# every Secret of `ruum` (the database DSNs, the token signing key): the deployer can read all of
+# them through pods it creates. So the deployer kubeconfig is operator-only. README S-4; backlog
+# O-29 and O-34.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

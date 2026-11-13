@@ -50,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("usage: ruum-server [seed-dev <file> | migrate]"),
     }
 
+    // RUUM_MIGRATE=false without DATABASE_URL refuses to start (Kimi review of O-25, finding 6).
+    let plan = migrate::plan(config.database_url.is_some(), migrate_only, config.migrate)?;
     let pool = if let Some(url) = &config.database_url {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.db_max_connections)
@@ -57,9 +59,13 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("connect to DATABASE_URL")?;
         let migrator = migrate::load(&config.migrations_dir).await?;
-        if migrate_only || config.migrate {
+        if plan == migrate::Plan::Migrate {
             let applied = migrate::run(&pool, &migrator, migrate::LOCK_WAIT).await?;
             tracing::info!(applied, "migrations are up to date");
+            if let Some(role) = &config.db_runtime_role {
+                migrate::restrict_runtime_role(&pool, role).await?;
+                tracing::info!(role = %role, "the runtime role cannot write _sqlx_migrations and has no DDL rights");
+            }
             if migrate_only {
                 return Ok(());
             }
@@ -69,8 +75,6 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("the database has every migration of this release");
         }
         Some(pool)
-    } else if migrate_only {
-        anyhow::bail!("ruum-server migrate needs DATABASE_URL");
     } else {
         tracing::warn!("DATABASE_URL is not set; using in-memory services");
         None

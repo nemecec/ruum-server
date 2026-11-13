@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploys one commit of main to staging, by digest (plan 6.2, review 1 S-7, review 2 P-4, U-3).
 #
-#   deploy/staging/deploy.sh <sha> [--rollback] [--acme letsencrypt-staging|zerossl]
+#   deploy/staging/deploy.sh <sha> [--rollback | --rollback-older] [--acme letsencrypt-staging|zerossl]
 #
 # Steps (on the Mac; the rollout itself runs in the tools container, where ops/deploy-chart.sh
 # validates the arguments and checks the digests and the provenance again with cosign, code
@@ -9,15 +9,21 @@
 #   1. <sha> is on origin/main and the `ci` workflow passed for it on a push to main;
 #   2. the tag <sha> of ghcr.io/nemecec/ruum-server and ruum-edge resolves to a digest;
 #   3. each digest has a provenance attestation from images.yml on refs/heads/main;
-#   4. a commit older than the deployed one is refused unless --rollback;
+#   4. a commit older than the deployed one is refused unless --rollback, and --rollback goes
+#      only to the previous release (design 12.7); an older one needs --rollback-older, with a
+#      warning (Kimi review of O-25, finding 2);
 #   5. new migrations since the deployed commit: an on-demand CNPG backup first;
 #   6. the migration step: a Job with the new server image runs `ruum-server migrate` under an
 #      advisory lock; if it fails, nothing is rolled out (design 12.7, backlog O-25);
 #   7. the rolling update: helm upgrade --rollback-on-failure --wait with image@sha256:...
 #      (ruum-server: two or more replicas, maxUnavailable 0; the edge: a DaemonSet that starts
 #      the new pod on a node before it stops the old one), then the smoke checks.
+# Steps 6 and 7 run under the deploy lock (Lease ruum/ruum-deploy, ops/deploy-lock.sh; Kimi review
+# of O-25, finding 3): ops/deploy-chart.sh takes it, reads the live release again and refuses when
+# it is not the one that step 4 read, or when another deploy holds the lock.
 # --rollback is the same path with an older commit: its migration step finds nothing to do
-# (the schema rule keeps the older release working on the newer schema). The floor: no commit
+# (the schema rule keeps the previous release working on the newer schema). The chart, the Job
+# and the platform come from this checkout, not from the target commit. The floor: no commit
 # before backlog O-25 (the migration step and the edge's certificate storage). Such a commit has
 # no `ruum-server migrate` and no storage module, so deploy.sh refuses it (ops/release-floor.sh).
 set -euo pipefail
@@ -30,13 +36,14 @@ set -euo pipefail
 
 REPO="${RUUM_REPO:-nemecec/ruum-server}"
 sha="${1:-}"
-[[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || stg_die "usage: deploy.sh <sha of main> [--rollback] [--acme letsencrypt-staging|zerossl]"
+[[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || stg_die "usage: deploy.sh <sha of main> [--rollback | --rollback-older] [--acme letsencrypt-staging|zerossl]"
 shift
 rollback=0
 acme=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --rollback) rollback=1; shift ;;
+    --rollback) [[ $rollback == 0 ]] || stg_die "--rollback and --rollback-older exclude each other"; rollback=1; shift ;;
+    --rollback-older) [[ $rollback == 0 ]] || stg_die "--rollback and --rollback-older exclude each other"; rollback=2; shift ;;
     --acme)
       [[ $# -ge 2 ]] && ruum_acme_issuer_ok "$2" || stg_die "--acme must be one of: ${RUUM_ACME_ISSUERS[*]}"
       acme=(--acme "$2")
@@ -84,9 +91,15 @@ stg_log "4. the deployed commit (through the admin tunnel)"
 stg_tunnel_up
 deployed="$(printf '__END__\n' | stg_run ro status --deployed-commit 2>/dev/null || true)"
 backup=()
+expect=(--expect-deployed none)
 if [[ "$deployed" =~ ^[0-9a-f]{40}$ ]]; then
+  expect=(--expect-deployed "$deployed")
   if [[ "$deployed" != "$sha" ]] && git -C "$STG_ROOT" merge-base --is-ancestor "$sha" "$deployed"; then
-    [[ $rollback == 1 ]] || stg_die "$sha is older than the deployed $deployed; pass --rollback to go back on purpose"
+    case $rollback in
+      0) stg_die "$sha is older than the deployed $deployed; pass --rollback to go back one release on purpose" ;;
+      1) expect+=(--rollback) ;;
+      2) stg_log "$RUUM_ROLLBACK_OLDER_WARNING"; expect+=(--rollback-older) ;;
+    esac
   fi
   # 5. Review 2 U-3: new migrations get an on-demand backup first.
   if [[ -n "$(git -C "$STG_ROOT" diff --name-only "$deployed" "$sha" -- migrations/)" ]]; then
@@ -97,6 +110,6 @@ else
 fi
 
 stg_log "6. migration step, then 7. rolling update of $sha (ops/deploy-chart.sh)"
-printf '__END__\n' | stg_run rw deploy "$sha" "${refs[0]}" "${refs[1]}" ${backup[@]+"${backup[@]}"} ${acme[@]+"${acme[@]}"}
+printf '__END__\n' | stg_run rw deploy "$sha" "${refs[0]}" "${refs[1]}" "${expect[@]}" ${backup[@]+"${backup[@]}"} ${acme[@]+"${acme[@]}"}
 stg_audit deploy "$sha"
 bash "$STG_HERE/ops/smoke.sh"

@@ -8,6 +8,11 @@
 //!
 //! On a laptop the server still migrates at start (`RUUM_MIGRATE` is on by default), under the
 //! same lock.
+//!
+//! In a cluster the migration step logs in as the database owner and the serving pods as a
+//! runtime role without DDL rights (Kimi review of O-25, finding 5). After each run the step
+//! takes every write right on `_sqlx_migrations` from the runtime role
+//! ([`restrict_runtime_role`]), so a compromised server cannot fake the migration records.
 
 use anyhow::{Context as _, bail};
 use sqlx::migrate::Migrator;
@@ -22,6 +27,33 @@ pub const LOCK_KEY: i64 = 0x7275_756d_2d6d_6967;
 pub const LOCK_WAIT: Duration = Duration::from_secs(600);
 /// How often a waiting step asks for the lock again.
 const LOCK_POLL: Duration = Duration::from_millis(500);
+
+/// What the process does with the platform database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Run the pending migrations (`ruum-server migrate`, or a laptop with `RUUM_MIGRATE` on).
+    Migrate,
+    /// Only check that the database has this release's migrations (`RUUM_MIGRATE=false`).
+    Check,
+    /// No database: in-memory services. Only on a laptop (`RUUM_MIGRATE` on).
+    Memory,
+}
+
+/// Chooses the [`Plan`]. `RUUM_MIGRATE=false` means a cluster, where in-memory services would
+/// serve empty, divergent state: without `DATABASE_URL` the server then refuses to start (fail
+/// closed; Kimi review of O-25, finding 6).
+pub fn plan(has_database_url: bool, migrate_only: bool, migrate: bool) -> anyhow::Result<Plan> {
+    match (has_database_url, migrate_only, migrate) {
+        (true, true, _) | (true, false, true) => Ok(Plan::Migrate),
+        (true, false, false) => Ok(Plan::Check),
+        (false, true, _) => bail!("ruum-server migrate needs DATABASE_URL"),
+        (false, false, false) => bail!(
+            "RUUM_MIGRATE=false (a cluster) but DATABASE_URL is missing or empty; refusing to \
+             start with in-memory services"
+        ),
+        (false, false, true) => Ok(Plan::Memory),
+    }
+}
 
 /// Reads the migrations of this release from `dir`.
 ///
@@ -113,6 +145,83 @@ pub async fn pending(conn: &mut PgConnection, migrator: &Migrator) -> anyhow::Re
         .map(|m| m.version)
         .filter(|version| !done.contains(version))
         .collect())
+}
+
+/// Takes every write right on `_sqlx_migrations` from `role` (the runtime role of the serving
+/// pods) and leaves it `SELECT`, which the start-up [`check`] needs. Then fails when `role`
+/// could still change the schema: a member of the current (owner) role, `CREATE` on the
+/// database or on the schema `public`, or a write right on `_sqlx_migrations`. Run by the
+/// migration step after [`run`], as the owner of the tables.
+pub async fn restrict_runtime_role(pool: &PgPool, role: &str) -> anyhow::Result<()> {
+    let valid = !role.is_empty()
+        && role.len() <= 63
+        && role
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && role
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !valid {
+        bail!("RUUM_DB_RUNTIME_ROLE must be a plain Postgres role name ([a-z_][a-z0-9_]*)");
+    }
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("connect to restrict the runtime role")?;
+    let (exists,): (bool,) =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(role)
+            .fetch_one(&mut *conn)
+            .await
+            .context("look for the runtime role")?;
+    if !exists {
+        bail!("the runtime role {role} does not exist; apply the platform first (k8s/apply.sh)");
+    }
+    // Before any change: a REVOKE from the owner itself would take the step's own rights.
+    let (member,): (bool,) = sqlx::query_as("SELECT pg_has_role($1, current_user, 'MEMBER')")
+        .bind(role)
+        .fetch_one(&mut *conn)
+        .await
+        .context("check the memberships of the runtime role")?;
+    if member {
+        bail!(
+            "the runtime role {role} is the migration role or a member of it; it would have its DDL rights"
+        );
+    }
+    // The name is checked above; quoting keeps it one identifier.
+    for statement in [
+        format!(
+            "REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE _sqlx_migrations FROM \"{role}\""
+        ),
+        format!("GRANT SELECT ON TABLE _sqlx_migrations TO \"{role}\""),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *conn)
+            .await
+            .with_context(|| format!("restrict the rights of {role} on _sqlx_migrations"))?;
+    }
+    let (create_db, create_schema, write_records): (bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT has_database_privilege($1, current_database(), 'CREATE'), \
+                    has_schema_privilege($1, 'public', 'CREATE'), \
+                    has_table_privilege($1, '_sqlx_migrations', 'INSERT, UPDATE, DELETE, TRUNCATE')",
+        )
+        .bind(role)
+        .fetch_one(&mut *conn)
+        .await
+        .context("check the rights of the runtime role")?;
+    if create_db || create_schema {
+        bail!(
+            "the runtime role {role} may create objects (CREATE on the database or the schema public)"
+        );
+    }
+    if write_records {
+        bail!(
+            "the runtime role {role} may still write _sqlx_migrations (a grant through another role?)"
+        );
+    }
+    Ok(())
 }
 
 /// The start-up check of a serving pod (`RUUM_MIGRATE=false`): the database must have every
@@ -241,6 +350,85 @@ mod tests {
             .unwrap();
         // The new image does not serve without its migration.
         assert!(check(&pool, &broken).await.is_err());
+    }
+
+    #[test]
+    fn the_plan_fails_closed_in_a_cluster_without_a_database() {
+        assert_eq!(plan(true, true, false).unwrap(), Plan::Migrate);
+        assert_eq!(plan(true, false, true).unwrap(), Plan::Migrate);
+        assert_eq!(plan(true, false, false).unwrap(), Plan::Check);
+        // Only a laptop (RUUM_MIGRATE on) may fall back to in-memory services.
+        assert_eq!(plan(false, false, true).unwrap(), Plan::Memory);
+        let err = plan(false, false, false).unwrap_err().to_string();
+        assert!(err.contains("RUUM_MIGRATE=false"), "{err}");
+        assert!(err.contains("DATABASE_URL"), "{err}");
+        assert!(plan(false, true, true).is_err());
+        assert!(plan(false, true, false).is_err());
+    }
+
+    /// The tests connect as a role without CREATEROLE, so they use predefined roles that every
+    /// Postgres 15+ has: `pg_monitor` stands for a runtime role (no table rights, no CREATE).
+    #[sqlx::test(migrations = false)]
+    async fn the_step_takes_the_write_rights_on_the_records_from_the_runtime_role(pool: PgPool) {
+        let migrator = load(&migrations_dir()).await.unwrap();
+        run(&pool, &migrator, LOCK_WAIT).await.unwrap();
+        // As the default privileges of the owner would grant it on a fresh cluster.
+        sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON _sqlx_migrations TO pg_monitor")
+            .execute(&pool)
+            .await
+            .unwrap();
+        restrict_runtime_role(&pool, "pg_monitor").await.unwrap();
+        let (write, read): (bool, bool) = sqlx::query_as(
+            "SELECT has_table_privilege('pg_monitor', '_sqlx_migrations', 'INSERT, UPDATE, DELETE, TRUNCATE'), \
+                    has_table_privilege('pg_monitor', '_sqlx_migrations', 'SELECT')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!write, "the runtime role can still write _sqlx_migrations");
+        assert!(read, "the start-up check needs SELECT on _sqlx_migrations");
+        // A second run changes nothing and passes.
+        restrict_runtime_role(&pool, "pg_monitor").await.unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_step_refuses_a_runtime_role_that_could_change_the_schema(pool: PgPool) {
+        let migrator = load(&migrations_dir()).await.unwrap();
+        run(&pool, &migrator, LOCK_WAIT).await.unwrap();
+        let (me,): (String,) = sqlx::query_as("SELECT current_user::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // The migration role itself: it owns the tables.
+        let err = restrict_runtime_role(&pool, &me)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is the migration role"), "{err}");
+        // Write rights through a role membership that a REVOKE on the table cannot remove.
+        let err = restrict_runtime_role(&pool, "pg_write_all_data")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may still write _sqlx_migrations"), "{err}");
+        // CREATE on the schema public (pg_database_owner owns it since Postgres 15).
+        let err = restrict_runtime_role(&pool, "pg_database_owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may create objects"), "{err}");
+        let err = restrict_runtime_role(&pool, "ruum_no_such_role_o25")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        for bad in ["", "Ruum", "ruum app", "ruum\"; drop table x; --", "1ruum"] {
+            let err = restrict_runtime_role(&pool, bad)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("plain Postgres role name"), "{bad}: {err}");
+        }
     }
 
     /// A temporary folder without a new dependency.

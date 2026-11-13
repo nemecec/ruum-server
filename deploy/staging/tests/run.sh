@@ -37,6 +37,11 @@
 #   Job (only when deploy-chart.sh asks for it; ruum-server migrate; not behind the Service; only
 #   DATABASE_URL); the edge DaemonSet with surge, certificates in Kubernetes Secrets, the edge's
 #   namespaced rights; the deployer may run Jobs in ruum; deploy-chart.sh migrates first;
+# - the Kimi review of O-25: the migration Job reads the owner's DSN from ruum-migrate-db and the
+#   serving pods never do; ruum-server-env holds ruum_app's DSN, written after the grants; the
+#   grants (with docker: against postgres:17) give ruum_app data rights only and no write on
+#   _sqlx_migrations; --rollback goes only to the previous release (ruum-release `previous`);
+#   the deploy lock (a fake kubectl) and its place around the read, the migration and helm;
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate; without the storage
 #   block, which only the edge image has);
 # - with tofu: fmt and validate of both roots; with tofu and talosctl: the machine config of
@@ -254,7 +259,13 @@ dc="$STG/ops/deploy-chart.sh"
 C=0123456789abcdef0123456789abcdef01234567
 SV="ghcr.io/nemecec/ruum-server@sha256:$(printf '%064d' 0)"
 ED="ghcr.io/nemecec/ruum-edge@sha256:$(printf '%064d' 1)"
-expect 0 "accepts valid arguments" bash "$dc" "$C" "$SV" "$ED" --acme zerossl --acme-email ops+stg@example.com --validate-only
+expect 0 "accepts valid arguments" bash "$dc" "$C" "$SV" "$ED" --expect-deployed "$C" --acme zerossl --acme-email ops+stg@example.com --validate-only
+expect 0 "accepts a first deploy (--expect-deployed none)" bash "$dc" "$C" "$SV" "$ED" --expect-deployed none --validate-only
+expect 0 "accepts a rollback to a live release" bash "$dc" "$C" "$SV" "$ED" --expect-deployed "$C" --rollback --validate-only
+expect 1 "refuses a deploy without --expect-deployed (the live release that deploy.sh checked)" bash "$dc" "$C" "$SV" "$ED" --validate-only
+expect 1 "refuses a short --expect-deployed" bash "$dc" "$C" "$SV" "$ED" --expect-deployed 0123456 --validate-only
+expect 1 "refuses a rollback without a live release" bash "$dc" "$C" "$SV" "$ED" --expect-deployed none --rollback --validate-only
+expect 1 "refuses --rollback with --rollback-older" bash "$dc" "$C" "$SV" "$ED" --expect-deployed "$C" --rollback --rollback-older --validate-only
 expect 1 "refuses a short commit" bash "$dc" 0123456 "$SV" "$ED" --validate-only
 expect 1 "refuses a commit with a --set injection" bash "$dc" "x,images.server=evil.example/a@sha256:$(printf '%064d' 0)" "$SV" "$ED" --validate-only
 expect 1 "refuses a server image from another registry" bash "$dc" "$C" "evil.example/nemecec/ruum-server@sha256:$(printf '%064d' 0)" "$ED" --validate-only
@@ -611,8 +622,20 @@ if has helm; then
   want "$TMP/job.yaml" "a failed migration is not retried (backoffLimit 0)" "backoffLimit: 0"
   want "$TMP/job.yaml" "the Job pods carry app: ruum-migrate" "labels: { app: ruum-migrate }"
   has_line "$TMP/job.yaml" "app: ruum-server" && bad "the Job pods carry app: ruum-server (the Service would send them traffic)" || ok "the Job pods are not behind the ruum-server Service"
-  want "$TMP/job.yaml" "the Job reads only DATABASE_URL of ruum-server-env" "secretKeyRef: { name: ruum-server-env, key: DATABASE_URL }"
-  has_line "$TMP/job.yaml" "envFrom" && bad "the Job takes every key of ruum-server-env" || ok "the Job takes no other secret"
+  # Kimi review of O-25, findings 1 and 5: the owner's DSN only in the Job, from a Secret of its own.
+  want "$TMP/job.yaml" "the Job reads the owner's DSN from ruum-migrate-db" "secretKeyRef: { name: ruum-migrate-db, key: DATABASE_URL }"
+  has_line "$TMP/job.yaml" "ruum-server-env" && bad "the Job reads ruum-server-env" || ok "the Job does not read ruum-server-env"
+  has_line "$TMP/job.yaml" "envFrom" && bad "the Job takes every key of a Secret" || ok "the Job takes no other secret"
+  [[ "$(grep -c 'secretKeyRef' "$TMP/job.yaml")" == 1 ]] && ok "the Job reads exactly one secret value" || bad "the Job reads more than one secret value"
+  want "$TMP/job.yaml" "the Job restricts the runtime role ruum_app after the migrations" '{ name: RUUM_DB_RUNTIME_ROLE, value: "ruum_app" }'
+  expect 1 "charts/ruum refuses a runtime role that is not a plain name" helm template ruum "$STG/charts/ruum" "${J[@]}" --set-string migrationJobName=ruum-migrate-0123456789ab-202611121200 --set-string 'database.runtimeRole=x"; drop' --show-only templates/migrate-job.yaml
+  has_line "$TMP/ruum.yaml" "ruum-migrate-db" && bad "the release (serving pods) mounts ruum-migrate-db" || ok "the serving pods never mount the owner's DSN (ruum-migrate-db)"
+  # The rollback rule (finding 2): ruum-release records the previous release.
+  awk '/^  name: ruum-release$/ {on=1} on && /^---/ {exit} on' "$TMP/ruum.yaml" | grep -qE '^  previous: ""$' &&
+    ok "ruum-release records the previous release (empty by default)" || bad "ruum-release has no previous key"
+  expect 0 "render ruum-release with a previous commit" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set-string previousCommit=0123456789abcdef0123456789abcdef01234567 --show-only templates/server.yaml
+  has_line "$TMP/out" 'previous: "0123456789abcdef0123456789abcdef01234567"' && ok "ruum-release keeps the previous commit" || bad "ruum-release lost the previous commit"
+  expect 1 "charts/ruum refuses a previous commit that is not 40 hex" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set-string 'previousCommit=abc,x' --show-only templates/server.yaml
   expect 1 "charts/ruum refuses a migration Job name outside the pattern" helm template ruum "$STG/charts/ruum" "${J[@]}" --set-string 'migrationJobName=x;y' --show-only templates/migrate-job.yaml
   expect 1 "charts/ruum refuses a migration Job without a name" helm template ruum "$STG/charts/ruum" "${J[@]}" --show-only templates/migrate-job.yaml
   expect 0 "render the edge templates" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --show-only templates/edge.yaml
@@ -643,6 +666,16 @@ if has helm; then
   awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
     awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: edge\n/' | grep -qF "jobs" &&
     bad "the deployer may run Jobs in edge" || ok "the deployer runs Jobs only in ruum"
+  awk '/^# Source: [a-z-]*\/templates\/cnpg.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/cnpg.yaml"
+  grep -A4 -E '^ +- name: ruum_app$' "$TMP/cnpg.yaml" | grep -qF 'passwordSecret: { name: pg-role-ruum-app }' &&
+    ok "CNPG manages the runtime role ruum_app" || bad "CNPG has no managed role ruum_app"
+  grep -A4 -E '^ +- name: ruum_app$' "$TMP/cnpg.yaml" | grep -qE 'inRoles|superuser: true|createdb: true|createrole: true' &&
+    bad "ruum_app gets a membership or a special right" || ok "ruum_app has no membership and no special right"
+  awk '/^# Source: [a-z-]*\/templates\/deployer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" |
+    awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deployer\n/ && /namespace: ruum\n/' >"$TMP/deployer-ruum.yaml"
+  grep -B1 -A2 -F 'resourceNames: [ruum-deploy]' "$TMP/deployer-ruum.yaml" | grep -qF 'verbs: [get, update]' &&
+    ok "the deployer may read and update only the Lease ruum-deploy (the deploy lock)" || bad "the deployer has no rights on the deploy lock"
+  grep -qE 'resources: \[secrets\]' "$TMP/deployer-ruum.yaml" && bad "the deployer has a rule on Secrets" || ok "the deployer has no rule on Secrets"
   jl="$(grep -nF -- '--show-only templates/migrate-job.yaml' "$dc" | head -1 | cut -d: -f1)"
   hl="$(grep -nE '^helm upgrade' "$dc" | head -1 | cut -d: -f1)"
   [[ -n "$jl" && -n "$hl" && "$jl" -lt "$hl" ]] && ok "deploy-chart.sh runs the migration Job before the rollout" || bad "deploy-chart.sh: the migration Job is not before helm upgrade"
@@ -780,6 +813,131 @@ if command -v git >/dev/null; then
     expect 0 "the release floor accepts this checkout's HEAD" floor "$ROOT" HEAD
   fi
   grep -qF 'ruum_release_floor_ok "$STG_ROOT" "$sha"' "$STG/deploy.sh" && ok "deploy.sh checks the release floor" || bad "deploy.sh does not check the release floor"
+fi
+
+# The rollback rule (Kimi review of O-25, finding 2): a plain --rollback goes only to the previous
+# release; an older one needs --rollback-older.
+echo "== deploy.sh rollback rule (Kimi review of O-25)"
+rb() { bash -c ". '$STG/ops/release-floor.sh' && ruum_rollback_target_ok \"\$1\" \"\$2\" \"\$3\"" _ "$@"; }
+P1=1111111111111111111111111111111111111111
+P2=2222222222222222222222222222222222222222
+expect 0 "a rollback to the previous release passes" rb "$P1" "$P1" 0
+expect 1 "a rollback two releases back is refused without --rollback-older" rb "$P2" "$P1" 0
+expect 1 "a rollback is refused when no previous release is recorded" rb "$P1" "" 0
+expect 0 "--rollback-older allows an older release" rb "$P2" "$P1" 1
+grep -qF 'RUUM_ROLLBACK_OLDER_WARNING' "$STG/deploy.sh" && grep -qF 'RUUM_ROLLBACK_OLDER_WARNING' "$STG/ops/deploy-chart.sh" &&
+  ok "deploy.sh and deploy-chart.sh print the warning for --rollback-older" || bad "no warning for --rollback-older"
+grep -qF 'ruum_rollback_target_ok "$commit" "$previous"' "$STG/ops/deploy-chart.sh" &&
+  ok "deploy-chart.sh checks the rollback rule against ruum-release, under the lock" || bad "deploy-chart.sh does not check the rollback rule"
+grep -qF '1) expect+=(--rollback)' "$STG/deploy.sh" &&
+  ok "deploy.sh passes --rollback to deploy-chart.sh" || bad "deploy.sh does not pass --rollback on"
+grep -qF '"${expect[@]}"' "$STG/deploy.sh" && ok "deploy.sh passes the live release it checked (--expect-deployed)" || bad "deploy.sh does not pass --expect-deployed"
+
+# The deploy lock (Kimi review of O-25, finding 3), with a fake kubectl that keeps the Lease in a
+# file and refuses a create of an existing Lease and a replace with an old resourceVersion, as
+# the API server does.
+echo "== deploy lock (Lease ruum/ruum-deploy)"
+FK="$TMP/fakekube"
+mkdir -p "$FK/bin"
+cat >"$FK/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+f="$FAKE_LEASE"
+case "$*" in
+  "-n ruum create -f -")
+    in="$(cat)"
+    [[ -s "$f" ]] && { echo 'Error from server (AlreadyExists): leases.coordination.k8s.io "ruum-deploy" already exists' >&2; exit 1; }
+    jq '.metadata.resourceVersion = "1"' <<<"$in" >"$f" ;;
+  "-n ruum get lease ruum-deploy -o json")
+    [[ -s "$f" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
+    cat "$f" ;;
+  "-n ruum replace -f -")
+    in="$(cat)"
+    [[ -s "$f" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
+    [[ "$(jq -r .metadata.resourceVersion <<<"$in")" == "$(jq -r .metadata.resourceVersion "$f")" ]] ||
+      { echo 'Error from server (Conflict): the object has been modified' >&2; exit 1; }
+    jq --arg rv "$(( $(jq -r .metadata.resourceVersion "$f") + 1 ))" '.metadata.resourceVersion = $rv' <<<"$in" >"$f" ;;
+  *) echo "fake kubectl: unexpected $*" >&2; exit 3 ;;
+esac
+FAKE
+chmod +x "$FK/bin/kubectl"
+lk() { PATH="$FK/bin:$PATH" FAKE_LEASE="$FK/lease.json" bash -c ". '$STG/ops/deploy-lock.sh' && \"\$@\"" _ "$@"; }
+expect 0 "deploy A takes the free lock" lk ruum_lock_acquire deploy-a
+expect 1 "deploy B is refused while A holds the lock" lk ruum_lock_acquire deploy-b
+grep -q 'deploy-a' "$TMP/out" && ok "the refusal names the holder" || bad "the refusal does not name the holder"
+expect 0 "A renews its lock between the steps" lk ruum_lock_renew deploy-a
+expect 1 "B cannot renew a lock that A holds" lk ruum_lock_renew deploy-b
+expect 0 "B's release leaves A's lock alone" lk ruum_lock_release deploy-b
+[[ "$(jq -r .spec.holderIdentity "$FK/lease.json")" == deploy-a ]] && ok "A still holds the lock after B's release" || bad "B's release removed A's lock"
+expect 0 "A releases the lock" lk ruum_lock_release deploy-a
+expect 0 "B takes the released lock" lk ruum_lock_acquire deploy-b
+expect 1 "A, which lost the lock, cannot renew it (it stops before its next step)" lk ruum_lock_renew deploy-a
+# An expired lock (its holder died): taken over with a compare-and-swap.
+jq '.spec.renewTime = "2020-01-01T00:00:00.000000Z" | .spec.acquireTime = "2020-01-01T00:00:00.000000Z"' "$FK/lease.json" >"$FK/l" && mv "$FK/l" "$FK/lease.json"
+expect 0 "C takes over an expired lock" lk ruum_lock_acquire deploy-c
+expect 1 "B, whose lock expired, cannot renew it" lk ruum_lock_renew deploy-b
+dcl() { grep -nF -- "$1" "$dc" | head -1 | cut -d: -f1; }
+la="$(dcl 'ruum_lock_acquire "$holder"')" lr="$(dcl 'configmap ruum-release -o jsonpath='"'"'{.data.commit}'"'"' 2>/dev/null')"
+lb="$(dcl 'if [[ $backup == 1 ]]')" lj="$(dcl 'kubectl -n ruum create -f "$tmp/job.yaml"')" lh="$(grep -nE '^helm upgrade' "$dc" | head -1 | cut -d: -f1)"
+[[ -n "$la" && -n "$lr" && -n "$lb" && -n "$lj" && -n "$lh" && "$la" -lt "$lr" && "$lr" -lt "$lb" && "$lb" -lt "$lj" && "$lj" -lt "$lh" ]] &&
+  ok "deploy-chart.sh takes the lock before it reads the live release, the backup, the migration step and helm upgrade" ||
+  bad "deploy-chart.sh: the lock does not cover read, backup, migration and rollout ($la $lr $lb $lj $lh)"
+lw="$(grep -nF 'ruum_lock_renew "$holder" || die "lost the deploy lock after the migration step' "$dc" | cut -d: -f1)"
+[[ -n "$lw" && "$lw" -gt "$lj" && "$lw" -lt "$lh" ]] && ok "deploy-chart.sh renews the lock before helm upgrade and stops when it lost it" || bad "deploy-chart.sh does not renew the lock before helm upgrade"
+grep -qF 'another deploy ran in between' "$dc" && ok "deploy-chart.sh refuses when the live release changed since deploy.sh checked it" || bad "deploy-chart.sh does not compare the live release"
+grep -qE '^trap cleanup EXIT' "$dc" && grep -qF 'ruum_lock_release "$holder"' "$dc" && ok "deploy-chart.sh releases the lock on exit" || bad "deploy-chart.sh does not release the lock"
+
+# The database roles (Kimi review of O-25, findings 1 and 5).
+echo "== database roles of ruum (owner for the migration Job, ruum_app for the serving pods)"
+ap="$STG/k8s/apply.sh"
+blk() { awk -v want="$1" '/^\{$/ { block = "" } { block = block $0 "\n" } $0 ~ want { printf "%s", block; exit }' "$ap"; }
+grep -B1 -F 'secret ruum ruum-migrate-db' "$ap" | grep -qF 'postgres://ruum:%s@' && grep -B1 -F 'secret ruum ruum-migrate-db' "$ap" | grep -qF '"$STG_PG_RUUM_PASSWORD"' &&
+  ok "ruum/ruum-migrate-db holds the owner's DSN" || bad "ruum/ruum-migrate-db does not hold the owner's DSN"
+blk '} \\| secret ruum ruum-server-env' >"$TMP/server-env-block"
+grep -qF 'postgres://ruum_app:%s@' "$TMP/server-env-block" && grep -qF 'STG_PG_RUUM_APP_PASSWORD' "$TMP/server-env-block" &&
+  ok "ruum/ruum-server-env holds ruum_app's DSN" || bad "ruum/ruum-server-env does not hold ruum_app's DSN"
+grep -qF 'STG_PG_RUUM_PASSWORD' "$TMP/server-env-block" && bad "ruum/ruum-server-env holds the owner's password" || ok "ruum/ruum-server-env does not hold the owner's password"
+gl="$(grep -nF 'sql/ruum-runtime-grants.sql" >/dev/null' "$ap" | cut -d: -f1)" sl="$(grep -nF '} | secret ruum ruum-server-env' "$ap" | cut -d: -f1)"
+[[ -n "$gl" && -n "$sl" && "$gl" -lt "$sl" ]] && ok "apply.sh grants ruum_app its rights before the serving pods get its DSN" || bad "apply.sh writes ruum-server-env before the grants"
+grep -qF 'add STG_PG_RUUM_APP_PASSWORD' "$STG/secrets-init.sh" && ok "secrets-init.sh generates STG_PG_RUUM_APP_PASSWORD" || bad "secrets-init.sh does not generate STG_PG_RUUM_APP_PASSWORD"
+grep -qF 'STG_PG_RUUM_APP_PASSWORD' <<<"$list" && ok "secrets-push.sh sends STG_PG_RUUM_APP_PASSWORD" || bad "secrets-push.sh does not send STG_PG_RUUM_APP_PASSWORD"
+gs="$STG/k8s/sql/ruum-runtime-grants.sql"
+grep -vE '^[[:space:]]*--' "$gs" | perl -ne 'print "$1\n" while /\bgrant\s+(.*?)\s+on\s/gi' | grep -iE '\b(create|all|truncate|references|trigger)\b' && bad "the grants give ruum_app DDL-like rights" || ok "the grants give ruum_app data rights only"
+if [[ $have_docker == 1 ]]; then
+  pgc="ruum-stg-grants-$$"
+  if docker run -d --rm --name "$pgc" -e POSTGRES_PASSWORD=probe postgres:17 >/dev/null 2>"$TMP/pg.err"; then
+    for _ in $(seq 1 90); do
+      [[ "$(docker logs "$pgc" 2>&1 | grep -c 'ready to accept connections')" -ge 2 ]] && break
+      sleep 1
+    done
+    pq() { docker exec -i "$pgc" psql -X -q -tA -v ON_ERROR_STOP=1 -U postgres "$@"; }
+    pgrants() { docker exec -i "$pgc" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d ruum -f - <"$gs"; }
+    pq -d postgres -c "create role ruum login" -c "create role ruum_app login noinherit" -c "create database ruum owner ruum" >/dev/null
+    pq -d ruum -c "set role ruum" -c "create table _sqlx_migrations (version bigint primary key, success boolean not null)" \
+      -c "create table nodes (id bigint generated always as identity primary key, name text)" -c "insert into _sqlx_migrations values (1, true)" >/dev/null
+    expect 0 "the grants apply" pgrants
+    expect 0 "the grants apply again (idempotent)" pgrants
+    expect 0 "ruum_app reads and writes the data tables" pq -d ruum -c "set role ruum_app" -c "insert into nodes (name) values ('a')" -c "update nodes set name = 'b'" -c "select count(*) from nodes" -c "delete from nodes"
+    expect 0 "ruum_app reads _sqlx_migrations (the start-up check)" pq -d ruum -c "set role ruum_app" -c "select version, success from _sqlx_migrations"
+    expect 1 "ruum_app cannot add a migration record" pq -d ruum -c "set role ruum_app" -c "insert into _sqlx_migrations values (2, true)"
+    expect 1 "ruum_app cannot change a migration record" pq -d ruum -c "set role ruum_app" -c "update _sqlx_migrations set success = false"
+    expect 1 "ruum_app cannot delete migration records" pq -d ruum -c "set role ruum_app" -c "delete from _sqlx_migrations"
+    expect 1 "ruum_app cannot create a table" pq -d ruum -c "set role ruum_app" -c "create table x (id int)"
+    expect 1 "ruum_app cannot alter a table" pq -d ruum -c "set role ruum_app" -c "alter table nodes add column y int"
+    expect 1 "ruum_app cannot drop a table" pq -d ruum -c "set role ruum_app" -c "drop table nodes"
+    expect 1 "ruum_app cannot truncate a table" pq -d ruum -c "set role ruum_app" -c "truncate nodes"
+    pq -d ruum -c "set role ruum" -c "create table later (id int)" >/dev/null
+    expect 0 "a table of a later migration gets ruum_app's data rights (default privileges)" pq -d ruum -c "set role ruum_app" -c "insert into later values (1)" -c "select count(*) from later"
+    pq -d ruum -c "set role ruum" -c "grant insert on _sqlx_migrations to ruum_app" >/dev/null
+    expect 0 "the grants take back a write right on _sqlx_migrations" pgrants
+    expect 1 "... and ruum_app cannot write it again" pq -d ruum -c "set role ruum_app" -c "insert into _sqlx_migrations values (3, true)"
+    pq -d postgres -c "grant ruum to ruum_app" >/dev/null
+    expect 3 "the grants fail when ruum_app is a member of ruum (it would have the owner's rights)" pgrants
+    docker rm -f "$pgc" >/dev/null 2>&1
+  else
+    echo "== runtime role grants: skipped (postgres:17 did not start: $(head -c 200 "$TMP/pg.err"))"
+  fi
+else
+  echo "== runtime role grants: skipped (no docker)"
 fi
 
 if [[ $failed == 0 ]]; then echo "staging tests: all passed"; else echo "staging tests: FAILED"; fi

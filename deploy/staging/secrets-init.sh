@@ -31,6 +31,8 @@ add TOFU_STATE_PASSPHRASE "$(rand_alnum 48)"
 # Zitadel's master key: exactly 32 printable bytes.
 add STG_ZITADEL_MASTERKEY "$(rand_alnum 32)"
 add STG_PG_RUUM_PASSWORD "$(rand_alnum 40)"
+# The runtime role of ruum-server (no DDL, no write on _sqlx_migrations; Kimi review of O-25).
+add STG_PG_RUUM_APP_PASSWORD "$(rand_alnum 40)"
 add STG_PG_ZITADEL_PASSWORD "$(rand_alnum 40)"
 add STG_PG_SPICEDB_PASSWORD "$(rand_alnum 40)"
 add STG_SPICEDB_PRESHARED_KEY "$(rand_alnum 48)"

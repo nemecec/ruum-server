@@ -124,7 +124,7 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
 | `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply, the talosconfig and the kubeconfig. |
 | `deploy/staging/ops/tunnel-setup.sh` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). |
-| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest, after the provenance check (with `gh` on the Mac, and again with `cosign` in the tools container); `--rollback` to go back on purpose; `--acme zerossl` to switch the CA. |
+| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest, after the provenance check (with `gh` on the Mac, and again with `cosign` in the tools container); `--rollback` to go back to the previous release on purpose, `--rollback-older` (with a warning) to go back further; one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server and Zitadel. Not read-only (a temporary namespace, ephemeral containers). |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
@@ -172,11 +172,12 @@ check the files).
 | Secret | Holds | Read by |
 |---|---|---|
 | `data/pg-backup-s3` | backup writer key | CNPG (Barman Cloud plugin) |
-| `data/pg-role-{ruum,zitadel,spicedb}` | database passwords | CNPG managed roles |
+| `data/pg-role-{ruum,ruum-app,zitadel,spicedb}` | database passwords (`ruum` owns the database ruum; `ruum_app` is the serving role) | CNPG managed roles |
 | `auth/zitadel-masterkey`, `auth/zitadel-db` | master key, DSN | Zitadel |
 | `auth/zitadel-smtp` | SMTP login at Scaleway: `user` (the project ID, `SCW_DEFAULT_PROJECT_ID`), `password` (`SCW_SMTP_SECRET_KEY`) | Zitadel (setup of a new instance), `ops/zitadel-bootstrap.sh` |
 | `authz/spicedb` | preshared key, DSN | SpiceDB |
-| `ruum/ruum-server-env` | DSN, Hetzner S3 key, SpiceDB key, token and content keys, allow-list | ruum-server |
+| `ruum/ruum-server-env` | DSN of `ruum_app` (data rights only: no DDL, read-only `_sqlx_migrations`), Hetzner S3 key, SpiceDB key, token and content keys, allow-list | ruum-server (serving pods) |
+| `ruum/ruum-migrate-db` | DSN of the owner `ruum` (DDL) | the migration Job only |
 | `ruum/ruum-oidc` | OIDC client ID (`client-id`) and the Zitadel IdP IDs of Google and Microsoft (`idp-google`, `idp-microsoft`, for `RUUM_OIDC_IDP_*`), made by `ops/zitadel-bootstrap.sh` | ruum-server |
 | `ops/blob-copy` | Hetzner S3 key, backup writer key, rclone crypt password and salt | the nightly copy |
 | `nats/nats-auth` | the ruum user's password | NATS |
@@ -258,8 +259,30 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   (the pod leaves the Service first), then SIGTERM: no new connections, open requests may finish
   for `RUUM_SHUTDOWN_GRACE_SECONDS` (35 s, longer than the 30 s long poll); longer WebDAV
   transfers and downloads are cut and the client retries.
+- **Two database roles** (Kimi review of O-25, findings 1 and 5). The serving pods log in as
+  `ruum_app`: select, insert, update and delete on the tables, select only on
+  `_sqlx_migrations`, no `CREATE`, owns nothing. Only the migration Job logs in as the owner
+  `ruum`, with the DSN in `ruum/ruum-migrate-db`, which the serving pods do not mount. CNPG makes
+  both roles (managed roles); `k8s/apply.sh` runs `k8s/sql/ruum-runtime-grants.sql` on the
+  primary on every platform step (idempotent; it fails when `ruum_app` could still change the
+  schema). After each run the migration step takes the write rights on `_sqlx_migrations` from
+  `ruum_app` again and checks its rights (`RUUM_DB_RUNTIME_ROLE`). A serving pod with
+  `RUUM_MIGRATE=false` and no `DATABASE_URL` refuses to start; it never falls back to memory.
+- **One deploy at a time** (finding 3). `ops/deploy-chart.sh` holds the Lease `ruum/ruum-deploy`
+  (`ops/deploy-lock.sh`) from before it reads the live release until `helm upgrade` has
+  finished. A second deploy stops with the holder's name and the lock's end. After it takes the
+  lock, it reads `ruum-release` again and stops when the live commit is not the one `deploy.sh`
+  checked (`--expect-deployed`). The Lease lasts 30 minutes and is renewed after the backup and
+  after the migration step; a deploy that lost it stops before its next step. A crashed deploy
+  leaves the lock until it expires (or the admin clears `spec.holderIdentity`).
 - An older commit than the deployed one needs `--rollback`: the same path; its migration step
-  has nothing to do. **The rollback floor is backlog O-25** (the commit that added the migration
+  has nothing to do. **`--rollback` goes back one release only** (finding 2): the target must be
+  the release that was live before the current one (`previous` in the ConfigMap `ruum-release`),
+  because design 12.7 promises only that the previous release runs on the new schema. An older
+  target needs `--rollback-older`, which prints a warning: check every migration since the target
+  for a contract step that it still uses. The first deploy with this rule records `previous`; until
+  then a rollback needs `--rollback-older`. The chart, the migration Job and the platform always
+  come from the checkout that runs `deploy.sh`, not from the target commit. **The rollback floor is backlog O-25** (the commit that added the migration
   step and the edge's certificate storage). An older commit has no `ruum-server migrate` (its
   Job would fail on a usage error) and its edge image has no `kubernetes_secret` storage module
   (Caddy would not load the Caddyfile). `deploy.sh` refuses such a commit before it touches the
@@ -275,6 +298,34 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   policy rule that lets the migration Job reach Postgres. `deploy-chart.sh` stops when the
   deployer cannot create Jobs. That first deploy replaces the edge Deployment with the DaemonSet
   (a short gap once) and issues the certificates once more into the new storage.
+
+### Moving an existing staging to the two database roles (once)
+
+The deploy after this change runs the migration Job with `ruum/ruum-migrate-db`, so the platform
+step must run first. The order keeps the live release serving at every step:
+
+1. Merge to main. On the Mac, in the main checkout: `git pull`.
+2. `deploy/staging/secrets-init.sh`: adds `STG_PG_RUUM_APP_PASSWORD` to `secrets.env` (prints
+   the name only).
+3. `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`: the platform step. It adds
+   the role `ruum_app` (CNPG), its grants, the Secret `ruum/ruum-migrate-db`, the deployer's
+   Lease rights, and then switches `ruum/ruum-server-env` to `ruum_app`'s DSN. The live pods keep
+   their environment until they restart; a pod that restarts now logs in as `ruum_app`, which has
+   its rights already (the live release does no DDL while it serves).
+4. Check: `deploy/staging/tool.sh kubectl -n data exec pg-1 -c postgres -- psql -d ruum -tAc
+   "select has_table_privilege('ruum_app', '_sqlx_migrations', 'INSERT')"` prints `f` (use the
+   primary's name if it is not `pg-1`).
+5. `deploy/staging/deploy.sh <sha of main>`: the migration Job logs in as `ruum`, restricts
+   `ruum_app` again, and the rollout starts pods with `ruum_app`'s DSN. This deploy records
+   `previous` in `ruum-release` for the first time.
+6. `deploy/staging/status.sh --checks` and the smoke checks (deploy.sh runs them).
+
+Going back: a rollback after step 5 to the release before it uses this checkout's chart, so its
+migration Job also logs in as `ruum` and its pods as `ruum_app`; it needs `--rollback-older` this
+once (no `previous` was recorded before step 5). To undo the role split itself, run the platform
+step from a checkout before this change: it writes the owner's DSN back into `ruum-server-env`
+(`ruum_app` and its grants stay, unused); then restart ruum-server
+(`deploy/staging/tool.sh kubectl -n ruum rollout restart deployment/ruum-server`).
 
 ## Capacity (N-1)
 
@@ -333,7 +384,7 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads, except the edge's (Secrets and Leases of `edge` only, for the certificate storage, backlog O-26). |
 | S-2 | The admin credentials only on the person's Mac (`~/.config/ruum`), never on the build server; namespaced `deployer` ServiceAccount for deploys. |
 | S-3 | One Secret per consumer; `secrets-push.sh` fixed list, refuses forbidden names; tests. |
-| S-4 | Certificates, ACME account keys and challenge tokens in Secrets of the `edge` namespace (backlog O-26); only the edge's ServiceAccount `ruum-edge` has a Role on them; no Hetzner key in the edge. **Not only the edge can read them:** the deployer manages the edge DaemonSet and may create pods in `edge`, so it can start a pod as `ruum-edge` and read every certificate private key and the ACME account key. This weakens stgsec S-11 for the TLS keys only: the database password and the token signing key stay out of the deployer's reach. Backlog O-29 takes it to the next security review. |
+| S-4 | Certificates, ACME account keys and challenge tokens in Secrets of the `edge` namespace (backlog O-26); only the edge's ServiceAccount `ruum-edge` has a Role on them; no Hetzner key in the edge. **The deployer can read every Secret of `ruum` and `edge`** (Kimi review of O-25, finding 1; an earlier version of this row said "TLS keys only", which was wrong). It has no `get secrets`, but it may create pods, Jobs, Deployments and DaemonSets in both namespaces and read pod logs, and a pod may mount any Secret of its namespace whatever its creator may read. So it can read `ruum-server-env` (the runtime DSN, the token and content signing keys, the S3 and SpiceDB keys), `ruum-migrate-db` (the owner's DSN), `ruum-oidc`, and every TLS and ACME key of `edge`. stgsec S-11 holds only in the sense that the deployer cannot reach the other namespaces (`data`, `auth`, `authz`, `nats`, `ops`) beyond creating CNPG Backups. **The deployer kubeconfig is operator-only**: it stays on the person's Mac like the admin kubeconfig, never on the build server, in CI or with an agent that should not see those secrets. What limits the damage: the serving pods' DSN is `ruum_app` (no DDL, read-only migration records), and the owner's DSN is in a Secret that the serving pods do not mount. Backlog O-29 (corrected) and O-34 (move the migration step and the rollout out of the deployer's reach). |
 | S-5 | rclone crypt for the blob copy; provider-side encryption stated for CNPG; HTTPS endpoints only. |
 | S-6 | Generated secrets in `secrets.env` (`secrets-init.sh`); `--restore-from`. |
 | S-7 | Deploy by digest; provenance attestation checked; Trivy scans vulnerabilities and secrets in the layers before the push. |

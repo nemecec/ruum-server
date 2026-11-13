@@ -49,10 +49,20 @@ spec:
       shared_buffers: 128MB
   managed:
     roles:
+      # Two roles for the platform database ruum (Kimi review of O-25, findings 1 and 5):
+      # - ruum owns the database and its tables. Only the migration Job logs in as ruum
+      #   (Secret ruum/ruum-migrate-db), because migrations need DDL.
+      # - ruum_app is the role of the serving pods (ruum/ruum-server-env): data rights only, no
+      #   DDL, read-only on _sqlx_migrations. k8s/apply.sh grants them (k8s/sql/ruum-runtime-grants.sql).
       - name: ruum
         ensure: present
         login: true
         passwordSecret: { name: pg-role-ruum }
+      - name: ruum_app
+        ensure: present
+        login: true
+        inherit: false
+        passwordSecret: { name: pg-role-ruum-app }
       - name: zitadel
         ensure: present
         login: true

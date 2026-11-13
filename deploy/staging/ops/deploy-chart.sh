@@ -10,7 +10,11 @@
 #   - each digest has a provenance attestation of images.yml on refs/heads/main (cosign);
 #   - the values go to helm in a values file (JSON), never through --set, so no value can add
 #     another key (helm splits --set on commas).
-# Then (design 12.7, backlog O-25):
+# Then (design 12.7, backlog O-25), holding the deploy lock (Lease ruum/ruum-deploy,
+# ops/deploy-lock.sh; Kimi review of O-25, finding 3) from step 0 to the end of step 3:
+#   0. the live release (ConfigMap ruum-release) must still be the one deploy.sh checked
+#      (--expect-deployed), so no other deploy changed it in between; a rollback (--rollback)
+#      must go to the previous release, unless --rollback-older (ops/release-floor.sh);
 #   1. with new migrations (--backup), an on-demand CNPG backup;
 #   2. the migration step: the Job of charts/ruum migrate-job.yaml with the new server image
 #      runs `ruum-server migrate` under an advisory lock; when it fails, the rollout does not
@@ -19,23 +23,33 @@
 #   3. the rolling update (helm upgrade --wait): new pods next to the old ones, never fewer
 #      ready than before.
 #
-#   deploy-chart.sh <commit> <server-ref@sha256:...> <edge-ref@sha256:...> [--backup] [--acme ISSUER] [--acme-email EMAIL] [--validate-only]
+#   deploy-chart.sh <commit> <server-ref@sha256:...> <edge-ref@sha256:...> --expect-deployed <commit|none>
+#                   [--rollback | --rollback-older] [--backup] [--acme ISSUER] [--acme-email EMAIL] [--validate-only]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STG="$(cd "$HERE/.." && pwd)"
 # shellcheck source=image-check.sh
 . "$HERE/image-check.sh"
+# shellcheck source=release-floor.sh
+. "$HERE/release-floor.sh"
+# shellcheck source=deploy-lock.sh
+. "$HERE/deploy-lock.sh"
 die() { echo "deploy-chart: $*" >&2; exit 1; }
 
-[[ $# -ge 3 ]] || die "usage: deploy-chart.sh <commit> <server-ref> <edge-ref> [--backup] [--acme ISSUER] [--acme-email EMAIL]"
+[[ $# -ge 3 ]] || die "usage: deploy-chart.sh <commit> <server-ref> <edge-ref> --expect-deployed <commit|none> [--rollback | --rollback-older] [--backup] [--acme ISSUER] [--acme-email EMAIL]"
 commit="$1" server="$2" edge="$3"
 shift 3
 backup=0
+rollback=0
+expect_deployed=""
 validate_only=0
 acme="" acme_email=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backup) backup=1; shift ;;
+    --rollback) [[ $rollback == 0 ]] || die "--rollback and --rollback-older exclude each other"; rollback=1; shift ;;
+    --rollback-older) [[ $rollback == 0 ]] || die "--rollback and --rollback-older exclude each other"; rollback=2; shift ;;
+    --expect-deployed) [[ $# -ge 2 ]] || die "--expect-deployed needs a value"; expect_deployed="$2"; shift 2 ;;
     --acme) [[ $# -ge 2 ]] || die "--acme needs a value"; acme="$2"; shift 2 ;;
     --acme-email) [[ $# -ge 2 ]] || die "--acme-email needs a value"; acme_email="$2"; shift 2 ;;
     --validate-only) validate_only=1; shift ;;
@@ -52,6 +66,9 @@ if [[ -n "$acme_email" ]]; then
   [[ "$acme_email" =~ $RUUM_EMAIL_RE ]] || die "--acme-email is not a plain email address"
 fi
 [[ "$acme" != zerossl || -n "$acme_email" ]] || die "--acme zerossl needs --acme-email"
+[[ "$expect_deployed" == none || "$expect_deployed" =~ $RUUM_COMMIT_RE ]] ||
+  die "--expect-deployed must be the live commit that deploy.sh read (40 lowercase hex characters) or none"
+[[ $rollback == 0 || "$expect_deployed" != none ]] || die "a rollback needs a live release (--expect-deployed)"
 [[ $validate_only == 0 ]] || { echo "deploy-chart: arguments are valid"; exit 0; }
 
 WORK="${RUUM_STAGING_WORK:-$HOME/.config/ruum/staging}"
@@ -66,6 +83,36 @@ for ref in "$server" "$edge"; do
   [[ "$tagged" == "${ref#*@}" ]] || die "ghcr.io/$name:$commit is not ${ref#*@} (got ${tagged:-nothing})"
   cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"
 done
+
+tmp="$(mktemp -d "$WORK/deploy.XXXXXX")"
+holder="deploy-${commit:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+locked=0
+cleanup() {
+  [[ $locked == 0 ]] || ruum_lock_release "$holder"
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+# 0. The deploy lock, then the live release again (Kimi review of O-25, findings 2 and 3).
+kubectl auth can-i update leases.coordination.k8s.io/ruum-deploy -n ruum >/dev/null 2>&1 ||
+  die "the deployer may not use Leases in ruum; apply the platform first (k8s/apply.sh)"
+rc=0
+ruum_lock_acquire "$holder" || rc=$?
+[[ $rc == 0 ]] || die "not deploying: $([[ $rc == 1 ]] && echo "another deploy runs (wait for it, or for the lease to expire)" || echo "the deploy lock failed")"
+locked=1
+echo "==> deploy lock ruum/$RUUM_DEPLOY_LOCK_NAME held by $holder" >&2
+live="$(kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.commit}' 2>/dev/null || true)"
+previous="$(kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.previous}' 2>/dev/null || true)"
+[[ "${live:-none}" == "$expect_deployed" ]] ||
+  die "the live release is ${live:-none}, not $expect_deployed as deploy.sh checked: another deploy ran in between; run deploy.sh again"
+if [[ $rollback != 0 ]]; then
+  ruum_rollback_target_ok "$commit" "$previous" "$([[ $rollback == 2 ]] && echo 1 || echo 0)" ||
+    die "$commit is not the previous release (${previous:-none recorded}); a plain --rollback goes back one release only (design 12.7). Use --rollback-older on purpose"
+  [[ $rollback != 2 || "$commit" == "$previous" ]] || echo "deploy-chart: $RUUM_ROLLBACK_OLDER_WARNING" >&2
+fi
+# The release before this one, recorded in ruum-release (a redeploy of the live commit keeps it).
+if [[ -n "$live" && "$live" != "$commit" ]]; then previous_value="$live"; else previous_value="$previous"; fi
+[[ -z "$previous_value" || "$previous_value" =~ $RUUM_COMMIT_RE ]] || previous_value=""
 
 if [[ $backup == 1 ]]; then
   # Review 2 U-3: a release with new migrations gets an on-demand backup first.
@@ -91,9 +138,7 @@ YAML
   done
   [[ "$phase" == completed ]] || die "the backup did not finish in 20 minutes; not deploying"
 fi
-
-tmp="$(mktemp -d "$WORK/deploy.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+ruum_lock_renew "$holder" || die "lost the deploy lock after the backup; not migrating"
 
 # 2. The migration step (design 12.7, backlog O-25), before the rollout.
 kubectl auth can-i create jobs.batch -n ruum >/dev/null 2>&1 ||
@@ -110,16 +155,23 @@ state=""
 for _ in $(seq 1 200); do
   state="$(kubectl -n ruum get job "$job" -o jsonpath='{.status.succeeded}/{.status.failed}' 2>/dev/null || true)"
   [[ "$state" == 1/* || "$state" == */1 ]] && break
+  # A missing Secret (ruum-migrate-db before the platform step) never fails the pod; it waits.
+  waiting="$(kubectl -n ruum get pods -l "job-name=$job" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || true)"
+  if [[ "$waiting" == *CreateContainerConfigError* ]]; then
+    kubectl -n ruum delete job "$job" --wait=false >/dev/null 2>&1 || true
+    die "the migration step $job cannot start (CreateContainerConfigError: is the Secret ruum/ruum-migrate-db there? Run the platform step, k8s/apply.sh); not rolling out, the old release keeps serving"
+  fi
   sleep 5
 done
 kubectl -n ruum logs "job/$job" --tail 50 >&2 || true
 [[ "$state" == 1/* ]] || die "the migration step $job did not succeed (${state:-no status}); not rolling out, the old release keeps serving"
 echo "==> migrations are up to date; rolling update" >&2
+ruum_lock_renew "$holder" || die "lost the deploy lock after the migration step; not rolling out (run deploy.sh again)"
 
 # 3. The values as JSON (valid YAML), built by jq from validated strings.
 values="$tmp/values.json"
-jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg acme "$acme" --arg email "$acme_email" '
-  { images: { server: $server, edge: $edge }, commit: $commit }
+jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg previous "$previous_value" --arg acme "$acme" --arg email "$acme_email" '
+  { images: { server: $server, edge: $edge }, commit: $commit, previousCommit: $previous }
   + (if $acme != "" then { acme: ({ issuer: $acme } + (if $email != "" then { email: $email } else {} end)) } else {} end)
 ' >"$values"
 
