@@ -1106,15 +1106,12 @@ async fn a_person_chooses_the_slug_of_a_personal_tenant() {
     );
     assert!(apps.store().tenant_settings(t.id).await.unwrap().is_none());
     // The choice is fixed; the same slug again is fine, another one is not.
-    let chosen = apps.choose_tenant_slug(&me, "owner-apps").await.unwrap();
+    let (chosen, new) = apps.choose_tenant_slug(&me, "owner-apps").await.unwrap();
     assert_eq!(chosen.slug, "owner-apps");
-    assert_eq!(
-        apps.choose_tenant_slug(&me, "owner-apps")
-            .await
-            .unwrap()
-            .slug,
-        "owner-apps"
-    );
+    assert!(new, "the first choice fixes the slug");
+    let (again, new) = apps.choose_tenant_slug(&me, "owner-apps").await.unwrap();
+    assert_eq!(again.slug, "owner-apps");
+    assert!(!new, "the same slug again fixes nothing new");
     assert_eq!(
         status_hint(apps.choose_tenant_slug(&me, "other-apps").await),
         (409, "app_slug_fixed".into())

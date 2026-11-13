@@ -11,6 +11,8 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post};
+use ruum_core::audit::NewAuditEntry;
+use ruum_core::audit::events::actions;
 use ruum_core::authz::Role;
 use ruum_core::identity::Authenticated;
 use ruum_core::tenants::{MemberRole, TenantPolicyChange, tenant_limits};
@@ -182,7 +184,25 @@ pub async fn update_tenant(
                 .with_hint("/app_slug"),
             )));
         }
-        state.services.apps.choose_tenant_slug(&ctx, slug).await?;
+        let (chosen, new) = state.services.apps.choose_tenant_slug(&ctx, slug).await?;
+        if new {
+            // A public, permanent write by a person: the audit log names the actor (the same
+            // action as a rename or a policy change). Not in the transaction of the settings
+            // row: when this write fails, the slug stays fixed and the request answers the
+            // error, like the sign-in events.
+            let c = crate::auth::current_client();
+            state
+                .services
+                .audit
+                .record(
+                    &ctx,
+                    NewAuditEntry::new(actions::TENANT_UPDATED)
+                        .target("tenant", ctx.tenant)
+                        .client(c.ip, c.user_agent)
+                        .data(json!({ "app_slug": chosen.slug })),
+                )
+                .await?;
+        }
         let t = state.services.tenants.get(&ctx).await?;
         return Ok(Json(with_app_approval(&state, &t).await?));
     }

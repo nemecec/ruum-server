@@ -452,7 +452,14 @@ impl AppService {
     /// the same slug answers the settings again and another one is `409`, hint
     /// `app_slug_fixed`. A slug that another tenant has or had is `409`, hint `app_slug_taken`.
     /// The slug is then fixed for good, like one given with the first app.
-    pub async fn choose_tenant_slug(&self, ctx: &Context, slug: &str) -> Result<TenantAppSettings> {
+    ///
+    /// The `bool` is `true` when this call fixed the slug (a new settings row), and `false` for
+    /// the same slug again. The caller records the audit entry of a new choice.
+    pub async fn choose_tenant_slug(
+        &self,
+        ctx: &Context,
+        slug: &str,
+    ) -> Result<(TenantAppSettings, bool)> {
         refuse_share_link(ctx)?;
         let user = crate::actor::require_user_actor(ctx)?;
         crate::tenants::rules::require_role(
@@ -475,7 +482,7 @@ impl AppService {
         let store = &self.deps.store;
         if let Some(t) = store.tenant_settings(ctx.tenant).await? {
             return if t.slug == slug {
-                Ok(t)
+                Ok((t, false))
             } else {
                 Err(tenant_slug_fixed())
             };
@@ -484,7 +491,7 @@ impl AppService {
             .ensure_tenant_settings(ctx.tenant, &[slug.to_string()])
             .await
         {
-            Ok(t) if t.slug == slug => Ok(t),
+            Ok(t) if t.slug == slug => Ok((t, true)),
             // Another request fixed the slug first.
             Ok(_) => Err(tenant_slug_fixed()),
             Err(Error::Api(e)) if e.code == ErrorCode::Conflict => Err(tenant_slug_taken()),

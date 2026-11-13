@@ -188,13 +188,15 @@ pub fn cases() -> Vec<Case> {
                 "getRoot",
                 "getTenant",
                 "updateTenant",
-                "createApp"
+                "createApp",
+                "listAudit"
             ],
             "updateTenant with app_slug chooses the tenant slug of a personal space once: rule \
              breaks and app_slug with name are 422 (hint /app_slug), a team space is 422, an \
              agent is user_required; then the same slug is 200 and another is 409 \
-             app_slug_fixed; the next app uses it; another person's space gets 409 \
-             app_slug_taken for it (decision 0008-1, card S-35)",
+             app_slug_fixed; the choice has one tenant.updated audit entry by the person; the \
+             next app uses it; another person's space gets 409 app_slug_taken for it \
+             (decision 0008-1, card S-35)",
             |cx| {
                 let who = Who::MemberEdit;
                 let (tid, _, root) = personal_tenant(&cx, who).await?;
@@ -251,6 +253,34 @@ pub fn cases() -> Vec<Case> {
                     )
                     .await?;
                 super::api::hint_has(&err, "app_slug_fixed")?;
+                // One audit entry for the choice, by the person; none for the same slug again.
+                let audit = cx
+                    .ok(
+                        who,
+                        RequestSpec::get(format!(
+                            "/v1/tenants/{tid}/audit?action=tenant.updated&limit=200"
+                        )),
+                        &[200],
+                    )
+                    .await?;
+                let me = cx.p(who).id.to_string();
+                let chosen: Vec<&Value> = audit["items"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|r| r["data"]["app_slug"] == mine.as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                check!(
+                    chosen.len() == 1
+                        && chosen[0]["action"] == "tenant.updated"
+                        && chosen[0]["actor"]["kind"] == "user"
+                        && chosen[0]["actor"]["id"] == me.as_str()
+                        && chosen[0]["target_type"] == "tenant"
+                        && chosen[0]["target_id"] == tid.to_string().as_str(),
+                    "the choice of {mine:?} has not one tenant.updated entry by the person: {audit}"
+                );
                 let app = cx
                     .ok(who, create_app_at(tid, &root, "plant list", None), &[202])
                     .await?;
