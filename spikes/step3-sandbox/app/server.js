@@ -1,6 +1,6 @@
 // Spike S-2: a small Node app. It echoes the request headers it received and checks the
 // Ruum-User token as the SDK would (signature with the public key in RUUM_USER_PUBKEY, iss, aud,
-// typ, env, exp). GET /cookies answers with Set-Cookie lines that the gateway must filter.
+// typ, env, numeric iat and exp, exp - iat <= 60 s). GET /cookies answers with Set-Cookie lines that the gateway must filter.
 'use strict';
 const http = require('node:http');
 const crypto = require('node:crypto');
@@ -32,7 +32,9 @@ function checkToken(tok) {
   if (claims.aud !== process.env.RUUM_AUDIENCE) return { valid: false, reason: 'aud' };
   if (claims.typ !== 'app_user') return { valid: false, reason: 'typ' };
   if (claims.env !== process.env.RUUM_ENV) return { valid: false, reason: 'env' };
-  if (typeof claims.exp !== 'number' || claims.exp < now || claims.exp - claims.iat > 60) {
+  // Both times must be numbers: without iat, exp - iat is NaN and a bound check would pass.
+  if (!Number.isInteger(claims.iat) || !Number.isInteger(claims.exp)) return { valid: false, reason: 'exp' };
+  if (claims.exp <= now || claims.iat > now + 5 || claims.exp - claims.iat > 60) {
     return { valid: false, reason: 'exp' };
   }
   return { valid: true, claims };
@@ -50,6 +52,8 @@ http
         '__Host-ruum_visit=fixation; Path=/; Secure',
         'ruum_session=fixation',
         'RUUM=x',
+        '=ruum_app=nameless; Path=/',
+        'ruum_app',
         'app_session=kept; Path=/; HttpOnly',
       ]);
       res.end('cookies\n');

@@ -1067,7 +1067,9 @@ May change:  crates/ruum-gateway/ (new crate), crates/ruum-core/src/identity/ (a
              for the code flow, agreed with the identity area).
 Done when:   T-6's cases of these rules pass; a request without use never reaches the app; a
              token for app A is refused by app B's SDK, a preview's token by the live app; a
-             removed role stops working within 5 s; an agent token is refused on a live host.
+             removed role stops working within 5 s; an agent token is refused on a live host; an
+             app's Set-Cookie with an empty cookie name (`=ruum_app=x`) or without `=` is
+             refused (dropped), because a browser sends it back as the pair in its value.
 After:       C-3, T-6, S-2 points 2 and 4
 ```
 

@@ -14,7 +14,8 @@ scripts/buildbox/run.sh <name> <worktree> -- spikes/step3-sandbox/run.sh 2 4    
 scripts/buildbox/run.sh <name> <worktree> -- spikes/step3-sandbox/run.sh --clean  # remove leftovers
 ```
 
-It prints `PASS`, `FAIL` or `SKIP` per check and exits non-zero on a `FAIL`. It needs Docker,
+It prints `PASS`, `FAIL` or `SKIP` per check and exits non-zero on a `FAIL`. `SKIP` is only for
+runsc. It first runs the gateway's unit tests (`cargo test` in `gw/`) and stops if they fail. It needs Docker,
 `cargo`, `curl`, `jq`, `openssl` and `python3` on the host, the dev stack's containers
 (`ruum-garage-1`, `ruum-postgres-1` and the others on `ruum_default`), and access to the internet
 for the egress checks.
@@ -25,7 +26,8 @@ it fails), together with the images it pulled itself (the Node, Ubuntu and Build
 they were not on the host before). The
 user-token key and the Garage secret live in `~/s3w1s-work` (mode 700) during a run, and the script
 never prints them. Hostile probes run only from the script's own containers, only as TCP connects
-and one HTTP GET to the metadata address, and never target staging or the SSH tunnel.
+and one HTTP GET to the metadata address, and never target staging or the SSH tunnel. The positive
+controls connect from the host (or a spike container) to the same addresses and close at once.
 
 ## Files
 
@@ -50,21 +52,55 @@ and one HTTP GET to the metadata address, and never target staging or the SSH tu
    host's public addresses (`EGRESS_DENY`: addresses or CIDR prefixes, checked on the IPv4 form of
    an IPv4-mapped IPv6 address). It also probes the host over IPv6 (the bridge's link-local address
    and the host's public IPv6 address) and records whether IPv6 is on inside the sandbox. A target
-   that has no address (a container that is down) is a `SKIP` line, not dropped.
+   that has no address (a container that is down) is a `FAIL`, and the probe must answer for
+   exactly the expected set of targets.
+
+   **No check passes on silence.** "Not reached" alone proves nothing: a target that is down, or a
+   firewall that drops packets, looks the same. So every TCP target, the metadata GET and the DNS
+   names have a **positive control** that must reach them at the same time: a connect from the
+   host to the same address, a container on the target's own network (another app), or, for the
+   host behind the app network's would-be gateway, the probe on a plain internal network (where
+   sshd answers). A probe whose control fails is a `FAIL`. A refused egress request passes only on
+   the proxy's own refusal: status 403 (405 for plain HTTP) with the header `X-Ruum-Egress-Deny`
+   and the expected reason (`port`, `allow-list`, `address`, `method`). A 502, a timeout, a TLS
+   error after a 200 or a 403 with another reason is a `FAIL`. The refused list includes
+   addresses that the allow-list lets through (numeric, decimal `2852039166`, octal, hex, `127.1`,
+   IPv4-mapped IPv6, `::1`, `fd00:ec2::254`, the host's IPv6 address and another address in its
+   /64), so only the address rules can refuse them. Host ports that listen on 127.0.0.1 only
+   (the dev stack's published ports) are not targets: no control reaches them on another address.
+   The host-bridge check first asserts that the network and its bridge device exist and that its
+   IPv6 setting is readable; an empty answer from a missing device is a `FAIL`.
 2. **Gateway headers.** The gateway removes every incoming `Ruum-*` header (also `Ruum_User`), the
    gateway cookies, partner keys, `traceparent`, `tracestate`, `baggage`, `Forwarded`, `X-Real-IP`
    and every `X-Forwarded-*` name, adds a fresh signed `Ruum-User` (EdDSA, 60 s), and drops an
-   app's `Set-Cookie` for any `ruum` name. It adds no `X-Forwarded-For`: apps do not get the
+   app's `Set-Cookie` for any `ruum` name, with an empty name (`=ruum_app=x`, which a browser sends
+   back as `ruum_app=x`) or without `=`. It adds no `X-Forwarded-For`: apps do not get the
    visitor's IP address. The app checks the token as the SDK would; a token for app A fails app B's
-   check.
+   check, and so do tokens with a wrong issuer, type, environment or algorithm, without `iat` or
+   `exp`, expired, or living longer than 60 s.
 3. **Cold start.** Median and p95 of 20 starts of a stopped container until the first HTTP answer.
 4. **Static files.** A static archive, unpacked into Garage under the deployment's prefix, served
-   byte for byte through the gateway; no path reaches another prefix.
+   byte for byte through the gateway; no path reaches another prefix. The object outside the
+   prefix is read back first (so it exists), every traversal path must get the gateway's own 404
+   or 400 (not `000` or a 5xx), and the gateway must still answer afterwards.
 5. **Hostile build.** A `package.json` whose `postinstall` calls the metadata address, the platform
    Postgres and the Docker socket runs `npm ci` in a sandbox job with the driver's flags and
-   reaches nothing; the packages come only through the egress proxy. The built layer (a plain tar)
-   runs in a sandbox. The script also tries rootless BuildKit under the same flags and prints the
+   reaches nothing; the packages come only through the build's own egress proxy (a second proxy
+   container, so point 1's log cannot answer this check). The job's output folder `/out` is a
+   Docker volume on tmpfs with a 64 MiB limit, not a host folder; the postinstall tries to write
+   96 MiB there and must stop with `ENOSPC`. The output is copied out with a byte cap, and only
+   the expected regular files are kept. The built layer (a plain tar) runs in a sandbox from a
+   read-only folder. The spike does not assemble an OCI image from the layer (R-2b does). The script also tries rootless BuildKit under the same flags and prints the
    outcome as an `INFO` line (it does not start: no user namespaces).
+
+**For the production recipe (R-2b):** never give a build job a writable host bind mount. Its
+output goes to a size-limited sandbox filesystem (a tmpfs volume with a size, or a quota) and
+leaves through a byte-capped, checked copy or stream. The base image is pinned by digest, as the
+spike does (`node:22-alpine@sha256:...`, `ubuntu:24.04@sha256:...`).
+
+Not tested by the spike: UDP (all direct probes are TCP; a DNS lookup that fails is not a UDP
+test), IPv6 egress (the outside network has no IPv6), a DNS rebinding answer (the `nip.io` names
+are static), Node's own `fetch` through `HTTPS_PROXY`, and OCI image assembly.
 
 Why `inhibit_ipv4`: without it the host has an address on every bridge, also on an internal one,
 and an app reaches every host service that listens on all addresses (on the build server: `sshd`)
