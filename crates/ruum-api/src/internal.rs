@@ -255,12 +255,20 @@ pub mod gateway {
             return Ok(None);
         }
         let allowed = may_open(s, b, session.user_id).await?;
+        // The roles claim (plan seam 3, card B-2): the active app roles of the user, or the
+        // default role. Empty when the user may not open the app.
+        let roles = if allowed {
+            s.services
+                .apps
+                .effective_roles(b.tenant_id, b.app_id, Some(session.user_id))
+                .await?
+        } else {
+            Vec::new()
+        };
         Ok(Some(SessionInfo {
             sub: subject(s, b.tenant_id, b.app_id, session.user_id.0).await?,
             allowed,
-            // Card B-2 provides `apps::roles::effective_roles` (plan seam 3); until it is merged
-            // the claim is empty.
-            roles: Vec::new(),
+            roles,
         }))
     }
 
