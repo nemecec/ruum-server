@@ -4,7 +4,12 @@
 # Secret per consumer and namespace (review 1 S-3), through `kubectl apply -f -` on stdin, never
 # a file or an argument.
 #
-#   KUBECONFIG=... k8s/apply.sh <generation> [<restore-from-generation>]
+#   KUBECONFIG=... DEPLOY_CONTROLLER_COMMIT=<sha of main> k8s/apply.sh <generation> [<restore-from-generation>]
+#
+# It also installs the deploy controller (backlog O-34) from the image of DEPLOY_CONTROLLER_COMMIT,
+# by digest, after the same provenance check as a deploy (cosign: images.yml on refs/heads/main),
+# and checks on the live cluster that the deployer may only write release requests
+# (ops/rbac-check.sh live).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STG="$(cd "$HERE/.." && pwd)"
@@ -17,6 +22,20 @@ restore_from="${2:-}"
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 k() { kubectl "$@"; }
+# shellcheck source=../ops/image-check.sh
+. "$STG/ops/image-check.sh"
+
+# The deploy controller image (backlog O-34), checked before anything changes.
+[[ "${DEPLOY_CONTROLLER_COMMIT:-}" =~ $RUUM_COMMIT_RE ]] ||
+  die "DEPLOY_CONTROLLER_COMMIT must be a commit of main (40 hex; secrets-push.sh passes it)"
+controller_digest="$(ghcr_digest nemecec/ruum-deploy-controller "$DEPLOY_CONTROLLER_COMMIT" || true)"
+[[ "$controller_digest" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+  die "no image ghcr.io/nemecec/ruum-deploy-controller:$DEPLOY_CONTROLLER_COMMIT (did images.yml publish it? Is the package public?)"
+export DEPLOY_CONTROLLER_IMAGE="ghcr.io/nemecec/ruum-deploy-controller@$controller_digest"
+[[ "$DEPLOY_CONTROLLER_IMAGE" =~ $RUUM_CONTROLLER_IMAGE_RE ]] || die "unexpected controller image $DEPLOY_CONTROLLER_IMAGE"
+cosign_verify_provenance "$DEPLOY_CONTROLLER_IMAGE" ||
+  die "no valid provenance attestation (images.yml on refs/heads/main) for $DEPLOY_CONTROLLER_IMAGE"
+log "deploy controller $DEPLOY_CONTROLLER_IMAGE (commit $DEPLOY_CONTROLLER_COMMIT, provenance checked)"
 
 for n in SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY \
   STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_RUUM_APP_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD \
@@ -135,6 +154,11 @@ printf 'DATABASE_URL=postgres://ruum:%s@pg-rw.data.svc.cluster.local:5432/ruum?s
 
 helmfile --file "$HERE/helmfile.yaml.gotmpl" sync
 
+log "deploy controller (namespace ruum-deploy, backlog O-34)"
+k -n ruum-deploy rollout status deployment/deploy-controller --timeout=5m >/dev/null ||
+  die "the deploy controller did not start (deploy/staging/tool.sh kubectl -n ruum-deploy describe pods)"
+log "the deployer may only write release requests (ops/rbac-check.sh live)"
+bash "$STG/ops/rbac-check.sh" live || die "the deployer or the deploy controller has other rights than it should (above)"
 log "deployer kubeconfig (namespaced, review 2 O-1)"
 bash "$STG/ops/deployer-kubeconfig.sh"
 log "platform is up (generation $generation${restore_from:+, restored from $restore_from})"

@@ -6,7 +6,9 @@
 #   deploy/staging/secrets-push.sh platform [--restore-from GENERATION]
 #
 # In the container, k8s/apply.sh splits them into one Kubernetes Secret per consumer and
-# namespace (README "Secrets").
+# namespace (README "Secrets"). The platform step also installs the deploy controller (backlog
+# O-34) from the image of this checkout's commit, which must be on origin/main (images.yml
+# publishes it there); RUUM_DEPLOY_CONTROLLER_COMMIT=<sha of main> picks another commit.
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -38,7 +40,13 @@ required=(SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZ
   STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY)
 missing="$(stg_missing "${required[@]}")"
 [[ -z "$missing" ]] || stg_die "missing in secrets.env: $(echo $missing) (secrets-init.sh generates the STG_* ones; the person adds SCW_BACKUP_*, SCW_SMTP_SECRET_KEY and STG_ALLOWED_EMAILS, docs/setup/ACCOUNTS.md)"
+# The deploy controller of this checkout's commit (or RUUM_DEPLOY_CONTROLLER_COMMIT), on main.
+git -C "$STG_ROOT" fetch -q origin main
+controller="$(git -C "$STG_ROOT" rev-parse --verify "${RUUM_DEPLOY_CONTROLLER_COMMIT:-HEAD}^{commit}")" ||
+  stg_die "RUUM_DEPLOY_CONTROLLER_COMMIT is not a commit"
+git -C "$STG_ROOT" merge-base --is-ancestor "$controller" origin/main ||
+  stg_die "the deploy controller comes from $controller, which is not on origin/main (images.yml publishes only main); check out main or set RUUM_DEPLOY_CONTROLLER_COMMIT"
 stg_tunnel_up
-stg_log "sending ${#names[@]} names to the tools container (values on stdin, never printed)"
+stg_log "sending ${#names[@]} names to the tools container (values on stdin, never printed); deploy controller of $controller"
 # The tofu names too: apply.sh reads the generation from the encrypted state.
-stg_secret_stream "${names[@]}" "${STG_NAMES_TOFU[@]}" | stg_run rw platform "$@"
+stg_secret_stream "${names[@]}" "${STG_NAMES_TOFU[@]}" | stg_run rw platform --controller "$controller" "$@"

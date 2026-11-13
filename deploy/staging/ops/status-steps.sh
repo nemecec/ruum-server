@@ -44,6 +44,10 @@ kubectl "${kc[@]}" -n data get cluster pg -o jsonpath='  phase: {.status.phase};
 kubectl "${kc[@]}" -n data get backups --sort-by=.metadata.creationTimestamp 2>&1 | tail -3 | sed 's/^/  /'
 echo "== Deployed commit"
 kubectl "${kc[@]}" -n ruum get configmap ruum-release -o jsonpath='  {.data.commit}{"\n"}' 2>&1
+echo "== Deploy controller (backlog O-34) and the last release requests"
+kubectl "${kc[@]}" -n ruum-deploy get pods -l app=deploy-controller --no-headers 2>&1 | sed 's/^/  /'
+kubectl "${kc[@]}" -n ruum-deploy get configmaps -l ruum.space/release-request=true --sort-by=.metadata.creationTimestamp \
+  -o custom-columns='NAME:.metadata.name,PHASE:.metadata.annotations.ruum\.space/phase,COMMIT:.data.commit' 2>&1 | tail -5 | sed 's/^/  /'
 if [[ "${1:-}" == --checks ]]; then
   echo "== Secrets that must not be in the cluster (stgsec 5.8)"
   if kubectl "${kc[@]}" get secrets -A -o json | jq -r '.items[].data // {} | keys[]' | grep -qiE 'HCLOUD|STRIPE'; then

@@ -1,7 +1,7 @@
 # The certificate storage of the edge (backlog O-26): Caddy keeps certificates, ACME accounts
 # and challenge tokens in Secrets of the edge namespace and locks with Leases there (the module
-# deploy/images/caddy-secret-storage). Here, not in charts/ruum: the deployer has no access to
-# Secrets, and Kubernetes does not let it grant what it does not hold.
+# deploy/images/caddy-secret-storage). Here, not in charts/ruum: the deploy controller that installs
+# charts/ruum has no access to Secrets, and Kubernetes does not let it grant what it does not hold.
 #
 # The edge namespace has no other Secrets today, so the token reaches only the edge's own
 # certificates. Nothing outside the namespace. The Role has no resourceNames: the module names
@@ -9,12 +9,11 @@
 # limited by name. A Secret that someone later puts into `edge` is readable and writable by the
 # edge (backlog O-36).
 #
-# Who else can read these keys: the deployer manages the edge DaemonSet and may create pods in
-# edge (deployer-rbac.yaml), so it can run a pod as ruum-edge, or mount the Secrets in a pod of
-# its own, and read every certificate private key and the ACME account key. The same holds for
-# every Secret of `ruum` (the database DSNs, the token signing key): the deployer can read all of
-# them through pods it creates. So the deployer kubeconfig is operator-only. README S-4; backlog
-# O-29 and O-34.
+# Who else can read these keys: the deploy controller (deploy-controller.yaml) manages the edge
+# DaemonSet and may create pods in edge, so through a pod it could read every certificate private
+# key and the ACME account key; it runs only code from an image of main, installed by digest by
+# the admin. The deployer cannot (backlog O-34): it creates no workload and reads no Secret
+# (deployer-rbac.yaml, ops/rbac-check.sh). README S-4.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
