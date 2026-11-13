@@ -647,7 +647,9 @@ pub fn cases() -> Vec<Case> {
             ["createApp", "updateTenant"],
             "guest_edit (edit on Projects) gets 403 permission_denied, hint \
              guests_create_resources, for createApp while the tenant policy is false and 202 \
-             when it is true; agent_of_guest_view (its user has view) stays refused",
+             when it is true; agent_of_guest_view (its user has view) stays refused (this \
+             checks the view cap only: an agent of an edit guest, which would test the policy \
+             for agents, is not in the fixture yet, backlog TK-5)",
             |cx| {
                 let err = cx
                     .refused(

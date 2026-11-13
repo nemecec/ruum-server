@@ -211,6 +211,12 @@ impl Ctx {
             self.called.lock().expect("lock").insert(op);
         }
         let res = client::send(&self.app, &req, who).await;
+        self.vet(&label, res)
+    }
+
+    /// The checks of [`Ctx::call`] on an answer that is already read (`label` names the
+    /// request). The app secret checks scan an answer before these checks can print it.
+    pub fn vet(&self, label: &str, res: Response) -> Result<Response, Fail> {
         if client::is_unrouted(&res, &self.fallback) {
             fail!("{label}: no handler answers this method and path");
         }

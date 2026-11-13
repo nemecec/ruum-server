@@ -1,10 +1,10 @@
 //! Deployment archives for the app cases, written by hand (the test kit has no archive
 //! library, and a new dependency needs the person, design 18.4): `.tar.gz` with stored deflate
 //! blocks, `.zip` with stored entries, and the hostile archives of card W-2 (zip slip, tar slip,
-//! links, device files and an archive bomb).
+//! links, device files, archive bombs and entry-count bombs).
 //!
 //! The formats: ustar (POSIX.1-1988), gzip (RFC 1952), deflate (RFC 1951), zip (APPNOTE 6.3,
-//! stored entries only). `apps_meta.rs` has an ignored test that writes every archive to a
+//! stored and deflated entries). `apps_meta.rs` has an ignored test that writes every archive to a
 //! folder, so a person can check them with `tar`, `gzip -t` and `unzip -l`.
 
 use std::sync::OnceLock;
@@ -275,27 +275,53 @@ impl<'a> ZipEntry<'a> {
 
 /// A zip archive with stored entries.
 pub fn zip(entries: &[ZipEntry]) -> Vec<u8> {
+    let records: Vec<ZipRecord> = entries
+        .iter()
+        .map(|e| ZipRecord {
+            name: e.name,
+            method: 0,
+            crc: crc32(e.data),
+            size: e.data.len() as u32,
+            data: e.data.to_vec(),
+            unix_mode: e.unix_mode,
+        })
+        .collect();
+    zip_records(&records)
+}
+
+/// One zip entry as it is written: `data` is the stored or compressed data, `size` the size
+/// after expansion and `crc` the CRC-32 of the expanded data.
+struct ZipRecord<'a> {
+    name: &'a str,
+    /// 0 stored, 8 deflate.
+    method: u16,
+    crc: u32,
+    size: u32,
+    data: Vec<u8>,
+    unix_mode: Option<u32>,
+}
+
+fn zip_records(entries: &[ZipRecord]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     for e in entries {
         let offset = out.len() as u32;
-        let crc = crc32(e.data);
-        let size = e.data.len() as u32;
+        let csize = e.data.len() as u32;
         let name = e.name.as_bytes();
         // Local file header.
         out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
-        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&e.method.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // time
         out.extend_from_slice(&0x5b21u16.to_le_bytes()); // date (2025-09-01)
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&e.crc.to_le_bytes());
+        out.extend_from_slice(&csize.to_le_bytes());
+        out.extend_from_slice(&e.size.to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // extra length
         out.extend_from_slice(name);
-        out.extend_from_slice(e.data);
+        out.extend_from_slice(&e.data);
         // Central directory header.
         let (made_by, attrs) = match e.unix_mode {
             Some(mode) => ((3u16 << 8) | 20, mode << 16),
@@ -305,12 +331,12 @@ pub fn zip(entries: &[ZipEntry]) -> Vec<u8> {
         central.extend_from_slice(&made_by.to_le_bytes());
         central.extend_from_slice(&20u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&e.method.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0x5b21u16.to_le_bytes());
-        central.extend_from_slice(&crc.to_le_bytes());
-        central.extend_from_slice(&size.to_le_bytes());
-        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&e.crc.to_le_bytes());
+        central.extend_from_slice(&csize.to_le_bytes());
+        central.extend_from_slice(&e.size.to_le_bytes());
         central.extend_from_slice(&(name.len() as u16).to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes()); // extra
         central.extend_from_slice(&0u16.to_le_bytes()); // comment
@@ -323,7 +349,7 @@ pub fn zip(entries: &[ZipEntry]) -> Vec<u8> {
     let cd_offset = out.len() as u32;
     let cd_size = central.len() as u32;
     out.extend(central);
-    let n = entries.len() as u16;
+    let n = u16::try_from(entries.len()).expect("a zip here has at most 65535 entries");
     out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -381,22 +407,24 @@ impl Bits {
 /// plan's archive limit, from about 4 MiB of gzip.
 pub const BOMB_BYTES: u64 = 4 << 30;
 
-/// An archive bomb: a valid `.tar.gz` with `app.yaml` (`runtime: static`) and one file of
-/// [`BOMB_BYTES`] zero bytes, about 4 MiB compressed (deflate's best ratio, about 1:1032).
-///
-/// The deflate stream: the tar headers in stored blocks, then one dynamic Huffman block with
-/// three literal/length codes (literal `0`: `10`, end of block: `11`, length 258: `0`) and two
-/// distance codes (distance 1: `0`), so each run of 258 zero bytes costs 2 bits.
-pub fn bomb_tar_gz() -> Vec<u8> {
-    let manifest = b"runtime: static\n";
-    let mut prefix = tar_entry_bytes(&TarEntry::file("app.yaml", manifest));
-    prefix.extend_from_slice(&tar_header("zeros.bin", TarKind::File, BOMB_BYTES, ""));
-    // The file (a multiple of 512 bytes, so no padding) and the two end blocks.
-    let zeros: u64 = BOMB_BYTES + 1024;
+/// How many bytes the deflated entry of the zip bomb expands to: 2 GiB (a zip without zip64
+/// holds sizes below 4 GiB), from about 2 MiB.
+pub const ZIP_BOMB_BYTES: u32 = 1 << 31;
 
-    let mut out = GZIP_HEADER.to_vec();
-    stored_blocks(&mut out, &prefix, false);
-    let mut b = Bits::new(out);
+/// How many files the entry-count bombs hold: each archive is small (a few MiB for the zip,
+/// about 32 MiB for the stored `.tar.gz`, under every plan's archive limit) but has more files
+/// than a static site needs. The contract names no number yet (see the pending entry of
+/// `entry_count_bomb_is_refused`).
+pub const COUNT_BOMB_FILES: usize = 65_000;
+
+/// Writes one final dynamic Huffman block of `zeros` zero bytes. When `after_zero` is false,
+/// the stream has no zero byte before the block (a fresh stream), so the block starts with one
+/// zero literal before the first back reference of distance 1.
+///
+/// The block has three literal/length codes (literal `0`: `10`, end of block: `11`, length
+/// 258: `0`) and two distance codes (distance 1: `0`), so each run of 258 zero bytes costs 2
+/// bits (deflate's best ratio, about 1:1032).
+fn zeros_block(b: &mut Bits, mut zeros: u64, after_zero: bool) {
     b.put(1, 1); // BFINAL
     b.put(2, 2); // BTYPE = dynamic
     b.put(286 - 257, 5); // HLIT
@@ -415,18 +443,21 @@ pub fn bomb_tar_gz() -> Vec<u8> {
         b.put(n - 11, 7);
     };
     // Literal/length lengths: 0 -> 2, 1..=255 -> 0, 256 -> 2, 257..=284 -> 0, 285 -> 1.
-    cl_2(&mut b);
-    cl_zeros(&mut b, 138);
-    cl_zeros(&mut b, 117);
-    cl_2(&mut b);
-    cl_zeros(&mut b, 28);
-    cl_1(&mut b);
+    cl_2(b);
+    cl_zeros(b, 138);
+    cl_zeros(b, 117);
+    cl_2(b);
+    cl_zeros(b, 28);
+    cl_1(b);
     // Distance lengths: 0 -> 1, 1 -> 1.
-    cl_1(&mut b);
-    cl_1(&mut b);
+    cl_1(b);
+    cl_1(b);
+    if !after_zero && zeros > 0 {
+        b.put(0b01, 2); // one zero literal, so distance 1 is valid
+        zeros -= 1;
+    }
     // The data: runs of 258 (code `0`, distance code `0`), then single zero literals (`10`),
-    // then the end of the block (`11`). The byte before the first run is a zero of the tar
-    // header, so distance 1 is valid.
+    // then the end of the block (`11`).
     let runs = zeros / 258;
     let rest = zeros % 258;
     b.zeros(runs * 2);
@@ -434,9 +465,104 @@ pub fn bomb_tar_gz() -> Vec<u8> {
         b.put(0b01, 2);
     }
     b.put(0b11, 2);
+}
+
+/// An archive bomb: a valid `.tar.gz` with `app.yaml` (`runtime: static`) and one file of
+/// [`BOMB_BYTES`] zero bytes, about 4 MiB compressed.
+///
+/// The deflate stream: the tar headers in stored blocks, then one dynamic Huffman block of
+/// zeros ([`zeros_block`]). The byte before the first run is a zero of the tar header, so
+/// distance 1 is valid.
+pub fn bomb_tar_gz() -> Vec<u8> {
+    let manifest = b"runtime: static\n";
+    let mut prefix = tar_entry_bytes(&TarEntry::file("app.yaml", manifest));
+    prefix.extend_from_slice(&tar_header("zeros.bin", TarKind::File, BOMB_BYTES, ""));
+    // The file (a multiple of 512 bytes, so no padding) and the two end blocks.
+    let zeros: u64 = BOMB_BYTES + 1024;
+
+    let mut out = GZIP_HEADER.to_vec();
+    stored_blocks(&mut out, &prefix, false);
+    let mut b = Bits::new(out);
+    zeros_block(&mut b, zeros, true);
     let mut out = b.finish();
 
     out.extend_from_slice(&crc32_then_zeros(&prefix, zeros).to_le_bytes());
     out.extend_from_slice(&((prefix.len() as u64 + zeros) as u32).to_le_bytes());
     out
 }
+
+/// A zip bomb: a valid `.zip` with `app.yaml` (stored) and `zeros.bin`, a deflated entry of
+/// about 2 MiB that expands to [`ZIP_BOMB_BYTES`] zero bytes. Its sizes and CRC are true, so
+/// a reader that trusts the declared size and one that counts while it expands both see 2 GiB.
+pub fn bomb_zip() -> Vec<u8> {
+    let manifest = b"runtime: static\n";
+    let mut b = Bits::new(Vec::new());
+    zeros_block(&mut b, u64::from(ZIP_BOMB_BYTES), false);
+    let deflated = b.finish();
+    zip_records(&[
+        ZipRecord {
+            name: "app.yaml",
+            method: 0,
+            crc: crc32(manifest),
+            size: manifest.len() as u32,
+            data: manifest.to_vec(),
+            unix_mode: None,
+        },
+        ZipRecord {
+            name: "zeros.bin",
+            method: 8,
+            crc: crc32_then_zeros(&[], u64::from(ZIP_BOMB_BYTES)),
+            size: ZIP_BOMB_BYTES,
+            data: deflated,
+            unix_mode: None,
+        },
+    ])
+}
+
+/// The names of the empty files of the entry-count bombs.
+pub fn count_bomb_names() -> Vec<String> {
+    (0..COUNT_BOMB_FILES)
+        .map(|i| format!("f/{i:05}.txt"))
+        .collect()
+}
+
+/// An entry-count bomb as a `.zip`: `app.yaml` and [`COUNT_BOMB_FILES`] empty files.
+pub fn count_bomb_zip() -> Vec<u8> {
+    let names = count_bomb_names();
+    let mut entries = vec![ZipEntry::file("app.yaml", b"runtime: static\n")];
+    entries.extend(names.iter().map(|n| ZipEntry::file(n, b"")));
+    zip(&entries)
+}
+
+/// An entry-count bomb as a `.tar.gz`: `app.yaml` and [`COUNT_BOMB_FILES`] empty files.
+pub fn count_bomb_tar_gz() -> Vec<u8> {
+    let names = count_bomb_names();
+    let mut entries = vec![TarEntry::file("app.yaml", b"runtime: static\n")];
+    entries.extend(names.iter().map(|n| TarEntry::file(n, b"")));
+    gzip(&tar(&entries))
+}
+
+/// The zip entries that escape the archive, with the file name of each archive: `..`
+/// segments, an absolute path, the Windows forms with `\` (APPNOTE 4.4.17 allows only `/`), drive
+/// paths and UNC paths (decision 0006, section H).
+pub const ZIP_ESCAPES: &[(&str, &str)] = &[
+    ("slip.zip", "../../outside.html"),
+    ("abs.zip", "/etc/ruum.html"),
+    ("backslash.zip", "..\\..\\outside.html"),
+    ("deep-backslash.zip", "dist\\..\\..\\outside.html"),
+    ("drive.zip", "C:\\ruum\\outside.html"),
+    ("drive-slash.zip", "C:/ruum/outside.html"),
+    ("unc.zip", "\\\\server\\share\\outside.html"),
+    ("unc-slash.zip", "//server/share/outside.html"),
+];
+
+/// The tar entries that escape the archive, with the file name of each archive.
+pub const TAR_ESCAPES: &[(&str, &str)] = &[
+    ("slip.tar.gz", "../outside.html"),
+    ("deep.tar.gz", "dist/../../outside.html"),
+    ("abs.tar.gz", "/etc/ruum.html"),
+    ("backslash.tar.gz", "..\\outside.html"),
+    ("deep-backslash.tar.gz", "dist\\..\\..\\outside.html"),
+    ("drive.tar.gz", "C:\\ruum\\outside.html"),
+    ("unc.tar.gz", "\\\\server\\share\\outside.html"),
+];

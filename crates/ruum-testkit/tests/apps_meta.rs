@@ -1,7 +1,10 @@
 //! Checks of the M1 app cases themselves (card T-4a): every case names its operations, every
 //! operation is in the contract, a case over a planned operation is reported as planned, every
 //! pending entry names its case and a card, each of the 12 M1 operations has a case, and the
-//! hand-written archives are well formed (also as `gzip`, `tar` and Python's `zipfile` read them).
+//! hand-written archives are well formed (also as `gzip`, `tar` and Python's `zipfile` and
+//! `tarfile` read them). It also checks, now, two rules that the planned cases rely on: the
+//! manifest schema refuses paths that leave the archive, and the secret scan finds encoded
+//! values.
 
 mod common;
 
@@ -9,6 +12,7 @@ use common::apps::{self, PENDING, app_gate, pending_reason};
 use common::apps_archive::{self, TarEntry, TarKind, ZipEntry};
 use common::{Outcome, all_cases};
 use ruum_testkit::contract;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// The 12 operations of milestone M1 that card T-4a covers.
@@ -200,6 +204,152 @@ fn the_bomb_is_small_and_claims_four_gib() {
     assert_eq!(isize, total as u32);
 }
 
+#[test]
+fn the_zip_bomb_is_small_and_claims_two_gib() {
+    let b = apps_archive::bomb_zip();
+    assert!(b.len() < 3 << 20, "the zip bomb is {} bytes", b.len());
+    let z = apps_archive::count_bomb_zip();
+    assert!(z.len() < 8 << 20, "the zip count bomb is {} bytes", z.len());
+    let t = apps_archive::count_bomb_tar_gz();
+    // Under the smallest plan's archive limit (free: 50 MiB), so only the file count refuses it.
+    assert!(
+        t.len() < 50 << 20,
+        "the tar count bomb is {} bytes",
+        t.len()
+    );
+}
+
+/// Every field of the manifest that names a path in the archive refuses a path that leaves
+/// it (`archive_path` of `contracts/manifests/app.schema.json`, decision 0006 H), and still
+/// takes ordinary paths. Runs now, through the server's own manifest check, although the
+/// deployment cases that rely on it are planned.
+#[test]
+fn manifest_paths_stay_inside_the_archive() {
+    use ruum_core::apps::{manifest, plan::AppPlanLimits};
+    use ruum_core::tenants::Plan;
+    let limits = AppPlanLimits::of(Plan::Team);
+    type Make = fn(&str) -> Value;
+    let fields: [(&str, Make); 6] = [
+        (
+            "/static/root",
+            |v| json!({ "runtime": "static", "static": { "root": v } }),
+        ),
+        (
+            "/static/spa_fallback",
+            |v| json!({ "runtime": "static", "static": { "spa_fallback": v } }),
+        ),
+        (
+            "/migrations/db",
+            |v| json!({ "runtime": "static", "migrations": { "db": v } }),
+        ),
+        ("/apis/orders/spec", |v| {
+            json!({ "runtime": "static", "apis": { "orders": {
+                "visibility": "internal", "protocol": "http", "spec": v,
+                "scopes": ["orders.read"],
+            } } })
+        }),
+        (
+            "/telemetry/privacy_file",
+            |v| json!({ "runtime": "static", "telemetry": { "privacy_file": v } }),
+        ),
+        (
+            "/telemetry/source_maps",
+            |v| json!({ "runtime": "static", "telemetry": { "source_maps": v } }),
+        ),
+    ];
+    let good = [
+        "dist",
+        "./dist",
+        "dist/",
+        "migrations/",
+        "a/b/index.html",
+        ".well-known/x",
+        "..a",
+        "...",
+        "a//b",
+    ];
+    let bad = [
+        "..",
+        "../x",
+        "../../outside",
+        "a/../b",
+        "a/..",
+        "/x",
+        "/",
+        "a\\b",
+        "..\\x",
+        "C:/x",
+        "C:\\x",
+        "\\\\server\\share",
+        "//server/share",
+        "",
+        "a b",
+    ];
+    for (pointer, make) in fields {
+        for v in good {
+            let r = manifest::validate(&make(v), &limits);
+            assert!(r.valid, "{pointer} = {v:?} is refused: {:?}", r.problems);
+        }
+        for v in bad {
+            let r = manifest::validate(&make(v), &limits);
+            assert!(!r.valid, "{pointer} = {v:?} is accepted");
+            assert!(
+                r.problems.iter().all(|p| p.pointer == pointer),
+                "{pointer} = {v:?}: {:?}",
+                r.problems
+            );
+        }
+    }
+    let glob = |v: &str| json!({ "runtime": "static", "telemetry": { "source_maps": v } });
+    assert!(manifest::validate(&glob("**/*.map"), &limits).valid);
+    assert!(!manifest::validate(&glob("../**/*.map"), &limits).valid);
+    assert!(!manifest::validate(&glob("/maps/*.map"), &limits).valid);
+}
+
+/// The secret scan finds a value raw, in hex, percent-encoded and in base64 at any byte
+/// position of a longer base64 text, and does not fire on other text.
+#[test]
+fn the_secret_scan_finds_encoded_values() {
+    let secret = "sk_test_ruum/fixture+42".to_string();
+    let secrets = vec![secret.clone()];
+    let b64 = |data: &[u8]| {
+        let out = std::process::Command::new("python3")
+            .args(["-I", "-c", "import sys, base64; sys.stdout.write(base64.b64encode(bytes.fromhex(sys.argv[1])).decode())"])
+            .arg(data.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .output()
+            .expect("python3 is needed by this test (CI has it)");
+        String::from_utf8(out.stdout).expect("utf-8")
+    };
+    assert_eq!(apps::leaked(&format!("x {secret} y"), &secrets), Some(0));
+    let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(apps::leaked(&hex, &secrets), Some(0));
+    assert_eq!(apps::leaked(&hex.to_uppercase(), &secrets), Some(0));
+    assert_eq!(
+        apps::leaked("sk_test_ruum%2Ffixture%2B42", &secrets),
+        Some(0)
+    );
+    for before in ["", "a", "ab", "abc", "{\"k\":\""] {
+        let data = [before.as_bytes(), secret.as_bytes(), b"\"} tail"].concat();
+        let enc = b64(&data);
+        assert_eq!(
+            apps::leaked(&enc, &secrets),
+            Some(0),
+            "after {before:?}: {enc}"
+        );
+        let url = enc.replace('+', "-").replace('/', "_");
+        assert_eq!(
+            apps::leaked(&url, &secrets),
+            Some(0),
+            "url-safe after {before:?}"
+        );
+    }
+    assert_eq!(apps::leaked("sk_test_ruum fixture 42", &secrets), None);
+    assert_eq!(
+        apps::leaked(&b64(b"another value entirely"), &secrets),
+        None
+    );
+}
+
 /// Runs a standard tool and returns its standard output; panics when it fails or is missing.
 fn tool(cmd: &str, args: &[&str]) -> String {
     let out = std::process::Command::new(cmd)
@@ -337,6 +487,83 @@ fn archives_decode_with_standard_tools() {
             "{name}: zipfile does not list {want:?}:\n{listing}"
         );
     }
+    // The escaping names, as Python reads them (GNU tar rewrites `/` and `\` names when it
+    // lists them; Python's readers keep the stored name).
+    for (name, evil) in apps_archive::ZIP_ESCAPES {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            apps_archive::zip(&[ZipEntry::file("app.yaml", m), ZipEntry::file(evil, i)]),
+        )
+        .expect("write");
+        let listing = tool(
+            "python3",
+            &["-I", "-c", script, path.to_str().expect("utf-8 path")],
+        );
+        assert!(
+            listing.lines().any(|l| l == format!("0o0 {evil}")),
+            "{name}: zipfile does not list {evil:?}:\n{listing}"
+        );
+    }
+    let tar_script = "import sys, tarfile\n\
+        t = tarfile.open(sys.argv[1], 'r:gz')\n\
+        names = [m.name for m in t.getmembers() if m.isfile()]\n\
+        print(len(names))\n\
+        for n in names[:5]:\n    print(n)\n";
+    for (name, evil) in apps_archive::TAR_ESCAPES {
+        let path = dir.join(name);
+        std::fs::write(&path, apps_archive::tar_gz(&[("app.yaml", m), (evil, i)])).expect("write");
+        let path = path.to_str().expect("utf-8 path");
+        tool("gzip", &["-t", path]);
+        let listing = tool("python3", &["-I", "-c", tar_script, path]);
+        assert!(
+            listing.lines().any(|l| l == *evil),
+            "{name}: tarfile does not list {evil:?}:\n{listing}"
+        );
+    }
+    // The zip bomb: zipfile expands it to its end (2 GiB, CRC checked) and reads the sizes.
+    let zbomb = dir.join("bomb.zip");
+    std::fs::write(&zbomb, apps_archive::bomb_zip()).expect("write");
+    let zip_bomb_script = "import sys, zipfile\n\
+        z = zipfile.ZipFile(sys.argv[1])\n\
+        assert z.testzip() is None\n\
+        e = z.getinfo('zeros.bin')\n\
+        print(e.compress_type, e.file_size, e.compress_size)\n";
+    let listing = tool(
+        "python3",
+        &[
+            "-I",
+            "-c",
+            zip_bomb_script,
+            zbomb.to_str().expect("utf-8 path"),
+        ],
+    );
+    let fields: Vec<u64> = listing
+        .split_whitespace()
+        .map(|x| x.parse().expect("a number"))
+        .collect();
+    assert_eq!(fields[..2], [8, u64::from(apps_archive::ZIP_BOMB_BYTES)]);
+    assert!(fields[2] < 3 << 20, "compressed {}", fields[2]);
+    // The entry-count bombs: every file is there.
+    let files = apps_archive::COUNT_BOMB_FILES + 1;
+    let many_zip = dir.join("many.zip");
+    std::fs::write(&many_zip, apps_archive::count_bomb_zip()).expect("write");
+    let listing = tool(
+        "python3",
+        &[
+            "-I",
+            "-c",
+            "import sys, zipfile\nz = zipfile.ZipFile(sys.argv[1])\nassert z.testzip() is None\nprint(len(z.infolist()))\n",
+            many_zip.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(listing.trim(), files.to_string());
+    let many_tar = dir.join("many.tar.gz");
+    std::fs::write(&many_tar, apps_archive::count_bomb_tar_gz()).expect("write");
+    let many_tar = many_tar.to_str().expect("utf-8 path");
+    tool("gzip", &["-t", many_tar]);
+    let listing = tool("python3", &["-I", "-c", tar_script, many_tar]);
+    assert_eq!(listing.lines().next(), Some(files.to_string().as_str()));
     let bomb = dir.join("bomb.tar.gz");
     std::fs::write(&bomb, apps_archive::bomb_tar_gz()).expect("write");
     tool("gzip", &["-t", bomb.to_str().expect("utf-8 path")]);
@@ -356,7 +583,7 @@ fn dump_archives() {
         ("app.yaml", b"runtime: static\n"),
         ("index.html", b"<h1>x</h1>"),
     ];
-    let out = [
+    let mut out = vec![
         ("site.tar.gz", apps_archive::tar_gz(&files)),
         (
             "site.zip",
@@ -384,7 +611,25 @@ fn dump_archives() {
             ])),
         ),
         ("bomb.tar.gz", apps_archive::bomb_tar_gz()),
+        ("bomb.zip", apps_archive::bomb_zip()),
+        ("many.zip", apps_archive::count_bomb_zip()),
+        ("many.tar.gz", apps_archive::count_bomb_tar_gz()),
     ];
+    for &(name, evil) in apps_archive::ZIP_ESCAPES {
+        out.push((
+            name,
+            apps_archive::zip(&[
+                ZipEntry::file("app.yaml", b"runtime: static\n"),
+                ZipEntry::file(evil, b"x"),
+            ]),
+        ));
+    }
+    for &(name, evil) in apps_archive::TAR_ESCAPES {
+        out.push((
+            name,
+            apps_archive::tar_gz(&[("app.yaml", b"runtime: static\n"), (evil, b"x")]),
+        ));
+    }
     for (name, bytes) in out {
         std::fs::write(dir.join(name), bytes).expect("write");
     }

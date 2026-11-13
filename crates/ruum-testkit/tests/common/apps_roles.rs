@@ -31,6 +31,30 @@ async fn grant(cx: &Ctx, by: Who, app: &str, role: &str, grantee: Who) -> Result
     str_at(&g, "/id")
 }
 
+/// The grant IDs of `app` (`listAppRoleGrants` as `member`, the first page), sorted.
+async fn grant_ids(cx: &Ctx, app: &str) -> Result<Vec<String>, Fail> {
+    let page = cx
+        .ok(Who::Member, list_role_grants(cx, app, ""), &[200])
+        .await?;
+    let mut ids: Vec<String> = items(&page)
+        .iter()
+        .filter_map(|g| g["id"].as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+/// Fails when the grants of `app` are not `before`: a refused grant change leaves nothing
+/// behind (a handler that writes and then answers `403` fails here).
+async fn grants_unchanged(cx: &Ctx, app: &str, before: &[String], what: &str) -> Result<(), Fail> {
+    let after = grant_ids(cx, app).await?;
+    check!(
+        after == before,
+        "{what}: the grants changed from {before:?} to {after:?}"
+    );
+    Ok(())
+}
+
 pub fn cases() -> Vec<Case> {
     vec![
         case!(
@@ -126,17 +150,20 @@ pub fn cases() -> Vec<Case> {
                 "getAppDeployment",
                 "publishAppDeployment",
                 "addAppRoleGrant",
-                "removeAppRoleGrant"
+                "removeAppRoleGrant",
+                "listAppRoleGrants"
             ],
             "guest (no grant on any node) holding admin (grants_roles) gives approver to \
              guest_comment (201) and removes it again (204); guest_comment (comment, holds \
              approver) and member_view (view, no share) get 403 for addAppRoleGrant and for \
-             removeAppRoleGrant (app_role#grant); after member removes guest's admin grant, \
-             guest can no longer grant (403 or 404)",
+             removeAppRoleGrant (app_role#grant), and listAppRoleGrants is unchanged after each \
+             refusal; after member removes guest's admin grant, guest can no longer grant (403 \
+             or 404) and the grants stay as they were",
             |cx| {
                 let live = live_app(&cx, cx.a().projects, "granted", ROLES_MANIFEST).await?;
                 let admin = grant(&cx, Who::Member, &live.id, "admin", Who::Guest).await?;
                 let id = grant(&cx, Who::Guest, &live.id, "approver", Who::GuestComment).await?;
+                let before = grant_ids(&cx, &live.id).await?;
                 for who in [Who::GuestComment, Who::MemberView] {
                     cx.refused(
                         who,
@@ -145,6 +172,7 @@ pub fn cases() -> Vec<Case> {
                         &["permission_denied"],
                     )
                     .await?;
+                    grants_unchanged(&cx, &live.id, &before, who.name()).await?;
                 }
                 for who in [Who::GuestComment, Who::MemberView] {
                     cx.refused(
@@ -154,6 +182,7 @@ pub fn cases() -> Vec<Case> {
                         &["permission_denied"],
                     )
                     .await?;
+                    grants_unchanged(&cx, &live.id, &before, who.name()).await?;
                 }
                 cx.ok(Who::Guest, remove_role_grant(&cx, &live.id, &id), &[204])
                     .await?;
@@ -163,6 +192,7 @@ pub fn cases() -> Vec<Case> {
                     &[204],
                 )
                 .await?;
+                let before = grant_ids(&cx, &live.id).await?;
                 let res = cx
                     .send(
                         Who::Guest,
@@ -175,6 +205,51 @@ pub fn cases() -> Vec<Case> {
                     res.status,
                     res.text()
                 );
+                grants_unchanged(&cx, &live.id, &before, "a removed grants_roles grant").await
+            }
+        ),
+        case!(
+            "an_editor_without_share_cannot_change_app_role_grants",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "publishAppDeployment",
+                "addAppRoleGrant",
+                "removeAppRoleGrant",
+                "listAppRoleGrants"
+            ],
+            "an app in Archive (editors_can_share false): guest_edit and member_edit (edit on \
+             the app, no share, no app role) get 403 permission_denied for addAppRoleGrant and \
+             for removeAppRoleGrant of member's grant, and listAppRoleGrants is unchanged after \
+             each refusal; on an app in Projects (editors share) guest_edit gives a role (201): \
+             app_role#grant is share, not edit (schema.zed)",
+            |cx| {
+                let archived = live_app(&cx, cx.a().archive, "archived", ROLES_MANIFEST).await?;
+                let id = grant(&cx, Who::Member, &archived.id, "approver", Who::Guest).await?;
+                let before = grant_ids(&cx, &archived.id).await?;
+                for who in [Who::GuestEdit, Who::MemberEdit] {
+                    cx.refused(
+                        who,
+                        add_role_grant(&cx, &archived.id, "approver", Who::GuestComment),
+                        403,
+                        &["permission_denied"],
+                    )
+                    .await?;
+                    grants_unchanged(&cx, &archived.id, &before, who.name()).await?;
+                    cx.refused(
+                        who,
+                        remove_role_grant(&cx, &archived.id, &id),
+                        403,
+                        &["permission_denied"],
+                    )
+                    .await?;
+                    grants_unchanged(&cx, &archived.id, &before, who.name()).await?;
+                }
+                let open = live_app(&cx, cx.a().projects, "shared", ROLES_MANIFEST).await?;
+                grant(&cx, Who::GuestEdit, &open.id, "approver", Who::GuestComment).await?;
                 Ok(())
             }
         ),
@@ -187,10 +262,11 @@ pub fn cases() -> Vec<Case> {
                 "createAppDeployment",
                 "getAppDeployment",
                 "publishAppDeployment",
-                "addAppRoleGrant"
+                "addAppRoleGrant",
+                "listAppRoleGrants"
             ],
             "addAppRoleGrant of a role that the live manifest does not declare (auditor) is 422 \
-             validation_failed, also for member (share)",
+             validation_failed, also for member (share), and adds no grant",
             |cx| {
                 let live = live_app(&cx, cx.a().projects, "audited", ROLES_MANIFEST).await?;
                 cx.refused(
@@ -200,7 +276,7 @@ pub fn cases() -> Vec<Case> {
                     &["validation_failed"],
                 )
                 .await?;
-                Ok(())
+                grants_unchanged(&cx, &live.id, &[], "a role outside the manifest").await
             }
         ),
         case!(
@@ -219,7 +295,7 @@ pub fn cases() -> Vec<Case> {
             ],
             "a new release without admin: listAppRoles shows admin inactive with its holder, \
              listAppRoleGrants still lists guest's grant, guest can no longer grant (403 or \
-             404) and nobody can give admin (422); publishing the first release again makes \
+             404) and nobody can give admin (422), and neither refusal adds a grant; publishing the first release again makes \
              admin active and guest grants again (design 9.3, card B-2)",
             |cx| {
                 let live = live_app(&cx, cx.a().projects, "changing", ROLES_MANIFEST).await?;
@@ -252,6 +328,7 @@ pub fn cases() -> Vec<Case> {
                     items(&page).iter().any(|g| g["id"] == admin.as_str()),
                     "the grant of the inactive role is gone: {page}"
                 );
+                let before = grant_ids(&cx, &live.id).await?;
                 let res = cx
                     .send(
                         Who::Guest,
@@ -264,6 +341,7 @@ pub fn cases() -> Vec<Case> {
                     res.status,
                     res.text()
                 );
+                grants_unchanged(&cx, &live.id, &before, "an inactive grants_roles role").await?;
                 cx.refused(
                     Who::Member,
                     add_role_grant(&cx, &live.id, "admin", Who::GuestEdit),
@@ -271,6 +349,7 @@ pub fn cases() -> Vec<Case> {
                     &["validation_failed"],
                 )
                 .await?;
+                grants_unchanged(&cx, &live.id, &before, "a grant of an inactive role").await?;
                 let back = cx
                     .ok(
                         Who::Member,
@@ -335,7 +414,7 @@ pub fn cases() -> Vec<Case> {
                 "listAppRoleGrants"
             ],
             "agent (scope Projects, view) gets 403 for addAppRoleGrant although its user may \
-             share; agent_out (scope Private, manage) gives approver on an app in Private (201): \
+             share, and no grant is added; agent_out (scope Private, manage) gives approver on an app in Private (201): \
              the user's right intersected with the scope, as addGrant",
             |cx| {
                 let projects = live_app(&cx, cx.a().projects, "bot roles", ROLES_MANIFEST).await?;
@@ -346,6 +425,7 @@ pub fn cases() -> Vec<Case> {
                     &["permission_denied"],
                 )
                 .await?;
+                grants_unchanged(&cx, &projects.id, &[], "agent's refused grant").await?;
                 let private = live_app(&cx, cx.a().private, "own roles", ROLES_MANIFEST).await?;
                 let id = grant(&cx, Who::AgentOut, &private.id, "approver", Who::Guest).await?;
                 let page = cx
