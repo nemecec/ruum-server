@@ -890,9 +890,10 @@ backlog 2026-11-10-run8 S-29 (the raw `up` of a migration approval).
    personal column; no `USAGE` on `ruum_mask` for the copy's owner; names only in
    `PrincipalRef` fields; the remaining untrusted marks; rule 10 walks the query of
    `CREATE TABLE ... AS` and `CREATE VIEW ... AS`; one line on "names, not relations".
-   Items 0 and 1 are built on `f/fu-1` (card FU-1, review pending; `panel/impl-fu1.md`).
-   Review fixes (`panel/review-fu1-fix.md`): a masked copy makes every materialized view again
-   and analyzes the masked tables, refuses a column its plan does not know and an enabled event
+   Items 0 and 1 are built on `f/fu-1-r10` (card FU-1, review pending; `panel/impl-fu1.md`).
+   Review fixes (`panel/review-fu1-fix.md`, run 10): a masked copy makes every materialized view
+   again, changes each masked column to its own type (which drops its statistics, also for a
+   statistics target of 0 and a table with no row) and analyzes the masked tables, refuses a column its plan does not know and an enabled event
    trigger; `current_setting` held by `PUBLIC` is let through until the cluster set-up's
    contract step (run `10-ruum-data.sh` again once the previous release is gone).
 2. **Flaky tests and connection drops** (2026-11-09 T-12, T-18 to T-20; 2026-11-08 T-4 to

@@ -725,14 +725,16 @@ async fn a_masked_copy_makes_views_over_masked_columns_again() {
 /// The column statistics of a masked copy hold no value of the source (review FU-1 required
 /// change 2). The copy is a `TEMPLATE` copy, so it starts with the source's `pg_statistic`
 /// and `pg_statistic_ext_data`; `UPDATE ... SET NULL` of a secret column does not change them,
-/// and `pg_stats` shows them to the copy's owner. Step 2 analyzes the masked tables again.
+/// and `pg_stats` shows them to the copy's owner. Step 2 changes each masked column's type to
+/// its own type, which drops them, also for a statistics target of 0 and for a table with no
+/// row (second review, required change 1), and analyzes the masked tables again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_masked_copy_keeps_no_statistics_of_the_source() {
     let Some(engine) = engine().await else { return };
     let f = Fixture::new(&engine).await;
     let sync = ClassSync {
         personal: vec!["email"],
-        secret: vec!["token"],
+        secret: vec!["token", "code"],
     };
     engine
         .apply_migration(
@@ -740,7 +742,8 @@ async fn a_masked_copy_keeps_no_statistics_of_the_source() {
             &f.key,
             &MigrationRequest {
                 up: "CREATE TABLE people (id integer PRIMARY KEY, email text, grp integer, token text);
-                     CREATE STATISTICS people_grp_token (mcv) ON grp, token FROM people;"
+                     CREATE STATISTICS people_grp_token (mcv) ON grp, token FROM people;
+                     CREATE TABLE emptied (id integer PRIMARY KEY, code text);"
                     .into(),
                 timeout: Duration::from_secs(10),
                 dry_run: false,
@@ -759,25 +762,42 @@ async fn a_masked_copy_keeps_no_statistics_of_the_source() {
         &mut source,
         "INSERT INTO people SELECT g, 'user' || g || '@example.com', g % 10, \
            'tok_secret_' || (g % 10) FROM generate_series(1, 200) g; \
-         ANALYZE people",
+         INSERT INTO emptied SELECT g, 'tok_code_' || (g % 10) FROM generate_series(1, 200) g; \
+         ANALYZE people; ANALYZE emptied",
     )
     .await
     .unwrap();
     let before = psql(&mut source, STATS).await.unwrap();
-    close(source).await;
     assert!(
         before.contains("tok_secret_") && before.contains("@example.com"),
         "the source has statistics of its values: {before}"
     );
-    let column = |name: &str| ColumnRef {
+    // A statistics target of 0 makes `ANALYZE` skip the column or the statistics object and
+    // keep its old rows; a table with no row keeps them too (second review, required change 1).
+    psql(
+        &mut source,
+        "ALTER TABLE people ALTER COLUMN token SET STATISTICS 0; \
+         ALTER STATISTICS people_grp_token SET STATISTICS 0; \
+         DELETE FROM emptied",
+    )
+    .await
+    .unwrap();
+    let kept = psql(&mut source, STATS).await.unwrap();
+    close(source).await;
+    assert!(
+        kept.contains("tok_secret_") && kept.contains("tok_code_"),
+        "the source keeps the statistics of its values: {kept}"
+    );
+    let column = |table: &str, name: &str| ColumnRef {
         schema: "public".into(),
-        table: "people".into(),
+        table: table.into(),
         column: name.into(),
     };
     let plan = MaskPlan {
         columns: vec![
-            (column("email"), MaskAs::Pseudonym),
-            (column("token"), MaskAs::Null),
+            (column("people", "email"), MaskAs::Pseudonym),
+            (column("people", "token"), MaskAs::Null),
+            (column("emptied", "code"), MaskAs::Null),
         ],
         planned_from: None,
     };

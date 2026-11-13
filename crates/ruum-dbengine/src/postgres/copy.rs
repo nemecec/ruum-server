@@ -714,12 +714,14 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// rules parked; a secret column is checked to hold no value afterwards.
 ///
 /// Derived data goes too: every materialized view of the database's own schema is made again
-/// from the masked tables ([`dependent_views`]), and the masked tables are analyzed again, so
-/// `pg_statistic` and the extended statistics hold values of the masked rows, not of the source
-/// (review FU-1 required changes 1 and 2). Limit: `ANALYZE` keeps the old statistics of a table
-/// that has no row, so a table the source emptied after its last `ANALYZE` keeps them (as in a
-/// `schema_only` copy); only a superuser (or `pg_clear_attribute_stats` of Postgres 18) can
-/// remove them.
+/// from the masked tables ([`dependent_views`]). Every masked column goes through
+/// `ALTER COLUMN TYPE`, which drops its `pg_statistic` rows and empties the extended statistics
+/// on it, also for a statistics target of 0 and for a table with no row; then the masked tables
+/// are analyzed again, so the statistics hold values of the masked rows, not of the source
+/// (review FU-1 required changes 1 and 2, second review required change 1). Limits: a
+/// `schema_only` copy masks no column, so it keeps the source's statistics; a column that a
+/// policy, a generated column or a trigger's `WHEN` reads cannot change its type, so such a
+/// secret column fails the copy, as a personal column already did.
 async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
     check_planned_from(conn, plan).await?;
     if plan.columns.is_empty() {
@@ -747,7 +749,12 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         let table = format!("public.{}", ident(&column.table));
         let col = ident(&column.column);
         let row = sqlx::query(
-            "select a.attrelid::int8, a.attnum::int2 from pg_catalog.pg_attribute a
+            "select a.attrelid::int8, a.attnum::int2,
+                    pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    || case when a.attcollation <> 0
+                            then ' collate ' || a.attcollation::pg_catalog.regcollation::pg_catalog.text
+                            else '' end
+               from pg_catalog.pg_attribute a
               where a.attrelid = pg_catalog.to_regclass($1) and a.attname = $2
                 and a.attnum > 0 and not a.attisdropped",
         )
@@ -760,6 +767,8 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         let Some(row) = row else { continue };
         let rel: i64 = row.get(0);
         let attnum: i16 = row.get(1);
+        // The column's own type and collation, for the `ALTER COLUMN TYPE` of a secret column.
+        let own_type: String = row.get(2);
         // Foreign keys from or to the column: drop now, build again after.
         for fk in sqlx::query(
             "select c.conname::text, c.conrelid::pg_catalog.regclass::text,
@@ -840,12 +849,18 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
                 .await?;
             }
             MaskAs::Null => {
+                // The `ALTER COLUMN TYPE` to the column's own type (no rewrite) drops the column's
+                // `pg_statistic` rows and builds each extended statistics object on it again
+                // without data (review FU-1 second review, required change 1). `ANALYZE` alone
+                // keeps the source's rows of a column or statistics object whose target is 0,
+                // and of a table with no row; the copy is a `TEMPLATE` copy, so it has them.
                 run(
                     conn,
                     "mask a secret column",
                     format!(
                         "alter table {table} alter column {col} drop not null;\n\
-                         update {table} set {col} = null where {col} is not null and {col}::text <> ''"
+                         update {table} set {col} = null where {col} is not null and {col}::text <> '';\n\
+                         alter table {table} alter column {col} type {own_type} using {col}"
                     ),
                 )
                 .await?;
@@ -885,10 +900,10 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         };
         run(conn, "end the savepoint", end.to_string()).await?;
     }
-    // The statistics of the masked tables (review FU-1 required change 2): `UPDATE ... SET NULL`
-    // of a secret column leaves the source's `most_common_vals` and `histogram_bounds` in
-    // `pg_statistic` (and in `pg_statistic_ext_data`), which `pg_stats` shows to the copy's
-    // owner. `ANALYZE` computes them again from the masked rows.
+    // The statistics of the masked tables (review FU-1 required change 2): the `ALTER COLUMN
+    // TYPE` above removed the source's `most_common_vals` and `histogram_bounds` of each masked
+    // column from `pg_statistic` and `pg_statistic_ext_data`, which `pg_stats` shows to the
+    // copy's owner. `ANALYZE` computes them again from the masked rows.
     let tables: Vec<String> = plan
         .columns
         .iter()
