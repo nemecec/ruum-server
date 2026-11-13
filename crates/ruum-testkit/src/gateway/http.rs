@@ -340,7 +340,9 @@ struct Stored {
 /// A cookie jar that follows browser rules (RFC 6265bis): host-only cookies go back only to the
 /// same host, `Domain` cookies to the domain and its subdomains, `__Host-` cookies are refused
 /// unless `Secure`, `Path=/` and without `Domain`, `__Secure-` cookies unless `Secure`, and a
-/// `Max-Age` of zero or less removes a cookie. The harness speaks for an `https` origin.
+/// `Max-Age` of zero or less removes a cookie. The harness speaks for an `https` origin. It has
+/// no Public Suffix List: a `Domain` cookie for a public suffix (`ruumapps.net`) would be kept,
+/// where a browser drops it. The cases never rely on that (the gateway sets no `Domain`).
 #[derive(Clone, Debug, Default)]
 pub struct Jar {
     cookies: Vec<Stored>,

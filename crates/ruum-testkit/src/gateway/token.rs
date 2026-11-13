@@ -24,7 +24,8 @@ pub const DELEGATED_TOKEN_SCHEMA: &str =
 
 /// The longest life of a user token (`exp - iat`), in seconds.
 pub const MAX_LIFE_SECONDS: i64 = 60;
-/// The clock skew the verifier accepts, in seconds.
+/// The clock skew the verifier accepts for `iat` in the future, in seconds. `exp` gets no
+/// leeway: the contract says the token must not have expired.
 pub const LEEWAY_SECONDS: i64 = 5;
 
 /// What the receiving app expects (`RUUM_ISSUER`, `RUUM_AUDIENCE`, `RUUM_ENV`).
@@ -167,7 +168,7 @@ pub fn verify_user_token(token: &str, jwks: &Value, expect: &Expect) -> Result<V
         return Err("iat and exp must both be numbers".into());
     };
     let t = now();
-    if exp <= t - LEEWAY_SECONDS {
+    if exp <= t {
         return Err("exp has passed".into());
     }
     if iat > t + LEEWAY_SECONDS {
@@ -262,6 +263,13 @@ pub fn hand_made_bad_tokens(
             s.sign(&with(&|c: &mut Value| {
                 c["iat"] = json!(t - 100);
                 c["exp"] = json!(t - 50);
+            })),
+        ),
+        (
+            "expired 2 s ago",
+            s.sign(&with(&|c: &mut Value| {
+                c["iat"] = json!(t - 30);
+                c["exp"] = json!(t - 2);
             })),
         ),
         (

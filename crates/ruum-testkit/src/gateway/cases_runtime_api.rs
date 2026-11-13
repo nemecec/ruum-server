@@ -1,8 +1,10 @@
 //! The runtime API and the internal gateway (cards R-3 and G-3): every case is in
 //! [`super::PENDING`] with its card until a [`super::RuntimeApiWorld`] exists.
 
-use super::token::{decode_unverified, delegated_schema_problems};
-use super::{Binding, BindingKind, Echo, Env, Fail, Req, RtCtx, RuntimeCase};
+use super::token::{
+    TestSigner, decode_unverified, delegated_schema_problems, live_aud, user_claims,
+};
+use super::{Binding, BindingKind, Echo, Env, Fail, Req, RtCtx, RuntimeCase, WorldError};
 use crate::{gw_check, gw_fail};
 use serde_json::json;
 
@@ -132,7 +134,8 @@ pub fn cases() -> Vec<RuntimeCase> {
         ),
         case!(
             "exchange_refuses_a_token_of_another_app",
-            "exchangeAppUserToken refuses (401) a user token whose aud is another app",
+            "exchangeAppUserToken refuses (401) a user token whose aud is another app, and a \
+             token with the right claims signed by a key that is not the gateway's",
             "contracts/apps/runtime.openapi.yaml /v1/token/exchange; decision 0006-10",
             ["exchangeAppUserToken"],
             |cx| {
@@ -150,6 +153,20 @@ pub fn cases() -> Vec<RuntimeCase> {
                 gw_check!(
                     r.status == 401,
                     "app B exchanged app A's token: {}",
+                    r.status
+                );
+                // Right claims for B, a foreign key.
+                let forged = TestSigner::new().sign(&user_claims(
+                    &cx.rt.issuer,
+                    &live_aud(&b.id),
+                    "live",
+                    "acme",
+                    "user",
+                ));
+                let r = exchange(&cx, b_w.expose(), &forged).await?;
+                gw_check!(
+                    r.status == 401,
+                    "app B exchanged a token signed by a foreign key: {}",
                     r.status
                 );
                 Ok(())
@@ -365,6 +382,7 @@ pub fn cases() -> Vec<RuntimeCase> {
                             kind: BindingKind::App {
                                 app_slug: "orchard".into(),
                                 api: "api".into(),
+                                tenant_slug: None,
                             },
                             on_behalf_of_user: false,
                             delegate: false,
@@ -416,6 +434,79 @@ pub fn cases() -> Vec<RuntimeCase> {
                      the fourth hop is refused (403)"
                         .into(),
                 ))
+            }
+        ),
+        case!(
+            "runtime_calls_never_cross_tenants",
+            "A workload token of a globex app cannot read a node of acme (403 or 404), cannot \
+             exchange a user token of an acme app (401), and a binding to an app of another \
+             tenant is refused when it is seeded or when it is called",
+            "CLAUDE.md (tenant isolation); contracts/apps/runtime.openapi.yaml \
+             /v1/nodes/{node_id}/content and /v1/token/exchange; decision 0006-10",
+            ["readBoundContent", "exchangeAppUserToken"],
+            |cx| {
+                let acme = cx
+                    .world
+                    .seed_app("acme", "garden", &[file_binding("doc", true)])
+                    .await?;
+                let globex = cx
+                    .world
+                    .seed_app("globex", "garden", &[file_binding("doc", true)])
+                    .await?;
+                let g_w = cx.workload_token(&globex, Env::Live).await?;
+                let h = cx.rt.internal_host.clone();
+                let acme_bound = node_of(&acme, "doc")?;
+                let acme_other = cx.world.seed_unbound_node("acme").await?;
+                for n in [acme_bound, acme_other] {
+                    let r = cx
+                        .send(bearer(
+                            Req::get(&h, &format!("/v1/nodes/{n}/content")),
+                            g_w.expose(),
+                        ))
+                        .await?;
+                    gw_check!(
+                        matches!(r.status, 403 | 404) && r.body != b"T6-BOUND-FILE",
+                        "globex's app read a node of acme: {}",
+                        r.status
+                    );
+                }
+                let acme_u = cx.user_token(&acme, Env::Live, "user").await?;
+                let r = exchange(&cx, g_w.expose(), acme_u.expose()).await?;
+                gw_check!(
+                    r.status == 401,
+                    "globex's app exchanged a user token of acme: {}",
+                    r.status
+                );
+                // A binding of a globex app to an API of acme's app.
+                let echo = Echo::start().await;
+                cx.world.set_upstream(&acme, &echo.url).await?;
+                let cross = Binding {
+                    name: "orders".into(),
+                    kind: BindingKind::App {
+                        app_slug: "garden".into(),
+                        api: "api".into(),
+                        tenant_slug: Some("acme".into()),
+                    },
+                    on_behalf_of_user: false,
+                    delegate: false,
+                };
+                match cx.world.seed_app("globex", "shed", &[cross]).await {
+                    Err(WorldError::Failed(m)) if m.starts_with("refused") => {}
+                    Err(e) => return Err(e.into()),
+                    Ok(shed) => {
+                        let w = cx.workload_token(&shed, Env::Live).await?;
+                        let host = format!("orders.api.{h}");
+                        let r = cx
+                            .send(bearer(Req::get(&host, "/items"), w.expose()))
+                            .await?;
+                        gw_check!(
+                            matches!(r.status, 403 | 404) && echo.hits() == 0,
+                            "a binding across tenants reached acme's app: {}",
+                            r.status
+                        );
+                    }
+                }
+                Ok(())
             }
         ),
     ]

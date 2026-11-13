@@ -6,9 +6,12 @@
 //! - The meta checks: every case names its rule and its source, every pending entry names a case
 //!   and a card, every path of `gateway.openapi.yaml` is named by a case, the reference token
 //!   verifier refuses hand-made bad tokens.
+//! - The outcome rules: a world cannot switch a case off (a `Missing` after `start()`, or a
+//!   `Pending` that `WORLD_PENDING` does not allow, fails the case).
 //! - The self-test: a deliberately wrong toy gateway (forwards every header, passes the app's
-//!   `Set-Cookie`, sets a cookie without `__Host-`, serves `..`) makes the cleaning, cookie and
-//!   traversal cases fail; a toy that does it right makes them pass. So the cases can fail.
+//!   `Set-Cookie`, sets a cookie without `__Host-`, serves `..`, accepts a sign-in callback on
+//!   another host) makes the cleaning, cookie, traversal and sign-in cases fail, each for its
+//!   intended reason; a toy that does it right makes them pass. So the cases can fail.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -19,8 +22,8 @@ use ruum_testkit::contract;
 use ruum_testkit::gateway::token::{self, Expect, TestSigner};
 use ruum_testkit::gateway::{
     self, Access, AgentAudience, App, CARDS, Deployment, Env, GATEWAY_CONTRACT, GatewayHandle,
-    GatewayWorld, MakeGatewayWorld, Outcome, PENDING, Relation, Req, Secret, SignIn, Tenant, User,
-    WorldError, WorldResult,
+    GatewayWorld, MakeGatewayWorld, Outcome, PENDING, Relation, Req, Secret, Tenant, User,
+    WORLD_PENDING, WORLD_PENDING_STEPS, WorldError, WorldResult,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -58,6 +61,184 @@ async fn a_missing_binary_reports_planned() {
         let ok = matches!(o, Outcome::Planned(_))
             || (matches!(o, Outcome::Pending(_)) && gateway::pending_reason(name).is_some());
         assert!(ok, "{name}: {o:?}");
+    }
+}
+
+/// A world that starts, and then answers every step with the same error.
+struct Stub(WorldError);
+
+impl Stub {
+    fn err<T>(&self) -> WorldResult<T> {
+        Err(self.0.clone())
+    }
+}
+
+#[async_trait]
+impl GatewayWorld for Stub {
+    async fn start(&self) -> WorldResult<GatewayHandle> {
+        Ok(GatewayHandle {
+            // Nothing listens there: a case that sends a request fails.
+            addr: "127.0.0.1:9".parse().expect("address"),
+            apps_domain: DOMAIN.into(),
+            issuer: ISS.into(),
+            user_token_jwks: TestSigner::new().jwks(),
+            ui_origin: ISS.into(),
+            platform_host: "ruum.localhost".into(),
+        })
+    }
+    async fn seed_tenant(&self, _: &str) -> WorldResult<Tenant> {
+        self.err()
+    }
+    async fn seed_user(&self, _: &Tenant, _: &str) -> WorldResult<User> {
+        self.err()
+    }
+    async fn seed_member(&self, _: &User, _: &Tenant) -> WorldResult<()> {
+        self.err()
+    }
+    async fn seed_app(&self, _: &Tenant, _: &str, _: Access) -> WorldResult<App> {
+        self.err()
+    }
+    async fn seed_deployment(
+        &self,
+        _: &App,
+        _: Env,
+        _: &[(String, Vec<u8>)],
+        _: Option<&str>,
+    ) -> WorldResult<Deployment> {
+        self.err()
+    }
+    async fn set_live(&self, _: &App, _: &Deployment) -> WorldResult<()> {
+        self.err()
+    }
+    async fn grant(&self, _: &User, _: &App, _: &Relation) -> WorldResult<()> {
+        self.err()
+    }
+    async fn revoke(&self, _: &User, _: &App, _: &Relation) -> WorldResult<()> {
+        self.err()
+    }
+    async fn platform_authorize(&self, _: &User, _: &str) -> WorldResult<String> {
+        self.err()
+    }
+    async fn sign_out_platform(&self, _: &User) -> WorldResult<()> {
+        self.err()
+    }
+    async fn agent_token(&self, _: &User, _: AgentAudience) -> WorldResult<Secret> {
+        self.err()
+    }
+    async fn partner_key(&self, _: &App, _: &str) -> WorldResult<Secret> {
+        self.err()
+    }
+    async fn set_upstream(&self, _: &Deployment, _: &str) -> WorldResult<()> {
+        self.err()
+    }
+    async fn set_public_approval(&self, _: &Tenant, _: bool) -> WorldResult<()> {
+        self.err()
+    }
+    async fn reuse_host(&self, _: &App, _: &App) -> WorldResult<App> {
+        self.err()
+    }
+    async fn rest_api_status(&self, _: &str) -> WorldResult<u16> {
+        self.err()
+    }
+}
+
+/// A world that answers `Missing` or `Pending` from its seeding steps (after `start()`) cannot
+/// make a case planned or pending: every case that runs fails.
+#[tokio::test]
+async fn a_world_cannot_switch_cases_off() {
+    let cases = gateway::gateway_cases();
+    for err in [
+        WorldError::Missing("not built".into()),
+        WorldError::Pending {
+            card: "B-2".into(),
+            why: "roles".into(),
+        },
+        WorldError::Pending {
+            card: "G-1a".into(),
+            why: "later".into(),
+        },
+        WorldError::Pending {
+            card: "Z-9".into(),
+            why: "no such card".into(),
+        },
+    ] {
+        let e = err.clone();
+        let make: MakeGatewayWorld = Arc::new(move || {
+            let e = e.clone();
+            Box::pin(async move { Ok(Arc::new(Stub(e)) as Arc<dyn GatewayWorld>) })
+        });
+        let rows = gateway::run_gateway_cases(&cases, Some(make)).await;
+        for (name, o) in &rows {
+            if gateway::pending_reason(name).is_some() {
+                assert!(matches!(o, Outcome::Pending(_)), "{name}: {o:?}");
+            } else {
+                assert!(o.is_failed(), "{err:?} switched {name} off: {o:?}");
+            }
+        }
+    }
+    // Pending from make() is not planned either.
+    let make: MakeGatewayWorld = Arc::new(|| {
+        Box::pin(async {
+            Err::<Arc<dyn GatewayWorld>, _>(WorldError::Pending {
+                card: "B-2".into(),
+                why: "x".into(),
+            })
+        })
+    });
+    let rows = gateway::run_gateway_cases(&cases, Some(make)).await;
+    for (name, o) in &rows {
+        assert!(
+            o.is_failed() || gateway::pending_reason(name).is_some(),
+            "{name}: {o:?}"
+        );
+    }
+}
+
+/// An app role step may answer pending B-2 in the role cases only; another card fails them.
+#[tokio::test]
+async fn a_world_may_answer_pending_only_where_allowed() {
+    let role_cases: Vec<_> = gateway::gateway_cases()
+        .into_iter()
+        .filter(|c| WORLD_PENDING.iter().any(|(n, _)| *n == c.name))
+        .collect();
+    assert_eq!(
+        role_cases.len(),
+        WORLD_PENDING.len(),
+        "a WORLD_PENDING case is missing"
+    );
+    for (answer, want_pending) in [
+        (
+            WorldError::Pending {
+                card: "B-2".into(),
+                why: "app roles".into(),
+            },
+            true,
+        ),
+        (
+            WorldError::Pending {
+                card: "G-1a".into(),
+                why: "later".into(),
+            },
+            false,
+        ),
+        (WorldError::Missing("no roles".into()), false),
+    ] {
+        let a = answer.clone();
+        let make: MakeGatewayWorld = Arc::new(move || {
+            let a = a.clone();
+            Box::pin(async move {
+                Ok(Arc::new(Toy::with_role_answer(Mode::Right, a)) as Arc<dyn GatewayWorld>)
+            })
+        });
+        let rows = gateway::run_gateway_cases(&role_cases, Some(make)).await;
+        let (text, _) = gateway::render("role steps", &rows);
+        for (name, o) in &rows {
+            if want_pending {
+                assert!(matches!(o, Outcome::Pending(_)), "{name}: {o:?}{text}");
+            } else {
+                assert!(o.is_failed(), "{answer:?} switched {name} off: {o:?}{text}");
+            }
+        }
     }
 }
 
@@ -125,6 +306,19 @@ fn every_pending_entry_names_a_case_and_a_card() {
             "the pending reason of {case} ({reason:?}) does not start with a card of {CARDS:?}"
         );
     }
+    // A world may answer pending only in the listed cases, with a known card that is not G-1a.
+    for (case, card) in WORLD_PENDING.iter().chain(WORLD_PENDING_STEPS.iter()) {
+        assert!(
+            CARDS.contains(card) && *card != "G-1a",
+            "{case}: a world may not answer pending with {card}"
+        );
+    }
+    for (case, _) in WORLD_PENDING {
+        assert!(
+            names.contains(case),
+            "WORLD_PENDING names {case}, which is not a case"
+        );
+    }
     // Every runtime API case waits for R-3 or G-3 (no runtime API world exists in this step).
     for c in gateway::runtime_cases() {
         let r = gateway::pending_reason(c.name).unwrap_or("");
@@ -186,6 +380,7 @@ fn the_reference_verifier_refuses_bad_tokens() {
         "wrong env",
         "no iat",
         "exp - iat over 60 s",
+        "expired 2 s ago",
         "unknown typ",
         "a foreign key",
     ] {
@@ -203,14 +398,38 @@ fn the_reference_verifier_refuses_bad_tokens() {
 // The self-test: two toy gateways
 // ---------------------------------------------------------------------------------------------
 
-/// The cases the toys run: cleaning, cookies and traversal.
-const SELF_TEST: &[&str] = &[
-    "request_headers_are_cleaned",
-    "incoming_traceparent_is_replaced",
-    "gateway_cookies_never_reach_the_app",
-    "app_set_cookie_for_ruum_names_is_dropped",
-    "gateway_cookies_follow_browser_rules",
-    "traversal_never_leaves_the_deployment",
+/// The cases the toys run (cleaning, cookies, traversal, the sign-in), each with the part of
+/// the failure message that names why the wrong toy must fail it. A case that fails for another
+/// reason (a step the toy does not do, a changed scene) breaks the self-test.
+const SELF_TEST: &[(&str, &str)] = &[
+    (
+        "request_headers_are_cleaned",
+        "the app got a forged value in ruum-user",
+    ),
+    (
+        "incoming_traceparent_is_replaced",
+        "the incoming trace ID was kept",
+    ),
+    (
+        "gateway_cookies_never_reach_the_app",
+        "the app got the cookies [",
+    ),
+    (
+        "app_set_cookie_for_ruum_names_is_dropped",
+        "the browser got the app's cookie",
+    ),
+    (
+        "gateway_cookies_follow_browser_rules",
+        "the gateway's cookie ruum_visit has no __Host- prefix",
+    ),
+    (
+        "traversal_never_leaves_the_deployment",
+        "/sub/../index.html: expected the gateway's refusal [400, 404], got 200",
+    ),
+    (
+        "the_sign_in_code_is_bound_to_its_host_and_used_once",
+        "with the callback of a sign-in on app A: expected the gateway's refusal [400], got 302",
+    ),
 ];
 
 #[tokio::test]
@@ -219,7 +438,18 @@ async fn a_wrong_toy_gateway_fails_the_cases() {
     let (text, _) = gateway::render("wrong toy gateway", &rows);
     println!("{text}");
     for (name, o) in &rows {
-        assert!(o.is_failed(), "the wrong toy did not fail {name}: {o:?}");
+        let why = SELF_TEST
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, w)| *w)
+            .expect("a self-test case");
+        match o {
+            Outcome::Failed(m) => assert!(
+                m.contains(why),
+                "the wrong toy failed {name} for another reason than {why:?}: {m}"
+            ),
+            o => panic!("the wrong toy did not fail {name}: {o:?}"),
+        }
     }
 }
 
@@ -240,7 +470,7 @@ async fn a_right_toy_gateway_passes_the_cases() {
 async fn run_toy(mode: Mode) -> Vec<(&'static str, Outcome)> {
     let cases: Vec<_> = gateway::gateway_cases()
         .into_iter()
-        .filter(|c| SELF_TEST.contains(&c.name))
+        .filter(|c| SELF_TEST.iter().any(|(n, _)| *n == c.name))
         .collect();
     assert_eq!(cases.len(), SELF_TEST.len(), "a self-test case is missing");
     let make: MakeGatewayWorld = Arc::new(move || {
@@ -284,12 +514,18 @@ struct ToyState {
     grants: HashSet<(String, String, String)>,
     /// session ID -> (user, deployment)
     sessions: HashMap<String, (String, String)>,
+    /// sign-in state -> (host, return_to, nonce of the state cookie)
+    states: HashMap<String, (String, String, String)>,
+    /// one-time code -> (user, state)
+    codes: HashMap<String, (String, String)>,
 }
 
 struct Toy {
     mode: Mode,
     st: Arc<Mutex<ToyState>>,
     signer: Arc<TestSigner>,
+    /// What granting or removing an app role answers (none: the toy does it).
+    role_answer: Option<WorldError>,
 }
 
 impl Toy {
@@ -298,6 +534,21 @@ impl Toy {
             mode,
             st: Arc::new(Mutex::new(ToyState::default())),
             signer: Arc::new(TestSigner::new()),
+            role_answer: None,
+        }
+    }
+
+    fn with_role_answer(mode: Mode, answer: WorldError) -> Toy {
+        Toy {
+            role_answer: Some(answer),
+            ..Toy::new(mode)
+        }
+    }
+
+    fn role_step(&self, r: &Relation) -> WorldResult<()> {
+        match (r, &self.role_answer) {
+            (Relation::Role(_), Some(e)) => Err(e.clone()),
+            _ => Ok(()),
         }
     }
 }
@@ -387,6 +638,10 @@ impl GatewayWorld for Toy {
         })
     }
 
+    async fn seed_member(&self, _user: &User, _tenant: &Tenant) -> WorldResult<()> {
+        Ok(())
+    }
+
     async fn seed_app(&self, tenant: &Tenant, slug: &str, access: Access) -> WorldResult<App> {
         let id = uuid::Uuid::now_v7().to_string();
         self.st.lock().unwrap().apps.insert(
@@ -447,6 +702,7 @@ impl GatewayWorld for Toy {
     }
 
     async fn grant(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()> {
+        self.role_step(relation)?;
         self.st
             .lock()
             .unwrap()
@@ -456,6 +712,7 @@ impl GatewayWorld for Toy {
     }
 
     async fn revoke(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()> {
+        self.role_step(relation)?;
         self.st
             .lock()
             .unwrap()
@@ -464,17 +721,27 @@ impl GatewayWorld for Toy {
         Ok(())
     }
 
-    async fn sign_in(&self, user: &User, host: &str) -> WorldResult<SignIn> {
+    /// The toy platform: issues a code for the state of the toy's sign-in start.
+    async fn platform_authorize(&self, user: &User, login_location: &str) -> WorldResult<String> {
+        let host = gateway::query_param(login_location, "app_host");
+        let state = gateway::query_param(login_location, "app_state");
+        let (Some(host), Some(state)) = (host, state) else {
+            return Err(WorldError::Failed(
+                "the toy platform got no app_host or app_state".into(),
+            ));
+        };
         let mut st = self.st.lock().unwrap();
-        let (_, dep) = resolve(&st, host)
-            .ok_or_else(|| WorldError::Failed(format!("the toy knows no host {host}")))?;
-        let sid = ruum_core::identity::secret::random_secret("toy_");
-        st.sessions.insert(sid.clone(), (user.id.clone(), dep));
-        Ok(SignIn {
-            set_cookies: vec![format!(
-                "__Host-ruum_app={sid}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=43200"
-            )],
-        })
+        if !st.states.contains_key(&state) {
+            return Err(WorldError::Failed(
+                "the toy platform knows no such state".into(),
+            ));
+        }
+        let code = ruum_core::identity::secret::random_secret("code_");
+        st.codes
+            .insert(code.clone(), (user.id.clone(), state.clone()));
+        Ok(format!(
+            "https://{host}/.ruum/v1/auth/callback?code={code}&state={state}"
+        ))
     }
 
     async fn sign_out_platform(&self, _user: &User) -> WorldResult<()> {
@@ -646,6 +913,21 @@ async fn toy_handle(
             });
         (app_id, dep_id, app, dep, tenant_ok, user)
     };
+    let host_lc = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if path == "/.ruum/v1/auth/start" {
+        return toy_start(&st, &host_lc, &target, dep.env);
+    }
+    if path == "/.ruum/v1/auth/callback" {
+        return toy_callback(
+            mode,
+            &st,
+            &host_lc,
+            &dep_id,
+            &target,
+            &cookie_pairs,
+            dep.env,
+        );
+    }
     if path.starts_with("/.ruum/") {
         return reply(404, security_headers(dep.env), b"toy: reserved".to_vec());
     }
@@ -849,6 +1131,87 @@ async fn toy_handle(
             }
         }
     }
+}
+
+/// `/.ruum/v1/auth/start`: a state bound to the host and `return_to`, its nonce in a cookie.
+fn toy_start(st: &Mutex<ToyState>, host: &str, target: &str, env: Env) -> Response<Body> {
+    let rt = gateway::query_param(target, "return_to").unwrap_or_else(|| "/".into());
+    let ok = rt.starts_with('/')
+        && !rt.starts_with("//")
+        && !rt.contains('\\')
+        && !rt.chars().any(|c| c.is_control());
+    if !ok {
+        return reply(400, security_headers(env), b"toy: bad return_to".to_vec());
+    }
+    let state = ruum_core::identity::secret::random_secret("st_");
+    let nonce = ruum_core::identity::secret::random_secret("n_");
+    st.lock()
+        .unwrap()
+        .states
+        .insert(state.clone(), (host.to_string(), rt, nonce.clone()));
+    let mut h = security_headers(env);
+    h.push((
+        "location".into(),
+        format!("{ISS}/v1/auth/login?app_host={host}&app_state={state}"),
+    ));
+    h.push((
+        "set-cookie".into(),
+        format!("__Host-ruum_auth={nonce}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600"),
+    ));
+    reply(302, h, vec![])
+}
+
+/// `/.ruum/v1/auth/callback`. The right toy checks the host of the state and the state cookie,
+/// and uses a code once; the wrong toy checks neither.
+fn toy_callback(
+    mode: Mode,
+    st: &Mutex<ToyState>,
+    host: &str,
+    dep_id: &str,
+    target: &str,
+    cookies: &[(String, String)],
+    env: Env,
+) -> Response<Body> {
+    let refuse = || reply(400, security_headers(env), b"toy: bad callback".to_vec());
+    let (Some(code), Some(state)) = (
+        gateway::query_param(target, "code"),
+        gateway::query_param(target, "state"),
+    ) else {
+        return refuse();
+    };
+    let mut st = st.lock().unwrap();
+    let Some((s_host, rt, nonce)) = st.states.get(&state).cloned() else {
+        return refuse();
+    };
+    let Some((user, c_state)) = st.codes.get(&code).cloned() else {
+        return refuse();
+    };
+    if c_state != state {
+        return refuse();
+    }
+    if mode == Mode::Right {
+        let cookie = cookies
+            .iter()
+            .find(|(n, _)| n == "__Host-ruum_auth")
+            .map(|(_, v)| v.as_str());
+        if s_host != host || cookie != Some(nonce.as_str()) {
+            return refuse();
+        }
+        st.codes.remove(&code);
+    }
+    let sid = ruum_core::identity::secret::random_secret("toy_");
+    st.sessions.insert(sid.clone(), (user, dep_id.to_string()));
+    let mut h = security_headers(env);
+    h.push(("location".into(), rt));
+    h.push((
+        "set-cookie".into(),
+        format!("__Host-ruum_app={sid}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=43200"),
+    ));
+    h.push((
+        "set-cookie".into(),
+        "__Host-ruum_auth=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0".into(),
+    ));
+    reply(302, h, vec![])
 }
 
 fn percent_decode(s: &str) -> String {

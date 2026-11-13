@@ -1,13 +1,15 @@
 //! The access check (cases 6, 7, 8, 13, 15 and 18 of card T-6): `use` on live hosts,
 //! `open_preview` on previews, removed rights, agent tokens, host rules and public apps.
 
+use super::token::{Expect, verify_user_token};
 use super::{
-    Access, AgentAudience, Ctx, Echo, Env, Fail, GatewayCase, Relation, Req, Resp,
-    SIGN_IN_OR_REFUSED, echoed, echoed_header, expect_refusal, files, is_echo, page, poll_until,
-    scene,
+    Access, AgentAudience, Ctx, Echo, Env, Fail, GatewayCase, Jar, Relation, Req, Resp,
+    SIGN_IN_OR_REFUSED, echoed, echoed_header, expect_no_session, expect_refusal, files, is_echo,
+    page, poll_until, query_param, same_origin_path, scene,
 };
 use crate::{gw_check, gw_fail};
 use std::time::Duration;
+use tokio::time::Instant;
 
 macro_rules! case {
     ($name:expr, $rule:expr, $source:expr, [$($op:expr),* $(,)?], |$cx:ident| $body:block) => {
@@ -26,8 +28,14 @@ macro_rules! case {
 /// The bound of "a removed right stops working" (card G-1a, decision 0006 G).
 pub const REVOKE_BOUND: Duration = Duration::from_secs(5);
 
-/// A redirect to the gateway's own sign-in start with `return_to`.
-fn expect_sign_in_redirect(label: &str, resp: &Resp) -> super::CaseResult {
+/// A redirect to the gateway's own sign-in start on the same host, whose `return_to` is
+/// `return_to` (the target the visitor asked for).
+fn expect_sign_in_redirect(
+    label: &str,
+    resp: &Resp,
+    host: &str,
+    return_to: &str,
+) -> super::CaseResult {
     gw_check!(
         !is_echo(resp) && resp.is_redirect(),
         "{label}: expected a redirect to /.ruum/v1/auth/start, got {} {}",
@@ -35,11 +43,39 @@ fn expect_sign_in_redirect(label: &str, resp: &Resp) -> super::CaseResult {
         resp.short_body()
     );
     let loc = resp.header("location").unwrap_or("");
+    let path = same_origin_path(loc, host);
     gw_check!(
-        loc.contains("/.ruum/v1/auth/start") && loc.contains("return_to="),
-        "{label}: the redirect goes to {loc:?}, expected /.ruum/v1/auth/start?return_to=..."
+        path.as_deref()
+            .map(|p| p.starts_with("/.ruum/v1/auth/start?"))
+            .unwrap_or(false),
+        "{label}: the redirect goes to {loc:?}, expected /.ruum/v1/auth/start?return_to=... on \
+         the same host"
+    );
+    let rt = query_param(loc, "return_to");
+    gw_check!(
+        rt.as_deref() == Some(return_to),
+        "{label}: the sign-in redirect's return_to is {rt:?}, expected {return_to:?}"
     );
     Ok(())
+}
+
+/// The claims of the one `Ruum-User` token of an echoed request, verified with the gateway's key
+/// set for `expect`.
+fn verified_token(
+    cx: &Ctx,
+    label: &str,
+    v: &serde_json::Value,
+    expect: &Expect,
+) -> Result<serde_json::Value, Fail> {
+    let t = echoed_header(v, "ruum-user");
+    gw_check!(
+        t.len() == 1,
+        "{label}: the app got {} Ruum-User headers, expected one",
+        t.len()
+    );
+    cx.secret(&t[0]);
+    verify_user_token(&t[0], &cx.gw.user_token_jwks, expect)
+        .map_err(|e| Fail::Failed(format!("{label}: the user token does not verify: {e}")))
 }
 
 /// A preview of `app` with an echo upstream.
@@ -73,7 +109,7 @@ pub fn cases() -> Vec<GatewayCase> {
                 let req = Req::get(&s.host, "/private?q=1");
                 let label = req.label();
                 let resp = cx.send(req).await?;
-                expect_sign_in_redirect(&label, &resp)?;
+                expect_sign_in_redirect(&label, &resp, &s.host, "/private?q=1")?;
                 // A member without any right on the app.
                 let stranger = cx.world.seed_user(&s.tenant, "toomas").await?;
                 let (mut jar, _) = cx.sign_in(&stranger, &s.host).await?;
@@ -81,6 +117,11 @@ pub fn cases() -> Vec<GatewayCase> {
                 let label = req.label();
                 let resp = cx.send_jar(&mut jar, req).await?;
                 expect_refusal(&label, &resp, &[403])?;
+                let body = resp.text().to_ascii_lowercase();
+                gw_check!(
+                    body.contains("ask") && body.contains("access"),
+                    "{label}: the 403 page does not tell the visitor to ask for access"
+                );
                 gw_check!(
                     s.echo().hits() == 0,
                     "{label}: the app got {} requests before any visitor with use",
@@ -159,21 +200,28 @@ pub fn cases() -> Vec<GatewayCase> {
                 let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
                 echoed(&label, &resp)?;
                 cx.world.revoke(&s.user, &s.app, &Relation::View).await?;
+                let since = Instant::now();
                 let label = format!("GET {}/ after view was removed", s.host);
-                poll_until(&label, REVOKE_BOUND, Duration::from_millis(200), || {
-                    let cx = cx.clone();
-                    let mut jar = s.jar.clone();
-                    let host = s.host.clone();
-                    let label = label.clone();
-                    async move {
-                        let resp = cx.send_jar(&mut jar, Req::get(&host, "/")).await?;
-                        if is_echo(&resp) {
-                            return Ok(false);
+                poll_until(
+                    &label,
+                    since,
+                    REVOKE_BOUND,
+                    Duration::from_millis(200),
+                    || {
+                        let cx = cx.clone();
+                        let mut jar = s.jar.clone();
+                        let host = s.host.clone();
+                        let label = label.clone();
+                        async move {
+                            let resp = cx.send_jar(&mut jar, Req::get(&host, "/")).await?;
+                            if is_echo(&resp) {
+                                return Ok(false);
+                            }
+                            expect_refusal(&label, &resp, &[403])?;
+                            Ok(true)
                         }
-                        expect_refusal(&label, &resp, &[403])?;
-                        Ok(true)
-                    }
-                })
+                    },
+                )
                 .await
             }
         ),
@@ -193,50 +241,80 @@ pub fn cases() -> Vec<GatewayCase> {
                 let resp = cx.send_jar(&mut jar.clone(), req).await?;
                 echoed(&label, &resp)?;
                 cx.world.revoke(&member, &s.app, &role).await?;
+                let since = Instant::now();
                 let label = format!("GET {}/ after the role was removed", s.host);
-                poll_until(&label, REVOKE_BOUND, Duration::from_millis(200), || {
-                    let cx = cx.clone();
-                    let mut jar = jar.clone();
-                    let host = s.host.clone();
-                    let label = label.clone();
-                    async move {
-                        let resp = cx.send_jar(&mut jar, Req::get(&host, "/")).await?;
-                        if is_echo(&resp) {
-                            return Ok(false);
+                poll_until(
+                    &label,
+                    since,
+                    REVOKE_BOUND,
+                    Duration::from_millis(200),
+                    || {
+                        let cx = cx.clone();
+                        let mut jar = jar.clone();
+                        let host = s.host.clone();
+                        let label = label.clone();
+                        async move {
+                            let resp = cx.send_jar(&mut jar, Req::get(&host, "/")).await?;
+                            if is_echo(&resp) {
+                                return Ok(false);
+                            }
+                            expect_refusal(&label, &resp, &[403])?;
+                            Ok(true)
                         }
-                        expect_refusal(&label, &resp, &[403])?;
-                        Ok(true)
-                    }
-                })
+                    },
+                )
                 .await
             }
         ),
         case!(
             "agent_tokens_reach_previews_only",
-            "An agent token with the audience ruumapps reaches a preview with open_preview (the \
-             app sees actor agent); a live host refuses it with 403; an agent token with the \
-             API audience is refused on every host",
+            "An agent token with the audience ruumapps is refused on a preview when its user has \
+             no open_preview, and reaches it with open_preview (the app sees actor agent and \
+             on_behalf_of the user's pairwise ID, never the platform user ID); a live host \
+             refuses it with 403; an agent token with the API audience is refused on every host",
             "decision 0006-10; gateway.openapi.yaml \"The check of every request\" 2 and \
              securitySchemes agentToken; STEP3 card T-6 \"Done when\"",
             [],
             |cx| {
                 let s = scene(&cx, true).await?;
                 let (prev, echo) = preview_with_echo(&cx, &s.app).await?;
+                let phost = cx.preview_host(&s.app, &prev);
+                // The agent of a member with view only: no open_preview, so refused.
+                let viewer = cx.world.seed_user(&s.tenant, "viewer").await?;
+                cx.world.grant(&viewer, &s.app, &Relation::View).await?;
+                let vtok = cx.agent_token(&viewer, AgentAudience::Ruumapps).await?;
+                let req = Req::get(&phost, "/")
+                    .header("Authorization", &format!("Bearer {}", vtok.expose()));
+                let label = format!("{} with the agent token of a viewer", req.label());
+                let resp = cx.send(req).await?;
+                expect_refusal(&label, &resp, &[403])?;
+                gw_check!(
+                    echo.hits() == 0,
+                    "{label}: the preview got the request of an agent without open_preview"
+                );
                 cx.world.grant(&s.user, &s.app, &Relation::Edit).await?;
                 let tok = cx.agent_token(&s.user, AgentAudience::Ruumapps).await?;
                 let bearer = format!("Bearer {}", tok.expose());
-                let phost = cx.preview_host(&s.app, &prev);
                 let req = Req::get(&phost, "/").header("Authorization", &bearer);
                 let label = req.label();
                 let resp = cx.send(req).await?;
                 let v = echoed(&label, &resp)?;
-                let actor = echoed_header(&v, "ruum-user")
-                    .first()
-                    .and_then(|t| super::token::decode_unverified(t).ok())
-                    .map(|(_, c)| c["actor"].clone());
+                let c = verified_token(
+                    &cx,
+                    &label,
+                    &v,
+                    &Expect::preview(&cx.gw.issuer, &s.app.id, &prev.id),
+                )?;
                 gw_check!(
-                    actor.as_ref().map(|a| a == "agent").unwrap_or(false),
-                    "{label}: the preview should see actor agent, got {actor:?}"
+                    c["actor"] == "agent",
+                    "{label}: the preview should see actor agent, got {}",
+                    c["actor"]
+                );
+                let obo = c["on_behalf_of"].as_str().unwrap_or("");
+                gw_check!(
+                    obo.starts_with("pairwise:") && !obo.contains(&s.user.id),
+                    "{label}: on_behalf_of must be the user's pairwise ID (pairwise:...), never \
+                     the platform user ID"
                 );
                 let live_hits = s.echo().hits();
                 let req = Req::get(&s.host, "/").header("Authorization", &bearer);
@@ -366,54 +444,73 @@ pub fn cases() -> Vec<GatewayCase> {
                 let echo = Echo::start().await;
                 w.set_upstream(&live, &echo.url).await?;
                 let host = cx.live_host(&app);
-                let actor_of = |label: &str, resp: &Resp| -> Result<String, Fail> {
+                let expect = Expect::live(&cx.gw.issuer, &app.id);
+                let claims_of = |label: &str, resp: &Resp| -> Result<serde_json::Value, Fail> {
                     let v = echoed(label, resp)?;
-                    let t = echoed_header(&v, "ruum-user");
-                    let Some(t) = t.first() else {
+                    if echoed_header(&v, "ruum-user").is_empty() {
                         gw_fail!("{label}: no Ruum-User on a public app");
-                    };
-                    let (_, c) = super::token::decode_unverified(t).map_err(Fail::Failed)?;
-                    Ok(c["actor"].as_str().unwrap_or("").to_string())
+                    }
+                    verified_token(&cx, label, &v, &expect)
                 };
                 let req = Req::get(&host, "/");
                 let label = req.label();
                 let resp = cx.send(req).await?;
-                let a = actor_of(&label, &resp)?;
+                let c = claims_of(&label, &resp)?;
                 gw_check!(
-                    a == "anonymous",
-                    "{label}: anonymous visitor has actor {a:?}"
+                    c["actor"] == "anonymous",
+                    "{label}: anonymous visitor has actor {}",
+                    c["actor"]
+                );
+                gw_check!(
+                    c["sub"]
+                        .as_str()
+                        .map(|x| x.starts_with("anonymous:"))
+                        .unwrap_or(false),
+                    "{label}: the sub of an anonymous visitor must start with anonymous:"
                 );
                 let (mut jar, _) = cx.sign_in(&user, &host).await?;
                 let req = Req::get(&host, "/");
                 let label = req.label();
                 let resp = cx.send_jar(&mut jar, req).await?;
-                let a = actor_of(&label, &resp)?;
-                gw_check!(a == "user", "{label}: signed-in visitor has actor {a:?}");
+                let c = claims_of(&label, &resp)?;
+                gw_check!(
+                    c["actor"] == "user",
+                    "{label}: signed-in visitor has actor {}",
+                    c["actor"]
+                );
                 w.set_public_approval(&tenant, false).await?;
+                let since = Instant::now();
                 let label = format!("GET {host}/ after the public approval was withdrawn");
-                poll_until(&label, REVOKE_BOUND, Duration::from_millis(200), || {
-                    let cx = cx.clone();
-                    let host = host.clone();
-                    let label = label.clone();
-                    async move {
-                        let resp = cx.send(Req::get(&host, "/")).await?;
-                        if is_echo(&resp) {
-                            return Ok(false);
+                poll_until(
+                    &label,
+                    since,
+                    REVOKE_BOUND,
+                    Duration::from_millis(200),
+                    || {
+                        let cx = cx.clone();
+                        let host = host.clone();
+                        let label = label.clone();
+                        async move {
+                            let resp = cx.send(Req::get(&host, "/")).await?;
+                            if is_echo(&resp) {
+                                return Ok(false);
+                            }
+                            expect_refusal(&label, &resp, &[302, 303, 307, 401, 403, 404, 503])?;
+                            Ok(true)
                         }
-                        expect_refusal(&label, &resp, &[302, 303, 307, 401, 403, 404, 503])?;
-                        Ok(true)
-                    }
-                })
+                    },
+                )
                 .await
             }
         ),
         case!(
-            "sign_in_start_keeps_return_to_on_the_origin",
-            "/.ruum/v1/auth/start accepts only a path on this origin as return_to: \
-             //host, a scheme or a backslash form never leads off the origin",
+            "sign_in_keeps_return_to_on_the_origin",
+            "A sign-in started with a return_to that is not a path on this origin (//host, a \
+             scheme, a backslash or an encoded form) is refused at the start (400) or ends with a \
+             callback whose Location is a path on the same origin",
             "gateway.openapi.yaml /.ruum/v1/auth/start (return_to pattern); card G-1a \"Sign-in \
-             on the app origin\"",
-            ["appAuthStart"],
+             on the app origin\" (the state is bound to the host and return_to)",
+            ["appAuthStart", "appAuthCallback"],
             |cx| {
                 let s = scene(&cx, false).await?;
                 for rt in [
@@ -422,18 +519,32 @@ pub fn cases() -> Vec<GatewayCase> {
                     "/\\t6evil.example",
                     "%2F%2Ft6evil.example",
                     "/%2F%2Ft6evil.example",
+                    "%2F%5Ct6evil.example",
                     "javascript:alert(1)",
                 ] {
-                    let req = Req::get(&s.host, &format!("/.ruum/v1/auth/start?return_to={rt}"));
-                    let label = req.label();
-                    let resp = cx.send(req).await?;
-                    gw_check!(!is_echo(&resp), "{label}: the app answered a gateway path");
-                    let loc = resp.header("location").unwrap_or("").to_ascii_lowercase();
+                    let mut jar = Jar::default();
+                    let start = cx.auth_start(&mut jar, &s.host, rt).await?;
+                    let label = format!("the sign-in on {} with return_to={rt}", s.host);
+                    gw_check!(!is_echo(&start), "{label}: the app answered a gateway path");
+                    if start.status == 400 {
+                        continue;
+                    }
+                    let cb = cx.authorize(&s.user, &s.host, &start).await?;
+                    let resp = cx.send_jar(&mut jar, Req::get(&s.host, &cb)).await?;
+                    gw_check!(!is_echo(&resp), "{label}: the app answered the callback");
+                    if resp.status == 400 {
+                        expect_no_session(&label, &resp)?;
+                        continue;
+                    }
                     gw_check!(
-                        resp.status == 400 || (resp.is_redirect() && !loc.contains("t6evil")),
-                        "{label}: expected 400 or a redirect that does not carry the foreign \
-                         return_to, got {} to {loc:?}",
+                        resp.is_redirect(),
+                        "{label}: the callback answered {}, expected 400 or a redirect",
                         resp.status
+                    );
+                    let loc = resp.header("location").unwrap_or("");
+                    gw_check!(
+                        same_origin_path(loc, &s.host).is_some(),
+                        "{label}: the callback sends the browser to {loc:?}, off the origin"
                     );
                 }
                 Ok(())
@@ -454,14 +565,88 @@ pub fn cases() -> Vec<GatewayCase> {
                 let label = req.label();
                 let resp = cx.send(req).await?;
                 expect_refusal(&label, &resp, &[400])?;
+                expect_no_session(&label, &resp)?;
+                Ok(())
+            }
+        ),
+        case!(
+            "the_sign_in_code_is_bound_to_its_host_and_used_once",
+            "The callback of a sign-in started on app A, sent to app B's host (the user has view \
+             on both), is refused (400) and opens nothing; the same callback a second time is \
+             refused (400, no session); when the start sets a state cookie, a callback without \
+             it is refused",
+            "card G-1a \"Sign-in on the app origin\" (a state bound to the host, a code used \
+             once within 60 s); gateway.openapi.yaml /.ruum/v1/auth/callback (400)",
+            ["appAuthStart", "appAuthCallback"],
+            |cx| {
+                let s = scene(&cx, true).await?;
+                let w = &cx.world;
+                let b = w.seed_app(&s.tenant, "orchard", Access::Platform).await?;
+                let b_live = w
+                    .seed_deployment(&b, Env::Live, &files(&[("index.html", &page("b"))]), None)
+                    .await?;
+                w.set_live(&b, &b_live).await?;
+                let b_echo = Echo::start().await;
+                w.set_upstream(&b_live, &b_echo.url).await?;
+                w.grant(&s.user, &b, &Relation::View).await?;
+                let b_host = cx.live_host(&b);
+
+                // (a) A's callback on B's host, in a browser that started a sign-in on B.
+                let mut a_jar = Jar::default();
+                let start = cx.auth_start(&mut a_jar, &s.host, "/").await?;
+                let a_cb = cx.authorize(&s.user, &s.host, &start).await?;
+                let mut b_jar = Jar::default();
+                cx.auth_start(&mut b_jar, &b_host, "/").await?;
+                let req = Req::get(&b_host, &a_cb);
+                let label = format!("GET {b_host} with the callback of a sign-in on app A");
+                let resp = cx.send_jar(&mut b_jar, req).await?;
+                expect_refusal(&label, &resp, &[400])?;
+                expect_no_session(&label, &resp)?;
+                let resp = cx.send_jar(&mut b_jar, Req::get(&b_host, "/")).await?;
                 gw_check!(
-                    !resp
-                        .set_cookies()
-                        .iter()
-                        .any(|c| c.to_ascii_lowercase().starts_with("__host-ruum_app=")
-                            && !c.contains("Max-Age=0")),
-                    "{label}: a bad callback set an app session"
+                    !is_echo(&resp) && b_echo.hits() == 0,
+                    "{label}: app B let the visitor in afterwards"
                 );
+
+                // (b) The same callback twice, with the cookies the browser had before it.
+                let mut jar = Jar::default();
+                let start = cx.auth_start(&mut jar, &s.host, "/").await?;
+                let cb = cx.authorize(&s.user, &s.host, &start).await?;
+                let cookie = jar.header_for(&s.host, "/.ruum/v1/auth/callback");
+                let with_cookie = |req: Req| match &cookie {
+                    Some(c) => req.header("Cookie", c),
+                    None => req,
+                };
+                let label = format!("GET {} with a sign-in callback", s.host);
+                let first = cx.send(with_cookie(Req::get(&s.host, &cb))).await?;
+                gw_check!(
+                    first.is_redirect()
+                        && first
+                            .set_cookies()
+                            .iter()
+                            .any(|c| c.starts_with("__Host-ruum_app=")),
+                    "{label}: the first use of the code did not sign in (got {})",
+                    first.status
+                );
+                let label = format!("GET {} with the same callback a second time", s.host);
+                let second = cx.send(with_cookie(Req::get(&s.host, &cb))).await?;
+                expect_refusal(&label, &second, &[400])?;
+                expect_no_session(&label, &second)?;
+
+                // (c) A state cookie, if the gateway sets one, is needed.
+                let mut jar = Jar::default();
+                let start = cx.auth_start(&mut jar, &s.host, "/").await?;
+                let state_cookie = !start.set_cookies().is_empty();
+                let cb = cx.authorize(&s.user, &s.host, &start).await?;
+                if state_cookie {
+                    let label = format!(
+                        "GET {} with a sign-in callback without its state cookie",
+                        s.host
+                    );
+                    let resp = cx.send(Req::get(&s.host, &cb)).await?;
+                    expect_refusal(&label, &resp, &[400])?;
+                    expect_no_session(&label, &resp)?;
+                }
                 Ok(())
             }
         ),

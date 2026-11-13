@@ -256,17 +256,27 @@ JSON, and sends the `Set-Cookie` and other headers a case asks for.
 A **world** starts the binary with an in-memory core and seeds what a case needs. The traits are
 `GatewayWorld` (card G-1a implements it in `crates/ruum-gateway/tests/` and calls
 `gateway::run_gateway_suite`) and `RuntimeApiWorld` (cards R-3 and G-3). A world method is about
-the seeded world (a tenant, an app, a deployment with static files, a grant, a sign-in, an agent
-token, the test upstream), never about the gateway's internals. A step a world cannot do yet
-answers `WorldError::Pending` with the card that brings it (an app role before B-2).
+the seeded world (a tenant, an app, a deployment with static files, a grant, an agent token, the
+test upstream), never about the gateway's internals. The sign-in code flow runs in the cases:
+`Ctx::sign_in` sends `/.ruum/v1/auth/start` and `/.ruum/v1/auth/callback` to the gateway over HTTP
+with a browser jar, and the world does only the platform side (`platform_authorize`: follow the
+start's `Location` as a signed-in user, return the callback URL). So the cases check the state
+of the flow (bound to the host and `return_to`, a code used once, the state cookie). Each case
+gets the world through `gateway::Guard`, which applies the outcome rules below to every step.
 
 Outcomes, as in the app cases:
 
-- **planned**: no world, or the world says the binary is missing. Never a failure, also not with
-  `RUUM_REQUIRE_IMPLEMENTED=1`. In this crate every case runs without a world, so all are planned.
+- **planned**: no world, or `make()` or `start()` says the binary is missing
+  (`WorldError::Missing`). Never a failure, also not with `RUUM_REQUIRE_IMPLEMENTED=1`. In this
+  crate every case runs without a world, so all are planned. A `Missing` from any later step
+  fails the case: the implementer writes the world, so the world must not be able to switch a
+  case off.
 - **pending**: `gateway::PENDING` names the case with a card (G-1b, G-2, G-3, G-4, R-3, B-3, W-5,
-  X-2), or the world answered `Pending`. Never a failure. The card removes its line when its
-  code makes the case pass; a planned case body of a later card fails until that card writes it.
+  X-2), or the world answered `Pending` from a step of `WORLD_PENDING_STEPS` (an app role: B-2;
+  a partner key: B-3) in a case that `WORLD_PENDING` lists with that card (the three role cases,
+  B-2). Any other world `Pending` fails the case. Never a failure. The card removes its line when
+  its code makes the case pass; a planned case body of a later card fails until that card writes
+  it.
 - **passed** or **failed** otherwise. A refusal passes only as the gateway's own answer (its
   status, never a connection error, a timeout or an answer of the echo app), and a "the app saw
   nothing" check counts the echo app's requests.
@@ -275,18 +285,23 @@ Failure messages never hold a token, a cookie or a key: the runner masks every v
 got from the world and everything that looks like a JWT, a bearer value or a Ruum cookie value.
 `gateway/token.rs` has the reference verifier of the user token, written from
 `contracts/apps/user-token.schema.json` (EdDSA signature by the gateway's key set, `iss`, `aud`,
-`typ`, `env`, numeric `iat` and `exp`, `exp - iat` at most 60 s, the schema with unknown claims
-allowed).
+`typ`, `env`, numeric `iat` and `exp`, `exp` after now with no leeway, `iat` at most 5 s in the
+future, `exp - iat` at most 60 s, the schema with unknown claims allowed). A time bound (a
+removed right within 5 s, a sign-out within 60 s) is timed from the world step to the arrival of
+the refusal, with an allowance of 1 s; a slow probe that answers after the bound fails.
 
 `tests/gateway.rs` and `tests/runtime_api.rs` run the cases without a world and check the cases
 themselves: every case names its rule and its source, every pending entry names a case and a
 card, every path of `contracts/apps/gateway.openapi.yaml` and every operation of
 `runtime.openapi.yaml` is named by a case, and the reference verifier refuses hand-made bad
-tokens (wrong `aud`, wrong `env`, no `iat`, `exp - iat` over 60 s, unknown `typ`, a foreign key).
-A self-test runs the cleaning, cookie and traversal cases against two toy gateways in the test
-file: a wrong one (forwards every header, passes the app's `Set-Cookie`, sets a cookie without
-`__Host-`, serves `..`) must fail each case, and a right one must pass each. So the cases can
-fail.
+tokens (wrong `aud`, wrong `env`, no `iat`, `exp - iat` over 60 s, expired, unknown `typ`, a
+foreign key). Two tests show that a world cannot switch cases off (`Missing` or `Pending` from a
+seeding step fails every case that runs; `Pending` from an app role step is pending only in the
+role cases and only with B-2). A self-test runs the cleaning, cookie, traversal and sign-in cases
+against two toy gateways in the test file: a wrong one (forwards every header, passes the app's
+`Set-Cookie`, sets a cookie without `__Host-`, serves `..`, accepts a sign-in callback on another
+host) must fail each case for its intended reason (each case names the part of the failure
+message it expects), and a right one must pass each. So the cases can fail.
 
 ```sh
 cargo test -p ruum-testkit --test gateway --test runtime_api -- --nocapture
