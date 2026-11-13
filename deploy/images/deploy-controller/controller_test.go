@@ -113,7 +113,7 @@ var t0 = time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 func newController(s *memStore, d *fakeDeployer) *Controller {
 	return &Controller{
 		Store: s, Checker: world(), Deployer: d, Me: "deploy-controller-abc",
-		MaxAge: 5 * time.Minute, Keep: 7 * 24 * time.Hour, Timeout: time.Hour, LogLines: 50,
+		MaxAge: 5 * time.Minute, Keep: 7 * 24 * time.Hour, Timeout: time.Hour, LogLines: 50, ProgressEvery: time.Millisecond,
 		Now: func() time.Time { return t0 }, Log: io.Discard,
 	}
 }
@@ -299,5 +299,64 @@ func TestRedact(t *testing.T) {
 		if got := redact(in); got != want {
 			t.Errorf("redact(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestControllerSkipsARequestItCannotClaim(t *testing.T) {
+	s, d := newStore(), &fakeDeployer{}
+	s.add("a-immutable", t0.Add(-2*time.Minute), data(req(cLive, cOld, "")))
+	s.add("b-good", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	c := newController(s, d)
+	c.Store = immutableStore{s, "a-immutable"}
+	if err := c.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.runs) != 1 || d.runs[0][0] != cNew {
+		t.Fatalf("runs %v: the good request must run past the one that cannot be claimed", d.runs)
+	}
+}
+
+// immutableStore refuses every update of one request (an immutable ConfigMap).
+type immutableStore struct {
+	*memStore
+	name string
+}
+
+func (s immutableStore) Update(ctx context.Context, cm ConfigMap) (ConfigMap, error) {
+	if cm.Metadata.Name == s.name {
+		return ConfigMap{}, errors.New("HTTP 422: field is immutable")
+	}
+	return s.memStore.Update(ctx, cm)
+}
+
+// slowDeployer prints a line, then waits until the request shows it.
+type slowDeployer struct {
+	store *memStore
+	name  string
+	seen  bool
+}
+
+func (d *slowDeployer) Run(_ context.Context, _ []string, line func(string)) error {
+	line("==> migration step ruum-migrate-x")
+	for range 500 {
+		cm, _ := d.store.Get(context.Background(), d.name)
+		if strings.Contains(cm.Data[keyLog], "migration step") {
+			d.seen = true
+			return nil
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return nil
+}
+
+func TestControllerWritesProgressWhileADeployRuns(t *testing.T) {
+	s := newStore()
+	s.add("x", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	d := &slowDeployer{store: s, name: "x"}
+	c := newController(s, &fakeDeployer{})
+	c.Deployer = d
+	_ = c.Reconcile(context.Background())
+	if !d.seen {
+		t.Fatal("the request did not show the output while the deploy ran")
 	}
 }
