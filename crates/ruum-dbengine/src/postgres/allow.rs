@@ -401,8 +401,14 @@ pub(crate) fn setting_readers_condition() -> String {
 /// of [`ROW_FUNCTIONS`] in the bind parameter `$param` (`text[]`). Every name and operator is
 /// qualified: this runs in the session of an untrusted request too.
 pub(crate) fn allowed_cte(param: usize) -> String {
+    allowed_cte_as("allowed", param)
+}
+
+/// [`allowed_cte`] under another name, for a query that builds its own `allowed` set on top of
+/// it (`copy::refuse_code_in_the_masking`).
+pub(crate) fn allowed_cte_as(name: &str, param: usize) -> String {
     format!(
-        "allowed as (
+        "{name} as (
   select p.oid from pg_catalog.pg_proc p
    where p.pronamespace operator(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace
      and p.provolatile operator(pg_catalog.<>) 'v'::pg_catalog.\"char\"
@@ -440,18 +446,9 @@ const OPERATOR_FIELDS: &str = "opno|eqop|sortop|hashop";
 const TYPE_FIELDS: &str = "resulttype|array_typeid|element_typeid|row_typeid|paramtype|aggtype|\
      wintype|funcresulttype";
 
-/// The common table expressions for the types that a tree coerces to (review-Q-2-harden-2 F-1),
-/// after [`allowed_cte`] in the same `WITH RECURSIVE` list:
-///
-/// - `type_edges(src, dst)`: which type holds which (a domain its base type and the types that
-///   its own checks coerce to, an array its element, a range its subtype, a multirange its range,
-///   a composite type the types of its fields);
-/// - `bad_types(oid)`: the domains that have a `CHECK` outside the allow-list, the types with an
-///   input, output or other type function (or a range with a canonical or subtype-difference
-///   function) that is not a built-in function, and every type that reaches one through
-///   `type_edges`.
-pub(crate) fn bad_types_cte() -> String {
-    let check_outside = unlisted_calls("k.conbin::pg_catalog.text");
+/// The common table expression `type_edges(src, dst)` of [`bad_types_cte`]: which type holds
+/// which. It needs no other CTE.
+pub(crate) fn type_edges_cte() -> String {
     format!(
         "type_edges(src, dst) as (
   select t.oid, t.typbasetype from pg_catalog.pg_type t
@@ -475,7 +472,24 @@ pub(crate) fn bad_types_cte() -> String {
          pg_catalog.regexp_matches(k.conbin::pg_catalog.text, ':(?:{TYPE_FIELDS}) ([1-9][0-9]*)', 'g') as m(g)
    where k.contypid operator(pg_catalog.<>) 0::pg_catalog.oid
      and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
-),
+)"
+    )
+}
+
+/// The common table expressions for the types that a tree coerces to (review-Q-2-harden-2 F-1),
+/// after [`allowed_cte`] in the same `WITH RECURSIVE` list:
+///
+/// - `type_edges(src, dst)`: which type holds which (a domain its base type and the types that
+///   its own checks coerce to, an array its element, a range its subtype, a multirange its range,
+///   a composite type the types of its fields);
+/// - `bad_types(oid)`: the domains that have a `CHECK` outside the allow-list, the types with an
+///   input, output or other type function (or a range with a canonical or subtype-difference
+///   function) that is not a built-in function, and every type that reaches one through
+///   `type_edges`.
+pub(crate) fn bad_types_cte() -> String {
+    let check_outside = unlisted_calls("k.conbin::pg_catalog.text");
+    format!(
+        "{edges},
 bad_types(oid) as (
   select k.contypid from pg_catalog.pg_constraint k
    where k.contypid operator(pg_catalog.<>) 0::pg_catalog.oid
@@ -502,7 +516,8 @@ bad_types(oid) as (
       or r.rngsubdiff::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
   union
   select e.src from type_edges e join bad_types b on b.oid operator(pg_catalog.=) e.dst
-)"
+)",
+        edges = type_edges_cte()
     )
 }
 
@@ -573,9 +588,15 @@ pub(crate) fn unlisted_calls(tree: &str) -> String {
 /// reaches a domain with a check outside the allow-list (review-Q-2-harden-2 F-1). It needs the
 /// CTEs [`allowed_cte`] and [`bad_types_cte`] in scope.
 pub(crate) fn unlisted_domains(tree: &str) -> String {
+    coerces_to(tree, "bad_types")
+}
+
+/// A SQL condition that is true when the stored node tree `tree` coerces a value to a type in
+/// the CTE `set` (a column `oid`).
+pub(crate) fn coerces_to(tree: &str, set: &str) -> String {
     format!(
         "exists (select 1 from pg_catalog.regexp_matches({tree}, ':(?:{TYPE_FIELDS}) ([1-9][0-9]*)', 'g') as m(g)
-                  where m.g[1]::pg_catalog.oid operator(pg_catalog.=) any (array(select b.oid from bad_types b)))"
+                  where m.g[1]::pg_catalog.oid operator(pg_catalog.=) any (array(select b.oid from {set} b)))"
     )
 }
 

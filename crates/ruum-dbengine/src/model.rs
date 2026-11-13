@@ -336,12 +336,23 @@ pub enum CopyData {
 pub struct MaskPlan {
     pub columns: Vec<(ColumnRef, MaskAs)>,
     /// Every column of the tables of the database's own schema in the catalog that the plan was
-    /// made from, also the `normal` ones. The platform reads that catalog before the engine
-    /// drains the source, so a migration can add a column in between. When this is set, the
-    /// engine refuses the copy with [`crate::EngineError::NotReady`] (try again) if the copy
-    /// has a column of its own schema that is not in the list (review FU-1-3 of Kimi). `None`
-    /// skips the check (unit tests that build a plan by hand).
-    pub planned_from: Option<Vec<ColumnRef>>,
+    /// made from, also the `normal` ones, with its identity. The platform reads that catalog
+    /// before the engine drains the source, so a migration can add, drop, rename or swap
+    /// columns or tables in between. When this is set, the engine refuses the copy with
+    /// [`crate::EngineError::NotReady`] (try again) unless the columns of its own schema are
+    /// exactly these, with the same identity (review FU-1-3 of Kimi, and FU1-R10-2 of the
+    /// Kimi review of run 10). `None` skips the check (unit tests that build a plan by hand).
+    pub planned_from: Option<Vec<PlannedColumn>>,
+}
+
+/// A column of the catalog that a mask plan was made from ([`MaskPlan::planned_from`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedColumn {
+    pub column: ColumnRef,
+    /// The column's identity in that catalog (Postgres). A `TEMPLATE` copy keeps `rel_oid`,
+    /// `attnum` and `type_oid`, so a rename, a swap or a drop and add of a column or a table
+    /// after the plan shows as a change. `None` when the engine has no column identity.
+    pub identity: Option<ColumnIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

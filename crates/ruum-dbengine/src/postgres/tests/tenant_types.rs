@@ -595,8 +595,12 @@ async fn the_state_from_before_the_fix_does_not_survive_a_build_or_a_restore() {
 
 /// The source of the two tests below: an enum `mood` with an implicit cast to `text` whose
 /// function runs `plant` (the tenant's code) and records what it saw in `seen`; a table `t` with
-/// the secret column `sec` of that type and one row. Step 2 of a masked copy runs
-/// `sec::text <> ''`, so the cast runs as the copy's owner (review-masking-1 F2).
+/// the secret column `sec` of that type and one row; a materialized view `mv` over `plant(sec)`,
+/// unpopulated in the source. Step 2 of a masked copy makes every materialized view again after
+/// the masking, with data, so `plant` runs as the copy's owner while the entry points of
+/// `ruum_copy` exist (review-masking-1 F2). (Before FU1-R10-1 of the Kimi review of run 10,
+/// step 2 ran `sec::text <> ''`, so the cast ran `plant` on the rows in clear; it no longer casts
+/// a tenant type, see `a_masked_copy_runs_no_tenant_code_on_values_in_clear`.)
 async fn planting_source<'e>(engine: &'e PostgresEngine, plant: &str) -> Fixture<'e> {
     let f = Fixture::new(engine).await;
     let sync = ClassSync {
@@ -619,7 +623,9 @@ async fn planting_source<'e>(engine: &'e PostgresEngine, plant: &str) -> Fixture
                RETURN 'planted';
              END $f$;
              CREATE CAST (public.mood AS text) WITH FUNCTION public.plant(public.mood) AS IMPLICIT;
-             CREATE TABLE t (id integer PRIMARY KEY, sec public.mood);",
+             CREATE TABLE t (id integer PRIMARY KEY, sec public.mood);
+             CREATE MATERIALIZED VIEW public.mv AS SELECT public.plant(t.sec) AS p FROM public.t
+               WITH NO DATA;",
             plant = lens::literal(plant)
         ),
         timeout: Duration::from_secs(10),

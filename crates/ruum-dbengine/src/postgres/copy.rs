@@ -22,8 +22,11 @@
 //! B-1): the copy's own `owner` runs it in a session of its own, after it disables the enabled
 //! triggers and rules of its tables and lifts forced row-level security, and it puts each one
 //! back in its old state afterwards. So tenant code runs at most with the rights of the copy's
-//! `owner`, which a migration of the copy has anyway. Then `ruum_dbhost` installs the copy's key
-//! and builds the lens views.
+//! `owner`, which a migration of the copy has anyway. A masked copy also runs no tenant code
+//! while values are still in clear: it refuses a table whose checks, index expressions,
+//! generated columns or secret columns' domains would call one (`refuse_code_in_the_masking`),
+//! and it casts no value of a tenant type (FU1-R10-1 of the Kimi review of run 10). Then
+//! `ruum_dbhost` installs the copy's key and builds the lens views.
 //!
 //! **Restore points.** Point-in-time restore is card E-4. A restore point here is
 //! `pg_create_restore_point` (or the current WAL position when `ruum_dbhost` may not call it)
@@ -32,6 +35,7 @@
 //! snapshot back (into a new database, or in place by swapping names). Snapshots go with their
 //! database.
 
+use super::allow;
 use super::errors::{internal, sqlstate};
 use super::lens::{self, ident};
 use super::setup::{self, run};
@@ -711,7 +715,10 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// Checks that read a masked column are dropped; foreign keys on masked columns are dropped and
 /// built again, and one that cannot be built again (its other side is not masked the same way)
 /// is left out. Runs in the `owner` session of [`change_data`], with the tenant's triggers and
-/// rules parked; a secret column is checked to hold no value afterwards.
+/// rules parked; a secret column is checked to hold no value afterwards. Before any row
+/// changes, the copy is refused when the masking would run other code of the tenant on rows in
+/// clear ([`refuse_code_in_the_masking`]). A secret column of a type that is not a built-in
+/// string type keeps no value at all (no cast of a tenant type runs to find an empty string).
 ///
 /// Derived data goes too: every materialized view of the database's own schema is made again
 /// from the masked tables ([`dependent_views`]). Every masked column goes through
@@ -720,8 +727,9 @@ async fn empty_tables(conn: &mut PgConnection) -> Result<(), EngineError> {
 /// are analyzed again, so the statistics hold values of the masked rows, not of the source
 /// (review FU-1 required changes 1 and 2, second review required change 1). Limits: a
 /// `schema_only` copy masks no column, so it keeps the source's statistics; a column that a
-/// policy, a generated column or a trigger's `WHEN` reads cannot change its type, so such a
-/// secret column fails the copy, as a personal column already did.
+/// policy, a generated column or a trigger's `WHEN` reads, and a column that a partition or an
+/// inheritance child inherits, cannot change its type, so such a secret column fails the copy,
+/// as a personal column already did.
 async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
     check_planned_from(conn, plan).await?;
     if plan.columns.is_empty() {
@@ -741,22 +749,37 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         .await
         .map_err(|e| v.refusal(e))?;
     }
+    // Pass 1: find each masked column, and drop the foreign keys and the checks on it, before
+    // any row changes.
     let mut fks: Vec<(String, String, String)> = Vec::new();
+    let mut found: Vec<FoundColumn<'_>> = Vec::new();
     for (column, how) in &plan.columns {
         if column.schema != "public" {
             continue;
         }
         let table = format!("public.{}", ident(&column.table));
-        let col = ident(&column.column);
         let row = sqlx::query(
             "select a.attrelid::int8, a.attnum::int2,
                     pg_catalog.format_type(a.atttypid, a.atttypmod)
-                    || case when a.attcollation <> 0
+                    || case when a.attcollation operator(pg_catalog.<>) 0::pg_catalog.oid
                             then ' collate ' || a.attcollation::pg_catalog.regcollation::pg_catalog.text
-                            else '' end
+                            else '' end,
+                    coalesce((
+                      with recursive b(oid) as (
+                        select a.atttypid
+                        union all
+                        select t.typbasetype from pg_catalog.pg_type t
+                          join b on t.oid operator(pg_catalog.=) b.oid
+                         where t.typtype operator(pg_catalog.=) 'd'::pg_catalog.\"char\")
+                      select t.oid operator(pg_catalog.<) 16384::pg_catalog.oid
+                             and t.typcategory operator(pg_catalog.=) 'S'::pg_catalog.\"char\"
+                        from b join pg_catalog.pg_type t on t.oid operator(pg_catalog.=) b.oid
+                       where t.typtype operator(pg_catalog.<>) 'd'::pg_catalog.\"char\"
+                       limit 1), false)
                from pg_catalog.pg_attribute a
-              where a.attrelid = pg_catalog.to_regclass($1) and a.attname = $2
-                and a.attnum > 0 and not a.attisdropped",
+              where a.attrelid operator(pg_catalog.=) pg_catalog.to_regclass($1)
+                and a.attname operator(pg_catalog.=) $2::pg_catalog.name
+                and a.attnum operator(pg_catalog.>) 0::pg_catalog.int2 and not a.attisdropped",
         )
         .persistent(false)
         .bind(&table)
@@ -767,8 +790,6 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
         let Some(row) = row else { continue };
         let rel: i64 = row.get(0);
         let attnum: i16 = row.get(1);
-        // The column's own type and collation, for the `ALTER COLUMN TYPE` of a secret column.
-        let own_type: String = row.get(2);
         // Foreign keys from or to the column: drop now, build again after.
         for fk in sqlx::query(
             "select c.conname::text, c.conrelid::pg_catalog.regclass::text,
@@ -819,7 +840,24 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
             )
             .await?;
         }
-        match how {
+        found.push(FoundColumn {
+            column,
+            how: *how,
+            table,
+            rel,
+            attnum,
+            own_type: row.get(2),
+            textual: row.get(3),
+        });
+    }
+    // No code of the tenant may run while values are still in clear (FU1-R10-1 of the Kimi
+    // review of run 10): the statements below would run it on every table they change.
+    refuse_code_in_the_masking(conn, &found).await?;
+    // Pass 2: mask.
+    for f in &found {
+        let (column, table, col) = (f.column, &f.table, ident(&f.column.column));
+        let (rel, attnum, own_type) = (f.rel, f.attnum, &f.own_type);
+        match f.how {
             MaskAs::Pseudonym => {
                 // A personal column of a type that is not a built-in base type (decision 0005
                 // B-2) holds no value in the copy: it becomes `text` and `NULL`, and no
@@ -849,6 +887,16 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
                 .await?;
             }
             MaskAs::Null => {
+                // An empty value is kept: `NULL`, or the empty string of a built-in string type.
+                // Any other type is not cast to `text`: a cast of a type of the tenant can be a
+                // function of the tenant (`CREATE CAST ... WITH FUNCTION`), which would run on the
+                // rows in clear (FU1-R10-1 of the Kimi review of run 10). So every non-`NULL`
+                // value of such a column becomes `NULL`.
+                let filled = if f.textual {
+                    format!("{col} is not null and {col}::text <> ''")
+                } else {
+                    format!("{col} is not null")
+                };
                 // The `ALTER COLUMN TYPE` to the column's own type (no rewrite) drops the column's
                 // `pg_statistic` rows and builds each extended statistics object on it again
                 // without data (review FU-1 second review, required change 1). `ANALYZE` alone
@@ -859,14 +907,13 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
                     "mask a secret column",
                     format!(
                         "alter table {table} alter column {col} drop not null;\n\
-                         update {table} set {col} = null where {col} is not null and {col}::text <> '';\n\
+                         update {table} set {col} = null where {filled};\n\
                          alter table {table} alter column {col} type {own_type} using {col}"
                     ),
                 )
                 .await?;
                 let left: bool = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "select exists (select 1 from {table} \
-                      where {col} is not null and {col}::text <> '')"
+                    "select exists (select 1 from {table} where {filled})"
                 )))
                 .persistent(false)
                 .fetch_one(&mut *conn)
@@ -926,38 +973,219 @@ async fn mask_columns(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), En
     Ok(())
 }
 
-/// Refuses a masked copy whose tables of the own schema have a column that the catalog of the
-/// plan did not have (review FU-1-3 of Kimi). The platform reads the catalog and the classes
-/// before the engine drains the source, so a migration can add a column in between; the plan
-/// does not name it, and it would be copied in clear. The copy fails with `NotReady` (try
-/// again), and the caller discards it.
+/// A masked column of the copy, found in pass 1 of [`mask_columns`].
+struct FoundColumn<'p> {
+    column: &'p ColumnRef,
+    how: MaskAs,
+    /// `public.name`, quoted.
+    table: String,
+    rel: i64,
+    attnum: i16,
+    /// The column's own type and collation, for the `ALTER COLUMN TYPE` of a secret column.
+    own_type: String,
+    /// Whether the column is of a built-in string type (also through domains), so an empty
+    /// string can be told from other values without a cast of the tenant.
+    textual: bool,
+}
+
+/// Refuses a masked copy when its statements would run code of the tenant while values are
+/// still in clear (FU1-R10-1 of the Kimi review of run 10). Step 2 masks one column after the
+/// other, as the copy's owner. Triggers and rules are parked, but each `UPDATE` and each
+/// `ALTER COLUMN TYPE` of a table also evaluates, on the rows in clear:
+///
+/// - every `CHECK` constraint of the table (also `NOT VALID` ones, also those that read no
+///   masked column; the checks that read a masked column are dropped in pass 1, before this);
+/// - every index expression and index predicate of the table;
+/// - every generated column of the table;
+/// - the checks of the domains that a secret column's type reaches (the `SET ... = NULL`
+///   coerces to the domain);
+///
+/// and the same for each inheritance child or partition of the table (an `UPDATE` without
+/// `ONLY` reaches them). Code there that calls a function of the tenant can read a table that
+/// is not masked yet and write its values into one that is (`a_leak` masked first, then a check
+/// on `people` copies `z_secrets` into it), so the copy would hold secrets in clear.
+///
+/// "Code of the tenant" is any function outside the allow-list ([`allow::allowed_cte`]: the
+/// built-in functions of [`allow::ROW_FUNCTIONS`] that are not `VOLATILE`, and the functions of
+/// built-in operators and casts) that is not a function of an extension (a member of an
+/// extension, not owned by the copy's owner, in a schema that the owner cannot create in). A
+/// built-in function outside the list is code of the tenant here too: `query_to_xml` reads any
+/// table, and `lo_from_bytea` or `setval` write a value where the copy keeps it. An extension's
+/// function sees only the values of its own row, and a check that reads a masked column of the
+/// row is already dropped. The operator classes of indexes are not checked: a tenant needs a
+/// superuser to make one.
+///
+/// The refusal is `Unsupported` and names each object; the transaction of step 2 rolls back
+/// and the caller discards the copy.
+async fn refuse_code_in_the_masking(
+    conn: &mut PgConnection,
+    found: &[FoundColumn<'_>],
+) -> Result<(), EngineError> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    let tables: Vec<String> = found.iter().map(|f| f.table.clone()).collect();
+    let (secret_tables, secret_columns): (Vec<String>, Vec<String>) = found
+        .iter()
+        .filter(|f| f.how == MaskAs::Null)
+        .map(|f| (f.table.clone(), f.column.column.clone()))
+        .unzip();
+    let sql = format!(
+        "with recursive {listed},
+allowed(oid) as (
+  select l.oid from listed l
+  union
+  select p.oid from pg_catalog.pg_proc p
+   where p.proowner operator(pg_catalog.<>)
+           (select r.oid from pg_catalog.pg_roles r where r.rolname operator(pg_catalog.=) current_user)
+     and not pg_catalog.has_schema_privilege(current_user, p.pronamespace, 'CREATE')
+     and exists (select 1 from pg_catalog.pg_depend d
+                  where d.classid operator(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+                    and d.objid operator(pg_catalog.=) p.oid
+                    and d.deptype operator(pg_catalog.=) 'e'::pg_catalog.\"char\")
+),
+{edges},
+code_types(oid) as (
+  select k.contypid from pg_catalog.pg_constraint k
+   where k.contypid operator(pg_catalog.<>) 0::pg_catalog.oid
+     and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+     and {domain_check}
+  union
+  select e.src from type_edges e join code_types c on c.oid operator(pg_catalog.=) e.dst
+),
+planned(oid) as (
+  select r::pg_catalog.oid from pg_catalog.unnest($1::pg_catalog.text[]) t, pg_catalog.to_regclass(t) r
+   where r is not null
+),
+touched(oid) as (
+  select p.oid from planned p
+  union
+  select i.inhrelid from pg_catalog.pg_inherits i
+    join touched t on t.oid operator(pg_catalog.=) i.inhparent
+),
+found(what) as (
+  select pg_catalog.format('check %I of %s', k.conname, k.conrelid::pg_catalog.regclass)
+    from pg_catalog.pg_constraint k
+   where k.conrelid operator(pg_catalog.=) any (array(select t.oid from touched t))
+     and k.contype operator(pg_catalog.=) 'c'::pg_catalog.\"char\"
+     and ({check_calls} or {check_types})
+  union all
+  select pg_catalog.format('index %s', i.indexrelid::pg_catalog.regclass)
+    from pg_catalog.pg_index i
+   where i.indrelid operator(pg_catalog.=) any (array(select t.oid from touched t))
+     and ({index_calls} or {index_types})
+  union all
+  select pg_catalog.format('generated column %I of %s', a.attname, ad.adrelid::pg_catalog.regclass)
+    from pg_catalog.pg_attrdef ad
+    join pg_catalog.pg_attribute a
+      on a.attrelid operator(pg_catalog.=) ad.adrelid and a.attnum operator(pg_catalog.=) ad.adnum
+   where ad.adrelid operator(pg_catalog.=) any (array(select t.oid from touched t))
+     and a.attgenerated operator(pg_catalog.<>) ''::pg_catalog.\"char\"
+     and ({generated_calls} or {generated_types})
+  union all
+  select pg_catalog.format('the type of column %I of %s', a.attname, a.attrelid::pg_catalog.regclass)
+    from rows from (pg_catalog.unnest($3::pg_catalog.text[]),
+                   pg_catalog.unnest($4::pg_catalog.text[])) as sc(rel, col)
+    join pg_catalog.pg_attribute a
+      on a.attrelid operator(pg_catalog.=) pg_catalog.to_regclass(sc.rel)
+     and a.attname operator(pg_catalog.=) sc.col::pg_catalog.name
+     and a.attnum operator(pg_catalog.>) 0::pg_catalog.int2 and not a.attisdropped
+   where a.atttypid operator(pg_catalog.=) any (array(select c.oid from code_types c))
+)
+select coalesce(pg_catalog.string_agg(what, ', ' order by what), '') from found",
+        listed = allow::allowed_cte_as("listed", 2),
+        edges = allow::type_edges_cte(),
+        domain_check = allow::unlisted_calls("k.conbin::pg_catalog.text"),
+        check_calls = allow::unlisted_calls("k.conbin::pg_catalog.text"),
+        check_types = allow::coerces_to("k.conbin::pg_catalog.text", "code_types"),
+        index_calls = allow::unlisted_calls(INDEX_TREE),
+        index_types = allow::coerces_to(INDEX_TREE, "code_types"),
+        generated_calls = allow::unlisted_calls("ad.adbin::pg_catalog.text"),
+        generated_types = allow::coerces_to("ad.adbin::pg_catalog.text", "code_types"),
+    );
+    let names: String = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .bind(&tables)
+        .bind(allow::row_functions())
+        .bind(&secret_tables)
+        .bind(&secret_columns)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| internal("list the code that the masking would run", e))?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::Unsupported(format!(
+        "a masked copy would run code of the tenant on values that are not masked yet: {names}; \
+         drop it or make it call only built-in functions, then copy again"
+    )))
+}
+
+/// The stored trees of an index (`pg_index i`): its expressions and its predicate.
+const INDEX_TREE: &str =
+    "pg_catalog.concat_ws(' ', i.indexprs::pg_catalog.text, i.indpred::pg_catalog.text)";
+
+/// Refuses a masked copy whose tables of the own schema do not have exactly the columns of the
+/// catalog of the plan, with the same identity (review FU-1-3 of Kimi, FU1-R10-2 of its run 10
+/// review). The platform reads the catalog and the classes before the engine drains the
+/// source, so a migration can change the tables in between, and the classes go by name. A new
+/// column is not in the plan, so it would be copied in clear. A rename or a swap gives a known
+/// name to other data (`DROP COLUMN harmless; RENAME token TO harmless`): every name is still
+/// known, but the secret values now sit under the name of a `normal` column. So each column of
+/// the copy must be in the plan's catalog with the same `rel_oid`, `attnum` and `type_oid` (a
+/// `TEMPLATE` copy keeps them), and each column of the plan's catalog must still be there. The
+/// copy fails with `NotReady` (try again), and the caller discards it.
 async fn check_planned_from(conn: &mut PgConnection, plan: &MaskPlan) -> Result<(), EngineError> {
-    let Some(known) = &plan.planned_from else {
+    let Some(planned) = &plan.planned_from else {
         return Ok(());
     };
-    let known: std::collections::HashSet<(&str, &str)> = known
+    type Pinned = Option<(u32, i16, u32)>;
+    let pin =
+        |id: &Option<ColumnIdentity>| -> Pinned { id.map(|i| (i.rel_oid, i.attnum, i.type_oid)) };
+    let known: std::collections::HashMap<(&str, &str), Pinned> = planned
         .iter()
-        .filter(|c| c.schema == "public")
-        .map(|c| (c.table.as_str(), c.column.as_str()))
+        .filter(|p| p.column.schema == "public")
+        .map(|p| {
+            (
+                (p.column.table.as_str(), p.column.column.as_str()),
+                pin(&p.identity),
+            )
+        })
         .collect();
     let catalog = super::catalog::read(conn).await?;
-    let unplanned: Vec<String> = catalog
+    let mut seen = std::collections::HashSet::new();
+    let mut changed: Vec<String> = Vec::new();
+    for t in catalog
         .tables
         .iter()
         .filter(|t| t.schema == "public" && t.kind == RelationKind::Table)
-        .flat_map(|t| {
-            t.columns
-                .iter()
-                .filter(|c| !known.contains(&(t.name.as_str(), c.name.as_str())))
-                .map(move |c| format!("{}.{}", t.name, c.name))
-        })
-        .collect();
-    if unplanned.is_empty() {
+    {
+        for c in &t.columns {
+            let name = (t.name.as_str(), c.name.as_str());
+            match known.get(&name) {
+                None => changed.push(format!("{}.{} (new)", t.name, c.name)),
+                Some(was) => {
+                    seen.insert(name);
+                    let now = pin(&c.identity);
+                    if was.is_some() && now != *was {
+                        changed.push(format!("{}.{} (changed)", t.name, c.name));
+                    }
+                }
+            }
+        }
+    }
+    for name in known.keys() {
+        if !seen.contains(name) {
+            changed.push(format!("{}.{} (gone)", name.0, name.1));
+        }
+    }
+    if changed.is_empty() {
         return Ok(());
     }
+    changed.sort();
     tracing::info!(
-        columns = %unplanned.join(", "),
-        "a masked copy is refused: the source has columns that its plan does not know"
+        columns = %changed.join(", "),
+        "a masked copy is refused: the columns of the source are not those of its plan"
     );
     Err(EngineError::NotReady)
 }

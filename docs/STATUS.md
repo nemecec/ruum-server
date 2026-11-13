@@ -892,10 +892,15 @@ backlog 2026-11-10-run8 S-29 (the raw `up` of a migration approval).
    `CREATE TABLE ... AS` and `CREATE VIEW ... AS`; one line on "names, not relations".
    Items 0 and 1 are built on `f/fu-1-r10` (card FU-1, review pending; `panel/impl-fu1.md`).
    Review fixes (`panel/review-fu1-fix.md`, run 10): a masked copy makes every materialized view
-   again, changes each masked column to its own type (which drops its statistics, also for a
-   statistics target of 0 and a table with no row) and analyzes the masked tables, refuses a column its plan does not know and an enabled event
-   trigger; `current_setting` held by `PUBLIC` is let through until the cluster set-up's
-   contract step (run `10-ruum-data.sh` again once the previous release is gone).
+   again, changes each masked column's type (a personal one to `text`, a secret one to its own
+   type; both drop its statistics, also for a statistics target of 0 and a table with no row)
+   and analyzes the masked tables, and refuses an enabled event trigger; `current_setting` held
+   by `PUBLIC` is let through until the cluster set-up's contract step (run `10-ruum-data.sh`
+   again once the previous release is gone). Kimi run 10 fixes: the plan pins each column's
+   identity, so a new, gone, renamed or swapped column or table refuses the copy (`NotReady`);
+   a check, index expression, generated column or secret column's domain that would run tenant
+   code on rows in clear refuses it (`Unsupported`); a secret column of a type that is not a
+   built-in string type is not cast to `text` (its tenant cast never runs) and keeps no value.
 2. **Flaky tests and connection drops** (2026-11-09 T-12, T-18 to T-20; 2026-11-08 T-4 to
    T-6): first the list of known flaky tests in `docs/TESTING.md` (T-6, raised: three new ones
    in run 6, among them `oauth.e2e.ts`, which failed in 2 of 4 full browser runs of this
