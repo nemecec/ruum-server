@@ -2,11 +2,12 @@
 //! ended by signing out, and cookies that follow browser rules.
 
 use super::{
-    Access, Ctx, Echo, Env, GatewayCase, Jar, Relation, Req, SIGN_IN_OR_REFUSED, SetCookie, echoed,
-    expect_refusal, files, is_echo, page, poll_until, scene,
+    Access, Ctx, Echo, Env, GatewayCase, Relation, Req, SIGN_IN_OR_REFUSED, SetCookie, echoed,
+    expect_refusal, files, is_echo, jar_with_session as moved, page, poll_until, scene,
 };
 use crate::gw_check;
 use std::time::Duration;
+use tokio::time::Instant;
 
 macro_rules! case {
     ($name:expr, $rule:expr, $source:expr, [$($op:expr),* $(,)?], |$cx:ident| $body:block) => {
@@ -24,16 +25,6 @@ macro_rules! case {
 
 /// The bound of "signing out of Ruum ends the app sessions within a minute".
 pub const SIGN_OUT_BOUND: Duration = Duration::from_secs(60);
-
-/// A jar that holds only `__Host-ruum_app=<sid>` for `host` (a session moved to another host).
-fn moved(host: &str, sid: &str) -> Jar {
-    let mut j = Jar::default();
-    j.store(
-        host,
-        &format!("__Host-ruum_app={sid}; Path=/; Secure; HttpOnly; SameSite=Lax"),
-    );
-    j
-}
 
 pub fn cases() -> Vec<GatewayCase> {
     vec![
@@ -153,21 +144,28 @@ pub fn cases() -> Vec<GatewayCase> {
                 let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
                 echoed(&label, &resp)?;
                 cx.world.sign_out_platform(&s.user).await?;
+                let since = Instant::now();
                 let label = format!("GET {}/ after signing out of Ruum", s.host);
-                poll_until(&label, SIGN_OUT_BOUND, Duration::from_secs(1), || {
-                    let cx = cx.clone();
-                    let mut jar = s.jar.clone();
-                    let host = s.host.clone();
-                    let label = label.clone();
-                    async move {
-                        let resp = cx.send_jar(&mut jar, Req::get(&host, "/")).await?;
-                        if is_echo(&resp) {
-                            return Ok(false);
+                poll_until(
+                    &label,
+                    since,
+                    SIGN_OUT_BOUND,
+                    Duration::from_secs(1),
+                    || {
+                        let cx = cx.clone();
+                        let mut jar = s.jar.clone();
+                        let host = s.host.clone();
+                        let label = label.clone();
+                        async move {
+                            let resp = cx.send_jar(&mut jar, Req::get(&host, "/")).await?;
+                            if is_echo(&resp) {
+                                return Ok(false);
+                            }
+                            expect_refusal(&label, &resp, SIGN_IN_OR_REFUSED)?;
+                            Ok(true)
                         }
-                        expect_refusal(&label, &resp, SIGN_IN_OR_REFUSED)?;
-                        Ok(true)
-                    }
-                })
+                    },
+                )
                 .await
             }
         ),

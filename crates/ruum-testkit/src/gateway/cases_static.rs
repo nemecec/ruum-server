@@ -339,7 +339,8 @@ pub fn cases() -> Vec<GatewayCase> {
         case!(
             "reserved_paths_belong_to_the_gateway",
             "Every path under /.ruum/ belongs to the gateway: a static file or an upstream \
-             route at /.ruum/x is never served",
+             route at /.ruum/x is never served, and an unknown path under /.ruum/ gets the \
+             gateway's 404; /.RUUM/x and /%2eruum/x never serve the app's file at /.ruum/x",
             "gateway.openapi.yaml \"Paths the gateway keeps for itself\"; STEP3 card T-6 \"Done \
              when\" (the reserved paths)",
             [],
@@ -365,7 +366,13 @@ pub fn cases() -> Vec<GatewayCase> {
                     "/.ruum/",
                     "/.ruum/v1/nothing",
                 ];
-                for path in reserved {
+                // Unknown paths under /.ruum/: the gateway's own 404. (script.js is served by
+                // the gateway from G-2 on, so only its content is checked.)
+                let unknown = ["/.ruum/x", "/.ruum/", "/.ruum/v1/nothing"];
+                // A URL path is case-sensitive, and a gateway may refuse or pass these; they must
+                // never serve the app's file at /.ruum/x.
+                let lookalikes = ["/.RUUM/x", "/%2eruum/x", "/%2Eruum/x"];
+                for path in reserved.iter().chain(lookalikes.iter()) {
                     let req = Req::get(&s.host, path);
                     let label = req.label();
                     let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
@@ -373,6 +380,9 @@ pub fn cases() -> Vec<GatewayCase> {
                         !resp.text().contains("T6-APP-FILE-AT-RESERVED-PATH"),
                         "{label}: the app's file at a reserved path was served"
                     );
+                    if unknown.contains(path) {
+                        expect_refusal(&label, &resp, &[404])?;
+                    }
                 }
                 // An upstream app with a route at /.ruum/x.
                 let echo = Echo::start().await;
@@ -392,6 +402,9 @@ pub fn cases() -> Vec<GatewayCase> {
                     let label = req.label();
                     let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
                     gw_check!(!is_echo(&resp), "{label}: the app answered a reserved path");
+                    if unknown.contains(&path) {
+                        expect_refusal(&label, &resp, &[404])?;
+                    }
                 }
                 gw_check!(
                     echo.seen().iter().all(|r| !r.target.starts_with("/.ruum/")),

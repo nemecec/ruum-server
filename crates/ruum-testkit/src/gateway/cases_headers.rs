@@ -3,8 +3,9 @@
 
 use super::echo::cookie_pairs;
 use super::{
-    AgentAudience, Ctx, Env, Fail, GatewayCase, Relation, Req, check_security_headers, echoed,
-    echoed_header, echoed_headers, files, frame_ancestors, page, scene,
+    Access, AgentAudience, Ctx, Echo, Env, Fail, GatewayCase, Relation, Req,
+    check_security_headers, echoed, echoed_header, echoed_headers, expect_refusal, files,
+    frame_ancestors, is_echo, page, scene,
 };
 use crate::{gw_check, gw_fail};
 
@@ -342,8 +343,9 @@ pub fn cases() -> Vec<GatewayCase> {
         ),
         case!(
             "frame_ancestors_follow_the_environment",
-            "A live app keeps its own frame-ancestors; a preview allows only the Ruum UI origin, \
-             whatever the app sends",
+            "A live app keeps its own frame-ancestors; a live app whose CSP has no \
+             frame-ancestors still gets frame-ancestors 'none'; a preview allows only the Ruum UI \
+             origin, whatever the app sends",
             "gateway.openapi.yaml \"The check of every request\" 4",
             [],
             |cx| {
@@ -362,6 +364,14 @@ pub fn cases() -> Vec<GatewayCase> {
                     !fa.is_empty() && fa.iter().all(|d| d == "https://partner.example"),
                     "{label}: the live app's own frame-ancestors was not kept alone: {csp:?}"
                 );
+                // A CSP of the app without frame-ancestors.
+                s.echo()
+                    .reply_with(&[("Content-Security-Policy", "default-src 'self'")]);
+                let req = Req::get(&s.host, "/csp-without-frame-ancestors");
+                let label = req.label();
+                let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
+                echoed(&label, &resp)?;
+                check_security_headers(&label, &resp, Env::Live, &cx.gw.ui_origin)?;
                 // A preview of the same app with the same upstream.
                 let w = &cx.world;
                 let prev = w
@@ -381,6 +391,106 @@ pub fn cases() -> Vec<GatewayCase> {
                 let resp = cx.send_jar(&mut jar, req).await?;
                 echoed(&label, &resp)?;
                 check_security_headers(&label, &resp, Env::Preview, &cx.gw.ui_origin)?;
+                Ok(())
+            }
+        ),
+        case!(
+            "hostile_framing_never_passes_the_check",
+            "Two Host headers get 400; an absolute-form target that names another app's host \
+             never reaches that app; two different Content-Length values get 400; \
+             Content-Length with Transfer-Encoding: chunked gets 400 or is read by the chunked \
+             framing alone (RFC 9112 6.1), and no smuggled second request ever reaches the app",
+            "decision 0006 G point 2 (the gateway decides on the request it checked); RFC 9112 \
+             3.2 and 6.1; gateway.openapi.yaml \"The check of every request\" 1 and 3",
+            [],
+            |cx| {
+                let s = scene(&cx, true).await?;
+                let w = &cx.world;
+                // App B of the same tenant: the user has no right on it.
+                let b = w.seed_app(&s.tenant, "orchard", Access::Platform).await?;
+                let b_live = w
+                    .seed_deployment(&b, Env::Live, &files(&[("index.html", &page("b"))]), None)
+                    .await?;
+                w.set_live(&b, &b_live).await?;
+                let b_echo = Echo::start().await;
+                w.set_upstream(&b_live, &b_echo.url).await?;
+                let b_host = cx.live_host(&b);
+                let a_hits = s.echo().hits();
+
+                let req = Req::get(&s.host, "/two-hosts").header("Host", &b_host);
+                let label = format!("{} with a second Host: {b_host}", req.label());
+                let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
+                expect_refusal(&label, &resp, &[400])?;
+                gw_check!(
+                    s.echo().hits() == a_hits && b_echo.hits() == 0,
+                    "{label}: a request with two Host headers reached an app"
+                );
+
+                let req = Req::get(&s.host, &format!("http://{b_host}/absolute"));
+                let label = format!("{} (absolute form, Host of app A)", req.label());
+                cx.send_jar(&mut s.jar.clone(), req).await?;
+                gw_check!(
+                    b_echo.hits() == 0,
+                    "{label}: the request reached app B, where the visitor has no right"
+                );
+
+                let smuggled = format!(
+                    "GET /t6smuggled HTTP/1.1\r\nHost: {}\r\nRuum-User: t6forged\r\n\r\n",
+                    s.host
+                );
+                let body = format!("abcdef{smuggled}");
+                let req = Req::post(&s.host, "/two-lengths")
+                    .header("Content-Length", "6")
+                    .header("Content-Length", &body.len().to_string())
+                    .body(body);
+                let label = format!("{} with two different Content-Length values", req.label());
+                let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
+                expect_refusal(&label, &resp, &[400])?;
+
+                let body = format!("0\r\n\r\n{smuggled}");
+                let req = Req::post(&s.host, "/cl-te")
+                    .header("Content-Length", &body.len().to_string())
+                    .header("Transfer-Encoding", "chunked")
+                    .body(body);
+                let label = format!(
+                    "{} with Content-Length and Transfer-Encoding: chunked",
+                    req.label()
+                );
+                let before = s.echo().hits();
+                let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
+                if is_echo(&resp) {
+                    // Read by the chunked framing alone: one request with an empty body, and
+                    // never both framings forwarded.
+                    let seen = s.echo().seen();
+                    gw_check!(
+                        seen.len() == before + 1,
+                        "{label}: the app got {} requests, expected one",
+                        seen.len() - before
+                    );
+                    let last = &seen[seen.len() - 1];
+                    gw_check!(
+                        last.body.is_empty(),
+                        "{label}: the app got the bytes after the last chunk as the body"
+                    );
+                    gw_check!(
+                        last.header_all("content-length").is_empty()
+                            || last.header_all("transfer-encoding").is_empty(),
+                        "{label}: the gateway forwarded both Content-Length and \
+                         Transfer-Encoding"
+                    );
+                } else {
+                    expect_refusal(&label, &resp, &[400])?;
+                }
+                // Give a smuggled request time to arrive, then look.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                gw_check!(
+                    s.echo()
+                        .seen()
+                        .iter()
+                        .chain(b_echo.seen().iter())
+                        .all(|r| !r.target.contains("t6smuggled")),
+                    "a smuggled second request reached the app"
+                );
                 Ok(())
             }
         ),

@@ -11,11 +11,14 @@
 //!
 //! # Outcomes
 //!
-//! - **planned**: no world is given, or the world answers [`WorldError::Missing`] (the binary
-//!   is not there yet). Never a failure, also not with `RUUM_REQUIRE_IMPLEMENTED=1`.
+//! - **planned**: no world is given, or `make()` or [`GatewayWorld::start`] answers
+//!   [`WorldError::Missing`] (the binary is not there yet). Never a failure, also not with
+//!   `RUUM_REQUIRE_IMPLEMENTED=1`. A `Missing` from any later step **fails** the case: the world
+//!   is written by the implementer, so it must not be able to switch a case off.
 //! - **pending**: the case waits for a named card. Either [`PENDING`] lists it (a rule that a
-//!   later card builds), or the world answers [`WorldError::Pending`] for a step it cannot do
-//!   yet (an app role before B-2). Never a failure.
+//!   later card builds), or the world answers [`WorldError::Pending`] from a step that
+//!   [`WORLD_PENDING_STEPS`] allows (an app role before B-2) in a case that [`WORLD_PENDING`]
+//!   lists with that card. Any other world `Pending` fails the case. Never a failure otherwise.
 //! - **passed** or **failed** otherwise.
 //!
 //! A case never passes on silence (decision 0006 G, the S-2 rule): a refusal must be the
@@ -34,6 +37,7 @@ pub mod cases_later;
 pub mod cases_runtime_api;
 pub mod cases_session;
 pub mod cases_static;
+pub mod cases_tenants;
 pub mod cases_tokens;
 pub mod echo;
 pub mod http;
@@ -139,6 +143,7 @@ pub const PENDING: &[(&str, &str)] = &[
     ("exchange_gives_a_delegated_token", "R-3: the runtime API"),
     ("bound_content_only", "R-3: the runtime API"),
     ("bound_children_only", "R-3: the runtime API"),
+    ("runtime_calls_never_cross_tenants", "R-3: the runtime API"),
     ("publish_app_event_needs_the_topic", "R-3: the runtime API"),
     (
         "app_tokens_never_work_at_the_rest_api",
@@ -157,6 +162,28 @@ pub const PENDING: &[(&str, &str)] = &[
 /// The reason of a case in [`PENDING`].
 pub fn pending_reason(case: &str) -> Option<&'static str> {
     PENDING.iter().find(|(c, _)| *c == case).map(|(_, r)| *r)
+}
+
+/// The cases in which a world may answer [`WorldError::Pending`], each with the one card it may
+/// name. A world `Pending` in any other case, or with another card, fails the case.
+pub const WORLD_PENDING: &[(&str, &str)] = &[
+    ("an_active_app_role_gives_use", "B-2"),
+    ("a_removed_role_stops_within_5_seconds", "B-2"),
+    ("the_roles_claim_lists_active_app_roles", "B-2"),
+];
+
+/// The world steps that may answer [`WorldError::Pending`], each with the one card it may name:
+/// granting or removing an app role (B-2), a partner key (B-3). Every other step that answers
+/// `Pending` fails the case (see [`Guard`]).
+pub const WORLD_PENDING_STEPS: &[(&str, &str)] = &[
+    ("grant(role)", "B-2"),
+    ("revoke(role)", "B-2"),
+    ("partner_key", "B-3"),
+];
+
+/// Whether a world may answer pending with `card` in `case`.
+pub fn world_pending_allowed(case: &str, card: &str) -> bool {
+    WORLD_PENDING.iter().any(|(c, k)| *c == case && *k == card)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -280,7 +307,7 @@ impl std::fmt::Debug for Secret {
 }
 
 /// The answer of a sign-in on an app origin: the raw `Set-Cookie` headers that the gateway's
-/// `/.ruum/v1/auth/callback` sent.
+/// `/.ruum/v1/auth/start` and `/.ruum/v1/auth/callback` sent.
 #[derive(Clone)]
 pub struct SignIn {
     pub set_cookies: Vec<String>,
@@ -337,11 +364,18 @@ pub trait GatewayWorld: Send + Sync {
     async fn set_live(&self, app: &App, deployment: &Deployment) -> WorldResult<()>;
     async fn grant(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()>;
     async fn revoke(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()>;
-    /// Signs `user` in to the app origin `host` through the gateway's real
-    /// `/.ruum/v1/auth/start` and `/.ruum/v1/auth/callback`, with the platform side of the code
-    /// flow (the world may sign the user in to the platform with a test session). Works for a
-    /// user without any right on the app: the gateway refuses such a visitor afterwards.
-    async fn sign_in(&self, user: &User, host: &str) -> WorldResult<SignIn>;
+    /// Makes an existing person a member of another tenant too (one platform account in two
+    /// tenants), without any right on its apps. For the cases across tenants.
+    async fn seed_member(&self, user: &User, tenant: &Tenant) -> WorldResult<()>;
+    /// The platform side of the sign-in code flow, and only that. `login_location` is the
+    /// `Location` of the gateway's answer to `/.ruum/v1/auth/start` (the platform's `loginStart`
+    /// with the app audience). The world signs `user` in to the platform (a test session may be
+    /// used), follows `login_location` as that user and returns the platform's redirect: the
+    /// absolute URL `https://<app host>/.ruum/v1/auth/callback?code=...&state=...`. The cases
+    /// send the start and the callback to the gateway over HTTP themselves ([`Ctx::sign_in`]).
+    /// The platform issues the code also for a user without any right on the app, or who is not
+    /// a member of the app's tenant: the gateway refuses such a visitor afterwards.
+    async fn platform_authorize(&self, user: &User, login_location: &str) -> WorldResult<String>;
     /// Ends the user's platform session (sign out of Ruum).
     async fn sign_out_platform(&self, user: &User) -> WorldResult<()>;
     /// A token of an agent of `user` (scope: the whole tenant) with `audience`.
@@ -366,6 +400,116 @@ pub trait GatewayWorld: Send + Sync {
 pub type MakeGatewayWorld =
     Arc<dyn Fn() -> BoxFuture<'static, WorldResult<Arc<dyn GatewayWorld>>> + Send + Sync>;
 
+/// The world as the cases see it: every step of the implementer's world after `start()`, with
+/// the outcome rules applied. A [`WorldError::Missing`] becomes a failure. A
+/// [`WorldError::Pending`] passes only from a step of [`WORLD_PENDING_STEPS`] with its card
+/// (the runner then also checks [`WORLD_PENDING`]); any other becomes a failure.
+pub struct Guard(pub Arc<dyn GatewayWorld>);
+
+fn guarded<T>(step: &str, r: WorldResult<T>) -> WorldResult<T> {
+    match r {
+        Err(WorldError::Missing(m)) => Err(WorldError::Failed(format!(
+            "{step} answered Missing after start ({m}); Missing counts only from make() and \
+             start(), never to switch a case off"
+        ))),
+        Err(WorldError::Pending { card, why })
+            if !WORLD_PENDING_STEPS
+                .iter()
+                .any(|(s, c)| *s == step && *c == card) =>
+        {
+            Err(WorldError::Failed(format!(
+                "{step} answered pending {card} ({why}); a world may answer pending only from \
+                 the steps of WORLD_PENDING_STEPS {WORLD_PENDING_STEPS:?}"
+            )))
+        }
+        r => r,
+    }
+}
+
+fn relation_step(verb: &str, r: &Relation) -> String {
+    match r {
+        Relation::Role(_) => format!("{verb}(role)"),
+        Relation::View => format!("{verb}(view)"),
+        Relation::Edit => format!("{verb}(edit)"),
+    }
+}
+
+#[async_trait]
+impl GatewayWorld for Guard {
+    async fn start(&self) -> WorldResult<GatewayHandle> {
+        guarded("start (again)", self.0.start().await)
+    }
+    async fn seed_tenant(&self, slug: &str) -> WorldResult<Tenant> {
+        guarded("seed_tenant", self.0.seed_tenant(slug).await)
+    }
+    async fn seed_user(&self, tenant: &Tenant, name: &str) -> WorldResult<User> {
+        guarded("seed_user", self.0.seed_user(tenant, name).await)
+    }
+    async fn seed_member(&self, user: &User, tenant: &Tenant) -> WorldResult<()> {
+        guarded("seed_member", self.0.seed_member(user, tenant).await)
+    }
+    async fn seed_app(&self, tenant: &Tenant, slug: &str, access: Access) -> WorldResult<App> {
+        guarded("seed_app", self.0.seed_app(tenant, slug, access).await)
+    }
+    async fn seed_deployment(
+        &self,
+        app: &App,
+        env: Env,
+        files: &[(String, Vec<u8>)],
+        spa_fallback: Option<&str>,
+    ) -> WorldResult<Deployment> {
+        guarded(
+            "seed_deployment",
+            self.0.seed_deployment(app, env, files, spa_fallback).await,
+        )
+    }
+    async fn set_live(&self, app: &App, deployment: &Deployment) -> WorldResult<()> {
+        guarded("set_live", self.0.set_live(app, deployment).await)
+    }
+    async fn grant(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()> {
+        guarded(
+            &relation_step("grant", relation),
+            self.0.grant(user, app, relation).await,
+        )
+    }
+    async fn revoke(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()> {
+        guarded(
+            &relation_step("revoke", relation),
+            self.0.revoke(user, app, relation).await,
+        )
+    }
+    async fn platform_authorize(&self, user: &User, login_location: &str) -> WorldResult<String> {
+        guarded(
+            "platform_authorize",
+            self.0.platform_authorize(user, login_location).await,
+        )
+    }
+    async fn sign_out_platform(&self, user: &User) -> WorldResult<()> {
+        guarded("sign_out_platform", self.0.sign_out_platform(user).await)
+    }
+    async fn agent_token(&self, user: &User, audience: AgentAudience) -> WorldResult<Secret> {
+        guarded("agent_token", self.0.agent_token(user, audience).await)
+    }
+    async fn partner_key(&self, app: &App, api: &str) -> WorldResult<Secret> {
+        guarded("partner_key", self.0.partner_key(app, api).await)
+    }
+    async fn set_upstream(&self, deployment: &Deployment, url: &str) -> WorldResult<()> {
+        guarded("set_upstream", self.0.set_upstream(deployment, url).await)
+    }
+    async fn set_public_approval(&self, tenant: &Tenant, approved: bool) -> WorldResult<()> {
+        guarded(
+            "set_public_approval",
+            self.0.set_public_approval(tenant, approved).await,
+        )
+    }
+    async fn reuse_host(&self, removed: &App, new: &App) -> WorldResult<App> {
+        guarded("reuse_host", self.0.reuse_host(removed, new).await)
+    }
+    async fn rest_api_status(&self, bearer: &str) -> WorldResult<u16> {
+        guarded("rest_api_status", self.0.rest_api_status(bearer).await)
+    }
+}
+
 /// A binding of a running app (runtime API cases).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
@@ -381,8 +525,15 @@ pub enum BindingKind {
     File(Vec<u8>),
     /// A folder node with files of these names.
     Folder(Vec<String>),
-    /// An API of another app of the tenant (app to app through the internal gateway).
-    App { app_slug: String, api: String },
+    /// An API of another app (app to app through the internal gateway). `tenant_slug` is `None`
+    /// for an app of the same tenant; `Some` names another tenant (a binding the core must
+    /// refuse: the world answers `WorldError::Failed` with a message that starts with
+    /// `refused`, or seeds it and the call is refused).
+    App {
+        app_slug: String,
+        api: String,
+        tenant_slug: Option<String>,
+    },
 }
 
 /// A running app in the runtime API world.
@@ -444,17 +595,22 @@ pub type MakeRuntimeWorld =
 #[derive(Debug)]
 pub enum Fail {
     Failed(String),
-    /// A world step answered [`WorldError::Missing`].
+    /// A world step answered [`WorldError::Missing`]. Inside a case this fails it (the runner
+    /// turns it into a failure): planned comes only from `make()` and `start()`.
     Planned(String),
-    /// A world step answered [`WorldError::Pending`].
-    Pending(String),
+    /// A world step answered [`WorldError::Pending`]. The runner accepts it only when
+    /// [`WORLD_PENDING`] lists the case with this card; otherwise the case fails.
+    Pending {
+        card: String,
+        why: String,
+    },
 }
 
 impl From<WorldError> for Fail {
     fn from(e: WorldError) -> Self {
         match e {
             WorldError::Missing(m) => Fail::Planned(m),
-            WorldError::Pending { card, why } => Fail::Pending(format!("{card}: {why}")),
+            WorldError::Pending { card, why } => Fail::Pending { card, why },
             WorldError::Failed(m) => Fail::Failed(format!("world: {m}")),
         }
     }
@@ -526,6 +682,7 @@ pub fn gateway_cases() -> Vec<GatewayCase> {
     v.extend(cases_tokens::cases());
     v.extend(cases_session::cases());
     v.extend(cases_static::cases());
+    v.extend(cases_tenants::cases());
     v.extend(cases_later::cases());
     v
 }
@@ -611,17 +768,107 @@ impl Ctx {
         Ok(resp)
     }
 
-    /// Signs `user` in to `host` and returns a jar with the cookies (all values are secrets).
-    pub async fn sign_in(&self, user: &User, host: &str) -> Result<(Jar, SignIn), Fail> {
-        let s = self.world.sign_in(user, host).await?;
-        let mut jar = Jar::default();
-        for c in &s.set_cookies {
-            if let Some(sc) = SetCookie::parse(c) {
-                self.secret(&sc.value);
+    /// Remembers the values of the query parameters of `url` that carry a credential of the
+    /// code flow (a name with `code`, `state`, `token` or `nonce`) as secrets. Hosts and IDs stay
+    /// readable in the messages.
+    fn secret_query(&self, url: &str) {
+        if let Some((_, q)) = url.split_once('?') {
+            for pair in q.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    let k = k.to_ascii_lowercase();
+                    if ["code", "state", "token", "nonce"]
+                        .iter()
+                        .any(|n| k.contains(n))
+                    {
+                        self.secret(v);
+                        self.secret(&percent_decode(v));
+                    }
+                }
             }
-            jar.store(host, c);
         }
-        Ok((jar, s))
+    }
+
+    /// `GET /.ruum/v1/auth/start?return_to=<return_to>` on `host` with `jar` (`return_to` is
+    /// sent as it is given).
+    pub async fn auth_start(
+        &self,
+        jar: &mut Jar,
+        host: &str,
+        return_to: &str,
+    ) -> Result<Resp, Fail> {
+        let req = Req::get(host, &format!("/.ruum/v1/auth/start?return_to={return_to}"));
+        let resp = self.send_jar(jar, req).await?;
+        if let Some(loc) = resp.header("location") {
+            self.secret_query(loc);
+        }
+        Ok(resp)
+    }
+
+    /// The platform side of the code flow: checks that `start` (the answer of
+    /// [`Ctx::auth_start`] on `host`) is the gateway's redirect, lets the world follow it as
+    /// `user`, checks that the platform sends the browser back to this host's callback, and
+    /// returns the callback's target (path and query).
+    pub async fn authorize(&self, user: &User, host: &str, start: &Resp) -> Result<String, Fail> {
+        let label = format!("GET {host}/.ruum/v1/auth/start");
+        gw_check!(
+            start.is_redirect() && !is_echo(start),
+            "{label}: expected the gateway's redirect to the platform sign-in, got {} {}",
+            start.status,
+            start.short_body()
+        );
+        let loc = start.header("location").unwrap_or("").to_string();
+        gw_check!(!loc.is_empty(), "{label}: the redirect has no Location");
+        let url = self.world.platform_authorize(user, &loc).await?;
+        self.secret_query(&url);
+        let want = format!("https://{host}/.ruum/v1/auth/callback?");
+        match url.strip_prefix(&want) {
+            Some(q) => Ok(format!("/.ruum/v1/auth/callback?{q}")),
+            None => gw_fail!(
+                "the platform sent the browser to {url:?} after the sign-in on {host}, expected                  {want}..."
+            ),
+        }
+    }
+
+    /// Signs `user` in to `host` through the gateway's real `/.ruum/v1/auth/start` and
+    /// `/.ruum/v1/auth/callback` (over HTTP, with a browser jar) and the world's platform side.
+    /// `Ok(None)` when the callback refused the sign-in (`400` without a session); the case
+    /// decides whether that is right.
+    pub async fn try_sign_in(
+        &self,
+        user: &User,
+        host: &str,
+    ) -> Result<Option<(Jar, SignIn)>, Fail> {
+        let mut jar = Jar::default();
+        let start = self.auth_start(&mut jar, host, "/").await?;
+        let mut raw: Vec<String> = start.set_cookies().iter().map(|c| c.to_string()).collect();
+        let target = self.authorize(user, host, &start).await?;
+        let req = Req::get(host, &target);
+        let label = format!("GET {host}/.ruum/v1/auth/callback");
+        let resp = self.send_jar(&mut jar, req).await?;
+        if resp.status == 400 && !is_echo(&resp) {
+            expect_no_session(&label, &resp)?;
+            return Ok(None);
+        }
+        gw_check!(
+            resp.is_redirect() && !is_echo(&resp),
+            "{label}: expected the gateway's redirect that sets the app session, got {} {}",
+            resp.status,
+            resp.short_body()
+        );
+        raw.extend(resp.set_cookies().iter().map(|c| c.to_string()));
+        Ok(Some((jar, SignIn { set_cookies: raw })))
+    }
+
+    /// Signs `user` in to `host` ([`Ctx::try_sign_in`]); a refused sign-in fails the case.
+    /// Returns a jar with the cookies (all values are secrets).
+    pub async fn sign_in(&self, user: &User, host: &str) -> Result<(Jar, SignIn), Fail> {
+        match self.try_sign_in(user, host).await? {
+            Some((jar, s)) => {
+                self.session_of(&jar, host)?;
+                Ok((jar, s))
+            }
+            None => gw_fail!("the sign-in on {host} was refused at the callback (400)"),
+        }
     }
 
     /// An agent token (a secret).
@@ -682,13 +929,45 @@ impl RtCtx {
 // The runner
 // ---------------------------------------------------------------------------------------------
 
-fn finish(result: Result<CaseResult, tokio::task::JoinError>, secrets: &[String]) -> Outcome {
+/// The outcome of a case that ran in a world (after `make()` and `start()`).
+fn finish(
+    case: &str,
+    result: Result<CaseResult, tokio::task::JoinError>,
+    secrets: &[String],
+) -> Outcome {
     match result {
         Err(e) => Outcome::Failed(scrub(&format!("the case panicked: {e}"), secrets)),
         Ok(Ok(())) => Outcome::Passed,
-        Ok(Err(Fail::Planned(m))) => Outcome::Planned(scrub(&m, secrets)),
-        Ok(Err(Fail::Pending(m))) => Outcome::Pending(scrub(&m, secrets)),
+        Ok(Err(Fail::Planned(m))) => Outcome::Failed(scrub(
+            &format!(
+                "a world step answered Missing after start ({m}); Missing counts only from make() \
+                 and start(), never to switch a case off"
+            ),
+            secrets,
+        )),
+        Ok(Err(Fail::Pending { card, why })) if world_pending_allowed(case, &card) => {
+            Outcome::Pending(scrub(&format!("{card}: {why}"), secrets))
+        }
+        Ok(Err(Fail::Pending { card, why })) => Outcome::Failed(scrub(
+            &format!(
+                "the world answered pending {card} ({why}), which this case does not allow \
+                 (WORLD_PENDING)"
+            ),
+            secrets,
+        )),
         Ok(Err(Fail::Failed(m))) => Outcome::Failed(scrub(&m, secrets)),
+    }
+}
+
+/// The outcome of a failed `make()` or `start()`: planned only for [`WorldError::Missing`].
+fn not_started(e: WorldError) -> Outcome {
+    match e {
+        WorldError::Missing(m) => Outcome::Planned(m),
+        WorldError::Pending { card, why } => Outcome::Failed(format!(
+            "the world answered pending {card} ({why}) before the case ran; only Missing may \
+             stop a world from starting"
+        )),
+        WorldError::Failed(m) => Outcome::Failed(format!("world: {m}")),
     }
 }
 
@@ -703,22 +982,22 @@ pub async fn run_gateway_case(case: &GatewayCase, make: Option<&MakeGatewayWorld
     }
     let world = match make().await {
         Ok(w) => w,
-        Err(e) => return finish(Ok(Err(e.into())), &[]),
+        Err(e) => return not_started(e),
     };
     let gw = match world.start().await {
         Ok(h) => h,
-        Err(e) => return finish(Ok(Err(e.into())), &[]),
+        Err(e) => return not_started(e),
     };
     let secrets = Arc::new(Mutex::new(Vec::new()));
     let cx = Ctx {
-        world,
+        world: Arc::new(Guard(world)),
         gw,
         secrets: secrets.clone(),
     };
     // On its own task, so a panic fails this case only.
     let result = tokio::spawn((case.run)(cx)).await;
     let s = secrets.lock().expect("lock").clone();
-    finish(result, &s)
+    finish(case.name, result, &s)
 }
 
 /// Runs one runtime API case.
@@ -733,11 +1012,11 @@ pub async fn run_runtime_case(case: &RuntimeCase, make: Option<&MakeRuntimeWorld
     }
     let world = match make().await {
         Ok(w) => w,
-        Err(e) => return finish(Ok(Err(e.into())), &[]),
+        Err(e) => return not_started(e),
     };
     let rt = match world.start().await {
         Ok(h) => h,
-        Err(e) => return finish(Ok(Err(e.into())), &[]),
+        Err(e) => return not_started(e),
     };
     let secrets = Arc::new(Mutex::new(Vec::new()));
     let cx = RtCtx {
@@ -747,15 +1026,16 @@ pub async fn run_runtime_case(case: &RuntimeCase, make: Option<&MakeRuntimeWorld
     };
     let result = tokio::spawn((case.run)(cx)).await;
     let s = secrets.lock().expect("lock").clone();
-    finish(result, &s)
+    finish(case.name, result, &s)
 }
 
-/// How many cases run at the same time.
+/// How many cases run at the same time (at least 1).
 fn jobs() -> usize {
     std::env::var("RUUM_GATEWAY_JOBS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4)
+        .max(1)
 }
 
 /// Runs gateway cases and returns one row per case.
@@ -806,7 +1086,8 @@ pub async fn run_runtime_suite(title: &str, make: Option<MakeRuntimeWorld>) {
 }
 
 /// The report of a run, and whether it passes. Planned and pending never fail, also not with
-/// `RUUM_REQUIRE_IMPLEMENTED=1` (the step 2 rule: planned is not a failure).
+/// `RUUM_REQUIRE_IMPLEMENTED=1` (the step 2 rule: planned is not a failure). The runner makes
+/// sure that a world cannot produce them at will (see "Outcomes" above).
 pub fn render(title: &str, rows: &[(&'static str, Outcome)]) -> (String, bool) {
     let count = |f: fn(&Outcome) -> bool| rows.iter().filter(|r| f(&r.1)).count();
     let passed = count(|o| *o == Outcome::Passed);
@@ -985,10 +1266,17 @@ pub fn expect_refusal(label: &str, resp: &Resp, allowed: &[u16]) -> CaseResult {
 /// The statuses of "go and sign in" or "not allowed": a redirect to the sign-in, `401`, `403`.
 pub const SIGN_IN_OR_REFUSED: &[u16] = &[302, 303, 307, 401, 403];
 
-/// Polls `probe` every `every` until it returns `true` or `bound` passes; the case fails when
-/// the bound passes first. The probe's own failures stop the poll.
+/// How much later than its bound a refusal may arrive (the time of one probe's round trip).
+pub const POLL_ALLOWANCE: Duration = Duration::from_secs(1);
+
+/// Polls `probe` every `every` until it returns `true` (the refusal arrived). `since` is the
+/// moment right after the world step (the right removed, the sign-out, the approval withdrawn).
+/// The case fails when the refusal has not **arrived** within `bound` plus [`POLL_ALLOWANCE`]
+/// after `since`: each probe gets only the time that is left, so a slow probe that starts inside
+/// the bound and answers after it fails. The probe's own failures stop the poll.
 pub async fn poll_until<F, Fut>(
     label: &str,
+    since: tokio::time::Instant,
     bound: Duration,
     every: Duration,
     mut probe: F,
@@ -997,16 +1285,104 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<bool, Fail>>,
 {
-    let start = tokio::time::Instant::now();
+    let deadline = since + bound + POLL_ALLOWANCE;
     loop {
-        if probe().await? {
-            return Ok(());
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            gw_fail!(
+                "{label}: still not refused {} ms after the change (bound {} ms)",
+                (now - since).as_millis(),
+                bound.as_millis()
+            );
         }
-        if start.elapsed() >= bound {
-            gw_fail!("{label}: still not refused after {} ms", bound.as_millis());
+        match tokio::time::timeout(deadline - now, probe()).await {
+            Ok(r) => {
+                if r? {
+                    return Ok(());
+                }
+            }
+            Err(_) => gw_fail!(
+                "{label}: no refusal arrived within {} ms after the change (bound {} ms)",
+                (bound + POLL_ALLOWANCE).as_millis(),
+                bound.as_millis()
+            ),
         }
         tokio::time::sleep(every).await;
     }
+}
+
+/// Fails when `resp` sets an app session (`__Host-ruum_app` with a value and without
+/// `Max-Age=0`; names and attributes compared without case).
+pub fn expect_no_session(label: &str, resp: &Resp) -> CaseResult {
+    for c in resp.set_cookies() {
+        let Some(sc) = SetCookie::parse(c) else {
+            continue;
+        };
+        let removal = sc
+            .attr("max-age")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|v| v <= 0)
+            .unwrap_or(false);
+        if sc.name.eq_ignore_ascii_case("__Host-ruum_app") && !sc.value.is_empty() && !removal {
+            gw_fail!("{label}: the answer set an app session");
+        }
+    }
+    Ok(())
+}
+
+/// A jar that holds only `__Host-ruum_app=<sid>` for `host` (a session moved to another host).
+pub fn jar_with_session(host: &str, sid: &str) -> Jar {
+    let mut j = Jar::default();
+    j.store(
+        host,
+        &format!("__Host-ruum_app={sid}; Path=/; Secure; HttpOnly; SameSite=Lax"),
+    );
+    j
+}
+
+/// Decodes `%XX` escapes (and nothing else; `+` stays).
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The decoded value of the query parameter `name` of a URL or a target.
+pub fn query_param(url: &str, name: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    q.split('&').find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        (k == name).then(|| percent_decode(&v.replace('+', " ")))
+    })
+}
+
+/// The path of a redirect `Location` when it stays on `host`: a relative path (`/x`, not
+/// `//x` or `/\x`) or `https://<host>/...`. `None` when it leads off the origin.
+pub fn same_origin_path(location: &str, host: &str) -> Option<String> {
+    let path = match location.strip_prefix(&format!("https://{host}")) {
+        Some("") => "/",
+        Some(rest) if rest.starts_with('/') => rest,
+        Some(_) => return None,
+        None => location,
+    };
+    let ok = path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains('\\')
+        && !path.chars().any(|c| c.is_control());
+    ok.then(|| path.to_string())
 }
 
 /// A small HTML page used as a static file.
@@ -1085,14 +1461,26 @@ pub async fn scene_with(
     })
 }
 
+/// The `max-age` of a `Strict-Transport-Security` value.
+pub fn hsts_max_age(value: &str) -> Option<u64> {
+    value.split(';').find_map(|d| {
+        let (k, v) = d.trim().split_once('=')?;
+        k.trim()
+            .eq_ignore_ascii_case("max-age")
+            .then(|| v.trim().trim_matches('"').parse().ok())
+            .flatten()
+    })
+}
+
 /// Checks the response headers that every answer of an app origin gets (`gateway.openapi.yaml`,
-/// "The check of every request" 4): HSTS, `nosniff`, a `Referrer-Policy`, and `frame-ancestors`
-/// (`'none'` for live apps without their own value; the UI origin for previews).
+/// "The check of every request" 4): HSTS with a positive `max-age`, `nosniff`,
+/// `Referrer-Policy: strict-origin-when-cross-origin`, and `frame-ancestors` (`'none'` for live
+/// apps without their own value; the UI origin for previews).
 pub fn check_security_headers(label: &str, resp: &Resp, env: Env, ui_origin: &str) -> CaseResult {
     let hsts = resp.header("strict-transport-security").unwrap_or("");
     gw_check!(
-        hsts.to_ascii_lowercase().contains("max-age="),
-        "{label}: Strict-Transport-Security missing or without max-age: {hsts:?}"
+        hsts_max_age(hsts).map(|a| a > 0).unwrap_or(false),
+        "{label}: Strict-Transport-Security missing or without a positive max-age: {hsts:?}"
     );
     gw_check!(
         resp.header("x-content-type-options")
@@ -1100,9 +1488,13 @@ pub fn check_security_headers(label: &str, resp: &Resp, env: Env, ui_origin: &st
             .unwrap_or(false),
         "{label}: X-Content-Type-Options: nosniff missing"
     );
+    let rp = resp.headers_all("referrer-policy");
     gw_check!(
-        resp.header("referrer-policy").is_some(),
-        "{label}: Referrer-Policy missing"
+        rp.len() == 1
+            && rp[0]
+                .trim()
+                .eq_ignore_ascii_case("strict-origin-when-cross-origin"),
+        "{label}: expected exactly Referrer-Policy: strict-origin-when-cross-origin, got {rp:?}"
     );
     let csp = resp.headers_all("content-security-policy").join(", ");
     let fa = frame_ancestors(&csp);
@@ -1123,12 +1515,22 @@ pub fn check_security_headers(label: &str, resp: &Resp, env: Env, ui_origin: &st
 }
 
 /// The values of every `frame-ancestors` directive in the CSP headers `csp` (joined with `, `:
-/// a browser enforces each policy, so every one counts).
+/// a browser enforces each policy, so every one counts). Directive names are matched without
+/// case, as CSP does.
 pub fn frame_ancestors(csp: &str) -> Vec<String> {
     csp.split([';', ','])
         .map(str::trim)
-        .filter_map(|d| d.strip_prefix("frame-ancestors"))
-        .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter_map(|d| {
+            let mut it = d.splitn(2, char::is_whitespace);
+            let name = it.next()?;
+            name.eq_ignore_ascii_case("frame-ancestors").then(|| {
+                it.next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        })
         .collect()
 }
 
@@ -1169,5 +1571,56 @@ mod tests {
             vec!["https://a.example", "'none'"]
         );
         assert!(frame_ancestors("default-src 'self'").is_empty());
+        assert_eq!(frame_ancestors("Frame-Ancestors 'none'"), vec!["'none'"]);
+        assert!(frame_ancestors("frame-ancestorsx 'none'").is_empty());
+    }
+
+    #[test]
+    fn helpers_of_the_cases() {
+        assert_eq!(
+            hsts_max_age("max-age=31536000; includeSubDomains"),
+            Some(31536000)
+        );
+        assert_eq!(hsts_max_age("Max-Age=0"), Some(0));
+        assert_eq!(hsts_max_age("includeSubDomains"), None);
+        assert_eq!(percent_decode("/%2e%2e/a%2Fb%"), "/../a/b%");
+        assert_eq!(
+            query_param(
+                "/.ruum/v1/auth/start?x=1&return_to=%2Fprivate%3Fq%3D1",
+                "return_to"
+            )
+            .as_deref(),
+            Some("/private?q=1")
+        );
+        let h = "garden.acme.ruumapps.localhost";
+        assert_eq!(same_origin_path("/a?b", h).as_deref(), Some("/a?b"));
+        assert_eq!(
+            same_origin_path(&format!("https://{h}/x"), h).as_deref(),
+            Some("/x")
+        );
+        for bad in [
+            "//evil.example/",
+            "/\\evil.example",
+            "https://evil.example/",
+            "javascript:alert(1)",
+            "https://garden.acme.ruumapps.localhost.evil.example/",
+        ] {
+            assert_eq!(same_origin_path(bad, h), None, "{bad}");
+        }
+        let ok = Resp {
+            status: 302,
+            headers: vec![(
+                "set-cookie".into(),
+                "__Host-ruum_app=; Path=/; MAX-AGE=0".into(),
+            )],
+            body: vec![],
+        };
+        assert!(expect_no_session("x", &ok).is_ok());
+        let bad = Resp {
+            status: 302,
+            headers: vec![("set-cookie".into(), "__host-RUUM_APP=s1; Path=/".into())],
+            body: vec![],
+        };
+        assert!(expect_no_session("x", &bad).is_err());
     }
 }

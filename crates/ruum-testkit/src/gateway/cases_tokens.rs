@@ -47,15 +47,17 @@ pub fn cases() -> Vec<GatewayCase> {
             "Ruum-User is on every forwarded request and verifies with the gateway's key set \
              (EdDSA): numeric iat and exp, exp - iat at most 60 s, typ app_user, iss the \
              instance origin, aud app:<app-id> and env live (a preview: \
-             app:<app-id>/preview/<deployment-id> and env preview), sub pairwise, the tenant \
+             app:<app-id>/preview/<deployment-id> and env preview), sub pairwise and the same \
+             on every request, no name or email when the app asks for no claims, the tenant \
              slug, the claims of user-token.schema.json (unknown claims allowed)",
             "contracts/apps/user-token.schema.json; contracts/apps/README.md \"Rules\"; decision \
-             0006 G point 2; STEP3 \"How an app runs\" rules 3 and 4",
+             0006 G point 2; STEP3 \"How an app runs\" rules 3 and 4; design 9.4 and 9.6 \
+             (pairwise IDs, only the facts the app may know)",
             [],
             |cx| {
                 let s = scene(&cx, true).await?;
                 let live = Expect::live(&cx.gw.issuer, &s.app.id);
-                let mut jtis = Vec::new();
+                let mut subs = Vec::new();
                 for path in ["/", "/a", "/b?c=d"] {
                     let req = Req::get(&s.host, path);
                     let label = req.label();
@@ -84,10 +86,18 @@ pub fn cases() -> Vec<GatewayCase> {
                         c["actor"] == "user",
                         "{label}: actor of a person must be user"
                     );
-                    if let Some(j) = c["jti"].as_str() {
-                        jtis.push(j.to_string());
+                    for claim in ["name", "email"] {
+                        gw_check!(
+                            c.get(claim).is_none(),
+                            "{label}: the token has {claim}, but the app asks for no claims"
+                        );
                     }
+                    subs.push(c["sub"].as_str().unwrap_or("").to_string());
                 }
+                gw_check!(
+                    subs.windows(2).all(|w| w[0] == w[1]),
+                    "the sub of the same person changed between requests to the same app"
+                );
                 // A preview.
                 let w = &cx.world;
                 let prev = w
@@ -147,13 +157,25 @@ pub fn cases() -> Vec<GatewayCase> {
                 let a_token = user_token_of(&label, &echoed(&label, &resp)?)?;
                 cx.secret(&a_token);
 
+                let a_claims = verify(
+                    &cx,
+                    &label,
+                    &a_token,
+                    &Expect::live(&cx.gw.issuer, &s.app.id),
+                )?;
+
                 let req = Req::get(&b_host, "/").header("Ruum-User", &a_token);
                 let label = req.label();
                 let resp = cx.send_jar(&mut b_jar, req).await?;
                 let b_token = user_token_of(&label, &echoed(&label, &resp)?)?;
                 cx.secret(&b_token);
                 gw_check!(b_token != a_token, "{label}: app B got app A's token");
-                verify(&cx, &label, &b_token, &Expect::live(&cx.gw.issuer, &b.id))?;
+                let b_claims = verify(&cx, &label, &b_token, &Expect::live(&cx.gw.issuer, &b.id))?;
+                gw_check!(
+                    a_claims["sub"] != b_claims["sub"],
+                    "{label}: the same person has the same sub at app A and app B (design 9.6: \
+                     pairwise, different for every app)"
+                );
                 gw_check!(
                     verify_user_token(
                         &a_token,
@@ -205,7 +227,8 @@ pub fn cases() -> Vec<GatewayCase> {
             "credentials_never_mix",
             "An app session cookie used as a bearer, a user token used as an agent token at the \
              gateway or as an API token at the REST API, an agent token at the REST API and an \
-             agent token used as a session cookie: each refused",
+             agent token used as a session cookie: each refused; on the preview the user has \
+             edit, so only the kind of credential can be the reason",
             "decision 0006-10; contracts/apps/README.md \"Rules\" (app tokens never work against \
              the REST API); STEP3 card T-6 \"Done when\"",
             [],
@@ -236,6 +259,13 @@ pub fn cases() -> Vec<GatewayCase> {
                 let p_echo = Echo::start().await;
                 w.set_upstream(&prev, &p_echo.url).await?;
                 let phost = cx.preview_host(&s.app, &prev);
+                // With edit the user may open the preview: a refusal there can only come from
+                // the kind of credential.
+                w.grant(&s.user, &s.app, &Relation::Edit).await?;
+                let req = Req::get(&phost, "/").header("Authorization", &format!("Bearer {sid}"));
+                let label = format!("{} with the live session ID as a bearer", req.label());
+                let resp = cx.send(req).await?;
+                expect_refusal(&label, &resp, SIGN_IN_OR_REFUSED)?;
                 for host in [&phost, &s.host] {
                     let req = Req::get(host, "/")
                         .header("Authorization", &format!("Bearer {user_token}"));
