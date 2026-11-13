@@ -98,6 +98,21 @@ export interface paths {
          * @description Redirects the browser to Zitadel (authorization code flow with PKCE). The server keeps the
          *     state, nonce and PKCE verifier in a short-lived cookie of this sign-in flow,
          *     `ruum_login_<hash of the state>`, so parallel sign-ins do not replace each other.
+         *
+         *     **The app audience** (the sign-in on an app origin, `contracts/apps/gateway.openapi.yaml`
+         *     "Sign-in on an app origin"; card G-1a). The app gateway's `/.ruum/v1/auth/start` sends the
+         *     browser here with `app_tenant`, `app_id`, `app_deployment` and `app_state` (all four, and
+         *     neither `return_to` nor `idp`). The platform checks that the app and the deployment exist
+         *     and serve (the app's live deployment, or a ready preview that has not expired), builds the
+         *     app host from its own records (the host lookup: `<app>.<tenant>.<apps domain>` or
+         *     `<short_id>--<app>.<tenant>.<apps domain>`), and redirects only to
+         *     `https://<that host>/.ruum/v1/auth/callback?code=...&state=<app_state>`. The `code` is
+         *     bound to the signed-in user, the platform session, the app node, the environment (and the
+         *     deployment of a preview) and the state; it is valid 60 seconds and usable once, and the
+         *     gateway redeems it through the core's internal listener, never through this API. Without a
+         *     platform session the normal sign-in runs first and comes back to this request. The session
+         *     cookie is the only credential of this branch (no bearer token). Every refused value gets
+         *     the same `400`, which does not say which app, tenant or deployment exists.
          */
         get: operations["loginStart"];
         put?: never;
@@ -7585,6 +7600,14 @@ export interface operations {
                 return_to?: string;
                 /** @description A hint for the identity provider (decision 6). */
                 idp?: "google" | "microsoft" | "passkey";
+                /** @description The app audience: the tenant of the app (with `app_id`, `app_deployment` and `app_state`). */
+                app_tenant?: string;
+                /** @description The app audience: the app node. */
+                app_id?: string;
+                /** @description The app audience: the deployment that the app host resolves to (the live deployment, or the preview). */
+                app_deployment?: string;
+                /** @description The app audience: the signed state of the app gateway (opaque to the platform; bound to the code). */
+                app_state?: string;
             };
             header?: never;
             path?: never;
@@ -7592,7 +7615,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Redirect to the identity provider. */
+            /** @description Redirect to the identity provider, or (the app audience, with a platform session) to the app origin's `/.ruum/v1/auth/callback` with a one-time code. */
             302: {
                 headers: {
                     Location?: string;
