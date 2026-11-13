@@ -382,44 +382,56 @@ async fn the_function_returns_only_ids_and_runs_with_nothing_else(pool: PgPool) 
         .unwrap();
     assert_eq!(rows, 0, "a transaction without a tenant reads no app row");
     tx.rollback().await.unwrap();
-    // As the gateway's role (when this database cluster has it and the test may use it): the
-    // lookup works, and no tenant table can be read.
+    // As the gateway's role: the lookup works, and no tenant table can be read. The role is
+    // cluster-wide; the test role must be a member of it (CI grants it: `ruum_gateway` to
+    // `ruum_test`). With RUUM_REQUIRE_GATEWAY_ROLE=1 (CI) a role that cannot be used fails the
+    // test instead of skipping this part (review-g1a 1).
+    let require = std::env::var("RUUM_REQUIRE_GATEWAY_ROLE").is_ok_and(|v| v == "1");
     let mut tx = pool.begin().await.unwrap();
-    let as_gateway = sqlx::query("set local role ruum_gateway")
+    let set_role = sqlx::query("set local role ruum_gateway")
         .execute(&mut *tx)
-        .await
-        .is_ok();
-    if as_gateway {
-        let found: Option<(Uuid, Uuid, Uuid)> =
-            sqlx::query_as("select * from ruum_app_host_lookup('acme', 'garden', null)")
-                .fetch_optional(&mut *tx)
-                .await
-                .unwrap();
-        assert_eq!(found, Some((s.tenant.0, s.garden.0, s.live)));
-        for table in [
-            "apps",
-            "app_deployments",
-            "tenant_app_settings",
-            "nodes",
-            "users",
-        ] {
-            sqlx::query("savepoint t").execute(&mut *tx).await.unwrap();
-            let read = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "select 1 from {table} limit 1"
-            )))
-            .execute(&mut *tx)
-            .await;
-            assert!(read.is_err(), "the gateway's role reads {table}");
-            sqlx::query("rollback to savepoint t")
+        .await;
+    match set_role {
+        Ok(_) => {
+            let found: Option<(Uuid, Uuid, Uuid)> =
+                sqlx::query_as("select * from ruum_app_host_lookup('acme', 'garden', null)")
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(found, Some((s.tenant.0, s.garden.0, s.live)));
+            for table in [
+                "apps",
+                "app_deployments",
+                "tenant_app_settings",
+                "app_sign_in_codes",
+                "app_sessions",
+                "nodes",
+                "users",
+                "tenants",
+            ] {
+                sqlx::query("savepoint t").execute(&mut *tx).await.unwrap();
+                let read = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "select 1 from {table} limit 1"
+                )))
                 .execute(&mut *tx)
-                .await
-                .unwrap();
+                .await;
+                assert!(read.is_err(), "the gateway's role reads {table}");
+                sqlx::query("rollback to savepoint t")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
         }
-    } else {
-        println!(
-            "the role ruum_gateway is not usable on this cluster (no CREATEROLE for the \
-             migration, or no membership); the checks above stand alone"
-        );
+        Err(e) => {
+            assert!(
+                !require,
+                "RUUM_REQUIRE_GATEWAY_ROLE=1, but the role ruum_gateway is not usable: {e}"
+            );
+            println!(
+                "the role ruum_gateway is not usable on this cluster (no CREATEROLE for the \
+                 migration, or no membership); the checks above stand alone"
+            );
+        }
     }
     tx.rollback().await.unwrap();
 }
