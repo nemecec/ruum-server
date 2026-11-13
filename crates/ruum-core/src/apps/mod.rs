@@ -327,7 +327,7 @@ pub fn build(
         platform,
     ));
     registry.register_shared(provider.clone())?;
-    Ok(Arc::new(AppService::new(AppDeps {
+    let service = Arc::new(AppService::new(AppDeps {
         nodes,
         authz,
         tenants,
@@ -337,7 +337,10 @@ pub fn build(
         usage: parts.usage,
         config: parts.config,
         roles: parts.roles,
-    })))
+    }));
+    // The active flags of app roles follow the live manifest (card B-2).
+    service.add_live_hook(Arc::new(service.active_roles()));
+    Ok(service)
 }
 
 /// `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`, `getAppDeployment`.
