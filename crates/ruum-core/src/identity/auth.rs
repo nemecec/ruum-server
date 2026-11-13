@@ -163,6 +163,51 @@ async fn authenticate_bearer_for(
     }
 }
 
+/// Checks an agent token for the app gateway: audience [`super::APPS_AGENT_AUDIENCE`] and type
+/// `agent` only (decision 0006-10). The agent row is read as for the API (scope, disabled). A
+/// token of any other audience or type is refused, so an API token never opens an app and an
+/// app-agent token never works at the API (whose check takes the API audience only).
+pub async fn authenticate_app_agent(s: &Services, token: &str) -> Result<Authenticated> {
+    let claims = s.tokens.verify_for(token, &[super::APPS_AGENT_AUDIENCE])?;
+    if claims.typ != TokenType::Agent {
+        return Err(unauthenticated(
+            "only agent tokens open app previews",
+            "get an agent token for the audience ruumapps",
+        ));
+    }
+    let (Some(tenant), Some(agent_id)) = (claims.tid, claims.agent) else {
+        return Err(unauthenticated(
+            "the agent token has no tenant or agent",
+            "get a new access token",
+        ));
+    };
+    if agent_id.0 != claims.sub {
+        return Err(unauthenticated(
+            "the agent token is not valid",
+            "get a new access token",
+        ));
+    }
+    let agent = s.agents.authenticate(tenant, agent_id).await?;
+    if claims.obo.is_some_and(|u| u != agent.owner_id) {
+        return Err(unauthenticated(
+            "the agent token is not valid",
+            "get a new access token",
+        ));
+    }
+    Ok(Authenticated {
+        actor: Actor {
+            actor: PrincipalRef {
+                kind: PrincipalKind::Agent,
+                id: agent.id.into(),
+            },
+            on_behalf_of: Some(agent.owner_id),
+        },
+        bound_tenant: Some(tenant),
+        scope: Some(agent.scope.as_scope()),
+        session_id: None,
+    })
+}
+
 /// Checks the secret of the session cookie.
 pub async fn authenticate_session(s: &Services, secret: &str) -> Result<Authenticated> {
     let session = s
