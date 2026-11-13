@@ -51,7 +51,7 @@ use crate::providers::*;
 use async_trait::async_trait;
 use ruum_dbengine::{
     Catalog, ColumnRef, CopyData, DataClass, DatabaseEngine, EngineError, EngineKind, MaskAs,
-    MaskPlan, NewDatabase, RelationKind,
+    MaskPlan, NewDatabase, PlannedColumn, RelationKind,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -621,8 +621,9 @@ fn engine_error(e: EngineError) -> Error {
 /// column of a table of the database's own schema by the class the lens gives it (`classes`:
 /// the stricter of the column store and the manifest's `data_classes`, backlog 2026-11-09
 /// S-18), `personal` when it has none. `personal` becomes a pseudonym, `secret` becomes `NULL`.
-/// The plan also lists every column of those tables (`planned_from`), so the engine refuses a
-/// copy whose source got a column after this catalog was read (review FU-1-3 of Kimi).
+/// The plan also lists every column of those tables with its identity (`planned_from`), so the
+/// engine refuses a copy whose source got, lost, renamed or swapped a column or a table after
+/// this catalog was read (review FU-1-3 of Kimi, FU1-R10-2 of its run 10 review).
 pub fn mask_plan(
     catalog: &Catalog,
     engine: EngineKind,
@@ -637,10 +638,13 @@ pub fn mask_plan(
         .filter(|t| t.schema == schema && t.kind == RelationKind::Table)
     {
         for c in &t.columns {
-            planned_from.push(ColumnRef {
-                schema: t.schema.clone(),
-                table: t.name.clone(),
-                column: c.name.clone(),
+            planned_from.push(PlannedColumn {
+                column: ColumnRef {
+                    schema: t.schema.clone(),
+                    table: t.name.clone(),
+                    column: c.name.clone(),
+                },
+                identity: c.identity,
             });
             let how = match classes
                 .class(&t.name, &c.name)
@@ -1220,12 +1224,17 @@ mod tests {
     /// when it has none); normal columns and views are left out.
     #[test]
     fn a_mask_plan_follows_the_classes() {
-        use ruum_dbengine::{CatalogColumn, CatalogTable};
+        use ruum_dbengine::{CatalogColumn, CatalogTable, ColumnIdentity};
         let col = |name: &str| CatalogColumn {
             name: name.into(),
             data_type: "text".into(),
             nullable: true,
-            identity: None,
+            identity: Some(ColumnIdentity {
+                rel_oid: 16400,
+                attnum: name.len() as i16,
+                type_oid: 25,
+                definition: None,
+            }),
         };
         let table = |schema: &str, name: &str, kind| CatalogTable {
             schema: schema.into(),
@@ -1287,15 +1296,26 @@ mod tests {
             .as_deref()
             .expect("the plan names the catalog it was made from")
             .iter()
-            .map(|c| format!("{}.{}.{}", c.schema, c.table, c.column))
+            .map(|p| {
+                let id = p.identity.expect("the identity of the column is pinned");
+                format!(
+                    "{}.{}.{}@{}.{}.{}",
+                    p.column.schema,
+                    p.column.table,
+                    p.column.column,
+                    id.rel_oid,
+                    id.attnum,
+                    id.type_oid
+                )
+            })
             .collect();
         assert_eq!(
             from,
             vec![
-                "public.people.email",
-                "public.people.token",
-                "public.people.latin",
-                "public.people.note",
+                "public.people.email@16400.5.25",
+                "public.people.token@16400.5.25",
+                "public.people.latin@16400.5.25",
+                "public.people.note@16400.4.25",
             ]
         );
     }

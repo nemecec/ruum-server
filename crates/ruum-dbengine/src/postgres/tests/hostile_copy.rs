@@ -825,6 +825,26 @@ async fn a_masked_copy_keeps_no_statistics_of_the_source() {
     );
 }
 
+/// What the platform's `mask_plan` pins of a catalog: every column of the tables of `public`,
+/// with its identity.
+fn pinned(catalog: &Catalog) -> Vec<PlannedColumn> {
+    catalog
+        .tables
+        .iter()
+        .filter(|t| t.schema == "public" && t.kind == RelationKind::Table)
+        .flat_map(|t| {
+            t.columns.iter().map(move |c| PlannedColumn {
+                column: ColumnRef {
+                    schema: t.schema.clone(),
+                    table: t.name.clone(),
+                    column: c.name.clone(),
+                },
+                identity: c.identity,
+            })
+        })
+        .collect()
+}
+
 /// A masked copy whose source got a column after the platform read the catalog of the plan is
 /// refused (review FU-1-3 of Kimi): the plan does not name the column, so it would be copied in
 /// clear. The copy fails with `NotReady` (try again); with the column in the plan's catalog, the
@@ -842,7 +862,7 @@ async fn a_masked_copy_refuses_a_column_that_its_plan_does_not_know() {
             f.db(),
             &f.key,
             &MigrationRequest {
-                up: "CREATE TABLE people (id integer PRIMARY KEY, email text, phone text);".into(),
+                up: "CREATE TABLE people (id integer PRIMARY KEY, email text);".into(),
                 timeout: Duration::from_secs(10),
                 dry_run: false,
             },
@@ -850,6 +870,11 @@ async fn a_masked_copy_refuses_a_column_that_its_plan_does_not_know() {
         )
         .await
         .expect("migration");
+    // The catalog of the plan is read before `phone` exists.
+    let stale_catalog = engine.catalog(f.db()).await.expect("catalog");
+    f.migrate("ALTER TABLE people ADD COLUMN phone text;")
+        .await
+        .expect("a new column");
     f.run(
         RoleKind::Owner,
         StatementMode::Write,
@@ -858,15 +883,14 @@ async fn a_masked_copy_refuses_a_column_that_its_plan_does_not_know() {
     )
     .await
     .expect("a row");
-    let column = |name: &str| ColumnRef {
+    let email = ColumnRef {
         schema: "public".into(),
         table: "people".into(),
-        column: name.into(),
+        column: "email".into(),
     };
-    // The catalog of the plan was read before `phone` existed.
     let stale = MaskPlan {
-        columns: vec![(column("email"), MaskAs::Pseudonym)],
-        planned_from: Some(vec![column("id"), column("email")]),
+        columns: vec![(email.clone(), MaskAs::Pseudonym)],
+        planned_from: Some(pinned(&stale_catalog)),
     };
     let (key, _) = conformance::test_key();
     let err = engine
@@ -881,8 +905,8 @@ async fn a_masked_copy_refuses_a_column_that_its_plan_does_not_know() {
         .expect_err("the copy is refused");
     assert!(matches!(err, EngineError::NotReady), "{err:?}");
     let fresh = MaskPlan {
-        columns: vec![(column("email"), MaskAs::Pseudonym)],
-        planned_from: Some(vec![column("id"), column("email"), column("phone")]),
+        columns: vec![(email, MaskAs::Pseudonym)],
+        planned_from: Some(pinned(&engine.catalog(f.db()).await.expect("catalog"))),
     };
     engine
         .copy_database(
@@ -894,6 +918,254 @@ async fn a_masked_copy_refuses_a_column_that_its_plan_does_not_know() {
         )
         .await
         .expect("a plan that knows every column goes through");
+}
+
+/// A masked copy is refused when a migration between the plan and the drain gives a known name
+/// to other data (FU1-R10-2 of the Kimi review of run 10). The classes go by name, so after
+/// `DROP COLUMN harmless; RENAME token TO harmless` the stale plan would skip the gone `token`
+/// and copy the secrets under the `normal` name `harmless`; a swap of two columns or of two
+/// tables keeps every name. The plan pins `rel_oid`, `attnum` and `type_oid`, so each of them
+/// fails with `NotReady`. A plan made from the catalog after the change goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_refuses_a_rename_or_a_swap_after_its_plan() {
+    let Some(engine) = engine().await else { return };
+    let (key, _) = conformance::test_key();
+    let col = |t: &str, c: &str| ColumnRef {
+        schema: "public".into(),
+        table: t.into(),
+        column: c.into(),
+    };
+    let cases: [(&str, &str); 3] = [
+        (
+            "drop and rename",
+            "ALTER TABLE t DROP COLUMN harmless; ALTER TABLE t RENAME COLUMN token TO harmless;",
+        ),
+        (
+            "swap of two columns",
+            "ALTER TABLE t RENAME COLUMN token TO tmp; ALTER TABLE t RENAME COLUMN harmless TO token;
+             ALTER TABLE t RENAME COLUMN tmp TO harmless;",
+        ),
+        (
+            "swap of two tables",
+            "ALTER TABLE t RENAME TO tmp; ALTER TABLE u RENAME TO t; ALTER TABLE tmp RENAME TO u;",
+        ),
+    ];
+    for (case, change) in cases {
+        let f = Fixture::new(&engine).await;
+        f.migrate(
+            "CREATE TABLE t (id integer PRIMARY KEY, token text, harmless text);
+             CREATE TABLE u (id integer PRIMARY KEY, token text, harmless text);",
+        )
+        .await
+        .expect("tables");
+        for insert in [
+            "INSERT INTO t VALUES (1, 'tok_secret', 'fine')",
+            "INSERT INTO u VALUES (1, NULL, 'fine')",
+        ] {
+            f.run(RoleKind::Owner, StatementMode::Write, insert, vec![])
+                .await
+                .expect("rows");
+        }
+        // `t.token` is secret; `u` holds nothing secret in the plan's catalog.
+        let stale = MaskPlan {
+            columns: vec![(col("t", "token"), MaskAs::Null)],
+            planned_from: Some(pinned(&engine.catalog(f.db()).await.expect("catalog"))),
+        };
+        f.migrate(change).await.expect(case);
+        let err = engine
+            .copy_database(
+                f.db(),
+                &f.key,
+                &conformance::new_database(f.db().tenant_id),
+                &CopyData::Masked(stale),
+                &key,
+            )
+            .await
+            .expect_err(case);
+        assert!(matches!(err, EngineError::NotReady), "{case}: {err:?}");
+        let fresh = MaskPlan {
+            columns: vec![(col("t", "token"), MaskAs::Null)],
+            planned_from: Some(pinned(&engine.catalog(f.db()).await.expect("catalog"))),
+        };
+        engine
+            .copy_database(
+                f.db(),
+                &f.key,
+                &conformance::new_database(f.db().tenant_id),
+                &CopyData::Masked(fresh),
+                &key,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{case}: a plan of the new catalog goes through: {e:?}"));
+    }
+}
+
+/// A masked copy runs no code of the tenant while values are still in clear (FU1-R10-1 of the
+/// Kimi review of run 10). `a_leak.v` is personal and is masked first; `people` has a
+/// `NOT VALID` check that reads no masked column and calls `leak()`, which copies the tokens of
+/// `z_secrets` into `a_leak`; `z_secrets.token` is masked last. The `UPDATE` of
+/// `people.token` would run the check on each row and put the raw tokens into the masked
+/// `a_leak`. The copy is refused and names the check; so it is for an index expression and for
+/// a domain of a secret column that call `leak()`. A secret column of a tenant enum with a
+/// tenant cast to `text` does not run the cast: the copy goes through, the cast left no mark,
+/// and the value is `NULL`. Without the check, the copy goes through with no token in clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_masked_copy_runs_no_tenant_code_on_values_in_clear() {
+    let Some(engine) = engine().await else { return };
+    let (key, _) = conformance::test_key();
+    let col = |t: &str, c: &str| ColumnRef {
+        schema: "public".into(),
+        table: t.into(),
+        column: c.into(),
+    };
+    let plan = || MaskPlan {
+        columns: vec![
+            (col("a_leak", "v"), MaskAs::Pseudonym),
+            (col("people", "token"), MaskAs::Null),
+            (col("z_secrets", "token"), MaskAs::Null),
+        ],
+        planned_from: None,
+    };
+    const BASE: &str = "CREATE TABLE a_leak (v text);
+         CREATE TABLE people (id integer PRIMARY KEY, token text);
+         CREATE TABLE z_secrets (id integer PRIMARY KEY, token text);
+         CREATE FUNCTION public.leak(i integer) RETURNS boolean LANGUAGE plpgsql AS $f$
+         BEGIN
+           INSERT INTO public.a_leak SELECT s.token FROM public.z_secrets s;
+           RETURN true;
+         END $f$;
+         CREATE FUNCTION public.leak_imm(i integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $f$
+         BEGIN
+           RETURN i;
+         END $f$;";
+    let rows = [
+        "INSERT INTO a_leak VALUES ('alice@example.com')",
+        "INSERT INTO people VALUES (1, 'tok_people')",
+        "INSERT INTO z_secrets VALUES (1, 'tok_z')",
+    ];
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "a check that reads no masked column",
+            "ALTER TABLE people ADD CONSTRAINT people_leak CHECK (public.leak(id)) NOT VALID;",
+            "check people_leak of people",
+        ),
+        (
+            "an index expression",
+            "CREATE INDEX people_leak_idx ON people (public.leak_imm(id));",
+            "index people_leak_idx",
+        ),
+        (
+            "a domain of a secret column",
+            "CREATE DOMAIN public.leaky AS text CHECK (public.leak(1));
+             ALTER TABLE people ALTER COLUMN token TYPE public.leaky;",
+            "the type of column token of people",
+        ),
+    ];
+    for (case, extra, named) in cases {
+        let f = Fixture::new(&engine).await;
+        f.migrate(BASE).await.expect("tables");
+        for insert in rows {
+            f.run(RoleKind::Owner, StatementMode::Write, insert, vec![])
+                .await
+                .expect("rows");
+        }
+        f.migrate(extra).await.expect(case);
+        let err = engine
+            .copy_database(
+                f.db(),
+                &f.key,
+                &conformance::new_database(f.db().tenant_id),
+                &CopyData::Masked(plan()),
+                &key,
+            )
+            .await
+            .expect_err(case);
+        assert!(
+            matches!(&err, EngineError::Unsupported(m) if m.contains(named)),
+            "{case}: {err:?}"
+        );
+    }
+    // The control: no such code. The copy goes through, and no token is in clear.
+    let f = Fixture::new(&engine).await;
+    f.migrate(BASE).await.expect("tables");
+    for insert in rows {
+        f.run(RoleKind::Owner, StatementMode::Write, insert, vec![])
+            .await
+            .expect("rows");
+    }
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(plan()),
+            &key,
+        )
+        .await
+        .expect("a copy without tenant code in the masking goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select (select string_agg(left(v, 2), ',') from a_leak) || '|' || \
+                    (select count(*) from people where token is not null) || '|' || \
+                    (select count(*) from z_secrets where token is not null)",
+        )
+        .await
+        .unwrap(),
+        "p_|0|0"
+    );
+    close(owner).await;
+    // A secret column of a tenant enum whose cast to `text` is the tenant's function: the
+    // masking does not cast it, so the function leaves no mark, and the value is `NULL`.
+    let f = Fixture::new(&engine).await;
+    f.migrate(
+        "CREATE TYPE public.mood AS ENUM ('happy', 'sad');
+         CREATE TABLE public.seen (what text);
+         CREATE FUNCTION public.mood_text(public.mood) RETURNS text LANGUAGE plpgsql AS $f$
+         BEGIN
+           INSERT INTO public.seen VALUES ('cast ran');
+           RETURN 'x';
+         END $f$;
+         CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood) AS IMPLICIT;
+         CREATE TABLE t (id integer PRIMARY KEY, sec public.mood);",
+    )
+    .await
+    .expect("tables");
+    f.run(
+        RoleKind::Owner,
+        StatementMode::Write,
+        "INSERT INTO t VALUES (1, 'happy')",
+        vec![],
+    )
+    .await
+    .expect("a row");
+    let copy = engine
+        .copy_database(
+            f.db(),
+            &f.key,
+            &conformance::new_database(f.db().tenant_id),
+            &CopyData::Masked(MaskPlan {
+                columns: vec![(col("t", "sec"), MaskAs::Null)],
+                planned_from: None,
+            }),
+            &key,
+        )
+        .await
+        .expect("the copy goes through");
+    let mut owner = session(&engine, &copy.database, RoleKind::Owner).await;
+    assert_eq!(
+        psql(
+            &mut owner,
+            "select (select count(*) from public.seen) || '|' || \
+                    (select count(*) from t where sec is not null)",
+        )
+        .await
+        .unwrap(),
+        "0|0",
+        "the tenant's cast did not run, and the secret is gone"
+    );
+    close(owner).await;
 }
 
 /// A copy of a database that holds an enabled event trigger is refused before the hand-over's
