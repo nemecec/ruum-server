@@ -19,6 +19,7 @@ pub mod backend;
 pub mod client;
 pub mod contract;
 pub mod fixtures;
+pub mod gateway;
 pub mod isolation;
 pub mod matrix;
 pub mod permissions;

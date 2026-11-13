@@ -13,10 +13,14 @@ workspace = true
 [dependencies]
 ruum-core.workspace = true
 ruum-api.workspace = true
+async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 blake3.workspace = true
 futures.workspace = true
 http-body-util.workspace = true
+jsonschema.workspace = true
+jsonwebtoken.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

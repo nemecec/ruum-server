@@ -2931,10 +2931,14 @@ dependencies = [
 name = "ruum-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "blake3",
  "futures",
  "http-body-util",
+ "jsonschema",
+ "jsonwebtoken",
  "ruum-api",
  "ruum-core",
  "serde_json",
