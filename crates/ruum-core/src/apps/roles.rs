@@ -291,6 +291,24 @@ impl ActiveRoles {
     }
 }
 
+/// The live-release hook of the deployments (`super::deployments::LiveReleaseHook`): the
+/// service calls it before it switches the live deployment, with the manifest that becomes live.
+/// It reads the graph, not `before`, so a switch that failed after an earlier call is repaired
+/// by the next one.
+#[async_trait]
+impl super::deployments::LiveReleaseHook for ActiveRoles {
+    async fn live_changed(
+        &self,
+        _tenant: TenantId,
+        app: NodeId,
+        _before: Option<&Value>,
+        after: &Value,
+        _actor: &Actor,
+    ) -> Result<()> {
+        self.sync(app, Some(after)).await
+    }
+}
+
 // ---------------------------------------------------------------------------- rows
 
 /// A row of `app_role_grants` (`AppRoleGrant`).
