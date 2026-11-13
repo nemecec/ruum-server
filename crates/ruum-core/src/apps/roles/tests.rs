@@ -411,6 +411,41 @@ async fn share_holders_and_grants_roles_holders_grant() {
     );
 }
 
+/// `app_role#grant` is `share`, not `edit`: an editor of the app without `share` (the node
+/// setting `editors_can_share` is false) cannot change grants.
+#[tokio::test]
+async fn an_editor_without_share_cannot_grant() {
+    let w = world().await;
+    let (editor, _) = user(&w.s, &w.team, w.owner, MemberRole::Member).await;
+    w.s.tenants
+        .update_member(&w.c(w.owner), editor, MemberRole::Member, Some(Role::Edit))
+        .await
+        .unwrap();
+    let g = w.grant(&w.c(editor), "approver", w.guest).await.unwrap();
+    w.s.sharing
+        .update_node_sharing(&w.c(w.owner), w.app, Some(false), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        code(w.grant(&w.c(editor), "approver", w.viewer).await),
+        (403, "permission_denied".into())
+    );
+    assert_eq!(
+        code(
+            w.s.apps
+                .remove_app_role_grant(&w.c(editor), w.app, g.value.id)
+                .await
+        ),
+        (403, "permission_denied".into())
+    );
+    let left =
+        w.s.apps
+            .list_app_role_grants(&w.c(w.member), w.app, None, PageRequest::default())
+            .await
+            .unwrap();
+    assert_eq!(left.items.len(), 1, "a refusal changes nothing");
+}
+
 #[tokio::test]
 async fn a_removed_role_keeps_its_grants_and_gives_nothing() {
     let w = world().await;
