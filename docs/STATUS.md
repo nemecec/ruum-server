@@ -18,7 +18,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 11-11: card M-1, card I-3, the step 3 specification and its UX package), the integration of card Q-2
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
-updates without downtime O-25), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -251,6 +251,19 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Kimi re-review fixes (2026-11-13; backlog run9 S-39). Kimi K3.1 Pro re-reviewed T-4a, S-2 and
+O-25 on `3badfb0`; three fix cards, each accepted by a Claude review, were rebased onto `main` in
+one stack, checked on the build server, pushed as `integ9k/<name>`, green in GitHub CI, then
+fast-forwarded in this order (linear history, no merge commit, no co-author line). Digest:
+`docs/digests/2026-11-12-run9.md`, "Kimi re-reviews and fixes"; deferred items:
+`docs/backlog/2026-11-12-run9.md` section 6.
+
+| Branch (pushed as) | What it adds | Review |
+|---|---|---|
+| `fix/o25-kimi` (`integ9k/o25-kimi`) | Two database roles on staging: serving pods log in as `ruum_app` (data rights, read-only `_sqlx_migrations`, no DDL), only the migration Job as the owner `ruum` (`ruum/ruum-migrate-db`); `ruum-server migrate` restricts the runtime role (`RUUM_DB_RUNTIME_ROLE`) and fails when it could change the schema. `--rollback` goes only to the recorded `previous` release (`--rollback-older` otherwise). A deploy lock (Lease `ruum/ruum-deploy`). No memory fallback with `RUUM_MIGRATE=false`. The deployer's reach is documented truthfully (O-34). New secret `STG_PG_RUUM_APP_PASSWORD`. | Kimi CHANGES REQUESTED (7), review-k9o25 accept |
+| `fix/t4a-kimi` (`integ9k/t4a-kimi`) | App acceptance cases: deflate zip bomb and entry-count bombs, more escape names, `422` only for entry attacks, agent deploy sources, edit without `share` on role grants, scanned answers (encoded forms too), whole-error "same as missing". Contract (provisional, decision 0006 H): manifest archive paths refuse `..`, a leading `/` and `\`. | Kimi CHANGES REQUESTED (12), review-k9t4a accept |
+| `fix/s2-kimi` (`integ9k/s2-kimi`) | Spike S-2: every "not reached" result has a positive control; refused egress needs the proxy's reason; missing targets fail; tmpfs `/out`; images by digest; nameless `Set-Cookie` dropped (G-1a rule); decision 0006 G names what is not tested. | Kimi CHANGES REQUESTED (14), review-k9s2 accept |
 
 Integration of run 9 (2026-11-12 to 11-13; eight branches rebased onto `main` `ae29f09` in one
 stack, each tip checked on the build server, pushed as `integ9/<name>`, green in GitHub CI, then
@@ -630,6 +643,24 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
+## Checks (2026-11-13, `main` after the Kimi re-review fixes, on the build server)
+
+`main` is `0ced7d7` before this documentation commit. The O-25 tip (`b6b0aef`) was checked with
+key `i9ko25`, the final tree with `i9ks2`; the T-4a tip has the same Rust code as the final tree
+(S-2 changes only `spikes/` and docs). On the final tree:
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`: pass.
+- `cargo test --workspace`: 946 passed, 0 failed, 3 ignored (940 after run 9; O-25 tip 943).
+- `cargo test -p ruum-testkit` with `RUUM_REQUIRE_IMPLEMENTED=1` on memory and on Postgres: every
+  binary passes, 0 failed.
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`, all 177 mutations in three
+  parallel shards (`i9km0` to `i9km2`): 177 of 177 killed, none survived, skipped or broken.
+- `deploy/staging/tests/run.sh` on the Mac: all passed (381 checks) on each tip.
+- Spike S-2 gateway: fmt, clippy and 6 unit tests pass; `spikes/step3-sandbox/run.sh` (the
+  card's run): 144 PASS, 0 FAIL, 1 SKIP (runsc).
+- GitHub CI: green on `integ9k/o25-kimi`, `integ9k/t4a-kimi` and `integ9k/s2-kimi`.
+
 ## Checks (2026-11-13, `main` after the integration of run 9, on the build server)
 
 `main` is `b63a308` before this documentation commit (the tree of `integ9/o-25`). Each of the
@@ -837,6 +868,12 @@ before D-3b; A-2w removes `WAIT_A2W` (T-32); R-2a fixes the self-overlapping red
 secret values (S-36); R-2b checks build canaries hex-encoded (S-37); W-2 and W-3a pass the
 tenant's plan to `validateManifest` (P-58); the journal readers accept unknown event types before
 more event types are added (P-57).
+
+The Kimi re-review fixes (2026-11-13) leave O-34 for a panel: the deployer can still read every
+Secret of `ruum`, the owner DSN included, so its kubeconfig stays operator-only until the
+migration step and the rollout move out of its reach. W-2 must answer TK-1 (the archive file
+count limit), match manifest globs on the archive's entry list (P-66) and size the count bomb
+against the 32 MiB `putContent` limit (T-40).
 
 Run 8 merged card M-1 (`s2/m-1-r1`), card I-3 (`s2/i-3`) and the step 3 specification with its
 UX package (`s3/ux-apps`); its new items are in `docs/backlog/2026-11-10-run8.md`. Card A-2
