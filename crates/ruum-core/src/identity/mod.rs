@@ -19,6 +19,7 @@
 //! Authentication of a request (the session cookie, a bearer token) is in [`auth`]; it is used by
 //! the `RequestContext` extractor of `ruum-api`, and by the MCP and WebDAV faces.
 
+pub mod app_sign_in;
 pub mod auth;
 pub mod idempotency;
 pub mod memory;
@@ -42,6 +43,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub use tokens::{JwtTokenIssuer, issue_user_token};
+
+/// The audience of agent tokens for the app gateway (decision 0006-10): accepted on preview hosts
+/// only, never by the REST API.
+pub const APPS_AGENT_AUDIENCE: &str = "ruumapps";
 
 /// The name of the session cookie of the web UI.
 pub const SESSION_COOKIE: &str = "ruum_session";
@@ -349,6 +354,29 @@ pub trait TokenIssuer: Send + Sync {
     /// Checks the signature, the issuer and the expiry. The audience must be the API origin or
     /// its `/mcp` URL; the caller compares it with what it needs.
     fn verify(&self, token: &str) -> Result<AccessClaims>;
+    /// Checks the signature, the issuer and the expiry like [`TokenIssuer::verify`], with an
+    /// audience in `audiences` instead of the API's own (the app gateway takes agent tokens of
+    /// [`APPS_AGENT_AUDIENCE`] only; decision 0006-10). The default takes the API audiences only.
+    fn verify_for(&self, token: &str, audiences: &[&str]) -> Result<AccessClaims> {
+        let claims = self.verify(token)?;
+        if audiences
+            .iter()
+            .any(|a| claims.aud == a.trim_end_matches('/'))
+        {
+            Ok(claims)
+        } else {
+            Err(unauthenticated(
+                "the access token is for another audience",
+                "get a token for this audience",
+            ))
+        }
+    }
+    /// Whether `token` carries a valid signature of this issuer's key (any audience, type or
+    /// expiry): a credential of the platform. The app gateway refuses such a token when it is
+    /// not an agent token for apps, instead of passing it to the app as the app's own scheme.
+    fn signed_by_platform(&self, token: &str) -> bool {
+        self.verify(token).is_ok()
+    }
     /// The public keys as a JWKS document.
     fn jwks(&self) -> serde_json::Value;
     /// Signs a JSON value for `purpose` (for example `oauth_request`), valid for `seconds`.
@@ -399,6 +427,50 @@ pub trait IdentityStore: Send + Sync {
     async fn bind_email_grants(&self, user: UserId, session: Uuid, force: bool) -> Result<usize> {
         let _ = (user, session, force);
         Ok(0)
+    }
+
+    /// Issues a one-time sign-in code for an app origin (the platform side of the code flow of
+    /// [`app_sign_in`]): bound to the user, the platform session, the app binding and the
+    /// gateway's state, valid [`app_sign_in::APP_CODE_SECONDS`]. Returns the code (shown once;
+    /// only its SHA-256 is stored).
+    async fn create_app_code(&self, code: app_sign_in::NewAppCode) -> Result<String> {
+        let _ = code;
+        Err(Error::Internal(
+            "this identity store has no app sign-in codes".into(),
+        ))
+    }
+
+    /// Redeems a sign-in code for an app session: at most once, before it expires, only for the
+    /// same binding and state, and only while its platform session lives. `None` for any other
+    /// case (the caller answers `400` without saying which). Returns the session and the secret
+    /// of its cookie (only its SHA-256 is stored).
+    async fn redeem_app_code(
+        &self,
+        binding: &app_sign_in::AppBinding,
+        code: &str,
+        state: &str,
+    ) -> Result<Option<(app_sign_in::AppSession, String)>> {
+        let _ = (binding, code, state);
+        Ok(None)
+    }
+
+    /// The live app session of `secret` in `tenant`: not ended, not expired, and its platform
+    /// session still live (signing out of Ruum ends it). `None` otherwise. The caller checks the
+    /// binding ([`app_sign_in::AppSession::serves`]).
+    async fn app_session(
+        &self,
+        tenant: TenantId,
+        secret: &str,
+    ) -> Result<Option<app_sign_in::AppSession>> {
+        let _ = (tenant, secret);
+        Ok(None)
+    }
+
+    /// Ends the app session of `secret` in `tenant` (logout on the app origin). Ending an unknown
+    /// or ended session is not an error.
+    async fn end_app_session(&self, tenant: TenantId, secret: &str) -> Result<()> {
+        let _ = (tenant, secret);
+        Ok(())
     }
 
     /// The app passwords of the caller in `ctx.tenant`, also revoked and expired ones, newest
