@@ -13,11 +13,11 @@
 //! This module holds the requests and set-up steps; the cases are in `apps_settings`,
 //! `apps_deploy`, `apps_publish` and `apps_roles`.
 
-use super::{Case, Ctx, Fail, Outcome, gate, run_case};
+use super::{Case, Ctx, Fail, Outcome, gate, operation_of, run_case};
 use crate::{check, fail};
 use axum::http::Method;
 use futures::stream::{self, StreamExt};
-use ruum_testkit::client::RequestSpec;
+use ruum_testkit::client::{self, RequestSpec, Response};
 use ruum_testkit::contract;
 use ruum_testkit::fixtures::{Backend, Credentials, Principal, TenantFixture, Who};
 use serde_json::{Value, json};
@@ -54,6 +54,11 @@ pub const PENDING: &[(&str, &str)] = &[
         "open question for W-1: the contract refuses a slug that this tenant used before \
          (slug_retired), STEP3.md says no other tenant gets it either; a host has the tenant \
          slug, so what does tenant B see?",
+    ),
+    (
+        "entry_count_bomb_is_refused",
+        "open question for W-2: the contract says unpack has a file count limit but names no \
+         number; this case assumes the limit is below 65,000 files (backlog TK-1)",
     ),
     (
         "preview_expiry_is_visible",
@@ -388,7 +393,18 @@ pub async fn new_app(
     parent: impl std::fmt::Display,
     name: &str,
 ) -> Result<Value, Fail> {
-    let made = cx.ok(who, create_app(cx, parent, name), &[202]).await?;
+    new_app_scanned(cx, who, parent, name, &[]).await
+}
+
+/// [`new_app`], with the answer scanned for `secrets` ([`ok_scanned`]).
+pub async fn new_app_scanned(
+    cx: &Ctx,
+    who: Who,
+    parent: impl std::fmt::Display,
+    name: &str,
+    secrets: &[String],
+) -> Result<Value, Fail> {
+    let made = ok_scanned(cx, who, create_app(cx, parent, name), &[202], secrets).await?;
     check!(
         made["app"]["node"]["id"].is_string(),
         "createApp gave no app.node.id: {made}"
@@ -509,12 +525,29 @@ pub async fn wait_state(
     dep: &str,
     states: &[&str],
 ) -> Result<Value, Fail> {
+    wait_state_scanned(cx, who, app, dep, states, &[]).await
+}
+
+/// [`wait_state`], with every answer scanned for `secrets` ([`ok_scanned`]).
+pub async fn wait_state_scanned(
+    cx: &Ctx,
+    who: Who,
+    app: &str,
+    dep: &str,
+    states: &[&str],
+    secrets: &[String],
+) -> Result<Value, Fail> {
     let start = Instant::now();
     loop {
         let asked = Instant::now();
-        let d = cx
-            .ok(who, get_deployment(cx, app, dep, Some(10)), &[200])
-            .await?;
+        let d = ok_scanned(
+            cx,
+            who,
+            get_deployment(cx, app, dep, Some(10)),
+            &[200],
+            secrets,
+        )
+        .await?;
         let state = d["state"].as_str().unwrap_or_default().to_string();
         if states.contains(&state.as_str()) {
             return Ok(d);
@@ -536,21 +569,43 @@ pub async fn wait_state(
 /// Starts a preview of `body` as `who` (`createAppDeployment`, `202`) and waits until it is
 /// `ready`. Returns the deployment.
 pub async fn preview(cx: &Ctx, who: Who, app: &str, body: Value) -> Result<Value, Fail> {
-    let made = cx.ok(who, create_deployment(cx, app, body), &[202]).await?;
+    preview_scanned(cx, who, app, body, &[]).await
+}
+
+/// [`preview`], with every answer scanned for `secrets` ([`ok_scanned`]).
+pub async fn preview_scanned(
+    cx: &Ctx,
+    who: Who,
+    app: &str,
+    body: Value,
+    secrets: &[String],
+) -> Result<Value, Fail> {
+    let made = ok_scanned(cx, who, create_deployment(cx, app, body), &[202], secrets).await?;
     check!(
         made["environment"] == "preview",
         "createAppDeployment did not start a preview: {made}"
     );
     let id = str_at(&made, "/id")?;
-    wait_state(cx, who, app, &id, &["ready"]).await
+    wait_state_scanned(cx, who, app, &id, &["ready"], secrets).await
 }
 
 /// Publishes a deployment as a person (`publishAppDeployment`, `200`) and waits until the
 /// deployment that the answer names is `live`. Returns it.
 pub async fn go_live(cx: &Ctx, who: Who, app: &str, dep: &str) -> Result<Value, Fail> {
-    let p = cx.ok(who, publish(cx, app, dep, json!({})), &[200]).await?;
+    go_live_scanned(cx, who, app, dep, &[]).await
+}
+
+/// [`go_live`], with every answer scanned for `secrets` ([`ok_scanned`]).
+pub async fn go_live_scanned(
+    cx: &Ctx,
+    who: Who,
+    app: &str,
+    dep: &str,
+    secrets: &[String],
+) -> Result<Value, Fail> {
+    let p = ok_scanned(cx, who, publish(cx, app, dep, json!({})), &[200], secrets).await?;
     let id = str_at(&p, "/id")?;
-    let live = wait_state(cx, who, app, &id, &["live"]).await?;
+    let live = wait_state_scanned(cx, who, app, &id, &["live"], secrets).await?;
     check!(
         live["environment"] == "live" && live["version_id"].is_string(),
         "a live deployment has environment live and a version_id: {live}"
@@ -588,13 +643,25 @@ pub async fn live_app(
     name: &str,
     manifest: &str,
 ) -> Result<LiveApp, Fail> {
+    live_app_scanned(cx, parent, name, manifest, &[]).await
+}
+
+/// [`live_app`], with every answer of `createApp`, `createAppDeployment`, `getAppDeployment`
+/// and `publishAppDeployment` scanned for `secrets` ([`ok_scanned`]).
+pub async fn live_app_scanned(
+    cx: &Ctx,
+    parent: impl std::fmt::Display,
+    name: &str,
+    manifest: &str,
+    secrets: &[String],
+) -> Result<LiveApp, Fail> {
     let parent = parent.to_string();
-    let app = new_app(cx, Who::Member, &parent, name).await?;
+    let app = new_app_scanned(cx, Who::Member, &parent, name, secrets).await?;
     let id = app_id(&app)?;
     let slug = str_at(&app, "/slug")?;
     let s = site(cx, Who::Member, &parent, &format!("{name} site"), manifest).await?;
-    let p = preview(cx, Who::Member, &id, from_folder(&s.folder, None)).await?;
-    let live = go_live(cx, Who::Member, &id, &str_at(&p, "/id")?).await?;
+    let p = preview_scanned(cx, Who::Member, &id, from_folder(&s.folder, None), secrets).await?;
+    let live = go_live_scanned(cx, Who::Member, &id, &str_at(&p, "/id")?, secrets).await?;
     Ok(LiveApp { id, slug, live })
 }
 
@@ -707,23 +774,127 @@ pub fn fixture_secrets(cx: &Ctx) -> Vec<String> {
     v
 }
 
-/// Sends `req` as `who` and fails, without printing any value, when the answer holds one of
-/// `secrets`. Returns the answer's status and JSON body.
+/// Base64 of `data` without padding, standard (`+/`) or URL-safe (`-_`) alphabet.
+fn base64(data: &[u8], url_safe: bool) -> String {
+    let abc: &[u8; 64] = if url_safe {
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    } else {
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    };
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..=c.len() {
+            out.push(abc[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// The forms of a secret that no answer may hold: the value itself, its hex (lower and upper
+/// case), its percent-encoding (when it differs), and its base64 (standard and URL-safe) at
+/// each of the three byte positions it can have in a longer base64 text. For base64 the
+/// characters that also depend on the bytes before or after the secret are left out; a secret
+/// has at least 12 bytes, so each base64 form keeps at least 8 characters.
+pub fn secret_forms(secret: &str) -> Vec<String> {
+    let b = secret.as_bytes();
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let mut v = vec![secret.to_string(), hex.to_uppercase(), hex];
+    for upper in [true, false] {
+        let pct: String = b
+            .iter()
+            .map(
+                |&x| match (x.is_ascii_alphanumeric() || b"-._~".contains(&x), upper) {
+                    (true, _) => (x as char).to_string(),
+                    (false, true) => format!("%{x:02X}"),
+                    (false, false) => format!("%{x:02x}"),
+                },
+            )
+            .collect();
+        if pct != secret {
+            v.push(pct);
+        }
+    }
+    for url_safe in [false, true] {
+        for k in 0..3 {
+            let mut data = vec![0u8; k];
+            data.extend_from_slice(b);
+            let enc = base64(&data, url_safe);
+            let from = if k == 0 { 0 } else { 4 };
+            let to = enc.len().saturating_sub(4);
+            if to > from + 7 {
+                v.push(enc[from..to].to_string());
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The number of the first of `secrets` that `text` holds in any of its [`secret_forms`].
+pub fn leaked(text: &str, secrets: &[String]) -> Option<usize> {
+    secrets
+        .iter()
+        .position(|s| secret_forms(s).iter().any(|f| text.contains(f.as_str())))
+}
+
+/// Sends `req` as `who` and scans the whole answer (body and headers) for `secrets` and their
+/// encoded forms ([`secret_forms`]) **before** any check can print it; then the checks of
+/// [`Ctx::call`]. A value the caller sent itself is not exempt: an answer that echoes an
+/// entered secret leaks it too. Values are never printed.
+pub async fn call_scanned(
+    cx: &Ctx,
+    who: &Principal,
+    req: RequestSpec,
+    secrets: &[String],
+) -> Result<Response, Fail> {
+    let label = format!("{} as {}", req.label(), who.who.name());
+    if let Some(op) = operation_of(req.method.as_str(), &req.uri) {
+        cx.called.lock().expect("lock").insert(op);
+    }
+    let res = client::send(&cx.app, &req, who).await;
+    if let Some(i) = leaked(&res.text(), secrets) {
+        fail!(
+            "{label}: the answer ({}) holds secret number {i} of the list or an encoding of it \
+             (value not printed)",
+            res.status
+        );
+    }
+    cx.vet(&label, res)
+}
+
+/// [`Ctx::ok`] through [`call_scanned`]: the answer is scanned for `secrets` before its status
+/// is checked (a wrong status prints the answer). With no secrets it is [`Ctx::ok`].
+pub async fn ok_scanned(
+    cx: &Ctx,
+    who: Who,
+    req: RequestSpec,
+    statuses: &[u16],
+    secrets: &[String],
+) -> Result<Value, Fail> {
+    let p = cx.p(who).clone();
+    let label = format!("{} as {}", req.label(), p.who.name());
+    let res = call_scanned(cx, &p, req, secrets).await?;
+    check!(
+        statuses.contains(&res.status.as_u16()),
+        "{label}: got {}, expected {statuses:?}: {}",
+        res.status,
+        res.text()
+    );
+    Ok(res.json().unwrap_or(Value::Null))
+}
+
+/// Sends `req` as `who` and fails, without printing any value, when the answer (of any status)
+/// holds one of `secrets` ([`call_scanned`]). Returns the answer's status and JSON body.
 pub async fn no_secret_in(
     cx: &Ctx,
     who: &Principal,
     req: RequestSpec,
     secrets: &[String],
 ) -> Result<(u16, Value), Fail> {
-    let label = format!("{} as {}", req.label(), who.who.name());
-    let sent = req.sent_text();
-    let res = cx.call(who, req).await?;
-    let text = res.text();
-    for (i, s) in secrets.iter().enumerate() {
-        // A value the caller sent itself (its own bearer token in a header is not in `text`).
-        if text.contains(s.as_str()) && !sent.contains(s.as_str()) {
-            fail!("{label}: the answer holds secret number {i} of the list (value not printed)");
-        }
-    }
+    let res = call_scanned(cx, who, req, secrets).await?;
     Ok((res.status.as_u16(), res.json().unwrap_or(Value::Null)))
 }

@@ -210,19 +210,31 @@ They follow the rules of the database cases above. Each binary is one group: `ap
 file sources, the direct `422` and `403`, drafts, hostile archives, secrets), `apps_publish` and
 `apps_roles`. `apps_meta` checks the cases and the hand-written archives.
 
-A hostile archive passes only with a direct `413 payload_too_large` or `422 validation_failed`
-(the stage `unpack` runs before the answer), and every direct refusal of `createAppDeployment`
-must leave no deployment in `listAppDeployments`. Next to the cross-tenant probes of C-3, the
-cases check one tenant too: a deployment source that the caller cannot `view` fails like a
-missing node, a `version_id` of another file is never packed, IDs of one app under the path of
-another app are `404`, and viewers see no stage messages, check result or previews.
+A hostile archive passes only with a direct refusal (the stage `unpack` runs before the
+answer): an entry that escapes (`..`, an absolute, `\`, drive or UNC path), a link or a device
+file only with `422 validation_failed`; a size or entry-count bomb with `413 payload_too_large`
+or `422 validation_failed` (decision 0006 H). Every direct refusal of `createAppDeployment`
+(archives, manifests, bindings, sources) must leave no deployment in `listAppDeployments`, and
+every refused role grant change must leave `listAppRoleGrants` as it was. "Fails like a missing
+node" compares the status and the whole error (code, message, hint, details) with the requested
+ID written as `<id>`. The secret cases scan every answer of the M1 operations, also those of the
+set-up steps and of refusals, for the raw value and its hex, percent and base64 forms before a
+check can print the answer; a value the caller sent is not exempt.
+
+Next to the cross-tenant probes of C-3, the cases check one tenant too: a deployment source
+that the caller cannot `view` (also one outside an agent's scope) fails like a missing node, a
+`version_id` of another file is never packed, IDs of one app under the path of another app are
+`404`, and viewers see no stage messages, check result or previews.
 
 The app cases keep their own pending list, `PENDING` in `tests/common/apps.rs`: a case that waits
 for another card (B-1, D-2) or for an answer to a contract question names it there. The archives
-(`tests/common/apps_archive.rs`: `.tar.gz`, `.zip`, zip and tar slip, links, device files, a
-4 MiB archive that expands to 4 GiB) are written by hand, so the test kit needs no new
-dependency. `apps_meta` reads them with `gzip -t`, `tar -tvzf` and Python's `zipfile` (so these
-tools must be on the PATH; the bomb is decoded to its end). To look at them yourself:
+(`tests/common/apps_archive.rs`: `.tar.gz`, `.zip`, zip and tar slip with `/`, `\`, drive
+and UNC forms, links, device files, a 4 MiB `.tar.gz` that expands to 4 GiB, a 2 MiB `.zip`
+whose deflated entry expands to 2 GiB, and two entry-count bombs of 65,000 files) are written by
+hand, so the test kit needs no new dependency. `apps_meta` reads them with `gzip -t`, `tar
+-tvzf` and Python's `zipfile` and `tarfile` (so these tools must be on the PATH; both bombs are
+decoded to their end). It also checks the manifest's `archive_path` rule through the server's
+manifest check, and the encoded forms of the secret scan. To look at them yourself:
 
 ```sh
 RUUM_ARCHIVE_DIR=/tmp/ruum-archives cargo test -p ruum-testkit --test apps_meta -- --ignored dump_archives

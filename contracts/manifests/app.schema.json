@@ -35,12 +35,12 @@
         "root": {
           "description": "The folder in the archive (`dist`). Default: the archive root.",
           "type": "string",
-          "pattern": "^[A-Za-z0-9._/-]{1,200}$"
+          "$ref": "#/$defs/archive_path"
         },
         "spa_fallback": {
           "description": "Answer unknown paths with this file (`index.html`), for single-page apps.",
           "type": "string",
-          "pattern": "^[A-Za-z0-9._/-]{1,200}$"
+          "$ref": "#/$defs/archive_path"
         },
         "headers": {
           "description": "Extra response headers per path glob. The gateway always sets its own security headers (CSP frame-ancestors, nosniff); these cannot weaken them.",
@@ -112,7 +112,7 @@
       "description": "The migrations per database binding (decision 19): a folder in the archive with files `NNNN_name.sql`. At deploy time the platform runs the ones not yet applied, in order, each in one transaction with a restore point first (`applyDatabaseMigration` rules); a failure stops the deployment and nothing changes. On a preview they run on the preview's branch. Each migration may carry a `-- ruum:classes` header with the classes of its new columns (design 8.5).",
       "type": "object",
       "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
-      "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" }
+      "additionalProperties": { "type": "string", "$ref": "#/$defs/archive_path" }
     },
     "secrets": {
       "description": "The secrets the app needs (design 9.9). Values are never in the archive; they are write-only in OpenBao and reach only the running app, as environment variables. Previews get generated secrets with preview values and no entered secret, unless a user with `manage` turned on `preview` for that secret (`setAppSecret`, stored state; the manifest cannot ask for it: decision 0006-5). A list of names means `entered` for each (the short form of design 9.1). The long form says how each value is made: `generate` (Ruum makes and rotates it; most secrets) or `entered` (a person with `manage` pastes it once). There is never a database password: databases come through bindings.",
@@ -173,7 +173,7 @@
             "description": "`http` (OpenAPI file) or `events` (AsyncAPI file, NATS JetStream subjects through the platform bus).",
             "type": "string", "enum": ["http", "events"]
           },
-          "spec": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" },
+          "spec": { "type": "string", "$ref": "#/$defs/archive_path" },
           "scopes": {
             "type": "array",
             "minItems": 1,
@@ -247,8 +247,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "privacy_file": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,200}$" },
-        "source_maps": { "type": "string", "pattern": "^[A-Za-z0-9._/*-]{1,200}$" },
+        "privacy_file": { "type": "string", "$ref": "#/$defs/archive_path" },
+        "source_maps": { "type": "string", "$ref": "#/$defs/archive_glob" },
         "browser_script": {
           "description": "Set to false to leave out the Ruum browser script (no frontend errors, no report widget). Default true.",
           "type": "boolean"
@@ -276,6 +276,20 @@
     }
   ],
   "$defs": {
+    "archive_path": {
+      "description": "A path inside the deployment archive, relative to its root: segments of letters, digits, `.`, `_` and `-`, separated by `/`. No segment is `..`, the path does not start with `/`, and it has no `\\`, drive letter or other character, so it can never name a file outside the archive (decision 0006, section H). Provisional, 2026-11-13.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^(?:\\.?[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+|\\.)(?:/+(?:\\.?[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+|\\.))*/*$"
+    },
+    "archive_glob": {
+      "description": "An `archive_path` that may also hold `*` (a glob of files in the archive).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^(?:\\.?[A-Za-z0-9_*-][A-Za-z0-9._*-]*|\\.\\.[A-Za-z0-9._*-]+|\\.)(?:/+(?:\\.?[A-Za-z0-9_*-][A-Za-z0-9._*-]*|\\.\\.[A-Za-z0-9._*-]+|\\.))*/*$"
+    },
     "secret_name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "not": { "pattern": "^(RUUM_|PORT$)" } },
     "scope": { "type": "string", "pattern": "^[a-z][a-z0-9_.]{0,63}$" },
     "node_binding": {

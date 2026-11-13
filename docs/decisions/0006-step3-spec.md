@@ -344,3 +344,31 @@ Not checked by the spike: Docker's daemon-wide user namespace remapping (needs r
 apps as user 10001 instead), Docker Desktop on macOS (the `inhibit_ipv4` behaviour may differ there;
 backlog T-26 covers sandbox suite skips), and Node's own `fetch` through `HTTPS_PROXY` (the SDK and
 R-2a must check that apps can use the proxy).
+
+## H. Paths that leave a deployment archive (2026-11-13)
+
+Status: `provisional`. Proposed by fix card T-4a Kimi (`fix/t4a-kimi`), after Kimi's second review
+of the T-4a acceptance cases (`ruum-server-wt/panel/kimi-t4a-recheck.md`, findings 2 and 3). A
+person can veto it.
+
+1. **Manifest paths stay inside the archive.** Every manifest field that names a path in the
+   archive (`static.root`, `static.spa_fallback`, the folders of `migrations`, `apis.*.spec`,
+   `telemetry.privacy_file`, `telemetry.source_maps`) is an `archive_path` (or `archive_glob`)
+   of `contracts/manifests/app.schema.json`: segments of letters, digits, `.`, `_` and `-` (and
+   `*` in a glob) separated by `/`. No segment is `..`, the path does not start with `/`, and a
+   `\`, a drive letter or any other character fails. The old pattern
+   `^[A-Za-z0-9._/-]{1,200}$` let `../../outside` and `/etc` through, so an unpacker that refused
+   every hostile entry could still read or serve a file outside the archive. The change only
+   refuses values that were never safe; every value it refuses names a place outside the archive
+   or holds a character the old pattern refused too. No released client writes such a value
+   (nothing of step 3 is released). Binding targets (`bindings.*.node`) are paths in the tenant
+   tree, not in the archive, and keep their rules.
+2. **Archive entry names.** The stage `unpack` refuses, with a direct `422 validation_failed`,
+   an entry whose name has a `..` segment, starts with `/`, holds a `\` (APPNOTE 4.4.17 allows
+   only `/` in zip names; in a tar name a `\` is a Windows separator to an unpacker on Windows or
+   to a gateway that normalizes it), starts with a drive letter (`C:`) or is a UNC path
+   (`\\server\share`, `//server/share`); also links and device files (STEP3, W-2). A `413
+   payload_too_large` is only for size and file count limits; it never stands in for these.
+   This is the rule that the gateway already applies to static keys (section G, point 4).
+3. The file count limit of `unpack` has no number yet (open question for W-2, backlog
+   `2026-11-13-t4a-kimi.md` TK-1); the entry-count case assumes fewer than 65,000 files.
