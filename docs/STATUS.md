@@ -16,7 +16,9 @@ cluster per agent, K-1 C-2, the step 2 error codes and query rule 10, the brand 
 on 2026-11-10), the integration of 2026-11-10 (run 7: card P-3, the Graphite theme, the drafts of
 the operations policy and the product direction), the integration of run 8 (2026-11-10 to
 11-11: card M-1, card I-3, the step 3 specification and its UX package), the integration of card Q-2
-(2026-11-11: the privacy filter of Postgres queries for agents), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+(2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
+11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
+updates without downtime O-25), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -250,6 +252,36 @@ Fixes made during the night integration:
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
 
+Integration of run 9 (2026-11-12 to 11-13; eight branches rebased onto `main` `ae29f09` in one
+stack, each tip checked on the build server, pushed as `integ9/<name>`, green in GitHub CI, then
+fast-forwarded in this order; linear history, no merge commit, no co-author line). The digest is
+`docs/digests/2026-11-12-run9.md`; new backlog items are in `docs/backlog/2026-11-12-run9.md`.
+
+| Branch (pushed as) | What it adds | Review |
+|---|---|---|
+| `d/s29` (`integ9/s29`) | Decision 0004-40 (backlog 2026-11-10-run8 S-29, P-35): the `up` of a migration approval goes in full only to people with `manage`; everyone else gets the query layer's normalized text. | architect panel |
+| `s2/a-2-r9` (`integ9/a-2`) | Card A-2, approvals of agent requests: `requestDatabaseAccessGrant`, `listPendingDatabaseApprovals`, `listDatabaseApprovals`, `getDatabaseApproval`, `decideDatabaseApproval` (users only); the approval store (memory, Postgres, conformance), the request and take functions, the event `database.approval_decided`, decision 0004-40 in the read path (`shown_statement`). Suite `databases_approvals_api` in CI. The two privacy cases that need the statement path of `queryDatabase` wait for card A-2w (`WAIT_A2W`; the person chose this, option 1). 8 new mutations. | review-a2 (one required change), Kimi CHANGES REQUESTED (the same finding), review-a2-2 accept |
+| `s2/d-3a` (`integ9/d-3a`) | Card D-3a, `schema_only` branches: `listDatabaseBranches`, `createDatabaseBranch`; a branch's row, migrations and columns in one transaction (`DatabaseStore::insert_branch`); masked and full branches wait for D-3b (`WAIT_MASKED_BRANCH`). Own backlog `docs/backlog/2026-11-12-d3a.md`. | review-d3a (6 changes), Kimi CHANGES REQUESTED (2 high, 4 medium), review-d3a-2 accept |
+| `s3/w-1-r9` (`integ9/w-1`, holds T-4a's first two commits) | Card W-1, the web app provider and control plane skeleton: `AppService` with the five operations above, `ruum.webapp` provider hooks (copy, trash, restore, purge), slugs, settings rules (`apply`, compare-and-swap writes), the manifest check, placeholder plan limits (unknown plan fails closed to free), the app store (memory, Postgres, conformance), `usage::UsageSink`, the event `app.settings_changed`, `Tenant.app_approval` in tenant answers. No migration (the tables of `0011_apps.sql`). 4 new mutations. | review-w1 (3 changes), Kimi CHANGES REQUESTED (5 high, 9 medium), review-w1-2 accept |
+| `s3/r-1` (`integ9/r-1`) | Card R-1: the `RuntimeDriver` and `Builder` traits, an in-memory driver and builder, conformance suites (21 driver cases, 5 builder cases, tenant checks on every call, per-app image repositories), streaming redaction of secret values in logs (`runtime::redact`). | review-r1 (5 changes), Kimi CHANGES REQUESTED (5 high, 4 medium), review-r1-2 accept with follow-ups for R-2a and R-2b |
+| `s3/t-4a` (`integ9/t-4a`) | Card T-4a, the acceptance cases of the 12 M1 app operations (suites `apps_settings`, `apps_deployments`, `apps_publish`, `apps_roles`, `apps_meta`; hand-written hostile archives). 12 of 48 app cases pass now (settings), the rest are planned. | review-t4a (4 gaps), Kimi no verdict (quota), review-t4a-2 accept |
+| `s3/s-2` (`integ9/s-2`) | Spike S-2 (`spikes/step3-sandbox/`), result in decision 0006 section G: app networks need `inhibit_ipv4`; gateway header rules; static files from Garage; cold start 0.25 to 0.5 s (runc); hostile builds in sandbox jobs. runsc not run (needs root). | review-s2 (7 changes), Kimi no verdict (quota), review-s2-2 accept |
+| `ops/o-25` (`integ9/o-25`) | Backlog O-25 and part of O-26, updates without downtime: `ruum-server migrate` (advisory lock) as a Job before the rollout, `RUUM_MIGRATE=false` in serving pods (they refuse to start without their migrations), SIGTERM drain (`RUUM_SHUTDOWN_GRACE_SECONDS`), two server replicas and a PDB, the edge as a DaemonSet with certificates in Kubernetes Secrets (`deploy/images/caddy-secret-storage`, Go), the rollback floor (`ops/release-floor.sh`). | review-o25 (4 changes), no Kimi, review-o25-2 accept |
+
+Not merged: card FU-1 (`f/fu-1`, head `95da0d9`), as the task said.
+
+Fixes made during this integration (conflicts only; no product change):
+
+- `crates/ruum-mcp/src/tools.json` generated again at the D-3a and W-1 rebases
+  (`gen-tools.mjs`); the MCP tool count in `crates/ruum-mcp/tests/mcp_server.rs` is 71 (A-2 4,
+  D-3a 2, W-1 5 on top of 60), with the offered names of all three cards.
+- `ci.yml`: both suite jobs run `databases_approvals_api` (A-2) and the five `apps_*` suites
+  (T-4a).
+- The enum arms of the two new event types (`DatabaseApprovalDecided`, `AppSettingsChanged`) are
+  kept side by side in `journal`, `agents` (undo), `undo.rs` and the changes test sample.
+- T-4a's fix commit `8c48333` was cherry-picked onto W-1 (W-1 already held T-4a's first two
+  commits, reworked by W-1 at its rebase).
+
 Integration of card Q-2 (2026-11-11; the branch `s2/q-2-harden-5` rebased onto `main` `4019de1`,
 checked on the build server, pushed as `integq2/q-2`, green in GitHub CI, then fast-forwarded;
 linear history, no merge commit, no co-author line):
@@ -436,8 +468,10 @@ Fixes made during the integration:
   showed `Loading...`; `auth.setup.e2e.ts` navigated while the sign-out redirect chain still ran.
 
 All 93 step 1 operations of `contracts/openapi.yaml` are built. Of the 24 step 2 database
-operations, 12 are built (cards D-1, K-1, A-1 and Q-1); the other 12 are marked `x-ruum-status:
-planned` (decision 0004-21).
+operations, 19 are built (cards D-1, K-1, A-1, Q-1, A-2 and D-3a); the other 5 are marked
+`x-ruum-status: planned` (decision 0004-21). Of the 45 step 3 app operations, 5 are built (card
+W-1: `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`, `getAppDeployment`); 48
+operations are still `planned` in all.
 
 | Area | What works |
 |---|---|
@@ -595,6 +629,32 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-13, `main` after the integration of run 9, on the build server)
+
+`main` is `b63a308` before this documentation commit (the tree of `integ9/o-25`). Each of the
+six code tips was checked with its own `run.sh` key (`r9a2`, `r9d3a`, `r9w1`, `r9r1`, `r9t4a`,
+`r9o25`); the numbers per tip are in `docs/digests/2026-11-12-run9.md`. On the final tree:
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`:
+  pass.
+- `cargo test --workspace --locked`: 940 passed, 0 failed, 3 ignored (801 after Q-2).
+- Suites with `RUUM_REQUIRE_IMPLEMENTED=1`, the same numbers on memory and on Postgres stores:
+  tenant isolation 503 checks (353 passed, 150 planned), permission matrix 2656 checks (1936
+  passed, 720 planned), trashed file suite 112/112, privacy suite 99 planned on memory and 38
+  passed, 61 planned on Postgres, approvals 7/7, app cases: settings 12 passed and 4 planned,
+  deployments 18, publish 7 and roles 7 planned; 0 pending (501), 0 failed.
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`. `scripts/e2e_browser.sh`: 172 passed.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`, all 177 mutations in three
+  parallel shards (`r9m0` to `r9m2`): 177 of 177 killed, none survived, skipped or broken.
+- `deploy/staging/tests/run.sh` on the Mac: all passed.
+- Under the load of four Postgres suites at once, the R-1 tip's `ruum-dbengine` tests failed
+  15 of 119 (the 768 MiB data cluster was OOM-killed; backlog run9 B-29); a rerun with
+  `--test-threads=4` passed 119 of 119. Two browser tests failed once under load (D-3a:
+  `oauth.e2e.ts`, backlog T-39; T-4a: a pseudo-locale visual timeout) and passed on a rerun of
+  the spec; neither tree changes `web/`.
+- GitHub CI: green on `integ9/s29`, `integ9/a-2`, `integ9/d-3a`, `integ9/w-1`, `integ9/r-1`,
+  `integ9/t-4a`, `integ9/s-2` and `integ9/o-25`.
 
 ## Checks (2026-11-11, card Q-2 on `main`, on the build server)
 
@@ -768,6 +828,15 @@ C-2 and the step 2 error codes with query rule 10 (2026-11-08 P-2, P-3; 2026-11-
 Run 7 merged card P-3 (`s2/wave5-fix`), the Graphite theme (`w/graphite-theme`, which closes
 backlog 2026-11-09 U-1 to U-4, the old card 3) and the drafts of the operations policy and the
 product direction (`d/ops-policy`). In this order:
+
+Run 9 merged decision 0004-40, card A-2 (`s2/a-2-r9`), card D-3a, step 3 wave 1 (T-4a, W-1, R-1,
+spike S-2) and O-25; card FU-1 waits on its branch. Its new items are in
+`docs/backlog/2026-11-12-run9.md`. The second reviews ask that these reach the next cards' texts:
+D-2 returns an approval only through `shown_statement` with `full = false` (S-32) and must not land
+before D-3b; A-2w removes `WAIT_A2W` (T-32); R-2a fixes the self-overlapping redaction cost and caps
+secret values (S-36); R-2b checks build canaries hex-encoded (S-37); W-2 and W-3a pass the
+tenant's plan to `validateManifest` (P-58); the journal readers accept unknown event types before
+more event types are added (P-57).
 
 Run 8 merged card M-1 (`s2/m-1-r1`), card I-3 (`s2/i-3`) and the step 3 specification with its
 UX package (`s3/ux-apps`); its new items are in `docs/backlog/2026-11-10-run8.md`. Card A-2
