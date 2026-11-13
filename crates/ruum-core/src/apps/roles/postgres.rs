@@ -11,6 +11,9 @@ use crate::journal::{ChangeInfo, EventType, NewEntry};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
+/// The most tuple updates in one outbox row of a purge (SpiceDB's limit per write is 1,000).
+const PURGE_CHUNK: usize = 500;
+
 /// The Postgres store.
 #[derive(Clone, Debug)]
 pub struct PgRoleStore {
@@ -349,5 +352,41 @@ impl RoleStore for PgRoleStore {
         tx.commit().await?;
         self.after_commit(authz, ctx.tenant, ob).await;
         Ok(grants.len())
+    }
+
+    async fn remove_app(
+        &self,
+        tenant: TenantId,
+        authz: &dyn Authz,
+        app: NodeId,
+        also: Vec<RelationshipUpdate>,
+    ) -> Result<usize> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "delete from app_role_grants where tenant_id = $1 and app_node_id = $2 \
+             returning {COLUMNS}"
+        )))
+        .bind(tenant)
+        .bind(app)
+        .fetch_all(&mut *tx)
+        .await?;
+        let gone = rows.iter().map(grant_row).collect::<Result<Vec<_>>>()?;
+        let mut updates: Vec<RelationshipUpdate> = gone
+            .iter()
+            .filter_map(RoleGrant::tuple)
+            .map(RelationshipUpdate::Delete)
+            .collect();
+        updates.extend(also);
+        // SpiceDB takes at most 1,000 updates per write and the worker applies one outbox row
+        // per write, so a large purge goes into several rows (all deletes: any order).
+        let mut ids = Vec::new();
+        for chunk in without_repeats(updates).chunks(PURGE_CHUNK) {
+            ids.extend(Self::enqueue(&mut tx, tenant, chunk).await?);
+        }
+        tx.commit().await?;
+        if !ids.is_empty() {
+            outbox::apply_after_commit(&self.pool, authz, tenant, &ids).await;
+        }
+        Ok(gone.len())
     }
 }
