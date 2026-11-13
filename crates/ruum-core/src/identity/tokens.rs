@@ -150,6 +150,25 @@ impl TokenIssuer for JwtTokenIssuer {
             .map_err(token_error)
     }
 
+    fn verify_for(&self, token: &str, audiences: &[&str]) -> Result<AccessClaims> {
+        let audiences: Vec<String> = audiences
+            .iter()
+            .map(|a| a.trim_end_matches('/').to_string())
+            .collect();
+        decode::<AccessClaims>(token, &self.decoding, &self.validation(&audiences))
+            .map(|d| d.claims)
+            .map_err(token_error)
+    }
+
+    fn signed_by_platform(&self, token: &str) -> bool {
+        let mut v = Validation::new(Algorithm::EdDSA);
+        v.required_spec_claims.clear();
+        v.validate_exp = false;
+        v.validate_nbf = false;
+        v.validate_aud = false;
+        decode::<Value>(token, &self.decoding, &v).is_ok()
+    }
+
     fn jwks(&self) -> Value {
         serde_json::to_value(JwkSet {
             keys: vec![self.jwk.clone()],

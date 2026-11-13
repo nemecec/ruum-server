@@ -123,6 +123,22 @@ pub(crate) struct OAuthCodeRow {
     pub used_at: Option<OffsetDateTime>,
 }
 
+/// A one-time sign-in code of an app origin (`app_sign_in_codes`).
+pub(crate) struct AppCodeRow {
+    pub binding: super::app_sign_in::AppBinding,
+    pub user: UserId,
+    pub platform_session: Uuid,
+    pub state_hash: [u8; 32],
+    pub expires_at: OffsetDateTime,
+    pub used_at: Option<OffsetDateTime>,
+}
+
+/// A session of an app origin (`app_sessions`).
+pub(crate) struct AppSessionRow {
+    pub session: super::app_sign_in::AppSession,
+    pub ended_at: Option<OffsetDateTime>,
+}
+
 /// All rows of the area.
 #[derive(Default)]
 pub(crate) struct State {
@@ -140,6 +156,10 @@ pub(crate) struct State {
     pub oauth_codes: HashMap<[u8; 32], OAuthCodeRow>,
     /// The last known names of people who left a tenant (`principal_names`, decision 0003-5).
     pub principal_names: HashMap<(TenantId, Uuid), String>,
+    /// Sign-in codes of app origins, by tenant and SHA-256 of the code.
+    pub app_codes: HashMap<(TenantId, [u8; 32]), AppCodeRow>,
+    /// Sessions of app origins, by tenant and SHA-256 of the secret.
+    pub app_sessions: HashMap<(TenantId, [u8; 32]), AppSessionRow>,
     pub order: u64,
 }
 
@@ -380,6 +400,12 @@ impl TokenIssuer for MemoryTokenIssuer {
     }
     fn verify(&self, token: &str) -> Result<AccessClaims> {
         self.0.verify(token)
+    }
+    fn verify_for(&self, token: &str, audiences: &[&str]) -> Result<AccessClaims> {
+        self.0.verify_for(token, audiences)
+    }
+    fn signed_by_platform(&self, token: &str) -> bool {
+        self.0.signed_by_platform(token)
     }
     fn jwks(&self) -> serde_json::Value {
         self.0.jwks()
@@ -632,6 +658,119 @@ impl IdentityStore for MemoryIdentityStore {
             }
             _ => Err(Error::not_found("session")),
         }
+    }
+
+    async fn create_app_code(&self, code: super::app_sign_in::NewAppCode) -> Result<String> {
+        let now = crate::now();
+        let secret = secret::random_secret("");
+        let mut st = self.area.lock();
+        let live = st.sessions.get(&code.platform_session).is_some_and(|r| {
+            r.session.user_id == code.user && r.ended_at.is_none() && r.session.expires_at > now
+        });
+        if !live {
+            return Err(Error::not_found("session"));
+        }
+        st.app_codes.retain(|_, r| r.expires_at > now);
+        st.app_codes.insert(
+            (code.binding.tenant_id, secret::sha256(&secret)),
+            AppCodeRow {
+                binding: code.binding,
+                user: code.user,
+                platform_session: code.platform_session,
+                state_hash: super::app_sign_in::state_hash(&code.state),
+                expires_at: now + time::Duration::seconds(super::app_sign_in::APP_CODE_SECONDS),
+                used_at: None,
+            },
+        );
+        Ok(secret)
+    }
+
+    async fn redeem_app_code(
+        &self,
+        binding: &super::app_sign_in::AppBinding,
+        code: &str,
+        state: &str,
+    ) -> Result<Option<(super::app_sign_in::AppSession, String)>> {
+        let now = crate::now();
+        let mut st = self.area.lock();
+        let key = (binding.tenant_id, secret::sha256(code));
+        let Some(row) = st.app_codes.get_mut(&key) else {
+            return Ok(None);
+        };
+        // A code is spent by the first try, also a refused one.
+        let fresh = row.used_at.is_none() && row.expires_at > now;
+        row.used_at = Some(now);
+        if !fresh
+            || row.binding != *binding
+            || !secret::constant_time_eq(&row.state_hash, &super::app_sign_in::state_hash(state))
+        {
+            return Ok(None);
+        }
+        let (user, platform_session) = (row.user, row.platform_session);
+        let live = st.sessions.get(&platform_session).is_some_and(|r| {
+            r.session.user_id == user && r.ended_at.is_none() && r.session.expires_at > now
+        });
+        if !live {
+            return Ok(None);
+        }
+        let secret = secret::random_secret("");
+        let session = super::app_sign_in::AppSession {
+            id: Uuid::now_v7(),
+            binding: *binding,
+            user_id: user,
+            platform_session_id: platform_session,
+            created_at: now,
+            expires_at: now + time::Duration::hours(super::app_sign_in::APP_SESSION_HOURS),
+        };
+        st.app_sessions
+            .retain(|_, r| r.ended_at.is_none() && r.session.expires_at > now);
+        st.app_sessions.insert(
+            (binding.tenant_id, secret::sha256(&secret)),
+            AppSessionRow {
+                session: session.clone(),
+                ended_at: None,
+            },
+        );
+        Ok(Some((session, secret)))
+    }
+
+    async fn app_session(
+        &self,
+        tenant: TenantId,
+        secret_value: &str,
+    ) -> Result<Option<super::app_sign_in::AppSession>> {
+        let now = crate::now();
+        let st = self.area.lock();
+        let Some(row) = st.app_sessions.get(&(tenant, secret::sha256(secret_value))) else {
+            return Ok(None);
+        };
+        if row.ended_at.is_some()
+            || row.session.expires_at <= now
+            || row.session.binding.tenant_id != tenant
+        {
+            return Ok(None);
+        }
+        let live = st
+            .sessions
+            .get(&row.session.platform_session_id)
+            .is_some_and(|r| {
+                r.session.user_id == row.session.user_id
+                    && r.ended_at.is_none()
+                    && r.session.expires_at > now
+            });
+        Ok(live.then(|| row.session.clone()))
+    }
+
+    async fn end_app_session(&self, tenant: TenantId, secret_value: &str) -> Result<()> {
+        let mut st = self.area.lock();
+        if let Some(row) = st
+            .app_sessions
+            .get_mut(&(tenant, secret::sha256(secret_value)))
+            && row.ended_at.is_none()
+        {
+            row.ended_at = Some(crate::now());
+        }
+        Ok(())
     }
 
     async fn bind_email_grants(&self, user: UserId, session: Uuid, force: bool) -> Result<usize> {
