@@ -65,13 +65,14 @@ func run(ctx context.Context) error {
 			Path: env("RUUM_DEPLOY_SCRIPT", "/opt/ruum/deploy/staging/ops/deploy-chart.sh"),
 			Env:  []string{"RUUM_DEPLOY_IN_CLUSTER=1"},
 		},
-		Me:       env("POD_NAME", "deploy-controller"),
-		MaxAge:   5 * time.Minute,
-		Keep:     7 * 24 * time.Hour,
-		Timeout:  55 * time.Minute,
-		LogLines: 300,
-		Now:      time.Now,
-		Log:      os.Stdout,
+		Me:            env("POD_NAME", "deploy-controller"),
+		MaxAge:        5 * time.Minute,
+		Keep:          7 * 24 * time.Hour,
+		Timeout:       55 * time.Minute,
+		LogLines:      300,
+		ProgressEvery: 10 * time.Second,
+		Now:           time.Now,
+		Log:           os.Stdout,
 	}
 	c.logf("started as %s; watching release requests in %s", c.Me, env("RUUM_REQUEST_NAMESPACE", "ruum-deploy"))
 	for {
