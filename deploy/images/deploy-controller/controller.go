@@ -53,8 +53,10 @@ type Controller struct {
 	Timeout time.Duration
 	// LogLines: the last lines of the deploy output kept in the request.
 	LogLines int
-	Now      func() time.Time
-	Log      io.Writer
+	// ProgressEvery: how often the output so far is written into the request.
+	ProgressEvery time.Duration
+	Now           func() time.Time
+	Log           io.Writer
 }
 
 func (c *Controller) logf(format string, args ...any) {
@@ -111,7 +113,10 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 			continue
 		}
 		if err != nil {
-			return err
+			// For example an immutable ConfigMap: skip it, so one bad request never blocks the
+			// others; it is never run, because it cannot be claimed.
+			c.logf("request %s cannot be claimed: %v", cm.Metadata.Name, err)
+			continue
 		}
 		c.run(ctx, claimed)
 		return nil
@@ -163,7 +168,25 @@ func (c *Controller) run(ctx context.Context, cm ConfigMap) {
 	c.progress(ctx, name, out, "checks passed; deploying (deploy lock, backup if needed, migration step, rolling update)")
 	runCtx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
-	last := c.Now()
+	// The output so far goes into the request every ProgressEvery while it grows, so the
+	// deployer sees where a long step (backup, migration Job, rollout) is.
+	stop := make(chan struct{})
+	ticker := make(chan struct{})
+	written := out.count() // the progress call above wrote these
+	go func() {
+		defer close(ticker)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(c.ProgressEvery):
+				if n := out.count(); n != written {
+					written = n
+					c.progress(ctx, name, out, "deploying")
+				}
+			}
+		}
+	}()
 	err = c.Deployer.Run(runCtx, plan.Args, func(line string) {
 		// The full output, the migration Job's log included, goes to this pod's log (admin
 		// only). The request, which the deployer reads, gets it without the Job's log lines and
@@ -173,11 +196,9 @@ func (c *Controller) run(ctx context.Context, cm ConfigMap) {
 			return
 		}
 		out.add(redact(line))
-		if c.Now().Sub(last) >= 10*time.Second {
-			last = c.Now()
-			c.progress(ctx, name, out, "deploying")
-		}
 	})
+	close(stop)
+	<-ticker
 	if err != nil {
 		c.logf("request %s failed: %v", name, err)
 		c.finishByName(ctx, name, PhaseFailed, fmt.Sprintf("the deploy failed (%v); the migration Job log is in the controller's log: kubectl -n ruum-deploy logs deploy/deploy-controller (admin)", err), out)
@@ -270,6 +291,14 @@ type tail struct {
 	mu    sync.Mutex
 	max   int
 	lines []string
+	added int
+}
+
+// count is the number of lines added so far (also the ones that fell out).
+func (t *tail) count() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.added
 }
 
 func (t *tail) add(line string) {
@@ -279,6 +308,7 @@ func (t *tail) add(line string) {
 		line = line[:2000] + " [cut]"
 	}
 	t.lines = append(t.lines, line)
+	t.added++
 	if t.max > 0 && len(t.lines) > t.max {
 		t.lines = t.lines[len(t.lines)-t.max:]
 	}
