@@ -44,3 +44,8 @@ blobCopy:
 
 # The private subnet of the nodes and the load balancer (tofu/cluster).
 nodeSubnet: 10.20.1.0/24
+
+# The deploy controller (backlog O-34): ghcr.io/nemecec/ruum-deploy-controller@sha256:<digest>.
+# k8s/apply.sh sets it from the commit that secrets-push.sh passes, after the provenance check.
+deployController:
+  image: ""

@@ -8,6 +8,9 @@ RUUM_IMAGE_REPO="nemecec/ruum-server"
 # The only images: the two Ruum images of this repository at GHCR, by digest.
 RUUM_IMAGE_RE='^ghcr\.io/nemecec/ruum-(server|edge)@sha256:[a-f0-9]{64}$'
 RUUM_COMMIT_RE='^[0-9a-f]{40}$'
+# The deploy controller (backlog O-34): installed by the platform step (k8s/apply.sh), by digest.
+# Never a server or edge image (the chart and the controller accept only RUUM_IMAGE_RE there).
+RUUM_CONTROLLER_IMAGE_RE='^ghcr\.io/nemecec/ruum-deploy-controller@sha256:[a-f0-9]{64}$'
 # The ACME issuers of the chart (review 2 R-3): never production Let's Encrypt.
 RUUM_ACME_ISSUERS=(letsencrypt-staging zerossl)
 # An email address for ACME/EAB: no comma, quote, space, equals sign or backslash.
@@ -35,7 +38,7 @@ ghcr_digest() {
 # On main, images.yml runs only from workflow_run (its push trigger ignores main).
 cosign_verify_provenance() {
   local ref="$1"
-  [[ "$ref" =~ $RUUM_IMAGE_RE ]] || { echo "not a Ruum image by digest: $ref" >&2; return 1; }
+  [[ "$ref" =~ $RUUM_IMAGE_RE || "$ref" =~ $RUUM_CONTROLLER_IMAGE_RE ]] || { echo "not a Ruum image by digest: $ref" >&2; return 1; }
   command -v cosign >/dev/null || { echo "cosign is missing (it is in the tools image, tools-image.sh)" >&2; return 1; }
   cosign verify-attestation "$ref" \
     --type https://slsa.dev/provenance/v1 \

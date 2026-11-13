@@ -1,0 +1,168 @@
+{{- /*
+The deploy controller (backlog O-34, decision 0008-2, option a): deploy/images/deploy-controller,
+in its own namespace ruum-deploy with its own ServiceAccount. It takes the release requests that
+the deployer writes (ConfigMaps in ruum-deploy), checks them itself (provenance with cosign,
+main, the floor, the order against the live release) and runs ops/deploy-chart.sh: the deploy
+lock, the backup, the migration Job (with the owner DSN of ruum/ruum-migrate-db) and helm upgrade.
+
+Its rights are the ones the deployer had before O-34, plus writing the outcome into the requests.
+Through the pods and Jobs it creates it can reach every Secret of ruum and edge, like the deployer
+could; that is why it runs only code from an image of main, verified by digest at the platform
+step, and takes nothing from a request but the checked fields. Nobody but the admin can change
+its Deployment, its ServiceAccount or its Roles.
+*/ -}}
+{{- $img := .Values.deployController.image | default "" }}
+{{- if not (regexMatch "^ghcr\\.io/nemecec/ruum-deploy-controller@sha256:[a-f0-9]{64}$" $img) }}
+{{- fail "deployController.image must be ghcr.io/nemecec/ruum-deploy-controller@sha256:<digest> (k8s/apply.sh resolves and verifies it)" }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deploy-controller
+  namespace: ruum-deploy
+automountServiceAccountToken: false
+{{- range list "ruum" "edge" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deploy-controller
+  namespace: {{ . }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, daemonsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [controllerrevisions]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [services, configmaps, pods, pods/log, events, serviceaccounts]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # No Secrets through the API: deploy-chart.sh runs Helm with HELM_DRIVER=configmap, and the
+  # chart has no Secret of its own (k8s/apply.sh makes them).
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch, create, update, patch, delete]
+{{- if eq . "ruum" }}
+  # The migration step before each rollout (design 12.7, backlog O-25).
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, delete]
+  # The deploy lock (Lease ruum/ruum-deploy, ops/deploy-lock.sh). No delete: a release clears
+  # the holder with a compare-and-swap.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [ruum-deploy]
+    verbs: [get, update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-controller
+  namespace: {{ . }}
+subjects:
+  - kind: ServiceAccount
+    name: deploy-controller
+    namespace: ruum-deploy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deploy-controller
+{{- end }}
+---
+# Before a release with new migrations, an on-demand CNPG backup (review 2 U-3).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deploy-controller-backup
+  namespace: data
+rules:
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [backups]
+    verbs: [get, list, watch, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-controller-backup
+  namespace: data
+subjects:
+  - kind: ServiceAccount
+    name: deploy-controller
+    namespace: ruum-deploy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deploy-controller-backup
+---
+# The release requests: read them, write the outcome, delete them after a week.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deploy-controller
+  namespace: ruum-deploy
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-controller
+  namespace: ruum-deploy
+subjects:
+  - kind: ServiceAccount
+    name: deploy-controller
+    namespace: ruum-deploy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: deploy-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-controller
+  namespace: ruum-deploy
+  labels: { app: deploy-controller }
+spec:
+  replicas: 1
+  # One controller at a time: a new pod starts after the old one stopped. A pod that stops
+  # during a deploy leaves its request Running; the next pod marks it Failed.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: deploy-controller }
+  template:
+    metadata:
+      labels: { app: deploy-controller }
+    spec:
+      serviceAccountName: deploy-controller
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      {{- include "platform.podSecurity" . | nindent 6 }}
+      containers:
+        - name: controller
+          image: {{ $img }}
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: RUUM_REQUEST_NAMESPACE, value: ruum-deploy }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          {{- include "platform.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        # HOME, the Helm and Sigstore caches and deploy-chart.sh's work folder.
+        - name: tmp
+          emptyDir: { sizeLimit: 1Gi }

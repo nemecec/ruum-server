@@ -3,9 +3,11 @@
 # - publish: only after a green `ci` run of a PUSH to main IN THIS REPOSITORY. A workflow_run
 #   also fires for pull requests (from forks too, whose head branch can be called `main`), so
 #   every condition below is required. The job checks out the exact commit that ci tested and
-#   never runs code from a pull request. It pushes ghcr.io/nemecec/ruum-server and ruum-edge
-#   with the tags <full sha> and main, scans the pushed digest, and only then adds the
-#   provenance attestation that deploy.sh and ops/deploy-chart.sh verify before a deploy.
+#   never runs code from a pull request. It pushes ghcr.io/nemecec/ruum-server, ruum-edge and
+#   ruum-deploy-controller (backlog O-34) with the tags <full sha> and main, scans the pushed
+#   digest, and only then adds the provenance attestation that deploy.sh, the deploy controller
+#   and ops/deploy-chart.sh verify before a deploy (and k8s/apply.sh before it installs the
+#   controller).
 # - build-check: on branches and pull requests that change the images, build without pushing,
 #   with a read-only token.
 name: images
@@ -17,9 +19,11 @@ on:
     branches: [main]
   push:
     branches-ignore: [main]
-    paths: [deploy/images/**, .github/workflows/images.yml, .dockerignore, web/package-lock.json, Cargo.lock]
+    paths: [deploy/images/**, .github/workflows/images.yml, .dockerignore, web/package-lock.json, Cargo.lock,
+      deploy/staging/charts/ruum/**, deploy/staging/ops/**, deploy/staging/setup.sh, deploy/staging/versions.env]
   pull_request:
-    paths: [deploy/images/**, .github/workflows/images.yml, .dockerignore]
+    paths: [deploy/images/**, .github/workflows/images.yml, .dockerignore,
+      deploy/staging/charts/ruum/**, deploy/staging/ops/**, deploy/staging/setup.sh, deploy/staging/versions.env]
 
 permissions: {}
 
@@ -37,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ruum-server, ruum-edge]
+        image: [ruum-server, ruum-edge, ruum-deploy-controller]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ruum-server, ruum-edge]
+        image: [ruum-server, ruum-edge, ruum-deploy-controller]
     env:
       SHA: ${{ github.event.workflow_run.head_sha }}
       IMAGE: ghcr.io/nemecec/${{ matrix.image }}

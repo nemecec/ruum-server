@@ -4,7 +4,7 @@
 # There is no egress policy: outgoing traffic is open, so Zitadel reaches Scaleway's SMTP on port
 # 587 (backlog O-20). The Hetzner firewall has inbound rules only. If an egress policy is added,
 # allow auth/zitadel to TCP 587 out (and DNS).
-{{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" }}
+{{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" "ruum-deploy" }}
 {{- range $ns }}
 ---
 apiVersion: networking.k8s.io/v1

@@ -15,13 +15,16 @@
 #   talosconfig    (rw)  write the talosconfig from the state, then the kubeconfig (0600; both
 #                        through the admin tunnel, which the Mac opens first)
 #   kubeconfig     (rw)  write the kubeconfig with talosctl through the admin tunnel (0600)
-#   platform       (rw)  helmfile sync of the platform (needs the cluster secrets on stdin);
-#                        needs RUUM_STAGING_APPLY=yes
+#   platform --controller COMMIT [--restore-from GENERATION] (rw)
+#                        helmfile sync of the platform with the deploy controller of COMMIT
+#                        (needs the cluster secrets on stdin); needs RUUM_STAGING_APPLY=yes
 #   zitadel-bootstrap (rw) OIDC app, Google and Microsoft, login policy, SMTP provider; `check`
 #                        reports drift
 #   check-backup   (rw)  WAL push and a base backup into the locked bucket work (bring-up check)
-#   deploy <commit> <server-ref> <edge-ref> [--backup] [--acme ISSUER --acme-email EMAIL] (rw)
-#                        helm upgrade of charts/ruum by digest (ops/deploy-chart.sh validates)
+#   deploy <commit> <server-ref> <edge-ref> --expect-deployed <commit|none> [--rollback | --rollback-older]
+#          [--acme ISSUER --acme-email EMAIL] (rw)
+#                        a release request for the deploy controller, with the deployer
+#                        kubeconfig, and its outcome (ops/release-request.sh, backlog O-34)
 #   status               what exists: state, hcloud by label, nodes, pods, backups
 #   destroy-plan         three lists: removed, kept on purpose, never touched; state vs labels
 #   destroy        (rw)  tofu destroy of the cluster root, snapshot, checks
@@ -356,13 +359,25 @@ case "$STEP" in
     tofu_env
     dir="$(prepare_root cluster s3)"
     generation="$(cd "$dir" && tofu output -raw pg_generation)"
-    # platform [--restore-from <generation>]: bootstrap pg from an older backup path (review 2 R-2).
-    restore_from=""
-    if [[ "${1:-}" == --restore-from ]]; then
-      restore_from="${2:-}"
-      [[ "$restore_from" =~ ^[0-9]{12}$ ]] || die "--restore-from needs a generation of 12 digits (YYYYMMDDHHMM)"
-    fi
-    KUBECONFIG="$KUBECONFIG_FILE" bash "$HERE/k8s/apply.sh" "$generation" "$restore_from"
+    # platform --controller <commit> [--restore-from <generation>]: the deploy controller image of
+    # that commit of main (backlog O-34; secrets-push.sh passes the checkout's commit), and
+    # bootstrap pg from an older backup path (review 2 R-2).
+    restore_from="" controller=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --restore-from)
+          restore_from="${2:-}"
+          [[ "$restore_from" =~ ^[0-9]{12}$ ]] || die "--restore-from needs a generation of 12 digits (YYYYMMDDHHMM)"
+          shift 2 ;;
+        --controller)
+          controller="${2:-}"
+          [[ "$controller" =~ ^[0-9a-f]{40}$ ]] || die "--controller needs a commit of 40 lowercase hex characters"
+          shift 2 ;;
+        *) die "unknown platform argument $1" ;;
+      esac
+    done
+    [[ -n "$controller" ]] || die "the platform step needs --controller <commit> (the deploy controller image; secrets-push.sh passes it)"
+    KUBECONFIG="$KUBECONFIG_FILE" DEPLOY_CONTROLLER_COMMIT="$controller" bash "$HERE/k8s/apply.sh" "$generation" "$restore_from"
     ;;
   zitadel-bootstrap)
     read_secrets GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET
@@ -374,8 +389,10 @@ case "$STEP" in
     KUBECONFIG="$KUBECONFIG_FILE" bash "$HERE/ops/check-backup.sh" "$@"
     ;;
   deploy)
+    # The deployer may only write release requests (backlog O-34); the deploy controller in
+    # ruum-deploy checks them and runs the migration step and the rollout.
     read_secrets
-    KUBECONFIG="$KUBECONFIG_FILE" bash "$HERE/ops/deploy-chart.sh" "$@"
+    KUBECONFIG="$WORK/deployer.kubeconfig" bash "$HERE/ops/release-request.sh" "$@"
     ;;
   status)
     read_secrets $TOFU_NAMES
