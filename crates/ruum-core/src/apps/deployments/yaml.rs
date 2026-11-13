@@ -729,8 +729,8 @@ mod tests {
     fn manifests_of_the_cases_read() {
         assert_eq!(p("runtime: static\n"), json!({ "runtime": "static" }));
         assert_eq!(
-            p("runtime: static\nenv:\n  RUUM_TOKEN: x\n"),
-            json!({ "runtime": "static", "env": { "RUUM_TOKEN": "x" } })
+            p("runtime: static\nenv:\n  APP_TOKEN: x\n"),
+            json!({ "runtime": "static", "env": { "APP_TOKEN": "x" } })
         );
         assert_eq!(
             p(
