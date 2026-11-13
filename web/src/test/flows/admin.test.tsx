@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { db } from '../../mocks/db'
-import { choose, dialog, ids, renderApp, team } from '../render'
+import { choose, dialog, ids, personal, renderApp, team } from '../render'
 import { recordRequests } from '../requests'
 
 describe('tenant admin', () => {
@@ -84,6 +84,51 @@ describe('tenant admin', () => {
     expect(await screen.findByText('Saved the sharing rules.')).toBeInTheDocument()
     const patch = seen.find((r) => r.method === 'PATCH' && r.path === `/v1/tenants/${ids.team}`)
     expect(patch?.body).toMatchObject({ name: 'Analytical Engines', policy: { allow_share_links: false } })
+  })
+
+  it('lets a personal space choose the address of its apps once, after a warning (S-35)', async () => {
+    const seen = recordRequests()
+    const { user } = renderApp(`${personal}/admin/policy`)
+    expect(await screen.findByRole('heading', { name: 'Address of your apps' })).toBeInTheDocument()
+    expect(await screen.findByText(/Your first app gives this space a random address, like ws-7k2m9q/)).toBeInTheDocument()
+    const field = screen.getByRole('textbox', { name: 'Choose an address' })
+    expect(field).toHaveAccessibleDescription(/Anyone can see it, and you can't change it later/)
+    // A slug against the rules is caught before the dialog.
+    await user.type(field, 'a--b')
+    await user.click(screen.getByRole('button', { name: 'Use this address' }))
+    expect(await screen.findByText(/Use 3 to 40 lower-case letters/)).toBeInTheDocument()
+    expect(seen.some((r) => r.method === 'PATCH')).toBe(false)
+    // A good one: the dialog says it is public and permanent, then the choice is sent alone.
+    await user.clear(field)
+    await user.type(field, 'Ada-Apps')
+    expect(field).toHaveValue('ada-apps')
+    await user.click(screen.getByRole('button', { name: 'Use this address' }))
+    const d = await dialog('Use ada-apps for good?')
+    expect(d).toHaveTextContent('This address is public: it appears in DNS and in public certificate logs')
+    expect(d).toHaveTextContent("You can't change it later")
+    await user.click(within(d).getByRole('button', { name: 'Use ada-apps' }))
+    expect(await screen.findByText('This space now has ada-apps in its app addresses.')).toBeInTheDocument()
+    expect(seen.find((r) => r.method === 'PATCH' && r.path === `/v1/tenants/${ids.personal}`)?.body).toEqual({ app_slug: 'ada-apps' })
+    expect(await screen.findByText(/in its address. Anyone can see it, and it never changes./)).toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Choose an address' })).not.toBeInTheDocument()
+  })
+
+  it('shows no address card in a team space (S-35)', async () => {
+    renderApp(`${team}/admin/policy`)
+    await screen.findByRole('checkbox', { name: 'Allow links' })
+    expect(screen.queryByRole('heading', { name: 'Address of your apps' })).not.toBeInTheDocument()
+  })
+
+  it('says when the chosen address is taken (S-35)', async () => {
+    Object.assign(db.tenants.find((t) => t.tenant.id === ids.team)!.tenant, { app_slug: 'taken-one' })
+    const { user } = renderApp(`${personal}/admin/policy`)
+    await user.type(await screen.findByRole('textbox', { name: 'Choose an address' }), 'taken-one')
+    await user.click(screen.getByRole('button', { name: 'Use this address' }))
+    const d = await dialog('Use taken-one for good?')
+    await user.click(within(d).getByRole('button', { name: 'Use taken-one' }))
+    expect(await screen.findByText('taken-one is taken. Try another one.')).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Choose an address' })).toHaveAccessibleDescription(/taken-one is taken/)
   })
 
   it('gives a member a content role, and a guest who becomes a member one in the same step (0003-1)', async () => {

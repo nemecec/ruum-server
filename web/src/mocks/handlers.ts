@@ -38,10 +38,12 @@ class Fail {
   readonly status: number
   readonly code: Schemas['ErrorCode']
   readonly message: string
-  constructor(status: number, code: Schemas['ErrorCode'], message: string) {
+  readonly hint?: string
+  constructor(status: number, code: Schemas['ErrorCode'], message: string, hint?: string) {
     this.status = status
     this.code = code
     this.message = message
+    this.hint = hint
   }
 }
 
@@ -140,7 +142,7 @@ function route<P extends keyof paths, M extends Method>(
       return HttpResponse.json(result as never, { status: options.status ?? 200 })
     } catch (e) {
       if (e instanceof Fail) {
-        return HttpResponse.json({ error: { code: e.code, message: e.message } }, { status: e.status })
+        return HttpResponse.json({ error: { code: e.code, message: e.message, ...(e.hint ? { hint: e.hint } : {}) } }, { status: e.status })
       }
       throw e
     }
@@ -466,6 +468,18 @@ export const handlers: HttpHandler[] = [
   route('get', '/v1/tenants/{tenant_id}', ({ params }) => membership(params.tenant_id).tenant),
   route('patch', '/v1/tenants/{tenant_id}', ({ params, body }) => {
     const m = requireAdmin(params.tenant_id)
+    // The address part of a personal space's apps (card S-35): once, alone, by the rules.
+    if (body.app_slug !== undefined) {
+      const slug = body.app_slug
+      if (body.name !== undefined || body.policy) throw new Fail(422, 'validation_failed', 'send app_slug in a request of its own', '/app_slug')
+      if (m.tenant.kind !== 'personal') throw new Fail(422, 'validation_failed', 'only a personal space chooses the address of its apps', '/app_slug')
+      if (!/^(?!xn-)[a-z0-9](?:[a-z0-9]|-(?!-)){1,38}[a-z0-9]$/.test(slug) || ['www', 'api', 'admin', 'app', 'apps'].includes(slug))
+        throw new Fail(422, 'validation_failed', 'this slug breaks a rule', '/app_slug')
+      if (m.tenant.app_slug && m.tenant.app_slug !== slug) throw new Fail(409, 'conflict', 'the address is fixed already', 'app_slug_fixed')
+      if (db.tenants.some((x) => x.tenant.id !== m.tenant.id && x.tenant.app_slug === slug)) throw new Fail(409, 'conflict', 'this address is taken', 'app_slug_taken')
+      Object.assign(m.tenant, { app_slug: slug })
+      return m.tenant
+    }
     if (body.name !== undefined) m.tenant.name = body.name
     if (body.policy) m.tenant.policy = body.policy
     db.audit.unshift({ id: newId(), action: 'tenant.updated', actor: userRef(), on_behalf_of: null, target_type: 'tenant', target_id: m.tenant.id, at: now(), data: { ...body } })

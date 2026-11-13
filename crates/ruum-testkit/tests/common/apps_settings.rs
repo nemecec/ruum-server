@@ -60,8 +60,225 @@ fn check_slug(app: &Value, name: &str) -> Result<String, Fail> {
     Ok(slug)
 }
 
+/// The personal tenant of `who` (`listTenants`): its ID, name and root node (`getRoot`).
+async fn personal_tenant(cx: &Ctx, who: Who) -> Result<(TenantId, String, String), Fail> {
+    let list = cx.ok(who, RequestSpec::get("/v1/tenants"), &[200]).await?;
+    let Some(m) = items(&list)
+        .into_iter()
+        .find(|m| m["tenant"]["kind"] == "personal" && m["role"] == "owner")
+    else {
+        fail!("{} has no personal space: {list}", who.name());
+    };
+    let id: TenantId = match str_at(&m, "/tenant/id")?.parse() {
+        Ok(id) => id,
+        Err(_) => fail!("listTenants gave an ID that is not a UUID: {m}"),
+    };
+    let root = cx
+        .ok(who, RequestSpec::get("/v1/nodes/root").tenant(id), &[200])
+        .await?;
+    Ok((id, str_at(&m, "/tenant/name")?, str_at(&root, "/id")?))
+}
+
+/// `ws-` and 6 lower-case base32 characters (decision 0008-1).
+fn is_neutral_slug(slug: &str) -> bool {
+    slug.len() == 9
+        && slug.starts_with("ws-")
+        && slug[3..]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
+/// The first word (3 or more letters or digits, lower case) of `name` that `slug` holds.
+fn name_word_in(slug: &str, name: &str) -> Option<String> {
+    name.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .find(|w| slug.contains(w))
+        .map(str::to_string)
+}
+
+/// `updateTenant` with only `app_slug`.
+fn choose_slug(tenant: TenantId, body: Value) -> RequestSpec {
+    RequestSpec::new(Method::PATCH, format!("/v1/tenants/{tenant}")).json(body)
+}
+
 pub fn cases() -> Vec<Case> {
     vec![
+        case!(
+            "personal_tenant_slugs_are_neutral_and_random",
+            [
+                "getMe",
+                "listTenants",
+                "getRoot",
+                "getTenant",
+                "createTenant",
+                "createApp"
+            ],
+            "the first app in a personal space fixes a neutral random tenant slug (ws- and 6 \
+             lower-case base32 characters) that holds no word of the display name or of the \
+             space name; Tenant.app_slug shows it; two personal spaces get two slugs; a team \
+             space keeps the slug of its name (decision 0008-1, card S-35)",
+            |cx| {
+                let mut seen = std::collections::BTreeSet::new();
+                for who in [Who::MemberView, Who::MemberComment] {
+                    let me = cx.ok(who, RequestSpec::get("/v1/me"), &[200]).await?;
+                    let display = str_at(&me, "/user/display_name")?;
+                    let (tid, name, root) = personal_tenant(&cx, who).await?;
+                    let before = cx
+                        .ok(who, RequestSpec::get(format!("/v1/tenants/{tid}")), &[200])
+                        .await?;
+                    let earlier = before["app_slug"].as_str().unwrap_or_default();
+                    check!(
+                        before["app_slug"].is_null() || is_neutral_slug(earlier),
+                        "{} has a personal space slug that is not neutral: {before}",
+                        who.name()
+                    );
+                    let app = cx
+                        .ok(who, create_app_at(tid, &root, "plant list", None), &[202])
+                        .await?;
+                    let (_, slug) = url_slugs(&str_at(&app, "/app/url")?)?;
+                    check!(
+                        is_neutral_slug(&slug),
+                        "the personal space {name:?} of {} got the slug {slug:?}, not ws-<6 \
+                         base32>",
+                        who.name()
+                    );
+                    for n in [&display, &name] {
+                        if let Some(w) = name_word_in(&slug, n) {
+                            fail!("the slug {slug:?} holds {w:?} of the name {n:?}");
+                        }
+                    }
+                    let after = cx
+                        .ok(who, RequestSpec::get(format!("/v1/tenants/{tid}")), &[200])
+                        .await?;
+                    check!(
+                        after["app_slug"] == slug.as_str(),
+                        "getTenant shows app_slug {} after the first app, not {slug:?}",
+                        after["app_slug"]
+                    );
+                    check!(
+                        seen.insert(slug.clone()),
+                        "two personal spaces got the slug {slug:?}"
+                    );
+                }
+                let team_name = format!(
+                    "Orchard club {}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                );
+                let (tid, root, _) = new_tenant(&cx, &team_name).await?;
+                let app = cx
+                    .ok(
+                        Who::Owner,
+                        create_app_at(tid, &root, "plant list", None),
+                        &[202],
+                    )
+                    .await?;
+                let (_, slug) = url_slugs(&str_at(&app, "/app/url")?)?;
+                check!(
+                    slug.starts_with("orchard-club-"),
+                    "the team space {team_name:?} got the slug {slug:?}, not one from its name"
+                );
+                Ok(())
+            }
+        ),
+        case!(
+            "a_person_chooses_a_permanent_personal_slug",
+            [
+                "listTenants",
+                "getRoot",
+                "getTenant",
+                "updateTenant",
+                "createApp"
+            ],
+            "updateTenant with app_slug chooses the tenant slug of a personal space once: rule \
+             breaks and app_slug with name are 422 (hint /app_slug), a team space is 422, an \
+             agent is user_required; then the same slug is 200 and another is 409 \
+             app_slug_fixed; the next app uses it; another person's space gets 409 \
+             app_slug_taken for it (decision 0008-1, card S-35)",
+            |cx| {
+                let who = Who::MemberEdit;
+                let (tid, _, root) = personal_tenant(&cx, who).await?;
+                let mine = format!("s35-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+                for bad in [
+                    json!({ "app_slug": "admin" }),
+                    json!({ "app_slug": "a--b" }),
+                    json!({ "app_slug": "Mine" }),
+                    json!({ "app_slug": "xn--mine" }),
+                    json!({ "app_slug": mine, "name": "New name" }),
+                ] {
+                    let err = cx
+                        .refused(
+                            who,
+                            choose_slug(tid, bad.clone()),
+                            422,
+                            &["validation_failed"],
+                        )
+                        .await?;
+                    super::api::hint_has(&err, "/app_slug")?;
+                }
+                let err = cx
+                    .refused(
+                        Who::Owner,
+                        choose_slug(cx.a().id, json!({ "app_slug": mine })),
+                        422,
+                        &["validation_failed"],
+                    )
+                    .await?;
+                super::api::hint_has(&err, "/app_slug")?;
+                cx.refused(
+                    Who::Agent,
+                    choose_slug(cx.a().id, json!({ "app_slug": mine })),
+                    403,
+                    &["user_required"],
+                )
+                .await?;
+                let t = cx
+                    .ok(who, choose_slug(tid, json!({ "app_slug": mine })), &[200])
+                    .await?;
+                check!(
+                    t["app_slug"] == mine.as_str(),
+                    "updateTenant answered app_slug {}, not {mine:?}",
+                    t["app_slug"]
+                );
+                cx.ok(who, choose_slug(tid, json!({ "app_slug": mine })), &[200])
+                    .await?;
+                let err = cx
+                    .refused(
+                        who,
+                        choose_slug(tid, json!({ "app_slug": format!("{mine}-b") })),
+                        409,
+                        &["conflict"],
+                    )
+                    .await?;
+                super::api::hint_has(&err, "app_slug_fixed")?;
+                let app = cx
+                    .ok(who, create_app_at(tid, &root, "plant list", None), &[202])
+                    .await?;
+                let (_, slug) = url_slugs(&str_at(&app, "/app/url")?)?;
+                check!(
+                    slug == mine,
+                    "the app address has the tenant slug {slug:?}, not the chosen {mine:?}"
+                );
+                let got = cx
+                    .ok(who, RequestSpec::get(format!("/v1/tenants/{tid}")), &[200])
+                    .await?;
+                check!(
+                    got["app_slug"] == mine.as_str(),
+                    "getTenant shows app_slug {}",
+                    got["app_slug"]
+                );
+                let (other, _, _) = personal_tenant(&cx, Who::GuestComment).await?;
+                let err = cx
+                    .refused(
+                        Who::GuestComment,
+                        choose_slug(other, json!({ "app_slug": mine })),
+                        409,
+                        &["conflict"],
+                    )
+                    .await?;
+                super::api::hint_has(&err, "app_slug_taken")
+            }
+        ),
         case!(
             "a_new_app_waits_for_its_first_deployment",
             [

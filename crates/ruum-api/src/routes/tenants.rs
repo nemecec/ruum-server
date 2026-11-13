@@ -119,7 +119,8 @@ pub async fn create_tenant(
 }
 
 /// The `Tenant` JSON with `app_approval` (read-only, what a Ruum platform admin approved for
-/// the tenant: card W-1, decision 0006-12; both off until the admin console turns them on).
+/// the tenant: card W-1, decision 0006-12; both off until the admin console turns them on) and
+/// `app_slug` (the tenant part of app addresses once it is fixed, else `null`; card S-35).
 async fn with_app_approval(
     state: &AppState,
     t: &ruum_core::tenants::Tenant,
@@ -130,6 +131,7 @@ async fn with_app_approval(
         "public_apps": a.as_ref().is_some_and(|a| a.public_apps_approved),
         "custom_domains": a.as_ref().is_some_and(|a| a.custom_domains_approved),
     });
+    v["app_slug"] = json!(a.as_ref().map(|a| a.slug.as_str()));
     Ok(v)
 }
 
@@ -149,6 +151,8 @@ pub async fn get_tenant(
 pub struct UpdateTenant {
     name: Option<String>,
     policy: Option<TenantPolicyChange>,
+    /// The slug of a personal tenant's app addresses, chosen once (card S-35, decision 0008-1).
+    app_slug: Option<String>,
 }
 
 /// Rename a tenant or change its policy. `PATCH /v1/tenants/{tenant_id}` (operationId `updateTenant`).
@@ -161,10 +165,26 @@ pub async fn update_tenant(
 ) -> ApiResult<Json<Value>> {
     let ctx = ctx_of(&state, &who, &tenant_id, &headers).await?;
     ruum_core::actor::require_user_actor(&ctx)?;
-    if body.name.is_none() && body.policy.is_none() {
+    if body.name.is_none() && body.policy.is_none() && body.app_slug.is_none() {
         return Err(HttpError(ruum_core::identity::invalid(
-            "give name or policy",
+            "give name, policy or app_slug",
         )));
+    }
+    // The slug is chosen for good, so it goes alone: a refusal of the other fields can never
+    // follow a choice that was made.
+    if let Some(slug) = &body.app_slug {
+        if body.name.is_some() || body.policy.is_some() {
+            return Err(HttpError(Error::Api(
+                ApiError::new(
+                    ErrorCode::ValidationFailed,
+                    "send app_slug in a request of its own",
+                )
+                .with_hint("/app_slug"),
+            )));
+        }
+        state.services.apps.choose_tenant_slug(&ctx, slug).await?;
+        let t = state.services.tenants.get(&ctx).await?;
+        return Ok(Json(with_app_approval(&state, &t).await?));
     }
     let t = state
         .services

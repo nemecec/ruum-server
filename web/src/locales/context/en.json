@@ -654,6 +654,71 @@
       "tone": "neutral",
       "maxLength": 10
     },
+    "appAddress.confirm.button": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Confirm button of the dialog. {slug} is the chosen address part.",
+      "tone": "calm",
+      "maxLength": 60
+    },
+    "appAddress.confirm.message": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Body of the confirmation dialog. Says that the address is public and permanent. Exact, no jokes.",
+      "tone": "calm",
+      "maxLength": 240
+    },
+    "appAddress.confirm.title": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Title of the confirmation dialog. {slug} is the chosen address part.",
+      "tone": "calm",
+      "maxLength": 70
+    },
+    "appAddress.fixed": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Shown when the address part is fixed. {slug} is the address part, for example ws-7k2m9q. Exact, no jokes.",
+      "tone": "calm",
+      "maxLength": 140
+    },
+    "appAddress.fixedNow": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Error in the dialog: the address part was fixed in the meantime (for example by the first app).",
+      "tone": "calm",
+      "maxLength": 90
+    },
+    "appAddress.hint": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Helper text under the field: the rules and that the choice is public and permanent.",
+      "tone": "calm",
+      "maxLength": 140
+    },
+    "appAddress.invalid": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Error under the field: the address part breaks a rule. www and api stay as they are.",
+      "tone": "calm",
+      "maxLength": 170
+    },
+    "appAddress.label": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Label of the text field for the chosen address part.",
+      "tone": "neutral",
+      "maxLength": 40
+    },
+    "appAddress.random": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Shown before the first app, when the address part is not fixed yet. ws-7k2m9q is an example and stays as it is.",
+      "tone": "neutral",
+      "maxLength": 170
+    },
+    "appAddress.saved": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Toast after the address part was chosen.",
+      "tone": "neutral",
+      "maxLength": 90
+    },
+    "appAddress.submit": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Button that opens the confirmation dialog.",
+      "tone": "neutral",
+      "maxLength": 30
+    },
+    "appAddress.taken": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Error in the dialog: another space has or had this address part.",
+      "tone": "calm",
+      "maxLength": 80
+    },
+    "appAddress.title": {
+      "description": "Space settings, Sharing rules tab of a personal space: the card about the address of the person's apps (card S-35). The address part is public (DNS, certificate logs) and permanent. Card heading.",
+      "tone": "neutral",
+      "maxLength": 40
+    },
     "audit.aMember": {
       "description": "Activity log of the space (Space settings): one line per event, \"<who> <verb phrase> <object>\". Neutral and exact: it is a security record. Stand-in for a member whose name Ruum cannot show, inside a sentence (lower case).",
       "tone": "calm",

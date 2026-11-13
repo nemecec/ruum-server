@@ -19,8 +19,11 @@
 //!   `guests_create_resources`); the plan's app count (`plan_limit_reached`). The slug comes
 //!   from the node name ([`slugs::candidates`]): a clash with a rule or with another app picks
 //!   the next free slug from the name; the name's own slug, when the tenant used it before for
-//!   another app, is `409 conflict` (hint `slug_retired`). The tenant slug comes from the tenant
-//!   name the first time an app is made, and never changes.
+//!   another app, is `409 conflict` (hint `slug_retired`). The tenant slug is fixed the first
+//!   time an app is made, and never changes: a team tenant's comes from its name, a personal
+//!   tenant's is neutral and random ([`slugs::personal`], decision 0008-1).
+//! - The owner (or an admin) of a personal tenant may choose its slug before it is fixed
+//!   ([`AppService::choose_tenant_slug`], `updateTenant` with `app_slug`). People only.
 //! - `getApp`, `listAppDeployments`, `getAppDeployment` need `view`; a node that is not a web
 //!   app is `404`. Stage messages and the check result need `edit` (they can quote log lines);
 //!   previews are listed in `App.previews` only for callers with `edit`.
@@ -57,7 +60,7 @@ use crate::nodes::{NewTyped, Node, NodeKind, NodeStore, OnConflict};
 use crate::paging::{Page, PageRequest};
 use crate::providers::store::TypedNodeStore;
 use crate::providers::{CreateTypedNodeRequest, ProviderState, Source};
-use crate::tenants::{MemberRole, TenantStore};
+use crate::tenants::{MemberRole, Tenant, TenantKind, TenantStore};
 use crate::usage::{MemoryUsageSink, UsageSink};
 use plan::AppPlanLimits;
 use serde::{Deserialize, Serialize};
@@ -370,16 +373,48 @@ fn not_an_app() -> Error {
     Error::not_found("app")
 }
 
-/// The provisional settings of a tenant that has no app yet (nothing is stored by a read).
-fn provisional_tenant(tenant: TenantId, name: &str) -> TenantAppSettings {
+/// The provisional settings of a tenant that has no app yet (nothing is stored by a read). A
+/// personal tenant shows a neutral random slug, never one from its name.
+fn provisional_tenant(tenant: &Tenant) -> TenantAppSettings {
     TenantAppSettings {
-        tenant_id: tenant,
-        slug: slugs::candidates(name, SlugKind::Tenant, 1)
+        tenant_id: tenant.id,
+        slug: tenant_slug_candidates(tenant, 1)
             .pop()
-            .unwrap_or_else(|| "space-2".into()),
+            .unwrap_or_else(slugs::personal),
         public_apps_approved: false,
         custom_domains_approved: false,
     }
+}
+
+/// The candidates of a tenant's slug: neutral random slugs for a personal tenant, the slug of
+/// the name and then random suffixes for a team tenant (decision 0008-1).
+fn tenant_slug_candidates(tenant: &Tenant, n: usize) -> Vec<String> {
+    match tenant.kind {
+        TenantKind::Personal => slugs::personal_candidates(n),
+        TenantKind::Team => slugs::tenant_candidates(&tenant.name, n),
+    }
+}
+
+/// `409 conflict`, hint `app_slug_fixed`: the tenant's slug is fixed already.
+fn tenant_slug_fixed() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::Conflict,
+            "the address of this space's apps is fixed already and never changes",
+        )
+        .with_hint("app_slug_fixed"),
+    )
+}
+
+/// `409 conflict`, hint `app_slug_taken`: another space has or had the slug.
+fn tenant_slug_taken() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::Conflict,
+            "this address is taken; an address used once is never given again",
+        )
+        .with_hint("app_slug_taken"),
+    )
 }
 
 impl AppService {
@@ -404,15 +439,57 @@ impl AppService {
         &self.deps.usage
     }
 
-    /// The candidates of a tenant's slug, from its name.
+    /// The candidates of a tenant's slug ([`tenant_slug_candidates`]).
     async fn tenant_candidates(&self, tenant: TenantId) -> Result<Vec<String>> {
         let t = self.deps.tenants.find(tenant).await?;
-        Ok(slugs::candidates_with_spares(
-            &t.name,
-            SlugKind::Tenant,
-            20,
-            20,
-        ))
+        Ok(tenant_slug_candidates(&t, 30))
+    }
+
+    /// Chooses the slug of a personal tenant before it is fixed (`updateTenant` with
+    /// `app_slug`; decision 0008-1). People only (`user_required`), with the tenant role `admin`
+    /// or `owner`. A team tenant takes its slug from its name (`422`). The slug follows the rules
+    /// of [`slugs::check`] (`422`, hint `/app_slug`). When the tenant's slug is fixed already,
+    /// the same slug answers the settings again and another one is `409`, hint
+    /// `app_slug_fixed`. A slug that another tenant has or had is `409`, hint `app_slug_taken`.
+    /// The slug is then fixed for good, like one given with the first app.
+    pub async fn choose_tenant_slug(&self, ctx: &Context, slug: &str) -> Result<TenantAppSettings> {
+        refuse_share_link(ctx)?;
+        let user = crate::actor::require_user_actor(ctx)?;
+        crate::tenants::rules::require_role(
+            self.deps.tenants.role_of(ctx.tenant, user).await?,
+            MemberRole::Admin,
+        )?;
+        let tenant = self.deps.tenants.find(ctx.tenant).await?;
+        if tenant.kind != TenantKind::Personal {
+            return Err(Error::Api(
+                ApiError::new(
+                    ErrorCode::ValidationFailed,
+                    "only a personal space chooses the address of its apps; a team space's \
+                     address comes from its name",
+                )
+                .with_hint("/app_slug"),
+            ));
+        }
+        slugs::check(slug, SlugKind::Tenant)
+            .map_err(|p| slugs::invalid("/app_slug", p, SlugKind::Tenant))?;
+        let store = &self.deps.store;
+        if let Some(t) = store.tenant_settings(ctx.tenant).await? {
+            return if t.slug == slug {
+                Ok(t)
+            } else {
+                Err(tenant_slug_fixed())
+            };
+        }
+        match store
+            .ensure_tenant_settings(ctx.tenant, &[slug.to_string()])
+            .await
+        {
+            Ok(t) if t.slug == slug => Ok(t),
+            // Another request fixed the slug first.
+            Ok(_) => Err(tenant_slug_fixed()),
+            Err(Error::Api(e)) if e.code == ErrorCode::Conflict => Err(tenant_slug_taken()),
+            Err(e) => Err(e),
+        }
     }
 
     /// The apps-domain settings of a tenant, made when missing.
@@ -796,7 +873,7 @@ impl AppService {
     async fn urls(&self, tenant: TenantId, node: &Node) -> Result<Urls> {
         let t = match self.deps.store.tenant_settings(tenant).await? {
             Some(t) => t,
-            None => provisional_tenant(tenant, &self.deps.tenants.find(tenant).await?.name),
+            None => provisional_tenant(&self.deps.tenants.find(tenant).await?),
         };
         let slug = match self.deps.store.get_app(tenant, node.id).await? {
             Some(r) => r.slug,

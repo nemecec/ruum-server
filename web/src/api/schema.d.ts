@@ -369,6 +369,20 @@ export interface paths {
          * @description Users only (agents get `user_required`). Needs the tenant role `admin` or `owner`. A change
          *     of `policy` applies at once to new grants, links and invitations; existing share links
          *     that the new policy forbids stop working (`allow_share_links`, `allow_edit_links`).
+         *
+         *     `app_slug` (step 3, decision 0008-1) chooses the tenant part of the app addresses
+         *     (`https://<app-slug>.<app_slug>.ruumapps.net`) of a **personal** tenant, in place of the
+         *     neutral random slug that it gets otherwise. It goes in a request of its own (with `name`
+         *     or `policy`: `422 validation_failed`, hint `/app_slug`). The slug is public (DNS,
+         *     certificate transparency logs) and permanent: it never changes and is never given to
+         *     another tenant, also after this tenant is deleted. So it can be chosen only while
+         *     `Tenant.app_slug` is `null` (before the first app); the same slug again answers `200`,
+         *     another one `409 conflict`, hint `app_slug_fixed`. A team tenant takes its slug from its
+         *     name (`422 validation_failed`, hint `/app_slug`). The slug follows the tenant slug rules
+         *     (`docs/STEP3.md`, "Host names and slugs": 3 to 40 characters, lower-case letters, digits
+         *     and single `-`, no `-` at either end, no `xn-` prefix, not reserved; `422
+         *     validation_failed`, hint `/app_slug`). A slug that another tenant has or had is `409
+         *     conflict`, hint `app_slug_taken`.
          */
         patch: operations["updateTenant"];
         trace?: never;
@@ -3230,8 +3244,13 @@ export interface paths {
          *     9.5 and decision 22): without it `403 permission_denied` (hint `public_apps_not_allowed`).
          *
          *     Writes `node.created` (kind `typed`, type `webapp`). The address is
-         *     `https://<app-slug>.<tenant-slug>.ruumapps.net` (`App.url`); the slugs come from the node
-         *     name and the tenant name and never change after the first deployment. An app slug is one
+         *     `https://<app-slug>.<tenant-slug>.ruumapps.net` (`App.url`). The app slug comes from the
+         *     node name and never changes after the first deployment. The tenant slug is fixed with the
+         *     tenant's first app and never changes (`Tenant.app_slug`, decision 0008-1): a team
+         *     tenant's comes from the tenant name (when another tenant has or had it, the name with a
+         *     random suffix, `<name>-<6 base32>`, never a counter); a personal tenant's is a neutral
+         *     random slug, `ws-` and 6 lower-case base32 characters (for example `ws-7k2m9q`), never
+         *     from its name, unless the person chose one before (`updateTenant`, `app_slug`). An app slug is one
          *     DNS label with room for the preview prefix: 2 to 53 characters, lower-case letters,
          *     digits and single `-` (no `--`, no `-` at either end, no `xn--` prefix), not a reserved
          *     slug (`docs/STEP3.md`) and not a slug that this tenant used before for another app
@@ -4797,6 +4816,15 @@ export interface components {
             root_node_id: components["schemas"]["Uuid"];
             policy: components["schemas"]["TenantPolicy"];
             app_approval?: components["schemas"]["AppTenantApproval"];
+            /**
+             * @description Step 3 (decision 0008-1). The tenant part of the app addresses
+             *     (`https://<app-slug>.<app_slug>.ruumapps.net`) once it is fixed: with the first app,
+             *     or when the owner of a personal tenant chose it (`updateTenant`). `null` until then.
+             *     Public and permanent. A personal tenant gets a neutral random slug (`ws-7k2m9q`),
+             *     a team tenant the slug of its name.
+             * @example ws-7k2m9q
+             */
+            readonly app_slug?: string | null;
             created_at: components["schemas"]["Timestamp"];
         };
         TenantMembership: {
@@ -4810,6 +4838,12 @@ export interface components {
             name?: string;
             /** @description Fields that are left out keep their value. */
             policy?: components["schemas"]["TenantPolicy"];
+            /**
+             * @description Step 3 (decision 0008-1). Personal tenants only, once, alone in the request: the
+             *     chosen tenant part of the app addresses. Public and permanent (see `updateTenant`).
+             * @example linn-apps
+             */
+            app_slug?: string;
         };
         Member: {
             tenant_id: components["schemas"]["Uuid"];
@@ -7971,6 +8005,7 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["PermissionDenied"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             422: components["responses"]["ValidationFailed"];
         };
     };

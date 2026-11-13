@@ -12,10 +12,20 @@
 //! - A slug used once is never given to another tenant or app (`retired_app_slugs`; the stores
 //!   check it).
 //!
-//! Slugs come from names ([`candidates`]): the platform turns the node name (or the tenant name)
-//! into a slug, and when that slug breaks a rule or is held by another app it picks the next free
+//! App slugs come from names ([`candidates`]): the platform turns the node name into a slug, and
+//! when that slug breaks a rule or is held by another app of the tenant it picks the next free
 //! one from the same name. A slug that the tenant used before for another app is refused
 //! (`409 conflict`, hint `slug_retired`; the service decides).
+//!
+//! Tenant slugs (decision 0008-1, backlog S-35):
+//!
+//! - A **personal** tenant never gets a slug from its name (`"<display name>'s space"` names a
+//!   person, and the slug is public and kept forever). It gets a neutral random slug
+//!   ([`personal`], `ws-<6 lower-case base32>`), unless the person chooses one explicitly
+//!   (`updateTenant`, `app_slug`).
+//! - A **team** tenant gets the slug of its name ([`tenant_candidates`]). When another tenant has
+//!   or had that slug, the next ones have a random suffix (`<name>-<6 base32>`), never `-2`,
+//!   `-3`: a counter would tell how many other tenants took the name.
 
 use crate::error::{ApiError, Error, ErrorCode};
 use unicode_normalization::UnicodeNormalization;
@@ -274,6 +284,63 @@ pub fn candidates_with_spares(name: &str, kind: SlugKind, n: usize, spares: usiz
     out
 }
 
+/// The random part of a neutral slug: 6 characters of lower-case base32.
+const RANDOM_LEN: usize = 6;
+
+/// A neutral random slug for a personal tenant: `ws-` and 6 characters of lower-case base32
+/// (about 10^9 values). It holds nothing of the tenant's name.
+pub fn personal() -> String {
+    format!("ws-{}", &short_id()[..RANDOM_LEN])
+}
+
+/// `n` different neutral random slugs for a personal tenant ([`personal`]), all valid.
+pub fn personal_candidates(n: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    while out.len() < n {
+        let c = personal();
+        if is_valid(&c, SlugKind::Tenant) && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The slugs to try for a team tenant, in order: the slug of the name when it follows the rules,
+/// then slugs with a random suffix (`<stem>-<6 base32>`) up to `n` in all. No numbered sequence:
+/// the candidates do not depend on how many other tenants took the name. A name with no usable
+/// letters starts from `space`. All valid.
+pub fn tenant_candidates(name: &str, n: usize) -> Vec<String> {
+    let kind = SlugKind::Tenant;
+    let mut base = from_name(name, kind.max());
+    while base.starts_with("xn-") {
+        base = format!("xn{}", &base[3..]);
+    }
+    if base.is_empty() {
+        base = "space".into();
+    }
+    let mut out = Vec::with_capacity(n);
+    if n > 0 && is_valid(&base, kind) {
+        out.push(base.clone());
+    }
+    let mut stem = base;
+    stem.truncate(kind.max() - RANDOM_LEN - 1);
+    while stem.ends_with('-') {
+        stem.pop();
+    }
+    if stem.is_empty() {
+        stem = "space".into();
+    }
+    let mut tries = 0;
+    while out.len() < n && tries < n * 8 + 8 {
+        tries += 1;
+        let c = format!("{stem}-{}", &short_id()[..RANDOM_LEN]);
+        if is_valid(&c, kind) && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A short ID of a preview host: 8 characters of lower-case base32 (RFC 4648 alphabet without
 /// padding, lower case).
 pub fn short_id() -> String {
@@ -403,6 +470,75 @@ mod tests {
         );
         let www = candidates_with_spares("www", SlugKind::App, 1, 1);
         assert!(www[1].starts_with("www-"), "{www:?}");
+    }
+
+    /// `ws-` and 6 characters of lower-case base32.
+    fn is_neutral(s: &str) -> bool {
+        s.len() == 9
+            && s.starts_with("ws-")
+            && s[3..]
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+    }
+
+    #[test]
+    fn personal_slugs_are_neutral_and_random() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let s = personal();
+            assert!(is_neutral(&s), "{s}");
+            assert!(is_valid(&s, SlugKind::Tenant), "{s}");
+            seen.insert(s);
+        }
+        // 32^6 values: 500 draws repeat with a chance of about 1 in 10^4.
+        assert!(seen.len() >= 498, "{}", seen.len());
+        let c = personal_candidates(20);
+        assert_eq!(c.len(), 20);
+        let unique: std::collections::HashSet<_> = c.iter().collect();
+        assert_eq!(unique.len(), 20, "{c:?}");
+        assert!(c.iter().all(|s| is_neutral(s)), "{c:?}");
+    }
+
+    #[test]
+    fn team_slugs_have_random_suffixes_not_a_counter() {
+        let c = tenant_candidates("Garden Club", 10);
+        assert_eq!(c.len(), 10);
+        assert_eq!(c[0], "garden-club");
+        for s in &c[1..] {
+            let tail = s
+                .strip_prefix("garden-club-")
+                .unwrap_or_else(|| panic!("{s}"));
+            assert_eq!(tail.len(), 6, "{s}");
+            assert!(
+                tail.bytes()
+                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)),
+                "{s}"
+            );
+            assert!(is_valid(s, SlugKind::Tenant), "{s}");
+        }
+        // No `-2`, `-3`: two lists for the same name share only the name's own slug.
+        let d = tenant_candidates("Garden Club", 10);
+        assert!(!c.iter().any(|s| s == "garden-club-2"), "{c:?}");
+        assert_eq!(c.iter().filter(|s| d.contains(s)).count(), 1, "{c:?} {d:?}");
+        // Names that break a rule still give valid slugs from the name.
+        for name in [
+            "admin".to_string(),
+            "id".into(),
+            "xn--a--b-".into(),
+            "日本".into(),
+            "t".repeat(100),
+            "_x".into(),
+        ] {
+            let c = tenant_candidates(&name, 5);
+            assert_eq!(c.len(), 5, "{name}: {c:?}");
+            for s in &c {
+                assert!(is_valid(s, SlugKind::Tenant), "{name}: {s}");
+            }
+        }
+        assert!(tenant_candidates("admin", 2)[0].starts_with("admin-"));
+        assert!(tenant_candidates("日本", 1)[0].starts_with("space"));
+        assert_eq!(tenant_candidates("t".repeat(100).as_str(), 1)[0].len(), 40);
+        assert!(tenant_candidates("Home", 0).is_empty());
     }
 
     #[test]

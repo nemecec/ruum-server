@@ -223,6 +223,12 @@ AI-written code is untrusted code (design 9.5). Eight rules, each with a test:
   `assets`, `docs`, `help`, `support`, `blog`, `dev`, `staging`, `test`, `mta-sts`,
   `autoconfig`, every slug shorter than 3 characters, and every slug starting with `_`.
 - A slug used once is never given to another tenant or app (`retired_app_slugs`).
+- **Tenant slugs** (decision 0008-1, card S-35): a personal tenant gets a neutral random slug,
+  `ws-` and 6 lower-case base32 characters (`ws-7k2m9q`), never one from its name; its owner may
+  choose one before the first app (`updateTenant`, `app_slug`; the UI says it is public and
+  permanent). A team tenant gets the slug of its name; when another tenant has or had it, the name
+  with a random suffix (`<name>-<6 base32>`), never `-2`, `-3`. Tenants that got a slug before
+  S-35 keep it.
 - A custom domain holds its host across tenants only when verified (`active`); a pending row is
   unique per tenant and expires after 7 days; the TXT proof decides.
 

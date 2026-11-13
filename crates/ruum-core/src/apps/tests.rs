@@ -558,7 +558,11 @@ async fn retired_slugs_and_tenant_slugs_across_tenants() {
             .await
             .unwrap();
     let t2 = w.s.apps.ensure_tenant(second_team.id).await.unwrap();
-    assert_eq!(t2.slug, "garden-club-2");
+    // A random suffix, not a counter that tells how many tenants took the name (0008-1).
+    let tail = t2.slug.strip_prefix("garden-club-").unwrap();
+    assert_eq!(tail.len(), 6, "{}", t2.slug);
+    assert!(slugs::is_valid(&t2.slug, SlugKind::Tenant));
+    assert_ne!(t2.slug, "garden-club-2");
     assert_eq!(
         store
             .tenant_settings(w.team.id)
@@ -919,4 +923,222 @@ async fn the_provider_follows_the_contract() {
             .unwrap();
     assert!(!r.valid);
     assert_eq!(r.problems[0].pointer, "/env/A");
+}
+
+/// The personal tenant of `user`.
+async fn personal_of(w: &World, user: UserId) -> Tenant {
+    w.s.tenants
+        .list_for_user(user)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(t, r)| t.kind == TenantKind::Personal && *r == MemberRole::Owner)
+        .map(|(t, _)| t)
+        .expect("a personal tenant")
+}
+
+/// `createApp` in the personal tenant `t` of `user`, at its root.
+async fn create_personal(w: &World, t: &Tenant, user: UserId, name: &str) -> Result<App> {
+    w.s.apps
+        .create(
+            &ctx(t.id, user),
+            CreateApp {
+                parent_id: t.root_node_id,
+                name: name.into(),
+                settings: None,
+                on_conflict: OnConflict::Fail,
+            },
+        )
+        .await
+        .map(|w| w.value)
+}
+
+/// The tenant label of an app address (`https://<app>.<tenant>.<domain>`).
+fn tenant_label(url: &str) -> String {
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    host.split('.').nth(1).unwrap_or_default().to_string()
+}
+
+fn is_neutral(slug: &str) -> bool {
+    slug.len() == 9
+        && slug.starts_with("ws-")
+        && slug[3..]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+}
+
+#[tokio::test]
+async fn personal_tenants_get_neutral_random_slugs() {
+    let w = world().await;
+    let mut seen = std::collections::HashSet::new();
+    for user in [w.owner, w.member, w.guest] {
+        let t = personal_of(&w, user).await;
+        // Before the first app: nothing is stored, and the provisional slug is neutral too.
+        assert!(
+            w.s.apps
+                .store()
+                .tenant_settings(t.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let app = create_personal(&w, &t, user, "Plant planner")
+            .await
+            .unwrap();
+        let slug = tenant_label(&app.url);
+        assert!(is_neutral(&slug), "{slug} ({})", t.name);
+        // Nothing of the display name ("owner's space"): no word of the name is in the slug.
+        let name = t.name.to_lowercase();
+        for word in name.split(|c: char| !c.is_ascii_alphanumeric()) {
+            if word.len() >= 3 {
+                assert!(!slug.contains(word), "{slug} holds {word:?} of {name:?}");
+            }
+        }
+        let stored =
+            w.s.apps
+                .store()
+                .tenant_settings(t.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.slug, slug);
+        // The slug stays: a second app has the same tenant label.
+        let again = create_personal(&w, &t, user, "Second").await.unwrap();
+        assert_eq!(tenant_label(&again.url), slug);
+        assert!(seen.insert(slug), "two personal tenants got one slug");
+    }
+    // Team tenants keep the slug of their name.
+    let team = w.create(&w.m(), "Planner", json!(null)).await.unwrap();
+    assert_eq!(tenant_label(&team.url), "garden-club");
+}
+
+#[tokio::test]
+async fn a_personal_slug_skips_taken_candidates() {
+    let w = world().await;
+    let t = personal_of(&w, w.owner).await;
+    // Every candidate but the last is taken by other tenants: the store takes the free one.
+    let store = w.s.apps.store();
+    let candidates = slugs::personal_candidates(5);
+    for c in &candidates[..4] {
+        let other =
+            w.s.tenants
+                .create_team(&Actor::user(w.owner), format!("other {c}"))
+                .await
+                .unwrap();
+        store
+            .ensure_tenant_settings(other.id, std::slice::from_ref(c))
+            .await
+            .unwrap();
+    }
+    let got = store
+        .ensure_tenant_settings(t.id, &candidates)
+        .await
+        .unwrap();
+    assert_eq!(got.slug, candidates[4]);
+    // All taken: `409`, never a slug from the name.
+    let me = personal_of(&w, w.member).await;
+    let err = store
+        .ensure_tenant_settings(me.id, &candidates)
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status(), 409);
+}
+
+#[tokio::test]
+async fn a_person_chooses_the_slug_of_a_personal_tenant() {
+    let w = world().await;
+    let t = personal_of(&w, w.owner).await;
+    let me = ctx(t.id, w.owner);
+    let apps = &w.s.apps;
+    // Rules of the slug: 422 with a pointer.
+    let long = "a".repeat(41);
+    for bad in [
+        "ab",
+        "admin",
+        "a--b",
+        "xn--abc",
+        "-abc",
+        "Abc",
+        long.as_str(),
+    ] {
+        assert_eq!(
+            status_hint(apps.choose_tenant_slug(&me, bad).await),
+            (422, "/app_slug".into()),
+            "{bad}"
+        );
+    }
+    // People only, owners and admins only, personal tenants only.
+    let agent = Context {
+        tenant: t.id,
+        actor: Actor {
+            actor: PrincipalRef {
+                kind: PrincipalKind::Agent,
+                id: Uuid::now_v7().into(),
+            },
+            on_behalf_of: Some(w.owner),
+        },
+        scope: None,
+        idempotency_key: None,
+    };
+    assert_eq!(
+        apps.choose_tenant_slug(&agent, "my-apps")
+            .await
+            .unwrap_err()
+            .http_status(),
+        403
+    );
+    assert_eq!(
+        apps.choose_tenant_slug(&ctx(t.id, w.member), "my-apps")
+            .await
+            .unwrap_err()
+            .http_status(),
+        404
+    );
+    assert_eq!(
+        status_hint(apps.choose_tenant_slug(&w.m(), "my-apps").await).0,
+        403
+    );
+    assert_eq!(
+        status_hint(apps.choose_tenant_slug(&w.o(), "my-apps").await),
+        (422, "/app_slug".into())
+    );
+    assert!(apps.store().tenant_settings(t.id).await.unwrap().is_none());
+    // The choice is fixed; the same slug again is fine, another one is not.
+    let chosen = apps.choose_tenant_slug(&me, "owner-apps").await.unwrap();
+    assert_eq!(chosen.slug, "owner-apps");
+    assert_eq!(
+        apps.choose_tenant_slug(&me, "owner-apps")
+            .await
+            .unwrap()
+            .slug,
+        "owner-apps"
+    );
+    assert_eq!(
+        status_hint(apps.choose_tenant_slug(&me, "other-apps").await),
+        (409, "app_slug_fixed".into())
+    );
+    let app = create_personal(&w, &t, w.owner, "Planner").await.unwrap();
+    assert_eq!(tenant_label(&app.url), "owner-apps");
+    // Another person cannot take it, nor the team's slug.
+    let theirs = personal_of(&w, w.member).await;
+    let them = ctx(theirs.id, w.member);
+    assert_eq!(
+        status_hint(apps.choose_tenant_slug(&them, "owner-apps").await),
+        (409, "app_slug_taken".into())
+    );
+    w.create(&w.m(), "Planner", json!(null)).await.unwrap();
+    assert_eq!(
+        status_hint(apps.choose_tenant_slug(&them, "garden-club").await),
+        (409, "app_slug_taken".into())
+    );
+    // Once the first app fixed a random slug, no choice is left.
+    create_personal(&w, &theirs, w.member, "Mine")
+        .await
+        .unwrap();
+    assert_eq!(
+        status_hint(apps.choose_tenant_slug(&them, "member-apps").await),
+        (409, "app_slug_fixed".into())
+    );
 }

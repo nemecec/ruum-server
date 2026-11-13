@@ -612,7 +612,93 @@ export function PolicyPage() {
           </Button>
         </Actions>
       </Card>
+      {tenant.kind === 'personal' && <AppAddressCard />}
     </section>
+  )
+}
+
+/** The rules of a tenant slug (docs/STEP3.md, "Host names and slugs"), checked before the server does. */
+const SLUG_PATTERN = /^(?!xn-)[a-z0-9](?:[a-z0-9]|-(?!-)){1,38}[a-z0-9]$/
+
+/**
+ * The address of a personal space's apps (card S-35, decision 0008-1). Before the first app the
+ * space has none: it will get a random one (`ws-7k2m9q`), or the person chooses a readable one
+ * now. The choice is public (DNS, certificate logs) and permanent, so a dialog asks first.
+ */
+function AppAddressCard() {
+  const { tenant } = useTenant()
+  const { toast } = useToast()
+  const current = useApi(() => unwrap(client.GET('/v1/tenants/{tenant_id}', { params: { path: { tenant_id: tenant.id } } })), [tenant.id])
+  const [slug, setSlug] = useState('')
+  const [asking, setAsking] = useState(false)
+  const [problem, setProblem] = useState<string | null>(null)
+  const wanted = slug.trim()
+
+  function ask(e: FormEvent) {
+    e.preventDefault()
+    setProblem(SLUG_PATTERN.test(wanted) ? null : t('appAddress.invalid'))
+    if (SLUG_PATTERN.test(wanted)) setAsking(true)
+  }
+
+  // A refusal that the person can fix closes the dialog and shows under the field (copy.md).
+  async function choose() {
+    try {
+      await unwrap(client.PATCH('/v1/tenants/{tenant_id}', { params: { path: { tenant_id: tenant.id } }, body: { app_slug: wanted } }))
+    } catch (err) {
+      if (!(err instanceof RuumApiError)) throw err
+      if (err.hint?.includes('app_slug_taken')) return setProblem(t('appAddress.taken', { slug: wanted }))
+      if (err.hint?.includes('app_slug_fixed')) {
+        toast(t('appAddress.fixedNow'))
+        return current.reload()
+      }
+      if (err.code === 'validation_failed') return setProblem(t('appAddress.invalid'))
+      throw err
+    }
+    toast(t('appAddress.saved', { slug: wanted }))
+    setSlug('')
+    current.reload()
+  }
+
+  return (
+    <Card aria-labelledby="app-address-title">
+      <h3 id="app-address-title">{t('appAddress.title')}</h3>
+      <Loaded state={current}>
+        {(tn) =>
+          tn.app_slug ? (
+            <Text>{tr('appAddress.fixed', { slug: tn.app_slug, b: (chunks) => <strong>{chunks}</strong> })}</Text>
+          ) : (
+            <Stack as="form" gap={4} onSubmit={ask}>
+              <Text>{t('appAddress.random')}</Text>
+              <Field label={t('appAddress.label')} hint={t('appAddress.hint')} error={problem} hintId="app-address-hint" errorId="app-address-error">
+                <TextInput
+                  value={slug}
+                  maxLength={40}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-describedby={problem ? 'app-address-hint app-address-error' : 'app-address-hint'}
+                  aria-invalid={problem ? true : undefined}
+                  onChange={(e) => (setSlug(e.target.value.toLowerCase()), setProblem(null))} // i18n-ignore: a slug is lower case by rule
+                />
+              </Field>
+              <Actions>
+                <Button type="submit" disabled={!wanted}>
+                  {t('appAddress.submit')}
+                </Button>
+              </Actions>
+            </Stack>
+          )
+        }
+      </Loaded>
+      {asking && (
+        <ConfirmDialog
+          title={t('appAddress.confirm.title', { slug: wanted })}
+          message={<p>{t('appAddress.confirm.message')}</p>}
+          confirmLabel={t('appAddress.confirm.button', { slug: wanted })}
+          onClose={() => setAsking(false)}
+          onConfirm={choose}
+        />
+      )}
+    </Card>
   )
 }
 

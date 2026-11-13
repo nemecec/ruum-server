@@ -290,6 +290,24 @@ Journeys J15 to J21 (`journeys.md`), screens A1 to A16 (`screens.md`).
 | Revoke key confirm | Title: Turn off the API key for *partner*? Body: Programs that use it stop working at once. Button: Turn off key |
 | Settings saved | Saved. |
 
+### Address of a personal space's apps (S-35, decision 0008-1)
+
+Space settings, Sharing rules tab, personal spaces only (`Tenant.app_slug`, `updateTenant`
+with `app_slug`). The address part is public and permanent, so the copy is calm and exact. The
+catalogue keys are `appAddress.*` (`web/src/locales/en.json`, Estonian in `et.json`).
+
+| Where | Copy |
+|---|---|
+| Heading | Address of your apps |
+| Fixed | Every app in this space has **ws-7k2m9q** in its address. Anyone can see it, and it never changes. |
+| Not fixed yet | Your first app gives this space a random address, like ws-7k2m9q. It says nothing about you. Prefer a name you can read? Choose it now. |
+| Field | Label: Choose an address. Helper: 3 to 40 characters: lower-case letters, digits and single dashes. Anyone can see it, and you can't change it later. Button: Use this address |
+| Confirm | Title: Use *linn-apps* for good? Body: This address is public: it appears in DNS and in public certificate logs, so anyone can find it. You can't change it later, and nobody can use it again, even after you delete this space. Button: Use *linn-apps* |
+| Saved (toast) | This space now has *linn-apps* in its app addresses. |
+| `conflict` + `app_slug_taken` | *linn-apps* is taken. Try another one. |
+| `conflict` + `app_slug_fixed` | This space already has an address for its apps. It can't change. |
+| `validation_failed` + `/app_slug` | Use 3 to 40 lower-case letters, digits and single dashes, with no dash at either end. Some words, like www or api, are kept for Ruum. |
+
 ### Report page (J21, A13)
 
 Calm tone. No Ruum words beyond the name "Ruum".
