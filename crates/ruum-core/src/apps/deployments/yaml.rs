@@ -287,18 +287,24 @@ impl<'a> Parser<'a> {
     fn inline(&mut self, l: &Line<'a>, text: &str, depth: usize) -> R<Value> {
         let text = text.trim();
         if text.starts_with('[') || text.starts_with('{') {
+            // The bracket and quote state is kept across lines, so each line is scanned once
+            // (a long open collection stays linear; review W-2s, 2).
             let mut whole = text.to_string();
-            while !balanced(&whole) {
+            let mut state = Balance::default();
+            state.feed(whole.as_bytes());
+            while !state.closed() {
                 self.skip_blank();
                 let Some(n) = self.lines.get(self.pos) else {
                     return err(Some(l.no), "a [ or { is not closed");
                 };
+                let from = whole.len();
                 whole.push(' ');
                 whole.push_str(&n.text);
+                state.feed(&whole.as_bytes()[from..]);
                 self.pos += 1;
             }
             let mut f = Flow {
-                s: whole.as_bytes(),
+                s: &whole,
                 i: 0,
                 line: l.no,
                 nodes: &mut self.nodes,
@@ -403,23 +409,38 @@ fn is_dash(t: &str) -> bool {
     t == "-" || t.starts_with("- ")
 }
 
-/// Brackets balance outside quotes.
-fn balanced(s: &str) -> bool {
-    let b = s.as_bytes();
-    let (mut depth, mut single, mut double) = (0i64, false, false);
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\\' if double => i += 1,
-            b'"' if !single => double = !double,
-            b'\'' if !double => single = !single,
-            b'[' | b'{' if !single && !double => depth += 1,
-            b']' | b'}' if !single && !double => depth -= 1,
-            _ => {}
+/// The bracket and quote state of a flow collection, fed one piece at a time.
+#[derive(Default)]
+struct Balance {
+    depth: i64,
+    single: bool,
+    double: bool,
+    /// The last byte fed was a `\\` inside a double-quoted string.
+    escape: bool,
+}
+
+impl Balance {
+    fn feed(&mut self, b: &[u8]) {
+        for &c in b {
+            if self.escape {
+                self.escape = false;
+                continue;
+            }
+            match c {
+                b'\\' if self.double => self.escape = true,
+                b'"' if !self.single => self.double = !self.double,
+                b'\'' if !self.double => self.single = !self.single,
+                b'[' | b'{' if !self.single && !self.double => self.depth += 1,
+                b']' | b'}' if !self.single && !self.double => self.depth -= 1,
+                _ => {}
+            }
         }
-        i += 1;
     }
-    depth <= 0 && !single && !double
+
+    /// Brackets balance outside quotes.
+    fn closed(&self) -> bool {
+        self.depth <= 0 && !self.single && !self.double
+    }
 }
 
 /// The key and the rest of a block mapping line (`key: value` or `key:`), or `None` when the
@@ -596,7 +617,9 @@ fn resolve(t: &str) -> Value {
 
 /// The flow parser (`[ ... ]`, `{ ... }`).
 struct Flow<'s, 'n> {
-    s: &'s [u8],
+    /// The whole collection; `i` is always at a character boundary (it moves over ASCII bytes
+    /// and whole quoted scalars only).
+    s: &'s str,
     i: usize,
     line: usize,
     nodes: &'n mut usize,
@@ -604,9 +627,14 @@ struct Flow<'s, 'n> {
 
 impl Flow<'_, '_> {
     fn ws(&mut self) {
-        while self.i < self.s.len() && (self.s[self.i] == b' ' || self.s[self.i] == b'\t') {
+        let b = self.s.as_bytes();
+        while self.i < b.len() && (b[self.i] == b' ' || b[self.i] == b'\t') {
             self.i += 1;
         }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.as_bytes().get(self.i).copied()
     }
 
     fn count(&mut self) -> R<()> {
@@ -623,19 +651,19 @@ impl Flow<'_, '_> {
         }
         self.ws();
         self.count()?;
-        match self.s.get(self.i) {
+        match self.peek() {
             Some(b'[') => {
                 self.i += 1;
                 let mut out = Vec::new();
                 loop {
                     self.ws();
-                    if self.s.get(self.i) == Some(&b']') {
+                    if self.peek() == Some(b']') {
                         self.i += 1;
                         return Ok(Value::Array(out));
                     }
                     out.push(self.value(depth + 1)?);
                     self.ws();
-                    match self.s.get(self.i) {
+                    match self.peek() {
                         Some(b',') => self.i += 1,
                         Some(b']') => {}
                         _ => return err(Some(self.line), "expected , or ] in a list"),
@@ -647,7 +675,7 @@ impl Flow<'_, '_> {
                 let mut out = Map::new();
                 loop {
                     self.ws();
-                    if self.s.get(self.i) == Some(&b'}') {
+                    if self.peek() == Some(b'}') {
                         self.i += 1;
                         return Ok(Value::Object(out));
                     }
@@ -657,10 +685,10 @@ impl Flow<'_, '_> {
                         other => other.to_string(),
                     };
                     self.ws();
-                    let value = if self.s.get(self.i) == Some(&b':') {
+                    let value = if self.peek() == Some(b':') {
                         self.i += 1;
                         self.ws();
-                        if matches!(self.s.get(self.i), Some(b',') | Some(b'}')) {
+                        if matches!(self.peek(), Some(b',') | Some(b'}')) {
                             Value::Null
                         } else {
                             self.value(depth + 1)?
@@ -672,7 +700,7 @@ impl Flow<'_, '_> {
                         return err(Some(self.line), "a key is given twice");
                     }
                     self.ws();
-                    match self.s.get(self.i) {
+                    match self.peek() {
                         Some(b',') => self.i += 1,
                         Some(b'}') => {}
                         _ => return err(Some(self.line), "expected , or } in a mapping"),
@@ -686,7 +714,8 @@ impl Flow<'_, '_> {
     /// A scalar in a flow collection; `key` stops a plain scalar at `:` too.
     fn scalar(&mut self, key: bool) -> R<Value> {
         self.ws();
-        let rest = std::str::from_utf8(&self.s[self.i..]).map_err(|_| YamlError {
+        // A slice, not a copy or a new UTF-8 check of the rest (review W-2s, 2).
+        let rest = self.s.get(self.i..).ok_or_else(|| YamlError {
             line: Some(self.line),
             message: "not UTF-8".into(),
         })?;
@@ -822,6 +851,33 @@ mod tests {
         assert!(parse(&deep).is_err());
         let big = "a: b\n".repeat(MAX_BYTES / 4);
         assert!(parse(&big).is_err());
+    }
+
+    /// The worst inputs under [`MAX_BYTES`] read (or are refused) in linear time: a flow
+    /// collection open over every line, one over many lines with many values, and many quoted
+    /// scalars in one collection (review W-2s, 2; quadratic before).
+    #[test]
+    fn worst_case_inputs_stay_fast() {
+        let lines = (MAX_BYTES - 16) / 2;
+        let open = format!("[\n{}", "a\n".repeat(lines));
+        let many = format!("[\n{}]\n", "a,\n".repeat((MAX_BYTES - 16) / 3));
+        let quoted = format!("[{}]\n", "'x',".repeat((MAX_BYTES - 16) / 4));
+        let nested = format!("{}\n", "[".repeat(MAX_BYTES - 16));
+        for (name, src) in [
+            ("open", open),
+            ("many", many),
+            ("quoted", quoted),
+            ("nested", nested),
+        ] {
+            assert!(src.len() <= MAX_BYTES, "{name}");
+            let t = std::time::Instant::now();
+            let _ = parse(&src);
+            let took = t.elapsed();
+            assert!(took < std::time::Duration::from_secs(1), "{name}: {took:?}");
+        }
+        assert!(parse(&format!("[\n{}", "a\n".repeat(lines))).is_err());
+        // A string over lines with a \ at a line end still closes.
+        assert_eq!(p("a: [\"x\\\\\",\n  y]\n"), json!({ "a": ["x\\", "y"] }));
     }
 
     #[test]

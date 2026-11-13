@@ -271,13 +271,18 @@ pub fn check_name(raw: &str) -> R<Option<String>> {
     if raw.starts_with('/') {
         return Err(Refusal::hostile(raw, "an absolute path"));
     }
-    let b = raw.as_bytes();
-    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-        return Err(Refusal::hostile(raw, "a drive letter"));
-    }
     let mut rest = raw;
     while let Some(r) = rest.strip_prefix("./") {
         rest = r;
+    }
+    // After the leading `./` parts, so `./C:/x` is refused like `C:/x`, and `.//x` like `/x`
+    // (review W-2s, Kimi 6).
+    if rest.starts_with('/') {
+        return Err(Refusal::hostile(raw, "an absolute path"));
+    }
+    let b = rest.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return Err(Refusal::hostile(raw, "a drive letter"));
     }
     let folder = rest.ends_with('/') || rest.is_empty();
     let body = rest.strip_suffix('/').unwrap_or(rest);

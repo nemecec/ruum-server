@@ -139,6 +139,7 @@ async fn insert_row(
     version: Option<VersionId>,
     now: OffsetDateTime,
 ) -> Result<DeploymentRow> {
+    crate::blobs::postgres::record_chunks(&mut *conn, ctx.tenant, &d.new_chunks).await?;
     let files = d
         .source
         .files
@@ -481,8 +482,14 @@ impl AppStore for PgAppStore {
 
     async fn slug_state(&self, tenant: TenantId, slug: &str, node: NodeId) -> Result<SlugState> {
         let mut tx = begin_tenant(&self.pool, tenant).await?;
-        let holder: Option<NodeId> = sqlx::query_scalar(
-            "select node_id from apps where tenant_id = $1 and slug = $2 and node_id <> $3",
+        // `gone`: the app's node is a purge tombstone (in the trash with the tenant root as
+        // its trash root, until the provider takes `purged`) or no longer exists. Its row still
+        // holds the slug, but the slug is retired at once (review W-2s, 1).
+        let holder: Option<(NodeId, bool)> = sqlx::query_as(
+            "select a.node_id, not exists (select 1 from nodes n where n.tenant_id = $1 \
+             and n.id = a.node_id and not exists (select 1 from nodes r where r.tenant_id = $1 \
+             and r.id = n.trash_root and r.parent_id is null)) \
+             from apps a where a.tenant_id = $1 and a.slug = $2 and a.node_id <> $3",
         )
         .bind(tenant)
         .bind(slug)
@@ -499,7 +506,8 @@ impl AppStore for PgAppStore {
         .await?;
         tx.commit().await?;
         Ok(match (holder, used_by.flatten()) {
-            (Some(n), _) => SlugState::InUse(n),
+            (Some((_, true)), _) => SlugState::Retired,
+            (Some((n, false)), _) => SlugState::InUse(n),
             (None, Some(n)) if n != node => SlugState::Retired,
             _ => SlugState::Free,
         })
@@ -646,6 +654,9 @@ impl AppStore for PgAppStore {
         let mut tx = begin_tenant(&self.pool, tenant).await?;
         for stmt in [
             "update apps set live_deployment_id = null where tenant_id = $1 and node_id = $2",
+            // An approval names its deployment (no cascade): it goes first, or a pending
+            // approval of an agent would block the purge for ever (review W-2s, Kimi 2).
+            "delete from app_approvals where tenant_id = $1 and app_node_id = $2",
             "delete from app_deployments where tenant_id = $1 and app_node_id = $2",
             "delete from apps where tenant_id = $1 and node_id = $2",
         ] {

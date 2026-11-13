@@ -284,7 +284,7 @@ async fn limits_and_usage(conn: &mut PgConnection, tenant: TenantId) -> Result<(
     ))
 }
 
-async fn record_chunks(
+pub(crate) async fn record_chunks(
     conn: &mut PgConnection,
     tenant: TenantId,
     chunks: &[ChunkRef],

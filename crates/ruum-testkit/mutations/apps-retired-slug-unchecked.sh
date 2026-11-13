@@ -4,6 +4,6 @@
 # (old links and bookmarks must not reach another app).
 DESCRIPTION="createApp ignores retired slugs"
 FILE="crates/ruum-core/src/apps/mod.rs"
-PERL='s/&& self\.deps\.store\.slug_state\(tenant, &own, node\)\.await\? == SlugState::Retired/&& false/'
+PERL='s/&& self\.slug_state\(ctx, &own, node\)\.await\? == SlugState::Retired/&& false/'
 TESTS="-p ruum-core --lib apps::tests::retired_slugs_and_tenant_slugs_across_tenants -- --exact"
 PLACEHOLDER=0

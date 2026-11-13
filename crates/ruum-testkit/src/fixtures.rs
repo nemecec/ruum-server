@@ -1295,6 +1295,7 @@ mod seed {
                         manifest: Some(manifest),
                         stages: serde_json::json!([]),
                         published_from: None,
+                        new_chunks: Vec::new(),
                         expires_at: None,
                     },
                 )
