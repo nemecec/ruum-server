@@ -187,6 +187,10 @@ fn sample(event: EventType, user: UserId) -> Value {
             "from_deployment_id": id(), "to_deployment_id": id(), "reason": "manual",
             "error_rate_before": null, "error_rate_after": null
         }),
+        EventType::AppRoleGranted | EventType::AppRoleRevoked => json!({
+            "role_grant_id": id(), "role": "approver",
+            "grantee": { "type": "user", "id": id() }
+        }),
     }
 }
 

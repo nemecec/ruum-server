@@ -266,6 +266,8 @@ pub struct AppDeps {
     pub sites: static_site::StaticSites,
     /// Runs the images of deployments (R-1's trait).
     pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,
+    /// The app role grants (card B-2, [`roles`]).
+    pub roles: Arc<dyn roles::RoleStore>,
 }
 
 /// The parts of the apps area for [`install`].
@@ -278,6 +280,7 @@ pub struct AppParts {
     pub sites: static_site::StaticSites,
     /// The runtime driver: the in-memory driver until card R-2a/I-4 give the real ones.
     pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,
+    pub roles: Arc<dyn roles::RoleStore>,
 }
 
 /// The in-memory runtime driver, whose usage records go nowhere yet (a static image runs no
@@ -300,6 +303,7 @@ impl AppParts {
     /// The in-memory store (with the journal for `app.settings_changed`) and a counting sink.
     pub fn memory(journal: Option<Arc<crate::journal::memory::MemoryJournal>>) -> Self {
         Self {
+            roles: Arc::new(roles::memory::MemoryRoleStore::new(journal.clone())),
             store: Arc::new(store::memory::MemoryAppStore::new(journal)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::default(),
@@ -311,6 +315,7 @@ impl AppParts {
     /// The Postgres store and a counting sink (card I-8 stores meters).
     pub fn postgres(pool: sqlx::PgPool) -> Self {
         Self {
+            roles: Arc::new(roles::postgres::PgRoleStore::new(pool.clone())),
             store: Arc::new(store::postgres::PgAppStore::new(pool)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::from_env(),
@@ -373,6 +378,7 @@ pub fn build(
         blobs: content.blobs,
         sites: parts.sites,
         runtime: parts.runtime,
+        roles: parts.roles,
     })))
 }
 

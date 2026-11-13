@@ -406,6 +406,20 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
                 .await?
                 .change
         }
+        AppRoleGranted => {
+            s.apps
+                .remove_app_role_grant(ctx, node()?, uuid_field(d, "role_grant_id")?)
+                .await?
+                .change
+        }
+        AppRoleRevoked => {
+            let req = crate::apps::roles::AddRoleGrant {
+                role: str_field(d, "role")?,
+                grantee: json_field(d, "grantee")?,
+                notify: false,
+            };
+            s.apps.add_app_role_grant(ctx, node()?, req).await?.change
+        }
         // `undo_action` gives `None`: skipped as irreversible before this point.
         DatabaseGrantRevoked | AppSettingsChanged => return Ok(None),
         // `undo_action` gives `None` (card W-2s).
