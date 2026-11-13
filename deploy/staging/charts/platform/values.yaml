@@ -49,3 +49,5 @@ nodeSubnet: 10.20.1.0/24
 # k8s/apply.sh sets it from the commit that secrets-push.sh passes, after the provenance check.
 deployController:
   image: ""
+  # The commit of main the image was built from (40 hex); k8s/apply.sh sets it.
+  commit: ""

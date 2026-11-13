@@ -47,8 +47,17 @@ type Controller struct {
 	// MaxAge: a request that waited longer than this before the controller saw it is refused, so
 	// an old request never deploys by surprise after a controller outage. deploy.sh waits less.
 	MaxAge time.Duration
-	// Keep: finished requests older than this are deleted.
+	// Keep: requests older than this are deleted, whatever their phase (a request that the
+	// deployer created with a preset phase, or that cannot be claimed, is never run, so it would
+	// stay forever otherwise).
 	Keep time.Duration
+	// KeepCount: at most this many finished requests are kept (the newest); older ones are
+	// deleted before Keep. With the ResourceQuota of ruum-deploy this bounds what the requests
+	// hold in etcd.
+	KeepCount int
+	// Commit is the commit of main this controller's image was built from: the chart, the
+	// migration Job and deploy-chart.sh of that commit run (charts/platform sets it).
+	Commit string
 	// Timeout of one deploy (deploy-chart.sh bounds its steps below it).
 	Timeout time.Duration
 	// LogLines: the last lines of the deploy output kept in the request.
@@ -57,6 +66,22 @@ type Controller struct {
 	ProgressEvery time.Duration
 	Now           func() time.Time
 	Log           io.Writer
+
+	// current is the request that run works on now (cleanup leaves it alone).
+	mu      sync.Mutex
+	current string
+}
+
+func (c *Controller) setCurrent(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.current = name
+}
+
+func (c *Controller) isCurrent(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return name != "" && c.current == name
 }
 
 func (c *Controller) logf(format string, args ...any) {
@@ -108,6 +133,10 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 			c.finish(ctx, cm, PhaseRefused, fmt.Sprintf("the request waited more than %s before the deploy controller saw it; run deploy.sh again", c.MaxAge), nil)
 			continue
 		}
+		// After SIGTERM no new request is taken (a running one finishes, see run).
+		if ctx.Err() != nil {
+			return nil
+		}
 		claimed, err := c.claim(ctx, cm)
 		if errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
 			continue
@@ -134,9 +163,15 @@ func (c *Controller) claim(ctx context.Context, cm ConfigMap) (ConfigMap, error)
 	return c.Store.Update(ctx, cm)
 }
 
-// run checks and deploys one claimed request and writes the outcome back.
+// run checks and deploys one claimed request and writes the outcome back. A stop of the pod
+// (SIGTERM) does not cancel it: deploy-chart.sh killed in the middle of helm upgrade leaves the
+// release pending-upgrade and the deploy lock held. The pod's terminationGracePeriodSeconds is
+// longer than Timeout, so the deploy finishes and its outcome is written before the pod goes.
 func (c *Controller) run(ctx context.Context, cm ConfigMap) {
+	ctx = context.WithoutCancel(ctx)
 	name := cm.Metadata.Name
+	c.setCurrent(name)
+	defer c.setCurrent("")
 	data := map[string]string{}
 	for k, v := range cm.Data {
 		data[k] = v
@@ -161,6 +196,11 @@ func (c *Controller) run(ctx context.Context, cm ConfigMap) {
 		return
 	}
 	out := &tail{max: c.LogLines}
+	commit := c.Commit
+	if commit == "" {
+		commit = "unknown"
+	}
+	out.add(fmt.Sprintf("deploy controller of commit %s: the chart, the migration Job and deploy-chart.sh of that commit run (a newer chart reaches staging with the platform step)", commit))
 	for _, n := range plan.Notes {
 		out.add(n)
 	}
@@ -264,19 +304,44 @@ func (c *Controller) finish(ctx context.Context, cm ConfigMap, phase, status str
 	return err == nil
 }
 
-// cleanup deletes finished requests older than Keep.
+// cleanup deletes every request older than Keep, whatever its phase, and the finished requests
+// beyond the newest KeepCount. Only the request that run works on now stays (Reconcile is
+// serial, so at this point there is none; the check guards a later change).
 func (c *Controller) cleanup(ctx context.Context, items []ConfigMap) {
+	var finished []ConfigMap
 	for _, cm := range items {
-		switch cm.Metadata.Annotations[annPhase] {
-		case PhaseSucceeded, PhaseFailed, PhaseRefused:
-		default:
+		if c.isCurrent(cm.Metadata.Name) {
 			continue
 		}
 		if c.Now().Sub(cm.Metadata.CreationTimestamp) > c.Keep {
-			if err := c.Store.Delete(ctx, cm.Metadata.Name); err == nil {
-				c.logf("deleted the old request %s", cm.Metadata.Name)
-			}
+			c.remove(ctx, cm.Metadata.Name, "older than "+c.Keep.String())
+			continue
 		}
+		switch cm.Metadata.Annotations[annPhase] {
+		case PhaseSucceeded, PhaseFailed, PhaseRefused:
+			finished = append(finished, cm)
+		}
+	}
+	if c.KeepCount <= 0 || len(finished) <= c.KeepCount {
+		return
+	}
+	sort.Slice(finished, func(i, j int) bool {
+		a, b := finished[i].Metadata, finished[j].Metadata
+		if !a.CreationTimestamp.Equal(b.CreationTimestamp) {
+			return a.CreationTimestamp.After(b.CreationTimestamp)
+		}
+		return a.Name > b.Name
+	})
+	for _, cm := range finished[c.KeepCount:] {
+		c.remove(ctx, cm.Metadata.Name, fmt.Sprintf("more than %d finished requests", c.KeepCount))
+	}
+}
+
+func (c *Controller) remove(ctx context.Context, name, why string) {
+	if err := c.Store.Delete(ctx, name); err == nil {
+		c.logf("deleted the request %s (%s)", name, why)
+	} else if !errors.Is(err, ErrNotFound) {
+		c.logf("cannot delete the request %s: %v", name, err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -143,17 +144,39 @@ func (r Requests) path(name string) string {
 	return p
 }
 
-// List implements Store: the ConfigMaps with the label ruum.space/release-request=true.
+// List implements Store: the ConfigMaps with the label ruum.space/release-request=true, in
+// pages of listPage, so that large requests (up to 1 MiB each) never make one answer larger than
+// the 32 MiB that do reads.
 func (r Requests) List(ctx context.Context) ([]ConfigMap, error) {
-	var out struct {
-		Items []ConfigMap `json:"items"`
+	var all []ConfigMap
+	cont := ""
+	for range 1000 {
+		var out struct {
+			Metadata struct {
+				Continue string `json:"continue"`
+			} `json:"metadata"`
+			Items []ConfigMap `json:"items"`
+		}
+		q := url.Values{}
+		q.Set("labelSelector", requestLabel+"=true")
+		q.Set("limit", strconv.Itoa(listPage))
+		if cont != "" {
+			q.Set("continue", cont)
+		}
+		if err := r.Kube.do(ctx, http.MethodGet, r.path("")+"?"+q.Encode(), nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Items...)
+		if out.Metadata.Continue == "" {
+			return all, nil
+		}
+		cont = out.Metadata.Continue
 	}
-	sel := url.QueryEscape(requestLabel + "=true")
-	if err := r.Kube.do(ctx, http.MethodGet, r.path("")+"?labelSelector="+sel, nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
+	return nil, errors.New("list of release requests: too many pages")
 }
+
+// listPage is the page size of List (at most 1 MiB per ConfigMap).
+const listPage = 10
 
 // Get implements Store.
 func (r Requests) Get(ctx context.Context, name string) (ConfigMap, error) {
