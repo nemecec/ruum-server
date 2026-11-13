@@ -15,7 +15,7 @@
 #   talosconfig    (rw)  write the talosconfig from the state, then the kubeconfig (0600; both
 #                        through the admin tunnel, which the Mac opens first)
 #   kubeconfig     (rw)  write the kubeconfig with talosctl through the admin tunnel (0600)
-#   platform --controller COMMIT [--restore-from GENERATION] (rw)
+#   platform --controller COMMIT [--restore-from GENERATION] [--ignore-running-deploy] (rw)
 #                        helmfile sync of the platform with the deploy controller of COMMIT
 #                        (needs the cluster secrets on stdin); needs RUUM_STAGING_APPLY=yes
 #   zitadel-bootstrap (rw) OIDC app, Google and Microsoft, login policy, SMTP provider; `check`
@@ -362,7 +362,7 @@ case "$STEP" in
     # platform --controller <commit> [--restore-from <generation>]: the deploy controller image of
     # that commit of main (backlog O-34; secrets-push.sh passes the checkout's commit), and
     # bootstrap pg from an older backup path (review 2 R-2).
-    restore_from="" controller=""
+    restore_from="" controller="" ignore_running=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --restore-from)
@@ -373,11 +373,14 @@ case "$STEP" in
           controller="${2:-}"
           [[ "$controller" =~ ^[0-9a-f]{40}$ ]] || die "--controller needs a commit of 40 lowercase hex characters"
           shift 2 ;;
+        # Admin only: run the step although a deploy runs (k8s/apply.sh refuses otherwise).
+        --ignore-running-deploy) ignore_running=yes; shift ;;
         *) die "unknown platform argument $1" ;;
       esac
     done
     [[ -n "$controller" ]] || die "the platform step needs --controller <commit> (the deploy controller image; secrets-push.sh passes it)"
-    KUBECONFIG="$KUBECONFIG_FILE" DEPLOY_CONTROLLER_COMMIT="$controller" bash "$HERE/k8s/apply.sh" "$generation" "$restore_from"
+    KUBECONFIG="$KUBECONFIG_FILE" DEPLOY_CONTROLLER_COMMIT="$controller" RUUM_APPLY_IGNORE_RUNNING_DEPLOY="$ignore_running" \
+      bash "$HERE/k8s/apply.sh" "$generation" "$restore_from"
     ;;
   zitadel-bootstrap)
     read_secrets GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET

@@ -3,7 +3,7 @@
 # (review 1 S-3). Each target has a fixed list of names; nothing else is ever sent, and the
 # Hetzner token and the Stripe keys are never sent to the cluster (tests/run.sh checks the lists).
 #
-#   deploy/staging/secrets-push.sh platform [--restore-from GENERATION]
+#   deploy/staging/secrets-push.sh platform [--restore-from GENERATION] [--ignore-running-deploy]
 #
 # In the container, k8s/apply.sh splits them into one Kubernetes Secret per consumer and
 # namespace (README "Secrets"). The platform step also installs the deploy controller (backlog
@@ -28,7 +28,7 @@ shift || true
 case "$target" in
   platform) names=("${PLATFORM_NAMES[@]}") ;;
   --list) printf '%s\n' "${PLATFORM_NAMES[@]}"; exit 0 ;;
-  *) stg_die "usage: secrets-push.sh platform [--restore-from GENERATION]" ;;
+  *) stg_die "usage: secrets-push.sh platform [--restore-from GENERATION] [--ignore-running-deploy]" ;;
 esac
 for n in "${names[@]}"; do
   [[ ! "$n" =~ $FORBIDDEN_RE ]] || stg_die "refusing to send $n to the cluster"

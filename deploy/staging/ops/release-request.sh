@@ -62,7 +62,7 @@ if [[ $validate_only == 1 ]]; then
 fi
 
 kubectl -n "$NS" create -f - >/dev/null <<<"$doc" ||
-  die "cannot write the release request into $NS (is the deploy controller installed? Run the platform step, k8s/apply.sh)"
+  die "cannot write the release request into $NS (is the deploy controller installed? Run the platform step, k8s/apply.sh. Or the ResourceQuota release-requests of $NS is full: admin, deploy/staging/tool.sh kubectl -n $NS get configmaps)"
 echo "==> release request $NS/$name written; waiting for the deploy controller" >&2
 
 printed=0
