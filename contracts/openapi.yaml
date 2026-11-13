@@ -4737,7 +4737,6 @@ paths:
       tags: [apps]
       operationId: createAppDeployment
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: Deploy an archive as a preview
       description: |
         Starts a **preview** deployment of a deployment archive (design 9.1: a `.tar.gz` or
@@ -4854,7 +4853,6 @@ paths:
       tags: [apps]
       operationId: publishAppDeployment
       x-ruum-area: apps
-      x-ruum-status: planned
       summary: Make a deployment live (publish or roll back)
       description: |
         Makes the deployment the live one. For a ready preview this is **Publish**: the archive

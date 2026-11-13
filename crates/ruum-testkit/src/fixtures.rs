@@ -364,6 +364,10 @@ pub struct TenantFixture {
     pub app_name: String,
     /// The live deployment of the app.
     pub app_deployment: Uuid,
+    /// A static site archive (ustar with `app.yaml` and `index.html`) in `Projects`, made by
+    /// `member`: the source of the standard `createAppDeployment` request (card W-2s).
+    pub site_archive: NodeId,
+    pub site_archive_name: String,
     /// A grant of the app role `approver` to `guest_view`.
     pub app_role_grant: Uuid,
     /// A custom domain of the app (`<prefix>-plants.example.test`).
@@ -470,6 +474,8 @@ impl TenantFixture {
             app: NodeId::new(),
             app_name: format!("{prefix}-planner"),
             app_deployment: Uuid::now_v7(),
+            site_archive: NodeId::new(),
+            site_archive_name: format!("{prefix}-site.tar"),
             app_role_grant: Uuid::now_v7(),
             app_domain: Uuid::now_v7(),
             app_api_key: Uuid::now_v7(),
@@ -566,6 +572,8 @@ impl TenantFixture {
             self.app.to_string(),
             self.app_name.clone(),
             self.app_deployment.to_string(),
+            self.site_archive.to_string(),
+            self.site_archive_name.clone(),
             self.app_role_grant.to_string(),
             self.app_domain.to_string(),
             self.app_api_key.to_string(),
@@ -618,6 +626,8 @@ impl TenantFixture {
             self.database_name.clone(),
             self.app.to_string(),
             self.app_name.clone(),
+            self.site_archive.to_string(),
+            self.site_archive_name.clone(),
             self.issue.to_string(),
             self.issue_name.clone(),
             self.template.to_string(),
@@ -1143,6 +1153,32 @@ mod seed {
                 t.plan = n.value.id;
             }
         }
+        // The site archive of the standard `createAppDeployment` request (card W-2s).
+        if let Ok(site) = ruum_core::apps::archive::pack_tar(&[
+            ("app.yaml".to_string(), &b"runtime: static\n"[..]),
+            (
+                "index.html".to_string(),
+                &b"<!doctype html><h1>Plants</h1>\n"[..],
+            ),
+        ]) {
+            let (s2, c, target) = (
+                s.clone(),
+                member_ctx.clone(),
+                UploadTarget::NewFile {
+                    parent_id: t.projects,
+                    name: t.site_archive_name.clone(),
+                    on_conflict: OnConflict::Fail,
+                },
+            );
+            if let Some((node, _)) = step("site archive", async move {
+                upload(&s2, &c, target, site).await
+            })
+            .await
+            {
+                t.site_archive = node;
+            }
+        }
+
         // The old file, in the trash.
         let (s2, c, req) = (
             s.clone(),

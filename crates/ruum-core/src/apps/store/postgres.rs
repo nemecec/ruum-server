@@ -131,6 +131,234 @@ async fn read_tenant(
     .transpose()
 }
 
+/// Inserts the row of a deployment (in the caller's transaction).
+async fn insert_row(
+    conn: &mut sqlx::PgConnection,
+    ctx: &Context,
+    d: &NewDeployment,
+    version: Option<VersionId>,
+    now: OffsetDateTime,
+) -> Result<DeploymentRow> {
+    let files = d
+        .source
+        .files
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| Error::Internal(format!("source_files: {e}")))?;
+    let release = d.is_release();
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "insert into app_deployments (tenant_id, id, app_node_id, environment, state, \
+         short_id, version_id, label, draft, source_kind, source_node_id, source_version_id, \
+         source_files, archive_hash, archive_size, archive_chunks, manifest, stages, \
+         published_from, created_kind, created_by, created_obo, created_at, published_at, \
+         expires_at) values ($1, $2, $3, $4::text::app_environment, \
+         $5::text::app_deployment_state, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+         $17, $18, $19, $20, $21, $22, $23, $24, $25) returning {DEPLOYMENT_COLUMNS}"
+    )))
+    .bind(ctx.tenant)
+    .bind(d.id)
+    .bind(d.app_node_id)
+    .bind(d.environment.as_str())
+    .bind(d.state.as_str())
+    .bind(&d.short_id)
+    .bind(version)
+    .bind(d.label.as_deref())
+    .bind(d.draft.as_deref())
+    .bind(&d.source.kind)
+    .bind(d.source.node_id)
+    .bind(d.source.version_id)
+    .bind(files)
+    .bind(d.archive.content_hash.to_vec())
+    .bind(d.archive.size)
+    .bind(&d.archive.chunks)
+    .bind(&d.manifest)
+    .bind(&d.stages)
+    .bind(d.published_from)
+    .bind(ctx.actor.actor.kind)
+    .bind(ctx.actor.actor.id.0)
+    .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+    .bind(now)
+    .bind(release.then_some(now))
+    .bind(d.expires_at)
+    .fetch_one(&mut *conn)
+    .await;
+    match row {
+        Ok(r) => deployment_row(&r),
+        Err(e) if unique_violation(&e).is_some() => Err(Error::api(
+            crate::error::ErrorCode::Conflict,
+            "the deployment exists",
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Inserts a release version (encoding `app_release_v1`) in the caller's transaction.
+async fn insert_version(conn: &mut sqlx::PgConnection, v: &Version, bytes: &[u8]) -> Result<()> {
+    sqlx::query(
+        "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
+         content_hash, content_type, restored_from, label, actor_kind, actor, on_behalf_of, \
+         created_at, updated_at) values ($1, $2, $3, $4, 'app_release_v1', $5, $6, $7, $8, $9, \
+         $10, $11, $12, $13, $13)",
+    )
+    .bind(v.id)
+    .bind(v.tenant_id)
+    .bind(v.node_id)
+    .bind(bytes)
+    .bind(v.size_bytes)
+    .bind(v.content_hash.0.to_vec())
+    .bind(v.content_type.as_deref())
+    .bind(v.restored_from)
+    .bind(v.label.as_deref())
+    .bind(v.actor.actor.kind)
+    .bind(v.actor.actor.id.0)
+    .bind(v.actor.on_behalf_of.map(|u| u.0))
+    .bind(v.created_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Makes `id` the live deployment of `app` (the old one `superseded`) and fixes the slug.
+async fn switch_live(
+    conn: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    app: NodeId,
+    id: Uuid,
+    previous: Option<Uuid>,
+    now: OffsetDateTime,
+) -> Result<()> {
+    if let Some(old) = previous {
+        sqlx::query(
+            "update app_deployments set state = 'superseded' where tenant_id = $1 and id = $2",
+        )
+        .bind(tenant)
+        .bind(old)
+        .execute(&mut *conn)
+        .await?;
+    }
+    sqlx::query(
+        "update apps set live_deployment_id = $3, slug_fixed_at = coalesce(slug_fixed_at, $4), \
+         updated_at = $4 where tenant_id = $1 and node_id = $2",
+    )
+    .bind(tenant)
+    .bind(app)
+    .bind(id)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// A version row of `versions` (the columns of [`VERSION_COLUMNS`]).
+const VERSION_COLUMNS: &str = "id, size_bytes, content_hash, content_type, restored_from, label, \
+    actor_kind, actor, on_behalf_of, created_at";
+
+fn version_row(tenant: TenantId, node: NodeId, r: &PgRow) -> Result<Version> {
+    let hash: Vec<u8> = r.try_get("content_hash")?;
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| Error::Internal("a stored hash is not 32 bytes".into()))?;
+    Ok(Version {
+        id: r.try_get("id")?,
+        tenant_id: tenant,
+        node_id: node,
+        size_bytes: r.try_get("size_bytes")?,
+        content_hash: crate::blobs::Hash(hash),
+        content_type: r.try_get("content_type")?,
+        restored_from: r.try_get("restored_from")?,
+        label: r.try_get("label")?,
+        actor: Actor {
+            actor: crate::actor::PrincipalRef {
+                kind: r.try_get("actor_kind")?,
+                id: crate::ids::PrincipalId(r.try_get("actor")?),
+            },
+            on_behalf_of: r
+                .try_get::<Option<Uuid>, _>("on_behalf_of")?
+                .map(crate::ids::UserId),
+        },
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+const APPROVAL_COLUMNS: &str = "tenant_id, id, app_node_id, deployment_id, status::text as status, \
+    changes, bound_archive_hash, bound_manifest_hash, bound_bindings, requested_kind, \
+    requested_by, requested_obo, decided_by, decided_at, comment, expires_at, created_at";
+
+fn approval_row(r: &PgRow) -> Result<ApprovalRow> {
+    let h32 = |v: Vec<u8>| -> Result<[u8; 32]> {
+        v.try_into()
+            .map_err(|_| Error::Internal("a stored hash is not 32 bytes".into()))
+    };
+    Ok(ApprovalRow {
+        tenant_id: r.try_get("tenant_id")?,
+        id: r.try_get("id")?,
+        app_node_id: r.try_get("app_node_id")?,
+        deployment_id: r.try_get("deployment_id")?,
+        status: r.try_get("status")?,
+        changes: r.try_get("changes")?,
+        bound_archive_hash: h32(r.try_get("bound_archive_hash")?)?,
+        bound_manifest_hash: h32(r.try_get("bound_manifest_hash")?)?,
+        bound_bindings: r.try_get("bound_bindings")?,
+        requested_by: Actor {
+            actor: crate::actor::PrincipalRef {
+                kind: r.try_get("requested_kind")?,
+                id: crate::ids::PrincipalId(r.try_get("requested_by")?),
+            },
+            on_behalf_of: r
+                .try_get::<Option<Uuid>, _>("requested_obo")?
+                .map(crate::ids::UserId),
+        },
+        decided_by: r.try_get("decided_by")?,
+        decided_at: r.try_get("decided_at")?,
+        comment: r.try_get("comment")?,
+        expires_at: r.try_get("expires_at")?,
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+async fn begin_system(pool: &sqlx::PgPool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select set_config('ruum.system', 'on', true)")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// Appends the entries in the caller's transaction; the change of the first.
+async fn append_all(
+    conn: &mut sqlx::PgConnection,
+    ctx: &Context,
+    node: NodeId,
+    entries: Vec<(EventType, Value)>,
+    at: OffsetDateTime,
+) -> Result<ChangeInfo> {
+    let mut first = None;
+    for (event, data) in entries {
+        let e = append(
+            conn,
+            ctx,
+            NewEntry {
+                node_id: Some(node),
+                revision: None,
+                event,
+                data,
+            },
+        )
+        .await?;
+        first.get_or_insert(ChangeInfo {
+            seq: Some(e.seq),
+            actor: ctx.actor,
+            at: e.at,
+        });
+    }
+    Ok(first.unwrap_or(ChangeInfo {
+        seq: None,
+        actor: ctx.actor,
+        at,
+    }))
+}
+
 /// The settings row of the tenant, made with the first free candidate when missing. Each try
 /// runs under a savepoint, so a clash with another tenant's slug (a unique violation on the
 /// global indexes) leaves the transaction usable.
@@ -445,109 +673,13 @@ impl AppStore for PgAppStore {
             return Err(Error::not_found("app"));
         };
         let now = crate::now();
-        let release = d.is_release();
-        let version = if release {
-            let bytes = release_manifest(&d);
-            let hash = blake3::hash(&bytes);
-            let version = VersionId::new();
-            sqlx::query(
-                "insert into versions (id, tenant_id, node_id, manifest, encoding, size_bytes, \
-                 content_hash, content_type, label, actor_kind, actor, on_behalf_of, created_at, \
-                 updated_at) values ($1, $2, $3, $4, 'app_release_v1', $5, $6, \
-                 'application/json', $7, $8, $9, $10, $11, $11)",
-            )
-            .bind(version)
-            .bind(tenant)
-            .bind(d.app_node_id)
-            .bind(&bytes)
-            .bind(bytes.len() as i64)
-            .bind(hash.as_bytes().to_vec())
-            .bind(d.label.as_deref())
-            .bind(ctx.actor.actor.kind)
-            .bind(ctx.actor.actor.id.0)
-            .bind(ctx.actor.on_behalf_of.map(|u| u.0))
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            Some(version)
-        } else {
-            None
-        };
-        let files = d
-            .source
-            .files
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|e| Error::Internal(format!("source_files: {e}")))?;
-        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "insert into app_deployments (tenant_id, id, app_node_id, environment, state, \
-             short_id, version_id, label, draft, source_kind, source_node_id, source_version_id, \
-             source_files, archive_hash, archive_size, archive_chunks, manifest, stages, \
-             published_from, created_kind, created_by, created_obo, created_at, published_at, \
-             expires_at) values ($1, $2, $3, $4::text::app_environment, \
-             $5::text::app_deployment_state, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18, $19, $20, $21, $22, $23, $24, $25) returning {DEPLOYMENT_COLUMNS}"
-        )))
-        .bind(tenant)
-        .bind(d.id)
-        .bind(d.app_node_id)
-        .bind(d.environment.as_str())
-        .bind(d.state.as_str())
-        .bind(&d.short_id)
-        .bind(version)
-        .bind(d.label.as_deref())
-        .bind(d.draft.as_deref())
-        .bind(&d.source.kind)
-        .bind(d.source.node_id)
-        .bind(d.source.version_id)
-        .bind(files)
-        .bind(d.archive.content_hash.to_vec())
-        .bind(d.archive.size)
-        .bind(&d.archive.chunks)
-        .bind(&d.manifest)
-        .bind(&d.stages)
-        .bind(d.published_from)
-        .bind(ctx.actor.actor.kind)
-        .bind(ctx.actor.actor.id.0)
-        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
-        .bind(now)
-        .bind(release.then_some(now))
-        .bind(d.expires_at)
-        .fetch_one(&mut *tx)
-        .await;
-        let row = match row {
-            Ok(r) => deployment_row(&r)?,
-            Err(e) if unique_violation(&e).is_some() => {
-                return Err(Error::api(
-                    crate::error::ErrorCode::Conflict,
-                    "the deployment exists",
-                ));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if release {
-            if let Some(old) = previous {
-                sqlx::query(
-                    "update app_deployments set state = 'superseded' \
-                     where tenant_id = $1 and id = $2",
-                )
-                .bind(tenant)
-                .bind(old)
-                .execute(&mut *tx)
-                .await?;
-            }
-            sqlx::query(
-                "update apps set live_deployment_id = $3, \
-                 slug_fixed_at = coalesce(slug_fixed_at, $4), updated_at = $4 \
-                 where tenant_id = $1 and node_id = $2",
-            )
-            .bind(tenant)
-            .bind(d.app_node_id)
-            .bind(d.id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        let release = d.is_release().then(|| release_version(ctx, &d, None, now));
+        if let Some((v, bytes)) = &release {
+            insert_version(&mut tx, v, bytes).await?;
+        }
+        let row = insert_row(&mut tx, ctx, &d, release.as_ref().map(|(v, _)| v.id), now).await?;
+        if release.is_some() {
+            switch_live(&mut tx, tenant, d.app_node_id, d.id, previous, now).await?;
         }
         tx.commit().await?;
         Ok(row)
@@ -628,5 +760,317 @@ impl AppStore for PgAppStore {
         .await?;
         tx.commit().await?;
         Ok(done.rows_affected() == 1)
+    }
+
+    async fn update_stages(&self, tenant: TenantId, id: Uuid, stages: &Value) -> Result<bool> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let done = sqlx::query(
+            "update app_deployments set state = 'running', stages = $3 \
+             where tenant_id = $1 and id = $2 and state in ('pending', 'running')",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(stages)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn finish_preview(
+        &self,
+        ctx: &Context,
+        id: Uuid,
+        stages: &Value,
+        check: Option<&Value>,
+    ) -> Result<DeploymentState> {
+        let tenant = ctx.tenant;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let me = sqlx::query(
+            "select app_node_id, draft, created_at from app_deployments where tenant_id = $1 \
+             and id = $2 and environment = 'preview' and state in ('pending', 'running') \
+             for update",
+        )
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::not_found("deployment"))?;
+        let app: NodeId = me.try_get("app_node_id")?;
+        let draft: Option<String> = me.try_get("draft")?;
+        let created: OffsetDateTime = me.try_get("created_at")?;
+        // The app row orders the finishes of one app (two previews of one draft).
+        sqlx::query("select 1 from apps where tenant_id = $1 and node_id = $2 for update")
+            .bind(tenant)
+            .bind(app)
+            .execute(&mut *tx)
+            .await?;
+        let mut state = DeploymentState::Ready;
+        if let Some(draft) = &draft {
+            let newer: bool = sqlx::query_scalar(
+                "select exists (select 1 from app_deployments where tenant_id = $1 \
+                 and app_node_id = $2 and environment = 'preview' and state = 'ready' \
+                 and draft = $3 and id <> $4 and (created_at, id) > ($5, $4))",
+            )
+            .bind(tenant)
+            .bind(app)
+            .bind(draft)
+            .bind(id)
+            .bind(created)
+            .fetch_one(&mut *tx)
+            .await?;
+            if newer {
+                state = DeploymentState::Superseded;
+            }
+            sqlx::query(
+                "update app_deployments set state = 'superseded' where tenant_id = $1 \
+                 and app_node_id = $2 and environment = 'preview' and state = 'ready' \
+                 and draft = $3 and id <> $4 and (created_at, id) < ($5, $4)",
+            )
+            .bind(tenant)
+            .bind(app)
+            .bind(draft)
+            .bind(id)
+            .bind(created)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "update app_deployments set state = $3::text::app_deployment_state, stages = $4, \
+             check_result = $5 where tenant_id = $1 and id = $2",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(state.as_str())
+        .bind(stages)
+        .bind(check)
+        .execute(&mut *tx)
+        .await?;
+        if state == DeploymentState::Ready {
+            append_all(
+                &mut tx,
+                ctx,
+                app,
+                vec![(EventType::AppDeployed, preview_deployed_data(id))],
+                crate::now(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(state)
+    }
+
+    async fn fail_deployment(
+        &self,
+        ctx: &Context,
+        id: Uuid,
+        stages: &Value,
+        check: Option<&Value>,
+        stage: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let tenant = ctx.tenant;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let row = sqlx::query(
+            "update app_deployments set state = 'failed', stages = $3, check_result = $4 \
+             where tenant_id = $1 and id = $2 returning app_node_id, environment::text as env",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(stages)
+        .bind(check)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::not_found("deployment"))?;
+        let app: NodeId = row.try_get("app_node_id")?;
+        let env: String = row.try_get("env")?;
+        let env = Environment::parse(&env).unwrap_or(Environment::Preview);
+        append_all(
+            &mut tx,
+            ctx,
+            app,
+            vec![(
+                EventType::AppDeploymentFailed,
+                deployment_failed_data(id, env, stage, reason),
+            )],
+            crate::now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn release(&self, ctx: &Context, d: NewDeployment, r: Release) -> Result<Released> {
+        if !d.is_release() {
+            return Err(Error::Internal(
+                "release() of a deployment that is not live".into(),
+            ));
+        }
+        let tenant = ctx.tenant;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let live: Option<Option<Uuid>> = sqlx::query_scalar(
+            "select live_deployment_id from apps where tenant_id = $1 and node_id = $2 for update",
+        )
+        .bind(tenant)
+        .bind(d.app_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(live) = live else {
+            return Err(Error::not_found("app"));
+        };
+        if live != r.expected_live {
+            return Err(live_changed());
+        }
+        let previous = match live {
+            Some(p) => {
+                let v: Option<Option<Uuid>> = sqlx::query_scalar(
+                    "select version_id from app_deployments where tenant_id = $1 and id = $2",
+                )
+                .bind(tenant)
+                .bind(p)
+                .fetch_optional(&mut *tx)
+                .await?;
+                Some((p, v.flatten().map(VersionId)))
+            }
+            None => None,
+        };
+        let now = crate::now();
+        let (version, bytes) = release_version(ctx, &d, r.restored_from, now);
+        insert_version(&mut tx, &version, &bytes).await?;
+        let row = insert_row(&mut tx, ctx, &d, Some(version.id), now).await?;
+        switch_live(&mut tx, tenant, d.app_node_id, d.id, live, now).await?;
+        let entries = release_entries(&d, &version, previous, &r);
+        let change = append_all(&mut tx, ctx, d.app_node_id, entries, now).await?;
+        tx.commit().await?;
+        Ok(Released {
+            deployment: row,
+            version,
+            change,
+        })
+    }
+
+    async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow> {
+        let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "insert into app_approvals (tenant_id, id, app_node_id, deployment_id, changes, \
+             bound_archive_hash, bound_manifest_hash, bound_bindings, requested_kind, \
+             requested_by, requested_obo, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             returning {APPROVAL_COLUMNS}"
+        )))
+        .bind(ctx.tenant)
+        .bind(a.id)
+        .bind(a.app_node_id)
+        .bind(a.deployment_id)
+        .bind(&a.changes)
+        .bind(a.bound_archive_hash.to_vec())
+        .bind(a.bound_manifest_hash.to_vec())
+        .bind(&a.bound_bindings)
+        .bind(ctx.actor.actor.kind)
+        .bind(ctx.actor.actor.id.0)
+        .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+        .bind(a.expires_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        approval_row(&row)
+    }
+
+    async fn list_versions(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>> {
+        let after = page
+            .cursor
+            .as_ref()
+            .map(crate::blobs::logic::decode_version_cursor)
+            .transpose()?;
+        let limit = page.limit() as usize;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {VERSION_COLUMNS} from versions \
+             where tenant_id = $1 and node_id = $2 and encoding = 'app_release_v1' \
+             and ($3::principal_kind is null or actor_kind = $3) \
+             and ($4::boolean is null or (label is not null) = $4) \
+             and ($5::timestamptz is null or (created_at, id) < ($5, $6)) \
+             order by created_at desc, id desc limit $7"
+        )))
+        .bind(tenant)
+        .bind(node)
+        .bind(filter.actor_kind)
+        .bind(filter.labeled)
+        .bind(after.map(|(at, _)| at))
+        .bind(after.map(|(_, id)| id))
+        .bind(limit as i64 + 1)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut items = rows
+            .iter()
+            .map(|r| version_row(tenant, node, r))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(version_page(&mut items, limit))
+    }
+
+    async fn release_of(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        version: VersionId,
+    ) -> Result<Option<(Version, Uuid)>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {VERSION_COLUMNS}, (select d.id from app_deployments d \
+             where d.tenant_id = v.tenant_id and d.version_id = v.id) as deployment_id \
+             from versions v where v.tenant_id = $1 and v.node_id = $2 and v.id = $3 \
+             and v.encoding = 'app_release_v1'"
+        )))
+        .bind(tenant)
+        .bind(node)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let deployment: Option<Uuid> = r.try_get("deployment_id")?;
+        match deployment {
+            Some(d) => Ok(Some((version_row(tenant, node, &r)?, d))),
+            None => Ok(None),
+        }
+    }
+
+    async fn expire_previews(
+        &self,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ExpiredPreview>> {
+        let mut tx = begin_system(&self.pool).await?;
+        let rows = sqlx::query(
+            "update app_deployments d set state = 'expired' from ( \
+               select tenant_id, id from app_deployments \
+               where environment = 'preview' and state = 'ready' and expires_at <= $1 \
+               order by expires_at limit $2 for update skip locked) e \
+             where d.tenant_id = e.tenant_id and d.id = e.id \
+             returning d.tenant_id, d.app_node_id, d.id",
+        )
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ExpiredPreview {
+                    tenant_id: r.try_get("tenant_id")?,
+                    app_node_id: r.try_get("app_node_id")?,
+                    id: r.try_get("id")?,
+                })
+            })
+            .collect()
     }
 }

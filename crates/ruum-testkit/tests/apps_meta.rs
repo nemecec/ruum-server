@@ -217,6 +217,14 @@ fn the_zip_bomb_is_small_and_claims_two_gib() {
         "the tar count bomb is {} bytes",
         t.len()
     );
+    // Both go up in one `putContent` (backlog T-40): a bigger body would be refused by the
+    // upload limit, and the case would not reach the unpacker at all.
+    for (name, len) in [("zip", z.len()), ("tar.gz", t.len())] {
+        assert!(
+            len <= ruum_core::blobs::MAX_PUT_CONTENT_BYTES,
+            "the {name} count bomb ({len} bytes) is over the putContent limit"
+        );
+    }
 }
 
 /// Every field of the manifest that names a path in the archive refuses a path that leaves

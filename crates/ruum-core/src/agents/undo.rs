@@ -408,6 +408,8 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
         }
         // `undo_action` gives `None`: skipped as irreversible before this point.
         DatabaseGrantRevoked | AppSettingsChanged => return Ok(None),
+        // `undo_action` gives `None` (card W-2s).
+        AppDeployed | AppDeploymentFailed | AppRolledBack => return Ok(None),
         // `undo_action` gives `None`: only a person decides an approval.
         DatabaseApprovalDecided => return Ok(None),
     };

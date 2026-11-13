@@ -564,5 +564,7 @@ pub const TAR_ESCAPES: &[(&str, &str)] = &[
     ("backslash.tar.gz", "..\\outside.html"),
     ("deep-backslash.tar.gz", "dist\\..\\..\\outside.html"),
     ("drive.tar.gz", "C:\\ruum\\outside.html"),
+    ("drive-slash.tar.gz", "C:/ruum/outside.html"),
     ("unc.tar.gz", "\\\\server\\share\\outside.html"),
+    ("unc-slash.tar.gz", "//server/share/outside.html"),
 ];
