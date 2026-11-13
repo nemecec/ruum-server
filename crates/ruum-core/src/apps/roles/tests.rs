@@ -186,6 +186,7 @@ impl World {
                     stages: json!([]),
                     published_from: None,
                     expires_at: None,
+                    new_chunks: Vec::new(),
                 },
             )
             .await
@@ -1259,6 +1260,7 @@ impl crate::apps::deployments::LiveReleaseHook for Winner {
                     stages: json!([]),
                     published_from: None,
                     expires_at: None,
+                    new_chunks: Vec::new(),
                 },
             )
             .await
