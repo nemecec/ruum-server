@@ -360,3 +360,141 @@ func TestControllerWritesProgressWhileADeployRuns(t *testing.T) {
 		t.Fatal("the request did not show the output while the deploy ran")
 	}
 }
+
+// A request that the deployer created with a preset phase (or a claim in the name of this very
+// pod) is never run, and it goes after Keep like every other request (review of O-34, change 1).
+func TestControllerNeverRunsAPresetPhaseAndDeletesItAfterKeep(t *testing.T) {
+	presets := map[string]map[string]string{
+		"running-me":  {annPhase: PhaseRunning, annClaimedBy: "deploy-controller-abc"},
+		"bogus":       {annPhase: "Bogus"},
+		"claimed-me":  {annClaimedBy: "deploy-controller-abc", annPhase: PhaseRunning, annStarted: "2026-11-13T11:59:00Z"},
+		"succeeded-x": {annPhase: PhaseSucceeded},
+	}
+	s, d := newStore(), &fakeDeployer{}
+	for name, ann := range presets {
+		s.add(name, t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+		cm, _ := s.Get(context.Background(), name)
+		cm.Metadata.Annotations = ann
+		if _, err := s.Update(context.Background(), cm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newController(s, d)
+	if err := c.RecoverInterrupted(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := c.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(d.runs) != 0 {
+		t.Fatalf("a request with a preset phase ran: %v", d.runs)
+	}
+	if len(s.items) != len(presets) {
+		t.Fatalf("a young request was deleted: %d left", len(s.items))
+	}
+	// A week and a bit later every one of them is gone.
+	c.Now = func() time.Time { return t0.Add(c.Keep + time.Hour) }
+	if err := c.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.items) != 0 || len(d.runs) != 0 {
+		t.Fatalf("left %v, runs %v", s.items, d.runs)
+	}
+}
+
+// A request that cannot be claimed (immutable) is deleted after Keep too (Kimi's note on O-34).
+func TestControllerDeletesAnUnclaimableRequestAfterKeep(t *testing.T) {
+	s, d := newStore(), &fakeDeployer{}
+	s.add("immutable", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	c := newController(s, d)
+	c.Store = immutableStore{s, "immutable"}
+	_ = c.Reconcile(context.Background())
+	if len(d.runs) != 0 || len(s.items) != 1 {
+		t.Fatalf("runs %v, items %d", d.runs, len(s.items))
+	}
+	c.Now = func() time.Time { return t0.Add(c.Keep + time.Hour) }
+	_ = c.Reconcile(context.Background())
+	if len(s.items) != 0 {
+		t.Fatal("the request that cannot be claimed is still there after Keep")
+	}
+}
+
+func TestControllerKeepsOnlyTheNewestFinishedRequests(t *testing.T) {
+	s, d := newStore(), &fakeDeployer{}
+	for i := range 5 {
+		name := "done-" + strconv.Itoa(i)
+		s.add(name, t0.Add(-time.Duration(10-i)*time.Hour), data(req(cNew, cLive, "")))
+		cm, _ := s.Get(context.Background(), name)
+		cm.Metadata.Annotations = map[string]string{annPhase: PhaseFailed}
+		_, _ = s.Update(context.Background(), cm)
+	}
+	s.add("fresh", t0.Add(-time.Minute), nil) // no phase: not counted, refused for its fields
+	c := newController(s, d)
+	c.KeepCount = 2
+	_ = c.Reconcile(context.Background())
+	for _, gone := range []string{"done-0", "done-1", "done-2"} {
+		if _, err := s.Get(context.Background(), gone); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s is still there", gone)
+		}
+	}
+	for _, kept := range []string{"done-3", "done-4", "fresh"} {
+		if _, err := s.Get(context.Background(), kept); err != nil {
+			t.Fatalf("%s was deleted", kept)
+		}
+	}
+}
+
+func TestControllerNamesItsCommitInTheRequestLog(t *testing.T) {
+	s, d := newStore(), &fakeDeployer{}
+	s.add("x", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	c := newController(s, d)
+	c.Commit = cLive
+	_ = c.Reconcile(context.Background())
+	cm, _ := s.Get(context.Background(), "x")
+	if !strings.Contains(cm.Data[keyLog], "deploy controller of commit "+cLive) {
+		t.Fatalf("log %q", cm.Data[keyLog])
+	}
+}
+
+// cancellingDeployer stops the pod (cancels the controller's context) in the middle of a deploy.
+type cancellingDeployer struct {
+	cancel    context.CancelFunc
+	cancelled bool
+}
+
+func (d *cancellingDeployer) Run(ctx context.Context, _ []string, line func(string)) error {
+	d.cancel()
+	time.Sleep(5 * time.Millisecond)
+	d.cancelled = ctx.Err() != nil
+	line("==> rolling update done")
+	return ctx.Err()
+}
+
+// A stop of the pod (SIGTERM) lets the running deploy finish and writes its outcome, and takes no
+// new request (review of O-34, change 3).
+func TestControllerFinishesARunningDeployOnStop(t *testing.T) {
+	s := newStore()
+	s.add("a", t0.Add(-2*time.Minute), data(req(cNew, cLive, "")))
+	s.add("b", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &cancellingDeployer{cancel: cancel}
+	c := newController(s, &fakeDeployer{})
+	c.Deployer = d
+	if err := c.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if d.cancelled {
+		t.Fatal("the stop cancelled the running deploy")
+	}
+	if p := s.phase("a"); p != PhaseSucceeded {
+		t.Fatalf("phase of the running request %q, want Succeeded", p)
+	}
+	if err := c.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := s.phase("b"); p != "" {
+		t.Fatalf("a new request was taken after the stop: %q", p)
+	}
+}

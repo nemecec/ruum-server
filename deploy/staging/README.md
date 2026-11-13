@@ -342,7 +342,17 @@ could read every Secret there (Kimi review of O-25, finding 1). Now:
 - **The outcome** goes back into the request: the annotation `ruum.space/phase` (`Running`,
   `Succeeded`, `Failed`, `Refused`), `data.status` and `data.log` (the last 300 lines of the
   output, without the migration Job's log, credentials in URLs masked). `deploy.sh` prints it as
-  it comes. The controller deletes finished requests after a week.
+  it comes. The first line names the controller's commit (the chart that ran). The controller
+  deletes every request after a week, whatever its phase (a request created with a preset phase,
+  or one it cannot claim, is never run), and keeps at most the newest 50 finished ones. The
+  ResourceQuota `release-requests` allows 100 ConfigMaps in `ruum-deploy`, so the deployer
+  cannot fill etcd; the controller lists the requests in pages. `status.sh` prints only checked
+  values of a request (a commit of 40 hex, one of the four phases); anything else shows as `?`.
+- **The chart is the controller's.** The chart, the migration Job and the deploy scripts come
+  from the controller's image, the commit of the last platform step (the annotation
+  `ruum.space/commit` on `ruum-deploy/deploy-controller`). `deploy.sh` reads that commit and warns
+  when the target's `charts/ruum` or deploy scripts differ from it: a chart change on main reaches
+  staging only with the platform step from a checkout that has it, then a deploy.
 - **The checks of the rights**: `ops/rbac-check.sh static` reads every binding of the deployer in
   the rendered manifests (CI, `tests/run.sh`: each way back to a Secret is refused: a pod, a Job,
   a Deployment patch, `pods/log`, exec, an ephemeral container, a token, a Secret by name, a
@@ -355,6 +365,13 @@ could read every Secret there (Kimi review of O-25, finding 1). Now:
   the checked fields. Only the admin can change its Deployment, ServiceAccount or Roles.
 - **What the deployer can still choose**: which signed commit of main at or after the O-25 floor
   runs, and `--rollback-older` (with its warning), as before. It cannot run anything else.
+  `--rollback-older` stays a person's decision until backlog O-37 (`schema_floor`), also when the
+  deployer kubeconfig is with an agent or CI.
+- **A stop of the controller** (the platform step, a node drain): it takes no new request after
+  SIGTERM and lets a running deploy finish (`terminationGracePeriodSeconds` 3660, longer than one
+  deploy). The platform step (`k8s/apply.sh`) stops before any change while a deploy runs (the
+  deploy lock is held, or a request is `Running`); the admin can pass
+  `secrets-push.sh platform --ignore-running-deploy`.
 
 ### Moving live staging to the deploy controller (once, the orchestrator)
 
@@ -382,8 +399,11 @@ kubeconfig stays on the person's Mac only (decision 0008-2).
 7. Only now may the deployer kubeconfig leave the Mac (an agent or CI), if the person wants that.
 
 Going back: run the platform step from a checkout before this change. It restores the old
-deployer rights (Pods, Jobs, Leases, Backups) and leaves `ruum-deploy` and the controller in
-place but unused (delete them with `deploy/staging/tool.sh kubectl delete namespace ruum-deploy`);
+deployer rights (Pods, Jobs, Leases, Backups). The controller's ServiceAccount, Roles,
+RoleBindings, ResourceQuota and Deployment are templates of the `platform` Helm release, so
+`helmfile sync` of that checkout deletes them. Only the namespace `ruum-deploy` (from
+`k8s/manifests/namespaces.yaml`, which `kubectl apply` never prunes) and the request ConfigMaps
+in it stay; delete them with `deploy/staging/tool.sh kubectl delete namespace ruum-deploy`.
 `deploy.sh` of that checkout runs `deploy-chart.sh` on the Mac again. The deployer kubeconfig is
 then operator-only again (README S-4 of that checkout).
 
@@ -554,9 +574,15 @@ PVC binds by itself when a node has the volume: the provisioner retries.
   slow image pull can need a second `up.sh --apply`.
 - Scaleway bucket policies that bind the backup key to the two buckets are not set (the key's
   permission sets and the compliance lock are the controls).
-- The deploy controller (backlog O-34): a controller pod that stops during a deploy (the platform
-  step, a node drain) kills its `deploy-chart.sh`; the next pod marks the request `Failed`, and
-  the deploy lock stays until it expires (30 minutes). Do not run the platform step while a deploy
-  runs. The controller uses GitHub's API without a token (60 calls per hour per address); a
-  failed call fails the request, and `deploy.sh` can run again. The controller's checks were run
-  against a throwaway k3s on the build server, not yet on live staging (the move above).
+- The deploy controller (backlog O-34): a pod killed during a deploy anyway (SIGKILL after the
+  grace period, a node lost) kills its `deploy-chart.sh`. The next pod marks the request
+  `Failed`, and the deploy lock stays until it expires (30 minutes). If `helm upgrade` was running,
+  the Helm release stays `pending-upgrade` (or `pending-rollback`) and the next deploy fails with
+  "another operation is in progress". Recovery (admin): `deploy/staging/tool.sh env
+  HELM_DRIVER=configmap helm -n ruum history ruum`, then `deploy/staging/tool.sh env
+  HELM_DRIVER=configmap helm -n ruum rollback ruum <the last revision with status deployed>`, then
+  `deploy.sh` again. The controller uses GitHub's API without a token (60 calls per hour per
+  address); a failed call fails the request, and `deploy.sh` can run again. The deployer can
+  fill the ResourceQuota of `ruum-deploy` (ConfigMaps without the label, or with a finalizer,
+  stay until the admin deletes them); that blocks only its own deploys. The controller's checks
+  were run against a throwaway k3s on the build server, not yet on live staging (the move above).

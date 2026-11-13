@@ -37,5 +37,23 @@ ruum_rollback_target_ok() {
   [[ "$older" == 1 ]]
 }
 
+# The files of a deploy that come from the deploy controller's image, not from the target commit
+# (backlog O-34): the chart, the migration Job and the deploy scripts. The image copies exactly
+# these (deploy/images/ruum-deploy-controller.Dockerfile; tests/run.sh compares them).
+RUUM_CONTROLLER_DEPLOY_PATHS=(
+  deploy/staging/charts/ruum
+  deploy/staging/ops/deploy-chart.sh
+  deploy/staging/ops/deploy-lock.sh
+  deploy/staging/ops/image-check.sh
+  deploy/staging/ops/release-floor.sh
+)
+
+# ruum_chart_drift REPO CONTROLLER TARGET: the files of RUUM_CONTROLLER_DEPLOY_PATHS that differ
+# between the controller's commit and the target, one per line (nothing when they are the same).
+# Exit 1 when git cannot compare them.
+ruum_chart_drift() {
+  git -C "$1" diff --name-only "$2" "$3" -- "${RUUM_CONTROLLER_DEPLOY_PATHS[@]}"
+}
+
 # shellcheck disable=SC2034 # used by deploy.sh and deploy-chart.sh, which source this file
 RUUM_ROLLBACK_OLDER_WARNING="WARNING: --rollback-older goes back past the previous release. Design 12.7 only promises that the previous release runs on the current schema. Check every migration since the target for a contract step (a dropped or renamed column or table) that the target still uses, and have the backup ready."

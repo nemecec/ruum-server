@@ -39,6 +39,14 @@ func env(name, def string) string {
 	return def
 }
 
+// commitEnv is RUUM_CONTROLLER_COMMIT when it is a full commit SHA.
+func commitEnv() string {
+	if v := os.Getenv("RUUM_CONTROLLER_COMMIT"); commitRE.MatchString(v) {
+		return v
+	}
+	return ""
+}
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -68,13 +76,19 @@ func run(ctx context.Context) error {
 		Me:            env("POD_NAME", "deploy-controller"),
 		MaxAge:        5 * time.Minute,
 		Keep:          7 * 24 * time.Hour,
+		KeepCount:     50,
+		Commit:        commitEnv(),
 		Timeout:       55 * time.Minute,
 		LogLines:      300,
 		ProgressEvery: 10 * time.Second,
 		Now:           time.Now,
 		Log:           os.Stdout,
 	}
-	c.logf("started as %s; watching release requests in %s", c.Me, env("RUUM_REQUEST_NAMESPACE", "ruum-deploy"))
+	c.logf("started as %s (commit %s); watching release requests in %s", c.Me, c.Commit, env("RUUM_REQUEST_NAMESPACE", "ruum-deploy"))
+	go func() {
+		<-ctx.Done()
+		c.logf("stop requested: no new request is taken; a running deploy finishes first")
+	}()
 	for {
 		if err := c.RecoverInterrupted(ctx); err == nil {
 			break
