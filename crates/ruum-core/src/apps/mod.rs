@@ -261,6 +261,14 @@ pub struct AppDeps {
     pub provider: Arc<provider::WebAppProvider>,
     pub usage: Arc<dyn UsageSink>,
     pub config: AppConfig,
+    /// Reads the source files of a deployment (with the caller's `view`).
+    pub transfers: Arc<dyn crate::blobs::Transfers>,
+    /// Stores the chunks of deployment archives.
+    pub blobs: Arc<dyn crate::blobs::BlobStore>,
+    /// The static sites (card W-2s; G-1a reads them).
+    pub sites: static_site::StaticSites,
+    /// Runs the images of deployments (R-1's trait).
+    pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,
 }
 
 /// The parts of the apps area for [`install`].
@@ -268,6 +276,27 @@ pub struct AppParts {
     pub store: Arc<dyn AppStore>,
     pub usage: Arc<dyn UsageSink>,
     pub config: AppConfig,
+    /// The object store of static sites: in memory by default; the server gives the S3 store
+    /// of the blob store when it has one.
+    pub sites: static_site::StaticSites,
+    /// The runtime driver: the in-memory driver until card R-2a/I-4 give the real ones.
+    pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,
+}
+
+/// The in-memory runtime driver, whose usage records go nowhere yet (a static image runs no
+/// code and records nothing).
+fn memory_runtime() -> Arc<dyn crate::runtime::RuntimeDriver> {
+    Arc::new(crate::runtime::MemoryDriver::new(
+        crate::runtime::MemoryRegistry::new(),
+        Arc::new(crate::runtime::MemoryUsage::new()),
+    ))
+}
+
+/// The content stores that the apps area reads and writes through.
+#[derive(Clone)]
+pub struct AppContent {
+    pub transfers: Arc<dyn crate::blobs::Transfers>,
+    pub blobs: Arc<dyn crate::blobs::BlobStore>,
 }
 
 impl AppParts {
@@ -277,6 +306,8 @@ impl AppParts {
             store: Arc::new(store::memory::MemoryAppStore::new(journal)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::default(),
+            sites: static_site::StaticSites::in_memory(),
+            runtime: memory_runtime(),
         }
     }
 
@@ -286,6 +317,8 @@ impl AppParts {
             store: Arc::new(store::postgres::PgAppStore::new(pool)),
             usage: Arc::new(MemoryUsageSink::new()),
             config: AppConfig::from_env(),
+            sites: static_site::StaticSites::in_memory(),
+            runtime: memory_runtime(),
         }
     }
 }
@@ -301,6 +334,10 @@ pub fn install(services: &mut crate::Services, parts: AppParts) -> Result<()> {
         services.typed_nodes.clone(),
         &services.providers,
         parts,
+        AppContent {
+            transfers: services.transfers.clone(),
+            blobs: services.blobs.clone(),
+        },
     )?;
     Ok(())
 }
@@ -313,6 +350,7 @@ pub fn build(
     typed: Arc<dyn TypedNodeStore>,
     registry: &crate::providers::ProviderRegistry,
     parts: AppParts,
+    content: AppContent,
 ) -> Result<Arc<AppService>> {
     let platform: Arc<dyn crate::providers::PlatformApi> =
         Arc::new(crate::providers::store::StoreReports::new(
@@ -334,6 +372,10 @@ pub fn build(
         provider,
         usage: parts.usage,
         config: parts.config,
+        transfers: content.transfers,
+        blobs: content.blobs,
+        sites: parts.sites,
+        runtime: parts.runtime,
     })))
 }
 
@@ -436,7 +478,6 @@ impl AppService {
     }
 
     /// The registered live hooks.
-    #[allow(dead_code)] // The publish of card W-2s calls it.
     pub(crate) fn live_hooks(&self) -> Vec<Arc<dyn deployments::LiveReleaseHook>> {
         self.hooks.read().expect("hook lock").clone()
     }
@@ -448,6 +489,11 @@ impl AppService {
     /// The store (for the fixtures and the later cards of the area).
     pub fn store(&self) -> &Arc<dyn AppStore> {
         &self.deps.store
+    }
+
+    /// The static sites of the area (the gateway reads them, card G-1a).
+    pub fn sites(&self) -> &static_site::StaticSites {
+        &self.deps.sites
     }
 
     /// The meter sink of the area.

@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::ids::{NodeId, TenantId, VersionId};
 use crate::journal::ChangeInfo;
 use crate::paging::{Cursor, Page, PageRequest};
+use crate::versions::{Version, VersionFilter};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -244,6 +245,95 @@ impl NewDeployment {
     }
 }
 
+/// What kind of release [`AppStore::release`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseKind {
+    /// A ready preview goes live.
+    Publish,
+    /// An older live deployment (or a version of the app) goes live again.
+    Rollback,
+}
+
+impl ReleaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReleaseKind::Publish => "publish",
+            ReleaseKind::Rollback => "rollback",
+        }
+    }
+}
+
+/// How [`AppStore::release`] writes a release.
+#[derive(Clone, Debug)]
+pub struct Release {
+    pub kind: ReleaseKind,
+    /// The live deployment the caller checked (and called the hooks with). When the app's live
+    /// deployment is another one under the row lock, the release is `409 conflict` and nothing
+    /// is written.
+    pub expected_live: Option<Uuid>,
+    /// The version a `restoreVersion` restores (`versions.restored_from`).
+    pub restored_from: Option<VersionId>,
+    /// The deployment a rollback brings back (`app.rolled_back.to_deployment_id` is the new
+    /// release; this is the old one it copies), for the journal.
+    pub rollback_of: Option<Uuid>,
+    /// The approval an agent's publish used (W-3b).
+    pub approval_id: Option<Uuid>,
+}
+
+/// What [`AppStore::release`] wrote.
+#[derive(Clone, Debug)]
+pub struct Released {
+    pub deployment: DeploymentRow,
+    pub version: Version,
+    /// The change of the version entry (`version.created` or `version.restored`).
+    pub change: ChangeInfo,
+}
+
+/// A new approval request of an agent's publish (`app_approvals`, decision 0006-4).
+#[derive(Clone, Debug)]
+pub struct NewApproval {
+    pub id: Uuid,
+    pub app_node_id: NodeId,
+    pub deployment_id: Uuid,
+    /// `AppApproval.changes` (names only).
+    pub changes: Value,
+    pub bound_archive_hash: [u8; 32],
+    /// BLAKE3 of the canonical JSON of the parsed manifest.
+    pub bound_manifest_hash: [u8; 32],
+    /// The binding targets resolved at preview time (none until card B-1).
+    pub bound_bindings: Value,
+    pub expires_at: OffsetDateTime,
+}
+
+/// A row of `app_approvals`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovalRow {
+    pub tenant_id: TenantId,
+    pub id: Uuid,
+    pub app_node_id: NodeId,
+    pub deployment_id: Uuid,
+    /// `pending`, `approved`, `denied`, `expired`, `used`.
+    pub status: String,
+    pub changes: Value,
+    pub bound_archive_hash: [u8; 32],
+    pub bound_manifest_hash: [u8; 32],
+    pub bound_bindings: Value,
+    pub requested_by: Actor,
+    pub decided_by: Option<Uuid>,
+    pub decided_at: Option<OffsetDateTime>,
+    pub comment: Option<String>,
+    pub expires_at: OffsetDateTime,
+    pub created_at: OffsetDateTime,
+}
+
+/// A preview that the sweeper ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiredPreview {
+    pub tenant_id: TenantId,
+    pub app_node_id: NodeId,
+    pub id: Uuid,
+}
+
 /// The encoding of a release version (decision 0006-2).
 pub const RELEASE_ENCODING: &str = "app_release_v1";
 
@@ -259,6 +349,119 @@ pub fn release_manifest(d: &NewDeployment) -> Vec<u8> {
         "app_manifest": d.manifest.clone().unwrap_or(Value::Null),
     });
     serde_json::to_vec(&v).unwrap_or_default()
+}
+
+/// The version of a release: the row the store writes into `versions` (encoding
+/// [`RELEASE_ENCODING`]) and the manifest bytes.
+pub fn release_version(
+    ctx: &Context,
+    d: &NewDeployment,
+    restored_from: Option<VersionId>,
+    at: OffsetDateTime,
+) -> (Version, Vec<u8>) {
+    let bytes = release_manifest(d);
+    let version = Version {
+        id: VersionId::new(),
+        tenant_id: ctx.tenant,
+        node_id: d.app_node_id,
+        size_bytes: bytes.len() as i64,
+        content_hash: crate::blobs::Hash::of(&bytes),
+        content_type: Some("application/json".into()),
+        restored_from,
+        label: d.label.clone(),
+        actor: ctx.actor,
+        created_at: at,
+    };
+    (version, bytes)
+}
+
+/// The journal entries of a release, in order: `version.created` (or `version.restored`),
+/// `app.deployed`, and for a rollback `app.rolled_back` (reason `manual`).
+pub fn release_entries(
+    d: &NewDeployment,
+    version: &Version,
+    previous: Option<(Uuid, Option<VersionId>)>,
+    r: &Release,
+) -> Vec<(crate::journal::EventType, Value)> {
+    use crate::journal::EventType;
+    let previous_version = previous.and_then(|(_, v)| v);
+    let mut out = Vec::new();
+    match version.restored_from {
+        Some(from) => out.push((
+            EventType::VersionRestored,
+            serde_json::json!({
+                "version_id": version.id,
+                "restored_from": from,
+                "previous_version_id": previous_version,
+            }),
+        )),
+        None => out.push((
+            EventType::VersionCreated,
+            serde_json::json!({
+                "version_id": version.id,
+                "previous_version_id": previous_version,
+                "size_bytes": version.size_bytes,
+                "content_hash": version.content_hash,
+                "content_type": version.content_type,
+                "coalesced": false,
+            }),
+        )),
+    }
+    out.push((
+        EventType::AppDeployed,
+        serde_json::json!({
+            "deployment_id": d.id,
+            "environment": "live",
+            "version_id": version.id,
+            "previous_deployment_id": previous.map(|(p, _)| p),
+            "kind": r.kind.as_str(),
+            "migrations_applied": 0,
+            "approval_id": r.approval_id,
+        }),
+    ));
+    if r.kind == ReleaseKind::Rollback
+        && let Some((from, _)) = previous
+    {
+        out.push((
+            EventType::AppRolledBack,
+            serde_json::json!({
+                "from_deployment_id": from,
+                "to_deployment_id": d.id,
+                "reason": "manual",
+                "error_rate_before": null,
+                "error_rate_after": null,
+            }),
+        ));
+    }
+    out
+}
+
+/// The data of `app.deployed` for a ready preview.
+pub fn preview_deployed_data(id: Uuid) -> Value {
+    serde_json::json!({
+        "deployment_id": id,
+        "environment": "preview",
+        "version_id": null,
+        "previous_deployment_id": null,
+        "kind": "preview",
+        "migrations_applied": 0,
+        "approval_id": null,
+    })
+}
+
+/// The data of `app.deployment_failed`.
+pub fn deployment_failed_data(
+    id: Uuid,
+    environment: Environment,
+    stage: &str,
+    reason: &str,
+) -> Value {
+    serde_json::json!({
+        "deployment_id": id,
+        "environment": environment.as_str(),
+        "stage": stage,
+        "reason": reason,
+    })
 }
 
 /// The data of `app.settings_changed`.
@@ -353,6 +556,68 @@ pub trait AppStore: Send + Sync {
         id: Uuid,
         state: DeploymentState,
     ) -> Result<bool>;
+
+    /// Stores the stages of a deployment whose stages run (`pending` or `running`), and sets
+    /// it `running`. False when it does not exist in the tenant or does not run any more.
+    async fn update_stages(&self, tenant: TenantId, id: Uuid, stages: &Value) -> Result<bool>;
+
+    /// A preview whose stages passed: state `ready` with its stages and check result, and
+    /// `app.deployed` (kind `preview`), in one unit. With a `draft` label, the older ready
+    /// previews of the app with that label become `superseded`; when a newer preview with that
+    /// label is ready already, this one becomes `superseded` instead. Returns the final state.
+    /// `not_found` when the deployment is not a running preview of the tenant.
+    async fn finish_preview(
+        &self,
+        ctx: &Context,
+        id: Uuid,
+        stages: &Value,
+        check: Option<&Value>,
+    ) -> Result<DeploymentState>;
+
+    /// A deployment whose stage `stage` failed: state `failed`, its stages and check result, and
+    /// `app.deployment_failed` (reason a snake_case code), in one unit.
+    async fn fail_deployment(
+        &self,
+        ctx: &Context,
+        id: Uuid,
+        stages: &Value,
+        check: Option<&Value>,
+        stage: &str,
+        reason: &str,
+    ) -> Result<()>;
+
+    /// Writes a release in one unit: inserts `d` (environment and state `live`), its version
+    /// ([`release_version`]), makes it the app's live deployment, supersedes the old live one,
+    /// fixes the slug and writes [`release_entries`]. `409 conflict` (nothing written) when the
+    /// live deployment is not `r.expected_live` any more.
+    async fn release(&self, ctx: &Context, d: NewDeployment, r: Release) -> Result<Released>;
+
+    /// Inserts the approval request of an agent's publish (status `pending`).
+    async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow>;
+
+    /// The release versions of an app node (encoding `app_release_v1`), newest first. No
+    /// permission check.
+    async fn list_versions(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>>;
+
+    /// A release version of an app node and the deployment it was written for.
+    async fn release_of(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        version: VersionId,
+    ) -> Result<Option<(Version, Uuid)>>;
+
+    /// Ends the ready previews of every tenant whose `expires_at` is before `now` (state
+    /// `expired`), at most `limit`, and returns them. A platform job (the sweeper), not a
+    /// tenant call.
+    async fn expire_previews(&self, now: OffsetDateTime, limit: u32)
+    -> Result<Vec<ExpiredPreview>>;
 }
 
 // ---------------------------------------------------------------------------- cursors
@@ -405,6 +670,31 @@ pub(crate) fn page_of(mut items: Vec<DeploymentRow>, limit: usize) -> Page<Deplo
         None
     };
     Page { items, next_cursor }
+}
+
+/// One page of versions (at most `limit + 1`, newest first).
+pub(crate) fn version_page(items: &mut Vec<Version>, limit: usize) -> Page<Version> {
+    let next_cursor = if items.len() > limit {
+        items.truncate(limit);
+        items.last().map(crate::blobs::logic::version_cursor)
+    } else {
+        None
+    };
+    Page {
+        items: std::mem::take(items),
+        next_cursor,
+    }
+}
+
+/// `409 conflict` when the live deployment changed while a release was checked.
+pub(crate) fn live_changed() -> Error {
+    Error::Api(
+        crate::error::ApiError::new(
+            crate::error::ErrorCode::Conflict,
+            "the live deployment changed at the same time",
+        )
+        .with_hint("read the app again and repeat the publish"),
+    )
 }
 
 /// `conflict` when no candidate slug is free.

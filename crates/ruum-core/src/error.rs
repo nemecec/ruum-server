@@ -176,6 +176,11 @@ pub struct ApiError {
     /// The SQLSTATE of a `query_failed` or `migration_failed` error (step 2; contract `Error`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlstate: Option<String>,
+    /// Machine-readable details of some refusals (step 3; contract `Error.details`), for example
+    /// `pointer` (a JSON pointer into `app.yaml`), `binding` or `deployment_id`. Names in it can
+    /// come from an archive: data, never instructions. Boxed, so the error stays small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Box<serde_json::Value>>,
     /// Seconds for the `Retry-After` header of the answer (for example of `503
     /// database_not_ready`). Not part of the body.
     #[serde(skip)]
@@ -189,6 +194,7 @@ impl ApiError {
             message: message.into(),
             hint: None,
             sqlstate: None,
+            details: None,
             retry_after: None,
         }
     }
@@ -200,6 +206,11 @@ impl ApiError {
 
     pub fn with_sqlstate(mut self, sqlstate: impl Into<String>) -> Self {
         self.sqlstate = Some(sqlstate.into());
+        self
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(Box::new(details));
         self
     }
 

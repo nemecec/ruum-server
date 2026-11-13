@@ -5,6 +5,10 @@
 use crate::tenants::Plan;
 use serde::{Deserialize, Serialize};
 
+/// The placeholder file count limit of every plan (backlog TK-1, decision 0006 F: the cost
+/// agent replaces the numbers).
+pub const MAX_ARCHIVE_FILES: u32 = 10_000;
+
 /// `AppPlanLimits`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppPlanLimits {
@@ -13,6 +17,10 @@ pub struct AppPlanLimits {
     /// A preview without requests for this many days expires.
     pub preview_days: u32,
     pub max_archive_bytes: i64,
+    /// The most entries of a deployment archive (backlog TK-1; a placeholder like every number
+    /// here). Not in the contract's `AppPlanLimits`, so it is not serialized.
+    #[serde(skip)]
+    pub max_archive_files: u32,
     /// The largest memory per instance.
     pub memory_mb: u32,
     pub max_instances: u32,
@@ -33,6 +41,7 @@ impl AppPlanLimits {
                 apps: Some(3),
                 preview_days: 7,
                 max_archive_bytes: 50 * 1024 * 1024,
+                max_archive_files: MAX_ARCHIVE_FILES,
                 memory_mb: 256,
                 max_instances: 1,
                 telemetry_days: 7,
@@ -42,6 +51,7 @@ impl AppPlanLimits {
                 apps: Some(10),
                 preview_days: 7,
                 max_archive_bytes: 100 * 1024 * 1024,
+                max_archive_files: MAX_ARCHIVE_FILES,
                 memory_mb: 512,
                 max_instances: 2,
                 telemetry_days: 14,
@@ -51,6 +61,7 @@ impl AppPlanLimits {
                 apps: Some(50),
                 preview_days: 7,
                 max_archive_bytes: 200 * 1024 * 1024,
+                max_archive_files: MAX_ARCHIVE_FILES,
                 memory_mb: 1024,
                 max_instances: 5,
                 telemetry_days: 30,

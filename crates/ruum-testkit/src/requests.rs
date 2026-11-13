@@ -393,7 +393,7 @@ pub fn standard(op: &str, t: &TenantFixture) -> Option<RequestSpec> {
         "createAppDeployment" => RequestSpec::post(app("/deployments"))
             .tenant(tid)
             .json(json!({
-                "source": { "kind": "file", "node_id": plan },
+                "source": { "kind": "file", "node_id": t.site_archive },
                 "label": "plant list",
             })),
         "getAppDeployment" => {

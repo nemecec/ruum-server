@@ -56,11 +56,6 @@ pub const PENDING: &[(&str, &str)] = &[
          slug, so what does tenant B see?",
     ),
     (
-        "entry_count_bomb_is_refused",
-        "open question for W-2: the contract says unpack has a file count limit but names no \
-         number; this case assumes the limit is below 65,000 files (backlog TK-1)",
-    ),
-    (
         "preview_expiry_is_visible",
         "open question for W-2: AppDeployment has no expiry field; where does a client read when \
          a preview expires?",

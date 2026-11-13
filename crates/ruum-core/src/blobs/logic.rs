@@ -330,6 +330,8 @@ pub fn stream_chunks(
 /// Reads all chunks of the manifest and checks each chunk size and the hash of the whole
 /// content. Chunks that are gone give `chunk_missing` (with the list, for the caller to clean
 /// up its chunk records); another content hash gives `hash_mismatch`.
+// `Error` grew by the boxed `details` of step 3 (card W-2s); this pair is on the slow path only.
+#[allow(clippy::result_large_err)]
 pub async fn verify_content(
     blobs: &dyn BlobStore,
     tenant: TenantId,
