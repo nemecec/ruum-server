@@ -5,7 +5,7 @@
 #
 # 1. crates/ruum-server/env-names.txt lists exactly the names the server code reads: string
 #    literals "RUUM_*", "DATABASE_URL", "SMTP_URL" and "S3_*" (as RUUM_S3_*) in crates/*/src,
-#    without ruum-cli and ruum-testkit.
+#    without ruum-cli, ruum-testkit and ruum-gateway (its own binary with its own settings).
 # 2. Every RUUM_* name that the ruum-server Deployment sets (env) or gets from the Secret
 #    ruum-server-env (the keys that apply.sh writes) is in the list and not a test name.
 # 3. Every name of class `required` is set by one of the two.
@@ -35,7 +35,8 @@ awk '$2 == "required" { print $1 }' "$TMP/list" | sort -u >"$TMP/required"
 
 # 1. The list against the code.
 find "$crates" -path '*/src/*' -name '*.rs' \
-  -not -path "$crates/ruum-cli/*" -not -path "$crates/ruum-testkit/*" -print0 |
+  -not -path "$crates/ruum-cli/*" -not -path "$crates/ruum-testkit/*" \
+  -not -path "$crates/ruum-gateway/*" -print0 |
   xargs -0 grep -hoE '"(RUUM_[A-Z0-9_]+|DATABASE_URL|SMTP_URL|S3_[A-Z0-9_]+)"' |
   tr -d '"' | sed 's/^S3_/RUUM_S3_/' | sort -u >"$TMP/code"
 while read -r n; do problem "the server reads $n, but env-names.txt does not list it"; done \
