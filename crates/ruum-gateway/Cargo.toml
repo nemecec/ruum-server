@@ -1,0 +1,44 @@
+[package]
+name = "ruum-gateway"
+description = "The app gateway: the internet-facing front of every app origin (decision 0006-1). No tenant keys, no general system access."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ruum-gateway"
+path = "src/main.rs"
+
+[dependencies]
+ruum-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+jsonwebtoken.workspace = true
+object_store.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+ruum-api.workspace = true
+ruum-testkit.workspace = true
+# `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.
+sqlx = { workspace = true, features = ["macros"] }

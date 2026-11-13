@@ -627,6 +627,180 @@ impl IdentityStore for PgIdentityStore {
         Ok(())
     }
 
+    async fn create_app_code(&self, code: app_sign_in::NewAppCode) -> Result<String> {
+        let b = code.binding;
+        let secret_value = secret::random_secret("");
+        let mut tx = self.area.system().await?;
+        let live: Option<Uuid> = sqlx::query_scalar(
+            "select id from sessions where id = $1 and user_id = $2 and ended_at is null \
+             and expires_at > now()",
+        )
+        .bind(code.platform_session)
+        .bind(code.user)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Err(Error::not_found("session"));
+        }
+        sqlx::query("delete from app_sign_in_codes where tenant_id = $1 and expires_at < now()")
+            .bind(b.tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "insert into app_sign_in_codes (tenant_id, code_hash, user_id, platform_session_id, \
+             app_node_id, environment, deployment_id, state_hash, expires_at) \
+             values ($1, $2, $3, $4, $5, $6::app_environment, $7, $8, \
+             now() + make_interval(secs => $9))",
+        )
+        .bind(b.tenant_id)
+        .bind(&secret::sha256(&secret_value)[..])
+        .bind(code.user)
+        .bind(code.platform_session)
+        .bind(b.app_id)
+        .bind(b.environment.as_str())
+        .bind(b.deployment_id)
+        .bind(&app_sign_in::state_hash(&code.state)[..])
+        .bind(app_sign_in::APP_CODE_SECONDS as f64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(secret_value)
+    }
+
+    async fn redeem_app_code(
+        &self,
+        binding: &app_sign_in::AppBinding,
+        code: &str,
+        state: &str,
+    ) -> Result<Option<(app_sign_in::AppSession, String)>> {
+        let mut tx = self.area.system().await?;
+        // A code is spent by the first try, also a refused one; the row lock serialises two
+        // tries of the same code.
+        let row = sqlx::query(
+            "update app_sign_in_codes set used_at = now() \
+             where tenant_id = $1 and code_hash = $2 and used_at is null \
+             returning user_id, platform_session_id, app_node_id, environment::text as env, \
+             deployment_id, state_hash, expires_at > now() as fresh",
+        )
+        .bind(binding.tenant_id)
+        .bind(&secret::sha256(code)[..])
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let user: UserId = row.try_get("user_id")?;
+        let platform_session: Uuid = row.try_get("platform_session_id")?;
+        let app: NodeId = row.try_get("app_node_id")?;
+        let env: String = row.try_get("env")?;
+        let deployment: Option<Uuid> = row.try_get("deployment_id")?;
+        let stored_state: Vec<u8> = row.try_get("state_hash")?;
+        let fresh: bool = row.try_get("fresh")?;
+        let same = app == binding.app_id
+            && app_sign_in::AppEnv::parse(&env) == Some(binding.environment)
+            && deployment == binding.deployment_id
+            && secret::constant_time_eq(&stored_state, &app_sign_in::state_hash(state));
+        let live: Option<Uuid> = sqlx::query_scalar(
+            "select id from sessions where id = $1 and user_id = $2 and ended_at is null \
+             and expires_at > now()",
+        )
+        .bind(platform_session)
+        .bind(user)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if !fresh || !same || live.is_none() {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let secret_value = secret::random_secret("");
+        let id = Uuid::now_v7();
+        let r = sqlx::query(
+            "insert into app_sessions (tenant_id, id, secret_hash, user_id, platform_session_id, \
+             app_node_id, environment, deployment_id, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, $7::app_environment, $8, \
+             now() + make_interval(hours => $9)) returning created_at, expires_at",
+        )
+        .bind(binding.tenant_id)
+        .bind(id)
+        .bind(&secret::sha256(&secret_value)[..])
+        .bind(user)
+        .bind(platform_session)
+        .bind(binding.app_id)
+        .bind(binding.environment.as_str())
+        .bind(binding.deployment_id)
+        .bind(app_sign_in::APP_SESSION_HOURS as i32)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some((
+            app_sign_in::AppSession {
+                id,
+                binding: *binding,
+                user_id: user,
+                platform_session_id: platform_session,
+                created_at: r.try_get("created_at")?,
+                expires_at: r.try_get("expires_at")?,
+            },
+            secret_value,
+        )))
+    }
+
+    async fn app_session(
+        &self,
+        tenant: TenantId,
+        secret_value: &str,
+    ) -> Result<Option<app_sign_in::AppSession>> {
+        let mut tx = self.area.system().await?;
+        let row = sqlx::query(
+            "select a.id, a.user_id, a.platform_session_id, a.app_node_id, \
+             a.environment::text as env, a.deployment_id, a.created_at, a.expires_at \
+             from app_sessions a join sessions s on s.id = a.platform_session_id \
+             and s.user_id = a.user_id \
+             where a.tenant_id = $1 and a.secret_hash = $2 and a.ended_at is null \
+             and a.expires_at > now() and s.ended_at is null and s.expires_at > now()",
+        )
+        .bind(tenant)
+        .bind(&secret::sha256(secret_value)[..])
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let env: String = r.try_get("env")?;
+        let Some(environment) = app_sign_in::AppEnv::parse(&env) else {
+            return Ok(None);
+        };
+        Ok(Some(app_sign_in::AppSession {
+            id: r.try_get("id")?,
+            binding: app_sign_in::AppBinding {
+                tenant_id: tenant,
+                app_id: r.try_get("app_node_id")?,
+                environment,
+                deployment_id: r.try_get("deployment_id")?,
+            },
+            user_id: r.try_get("user_id")?,
+            platform_session_id: r.try_get("platform_session_id")?,
+            created_at: r.try_get("created_at")?,
+            expires_at: r.try_get("expires_at")?,
+        }))
+    }
+
+    async fn end_app_session(&self, tenant: TenantId, secret_value: &str) -> Result<()> {
+        let mut tx = self.area.system().await?;
+        sqlx::query(
+            "update app_sessions set ended_at = now() where tenant_id = $1 and secret_hash = $2 \
+             and ended_at is null",
+        )
+        .bind(tenant)
+        .bind(&secret::sha256(secret_value)[..])
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn bind_email_grants(&self, user: UserId, session: Uuid, force: bool) -> Result<usize> {
         let mut tx = self.area.system().await?;
         // The throttle: one check per session per minute, unless forced. A session of another

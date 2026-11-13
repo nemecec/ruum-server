@@ -186,6 +186,157 @@ fn login_cookies_to_clear(state: &AppState, headers: &HeaderMap) -> Vec<String> 
 pub struct LoginQuery {
     return_to: Option<String>,
     idp: Option<String>,
+    /// The app audience of the code flow of an app origin (card G-1a): the tenant, the app node,
+    /// the deployment that the host resolves to, and the gateway's state.
+    app_tenant: Option<String>,
+    app_id: Option<String>,
+    app_deployment: Option<String>,
+    app_state: Option<String>,
+}
+
+impl LoginQuery {
+    fn is_app(&self) -> bool {
+        self.app_tenant.is_some()
+            || self.app_id.is_some()
+            || self.app_deployment.is_some()
+            || self.app_state.is_some()
+    }
+}
+
+/// The refusal of an app sign-in that does not fit: the same answer for every reason, so it
+/// tells nothing about which app, tenant or deployment exists.
+fn app_login_refused() -> HttpError {
+    bad_request(
+        "the sign-in for this app is not valid",
+        "open the app again to start a new sign-in",
+    )
+}
+
+/// The app branch of `loginStart` (card G-1a; `contracts/apps/gateway.openapi.yaml`, "Sign-in on
+/// an app origin"). A signed-in user (the session cookie only, never a bearer token) gets a
+/// one-time code for the app origin, bound to the user, the platform session, the app node, the
+/// environment, the deployment of a preview and the gateway's state, valid 60 seconds and usable
+/// once (`identity::app_sign_in`). The platform checks that the app and the deployment exist and
+/// serve (the live deployment, or a ready preview), builds the host from its own records, and
+/// redirects only to `https://<that host>/.ruum/v1/auth/callback`. Without a session it runs the
+/// normal sign-in first and comes back here (`return_to` is this request).
+async fn app_login(state: &AppState, headers: &HeaderMap, q: LoginQuery) -> ApiResult<Response> {
+    use ruum_core::apps::store::{DeploymentState, Environment};
+    use ruum_core::identity::app_sign_in::{AppBinding, AppEnv, NewAppCode, valid_state};
+    let parse = |v: &Option<String>| v.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+    let (Some(tenant), Some(app_id), Some(deployment), Some(app_state)) = (
+        parse(&q.app_tenant),
+        parse(&q.app_id),
+        parse(&q.app_deployment),
+        q.app_state.clone().filter(|s| valid_state(s)),
+    ) else {
+        return Err(app_login_refused());
+    };
+    if q.return_to.is_some() || q.idp.is_some() {
+        return Err(bad_request(
+            "an app sign-in takes no return_to or idp",
+            "the app origin chooses where to go after the sign-in",
+        ));
+    }
+    let session = match crate::auth::cookie(headers, SESSION_COOKIE).filter(|s| !s.is_empty()) {
+        Some(secret) => ruum_core::identity::auth::authenticate_session(&state.services, &secret)
+            .await
+            .ok(),
+        None => None,
+    };
+    let Some(who) = session else {
+        // Sign in to the platform first, then come back to this request.
+        let query = serde_urlencoded_query(&q);
+        let return_to = format!("/v1/auth/login?{query}");
+        let normal = LoginQuery {
+            return_to: Some(return_to),
+            idp: None,
+            app_tenant: None,
+            app_id: None,
+            app_deployment: None,
+            app_state: None,
+        };
+        return start_platform_login(state, headers, normal).await;
+    };
+    let (Some(user), Some(platform_session)) = (who.user(), who.session_id) else {
+        return Err(app_login_refused());
+    };
+    let tenant = ruum_core::TenantId(tenant);
+    let node = ruum_core::NodeId(app_id);
+    let store = state.services.apps.store();
+    let Some(settings) = store.tenant_settings(tenant).await? else {
+        return Err(app_login_refused());
+    };
+    let Some(app) = store.get_app(tenant, node).await? else {
+        return Err(app_login_refused());
+    };
+    let Some(dep) = store.get_deployment(tenant, node, deployment).await? else {
+        return Err(app_login_refused());
+    };
+    let now = ruum_core::now();
+    let (env, label) = if dep.environment == Environment::Live
+        && dep.state == DeploymentState::Live
+        && app.live_deployment_id == Some(dep.id)
+    {
+        (AppEnv::Live, app.slug.clone())
+    } else if dep.environment == Environment::Preview
+        && dep.state == DeploymentState::Ready
+        && dep.expires_at.is_none_or(|t| t > now)
+    {
+        (AppEnv::Preview, format!("{}--{}", dep.short_id, app.slug))
+    } else {
+        return Err(app_login_refused());
+    };
+    let apps_domain = state
+        .services
+        .apps
+        .deps()
+        .config
+        .apps_domain
+        .trim_matches('.')
+        .to_ascii_lowercase();
+    let host = format!("{label}.{}.{apps_domain}", settings.slug);
+    let code = state
+        .services
+        .identity
+        .create_app_code(NewAppCode {
+            binding: AppBinding::of(tenant, node, env, dep.id),
+            user,
+            platform_session,
+            state: app_state.clone(),
+        })
+        .await
+        .map_err(|e| match e {
+            Error::Api(_) => app_login_refused(),
+            other => HttpError(other),
+        })?;
+    let location = format!("https://{host}/.ruum/v1/auth/callback?code={code}&state={app_state}");
+    let mut res = redirect(&location, &[])?;
+    res.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    res.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    Ok(res)
+}
+
+/// The query string of a login request (for the `return_to` of an app sign-in).
+fn serde_urlencoded_query(q: &LoginQuery) -> String {
+    let mut s = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in [
+        ("app_tenant", &q.app_tenant),
+        ("app_id", &q.app_id),
+        ("app_deployment", &q.app_deployment),
+        ("app_state", &q.app_state),
+    ] {
+        if let Some(v) = v {
+            s.append_pair(k, v);
+        }
+    }
+    s.finish()
 }
 
 /// Start OIDC sign-in. `GET /v1/auth/login` (operationId `loginStart`).
@@ -197,6 +348,18 @@ pub async fn login_start(
     State(state): State<AppState>,
     headers: HeaderMap,
     QueryParams(q): QueryParams<LoginQuery>,
+) -> ApiResult<Response> {
+    if q.is_app() {
+        return app_login(&state, &headers, q).await;
+    }
+    start_platform_login(&state, &headers, q).await
+}
+
+/// The sign-in to the platform (the OIDC flow), without the app branch.
+async fn start_platform_login(
+    state: &AppState,
+    headers: &HeaderMap,
+    q: LoginQuery,
 ) -> ApiResult<Response> {
     let return_to = q.return_to.unwrap_or_else(|| "/".into());
     if !valid_return_to(&return_to) {
@@ -229,9 +392,9 @@ pub async fn login_start(
         LOGIN_SECONDS,
     )?;
     let name = login_cookie_name(&flow.start.state);
-    let mut cookies = login_cookies_to_clear(&state, &headers);
+    let mut cookies = login_cookies_to_clear(state, headers);
     cookies.push(set_cookie(
-        &state,
+        state,
         &name,
         &sealed,
         LOGIN_COOKIE_PATH,
