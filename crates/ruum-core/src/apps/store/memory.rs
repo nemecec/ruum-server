@@ -310,6 +310,8 @@ impl AppStore for MemoryAppStore {
 
     async fn remove_app(&self, tenant: TenantId, node: NodeId) -> Result<()> {
         let mut st = self.st();
+        st.approvals
+            .retain(|(t, _), a| !(*t == tenant && a.app_node_id == node));
         st.deployments
             .retain(|(t, _), d| !(*t == tenant && d.app_node_id == node));
         st.apps.remove(&(tenant, node));

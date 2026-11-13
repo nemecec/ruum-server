@@ -61,7 +61,9 @@ pub enum SlugState {
     Free,
     /// Another app of the tenant has it now.
     InUse(NodeId),
-    /// Another app of the tenant had it and is gone: never given again.
+    /// Another app of the tenant had it and is gone: never given again. Also while the gone
+    /// app's row is still there: the Postgres store sees that its node is a purge tombstone,
+    /// and the service checks that the node exists (review W-2s, 1).
     Retired,
 }
 
@@ -236,6 +238,11 @@ pub struct NewDeployment {
     pub stages: Value,
     pub published_from: Option<Uuid>,
     pub expires_at: Option<OffsetDateTime>,
+    /// The archive chunks this deployment stored in the blob store. The Postgres store records
+    /// them in `chunks` in the deployment's transaction, so the chunk garbage collection frees
+    /// them once no release or live preview names them (review W-2s, 3). The in-memory store
+    /// keeps no chunk rows (its blob store's collection does not read deployments).
+    pub new_chunks: Vec<crate::blobs::ChunkRef>,
 }
 
 impl NewDeployment {

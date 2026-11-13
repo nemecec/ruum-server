@@ -55,6 +55,7 @@ fn deployment(app: NodeId, env: Environment, state: DeploymentState) -> NewDeplo
         manifest: Some(serde_json::json!({ "runtime": "static" })),
         stages: serde_json::json!([]),
         published_from: None,
+        new_chunks: Vec::new(),
         expires_at: None,
     }
 }
@@ -602,6 +603,11 @@ pub(crate) async fn previews_releases_and_versions(h: &dyn Harness) {
     assert!(!ended.iter().any(|e| e.id == fresh.id));
     assert_eq!(state(old.id).await, DeploymentState::Expired);
     assert_eq!(state(fresh.id).await, DeploymentState::Ready);
+    // A purge removes the app with its deployments, also while an agent's approval is
+    // pending (the approval names a deployment; review W-2s, Kimi 2).
+    s.remove_app(a, n).await.unwrap();
+    assert!(s.get_app(a, n).await.unwrap().is_none());
+    assert!(s.get_deployment(a, n, p3.id).await.unwrap().is_none());
 }
 
 /// The deployment writes and reads of card W-2s stay in their tenant.
@@ -839,6 +845,72 @@ mod tests {
         run_all(&h).await;
     }
 
+    /// The slug of an app whose node was purged is retired at once, while the app row still
+    /// waits for the provider's `purged` delivery (the node is a hidden tombstone; review
+    /// W-2s, 1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_slug_of_a_purged_app_is_retired_at_once(pool: sqlx::PgPool) {
+        let (t, u) = pg_tenant(&pool).await;
+        let n = pg_app_node(&pool, t, u).await;
+        let store = PgAppStore::new(pool.clone());
+        let slug = unique("purged");
+        store
+            .insert_app(&ctx(t, u), app(n, &slug))
+            .await
+            .unwrap()
+            .unwrap();
+        let other = NodeId::new();
+        assert_eq!(
+            store.slug_state(t, &slug, other).await.unwrap(),
+            SlugState::InUse(n)
+        );
+        // A trashed app (not purged) still holds its slug.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "update nodes set trash_root = id, trashed_at = now() where tenant_id = $1 and id = $2",
+        )
+        .bind(t)
+        .bind(n)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            store.slug_state(t, &slug, other).await.unwrap(),
+            SlugState::InUse(n)
+        );
+        // The purge makes it a tombstone: under the root, with the root as its trash root.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "update nodes set parent_id = r.id, trash_root = r.id from nodes r \
+             where nodes.tenant_id = $1 and nodes.id = $2 and r.tenant_id = $1 \
+             and r.parent_id is null",
+        )
+        .bind(t)
+        .bind(n)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            store.slug_state(t, &slug, other).await.unwrap(),
+            SlugState::Retired
+        );
+        // The same node gets its slug back (a restore is not possible, but the rule holds).
+        assert_eq!(
+            store.slug_state(t, &slug, n).await.unwrap(),
+            SlugState::Free
+        );
+    }
+
     /// The chunk garbage collection reads the chunk lists of app releases (`app_release_v1`)
     /// and of previews that have not ended, and frees the chunks of an expired preview (card
     /// W-2s, P-60; the mutation `apps-deploy-gc-ignores-releases` drops the release lists).
@@ -863,24 +935,11 @@ mod tests {
                 .put_chunk(t, h, bytes::Bytes::from(data.clone()))
                 .await
                 .unwrap();
-            let mut tx = pool.begin().await.unwrap();
-            sqlx::query("set local ruum.system = 'on'")
-                .execute(&mut *tx)
-                .await
-                .unwrap();
-            sqlx::query(
-                "insert into chunks (tenant_id, hash, size_bytes, created_at) \
-                 values ($1, $2, $3, now() - interval '1 hour')",
-            )
-            .bind(t)
-            .bind(h.0.to_vec())
-            .bind(data.len() as i32)
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-            tx.commit().await.unwrap();
             hashes.push((h, data.len() as u32));
         }
+        // The chunk rows come from the store, with each deployment (review W-2s, 3): no row
+        // is written by hand here.
+        let rows = |(h, size): (Hash, u32)| vec![ChunkRef { hash: h, size }];
         let list = |(h, size): (Hash, u32)| {
             Manifest {
                 format: ManifestFormat::ChunksV1,
@@ -895,6 +954,7 @@ mod tests {
         // so only the version keeps the chunk (as after the row is gone).
         let mut r = deployment(n, Environment::Live, DeploymentState::Live);
         r.archive.chunks = list(hashes[0]);
+        r.new_chunks = rows(hashes[0]);
         let released = store
             .release(
                 &c,
@@ -923,9 +983,11 @@ mod tests {
         // A ready preview and an expired one.
         let mut ready = deployment(n, Environment::Preview, DeploymentState::Ready);
         ready.archive.chunks = list(hashes[1]);
+        ready.new_chunks = rows(hashes[1]);
         store.insert_deployment(&c, ready).await.unwrap();
         let mut gone = deployment(n, Environment::Preview, DeploymentState::Ready);
         gone.archive.chunks = list(hashes[2]);
+        gone.new_chunks = rows(hashes[2]);
         let gone = store.insert_deployment(&c, gone).await.unwrap();
         assert!(
             store
@@ -950,6 +1012,24 @@ mod tests {
             .collect_garbage(t, time::Duration::ZERO)
             .await
             .unwrap();
+        let recorded: i64 = {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query("set local ruum.system = 'on'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let n = sqlx::query_scalar("select count(*) from chunks where tenant_id = $1")
+                .bind(t)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            n
+        };
+        assert_eq!(
+            recorded, 2,
+            "the expired preview's row is gone, the others stay"
+        );
         assert_eq!(report.deleted, 1, "{report:?}");
         let have = blobs
             .has_chunks(t, &[hashes[0].0, hashes[1].0, hashes[2].0])

@@ -281,12 +281,26 @@ pub(crate) fn fail_closed(m: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The privacy file of the telemetry at the archive root when the manifest names none.
+const DEFAULT_PRIVACY_FILE: &str = "telemetry-privacy.yaml";
+
 /// The site files of a static manifest: the files under `static.root` (paths relative to it),
-/// without `app.yaml` of the archive root.
+/// without `app.yaml` of the archive root, the telemetry privacy file and the files of
+/// `telemetry.source_maps`, which the contract keeps private and never serves (review W-2s,
+/// Kimi 3).
 pub(crate) fn site_files(
     unpacked: &archive::Unpacked,
     manifest: &Value,
 ) -> Vec<(String, bytes::Bytes)> {
+    let privacy = manifest
+        .pointer("/telemetry/privacy_file")
+        .and_then(Value::as_str)
+        .map(normal_archive_path)
+        .unwrap_or_else(|| DEFAULT_PRIVACY_FILE.to_string());
+    let maps = manifest
+        .pointer("/telemetry/source_maps")
+        .and_then(Value::as_str)
+        .map(Glob::new);
     let root = manifest
         .pointer("/static/root")
         .and_then(Value::as_str)
@@ -296,7 +310,8 @@ pub(crate) fn site_files(
     unpacked
         .entries
         .iter()
-        .filter(|e| !(e.name == "app.yaml"))
+        .filter(|e| e.name != "app.yaml" && e.name != privacy)
+        .filter(|e| !maps.as_ref().is_some_and(|g| g.matches(&e.name)))
         .filter_map(|e| {
             if root.is_empty() {
                 Some((e.name.clone(), e.data.clone()))
@@ -309,6 +324,62 @@ pub(crate) fn site_files(
             }
         })
         .collect()
+}
+
+/// An `archive_path` without `.` and empty segments (`./a//b/` is `a/b`).
+fn normal_archive_path(p: &str) -> String {
+    p.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// An `archive_glob` of the manifest, matched against the names of the archive entries.
+///
+/// `*` matches any run of characters, also `/`, so `*.map` leaves out the maps of every folder:
+/// the glob names files that must never be served, so it errs on the side of matching more. A
+/// glob that ends with `/` (or names `.`) matches everything under that folder. The match is
+/// linear in the name: the parts between the stars are found left to right, and the leftmost
+/// place of each part is always a right choice.
+pub(crate) struct Glob {
+    parts: Vec<String>,
+}
+
+impl Glob {
+    pub(crate) fn new(pattern: &str) -> Self {
+        let mut p = normal_archive_path(pattern);
+        if pattern.ends_with('/') || p.is_empty() {
+            p = if p.is_empty() {
+                "*".into()
+            } else {
+                format!("{p}/*")
+            };
+        }
+        Self {
+            parts: p.split('*').map(str::to_string).collect(),
+        }
+    }
+
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        let (first, rest) = match self.parts.split_first() {
+            Some(x) => x,
+            None => return name.is_empty(),
+        };
+        let Some(mut tail) = name.strip_prefix(first.as_str()) else {
+            return false;
+        };
+        let Some((last, middle)) = rest.split_last() else {
+            // No star: the whole name.
+            return tail.is_empty();
+        };
+        for part in middle {
+            match tail.find(part.as_str()) {
+                Some(at) => tail = &tail[at + part.len()..],
+                None => return false,
+            }
+        }
+        tail.ends_with(last.as_str())
+    }
 }
 
 impl AppService {
@@ -395,6 +466,16 @@ impl AppService {
             Some("application/octet-stream"),
         )
         .await?;
+        // Every chunk of the archive gets a `chunks` row (an existing row is marked again), so
+        // the garbage collection can free the archive once nothing names it (review W-2s, 3).
+        // All chunks, not only the ones stored now: an object can exist without a row.
+        let mut seen = std::collections::HashSet::new();
+        let new_chunks: Vec<crate::blobs::ChunkRef> = archive_manifest
+            .chunks
+            .iter()
+            .filter(|c| seen.insert(c.hash))
+            .copied()
+            .collect();
         let archive = Archive {
             content_hash: archive_manifest.content_hash.0,
             size: archive_bytes.len() as i64,
@@ -418,6 +499,7 @@ impl AppService {
                 stages: stages.clone(),
                 published_from: None,
                 expires_at: Some(now + time::Duration::days(i64::from(plan.preview_days))),
+                new_chunks: new_chunks.clone(),
             };
             match self.deps.store.insert_deployment(ctx, d).await {
                 Ok(r) => {
@@ -501,11 +583,24 @@ impl AppService {
                 ));
             }
         };
+        // A person goes live at once, an agent asks a person (decision 0006-4); every other
+        // principal (an app, a group) is refused, so a new kind never goes live by default
+        // (review W-2s, 4).
         if ctx.actor.is_agent() {
             let approval = self.request_approval(ctx, &row, &dep, public_url).await?;
             return Ok(Published::ApprovalRequired(json!({ "approval": approval })));
         }
-        let released = self.go_live(ctx, &row, &dep, kind, None).await?;
+        if !ctx.actor.is_user() {
+            return Err(Error::user_required());
+        }
+        // A rollback is the same as `restoreVersion` of the old deployment's version: the new
+        // version records where it came from, and the journal has `version.restored` (review
+        // W-2s, 5).
+        let restored_from = match kind {
+            ReleaseKind::Rollback => dep.version_id,
+            ReleaseKind::Publish => None,
+        };
+        let released = self.go_live(ctx, &row, &dep, kind, restored_from).await?;
         Ok(Published::Live(Box::new(deployment_view(
             &released.deployment,
             &urls,
@@ -521,7 +616,7 @@ impl AppService {
         version: VersionId,
     ) -> Result<Written<Version>> {
         let (_, row) = self.editable_app(ctx, app).await?;
-        let (_, deployment) = self
+        let (release, deployment) = self
             .deps
             .store
             .release_of(ctx.tenant, app, version)
@@ -537,6 +632,21 @@ impl AppService {
                 .with_hint("publishAppDeployment")
                 .with_details(json!({ "deployment_id": deployment })),
             ));
+        }
+        if !ctx.actor.is_user() {
+            return Err(Error::user_required());
+        }
+        // The release that is live now: nothing to do, as `publishAppDeployment` of the live
+        // deployment (no copy, no `app.rolled_back` from a deployment to itself; review W-2s, 6).
+        if row.live_deployment_id == Some(deployment) {
+            return Ok(Written {
+                value: release,
+                change: crate::journal::ChangeInfo {
+                    seq: None,
+                    actor: ctx.actor,
+                    at: crate::now(),
+                },
+            });
         }
         let dep = self
             .deps
@@ -651,6 +761,7 @@ impl AppService {
                 manifest: Some(manifest.clone()),
                 stages: stages::release(now),
                 published_from: Some(dep.id),
+                new_chunks: Vec::new(),
                 expires_at: None,
             };
             self.deps
