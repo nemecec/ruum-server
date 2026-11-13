@@ -309,11 +309,13 @@ async fn active_flags_are_one_write_also_on_rollback() {
         inner: w.authz.clone(),
         writes: Mutex::new(Vec::new()),
     });
-    let hook = ActiveRoles::new(rec.clone());
+    let hook = ActiveRoles::new(rec.clone(), w.s.apps.roles().clone());
     let rec = |_: &ActiveRoles| rec.writes.lock().unwrap().clone();
     let no_admin: Value = serde_json::from_str(NO_ADMIN).unwrap();
     let roles: Value = serde_json::from_str(ROLES).unwrap();
-    hook.sync(w.app, Some(&no_admin)).await.unwrap();
+    hook.sync(w.team.id, w.app, None, Some(&no_admin))
+        .await
+        .unwrap();
     let writes = rec(&hook);
     assert_eq!(writes.len(), 1, "one engine write per live change");
     let first = &writes[0];
@@ -327,14 +329,16 @@ async fn active_flags_are_one_write_also_on_rollback() {
     assert!(deletes(first, &active_tuple(w.app, "admin")));
     assert!(deletes(first, &active_role_tuple(w.app, "admin")));
     assert!(deletes(first, &granter_tuple(w.app, "member", "admin")));
-    hook.sync(w.app, Some(&roles)).await.unwrap();
+    hook.sync(w.team.id, w.app, None, Some(&roles))
+        .await
+        .unwrap();
     let writes = rec(&hook);
     assert_eq!(writes.len(), 2, "the rollback is one write too");
     let back = &writes[1];
     assert!(touches(back, &active_tuple(w.app, "admin")));
     assert!(touches(back, &active_role_tuple(w.app, "admin")));
     assert!(touches(back, &granter_tuple(w.app, "approver", "admin")));
-    hook.sync(w.app, None).await.unwrap();
+    hook.sync(w.team.id, w.app, None, None).await.unwrap();
     let writes = rec(&hook);
     let none = &writes[2];
     for r in ["member", "approver", "admin"] {
@@ -649,6 +653,16 @@ impl RoleStore for CountingRoles {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.bind_email(c, a, e, u).await
     }
+    async fn remove_app(
+        &self,
+        t: TenantId,
+        a: &dyn Authz,
+        app: NodeId,
+        also: Vec<RelationshipUpdate>,
+    ) -> Result<usize> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.remove_app(t, a, app, also).await
+    }
 }
 
 /// The calls of one holder page of `role` with `limit`: (engine calls, role store calls,
@@ -777,8 +791,8 @@ async fn holders_page_and_the_default_role_costs_one_page() {
         large.0
     );
     assert!(
-        large.1 == 0 && small.1 == 0,
-        "the default role reads no grant rows"
+        large.1 == 1 && small.1 == 1,
+        "the first page of the default role reads one page of its own grants (none here)"
     );
     assert!(large.0 >= small.0);
     for _ in 0..40 {
@@ -874,5 +888,500 @@ async fn the_services_register_the_live_release_hook() {
             .check(&subject, "has", &role_object(w.app, "admin"), None)
             .await
             .unwrap()
+    );
+}
+
+// ------------------------------------------------------------------ review fixes
+
+/// An engine whose reads see nothing (a stale read on another server) and that records its
+/// writes.
+struct Blind {
+    inner: Arc<dyn Authz>,
+    writes: Mutex<Vec<Vec<RelationshipUpdate>>>,
+}
+
+#[async_trait]
+impl Authz for Blind {
+    async fn check(
+        &self,
+        s: &SubjectRef,
+        p: &str,
+        o: &ObjectRef,
+        t: Option<&ConsistencyToken>,
+    ) -> Result<bool> {
+        self.inner.check(s, p, o, t).await
+    }
+    async fn check_bulk(&self, s: &SubjectRef, p: &str, o: &[ObjectRef]) -> Result<Vec<bool>> {
+        self.inner.check_bulk(s, p, o).await
+    }
+    async fn write(&self, u: Vec<RelationshipUpdate>) -> Result<ConsistencyToken> {
+        self.writes.lock().unwrap().push(u.clone());
+        self.inner.write(u).await
+    }
+    async fn read(&self, _: &ObjectRef) -> Result<Vec<Relationship>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A stale graph read does not keep a removed role active: the roles of `before` and of the
+/// grant rows are switched off too, in the one write, with no update named twice.
+#[tokio::test]
+async fn a_stale_read_still_switches_off_the_roles_that_left() {
+    let w = world().await;
+    w.grant(&w.c(w.member), "admin", w.guest).await.unwrap();
+    let blind = Arc::new(Blind {
+        inner: w.authz.clone(),
+        writes: Mutex::new(Vec::new()),
+    });
+    let hook = ActiveRoles::new(blind.clone(), w.s.apps.roles().clone());
+    let roles: Value = serde_json::from_str(ROLES).unwrap();
+    let no_admin: Value = serde_json::from_str(NO_ADMIN).unwrap();
+    super::super::deployments::LiveReleaseHook::live_changed(
+        &hook,
+        w.team.id,
+        w.app,
+        Some(&roles),
+        &no_admin,
+        &w.c(w.member).actor,
+    )
+    .await
+    .unwrap();
+    let writes = blind.writes.lock().unwrap().clone();
+    assert_eq!(writes.len(), 1, "one engine write");
+    let one = &writes[0];
+    assert!(deletes(one, &active_tuple(w.app, "admin")));
+    assert!(deletes(one, &active_role_tuple(w.app, "admin")));
+    assert!(deletes(one, &granter_tuple(w.app, "member", "admin")));
+    assert!(deletes(one, &granter_tuple(w.app, "approver", "admin")));
+    for (i, u) in one.iter().enumerate() {
+        assert!(!one[i + 1..].contains(u), "{u:?} is named twice");
+    }
+    let subject = SubjectRef::user(w.guest);
+    assert!(
+        !w.authz
+            .check(&subject, "has", &role_object(w.app, "admin"), None)
+            .await
+            .unwrap(),
+        "the removed role gives nothing"
+    );
+    // Without `before` (a repair), the grant rows still name the role.
+    hook.sync(w.team.id, w.app, None, Some(&roles))
+        .await
+        .unwrap();
+    hook.sync(w.team.id, w.app, None, Some(&no_admin))
+        .await
+        .unwrap();
+    let writes = blind.writes.lock().unwrap().clone();
+    assert!(deletes(&writes[2], &active_tuple(w.app, "admin")));
+}
+
+/// An explicit grant of the default role is listed among its holders (it gives `use` and the
+/// role on its own); the implicit holders follow, without repeats.
+#[tokio::test]
+async fn explicit_grants_of_the_default_role_are_holders() {
+    let w = world().await;
+    let m = w.c(w.member);
+    w.grant(&m, "member", w.guest).await.unwrap();
+    w.grant(&m, "member", w.viewer).await.unwrap();
+    assert_eq!(w.roles_of(Some(w.guest)).await, ["member"]);
+    let walk = |limit: u32| {
+        let w = &w;
+        async move {
+            let mut all = Vec::new();
+            let mut cursor = None;
+            loop {
+                let p =
+                    w.s.apps
+                        .role_holders(
+                            &w.c(w.owner),
+                            w.app,
+                            "member",
+                            PageRequest {
+                                cursor,
+                                limit: Some(limit),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                all.extend(p.items);
+                match p.next_cursor {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            all
+        }
+    };
+    for limit in [1, 2, 50] {
+        let mut all = walk(limit).await;
+        all.sort_by_key(|h| format!("{h:?}"));
+        let mut want = vec![
+            Holder::User(w.guest),
+            Holder::User(w.viewer),
+            Holder::User(w.owner),
+            Holder::User(w.member),
+        ];
+        want.sort_by_key(|h| format!("{h:?}"));
+        assert_eq!(all, want, "limit {limit}");
+    }
+    // A `tenant_members` grant of the default role is everybody, never the member list.
+    w.s.apps
+        .add_app_role_grant(
+            &m,
+            w.app,
+            AddRoleGrant {
+                role: "member".into(),
+                grantee: Grantee::TenantMembers,
+                notify: false,
+            },
+        )
+        .await
+        .unwrap();
+    let mut all = walk(50).await;
+    all.sort_by_key(|h| format!("{h:?}"));
+    let mut want = vec![
+        Holder::User(w.guest),
+        Holder::User(w.viewer),
+        Holder::Everyone,
+    ];
+    want.sort_by_key(|h| format!("{h:?}"));
+    assert_eq!(all, want);
+    // A cursor of an explicit role is not one of the default role's members.
+    let bad = holder_cursor("m", "");
+    assert_eq!(
+        code(
+            w.s.apps
+                .role_holders(
+                    &w.c(w.owner),
+                    w.app,
+                    "approver",
+                    PageRequest {
+                        cursor: Some(bad),
+                        limit: None,
+                    },
+                )
+                .await
+        )
+        .0,
+        400
+    );
+}
+
+/// While the tenant does not allow guests, an email that resolves to a guest is refused as
+/// the guest's user ID is: for a person and for their agent.
+#[tokio::test]
+async fn an_email_of_a_guest_is_refused_while_guests_are_off() {
+    let w = world().await;
+    let (_, guest_email) = user(&w.s, &w.team, w.owner, MemberRole::Guest).await;
+    w.s.tenants
+        .update(
+            &w.c(w.owner),
+            None,
+            Some(crate::tenants::TenantPolicyChange {
+                allow_guests: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let by_email = |c: Context| {
+        let w = &w;
+        let email = guest_email.clone();
+        async move {
+            w.s.apps
+                .add_app_role_grant(
+                    &c,
+                    w.app,
+                    AddRoleGrant {
+                        role: "approver".into(),
+                        grantee: Grantee::Email { email },
+                        notify: false,
+                    },
+                )
+                .await
+        }
+    };
+    assert_eq!(code(by_email(w.c(w.member)).await).0, 403);
+    let agent = w.agent(w.member, Role::Manage).await;
+    assert_eq!(code(by_email(agent.clone()).await).0, 403);
+    assert_eq!(
+        code(w.grant(&w.c(w.member), "approver", w.guest).await).0,
+        403
+    );
+    assert_eq!(code(w.grant(&agent, "approver", w.guest).await).0, 403);
+    assert!(
+        w.s.apps
+            .roles()
+            .counts(w.team.id, w.app)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing was granted"
+    );
+    // A member's email still becomes a user grant.
+    let (fern, fern_email) = user(&w.s, &w.team, w.owner, MemberRole::Member).await;
+    let g =
+        w.s.apps
+            .add_app_role_grant(
+                &w.c(w.member),
+                w.app,
+                AddRoleGrant {
+                    role: "approver".into(),
+                    grantee: Grantee::Email { email: fern_email },
+                    notify: false,
+                },
+            )
+            .await
+            .unwrap();
+    assert_eq!(g.value.grantee, Grantee::User { id: fern });
+}
+
+/// Every relation of the role objects of `app` and the node's `active_role` tuples.
+async fn role_tuples(w: &World) -> Vec<Relationship> {
+    let mut out = Vec::new();
+    for r in ["member", "approver", "admin"] {
+        out.extend(w.authz.read(&role_object(w.app, r)).await.unwrap());
+    }
+    out.extend(
+        w.authz
+            .read(&ObjectRef::node(w.app))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.relation == "active_role"),
+    );
+    out
+}
+
+/// The purge of an app with a user grant, a `tenant_members` grant and an email grant succeeds
+/// and leaves no grant row and no tuple of its roles.
+#[tokio::test]
+async fn the_purge_of_an_app_deletes_its_role_grants_and_tuples() {
+    let w = world().await;
+    let m = w.c(w.member);
+    w.grant(&m, "approver", w.guest).await.unwrap();
+    for grantee in [
+        Grantee::TenantMembers,
+        Grantee::Email {
+            email: "fern@example.test".into(),
+        },
+    ] {
+        w.s.apps
+            .add_app_role_grant(
+                &m,
+                w.app,
+                AddRoleGrant {
+                    role: "admin".into(),
+                    grantee,
+                    notify: false,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert!(!role_tuples(&w).await.is_empty());
+    let o = w.c(w.owner);
+    w.s.nodes.trash(&o, w.app, None).await.unwrap();
+    w.s.nodes.purge(&o, w.app).await.unwrap();
+    crate::providers::deliveries::DeliveryWorker::new(
+        w.s.typed_nodes.clone(),
+        w.s.providers.clone(),
+        crate::providers::deliveries::Backoff::default(),
+    )
+    .run_once(100)
+    .await
+    .unwrap();
+    assert!(
+        w.s.apps
+            .store()
+            .get_app(w.team.id, w.app)
+            .await
+            .unwrap()
+            .is_none(),
+        "the purge finished"
+    );
+    assert!(
+        w.s.apps
+            .roles()
+            .counts(w.team.id, w.app)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(role_tuples(&w).await, Vec::<Relationship>::new());
+}
+
+/// A hook that makes another release live while a publish is under way (the publish that wins
+/// the compare-and-set), once.
+struct Winner {
+    store: Arc<dyn crate::apps::AppStore>,
+    ctx: Context,
+    manifest: Value,
+    fired: Mutex<bool>,
+}
+
+#[async_trait]
+impl crate::apps::deployments::LiveReleaseHook for Winner {
+    async fn live_changed(
+        &self,
+        _tenant: TenantId,
+        app: NodeId,
+        _before: Option<&Value>,
+        _after: &Value,
+        _actor: &Actor,
+    ) -> Result<()> {
+        if std::mem::replace(&mut *self.fired.lock().unwrap(), true) {
+            return Ok(());
+        }
+        self.store
+            .insert_deployment(
+                &self.ctx,
+                NewDeployment {
+                    id: Uuid::now_v7(),
+                    app_node_id: app,
+                    environment: Environment::Live,
+                    state: DeploymentState::Live,
+                    short_id: crate::apps::slugs::short_id(),
+                    label: None,
+                    draft: None,
+                    source: DeploymentSource {
+                        kind: "file".into(),
+                        node_id: Some(NodeId::new()),
+                        version_id: Some(VersionId::new()),
+                        files: None,
+                    },
+                    archive: Archive {
+                        content_hash: [2; 32],
+                        size: 3,
+                        chunks: vec![1],
+                    },
+                    manifest: Some(self.manifest.clone()),
+                    stages: json!([]),
+                    published_from: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+/// Two publishes race: the loser's hook has written the flags of its manifest, then its live
+/// switch fails. The service writes the flags of the real live manifest again, so a role that
+/// only the loser declares is not active afterwards.
+#[tokio::test]
+async fn the_loser_of_a_publish_race_leaves_no_role_active() {
+    let w = world().await;
+    let m = w.c(w.member);
+    w.grant(&m, "admin", w.guest).await.unwrap();
+    w.release(NO_ADMIN).await;
+    let has_admin = || async {
+        w.authz
+            .check(
+                &SubjectRef::user(w.guest),
+                "has",
+                &role_object(w.app, "admin"),
+                None,
+            )
+            .await
+            .unwrap()
+    };
+    assert!(!has_admin().await);
+    // A preview whose manifest declares `admin` again.
+    let folder =
+        w.s.nodes
+            .create(
+                &m,
+                NewNode {
+                    parent_id: w.team.root_node_id,
+                    name: "site".into(),
+                    kind: NodeKind::Folder,
+                    node_type: None,
+                    link: None,
+                    on_conflict: OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .id;
+    let yaml: &[u8] = b"runtime: static\nroles:\n  member:\n    description: Can use the planner\n    default: true\n  approver:\n    description: Can approve orders\n  admin:\n    description: Can grant app roles\n    grants_roles: true\n";
+    for (name, data) in [
+        ("app.yaml", yaml),
+        ("index.html", b"<!doctype html><h1>Plants</h1>\n".as_slice()),
+    ] {
+        let node =
+            w.s.nodes
+                .create(
+                    &m,
+                    NewNode {
+                        parent_id: folder,
+                        name: name.into(),
+                        kind: NodeKind::File,
+                        node_type: None,
+                        link: None,
+                        on_conflict: OnConflict::Fail,
+                    },
+                )
+                .await
+                .unwrap()
+                .value
+                .id;
+        w.s.transfers
+            .put_content(&m, node, bytes::Bytes::copy_from_slice(data), None, None)
+            .await
+            .unwrap();
+    }
+    let preview =
+        w.s.apps
+            .create_deployment(
+                &m,
+                w.app,
+                crate::apps::deployments::CreateDeployment {
+                    source: crate::apps::deployments::SourceRequest {
+                        kind: "folder".into(),
+                        node_id: folder,
+                        version_id: None,
+                    },
+                    label: None,
+                    draft: None,
+                },
+            )
+            .await
+            .unwrap();
+    let mut ready = false;
+    for _ in 0..200 {
+        let d =
+            w.s.apps
+                .get_deployment(&m, w.app, preview.id, std::time::Duration::from_millis(200))
+                .await
+                .unwrap();
+        if !d.state.is_moving() {
+            assert_eq!(d.state, DeploymentState::Ready, "{:?}", d.stages);
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "the preview settled");
+    w.s.apps.add_live_hook(Arc::new(Winner {
+        store: w.s.apps.store().clone(),
+        ctx: m.clone(),
+        manifest: serde_json::from_str(NO_ADMIN).unwrap(),
+        fired: Mutex::new(false),
+    }));
+    let lost =
+        w.s.apps
+            .publish_deployment(
+                &m,
+                w.app,
+                preview.id,
+                crate::apps::deployments::PublishDeployment::default(),
+                "https://ruum.test",
+            )
+            .await;
+    assert!(lost.is_err(), "the other publish won the switch");
+    assert!(
+        !has_admin().await,
+        "the loser's manifest declared admin, the live one does not"
     );
 }

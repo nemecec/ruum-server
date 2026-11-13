@@ -225,4 +225,34 @@ impl RoleStore for MemoryRoleStore {
         }
         Ok(bound)
     }
+
+    async fn remove_app(
+        &self,
+        tenant: TenantId,
+        authz: &dyn Authz,
+        app: NodeId,
+        also: Vec<RelationshipUpdate>,
+    ) -> Result<usize> {
+        let gone: Vec<RoleGrant> = self
+            .rows()
+            .values()
+            .filter(|g| g.tenant_id == tenant && g.app_id == app)
+            .cloned()
+            .collect();
+        let mut updates: Vec<RelationshipUpdate> = gone
+            .iter()
+            .filter_map(RoleGrant::tuple)
+            .map(RelationshipUpdate::Delete)
+            .collect();
+        updates.extend(also);
+        let updates = without_repeats(updates);
+        if !updates.is_empty() {
+            authz.write(updates).await?;
+        }
+        let mut rows = self.rows();
+        for g in &gone {
+            rows.remove(&(tenant, g.id));
+        }
+        Ok(gone.len())
+    }
 }

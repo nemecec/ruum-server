@@ -675,6 +675,9 @@ impl AppService {
                 Ok(r)
             }
             Err(e) => {
+                // The hooks may have run for a switch that did not happen (card B-2).
+                self.repair_after_failed_switch(ctx.tenant, app.node_id)
+                    .await;
                 // Nothing went live: drop the copied index (the files stay, they are shared).
                 if let Err(d) = self.deps.sites.delete_index(ctx.tenant, id).await {
                     tracing::warn!(tenant = %ctx.tenant, error = %d, "could not delete an unused site index");

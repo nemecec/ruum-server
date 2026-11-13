@@ -313,11 +313,82 @@ pub(crate) async fn email_grants_bind(h: &dyn Harness) {
     );
 }
 
+/// The purge of an app deletes all its grants (user, `tenant_members`, email) with their
+/// `holder` tuples and the extra tuple updates, and nothing of another app or tenant.
+pub(crate) async fn remove_app_deletes_its_grants(h: &dyn Harness) {
+    let authz = MemoryAuthz::default();
+    let s = h.store();
+    let (t, u) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let app = h.app(t, u).await;
+    let kept = h.app(t, u).await;
+    let theirs = h.app(b, ub).await;
+    let c = ctx(t, u);
+    let fern = UserId::new();
+    for grantee in [
+        Grantee::User { id: fern },
+        Grantee::TenantMembers,
+        Grantee::Email {
+            email: "fern@example.test".into(),
+        },
+    ] {
+        s.add(&c, &authz, new_grant(app, "approver", grantee))
+            .await
+            .unwrap();
+    }
+    s.add(
+        &c,
+        &authz,
+        new_grant(kept, "approver", Grantee::User { id: fern }),
+    )
+    .await
+    .unwrap();
+    s.add(
+        &ctx(b, ub),
+        &authz,
+        new_grant(theirs, "approver", Grantee::User { id: ub }),
+    )
+    .await
+    .unwrap();
+    authz
+        .write(vec![RelationshipUpdate::Touch(active_tuple(
+            app, "approver",
+        ))])
+        .await
+        .unwrap();
+    // Another tenant removes nothing, also with this app's ID.
+    assert_eq!(s.remove_app(b, &authz, app, Vec::new()).await.unwrap(), 0);
+    assert_eq!(holders(&authz, app, "approver").await.len(), 2);
+    let n = s
+        .remove_app(
+            t,
+            &authz,
+            app,
+            vec![RelationshipUpdate::Delete(active_tuple(app, "approver"))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+    assert!(s.counts(t, app).await.unwrap().is_empty());
+    assert!(
+        authz
+            .read(&role_object(app, "approver"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "no holder and no flag is left"
+    );
+    assert_eq!(s.counts(t, kept).await.unwrap().get("approver"), Some(&1));
+    assert_eq!(holders(&authz, kept, "approver").await.len(), 1);
+    assert_eq!(s.counts(b, theirs).await.unwrap().get("approver"), Some(&1));
+}
+
 pub(crate) async fn run_all(h: &dyn Harness) {
     grants_write_rows_and_tuples(h).await;
     lists_page_and_filter(h).await;
     grants_stay_in_their_tenant(h).await;
     email_grants_bind(h).await;
+    remove_app_deletes_its_grants(h).await;
 }
 
 #[cfg(test)]
@@ -500,6 +571,38 @@ mod tests {
             pool,
         };
         grants_stay_in_their_tenant(&h).await;
+        remove_app_deletes_its_grants(&h).await;
+    }
+
+    /// After the grants of an app are removed, the app store's purge deletes the app row
+    /// (`app_role_grants` refers to `apps`, so it failed while grants were left).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_app_purge_passes_after_the_grants_go(pool: sqlx::PgPool) {
+        use crate::apps::AppStore as _;
+        let store = PgRoleStore::new(pool.clone());
+        let apps = crate::apps::store::postgres::PgAppStore::new(pool.clone());
+        let (t, u) = pg_tenant(&pool).await;
+        let app = pg_app(&pool, t, u).await;
+        let authz = MemoryAuthz::default();
+        store
+            .add(
+                &ctx(t, u),
+                &authz,
+                new_grant(app, "approver", Grantee::TenantMembers),
+            )
+            .await
+            .unwrap();
+        assert!(
+            apps.remove_app(t, app).await.is_err(),
+            "the grant row holds the app row"
+        );
+        assert_eq!(
+            store.remove_app(t, &authz, app, Vec::new()).await.unwrap(),
+            1
+        );
+        apps.remove_app(t, app).await.unwrap();
+        assert!(apps.get_app(t, app).await.unwrap().is_none());
+        assert!(holders(&authz, app, "approver").await.is_empty());
     }
 
     /// An engine that refuses every write (SpiceDB down, or a crash after the commit).

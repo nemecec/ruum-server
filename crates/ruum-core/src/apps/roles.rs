@@ -15,9 +15,16 @@
 //!   [`ActiveRoles`] writes them on every live change in **one** engine write (decision 0006 S4).
 //!   A role that a new release removes loses `active` and `active_role`: its grants stay and give
 //!   nothing (neither `use` nor `grant`); a rollback to a release that declares it writes them
-//!   again.
-//! - The default role is not in the graph: [`AppService::effective_roles`] gives it to a person
-//!   with `view` on the app node and no explicit active role.
+//!   again. The roles to switch off are the roles of the graph, of the manifest that was live
+//!   before and of the grant rows, so a stale graph read cannot leave a role active. When a live
+//!   switch fails after the hooks ran, the service writes the flags of the real live manifest
+//!   again ([`AppService::repair_after_failed_switch`]).
+//! - The default role has no implicit tuples: [`AppService::effective_roles`] gives it to a
+//!   person with `view` on the app node and no explicit active role. It can also be granted
+//!   explicitly (for example to a guest without `view`); [`AppService::role_holders`] lists those
+//!   grants first, then the implicit holders.
+//! - The purge of an app ([`RolePurge`]) deletes its grant rows and every tuple of its roles
+//!   before the provider deletes the app rows.
 //!
 //! # Who may change grants
 //!
@@ -32,8 +39,9 @@
 //!
 //! The grantee follows `addGrant`: a user must be a member or guest of the tenant (a guest only
 //! while the tenant allows guests); an email of a verified person of the tenant becomes a user
-//! grant for callers who may list the members; any other email stays an email grant while the
-//! tenant allows guests.
+//! grant for callers who may list the members, and then follows the rule of a user (an email of
+//! a guest is refused while the tenant does not allow guests); any other email stays an email
+//! grant while the tenant allows guests.
 //!
 //! # Rows and tuples
 //!
@@ -240,15 +248,35 @@ pub fn active_updates(
 
 // ---------------------------------------------------------------------------- the hook
 
+/// The updates without repeats, in their first order. SpiceDB refuses a write that names one
+/// relationship twice; a touch and a delete of the same tuple never meet ([`active_updates`]
+/// keeps them apart), so only exact repeats go.
+pub fn without_repeats(updates: Vec<RelationshipUpdate>) -> Vec<RelationshipUpdate> {
+    let mut seen = Vec::with_capacity(updates.len());
+    for u in updates {
+        if !seen.contains(&u) {
+            seen.push(u);
+        }
+    }
+    seen
+}
+
 /// The active flags of app roles (the plan's seam 2): on every live change (publish, rollback)
 /// it writes the tuples of [`active_updates`] in one engine write. An error fails the publish.
+///
+/// The roles to switch off come from three sources, because a graph read can be stale (SpiceDB
+/// answers a read at the request floor or this server's last token, so a read on another server
+/// can miss a tuple that was just written): the graph now, the roles of the manifest that was
+/// live before (`before`), and the roles that have grant rows (the store is strongly consistent).
+/// Deleting a tuple that is not there changes nothing, so the union is safe.
 pub struct ActiveRoles {
     authz: Arc<dyn Authz>,
+    roles: Arc<dyn RoleStore>,
 }
 
 impl ActiveRoles {
-    pub fn new(authz: Arc<dyn Authz>) -> Self {
-        Self { authz }
+    pub fn new(authz: Arc<dyn Authz>, roles: Arc<dyn RoleStore>) -> Self {
+        Self { authz, roles }
     }
 
     /// The active roles and granter tuples of `app` in the graph now.
@@ -275,13 +303,47 @@ impl ActiveRoles {
         Ok(s)
     }
 
-    /// Makes the graph of `app` match the live manifest `after` (`None`: no live deployment).
-    /// One engine write, also when nothing changes (touches are idempotent), so a repeat repairs
-    /// a graph that a failed earlier call left behind.
-    pub async fn sync(&self, app: NodeId, after: Option<&Value>) -> Result<()> {
-        let now = self.state(app).await?;
+    /// The state to correct: the graph ([`Self::state`]) plus every role of `before` (with the
+    /// granter tuples of its `grants_roles` role) and every role with grant rows.
+    async fn known_state(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        before: Option<&Value>,
+    ) -> Result<ActiveState> {
+        let mut s = self.state(app).await?;
+        if let Some(b) = before {
+            let old = manifest_roles(b);
+            let granter = old.iter().find(|r| r.grants_roles).map(|r| r.name.clone());
+            for r in &old {
+                s.active.insert(r.name.clone());
+                if let Some(g) = &granter {
+                    s.granters.insert((r.name.clone(), g.clone()));
+                }
+            }
+        }
+        for role in self.roles.counts(tenant, app).await?.into_keys() {
+            if valid_role_name(&role) {
+                s.active.insert(role);
+            }
+        }
+        Ok(s)
+    }
+
+    /// Makes the graph of `app` match the live manifest `after` (`None`: no live deployment);
+    /// `before` is the manifest that was live until now, when the caller knows it. One engine
+    /// write, also when nothing changes (touches are idempotent), so a repeat repairs a graph
+    /// that a failed earlier call left behind.
+    pub async fn sync(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        before: Option<&Value>,
+        after: Option<&Value>,
+    ) -> Result<()> {
+        let now = self.known_state(tenant, app, before).await?;
         let roles = after.map(manifest_roles).unwrap_or_default();
-        let updates = active_updates(app, &now, &roles);
+        let updates = without_repeats(active_updates(app, &now, &roles));
         if updates.is_empty() {
             return Ok(());
         }
@@ -293,19 +355,82 @@ impl ActiveRoles {
 
 /// The live-release hook of the deployments (`super::deployments::LiveReleaseHook`): the
 /// service calls it before it switches the live deployment, with the manifest that becomes live.
-/// It reads the graph, not `before`, so a switch that failed after an earlier call is repaired
-/// by the next one.
+/// It switches off the roles of the graph, of `before` and of the grant rows that `after` does
+/// not declare, so neither a stale read nor a switch that failed after an earlier call leaves a
+/// role active.
 #[async_trait]
 impl super::deployments::LiveReleaseHook for ActiveRoles {
     async fn live_changed(
         &self,
-        _tenant: TenantId,
+        tenant: TenantId,
         app: NodeId,
-        _before: Option<&Value>,
+        before: Option<&Value>,
         after: &Value,
         _actor: &Actor,
     ) -> Result<()> {
-        self.sync(app, Some(after)).await
+        self.sync(tenant, app, before, Some(after)).await
+    }
+}
+
+/// The purge of an app (`super::provider::PurgeHook`): deletes every role grant of the app and
+/// every tuple of its roles (`holder`, `app`, `active`, `granter` and the node's `active_role`)
+/// before the provider deletes the app rows (`app_role_grants` refers to `apps`).
+pub struct RolePurge {
+    authz: Arc<dyn Authz>,
+    roles: Arc<dyn RoleStore>,
+    store: Arc<dyn super::AppStore>,
+}
+
+impl RolePurge {
+    pub fn new(
+        authz: Arc<dyn Authz>,
+        roles: Arc<dyn RoleStore>,
+        store: Arc<dyn super::AppStore>,
+    ) -> Self {
+        Self {
+            authz,
+            roles,
+            store,
+        }
+    }
+}
+
+#[async_trait]
+impl super::provider::PurgeHook for RolePurge {
+    async fn app_purged(&self, tenant: TenantId, app: NodeId) -> Result<()> {
+        // Every role the app can have tuples of: the graph, the grant rows and the live manifest.
+        let flags = ActiveRoles::new(self.authz.clone(), self.roles.clone());
+        let mut known = flags.known_state(tenant, app, None).await?;
+        if let Some(row) = self.store.get_app(tenant, app).await?
+            && let Some(live) = row.live_deployment_id
+            && let Some(m) = self
+                .store
+                .get_deployment(tenant, app, live)
+                .await?
+                .and_then(|d| d.manifest)
+        {
+            let live = manifest_roles(&m);
+            let granter = live.iter().find(|r| r.grants_roles).map(|r| r.name.clone());
+            for r in live {
+                if let Some(g) = &granter {
+                    known.granters.insert((r.name.clone(), g.clone()));
+                }
+                known.active.insert(r.name);
+            }
+        }
+        let mut deletes = Vec::new();
+        for r in &known.active {
+            deletes.push(RelationshipUpdate::Delete(app_tuple(app, r)));
+            deletes.push(RelationshipUpdate::Delete(active_tuple(app, r)));
+            deletes.push(RelationshipUpdate::Delete(active_role_tuple(app, r)));
+        }
+        for (r, g) in &known.granters {
+            deletes.push(RelationshipUpdate::Delete(granter_tuple(app, r, g)));
+        }
+        self.roles
+            .remove_app(tenant, &*self.authz, app, without_repeats(deletes))
+            .await
+            .map(|_| ())
     }
 }
 
@@ -424,6 +549,18 @@ pub trait RoleStore: Send + Sync {
         authz: &dyn Authz,
         email: &str,
         user: UserId,
+    ) -> Result<usize>;
+
+    /// Deletes every grant of `app` in `tenant` (the purge of the app) and, with their
+    /// `holder` tuples, the tuple updates `also` (the role flags of the app): the Postgres store
+    /// in one transaction through the outbox. No journal entry: the app node is gone. Returns
+    /// how many grants went.
+    async fn remove_app(
+        &self,
+        tenant: TenantId,
+        authz: &dyn Authz,
+        app: NodeId,
+        also: Vec<RelationshipUpdate>,
     ) -> Result<usize>;
 }
 
@@ -544,14 +681,39 @@ impl AppService {
 
     /// The hook that keeps the active flags (register it with the live-release hooks).
     pub fn active_roles(&self) -> ActiveRoles {
-        ActiveRoles::new(self.deps().authz.clone())
+        ActiveRoles::new(self.deps().authz.clone(), self.deps().roles.clone())
+    }
+
+    /// The purge hook of the role grants (register it with the provider's purge hooks).
+    pub fn role_purge(&self) -> RolePurge {
+        RolePurge::new(
+            self.deps().authz.clone(),
+            self.deps().roles.clone(),
+            self.deps().store.clone(),
+        )
     }
 
     /// Writes the active flags of `app` from its live manifest now (the fixtures, which seed a
     /// live deployment through the store; a repair after a failed hook).
     pub async fn sync_active_roles(&self, tenant: TenantId, app: NodeId) -> Result<()> {
         let live = live_manifest(self, tenant, app).await?;
-        self.active_roles().sync(app, live.as_ref()).await
+        self.active_roles()
+            .sync(tenant, app, None, live.as_ref())
+            .await
+    }
+
+    /// Called when a live switch failed after the live-release hooks ran (a concurrent publish
+    /// won the compare-and-set, a later hook or the store failed): the hooks may have written the
+    /// flags of a manifest that never went live, which could open the app to the holders of a
+    /// role that is not live. Writes the flags of the real live manifest again. A failure here
+    /// is logged; the caller returns its own error.
+    pub(crate) async fn repair_after_failed_switch(&self, tenant: TenantId, app: NodeId) {
+        if let Err(e) = self.sync_active_roles(tenant, app).await {
+            tracing::error!(
+                tenant = %tenant, app = %app, error = %e,
+                "could not repair the app role flags after a failed live switch"
+            );
+        }
     }
 
     /// The roles of the live manifest of `app` (empty without a live deployment).
@@ -710,19 +872,14 @@ impl AppService {
             .await
     }
 
-    /// The grantee of a new grant, as `addGrant` stores it (see the module docs).
+    /// The grantee of a new grant, as `addGrant` stores it (see the module docs). An email is
+    /// resolved first; the guest policy then applies to the resolved grantee, so an email of a
+    /// guest is refused while the tenant does not allow guests, as a user grantee is.
     async fn checked_grantee(&self, ctx: &Context, grantee: Grantee) -> Result<Grantee> {
         let d = self.deps();
         let tenant = d.tenants.find(ctx.tenant).await?;
         let allow_guests = tenant.policy.allow_guests;
-        match grantee {
-            Grantee::User { id } => match d.tenants.role_of(ctx.tenant, id).await? {
-                None => Err(crate::sharing::rules::no_such_user()),
-                Some(MemberRole::Guest) if !allow_guests => {
-                    Err(crate::sharing::rules::guests_refused())
-                }
-                Some(_) => Ok(Grantee::User { id }),
-            },
+        let grantee = match grantee {
             Grantee::Email { email } => {
                 let email = crate::sharing::rules::check_grantee(&Grantee::Email { email })?
                     .unwrap_or_default();
@@ -733,23 +890,41 @@ impl AppService {
                     ),
                     None => false,
                 };
-                if caller_inside
-                    && let Some(u) = d.tenants.verified_person(ctx.tenant, &email).await?
-                {
-                    return Ok(Grantee::User { id: u });
+                if caller_inside {
+                    match d.tenants.verified_person(ctx.tenant, &email).await? {
+                        Some(id) => Grantee::User { id },
+                        None => Grantee::Email { email },
+                    }
+                } else if !allow_guests {
+                    return Err(crate::sharing::rules::guests_refused());
+                } else {
+                    Grantee::Email { email }
                 }
-                if !allow_guests
-                    && !(caller_inside
-                        && d.tenants
-                            .is_verified_member_email(ctx.tenant, &email)
-                            .await?)
-                {
+            }
+            other => other,
+        };
+        match &grantee {
+            Grantee::User { id } => match d.tenants.role_of(ctx.tenant, *id).await? {
+                None => return Err(crate::sharing::rules::no_such_user()),
+                Some(MemberRole::Guest) if !allow_guests => {
                     return Err(crate::sharing::rules::guests_refused());
                 }
-                Ok(Grantee::Email { email })
+                Some(_) => {}
+            },
+            // While guests are off, an email grant reaches only the verified email of a person
+            // who is already inside the tenant (callers outside were refused above).
+            Grantee::Email { email }
+                if !allow_guests
+                    && !d
+                        .tenants
+                        .is_verified_member_email(ctx.tenant, email)
+                        .await? =>
+            {
+                return Err(crate::sharing::rules::guests_refused());
             }
-            Grantee::TenantMembers => Ok(Grantee::TenantMembers),
+            _ => {}
         }
+        Ok(grantee)
     }
 
     /// `addAppRoleGrant`.
@@ -840,11 +1015,13 @@ impl AppService {
     /// - An explicit role pages over its grants: a user grant is its user, a `tenant_members`
     ///   grant is [`Holder::Everyone`] (never the member list), an email grant that has not bound
     ///   yet is nobody.
-    /// - The default role pages over the people of the tenant (`list_members` as `ctx`, which
-    ///   must be allowed to list them) and keeps those with `view` on the app node and no
-    ///   explicit active role. One member page per holder page, so a page can hold fewer than
-    ///   `limit` holders (follow `next_cursor`). The calls per page are bounded by `limit`: one
-    ///   member page, and per person one bulk check of the roles and one check of `view`.
+    /// - The default role pages first over its own explicit grants (as above; cursor `g.`), then
+    ///   over the people of the tenant (`list_members` as `ctx`, which must be allowed to list
+    ///   them; cursor `m.`) and keeps those with `view` on the app node and no explicit active
+    ///   role, the default role included (those were listed with the grants). One store page per
+    ///   holder page, so a page can hold fewer than `limit` holders (follow `next_cursor`). The
+    ///   calls per page are bounded by `limit`: at most one grant page and one member page, and
+    ///   per person one bulk check of the roles and one check of `view`.
     pub async fn role_holders(
         &self,
         ctx: &Context,
@@ -856,13 +1033,16 @@ impl AppService {
         let Some(r) = live.iter().find(|r| r.name == role) else {
             return Err(Error::not_found("role"));
         };
-        if !r.default {
-            let inner = page
-                .cursor
-                .as_ref()
-                .map(|c| parse_holder_cursor(c, "g"))
-                .transpose()?
-                .map(Cursor);
+        // Where the page starts: in the grants (`g.`, also the first page) or in the members.
+        let (in_grants, mut inner) = match &page.cursor {
+            None => (true, None),
+            Some(c) if r.default => match parse_holder_cursor(c, "m") {
+                Ok(m) => (false, (!m.is_empty()).then_some(Cursor(m))),
+                Err(_) => (true, Some(Cursor(parse_holder_cursor(c, "g")?))),
+            },
+            Some(c) => (true, Some(Cursor(parse_holder_cursor(c, "g")?))),
+        };
+        if in_grants {
             let grants = self
                 .roles()
                 .list(
@@ -870,30 +1050,45 @@ impl AppService {
                     app,
                     Some(role),
                     PageRequest {
-                        cursor: inner,
+                        cursor: inner.take(),
                         limit: page.limit,
                     },
                 )
                 .await?;
-            return Ok(Page {
-                items: grants
-                    .items
-                    .iter()
-                    .filter_map(|g| match &g.grantee {
-                        Grantee::User { id } => Some(Holder::User(*id)),
-                        Grantee::TenantMembers => Some(Holder::Everyone),
-                        Grantee::Email { .. } => None,
-                    })
-                    .collect(),
-                next_cursor: grants.next_cursor.map(|c| holder_cursor("g", &c.0)),
-            });
+            let items: Vec<Holder> = grants
+                .items
+                .iter()
+                .filter_map(|g| match &g.grantee {
+                    Grantee::User { id } => Some(Holder::User(*id)),
+                    Grantee::TenantMembers => Some(Holder::Everyone),
+                    Grantee::Email { .. } => None,
+                })
+                .collect();
+            match grants.next_cursor {
+                Some(c) => {
+                    return Ok(Page {
+                        items,
+                        next_cursor: Some(holder_cursor("g", &c.0)),
+                    });
+                }
+                None if !r.default => {
+                    return Ok(Page {
+                        items,
+                        next_cursor: None,
+                    });
+                }
+                // The default role: the members follow on the next page, or on this one when
+                // the grants gave nobody.
+                None if !items.is_empty() => {
+                    return Ok(Page {
+                        items,
+                        next_cursor: Some(holder_cursor("m", "")),
+                    });
+                }
+                None => {}
+            }
         }
-        let inner = page
-            .cursor
-            .as_ref()
-            .map(|c| parse_holder_cursor(c, "m"))
-            .transpose()?
-            .map(Cursor);
+        // After the grants, the members start at their beginning (`inner` was taken).
         let d = self.deps();
         let members = d
             .tenants
@@ -905,21 +1100,18 @@ impl AppService {
                 },
             )
             .await?;
-        let explicit: Vec<ObjectRef> = live
-            .iter()
-            .filter(|r| !r.default)
-            .map(|r| role_object(app, &r.name))
-            .collect();
+        // Every live role: a person who holds one explicitly (the default role too) is not an
+        // implicit holder of the default role.
+        let explicit: Vec<ObjectRef> = live.iter().map(|r| role_object(app, &r.name)).collect();
         let node = ObjectRef::node(app);
         let mut items = Vec::new();
         for m in &members.items {
             let subject = SubjectRef::user(m.user_id);
-            if !explicit.is_empty()
-                && d.authz
-                    .check_bulk(&subject, "has", &explicit)
-                    .await?
-                    .into_iter()
-                    .any(|h| h)
+            if d.authz
+                .check_bulk(&subject, "has", &explicit)
+                .await?
+                .into_iter()
+                .any(|h| h)
             {
                 continue;
             }

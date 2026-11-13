@@ -380,8 +380,13 @@ pub fn build(
         runtime: parts.runtime,
         roles: parts.roles,
     }));
-    // The active flags of app roles follow the live manifest (card B-2).
+    // The active flags of app roles follow the live manifest, and a purge deletes the role
+    // grants before the app rows (card B-2).
     service.add_live_hook(Arc::new(service.active_roles()));
+    service
+        .deps
+        .provider
+        .add_purge_hook(Arc::new(service.role_purge()));
     Ok(service)
 }
 
