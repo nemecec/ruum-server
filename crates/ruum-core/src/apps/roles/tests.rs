@@ -824,3 +824,48 @@ async fn an_email_grant_binds_at_sign_in() {
     assert_eq!(n, 1);
     assert_eq!(w.roles_of(Some(fern.id)).await, ["approver"]);
 }
+
+/// The services register the hook: a publish (here: the hook called as the publish calls it)
+/// changes the active flags.
+#[tokio::test]
+async fn the_services_register_the_live_release_hook() {
+    let w = world().await;
+    w.grant(&w.c(w.member), "admin", w.guest).await.unwrap();
+    let hooks = w.s.apps.live_hooks();
+    assert_eq!(hooks.len(), 1);
+    let roles: Value = serde_json::from_str(ROLES).unwrap();
+    let no_admin: Value = serde_json::from_str(NO_ADMIN).unwrap();
+    hooks[0]
+        .live_changed(
+            w.team.id,
+            w.app,
+            Some(&roles),
+            &no_admin,
+            &w.c(w.member).actor,
+        )
+        .await
+        .unwrap();
+    let subject = SubjectRef::user(w.guest);
+    assert!(
+        !w.s.authz
+            .check(&subject, "has", &role_object(w.app, "admin"), None)
+            .await
+            .unwrap()
+    );
+    hooks[0]
+        .live_changed(
+            w.team.id,
+            w.app,
+            Some(&no_admin),
+            &roles,
+            &w.c(w.member).actor,
+        )
+        .await
+        .unwrap();
+    assert!(
+        w.s.authz
+            .check(&subject, "has", &role_object(w.app, "admin"), None)
+            .await
+            .unwrap()
+    );
+}
