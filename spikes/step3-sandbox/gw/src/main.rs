@@ -117,6 +117,18 @@ pub fn is_platform_cookie(name: &[u8]) -> bool {
     n.starts_with("ruum")
 }
 
+/// The name and the rest of a `Set-Cookie` value, or `None` when the name is empty or there is no
+/// `=` before the first `;`.
+pub fn split_cookie_pair(v: &[u8]) -> Option<(&[u8], &[u8])> {
+    let pair = v.split(|b| *b == b';').next().unwrap_or_default();
+    let eq = pair.iter().position(|b| *b == b'=')?;
+    let name = pair[..eq].trim_ascii();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, &v[eq + 1..]))
+}
+
 fn strip_hop_by_hop(h: &mut HeaderMap) {
     let listed: Vec<String> = h
         .get_all(header::CONNECTION)
@@ -188,11 +200,12 @@ pub fn clean_response(h: &mut HeaderMap) {
         .get_all(header::SET_COOKIE)
         .iter()
         .filter(|v| {
-            let name = v
-                .as_bytes()
-                .split(|b| *b == b'=')
-                .next()
-                .unwrap_or_default();
+            // A cookie with an empty name (`=ruum_app=x`) or with no `=` (`ruum_app`) is a nameless
+            // cookie in browsers (RFC 6265bis): its value goes back as the whole pair, so
+            // `=ruum_app=x` would come back as `Cookie: ruum_app=x`. The gateway drops both.
+            let Some((name, _)) = split_cookie_pair(v.as_bytes()) else {
+                return false;
+            };
             !is_platform_cookie(name)
         })
         .cloned()
@@ -508,6 +521,10 @@ fn host_allowed(allow: &[String], host: &str) -> bool {
     })
 }
 
+/// The header of the egress proxy's own refusal (403 or 405); its value is the reason: `port`,
+/// `allow-list`, `address` or `method`.
+pub const DENY_HEADER: &str = "X-Ruum-Egress-Deny";
+
 async fn egress(cfg: Arc<EgressCfg>, peer: SocketAddr, mut client: TcpStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::with_capacity(1024);
@@ -530,6 +547,11 @@ async fn egress(cfg: Arc<EgressCfg>, peer: SocketAddr, mut client: TcpStream) {
     let mut it = first.split_whitespace();
     let (method, target) = (it.next().unwrap_or_default(), it.next().unwrap_or_default());
     let reply = |code: &str| format!("HTTP/1.1 {code}\r\nContent-Length: 0\r\n\r\n");
+    // The proxy's own refusal carries the reason in a header, so a probe can tell it apart from a
+    // 502 (destination down) or a 403 of anything else.
+    let deny = |code: &str, reason: &str| {
+        format!("HTTP/1.1 {code}\r\n{DENY_HEADER}: {reason}\r\nContent-Length: 0\r\n\r\n")
+    };
     let log = |host: &str, port: &str, status: u16, up: u64, down: u64| {
         eprintln!(
             "egress peer={} host={host} port={port} status={status} bytes_up={up} bytes_down={down}",
@@ -538,7 +560,7 @@ async fn egress(cfg: Arc<EgressCfg>, peer: SocketAddr, mut client: TcpStream) {
     };
     if method != "CONNECT" {
         let _ = client
-            .write_all(reply("405 Method Not Allowed").as_bytes())
+            .write_all(deny("405 Method Not Allowed", "method").as_bytes())
             .await;
         log("-", "-", 405, 0, 0);
         return;
@@ -549,8 +571,17 @@ async fn egress(cfg: Arc<EgressCfg>, peer: SocketAddr, mut client: TcpStream) {
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let port: u16 = port_s.parse().unwrap_or(0);
-    if !cfg.ports.contains(&port) || !host_allowed(&cfg.allow, host) {
-        let _ = client.write_all(reply("403 Forbidden").as_bytes()).await;
+    if !cfg.ports.contains(&port) {
+        let _ = client
+            .write_all(deny("403 Forbidden", "port").as_bytes())
+            .await;
+        log(host, port_s, 403, 0, 0);
+        return;
+    }
+    if !host_allowed(&cfg.allow, host) {
+        let _ = client
+            .write_all(deny("403 Forbidden", "allow-list").as_bytes())
+            .await;
         log(host, port_s, 403, 0, 0);
         return;
     }
@@ -570,7 +601,9 @@ async fn egress(cfg: Arc<EgressCfg>, peer: SocketAddr, mut client: TcpStream) {
         .filter(|a| is_public(a.ip()) && !cfg.deny.iter().any(|d| d.contains(a.ip())))
         .collect();
     let Some(addr) = ok.first() else {
-        let _ = client.write_all(reply("403 Forbidden").as_bytes()).await;
+        let _ = client
+            .write_all(deny("403 Forbidden", "address").as_bytes())
+            .await;
         log(host, port_s, 403, 0, 0);
         return;
     };
@@ -807,6 +840,10 @@ mod tests {
             "__Host-ruum_app=x; Path=/",
             "ruum_session=1",
             "__Secure-Ruum=2",
+            "=ruum_app=nameless; Path=/",
+            " =ruum_app=nameless",
+            "ruum_app",
+            "nameless; Path=/",
             "app=ok; Path=/",
         ] {
             h.append(header::SET_COOKIE, HeaderValue::from_static(c));

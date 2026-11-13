@@ -18,7 +18,8 @@ WORK="${S2_WORK:-$HOME/$P-work}"
 GARAGE_C="${S2_GARAGE_CONTAINER:-ruum-garage-1}"
 TARGET="${CARGO_TARGET_DIR:-$HERE/gw/target}"
 GW="$TARGET/release/s2-gw"
-NODE_IMAGE="${S2_NODE_IMAGE:-node:22-alpine}"
+# Base images by digest (multi-arch indexes, 2026-11-13), not by a tag that can move.
+NODE_IMAGE="${S2_NODE_IMAGE:-node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a}"
 ISS="https://ruum.localhost"
 AUD_A="app:0190b6c4-a00d-7cc1-9a4b-00000000000a"
 AUD_B="app:0190b6c4-a00d-7cc1-9a4b-00000000000b"
@@ -33,6 +34,7 @@ check() { # name command...
   if "$@"; then pass "$name"; else fail "$name"; fi
 }
 jqe() { jq -e "$1" >/dev/null 2>&1; }
+jqf() { jq -e "$@" >/dev/null 2>&1; } # jq options... filter file
 section() { printf '\n== %s\n' "$*"; }
 note() { printf '      %s\n' "$*"; }
 
@@ -106,8 +108,12 @@ chmod 700 "$WORK"
 section "set-up"
 df -h / | awk 'NR==2 {print "      disk free: " $4}'
 (cd "$HERE/gw" && cargo build --release --locked -q) || { echo "gateway build failed" >&2; exit 2; }
+# The gateway's unit tests (header, cookie, CIDR and address rules) run first; a failure stops the run.
+(cd "$HERE/gw" && cargo test --release --locked -q >"$WORK/gw-test.log" 2>&1) ||
+  { tail -30 "$WORK/gw-test.log" >&2; echo "gateway unit tests failed" >&2; exit 2; }
+note "gateway unit tests: $(grep -o '[0-9]* passed' "$WORK/gw-test.log" | head -1)"
 pull "$NODE_IMAGE"
-note "node image: $(docker image inspect "$NODE_IMAGE" -f '{{index .RepoDigests 0}}')"
+note "node image: $NODE_IMAGE"
 docker build -q -t "$P-app:1" --label ruum.app=$P "$HERE/app" >/dev/null || { echo "app image failed" >&2; exit 2; }
 
 # The user-token key (Ed25519, made for this run, never printed, removed at the end).
@@ -193,7 +199,7 @@ point2() {
 
   local hdr
   hdr="$(curl -fsS -D - -o /dev/null "$G/cookies" | tr -d '\r')"
-  check "2.8 an app's Set-Cookie for __Host-ruum_*, ruum_* and RUUM is dropped; its own stays" \
+  check "2.8 an app's Set-Cookie for __Host-ruum_*, ruum_*, RUUM, an empty name (=ruum_app=x) or no = (ruum_app) is dropped; its own stays" \
     test "$(grep -i '^set-cookie:' <<<"$hdr" | sed 's/^[^:]*: //')" = "app_session=kept; Path=/; HttpOnly"
   check "2.9 the response has HSTS, nosniff, Referrer-Policy and frame-ancestors 'none'" bash -c '
     h=$(cat); grep -qi "^strict-transport-security: max-age" <<<"$h" &&
@@ -209,16 +215,44 @@ point2() {
     jqe '.ruum_user.valid == false and .ruum_user.reason == "aud"' <<<"$out"
   # A token signed with another key fails the signature check.
   openssl genpkey -algorithm ed25519 -out "$WORK/other.pem" 2>/dev/null
-  local forged
-  forged="$(python3 - "$WORK/other.pem" "$ISS" "$AUD_B" <<'PY'
+  out="$(curl -fsS "http://$ipb:8080/" -H "Ruum-User: $(token "$WORK/other.pem" "$AUD_B" '{}')")"
+  check "2.11 a token signed with another key fails the SDK check (signature)" \
+    jqe '.ruum_user.valid == false and .ruum_user.reason == "signature"' <<<"$out"
+  # Tokens signed with the right key and one claim wrong: each fails app B's check with its reason.
+  local spec claims reason
+  for spec in \
+    'iss|{"iss":"https://evil.example"}' 'typ|{"typ":"agent"}' 'env|{"env":"preview"}' \
+    'exp|{"iat":null}' 'exp|{"iat":"0"}' 'exp|{"exp":null}' 'exp|{"exp_offset":-1}' 'exp|{"exp_offset":0}' \
+    'exp|{"exp_offset":61}' 'alg|{"alg":"none"}'; do
+    reason=${spec%%|*} claims=${spec#*|}
+    out="$(curl -fsS "http://$ipb:8080/" -H "Ruum-User: $(token "$WORK/user-token.pem" "$AUD_B" "$claims")")"
+    check "2.13 the SDK check refuses a token with $claims ($reason)" \
+      jqe '.ruum_user.valid == false and .ruum_user.reason == "'"$reason"'"' <<<"$out"
+  done
+  out="$(curl -fsS "http://$ipb:8080/" -H "Ruum-User: $(token "$WORK/user-token.pem" "$AUD_B" '{}')")"
+  check "2.14 the same helper's well-formed token passes app B's check (the negative cases above are not vacuous)" \
+    jqe '.ruum_user.valid == true' <<<"$out"
+}
+
+# A Ruum-User token signed with key for audience aud; overrides is JSON: claim values (null removes
+# the claim), "alg", and "exp_offset" (exp = now + offset, default 60).
+token() { # key aud overrides
+  python3 - "$1" "$ISS" "$2" "$3" <<'PY'
 import base64, json, subprocess, sys, time
-key, iss, aud = sys.argv[1:4]
+key, iss, aud, over = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
 b = lambda d: base64.urlsafe_b64encode(d).rstrip(b"=").decode()
 now = int(time.time())
-h = b(json.dumps({"alg": "EdDSA", "typ": "JWT"}).encode())
-c = b(json.dumps({"iss": iss, "aud": aud, "typ": "app_user", "env": "live", "sub": "pairwise:x",
-                  "tenant": "t", "roles": ["admin"], "node_roles": {}, "actor": "user",
-                  "iat": now, "exp": now + 60, "jti": "x"}).encode())
+claims = {"iss": iss, "aud": aud, "typ": "app_user", "env": "live", "sub": "pairwise:x",
+          "tenant": "t", "roles": ["admin"], "node_roles": {}, "actor": "user",
+          "iat": now, "exp": now + over.pop("exp_offset", 60), "jti": "x"}
+alg = over.pop("alg", "EdDSA")
+for k, v in over.items():
+    if v is None:
+        claims.pop(k, None)
+    else:
+        claims[k] = v
+h = b(json.dumps({"alg": alg, "typ": "JWT"}).encode())
+c = b(json.dumps(claims).encode())
 msg = key + ".msg"
 with open(msg, "wb") as f:
     f.write(f"{h}.{c}".encode())
@@ -226,10 +260,6 @@ sig = subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", key, "-rawin", "-
                      capture_output=True, check=True).stdout
 print(f"{h}.{c}.{b(sig)}")
 PY
-)"
-  out="$(curl -fsS "http://$ipb:8080/" -H "Ruum-User: $forged")"
-  check "2.11 a token signed with another key fails the SDK check (signature)" \
-    jqe '.ruum_user.valid == false and .ruum_user.reason == "signature"' <<<"$out"
 }
 
 # ------------------------------------------------------------------------------------------------
@@ -281,14 +311,30 @@ point4() {
   check "4.4 content types: html, javascript, css" \
     test "$ct" = "text/html; charset=utf-8 text/javascript; charset=utf-8 text/css; charset=utf-8"
   check "4.5 a missing file is 404" test "$(curl -s -o /dev/null -w '%{http_code}' "$S/nope.html")" = 404
-  local bad leaked=0 code body
+  # The object outside the deployment's prefix exists and holds the secret: read it back through a
+  # second static gateway on the prefix "other", so the traversal checks below test a real object.
+  local oport
+  oport="$(free_port)"
+  (set -a; . "$WORK/s3.env"; GW_LISTEN="127.0.0.1:$oport" GW_PREFIX="other" exec "$GW" static) 2>"$WORK/static-other.log" &
+  PIDS+=($!)
+  if wait_http "http://127.0.0.1:$oport/secret.txt"; then
+    check "4.6a the outside object other/secret.txt exists in the bucket (read back on its own prefix)" \
+      test "$(curl -fsS "http://127.0.0.1:$oport/secret.txt")" = "S2-SECRET-OUTSIDE-PREFIX"
+  else
+    fail "4.6a the outside object other/secret.txt exists in the bucket (read back on its own prefix)"
+  fi
+  local bad bad_ok=1 code body
   for bad in "/../other/secret.txt" "/nested/../../other/secret.txt" "/%2e%2e/other/secret.txt" \
     "/..%2fother/secret.txt" "/nested/%2e%2e/%2e%2e/other/secret.txt" "//other/secret.txt" "/.%2e/other/secret.txt"; do
-    body="$(curl -s --path-as-is "$S$bad")"
-    code="$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$S$bad")"
-    if [[ $body == *S2-SECRET* || $code == 200 ]]; then leaked=1; note "leaked: $bad ($code)"; fi
+    body="$(curl -s --path-as-is -w '\n%{http_code}' "$S$bad")"
+    code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    # Only the gateway's own refusal counts: 404 or 400. 000 (no answer), 5xx or 200 is a FAIL.
+    if [[ $body == *S2-SECRET* || ! $code =~ ^(400|404)$ ]]; then bad_ok=0; note "not refused: $bad ($code)"; fi
   done
-  check "4.6 no path reaches another prefix of the bucket (.., %2e%2e, %2f, //)" test $leaked = 0
+  check "4.6 every path to another prefix (.., %2e%2e, %2f, //) is refused with 404 or 400 and no secret" test $bad_ok = 1
+  check "4.6b the static gateway still answers after the traversal attempts" \
+    test "$(curl -s -o /dev/null -w '%{http_code}' "$S/index.html")" = 200
   check "4.7 POST is refused (405)" test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$S/index.html")" = 405
   local hdr
   hdr="$(curl -fsS -D - -o /dev/null "$S/index.html" | tr -d '\r')"
@@ -299,40 +345,70 @@ point4() {
 
 # ------------------------------------------------------------------------------------------------
 # The egress proxy: the spike gateway binary in `egress` mode, in a container with the driver's
-# flags, on an outside network and on the app networks it serves.
+# flags, on an outside network and on the app networks it serves. Point 1 and point 5 each get
+# their own proxy container, so the log of one point never answers a check of the other.
 HOST_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {sub(/\/.*/, "", $4); print $4; exit}')"
 # The host's global IPv6 address with its prefix (for example x:y::1/64), if it has one.
 HOST_IP6_NET="$(ip -6 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth)/ {print $4; exit}')"
 HOST_IP6="${HOST_IP6_NET%/*}"
-EGRESS_IMAGE="${S2_EGRESS_IMAGE:-ubuntu:24.04}" # the same glibc as the host that built the binary
-egress_up() { # app networks...
+# Another address in the host's IPv6 prefix (the deny list takes the whole /64, not one address).
+HOST_IP6_OTHER="$([[ -n $HOST_IP6_NET ]] && python3 -c 'import ipaddress, sys; n = ipaddress.ip_interface(sys.argv[1]).network; print(n.network_address + 0x5eed)' "$HOST_IP6_NET" 2>/dev/null)"
+# The same glibc as the host that built the binary; by digest (ubuntu:24.04, 2026-11-13).
+EGRESS_IMAGE="${S2_EGRESS_IMAGE:-ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5}"
+# Address forms that the allow-list lets through, so only the address rules (private, link-local,
+# loopback, ULA, EGRESS_DENY, IPv4-mapped) can refuse them: decimal, octal and hex IPv4 (glibc's
+# getaddrinfo reads them as numbers), short forms and IPv6 literals.
+EGRESS_ALLOW="registry.npmjs.org,localhost,169.254.169.254.nip.io,$HOST_IP.nip.io,169.254.169.254,172.18.0.2"
+EGRESS_ALLOW+=",2852039166,0251.0376.0251.0376,0xa9fea9fe,127.1,::ffff:169.254.169.254,::ffff:a9fe:a9fe,::1,fd00:ec2::254"
+EGRESS_ALLOW+=",$HOST_IP${HOST_IP6:+,$HOST_IP6}${HOST_IP6_OTHER:+,$HOST_IP6_OTHER},::ffff:$HOST_IP"
+egress_up() { # container app-networks...
+  local c=$1 n
+  shift
   pull "$EGRESS_IMAGE"
   docker network inspect "$P-outside" >/dev/null 2>&1 ||
     docker network create --label ruum.app=$P "$P-outside" >/dev/null
-  if ! docker inspect "$P-egress" >/dev/null 2>&1; then
-    docker run -d --name "$P-egress" --network "$P-outside" --read-only --cap-drop ALL \
+  if ! docker inspect "$c" >/dev/null 2>&1; then
+    docker run -d --name "$c" --network "$P-outside" --read-only --cap-drop ALL \
       --security-opt no-new-privileges --user 10001:10001 --memory 128m --cpus 1 --pids-limit 64 \
       --label ruum.app=$P -v "$GW:/gw:ro" -e GW_LISTEN=0.0.0.0:3128 -e EGRESS_PORTS=443 \
-      -e EGRESS_ALLOW="registry.npmjs.org,localhost,169.254.169.254.nip.io,$HOST_IP.nip.io" \
+      -e EGRESS_ALLOW="$EGRESS_ALLOW" \
       -e EGRESS_DENY="$HOST_IP${HOST_IP6_NET:+,$HOST_IP6_NET}" "$EGRESS_IMAGE" /gw egress >/dev/null
   fi
-  local n
-  for n in "$@"; do docker network connect "$P-$n" "$P-egress" 2>/dev/null; done
+  for n in "$@"; do docker network connect "$P-$n" "$c" 2>/dev/null; done
 }
-EGRESS_REFUSED='["example.org:443","registry.npmjs.org:22","localhost:443","169.254.169.254.nip.io:443","169.254.169.254:443","'"$HOST_IP"'.nip.io:443","172.18.0.2:5432"]'
+# Every refused CONNECT with the reason the proxy must give (its X-Ruum-Egress-Deny header). A 502,
+# a timeout, a TLS error after a 200 or a 403 with another reason is a FAIL.
+EGRESS_REFUSED_SPEC=(
+  "example.org:443|allow-list" "registry.npmjs.org:22|port" "localhost:443|address"
+  "169.254.169.254.nip.io:443|address" "169.254.169.254:443|address" "$HOST_IP.nip.io:443|address"
+  "$HOST_IP:443|address" "[::ffff:$HOST_IP]:443|address" "172.18.0.2:443|address"
+  "2852039166:443|address" "0251.0376.0251.0376:443|address" "0xa9fea9fe:443|address" "127.1:443|address"
+  "[::ffff:169.254.169.254]:443|address" "[::ffff:a9fe:a9fe]:443|address" "[::1]:443|address"
+  "[fd00:ec2::254]:443|address"
+)
+[[ -n $HOST_IP6 ]] && EGRESS_REFUSED_SPEC+=("[$HOST_IP6]:443|address")
+[[ -n $HOST_IP6_OTHER ]] && EGRESS_REFUSED_SPEC+=("[$HOST_IP6_OTHER]:443|address")
+EGRESS_REASONS="$(printf '%s\n' "${EGRESS_REFUSED_SPEC[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | capture("^(?<t>.*)\\|(?<r>[^|]*)$")) | map({key: .t, value: .r}) | from_entries')"
+EGRESS_REFUSED="$(jq -c 'keys_unsorted' <<<"$EGRESS_REASONS")"
 
-# The targets an app or a build must never reach, as JSON for the probe, in TARGETS. Only dev stack
-# containers, the host's own addresses and the spike's own containers; never staging or the SSH
-# tunnel. An expected target without an address (a container that is down, a network without a
-# gateway) is a counted SKIP line, never dropped silently.
+# The targets an app or a build must never reach, as JSON for the probe, in TARGETS:
+# [{name, host, port, control}]. Only dev stack containers, the host's own addresses and the
+# spike's own containers; never staging or the SSH tunnel. Every target has a positive control
+# that must reach it (run_controls): "host" (a connect from the host to the same address),
+# "host:<address>" (from the host to that address, for a link-local address with another scope),
+# "net:<network>" (from a container on that network) or "plain:<name>" (the result <name> of the
+# probe on a plain internal network, see plain_control). An expected target without an address is
+# a FAIL, never a SKIP. Host ports that listen on 127.0.0.1 only (the dev stack's published ports,
+# such as 5434) are not targets: no control can reach them on another address, so their probe
+# would pass whatever the network does.
 probe_targets() { # check prefix, app network, other app container, other app network
   local pre=$1 net=$2 lines=() gw gwname subnet holder bridge ll
   shift
-  add() { # name address port
+  add() { # name address port control
     if [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $2 =~ ^[0-9a-fA-F]*:[0-9a-fA-F:.]+(%[A-Za-z0-9_.-]+)?$ ]]; then
-      lines+=("$1|$2|$3")
+      lines+=("$1|$2|$3|${4:-host}")
     else
-      skip "$pre.target $1" "no address"
+      fail "$pre.target $1 has an address" "none found"
     fi
   }
   add "platform Postgres (ruum-postgres-1)" "$(ip_of ruum-postgres-1 ruum_default)" 5432
@@ -348,7 +424,8 @@ probe_targets() { # check prefix, app network, other app container, other app ne
     add "agent Postgres on the default bridge (pg-$BUILDBOX_NAME)" "$(ip_of "pg-$BUILDBOX_NAME" bridge)" 5432
   fi
   # The host through the app network's bridge. With inhibit_ipv4 Docker reports no gateway; the
-  # host would hold the subnet's first host address, so that address is the target.
+  # host would hold the subnet's first host address, so that address is the target. Its control is
+  # the plain internal network, where the host does hold the gateway address and sshd answers.
   gw="$(docker network inspect "$P-$net" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
   gwname="gateway"
   if [[ ! $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then # Docker prints "invalid IP" for none
@@ -358,47 +435,148 @@ probe_targets() { # check prefix, app network, other app container, other app ne
     holder="$(docker network inspect "$P-$net" -f '{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' | tr ' ' '\n' | grep "=$gw/" | cut -d= -f1)"
     [[ -z $holder ]] || note "INFO the would-be gateway address $gw is held by the container $holder"
   fi
-  add "host through the app network's $gwname, sshd" "$gw" 22
-  add "host through the app network's $gwname, platform Postgres port" "$gw" 5434
-  # IPv6: a bridge gets a link-local address even without an IPv4 address.
-  bridge="$(docker network inspect "$P-$net" -f '{{index .Options "com.docker.network.bridge.name"}}' 2>/dev/null)"
-  [[ -n $bridge && $bridge != "<no value>" ]] || bridge="br-$(docker network inspect "$P-$net" -f '{{.Id}}' | cut -c1-12)"
+  add "host through the app network's $gwname, sshd" "$gw" 22 plain:sshd
   # The finding itself, on the host: the bridge has no IPv4 address, so no host service listens on
   # it. (With inhibit_ipv4 Docker gives the subnet's first address to a container, so a probe of
-  # that address alone would not show it.)
-  local v4
-  v4="$(ip -4 -o addr show dev "$bridge" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
-  check "$pre.v4 the host has no IPv4 address on the app bridge $bridge${v4:+ (has: $v4)}" test -z "$v4"
-  ll="$(ip -6 -o addr show dev "$bridge" scope link 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')"
-  note "IPv6 of the app bridge $bridge: disable_ipv6=$(cat "/proc/sys/net/ipv6/conf/$bridge/disable_ipv6" 2>/dev/null || echo '?'), link-local ${ll:-none}"
-  if [[ -n $ll ]]; then
-    add "host through the app bridge's IPv6 link-local address, sshd" "$ll%eth0" 22
+  # that address alone would not show it.) Every step must work first: the network exists, its
+  # bridge device exists, and the address list and the IPv6 setting can be read. An empty answer
+  # from a missing device is a FAIL, not "no address".
+  bridge=""
+  if docker network inspect "$P-$net" >/dev/null 2>&1; then
+    bridge="$(docker network inspect "$P-$net" -f '{{index .Options "com.docker.network.bridge.name"}}' 2>/dev/null)"
+    [[ -n $bridge && $bridge != "<no value>" ]] || bridge="br-$(docker network inspect "$P-$net" -f '{{.Id}}' | cut -c1-12)"
+  fi
+  if [[ -n $bridge ]] && ip link show dev "$bridge" >/dev/null 2>&1; then
+    pass "$pre.br the app network's bridge device $bridge exists on the host"
+    local v4 v4rc dis6
+    v4="$(ip -4 -o addr show dev "$bridge" 2>/dev/null)"
+    v4rc=$?
+    v4="$(awk '{print $4}' <<<"$v4" | tr '\n' ' ' | sed 's/ *$//')"
+    check "$pre.v4 the host has no IPv4 address on the app bridge $bridge${v4:+ (has: $v4)}" test "$v4rc" = 0 -a -z "$v4"
+    dis6="$(cat "/proc/sys/net/ipv6/conf/$bridge/disable_ipv6" 2>/dev/null)"
+    ll="$(ip -6 -o addr show dev "$bridge" scope link 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')"
+    note "IPv6 of the app bridge $bridge: disable_ipv6=${dis6:-unreadable}, link-local ${ll:-none}"
+    if [[ ! $dis6 =~ ^[01]$ ]]; then
+      fail "$pre.v6 the IPv6 setting of the app bridge $bridge is readable"
+    elif [[ -n $ll ]]; then
+      add "host through the app bridge's IPv6 link-local address, sshd" "$ll%eth0" 22 "host:$ll%$bridge"
+    else
+      pass "$pre.v6 the app bridge $bridge has no IPv6 link-local address (no IPv6 path to the host through it)"
+    fi
   else
-    pass "$pre.v6 the app bridge $bridge has no IPv6 link-local address (no IPv6 path to the host through it)"
+    fail "$pre.br the app network's bridge device exists on the host" "network $P-$net, bridge '${bridge:-none}'"
   fi
   add "host public IPv6 address, sshd" "$HOST_IP6" 22
   add "host through ruum_default's gateway, sshd" "$(docker network inspect ruum_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)" 22
   add "host through docker0, sshd" 172.17.0.1 22
-  add "host through docker0, platform Postgres port" 172.17.0.1 5434
   add "host public address, sshd" "$HOST_IP" 22
   add "metadata address TCP 80" 169.254.169.254 80
   add "internet direct 1.1.1.1:443" 1.1.1.1 443
   add "internet direct 8.8.8.8:53" 8.8.8.8 53
-  [[ -n ${2:-} ]] && add "another app ($2)" "$(ip_of "$P-$2" "$P-$3")" 8080
-  TARGETS="$(printf '%s\n' "${lines[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {name: .[0], host: .[1], port: (.[2] | tonumber)})')"
+  [[ -n ${2:-} ]] && add "another app ($2)" "$(ip_of "$P-$2" "$P-$3")" 8080 "net:$P-$3"
+  TARGETS="$(printf '%s\n' "${lines[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {name: .[0], host: .[1], port: (.[2] | tonumber), control: .[3]})')"
 }
 
-# Checks of a probe result: nothing reached except the allowed egress target.
-probe_checks() { # prefix result.json
-  local pre=$1 f=$2 k d i=0
-  [[ -s $f ]] || { fail "$pre the probe ran"; return; }
-  while IFS=$'\t' read -r k d; do
-    i=$((i + 1))
-    case $k in
-      "egress allowed "*) check "$pre.$i $k is reached through the egress proxy ($d)" jqe ".\"$k\".reached == true" <"$f" ;;
-      *) check "$pre.$i $k: not reached ($d)" jqe ".\"$k\".reached == false" <"$f" ;;
+# The positive control of the host path: the same probe on a plain internal network (no
+# inhibit_ipv4), where the host holds the gateway address. sshd must answer there, or the
+# "would-be gateway" target of the app network proves nothing. Run once per run.
+plain_control() {
+  [[ -s $WORK/plain/result.json ]] && return 0
+  net plain
+  local gw
+  gw="$(docker network inspect "$P-plain" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+  mkdir -p "$WORK/plain" && chmod 777 "$WORK/plain"
+  docker run --rm --network "$P-plain" "${DRIVER_FLAGS[@]}" -v "$HERE/probe:/probe:ro" \
+    -v "$WORK/plain:/out" -e PROBE_OUT=/out/result.json -e PROBE_ONLY_TARGETS=1 \
+    -e PROBE_TARGETS="[{\"name\":\"sshd\",\"host\":\"$gw\",\"port\":22}]" \
+    "$NODE_IMAGE" node /probe/probe.js
+  check "plain.1 control: on a plain internal network (no inhibit_ipv4) the host's sshd IS reached through the gateway $gw ($(jq -r .sshd.detail "$WORK/plain/result.json" 2>/dev/null))" \
+    jqe '.sshd.reached == true' <"$WORK/plain/result.json"
+}
+
+host_tcp() { # address port: prints the outcome, "connected" when the host reaches it
+  python3 - "$1" "$2" <<'PY'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+try:
+    fam, typ, proto, _, addr = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)[0]
+    s = socket.socket(fam, typ, proto)
+    s.settimeout(3)
+    s.connect(addr)
+    s.close()
+    print("connected")
+except Exception as e:
+    print(type(e).__name__)
+PY
+}
+
+# The positive controls of one probe run, in a JSON file {key: {reached, detail}}: one per TCP
+# target (its control), the metadata GET (from the host) and the DNS names (resolved on the host).
+run_controls() { # targets-json out-file
+  local name host port ctl res c='{}'
+  while IFS=$'\t' read -r name host port ctl; do
+    case $ctl in
+      host) res="$(host_tcp "$host" "$port")" ;;
+      host:*) res="$(host_tcp "${ctl#host:}" "$port")" ;;
+      plain:*) res="$(jq -r --arg k "${ctl#plain:}" '.[$k].detail // "no plain result"' "$WORK/plain/result.json" 2>/dev/null)" ;;
+      net:*)
+        res="$(docker run --rm --network "${ctl#net:}" "${DRIVER_FLAGS[@]}" -v "$HERE/probe:/probe:ro" \
+          -e PROBE_ONLY_TARGETS=1 -e PROBE_TARGETS="[{\"name\":\"c\",\"host\":\"$host\",\"port\":$port}]" \
+          "$NODE_IMAGE" node /probe/probe.js 2>/dev/null | jq -r '.c.detail')" ;;
+      *) res="unknown control $ctl" ;;
     esac
-  done < <(jq -r 'to_entries[] | select(.key != "self") | [.key, .value.detail] | @tsv' "$f")
+    c="$(jq -c --arg k "$name" --arg d "${res:-no answer}" '.[$k] = {reached: ($d == "connected"), detail: ("control " + $d)}' <<<"$c")"
+  done < <(jq -r '.[] | [.name, .host, (.port | tostring), .control] | @tsv' <<<"$1")
+  res="$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://169.254.169.254/ 2>/dev/null)"
+  c="$(jq -c --arg d "$res" '.["metadata HTTP GET 169.254.169.254"] = {reached: ($d != "000" and $d != ""), detail: ("control host HTTP " + $d)}' <<<"$c")"
+  for name in registry.npmjs.org example.com; do
+    res="$(getent ahosts "$name" | awk 'NR==1 {print $1}')"
+    c="$(jq -c --arg k "DNS $name" --arg d "$res" '.[$k] = {reached: ($d != ""), detail: ("control host resolves " + (if $d == "" then "nothing" else $d end))}' <<<"$c")"
+  done
+  echo "$c" >"$2"
+}
+
+# Checks of a probe result. The probe must answer for exactly the expected keys. A TCP target, the
+# metadata GET and the DNS names pass only when the sandbox did not reach them AND their positive
+# control did: a timeout or an error alone is no proof (a dead target looks the same). A refused
+# egress request passes only on the proxy's own deny answer with the expected reason; the allowed
+# one only with an HTTPS answer through the tunnel.
+probe_checks() { # prefix result.json targets-json controls.json egress(0|1) allowed-json
+  local pre=$1 f=$2 tj=$3 cf=$4 eg=$5 allowed=${6:-'[]'} k i=0 want got
+  [[ -s $f ]] || { fail "$pre the probe ran"; return; }
+  want="$(jq -c --argjson eg "$eg" --argjson allowed "$allowed" --argjson refused "$EGRESS_REFUSED" \
+    'map(.name) + ["metadata HTTP GET 169.254.169.254", "DNS registry.npmjs.org", "DNS example.com"]
+     + (if $eg == 1 then ($allowed | map("egress allowed " + .)) + ($refused | map("egress refused " + .)) + ["egress plain HTTP GET"] else [] end)
+     | sort' <<<"$tj")"
+  got="$(jq -c 'del(.self) | keys | sort' "$f")"
+  check "$pre.set the probe answered for exactly the $(jq length <<<"$want") expected targets" test "$got" = "$want"
+  [[ $got == "$want" ]] || note "missing: $(jq -cn --argjson w "$want" --argjson g "$got" '$w - $g'); unexpected: $(jq -cn --argjson w "$want" --argjson g "$got" '$g - $w')"
+  while IFS= read -r k; do
+    i=$((i + 1))
+    local d
+    d="$(jq -r --arg k "$k" '.[$k].detail // "no result"' "$f")"
+    case $k in
+      "egress allowed "*)
+        check "$pre.$i $k is reached through the egress proxy ($d)" \
+          jqf --arg k "$k" '.[$k].outcome == "tunnel" and (.[$k].https | type) == "number"' "$f" ;;
+      "egress refused "*)
+        local r
+        r="$(jq -r --arg t "${k#egress refused }" '.[$t]' <<<"$EGRESS_REASONS")"
+        check "$pre.$i $k: the proxy refuses it (403, deny=$r) ($d)" \
+          jqf --arg k "$k" --arg r "$r" '.[$k].outcome == "denied" and .[$k].status == 403 and .[$k].deny == $r' "$f" ;;
+      "egress plain HTTP GET")
+        check "$pre.$i $k: the proxy refuses it (405, deny=method) ($d)" \
+          jqf --arg k "$k" '.[$k].outcome == "denied" and .[$k].status == 405 and .[$k].deny == "method"' "$f" ;;
+      *)
+        local cd
+        cd="$(jq -r --arg k "$k" '.[$k].detail // "control missing"' "$cf")"
+        if jq -e --arg k "$k" '.[$k].reached == true' "$cf" >/dev/null 2>&1; then
+          check "$pre.$i $k: not reached ($d; $cd)" jqf --arg k "$k" '.[$k].reached == false' "$f"
+        else
+          fail "$pre.$i $k: the positive control does not reach it, so the probe proves nothing" "$d; $cd"
+        fi ;;
+    esac
+  done < <(jq -r '.[]' <<<"$want")
   check "$pre.self runs as a non-root user with no capabilities" jqe '.self.uid != 0 and .self.cap_eff == "0000000000000000" and .self.cap_bnd == "0000000000000000"' <"$f"
   check "$pre.self has no_new_privs and a seccomp filter (mode 2)" jqe '.self.no_new_privs == "1" and .self.seccomp == "2"' <"$f"
   check "$pre.self has a read-only root and no Docker socket" jqe '.self.root_writable == false and .self.docker_socket == false' <"$f"
@@ -408,12 +586,13 @@ probe_checks() { # prefix result.json
 point1() { # [tag: r for runsc]
   local t=${1:-}
   section "point 1${t:+ ($t)}: a Node app in plain Docker with the driver's flags reaches nothing but the egress proxy"
+  plain_control
   net p1$t-a "${APP_NET_OPTS[@]}"
   net p1$t-b "${APP_NET_OPTS[@]}"
   app p1$t-other p1$t-b "$AUD_B"
-  egress_up p1$t-a p1$t-b
+  egress_up "$P-egress$t" p1$t-a p1$t-b
   local eip targets
-  eip="$(ip_of "$P-egress" "$P-p1$t-a")"
+  eip="$(ip_of "$P-egress$t" "$P-p1$t-a")"
   [[ -n $eip ]] || { fail "1$t egress proxy on the app network"; return; }
   probe_targets "1$t" p1$t-a p1$t-other p1$t-b
   targets=$TARGETS
@@ -423,25 +602,16 @@ point1() { # [tag: r for runsc]
     -v "$HERE/probe:/probe:ro" -v "$WORK/p1$t:/out" -e PROBE_OUT=/out/result.json \
     -e PROBE_TARGETS="$targets" -e EGRESS="$eip:3128" -e EGRESS_ALLOWED='["registry.npmjs.org:443"]' \
     -e EGRESS_REFUSED="$EGRESS_REFUSED" "$NODE_IMAGE" node /probe/probe.js
-  probe_checks "1$t.p" "$WORK/p1$t/result.json"
+  run_controls "$targets" "$WORK/p1$t/controls.json"
+  probe_checks "1$t.p" "$WORK/p1$t/result.json" "$targets" "$WORK/p1$t/controls.json" 1 '["registry.npmjs.org:443"]'
   note "IPv6 inside the app container: $(jq -r '.self.ipv6 | to_entries | map("\(.key)=\(.value)") | join(" ")' "$WORK/p1$t/result.json" 2>/dev/null)"
   local cfg
   cfg="$(docker inspect "$P-p1$t-other" -f '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.Config.User}} {{.HostConfig.Memory}} {{.HostConfig.NanoCpus}} {{.HostConfig.PidsLimit}} {{.HostConfig.Privileged}} {{len .Mounts}}')"
   note "app container: $cfg"
   check "1$t.cfg the app container has the driver's flags (read-only, cap-drop ALL, no-new-privileges, user, limits, no mounts)" \
     test "$cfg" = "true [ALL] [no-new-privileges] 10001:10001 268435456 1000000000 128 false 0"
-  # For the record: the same probe on a plain internal network (no inhibit_ipv4).
-  net p1$t-plain
-  local gw
-  gw="$(docker network inspect "$P-p1$t-plain" -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
-  mkdir -p "$WORK/p1$t-plain" && chmod 777 "$WORK/p1$t-plain"
-  docker run --rm --network "$P-p1$t-plain" "${DRIVER_FLAGS[@]}" -v "$HERE/probe:/probe:ro" \
-    -v "$WORK/p1$t-plain:/out" -e PROBE_OUT=/out/result.json \
-    -e PROBE_TARGETS="[{\"name\":\"sshd\",\"host\":\"$gw\",\"port\":22},{\"name\":\"pg\",\"host\":\"$gw\",\"port\":5434}]" \
-    "$NODE_IMAGE" node /probe/probe.js
-  note "INFO plain internal network (no inhibit_ipv4), host through its gateway $gw: sshd $(jq -r .sshd.detail "$WORK/p1$t-plain/result.json"), port 5434 $(jq -r .pg.detail "$WORK/p1$t-plain/result.json")"
   local log
-  log="$(docker logs "$P-egress" 2>&1)"
+  log="$(docker logs "$P-egress$t" 2>&1)"
   check "1$t.log the egress proxy logs host, port, status and bytes, and no path" bash -c '
     l=$(cat); grep -q "host=registry.npmjs.org port=443 status=200 bytes_up=[0-9]* bytes_down=[0-9]*" <<<"$l" &&
     grep -q "host=example.org port=443 status=403" <<<"$l" && ! grep -q "GET\|HEAD /" <<<"$l"' <<<"$log"
@@ -530,23 +700,35 @@ PY
 # ------------------------------------------------------------------------------------------------
 point5() {
   section "point 5: a hostile package.json builds in a sandbox job and reaches nothing"
+  plain_control
   net build "${APP_NET_OPTS[@]}"
   net p5-other "${APP_NET_OPTS[@]}"
   app p5-other p5-other "$AUD_B"
-  egress_up build
+  # Its own egress proxy: check 5.2 reads only the build's traffic, never point 1's.
+  egress_up "$P-egress-build" build
   local eip targets rc
-  eip="$(ip_of "$P-egress" "$P-build")"
+  eip="$(ip_of "$P-egress-build" "$P-build")"
+  [[ -n $eip ]] || { fail "5 egress proxy on the build network"; return; }
   probe_targets 5 build p5-other p5-other
   targets=$TARGETS
-  mkdir -p "$WORK/p5" && chmod 777 "$WORK/p5"
+  mkdir -p "$WORK/p5"
+  # The job's output folder is a Docker volume on tmpfs with a size limit (64 MiB), not a
+  # writable host folder: a postinstall cannot fill the host's disk. The production recipe must
+  # not give a build a writable host bind mount either (README.md, point 5).
+  docker volume create --label ruum.app=$P --driver local --opt type=tmpfs --opt device=tmpfs \
+    --opt o=size=64m,uid=10001,gid=10001,mode=0700 "$P-p5-out" >/dev/null
+  # Docker mounts a tmpfs volume while a container uses it and drops its content after the last one
+  # stops, so a holder container keeps it mounted until the output is copied out.
+  docker run -d --name "$P-p5-hold" --network none "${DRIVER_FLAGS[@]}" -v "$P-p5-out:/out:ro" \
+    "$NODE_IMAGE" sleep 900 >/dev/null
   # The fixed node22 recipe, step 1: npm ci as a sandbox job (the driver's flags, a tmpfs work
-  # folder, a time limit, no secrets, egress only through the proxy).
+  # folder, a size-limited output volume, a time limit, no secrets, egress only through the proxy).
   timeout 300 docker run --rm --name "$P-build-job" --network "$P-build" \
     --read-only --cap-drop ALL --security-opt no-new-privileges --user 10001:10001 \
     --memory 512m --memory-swap 512m --cpus 2 --pids-limit 256 --label ruum.app=$P \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
     --tmpfs /work:rw,noexec,nosuid,nodev,size=256m,uid=10001,gid=10001 \
-    -v "$HERE/hostile:/src:ro" -v "$HERE/probe:/probe:ro" -v "$WORK/p5:/out" \
+    -v "$HERE/hostile:/src:ro" -v "$HERE/probe:/probe:ro" -v "$P-p5-out:/out" \
     -e HOME=/tmp -e npm_config_cache=/tmp/npm-cache -e npm_config_update_notifier=false \
     -e HTTPS_PROXY="http://$eip:3128" -e https_proxy="http://$eip:3128" \
     -e PROBE_TARGETS="$targets" -e EGRESS="$eip:3128" -e EGRESS_ALLOWED='[]' \
@@ -554,15 +736,30 @@ point5() {
     "$NODE_IMAGE" sh -c 'cp -r /src/. /work/ && cd /work && npm ci --no-audit --no-fund --foreground-scripts \
       && tar -C /work -cf /out/layer.tar package.json node_modules' >"$WORK/p5/npm.log" 2>&1
   rc=$?
+  run_controls "$targets" "$WORK/p5/controls.json"
   check "5.1 npm ci of the hostile package succeeds in the sandbox job (exit $rc)" test $rc = 0
   [[ $rc == 0 ]] || sed 's/^/      npm: /' "$WORK/p5/npm.log" | tail -20
-  check "5.2 the dependency came through the egress proxy" bash -c "docker logs '$P-egress' 2>&1 | grep -q 'host=registry.npmjs.org port=443 status=200'"
+  check "5.2 the dependency came through the build's own egress proxy" bash -c "docker logs '$P-egress-build' 2>&1 | grep -q 'host=registry.npmjs.org port=443 status=200'"
+  # Copy the output out of the volume, capped in bytes, and keep only the expected regular files.
+  local cap=$((80 * 1024 * 1024)) size
+  docker exec "$P-p5-hold" sh -c 'cd /out && tar -cf - $(ls -A)' 2>/dev/null | head -c "$cap" >"$WORK/p5/out.tar"
+  docker rm -f "$P-p5-hold" >/dev/null 2>&1
+  size="$(stat -c %s "$WORK/p5/out.tar")"
+  check "5.5a the job's output is copied out under the byte cap ($size of $cap bytes)" test "$size" -gt 0 -a "$size" -lt "$cap"
+  tar -C "$WORK/p5" --no-same-owner --no-same-permissions -xf "$WORK/p5/out.tar" layer.tar postinstall.json fill.json 2>/dev/null
+  local f
+  for f in layer.tar postinstall.json fill.json; do
+    [[ -L $WORK/p5/$f ]] && { rm -f "$WORK/p5/$f"; note "dropped a link: $f"; }
+  done
+  check "5.5 the output folder has a size limit: the postinstall's 96 MiB write stops with ENOSPC at 64 MiB or less ($(cat "$WORK/p5/fill.json" 2>/dev/null))" \
+    jqf '.error == "ENOSPC" and .written <= 67108864' "$WORK/p5/fill.json"
   check "5.3 the postinstall ran and wrote its probe result" test -s "$WORK/p5/postinstall.json"
-  probe_checks 5.p "$WORK/p5/postinstall.json"
-  # Step 2 of the recipe: the layer is a plain tar; the app runs from it in a sandbox.
-  if [[ -s $WORK/p5/layer.tar ]]; then
+  probe_checks 5.p "$WORK/p5/postinstall.json" "$targets" "$WORK/p5/controls.json" 1 '[]'
+  # Step 2 of the recipe: the layer is a plain tar; the app runs from it in a sandbox. (Read-only
+  # bind of the unpacked layer: the spike does not assemble an OCI image; R-2b does.)
+  if [[ -s $WORK/p5/layer.tar && ! -L $WORK/p5/layer.tar ]]; then
     note "layer: $(sha256sum "$WORK/p5/layer.tar" | cut -c1-71) ($(stat -c %s "$WORK/p5/layer.tar") bytes)"
-    mkdir -p "$WORK/p5/app" && tar -C "$WORK/p5/app" -xf "$WORK/p5/layer.tar"
+    mkdir -p "$WORK/p5/app" && tar -C "$WORK/p5/app" --no-same-owner -xf "$WORK/p5/layer.tar"
     check "5.4 the built layer runs in a sandbox (require('ms'))" bash -c "
       [[ \$(docker run --rm --network none ${DRIVER_FLAGS[*]} -v '$WORK/p5/app:/app:ro' -w /app '$NODE_IMAGE' \
         node -e \"process.stdout.write(String(require('ms')('2h')))\") == 7200000 ]]"
