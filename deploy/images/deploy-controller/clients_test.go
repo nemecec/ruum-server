@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -178,5 +179,34 @@ func TestScriptRunStreamsLinesAndExitStatus(t *testing.T) {
 	}
 	if strings.Join(lines, "|") != "in-cluster=1 args=a b|err" {
 		t.Fatalf("lines %q", lines)
+	}
+}
+
+// List reads the requests in pages (review of O-34, change 1: large requests never make one
+// answer too large).
+func TestRequestsListPages(t *testing.T) {
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.RawQuery)
+		if r.URL.Query().Get("labelSelector") != requestLabel+"=true" || r.URL.Query().Get("limit") != strconv.Itoa(listPage) {
+			http.Error(w, "bad query", http.StatusBadRequest)
+			return
+		}
+		switch r.URL.Query().Get("continue") {
+		case "":
+			_, _ = w.Write([]byte(`{"metadata":{"continue":"p2"},"items":[{"metadata":{"name":"a"}}]}`))
+		case "p2":
+			_, _ = w.Write([]byte(`{"metadata":{},"items":[{"metadata":{"name":"b"}},{"metadata":{"name":"c"}}]}`))
+		default:
+			http.Error(w, "bad continue", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+	items, err := Requests{Kube: &Kube{Base: srv.URL, HTTP: srv.Client()}, Namespace: "ruum-deploy"}.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 || items[0].Metadata.Name != "a" || items[2].Metadata.Name != "c" || len(queries) != 2 {
+		t.Fatalf("items %v, queries %v", items, queries)
 	}
 }

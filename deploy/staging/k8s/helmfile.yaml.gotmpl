@@ -59,6 +59,7 @@ releases:
         # The deploy controller by digest (backlog O-34); apply.sh checked its provenance.
         deployController:
           image: {{ requiredEnv "DEPLOY_CONTROLLER_IMAGE" }}
+          commit: {{ requiredEnv "DEPLOY_CONTROLLER_COMMIT" | quote }}
 
   - name: nats
     namespace: nats

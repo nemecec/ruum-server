@@ -559,7 +559,8 @@ if has helm; then
   e="ghcr.io/nemecec/ruum-edge@sha256:$(printf '%064d' 1)"
   expect 0 "helm lint charts/ruum" helm lint "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e"
   PCI="ghcr.io/nemecec/ruum-deploy-controller@sha256:$(printf '%064d' 2)"
-  expect 0 "helm lint charts/platform" helm lint "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
+  PCC=0123456789abcdef0123456789abcdef01234567
+  expect 0 "helm lint charts/platform" helm lint "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC"
   expect 0 "render charts/ruum by digest" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e"
   cp "$TMP/out" "$TMP/ruum.yaml"
   # The server and the chart agree on the settings (tests/server-env.sh, crates/ruum-server/env-names.txt).
@@ -594,15 +595,17 @@ if has helm; then
   expect 1 "charts/ruum refuses an odd acme email" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set acme.issuer=zerossl --set-string "acme.email=a b@c.io"
   expect 1 "charts/ruum refuses production Let's Encrypt" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set acme.issuer=letsencrypt
   expect 1 "charts/ruum refuses ZeroSSL without an email" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set acme.issuer=zerossl
-  expect 0 "render charts/platform" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
+  expect 0 "render charts/platform" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC"
   grep -q "serverName: pg-202611111200" "$TMP/out" && ok "the backup path carries the generation (review 2 R-2)" || bad "backup path generation"
   grep -q "retentionPolicy" "$TMP/out" && bad "barman retention is set (the in-cluster key must need no delete)" || ok "no barman retention (review 1 B-3)"
-  expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200 --set "deployController.image=$PCI"
+  expect 0 "render charts/platform in restore mode" helm template platform "$STG/charts/platform" --set generation=202612010000 --set restoreFrom=202611111200 --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC"
   grep -q "serverName: pg-202611111200" "$TMP/out" && grep -q "recovery:" "$TMP/out" && ok "restore mode bootstraps from the old generation" || bad "restore mode"
-  expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform" --set "deployController.image=$PCI"
+  expect 1 "charts/platform refuses an empty generation" helm template platform "$STG/charts/platform" --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC"
   expect 1 "charts/platform refuses a missing deploy controller image (O-34)" helm template platform "$STG/charts/platform" --set generation=202611111200
   expect 1 "charts/platform refuses the controller by tag" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=ghcr.io/nemecec/ruum-deploy-controller:main"
-  expect 1 "charts/platform refuses a server image as the controller" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$d"
+  expect 1 "charts/platform refuses a server image as the controller" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$d" --set-string "deployController.commit=$PCC"
+  expect 1 "charts/platform refuses a missing controller commit (review of O-34, change 4)" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
+  expect 1 "charts/platform refuses a short controller commit" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI" --set-string deployController.commit=0123456
   # Updates without downtime (design 12.7, backlog O-25 and O-26).
   echo "== updates without downtime (O-25, O-26)"
   has_line() { grep -qF -- "$2" "$1"; }
@@ -663,7 +666,7 @@ if has helm; then
   want "$TMP/edge.yaml" "the certificate storage is the edge namespace" "namespace edge"
   want "$TMP/edge.yaml" "Caddy drains open connections for 30 s" "grace_period 30s"
   has_line "$TMP/edge.yaml" "file_system" && bad "the edge still keeps certificates in a file system" || ok "no file system storage for certificates"
-  expect 0 "render the platform for the edge and deployer rights" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI"
+  expect 0 "render the platform for the edge and deployer rights" helm template platform "$STG/charts/platform" --set generation=202611111200 --set "deployController.image=$PCI" --set-string "deployController.commit=$PCC"
   cp "$TMP/out" "$TMP/platform.yaml"
   awk '/^# Source: [a-z-]*\/templates\/edge-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/edge-rbac.yaml"
   want "$TMP/edge-rbac.yaml" "the platform makes the ServiceAccount ruum-edge" "name: ruum-edge"
@@ -745,6 +748,15 @@ if has helm; then
   [[ "$(awk 'BEGIN{RS="---"} /kind: Deployment\n/' "$TMP/controller.yaml" | grep -cE '^  namespace: ruum-deploy$')" == 1 ]] &&
     ok "the deploy controller runs in ruum-deploy" || bad "the deploy controller is not in ruum-deploy"
   want "$TMP/controller.yaml" "one controller at a time (Recreate)" "strategy: { type: Recreate }"
+  # Review of O-34: the quota on the requests (change 1), the commit of the chart (change 4), a
+  # stop that lets a running deploy finish (change 3).
+  awk 'BEGIN{RS="---"} /kind: ResourceQuota\n/ && /namespace: ruum-deploy\n/' "$TMP/controller.yaml" | grep -qE '^    count/configmaps: "[0-9]+"$' &&
+    ok "a ResourceQuota bounds the ConfigMaps in ruum-deploy (the deployer's requests)" || bad "no ResourceQuota on the ConfigMaps of ruum-deploy"
+  want "$TMP/controller.yaml" "the controller's Deployment names its commit (deploy.sh compares the chart)" "ruum.space/commit: \"$PCC\""
+  want "$TMP/controller.yaml" "the controller knows its commit (it prints it in each request)" "- { name: RUUM_CONTROLLER_COMMIT, value: \"$PCC\" }"
+  grace="$(grep -oE 'terminationGracePeriodSeconds: [0-9]+' "$TMP/controller.yaml" | grep -oE '[0-9]+$')"
+  [[ -n "$grace" && "$grace" -gt 3600 ]] && ok "a stop of the controller lets a running deploy finish (grace $grace s > 5 min checks + 55 min deploy)" ||
+    bad "the controller's grace period ($grace) is shorter than one deploy"
   want "$TMP/controller.yaml" "the controller's file system is read-only" "readOnlyRootFilesystem: true"
   grep -qE 'kind: Cluster(Role|RoleBinding)' "$TMP/controller.yaml" && bad "the deploy controller gets cluster-wide rights" || ok "the deploy controller's rights are namespaced"
   [[ "$(grep -E '^  - kind: ' "$TMP/controller.yaml" | sort -u)" == "  - kind: ServiceAccount" &&
@@ -1015,6 +1027,95 @@ grep -qF 'stg_run rw platform --controller "$controller"' "$STG/secrets-push.sh"
   ok "the platform step installs the controller of a commit of main" || bad "secrets-push.sh does not pass a controller commit of main"
 grep -qF 'cosign_verify_provenance "$DEPLOY_CONTROLLER_IMAGE"' "$STG/k8s/apply.sh" && grep -qF 'bash "$STG/ops/rbac-check.sh" live' "$STG/k8s/apply.sh" &&
   ok "apply.sh checks the controller's provenance and the live rights" || bad "apply.sh skips the controller's provenance or the live rights check"
+
+# Review of O-34, change 2: status.sh prints only checked values of the requests (the deployer
+# writes them); an escape sequence never reaches the admin's terminal.
+FS="$TMP/fakestatus"
+mkdir -p "$FS/bin"
+ESC=$'\033'
+jq -n --arg esc "$ESC" --arg c "$C" '{ items: [
+  { metadata: { name: "release-good", creationTimestamp: "2026-11-13T10:00:00Z", annotations: { "ruum.space/phase": "Succeeded" } }, data: { commit: $c } },
+  { metadata: { name: "release-evil", creationTimestamp: "2026-11-13T11:00:00Z", annotations: { "ruum.space/phase": ("Running" + $esc + "]52;c;ZXZpbA==" + $esc + "\\") } },
+    data: { commit: ($esc + "]0;owned" + $esc + "\\" + $c) } },
+  { metadata: { name: "release-new", creationTimestamp: "2026-11-13T12:00:00Z" }, data: { commit: "abc" } } ] }' >"$FS/list.json"
+cat >"$FS/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+[[ "$*" == *"-n ruum-deploy get configmaps -l ruum.space/release-request=true -o json"* ]] || { echo "fake kubectl: unexpected $*" >&2; exit 3; }
+cat "$FAKE_LIST"
+FAKE
+chmod +x "$FS/bin/kubectl"
+echo x >"$FS/kubeconfig"
+PATH="$FS/bin:$PATH" FAKE_LIST="$FS/list.json" WORK="$FS" KUBECONFIG_FILE="$FS/kubeconfig" bash "$STG/ops/status-steps.sh" --requests >"$FS/out" 2>&1
+if LC_ALL=C grep -q "$ESC" "$FS/out"; then bad "status.sh passes an escape sequence of a request to the terminal"
+elif [[ "$(cat "$FS/out")" == "release-good Succeeded $C"$'\n'"release-evil ? ?"$'\n'"release-new new ?" ]]; then
+  ok "status.sh prints only checked values of a release request (an ESC in its commit or phase shows as ?)"
+else bad "status.sh requests: $(LC_ALL=C cat -v "$FS/out")"; fi
+grep -qF 'ruum_request_rows "${kc[@]}" | tail -5' "$STG/ops/status-steps.sh" && ! grep -qF 'COMMIT:.data.commit' "$STG/ops/status-steps.sh" &&
+  ok "the status report uses the checked request rows" || bad "the status report prints raw request values"
+
+# Review of O-34, change 3: no platform step while a deploy runs, unless the admin says so.
+ap="$STG/k8s/apply.sh"
+lg="$(grep -nF 'elif why="$(running_deploy)"; then' "$ap" | cut -d: -f1)"
+lh="$(grep -nE '^helmfile ' "$ap" | head -1 | cut -d: -f1)"
+lns="$(grep -nF 'k apply -f "$HERE/manifests/namespaces.yaml"' "$ap" | cut -d: -f1)"
+[[ -n "$lg" && -n "$lh" && -n "$lns" && "$lg" -lt "$lns" && "$lg" -lt "$lh" ]] &&
+  ok "apply.sh checks for a running deploy before it changes anything" || bad "apply.sh does not check for a running deploy before helmfile ($lg $lns $lh)"
+grep -qF 'ruum_lock_expiry "$lease"' "$ap" && grep -qF 'select(.metadata.annotations["ruum.space/phase"] == "Running")' "$ap" &&
+  ok "apply.sh looks at the deploy lock and at Running requests" || bad "apply.sh does not look at the deploy lock and the Running requests"
+grep -qF 'RUUM_APPLY_IGNORE_RUNNING_DEPLOY:-}" == yes' "$ap" && grep -qF -- '--ignore-running-deploy) ignore_running=yes' "$STG/steps.sh" &&
+  grep -qF 'RUUM_APPLY_IGNORE_RUNNING_DEPLOY="$ignore_running"' "$STG/steps.sh" &&
+  ok "the admin can override the running-deploy check (steps.sh platform --ignore-running-deploy)" || bad "no override of the running-deploy check"
+# The check itself, with a fake kubectl: a held lock, a Running request, an old Running request.
+FG="$TMP/fakeguard"
+mkdir -p "$FG/bin"
+cat >"$FG/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+case "$*" in
+  "-n ruum get lease ruum-deploy -o json") [[ -s "$FAKE_DIR/lease.json" ]] && cat "$FAKE_DIR/lease.json" || exit 1 ;;
+  "-n ruum-deploy get configmaps -l ruum.space/release-request=true -o json") cat "$FAKE_DIR/list.json" ;;
+  *) echo "fake kubectl: unexpected $*" >&2; exit 3 ;;
+esac
+FAKE
+chmod +x "$FG/bin/kubectl"
+# running_deploy, cut out of apply.sh, with the lock helpers.
+awk '/^running_deploy\(\) \{/ {on=1} on {print} on && /^}/ {exit}' "$ap" >"$FG/guard.sh"
+guard() { PATH="$FG/bin:$PATH" FAKE_DIR="$FG" bash -c "k() { kubectl \"\$@\"; }; . '$STG/ops/deploy-lock.sh'; . '$FG/guard.sh'; running_deploy"; }
+now_iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000000Z 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000000Z; }
+t_now=$(date -u +%s)
+: >"$FG/lease.json"; echo '{"items":[]}' >"$FG/list.json"
+expect 1 "the running-deploy check passes with no lock and no request" guard
+jq -n --arg r "$(now_iso "$t_now")" '{ spec: { holderIdentity: "deploy-chart@deploy-controller-x", leaseDurationSeconds: 1800, renewTime: $r } }' >"$FG/lease.json"
+expect 0 "the running-deploy check stops on a held deploy lock" guard
+jq -n --arg r "$(now_iso $(( t_now - 3600 )))" '{ spec: { holderIdentity: "old", leaseDurationSeconds: 1800, renewTime: $r } }' >"$FG/lease.json"
+expect 1 "the running-deploy check ignores an expired deploy lock" guard
+jq -n --arg c "$(now_iso $(( t_now - 120 )) | sed 's/\.000000//')" '{ items: [ { metadata: { name: "release-x", creationTimestamp: $c, annotations: { "ruum.space/phase": "Running" } } } ] }' >"$FG/list.json"
+expect 0 "the running-deploy check stops on a Running request" guard
+jq -n --arg c "$(now_iso $(( t_now - 7200 )) | sed 's/\.000000//')" '{ items: [ { metadata: { name: "release-x", creationTimestamp: $c, annotations: { "ruum.space/phase": "Running" } } } ] }' >"$FG/list.json"
+expect 1 "the running-deploy check ignores a Running request older than one deploy (a forged one never blocks for long)" guard
+
+# Review of O-34, change 4: deploy.sh warns when the target's chart is not the controller's.
+grep -qF 'stg_run ro status --controller-commit' "$STG/deploy.sh" && grep -qF 'ruum_chart_drift "$STG_ROOT" "$controller" "$sha"' "$STG/deploy.sh" &&
+  ok "deploy.sh compares the target's chart with the deploy controller's" || bad "deploy.sh does not compare the chart with the controller's"
+grep -qF -- '--controller-commit' "$STG/ops/status-steps.sh" && grep -qF 'ruum\.space/commit' "$STG/ops/status-steps.sh" &&
+  ok "status-steps.sh reads the controller's commit" || bad "status-steps.sh cannot read the controller's commit"
+for f in $(bash -c ". '$STG/ops/release-floor.sh'; printf '%s\n' \"\${RUUM_CONTROLLER_DEPLOY_PATHS[@]}\""); do
+  grep -qF "$f" "$ROOT/deploy/images/ruum-deploy-controller.Dockerfile" || bad "the controller image lacks $f (RUUM_CONTROLLER_DEPLOY_PATHS)"
+done
+if command -v git >/dev/null; then
+  CD="$TMP/drift"
+  mkdir -p "$CD/deploy/staging/charts/ruum/templates" "$CD/deploy/staging/ops" "$CD/crates"
+  git -C "$CD" init -q && git -C "$CD" config user.email t@example.invalid && git -C "$CD" config user.name t
+  echo a >"$CD/deploy/staging/charts/ruum/templates/x.yaml" && echo s >"$CD/deploy/staging/ops/deploy-chart.sh" && git -C "$CD" add -A && git -C "$CD" commit -qm c1
+  c1="$(git -C "$CD" rev-parse HEAD)"
+  echo code >"$CD/crates/lib.rs" && echo o >"$CD/deploy/staging/ops/other.sh" && git -C "$CD" add -A && git -C "$CD" commit -qm c2
+  c2="$(git -C "$CD" rev-parse HEAD)"
+  echo b >"$CD/deploy/staging/charts/ruum/templates/x.yaml" && git -C "$CD" add -A && git -C "$CD" commit -qm c3
+  c3="$(git -C "$CD" rev-parse HEAD)"
+  drift() { bash -c ". '$STG/ops/release-floor.sh' && ruum_chart_drift \"\$@\"" _ "$@"; }
+  [[ -z "$(drift "$CD" "$c1" "$c2")" ]] && ok "no chart drift when only code and other scripts changed" || bad "chart drift for a code change: $(drift "$CD" "$c1" "$c2")"
+  [[ "$(drift "$CD" "$c1" "$c3")" == deploy/staging/charts/ruum/templates/x.yaml ]] && ok "chart drift names a chart change after the controller's commit" || bad "chart drift: $(drift "$CD" "$c1" "$c3")"
+  [[ "$(drift "$CD" "$c3" "$c1")" == deploy/staging/charts/ruum/templates/x.yaml ]] && ok "chart drift names the chart of a rollback target older than the controller's" || bad "chart drift (rollback): $(drift "$CD" "$c3" "$c1")"
+fi
 
 echo "== live rights check (ops/rbac-check.sh live, a fake kubectl)"
 FA="$TMP/fakeauth"

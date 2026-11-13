@@ -27,7 +27,9 @@
 #   8. the smoke checks (here, on the Mac).
 # The chart, the migration Job and the deploy scripts come from the controller's image (the
 # commit of main that the last platform step installed), not from this checkout or the target
-# commit. The floor: no commit before backlog O-25 (ops/release-floor.sh).
+# commit. deploy.sh reads the controller's commit and warns when the target's chart or deploy
+# scripts differ from it (a chart change reaches staging only with the platform step).
+# The floor: no commit before backlog O-25 (ops/release-floor.sh).
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -108,6 +110,22 @@ if [[ "$deployed" =~ ^[0-9a-f]{40}$ ]]; then
   fi
 else
   stg_log "no deployed commit yet (first deploy)"
+fi
+
+# The chart that runs is the controller's (review of O-34, change 4): say so when it is not the
+# target's.
+controller="$(printf '__END__\n' | stg_run ro status --controller-commit 2>/dev/null || true)"
+if [[ ! "$controller" =~ ^[0-9a-f]{40}$ ]]; then
+  stg_warn "cannot read the deploy controller's commit (annotation ruum.space/commit of ruum-deploy/deploy-controller); the chart and the deploy scripts of the last platform step run, whatever $sha has"
+elif ! git -C "$STG_ROOT" cat-file -e "$controller^{commit}" 2>/dev/null; then
+  stg_warn "the deploy controller's commit $controller is not in this checkout (git fetch); cannot compare its chart with $sha"
+elif drift="$(ruum_chart_drift "$STG_ROOT" "$controller" "$sha")" && [[ -n "$drift" ]]; then
+  if git -C "$STG_ROOT" merge-base --is-ancestor "$controller" "$sha"; then
+    stg_warn "$sha changes the chart or the deploy scripts after the deploy controller's commit $controller. THESE CHANGES DO NOT REACH STAGING WITH THIS DEPLOY: the controller runs its own chart and scripts. To ship them, run the platform step from a checkout of main at or after $sha (RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform), then deploy again. Files:"
+  else
+    stg_warn "the chart or the deploy scripts of $sha differ from the deploy controller's (commit $controller). This deploy runs the controller's chart and scripts, not the ones of $sha (for a rollback that is the rule: design 12.7). Files:"
+  fi
+  sed 's/^/    /' <<<"$drift" >&2
 fi
 
 stg_log "5. release request for the deploy controller; 6. its checks, 7. migration step and rolling update of $sha"

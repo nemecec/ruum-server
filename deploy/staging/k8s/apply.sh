@@ -6,6 +6,11 @@
 #
 #   KUBECONFIG=... DEPLOY_CONTROLLER_COMMIT=<sha of main> k8s/apply.sh <generation> [<restore-from-generation>]
 #
+# It stops before any change while a deploy runs (the deploy lock ruum/ruum-deploy is held, or a
+# release request is Running in the controller): the platform step replaces the controller pod.
+# RUUM_APPLY_IGNORE_RUNNING_DEPLOY=yes (steps.sh platform --ignore-running-deploy) skips that
+# check, for the admin only.
+#
 # It also installs the deploy controller (backlog O-34) from the image of DEPLOY_CONTROLLER_COMMIT,
 # by digest, after the same provenance check as a deploy (cosign: images.yml on refs/heads/main),
 # and checks on the live cluster that the deployer may only write release requests
@@ -24,6 +29,8 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 k() { kubectl "$@"; }
 # shellcheck source=../ops/image-check.sh
 . "$STG/ops/image-check.sh"
+# shellcheck source=../ops/deploy-lock.sh
+. "$STG/ops/deploy-lock.sh"
 
 # The deploy controller image (backlog O-34), checked before anything changes.
 [[ "${DEPLOY_CONTROLLER_COMMIT:-}" =~ $RUUM_COMMIT_RE ]] ||
@@ -35,6 +42,7 @@ export DEPLOY_CONTROLLER_IMAGE="ghcr.io/nemecec/ruum-deploy-controller@$controll
 [[ "$DEPLOY_CONTROLLER_IMAGE" =~ $RUUM_CONTROLLER_IMAGE_RE ]] || die "unexpected controller image $DEPLOY_CONTROLLER_IMAGE"
 cosign_verify_provenance "$DEPLOY_CONTROLLER_IMAGE" ||
   die "no valid provenance attestation (images.yml on refs/heads/main) for $DEPLOY_CONTROLLER_IMAGE"
+export DEPLOY_CONTROLLER_COMMIT
 log "deploy controller $DEPLOY_CONTROLLER_IMAGE (commit $DEPLOY_CONTROLLER_COMMIT, provenance checked)"
 
 for n in SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY \
@@ -66,6 +74,34 @@ while :; do
   log "  nodes Ready: $ready; retry in 10 s"
   sleep 10
 done
+
+# No platform step while a deploy runs (review of O-34, change 3): the step replaces the
+# controller pod, and a deploy cut in the middle of helm upgrade leaves the release
+# pending-upgrade and the deploy lock held. The Lease can only be written by the controller; a
+# Running request counts while it is younger than one deploy can last (the deployer can create
+# a request that looks Running, so an old one does not block the step forever).
+running_deploy() {
+  local now lease until
+  now="$(date -u +%s)"
+  if lease="$(ruum_lock_read)"; then
+    until="$(ruum_lock_expiry "$lease" 2>/dev/null || echo 0)"
+    if [[ "$until" =~ ^[0-9]+$ ]] && (( until > now )); then
+      printf 'the deploy lock ruum/ruum-deploy is held by %s\n' "$(jq -r '.spec.holderIdentity' <<<"$lease" | LC_ALL=C tr -cd 'A-Za-z0-9._:/@-' | cut -c1-120)"
+      return 0
+    fi
+  fi
+  k -n ruum-deploy get configmaps -l ruum.space/release-request=true -o json 2>/dev/null |
+    jq -r --argjson now "$now" '.items[]
+      | select(.metadata.annotations["ruum.space/phase"] == "Running")
+      | select((.metadata.creationTimestamp | fromdateiso8601) > $now - 3900)
+      | "the release request \(.metadata.name) is Running"' 2>/dev/null | head -1 | grep . && return 0
+  return 1
+}
+if [[ "${RUUM_APPLY_IGNORE_RUNNING_DEPLOY:-}" == yes ]]; then
+  log "not checking for a running deploy (RUUM_APPLY_IGNORE_RUNNING_DEPLOY=yes)"
+elif why="$(running_deploy)"; then
+  die "a deploy runs now ($why). Wait for it (deploy/staging/status.sh), or, admin only, pass --ignore-running-deploy to the platform step"
+fi
 
 log "namespaces, network policy engine, local-path storage"
 k apply -f "$HERE/manifests/namespaces.yaml" >/dev/null

@@ -15,6 +15,10 @@ its Deployment, its ServiceAccount or its Roles.
 {{- if not (regexMatch "^ghcr\\.io/nemecec/ruum-deploy-controller@sha256:[a-f0-9]{64}$" $img) }}
 {{- fail "deployController.image must be ghcr.io/nemecec/ruum-deploy-controller@sha256:<digest> (k8s/apply.sh resolves and verifies it)" }}
 {{- end }}
+{{- $commit := .Values.deployController.commit | default "" | toString }}
+{{- if not (regexMatch "^[0-9a-f]{40}$" $commit) }}
+{{- fail "deployController.commit must be the commit of main the image was built from (40 hex; k8s/apply.sh sets it)" }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -127,12 +131,29 @@ roleRef:
   kind: Role
   name: deploy-controller
 ---
+# The deployer may create ConfigMaps in ruum-deploy (its release requests), and RBAC cannot
+# limit that by label or size. The quota bounds how many there are (each up to 1 MiB), so a
+# hostile or broken deployer cannot fill etcd; the controller deletes old requests (review of
+# O-34, change 1).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: release-requests
+  namespace: ruum-deploy
+spec:
+  hard:
+    count/configmaps: "100"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: deploy-controller
   namespace: ruum-deploy
   labels: { app: deploy-controller }
+  annotations:
+    # The commit of the chart and the deploy scripts in the image (deploy.sh compares it with
+    # the target and warns when the target's chart would not run; review of O-34, change 4).
+    ruum.space/commit: {{ $commit | quote }}
 spec:
   replicas: 1
   # One controller at a time: a new pod starts after the old one stopped. A pod that stops
@@ -147,7 +168,10 @@ spec:
       serviceAccountName: deploy-controller
       automountServiceAccountToken: true
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 30
+      # A stop (the platform step, a node drain) lets a running deploy finish: the controller
+      # takes no new request after SIGTERM, and one deploy lasts at most 5 minutes of checks and
+      # 55 minutes of deploy-chart.sh (review of O-34, change 3). Without a deploy it stops at once.
+      terminationGracePeriodSeconds: 3660
       {{- include "platform.podSecurity" . | nindent 6 }}
       containers:
         - name: controller
@@ -156,6 +180,7 @@ spec:
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - { name: RUUM_REQUEST_NAMESPACE, value: ruum-deploy }
+            - { name: RUUM_CONTROLLER_COMMIT, value: {{ $commit | quote }} }
           resources:
             requests: { cpu: 20m, memory: 64Mi }
             limits: { memory: 512Mi }
