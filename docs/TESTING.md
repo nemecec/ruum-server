@@ -242,6 +242,56 @@ RUUM_SUITE_BACKEND=postgres RUUM_REQUIRE_IMPLEMENTED=1 cargo test -p ruum-testki
   --test apps_settings --test apps_deployments --test apps_publish --test apps_roles -- --nocapture
 ```
 
+## Gateway and runtime API harness (T-6)
+
+`crates/ruum-testkit/src/gateway/` (card T-6) holds the cases of the app gateway and the runtime
+API, written before the code (design 18.2). They are black-box cases: a case talks HTTP to the
+listener of `ruum-gateway` (or `ruum-runtime-api`) and never to its internals. A raw HTTP/1.1
+client (`gateway/http.rs`) sends any `Host` header to the listener, so every app host
+(`<app>.<tenant>.ruumapps.localhost`, `<short_id>--<app>.<tenant>.ruumapps.localhost`) reaches
+it, and it sends the request target byte for byte (`..`, `%2e%2e`, `\` are not normalized on
+the way). A fake echo app (`gateway/echo.rs`) answers every request with the request it got, as
+JSON, and sends the `Set-Cookie` and other headers a case asks for.
+
+A **world** starts the binary with an in-memory core and seeds what a case needs. The traits are
+`GatewayWorld` (card G-1a implements it in `crates/ruum-gateway/tests/` and calls
+`gateway::run_gateway_suite`) and `RuntimeApiWorld` (cards R-3 and G-3). A world method is about
+the seeded world (a tenant, an app, a deployment with static files, a grant, a sign-in, an agent
+token, the test upstream), never about the gateway's internals. A step a world cannot do yet
+answers `WorldError::Pending` with the card that brings it (an app role before B-2).
+
+Outcomes, as in the app cases:
+
+- **planned**: no world, or the world says the binary is missing. Never a failure, also not with
+  `RUUM_REQUIRE_IMPLEMENTED=1`. In this crate every case runs without a world, so all are planned.
+- **pending**: `gateway::PENDING` names the case with a card (G-1b, G-2, G-3, G-4, R-3, B-3, W-5,
+  X-2), or the world answered `Pending`. Never a failure. The card removes its line when its
+  code makes the case pass; a planned case body of a later card fails until that card writes it.
+- **passed** or **failed** otherwise. A refusal passes only as the gateway's own answer (its
+  status, never a connection error, a timeout or an answer of the echo app), and a "the app saw
+  nothing" check counts the echo app's requests.
+
+Failure messages never hold a token, a cookie or a key: the runner masks every value the case
+got from the world and everything that looks like a JWT, a bearer value or a Ruum cookie value.
+`gateway/token.rs` has the reference verifier of the user token, written from
+`contracts/apps/user-token.schema.json` (EdDSA signature by the gateway's key set, `iss`, `aud`,
+`typ`, `env`, numeric `iat` and `exp`, `exp - iat` at most 60 s, the schema with unknown claims
+allowed).
+
+`tests/gateway.rs` and `tests/runtime_api.rs` run the cases without a world and check the cases
+themselves: every case names its rule and its source, every pending entry names a case and a
+card, every path of `contracts/apps/gateway.openapi.yaml` and every operation of
+`runtime.openapi.yaml` is named by a case, and the reference verifier refuses hand-made bad
+tokens (wrong `aud`, wrong `env`, no `iat`, `exp - iat` over 60 s, unknown `typ`, a foreign key).
+A self-test runs the cleaning, cookie and traversal cases against two toy gateways in the test
+file: a wrong one (forwards every header, passes the app's `Set-Cookie`, sets a cookie without
+`__Host-`, serves `..`) must fail each case, and a right one must pass each. So the cases can
+fail.
+
+```sh
+cargo test -p ruum-testkit --test gateway --test runtime_api -- --nocapture
+```
+
 ## The privacy suite
 
 `crates/ruum-testkit/src/privacy.rs` (card T-2) checks design 8.5: an agent never sees a raw
