@@ -71,6 +71,13 @@ jobs:
         run: |
           psql "postgres://ruum:ruum@localhost:5432/ruum" -c "create role ruum_test login password 'ruum_test' createdb"
           psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant create on database ruum to ruum_test"
+      # The gateway's database role (card G-1a, migration 0013; review-g1a 1): the tests run part
+      # of the host lookup test as this role, so the test role is a member of it. The role may
+      # only execute ruum_app_host_lookup; the test checks that it reads no tenant table.
+      - name: Gateway role for the tests
+        run: |
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "do \$\$ begin if not exists (select 1 from pg_roles where rolname = 'ruum_gateway') then create role ruum_gateway nologin; end if; end \$\$"
+          psql "postgres://ruum:ruum@localhost:5432/ruum" -c "grant ruum_gateway to ruum_test"
       # The data cluster of step 2 (STEP2 "Infrastructure work" 1, 2 and 7; card E-2): the image of
       # deploy/dev/postgres-data with its init script, on 127.0.0.1:5435 as on the laptop. It is
       # built here (a service container cannot be built). The Postgres engine tests of
@@ -112,6 +119,8 @@ jobs:
           DATABASE_URL: postgres://ruum_test:ruum_test@localhost:5432/ruum
           RUUM_DBHOST_URL: postgres://ruum_dbhost:ci-dbhost@127.0.0.1:5435/postgres
           RUUM_PG_DUMP: /usr/lib/postgresql/17/bin/pg_dump
+          # host_lookup_pg fails, not skips, when it cannot act as ruum_gateway (card G-1a).
+          RUUM_REQUIRE_GATEWAY_ROLE: "1"
         run: |
           cargo test --workspace --exclude ruum-testkit --locked
           cargo test -p ruum-testkit --lib --test contract --test databases_meta --locked

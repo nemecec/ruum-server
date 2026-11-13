@@ -255,6 +255,7 @@ pub async fn handle(State(gw): State<Arc<Gateway>>, req: Request) -> Response {
         check::Outcome::Unauthorized => return pages::unauthorized(site.look()),
         check::Outcome::Forbidden => return pages::forbidden(site.look()),
         check::Outcome::Unavailable => return pages::unavailable(site.look()),
+        check::Outcome::BadRequest => return pages::bad_request(site.look()),
     };
     let (visit, new_visit) = session::visit_of(req.headers());
     let mut resp = match gw.upstreams.get(site.resolved.deployment_id) {

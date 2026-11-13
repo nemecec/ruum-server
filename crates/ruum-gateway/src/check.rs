@@ -13,6 +13,10 @@
 //! - `access: public` (live only) passes everybody, but only while the tenant's public approval
 //!   is current (backlog S-33); without it the app is treated as `access: platform`.
 //! - Partner keys (`ruum_appkey_...`) are refused with `403` until card B-3.
+//! - More than one `Authorization` header gets `400` before anything else: the gateway decides
+//!   on the one credential it checked, so a second value (a platform token behind an app's
+//!   `Basic` value) can never pass unchecked to the app (review-g1a 2; the same rule as for two
+//!   `Host` headers).
 //!
 //! Every answer of the core is cached at most a few seconds ([`crate::core_api::CHECK_TTL`]).
 
@@ -56,6 +60,8 @@ pub enum Outcome {
     Forbidden,
     /// The core could not answer: fail closed.
     Unavailable,
+    /// The request is ambiguous (more than one `Authorization` header): `400`.
+    BadRequest,
 }
 
 /// The visible prefix of a partner API key (`createAppApiKey`, card B-3).
@@ -83,8 +89,20 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (jwt || token.starts_with(PARTNER_KEY_PREFIX)).then_some(token)
 }
 
+/// Whether the request has at most one `Authorization` header.
+fn one_authorization(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::AUTHORIZATION)
+        .iter()
+        .nth(1)
+        .is_none()
+}
+
 /// The check of one request (see the module docs).
 pub async fn check(gw: &Gateway, site: &Site, headers: &HeaderMap) -> Outcome {
+    if !one_authorization(headers) {
+        return Outcome::BadRequest;
+    }
     if let Some(token) = bearer(headers) {
         if token.starts_with(PARTNER_KEY_PREFIX) {
             // Partner keys reach only their external API: card B-3.
@@ -174,5 +192,17 @@ mod tests {
             assert_eq!(bearer(&auth(other)), None, "{other}");
         }
         assert_eq!(bearer(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn two_authorization_headers_are_refused() {
+        assert!(one_authorization(&HeaderMap::new()));
+        assert!(one_authorization(&auth("Basic YXBwOnQ2b3du")));
+        let mut two = auth("Basic YXBwOnQ2b3du");
+        two.append(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer aaa.bbb.ccc"),
+        );
+        assert!(!one_authorization(&two));
     }
 }

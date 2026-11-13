@@ -1026,3 +1026,73 @@ async fn a_request_path_never_chooses_the_object() {
         assert!(!r.text().contains("T6-SECRET"), "{target}");
     }
 }
+
+/// Two `Authorization` headers get `400` and reach nothing: an app's own `Basic` value in front
+/// cannot carry a platform token past the check to the app (review-g1a 2; decision 0006-10,
+/// `gateway.openapi.yaml` "The check of every request" 3). One header of the app's own scheme
+/// still passes, and one platform token alone gets `401`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_authorization_header_never_passes() {
+    let w = World::new().await.unwrap();
+    let (_, a, u, host) = app_scene(&w).await;
+    let live = w
+        .seed_deployment(
+            &a,
+            Env::Live,
+            &gateway::files(&[("index.html", b"hi")]),
+            None,
+        )
+        .await
+        .unwrap();
+    w.set_live(&a, &live).await.unwrap();
+    let echo = gateway::Echo::start().await;
+    w.set_upstream(&live, &echo.url).await.unwrap();
+    let (target, nonce) = code_for(&w, &u, &host).await;
+    let cb = w
+        .gateway_get(&host, &target, Some(&format!("__Host-ruum_auth={nonce}")))
+        .await
+        .unwrap();
+    let session = format!(
+        "__Host-ruum_app={}",
+        cookie_value(&cb, "__Host-ruum_app").unwrap()
+    );
+    let api = w.agent_token(&u, AgentAudience::Api).await.unwrap();
+    let platform = format!("Bearer {}", api.expose());
+    let addr = w.gateway;
+    let send = |values: Vec<String>| {
+        let mut req = Req::get(&host, "/").header("Cookie", &session);
+        for v in &values {
+            req = req.header("Authorization", v);
+        }
+        async move { gateway::http::send(addr, &req, Duration::from_secs(20)).await }
+    };
+    let basic = "Basic YXBwOnQ2b3du".to_string();
+    // One value of the app's own scheme: forwarded with the session.
+    let r = send(vec![basic.clone()]).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(echo.hits(), 1);
+    // One platform token alone: 401.
+    let r = send(vec![platform.clone()]).await.unwrap();
+    assert_eq!(r.status, 401);
+    // Two values, in either order: 400, and the app sees nothing.
+    for (what, values) in [
+        ("basic first", vec![basic.clone(), platform.clone()]),
+        ("token first", vec![platform.clone(), basic.clone()]),
+        ("two of the app's own", vec![basic.clone(), basic.clone()]),
+    ] {
+        let r = send(values).await.unwrap();
+        assert_eq!(r.status, 400, "{what}");
+        assert!(!r.text().contains(api.expose()), "{what}");
+    }
+    assert_eq!(
+        echo.hits(),
+        1,
+        "a request with two Authorization headers reached the app"
+    );
+    assert!(
+        echo.seen()
+            .iter()
+            .all(|s| s.headers.iter().all(|(_, v)| !v.contains(api.expose()))),
+        "the platform token reached the app"
+    );
+}
