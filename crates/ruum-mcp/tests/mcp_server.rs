@@ -249,9 +249,9 @@ async fn initialize_and_list_every_tool_of_the_contract() {
     // (confirmColumnClasses is users only: no tool), the two grant tools of card A-1
     // (`createDatabaseAccessGrant` is users only, so it has no tool), the three of card Q-1,
     // the four approval tools of card A-2 (`decideDatabaseApproval` is users only: no tool),
-    // the two branch tools of card D-3a, the five web app tools of card W-1 and the two of
-    // card W-2s (deploy_app_preview, publish_app_deployment).
-    assert_eq!(names.len(), 73);
+    // the two branch tools of card D-3a, the five web app tools of card W-1, the two of card
+    // W-2s (deploy_app_preview, publish_app_deployment) and the four app role tools of card B-2.
+    assert_eq!(names.len(), 77);
     for t in [
         "create_database",
         "get_database",
