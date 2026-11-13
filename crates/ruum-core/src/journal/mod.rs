@@ -82,6 +82,12 @@ pub enum EventType {
     DatabaseApprovalDecided,
     #[serde(rename = "app.settings_changed")]
     AppSettingsChanged,
+    #[serde(rename = "app.deployed")]
+    AppDeployed,
+    #[serde(rename = "app.deployment_failed")]
+    AppDeploymentFailed,
+    #[serde(rename = "app.rolled_back")]
+    AppRolledBack,
 }
 
 impl EventType {
@@ -110,6 +116,9 @@ impl EventType {
         EventType::DatabaseGrantRevoked,
         EventType::DatabaseApprovalDecided,
         EventType::AppSettingsChanged,
+        EventType::AppDeployed,
+        EventType::AppDeploymentFailed,
+        EventType::AppRolledBack,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -139,6 +148,9 @@ impl EventType {
             DatabaseGrantRevoked => "database.grant_revoked",
             DatabaseApprovalDecided => "database.approval_decided",
             AppSettingsChanged => "app.settings_changed",
+            AppDeployed => "app.deployed",
+            AppDeploymentFailed => "app.deployment_failed",
+            AppRolledBack => "app.rolled_back",
         }
     }
 
@@ -463,7 +475,15 @@ mod tests {
                     || *e == EventType::DatabaseColumnsConfirmed
                     // The entry names the new settings only (its schema), so there is nothing
                     // to set back; an agent can only lower settings anyway.
-                    || *e == EventType::AppSettingsChanged,
+                    || *e == EventType::AppSettingsChanged
+                    // A deployment is not undone: a preview expires on its own, a failure
+                    // changed nothing, and only a person publishes or rolls back (card W-2s).
+                    || matches!(
+                        e,
+                        EventType::AppDeployed
+                            | EventType::AppDeploymentFailed
+                            | EventType::AppRolledBack
+                    ),
                 "{e:?} has no inverse"
             );
         }

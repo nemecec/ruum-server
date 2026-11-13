@@ -433,12 +433,250 @@ pub(crate) async fn deployments_list_and_releases(h: &dyn Harness) {
     assert_eq!(e.http_status(), 400);
 }
 
+/// A preview's stages, its finish (with draft supersession), a failure, releases with the
+/// compare of the live deployment, versions and their deployments, approvals and the expiry
+/// of previews (card W-2s).
+pub(crate) async fn previews_releases_and_versions(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let c = ctx(a, ua);
+    s.insert_app(&c, app(n, &unique("planner")))
+        .await
+        .unwrap()
+        .unwrap();
+    // Two previews of one draft: the older ready one is superseded by the newer one.
+    let mut d1 = deployment(n, Environment::Preview, DeploymentState::Running);
+    d1.draft = Some("sortable".into());
+    let p1 = s.insert_deployment(&c, d1).await.unwrap();
+    let stages = serde_json::json!([{ "name": "image", "state": "running" }]);
+    assert!(s.update_stages(a, p1.id, &stages).await.unwrap());
+    let check = serde_json::json!({ "passed": true });
+    assert_eq!(
+        s.finish_preview(&c, p1.id, &stages, Some(&check))
+            .await
+            .unwrap(),
+        DeploymentState::Ready
+    );
+    let got = s.get_deployment(a, n, p1.id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.stages.clone()),
+        (DeploymentState::Ready, stages.clone())
+    );
+    assert_eq!(got.check_result, Some(check.clone()));
+    // A finished preview takes no more stages.
+    assert!(!s.update_stages(a, p1.id, &stages).await.unwrap());
+    let mut d2 = deployment(n, Environment::Preview, DeploymentState::Running);
+    d2.draft = Some("sortable".into());
+    let p2 = s.insert_deployment(&c, d2).await.unwrap();
+    let mut d3 = deployment(n, Environment::Preview, DeploymentState::Running);
+    d3.draft = Some("colours".into());
+    let p3 = s.insert_deployment(&c, d3).await.unwrap();
+    s.finish_preview(&c, p2.id, &stages, None).await.unwrap();
+    s.finish_preview(&c, p3.id, &stages, None).await.unwrap();
+    let state = |id| async move { s.get_deployment(a, n, id).await.unwrap().unwrap().state };
+    assert_eq!(state(p1.id).await, DeploymentState::Superseded);
+    assert_eq!(state(p2.id).await, DeploymentState::Ready);
+    assert_eq!(state(p3.id).await, DeploymentState::Ready);
+    // A failure.
+    let p4 = s
+        .insert_deployment(
+            &c,
+            deployment(n, Environment::Preview, DeploymentState::Running),
+        )
+        .await
+        .unwrap();
+    s.fail_deployment(&c, p4.id, &stages, None, "image", "image_failed")
+        .await
+        .unwrap();
+    assert_eq!(state(p4.id).await, DeploymentState::Failed);
+    // The first release: the live deployment must still be none.
+    let mut r1 = deployment(n, Environment::Live, DeploymentState::Live);
+    r1.published_from = Some(p2.id);
+    let wrong = Release {
+        kind: ReleaseKind::Publish,
+        expected_live: Some(p3.id),
+        restored_from: None,
+        rollback_of: None,
+        approval_id: None,
+    };
+    let e = s.release(&c, r1.clone(), wrong).await.unwrap_err();
+    assert_eq!(e.http_status(), 409);
+    assert!(s.get_deployment(a, n, r1.id).await.unwrap().is_none());
+    let publish = Release {
+        kind: ReleaseKind::Publish,
+        expected_live: None,
+        restored_from: None,
+        rollback_of: None,
+        approval_id: None,
+    };
+    let v1 = s.release(&c, r1.clone(), publish.clone()).await.unwrap();
+    assert_eq!(v1.deployment.version_id, Some(v1.version.id));
+    assert_eq!(v1.deployment.state, DeploymentState::Live);
+    assert_eq!(v1.version.node_id, n);
+    assert_eq!(v1.version.actor, Actor::user(ua));
+    let row = s.get_app(a, n).await.unwrap().unwrap();
+    assert_eq!(row.live_deployment_id, Some(r1.id));
+    assert!(row.slug_fixed_at.is_some());
+    // A rollback copy: the live deployment is compared, the old one is superseded.
+    let r2 = deployment(n, Environment::Live, DeploymentState::Live);
+    let stale = s
+        .release(&c, r2.clone(), publish.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(stale.http_status(), 409);
+    let v2 = s
+        .release(
+            &c,
+            r2.clone(),
+            Release {
+                kind: ReleaseKind::Rollback,
+                expected_live: Some(r1.id),
+                restored_from: Some(v1.version.id),
+                rollback_of: Some(r1.id),
+                approval_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(v2.version.restored_from, Some(v1.version.id));
+    assert_eq!(state(r1.id).await, DeploymentState::Superseded);
+    let versions = s
+        .list_versions(
+            a,
+            n,
+            crate::versions::VersionFilter::default(),
+            PageRequest::default(),
+        )
+        .await
+        .unwrap();
+    let ids: Vec<VersionId> = versions.items.iter().map(|v| v.id).collect();
+    assert_eq!(ids, [v2.version.id, v1.version.id]);
+    let (v, d) = s.release_of(a, n, v1.version.id).await.unwrap().unwrap();
+    assert_eq!((v.id, d), (v1.version.id, r1.id));
+    assert!(
+        s.release_of(a, n, VersionId::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // An approval request of an agent's publish.
+    let ap = s
+        .insert_approval(
+            &c,
+            NewApproval {
+                id: Uuid::now_v7(),
+                app_node_id: n,
+                deployment_id: p3.id,
+                changes: serde_json::json!({ "roles_added": [] }),
+                bound_archive_hash: [7; 32],
+                bound_manifest_hash: [8; 32],
+                bound_bindings: serde_json::json!([]),
+                expires_at: crate::now() + time::Duration::hours(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((ap.status.as_str(), ap.deployment_id), ("pending", p3.id));
+    assert_eq!(ap.requested_by, Actor::user(ua));
+    // The sweeper ends a ready preview whose expiry passed, and only that one.
+    let mut old = deployment(n, Environment::Preview, DeploymentState::Ready);
+    old.expires_at = Some(crate::now() - time::Duration::minutes(1));
+    let old = s.insert_deployment(&c, old).await.unwrap();
+    let mut fresh = deployment(n, Environment::Preview, DeploymentState::Ready);
+    fresh.expires_at = Some(crate::now() + time::Duration::days(1));
+    let fresh = s.insert_deployment(&c, fresh).await.unwrap();
+    let mut ended = Vec::new();
+    for _ in 0..100 {
+        let got = s.expire_previews(crate::now(), 1000).await.unwrap();
+        if got.is_empty() {
+            break;
+        }
+        ended.extend(got);
+    }
+    assert!(
+        ended
+            .iter()
+            .any(|e| e.id == old.id && e.tenant_id == a && e.app_node_id == n)
+    );
+    assert!(!ended.iter().any(|e| e.id == fresh.id));
+    assert_eq!(state(old.id).await, DeploymentState::Expired);
+    assert_eq!(state(fresh.id).await, DeploymentState::Ready);
+}
+
+/// The deployment writes and reads of card W-2s stay in their tenant.
+pub(crate) async fn deployments_stay_in_their_tenant(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let (ca, cb) = (ctx(a, ua), ctx(b, ub));
+    s.insert_app(&ca, app(n, &unique("planner")))
+        .await
+        .unwrap()
+        .unwrap();
+    let p = s
+        .insert_deployment(
+            &ca,
+            deployment(n, Environment::Preview, DeploymentState::Running),
+        )
+        .await
+        .unwrap();
+    let stages = serde_json::json!([]);
+    assert!(!s.update_stages(b, p.id, &stages).await.unwrap());
+    assert!(s.finish_preview(&cb, p.id, &stages, None).await.is_err());
+    assert!(
+        s.fail_deployment(&cb, p.id, &stages, None, "image", "x")
+            .await
+            .is_err()
+    );
+    assert!(s.get_deployment(b, n, p.id).await.unwrap().is_none());
+    // A release under another tenant's app is refused; nothing changes in A.
+    let r = deployment(n, Environment::Live, DeploymentState::Live);
+    let publish = Release {
+        kind: ReleaseKind::Publish,
+        expected_live: None,
+        restored_from: None,
+        rollback_of: None,
+        approval_id: None,
+    };
+    assert!(s.release(&cb, r.clone(), publish.clone()).await.is_err());
+    assert!(
+        s.get_app(a, n)
+            .await
+            .unwrap()
+            .unwrap()
+            .live_deployment_id
+            .is_none()
+    );
+    let v = s.release(&ca, r, publish).await.unwrap();
+    assert!(s.release_of(b, n, v.version.id).await.unwrap().is_none());
+    assert!(
+        s.list_versions(
+            b,
+            n,
+            crate::versions::VersionFilter::default(),
+            PageRequest::default()
+        )
+        .await
+        .unwrap()
+        .items
+        .is_empty()
+    );
+    assert_eq!(
+        s.get_deployment(a, n, p.id).await.unwrap().unwrap().state,
+        DeploymentState::Running
+    );
+}
+
 /// Runs every case.
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
     apps_stay_in_their_tenant(h).await;
     used_slugs_are_never_given_again(h).await;
     deployments_list_and_releases(h).await;
+    previews_releases_and_versions(h).await;
+    deployments_stay_in_their_tenant(h).await;
 }
 
 #[cfg(test)]
@@ -601,6 +839,125 @@ mod tests {
         run_all(&h).await;
     }
 
+    /// The chunk garbage collection reads the chunk lists of app releases (`app_release_v1`)
+    /// and of previews that have not ended, and frees the chunks of an expired preview (card
+    /// W-2s, P-60; the mutation `apps-deploy-gc-ignores-releases` drops the release lists).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_gc_keeps_release_chunks_and_frees_ended_previews(pool: sqlx::PgPool) {
+        use crate::blobs::{BlobStore, ChunkRef, ContentSigner, Hash, Manifest, ManifestFormat};
+        let (t, u) = pg_tenant(&pool).await;
+        let n = pg_app_node(&pool, t, u).await;
+        let store = PgAppStore::new(pool.clone());
+        let c = ctx(t, u);
+        store
+            .insert_app(&c, app(n, &unique("gc")))
+            .await
+            .unwrap()
+            .unwrap();
+        let blobs = Arc::new(crate::blobs::memory::MemoryBlobStore::default());
+        let mut hashes = Vec::new();
+        for name in ["release", "ready", "expired"] {
+            let data = format!("{name} archive {}", Uuid::now_v7());
+            let h = Hash::of(data.as_bytes());
+            blobs
+                .put_chunk(t, h, bytes::Bytes::from(data.clone()))
+                .await
+                .unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query("set local ruum.system = 'on'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query(
+                "insert into chunks (tenant_id, hash, size_bytes, created_at) \
+                 values ($1, $2, $3, now() - interval '1 hour')",
+            )
+            .bind(t)
+            .bind(h.0.to_vec())
+            .bind(data.len() as i32)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            hashes.push((h, data.len() as u32));
+        }
+        let list = |(h, size): (Hash, u32)| {
+            Manifest {
+                format: ManifestFormat::ChunksV1,
+                chunking: "fastcdc-2020-16k-32k-64k".into(),
+                chunks: vec![ChunkRef { hash: h, size }],
+                size: u64::from(size),
+                content_hash: h,
+            }
+            .encode()
+        };
+        // A release: its version names the archive. The deployment row's own list is emptied,
+        // so only the version keeps the chunk (as after the row is gone).
+        let mut r = deployment(n, Environment::Live, DeploymentState::Live);
+        r.archive.chunks = list(hashes[0]);
+        let released = store
+            .release(
+                &c,
+                r,
+                Release {
+                    kind: ReleaseKind::Publish,
+                    expected_live: None,
+                    restored_from: None,
+                    rollback_of: None,
+                    approval_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("update app_deployments set archive_chunks = ''::bytea where id = $1")
+            .bind(released.deployment.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // A ready preview and an expired one.
+        let mut ready = deployment(n, Environment::Preview, DeploymentState::Ready);
+        ready.archive.chunks = list(hashes[1]);
+        store.insert_deployment(&c, ready).await.unwrap();
+        let mut gone = deployment(n, Environment::Preview, DeploymentState::Ready);
+        gone.archive.chunks = list(hashes[2]);
+        let gone = store.insert_deployment(&c, gone).await.unwrap();
+        assert!(
+            store
+                .set_deployment_state(t, gone.id, DeploymentState::Expired)
+                .await
+                .unwrap()
+        );
+        let authz: Arc<dyn crate::authz::Authz> =
+            Arc::new(crate::authz::memory::MemoryAuthz::default());
+        let nodes = Arc::new(crate::nodes::memory::MemoryNodeStore::new(
+            authz.clone(),
+            Arc::new(MemoryJournal::default()),
+        ));
+        let content = crate::blobs::postgres::PgContentStore::new(
+            pool.clone(),
+            authz,
+            nodes,
+            blobs.clone(),
+            ContentSigner::random(),
+        );
+        let report = content
+            .collect_garbage(t, time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, 1, "{report:?}");
+        let have = blobs
+            .has_chunks(t, &[hashes[0].0, hashes[1].0, hashes[2].0])
+            .await
+            .unwrap();
+        assert_eq!(have, [true, true, false]);
+    }
+
     /// The Postgres store keeps every row in its tenant with row-level security off, so only
     /// the tenant filters of its statements hold (the mutation `apps-tenant-filter-postgres`
     /// drops one).
@@ -611,6 +968,8 @@ mod tests {
             "apps",
             "retired_app_slugs",
             "app_deployments",
+            "app_approvals",
+            "journal",
             "typed_nodes",
             "versions",
             "nodes",
@@ -628,5 +987,6 @@ mod tests {
         };
         apps_stay_in_their_tenant(&h).await;
         used_slugs_are_never_given_again(&h).await;
+        deployments_stay_in_their_tenant(&h).await;
     }
 }

@@ -15,6 +15,9 @@ struct Inner {
     /// Every app slug ever given in a tenant, and its app node.
     app_slugs: HashMap<(TenantId, String), NodeId>,
     deployments: HashMap<(TenantId, Uuid), DeploymentRow>,
+    /// The release versions of each app node, oldest first, with their deployment.
+    versions: HashMap<(TenantId, NodeId), Vec<(Version, Uuid)>>,
+    approvals: HashMap<(TenantId, Uuid), ApprovalRow>,
 }
 
 /// The in-memory store. With a journal, `update_settings` appends its entry there.
@@ -33,6 +36,110 @@ impl MemoryAppStore {
 
     fn st(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("app store lock")
+    }
+
+    /// Appends the entries to the journal (when the store has one); the change of the first.
+    fn journal(
+        &self,
+        ctx: &Context,
+        node: NodeId,
+        entries: Vec<(EventType, Value)>,
+        at: OffsetDateTime,
+    ) -> Result<ChangeInfo> {
+        let mut first = None;
+        for (event, data) in entries {
+            let change = match &self.journal {
+                Some(j) => {
+                    let e = j.append(
+                        ctx,
+                        NewEntry {
+                            node_id: Some(node),
+                            revision: None,
+                            event,
+                            data,
+                        },
+                    )?;
+                    ChangeInfo {
+                        seq: Some(e.seq),
+                        actor: ctx.actor,
+                        at: e.at,
+                    }
+                }
+                None => ChangeInfo {
+                    seq: None,
+                    actor: ctx.actor,
+                    at,
+                },
+            };
+            first.get_or_insert(change);
+        }
+        Ok(first.unwrap_or(ChangeInfo {
+            seq: None,
+            actor: ctx.actor,
+            at,
+        }))
+    }
+}
+
+/// Inserts a deployment row under the lock (the checks of [`AppStore::insert_deployment`]).
+fn insert_row(
+    st: &mut Inner,
+    ctx: &Context,
+    d: &NewDeployment,
+    version: Option<VersionId>,
+    now: OffsetDateTime,
+) -> Result<DeploymentRow> {
+    let tenant = ctx.tenant;
+    if !st.apps.contains_key(&(tenant, d.app_node_id)) {
+        return Err(Error::not_found("app"));
+    }
+    if st
+        .deployments
+        .values()
+        .any(|x| x.tenant_id == tenant && (x.id == d.id || x.short_id == d.short_id))
+    {
+        return Err(Error::api(
+            crate::error::ErrorCode::Conflict,
+            "the deployment exists",
+        ));
+    }
+    let release = d.is_release();
+    Ok(DeploymentRow {
+        tenant_id: tenant,
+        id: d.id,
+        app_node_id: d.app_node_id,
+        environment: d.environment,
+        state: d.state,
+        short_id: d.short_id.clone(),
+        version_id: version,
+        label: d.label.clone(),
+        draft: d.draft.clone(),
+        source: d.source.clone(),
+        archive: d.archive.clone(),
+        manifest: d.manifest.clone(),
+        stages: d.stages.clone(),
+        check_result: None,
+        published_from: d.published_from,
+        approval_id: None,
+        created_by: ctx.actor,
+        created_at: now,
+        published_at: release.then_some(now),
+        expires_at: d.expires_at,
+    })
+}
+
+/// Makes `row` the live deployment of its app (the old one `superseded`) and fixes the slug.
+fn switch_live(st: &mut Inner, tenant: TenantId, row: &DeploymentRow, now: OffsetDateTime) {
+    let Some(app) = st.apps.get_mut(&(tenant, row.app_node_id)) else {
+        return;
+    };
+    let old = app.live_deployment_id.replace(row.id);
+    app.slug_fixed_at.get_or_insert(now);
+    app.updated_at = now;
+    if let Some(old) = old
+        && let Some(prev) = st.deployments.get_mut(&(tenant, old))
+    {
+        prev.state = DeploymentState::Superseded;
     }
 }
 
@@ -211,59 +318,16 @@ impl AppStore for MemoryAppStore {
 
     async fn insert_deployment(&self, ctx: &Context, d: NewDeployment) -> Result<DeploymentRow> {
         let mut st = self.st();
-        let tenant = ctx.tenant;
-        if !st.apps.contains_key(&(tenant, d.app_node_id)) {
-            return Err(Error::not_found("app"));
-        }
-        if st
-            .deployments
-            .values()
-            .any(|x| x.tenant_id == tenant && (x.id == d.id || x.short_id == d.short_id))
-        {
-            return Err(Error::api(
-                crate::error::ErrorCode::Conflict,
-                "the deployment exists",
-            ));
-        }
         let now = crate::now();
-        let release = d.is_release();
-        let row = DeploymentRow {
-            tenant_id: tenant,
-            id: d.id,
-            app_node_id: d.app_node_id,
-            environment: d.environment,
-            state: d.state,
-            short_id: d.short_id,
-            version_id: release.then(VersionId::new),
-            label: d.label,
-            draft: d.draft,
-            source: d.source,
-            archive: d.archive,
-            manifest: d.manifest,
-            stages: d.stages,
-            check_result: None,
-            published_from: d.published_from,
-            approval_id: None,
-            created_by: ctx.actor,
-            created_at: now,
-            published_at: release.then_some(now),
-            expires_at: d.expires_at,
-        };
-        if release {
-            let app = st
-                .apps
-                .get_mut(&(tenant, d.app_node_id))
-                .expect("checked above");
-            if let Some(old) = app.live_deployment_id.replace(row.id)
-                && let Some(prev) = st.deployments.get_mut(&(tenant, old))
-            {
-                prev.state = DeploymentState::Superseded;
-            }
-            let app = st
-                .apps
-                .get_mut(&(tenant, d.app_node_id))
-                .expect("checked above");
-            app.slug_fixed_at.get_or_insert(now);
+        let tenant = ctx.tenant;
+        let release = d.is_release().then(|| release_version(ctx, &d, None, now));
+        let row = insert_row(&mut st, ctx, &d, release.as_ref().map(|(v, _)| v.id), now)?;
+        if let Some((v, _)) = release {
+            switch_live(&mut st, tenant, &row, now);
+            st.versions
+                .entry((tenant, d.app_node_id))
+                .or_default()
+                .push((v, row.id));
         }
         st.deployments.insert((tenant, row.id), row.clone());
         Ok(row)
@@ -323,5 +387,243 @@ impl AppStore for MemoryAppStore {
             }
             None => false,
         })
+    }
+
+    async fn update_stages(&self, tenant: TenantId, id: Uuid, stages: &Value) -> Result<bool> {
+        Ok(match self.st().deployments.get_mut(&(tenant, id)) {
+            Some(d) if d.state.is_moving() => {
+                d.state = DeploymentState::Running;
+                d.stages = stages.clone();
+                true
+            }
+            _ => false,
+        })
+    }
+
+    async fn finish_preview(
+        &self,
+        ctx: &Context,
+        id: Uuid,
+        stages: &Value,
+        check: Option<&Value>,
+    ) -> Result<DeploymentState> {
+        let mut st = self.st();
+        let tenant = ctx.tenant;
+        let Some(me) = st.deployments.get(&(tenant, id)).cloned() else {
+            return Err(Error::not_found("deployment"));
+        };
+        if me.environment != Environment::Preview || !me.state.is_moving() {
+            return Err(Error::not_found("deployment"));
+        }
+        let mut state = DeploymentState::Ready;
+        if let Some(draft) = &me.draft {
+            let same: Vec<Uuid> = st
+                .deployments
+                .values()
+                .filter(|x| {
+                    x.tenant_id == tenant
+                        && x.app_node_id == me.app_node_id
+                        && x.environment == Environment::Preview
+                        && x.state == DeploymentState::Ready
+                        && x.draft.as_deref() == Some(draft.as_str())
+                        && x.id != id
+                })
+                .map(|x| x.id)
+                .collect();
+            for other in same {
+                let o = st
+                    .deployments
+                    .get_mut(&(tenant, other))
+                    .expect("listed above");
+                if (o.created_at, o.id) < (me.created_at, me.id) {
+                    o.state = DeploymentState::Superseded;
+                } else {
+                    state = DeploymentState::Superseded;
+                }
+            }
+        }
+        let row = st.deployments.get_mut(&(tenant, id)).expect("read above");
+        row.state = state;
+        row.stages = stages.clone();
+        row.check_result = check.cloned();
+        let node = row.app_node_id;
+        if state == DeploymentState::Ready {
+            self.journal(
+                ctx,
+                node,
+                vec![(EventType::AppDeployed, preview_deployed_data(id))],
+                crate::now(),
+            )?;
+        }
+        Ok(state)
+    }
+
+    async fn fail_deployment(
+        &self,
+        ctx: &Context,
+        id: Uuid,
+        stages: &Value,
+        check: Option<&Value>,
+        stage: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let mut st = self.st();
+        let row = st
+            .deployments
+            .get_mut(&(ctx.tenant, id))
+            .ok_or_else(|| Error::not_found("deployment"))?;
+        row.state = DeploymentState::Failed;
+        row.stages = stages.clone();
+        row.check_result = check.cloned();
+        let (node, env) = (row.app_node_id, row.environment);
+        self.journal(
+            ctx,
+            node,
+            vec![(
+                EventType::AppDeploymentFailed,
+                deployment_failed_data(id, env, stage, reason),
+            )],
+            crate::now(),
+        )?;
+        Ok(())
+    }
+
+    async fn release(&self, ctx: &Context, d: NewDeployment, r: Release) -> Result<Released> {
+        if !d.is_release() {
+            return Err(Error::Internal(
+                "release() of a deployment that is not live".into(),
+            ));
+        }
+        let mut st = self.st();
+        let tenant = ctx.tenant;
+        let live = st
+            .apps
+            .get(&(tenant, d.app_node_id))
+            .ok_or_else(|| Error::not_found("app"))?
+            .live_deployment_id;
+        if live != r.expected_live {
+            return Err(live_changed());
+        }
+        let previous = live.map(|p| {
+            let v = st.deployments.get(&(tenant, p)).and_then(|x| x.version_id);
+            (p, v)
+        });
+        let now = crate::now();
+        let (version, _) = release_version(ctx, &d, r.restored_from, now);
+        let row = insert_row(&mut st, ctx, &d, Some(version.id), now)?;
+        let entries = release_entries(&d, &version, previous, &r);
+        // The journal first: a failed append leaves nothing behind (as the Postgres rollback).
+        let change = self.journal(ctx, d.app_node_id, entries, now)?;
+        switch_live(&mut st, tenant, &row, now);
+        st.versions
+            .entry((tenant, d.app_node_id))
+            .or_default()
+            .push((version.clone(), row.id));
+        st.deployments.insert((tenant, row.id), row.clone());
+        Ok(Released {
+            deployment: row,
+            version,
+            change,
+        })
+    }
+
+    async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow> {
+        let mut st = self.st();
+        let tenant = ctx.tenant;
+        if !st.deployments.contains_key(&(tenant, a.deployment_id)) {
+            return Err(Error::not_found("deployment"));
+        }
+        let row = ApprovalRow {
+            tenant_id: tenant,
+            id: a.id,
+            app_node_id: a.app_node_id,
+            deployment_id: a.deployment_id,
+            status: "pending".into(),
+            changes: a.changes,
+            bound_archive_hash: a.bound_archive_hash,
+            bound_manifest_hash: a.bound_manifest_hash,
+            bound_bindings: a.bound_bindings,
+            requested_by: ctx.actor,
+            decided_by: None,
+            decided_at: None,
+            comment: None,
+            expires_at: a.expires_at,
+            created_at: crate::now(),
+        };
+        st.approvals.insert((tenant, row.id), row.clone());
+        Ok(row)
+    }
+
+    async fn list_versions(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        filter: VersionFilter,
+        page: PageRequest,
+    ) -> Result<Page<Version>> {
+        let after = page
+            .cursor
+            .as_ref()
+            .map(crate::blobs::logic::decode_version_cursor)
+            .transpose()?;
+        let limit = page.limit() as usize;
+        let mut all: Vec<Version> = self
+            .st()
+            .versions
+            .get(&(tenant, node))
+            .map(|vs| {
+                vs.iter()
+                    .map(|(v, _)| v)
+                    .filter(|v| filter.matches(v))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        let mut items: Vec<Version> = all
+            .into_iter()
+            .filter(|v| after.is_none_or(|(at, id)| (v.created_at, v.id) < (at, id)))
+            .take(limit + 1)
+            .collect();
+        Ok(version_page(&mut items, limit))
+    }
+
+    async fn release_of(
+        &self,
+        tenant: TenantId,
+        node: NodeId,
+        version: VersionId,
+    ) -> Result<Option<(Version, Uuid)>> {
+        Ok(self.st().versions.get(&(tenant, node)).and_then(|vs| {
+            vs.iter()
+                .find(|(v, _)| v.id == version)
+                .map(|(v, d)| (v.clone(), *d))
+        }))
+    }
+
+    async fn expire_previews(
+        &self,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ExpiredPreview>> {
+        let mut st = self.st();
+        let mut out = Vec::new();
+        for d in st.deployments.values_mut() {
+            if out.len() >= limit as usize {
+                break;
+            }
+            if d.environment == Environment::Preview
+                && d.state == DeploymentState::Ready
+                && d.expires_at.is_some_and(|t| t <= now)
+            {
+                d.state = DeploymentState::Expired;
+                out.push(ExpiredPreview {
+                    tenant_id: d.tenant_id,
+                    app_node_id: d.app_node_id,
+                    id: d.id,
+                });
+            }
+        }
+        Ok(out)
     }
 }

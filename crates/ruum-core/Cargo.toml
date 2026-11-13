@@ -18,6 +18,8 @@ base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 fastcdc.workspace = true
+# Inflating deployment archives (card W-2s).
+flate2.workspace = true
 futures.workspace = true
 hex.workspace = true
 image.workspace = true

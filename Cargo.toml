@@ -77,6 +77,8 @@ blake3 = "1.8.7"
 # sqlx, never built) asks for libsqlite3-sys < 0.38, and Cargo allows one `sqlite3` only: see the patch below.
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "hooks", "functions", "limits", "backup", "column_metadata", "column_decltype"] }
 fastcdc = "5.0.0"
+# Inflating deployment archives (card W-2s): `.tar.gz` and deflated `.zip` entries.
+flate2 = "1.1.10"
 # The SQL parser of the query API (cards Q-1 and A-2; decision 0004-36): one statement per call,
 # the statements that never run, the literals of the query log. Dialects PostgreSqlDialect and
 # SQLiteDialect. `std` only: no `recursive-protection` (the parser's own recursion limit bounds

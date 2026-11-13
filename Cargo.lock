@@ -2838,6 +2838,7 @@ dependencies = [
  "blake3",
  "bytes",
  "fastcdc",
+ "flate2",
  "futures",
  "hex",
  "image",
