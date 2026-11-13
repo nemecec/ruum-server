@@ -228,6 +228,7 @@ impl World {
                             "details": { "route": "/" } },
                         "started_at": null, "finished_at": null }]),
                     published_from: None,
+                    new_chunks: Vec::new(),
                     expires_at: None,
                 },
             )
@@ -518,6 +519,12 @@ async fn retired_slugs_and_tenant_slugs_across_tenants() {
     assert_eq!(app.slug, "planner");
     w.s.nodes.trash(&w.o(), app.node.id, None).await.unwrap();
     w.s.nodes.purge(&w.o(), app.node.id).await.unwrap();
+    // Before the provider's `purged` delivery runs, the app row still holds the slug: the
+    // slug is retired at once all the same (review W-2s, 1).
+    assert_eq!(
+        status_hint(w.create(&w.m(), "Planner", json!(null)).await),
+        (409, "slug_retired".into())
+    );
     w.deliver().await;
     assert!(
         w.s.apps

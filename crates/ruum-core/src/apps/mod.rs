@@ -642,17 +642,36 @@ impl AppService {
         }
     }
 
+    /// What `slug` is for the app node `node`. A slug held by the app row of a purged node is
+    /// retired at once: the row goes only when the provider's `purged` delivery runs, which is
+    /// asynchronous, and a new app must not get `-2` in that window (review W-2s, 1). The node
+    /// lookup has no permission check (`NodeStore::ancestors`): it only tells whether the node
+    /// still exists in the tenant, trashed or not, and the answer names no node.
+    async fn slug_state(&self, ctx: &Context, slug: &str, node: NodeId) -> Result<SlugState> {
+        let state = self.deps.store.slug_state(ctx.tenant, slug, node).await?;
+        if let SlugState::InUse(holder) = state {
+            match self.deps.nodes.ancestors(ctx, holder).await {
+                Ok(_) => {}
+                Err(Error::Api(e)) if e.code == ErrorCode::NotFound => {
+                    return Ok(SlugState::Retired);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(state)
+    }
+
     /// The slug of a new app: see the module docs. Reads only.
-    async fn pick_slug(&self, tenant: TenantId, name: &str, node: NodeId) -> Result<Vec<String>> {
+    async fn pick_slug(&self, ctx: &Context, name: &str, node: NodeId) -> Result<Vec<String>> {
         let own = slugs::from_name(name, slugs::APP_MAX);
         if slugs::is_valid(&own, SlugKind::App)
-            && self.deps.store.slug_state(tenant, &own, node).await? == SlugState::Retired
+            && self.slug_state(ctx, &own, node).await? == SlugState::Retired
         {
             return Err(slugs::retired());
         }
         let mut free = Vec::new();
         for c in slugs::candidates_with_spares(name, SlugKind::App, 50, 20) {
-            if self.deps.store.slug_state(tenant, &c, node).await? == SlugState::Free {
+            if self.slug_state(ctx, &c, node).await? == SlugState::Free {
                 free.push(c);
                 if free.len() >= 5 {
                     break;
@@ -690,7 +709,7 @@ impl AppService {
         // The slug is chosen before the node exists, so a refusal leaves nothing behind. The
         // node ID is not known yet: no node had a slug before, so any node stands in.
         let placeholder = NodeId::new();
-        let mut slugs = self.pick_slug(ctx.tenant, &name, placeholder).await?;
+        let mut slugs = self.pick_slug(ctx, &name, placeholder).await?;
         self.ensure_tenant(ctx.tenant).await?;
         let written = d
             .nodes
@@ -716,7 +735,7 @@ impl AppService {
                     return Err(store::no_free_slug());
                 }
                 tries += 1;
-                slugs = self.pick_slug(ctx.tenant, &name, node).await?;
+                slugs = self.pick_slug(ctx, &name, node).await?;
                 continue;
             };
             slugs.remove(0);

@@ -574,6 +574,7 @@ async fn drafts_supersede_and_the_sweeper_ends_expired_previews() {
         manifest: d.manifest.clone(),
         stages: d.stages.clone(),
         published_from: None,
+        new_chunks: Vec::new(),
         expires_at: d.expires_at,
     };
     let row =
@@ -729,6 +730,30 @@ async fn publish_and_rollback_call_the_hook_once_per_live_change() {
     assert_eq!(back.manifest, l1.manifest);
     assert_eq!(w.live(app).await, Some(back.id));
     assert_eq!(hook.calls.lock().unwrap().len(), 3);
+    // The rollback is the same as restoreVersion of the first release: its version records
+    // where it came from, and the journal has version.restored (review W-2s, 5).
+    let newest =
+        w.s.apps
+            .list_versions(
+                &w.m(),
+                app,
+                VersionFilter::default(),
+                PageRequest::default(),
+            )
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+    assert_eq!(Some(newest.id), back.version_id);
+    assert_eq!(newest.restored_from, l1.version_id);
+    let entries = w.s.journal.read(&w.m(), None, 1000).await.unwrap().items;
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.event == crate::journal::EventType::VersionRestored
+                && e.data["version_id"] == json!(newest.id)),
+        "no version.restored for the rollback"
+    );
     // restoreVersion of the second release by a person rolls back again.
     let v2 = l2.version_id.unwrap();
     let restored = w.s.apps.restore_version(&w.m(), app, v2).await.unwrap();
@@ -752,6 +777,155 @@ async fn publish_and_rollback_call_the_hook_once_per_live_change() {
             .await
             .unwrap();
     assert_eq!(versions.items.len(), 4);
+    // restoreVersion of the release that is live now changes nothing (review W-2s, 6).
+    let rolled_back = |entries: &[crate::journal::JournalEntry]| {
+        entries
+            .iter()
+            .filter(|e| e.event == crate::journal::EventType::AppRolledBack)
+            .count()
+    };
+    let before = rolled_back(&w.s.journal.read(&w.m(), None, 1000).await.unwrap().items);
+    let current = live.version_id.unwrap();
+    let same =
+        w.s.apps
+            .restore_version(&w.m(), app, current)
+            .await
+            .unwrap();
+    assert_eq!(same.value.id, current);
+    assert_eq!(same.change.seq, None);
+    assert_eq!(w.live(app).await, Some(live.id));
+    assert_eq!(hook.calls.lock().unwrap().len(), 4);
+    let after = rolled_back(&w.s.journal.read(&w.m(), None, 1000).await.unwrap().items);
+    assert_eq!(before, after);
+    assert_eq!(
+        w.s.apps
+            .list_versions(
+                &w.o(),
+                app,
+                VersionFilter::default(),
+                PageRequest::default(),
+            )
+            .await
+            .unwrap()
+            .items
+            .len(),
+        4
+    );
+}
+
+/// Only a person goes live at once: an app principal (or any kind that is neither a person nor
+/// an agent) is refused by publish and restore, and nothing goes live (review W-2s, 4).
+#[tokio::test]
+async fn only_a_person_goes_live_at_once() {
+    let w = world().await;
+    let app = w.app("Principals").await;
+    let site = w
+        .folder("site", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    let p = w.preview(app, site, None).await;
+    let as_app = Context {
+        tenant: w.team.id,
+        actor: Actor {
+            actor: PrincipalRef {
+                kind: PrincipalKind::App,
+                id: crate::ids::PrincipalId(Uuid::now_v7()),
+            },
+            on_behalf_of: Some(w.member),
+        },
+        scope: None,
+        idempotency_key: None,
+    };
+    let e = w.publish(&as_app, app, p.id).await.unwrap_err();
+    assert_eq!(e.http_status(), 403, "{e:?}");
+    assert_eq!(e.to_api().code, ErrorCode::UserRequired);
+    assert_eq!(w.live(app).await, None);
+    let Published::Live(l) = w.publish(&w.m(), app, p.id).await.unwrap() else {
+        panic!("live");
+    };
+    let p2 = w.preview(app, site, None).await;
+    let Published::Live(l2) = w.publish(&w.m(), app, p2.id).await.unwrap() else {
+        panic!("live");
+    };
+    let e =
+        w.s.apps
+            .restore_version(&as_app, app, l.version_id.unwrap())
+            .await
+            .unwrap_err();
+    assert_eq!(e.http_status(), 403, "{e:?}");
+    assert_eq!(e.to_api().code, ErrorCode::UserRequired);
+    assert_eq!(w.live(app).await, Some(l2.id));
+    let e = w.publish(&as_app, app, l.id).await.unwrap_err();
+    assert_eq!(e.http_status(), 403, "{e:?}");
+    assert_eq!(e.to_api().code, ErrorCode::UserRequired);
+    assert_eq!(w.live(app).await, Some(l2.id));
+}
+
+/// The site leaves out the telemetry privacy file and the files of `telemetry.source_maps`,
+/// which are never served (review W-2s, Kimi 3).
+#[tokio::test]
+async fn source_maps_and_the_privacy_file_are_not_served() {
+    let w = world().await;
+    let app = w.app("Maps").await;
+    let site = w
+        .folder(
+            "site",
+            &[
+                (
+                    "app.yaml",
+                    b"runtime: static
+telemetry:
+  source_maps: '*.map'
+",
+                ),
+                ("index.html", INDEX),
+                ("app.js", b"console.log(1)"),
+                ("app.js.map", b"{\"sourcesContent\":[\"secret\"]}"),
+                ("assets/vendor.js.map", b"{}"),
+                ("telemetry-privacy.yaml", b"fields: {}\n"),
+            ],
+        )
+        .await;
+    let d = w.preview(app, site, None).await;
+    let index =
+        w.s.apps
+            .sites()
+            .read_index(w.team.id, d.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let names: Vec<&String> = index.files.keys().collect();
+    assert_eq!(names, ["app.js", "index.html"]);
+}
+
+#[test]
+fn archive_globs_match() {
+    for (glob, name, want) in [
+        ("*.map", "app.js.map", true),
+        ("*.map", "assets/deep/app.js.map", true),
+        ("*.map", "app.js", false),
+        ("*.map", "map", false),
+        ("maps/*", "maps/a.map", true),
+        ("maps/*", "other/a.map", false),
+        ("./maps//", "maps/x/y.map", true),
+        ("maps/", "maps", false),
+        ("dist/app.js.map", "dist/app.js.map", true),
+        ("dist/app.js.map", "dist/app.js.map2", false),
+        ("a*b*b", "ab", false),
+        ("a*b*b", "abb", true),
+        ("*ab*b", "ab", false),
+        ("**/*.map", "x/y.map", true),
+        (".", "anything/at/all", true),
+    ] {
+        assert_eq!(Glob::new(glob).matches(name), want, "{glob:?} {name:?}");
+    }
+    // Linear in the name, also for many stars.
+    let glob = Glob::new(&format!("{}b", "*a".repeat(90)));
+    let name = "a".repeat(1024);
+    let t = std::time::Instant::now();
+    for _ in 0..1000 {
+        assert!(!glob.matches(&name));
+    }
+    assert!(t.elapsed() < Duration::from_secs(2));
 }
 
 #[tokio::test]
