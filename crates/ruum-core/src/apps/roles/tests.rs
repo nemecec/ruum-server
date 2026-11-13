@@ -480,6 +480,13 @@ async fn a_removed_role_keeps_its_grants_and_gives_nothing() {
             .await
             .unwrap()
     );
+    // The grant gives no `has` in the graph either (so no `app_role#grant`, no token role).
+    assert!(
+        !w.s.authz
+            .check(&subject, "has", &role_object(w.app, "admin"), None)
+            .await
+            .unwrap()
+    );
     // A rollback makes it active again with the same grant.
     w.release(ROLES).await;
     assert_eq!(w.roles_of(Some(w.guest)).await, ["admin"]);
