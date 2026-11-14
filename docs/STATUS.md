@@ -18,7 +18,8 @@ the operations policy and the product direction), the integration of run 8 (2026
 11-11: card M-1, card I-3, the step 3 specification and its UX package), the integration of card Q-2
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
-updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +253,43 @@ Fixes made during the night integration:
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
 
+Integration of run 10 (2026-11-13 to 11-14; five branches rebased onto `main` `f69e22a` in one
+stack, each tip checked on the build server, pushed as `integ10/<name>`, green in GitHub CI, then
+fast-forwarded in this order; linear history, no merge commit, no co-author line). The digest is
+`docs/digests/2026-11-13-run10.md`; new backlog items are in `docs/backlog/2026-11-13-run10.md`
+(and the cards' own `docs/backlog/2026-11-13-w2s.md`, `docs/backlog/2026-11-14-g1a.md`).
+
+| Branch (pushed as) | What it adds | Review |
+|---|---|---|
+| `s3/s-35` (`integ10/s-35`) | Card S-35, decision 0008-1: a personal tenant gets a random app slug (`ws-` plus random characters), never one from the display name; a team tenant keeps its name-based slug, with random suffixes instead of `-2`, `-3`. A person may choose a permanent slug once (`updateTenant` `app_slug`; contract text change, additive), audited as `tenant.updated` with `data.app_slug`. The web UI's Admin page has the choice with the "public and permanent" warning (en, et). | review-s35 (one change), no Kimi, review-s35-2 approved |
+| `s3/t-6` (`integ10/t-6`) | Card T-6, the black-box harness of the app gateway and the runtime API, cases before code (`crates/ruum-testkit/src/gateway/`, 49 gateway and 13 runtime cases): access, tokens, sessions and the sign-in code flow over HTTP, headers, static files, cross-tenant credentials, hostile framing; a right and a wrong toy gateway prove each case can fail and why. A world cannot switch cases off (`Guard`, `WORLD_PENDING`). | review-t6 (9 changes), Kimi no verdict (cut off), review-t6-2 accept |
+| `s3/w-2s` (`integ10/w-2s`) | Card W-2s, static deployments: `createAppDeployment` (file or folder archive, the static site layout v1, whole objects by BLAKE3 hash plus one index per deployment), `publishAppDeployment` and rollback (users only; agents get an approval), `restoreVersion` of an app release, the live release hook, slugs of purged apps retired at once, archive chunks under the blob GC, source maps never served. A hand-written YAML subset reader and tar/zip unpacker; one new dependency, `flate2` 1.1.10 (inflating archives). | review-w2s (6 changes), Kimi CHANGES REQUESTED (1 high, 4 medium, 1 low), review-w2s-2 accept |
+| `s3/b-2-r1` (`integ10/b-2`) | Card B-2, app roles: `listAppRoles`, `listAppRoleGrants`, `addAppRoleGrant`, `removeAppRoleGrant`; active flags follow the live manifest (hook in `apps::build`), the purge deletes grants and tuples, a failed switch repairs the flags, the guest policy after email resolution; `effective_roles` and `role_holders`. 11 mutations. | review-b2 (5 changes), Kimi CHANGES REQUESTED (3 high, 4 medium, 1 low), review-b2-2 accept with M-1 to M-4 |
+| `s3/g-1a-r10` (`integ10/g-1a`) | Card G-1a, the app gateway without the sandbox: the crate `ruum-gateway` (host parsing, the `SECURITY DEFINER` host lookup of migration `0013_app_host_lookup.sql` for the role `ruum_gateway`, sign-in on app origins with sealed state, nonce cookie and single-use codes, app sessions, the access check, pairwise user tokens, request and response cleaning, static files, one `Authorization` header only); contract: the app audience of `loginStart` (additive). All T-6 gateway cases pass with its world, except the three role cases (pending, P-68). | review-g1a (3 changes), **Kimi did not run** (quota), review-g1a-2 accept |
+
+Not merged: card FU-1 (`f/fu-1-r10`; review-fu1-2 asks for one more change), and O-34
+(`ops/o-34`, accepted by review-o34-2; Kimi did not finish; not in this run's list, backlog O-41).
+
+Fixes made during this integration:
+
+- `crates/ruum-mcp/src/tools.json` generated again at the W-2s, B-2 and G-1a rebases
+  (`gen-tools.mjs`; only `openapi_sha256` changed). `web/src/api/schema.d.ts` checked
+  (`npm run gen:api`, no change).
+- B-2 (review-b2-2 M-1): the two `NewDeployment` literals in `apps/roles/tests.rs` set
+  `new_chunks` (W-2s's review fix added the field).
+- T-4a data fix (review-b2-2 M-2): `ROLES_MANIFEST` and `ROLES_MANIFEST_NO_ADMIN` in
+  `crates/ruum-testkit/tests/common/apps.rs` kept no indentation after the Rust `\` line
+  continuation, so `approver:` and `admin:` were at the YAML root and all 8 `apps_roles` cases got
+  `422`. The spaces now come before the backslash. No assertion changed; both reviews of B-2 asked
+  for it.
+- G-1a (impl-g1a "Not done" 2): the roles claim of an app session comes from
+  `AppService::effective_roles` (empty when the user may not open the app). The T-6 world grants
+  no roles yet, so the three role cases stay pending (backlog P-68).
+- G-1a's 9 lines in `.github/workflows/ci.yml` (the `ruum_gateway` role for the unit job and
+  `RUUM_REQUIRE_GATEWAY_ROLE=1`) are accepted, as review-g1a-2 asks (backlog T-42).
+- The rebased branches were pushed as `integ10/s-35`, `integ10/t-6`, `integ10/w-2s`,
+  `integ10/b-2` and `integ10/g-1a` (no force push).
+
 Kimi re-review fixes (2026-11-13; backlog run9 S-39). Kimi K3.1 Pro re-reviewed T-4a, S-2 and
 O-25 on `3badfb0`; three fix cards, each accepted by a Claude review, were rebased onto `main` in
 one stack, checked on the build server, pushed as `integ9k/<name>`, green in GitHub CI, then
@@ -482,9 +520,11 @@ Fixes made during the integration:
 
 All 93 step 1 operations of `contracts/openapi.yaml` are built. Of the 24 step 2 database
 operations, 19 are built (cards D-1, K-1, A-1, Q-1, A-2 and D-3a); the other 5 are marked
-`x-ruum-status: planned` (decision 0004-21). Of the 45 step 3 app operations, 5 are built (card
-W-1: `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`, `getAppDeployment`); 48
-operations are still `planned` in all.
+`x-ruum-status: planned` (decision 0004-21). Of the 45 step 3 app operations, 11 are built (card
+W-1: `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`, `getAppDeployment`; card
+W-2s: `createAppDeployment`, `publishAppDeployment`; card B-2: `listAppRoles`,
+`listAppRoleGrants`, `addAppRoleGrant`, `removeAppRoleGrant`); 42 operations are still `planned`
+in all. The app gateway (`ruum-gateway`, card G-1a) serves static apps; it is not deployed yet.
 
 | Area | What works |
 |---|---|
@@ -642,6 +682,42 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-14, `main` after the integration of run 10, on the build server)
+
+`main` is `7b579ec` before this documentation commit. Each tip was checked with its own key
+(`i10s35`, `i10t6`, `i10w2s`, `i10b2`, `i10g1a`; at most two full checks at a time, with
+`CARGO_BUILD_JOBS=8`). The G-1a tip is the final code tree.
+
+| Tip | `cargo test --workspace` | Isolation (memory = Postgres) | Permission matrix | App cases roles / publish / deployments / settings | Browser |
+|---|---|---|---|---|---|
+| main before (`f69e22a`) | 946 / 0 / 3 ignored | 353 passed, 150 planned | 1936 passed, 720 planned | planned / planned / planned / 12 passed, 4 planned (16 cases) | 172 |
+| S-35 (`b66c7ee`) | 951 / 0 / 3 | 353, 150 | 1936, 720 | 0 / 0 / 0 / 14 passed, 4 planned | 172 passed* |
+| T-6 (`455af32`) | 971 / 0 / 3 | 353, 150 | 1936, 720 | same as S-35 | 171 + 1 visual, passed on rerun** |
+| W-2s (`869076e`) | 1002 / 0 / 3 | 361, 142 | 1968, 688 | 0 / 5 / 14 / 17 | 172 passed |
+| B-2 (`cb41fad`) | 1023 / 0 / 3 | 375, 128 | 2032, 624 | 8 / 6 / 15 / 17 | 172 passed |
+| G-1a (`7b579ec`, final) | **1068 / 0 / 3** | **375 passed, 128 planned** | **2032 passed, 624 planned** | **8 / 6 / 15 / 17** (all others planned or pending a card) | **172 passed** |
+
+*S-35's first run was spoiled: five full checks at once ran the build server out of memory (the
+linker was killed), and a sharing test timed out under that load; the rerun passed everything.
+**T-6 changes no web code; `visual.e2e.ts` alone passed on the rerun (145 of 145).
+
+On every tip: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D
+warnings` clean; `cargo test -p ruum-testkit` with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and on Postgres, with the same numbers on both backends; trashed file suite 112 of 112; privacy
+99 planned (memory) and 38 passed, 61 planned (Postgres); 0 operations without a case. On the
+final tree also:
+
+- The gateway: `t6_gateway_cases_pass_with_the_g1a_world` and the other 6 world tests pass;
+  `host_lookup_pg` 2 of 2. The T-6 self-test: the right toy passes 7 of 7, the wrong toy fails 7
+  of 7.
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`, all 208 mutations in three
+  parallel shards (`i10m0` to `i10m2`, about 2 hours 45 minutes): 208 of 208 killed, none
+  survived, skipped or broken (177 before this run).
+- `deploy/staging/tests/run.sh` on the Mac: all passed (381 checks) on each tip.
+- GitHub CI: green on `integ10/s-35`, `integ10/t-6`, `integ10/w-2s`, `integ10/b-2` and
+  `integ10/g-1a`, every job, first try.
 
 ## Checks (2026-11-13, `main` after the Kimi re-review fixes, on the build server)
 
