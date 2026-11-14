@@ -167,6 +167,7 @@ func TestControllerRefusesWithoutRunning(t *testing.T) {
 		"non-main":     req(cSide, cLive, ""),
 		"older":        req(cOld, cLive, ""),
 		"before-floor": req(cPre, "none", ""),
+		"older-back":   req(cOld, cNew, RollbackOlder),
 	}
 	for name, r := range cases {
 		s, d := newStore(), &fakeDeployer{}

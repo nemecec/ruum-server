@@ -11,8 +11,9 @@
 #   2. the tag <sha> of ghcr.io/nemecec/ruum-server and ruum-edge resolves to a digest;
 #   3. each digest has a provenance attestation from images.yml on refs/heads/main;
 #   4. a commit older than the deployed one is refused unless --rollback, and --rollback goes
-#      only to the previous release (design 12.7); an older one needs --rollback-older, with a
-#      warning (Kimi review of O-25, finding 2);
+#      only to the previous release (design 12.7); an older one (--rollback-older, with a
+#      warning, Kimi review of O-25, finding 2) stops here: the controller never runs it, an admin
+#      does (README, "Going back past the previous release"; Kimi review of O-34, finding 1);
 #   5. the release request (ops/release-request.sh: the commit, the two digests, the live commit
 #      read in step 4, the rollback mode); deploy.sh waits for its outcome and prints the
 #      controller's output;
@@ -101,7 +102,10 @@ if [[ "$deployed" =~ ^[0-9a-f]{40}$ ]]; then
     case $rollback in
       0) stg_die "$sha is older than the deployed $deployed; pass --rollback to go back one release on purpose" ;;
       1) expect+=(--rollback) ;;
-      2) stg_log "$RUUM_ROLLBACK_OLDER_WARNING"; expect+=(--rollback-older) ;;
+      # The controller refuses rollback older (Kimi review of O-34, finding 1): an admin runs it
+      # in the controller's pod (README, "Going back past the previous release").
+      2) stg_log "$RUUM_ROLLBACK_OLDER_WARNING"
+         stg_die "the deploy controller does not run --rollback-older (backlog O-37); an admin runs it in the controller's pod after checking every migration since $sha: see deploy/staging/README.md, \"Going back past the previous release\"" ;;
     esac
   fi
   # The controller decides the backup itself (new migrations since the live release, review 2 U-3).
