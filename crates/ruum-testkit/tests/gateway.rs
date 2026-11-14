@@ -10,8 +10,9 @@
 //!   `Pending` that `WORLD_PENDING` does not allow, fails the case).
 //! - The self-test: a deliberately wrong toy gateway (forwards every header, passes the app's
 //!   `Set-Cookie`, sets a cookie without `__Host-`, serves `..`, accepts a sign-in callback on
-//!   another host) makes the cleaning, cookie, traversal and sign-in cases fail, each for its
-//!   intended reason; a toy that does it right makes them pass. So the cases can fail.
+//!   another host, checks the `Host`'s app but forwards an absolute-form target to the app its
+//!   authority names) makes the cleaning, cookie, traversal, sign-in and framing cases fail, each
+//!   for its intended reason; a toy that does it right makes them pass. So the cases can fail.
 
 use async_trait::async_trait;
 use axum::Router;
@@ -194,34 +195,43 @@ async fn a_world_cannot_switch_cases_off() {
     }
 }
 
-/// An app role step may answer pending B-2 in the role cases only; another card fails them.
+/// The three app role cases. They waited for B-2; B-2 is merged (backlog P-68).
+const ROLE_CASES: &[&str] = &[
+    "an_active_app_role_gives_use",
+    "a_removed_role_stops_within_5_seconds",
+    "the_roles_claim_lists_active_app_roles",
+];
+
+/// An app role step may no longer answer pending (B-2 is merged): pending B-2, pending with
+/// another card or `Missing` from granting a role fails each role case, and no world may answer
+/// pending in them.
 #[tokio::test]
-async fn a_world_may_answer_pending_only_where_allowed() {
+async fn an_app_role_step_may_not_answer_pending() {
     let role_cases: Vec<_> = gateway::gateway_cases()
         .into_iter()
-        .filter(|c| WORLD_PENDING.iter().any(|(n, _)| *n == c.name))
+        .filter(|c| ROLE_CASES.contains(&c.name))
         .collect();
-    assert_eq!(
-        role_cases.len(),
-        WORLD_PENDING.len(),
-        "a WORLD_PENDING case is missing"
-    );
-    for (answer, want_pending) in [
-        (
-            WorldError::Pending {
-                card: "B-2".into(),
-                why: "app roles".into(),
-            },
-            true,
-        ),
-        (
-            WorldError::Pending {
-                card: "G-1a".into(),
-                why: "later".into(),
-            },
-            false,
-        ),
-        (WorldError::Missing("no roles".into()), false),
+    assert_eq!(role_cases.len(), ROLE_CASES.len(), "a role case is missing");
+    for name in ROLE_CASES {
+        assert!(
+            !WORLD_PENDING.iter().any(|(c, _)| c == name),
+            "WORLD_PENDING still lets a world switch {name} off"
+        );
+        assert!(
+            gateway::pending_reason(name).is_none(),
+            "PENDING still lists {name}"
+        );
+    }
+    for answer in [
+        WorldError::Pending {
+            card: "B-2".into(),
+            why: "app roles".into(),
+        },
+        WorldError::Pending {
+            card: "G-1a".into(),
+            why: "later".into(),
+        },
+        WorldError::Missing("no roles".into()),
     ] {
         let a = answer.clone();
         let make: MakeGatewayWorld = Arc::new(move || {
@@ -233,11 +243,7 @@ async fn a_world_may_answer_pending_only_where_allowed() {
         let rows = gateway::run_gateway_cases(&role_cases, Some(make)).await;
         let (text, _) = gateway::render("role steps", &rows);
         for (name, o) in &rows {
-            if want_pending {
-                assert!(matches!(o, Outcome::Pending(_)), "{name}: {o:?}{text}");
-            } else {
-                assert!(o.is_failed(), "{answer:?} switched {name} off: {o:?}{text}");
-            }
+            assert!(o.is_failed(), "{answer:?} switched {name} off: {o:?}{text}");
         }
     }
 }
@@ -429,6 +435,10 @@ const SELF_TEST: &[(&str, &str)] = &[
     (
         "the_sign_in_code_is_bound_to_its_host_and_used_once",
         "with the callback of a sign-in on app A: expected the gateway's refusal [400], got 302",
+    ),
+    (
+        "hostile_framing_never_passes_the_check",
+        "(absolute form, Host of app A): the request reached app B",
     ),
 ];
 
@@ -891,6 +901,24 @@ async fn toy_handle(
         })
         .collect();
 
+    // One host only: two Host headers get 400 (both toys). The right toy also refuses an
+    // absolute-form target whose authority is not the Host; the wrong toy checks the Host's
+    // app and later forwards to the upstream of the app the authority names.
+    if parts.headers.get_all("host").iter().count() > 1 {
+        return reply(400, vec![], b"toy: two hosts".to_vec());
+    }
+    let authority = parts
+        .uri
+        .authority()
+        .map(|a| a.as_str().to_ascii_lowercase());
+    if mode == Mode::Right
+        && authority
+            .as_deref()
+            .is_some_and(|a| a != host.to_ascii_lowercase())
+    {
+        return reply(400, vec![], b"toy: another authority".to_vec());
+    }
+
     // Host, access check.
     let (app_id, dep_id, app, dep, tenant_ok, user) = {
         let st = st.lock().unwrap();
@@ -943,8 +971,15 @@ async fn toy_handle(
         );
     }
 
-    // The upstream.
-    if let Some(up) = dep.upstream {
+    // The upstream (the wrong toy: of the app the absolute-form authority names).
+    let upstream = match (&mode, &authority) {
+        (Mode::Wrong, Some(a)) => {
+            let st = st.lock().unwrap();
+            resolve(&st, a).and_then(|(_, d)| st.deps.get(&d).and_then(|d| d.upstream))
+        }
+        _ => dep.upstream,
+    };
+    if let Some(up) = upstream {
         let mut fwd = Req::new(parts.method.as_str(), &up.to_string(), &target).body(body);
         match mode {
             Mode::Wrong => {
