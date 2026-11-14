@@ -203,16 +203,50 @@ func TestRollbackToAnOlderCommitPassesTheMode(t *testing.T) {
 	if slices.Contains(p.Args, "--backup") {
 		t.Fatalf("no migrations between cOld and cLive, but args %v", p.Args)
 	}
-	p, err = world().Check(context.Background(), req(cOld, cNew, RollbackOlder))
+	// Newer migrations between the target and the live release: a backup first.
+	p, err = world().Check(context.Background(), req(cOld, cNew, RollbackPrevious))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(p.Args, "--rollback-older") || !slices.Contains(p.Args, "--backup") {
-		t.Fatalf("args %v: want --rollback-older and --backup (migrations between cOld and cNew)", p.Args)
+	if !slices.Contains(p.Args, "--rollback") || !slices.Contains(p.Args, "--backup") {
+		t.Fatalf("args %v: want --rollback and --backup (migrations between cOld and cNew)", p.Args)
 	}
-	if len(p.Notes) == 0 || p.Notes[0] != RollbackOlderWarning {
-		t.Fatalf("notes %v: want the --rollback-older warning", p.Notes)
+}
+
+// Kimi review of O-34, finding 1: the deployer credential (maybe with an agent or CI) never
+// gets a rollback past the previous release, whatever the target; the admin runs it.
+func TestRefusesARollbackOlder(t *testing.T) {
+	for _, r := range []Request{
+		req(cOld, cNew, RollbackOlder),  // two releases back, migrations in between
+		req(cOld, cLive, RollbackOlder), // one back: --rollback is the way
+	} {
+		w := world()
+		w.Registry, w.Git = panicRegistry{}, panicGit{}
+		p, err := w.Check(context.Background(), r)
+		mustRefuse(t, err, "does not run it")
+		if p.Args != nil {
+			t.Fatalf("a refusal with a plan: %v", p.Args)
+		}
 	}
+}
+
+// panicRegistry and panicGit: a refused rollback older reads nothing (no GitHub call spent).
+type panicRegistry struct{}
+
+func (panicRegistry) TagDigest(context.Context, string, string) (string, error) {
+	panic("registry read for a rollback older")
+}
+func (panicRegistry) Revision(context.Context, string) (string, error) {
+	panic("registry read for a rollback older")
+}
+
+type panicGit struct{}
+
+func (panicGit) Compare(context.Context, string, string) (Comparison, error) {
+	panic("GitHub read for a rollback older")
+}
+func (panicGit) HasFile(context.Context, string, string) (bool, error) {
+	panic("GitHub read for a rollback older")
 }
 
 func TestRefusesARollbackToANewerCommit(t *testing.T) {

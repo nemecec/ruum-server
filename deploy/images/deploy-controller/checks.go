@@ -43,8 +43,14 @@ var floorFiles = []string{
 	"deploy/images/caddy-secret-storage/storage.go",
 }
 
-// RollbackOlderWarning is the warning of --rollback-older (ops/release-floor.sh).
-const RollbackOlderWarning = "WARNING: --rollback-older goes back past the previous release. Design 12.7 only promises that the previous release runs on the current schema. Check every migration since the target for a contract step (a dropped or renamed column or table) that the target still uses, and have the backup ready."
+// RollbackOlderRefusal is the reason for a request with rollback "older" (Kimi review of O-34,
+// finding 1). An older image ignores newer migrations that it does not know, so the migration Job
+// does not stop a release that cannot run on the current schema; only a person who checked every
+// migration since the target may go back past the previous release. The deployer credential may
+// be with an agent or CI, so the controller never runs such a rollback; the admin runs it in the
+// controller's pod (deploy/staging/README.md, "Going back past the previous release"). This stays
+// until backlog O-37 (schema_floor) lets the controller check the schema itself.
+const RollbackOlderRefusal = "rollback older goes back past the previous release, and the deploy controller does not run it: design 12.7 only promises that the previous release runs on the current schema. An admin runs it in the controller's pod after checking every migration since the target (deploy/staging/README.md, \"Going back past the previous release\"; backlog O-37)"
 
 // Plan is what the controller runs for an accepted request: the arguments of deploy-chart.sh.
 type Plan struct {
@@ -63,6 +69,10 @@ type Checker struct {
 // Check runs every check of a request and returns the plan, a *Refusal, or another error (a
 // registry or GitHub failure; the request fails and the person runs deploy.sh again).
 func (c Checker) Check(ctx context.Context, r Request) (Plan, error) {
+	// 0. Never a rollback past the previous release (Kimi review of O-34, finding 1).
+	if r.Rollback == RollbackOlder {
+		return Plan{}, refuse("%s", RollbackOlderRefusal)
+	}
 	var notes []string
 	// 1. Each image: the tag <commit> is this digest, the digest has a provenance attestation of
 	//    images.yml on refs/heads/main (cosign), and the attested image says it was built from
@@ -126,9 +136,6 @@ func (c Checker) Check(ctx context.Context, r Request) (Plan, error) {
 				return Plan{}, refuse("%s is older than the live %s; pass --rollback to go back one release on purpose", r.Commit, r.ExpectDeployed)
 			case RollbackPrevious:
 				args = append(args, "--rollback")
-			case RollbackOlder:
-				args = append(args, "--rollback-older")
-				notes = append(notes, RollbackOlderWarning)
 			}
 			// Three-dot compare shows the changes since the merge base, which is the target
 			// itself here; the other direction lists the migrations between the two.

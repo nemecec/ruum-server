@@ -921,6 +921,12 @@ grep -qF 'ruum_rollback_target_ok "$commit" "$previous"' "$STG/ops/deploy-chart.
 grep -qF '1) expect+=(--rollback)' "$STG/deploy.sh" &&
   ok "deploy.sh passes --rollback to deploy-chart.sh" || bad "deploy.sh does not pass --rollback on"
 grep -qF '"${expect[@]}"' "$STG/deploy.sh" && ok "deploy.sh passes the live release it checked (--expect-deployed)" || bad "deploy.sh does not pass --expect-deployed"
+# Kimi review of O-34, finding 1: the controller refuses rollback older, so deploy.sh never asks
+# for it; it stops on the Mac and names the admin path.
+grep -vE '^[[:space:]]*#' "$STG/deploy.sh" | grep -qF 'expect+=(--rollback-older)' &&
+  bad "deploy.sh still asks the controller for --rollback-older" || ok "deploy.sh never asks the controller for --rollback-older"
+grep -qF 'Going back past the previous release' "$STG/deploy.sh" && grep -qF '### Going back past the previous release' "$STG/README.md" &&
+  ok "deploy.sh names the admin path of --rollback-older" || bad "deploy.sh does not name the admin path of --rollback-older"
 
 # The deploy lock (Kimi review of O-25, finding 3), with a fake kubectl that keeps the Lease in a
 # file and refuses a create of an existing Lease and a replace with an old resourceVersion, as
@@ -1168,12 +1174,13 @@ done
 grep -qF 'go test -count=1 ./...' "$DF" && ok "the image build runs the controller's tests" || bad "the image build skips the controller's tests"
 [[ "$(grep -cF 'image: [ruum-server, ruum-edge, ruum-deploy-controller]' "$ROOT/.github/workflows/images.yml")" == 2 ]] &&
   ok "images.yml builds and attests the controller image" || bad "images.yml does not build the controller image"
-# The floor and the --rollback-older warning are the same in the controller and in ops/release-floor.sh.
+# The floor is the same in the controller and in ops/release-floor.sh. The controller never runs a
+# rollback older (Kimi review of O-34, finding 1; its Go tests check the refusal).
 for f in $(bash -c ". '$STG/ops/release-floor.sh'; printf '%s\n' \"\${RUUM_RELEASE_FLOOR_FILES[@]}\""); do
   grep -qF "\"$f\"" "$ROOT/deploy/images/deploy-controller/checks.go" || bad "the controller's floor lacks $f"
 done
-grep -qF "$(bash -c ". '$STG/ops/release-floor.sh'; printf '%s' \"\$RUUM_ROLLBACK_OLDER_WARNING\"")" "$ROOT/deploy/images/deploy-controller/checks.go" &&
-  ok "the controller prints the same --rollback-older warning" || bad "the controller's --rollback-older warning differs"
+grep -qF 'if r.Rollback == RollbackOlder {' "$ROOT/deploy/images/deploy-controller/checks.go" &&
+  ok "the controller refuses a rollback older before its other checks" || bad "the controller does not refuse a rollback older"
 GO_DIR="$ROOT/deploy/images/deploy-controller"
 if command -v go >/dev/null; then
   echo "== deploy controller: go vet and go test"
