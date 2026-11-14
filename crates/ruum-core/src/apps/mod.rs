@@ -390,6 +390,11 @@ pub fn build(
         .deps
         .provider
         .add_purge_hook(Arc::new(service.role_purge()));
+    // A member or guest who leaves loses the app role grants (backlog S-43).
+    service
+        .deps
+        .tenants
+        .set_app_role_cleanup(Arc::new(service.role_member_cleanup()));
     Ok(service)
 }
 

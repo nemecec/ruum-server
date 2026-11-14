@@ -104,6 +104,40 @@ async fn journal(
     })
 }
 
+/// The app role part of `removeMember` (backlog S-43), in the caller's transaction (which has
+/// set the tenant): deletes every user grant of `user` in `ctx.tenant` with an
+/// `app.role_revoked` entry each, and returns how many went and the deletes of their `holder`
+/// tuples for the caller's outbox row. Email and `tenant_members` grants stay.
+pub(crate) async fn remove_user_grants(
+    conn: &mut sqlx::PgConnection,
+    ctx: &Context,
+    user: UserId,
+) -> Result<(usize, Vec<RelationshipUpdate>)> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "delete from app_role_grants where tenant_id = $1 and grantee_kind = 'user' \
+         and grantee_id = $2 returning {COLUMNS}"
+    )))
+    .bind(ctx.tenant)
+    .bind(user.0)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut gone = rows.iter().map(grant_row).collect::<Result<Vec<_>>>()?;
+    gone.sort_by_key(|g| g.id);
+    let mut updates = Vec::new();
+    for g in &gone {
+        journal(
+            conn,
+            ctx,
+            g.app_id,
+            EventType::AppRoleRevoked,
+            event_data(g),
+        )
+        .await?;
+        updates.extend(g.tuple().map(RelationshipUpdate::Delete));
+    }
+    Ok((gone.len(), updates))
+}
+
 impl PgRoleStore {
     /// Stores the updates in the outbox of `tx` (nothing for none).
     async fn enqueue(
@@ -352,6 +386,15 @@ impl RoleStore for PgRoleStore {
         tx.commit().await?;
         self.after_commit(authz, ctx.tenant, ob).await;
         Ok(grants.len())
+    }
+
+    async fn remove_user(&self, ctx: &Context, authz: &dyn Authz, user: UserId) -> Result<usize> {
+        let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        let (n, updates) = remove_user_grants(&mut tx, ctx, user).await?;
+        let ob = Self::enqueue(&mut tx, ctx.tenant, &updates).await?;
+        tx.commit().await?;
+        self.after_commit(authz, ctx.tenant, ob).await;
+        Ok(n)
     }
 
     async fn remove_app(

@@ -44,6 +44,10 @@ impl MemoryTenantStore {
 
 #[async_trait]
 impl TenantStore for MemoryTenantStore {
+    fn set_app_role_cleanup(&self, hook: Arc<dyn MemberCleanup>) {
+        self.area.set_role_cleanup(hook);
+    }
+
     async fn list_for_user(&self, user: UserId) -> Result<Vec<(Tenant, MemberRole)>> {
         let st = self.area.lock();
         let mut v: Vec<(u64, Tenant, MemberRole)> = st
@@ -439,6 +443,10 @@ impl TenantStore for MemoryTenantStore {
         };
         // The sharing side first: direct grants and the user's share links.
         if let Some(c) = self.area.cleanup_hook() {
+            c.member_removed(ctx, user).await?;
+        }
+        // Then the user's app role grants and their `holder` tuples (backlog S-43).
+        if let Some(c) = self.area.role_cleanup_hook() {
             c.member_removed(ctx, user).await?;
         }
         let ended_agents: Vec<AgentId> = {

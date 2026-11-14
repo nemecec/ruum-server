@@ -576,6 +576,92 @@ async fn effective_roles_of_each_kind_of_principal() {
     assert!(w.roles_of(None).await.is_empty());
 }
 
+// ------------------------------------------------------------------ member removal
+
+/// `use` of the app for `u` in the graph.
+async fn uses(w: &World, u: UserId) -> bool {
+    w.s.authz
+        .check(&SubjectRef::user(u), "use", &ObjectRef::node(w.app), None)
+        .await
+        .unwrap()
+}
+
+/// A member who is removed and a guest who leaves keep no app role grant, no `holder` tuple
+/// and no `use` of the app; the member's agent can no longer use the member's `grants_roles`
+/// role; the grants of others stay (backlog S-43; the mutation
+/// `apps-roles-member-removal-keeps-grants` skips the delete).
+#[tokio::test]
+async fn a_removed_member_keeps_no_app_role() {
+    let w = world().await;
+    let m = w.c(w.member);
+    w.grant(&m, "admin", w.viewer).await.unwrap();
+    w.grant(&m, "approver", w.viewer).await.unwrap();
+    w.grant(&m, "approver", w.guest).await.unwrap();
+    w.grant(&m, "approver", w.owner).await.unwrap();
+    let agent = w.agent(w.viewer, Role::Manage).await;
+    assert!(
+        uses(&w, w.guest).await,
+        "the guest uses the app through approver"
+    );
+    assert_eq!(w.roles_of(Some(w.viewer)).await, ["admin", "approver"]);
+    // The agent of the viewer grants through the viewer's admin role.
+    let by_agent = w.grant(&agent, "approver", w.member).await.unwrap();
+
+    w.s.tenants
+        .remove_member(&w.c(w.owner), w.viewer)
+        .await
+        .unwrap();
+    w.s.tenants
+        .remove_member(&w.c(w.guest), w.guest)
+        .await
+        .unwrap();
+
+    for gone in [w.viewer, w.guest] {
+        assert!(
+            w.roles_of(Some(gone)).await.is_empty(),
+            "{gone} has no role"
+        );
+        assert!(!uses(&w, gone).await, "{gone} has no use");
+        for r in ["approver", "admin"] {
+            assert!(
+                !w.s.authz
+                    .check(&SubjectRef::user(gone), "has", &role_object(w.app, r), None)
+                    .await
+                    .unwrap(),
+                "{gone} holds {r}"
+            );
+        }
+    }
+    let left: Vec<Grantee> =
+        w.s.apps
+            .list_app_role_grants(&m, w.app, None, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|g| g.grantee)
+            .collect();
+    assert_eq!(
+        left,
+        [
+            Grantee::User { id: w.owner },
+            Grantee::User { id: w.member }
+        ],
+        "only the grants to the people who stay are left"
+    );
+    assert!(
+        role_tuples(&w).await.iter().all(|r| r.relation != "holder"
+            || (r.subject.object.object_id != w.viewer.to_string()
+                && r.subject.object.object_id != w.guest.to_string())),
+        "no holder tuple of a person who left"
+    );
+    // The agent of the removed viewer grants nothing more.
+    assert!(w.grant(&agent, "approver", w.owner).await.is_err());
+    assert_eq!(by_agent.value.grantee, Grantee::User { id: w.member });
+    assert_eq!(w.roles_of(Some(w.owner)).await, ["approver"]);
+    assert!(uses(&w, w.owner).await);
+}
+
 // ------------------------------------------------------------------ holders and their cost
 
 /// An engine that counts its calls.
@@ -653,6 +739,10 @@ impl RoleStore for CountingRoles {
     async fn bind_email(&self, c: &Context, a: &dyn Authz, e: &str, u: UserId) -> Result<usize> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.bind_email(c, a, e, u).await
+    }
+    async fn remove_user(&self, c: &Context, a: &dyn Authz, u: UserId) -> Result<usize> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.remove_user(c, a, u).await
     }
     async fn remove_app(
         &self,
