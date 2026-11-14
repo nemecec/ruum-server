@@ -435,4 +435,199 @@ mod tests {
             );
         }
     }
+
+    /// Kimi G-1a K-1: the roles claim of the gateway's `session` answer (internal API) follows a
+    /// role revoke made on another server at once. Server B grants and revokes Bob's app role
+    /// `approver`; Bob keeps `use` on the app (he is a member). Server A answers the gateway. Before
+    /// the fix, the internal router ran without a request floor, so A read the roles at its own
+    /// last token (or at SpiceDB's quantization window) and kept the revoked role. Needs the
+    /// laptop stack (`DATABASE_URL`, SpiceDB).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn app_roles_revoked_on_another_server_leave_the_roles_claim_at_once(pool: sqlx::PgPool) {
+        use ruum_core::apps::roles::AddRoleGrant;
+        use ruum_core::apps::store::{
+            Archive, DeploymentSource, DeploymentState, Environment, NewDeployment,
+        };
+        use ruum_core::identity::app_sign_in::wire::{PREFIX, SessionInfo, SessionRequest};
+        use ruum_core::identity::app_sign_in::{AppBinding, NewAppCode};
+        use ruum_core::sharing::Grantee;
+
+        if ruum_core::authz::spicedb::SpiceDbConfig::from_env().is_none() {
+            eprintln!("skipped: SPICEDB_PRESHARED_KEY is not set");
+            return;
+        }
+        let key = ruum_core::identity::secret::random_secret("");
+        let (sb, _) = server(&pool, &key).await;
+        let (sa, _) = server(&pool, &key).await;
+        let config = ApiConfig {
+            public_url: URL.into(),
+            content_url: "http://content.ruumapps.localhost".into(),
+            dav_url: "http://127.0.0.1:8492/".into(),
+            signup: None,
+        };
+        let internal_a = ruum_api::internal::gateway::router(AppState::new(sa.clone(), config));
+        let run = ruum_core::ids::NodeId::new().0.simple().to_string();
+        let login = |name: &str| VerifiedLogin {
+            issuer: "https://dev-seed.ruum.localhost".into(),
+            subject: format!("{name}-{run}"),
+            email: Some(format!("{name}-{run}@example.test")),
+            email_verified: true,
+            name: Some(name.into()),
+            id_token: None,
+        };
+        // Server B: Alice's team, Bob a member, the app `Planner`, live with three roles.
+        let alice = sb
+            .identity
+            .upsert_from_login(&login("alice"))
+            .await
+            .unwrap();
+        let bob = sb.identity.upsert_from_login(&login("bob")).await.unwrap();
+        let team = sb
+            .tenants
+            .create_team(&Actor::user(alice.id), "Roles".into())
+            .await
+            .unwrap();
+        let alice_ctx = Context {
+            tenant: team.id,
+            actor: Actor::user(alice.id),
+            scope: None,
+            idempotency_key: None,
+        };
+        let (_, invitation) = sb
+            .tenants
+            .invite(&alice_ctx, bob.email.clone(), MemberRole::Member, None)
+            .await
+            .unwrap();
+        sb.tenants
+            .accept_invitation(&Actor::user(bob.id), &invitation)
+            .await
+            .unwrap();
+        let app = sb
+            .apps
+            .create(
+                &alice_ctx,
+                ruum_core::apps::CreateApp {
+                    parent_id: team.root_node_id,
+                    name: "Planner".into(),
+                    settings: None,
+                    on_conflict: ruum_core::nodes::OnConflict::Fail,
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .node
+            .id;
+        let manifest = json!({ "runtime": "static", "roles": {
+            "member": { "description": "Can use the planner", "default": true },
+            "approver": { "description": "Can approve orders" } } });
+        sb.apps
+            .store()
+            .insert_deployment(
+                &alice_ctx,
+                NewDeployment {
+                    id: ruum_core::ids::NodeId::new().0, // a UUIDv7
+                    app_node_id: app,
+                    environment: Environment::Live,
+                    state: DeploymentState::Live,
+                    short_id: ruum_core::apps::slugs::short_id(),
+                    label: None,
+                    draft: None,
+                    source: DeploymentSource {
+                        kind: "file".into(),
+                        node_id: Some(ruum_core::ids::NodeId::new()),
+                        version_id: Some(ruum_core::ids::VersionId::new()),
+                        files: None,
+                    },
+                    archive: Archive {
+                        content_hash: [1; 32],
+                        size: 3,
+                        chunks: vec![1],
+                    },
+                    manifest: Some(manifest),
+                    stages: json!([]),
+                    published_from: None,
+                    expires_at: None,
+                    new_chunks: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        sb.apps.sync_active_roles(team.id, app).await.unwrap();
+        // Bob's app session on the live app (the platform side of the gateway's sign-in).
+        let binding = AppBinding::live(team.id, app);
+        let (platform, _) = sb.identity.create_session(bob.id, None).await.unwrap();
+        let state = format!("state-{run}");
+        let code = sb
+            .identity
+            .create_app_code(NewAppCode {
+                binding,
+                user: bob.id,
+                platform_session: platform.id,
+                state: state.clone(),
+            })
+            .await
+            .unwrap();
+        let (_, session) = sb
+            .identity
+            .redeem_app_code(&binding, &code, &state)
+            .await
+            .unwrap()
+            .expect("the app session");
+        let request = serde_json::to_string(&SessionRequest { binding, session }).unwrap();
+        let session_on_a = || async {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("{PREFIX}/session"))
+                .header("content-type", "application/json")
+                .body(Body::from(request.clone()))
+                .unwrap();
+            let res = internal_a.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<SessionInfo>(&bytes).unwrap()
+        };
+        let info = session_on_a().await;
+        assert!(info.allowed, "a member may use the app");
+        assert_eq!(info.roles, vec!["member".to_string()], "the default role");
+        for round in 0..3 {
+            // B grants Bob `approver`; A's roles claim has it at once.
+            let grant = sb
+                .apps
+                .add_app_role_grant(
+                    &alice_ctx,
+                    app,
+                    AddRoleGrant {
+                        role: "approver".into(),
+                        grantee: Grantee::User { id: bob.id },
+                        notify: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .value
+                .id;
+            let info = session_on_a().await;
+            assert!(info.allowed, "round {round}: grant");
+            assert_eq!(
+                info.roles,
+                vec!["approver".to_string()],
+                "round {round}: grant"
+            );
+            // B revokes it; Bob keeps `use`, and A's roles claim loses `approver` at once.
+            sb.apps
+                .remove_app_role_grant(&alice_ctx, app, grant)
+                .await
+                .unwrap();
+            let info = session_on_a().await;
+            assert!(info.allowed, "round {round}: revoke keeps use");
+            assert_eq!(
+                info.roles,
+                vec!["member".to_string()],
+                "round {round}: a revoked app role stays in the roles claim"
+            );
+        }
+    }
 }
