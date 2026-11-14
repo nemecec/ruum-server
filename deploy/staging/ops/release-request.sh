@@ -86,7 +86,7 @@ while :; do
       echo "==> $(jq -r '.data.status // ""' <<<"$cm")" >&2
       exit 0 ;;
     Failed | Refused)
-      die "the deploy controller ${phase,,} the request: $(jq -r '.data.status // ""' <<<"$cm")" ;;
+      die "the deploy controller $(tr "[:upper:]" "[:lower:]" <<<"$phase") the request: $(jq -r '.data.status // ""' <<<"$cm")" ;;
     "")
       (( SECONDS - start < CLAIM_SECONDS )) ||
         die "the deploy controller did not take the request in ${CLAIM_SECONDS}s (admin: deploy/staging/tool.sh kubectl -n $NS get pods); it refuses it once it is five minutes old" ;;
