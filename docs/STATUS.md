@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -269,6 +269,7 @@ fast-forwarded in this order; linear history, no merge commit, no co-author line
 
 Not merged: card FU-1 (`f/fu-1-r10`; review-fu1-2 asks for one more change), and O-34
 (`ops/o-34`, accepted by review-o34-2; Kimi did not finish; not in this run's list, backlog O-41).
+O-34 merged later, in the Kimi review fixes of run 10 (below).
 
 Fixes made during this integration:
 
@@ -289,6 +290,27 @@ Fixes made during this integration:
   `RUUM_REQUIRE_GATEWAY_ROLE=1`) are accepted, as review-g1a-2 asks (backlog T-42).
 - The rebased branches were pushed as `integ10/s-35`, `integ10/t-6`, `integ10/w-2s`,
   `integ10/b-2` and `integ10/g-1a` (no force push).
+
+Kimi review fixes of run 10 (2026-11-14; backlog S-49). Kimi K3.1 Pro (`kimi-code/k3.1-pro`,
+effort max) reviewed T-6, G-1a and W-2s on `main` `4e60ea8` and the deploy controller on
+`ops/o-34`; all four said CHANGES REQUESTED (checked: `panel/kimi-*-r10b-checked.md`). Four
+branches, each accepted by a Claude review, were rebased onto `main` in one stack, checked on the
+build server, pushed, green in GitHub CI, then fast-forwarded in this order (linear history, no
+merge commit, no co-author line). `main` moved twice during the checks (`aa5efe4` and `24f96e1`, backlog
+lines, decision 0008-3 and CLAUDE.md), so the stack was rebased again each time and pushed under
+new names (`integ10k/<name>-m`, then `-m2`); the code tree did not change. Digest: `docs/digests/2026-11-13-run10.md`, "Kimi reviews and fixes (run
+10)".
+
+| Branch (pushed as) | What it adds | Review |
+|---|---|---|
+| `fix/t6-kimi` (`integ10k/t6-kimi-m2`) | Kimi T-6 F1, F3, F4, F5: the G-1a world grants and removes app roles through B-2, so the three role cases run and pass (backlog P-68; 34 of 49 gateway cases pass, 15 pending a named card, 0 fail); the absolute-form host probe sends the session and requires `400` with no hit on either app; `verify_delegated_token` checks the signature and claims of delegated and `Ruum-User` tokens (latent R-3/G-3); the report-consent cases require the contract refusal (latent G-4). Lows: backlog T6K-1 to T6K-5. | review-k10t6 accept |
+| `fix/g1a-kimi` (`integ10k/g1a-kimi-m2`) | Kimi G-1a K-1: the internal gateway router runs each request in `with_request_freshness`, and `may_open` raises the floor to the tenant token, so a revoked app role leaves the roles claim at once on every replica (test with two servers on one database). K-2 (low): backlog S-52. | review-k10g1a accept |
+| `fix/s-43` (`integ10k/s-43-m2`) | Backlog S-43: `removeMember` deletes the removed person's app role grants and `holder` tuples (Postgres in the same transaction and outbox row, memory through a cleanup hook), with `app.role_revoked` entries and `app_role_grants_removed` in the `member.removed` audit data. Conformance, unit and test kit cases; 2 new strict mutations. | review-k10s43 accept |
+| `ops/o-34-r2` (`integ10k/o-34-r2-m2`) | Backlog O-34, decision 0008-2 option a: **the deploy controller** (`deploy/images/deploy-controller`, Go, namespace `ruum-deploy`, image `ghcr.io/nemecec/ruum-deploy-controller`). The deployer may only write release requests (ConfigMaps in `ruum-deploy`); the controller checks each one (digest, cosign provenance, revision label, on main, the O-25 floor, the order) and runs `ops/deploy-chart.sh` with its own ServiceAccount. `ops/rbac-check.sh` checks the deployer's rights statically (CI) and live (every platform step). Kimi O-34 #1 fixed: the controller refuses `rollback: older` (admin only). Lows: backlog O-43 to O-49; O-49 fixed at this integration (`tr` instead of `${phase,,}`, so `tests/run.sh` passes on the Mac's bash 3.2). | review-o34-2 accept, review-k10o34 accept |
+
+Not merged: `fix/w2s-kimi` (Kimi W-2s findings 1, 2 and 6) was not accepted for this
+integration; the W-2s findings stay open on `main` (backlog W2S-3, before I-6). Staging does not
+run the controller yet: the orchestrator's steps are in the digest.
 
 Kimi re-review fixes (2026-11-13; backlog run9 S-39). Kimi K3.1 Pro re-reviewed T-4a, S-2 and
 O-25 on `3badfb0`; three fix cards, each accepted by a Claude review, were rebased onto `main` in
@@ -683,6 +705,37 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
+## Checks (2026-11-14, `main` after the Kimi review fixes of run 10, on the build server)
+
+`main` is `1cfeb96` before this documentation commit. Each tip was checked with the key `i10k`, one
+full check at a time (`CARGO_BUILD_JOBS=8`, `CARGO_PROFILE_DEV_DEBUG=line-tables-only`); the O-34
+tip has the same Rust, migrations, contracts and web code as the S-43 tip (O-34 changes only
+`deploy/`, `.github/workflows/images.yml` and docs), so one run covers both. The rebases onto
+`aa5efe4` and `24f96e1` changed only docs, no code.
+
+| Tip | `cargo test --workspace` | Isolation (memory = Postgres) | Permission matrix | Privacy (memory / Postgres) | Trashed |
+|---|---|---|---|---|---|
+| main before (`4e60ea8`) | 1068 / 0 / 3 ignored | 375 passed, 128 planned | 2032 passed, 624 planned | 99 planned / 38 passed, 61 planned | 112 |
+| T-6 fix | 1070 / 0 / 3 | every test kit binary passes on both backends | | | |
+| G-1a fix | 1071 / 0 / 3 | 375, 128 | 2032, 624 | same | 112 |
+| S-43 fix and O-34 (final) | **1073 / 0 / 3** | **375 passed, 128 planned** | **2032 passed, 624 planned** | **99 planned / 38 passed, 61 planned** | **112** |
+
+On every tip: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked --
+-D warnings` clean; `cargo test -p ruum-testkit` with `RUUM_REQUIRE_IMPLEMENTED=1` passes on
+memory and Postgres, 0 operations without a case. On the final tree also:
+
+- The gateway T-6 world: 49 cases, 34 passed, 15 pending a named card, 0 failed (the three role
+  cases pass now).
+- `scripts/e2e_smoke.sh`: `PASSED: 59 checks`.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: all 210 mutations killed, none survived, skipped or broken (208 before; 2 new from S-43). It ran as one job on one key (`i10km`), not in shards. The SSH session dropped after 67 mutations; the other 143 ran again detached on the server. The data cluster was OOM-killed once during that run, so the 19 mutations around that time (`privacy-lens-secret-postgres` to `providers-unreadable-delete-refused-postgres`) ran again on a fresh data cluster: all killed.
+- `deploy/staging/tests/run.sh` on the Mac: 381 checks passed on the T-6, G-1a and S-43 tips; 485
+  on the O-34 tip (all passed, after the O-49 fix; before it, the Refused test failed on bash 3.2).
+- The deploy controller's Go tests (`go vet`, `go test`) run in the image build: `images` green.
+- GitHub CI: green on `integ10k/t6-kimi`, `integ10k/g1a-kimi`, `integ10k/s-43`,
+  `integ10k/o-34-r2` (`ci` and `images`), and again on the `-m` and `-m2` names after the rebases
+  (`-m2`: `ci` runs 43583616735, 43583618446, 43583620341, 43583622949; `images` 43583622925),
+  every job, first try.
+
 ## Checks (2026-11-14, `main` after the integration of run 10, on the build server)
 
 `main` is `7b579ec` before this documentation commit. Each tip was checked with its own key
@@ -945,6 +998,8 @@ secret values (S-36); R-2b checks build canaries hex-encoded (S-37); W-2 and W-3
 tenant's plan to `validateManifest` (P-58); the journal readers accept unknown event types before
 more event types are added (P-57).
 
+Since the Kimi review fixes of run 10, O-34 is merged (the deploy controller); until the
+orchestrator runs its platform step on staging, the old rights below still hold there.
 The Kimi re-review fixes (2026-11-13) leave O-34 for a panel: the deployer can still read every
 Secret of `ruum`, the owner DSN included, so its kubeconfig stays operator-only until the
 migration step and the rollout move out of its reach. W-2 must answer TK-1 (the archive file
