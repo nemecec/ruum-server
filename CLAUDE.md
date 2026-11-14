@@ -44,3 +44,4 @@ Docs and comments: plain English, short sentences, active voice.
 Author: Neeme Praks <neeme@praks.net> (set in the local git config). Do not add `Co-Authored-By` trailers.
 Keep the history linear: no merge commits. Integrate a branch with `git rebase main` and a fast-forward
 (`git merge --ff-only`), or as one squashed commit when its own commits are noise.
+- CI file: a card may add lines to `.github/workflows/ci.yml` that its own tests need (role, service, variable, suite line, require flag), with a comment naming the card; the reviewer checks them; new jobs, triggers, permissions or secrets need their own card (decision 0008-3).
