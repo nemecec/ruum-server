@@ -114,7 +114,19 @@ pub mod gateway {
             .route(&format!("{PREFIX}/session"), post(session))
             .route(&format!("{PREFIX}/session/end"), post(end_session))
             .route(&format!("{PREFIX}/agent"), post(agent))
+            // Each request gets its own authz freshness floor, as on the public router (decision
+            // 0002-4). Without it the floor helpers do nothing here, and a check falls back to
+            // this process's own last token: a revoke made on another replica could still pass.
+            .layer(axum::middleware::from_fn(request_freshness))
             .with_state(app)
+    }
+
+    /// Runs one internal request inside `ruum_core::authz::with_request_freshness`.
+    async fn request_freshness(
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        ruum_core::authz::with_request_freshness(next.run(req)).await
     }
 
     /// An internal error: logged without values, answered `500` (the gateway fails closed).
@@ -210,13 +222,17 @@ pub mod gateway {
     }
 
     /// `use` (live) or `open_preview` (preview) of `user` on the app node, at least as fresh as
-    /// the tenant's newest relationship write.
+    /// the tenant's newest relationship write. It also raises the request's floor to that token,
+    /// so the later reads of the request (the roles claim) are as fresh (Kimi G-1a K-1).
     async fn may_open(s: &AppState, binding: &AppBinding, user: UserId) -> ruum_core::Result<bool> {
         let permission = match binding.environment {
             AppEnv::Live => "use",
             AppEnv::Preview => "open_preview",
         };
         let token = s.services.freshness.tenant_token(binding.tenant_id).await?;
+        if let Some(t) = &token {
+            ruum_core::authz::raise_request_floor(t);
+        }
         s.services
             .authz
             .check(
@@ -256,7 +272,9 @@ pub mod gateway {
         }
         let allowed = may_open(s, b, session.user_id).await?;
         // The roles claim (plan seam 3, card B-2): the active app roles of the user, or the
-        // default role. Empty when the user may not open the app.
+        // default role. Empty when the user may not open the app. The role reads pass no token:
+        // they read at the request floor that `may_open` raised to the tenant's newest token, so
+        // a role revoked on another replica is gone here at once.
         let roles = if allowed {
             s.services
                 .apps
