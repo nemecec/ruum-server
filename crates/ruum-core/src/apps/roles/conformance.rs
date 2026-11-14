@@ -383,12 +383,95 @@ pub(crate) async fn remove_app_deletes_its_grants(h: &dyn Harness) {
     assert_eq!(s.counts(b, theirs).await.unwrap().get("approver"), Some(&1));
 }
 
+/// The app role part of `removeMember` (backlog S-43): every user grant of the user in the
+/// tenant goes, on every app, with its `holder` tuple and an `app.role_revoked` entry; the
+/// grants of other users, `tenant_members` and email grants stay, and so does the same user's
+/// grant in another tenant.
+pub(crate) async fn remove_user_deletes_only_that_users_grants(h: &dyn Harness) {
+    let authz = MemoryAuthz::default();
+    let s = h.store();
+    let (t, u) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let app = h.app(t, u).await;
+    let second = h.app(t, u).await;
+    let theirs = h.app(b, ub).await;
+    let c = ctx(t, u);
+    let fern = UserId::new();
+    let mut fern_grants = Vec::new();
+    for (on, role) in [(app, "approver"), (app, "admin"), (second, "approver")] {
+        let g = s
+            .add(&c, &authz, new_grant(on, role, Grantee::User { id: fern }))
+            .await
+            .unwrap();
+        fern_grants.push(g.value.id);
+    }
+    let mut kept = Vec::new();
+    for grantee in [
+        Grantee::User { id: u },
+        Grantee::TenantMembers,
+        Grantee::Email {
+            email: "fern@example.test".into(),
+        },
+    ] {
+        kept.push(
+            s.add(&c, &authz, new_grant(app, "approver", grantee))
+                .await
+                .unwrap()
+                .value
+                .id,
+        );
+    }
+    let elsewhere = s
+        .add(
+            &ctx(b, ub),
+            &authz,
+            new_grant(theirs, "approver", Grantee::User { id: fern }),
+        )
+        .await
+        .unwrap()
+        .value
+        .id;
+    // The removal of the same user from a third tenant leaves the grants of the others.
+    let (third, u3) = h.tenant().await;
+    assert_eq!(
+        s.remove_user(&ctx(third, u3), &authz, fern).await.unwrap(),
+        0
+    );
+    assert_eq!(s.counts(t, app).await.unwrap().get("admin"), Some(&1));
+    assert_eq!(holders(&authz, theirs, "approver").await.len(), 1);
+    let n = s.remove_user(&c, &authz, fern).await.unwrap();
+    assert_eq!(n, 3);
+    for id in &fern_grants {
+        assert!(s.get(t, app, *id).await.unwrap().is_none());
+        assert!(s.get(t, second, *id).await.unwrap().is_none());
+    }
+    for id in &kept {
+        assert!(s.get(t, app, *id).await.unwrap().is_some(), "{id} stays");
+    }
+    let fern_subject = format!("user:{fern}");
+    for (on, role) in [(app, "approver"), (app, "admin"), (second, "approver")] {
+        assert!(
+            !holders(&authz, on, role).await.contains(&fern_subject),
+            "the holder tuple of {role} is gone"
+        );
+    }
+    assert_eq!(
+        holders(&authz, app, "approver").await.len(),
+        2,
+        "the user grant of {u} and tenant_members stay"
+    );
+    assert!(s.get(b, theirs, elsewhere).await.unwrap().is_some());
+    assert_eq!(holders(&authz, theirs, "approver").await, [fern_subject]);
+    assert_eq!(s.remove_user(&c, &authz, fern).await.unwrap(), 0);
+}
+
 pub(crate) async fn run_all(h: &dyn Harness) {
     grants_write_rows_and_tuples(h).await;
     lists_page_and_filter(h).await;
     grants_stay_in_their_tenant(h).await;
     email_grants_bind(h).await;
     remove_app_deletes_its_grants(h).await;
+    remove_user_deletes_only_that_users_grants(h).await;
 }
 
 #[cfg(test)]
@@ -572,6 +655,7 @@ mod tests {
         };
         grants_stay_in_their_tenant(&h).await;
         remove_app_deletes_its_grants(&h).await;
+        remove_user_deletes_only_that_users_grants(&h).await;
     }
 
     /// After the grants of an app are removed, the app store's purge deletes the app row
@@ -603,6 +687,149 @@ mod tests {
         apps.remove_app(t, app).await.unwrap();
         assert!(apps.get_app(t, app).await.unwrap().is_none());
         assert!(holders(&authz, app, "approver").await.is_empty());
+    }
+
+    /// `removeMember` on the Postgres tenant store (backlog S-43): a removed member and a guest
+    /// who leaves lose their app role grants, with an `app.role_revoked` entry each, and the
+    /// deletes of their `holder` tuples are in the outbox of the same transaction. The grants
+    /// of others and the removed member's grant in another tenant stay. (The mutation
+    /// `apps-roles-member-removal-keeps-grants-postgres` skips the delete.)
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_member_removal_deletes_role_grants_and_tuples(pool: sqlx::PgPool) {
+        use crate::identity::tests::{postgres, user};
+        use crate::tenants::MemberRole;
+        let a = postgres(pool.clone());
+        let owner = user(&a, "owner").await;
+        let member = user(&a, "member").await;
+        let guest = user(&a, "guest").await;
+        let team = a
+            .tenants
+            .create_team(&Actor::user(owner.id), "Acme".into())
+            .await
+            .unwrap();
+        let other = a
+            .tenants
+            .create_team(&Actor::user(owner.id), "Other".into())
+            .await
+            .unwrap();
+        for (t, u, role) in [
+            (team.id, &member, MemberRole::Member),
+            (team.id, &guest, MemberRole::Guest),
+            (other.id, &member, MemberRole::Member),
+        ] {
+            let (_, token) = a
+                .tenants
+                .invite(&ctx(t, owner.id), u.email.clone(), role, None)
+                .await
+                .unwrap();
+            a.tenants
+                .accept_invitation(&Actor::user(u.id), &token)
+                .await
+                .unwrap();
+        }
+        let app = pg_app(&pool, team.id, owner.id).await;
+        let theirs = pg_app(&pool, other.id, owner.id).await;
+        let store = PgRoleStore::new(pool.clone());
+        let authz = MemoryAuthz::default();
+        let oc = ctx(team.id, owner.id);
+        for (role, to) in [
+            ("approver", member.id),
+            ("admin", member.id),
+            ("approver", guest.id),
+            ("approver", owner.id),
+        ] {
+            store
+                .add(&oc, &authz, new_grant(app, role, Grantee::User { id: to }))
+                .await
+                .unwrap();
+        }
+        let elsewhere = store
+            .add(
+                &ctx(other.id, owner.id),
+                &authz,
+                new_grant(theirs, "approver", Grantee::User { id: member.id }),
+            )
+            .await
+            .unwrap()
+            .value
+            .id;
+        // Both roles are active (the flags of a live manifest), so a holder may use the app.
+        let mut flags = Vec::new();
+        for (on, role) in [(app, "approver"), (app, "admin"), (theirs, "approver")] {
+            flags.push(RelationshipUpdate::Touch(active_tuple(on, role)));
+            flags.push(RelationshipUpdate::Touch(active_role_tuple(on, role)));
+        }
+        authz.write(flags).await.unwrap();
+        let uses = |u: UserId, on: NodeId| {
+            let authz = &authz;
+            async move {
+                authz
+                    .check(&SubjectRef::user(u), "use", &ObjectRef::node(on), None)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(uses(member.id, app).await && uses(guest.id, app).await);
+        a.tenants.remove_member(&oc, member.id).await.unwrap();
+        a.tenants
+            .remove_member(&ctx(team.id, guest.id), guest.id)
+            .await
+            .unwrap();
+        // The area has no engine: the tuple deletes wait in the outbox, as after a crash.
+        outbox::apply_pending(&pool, &authz, 1000).await.unwrap();
+        let left: Vec<Grantee> = store
+            .list(team.id, app, None, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|g| g.grantee)
+            .collect();
+        assert_eq!(left, [Grantee::User { id: owner.id }]);
+        assert_eq!(
+            holders(&authz, app, "approver").await,
+            [format!("user:{}", owner.id)]
+        );
+        assert!(holders(&authz, app, "admin").await.is_empty());
+        assert!(!uses(member.id, app).await, "a removed member uses no app");
+        assert!(!uses(guest.id, app).await, "a guest who left uses no app");
+        assert!(uses(owner.id, app).await);
+        // The other tenant keeps the member and the grant.
+        assert!(
+            store
+                .get(other.id, theirs, elsewhere)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(uses(member.id, theirs).await);
+        assert_eq!(
+            holders(&authz, theirs, "approver").await,
+            [format!("user:{}", member.id)]
+        );
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let revoked: i64 = sqlx::query_scalar(
+            "select count(*) from journal where tenant_id = $1 and type = 'app.role_revoked'",
+        )
+        .bind(team.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(revoked, 3, "one entry per removed grant");
+        let data: serde_json::Value = sqlx::query_scalar(
+            "select data from audit where tenant_id = $1 and action = 'member.removed' \
+             and target_id = $2",
+        )
+        .bind(team.id)
+        .bind(member.id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(data["app_role_grants_removed"], 2);
     }
 
     /// An engine that refuses every write (SpiceDB down, or a crash after the commit).
