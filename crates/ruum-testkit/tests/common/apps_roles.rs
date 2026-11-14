@@ -55,8 +55,137 @@ async fn grants_unchanged(cx: &Ctx, app: &str, before: &[String], what: &str) ->
     Ok(())
 }
 
+/// `use` of `app` for the user `user` in the engine of the services (the gateway's check).
+async fn uses(cx: &Ctx, user: uuid::Uuid, app: &str) -> Result<bool, Fail> {
+    use ruum_core::authz::{ObjectRef, SubjectRef};
+    let node: uuid::Uuid = app
+        .parse()
+        .map_err(|e| Fail::Failed(format!("app ID {app}: {e}")))?;
+    cx.state
+        .services
+        .authz
+        .check(
+            &SubjectRef::user(ruum_core::UserId(user)),
+            "use",
+            &ObjectRef::node(ruum_core::NodeId(node)),
+            None,
+        )
+        .await
+        .map_err(|e| Fail::Failed(format!("use check: {e}")))
+}
+
+/// The grantee IDs of the user grants of `app` (`listAppRoleGrants` as `member`).
+async fn user_grantees(cx: &Ctx, app: &str) -> Result<Vec<String>, Fail> {
+    let page = cx
+        .ok(Who::Member, list_role_grants(cx, app, ""), &[200])
+        .await?;
+    Ok(items(&page)
+        .iter()
+        .filter(|g| g["grantee"]["type"] == "user")
+        .filter_map(|g| g["grantee"]["id"].as_str().map(str::to_string))
+        .collect())
+}
+
 pub fn cases() -> Vec<Case> {
     vec![
+        case!(
+            "a_removed_member_keeps_no_app_role",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "publishAppDeployment",
+                "addAppRoleGrant",
+                "listAppRoleGrants",
+                "removeMember"
+            ],
+            "an app in Private (no grants): guest_view and guest hold approver, so both may use \
+             it; owner removes guest_view (removeMember, 204): guest_view's grants of this app and \
+             of W are gone, guest_view has no use and no role, and its agent \
+             (agent_of_guest_view) gets no grant list (401, 403 or 404); guest keeps its grant \
+             and use, and tenant B's grant to its guest_view stays (backlog S-43)",
+            |cx| {
+                let live = live_app(&cx, cx.a().private, "left", ROLES_MANIFEST).await?;
+                grant(&cx, Who::Member, &live.id, "approver", Who::GuestView).await?;
+                grant(&cx, Who::Member, &live.id, "approver", Who::Guest).await?;
+                let gv = cx.p(Who::GuestView).id;
+                let guest = cx.p(Who::Guest).id;
+                check!(
+                    uses(&cx, gv, &live.id).await? && uses(&cx, guest, &live.id).await?,
+                    "approver gives use before the removal"
+                );
+                let w = cx.a().app.to_string();
+                check!(
+                    user_grantees(&cx, &w).await?.contains(&gv.to_string()),
+                    "the seeded approver grant of guest_view on W is missing"
+                );
+                let removal = ruum_testkit::client::RequestSpec::new(
+                    axum::http::Method::DELETE,
+                    format!("/v1/tenants/{}/members/{gv}", cx.a().id),
+                );
+                cx.ok(Who::Owner, removal, &[204]).await?;
+                for app in [live.id.as_str(), w.as_str()] {
+                    let left = user_grantees(&cx, app).await?;
+                    check!(
+                        !left.contains(&gv.to_string()),
+                        "the removed guest_view still holds a role of {app}: {left:?}"
+                    );
+                }
+                check!(
+                    user_grantees(&cx, &live.id).await? == [guest.to_string()],
+                    "guest's grant must stay"
+                );
+                check!(
+                    !uses(&cx, gv, &live.id).await?,
+                    "the removed guest_view still uses the app"
+                );
+                check!(uses(&cx, guest, &live.id).await?, "guest lost use");
+                let roles = cx
+                    .state
+                    .services
+                    .apps
+                    .effective_roles(
+                        cx.a().id,
+                        ruum_core::NodeId(live.id.parse().map_err(|_| Fail::Failed("id".into()))?),
+                        Some(ruum_core::UserId(gv)),
+                    )
+                    .await
+                    .map_err(|e| Fail::Failed(format!("effective_roles: {e}")))?;
+                check!(
+                    roles.is_empty(),
+                    "roles of the removed guest_view: {roles:?}"
+                );
+                let res = cx
+                    .send(Who::AgentOfGuestView, list_role_grants(&cx, &w, ""))
+                    .await?;
+                check!(
+                    matches!(res.status.as_u16(), 401 | 403 | 404),
+                    "the agent of the removed guest_view lists grants: {} {}",
+                    res.status,
+                    res.text()
+                );
+                let b = &cx.w.b;
+                let kept = cx
+                    .state
+                    .services
+                    .apps
+                    .roles()
+                    .get(b.id, b.app, b.app_role_grant)
+                    .await
+                    .map_err(|e| Fail::Failed(format!("tenant B's grant: {e}")))?;
+                check!(
+                    kept.is_some(),
+                    "the removal in tenant A deleted tenant B's grant"
+                );
+                check!(
+                    uses(&cx, b.user_id(Who::GuestView).0, &b.app.to_string()).await?,
+                    "tenant B's guest_view lost use of B's app"
+                );
+                Ok(())
+            }
+        ),
         case!(
             "app_roles_follow_the_live_manifest",
             [

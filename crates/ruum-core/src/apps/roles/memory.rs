@@ -226,6 +226,29 @@ impl RoleStore for MemoryRoleStore {
         Ok(bound)
     }
 
+    async fn remove_user(&self, ctx: &Context, authz: &dyn Authz, user: UserId) -> Result<usize> {
+        let me = Grantee::User { id: user };
+        let gone: Vec<RoleGrant> = self
+            .rows()
+            .values()
+            .filter(|g| g.tenant_id == ctx.tenant && g.grantee == me)
+            .cloned()
+            .collect();
+        let updates: Vec<RelationshipUpdate> = gone
+            .iter()
+            .filter_map(RoleGrant::tuple)
+            .map(RelationshipUpdate::Delete)
+            .collect();
+        if !updates.is_empty() {
+            authz.write(updates).await?;
+        }
+        for g in &gone {
+            self.change(ctx, g.app_id, EventType::AppRoleRevoked, event_data(g))?;
+            self.rows().remove(&(ctx.tenant, g.id));
+        }
+        Ok(gone.len())
+    }
+
     async fn remove_app(
         &self,
         tenant: TenantId,
