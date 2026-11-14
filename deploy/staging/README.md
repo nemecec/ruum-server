@@ -124,7 +124,7 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
 | `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply, the talosconfig and the kubeconfig. |
 | `deploy/staging/ops/tunnel-setup.sh` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). |
-| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` (with a warning) to go back further; one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
+| `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` stops with the admin path to go back further ("Going back past the previous release"); one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server and Zitadel. Not read-only (a temporary namespace, ephemeral containers). |
 | `deploy/staging/destroy.sh --plan` | Three lists (removed, kept on purpose, never touched) and the state compared with the labelled resources. Read-only. |
@@ -284,7 +284,8 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   the release that was live before the current one (`previous` in the ConfigMap `ruum-release`),
   because design 12.7 promises only that the previous release runs on the new schema. An older
   target needs `--rollback-older`, which prints a warning: check every migration since the target
-  for a contract step that it still uses. The first deploy with this rule records `previous`; until
+  for a contract step that it still uses. The deploy controller never runs it (Kimi review of
+  O-34, finding 1): an admin does ("Going back past the previous release"). The first deploy with this rule records `previous`; until
   then a rollback needs `--rollback-older`. The chart and the migration Job always come from the
   deploy controller's image (the commit of main that the last platform step installed), and the
   platform from the checkout that runs the platform step; never from the target commit. **The rollback floor is backlog O-25** (the commit that added the migration
@@ -336,7 +337,8 @@ could read every Secret there (Kimi review of O-25, finding 1). Now:
   request that waited more than five minutes before the controller saw it is refused, so an old
   request never deploys by surprise.
 - **Then it runs `ops/deploy-chart.sh`** with its own ServiceAccount: the deploy lock, the live
-  release check, the rollback rule (previous release only unless `--rollback-older`), the backup,
+  release check, the rollback rule (previous release only; the controller refuses a request with
+  `rollback: older` before any other check), the backup,
   the migration Job with the owner DSN of `ruum-migrate-db`, and `helm upgrade`. The rules of
   "Deploy rules" are unchanged.
 - **The outcome** goes back into the request: the annotation `ruum.space/phase` (`Running`,
@@ -364,14 +366,33 @@ could read every Secret there (Kimi review of O-25, finding 1). Now:
   from an image of main, installed by digest by the admin, and takes nothing from a request but
   the checked fields. Only the admin can change its Deployment, ServiceAccount or Roles.
 - **What the deployer can still choose**: which signed commit of main at or after the O-25 floor
-  runs, and `--rollback-older` (with its warning), as before. It cannot run anything else.
-  `--rollback-older` stays a person's decision until backlog O-37 (`schema_floor`), also when the
-  deployer kubeconfig is with an agent or CI.
+  runs: a newer one, or the previous release with `--rollback`. It cannot run anything else.
+  It cannot go back past the previous release (Kimi review of O-34, finding 1): an older image
+  ignores newer migrations that it does not know (`set_ignore_missing`), so the migration Job does
+  not stop a release that reads a dropped column. The controller refuses `rollback: older`, so
+  this stays an admin decision until backlog O-37 (`schema_floor`), also when the deployer
+  kubeconfig is with an agent or CI.
 - **A stop of the controller** (the platform step, a node drain): it takes no new request after
   SIGTERM and lets a running deploy finish (`terminationGracePeriodSeconds` 3660, longer than one
   deploy). The platform step (`k8s/apply.sh`) stops before any change while a deploy runs (the
   deploy lock is held, or a request is `Running`); the admin can pass
   `secrets-push.sh platform --ignore-running-deploy`.
+
+### Going back past the previous release (the admin)
+
+The controller refuses a request with `rollback: older`, and `deploy.sh --rollback-older` stops
+on the Mac with the warning. Only the admin, with the admin kubeconfig, can run such a rollback:
+
+1. Check every migration since the target (`git diff --name-only <target> <live> -- migrations/`)
+   for a contract step (a dropped or renamed column or table) that the target still uses. If
+   there is one, do not go back: revert on main and deploy the revert.
+2. Read the two digests that `deploy.sh` printed for the target (or `ghcr.io/nemecec/ruum-server:<target>`
+   and `ruum-edge:<target>` resolved by digest) and the live commit (`status.sh`).
+3. Run `ops/deploy-chart.sh` in the controller's pod, with its ServiceAccount, the deploy lock and
+   every check of the script (the tag, the provenance with `cosign`, the live release):
+   `deploy/staging/tool.sh kubectl -n ruum-deploy exec deploy/deploy-controller -- env RUUM_DEPLOY_IN_CLUSTER=1 bash /opt/ruum/deploy/staging/ops/deploy-chart.sh <target> <server@sha256:...> <edge@sha256:...> --expect-deployed <live> --rollback-older --backup`.
+   It prints the warning again. No request is written, so `status.sh` shows no request for it.
+4. `bash deploy/staging/ops/smoke.sh`.
 
 ### Moving live staging to the deploy controller (once, the orchestrator)
 
@@ -430,7 +451,8 @@ step must run first. The order keeps the live release serving at every step:
 
 Going back: a rollback after step 5 to the release before it uses this checkout's chart, so its
 migration Job also logs in as `ruum` and its pods as `ruum_app`; it needs `--rollback-older` this
-once (no `previous` was recorded before step 5). To undo the role split itself, run the platform
+once (no `previous` was recorded before step 5), which the admin runs ("Going back past the
+previous release"). To undo the role split itself, run the platform
 step from a checkout before this change: it writes the owner's DSN back into `ruum-server-env`
 (`ruum_app` and its grants stay, unused); then restart ruum-server
 (`deploy/staging/tool.sh kubectl -n ruum rollout restart deployment/ruum-server`).
