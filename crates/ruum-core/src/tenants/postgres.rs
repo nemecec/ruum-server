@@ -1012,6 +1012,12 @@ impl TenantStore for PgTenantStore {
         .bind(obo)
         .execute(&mut *tx)
         .await?;
+        // App role grants to the user, with their `holder` tuples (backlog S-43): a person who
+        // left keeps no `use` of an app through an app role (nor do the user's agents, which
+        // act only for the user).
+        let (roles_removed, role_tuples) =
+            crate::apps::roles::postgres::remove_user_grants(&mut tx, ctx, user).await?;
+        tuples.extend(role_tuples);
 
         let outbox = enqueue(&mut tx, t, &tuples).await?;
         audit(
@@ -1025,6 +1031,7 @@ impl TenantStore for PgTenantStore {
                 "role": target_role,
                 "grants_removed": grants.len(),
                 "share_links_revoked": links.len(),
+                "app_role_grants_removed": roles_removed,
                 "agents_disabled": agents,
             }),
         )

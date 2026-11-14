@@ -25,6 +25,10 @@
 //!   grants first, then the implicit holders.
 //! - The purge of an app ([`RolePurge`]) deletes its grant rows and every tuple of its roles
 //!   before the provider deletes the app rows.
+//! - `removeMember` (a member or guest who leaves or is removed) deletes the user's grant rows
+//!   and their `holder` tuples in the same operation (backlog S-43): the Postgres tenant store
+//!   in its transaction through the outbox ([`postgres::remove_user_grants`]), the in-memory
+//!   one through [`RoleMemberCleanup`]. Email and `tenant_members` grants stay.
 //!
 //! # Who may change grants
 //!
@@ -395,6 +399,33 @@ impl RolePurge {
     }
 }
 
+/// The app role part of `removeMember` for a tenant store that runs it through a hook (the
+/// in-memory store; backlog S-43): the removed user's role grants and their `holder` tuples
+/// go, so a person who left keeps no `use` of an app through an app role. Agents act only
+/// for their user (and are disabled when the user leaves), so they lose it too. The Postgres
+/// tenant store deletes the same rows in its own transaction
+/// ([`postgres::remove_user_grants`]).
+pub struct RoleMemberCleanup {
+    authz: Arc<dyn Authz>,
+    roles: Arc<dyn RoleStore>,
+}
+
+impl RoleMemberCleanup {
+    pub fn new(authz: Arc<dyn Authz>, roles: Arc<dyn RoleStore>) -> Self {
+        Self { authz, roles }
+    }
+}
+
+#[async_trait]
+impl crate::tenants::MemberCleanup for RoleMemberCleanup {
+    async fn member_removed(&self, ctx: &Context, user: UserId) -> Result<()> {
+        self.roles
+            .remove_user(ctx, self.authz.as_ref(), user)
+            .await
+            .map(|_| ())
+    }
+}
+
 #[async_trait]
 impl super::provider::PurgeHook for RolePurge {
     async fn app_purged(&self, tenant: TenantId, app: NodeId) -> Result<()> {
@@ -551,6 +582,13 @@ pub trait RoleStore: Send + Sync {
         user: UserId,
     ) -> Result<usize>;
 
+    /// Deletes every user grant of `user` in `ctx.tenant` (the app role part of `removeMember`,
+    /// backlog S-43), with an `app.role_revoked` entry and the delete of its `holder` tuple
+    /// each: the Postgres store in one transaction through the outbox. Email and
+    /// `tenant_members` grants stay. Returns how many grants went. No permission check: the
+    /// caller (the tenant store) has checked the removal.
+    async fn remove_user(&self, ctx: &Context, authz: &dyn Authz, user: UserId) -> Result<usize>;
+
     /// Deletes every grant of `app` in `tenant` (the purge of the app) and, with their
     /// `holder` tuples, the tuple updates `also` (the role flags of the app): the Postgres store
     /// in one transaction through the outbox. No journal entry: the app node is gone. Returns
@@ -691,6 +729,12 @@ impl AppService {
             self.deps().roles.clone(),
             self.deps().store.clone(),
         )
+    }
+
+    /// The app role part of `removeMember` (register it with the tenant store,
+    /// [`crate::tenants::TenantStore::set_app_role_cleanup`]).
+    pub fn role_member_cleanup(&self) -> RoleMemberCleanup {
+        RoleMemberCleanup::new(self.deps().authz.clone(), self.deps().roles.clone())
     }
 
     /// Writes the active flags of `app` from its live manifest now (the fixtures, which seed a

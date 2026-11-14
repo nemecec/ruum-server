@@ -301,6 +301,13 @@ pub trait RootCreated: Send + Sync {
 
 #[async_trait]
 pub trait TenantStore: Send + Sync {
+    /// Sets the app role part of `removeMember` (backlog S-43): the apps area registers it, so
+    /// a store that runs it through a hook (the in-memory store) deletes the removed user's app
+    /// role grants and their tuples. The Postgres store deletes them in its own transaction and
+    /// ignores the hook (the default). A later call replaces the hook.
+    fn set_app_role_cleanup(&self, hook: std::sync::Arc<dyn MemberCleanup>) {
+        let _ = hook;
+    }
     /// The tenants where the user is a member or guest, with the user's role.
     async fn list_for_user(&self, user: UserId) -> Result<Vec<(Tenant, MemberRole)>>;
     /// Makes a team tenant on the `team` plan; the creator becomes the owner. Users only.

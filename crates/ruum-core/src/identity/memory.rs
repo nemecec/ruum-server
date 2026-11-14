@@ -197,6 +197,9 @@ pub struct MemoryArea {
     /// sharing store reads tenant policies, and cleans up when a member leaves).
     late_root: std::sync::OnceLock<Arc<dyn RootCreated>>,
     late_cleanup: std::sync::OnceLock<Arc<dyn MemberCleanup>>,
+    /// The app role part of `removeMember` (backlog S-43), set by the apps area; the newest
+    /// apps area wins.
+    role_cleanup: std::sync::RwLock<Option<Arc<dyn MemberCleanup>>>,
 }
 
 impl Default for MemoryArea {
@@ -212,6 +215,7 @@ impl MemoryArea {
             deps,
             late_root: std::sync::OnceLock::new(),
             late_cleanup: std::sync::OnceLock::new(),
+            role_cleanup: std::sync::RwLock::new(None),
         }
     }
 
@@ -226,6 +230,18 @@ impl MemoryArea {
     /// ignored.
     pub fn set_member_cleanup(&self, hook: Arc<dyn MemberCleanup>) {
         let _ = self.late_cleanup.set(hook);
+    }
+
+    /// Sets the app role cleanup of `removeMember` (backlog S-43). A later call replaces it.
+    pub fn set_role_cleanup(&self, hook: Arc<dyn MemberCleanup>) {
+        *self.role_cleanup.write().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    pub(crate) fn role_cleanup_hook(&self) -> Option<Arc<dyn MemberCleanup>> {
+        self.role_cleanup
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn root_hook(&self) -> Option<&Arc<dyn RootCreated>> {
