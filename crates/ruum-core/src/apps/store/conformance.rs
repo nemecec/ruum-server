@@ -845,6 +845,44 @@ mod tests {
         run_all(&h).await;
     }
 
+    /// The live switch of one app is held across connections (processes) until the guard
+    /// drops; another app is not held up (Kimi W-2s run 10b, 1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_live_switch_lock_serializes_one_app(pool: sqlx::PgPool) {
+        use std::time::Duration;
+        let (t, u) = pg_tenant(&pool).await;
+        let (a, b) = (
+            pg_app_node(&pool, t, u).await,
+            pg_app_node(&pool, t, u).await,
+        );
+        // Two stores on one database, as two processes would have.
+        let one = PgAppStore::new(pool.clone());
+        let two = PgAppStore::new(pool.clone());
+        let held = one
+            .lock_live_switch(t, a, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let busy = two
+            .lock_live_switch(t, a, Duration::from_millis(200))
+            .await
+            .err()
+            .expect("the switch of the app is held");
+        assert!(
+            matches!(&busy, Error::Api(e) if e.code == crate::error::ErrorCode::Conflict),
+            "{busy:?}"
+        );
+        let other = two
+            .lock_live_switch(t, b, Duration::from_millis(200))
+            .await
+            .unwrap();
+        drop(held);
+        let again = two
+            .lock_live_switch(t, a, Duration::from_secs(5))
+            .await
+            .unwrap();
+        drop((other, again));
+    }
+
     /// The slug of an app whose node was purged is retired at once, while the app row still
     /// waits for the provider's `purged` delivery (the node is a hidden tombstone; review
     /// W-2s, 1).

@@ -529,6 +529,16 @@ impl AppStore for MemoryAppStore {
         })
     }
 
+    async fn lock_live_switch(
+        &self,
+        _tenant: TenantId,
+        _app: NodeId,
+        _wait: std::time::Duration,
+    ) -> Result<LiveSwitchLock> {
+        // One process: the service's own lock serializes the switches.
+        Ok(LiveSwitchLock::unheld())
+    }
+
     async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow> {
         let mut st = self.st();
         let tenant = ctx.tenant;

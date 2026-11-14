@@ -897,6 +897,42 @@ telemetry:
     assert_eq!(names, ["app.js", "index.html"]);
 }
 
+/// `source_maps: '**/*.map'` also keeps the maps at the root of the site private (Kimi W-2s
+/// run 10b, 6: `**/` needed a folder, so `app.js.map` was served).
+#[tokio::test]
+async fn a_double_star_source_map_glob_hides_root_maps() {
+    let w = world().await;
+    let app = w.app("Root maps").await;
+    let site = w
+        .folder(
+            "site",
+            &[
+                (
+                    "app.yaml",
+                    b"runtime: static
+telemetry:
+  source_maps: '**/*.map'
+",
+                ),
+                ("index.html", INDEX),
+                ("app.js", b"console.log(1)"),
+                ("app.js.map", b"{\"sourcesContent\":[\"secret\"]}"),
+                ("assets/vendor.js.map", b"{}"),
+            ],
+        )
+        .await;
+    let d = w.preview(app, site, None).await;
+    let index =
+        w.s.apps
+            .sites()
+            .read_index(w.team.id, d.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let names: Vec<&String> = index.files.keys().collect();
+    assert_eq!(names, ["app.js", "index.html"]);
+}
+
 #[test]
 fn archive_globs_match() {
     for (glob, name, want) in [
@@ -914,6 +950,16 @@ fn archive_globs_match() {
         ("a*b*b", "abb", true),
         ("*ab*b", "ab", false),
         ("**/*.map", "x/y.map", true),
+        // `**/` is zero or more folders: a map at the root matches too (Kimi W-2s run 10b, 6).
+        ("**/*.map", "app.js.map", true),
+        ("**/*.map", "a/b/c/app.js.map", true),
+        ("**/*.map", "app.js", false),
+        ("./**/*.map", "app.js.map", true),
+        ("**/**/*.map", "app.js.map", true),
+        ("src/**/*.map", "src/app.js.map", true),
+        ("src/**/*.map", "src/deep/app.js.map", true),
+        ("src/**/*.map", "other/app.js.map", false),
+        ("**/maps/x.map", "maps/x.map", true),
         (".", "anything/at/all", true),
     ] {
         assert_eq!(Glob::new(glob).matches(name), want, "{glob:?} {name:?}");
@@ -999,4 +1045,175 @@ async fn an_agent_publishes_through_a_person_and_cannot_restore() {
             .http_status(),
         403
     );
+}
+
+/// Blocks the first live change until released; records whether two hook calls overlapped.
+#[derive(Default)]
+struct Gate {
+    in_hook: std::sync::atomic::AtomicUsize,
+    overlapped: std::sync::atomic::AtomicBool,
+    calls: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl LiveReleaseHook for Gate {
+    async fn live_changed(
+        &self,
+        _tenant: TenantId,
+        _app: NodeId,
+        _before: Option<&Value>,
+        _after: &Value,
+        _actor: &Actor,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.in_hook.fetch_add(1, SeqCst) > 0 {
+            self.overlapped.store(true, SeqCst);
+        }
+        if self.calls.fetch_add(1, SeqCst) == 0 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.in_hook.fetch_sub(1, SeqCst);
+        Ok(())
+    }
+}
+
+/// Two publishes of one app never run their live-release hooks at the same time: the second
+/// waits for the live switch of the first, sees that the live deployment changed and runs no
+/// hook (Kimi W-2s run 10b, 1: a failed switch's repair could write stale role flags after a
+/// concurrent switch).
+#[tokio::test]
+async fn publishes_of_one_app_take_turns_in_the_live_switch() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let w = world().await;
+    let gate = Arc::new(Gate::default());
+    w.s.apps.add_live_hook(gate.clone());
+    let app = w.app("Turns").await;
+    let s1 = w
+        .folder("t1", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    let s2 = w
+        .folder(
+            "t2",
+            &[
+                ("app.yaml", b"runtime: static\nenv:\n  RELEASE: two\n"),
+                ("index.html", INDEX),
+            ],
+        )
+        .await;
+    let p1 = w.preview(app, s1, None).await;
+    let p2 = w.preview(app, s2, None).await;
+    let m = w.m();
+    let first = w.publish(&m, app, p1.id);
+    let second = async {
+        // The first publish waits inside its hook now.
+        gate.entered.notified().await;
+        let second = w.publish(&m, app, p2.id);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            gate.release.notify_one();
+        };
+        let (r, ()) = tokio::join!(second, release);
+        r
+    };
+    let (a, b) = tokio::join!(first, second);
+    assert!(
+        !gate.overlapped.load(SeqCst),
+        "the hooks of two publishes overlapped"
+    );
+    let Published::Live(l1) = a.unwrap() else {
+        panic!("a person's publish is live");
+    };
+    let err = b.expect_err("the second publish saw a changed live deployment");
+    assert!(
+        matches!(&err, Error::Api(e) if e.code == ErrorCode::Conflict),
+        "{err:?}"
+    );
+    assert_eq!(
+        gate.calls.load(SeqCst),
+        1,
+        "no hook for a switch that would fail"
+    );
+    assert_eq!(w.live(app).await, Some(l1.id));
+    // The lock is free again: the second preview goes live now.
+    let Published::Live(l2) = w.publish(&m, app, p2.id).await.unwrap() else {
+        panic!("a person's publish is live");
+    };
+    assert_eq!(w.live(app).await, Some(l2.id));
+}
+
+#[tokio::test]
+async fn deploy_slots_bound_each_tenant_and_the_process() {
+    let slots = DeploySlots::new(2, 3, Duration::from_millis(100));
+    let (a, b) = (TenantId::new(), TenantId::new());
+    let a1 = slots.take(a).await.unwrap();
+    let a2 = slots.take(a).await.unwrap();
+    let busy = slots
+        .take(a)
+        .await
+        .err()
+        .expect("a third deployment of one tenant waits, then is refused");
+    match busy {
+        Error::Api(e) => {
+            assert_eq!(e.code, ErrorCode::Conflict);
+            assert!(e.retry_after.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    let b1 = slots.take(b).await.unwrap();
+    // Three run in all: another tenant waits too.
+    assert!(slots.take(TenantId::new()).await.is_err());
+    // A freed slot goes to the one that waits.
+    let (a3, ()) = tokio::join!(slots.take(a), async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(a1);
+    });
+    let a3 = a3.unwrap();
+    drop((a2, a3, b1));
+    assert_eq!(slots.busy_tenants(), 0);
+    assert_eq!(slots.global.available_permits(), 3);
+}
+
+/// A deployment waits for a slot of its tenant before it reads its source; it frees the slot
+/// when its stages end (Kimi W-2s run 10b, 2).
+#[tokio::test]
+async fn a_tenant_runs_a_bounded_number_of_deployments() {
+    let w = world().await;
+    let app = w.app("Bounded").await;
+    let site = w
+        .folder("b", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    let mut held = Vec::new();
+    for _ in 0..TENANT_DEPLOYS {
+        held.push(w.s.apps.deploy_slots.take(w.team.id).await.unwrap());
+    }
+    let started = std::time::Instant::now();
+    let waited = Duration::from_millis(300);
+    let m = w.m();
+    let deploy = async {
+        let d = w.deploy(&m, app, site, None).await;
+        (d, started.elapsed())
+    };
+    let release = async move {
+        tokio::time::sleep(waited).await;
+        drop(held);
+    };
+    let ((d, took), ()) = tokio::join!(deploy, release);
+    assert!(took >= waited, "the deployment did not wait for a slot");
+    let d = d.unwrap();
+    w.settled(app, d.id).await;
+    // More deployments than slots, one after the other: each frees its slot.
+    for _ in 0..=TENANT_DEPLOYS {
+        let d = w.deploy(&w.m(), app, site, None).await.unwrap();
+        w.settled(app, d.id).await;
+    }
+    for _ in 0..100 {
+        if w.s.apps.deploy_slots.busy_tenants() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(w.s.apps.deploy_slots.busy_tenants(), 0);
 }

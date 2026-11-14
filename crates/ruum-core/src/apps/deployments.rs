@@ -21,6 +21,11 @@
 //! R-2b) and `secrets` (`secrets_not_ready`: W-4). With no binding the stage `bindings` is
 //! `skipped`. `build` and `test` are always `skipped` in step 3.
 //!
+//! A deployment holds a slot from before the source is read until its stages end: at most
+//! [`TENANT_DEPLOYS`] per tenant and [`GLOBAL_DEPLOYS`] per process. A request waits up to
+//! [`DEPLOY_SLOT_WAIT`] for a slot, holding no archive, then gets `409 conflict` with
+//! `Retry-After`, before anything is read or stored. Unpacking runs on the blocking pool.
+//!
 //! After the `202` the stages `image` (the files under `static.root` as content-addressed
 //! objects and the site index, [`super::static_site`]; R-1's `StaticImage`), `start` (the image
 //! through the [`crate::runtime::RuntimeDriver`]; a static instance runs no code, so it is
@@ -46,7 +51,10 @@
 //! `app.rolled_back` (reason `manual`), in one store transaction (P-62: a rollback answers with
 //! the new deployment, whose manifest is the old one's). Before the switch every
 //! [`LiveReleaseHook`] is called; a hook error fails the publish and the old live deployment
-//! keeps serving. Publishing the deployment that is live already changes nothing (`200`).
+//! keeps serving. Publishing the deployment that is live already changes nothing (`200`). The
+//! hooks, the switch and the repair after a failed switch run under the app's live switch (a
+//! lock of the process and of the store), so two publishes of one app take turns; a publish
+//! that waited and finds another live deployment answers `409 conflict`.
 //!
 //! An agent's publish answers `202` with a pending approval (`AppApprovalRequired`, decision
 //! 0006-4): the `app_approvals` row is bound to the archive hash, the hash of the parsed
@@ -96,8 +104,11 @@ pub use stages::{STAGE_NAMES, StageError};
 /// The service calls every hook after the new release is checked and before the store switches
 /// the live deployment: a hook error fails the publish, the old live deployment keeps serving
 /// and nothing of the publish is recorded. A hook must therefore tolerate being called for a
-/// switch that then fails in the store (rare: a concurrent publish of the same app); the next
-/// successful switch calls it again with the true `before`.
+/// switch that then fails in the store (rare: a store error); the service then repairs from the
+/// live deployment ([`AppService::repair_after_failed_switch`]), and the next successful switch
+/// calls it again with the true `before`. The hooks, the release and the repair of one app run
+/// under its live switch ([`AppService::lock_live_switch`]), so two publishes of one app never
+/// interleave them.
 ///
 /// `before` is the parsed manifest (`app.yaml` as JSON) of the live deployment before the
 /// change (`None` for the first publish); `after` is the manifest of the new live deployment.
@@ -116,6 +127,134 @@ pub trait LiveReleaseHook: Send + Sync {
 
 /// How long an agent's pending publish request waits for a person.
 pub const APPROVAL_HOURS: i64 = 24;
+
+/// How many deployments of one tenant read, unpack and run their stages at the same time in
+/// one process (Kimi W-2s run 10b, 2). A deployment holds its packed and unpacked archive in
+/// memory until its stages end, so the bound keeps one tenant from taking the server's memory.
+pub const TENANT_DEPLOYS: usize = 2;
+
+/// How many deployments of all tenants run at the same time in one process (the same reason).
+pub const GLOBAL_DEPLOYS: usize = 4;
+
+/// How long a deployment request waits for a slot, then `409 conflict` with `Retry-After`.
+pub const DEPLOY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The deployment slots of one process: at most `per_tenant` per tenant and `global` in all
+/// ([`TENANT_DEPLOYS`], [`GLOBAL_DEPLOYS`]). A request waits for a slot before it reads its
+/// source, so a waiting request holds no archive in memory; after `wait` it is refused.
+pub(crate) struct DeploySlots {
+    per_tenant: usize,
+    wait: std::time::Duration,
+    global: Arc<tokio::sync::Semaphore>,
+    tenants: std::sync::Mutex<std::collections::HashMap<TenantId, Arc<tokio::sync::Semaphore>>>,
+}
+
+/// One taken slot; dropping it frees the slot.
+pub(crate) struct DeploySlot {
+    _tenant: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// How long a publish waits for the live switch of its app (another publish of the same app
+/// runs its hooks and its release), then `409 conflict`.
+pub const LIVE_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The live-switch locks of one process, one per app (only apps with a switch running or
+/// waiting have an entry).
+#[derive(Default)]
+pub(crate) struct LiveLocks(std::sync::Mutex<LockMap>);
+
+type LockMap =
+    std::collections::HashMap<(TenantId, NodeId), std::sync::Weak<tokio::sync::Mutex<()>>>;
+
+impl LiveLocks {
+    fn of(&self, tenant: TenantId, app: NodeId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, l| l.strong_count() > 0);
+        if let Some(l) = locks.get(&(tenant, app)).and_then(std::sync::Weak::upgrade) {
+            return l;
+        }
+        let l = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert((tenant, app), Arc::downgrade(&l));
+        l
+    }
+}
+
+/// The live switch of one app is held while both parts live: the lock of this process and the
+/// store's lock across processes.
+pub(crate) struct LiveSwitch {
+    _store: store::LiveSwitchLock,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
+pub(crate) fn live_switch_busy() -> Error {
+    Error::Api(
+        ApiError::new(
+            ErrorCode::Conflict,
+            "another publish or rollback of this app is running",
+        )
+        .with_hint("wait until it ends, then read the app again and repeat the publish")
+        .with_retry_after(5),
+    )
+}
+
+fn deploys_busy(message: &str) -> Error {
+    Error::Api(
+        ApiError::new(ErrorCode::Conflict, message.to_string())
+            .with_hint("wait until a running deployment ends, then try again")
+            .with_retry_after(10),
+    )
+}
+
+impl DeploySlots {
+    pub(crate) fn new(per_tenant: usize, global: usize, wait: std::time::Duration) -> Self {
+        Self {
+            per_tenant,
+            wait,
+            global: Arc::new(tokio::sync::Semaphore::new(global)),
+            tenants: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The semaphore of `tenant` (only tenants with a slot taken or awaited keep an entry).
+    fn of(&self, tenant: TenantId) -> Arc<tokio::sync::Semaphore> {
+        let mut tenants = self.tenants.lock().unwrap_or_else(|e| e.into_inner());
+        tenants.retain(|_, s| Arc::strong_count(s) > 1);
+        tenants
+            .entry(tenant)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_tenant)))
+            .clone()
+    }
+
+    /// Takes a slot of `tenant`, waiting at most the slots' `wait` in all.
+    pub(crate) async fn take(&self, tenant: TenantId) -> Result<DeploySlot> {
+        let deadline = tokio::time::Instant::now() + self.wait;
+        let mine = tokio::time::timeout_at(deadline, self.of(tenant).acquire_owned())
+            .await
+            .map_err(|_| {
+                deploys_busy("this space has the most deployments running at the same time")
+            })?
+            .map_err(|_| Error::Internal("the deployment slots are closed".into()))?;
+        let global = tokio::time::timeout_at(deadline, self.global.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                deploys_busy("the server has the most deployments running at the same time")
+            })?
+            .map_err(|_| Error::Internal("the deployment slots are closed".into()))?;
+        Ok(DeploySlot {
+            _tenant: mine,
+            _global: global,
+        })
+    }
+
+    /// The tenants with a slot taken or awaited (for the tests).
+    #[cfg(test)]
+    pub(crate) fn busy_tenants(&self) -> usize {
+        let mut tenants = self.tenants.lock().unwrap_or_else(|e| e.into_inner());
+        tenants.retain(|_, s| Arc::strong_count(s) > 1);
+        tenants.len()
+    }
+}
 
 /// How many short IDs a new preview tries before it gives up (a clash is rare: 32^8 IDs).
 const SHORT_ID_TRIES: usize = 8;
@@ -337,10 +476,12 @@ fn normal_archive_path(p: &str) -> String {
 /// An `archive_glob` of the manifest, matched against the names of the archive entries.
 ///
 /// `*` matches any run of characters, also `/`, so `*.map` leaves out the maps of every folder:
-/// the glob names files that must never be served, so it errs on the side of matching more. A
-/// glob that ends with `/` (or names `.`) matches everything under that folder. The match is
-/// linear in the name: the parts between the stars are found left to right, and the leftmost
-/// place of each part is always a right choice.
+/// the glob names files that must never be served, so it errs on the side of matching more.
+/// `**/` is zero or more folders, so `**/*.map` also matches `app.js.map` at the root (Kimi
+/// W-2s run 10b, 6): it becomes `*`, which can also match a part of a name (`a/**/b` matches
+/// `a/xb`; more, never less). A glob that ends with `/` (or names `.`) matches everything under
+/// that folder. The match is linear in the name: the parts between the stars are found left to
+/// right, and the leftmost place of each part is always a right choice.
 pub(crate) struct Glob {
     parts: Vec<String>,
 }
@@ -348,6 +489,9 @@ pub(crate) struct Glob {
 impl Glob {
     pub(crate) fn new(pattern: &str) -> Self {
         let mut p = normal_archive_path(pattern);
+        while p.contains("**/") {
+            p = p.replace("**/", "*");
+        }
         if pattern.ends_with('/') || p.is_empty() {
             p = if p.is_empty() {
                 "*".into()
@@ -451,11 +595,21 @@ impl AppService {
         }
         let plan = self.plan_limits(ctx.tenant).await?;
         let limits = Limits::of(&plan);
+        // A slot of the tenant and of the process, held until the stages end: the archive stays
+        // in memory that long (Kimi W-2s run 10b, 2). The wait comes before the source is read.
+        let slot = self.deploy_slots.take(ctx.tenant).await?;
         // unpack and validate: direct answers, nothing stored yet.
         let packed = self.read_source(ctx, &req.source, &limits).await?;
-        let unpacked = archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
-        let manifest = checked_manifest(&unpacked, &plan)?;
-        let files = site_files(&unpacked, &manifest);
+        // Unpacking inflates and checks up to the plan's archive limit: CPU work, so it runs on
+        // the blocking pool and never stalls the async workers.
+        let (packed, manifest, files) = tokio::task::spawn_blocking(move || {
+            let unpacked = archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
+            let manifest = checked_manifest(&unpacked, &plan)?;
+            let files = site_files(&unpacked, &manifest);
+            Ok::<_, Error>((packed, manifest, files))
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("the unpack task failed: {e}")))??;
         // The tenant slug is fixed by now (W-1 makes it with the first app).
         self.ensure_tenant(ctx.tenant).await?;
         let archive_bytes = bytes::Bytes::from(packed.bytes);
@@ -528,7 +682,10 @@ impl AppService {
             files,
             stages,
         };
-        tokio::spawn(async move { me.run_stages(ctx, run).await });
+        tokio::spawn(async move {
+            me.run_stages(ctx, run).await;
+            drop(slot);
+        });
         Ok(view)
     }
 
@@ -685,6 +842,33 @@ impl AppService {
         Ok(self.deps.store.get_app(tenant, node).await?.is_some())
     }
 
+    /// Takes the live switch of `app`: the live-release hooks, the release and the repair
+    /// after a failed release of one app never run at the same time as another switch of that
+    /// app, in this process or in another one (Kimi W-2s run 10b, 1). Without it, the repair of
+    /// a failed publish could read the old live manifest, and write its role flags after a
+    /// concurrent publish switched and wrote its own.
+    pub(crate) async fn lock_live_switch(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+    ) -> Result<LiveSwitch> {
+        let local = tokio::time::timeout(
+            LIVE_SWITCH_WAIT,
+            self.live_locks.of(tenant, app).lock_owned(),
+        )
+        .await
+        .map_err(|_| live_switch_busy())?;
+        let store = self
+            .deps
+            .store
+            .lock_live_switch(tenant, app, LIVE_SWITCH_WAIT)
+            .await?;
+        Ok(LiveSwitch {
+            _store: store,
+            _local: local,
+        })
+    }
+
     /// Makes `dep` (a ready preview or an older live deployment) live as a new deployment.
     async fn go_live(
         &self,
@@ -700,6 +884,18 @@ impl AppService {
             .ok_or_else(|| Error::Internal(format!("deployment {} has no manifest", dep.id)))?;
         // The rules of today, also for an old deployment.
         fail_closed(&manifest)?;
+        // Held until this function returns: the hooks, the release and the repair.
+        let _switch = self.lock_live_switch(ctx.tenant, app.node_id).await?;
+        // A switch that ran while this one waited: no hook runs for a release that would fail.
+        let current = self
+            .deps
+            .store
+            .get_app(ctx.tenant, app.node_id)
+            .await?
+            .ok_or_else(|| Error::not_found("app"))?;
+        if current.live_deployment_id != app.live_deployment_id {
+            return Err(store::live_changed());
+        }
         let before = match app.live_deployment_id {
             Some(live) => self
                 .deps

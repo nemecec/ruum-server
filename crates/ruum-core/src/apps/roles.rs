@@ -705,14 +705,30 @@ impl AppService {
     /// Called when a live switch failed after the live-release hooks ran (a concurrent publish
     /// won the compare-and-set, a later hook or the store failed): the hooks may have written the
     /// flags of a manifest that never went live, which could open the app to the holders of a
-    /// role that is not live. Writes the flags of the real live manifest again. A failure here
-    /// is logged; the caller returns its own error.
+    /// role that is not live. Writes the flags of the real live manifest again, up to three
+    /// times (Kimi W-2s run 10b, 1); the caller holds the live switch of the app, so no other
+    /// switch writes flags in between. A last failure is logged; the caller returns its own
+    /// error.
     pub(crate) async fn repair_after_failed_switch(&self, tenant: TenantId, app: NodeId) {
-        if let Err(e) = self.sync_active_roles(tenant, app).await {
-            tracing::error!(
-                tenant = %tenant, app = %app, error = %e,
-                "could not repair the app role flags after a failed live switch"
-            );
+        const TRIES: u32 = 3;
+        for attempt in 1..=TRIES {
+            match self.sync_active_roles(tenant, app).await {
+                Ok(()) => return,
+                Err(e) if attempt == TRIES => {
+                    tracing::error!(
+                        tenant = %tenant, app = %app, error = %e,
+                        "could not repair the app role flags after a failed live switch"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tenant = %tenant, app = %app, error = %e, attempt,
+                        "the repair of the app role flags failed; trying again"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
+                        .await;
+                }
+            }
         }
     }
 

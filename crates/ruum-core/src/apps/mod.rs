@@ -400,6 +400,11 @@ pub struct AppService {
     changed: tokio::sync::Notify,
     /// The hooks called when the live deployment changes (card B-2; empty by default).
     hooks: std::sync::RwLock<Vec<Arc<dyn deployments::LiveReleaseHook>>>,
+    /// The deployment slots of this process (Kimi W-2s run 10b, 2).
+    deploy_slots: deployments::DeploySlots,
+    /// The live-switch locks of this process, one per app (Kimi W-2s run 10b, 1); the store's
+    /// lock serializes the processes.
+    live_locks: deployments::LiveLocks,
 }
 
 /// Share-link bearers call no app operation (`403 user_required`).
@@ -482,6 +487,12 @@ impl AppService {
             deps,
             changed: tokio::sync::Notify::new(),
             hooks: std::sync::RwLock::new(Vec::new()),
+            deploy_slots: deployments::DeploySlots::new(
+                deployments::TENANT_DEPLOYS,
+                deployments::GLOBAL_DEPLOYS,
+                deployments::DEPLOY_SLOT_WAIT,
+            ),
+            live_locks: deployments::LiveLocks::default(),
         }
     }
 
