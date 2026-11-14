@@ -165,7 +165,9 @@ pub fn cases() -> Vec<GatewayCase> {
         case!(
             "an_app_script_cannot_read_the_report_preview",
             "The report preview answers only with the report session cookie and the CSRF \
-             header: from the app origin (app session, no report session) it is refused",
+             header: from the app origin (app session, no report session) the gateway refuses \
+             it (400, 401, 403 or 404, never the app's answer), and on the platform origin \
+             without a report session (401) or with a forged one (401 or 403)",
             "gateway.openapi.yaml /.ruum-report/v1/preview; decision 0006-15; STEP3 card T-6 \
              \"Done when\" (the report origin)",
             ["previewAppReport"],
@@ -176,10 +178,7 @@ pub fn cases() -> Vec<GatewayCase> {
                     .header("Ruum-Report-Csrf", "t6guess");
                 let label = req.label();
                 let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
-                gw_check!(
-                    resp.status != 200,
-                    "{label}: the app origin answered the report preview"
-                );
+                expect_refusal(&label, &resp, &[400, 401, 403, 404])?;
                 // The platform origin without a report session, and with a forged one.
                 let p = cx.gw.platform_host.clone();
                 let req =
@@ -199,8 +198,9 @@ pub fn cases() -> Vec<GatewayCase> {
         case!(
             "report_choices_are_refused_from_the_app_origin",
             "A report with include choices posted from the app origin (with the app session, no \
-             report session and CSRF token) is refused; choices are accepted only on the report \
-             origin",
+             report session and CSRF token) is refused by the gateway (on the app host 400, 401, \
+             403 or 404; on the platform host 401 or 403; never the app's answer), and no report \
+             is made; choices are accepted only on the report origin",
             "gateway.openapi.yaml /.ruum-report/v1/reports; decision 0006-15",
             ["createAppReport"],
             |cx| {
@@ -208,20 +208,25 @@ pub fn cases() -> Vec<GatewayCase> {
                 let body = "--t6b\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n\
                             broken\r\n--t6b\r\nContent-Disposition: form-data; \
                             name=\"choices\"\r\n\r\n{\"*\":\"include\"}\r\n--t6b--\r\n";
-                for host in [s.host.clone(), cx.gw.platform_host.clone()] {
+                let refusals: [(String, &[u16]); 2] = [
+                    (s.host.clone(), &[400, 401, 403, 404]),
+                    (cx.gw.platform_host.clone(), &[401, 403]),
+                ];
+                for (host, allowed) in refusals {
                     let req = Req::post(&host, "/.ruum-report/v1/reports")
                         .header("Content-Type", "multipart/form-data; boundary=t6b")
                         .header("Origin", &format!("https://{}", s.host))
                         .body(body);
                     let label = req.label();
                     let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
-                    gw_check!(
-                        resp.status != 201 && !is_echo(&resp),
-                        "{label}: a report from the app origin was accepted ({})",
-                        resp.status
-                    );
+                    expect_refusal(&label, &resp, allowed)?;
                 }
-                Ok(())
+                // A refusal status alone does not prove that nothing was filed.
+                plan(
+                    "G-4",
+                    "after the refusals, read the reports (issues) of the app through a world \
+                     step and expect none; a status check alone never passes this case",
+                )
             }
         ),
         case!(

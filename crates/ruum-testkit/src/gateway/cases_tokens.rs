@@ -1,6 +1,6 @@
 //! The user token and the credentials that never mix (cases 9, 10, 14 and 20 of card T-6).
 
-use super::token::{Expect, decode_unverified, verify_user_token};
+use super::token::{Expect, verify_user_token};
 use super::{
     AgentAudience, Ctx, Echo, Env, Fail, GatewayCase, Relation, Req, SIGN_IN_OR_REFUSED, echoed,
     echoed_header, expect_refusal, files, page, scene,
@@ -307,7 +307,8 @@ pub fn cases() -> Vec<GatewayCase> {
         ),
         case!(
             "the_roles_claim_lists_active_app_roles",
-            "The roles claim lists the visitor's active app roles",
+            "The roles claim of a user token that verifies with the gateway's key set (EdDSA, \
+             iss, aud app:<app-id>, env live) lists the visitor's active app roles",
             "contracts/apps/user-token.schema.json roles; design 9.3; plan seam 3 (B-2's \
              effective_roles)",
             [],
@@ -323,7 +324,7 @@ pub fn cases() -> Vec<GatewayCase> {
                 let resp = cx.send_jar(&mut jar, req).await?;
                 let t = user_token_of(&label, &echoed(&label, &resp)?)?;
                 cx.secret(&t);
-                let (_, c) = decode_unverified(&t).map_err(Fail::Failed)?;
+                let c = verify(&cx, &label, &t, &Expect::live(&cx.gw.issuer, &s.app.id))?;
                 let roles: Vec<&str> = c["roles"]
                     .as_array()
                     .map(|a| a.iter().filter_map(Value::as_str).collect())

@@ -190,6 +190,90 @@ pub fn verify_user_token(token: &str, jwks: &Value, expect: &Expect) -> Result<V
     Ok(c)
 }
 
+/// The longest life of a delegated token (`exp - iat`), in seconds.
+pub const MAX_DELEGATED_LIFE_SECONDS: i64 = 300;
+
+/// The reference verifier of a delegated token (`exchangeAppUserToken`,
+/// `contracts/apps/delegated-token.schema.json`): the EdDSA signature by a key of `jwks` (the
+/// workload-token keys), `typ` = `app_delegated`, `aud` = `ruum.internal`, `iss`, `env`, the
+/// app principal `app` (the app node ID for live, the deployment ID for a preview) as `sub` and
+/// as the actor (`act.kind` = `app`), numeric `iat` and `exp`, `exp` after now, `exp - iat`
+/// 1..300 s, and the schema. Returns the claims, or why the token is refused (claim names, never
+/// values).
+pub fn verify_delegated_token(
+    token: &str,
+    jwks: &Value,
+    iss: &str,
+    env: &str,
+    app: &str,
+) -> Result<Value, String> {
+    signature_ok(token, jwks)?;
+    let (_, c) = decode_unverified(token)?;
+    if c["typ"] != "app_delegated" {
+        return Err("typ is not app_delegated".into());
+    }
+    if c["aud"] != "ruum.internal" {
+        return Err("aud is not ruum.internal".into());
+    }
+    if c["iss"].as_str() != Some(iss) {
+        return Err(format!("iss is not {iss}"));
+    }
+    if c["env"].as_str() != Some(env) {
+        return Err(format!("env is not {env}"));
+    }
+    if c["sub"].as_str() != Some(app) {
+        return Err("sub is not the app that asked".into());
+    }
+    if c["act"]["kind"] != "app" || c["act"]["id"].as_str() != Some(app) {
+        return Err("act is not the app that asked".into());
+    }
+    let (Some(iat), Some(exp)) = (c["iat"].as_i64(), c["exp"].as_i64()) else {
+        return Err("iat and exp must both be numbers".into());
+    };
+    let t = now();
+    if exp <= t {
+        return Err("exp has passed".into());
+    }
+    if iat > t + LEEWAY_SECONDS {
+        return Err("iat is in the future".into());
+    }
+    if exp <= iat || exp - iat > MAX_DELEGATED_LIFE_SECONDS {
+        return Err(format!(
+            "exp - iat is {} s, it must be between 1 and {MAX_DELEGATED_LIFE_SECONDS}",
+            exp - iat
+        ));
+    }
+    let problems = delegated_schema_problems(&c);
+    if !problems.is_empty() {
+        return Err(format!(
+            "the claims do not match delegated-token.schema.json: {}",
+            problems.join("; ")
+        ));
+    }
+    Ok(c)
+}
+
+/// Valid delegated token claims of the live app `app` for now (for hand-made tokens).
+pub fn delegated_claims(iss: &str, app: &str, tid: &str, user: &str) -> Value {
+    let t = now();
+    json!({
+        "iss": iss,
+        "aud": "ruum.internal",
+        "typ": "app_delegated",
+        "sub": app,
+        "tid": tid,
+        "env": "live",
+        "act": { "kind": "app", "id": app },
+        "on_behalf_of": user,
+        "agent": null,
+        "chain": [],
+        "bindings": ["doc"],
+        "iat": t,
+        "exp": t + 300,
+        "jti": format!("t6-{}", uuid::Uuid::now_v7()),
+    })
+}
+
 /// Valid user token claims for now (for hand-made tokens).
 pub fn user_claims(iss: &str, aud: &str, env: &str, tenant: &str, actor: &str) -> Value {
     let t = now();
@@ -398,6 +482,67 @@ mod tests {
             parts[2]
         );
         assert!(verify_user_token(&forged, &jwks, &live).is_err());
+    }
+
+    /// The delegated token verifier refuses an unsigned (`alg: none`) token, a foreign key, a
+    /// token of another app and the other bad claims (review kimi-t6 F4).
+    #[test]
+    fn the_delegated_verifier_refuses_bad_tokens() {
+        const TID: &str = "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a";
+        const USER: &str = "0190b6c4-6000-7cc1-9a4b-1f2e3d4c5b6b";
+        const OTHER: &str = "0190b6c4-a00d-7cc1-9a4b-000000000000";
+        let s = TestSigner::new();
+        let jwks = s.jwks();
+        let check = |t: &str| verify_delegated_token(t, &jwks, ISS, "live", APP);
+        let good_claims = delegated_claims(ISS, APP, TID, USER);
+        let good = s.sign(&good_claims);
+        check(&good).expect("a good delegated token verifies");
+        let none = format!(
+            "{}.{}.",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(good_claims.to_string())
+        );
+        assert!(check(&none).is_err(), "an unsigned token verified");
+        assert!(
+            check(&TestSigner::new().sign(&good_claims)).is_err(),
+            "a token of a foreign key verified"
+        );
+        type Spoil = fn(&mut Value);
+        let bad: [(&str, Spoil); 11] = [
+            ("another app as sub", |c| c["sub"] = json!(OTHER)),
+            ("another app as actor", |c| c["act"]["id"] = json!(OTHER)),
+            ("a person as actor", |c| c["act"]["kind"] = json!("user")),
+            ("typ app_user", |c| c["typ"] = json!("app_user")),
+            ("the app's audience", |c| c["aud"] = json!(live_aud(APP))),
+            ("another issuer", |c| {
+                c["iss"] = json!("https://evil.example")
+            }),
+            ("env preview", |c| c["env"] = json!("preview")),
+            ("life over 300 s", |c| {
+                let t = now();
+                c["iat"] = json!(t);
+                c["exp"] = json!(t + 301);
+            }),
+            ("expired", |c| {
+                let t = now();
+                c["iat"] = json!(t - 400);
+                c["exp"] = json!(t - 100);
+            }),
+            ("no bindings", |c| c["bindings"] = json!([])),
+            ("no on_behalf_of", |c| {
+                if let Some(o) = c.as_object_mut() {
+                    o.remove("on_behalf_of");
+                }
+            }),
+        ];
+        for (what, f) in bad {
+            let mut c = good_claims.clone();
+            f(&mut c);
+            assert!(
+                check(&s.sign(&c)).is_err(),
+                "the delegated verifier accepted {what}"
+            );
+        }
     }
 
     #[test]
