@@ -17,8 +17,9 @@
 //!   is written by the implementer, so it must not be able to switch a case off.
 //! - **pending**: the case waits for a named card. Either [`PENDING`] lists it (a rule that a
 //!   later card builds), or the world answers [`WorldError::Pending`] from a step that
-//!   [`WORLD_PENDING_STEPS`] allows (an app role before B-2) in a case that [`WORLD_PENDING`]
-//!   lists with that card. Any other world `Pending` fails the case. Never a failure otherwise.
+//!   [`WORLD_PENDING_STEPS`] allows (a partner key before B-3) in a case that
+//!   [`WORLD_PENDING`] lists with that card. Any other world `Pending` fails the case. Never a
+//!   failure otherwise.
 //! - **passed** or **failed** otherwise.
 //!
 //! A case never passes on silence (decision 0006 G, the S-2 rule): a refusal must be the
@@ -165,21 +166,15 @@ pub fn pending_reason(case: &str) -> Option<&'static str> {
 }
 
 /// The cases in which a world may answer [`WorldError::Pending`], each with the one card it may
-/// name. A world `Pending` in any other case, or with another card, fails the case.
-pub const WORLD_PENDING: &[(&str, &str)] = &[
-    ("an_active_app_role_gives_use", "B-2"),
-    ("a_removed_role_stops_within_5_seconds", "B-2"),
-    ("the_roles_claim_lists_active_app_roles", "B-2"),
-];
+/// name. A world `Pending` in any other case, or with another card, fails the case. Empty: the
+/// three app role cases waited for B-2, which is merged (backlog P-68), so a world must grant
+/// and remove app roles now.
+pub const WORLD_PENDING: &[(&str, &str)] = &[];
 
 /// The world steps that may answer [`WorldError::Pending`], each with the one card it may name:
-/// granting or removing an app role (B-2), a partner key (B-3). Every other step that answers
-/// `Pending` fails the case (see [`Guard`]).
-pub const WORLD_PENDING_STEPS: &[(&str, &str)] = &[
-    ("grant(role)", "B-2"),
-    ("revoke(role)", "B-2"),
-    ("partner_key", "B-3"),
-];
+/// a partner key (B-3). Every other step that answers `Pending` fails the case (see [`Guard`]);
+/// granting or removing an app role no longer may (B-2 is merged).
+pub const WORLD_PENDING_STEPS: &[(&str, &str)] = &[("partner_key", "B-3")];
 
 /// Whether a world may answer pending with `card` in `case`.
 pub fn world_pending_allowed(case: &str, card: &str) -> bool {
@@ -195,8 +190,8 @@ pub fn world_pending_allowed(case: &str, card: &str) -> bool {
 pub enum WorldError {
     /// The binary under test is not there yet: the case reports planned.
     Missing(String),
-    /// The world cannot do this step until the named card lands (for example an app role before
-    /// B-2): the case reports pending with that card.
+    /// The world cannot do this step until the named card lands (for example a partner key
+    /// before B-3): the case reports pending with that card.
     Pending { card: String, why: String },
     /// The step failed: the case fails.
     Failed(String),
@@ -558,6 +553,9 @@ pub struct RuntimeHandle {
     pub issuer: String,
     /// The public key set of the delegated tokens.
     pub delegated_jwks: Value,
+    /// The public key set of the `Ruum-User` tokens that the internal gateway adds to an
+    /// app-to-app call.
+    pub user_token_jwks: Value,
 }
 
 /// The seeded world of the runtime API cases (cards R-3 and G-3).

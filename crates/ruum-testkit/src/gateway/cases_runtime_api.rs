@@ -2,7 +2,7 @@
 //! [`super::PENDING`] with its card until a [`super::RuntimeApiWorld`] exists.
 
 use super::token::{
-    TestSigner, decode_unverified, delegated_schema_problems, live_aud, user_claims,
+    Expect, TestSigner, live_aud, user_claims, verify_delegated_token, verify_user_token,
 };
 use super::{Binding, BindingKind, Echo, Env, Fail, Req, RtCtx, RuntimeCase, WorldError};
 use crate::{gw_check, gw_fail};
@@ -194,8 +194,9 @@ pub fn cases() -> Vec<RuntimeCase> {
         ),
         case!(
             "exchange_gives_a_delegated_token",
-            "exchangeAppUserToken gives a delegated token (typ app_delegated, aud ruum.internal, \
-             at most 300 s, the bindings with on_behalf_of_user) that matches \
+            "exchangeAppUserToken gives a delegated token that verifies with the delegated key \
+             set (EdDSA; typ app_delegated, aud ruum.internal, iss, env live, sub and actor the \
+             app, at most 300 s, the bindings with on_behalf_of_user) and matches \
              delegated-token.schema.json",
             "contracts/apps/runtime.openapi.yaml /v1/token/exchange; \
              contracts/apps/delegated-token.schema.json",
@@ -218,22 +219,14 @@ pub fn cases() -> Vec<RuntimeCase> {
                     gw_fail!("the exchange gave no access_token");
                 };
                 cx.secret(t);
-                let (_, c) = decode_unverified(t).map_err(Fail::Failed)?;
-                let p = delegated_schema_problems(&c);
-                gw_check!(
-                    p.is_empty(),
-                    "the delegated token's claims: {}",
-                    p.join("; ")
-                );
-                gw_check!(
-                    c["typ"] == "app_delegated" && c["aud"] == "ruum.internal",
-                    "typ or aud"
-                );
-                let life = c["exp"].as_i64().unwrap_or(0) - c["iat"].as_i64().unwrap_or(0);
-                gw_check!(
-                    life > 0 && life <= 300,
-                    "the delegated token lives {life} s"
-                );
+                let c = verify_delegated_token(
+                    t,
+                    &cx.rt.delegated_jwks,
+                    &cx.rt.issuer,
+                    "live",
+                    &app.id,
+                )
+                .map_err(|e| Fail::Failed(format!("the delegated token does not verify: {e}")))?;
                 gw_check!(
                     c["bindings"] == json!(["doc"]),
                     "bindings: {}",
@@ -364,7 +357,8 @@ pub fn cases() -> Vec<RuntimeCase> {
         case!(
             "the_internal_gateway_removes_the_workload_token",
             "An app-to-app call through the internal gateway reaches app B without Authorization \
-             and without app A's workload token in any header; B sees actor app in Ruum-User",
+             and without app A's workload token in any header; B gets one Ruum-User that \
+             verifies for B (key set, iss, aud app:<B>, env live) with actor app",
             "contracts/apps/runtime.openapi.yaml \"The app's credential\"; decision 0006-10; \
              STEP3 \"How an app runs\" rule 4; STEP3 card T-6 \"Done when\"",
             [],
@@ -410,13 +404,22 @@ pub fn cases() -> Vec<RuntimeCase> {
                     );
                 }
                 let ru = last.header_all("ruum-user");
-                let actor = ru
-                    .first()
-                    .and_then(|t| decode_unverified(t).ok())
-                    .map(|(_, c)| c["actor"].clone());
                 gw_check!(
-                    actor.as_ref().map(|a| a == "app").unwrap_or(false),
-                    "app B should see actor app, got {actor:?}"
+                    ru.len() == 1,
+                    "app B got {} Ruum-User headers, expected one",
+                    ru.len()
+                );
+                cx.secret(ru[0]);
+                let c = verify_user_token(
+                    ru[0],
+                    &cx.rt.user_token_jwks,
+                    &Expect::live(&cx.rt.issuer, &b.id),
+                )
+                .map_err(|e| Fail::Failed(format!("app B's Ruum-User does not verify: {e}")))?;
+                gw_check!(
+                    c["actor"] == "app",
+                    "app B should see actor app, got {}",
+                    c["actor"]
                 );
                 Ok(())
             }

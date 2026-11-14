@@ -10,7 +10,9 @@
 //!   and the core's internal API.
 //! - Seeding goes through the core's stores: team tenants with exact slugs, people with a platform
 //!   account (guests, without any right on an app), apps through `createApp`, deployments through
-//!   the store, grants as tuples of the graph, agents through the agent store.
+//!   the store, grants as tuples of the graph, app roles through B-2's `addAppRoleGrant` and
+//!   `removeAppRoleGrant` (every seeded deployment declares the roles `member` and `approver`),
+//!   agents through the agent store.
 //! - The world tells the gateway when a host changes (a new live deployment, a reused host), as
 //!   the journal feed does in production.
 
@@ -19,6 +21,7 @@ use bytes::Bytes;
 use ruum_api::AppState;
 use ruum_core::actor::{Actor, Context};
 use ruum_core::agents::{AgentScope, NewAgent};
+use ruum_core::apps::roles::AddRoleGrant;
 use ruum_core::apps::static_site::StaticSites;
 use ruum_core::apps::store::{
     ApprovalChange, Archive, DeploymentSource, DeploymentState, Environment, NewDeployment,
@@ -26,6 +29,7 @@ use ruum_core::apps::store::{
 use ruum_core::authz::{ObjectRef, Relationship, RelationshipUpdate, Role, SubjectRef};
 use ruum_core::identity::{APPS_AGENT_AUDIENCE, AccessClaims, TokenType, VerifiedLogin};
 use ruum_core::nodes::OnConflict;
+use ruum_core::sharing::Grantee;
 use ruum_core::{NodeId, TenantId, UserId};
 use ruum_gateway::host::{AppHost, MemoryHostLookup, Resolved};
 use ruum_gateway::token::UserTokenSigner;
@@ -66,6 +70,8 @@ struct Seeds {
     deployments: HashMap<Uuid, Seeded>,
     /// app ID -> slug the host of the app has now
     app_slugs: HashMap<NodeId, String>,
+    /// (user, app, role) -> the ID of the app role grant
+    role_grants: HashMap<(UserId, NodeId, String), Uuid>,
     count: u64,
 }
 
@@ -220,22 +226,64 @@ impl World {
             .map_err(|e| failed("a grant", e))
     }
 
-    fn relation(user: UserId, app: NodeId, relation: &Relation) -> WorldResult<Relationship> {
-        let rel = match relation {
-            Relation::View => Role::View.relation(),
-            Relation::Edit => Role::Edit.relation(),
-            Relation::Role(_) => {
-                return Err(WorldError::Pending {
-                    card: "B-2".into(),
-                    why: "app role grants come with card B-2 (apps::roles)".into(),
-                });
-            }
-        };
-        Ok(Relationship {
+    /// The tuple of `view` or `edit` (an app role goes through B-2's grants instead).
+    fn relation(user: UserId, app: NodeId, relation: &Role) -> Relationship {
+        Relationship {
             object: ObjectRef::node(app),
-            relation: rel.into(),
+            relation: relation.relation().into(),
             subject: SubjectRef::user(user),
-        })
+        }
+    }
+
+    /// Grants the app role `role` of the live manifest to `user` (`addAppRoleGrant` as the
+    /// tenant's owner; the role must be live, as in production).
+    async fn grant_role(&self, user: UserId, app: &App, role: &str) -> WorldResult<()> {
+        let tid = Self::tenant_id(&app.tenant)?;
+        let node = Self::node_id(&app.id)?;
+        let ctx = self.owner_ctx(tid)?;
+        let grant = self
+            .state
+            .services
+            .apps
+            .add_app_role_grant(
+                &ctx,
+                node,
+                AddRoleGrant {
+                    role: role.to_string(),
+                    grantee: Grantee::User { id: user },
+                    notify: false,
+                },
+            )
+            .await
+            .map_err(|e| failed("addAppRoleGrant", e))?
+            .value;
+        self.seeds
+            .lock()
+            .expect("seeds")
+            .role_grants
+            .insert((user, node, role.to_string()), grant.id);
+        Ok(())
+    }
+
+    /// Removes the grant of `role` to `user` (`removeAppRoleGrant` as the tenant's owner).
+    async fn revoke_role(&self, user: UserId, app: &App, role: &str) -> WorldResult<()> {
+        let tid = Self::tenant_id(&app.tenant)?;
+        let node = Self::node_id(&app.id)?;
+        let ctx = self.owner_ctx(tid)?;
+        let id = self
+            .seeds
+            .lock()
+            .expect("seeds")
+            .role_grants
+            .remove(&(user, node, role.to_string()))
+            .ok_or_else(|| WorldError::Failed(format!("no grant of the role {role} to remove")))?;
+        self.state
+            .services
+            .apps
+            .remove_app_role_grant(&ctx, node, id)
+            .await
+            .map(|_| ())
+            .map_err(|e| failed("removeAppRoleGrant", e))
     }
 
     /// A platform session of `user` (made once), as a sign-in to Ruum would make it.
@@ -494,16 +542,35 @@ impl GatewayWorld for World {
         // The journal event of the new release (W-2s's `app.deployed`) reaches the gateway.
         self.gw.hosts.invalidate_app(seeded.tenant, seeded.app);
         self.gw.hosts.invalidate_tenant_slug(&seeded.tenant_slug);
-        Ok(())
+        // The live-release hook of B-2 (the active flags of the live manifest's roles): the
+        // world writes the live row through the store, so it runs the hook's sync itself.
+        self.state
+            .services
+            .apps
+            .sync_active_roles(seeded.tenant, seeded.app)
+            .await
+            .map_err(|e| failed("the active app roles", e))
     }
 
     async fn grant(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()> {
-        let r = Self::relation(Self::user_id(user)?, Self::node_id(&app.id)?, relation)?;
+        let uid = Self::user_id(user)?;
+        let role = match relation {
+            Relation::View => Role::View,
+            Relation::Edit => Role::Edit,
+            Relation::Role(name) => return self.grant_role(uid, app, name).await,
+        };
+        let r = Self::relation(uid, Self::node_id(&app.id)?, &role);
         self.write(vec![RelationshipUpdate::Touch(r)]).await
     }
 
     async fn revoke(&self, user: &User, app: &App, relation: &Relation) -> WorldResult<()> {
-        let r = Self::relation(Self::user_id(user)?, Self::node_id(&app.id)?, relation)?;
+        let uid = Self::user_id(user)?;
+        let role = match relation {
+            Relation::View => Role::View,
+            Relation::Edit => Role::Edit,
+            Relation::Role(name) => return self.revoke_role(uid, app, name).await,
+        };
+        let r = Self::relation(uid, Self::node_id(&app.id)?, &role);
         self.write(vec![RelationshipUpdate::Delete(r)]).await
     }
 
@@ -717,7 +784,15 @@ impl World {
             idempotency_key: None,
         };
         let archive = format!("{id} archive");
-        let manifest = serde_json::json!({ "static": { "root": "." } });
+        // Two app roles (B-2) that the role cases grant; neither is the default role, so a
+        // visitor with `view` alone has no role.
+        let manifest = serde_json::json!({
+            "static": { "root": "." },
+            "roles": {
+                "member": { "description": "A member of the app" },
+                "approver": { "description": "Approves requests" },
+            },
+        });
         self.state
             .services
             .apps
@@ -765,8 +840,9 @@ fn make() -> MakeGatewayWorld {
     })
 }
 
-/// Every T-6 case with the G-1a world: none fails, and none reports planned (the world is
-/// there; a case waits only for a named later card).
+/// Every T-6 case with the G-1a world: none fails, none reports planned (the world is there),
+/// and a case is pending only when `PENDING` lists it for a later card (the world itself
+/// answers pending for no step: B-2's app roles are merged, P-68).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t6_gateway_cases_pass_with_the_g1a_world() {
     let cases = gateway::gateway_cases();
@@ -778,6 +854,10 @@ async fn t6_gateway_cases_pass_with_the_g1a_world() {
         assert!(
             !matches!(o, gateway::Outcome::Planned(_)),
             "{name} is planned with the G-1a world: {o:?}"
+        );
+        assert!(
+            !matches!(o, gateway::Outcome::Pending(_)) || gateway::pending_reason(name).is_some(),
+            "{name} is pending with the G-1a world, but PENDING does not list it: {o:?}"
         );
     }
 }

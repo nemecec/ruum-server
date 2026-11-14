@@ -59,9 +59,23 @@ impl Req {
             .body(v.to_string())
     }
 
-    /// The path of the target (before `?`).
+    /// The path of the target (before `?`). For an absolute-form target
+    /// (`http://<authority>/<path>`, RFC 9112 3.2.2) the path after the authority (`/` when
+    /// there is none), so the cookie jar matches it as a browser would.
     pub fn path(&self) -> &str {
-        self.target.split('?').next().unwrap_or("/")
+        let t = self.target.split('?').next().unwrap_or("/");
+        let lower = t.get(..8).unwrap_or(t).to_ascii_lowercase();
+        let rest = if lower.starts_with("http://") {
+            &t[7..]
+        } else if lower.starts_with("https://") {
+            &t[8..]
+        } else {
+            return t;
+        };
+        match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "/",
+        }
     }
 
     /// `METHOD host target`, for messages (no header values).
@@ -458,6 +472,28 @@ impl Jar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_path_of_an_absolute_form_target_is_after_the_authority() {
+        for (target, path) in [
+            ("/a/b?c=d", "/a/b"),
+            ("http://b.example/absolute", "/absolute"),
+            ("HTTP://b.example/x/y?z=1", "/x/y"),
+            ("https://b.example", "/"),
+            ("https://b.example?q=1", "/"),
+            ("*", "*"),
+        ] {
+            assert_eq!(Req::get("a.example", target).path(), path, "{target}");
+        }
+        // A jar sends the Path=/ cookie of the Host to an absolute-form target.
+        let mut jar = Jar::default();
+        assert!(jar.store("a.example", "__Host-s=1; Path=/; Secure"));
+        let req = Req::get("a.example", "http://b.example/absolute");
+        assert_eq!(
+            jar.header_for(&req.host, req.path()).as_deref(),
+            Some("__Host-s=1")
+        );
+    }
 
     #[test]
     fn parses_chunked_and_length_answers() {

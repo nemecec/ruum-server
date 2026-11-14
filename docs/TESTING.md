@@ -272,9 +272,10 @@ Outcomes, as in the app cases:
   fails the case: the implementer writes the world, so the world must not be able to switch a
   case off.
 - **pending**: `gateway::PENDING` names the case with a card (G-1b, G-2, G-3, G-4, R-3, B-3, W-5,
-  X-2), or the world answered `Pending` from a step of `WORLD_PENDING_STEPS` (an app role: B-2;
-  a partner key: B-3) in a case that `WORLD_PENDING` lists with that card (the three role cases,
-  B-2). Any other world `Pending` fails the case. Never a failure. The card removes its line when
+  X-2), or the world answered `Pending` from a step of `WORLD_PENDING_STEPS` (a partner key:
+  B-3) in a case that `WORLD_PENDING` lists with that card (none today: the three app role cases
+  waited for B-2, which is merged, so a world must grant app roles). Any other world `Pending`
+  fails the case. Never a failure. The card removes its line when
   its code makes the case pass; a planned case body of a later card fails until that card writes
   it.
 - **passed** or **failed** otherwise. A refusal passes only as the gateway's own answer (its

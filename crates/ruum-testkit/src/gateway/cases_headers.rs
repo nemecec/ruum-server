@@ -396,8 +396,9 @@ pub fn cases() -> Vec<GatewayCase> {
         ),
         case!(
             "hostile_framing_never_passes_the_check",
-            "Two Host headers get 400; an absolute-form target that names another app's host \
-             never reaches that app; two different Content-Length values get 400; \
+            "Two Host headers get 400; an absolute-form target that names another app's host, \
+             sent with the visitor's session of the Host's app, gets 400 and reaches neither \
+             app; two different Content-Length values get 400; \
              Content-Length with Transfer-Encoding: chunked gets 400 or is read by the chunked \
              framing alone (RFC 9112 6.1), and no smuggled second request ever reaches the app",
             "decision 0006 G point 2 (the gateway decides on the request it checked); RFC 9112 \
@@ -426,13 +427,25 @@ pub fn cases() -> Vec<GatewayCase> {
                     "{label}: a request with two Host headers reached an app"
                 );
 
+                // With A's session (Path=/ matches the absolute form's path), so a gateway that
+                // checks the Host's app and forwards by the target's authority is caught.
                 let req = Req::get(&s.host, &format!("http://{b_host}/absolute"));
                 let label = format!("{} (absolute form, Host of app A)", req.label());
-                cx.send_jar(&mut s.jar.clone(), req).await?;
+                gw_check!(
+                    s.jar.header_for(&s.host, req.path()).is_some(),
+                    "{label}: the visitor's session of app A would not be sent"
+                );
+                let a_hits = s.echo().hits();
+                let resp = cx.send_jar(&mut s.jar.clone(), req).await?;
                 gw_check!(
                     b_echo.hits() == 0,
                     "{label}: the request reached app B, where the visitor has no right"
                 );
+                gw_check!(
+                    s.echo().hits() == a_hits,
+                    "{label}: the request reached app A, although its target names app B"
+                );
+                expect_refusal(&label, &resp, &[400])?;
 
                 let smuggled = format!(
                     "GET /t6smuggled HTTP/1.1\r\nHost: {}\r\nRuum-User: t6forged\r\n\r\n",
