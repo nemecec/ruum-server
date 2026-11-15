@@ -320,11 +320,31 @@ where
         Decision::Allow(ip) => ip,
         Decision::Deny(r) => return deny(state, &ctx, &mut client, r).await,
     };
-    let target = SocketAddr::new(checked, port);
-    ctx.resolved = Some(target);
-    let mut upstream = match tokio::time::timeout_at(deadline, TcpStream::connect(target)).await {
-        Ok(Ok(s)) => s,
-        _ => return plain(state, &ctx, &mut client, 502).await,
+    // Every answer passed the address rules (one refused answer refuses them all), so each is a
+    // checked address: try them in order, the one `decide` named first (an IPv6 answer first
+    // fails at once on a network without IPv6). No new resolution.
+    let mut candidates = vec![checked];
+    for ip in &resolved {
+        let ip = canonical(*ip);
+        if !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    let mut connected = None;
+    for checked in candidates {
+        let target = SocketAddr::new(checked, port);
+        ctx.resolved = Some(target);
+        match tokio::time::timeout_at(deadline, TcpStream::connect(target)).await {
+            Ok(Ok(s)) => {
+                connected = Some(s);
+                break;
+            }
+            Ok(Err(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    let Some(mut upstream) = connected else {
+        return plain(state, &ctx, &mut client, 502).await;
     };
     let _ = upstream.set_nodelay(true);
     if client

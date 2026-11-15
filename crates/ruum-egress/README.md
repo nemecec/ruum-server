@@ -10,6 +10,8 @@ and section G, STEP3 "How an app runs" rule 2). A small Rust `CONNECT` proxy:
 - It checks the host against the network's `egress.allow`, resolves the name **once**, refuses
   the request when **any** answer is not a public address, and connects to the checked address.
   It never resolves again for that tunnel, so a DNS answer that changes cannot redirect it.
+  (When the first checked address does not answer, it tries the other answers of the same
+  resolution, which all passed the rules.)
 - It limits tunnels per identity (at once, and a rate), closes idle and old tunnels, counts bytes
   per identity and hour, and logs one line per tunnel (no path, no query string, no header).
 
@@ -157,8 +159,16 @@ first line of the request head, and an absolute-form request is logged with host
   whole `127.0.0.0/8` is loopback there).
 - The container check on the build server (acceptance test 2):
   `crates/ruum-egress/tests/container_check.sh` builds the image, starts it on an
-  `internal: true`, `inhibit_ipv4` network and probes from a container on that network. It needs
-  Docker and the internet; it is not part of `cargo test`.
+  `internal: true`, `inhibit_ipv4` network and probes from a container on that network
+  (npm reached; the metadata addresses, the host's public IPv4, its IPv6 and /64 neighbour, and
+  encoded forms refused with `deny=address`; the allow-list; an unregistered network; no direct
+  way out; the token and paths not in the log; no test hook in the release binary). It needs
+  Docker and the internet; it is not part of `cargo test`. Its containers, networks and image
+  carry the label `ruum.test=s3w3r2e` and are removed at the end.
+- The test-only switch that treats one loopback socket address as public
+  (`MemoryPolicy::set_test_public`) exists only with the `test-hooks` feature, which only the
+  crate's dev-dependency on itself turns on. No environment variable reaches it, and the release
+  build of the image does not contain it (the container check looks).
 - Mutations: `crates/ruum-testkit/mutations/egress-*.sh`
   (`crates/ruum-testkit/scripts/mutation_check.sh egress-...`).
 
