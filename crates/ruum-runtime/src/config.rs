@@ -88,7 +88,10 @@ pub struct DockerConfig {
     /// The longest log line in bytes; a longer one is cut at the cap.
     pub max_line_bytes: usize,
     /// The health check command inside the sandbox; the URL of the check is appended as the
-    /// last argument. The default runs a short Node script (`node22` images have Node).
+    /// last argument. The default is busybox `wget` with the proxy off (`-Y off`: the egress
+    /// proxy variables must not apply to a local check), which the Alpine-based `node22` images
+    /// carry. A `node -e` check costs seconds per run under runsc at a small CPU limit (and Node
+    /// reads the proxy variables), so it is not the default.
     pub health_command: Vec<String>,
     /// How often the health check runs while the instance starts (Docker's `start-interval`),
     /// and how long the start period lasts. A wake waits for the first passing check.
@@ -100,9 +103,20 @@ pub struct DockerConfig {
     pub api_timeout: Duration,
 }
 
-/// The default health check: `node -e <script> <url>`. The URL is an argument, never part of the
-/// script, so no character of the health path can change the script.
-pub const NODE_HEALTH_SCRIPT: &str = "require('http').get(process.argv[1],{timeout:2000},r=>{r.resume();process.exit(r.statusCode>=200&&r.statusCode<400?0:1)}).on('error',()=>process.exit(1)).on('timeout',()=>process.exit(1))";
+/// The default health check: busybox `wget` without a proxy, quiet, output discarded, a 2 s
+/// timeout; the URL is the last argument (exec form, no shell, so no character of the health
+/// path is interpreted).
+pub const DEFAULT_HEALTH_COMMAND: &[&str] = &[
+    "CMD",
+    "wget",
+    "-q",
+    "-Y",
+    "off",
+    "-O",
+    "/dev/null",
+    "-T",
+    "2",
+];
 
 impl DockerConfig {
     /// A configuration with the defaults for everything but the endpoint, the registry and the
@@ -124,12 +138,10 @@ impl DockerConfig {
             stop_timeout: Duration::from_secs(10),
             log_lines: 10_000,
             max_line_bytes: 16 * 1024,
-            health_command: vec![
-                "CMD".to_owned(),
-                "node".to_owned(),
-                "-e".to_owned(),
-                NODE_HEALTH_SCRIPT.to_owned(),
-            ],
+            health_command: DEFAULT_HEALTH_COMMAND
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
             start_interval: Duration::from_millis(250),
             start_period: Duration::from_secs(10),
             extra_labels: BTreeMap::new(),

@@ -49,7 +49,7 @@ mod driver;
 mod egress;
 mod logs;
 
-pub use config::{DockerConfig, NODE_HEALTH_SCRIPT, RuntimeKind, SharedContainer};
+pub use config::{DEFAULT_HEALTH_COMMAND, DockerConfig, RuntimeKind, SharedContainer};
 pub use driver::{
     DockerDriver, LABEL_APP, LABEL_DEPLOYMENT, LABEL_ENV, LABEL_INSTANCE, LABEL_MANAGED,
     LABEL_TENANT, RESERVED_ENV, SANDBOX_USER, label_keys, network_name, repository,

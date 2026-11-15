@@ -216,6 +216,26 @@ async function probe(cfg) {
       gvisor: (() => { try { return /gVisor/.test(cp.execFileSync('dmesg', { encoding: 'utf8', timeout: 3000 })); } catch { return false; } })(),
     });
   }
+  if (cfg.listen) {
+    // The sockets of this network namespace (run with --network container:<shared container>).
+    const socks = [];
+    for (const f of ['tcp', 'tcp6', 'udp', 'udp6']) {
+      let text = '';
+      try { text = fs.readFileSync(`/proc/net/${f}`, 'utf8'); } catch { continue; }
+      for (const line of text.split('\n').slice(1)) {
+        const c = line.trim().split(/\s+/);
+        if (c.length < 4) continue;
+        const [addr, port] = c[1].split(':');
+        const listening = f.startsWith('tcp') ? c[3] === '0A' : true;
+        if (listening) socks.push({ proto: f, addr, port: parseInt(port, 16) });
+      }
+    }
+    const fwd = {};
+    for (const k of ['ipv4/ip_forward', 'ipv6/conf/all/forwarding']) {
+      try { fwd[k] = fs.readFileSync(`/proc/sys/net/${k}`, 'utf8').trim(); } catch (e) { fwd[k] = e.code; }
+    }
+    report('listen', { kind: 'listen', sockets: socks, forwarding: fwd });
+  }
   if (cfg.forkbomb) report('forkbomb', { kind: 'forkbomb', ...(await forkBomb(cfg.forkbomb.n, cfg.forkbomb.ms)) });
 }
 
