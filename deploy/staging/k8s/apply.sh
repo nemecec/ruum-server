@@ -194,7 +194,9 @@ log "deploy controller (namespace ruum-deploy, backlog O-34)"
 k -n ruum-deploy rollout status deployment/deploy-controller --timeout=5m >/dev/null ||
   die "the deploy controller did not start (deploy/staging/tool.sh kubectl -n ruum-deploy describe pods)"
 log "the deployer may only write release requests (ops/rbac-check.sh live)"
-bash "$STG/ops/rbac-check.sh" live || die "the deployer or the deploy controller has other rights than it should (above)"
+bash "$STG/ops/rbac-check.sh" live || die "the deployer, observer or deploy controller has other rights than it should (above)"
 log "deployer kubeconfig (namespaced, review 2 O-1)"
 bash "$STG/ops/deployer-kubeconfig.sh"
+log "observer kubeconfig (read-only troubleshooting, O-51)"
+bash "$STG/ops/deployer-kubeconfig.sh" observer
 log "platform is up (generation $generation${restore_from:+, restored from $restore_from})"

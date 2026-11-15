@@ -6,6 +6,9 @@
 # of its namespace whatever its creator may read, so "no workload" is what keeps the Secrets out
 # of its reach.
 #
+# The observer (O-51) reads only troubleshooting resources and pod logs in ruum, edge and
+# ruum-deploy. Its direct and group bindings pass the same checks, with a strict allow-list.
+#
 #   rbac-check.sh static FILE...   the rendered manifests (helm template; CI, tests/run.sh)
 #   rbac-check.sh live             the live cluster, with the admin kubeconfig (k8s/apply.sh runs
 #                                  it after every platform step): kubectl auth can-i --as
@@ -25,6 +28,8 @@ DEPLOYER=deployer
 REQUESTS_NS=ruum-deploy
 CONTROLLER_NS=ruum-deploy
 CONTROLLER=deploy-controller
+OBSERVER_NS=ruum
+OBSERVER=observer
 
 fail=0
 problem() { echo "rbac-check: $*" >&2; fail=1; }
@@ -61,13 +66,13 @@ docs() {
   ' "$@"
 }
 
-# is_deployer KIND NAME NAMESPACE: the subject is the deployer, or a group that holds it.
-is_deployer() {
+# is_subject KIND NAME NAMESPACE: the subject includes the identity being checked.
+is_subject() {
   case "$1" in
-    ServiceAccount) [[ "$2" == "$DEPLOYER" && "$3" == "$DEPLOYER_NS" ]] ;;
-    User) [[ "$2" == "system:serviceaccount:$DEPLOYER_NS:$DEPLOYER" ]] ;;
-    Group) [[ "$2" == system:serviceaccounts || "$2" == "system:serviceaccounts:$DEPLOYER_NS" || "$2" == system:authenticated ]] ;;
-    *) return 0 ;; # unreadable: count it as the deployer (fail closed)
+    ServiceAccount) [[ "$2" == "$identity" && "$3" == "$identity_ns" ]] ;;
+    User) [[ "$2" == "system:serviceaccount:$identity_ns:$identity" ]] ;;
+    Group) [[ "$2" == system:serviceaccounts || "$2" == "system:serviceaccounts:$identity_ns" || "$2" == system:authenticated ]] ;;
+    *) return 0 ;; # unreadable: count it as this identity (fail closed)
   esac
 }
 
@@ -104,14 +109,40 @@ check_rule() {
   done < <(items "$resources")
 }
 
-static() {
-  local recs rec t doc kind ns name sk sn sns rk rn bound=0
-  [[ $# -gt 0 ]] || { echo "usage: rbac-check.sh static FILE..." >&2; exit 2; }
-  recs="$(docs "$@")"
-  # The bindings of the deployer.
+# Only these API group/resource/verb combinations belong to the observer.
+check_observer_rule() {
+  local ns="$1" line="$2" groups resources verbs g r v
+  if [[ ! "$line" =~ $RULE_RE ]]; then
+    problem "observer Role in $ns: unreadable rule: $line"
+    return
+  fi
+  groups="${BASH_REMATCH[1]}" resources="${BASH_REMATCH[2]}" verbs="${BASH_REMATCH[5]}"
+  [[ "$line" != *'*'* ]] || { problem "observer Role in $ns: wildcard: $line"; return; }
+  while IFS= read -r g; do
+    while IFS= read -r r; do
+      case "$g:$r" in
+        :pods | :events | :pods/log | events.k8s.io:events | apps:deployments | apps:daemonsets | apps:replicasets | batch:jobs) ;;
+        *) problem "observer Role in $ns: forbidden resource $g:$r" ;;
+      esac
+      while IFS= read -r v; do
+        case "$r:$v" in
+          pods/log:get) ;;
+          pods/log:*) problem "observer Role in $ns: only get is allowed on pods/log" ;;
+          *:get | *:list | *:watch) ;;
+          *) problem "observer Role in $ns: forbidden verb $v" ;;
+        esac
+      done < <(items "$verbs")
+    done < <(items "$resources")
+  done < <(items "$groups")
+}
+
+check_bindings() {
+  local identity="$1" identity_ns="$2" checker="$3"
+  local rec t doc kind ns name sk sn sns rk rn d line bound=0 seen=" "
+  # Check direct, user and group bindings for this identity.
   while IFS=$'\t' read -r t doc sk sn sns; do
     [[ "$t" == S ]] || continue
-    is_deployer "$sk" "$sn" "$sns" || continue
+    is_subject "$sk" "$sn" "$sns" || continue
     rec="$(awk -F'\t' -v d="$doc" '$1 == "D" && $2 == d' <<<"$recs")"
     IFS=$'\t' read -r _ _ kind ns name <<<"$rec"
     IFS=$'\t' read -r _ _ rk rn <<<"$(awk -F'\t' -v d="$doc" '$1 == "R" && $2 == d' <<<"$recs")"
@@ -120,21 +151,40 @@ static() {
       continue
     fi
     if [[ "$kind" != RoleBinding || "$rk" != Role ]]; then
-      problem "$kind ${ns:+$ns/}$name binds $sk $sn to $rk $rn: the deployer gets only namespaced Roles"
+      problem "$kind ${ns:+$ns/}$name binds $sk $sn to $rk $rn: the $identity gets only namespaced Roles"
       continue
     fi
     rec="$(awk -F'\t' -v ns="$ns" -v n="$rn" '$1 == "D" && $3 == "Role" && $4 == ns && $5 == n { print $2 }' <<<"$recs")"
-    if [[ -z "$rec" ]]; then
-      problem "RoleBinding $ns/$name binds the deployer to Role $ns/$rn, which is not in the manifests"
+    if [[ -z "$rec" || "$rec" == *$'\n'* ]]; then
+      problem "RoleBinding $ns/$name binds the $identity to Role $ns/$rn, which is missing or duplicated in the manifests"
       continue
+    fi
+    if [[ "$identity" == "$OBSERVER" ]]; then
+      case "$ns" in
+        ruum | edge | ruum-deploy) seen=" $ns$seen" ;;
+        *) problem "observer binding outside ruum, edge and ruum-deploy: $ns/$name" ;;
+      esac
     fi
     bound=$((bound + 1))
     while IFS=$'\t' read -r t d line; do
-      [[ "$t" == L && "$d" == "$rec" ]] && check_rule "$ns" "$line"
+      [[ "$t" == L && "$d" == "$rec" ]] && "$checker" "$ns" "$line"
     done <<<"$recs"
   done <<<"$recs"
-  [[ $bound -gt 0 ]] || problem "no RoleBinding of the deployer found (wrong files?)"
-  [[ $fail == 0 ]] && echo "rbac-check: the deployer may only write release requests ($bound bindings checked)"
+  [[ $bound -gt 0 ]] || problem "no RoleBinding of the $identity found (wrong files?)"
+  if [[ "$identity" == "$OBSERVER" ]]; then
+    for ns in ruum edge ruum-deploy; do
+      [[ "$seen" == *" $ns "* ]] || problem "no observer RoleBinding in $ns"
+    done
+  fi
+  [[ $fail == 0 ]] && echo "rbac-check: $identity rights checked ($bound bindings)"
+}
+
+static() {
+  local recs
+  [[ $# -gt 0 ]] || { echo "usage: rbac-check.sh static FILE..." >&2; exit 2; }
+  recs="$(docs "$@")"
+  check_bindings "$DEPLOYER" "$DEPLOYER_NS" check_rule
+  check_bindings "$OBSERVER" "$OBSERVER_NS" check_observer_rule
   return "$fail"
 }
 
@@ -194,7 +244,31 @@ live() {
     want no "$c" "$ns" list secrets
   done
   want no "$c" auth create pods
-  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret"
+  local o="system:serviceaccount:$OBSERVER_NS:$OBSERVER" resource verb
+  for ns in ruum edge ruum-deploy; do
+    for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
+      for verb in get list watch; do
+        want yes "$o" "$ns" "$verb" "$resource"
+      done
+    done
+    want yes "$o" "$ns" get pods log
+  done
+  for ns in ruum edge ruum-deploy data auth authz nats ops default kube-system; do
+    want no "$o" "$ns" get secrets
+    want no "$o" "$ns" get configmaps
+    want no "$o" "$ns" create pods
+    want no "$o" "$ns" create pods exec
+    want no "$o" "$ns" create pods attach
+    want no "$o" "$ns" create pods portforward
+    want no "$o" "$ns" patch pods ephemeralcontainers
+    want no "$o" "$ns" create serviceaccounts token
+    want no "$o" "$ns" patch deployments.apps
+    case "$ns" in
+      ruum | edge | ruum-deploy) ;;
+      *) want no "$o" "$ns" get pods; want no "$o" "$ns" get pods log ;;
+    esac
+  done
+  [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only"
   return "$fail"
 }
 
