@@ -1,0 +1,29 @@
+[package]
+name = "ruum-runtime"
+description = "The Docker runtime driver (card R-2a): app workloads in sandboxed containers, plain runc or gVisor (runsc)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruum-core.workspace = true
+async-trait.workspace = true
+bollard.workspace = true
+bytes.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+base64.workspace = true

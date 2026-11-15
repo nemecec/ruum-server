@@ -1,0 +1,1382 @@
+//! [`DockerDriver`]: the runtime border on a Docker engine (see the crate docs).
+
+use crate::config::{DockerConfig, RuntimeKind};
+use crate::egress::{EgressNetwork, EgressRegistry};
+use crate::logs::{Redactors, Ring};
+use async_trait::async_trait;
+use bollard::Docker;
+use bollard::container::LogOutput;
+use bollard::models::{
+    ContainerCreateBody, ContainerInspectResponse, EndpointSettings, HealthConfig,
+    HealthStatusEnum, HostConfig, HostConfigLogConfig, NetworkConnectRequest, NetworkCreateRequest,
+    NetworkDisconnectRequest,
+};
+use bollard::query_parameters::{
+    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+    KillContainerOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+};
+use futures::StreamExt;
+use ruum_core::ids::TenantId;
+use ruum_core::runtime::redact::{check_secret_value, redact};
+use ruum_core::runtime::{
+    Applied, EnvValue, ExitReason, ExitStatus, Health, ImageRef, InstanceId, InstanceState,
+    InstanceStatus, Limits, LogLine, LogStream, NetworkId, OciDigest, Route, RuntimeDriver,
+    RuntimeError, RuntimeUsage, RuntimeUsageSink, SecretValue, TOKEN_FILE, TOKEN_FILE_ENV,
+    WorkloadIdentity, WorkloadKind, WorkloadSpec,
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use time::OffsetDateTime;
+use tokio::task::JoinHandle;
+
+/// The user every sandbox runs as. The image's `USER` is ignored.
+pub const SANDBOX_USER: &str = "10001:10001";
+
+/// The label keys the driver sets (README, "Docker API surface").
+pub const LABEL_APP: &str = "ruum.app";
+pub const LABEL_TENANT: &str = "ruum.tenant";
+pub const LABEL_ENV: &str = "ruum.env";
+pub const LABEL_DEPLOYMENT: &str = "ruum.deployment";
+pub const LABEL_INSTANCE: &str = "ruum.instance";
+pub const LABEL_MANAGED: &str = "ruum.managed";
+
+/// The environment variables the driver sets itself; a spec that sets one is `invalid_spec`.
+pub const RESERVED_ENV: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "NODE_USE_ENV_PROXY",
+];
+
+const INHIBIT_IPV4: &str = "com.docker.network.bridge.inhibit_ipv4";
+const TICK: Duration = Duration::from_millis(100);
+const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
+
+/// The registry repository of a tenant and app: `ruum/<tenant>/<app>`. Builders push there; the
+/// driver pulls only from there.
+pub fn repository(identity: &WorkloadIdentity) -> String {
+    format!("ruum/{}/{}", identity.tenant.0, identity.app.0)
+}
+
+/// The Docker network of an app and environment.
+pub fn network_name(identity: &WorkloadIdentity) -> String {
+    format!(
+        "ruum-app-{}-{}-{}",
+        identity.tenant.0.simple(),
+        identity.app.0.simple(),
+        identity.environment.as_str()
+    )
+}
+
+fn container_name(id: InstanceId) -> String {
+    format!("ruum-i-{}", id.0.simple())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Intent {
+    None,
+    Stop,
+    ScaleToZero,
+    Timeout,
+}
+
+struct St {
+    state: InstanceState,
+    intent: Intent,
+    last_touch: Instant,
+    run_started: Instant,
+    ring: Ring,
+    /// Every value to redact: the spec's secrets, previous values and every token so far.
+    secrets: Vec<String>,
+    redactors: Option<Arc<Mutex<Redactors>>>,
+    supervisor: Option<JoinHandle<()>>,
+    torn_down: bool,
+}
+
+struct Instance {
+    id: InstanceId,
+    identity: WorkloadIdentity,
+    kind: WorkloadKind,
+    routes: Vec<Route>,
+    limits: Limits,
+    network: Option<String>,
+    started_at: OffsetDateTime,
+    container: Option<String>,
+    token_dir: Option<PathBuf>,
+    op: tokio::sync::Mutex<()>,
+    st: Mutex<St>,
+}
+
+impl Instance {
+    fn lock(&self) -> std::sync::MutexGuard<'_, St> {
+        self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn secrets(&self) -> Vec<String> {
+        self.lock().secrets.clone()
+    }
+
+    fn health_check(&self) -> bool {
+        matches!(&self.kind, WorkloadKind::Service(s) if s.health.is_some())
+    }
+}
+
+struct NetState {
+    id: String,
+    routes: Vec<Route>,
+    users: HashSet<InstanceId>,
+    egress: bool,
+}
+
+struct Inner {
+    docker: Docker,
+    cfg: DockerConfig,
+    usage: Arc<dyn RuntimeUsageSink>,
+    egress: Arc<dyn EgressRegistry>,
+    http: reqwest::Client,
+    instances: Mutex<HashMap<InstanceId, Arc<Instance>>>,
+    networks: tokio::sync::Mutex<HashMap<String, NetState>>,
+}
+
+/// The Docker runtime driver (card R-2a). See the crate documentation for the sandbox it
+/// builds and the Docker API calls it makes.
+pub struct DockerDriver {
+    inner: Arc<Inner>,
+}
+
+fn sorted(routes: &[Route]) -> Vec<Route> {
+    let mut r = routes.to_vec();
+    r.sort();
+    r
+}
+
+fn state_err(operation: &str, state: &InstanceState) -> RuntimeError {
+    RuntimeError::InvalidState {
+        operation: operation.to_owned(),
+        state: state.name().to_owned(),
+    }
+}
+
+fn status_of(e: &bollard::errors::Error) -> Option<u16> {
+    match e {
+        bollard::errors::Error::DockerResponseServerError { status_code, .. } => Some(*status_code),
+        _ => None,
+    }
+}
+
+impl DockerDriver {
+    /// Connects to the engine of `cfg.docker_host`, checks the configuration, and (for runsc)
+    /// that the engine has the runtime `runsc`: without it the driver refuses to start.
+    pub async fn connect(
+        cfg: DockerConfig,
+        usage: Arc<dyn RuntimeUsageSink>,
+        egress: Arc<dyn EgressRegistry>,
+    ) -> Result<Self, RuntimeError> {
+        cfg.check()?;
+        let unavailable = |what: &str, e: bollard::errors::Error| RuntimeError::Unavailable {
+            reason: format!("{what}: {e}"),
+        };
+        let timeout = cfg.api_timeout.as_secs().max(1);
+        let docker = if let Some(path) = cfg.docker_host.strip_prefix("unix://") {
+            Docker::connect_with_unix(path, timeout, bollard::API_DEFAULT_VERSION)
+        } else if cfg.docker_host.starts_with("tcp://") || cfg.docker_host.starts_with("http://") {
+            Docker::connect_with_http(&cfg.docker_host, timeout, bollard::API_DEFAULT_VERSION)
+        } else {
+            return Err(RuntimeError::Internal {
+                reason: "RUUM_DOCKER_HOST must start with unix://, tcp:// or http://".to_owned(),
+            });
+        }
+        .map_err(|e| unavailable("the Docker engine", e))?;
+        let docker = docker
+            .negotiate_version()
+            .await
+            .map_err(|e| unavailable("the Docker engine", e))?;
+        if cfg.runtime == RuntimeKind::Runsc {
+            let info = docker
+                .info()
+                .await
+                .map_err(|e| unavailable("the Docker engine", e))?;
+            let has = info
+                .runtimes
+                .as_ref()
+                .is_some_and(|r| r.contains_key("runsc"));
+            if !has {
+                return Err(RuntimeError::Unavailable {
+                    reason: "RUUM_RUNTIME_DRIVER=runsc, but the engine has no runtime runsc"
+                        .to_owned(),
+                });
+            }
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&cfg.state_dir)
+            .map_err(|e| RuntimeError::Internal {
+                reason: format!("the state folder: {e}"),
+            })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .no_proxy()
+            .build()
+            .map_err(|e| RuntimeError::Internal {
+                reason: format!("the registry client: {e}"),
+            })?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                docker,
+                cfg,
+                usage,
+                egress,
+                http,
+                instances: Mutex::new(HashMap::new()),
+                networks: tokio::sync::Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    /// The container name of an instance (for tests and operations; never for an app).
+    pub fn container_of(&self, instance: InstanceId) -> Option<String> {
+        self.inner.get(instance).and_then(|i| i.container.clone())
+    }
+}
+
+impl Inner {
+    fn get(&self, id: InstanceId) -> Option<Arc<Instance>> {
+        self.instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .cloned()
+    }
+
+    fn get_for(&self, tenant: TenantId, id: InstanceId) -> Result<Arc<Instance>, RuntimeError> {
+        match self.get(id) {
+            Some(i) if i.identity.tenant == tenant => Ok(i),
+            _ => Err(RuntimeError::NotFound { instance: id }),
+        }
+    }
+
+    /// An error of the engine, with every secret value of the instance redacted from its text.
+    fn docker_err(
+        &self,
+        what: &str,
+        e: &bollard::errors::Error,
+        secrets: &[String],
+    ) -> RuntimeError {
+        let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        RuntimeError::Unavailable {
+            reason: redact(&format!("{what}: {e}"), &refs),
+        }
+    }
+
+    fn labels(&self, identity: &WorkloadIdentity) -> HashMap<String, String> {
+        let mut l: HashMap<String, String> = self
+            .cfg
+            .extra_labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        l.insert(LABEL_APP.to_owned(), identity.app.0.to_string());
+        l.insert(LABEL_TENANT.to_owned(), identity.tenant.0.to_string());
+        l.insert(
+            LABEL_ENV.to_owned(),
+            identity.environment.as_str().to_owned(),
+        );
+        l.insert(LABEL_MANAGED.to_owned(), "ruum-runtime".to_owned());
+        l
+    }
+
+    /// The driver's own checks on top of [`WorkloadSpec::validate`].
+    fn check_spec(&self, spec: &WorkloadSpec) -> Result<(), RuntimeError> {
+        for v in &spec.env {
+            if RESERVED_ENV.contains(&v.name.as_str()) {
+                return Err(RuntimeError::invalid(
+                    "env",
+                    format!("{} is set by the platform", v.name),
+                ));
+            }
+            if let EnvValue::Secret(s) = &v.value {
+                check_secret_value("env", s.expose())?;
+            }
+        }
+        for s in &spec.previous_secrets {
+            check_secret_value("previous_secrets", s.expose())?;
+        }
+        check_secret_value("workload_token", spec.workload_token.expose())?;
+        match &spec.kind {
+            WorkloadKind::Service(_) | WorkloadKind::Job(_) => {}
+            other => {
+                return Err(RuntimeError::UnsupportedKind {
+                    kind: other.name().to_owned(),
+                });
+            }
+        }
+        for r in &spec.routes {
+            if !self.cfg.routes.contains_key(r) {
+                return Err(RuntimeError::Unavailable {
+                    reason: format!("the driver has no shared container for {}", r.as_str()),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Looks the digest up in the repository of the spec's tenant and app, at the registry
+    /// itself: the engine's local store may hold the same digest for another app.
+    async fn check_registry(
+        &self,
+        identity: &WorkloadIdentity,
+        digest: &OciDigest,
+    ) -> Result<(), RuntimeError> {
+        let url = format!(
+            "{}/v2/{}/manifests/{}",
+            self.cfg.registry_url.trim_end_matches('/'),
+            repository(identity),
+            digest
+        );
+        let accept = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json";
+        let r = self
+            .http
+            .head(&url)
+            .header(reqwest::header::ACCEPT, accept)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::Unavailable {
+                reason: format!("the registry: {}", e.without_url()),
+            })?;
+        match r.status() {
+            s if s.is_success() => Ok(()),
+            reqwest::StatusCode::NOT_FOUND => Err(RuntimeError::ImageNotFound {
+                image: digest.to_string(),
+            }),
+            s => Err(RuntimeError::Unavailable {
+                reason: format!("the registry answered {s}"),
+            }),
+        }
+    }
+
+    async fn ensure_image(&self, reference: &str, digest: &OciDigest) -> Result<(), RuntimeError> {
+        if self.docker.inspect_image(reference).await.is_ok() {
+            return Ok(());
+        }
+        let opts = CreateImageOptionsBuilder::new()
+            .from_image(reference)
+            .build();
+        let mut pull = self.docker.create_image(Some(opts), None, None);
+        while let Some(item) = pull.next().await {
+            if let Err(e) = item {
+                return Err(match status_of(&e) {
+                    Some(404) => RuntimeError::ImageNotFound {
+                        image: digest.to_string(),
+                    },
+                    _ => RuntimeError::Unavailable {
+                        reason: format!("pulling the image: {e}"),
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Joins the instance to the network of its app and environment, creating it (and attaching
+    /// the shared containers of its routes, and registering it with the egress proxy) when it is
+    /// the first.
+    async fn acquire_network(
+        &self,
+        id: InstanceId,
+        spec: &WorkloadSpec,
+    ) -> Result<String, RuntimeError> {
+        let name = network_name(&spec.identity);
+        let routes = sorted(&spec.routes);
+        let mut nets = self.networks.lock().await;
+        if let Some(n) = nets.get_mut(&name) {
+            if n.routes != routes {
+                return Err(RuntimeError::invalid(
+                    "routes",
+                    "another instance of this app and environment runs with other routes",
+                ));
+            }
+            n.users.insert(id);
+            return Ok(name);
+        }
+        let mut labels = self.labels(&spec.identity);
+        labels.remove(LABEL_INSTANCE);
+        let req = NetworkCreateRequest {
+            name: name.clone(),
+            driver: Some("bridge".to_owned()),
+            internal: Some(true),
+            attachable: Some(false),
+            options: Some(HashMap::from([(
+                INHIBIT_IPV4.to_owned(),
+                "true".to_owned(),
+            )])),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        let created = self
+            .docker
+            .create_network(req)
+            .await
+            .map_err(|e| self.docker_err("creating the network", &e, &[]))?;
+        let net_id = created.id;
+        let result = self.finish_network(&name, &net_id, spec, &routes).await;
+        match result {
+            Ok(egress) => {
+                nets.insert(
+                    name.clone(),
+                    NetState {
+                        id: net_id,
+                        routes,
+                        users: HashSet::from([id]),
+                        egress,
+                    },
+                );
+                Ok(name)
+            }
+            Err(e) => {
+                self.drop_network(&name, &net_id, &routes, false).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn finish_network(
+        &self,
+        name: &str,
+        net_id: &str,
+        spec: &WorkloadSpec,
+        routes: &[Route],
+    ) -> Result<bool, RuntimeError> {
+        let inspect = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|e| self.docker_err("inspecting the network", &e, &[]))?;
+        let inhibit = inspect
+            .options
+            .as_ref()
+            .and_then(|o| o.get(INHIBIT_IPV4))
+            .map(String::as_str);
+        if inspect.internal != Some(true)
+            || inhibit != Some("true")
+            || inspect.enable_ipv6 == Some(true)
+        {
+            return Err(RuntimeError::Internal {
+                reason: format!(
+                    "the engine made network {name} with internal={:?}, inhibit_ipv4={inhibit:?}, ipv6={:?}",
+                    inspect.internal, inspect.enable_ipv6
+                ),
+            });
+        }
+        let subnet = inspect
+            .ipam
+            .as_ref()
+            .and_then(|i| i.config.as_ref())
+            .and_then(|c| c.iter().find_map(|x| x.subnet.clone()))
+            .ok_or_else(|| RuntimeError::Internal {
+                reason: format!("network {name} has no subnet"),
+            })?;
+        for r in routes {
+            let shared = &self.cfg.routes[r];
+            self.docker
+                .connect_network(
+                    net_id,
+                    NetworkConnectRequest {
+                        container: shared.container.clone(),
+                        endpoint_config: Some(EndpointSettings {
+                            aliases: Some(vec![shared.alias.clone()]),
+                            ..Default::default()
+                        }),
+                    },
+                )
+                .await
+                .map_err(|e| self.docker_err(&format!("attaching {}", r.as_str()), &e, &[]))?;
+        }
+        if routes.contains(&Route::EgressProxy) {
+            self.egress
+                .register(&EgressNetwork {
+                    network: net_id.to_owned(),
+                    subnet,
+                    identity: spec.identity,
+                    allow: Vec::new(),
+                })
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn drop_network(&self, name: &str, net_id: &str, routes: &[Route], egress: bool) {
+        if egress && let Err(e) = self.egress.unregister(net_id).await {
+            tracing::warn!(network = name, error = %e, "unregistering the network at the egress proxy");
+        }
+        for r in routes {
+            if let Some(shared) = self.cfg.routes.get(r) {
+                let _ = self
+                    .docker
+                    .disconnect_network(
+                        net_id,
+                        NetworkDisconnectRequest {
+                            container: shared.container.clone(),
+                            force: Some(true),
+                        },
+                    )
+                    .await;
+            }
+        }
+        if let Err(e) = self.docker.remove_network(net_id).await
+            && status_of(&e) != Some(404)
+        {
+            tracing::warn!(network = name, error = %e, "removing the network");
+        }
+    }
+
+    async fn release_network(&self, id: InstanceId, name: &str) {
+        let mut nets = self.networks.lock().await;
+        let gone = match nets.get_mut(name) {
+            Some(n) => {
+                n.users.remove(&id);
+                n.users.is_empty()
+            }
+            None => false,
+        };
+        if gone && let Some(n) = nets.remove(name) {
+            self.drop_network(name, &n.id, &n.routes, n.egress).await;
+        }
+    }
+
+    fn write_token(path: &std::path::Path, token: &str, create: bool) -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .mode(0o644)
+            .open(path)?;
+        // In place (same inode): the engine bind-mounted this file, so a new file would not
+        // reach the sandbox.
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(token.as_bytes())?;
+        f.set_len(token.len() as u64)?;
+        f.sync_all()
+    }
+
+    fn container_body(
+        &self,
+        spec: &WorkloadSpec,
+        image: &str,
+        network: &str,
+        token_file: &std::path::Path,
+        id: InstanceId,
+    ) -> ContainerCreateBody {
+        let mut env: Vec<String> = spec
+            .env
+            .iter()
+            .map(|v| match &v.value {
+                EnvValue::Plain(p) => format!("{}={p}", v.name),
+                EnvValue::Secret(s) => format!("{}={}", v.name, s.expose()),
+            })
+            .collect();
+        env.push(format!("{TOKEN_FILE_ENV}={TOKEN_FILE}"));
+        if spec.routes.contains(&Route::EgressProxy) {
+            let p = &self.cfg.routes[&Route::EgressProxy];
+            let proxy = format!("http://{}:{}", p.alias, p.port);
+            for name in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+                env.push(format!("{name}={proxy}"));
+            }
+            let mut no: Vec<String> = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
+            for r in &spec.routes {
+                if *r != Route::EgressProxy {
+                    no.push(self.cfg.routes[r].alias.clone());
+                }
+            }
+            env.push(format!("NO_PROXY={}", no.join(",")));
+            env.push(format!("no_proxy={}", no.join(",")));
+            env.push("NODE_USE_ENV_PROXY=1".to_owned());
+        }
+        let healthcheck = match &spec.kind {
+            WorkloadKind::Service(s) => match &s.health {
+                Some(h) => {
+                    let mut test = self.cfg.health_command.clone();
+                    test.push(format!("http://127.0.0.1:{}{}", s.port, h.path));
+                    let interval = h.interval.max(Duration::from_millis(1));
+                    Some(HealthConfig {
+                        test: Some(test),
+                        interval: Some(interval.as_nanos().min(i64::MAX as u128) as i64),
+                        timeout: Some(Duration::from_secs(5).as_nanos() as i64),
+                        retries: Some(i64::from(h.failure_threshold)),
+                        start_period: Some(self.cfg.start_period.as_nanos() as i64),
+                        start_interval: Some(self.cfg.start_interval.as_nanos() as i64),
+                    })
+                }
+                None => Some(HealthConfig {
+                    test: Some(vec!["NONE".to_owned()]),
+                    ..Default::default()
+                }),
+            },
+            _ => Some(HealthConfig {
+                test: Some(vec!["NONE".to_owned()]),
+                ..Default::default()
+            }),
+        };
+        let mut labels = self.labels(&spec.identity);
+        labels.insert(
+            LABEL_DEPLOYMENT.to_owned(),
+            spec.identity.deployment.to_string(),
+        );
+        labels.insert(LABEL_INSTANCE.to_owned(), id.to_string());
+        let host = HostConfig {
+            readonly_rootfs: Some(true),
+            cap_drop: Some(vec!["ALL".to_owned()]),
+            security_opt: Some(vec!["no-new-privileges".to_owned()]),
+            privileged: Some(false),
+            memory: Some(spec.limits.memory_bytes as i64),
+            memory_swap: Some(spec.limits.memory_bytes as i64),
+            nano_cpus: Some(i64::from(spec.limits.cpu_millis) * 1_000_000),
+            pids_limit: Some(self.cfg.pids_limit),
+            tmpfs: Some(HashMap::from([(
+                "/tmp".to_owned(),
+                format!("rw,noexec,nosuid,nodev,size={}", spec.limits.disk_bytes),
+            )])),
+            binds: Some(vec![format!("{}:{TOKEN_FILE}:ro", token_file.display())]),
+            network_mode: Some(network.to_owned()),
+            ipc_mode: Some("private".to_owned()),
+            init: Some(true),
+            publish_all_ports: Some(false),
+            log_config: Some(HostConfigLogConfig {
+                typ: Some("none".to_owned()),
+                config: None,
+            }),
+            runtime: Some(self.cfg.runtime.docker_name().to_owned()),
+            ..Default::default()
+        };
+        ContainerCreateBody {
+            image: Some(image.to_owned()),
+            cmd: if spec.command.is_empty() {
+                None
+            } else {
+                Some(spec.command.clone())
+            },
+            env: Some(env),
+            user: Some(SANDBOX_USER.to_owned()),
+            labels: Some(labels),
+            healthcheck,
+            stop_timeout: Some(self.cfg.stop_timeout.as_secs() as i64),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            open_stdin: Some(false),
+            network_disabled: Some(false),
+            host_config: Some(host),
+            ..Default::default()
+        }
+    }
+
+    /// Reads the sandbox back from the engine: every flag as asked, and the limits that the
+    /// engine applied (a mismatch is an error, not a report).
+    fn verify(
+        &self,
+        c: &ContainerInspectResponse,
+        spec: &WorkloadSpec,
+        network: &str,
+        token_file: &std::path::Path,
+    ) -> Result<Limits, String> {
+        let h = c.host_config.as_ref().ok_or("no host config")?;
+        let cfg = c.config.as_ref().ok_or("no config")?;
+        let mut bad = Vec::new();
+        let mut want = |ok: bool, what: &str| {
+            if !ok {
+                bad.push(what.to_owned());
+            }
+        };
+        want(h.readonly_rootfs == Some(true), "read-only root");
+        want(
+            h.cap_drop.as_deref() == Some(&["ALL".to_owned()][..]),
+            "cap-drop ALL",
+        );
+        want(
+            h.cap_add.as_ref().is_none_or(|c| c.is_empty()),
+            "no added capability",
+        );
+        let sec = h.security_opt.clone().unwrap_or_default();
+        want(
+            sec.iter()
+                .any(|s| s == "no-new-privileges" || s == "no-new-privileges:true"),
+            "no-new-privileges",
+        );
+        want(
+            !sec.iter().any(|s| s.contains("unconfined")),
+            "no unconfined profile",
+        );
+        want(h.privileged != Some(true), "not privileged");
+        want(
+            h.network_mode.as_deref() == Some(network),
+            "the app network",
+        );
+        want(
+            h.pid_mode.as_deref().unwrap_or("").is_empty(),
+            "own PID namespace",
+        );
+        want(
+            h.uts_mode.as_deref().unwrap_or("").is_empty(),
+            "own UTS namespace",
+        );
+        want(
+            h.userns_mode.as_deref().unwrap_or("").is_empty(),
+            "no host user namespace",
+        );
+        want(h.ipc_mode.as_deref() == Some("private"), "private IPC");
+        want(h.init == Some(true), "init");
+        want(h.publish_all_ports != Some(true), "no published ports");
+        want(
+            h.port_bindings.as_ref().is_none_or(|p| p.is_empty()),
+            "no port bindings",
+        );
+        want(
+            h.devices.as_ref().is_none_or(|d| d.is_empty()),
+            "no devices",
+        );
+        want(h.mounts.as_ref().is_none_or(|m| m.is_empty()), "no mounts");
+        want(
+            h.binds.as_deref() == Some(&[format!("{}:{TOKEN_FILE}:ro", token_file.display())][..]),
+            "only the token file bound",
+        );
+        want(h.pids_limit == Some(self.cfg.pids_limit), "pids limit");
+        want(h.memory_swap == h.memory, "swap equals memory");
+        want(
+            h.runtime.as_deref() == Some(self.cfg.runtime.docker_name()),
+            "the runtime",
+        );
+        want(cfg.user.as_deref() == Some(SANDBOX_USER), "user 10001");
+        want(
+            c.app_armor_profile.as_deref() != Some("unconfined"),
+            "no AppArmor unconfined",
+        );
+        let disk = h
+            .tmpfs
+            .as_ref()
+            .and_then(|t| t.get("/tmp"))
+            .and_then(|o| o.split(',').find_map(|x| x.strip_prefix("size=")))
+            .and_then(|s| s.parse::<u64>().ok());
+        let applied = Limits {
+            cpu_millis: h.nano_cpus.map_or(0, |n| (n / 1_000_000) as u32),
+            memory_bytes: h.memory.map_or(0, |m| m as u64),
+            disk_bytes: disk.unwrap_or(0),
+        };
+        want(applied == spec.limits, "the limits");
+        if bad.is_empty() {
+            Ok(applied)
+        } else {
+            Err(bad.join(", "))
+        }
+    }
+
+    async fn remove_container(&self, name: &str) {
+        let opts = RemoveContainerOptionsBuilder::new()
+            .force(true)
+            .v(true)
+            .build();
+        if let Err(e) = self.docker.remove_container(name, Some(opts)).await
+            && status_of(&e) != Some(404)
+        {
+            tracing::warn!(container = name, error = %e, "removing a container");
+        }
+    }
+
+    /// Frees the sandbox of an instance: the container, the token folder and its place on the
+    /// network (the last one removes the network).
+    async fn teardown(&self, inst: &Instance) {
+        {
+            let mut st = inst.lock();
+            if st.torn_down {
+                return;
+            }
+            st.torn_down = true;
+        }
+        if let Some(c) = &inst.container {
+            self.remove_container(c).await;
+        }
+        if let Some(d) = &inst.token_dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        if let Some(n) = &inst.network {
+            self.release_network(inst.id, n).await;
+        }
+    }
+
+    /// One run of the container: attach, start, then the supervisor.
+    async fn begin_run(self: &Arc<Self>, inst: &Arc<Instance>) -> Result<(), RuntimeError> {
+        let name = inst
+            .container
+            .clone()
+            .ok_or_else(|| RuntimeError::Internal {
+                reason: "no container".to_owned(),
+            })?;
+        let secrets = inst.secrets();
+        let opts = AttachContainerOptionsBuilder::new()
+            .stream(true)
+            .stdout(true)
+            .stderr(true)
+            .logs(false)
+            .build();
+        let attached = self
+            .docker
+            .attach_container(&name, Some(opts))
+            .await
+            .map_err(|e| self.docker_err("attaching to the container", &e, &secrets))?;
+        let redactors = Arc::new(Mutex::new(Redactors::new(&secrets)));
+        let pump = tokio::spawn(pump(inst.clone(), redactors.clone(), attached.output));
+        if let Err(e) = self.docker.start_container(&name, None).await {
+            pump.abort();
+            return Err(self.docker_err("starting the container", &e, &secrets));
+        }
+        {
+            let mut st = inst.lock();
+            st.state = InstanceState::Running;
+            st.intent = Intent::None;
+            st.run_started = Instant::now();
+            st.last_touch = Instant::now();
+            st.redactors = Some(redactors);
+        }
+        let sup = tokio::spawn(supervise(self.clone(), inst.clone(), pump));
+        inst.lock().supervisor = Some(sup);
+        Ok(())
+    }
+
+    async fn health(&self, inst: &Instance) -> Health {
+        let Some(c) = &inst.container else {
+            return Health::Healthy;
+        };
+        if !inst.health_check() {
+            return Health::Unknown;
+        }
+        match self
+            .docker
+            .inspect_container(
+                c,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(r) => match r.state.and_then(|s| s.health).and_then(|h| h.status) {
+                Some(HealthStatusEnum::HEALTHY) => Health::Healthy,
+                Some(HealthStatusEnum::UNHEALTHY) => Health::Unhealthy,
+                _ => Health::Unknown,
+            },
+            Err(_) => Health::Unknown,
+        }
+    }
+
+    async fn status(&self, inst: &Instance) -> InstanceStatus {
+        let state = inst.lock().state;
+        let health = match (&inst.container, state) {
+            (None, _) => Health::Healthy,
+            (Some(_), InstanceState::Running) => self.health(inst).await,
+            _ => Health::Unknown,
+        };
+        InstanceStatus {
+            id: inst.id,
+            identity: inst.identity,
+            kind: inst.kind.name(),
+            state,
+            health,
+            applied: Applied {
+                routes: inst.routes.clone(),
+                network: inst.network.clone().map(NetworkId),
+                limits: inst.limits,
+            },
+            started_at: inst.started_at,
+        }
+    }
+}
+
+/// Copies the container's output through the redactors into the ring, line by line.
+async fn pump(
+    inst: Arc<Instance>,
+    redactors: Arc<Mutex<Redactors>>,
+    mut output: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>,
+    >,
+) {
+    let push = |inst: &Instance, stream: LogStream, lines: Vec<(OffsetDateTime, String)>| {
+        if lines.is_empty() {
+            return;
+        }
+        let mut st = inst.lock();
+        for (at, text) in lines {
+            st.ring.push(inst.id, inst.identity, stream, at, text);
+        }
+    };
+    while let Some(item) = output.next().await {
+        let Ok(item) = item else { break };
+        let now = OffsetDateTime::now_utc();
+        let (stream, lines) = {
+            let mut r = redactors.lock().unwrap_or_else(|p| p.into_inner());
+            match item {
+                LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                    (LogStream::Stdout, r.out.push_bytes(&message, now))
+                }
+                LogOutput::StdErr { message } => {
+                    (LogStream::Stderr, r.err.push_bytes(&message, now))
+                }
+                LogOutput::StdIn { .. } => continue,
+            }
+        };
+        push(&inst, stream, lines);
+    }
+    let now = OffsetDateTime::now_utc();
+    let (out, err) = {
+        let mut r = redactors.lock().unwrap_or_else(|p| p.into_inner());
+        (r.out.finish(now), r.err.finish(now))
+    };
+    push(&inst, LogStream::Stdout, out);
+    push(&inst, LogStream::Stderr, err);
+}
+
+/// Watches one run: the job timeout, the idle timer of a service, the end of the process.
+async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>) {
+    let Some(name) = inst.container.clone() else {
+        return;
+    };
+    let mut wait = Box::pin(inner.docker.wait_container(
+        &name,
+        None::<bollard::query_parameters::WaitContainerOptions>,
+    ));
+    let mut tick = tokio::time::interval(TICK);
+    let mut ready = !inst.health_check();
+    loop {
+        tokio::select! {
+            _ = wait.next() => break,
+            _ = tick.tick() => {
+                // The idle clock of a service starts when the run is ready (its first passing
+                // health check), so a slow start (runsc at a small CPU limit) is not taken for
+                // idle time. A run that never gets healthy counts as ready after the start period.
+                if !ready {
+                    let started = inst.lock().run_started.elapsed();
+                    if started >= inner.cfg.start_period
+                        || inner.health(&inst).await == Health::Healthy
+                    {
+                        ready = true;
+                        inst.lock().last_touch = Instant::now();
+                    }
+                }
+                let action = {
+                    let mut st = inst.lock();
+                    if st.intent != Intent::None || st.state != InstanceState::Running {
+                        None
+                    } else {
+                        match &inst.kind {
+                            WorkloadKind::Job(j) if st.run_started.elapsed() >= j.timeout => {
+                                st.intent = Intent::Timeout;
+                                Some(Intent::Timeout)
+                            }
+                            WorkloadKind::Service(s) => match s.idle_timeout {
+                                Some(idle) if ready && st.last_touch.elapsed() >= idle => {
+                                    st.intent = Intent::ScaleToZero;
+                                    Some(Intent::ScaleToZero)
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    }
+                };
+                match action {
+                    Some(Intent::Timeout) => {
+                        let opts = KillContainerOptionsBuilder::new().signal("SIGKILL").build();
+                        let _ = inner.docker.kill_container(&name, Some(opts)).await;
+                    }
+                    Some(Intent::ScaleToZero) => {
+                        let t = inner.cfg.stop_timeout.as_secs() as i32;
+                        let opts = StopContainerOptionsBuilder::new().t(t).build();
+                        let _ = inner.docker.stop_container(&name, Some(opts)).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Every line of the run is in the ring before the state says the run ended.
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    let inspect = inner
+        .docker
+        .inspect_container(
+            &name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .ok();
+    let (code, oom) = inspect
+        .and_then(|c| c.state)
+        .map(|s| (s.exit_code.unwrap_or(-1), s.oom_killed == Some(true)))
+        .unwrap_or((-1, false));
+    let (intent, ran) = {
+        let st = inst.lock();
+        (st.intent, st.run_started.elapsed())
+    };
+    inner.usage.record(RuntimeUsage::Instance {
+        identity: inst.identity,
+        instance: inst.id,
+        ran,
+        memory_bytes: inst.limits.memory_bytes,
+    });
+    let next = match intent {
+        Intent::Stop => InstanceState::Stopped,
+        Intent::ScaleToZero => InstanceState::ScaledToZero,
+        Intent::Timeout => InstanceState::Exited(ExitStatus::of(ExitReason::TimedOut)),
+        Intent::None if oom => InstanceState::Exited(ExitStatus::of(ExitReason::OutOfMemory)),
+        Intent::None => InstanceState::Exited(ExitStatus::completed(code as i32)),
+    };
+    if next != InstanceState::ScaledToZero {
+        inner.teardown(&inst).await;
+    }
+    let mut st = inst.lock();
+    st.state = next;
+    st.intent = Intent::None;
+    st.redactors = None;
+}
+
+#[async_trait]
+impl RuntimeDriver for DockerDriver {
+    fn name(&self) -> &str {
+        self.inner.cfg.runtime.driver_name()
+    }
+
+    async fn start(&self, spec: WorkloadSpec) -> Result<InstanceStatus, RuntimeError> {
+        spec.validate()?;
+        let inner = &self.inner;
+        inner.check_spec(&spec)?;
+        let id = InstanceId::new();
+        let secrets: Vec<String> = spec
+            .redacted_values()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let new_st = |state| St {
+            state,
+            intent: Intent::None,
+            last_touch: Instant::now(),
+            run_started: Instant::now(),
+            ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
+            secrets: secrets.clone(),
+            redactors: None,
+            supervisor: None,
+            torn_down: false,
+        };
+        let digest = match &spec.image {
+            ImageRef::Static(_) => {
+                // No code runs: the gateway serves the files.
+                let inst = Arc::new(Instance {
+                    id,
+                    identity: spec.identity,
+                    kind: spec.kind.clone(),
+                    routes: Vec::new(),
+                    limits: spec.limits,
+                    network: None,
+                    started_at: OffsetDateTime::now_utc(),
+                    container: None,
+                    token_dir: None,
+                    op: tokio::sync::Mutex::new(()),
+                    st: Mutex::new(new_st(InstanceState::Running)),
+                });
+                inner
+                    .instances
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id, inst.clone());
+                return Ok(inner.status(&inst).await);
+            }
+            ImageRef::Oci(d) => d.clone(),
+            other => {
+                return Err(RuntimeError::UnsupportedImage {
+                    reason: format!("the Docker driver does not run {} images", other.kind()),
+                });
+            }
+        };
+        inner.check_registry(&spec.identity, &digest).await?;
+        let reference = format!(
+            "{}/{}@{}",
+            inner.cfg.registry,
+            repository(&spec.identity),
+            digest
+        );
+        inner.ensure_image(&reference, &digest).await?;
+
+        let token_dir = inner.cfg.state_dir.join(id.0.simple().to_string());
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&token_dir)
+            .map_err(|e| RuntimeError::Internal {
+                reason: format!("the token folder: {e}"),
+            })?;
+        let token_file = token_dir.join("token");
+        if let Err(e) = Inner::write_token(&token_file, spec.workload_token.expose(), true) {
+            let _ = std::fs::remove_dir_all(&token_dir);
+            return Err(RuntimeError::Internal {
+                reason: format!("the token file: {e}"),
+            });
+        }
+        let network = match inner.acquire_network(id, &spec).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&token_dir);
+                return Err(e);
+            }
+        };
+        let name = container_name(id);
+        let inst = Arc::new(Instance {
+            id,
+            identity: spec.identity,
+            kind: spec.kind.clone(),
+            routes: sorted(&spec.routes),
+            limits: spec.limits,
+            network: Some(network.clone()),
+            started_at: OffsetDateTime::now_utc(),
+            container: Some(name.clone()),
+            token_dir: Some(token_dir),
+            op: tokio::sync::Mutex::new(()),
+            st: Mutex::new(new_st(InstanceState::Starting)),
+        });
+        let body = inner.container_body(&spec, &reference, &network, &token_file, id);
+        let opts = CreateContainerOptionsBuilder::new().name(&name).build();
+        let created = inner.docker.create_container(Some(opts), body).await;
+        if let Err(e) = created {
+            inner.teardown(&inst).await;
+            return Err(match status_of(&e) {
+                Some(400) => {
+                    let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+                    RuntimeError::invalid("limits", redact(&e.to_string(), &refs))
+                }
+                _ => inner.docker_err("creating the container", &e, &secrets),
+            });
+        }
+        let checked = match inner
+            .docker
+            .inspect_container(
+                &name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(c) => inner
+                .verify(&c, &spec, &network, &token_file)
+                .map_err(|what| RuntimeError::Internal {
+                    reason: format!("the engine did not apply the sandbox: {what}"),
+                }),
+            Err(e) => Err(inner.docker_err("inspecting the container", &e, &secrets)),
+        };
+        if let Err(e) = checked {
+            inner.teardown(&inst).await;
+            return Err(e);
+        }
+        inner
+            .instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, inst.clone());
+        let _op = inst.op.lock().await;
+        if let Err(e) = inner.begin_run(&inst).await {
+            inner.teardown(&inst).await;
+            inst.lock().state = InstanceState::Exited(ExitStatus::of(ExitReason::Killed));
+            return Err(e);
+        }
+        Ok(inner.status(&inst).await)
+    }
+
+    async fn status(
+        &self,
+        tenant: TenantId,
+        instance: InstanceId,
+    ) -> Result<InstanceStatus, RuntimeError> {
+        let inst = self.inner.get_for(tenant, instance)?;
+        Ok(self.inner.status(&inst).await)
+    }
+
+    async fn stop(&self, tenant: TenantId, instance: InstanceId) -> Result<(), RuntimeError> {
+        let inner = &self.inner;
+        let inst = inner.get_for(tenant, instance)?;
+        let _op = inst.op.lock().await;
+        let (state, sup) = {
+            let mut st = inst.lock();
+            let s = st.state;
+            if matches!(s, InstanceState::Running | InstanceState::Starting) {
+                st.intent = Intent::Stop;
+            }
+            (s, st.supervisor.take())
+        };
+        match state {
+            InstanceState::Stopped | InstanceState::Exited(_) => {
+                if let Some(s) = sup {
+                    let _ = s.await;
+                }
+                Ok(())
+            }
+            InstanceState::ScaledToZero => {
+                if let Some(s) = sup {
+                    let _ = s.await;
+                }
+                inner.teardown(&inst).await;
+                inst.lock().state = InstanceState::Stopped;
+                Ok(())
+            }
+            InstanceState::Running | InstanceState::Starting => {
+                if inst.container.is_none() {
+                    inst.lock().state = InstanceState::Stopped;
+                    return Ok(());
+                }
+                let name = inst.container.clone().unwrap_or_default();
+                let t = inner.cfg.stop_timeout.as_secs() as i32;
+                let opts = StopContainerOptionsBuilder::new().t(t).build();
+                let _ = inner.docker.stop_container(&name, Some(opts)).await;
+                if let Some(s) = sup {
+                    let _ = s.await;
+                }
+                // A scale to zero that won the race already ended the run.
+                inner.teardown(&inst).await;
+                inst.lock().state = InstanceState::Stopped;
+                Ok(())
+            }
+        }
+    }
+
+    async fn touch(&self, tenant: TenantId, instance: InstanceId) -> Result<(), RuntimeError> {
+        let inst = self.inner.get_for(tenant, instance)?;
+        if !matches!(inst.kind, WorkloadKind::Service(_)) {
+            let st = inst.lock();
+            return Err(state_err("touch", &st.state));
+        }
+        let mut st = inst.lock();
+        match st.state {
+            InstanceState::Running | InstanceState::Starting => {
+                st.last_touch = Instant::now();
+                Ok(())
+            }
+            InstanceState::ScaledToZero => Ok(()),
+            s => Err(state_err("touch", &s)),
+        }
+    }
+
+    async fn wake(
+        &self,
+        tenant: TenantId,
+        instance: InstanceId,
+    ) -> Result<InstanceStatus, RuntimeError> {
+        let inner = &self.inner;
+        let inst = inner.get_for(tenant, instance)?;
+        let _op = inst.op.lock().await;
+        if !matches!(inst.kind, WorkloadKind::Service(_)) {
+            let s = inst.lock().state;
+            return Err(state_err("wake", &s));
+        }
+        // A scale to zero in progress ends first; then the instance starts again.
+        let pending = {
+            let mut st = inst.lock();
+            if st.intent == Intent::ScaleToZero {
+                st.supervisor.take()
+            } else {
+                None
+            }
+        };
+        if let Some(p) = pending {
+            let _ = p.await;
+        }
+        let state = inst.lock().state;
+        match state {
+            InstanceState::Running => {
+                inst.lock().last_touch = Instant::now();
+                return Ok(inner.status(&inst).await);
+            }
+            InstanceState::ScaledToZero => {}
+            s => return Err(state_err("wake", &s)),
+        }
+        let old = inst.lock().supervisor.take();
+        if let Some(old) = old {
+            let _ = old.await;
+        }
+        inner.begin_run(&inst).await?;
+        // Hold until the service answers its health check (or runs, without one).
+        let deadline = Instant::now() + inner.cfg.start_period + Duration::from_secs(5);
+        loop {
+            let s = inner.status(&inst).await;
+            let ready = s.state != InstanceState::Running
+                || !inst.health_check()
+                || s.health == Health::Healthy;
+            if ready || Instant::now() > deadline {
+                return Ok(s);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn logs(
+        &self,
+        tenant: TenantId,
+        instance: InstanceId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<LogLine>, RuntimeError> {
+        let inst = self.inner.get_for(tenant, instance)?;
+        let st = inst.lock();
+        Ok(st.ring.after(after, limit))
+    }
+
+    async fn rotate_token(
+        &self,
+        tenant: TenantId,
+        instance: InstanceId,
+        token: SecretValue,
+    ) -> Result<(), RuntimeError> {
+        if token.expose().is_empty() {
+            return Err(RuntimeError::invalid("workload_token", "must not be empty"));
+        }
+        check_secret_value("workload_token", token.expose())?;
+        let inst = self.inner.get_for(tenant, instance)?;
+        let _op = inst.op.lock().await;
+        let state = inst.lock().state;
+        if !matches!(
+            state,
+            InstanceState::Starting | InstanceState::Running | InstanceState::ScaledToZero
+        ) {
+            return Err(state_err("rotate the token of", &state));
+        }
+        // Redact the new value before the process can read it.
+        {
+            let mut st = inst.lock();
+            st.secrets.push(token.expose().to_owned());
+            if let Some(r) = &st.redactors {
+                r.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .add(token.expose());
+            }
+        }
+        if let Some(dir) = &inst.token_dir {
+            Inner::write_token(&dir.join("token"), token.expose(), false).map_err(|e| {
+                RuntimeError::Internal {
+                    reason: format!("rewriting the token file: {e}"),
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The labels the driver sets on networks and containers (for the README and I-4).
+pub fn label_keys() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (LABEL_APP, "the app node ID (networks and containers)"),
+        (LABEL_TENANT, "the tenant ID (networks and containers)"),
+        (LABEL_ENV, "live or preview (networks and containers)"),
+        (LABEL_DEPLOYMENT, "the deployment ID (containers)"),
+        (LABEL_INSTANCE, "the instance ID (containers)"),
+        (LABEL_MANAGED, "ruum-runtime (networks and containers)"),
+    ])
+}
