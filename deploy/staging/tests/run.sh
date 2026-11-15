@@ -1158,6 +1158,11 @@ for extra in "$D ruum create pods -" "$D ruum create jobs.batch -" "$D ruum get 
   { cat "$FA/allow"; echo "$extra"; } >"$FA/more"
   expect 1 "the live check refuses: $extra" livecheck "$FA/more"
 done
+# Backlog O-50: the deployer may get pods, so the API server answers yes to `can-i get pods/log`
+# (kubectl reads that as the pod named log). The check asks for the log subresource instead, so
+# that answer does not count; `$D ruum get pods log` above is the real one.
+{ cat "$FA/allow"; echo "$D ruum get pods -"; echo "$D ruum get pods/log -"; } >"$FA/more"
+expect 0 "the live check reads pod logs as the subresource, not as the pod named log (O-50)" livecheck "$FA/more"
 grep -vF "$K ruum create jobs.batch -" "$FA/allow" >"$FA/less"
 expect 1 "the live check fails when the controller cannot run the migration Job" livecheck "$FA/less"
 grep -vF "$D ruum-deploy create configmaps -" "$FA/allow" >"$FA/less"

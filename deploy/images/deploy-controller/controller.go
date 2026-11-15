@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -227,12 +228,16 @@ func (c *Controller) run(ctx context.Context, cm ConfigMap) {
 			}
 		}
 	}()
+	// The migration Job's log, kept apart: it reaches the request only when the deploy fails
+	// (backlog O-50: the deployer reads no pod log, so the request must say why), as its last
+	// MigrateLines lines with secret-looking values masked (redactSecrets).
+	migrate := &tail{max: MigrateLines}
 	err = c.Deployer.Run(runCtx, plan.Args, func(line string) {
 		// The full output, the migration Job's log included, goes to this pod's log (admin
-		// only). The request, which the deployer reads, gets it without the Job's log lines and
-		// with any credentials in URLs masked.
+		// only). The request, which the deployer reads, gets it with any credentials masked.
 		fmt.Fprintf(c.Log, "%s | %s\n", name, line)
 		if strings.HasPrefix(line, "migrate| ") {
+			migrate.add(redactSecrets(line))
 			return
 		}
 		out.add(redact(line))
@@ -241,7 +246,13 @@ func (c *Controller) run(ctx context.Context, cm ConfigMap) {
 	<-ticker
 	if err != nil {
 		c.logf("request %s failed: %v", name, err)
-		c.finishByName(ctx, name, PhaseFailed, fmt.Sprintf("the deploy failed (%v); the migration Job log is in the controller's log: kubectl -n ruum-deploy logs deploy/deploy-controller (admin)", err), out)
+		if n := migrate.count(); n > 0 {
+			out.add(fmt.Sprintf("the last %d lines of the migration Job's log (secret-looking values masked):", min(n, MigrateLines)))
+			for _, l := range migrate.all() {
+				out.add(l)
+			}
+		}
+		c.finishByName(ctx, name, PhaseFailed, fmt.Sprintf("the deploy failed (%v); the reason is in the log of this request (the migration Job's log tail, the helm error, the warning events)", err), out)
 		return
 	}
 	c.logf("request %s succeeded", name)
@@ -351,6 +362,22 @@ var userinfoRE = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^\s/@]+@`)
 // redact masks credentials in URLs.
 func redact(s string) string { return userinfoRE.ReplaceAllString(s, "${1}[redacted]@") }
 
+// MigrateLines is how many lines of the migration Job's log a failed request shows.
+const MigrateLines = 100
+
+// secretRE matches a value after a secret-looking key (password=..., "token": "...", secret: ...).
+var secretRE = regexp.MustCompile(`(?i)((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)[A-Za-z0-9_-]*["']?\s*[:=]\s*["']?)(?:bearer\s+|basic\s+)?[^\s"',;&]+`)
+
+// longTokenRE matches long runs that look like keys or tokens (40 or more base64 or hex characters).
+var longTokenRE = regexp.MustCompile(`[A-Za-z0-9+/_=-]{40,}`)
+
+// redactSecrets masks credentials in URLs, values after secret-looking keys and long tokens.
+func redactSecrets(s string) string {
+	s = redact(s)
+	s = secretRE.ReplaceAllString(s, "${1}[redacted]")
+	return longTokenRE.ReplaceAllString(s, "[redacted]")
+}
+
 // tail keeps the last max lines.
 type tail struct {
 	mu    sync.Mutex
@@ -377,6 +404,13 @@ func (t *tail) add(line string) {
 	if t.max > 0 && len(t.lines) > t.max {
 		t.lines = t.lines[len(t.lines)-t.max:]
 	}
+}
+
+// all is a copy of the lines kept.
+func (t *tail) all() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.lines)
 }
 
 func (t *tail) String() string {

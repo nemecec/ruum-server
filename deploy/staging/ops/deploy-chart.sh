@@ -170,7 +170,8 @@ for _ in $(seq 1 200); do
   fi
   sleep 5
 done
-kubectl -n ruum logs "job/$job" --tail 50 2>&1 | sed 's/^/migrate| /' >&2 || true
+# The controller copies these lines (masked) into the request when the step fails (O-50).
+kubectl -n ruum logs "job/$job" --tail 100 2>&1 | sed 's/^/migrate| /' >&2 || true
 [[ "$state" == 1/* ]] || die "the migration step $job did not succeed (${state:-no status}); not rolling out, the old release keeps serving"
 echo "==> migrations are up to date; rolling update" >&2
 ruum_lock_renew "$holder" || die "lost the deploy lock after the migration step; not rolling out (run deploy.sh again)"
@@ -185,8 +186,14 @@ jq -n --arg server "$server" --arg edge "$edge" --arg commit "$commit" --arg pre
 # --rollback-on-failure is Helm 4's name for --atomic (review 2 U-4): a failed rollout rolls
 # the release back by itself (DESIGN 19.1 layer 1). The schema stays: the previous release
 # runs on it (design 12.7). --wait waits for the rolling update of ruum-server and the edge.
+# On a failure the warning events of ruum go into the output, so the request (which the deployer
+# reads; it reads no pod log, backlog O-50) says why the rollout failed, next to helm's error.
 helm upgrade --install ruum "$STG/charts/ruum" --namespace ruum \
   --reset-then-reuse-values \
   --values "$values" \
-  --rollback-on-failure --wait --timeout 10m
+  --rollback-on-failure --wait --timeout 10m || {
+  echo "==> warning events in ruum (the last 30):" >&2
+  kubectl -n ruum get events --field-selector type=Warning --sort-by=.lastTimestamp 2>&1 | tail -n 30 >&2 || true
+  die "helm upgrade failed (above); the release was rolled back, the old release keeps serving"
+}
 kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.commit}{"\n"}'

@@ -165,6 +165,9 @@ live() {
       # shellcheck disable=SC2086 # verb and resource
       want no "$d" "$ns" $x
     done
+    # Pod logs through the subresource (backlog O-50): `kubectl auth can-i get pods/log` reads
+    # `log` as the name of a pod, so it answers yes for anyone who may get pods. Only
+    # `--subresource log` asks for the logs.
     want no "$d" "$ns" get pods log
     want no "$d" "$ns" create pods exec
     want no "$d" "$ns" create pods attach

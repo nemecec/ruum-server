@@ -599,6 +599,18 @@ pub trait AppStore: Send + Sync {
     /// live deployment is not `r.expected_live` any more.
     async fn release(&self, ctx: &Context, d: NewDeployment, r: Release) -> Result<Released>;
 
+    /// Takes the live-switch lock of `app` across processes and holds it until the guard
+    /// drops (Kimi W-2s run 10b, 1): the service runs the live-release hooks, the release and
+    /// the repair after a failed release under it. Waits at most `wait`, then `409 conflict`.
+    /// The in-memory store lives in one process, where the service's own lock is enough, so
+    /// its guard holds nothing.
+    async fn lock_live_switch(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        wait: std::time::Duration,
+    ) -> Result<LiveSwitchLock>;
+
     /// Inserts the approval request of an agent's publish (status `pending`).
     async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow>;
 
@@ -690,6 +702,24 @@ pub(crate) fn version_page(items: &mut Vec<Version>, limit: usize) -> Page<Versi
     Page {
         items: std::mem::take(items),
         next_cursor,
+    }
+}
+
+/// The guard of [`AppStore::lock_live_switch`]: the lock is held until it drops.
+pub struct LiveSwitchLock {
+    _held: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl LiveSwitchLock {
+    /// A guard that holds nothing (a store of one process).
+    pub fn unheld() -> Self {
+        Self { _held: None }
+    }
+
+    /// A guard that holds `lock` (for example a transaction with an advisory lock) until it
+    /// drops.
+    pub fn held(lock: Box<dyn std::any::Any + Send>) -> Self {
+        Self { _held: Some(lock) }
     }
 }
 

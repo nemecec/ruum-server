@@ -134,6 +134,9 @@ pub(crate) struct Run {
     pub manifest: Value,
     pub files: Vec<(String, bytes::Bytes)>,
     pub stages: Value,
+    /// The deployment slot ([`super::DeploySlots`]), held while the files are in memory and
+    /// freed once the image stage has stored them (or the run ends).
+    pub slot: Option<super::DeploySlot>,
 }
 
 /// The spec of a static image: a service that runs no code (R-1's rules).
@@ -344,7 +347,9 @@ impl AppService {
                     None,
                 ))
             })?;
-        run.files.clear();
+        // The files are stored: free their memory and the slot that bounds it.
+        run.files = Vec::new();
+        run.slot = None;
         if written.new_bytes > 0 {
             let event = UsageEvent {
                 tenant,

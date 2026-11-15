@@ -253,9 +253,11 @@ Transactional Email: `smtp.tem.scaleway.com:587`, STARTTLS, sender `Ruum (stagin
   controller) renders the Job of
   `charts/ruum/templates/migrate-job.yaml` with the new server image, which runs
   `ruum-server migrate` under a Postgres advisory lock, and waits for it. If it fails, nothing is
-  rolled out and the old release keeps serving; the Job log goes to the controller's log (admin:
-  `deploy/staging/tool.sh kubectl -n ruum-deploy logs deploy/deploy-controller`), not into the
-  request that the deployer reads, and the Job stays for a week. The serving pods run with `RUUM_MIGRATE=false` and do not start on a database that lacks
+  rolled out and the old release keeps serving; the full Job log goes to the controller's log (admin:
+  `deploy/staging/tool.sh kubectl -n ruum-deploy logs deploy/deploy-controller`); the request
+  that the deployer reads gets its last 100 lines, with secret-looking values masked, only when
+  the step fails (backlog O-50: the deployer reads no pod log). A failed rollout puts helm's error
+  and the warning events of ruum into the request. The Job stays for a week. The serving pods run with `RUUM_MIGRATE=false` and do not start on a database that lacks
   a migration of their release.
 - **Rolling update**: ruum-server runs two replicas spread over the nodes, `maxUnavailable: 0`,
   a disruption budget of one, a readiness check every 5 s. Stopping: a 10 s `preStop` pause

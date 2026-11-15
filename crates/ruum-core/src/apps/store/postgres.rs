@@ -419,6 +419,19 @@ async fn ensure_in(
     Err(no_free_slug())
 }
 
+/// The advisory lock key of the live switch of one app: 8 bytes of a keyed hash of the tenant
+/// and the app (a clash only makes two apps wait for each other).
+fn live_switch_key(tenant: TenantId, app: NodeId) -> i64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ruum.apps.live_switch.v1");
+    h.update(tenant.0.as_bytes());
+    h.update(app.0.as_bytes());
+    let b = h.finalize();
+    let mut k = [0u8; 8];
+    k.copy_from_slice(&b.as_bytes()[..8]);
+    i64::from_be_bytes(k)
+}
+
 #[async_trait]
 impl AppStore for PgAppStore {
     async fn tenant_settings(&self, tenant: TenantId) -> Result<Option<TenantAppSettings>> {
@@ -958,6 +971,35 @@ impl AppStore for PgAppStore {
             version,
             change,
         })
+    }
+
+    async fn lock_live_switch(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        wait: std::time::Duration,
+    ) -> Result<LiveSwitchLock> {
+        // A transaction-level advisory lock, held by a transaction that stays open until the
+        // guard drops (a dropped transaction rolls back and frees the lock). `try` in a loop:
+        // a waiting publish holds no pooled connection, so waiters cannot use up the pool that
+        // the holder needs for its release.
+        let key = live_switch_key(tenant, app);
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let got: bool = sqlx::query_scalar("select pg_try_advisory_xact_lock($1)")
+                .bind(key)
+                .fetch_one(&mut *tx)
+                .await?;
+            if got {
+                return Ok(LiveSwitchLock::held(Box::new(tx)));
+            }
+            tx.rollback().await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(crate::apps::deployments::live_switch_busy());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn insert_approval(&self, ctx: &Context, a: NewApproval) -> Result<ApprovalRow> {

@@ -126,6 +126,48 @@ func data(r Request) map[string]string {
 	return d
 }
 
+// A failed migration Job: its reason reaches the request (backlog O-50: the deployer reads no
+// pod log), as the tail of the Job's log with secret-looking values masked. A successful deploy
+// keeps the Job's log out of the request (above).
+func TestAFailedMigrationShowsItsReasonInTheRequest(t *testing.T) {
+	lines := []string{"==> migration step ruum-migrate-111111111111-202611131200"}
+	for i := range 120 {
+		lines = append(lines, "migrate| applying step "+strconv.Itoa(i))
+	}
+	lines = append(lines,
+		"migrate| error: migration 0042 failed: column \"plan\" does not exist",
+		"migrate| connecting to postgres://ruum:s3cret@pg-rw.data:5432/ruum password=hunter2 token: abcd",
+		"migrate| key AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDDEEEE",
+		"error: the migration step ruum-migrate-111111111111-202611131200 did not succeed (0/1)",
+	)
+	s, d := newStore(), &fakeDeployer{lines: lines, err: errors.New("exit status 1")}
+	s.add("release-m", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	c := newController(s, d)
+	c.LogLines = 300
+	if err := c.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := s.Get(context.Background(), "release-m")
+	log := cm.Data[keyLog]
+	if cm.Metadata.Annotations[annPhase] != PhaseFailed {
+		t.Fatalf("phase %v", cm.Metadata.Annotations)
+	}
+	if !strings.Contains(log, `migration 0042 failed: column "plan" does not exist`) || !strings.Contains(log, "did not succeed") {
+		t.Fatalf("the reason is not in the request: %q", log)
+	}
+	for _, secret := range []string{"s3cret", "hunter2", "abcd", "AAAAAAAAAABBBBBBBBBB"} {
+		if strings.Contains(log, secret) {
+			t.Fatalf("%q reached the request: %q", secret, log)
+		}
+	}
+	if got := strings.Count(log, "migrate| "); got != MigrateLines {
+		t.Fatalf("%d migration lines in the request, want the last %d", got, MigrateLines)
+	}
+	if strings.Contains(log, "applying step 0\n") {
+		t.Fatalf("an old line of the Job's log is in the request")
+	}
+}
+
 func TestControllerDeploysAnAcceptedRequest(t *testing.T) {
 	s, d := newStore(), &fakeDeployer{lines: []string{
 		"==> migration step ruum-migrate-111111111111-202611131200",
