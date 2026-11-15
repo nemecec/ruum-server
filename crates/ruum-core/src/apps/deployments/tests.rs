@@ -1176,6 +1176,49 @@ async fn deploy_slots_bound_each_tenant_and_the_process() {
     assert_eq!(slots.global.available_permits(), 3);
 }
 
+/// A cancelled request does not free its slot while its unpacking still runs: the slot is in
+/// the blocking task (Kimi W-2s run 11, 4).
+#[tokio::test]
+async fn a_cancelled_deployment_keeps_its_slot_until_the_unpacking_ends() {
+    let slots = DeploySlots::new(1, 1, Duration::from_millis(50));
+    let t = TenantId::new();
+    let slot = slots.take(t).await.unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let request = tokio::spawn(blocking_with_slot(slot, move || {
+        started_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+        // Runs as the closure ends, before the slot (moved into the closure) drops.
+        let _ = done_tx.send(());
+        Ok(())
+    }));
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .unwrap();
+    // The request is cancelled while the unpacking runs.
+    request.abort();
+    assert!(matches!(request.await, Err(e) if e.is_cancelled()));
+    assert_eq!(slots.global.available_permits(), 0);
+    assert!(
+        slots.take(t).await.is_err(),
+        "the slot was freed while the unpacking runs"
+    );
+    go_tx.send(()).unwrap();
+    done_rx.await.unwrap();
+    // The blocking task ends and frees the slot.
+    let mut freed = false;
+    for _ in 0..100 {
+        if slots.global.available_permits() == 1 {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(freed, "the slot was not freed when the unpacking ended");
+    assert!(slots.take(t).await.is_ok());
+}
+
 /// A deployment waits for a slot of its tenant before it reads its source; it frees the slot
 /// once its image stage has stored the files (Kimi W-2s run 10b, 2).
 #[tokio::test]

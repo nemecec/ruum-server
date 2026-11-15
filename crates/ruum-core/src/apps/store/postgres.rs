@@ -14,11 +14,34 @@ use sqlx::postgres::PgRow;
 #[derive(Clone, Debug)]
 pub struct PgAppStore {
     pool: sqlx::PgPool,
+    /// The pool of the live-switch locks, apart from `pool` (Kimi W-2s run 11, 3): a holder
+    /// keeps one of these connections while it does its release work on `pool`, so the locks
+    /// never use up the connections that the holders (or other tenants) need. Made on first
+    /// use, with the connect options of `pool`.
+    locks: std::sync::Arc<std::sync::OnceLock<sqlx::PgPool>>,
 }
+
+/// At most this many live switches run at the same time in one process (each holds one
+/// connection of the lock pool); more wait, up to the wait of the switch, then get
+/// `live_switch_busy`.
+pub(crate) const LIVE_SWITCH_CONNECTIONS: u32 = 4;
 
 impl PgAppStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            locks: std::sync::Arc::default(),
+        }
+    }
+
+    fn lock_pool(&self) -> &sqlx::PgPool {
+        self.locks.get_or_init(|| {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(LIVE_SWITCH_CONNECTIONS)
+                .min_connections(0)
+                .idle_timeout(std::time::Duration::from_secs(60))
+                .connect_lazy_with((*self.pool.connect_options()).clone())
+        })
     }
 }
 
@@ -980,23 +1003,31 @@ impl AppStore for PgAppStore {
         wait: std::time::Duration,
     ) -> Result<LiveSwitchLock> {
         // A transaction-level advisory lock, held by a transaction that stays open until the
-        // guard drops (a dropped transaction rolls back and frees the lock). `try` in a loop:
-        // a waiting publish holds no pooled connection, so waiters cannot use up the pool that
-        // the holder needs for its release.
+        // guard drops (a dropped transaction rolls back and frees the lock). The transaction is
+        // on the lock pool, not on the store pool, so a holder never waits for a store
+        // connection that another holder keeps. `try` in a loop: a waiting switch holds no
+        // connection. The whole acquisition (the connection and the lock) is inside `wait`.
         let key = live_switch_key(tenant, app);
         let deadline = tokio::time::Instant::now() + wait;
+        let busy = crate::apps::deployments::live_switch_busy;
         loop {
-            let mut tx = self.pool.begin().await?;
-            let got: bool = sqlx::query_scalar("select pg_try_advisory_xact_lock($1)")
-                .bind(key)
-                .fetch_one(&mut *tx)
-                .await?;
+            let mut tx = tokio::time::timeout_at(deadline, self.lock_pool().begin())
+                .await
+                .map_err(|_| busy())??;
+            let got: bool = tokio::time::timeout_at(
+                deadline,
+                sqlx::query_scalar("select pg_try_advisory_xact_lock($1)")
+                    .bind(key)
+                    .fetch_one(&mut *tx),
+            )
+            .await
+            .map_err(|_| busy())??;
             if got {
                 return Ok(LiveSwitchLock::held(Box::new(tx)));
             }
             tx.rollback().await?;
             if tokio::time::Instant::now() >= deadline {
-                return Err(crate::apps::deployments::live_switch_busy());
+                return Err(busy());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

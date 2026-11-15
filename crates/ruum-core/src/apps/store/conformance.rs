@@ -883,6 +883,52 @@ mod tests {
         drop((other, again));
     }
 
+    /// The live-switch lock takes no connection of the store pool (Kimi W-2s run 11, 3): with a
+    /// store pool of one connection, a holder still does its store work, and many switches of
+    /// different apps at once do not deadlock (the lock pool bounds them; the rest wait).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_live_switch_lock_needs_no_store_connection(pool: sqlx::PgPool) {
+        use std::time::Duration;
+        let (t, u) = pg_tenant(&pool).await;
+        let one = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let store = PgAppStore::new(one);
+        let a = pg_app_node(&pool, t, u).await;
+        let held = store
+            .lock_live_switch(t, a, Duration::from_secs(1))
+            .await
+            .unwrap();
+        // The holder's own store work (a pool of one: the lock is not on it).
+        store.get_app(t, a).await.unwrap();
+        drop(held);
+        let mut apps = Vec::new();
+        for _ in 0..(crate::apps::store::postgres::LIVE_SWITCH_CONNECTIONS as usize + 3) {
+            apps.push(pg_app_node(&pool, t, u).await);
+        }
+        let runs = apps.into_iter().map(|app| {
+            let store = store.clone();
+            async move {
+                let held = store
+                    .lock_live_switch(t, app, Duration::from_secs(10))
+                    .await?;
+                store.get_app(t, app).await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(held);
+                Ok::<_, Error>(())
+            }
+        });
+        let all = tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(runs))
+            .await
+            .expect("the switches deadlocked");
+        for r in all {
+            r.unwrap();
+        }
+    }
+
     /// The slug of an app whose node was purged is retired at once, while the app row still
     /// waits for the provider's `purged` delivery (the node is a hidden tombstone; review
     /// W-2s, 1).

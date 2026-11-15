@@ -232,15 +232,17 @@ func (c *Controller) run(ctx context.Context, cm ConfigMap) {
 	// (backlog O-50: the deployer reads no pod log, so the request must say why), as its last
 	// MigrateLines lines with secret-looking values masked (redactSecrets).
 	migrate := &tail{max: MigrateLines}
+	keep := []string{req.Commit, req.ExpectDeployed, c.Commit}
 	err = c.Deployer.Run(runCtx, plan.Args, func(line string) {
 		// The full output, the migration Job's log included, goes to this pod's log (admin
-		// only). The request, which the deployer reads, gets it with any credentials masked.
+		// only). The request, which the deployer reads, gets every line through the full
+		// secret mask (helm's error and the warning events too, not only the Job's log).
 		fmt.Fprintf(c.Log, "%s | %s\n", name, line)
 		if strings.HasPrefix(line, "migrate| ") {
-			migrate.add(redactSecrets(line))
+			migrate.add(redactSecrets(line, keep...))
 			return
 		}
-		out.add(redact(line))
+		out.add(redactSecrets(line, keep...))
 	})
 	close(stop)
 	<-ticker
@@ -303,7 +305,7 @@ func (c *Controller) finish(ctx context.Context, cm ConfigMap, phase, status str
 	if cm.Metadata.Annotations[annClaimedBy] == "" {
 		cm.Metadata.Annotations[annClaimedBy] = c.Me
 	}
-	cm.Data[keyStatus] = redact(status)
+	cm.Data[keyStatus] = redactSecrets(status, cm.Data["commit"], cm.Data["expectDeployed"], c.Commit)
 	if out != nil {
 		cm.Data[keyLog] = out.String()
 	}
@@ -365,17 +367,192 @@ func redact(s string) string { return userinfoRE.ReplaceAllString(s, "${1}[redac
 // MigrateLines is how many lines of the migration Job's log a failed request shows.
 const MigrateLines = 100
 
-// secretRE matches a value after a secret-looking key (password=..., "token": "...", secret: ...).
-var secretRE = regexp.MustCompile(`(?i)((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)[A-Za-z0-9_-]*["']?\s*[:=]\s*["']?)(?:bearer\s+|basic\s+)?[^\s"',;&]+`)
+// keyRE matches a key and its separator: password=, "token": , api-key: , \"secret\":.
+// The caller checks that the key starts a word (Go regexp has no look-behind).
+var keyRE = regexp.MustCompile(`(\\?["']?)([A-Za-z][A-Za-z0-9_.-]*)(\\?["']?)\s*[:=]\s*`)
+
+// secretWords are the words of a key whose value is masked. A key is split into words at
+// "_", "-", "." and camelCase borders, so API_KEY, apiKey, private-key and key match, monkey not.
+var secretWords = map[string]bool{
+	"key": true, "keys": true, "apikey": true, "password": true, "passwd": true, "pwd": true,
+	"passphrase": true, "pass": true, "secret": true, "secrets": true, "token": true, "tokens": true,
+	"credential": true, "credentials": true, "authorization": true, "auth": true, "cookie": true,
+	"bearer": true, "signature": true, "dsn": true,
+}
+
+// authSchemes are the words that come before a credential in an Authorization value.
+var authSchemes = map[string]bool{"bearer": true, "basic": true, "token": true, "digest": true, "negotiate": true}
+
+// bearerRE matches a bearer credential without a key (Bearer abc).
+var bearerRE = regexp.MustCompile(`(?i)\b(bearer\s+)[^\s"',;]+`)
+
+// jwtRE matches a JSON Web Token (three base64url parts with dots).
+var jwtRE = regexp.MustCompile(`eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?`)
 
 // longTokenRE matches long runs that look like keys or tokens (40 or more base64 or hex characters).
 var longTokenRE = regexp.MustCompile(`[A-Za-z0-9+/_=-]{40,}`)
 
-// redactSecrets masks credentials in URLs, values after secret-looking keys and long tokens.
-func redactSecrets(s string) string {
+// hex64RE is an image digest after "sha256:" (public, not a secret).
+var hex64RE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+const masked = "[redacted]"
+
+// redactSecrets masks credentials in URLs, the values of secret-looking keys (the full value:
+// quoted with escapes and spaces, or unquoted to the next space; the rest of the line when the
+// value cannot be parsed for sure), bearer credentials, JWTs and long tokens. keep are values
+// that may stay (the commits of the request: public, and the deployer needs to see them).
+// Every line that goes into a request passes this function.
+func redactSecrets(s string, keep ...string) string {
 	s = redact(s)
-	s = secretRE.ReplaceAllString(s, "${1}[redacted]")
-	return longTokenRE.ReplaceAllString(s, "[redacted]")
+	s = maskKeyValues(s)
+	s = bearerRE.ReplaceAllString(s, "${1}"+masked)
+	s = jwtRE.ReplaceAllString(s, masked)
+	var b strings.Builder
+	last := 0
+	for _, m := range longTokenRE.FindAllStringIndex(s, -1) {
+		tok := s[m[0]:m[1]]
+		if keepToken(tok, s[:m[0]], keep) {
+			continue
+		}
+		b.WriteString(s[last:m[0]])
+		b.WriteString(masked)
+		last = m[1]
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+func keepToken(tok, before string, keep []string) bool {
+	if hex64RE.MatchString(tok) && strings.HasSuffix(before, "sha256:") {
+		return true
+	}
+	for _, k := range keep {
+		if len(k) >= 7 && strings.Contains(tok, k) && len(tok)-len(k) < 16 {
+			return true
+		}
+	}
+	return false
+}
+
+// maskKeyValues masks the value after every secret-looking key.
+func maskKeyValues(s string) string {
+	var b strings.Builder
+	pos := 0
+	for pos < len(s) {
+		m := keyRE.FindStringSubmatchIndex(s[pos:])
+		if m == nil {
+			break
+		}
+		start, end := pos+m[0], pos+m[1]
+		key := s[pos+m[4] : pos+m[5]]
+		// The key must start a word: "xpassword=" is no key.
+		if start > 0 && isWordByte(s[start-1]) && m[2] == m[3] || !isSecretKey(key) {
+			// Go on after the key, so that a key in the rest is still found.
+			b.WriteString(s[pos : pos+m[5]])
+			pos += m[5]
+			continue
+		}
+		b.WriteString(s[pos:end])
+		n, all := valueLen(s[end:])
+		if all {
+			b.WriteString(masked)
+			return b.String()
+		}
+		q := ""
+		if n > 0 && (s[end] == '"' || s[end] == '\'') {
+			q = s[end : end+1]
+		}
+		if n > 0 {
+			b.WriteString(q + masked + q)
+		}
+		pos = end + n
+	}
+	b.WriteString(s[pos:])
+	return b.String()
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c == '-' || c == '.' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// valueLen is the length of the value at the start of v; all is true when the value cannot be
+// parsed for sure (an open quote, an escaped quote, a structure), so the rest of the line goes.
+func valueLen(v string) (n int, all bool) {
+	if v == "" {
+		return 0, false
+	}
+	switch v[0] {
+	case '"', '\'':
+		for i := 1; i < len(v); i++ {
+			switch v[i] {
+			case '\\':
+				i++
+			case v[0]:
+				return i + 1, false
+			}
+		}
+		return 0, true
+	case '\\', '{', '[', '(', '<':
+		return 0, true
+	}
+	n = wordEnd(v, 0)
+	if authSchemes[strings.ToLower(v[:n])] && n < len(v) && (v[n] == ' ' || v[n] == '\t') {
+		i := n
+		for i < len(v) && (v[i] == ' ' || v[i] == '\t') {
+			i++
+		}
+		if i < len(v) && strings.ContainsRune("\"'\\{[(<", rune(v[i])) {
+			return 0, true
+		}
+		n = wordEnd(v, i)
+	}
+	return n, false
+}
+
+// wordEnd is the index of the first space or tab at or after i.
+func wordEnd(v string, i int) int {
+	for i < len(v) && v[i] != ' ' && v[i] != '\t' {
+		i++
+	}
+	return i
+}
+
+// isSecretKey splits the key into words ("_", "-", ".", camelCase) and looks for a secret word.
+func isSecretKey(key string) bool {
+	if secretWords[strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(key))] {
+		return true
+	}
+	var words []string
+	cur := []rune{}
+	rs := []rune(key)
+	flush := func() {
+		if len(cur) > 0 {
+			words = append(words, strings.ToLower(string(cur)))
+			cur = cur[:0]
+		}
+	}
+	for i, r := range rs {
+		if r == '_' || r == '-' || r == '.' {
+			flush()
+			continue
+		}
+		upper := r >= 'A' && r <= 'Z'
+		if upper && i > 0 {
+			prev := rs[i-1]
+			nextLower := i+1 < len(rs) && rs[i+1] >= 'a' && rs[i+1] <= 'z'
+			if prev >= 'a' && prev <= 'z' || prev >= '0' && prev <= '9' || (prev >= 'A' && prev <= 'Z' && nextLower) {
+				flush()
+			}
+		}
+		cur = append(cur, r)
+	}
+	flush()
+	for _, w := range words {
+		if secretWords[w] {
+			return true
+		}
+	}
+	return false
 }
 
 // tail keeps the last max lines.

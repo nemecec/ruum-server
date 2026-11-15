@@ -208,6 +208,18 @@ fn deploys_busy(message: &str) -> Error {
     )
 }
 
+/// Runs `work` on the blocking pool with `slot` moved into it; the slot comes back with the
+/// result. When the caller is cancelled, the slot stays taken until `work` ends (a running
+/// blocking task cannot be stopped).
+pub(crate) async fn blocking_with_slot<T: Send + 'static>(
+    slot: DeploySlot,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<(T, DeploySlot)> {
+    tokio::task::spawn_blocking(move || work().map(|v| (v, slot)))
+        .await
+        .map_err(|e| Error::Internal(format!("the unpack task failed: {e}")))?
+}
+
 impl DeploySlots {
     pub(crate) fn new(per_tenant: usize, global: usize, wait: std::time::Duration) -> Self {
         Self {
@@ -604,14 +616,15 @@ impl AppService {
         let packed = self.read_source(ctx, &req.source, &limits).await?;
         // Unpacking inflates and checks up to the plan's archive limit: CPU work, so it runs on
         // the blocking pool and never stalls the async workers.
-        let (packed, manifest, files) = tokio::task::spawn_blocking(move || {
+        // The slot goes into the blocking task and comes back with its result: a cancelled
+        // request cannot free the slot while the unpacking still runs (Kimi W-2s run 11, 4).
+        let ((packed, manifest, files), slot) = blocking_with_slot(slot, move || {
             let unpacked = archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
             let manifest = checked_manifest(&unpacked, &plan)?;
             let files = site_files(&unpacked, &manifest);
             Ok::<_, Error>((packed, manifest, files))
         })
-        .await
-        .map_err(|e| Error::Internal(format!("the unpack task failed: {e}")))??;
+        .await?;
         // The tenant slug is fixed by now (W-1 makes it with the first app).
         self.ensure_tenant(ctx.tenant).await?;
         let archive_bytes = bytes::Bytes::from(packed.bytes);

@@ -541,3 +541,74 @@ func TestControllerFinishesARunningDeployOnStop(t *testing.T) {
 		t.Fatalf("a new request was taken after the stop: %q", p)
 	}
 }
+
+// The full secret mask (Kimi run 11, findings 1 and 2): bare key and *_key / *Key / api-key
+// keys, whole values (quoted with spaces and escapes, or unquoted to the next space), the rest
+// of the line when the value cannot be parsed for sure, bearer credentials, JWTs, long tokens.
+func TestRedactSecrets(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
+	for in, want := range map[string]string{
+		"key=abcd":                                   "key=[redacted]",
+		`password="two words" next`:                  `password="[redacted]" next`,
+		`token: 'a b' next`:                          `token: '[redacted]' next`,
+		"API_KEY=sk_live_x1 more":                    "API_KEY=[redacted] more",
+		"apiKey: zzz":                                "apiKey: [redacted]",
+		"x-api-key: zzz":                             "x-api-key: [redacted]",
+		"privateKey=zzz":                             "privateKey=[redacted]",
+		"AWS_SECRET_ACCESS_KEY=zzz":                  "AWS_SECRET_ACCESS_KEY=[redacted]",
+		"Authorization: Bearer abc.def":              "Authorization: [redacted]",
+		"authorization: Basic dXNlcjpwYXNz":          "authorization: [redacted]",
+		"sent Bearer abc123 upstream":                "sent Bearer [redacted] upstream",
+		"jwt " + jwt + " end":                        "jwt [redacted] end",
+		`{"password":"x y","user":"u"}`:              `{"password":"[redacted]","user":"u"}`,
+		`password="a \" b" tail`:                     `password="[redacted]" tail`,
+		`password="never closed tail`:                `password=[redacted]`,
+		`{\"token\":\"a b\"} tail`:                   `{\"token\":[redacted]`,
+		`secret: {"a": "b c"}`:                       `secret: [redacted]`,
+		"monkey=banana keyboard=us":                  "monkey=banana keyboard=us",
+		"xpassword=visible":                          "xpassword=visible",
+		"url https://h/?api_key=abc&x=1 ok":          "url https://h/?api_key=[redacted] ok",
+		"postgres://ruum:pw@pg:5432/ruum":            "postgres://[redacted]@pg:5432/ruum",
+		"image x@sha256:" + strings.Repeat("ab", 32): "image x@sha256:" + strings.Repeat("ab", 32),
+		"k " + strings.Repeat("Q", 44):               "k [redacted]",
+	} {
+		if got := redactSecrets(in); got != want {
+			t.Errorf("redactSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
+	commit := strings.Repeat("1a", 20)
+	if got := redactSecrets("deployed "+commit, commit); got != "deployed "+commit {
+		t.Errorf("the request's commit was masked: %q", got)
+	}
+}
+
+// A failed helm upgrade: helm's error and the warning events reach the request through the
+// full secret mask, not only the URL mask (Kimi run 11, finding 1).
+func TestAFailedHelmUpgradeMasksSecretsInTheRequest(t *testing.T) {
+	long := "AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDDDDDDDDDDEEEE"
+	d := &fakeDeployer{lines: []string{
+		"Error: UPGRADE FAILED: render: token=tok-visible-1 password=pw-visible-2",
+		"==> warning events in ruum (the last 30):",
+		`5s Warning Failed pod/ruum-1 Error: env API_KEY="key visible 3" key ` + long,
+		"5s Warning Failed pod/ruum-2 Authorization: Bearer bearer-visible-4",
+	}, err: errors.New("exit status 1 password=pw-visible-5")}
+	s := newStore()
+	s.add("release-h", t0.Add(-time.Minute), data(req(cNew, cLive, "")))
+	c := newController(s, d)
+	if err := c.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := s.Get(context.Background(), "release-h")
+	if cm.Metadata.Annotations[annPhase] != PhaseFailed {
+		t.Fatalf("phase %v", cm.Metadata.Annotations)
+	}
+	all := cm.Data[keyLog] + "\n" + cm.Data[keyStatus]
+	if !strings.Contains(all, "UPGRADE FAILED") || !strings.Contains(all, "warning events") {
+		t.Fatalf("the reason is not in the request: %q", all)
+	}
+	for _, secret := range []string{"tok-visible", "pw-visible", "key visible", "visible 3", "AAAAAAAAAABBBBBBBBBB", "bearer-visible"} {
+		if strings.Contains(all, secret) {
+			t.Fatalf("%q reached the request: %q", secret, all)
+		}
+	}
+}
