@@ -453,9 +453,11 @@ func maskKeyValues(s string) string {
 			continue
 		}
 		b.WriteString(s[pos:end])
-		// A cookie or Authorization value has several parts (a=b; session=..., Digest
-		// username="u", response="..."): the rest of the line goes.
-		if lk := strings.ToLower(key); strings.Contains(lk, "cookie") || strings.Contains(lk, "authorization") {
+		// A cookie or auth value has several parts (a=b; session=..., Digest
+		// username="u", response="..."): the rest of the line goes. "auth" covers
+		// Authorization, Proxy-Authorization and the short Auth alias (Kimi run 11, third
+		// review); masking a little too much (Author:) is the safe side.
+		if lk := strings.ToLower(key); strings.Contains(lk, "cookie") || strings.Contains(lk, "auth") {
 			b.WriteString(masked)
 			return b.String()
 		}

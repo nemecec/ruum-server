@@ -577,9 +577,11 @@ func TestRedactSecrets(t *testing.T) {
 		}
 	}
 	for in, want := range map[string]string{
-		"Cookie: a=b; session=hunter2":                                    "Cookie: [redacted]",
-		"set-cookie: sid=x; Path=/":                                       "set-cookie: [redacted]",
-		`Authorization: Digest username="u", response="0123456789abcdef"`: "Authorization: [redacted]",
+		"Cookie: a=b; session=hunter2":                                           "Cookie: [redacted]",
+		"set-cookie: sid=x; Path=/":                                              "set-cookie: [redacted]",
+		`Authorization: Digest username="u", response="0123456789abcdef"`:        "Authorization: [redacted]",
+		`Auth: Digest username="u", response="0123456789abcdef0123456789abcdef"`: "Auth: [redacted]",
+		`Proxy-Authorization: Digest username="u", response="0123456789abcdef"`:  "Proxy-Authorization: [redacted]",
 	} {
 		if got := redactSecrets(in); got != want {
 			t.Errorf("redactSecrets(%q) = %q, want %q", in, got, want)
