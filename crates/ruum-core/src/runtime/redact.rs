@@ -6,10 +6,24 @@
 //! as one piece too.
 //!
 //! The output of an app is hostile input, and the redactor runs on the platform side of the
-//! sandbox (in the driver's log shipper). Its cost is linear in the output: each piece is
-//! scanned once, plus a window of the longest value's length at the end. A piece written one
-//! byte at a time with no line end costs no more than one large write.
+//! sandbox (in the driver's log shipper). Its cost is linear in the output, whatever the values
+//! are (backlog S-36): the values form one Aho-Corasick automaton (a trie with failure links,
+//! written here, no extra dependency), and each byte of output goes through it once. The
+//! automaton gives, for each position, the longest value that starts there and the longest end
+//! of the output that could still grow into a value, without comparing a value byte by byte. A
+//! value that overlaps itself (`"a"` × (L−1) + `"b"`) written one byte at a time costs no more
+//! than any other output. Only the matches that end at the same byte cost extra (one step each),
+//! and only values that are suffixes of one another make several.
+//!
+//! The redaction is exact-match only: a value written in another form (hex, base64, reversed,
+//! one character per line) is not found. That is the known limit of rule 7 at this layer; the
+//! telemetry pipeline (card O-1a) looks for encoded forms.
+//!
+//! A value is at most [`MAX_SECRET_VALUE_BYTES`] long. Drivers refuse a longer secret value or
+//! workload token before they start anything, so the automaton and the held-back text stay
+//! small.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use time::OffsetDateTime;
 
@@ -21,12 +35,30 @@ pub const REDACTED: &str = "<hidden secret>";
 /// A line longer than this is let out in pieces (each still redacted).
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
+/// The longest secret value (or workload token) a driver accepts, in bytes (16 KiB: room for a
+/// PEM private key of RSA 4096). Drivers refuse a longer one with `invalid_spec`
+/// ([`check_secret_value`]).
+pub const MAX_SECRET_VALUE_BYTES: usize = 16 * 1024;
+
+/// Checks the length of a value to redact: at most [`MAX_SECRET_VALUE_BYTES`]. A driver calls it
+/// for every secret value, previous value and workload token before it starts anything.
+pub fn check_secret_value(field: &str, value: &str) -> Result<(), super::RuntimeError> {
+    if value.len() > MAX_SECRET_VALUE_BYTES {
+        return Err(super::RuntimeError::invalid(
+            field,
+            format!("a secret value is at most {MAX_SECRET_VALUE_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
 /// Replaces every exact match of a value in `text` with [`REDACTED`]. At each position the
 /// longest value wins. A line in which a value appears again after the replacement (a value
 /// that overlaps the marker text) becomes the marker as a whole.
 pub fn redact(text: &str, values: &[&str]) -> String {
     let values = normalize(values.iter().copied());
-    let matches = find_matches(text, &values, 0);
+    let ac = Automaton::new(&values);
+    let matches = ac.find_all(text.as_bytes());
     let out = replace(text, &matches);
     if !contains_any(&out, &values) {
         return out;
@@ -52,24 +84,173 @@ fn normalize<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     v
 }
 
-/// The longest value at the start of `rest` (the values are sorted longest first).
-fn value_at<'v>(rest: &str, values: &'v [String]) -> Option<&'v String> {
-    values.iter().find(|v| rest.starts_with(v.as_str()))
+// ------------------------------------------------------------------------------ the automaton
+
+const ROOT: u32 = 0;
+const NONE: u32 = u32::MAX;
+
+/// An Aho-Corasick automaton over the bytes of the values.
+///
+/// Every node is a prefix of a value. A node's failure link is the longest proper suffix of it
+/// that is a node too. Feeding the output byte by byte keeps the state at the longest end of the
+/// output that is a node; the matches that end at a byte are the state and the terminal nodes
+/// on its failure chain ([`Automaton::dict`]). The amortized cost per byte is constant.
+struct Automaton {
+    /// The edges of each node, sorted by byte.
+    edges: Vec<Vec<(u8, u32)>>,
+    fail: Vec<u32>,
+    depth: Vec<u32>,
+    /// True when the node is a whole value.
+    terminal: Vec<bool>,
+    /// The next terminal node on the failure chain (not the node itself), or [`NONE`].
+    dict: Vec<u32>,
+    /// The longest suffix of the node (the node itself or one on its failure chain) that is a
+    /// proper prefix of a value: a node with edges. [`ROOT`] when there is none.
+    open: Vec<u32>,
 }
 
-/// The matches in `text[from..]`, leftmost first, the longest value at each position, as
-/// ranges of `text`.
-fn find_matches(text: &str, values: &[String], from: usize) -> Vec<Range<usize>> {
+impl Automaton {
+    fn new(values: &[String]) -> Self {
+        let mut a = Automaton {
+            edges: vec![Vec::new()],
+            fail: vec![ROOT],
+            depth: vec![0],
+            terminal: vec![false],
+            dict: vec![NONE],
+            open: vec![ROOT],
+        };
+        for v in values {
+            let mut n = ROOT;
+            for &b in v.as_bytes() {
+                n = match a.edge(n, b) {
+                    Some(next) => next,
+                    None => {
+                        let next = a.edges.len() as u32;
+                        a.edges.push(Vec::new());
+                        a.fail.push(ROOT);
+                        a.depth.push(a.depth[n as usize] + 1);
+                        a.terminal.push(false);
+                        a.dict.push(NONE);
+                        a.open.push(ROOT);
+                        let e = &mut a.edges[n as usize];
+                        let at = e.partition_point(|(x, _)| *x < b);
+                        e.insert(at, (b, next));
+                        next
+                    }
+                };
+            }
+            a.terminal[n as usize] = true;
+        }
+        // Breadth first: a node's failure link is shallower, so it is done before the node.
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        for &(_, child) in &a.edges[ROOT as usize] {
+            queue.push_back(child);
+        }
+        while let Some(n) = queue.pop_front() {
+            let ni = n as usize;
+            // The failure link of `n` was set when its parent was taken from the queue.
+            let f = a.fail[ni];
+            a.dict[ni] = if a.terminal[f as usize] {
+                f
+            } else {
+                a.dict[f as usize]
+            };
+            a.open[ni] = if a.edges[ni].is_empty() {
+                a.open[f as usize]
+            } else {
+                n
+            };
+            for i in 0..a.edges[ni].len() {
+                let (b, child) = a.edges[ni][i];
+                let mut f = a.fail[ni];
+                let link = loop {
+                    if let Some(x) = a.edge(f, b) {
+                        break x;
+                    }
+                    if f == ROOT {
+                        break ROOT;
+                    }
+                    f = a.fail[f as usize];
+                };
+                a.fail[child as usize] = link;
+                queue.push_back(child);
+            }
+        }
+        a
+    }
+
+    fn edge(&self, n: u32, b: u8) -> Option<u32> {
+        let e = &self.edges[n as usize];
+        e.binary_search_by_key(&b, |(x, _)| *x).ok().map(|i| e[i].1)
+    }
+
+    /// The state after one more byte.
+    fn step(&self, mut n: u32, b: u8) -> u32 {
+        loop {
+            if let Some(next) = self.edge(n, b) {
+                return next;
+            }
+            if n == ROOT {
+                return ROOT;
+            }
+            n = self.fail[n as usize];
+        }
+    }
+
+    /// Calls `found(len)` for each value that ends at the state `n`, longest first.
+    fn matches_at(&self, n: u32, mut found: impl FnMut(usize)) {
+        if self.terminal[n as usize] {
+            found(self.depth[n as usize] as usize);
+        }
+        let mut d = self.dict[n as usize];
+        while d != NONE {
+            found(self.depth[d as usize] as usize);
+            d = self.dict[d as usize];
+        }
+    }
+
+    /// The length of the longest end of the text fed so far (state `n`) that a later byte could
+    /// still grow into a value.
+    fn open_len(&self, n: u32) -> usize {
+        self.depth[self.open[n as usize] as usize] as usize
+    }
+
+    fn longest(&self) -> usize {
+        self.depth.iter().copied().max().unwrap_or(0) as usize
+    }
+
+    /// The matches of the whole text, leftmost first, the longest value at each position.
+    fn find_all(&self, text: &[u8]) -> Vec<Range<usize>> {
+        let mut best = vec![0u32; text.len()];
+        let mut n = ROOT;
+        for (i, &b) in text.iter().enumerate() {
+            n = self.step(n, b);
+            self.matches_at(n, |len| record(&mut best, i + 1, len));
+        }
+        greedy(&best, 0, text.len())
+    }
+}
+
+/// Notes a value of length `len` that ends at `end`: `best[start]` is the longest value that
+/// starts at `start`. Ends come in order, so a later end at the same start is longer.
+fn record(best: &mut [u32], end: usize, len: usize) {
+    if let Some(start) = end.checked_sub(len) {
+        let slot = &mut best[start];
+        if (len as u32) > *slot {
+            *slot = len as u32;
+        }
+    }
+}
+
+/// The leftmost-longest matches of `best[from..to]` that end at or before `to`.
+fn greedy(best: &[u32], from: usize, to: usize) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut i = from;
-    while i < text.len() {
-        if !text.is_char_boundary(i) {
-            i += 1;
-            continue;
-        }
-        if let Some(v) = value_at(&text[i..], values) {
-            out.push(i..i + v.len());
-            i += v.len();
+    while i < to {
+        let len = best[i] as usize;
+        if len > 0 && i + len <= to {
+            out.push(i..i + len);
+            i += len;
         } else {
             i += 1;
         }
@@ -102,14 +283,6 @@ fn scrub(line: &str, values: &[String]) -> String {
     }
 }
 
-/// True when `tail` is the start of a value but not a whole value: the next piece could
-/// complete it.
-fn is_proper_prefix(tail: &str, values: &[String]) -> bool {
-    values
-        .iter()
-        .any(|v| v.len() > tail.len() && v.starts_with(tail))
-}
-
 /// The range of `ranges` (sorted, not overlapping) that holds the byte `p`.
 fn containing(ranges: &[Range<usize>], p: usize) -> Option<&Range<usize>> {
     let i = ranges.partition_point(|m| m.end <= p);
@@ -119,33 +292,45 @@ fn containing(ranges: &[Range<usize>], p: usize) -> Option<&Range<usize>> {
 /// Turns output pieces into redacted lines.
 ///
 /// The state, all as positions in `pending`:
+/// - `state`: the automaton state after all of `pending`.
+/// - `best`: for each position, the length of the longest value that starts there and ends
+///   inside `pending` (0 for none).
 /// - `matches` and `scan`: the matches before `scan` are final. A match at a position is final
 ///   once the text holds the longest value's length from there; the rest of the text (shorter
-///   than the longest value) is scanned again when lines are let out.
-/// - `prefixes`: the positions whose end of text is the start of a value (the next piece could
-///   complete it). The first one is the safe end: no text before it can still change.
+///   than the longest value) is matched again from `best` when lines are let out.
+/// - the safe end: `pending.len()` minus the longest end of `pending` that could still grow
+///   into a value. No text before it can still change.
 /// - `checked`: no line end before it is a cut point (each one is inside a match).
 pub struct LineRedactor {
     values: Vec<String>,
+    ac: Automaton,
+    longest: usize,
     pending: String,
     /// The end of the bytes given to [`LineRedactor::push_bytes`] that is not yet a whole
     /// UTF-8 character.
     partial: Vec<u8>,
+    state: u32,
+    best: Vec<u32>,
     matches: Vec<Range<usize>>,
     scan: usize,
-    prefixes: Vec<usize>,
     checked: usize,
 }
 
 impl LineRedactor {
     pub fn new<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let values = normalize(values);
+        let ac = Automaton::new(&values);
+        let longest = ac.longest();
         Self {
-            values: normalize(values),
+            values,
+            ac,
+            longest,
             pending: String::new(),
             partial: Vec::new(),
+            state: ROOT,
+            best: Vec::new(),
             matches: Vec::new(),
             scan: 0,
-            prefixes: Vec::new(),
             checked: 0,
         }
     }
@@ -155,16 +340,16 @@ impl LineRedactor {
         let mut all: Vec<&str> = self.values.iter().map(String::as_str).collect();
         all.push(value);
         self.values = normalize(all);
-        // The longest value can change: scan the held-back text again (once per renewal).
+        self.ac = Automaton::new(&self.values);
+        self.longest = self.ac.longest();
+        // Feed the held-back text through the new automaton (once per renewal).
+        self.state = ROOT;
+        self.best.clear();
+        self.best.resize(self.pending.len(), 0);
         self.matches.clear();
         self.scan = 0;
-        self.prefixes.clear();
         self.checked = 0;
         self.advance(0);
-    }
-
-    fn longest(&self) -> usize {
-        self.values.first().map_or(0, String::len)
     }
 
     /// Takes one piece of raw output (bytes as the process wrote them) and returns the lines
@@ -210,49 +395,45 @@ impl LineRedactor {
     pub fn push(&mut self, piece: &str, at: OffsetDateTime) -> Vec<(OffsetDateTime, String)> {
         let old = self.pending.len();
         self.pending.push_str(piece);
+        self.best.resize(self.pending.len(), 0);
         self.advance(old);
         self.take_lines(at)
     }
 
-    /// Updates the final matches and the prefix positions after text was added at `old`.
+    /// Feeds the bytes from `old` on through the automaton and moves the final matches on.
     fn advance(&mut self, old: usize) {
         let len = self.pending.len();
-        let longest = self.longest();
-        if longest == 0 {
+        if self.longest == 0 {
             self.scan = len;
-            self.prefixes.clear();
             return;
         }
-        let (pending, values) = (&self.pending, &self.values);
-        while self.scan + longest <= len {
-            let i = self.scan;
-            if !pending.is_char_boundary(i) {
-                self.scan += 1;
-                continue;
-            }
-            if let Some(v) = value_at(&pending[i..], values) {
-                self.matches.push(i..i + v.len());
-                self.scan += v.len();
+        let bytes = self.pending.as_bytes();
+        for (i, &b) in bytes.iter().enumerate().take(len).skip(old) {
+            self.state = self.ac.step(self.state, b);
+            let best = &mut self.best;
+            self.ac.matches_at(self.state, |l| record(best, i + 1, l));
+        }
+        while self.scan + self.longest <= len {
+            let l = self.best[self.scan] as usize;
+            if l > 0 {
+                self.matches.push(self.scan..self.scan + l);
+                self.scan += l;
             } else {
                 self.scan += 1;
             }
         }
-        // A position that was not a prefix stays one that is not; only the old prefixes and
-        // the new positions in the last `longest - 1` bytes need a check.
-        self.prefixes
-            .retain(|&k| is_proper_prefix(&pending[k..], values));
-        let from = old.max(len.saturating_sub(longest - 1));
-        for k in from..len {
-            if pending.is_char_boundary(k) && is_proper_prefix(&pending[k..], values) {
-                self.prefixes.push(k);
-            }
-        }
+    }
+
+    /// The first byte that a later piece could still change: the start of the longest end of
+    /// the text that is a proper prefix of a value.
+    fn safe_end(&self) -> usize {
+        self.pending.len() - self.ac.open_len(self.state)
     }
 
     /// Lets out the complete lines before the safe end, or a piece of a very long line.
     fn take_lines(&mut self, at: OffsetDateTime) -> Vec<(OffsetDateTime, String)> {
         let len = self.pending.len();
-        let safe = self.prefixes.first().copied().unwrap_or(len);
+        let safe = self.safe_end();
         let checked = self.checked.min(safe);
         let has_line_end = self.pending.as_bytes()[checked..safe].contains(&b'\n');
         if !has_line_end && len <= MAX_LINE_BYTES {
@@ -261,7 +442,7 @@ impl LineRedactor {
         }
         // The text after `scan` is shorter than the longest value: its matches as they stand.
         // Before `safe` they are final too (no value can start there and still grow).
-        let tentative = find_matches(&self.pending, &self.values, self.scan);
+        let tentative = greedy(&self.best, self.scan, len);
         let inside = |p: usize| {
             containing(&self.matches, p)
                 .or_else(|| containing(&tentative, p))
@@ -299,6 +480,7 @@ impl LineRedactor {
             return Vec::new();
         };
         let head: String = self.pending.drain(..cut).collect();
+        self.best.drain(..cut);
         let split = self.matches.partition_point(|m| m.end <= cut);
         let mut head_matches: Vec<Range<usize>> = self.matches.drain(..split).collect();
         head_matches.extend(tentative.into_iter().filter(|m| m.end <= cut));
@@ -307,9 +489,6 @@ impl LineRedactor {
             m.end -= cut;
         }
         self.scan = self.scan.max(cut) - cut;
-        for k in &mut self.prefixes {
-            *k -= cut;
-        }
         self.checked = safe - cut;
         let text = replace(&head, &head_matches);
         self.lines(&text, at)
@@ -328,15 +507,45 @@ impl LineRedactor {
         if !self.partial.is_empty() {
             rest.push_str(&String::from_utf8_lossy(&std::mem::take(&mut self.partial)));
         }
+        self.state = ROOT;
+        self.best.clear();
         self.matches.clear();
         self.scan = 0;
-        self.prefixes.clear();
         self.checked = 0;
         if rest.is_empty() {
             return Vec::new();
         }
-        let matches = find_matches(&rest, &self.values, 0);
+        let matches = self.ac.find_all(rest.as_bytes());
         let text = replace(&rest, &matches);
         self.lines(&text, at)
     }
+}
+
+/// The plain leftmost-longest search, value by value at each position: the reference the tests
+/// check the automaton against. Quadratic; never used on app output.
+#[cfg(test)]
+pub(crate) fn find_matches_naive(text: &str, values: &[&str]) -> Vec<Range<usize>> {
+    let values = normalize(values.iter().copied());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if let Some(v) = values.iter().find(|v| text[i..].starts_with(v.as_str())) {
+            out.push(i..i + v.len());
+            i += v.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The automaton's leftmost-longest search, for the tests.
+#[cfg(test)]
+pub(crate) fn find_matches(text: &str, values: &[&str]) -> Vec<Range<usize>> {
+    let values = normalize(values.iter().copied());
+    Automaton::new(&values).find_all(text.as_bytes())
 }
