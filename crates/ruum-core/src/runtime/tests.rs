@@ -6,7 +6,10 @@ use super::memory::{
     BuilderFaults, ENV_DUMP_ARCHIVE_MARKER, FAILING_ARCHIVE_MARKER, Faults, SLOW_ARCHIVE_MARKER,
 };
 use super::program::{self, Step};
-use super::redact::{LineRedactor, MAX_LINE_BYTES, REDACTED, redact};
+use super::redact::{
+    LineRedactor, MAX_LINE_BYTES, MAX_SECRET_VALUE_BYTES, REDACTED, check_secret_value,
+    find_matches, find_matches_naive, redact,
+};
 use super::*;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -818,4 +821,101 @@ fn streaming_redaction_matches_whole_text_redaction() {
         lines.extend(texts(r.finish(at())));
         assert_eq!(lines, want, "round {round}: text {text:?}, values {refs:?}");
     }
+}
+
+#[test]
+fn a_self_overlapping_value_costs_linear_time() {
+    // Backlog S-36: a 4 KiB value that overlaps itself ("a" x 4095 + "b") keeps about 4096
+    // positions open while an app writes "a" bytes. A redactor that checks each open position
+    // against the value again on each byte costs about 4096 * 4096 / 2 compares per byte, so
+    // 256 KiB in one-byte writes takes hours; the automaton takes one step per byte.
+    let value = format!("{}b", "a".repeat(4095));
+    let mut text = String::new();
+    while text.len() < 256 * 1024 {
+        text.push_str(&"a".repeat(6000));
+        text.push_str(&value);
+        text.push_str("x\n");
+    }
+    let refs = [value.as_str()];
+    let mut r = LineRedactor::new(refs);
+    let begun = std::time::Instant::now();
+    let mut out = Vec::new();
+    for b in text.as_bytes() {
+        out.extend(texts(r.push(std::str::from_utf8(&[*b]).unwrap(), at())));
+    }
+    out.extend(texts(r.finish(at())));
+    let took = begun.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "256 KiB in one-byte writes with a self-overlapping 4 KiB value took {took:?}"
+    );
+    let whole = redact(&text, &refs);
+    let whole = whole.strip_suffix('\n').unwrap_or(&whole);
+    assert_eq!(out, whole.split('\n').collect::<Vec<_>>());
+    assert!(out.iter().all(|l| !l.contains(value.as_str())));
+    assert!(out.iter().all(|l| l.ends_with(&format!("{REDACTED}x"))));
+}
+
+#[test]
+fn a_self_overlapping_value_on_one_long_line_costs_linear_time() {
+    // The same value in a line without a line end: the redactor lets the line out in pieces
+    // (MAX_LINE_BYTES) and must stay linear there too.
+    let value = format!("{}b", "a".repeat(4095));
+    let mut text = "a".repeat(200 * 1024);
+    text.push_str(&value);
+    text.push_str(&"a".repeat(60 * 1024));
+    let refs = [value.as_str()];
+    let mut r = LineRedactor::new(refs);
+    let begun = std::time::Instant::now();
+    let mut out = Vec::new();
+    for b in text.as_bytes() {
+        out.extend(texts(r.push(std::str::from_utf8(&[*b]).unwrap(), at())));
+    }
+    out.extend(texts(r.finish(at())));
+    let took = begun.elapsed();
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    assert!(out.len() > 1, "the long line was never let out");
+    assert_eq!(out.concat(), redact(&text, &refs));
+    assert_eq!(out.concat().matches(REDACTED).count(), 1);
+}
+
+#[test]
+fn the_automaton_finds_what_the_plain_search_finds() {
+    // Random texts and values over a small alphabet: values that overlap themselves and one
+    // another, values that are suffixes and prefixes of one another, multi-byte characters.
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let alphabet = ['a', 'b', 'a', 'a', 'ä', '\n'];
+    for round in 0..5000 {
+        let mut word = |len: u64| -> String {
+            (0..len)
+                .map(|_| alphabet[next(alphabet.len() as u64) as usize])
+                .collect()
+        };
+        let values: Vec<String> = (0..1 + round % 5)
+            .map(|i| word(1 + (round + i) as u64 % 7))
+            .collect();
+        let text = word(round as u64 % 80);
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        assert_eq!(
+            find_matches(&text, &refs),
+            find_matches_naive(&text, &refs),
+            "round {round}: text {text:?}, values {refs:?}"
+        );
+    }
+}
+
+#[test]
+fn secret_values_have_a_length_cap() {
+    let at_cap = "s".repeat(MAX_SECRET_VALUE_BYTES);
+    assert!(check_secret_value("env", &at_cap).is_ok());
+    let over = "s".repeat(MAX_SECRET_VALUE_BYTES + 1);
+    let err = check_secret_value("env", &over).unwrap_err();
+    assert_eq!(err.code(), "invalid_spec");
+    assert!(err.to_string().contains("16384"), "{err}");
 }
