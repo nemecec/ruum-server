@@ -380,6 +380,17 @@ could read every Secret there (Kimi review of O-25, finding 1). Now:
   deploy lock is held, or a request is `Running`); the admin can pass
   `secrets-push.sh platform --ignore-running-deploy`.
 
+### Observer (troubleshooting)
+
+The separate ServiceAccount `ruum/observer` can get, list and watch pods, events (both APIs),
+deployments, daemonsets, replicasets and jobs in `ruum`, `edge` and `ruum-deploy`. It can read pod
+logs. It never sees Kubernetes Secrets or ConfigMaps, cannot exec, attach or port-forward, and
+cannot add ephemeral containers, mint tokens or write anything. The platform step writes its
+own `observer.kubeconfig` beside `deployer.kubeconfig` in `~/.config/ruum/staging` on the Mac
+(or `RUUM_STAGING_WORK`), mode 0600. Use that file for troubleshooting through the admin tunnel;
+keep it separate from deploy credentials. `ops/rbac-check.sh` checks its bindings and rules
+statically and its permissions on the live cluster after each platform step.
+
 ### Going back past the previous release (the admin)
 
 The controller refuses a request with `rollback: older`, and `deploy.sh --rollback-older` stops

@@ -704,6 +704,19 @@ if has helm; then
   rc="$STG/ops/rbac-check.sh"
   cat "$TMP/platform.yaml" "$TMP/ruum.yaml" "$STG"/k8s/manifests/*.yaml >"$TMP/all.yaml"
   expect 0 "the rendered manifests let the deployer only write release requests" bash "$rc" static "$TMP/all.yaml"
+  # O-51: all three observer Roles have the complete, read-only troubleshooting rights.
+  awk '/^# Source: [a-z-]*\/templates\/observer-rbac.yaml/ {on=1; next} /^# Source:/ {on=0} on' "$TMP/platform.yaml" >"$TMP/observer-rbac.yaml"
+  for rule in \
+    '  - { apiGroups: [""], resources: [pods, events], verbs: [get, list, watch] }' \
+    '  - { apiGroups: [events.k8s.io], resources: [events], verbs: [get, list, watch] }' \
+    '  - { apiGroups: [apps], resources: [deployments, daemonsets, replicasets], verbs: [get, list, watch] }' \
+    '  - { apiGroups: [batch], resources: [jobs], verbs: [get, list, watch] }' \
+    '  - { apiGroups: [""], resources: [pods/log], verbs: [get] }'; do
+    [[ "$(grep -cxF "$rule" "$TMP/observer-rbac.yaml")" == 3 ]] &&
+      ok "all observer Roles grant $rule" || bad "observer Role missing $rule"
+  done
+  grep -qF 'kubernetes.io/service-account.name: observer' "$TMP/observer-rbac.yaml" &&
+    ok "observer has its own token Secret" || bad "observer token Secret missing"
   # Each way back to the Secrets is refused. rbac_mutant NAME DESCRIPTION SED: the deployer Role
   # of ruum gets one more rule (or the file another change), and the check must fail.
   rbac_mutant() {
@@ -711,6 +724,44 @@ if has helm; then
     cmp -s "$TMP/all.yaml" "$TMP/rbac-$1.yaml" && { bad "rbac mutant $1 changed nothing"; return; }
     expect 1 "rbac-check refuses $2" bash "$rc" static "$TMP/rbac-$1.yaml"
   }
+  OBSERVER_RULE='/resources: \[pods\/log\], verbs: \[get\] }/a\
+'
+  for resource in secrets configmaps pods/exec pods/attach pods/portforward pods/ephemeralcontainers serviceaccounts/token services '*'; do
+    rbac_mutant "observer-resource-${resource//\//-}" "observer reading $resource" "${OBSERVER_RULE}  - { apiGroups: [\"\"], resources: [$resource], verbs: [get] }"
+  done
+  for verb in create update patch delete deletecollection '*'; do
+    rbac_mutant "observer-verb-$verb" "observer $verb pods" "${OBSERVER_RULE}  - { apiGroups: [\"\"], resources: [pods], verbs: [$verb] }"
+  done
+  rbac_mutant observer-log-list "observer listing logs" 's/resources: \[pods\/log\], verbs: \[get\]/resources: [pods\/log], verbs: [get, list]/'
+  rbac_mutant observer-group "observer reading pods in the wrong API group" "${OBSERVER_RULE}  - { apiGroups: [apps], resources: [pods], verbs: [get] }"
+  rbac_mutant observer-unreadable "an unreadable observer rule" "${OBSERVER_RULE}  - apiGroups: [\"\"]"
+  rbac_mutant observer-missing "missing observer bindings" 's/name: observer$/name: other-observer/'
+  # Extra bindings must be checked too, including an observer named as a User.
+  for subject in ServiceAccount User Group; do
+    case "$subject" in
+      ServiceAccount) subject_name=observer ;;
+      User) subject_name=system:serviceaccount:ruum:observer ;;
+      Group) subject_name=system:serviceaccounts:ruum ;;
+    esac
+    cp "$TMP/all.yaml" "$TMP/observer-binding.yaml"
+    cat >>"$TMP/observer-binding.yaml" <<YAML
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: observer-extra
+  namespace: ruum
+subjects:
+  - kind: $subject
+    name: $subject_name
+    namespace: ruum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+YAML
+    expect 1 "observer cannot receive a ClusterRole through $subject" bash "$rc" static "$TMP/observer-binding.yaml"
+  done
   RUUM_RULE='/resourceNames: \[ruum-release\], verbs: \[get\] }/a\
 '
   rbac_mutant pods "the deployer creating a pod in ruum" "${RUUM_RULE}  - { apiGroups: [\"\"], resources: [pods], verbs: [create] }"
@@ -1149,6 +1200,15 @@ D=system:serviceaccount:ruum:deployer K=system:serviceaccount:ruum-deploy:deploy
 printf '%s\n' "$D ruum-deploy create configmaps -" "$D ruum get configmaps/ruum-release -" \
   "$K ruum create jobs.batch -" "$K ruum update leases.coordination.k8s.io/ruum-deploy -" "$K ruum patch deployments.apps -" \
   "$K edge patch daemonsets.apps -" "$K data create backups.postgresql.cnpg.io -" "$K ruum-deploy update configmaps -" >"$FA/allow"
+O=system:serviceaccount:ruum:observer
+for ns in ruum edge ruum-deploy; do
+  for resource in pods events events.events.k8s.io deployments.apps daemonsets.apps replicasets.apps jobs.batch; do
+    for verb in get list watch; do
+      echo "$O $ns $verb $resource -" >>"$FA/allow"
+    done
+  done
+  echo "$O $ns get pods log" >>"$FA/allow"
+done
 livecheck() { PATH="$FA/bin:$PATH" FAKE_ALLOW="$1" bash "$STG/ops/rbac-check.sh" live; }
 expect 0 "the live check passes when the deployer may only write release requests" livecheck "$FA/allow"
 for extra in "$D ruum create pods -" "$D ruum create jobs.batch -" "$D ruum get secrets -" "$D ruum get pods log" \
@@ -1167,6 +1227,27 @@ grep -vF "$K ruum create jobs.batch -" "$FA/allow" >"$FA/less"
 expect 1 "the live check fails when the controller cannot run the migration Job" livecheck "$FA/less"
 grep -vF "$D ruum-deploy create configmaps -" "$FA/allow" >"$FA/less"
 expect 1 "the live check fails when the deployer cannot write a request" livecheck "$FA/less"
+
+# O-51: check both denied rights and missing required observer rights in every namespace.
+for ns in ruum edge ruum-deploy; do
+  for extra in "get secrets -" "get configmaps -" "create pods -" "create pods exec" \
+    "create pods attach" "create pods portforward" "patch pods ephemeralcontainers" \
+    "create serviceaccounts token" "patch deployments.apps -"; do
+    { cat "$FA/allow"; echo "$O $ns $extra"; } >"$FA/more"
+    expect 1 "observer live check refuses $ns $extra" livecheck "$FA/more"
+  done
+  for missing in "get pods -" "get pods log" "list events -" "list events.events.k8s.io -"; do
+    grep -vxF "$O $ns $missing" "$FA/allow" >"$FA/less"
+    expect 1 "observer live check requires $ns $missing" livecheck "$FA/less"
+  done
+  grep -vxF "$O $ns get pods log" "$FA/allow" >"$FA/less"
+  echo "$O $ns get pods/log -" >>"$FA/less"
+  expect 1 "a pod named log does not grant observer logs in $ns" livecheck "$FA/less"
+done
+{ cat "$FA/allow"; echo "$O data get pods log"; } >"$FA/more"
+expect 1 "observer cannot read logs outside its three namespaces" livecheck "$FA/more"
+grep -qF 'bash "$STG/ops/deployer-kubeconfig.sh" observer' "$STG/k8s/apply.sh" &&
+  ok "platform writes the separate observer kubeconfig" || bad "platform does not write observer kubeconfig"
 
 echo "== the deploy controller image (O-34)"
 DF="$ROOT/deploy/images/ruum-deploy-controller.Dockerfile"

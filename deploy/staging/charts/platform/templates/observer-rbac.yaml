@@ -1,0 +1,45 @@
+# Troubleshooting only (backlog O-51). Separate from the deployer and controller.
+# Keep rules on one line: ops/rbac-check.sh checks every bound Role.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: observer
+  namespace: ruum
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: observer-token
+  namespace: ruum
+  annotations:
+    kubernetes.io/service-account.name: observer
+type: kubernetes.io/service-account-token
+{{- range list "ruum" "edge" "ruum-deploy" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: observer
+  namespace: {{ . }}
+rules:
+  - { apiGroups: [""], resources: [pods, events], verbs: [get, list, watch] }
+  - { apiGroups: [events.k8s.io], resources: [events], verbs: [get, list, watch] }
+  - { apiGroups: [apps], resources: [deployments, daemonsets, replicasets], verbs: [get, list, watch] }
+  - { apiGroups: [batch], resources: [jobs], verbs: [get, list, watch] }
+  - { apiGroups: [""], resources: [pods/log], verbs: [get] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: observer
+  namespace: {{ . }}
+subjects:
+  - kind: ServiceAccount
+    name: observer
+    namespace: ruum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: observer
+{{- end }}
