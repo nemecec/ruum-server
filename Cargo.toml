@@ -109,6 +109,11 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 rmcp = { version = "3.9.0", features = ["server", "transport-streamable-http-server", "transport-io"] }
 dav-server = { version = "0.11.0", default-features = false }
 
+# The Docker API client of the runtime driver (card R-2a; decision 0006 E-5/F). The `http` and
+# `pipe` features only (a Unix socket or plain HTTP to a local socket proxy): no TLS, no SSH,
+# no BuildKit.
+bollard = { version = "0.21.1", default-features = false, features = ["http", "pipe"] }
+
 # Tests
 proptest = "1.12.0"
 wiremock = "0.6.5"
