@@ -1,0 +1,62 @@
+# Loki for the laptop stack (card I-5, docs/DEVSTACK.md "Telemetry stack (profile apps)").
+# Single binary, local files in the named volume `loki`.
+#
+# Tenancy: auth_enabled is true, so every push and every query needs the X-Scope-OrgID header.
+# A request without it gets 401; there is no default tenant. One storage tenant per Ruum tenant;
+# the processor (card O-1b) sets the header from the workload identity, never an app.
+
+auth_enabled: true
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: warn
+
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Caps: the laptop disk filled once. Retention 72 hours; the compactor deletes older chunks.
+limits_config:
+  retention_period: 72h
+  max_query_lookback: 72h
+  reject_old_samples: true
+  reject_old_samples_max_age: 72h
+  allow_structured_metadata: true
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 8
+  per_stream_rate_limit: 1MB
+  per_stream_rate_limit_burst: 4MB
+  max_global_streams_per_user: 5000
+  max_line_size: 256KB
+  max_entries_limit_per_query: 5000
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 1h
+  delete_request_store: filesystem
+
+ruler:
+  enable_api: false
+
+analytics:
+  reporting_enabled: false

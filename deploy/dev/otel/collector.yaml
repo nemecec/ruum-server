@@ -1,0 +1,90 @@
+# The OpenTelemetry Collector of the laptop stack (card I-5; docs/DEVSTACK.md "Telemetry stack
+# (profile apps)"). A skeleton: card O-1b extends it.
+#
+# The Collector only forwards (decision 0006 answer 4). It has no classification, redaction or
+# pseudonym processor: the processor role of ruum-server does that before the data comes here.
+#
+# Tenancy: the processor is the only writer. It sends each request with the header
+# X-Scope-OrgID, the storage tenant that it took from the workload identity. The Collector copies
+# that header from the incoming request to the outgoing request (include_metadata on the receiver,
+# headers_setter with from_context on each exporter). It never sets a tenant itself. A request
+# without the header goes to the store without one, the store refuses it (401), and the Collector
+# returns the error to the sender: nothing is stored in a default tenant.
+#
+# The exporters send synchronously (no sending queue and no batch processor), so the request
+# context with the header stays with the data and a refusal reaches the sender.
+
+extensions:
+  headers_setter:
+    headers:
+      - action: upsert
+        key: X-Scope-OrgID
+        from_context: X-Scope-OrgID
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        include_metadata: true
+      http:
+        endpoint: 0.0.0.0:4318
+        include_metadata: true
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 160
+    spike_limit_mib: 32
+
+exporters:
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    auth:
+      authenticator: headers_setter
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      max_interval: 5s
+      max_elapsed_time: 15s
+  otlp_http/mimir:
+    endpoint: http://mimir:9009/otlp
+    auth:
+      authenticator: headers_setter
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      max_interval: 5s
+      max_elapsed_time: 15s
+  otlp_http/tempo:
+    endpoint: http://tempo:4318
+    auth:
+      authenticator: headers_setter
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      max_interval: 5s
+      max_elapsed_time: 15s
+
+service:
+  extensions: [headers_setter]
+  telemetry:
+    logs:
+      level: warn
+      # A refused write (no tenant header) is logged in one line, without a stack trace.
+      disable_stacktrace: true
+    metrics:
+      level: none
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [otlp_http/loki]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [otlp_http/mimir]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [otlp_http/tempo]

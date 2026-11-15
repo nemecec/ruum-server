@@ -1,0 +1,67 @@
+# Mimir for the laptop stack (card I-5, docs/DEVSTACK.md "Telemetry stack (profile apps)").
+# Monolithic mode (target all), blocks on the local file system in the named volume `mimir`.
+#
+# Tenancy: multitenancy_enabled is true, so every push and every query needs the X-Scope-OrgID
+# header. A request without it gets 401; there is no default tenant. One storage tenant per Ruum
+# tenant; the processor (card O-1b) sets the header from the workload identity, never an app.
+
+target: all
+multitenancy_enabled: true
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  log_level: warn
+
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/blocks
+  bucket_store:
+    sync_dir: /data/tsdb-sync
+  tsdb:
+    dir: /data/tsdb
+    # Local copies in the ingester after the upload to the block store.
+    retention_period: 6h
+
+compactor:
+  data_dir: /data/compactor
+  sharding_ring:
+    kvstore:
+      store: memberlist
+
+distributor:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: memberlist
+
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: memberlist
+    replication_factor: 1
+
+store_gateway:
+  sharding_ring:
+    replication_factor: 1
+
+ruler_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/rules
+
+# Caps: the laptop disk filled once. The compactor deletes blocks older than 72 hours. Per-tenant
+# ingestion and series limits keep one tenant from filling the disk.
+limits:
+  compactor_blocks_retention_period: 72h
+  ingestion_rate: 10000
+  ingestion_burst_size: 50000
+  max_global_series_per_user: 50000
+  max_global_series_per_metric: 10000
+  max_label_names_per_series: 30
+  max_query_lookback: 72h
+
+usage_stats:
+  enabled: false

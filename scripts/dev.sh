@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The Ruum laptop stack (docs/DESIGN.md section 12.2, docs/DEVSTACK.md).
 #
-#   scripts/dev.sh up [--step4] [--sso-mock]
+#   scripts/dev.sh up [--step4] [--sso-mock] [--apps]
 #                                 create .env on the first run, start, wait until healthy, init
-#                                 (--sso-mock: also the mock OIDC provider for sign-in tests)
+#                                 (--sso-mock: also the mock OIDC provider for sign-in tests;
+#                                 --apps: also the step 3 services, the telemetry stack first)
 #   scripts/dev.sh down           stop the stack (keeps the data)
 #   scripts/dev.sh clean          stop the stack and delete all its data (the local KEK file and
 #                                 the local SQLite files too)
@@ -32,6 +33,8 @@ ZITADEL_URL="http://localhost:8180"
 # No provenance attestation: it carries a build time, so every `up --build` would give the postgres
 # image a new ID and recreate the container (seen with buildx and the containerd image store).
 compose() { BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --project-directory "$DEV" -f "$DEV/docker-compose.yml" --env-file "$ENV_FILE" "$@"; }
+# Every profile, so that down, clean and status reach the services of each one.
+ALL_PROFILES=(--profile step4 --profile sso-mock --profile apps)
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
@@ -251,12 +254,13 @@ cmd_up() {
   mkdir -p "$STATE/zitadel"
   # Made here, not by docker: a bind mount that docker creates belongs to root.
   mkdir -p "$SQLITE_DIR"
-  local profile=() arg
+  local profile=() arg apps=0
   for arg in "$@"; do
     case "$arg" in
       --step4) profile+=(--profile step4) ;;
       --sso-mock) profile+=(--profile sso-mock) ;;
-      *) die "unknown option $arg (use --step4 or --sso-mock)" ;;
+      --apps) profile+=(--profile apps); apps=1 ;;
+      *) die "unknown option $arg (use --step4, --sso-mock or --apps)" ;;
     esac
   done
   log "building and starting postgres and postgres-data"
@@ -267,6 +271,7 @@ cmd_up() {
   log "starting the stack"
   compose ${profile[@]+"${profile[@]}"} up -d
   wait_healthy 300
+  ((apps == 0)) || wait_telemetry 180
   init_garage
   init_zitadel
   init_idps
@@ -278,6 +283,42 @@ cmd_up() {
   compose ${profile[@]+"${profile[@]}"} ps --format 'table {{.Service}}\t{{.Status}}'
 }
 
+# Ports of the telemetry stack (profile apps). A value in the environment wins over deploy/dev/.env,
+# as in docker compose. The defaults are the ones of docker-compose.yml.
+telemetry_ports() {
+  local saved_otlp_grpc=${RUUM_OTLP_GRPC_PORT:-} saved_otlp_http=${RUUM_OTLP_HTTP_PORT:-}
+  local saved_loki=${RUUM_LOKI_PORT:-} saved_mimir=${RUUM_MIMIR_PORT:-} saved_tempo=${RUUM_TEMPO_PORT:-}
+  load_env
+  OTLP_GRPC_PORT=${saved_otlp_grpc:-${RUUM_OTLP_GRPC_PORT:-4317}}
+  OTLP_HTTP_PORT=${saved_otlp_http:-${RUUM_OTLP_HTTP_PORT:-4318}}
+  LOKI_PORT=${saved_loki:-${RUUM_LOKI_PORT:-3100}}
+  MIMIR_PORT=${saved_mimir:-${RUUM_MIMIR_PORT:-9009}}
+  TEMPO_PORT=${saved_tempo:-${RUUM_TEMPO_PORT:-3200}}
+}
+
+# The telemetry images have no shell, so compose has no healthcheck for them. Wait until each
+# store answers on /ready and the Collector's OTLP HTTP port answers.
+wait_telemetry() {
+  telemetry_ports
+  local deadline=$((SECONDS + ${1:-180})) url pending
+  log "waiting for the telemetry stack (Loki, Mimir, Tempo, the Collector)"
+  while :; do
+    pending=()
+    for url in "http://127.0.0.1:$LOKI_PORT/ready" "http://127.0.0.1:$MIMIR_PORT/ready" "http://127.0.0.1:$TEMPO_PORT/ready"; do
+      curl -fsS -m 3 -o /dev/null "$url" 2>/dev/null || pending+=("$url")
+    done
+    # Any HTTP answer (405 for a GET) means that the receiver listens.
+    url="http://127.0.0.1:$OTLP_HTTP_PORT/v1/logs"
+    [[ "$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)" =~ ^[1-5][0-9][0-9]$ ]] || pending+=("$url")
+    ((${#pending[@]} == 0)) && return 0
+    if ((SECONDS > deadline)); then
+      compose --profile apps logs --tail=30 loki mimir tempo otel-collector >&2 || true
+      die "the telemetry stack is not ready in time: ${pending[*]}"
+    fi
+    sleep 3
+  done
+}
+
 cmd_seed() {
   ensure_databases
   ensure_data_cluster
@@ -287,7 +328,7 @@ cmd_seed() {
 }
 
 cmd_env() {
-  load_env
+  telemetry_ports # loads .env
   local apps="$STATE/zitadel/apps.env"
   # shellcheck disable=SC1090
   [[ -f "$apps" ]] && source "$apps"
@@ -328,6 +369,11 @@ export RUUM_OIDC_CLIENT_ID=${ZITADEL_WEB_CLIENT_ID:-}
 export RUUM_S3_ENDPOINT=http://127.0.0.1:3900
 export RUUM_S3_BUCKET=$S3_BUCKET
 export RUUM_SPICEDB_ENDPOINT=http://127.0.0.1:50051
+export RUUM_OTLP_ENDPOINT=http://127.0.0.1:$OTLP_HTTP_PORT
+export RUUM_OTLP_GRPC_ENDPOINT=http://127.0.0.1:$OTLP_GRPC_PORT
+export RUUM_LOKI_URL=http://127.0.0.1:$LOKI_PORT
+export RUUM_MIMIR_URL=http://127.0.0.1:$MIMIR_PORT
+export RUUM_TEMPO_URL=http://127.0.0.1:$TEMPO_PORT
 EOF
 }
 
@@ -342,16 +388,16 @@ main() {
   shift || true
   case "$cmd" in
     up) cmd_up "$@" ;;
-    down) ensure_env; compose --profile step4 --profile sso-mock down ;;
+    down) ensure_env; compose "${ALL_PROFILES[@]}" down ;;
     clean)
       ensure_env
-      compose --profile step4 --profile sso-mock down -v --remove-orphans
+      compose "${ALL_PROFILES[@]}" down -v --remove-orphans
       rm -rf "$STATE"
       clean_sqlite
       log "volumes, deploy/dev/.state (with the local KEK file) and deploy/dev/data/sqlite deleted (deploy/dev/.env is kept)"
       ;;
     logs) compose logs -f --tail=200 "$@" ;;
-    status) compose --profile step4 --profile sso-mock ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
+    status) compose "${ALL_PROFILES[@]}" ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
     psql)
       load_env
       local tty=()
@@ -362,7 +408,7 @@ main() {
     env) cmd_env ;;
     ca) cmd_ca ;;
     idps) init_idps "$@" ;;
-    *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$cmd" ]] || exit 1 ;;
+    *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$cmd" ]] || exit 1 ;;
   esac
 }
 

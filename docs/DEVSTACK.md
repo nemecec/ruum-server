@@ -12,10 +12,11 @@ You need Docker with Compose, `openssl`, `curl` and `jq`.
 | `scripts/dev.sh up` | On the first run, copies `deploy/dev/.env.example` to `deploy/dev/.env` with new random secrets. Later runs add the settings that `.env.example` has and `.env` lacks (for example the passwords of `postgres-data`). Makes the local KEK file `deploy/dev/.state/tenant-keys.kek` if it is missing (see "Tenant keys"). Starts the stack, waits until all services are healthy, and runs the init steps (Garage buckets `ruum-dev` and `ruum-sqlite` and the key, Zitadel project and OIDC apps, the OpenBao transit engine and key). You can run it again at any time. |
 | `scripts/dev.sh up --step4` | The same, and also starts Forgejo (compose profile `step4`). |
 | `scripts/dev.sh up --sso-mock` | The same, and also starts the mock OIDC provider (compose profile `sso-mock`) and adds it to Zitadel as "Mock SSO". The flags can go together. See "Sign-in providers". |
+| `scripts/dev.sh up --apps` | The same, and also starts the step 3 services (compose profile `apps`): today the telemetry stack. It waits until the stores answer on `/ready` and the Collector listens. See "Telemetry stack (profile apps)". |
 | `scripts/dev.sh idps` | Configures the sign-in providers of Zitadel again (`scripts/zitadel_idps.sh`). `up` does this too. |
 | `scripts/dev.sh idps check` | Starts the flow of each provider on the Zitadel login page without a password and stops at the provider. See "Sign-in providers". |
-| `scripts/dev.sh down` | Stops the stack. The data stays. |
-| `scripts/dev.sh clean` | Stops the stack and deletes all volumes and `deploy/dev/.state/`, with the local KEK file, and the local SQLite files in `deploy/dev/data/sqlite/`. It keeps `.env`. |
+| `scripts/dev.sh down` | Stops the stack, with the services of every profile (`step4`, `sso-mock`, `apps`). The data stays. |
+| `scripts/dev.sh clean` | Stops the stack and deletes all volumes (the telemetry volumes of the profile `apps` too) and `deploy/dev/.state/`, with the local KEK file, and the local SQLite files in `deploy/dev/data/sqlite/`. It keeps `.env`. |
 | `scripts/dev.sh logs [service]` | Follows the logs. |
 | `scripts/dev.sh status` | Shows the services and their health. |
 | `scripts/dev.sh psql [db]` | Opens `psql` as the `ruum` role. The default database is `ruum`. |
@@ -45,6 +46,10 @@ All ports bind to `127.0.0.1`. The stack does not use 5433, 8080, 8787 or 8788 (
 | 1025 | Mailpit SMTP |
 | 3001, 2222 | Forgejo web and SSH (profile `step4` only) |
 | 8190 | The mock OIDC provider, issuer `http://oidc-mock.localhost:8190/ruum` (profile `sso-mock` only) |
+| 4318, 4317 | The OpenTelemetry Collector: OTLP HTTP and OTLP gRPC (profile `apps` only; `RUUM_OTLP_HTTP_PORT`, `RUUM_OTLP_GRPC_PORT`) |
+| 3100 | Loki (profile `apps` only; `RUUM_LOKI_PORT`) |
+| 9009 | Mimir (profile `apps` only; `RUUM_MIMIR_PORT`) |
+| 3200 | Tempo (profile `apps` only; `RUUM_TEMPO_PORT`) |
 | 8490 | Reserved for the Ruum server on the host (`RUUM_BIND`, the server default). Caddy proxies `https://ruum.localhost` to it. |
 
 ## Services
@@ -379,6 +384,99 @@ changes (the Microsoft secret expires after 24 months):
    Mailpit, `http://localhost:8025`), then you land on your files.
 4. The other points of the manual checklist in `docs/TESTING.md` (an existing user with the same
    verified email, email grants).
+
+## Telemetry stack (profile apps)
+
+Card I-5 (`docs/STEP3.md` "Infrastructure work" 5). The stack keeps the logs, metrics and traces
+of the apps. It is in the compose profile `apps`, so `scripts/dev.sh up` without `--apps` does not
+start it (step 1 and 2 work does not pay its RAM and disk). Start it with `scripts/dev.sh up --apps`.
+
+### Services
+
+| Service | Image (version and multi-arch index digest) | Config |
+|---|---|---|
+| `otel-collector` | `otel/opentelemetry-collector-contrib:0.165.0@sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea` | `deploy/dev/otel/collector.yaml` |
+| `loki` (logs) | `grafana/loki:3.7.10@sha256:b43c257ccfc925d4a50b8717cac61a3b51df8c48d01847936057e5c4075a24a7` | `deploy/dev/telemetry/loki.yaml` |
+| `mimir` (metrics, monolithic mode) | `grafana/mimir:3.2.5@sha256:245ce851e2f5d27db6bd37720d9ab12bcb017f4b4e20340d9b58266435dbe4b6` | `deploy/dev/telemetry/mimir.yaml` |
+| `tempo` (traces) | `grafana/tempo:2.10.10@sha256:12b0820f13ffa10ce956b6e9acc3b03f3cffded99109be6cc09d106fe56e5d38` | `deploy/dev/telemetry/tempo.yaml` |
+
+Each digest is the digest of the multi-arch index (linux/amd64 and linux/arm64), so the same pin
+works on the Mac, the build server and CI. The images have no shell, so compose has no
+healthcheck for them; `dev.sh up --apps` waits for `/ready` of each store and for the Collector's
+OTLP HTTP port instead. There is no Grafana in the stack. Query the stores with `curl` and the
+header (see below), or point a Grafana of your own at the URLs with the header set.
+
+### The tenant header rule
+
+- The storage tenant is the HTTP header (or gRPC metadata) `X-Scope-OrgID`. One storage tenant
+  per Ruum tenant.
+- Loki (`auth_enabled: true`), Mimir (`multitenancy_enabled: true`) and Tempo
+  (`multitenancy_enabled: true`) need the header on every write and every query. A request
+  without it gets 401 (Tempo's OTLP write: 400 "no org id"). There is no default tenant.
+- The processor role of `ruum-server` (card O-1b) is the only writer. It decides the tenant from
+  the workload identity, never from what an app sends, and sends it in `X-Scope-OrgID`.
+- The Collector only forwards (decision 0006 answer 4). It copies `X-Scope-OrgID` from the
+  incoming request to the request to the store (`include_metadata` on the OTLP receiver,
+  `headers_setter` with `from_context` on each exporter). It never sets a tenant. It has no
+  classification, redaction or pseudonym processor: the Rust processor does that first.
+- A write without the header reaches the store without one; the store refuses it and the
+  Collector returns the error to the sender. The exporters have no sending queue, so the request
+  context with the header stays with the data and a refusal reaches the sender at once.
+
+### Network
+
+All ports bind to 127.0.0.1. The Collector and the stores are on the compose network `telemetry`
+only. No app network joins it, and no other service of the stack is on it. The processor on the
+host writes through the Collector's published port. Tempo's own OTLP receiver is not published.
+
+### Settings
+
+`scripts/dev.sh env` always prints these lines; without `--apps` nothing listens on them.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `RUUM_OTLP_ENDPOINT` | `http://127.0.0.1:4318` | The Collector's OTLP HTTP endpoint, for the processor (`/v1/logs`, `/v1/metrics`, `/v1/traces`) |
+| `RUUM_OTLP_GRPC_ENDPOINT` | `http://127.0.0.1:4317` | The same over OTLP gRPC (plain text, no TLS on the laptop) |
+| `RUUM_LOKI_URL` | `http://127.0.0.1:3100` | Loki query API (`/loki/api/v1/query_range`) |
+| `RUUM_MIMIR_URL` | `http://127.0.0.1:9009` | Mimir; the Prometheus query API is under `/prometheus/api/v1/` |
+| `RUUM_TEMPO_URL` | `http://127.0.0.1:3200` | Tempo query API (`/api/v2/traces/<trace id>`, `/api/search`) |
+
+The ports come from `RUUM_OTLP_HTTP_PORT`, `RUUM_OTLP_GRPC_PORT`, `RUUM_LOKI_PORT`,
+`RUUM_MIMIR_PORT` and `RUUM_TEMPO_PORT` in `deploy/dev/.env`. A value in the environment wins over
+`.env`, as in docker compose (the build server runs a second copy this way, with
+`COMPOSE_PROJECT_NAME` set).
+
+### Caps
+
+- Retention: 72 hours in each store (Loki `retention_period` with the compactor, Mimir
+  `compactor_blocks_retention_period`, Tempo `block_retention`). Loki and Mimir also refuse
+  queries older than 72 hours, and Loki refuses records older than 72 hours.
+- Per-tenant ingestion limits: Loki 4 MB/s (burst 8 MB, 5000 streams, 256 KB per line); Mimir
+  10000 samples/s (burst 50000, 50000 series); Tempo 4 MB/s (burst 8 MB, 10000 live traces, 2 MB
+  per trace).
+- Data: the named volumes `loki`, `mimir` and `tempo`. `dev.sh clean` deletes them.
+- Container logs: 3 files of 10 MB each, as every service of the stack.
+- Memory: the limits are Loki 384 MB, Mimir 512 MB, Tempo 384 MB and the Collector 256 MB, so
+  1.5 GB at most for the profile. Measured on the build server with `docker stats` after four
+  runs of the check (2026-11-15): Loki 88 MiB, Mimir 48 MiB, Tempo 57 MiB, the Collector
+  42 MiB, about 235 MiB together.
+
+### The check
+
+`scripts/telemetry_check.sh` writes one log line, one metric point and one span through the
+Collector with `X-Scope-OrgID: t-a`, and the same for `t-b`. It reads each record back from its
+store: found with its own tenant, not found with the other tenant, and refused without the
+header. "Not found" counts only after the same query found the record with its own tenant, and the
+script waits for ingestion for at most `RUUM_TELEMETRY_TIMEOUT` seconds (default 60). It also
+checks that a write without the header is refused, that every published port binds to 127.0.0.1
+only, and that the services are on the network `telemetry` only. It prints `PASS` or `FAIL` per
+check and exits non-zero on a failure. It needs `curl`, `jq`, `openssl` and `docker`.
+
+```sh
+scripts/dev.sh up --apps
+eval "$(scripts/dev.sh env)"
+scripts/telemetry_check.sh
+```
 
 ## Manual steps
 

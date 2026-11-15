@@ -1,0 +1,52 @@
+# Tempo for the laptop stack (card I-5, docs/DEVSTACK.md "Telemetry stack (profile apps)").
+# Single binary, local blocks in the named volume `tempo`.
+#
+# Tenancy: multitenancy_enabled is true, so every push and every query needs the X-Scope-OrgID
+# header. A request without it gets 401; there is no default tenant. One storage tenant per Ruum
+# tenant; the processor (card O-1b) sets the header from the workload identity, never an app.
+
+multitenancy_enabled: true
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+  log_level: warn
+
+# Only the Collector writes here (on the network `telemetry`); these ports are not published.
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  max_block_duration: 5m
+
+# Caps: the laptop disk filled once. Retention 72 hours.
+compactor:
+  compaction:
+    block_retention: 72h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 4000000
+      burst_size_bytes: 8000000
+      max_traces_per_user: 10000
+    global:
+      max_bytes_per_trace: 2000000
+
+usage_report:
+  reporting_enabled: false
