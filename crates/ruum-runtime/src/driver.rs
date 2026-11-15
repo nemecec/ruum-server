@@ -508,7 +508,7 @@ impl Inner {
                     network: net_id.to_owned(),
                     subnet,
                     identity: spec.identity,
-                    allow: Vec::new(),
+                    allow: None,
                 })
                 .await?;
             return Ok(true);
