@@ -1,0 +1,40 @@
+[package]
+name = "ruum-egress"
+description = "The egress proxy: the only way from an app or build sandbox to the internet (decision 23, 0006 answer 5). CONNECT only, address rules after resolution, per-app allow-lists, limits, byte counters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ruum-egress"
+path = "src/main.rs"
+
+[features]
+# Test-only hooks (a fake resolver is always injectable; this adds the switch that treats one
+# loopback socket address as public). Enabled only through the dev-dependency on the crate itself
+# below, so a `cargo build --release -p ruum-egress` (the image) never contains it, and no
+# environment variable can turn it on.
+test-hooks = []
+
+# Workspace dependencies only (decision 0006 section C: the proxy adds no new dependency).
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+ruum-egress = { path = ".", features = ["test-hooks"] }
+tempfile.workspace = true
