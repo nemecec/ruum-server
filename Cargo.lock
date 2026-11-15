@@ -3041,6 +3041,7 @@ dependencies = [
  "hex",
  "reqwest",
  "ruum-core",
+ "ruum-egress",
  "serde",
  "serde_json",
  "time",

@@ -28,6 +28,8 @@ ruum-mcp = { path = "crates/ruum-mcp" }
 ruum-webdav = { path = "crates/ruum-webdav" }
 ruum-testkit = { path = "crates/ruum-testkit" }
 ruum-dbengine = { path = "crates/ruum-dbengine" }
+# The egress proxy (card R-2e); the Docker driver (R-2a) uses its control API types.
+ruum-egress = { path = "crates/ruum-egress" }
 
 # Async runtime and HTTP
 tokio = { version = "1.54", features = ["full"] }
