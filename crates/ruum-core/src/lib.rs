@@ -29,6 +29,7 @@ pub mod runtime;
 pub mod search;
 pub mod sharing;
 pub mod tags;
+pub mod telemetry;
 pub mod tenants;
 pub mod usage;
 pub mod versions;
