@@ -1025,11 +1025,15 @@ impl AppStore for PgAppStore {
             if got {
                 return Ok(LiveSwitchLock::held(Box::new(tx)));
             }
-            tx.rollback().await?;
-            if tokio::time::Instant::now() >= deadline {
+            tokio::time::timeout_at(deadline, tx.rollback())
+                .await
+                .map_err(|_| busy())??;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return Err(busy());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(50)))
+                .await;
         }
     }
 

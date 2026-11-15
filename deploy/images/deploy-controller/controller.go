@@ -427,7 +427,7 @@ func keepToken(tok, before string, keep []string) bool {
 		return true
 	}
 	for _, k := range keep {
-		if len(k) >= 7 && strings.Contains(tok, k) && len(tok)-len(k) < 16 {
+		if len(k) >= 7 && tok == k {
 			return true
 		}
 	}
@@ -453,6 +453,12 @@ func maskKeyValues(s string) string {
 			continue
 		}
 		b.WriteString(s[pos:end])
+		// A cookie or Authorization value has several parts (a=b; session=..., Digest
+		// username="u", response="..."): the rest of the line goes.
+		if lk := strings.ToLower(key); strings.Contains(lk, "cookie") || strings.Contains(lk, "authorization") {
+			b.WriteString(masked)
+			return b.String()
+		}
 		n, all := valueLen(s[end:])
 		if all {
 			b.WriteString(masked)

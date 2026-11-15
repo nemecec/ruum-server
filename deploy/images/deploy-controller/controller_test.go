@@ -576,7 +576,19 @@ func TestRedactSecrets(t *testing.T) {
 			t.Errorf("redactSecrets(%q) = %q, want %q", in, got, want)
 		}
 	}
+	for in, want := range map[string]string{
+		"Cookie: a=b; session=hunter2":                                    "Cookie: [redacted]",
+		"set-cookie: sid=x; Path=/":                                       "set-cookie: [redacted]",
+		`Authorization: Digest username="u", response="0123456789abcdef"`: "Authorization: [redacted]",
+	} {
+		if got := redactSecrets(in); got != want {
+			t.Errorf("redactSecrets(%q) = %q, want %q", in, got, want)
+		}
+	}
 	commit := strings.Repeat("1a", 20)
+	if got := redactSecrets("t "+commit+"A", commit); got != "t [redacted]" {
+		t.Errorf("a token that contains the commit was kept: %q", got)
+	}
 	if got := redactSecrets("deployed "+commit, commit); got != "deployed "+commit {
 		t.Errorf("the request's commit was masked: %q", got)
 	}
