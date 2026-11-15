@@ -8,7 +8,8 @@ use ruum_core::runtime::{
     ImageRef, MemoryUsage, OciDigest, Route, RuntimeUsageSink, WorkloadIdentity,
 };
 use ruum_runtime::{
-    DockerConfig, DockerDriver, EgressRegistry, NoEgress, RuntimeKind, SharedContainer,
+    DockerConfig, DockerDriver, EgressRegistry, HttpEgressRegistry, NoEgress, RuntimeKind,
+    SharedContainer,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -95,12 +96,27 @@ pub struct Harness {
     pub shared: HashMap<Route, SharedContainer>,
     pub shared_network: String,
     pushed: Mutex<HashMap<(uuid::Uuid, uuid::Uuid), String>>,
+    /// The real egress proxy (card R-2e), when [`Harness::start_egress`] ran.
+    pub egress: Option<Egress>,
+}
+
+/// The egress proxy of R-2e (`deploy/images/ruum-egress`), built and started by the harness: on
+/// an outside network, with its control socket on a host folder and its token in a file.
+pub struct Egress {
+    pub container: String,
+    pub control: String,
+    pub registry: Arc<HttpEgressRegistry>,
+    pub deny: String,
+    pub dir: PathBuf,
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
         cleanup();
         let _ = std::fs::remove_dir_all(&self.state_dir);
+        if let Some(e) = &self.egress {
+            let _ = std::fs::remove_dir_all(&e.dir);
+        }
     }
 }
 
@@ -199,7 +215,122 @@ impl Harness {
             shared,
             shared_network,
             pushed: Mutex::new(HashMap::new()),
+            egress: None,
         }
+    }
+
+    /// Builds R-2e's image and starts the egress proxy in place of the stand-in. `deny` is its
+    /// `EGRESS_DENY` (the host's public addresses).
+    pub fn start_egress(&mut self, deny: &str) -> Result<(), String> {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let dockerfile = format!("{root}/deploy/images/ruum-egress/Dockerfile");
+        if !std::path::Path::new(&dockerfile).exists() {
+            return Err(format!(
+                "no {dockerfile}: R-2e's image recipe is not in this tree"
+            ));
+        }
+        let image = "ruum-egress:s3w3r2a";
+        docker(&[
+            "build",
+            "-q",
+            "--label",
+            LABEL,
+            "-f",
+            &dockerfile,
+            "-t",
+            image,
+            root,
+        ])?;
+        let id = run_id();
+        let out = format!("r2a-out-{id}");
+        docker(&["network", "create", "--label", LABEL, &out])?;
+        let dir = std::env::temp_dir().join(format!("r2a-egress-{id}"));
+        let ctl = dir.join("ctl");
+        std::fs::create_dir_all(&ctl).map_err(|e| e.to_string())?;
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let token_file = dir.join("token");
+        std::fs::write(&token_file, &token).map_err(|e| e.to_string())?;
+        let uid = Command::new("id")
+            .arg("-u")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let gid = Command::new("id")
+            .arg("-g")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let user = format!(
+            "{}:{}",
+            String::from_utf8_lossy(&uid.stdout).trim(),
+            String::from_utf8_lossy(&gid.stdout).trim()
+        );
+        let name = format!("r2a-egress-{id}");
+        let ctl_mount = format!("{}:/run/egress", ctl.display());
+        let token_mount = format!("{}:/run/egress-token/token:ro", token_file.display());
+        let deny_env = format!("EGRESS_DENY={deny}");
+        // The proxy runs as the calling user, so the control socket on the bind mount is usable
+        // by the test (the driver's process); production gives the volume to the server only.
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--label",
+            LABEL,
+            "--network",
+            &out,
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            &user,
+            "-v",
+            &ctl_mount,
+            "-v",
+            &token_mount,
+            "-e",
+            "RUUM_EGRESS_CONTROL=unix:/run/egress/control.sock",
+            "-e",
+            "RUUM_EGRESS_CONTROL_TOKEN_FILE=/run/egress-token/token",
+            "-e",
+            &deny_env,
+            image,
+        ])?;
+        let sock = ctl.join("control.sock");
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !sock.exists() {
+            return Err(format!(
+                "the egress proxy made no control socket: {}",
+                docker(&["logs", &name]).unwrap_or_default()
+            ));
+        }
+        let control = format!("unix:{}", sock.display());
+        let registry = Arc::new(
+            HttpEgressRegistry::new(&control, ruum_core::runtime::SecretValue::new(token))
+                .map_err(|e| e.to_string())?,
+        );
+        if let Some(s) = self.shared.get_mut(&Route::EgressProxy) {
+            let _ = docker(&["rm", "-f", &s.container]);
+            s.container = name.clone();
+        }
+        self.egress = Some(Egress {
+            container: name,
+            control,
+            registry,
+            deny: deny.to_owned(),
+            dir,
+        });
+        Ok(())
     }
 
     pub fn config(&self) -> DockerConfig {

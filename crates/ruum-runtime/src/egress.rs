@@ -4,7 +4,8 @@
 //! it removes the network.
 
 use async_trait::async_trait;
-use ruum_core::runtime::{RuntimeError, SecretValue, WorkloadIdentity};
+use ruum_core::runtime::{Environment, RuntimeError, SecretValue, WorkloadIdentity};
+use ruum_egress::api;
 use std::time::Duration;
 
 /// One app network as the egress proxy sees it.
@@ -17,10 +18,10 @@ pub struct EgressNetwork {
     /// The identity of the instance that created the network. A network holds the instances of
     /// one app and environment, so tenant, app and environment are the same for all of them.
     pub identity: WorkloadIdentity,
-    /// The app's `egress.allow` list; empty means every host passes the allow step (the
-    /// address rules still apply). The spec has no such field yet (a trait gap reported by
-    /// R-2a), so the driver registers an empty list.
-    pub allow: Vec<String>,
+    /// The app's `egress.allow` list. `None`: every host passes the allow step (the address
+    /// rules still apply); `Some(vec![])` would let no host pass. The spec has no such field
+    /// yet (a trait gap reported by R-2a), so the driver registers `None`.
+    pub allow: Option<Vec<String>>,
 }
 
 /// Registers app networks with the egress proxy.
@@ -47,10 +48,10 @@ impl EgressRegistry for NoEgress {
     }
 }
 
-/// The registry that calls the proxy's control listener (R-2e): `PUT /v1/networks/{id}` with
-/// `{subnet, identity, allow}` and `DELETE /v1/networks/{id}`, authenticated with the shared
-/// control token as a bearer token. The control listener is on a network that app networks
-/// cannot reach.
+/// The registry that calls the proxy's control listener (R-2e, `ruum_egress::api`):
+/// `PUT /v1/networks/{id}` with a [`api::NetworkRegistration`] and `DELETE /v1/networks/{id}`,
+/// with the shared control token as a bearer token. The control listener is a Unix socket on a
+/// volume only the server mounts (`unix:/path`), or an `http://` address for tests.
 pub struct HttpEgressRegistry {
     base: String,
     token: SecretValue,
@@ -58,25 +59,30 @@ pub struct HttpEgressRegistry {
 }
 
 impl HttpEgressRegistry {
-    /// `base` is the control listener (`http://host:port`); `token` the shared control token,
-    /// read from its file by the caller.
-    pub fn new(base: impl Into<String>, token: SecretValue) -> Result<Self, RuntimeError> {
-        let client = reqwest::Client::builder()
+    /// `control` is `unix:/path/to/control.sock` or `http://host:port`; `token` the shared
+    /// control token, read from its file by the caller.
+    pub fn new(control: &str, token: SecretValue) -> Result<Self, RuntimeError> {
+        let mut b = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .no_proxy()
-            .build()
-            .map_err(|e| RuntimeError::Internal {
-                reason: format!("the egress control client: {e}"),
-            })?;
+            .no_proxy();
+        let base = if let Some(path) = control.strip_prefix("unix:") {
+            b = b.unix_socket(std::path::PathBuf::from(path));
+            "http://egress".to_owned()
+        } else {
+            control.trim_end_matches('/').to_owned()
+        };
+        let client = b.build().map_err(|e| RuntimeError::Internal {
+            reason: format!("the egress control client: {e}"),
+        })?;
         Ok(Self {
-            base: base.into().trim_end_matches('/').to_owned(),
+            base,
             token,
             client,
         })
     }
 
     fn url(&self, network: &str) -> String {
-        format!("{}/v1/networks/{network}", self.base)
+        format!("{}{}/{network}", self.base, api::NETWORKS_PATH)
     }
 }
 
@@ -86,19 +92,28 @@ fn unavailable(what: &str, e: impl std::fmt::Display) -> RuntimeError {
     }
 }
 
+/// The proxy's form of the identity (the same fields; R-2e does not depend on `ruum-core`).
+pub(crate) fn proxy_identity(id: &WorkloadIdentity) -> api::WorkloadIdentity {
+    api::WorkloadIdentity {
+        tenant: id.tenant.0,
+        app: id.app.0,
+        deployment: id.deployment,
+        environment: match id.environment {
+            Environment::Live => api::Environment::Live,
+            Environment::Preview => api::Environment::Preview,
+        },
+    }
+}
+
 #[async_trait]
 impl EgressRegistry for HttpEgressRegistry {
     async fn register(&self, n: &EgressNetwork) -> Result<(), RuntimeError> {
-        let body = serde_json::json!({
-            "subnet": n.subnet,
-            "identity": {
-                "tenant": n.identity.tenant,
-                "app": n.identity.app,
-                "deployment": n.identity.deployment,
-                "environment": n.identity.environment,
-            },
-            "allow": n.allow,
-        });
+        let body = api::NetworkRegistration {
+            subnet: n.subnet.clone(),
+            identity: proxy_identity(&n.identity),
+            allow: n.allow.clone(),
+            limits: None,
+        };
         let r = self
             .client
             .put(self.url(&n.network))
