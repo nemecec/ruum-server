@@ -349,6 +349,84 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # ---------------------------------------------------------------------------------------------
+  # Profile apps (step 3). Not started by default: scripts/dev.sh up --apps. Step 1 and 2 work
+  # does not pay its RAM and disk (docs/STEP3.md area 8). Keep every service of the profile in
+  # this section. Card I-5 added the telemetry stack below; card I-4 adds the runtime services.
+  #
+  # The telemetry stack (docs/DEVSTACK.md "Telemetry stack (profile apps)"): the OpenTelemetry
+  # Collector and Loki, Mimir and Tempo, each with multi-tenancy on (the header X-Scope-OrgID is
+  # the storage tenant; no default tenant). They are on the network `telemetry` only, never on an
+  # app network: the processor role of ruum-server (on the host) is the only writer, through the
+  # Collector's published port. The images have no shell, so they have no healthcheck;
+  # `dev.sh up --apps` waits for their ready endpoints instead. Each image is pinned by version
+  # and by the digest of its multi-arch index (linux/amd64 and linux/arm64).
+  loki:
+    profiles: ["apps"]
+    image: grafana/loki:3.7.10@sha256:b43c257ccfc925d4a50b8717cac61a3b51df8c48d01847936057e5c4075a24a7
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./telemetry/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki:/loki
+    ports:
+      - "127.0.0.1:${RUUM_LOKI_PORT:-3100}:3100" # query and push API
+    networks:
+      - telemetry
+    mem_limit: 384m
+    restart: unless-stopped
+    logging: *logging
+
+  mimir:
+    profiles: ["apps"]
+    image: grafana/mimir:3.2.5@sha256:245ce851e2f5d27db6bd37720d9ab12bcb017f4b4e20340d9b58266435dbe4b6
+    command: ["-config.file=/etc/mimir/mimir.yaml"]
+    volumes:
+      - ./telemetry/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir:/data
+    ports:
+      - "127.0.0.1:${RUUM_MIMIR_PORT:-9009}:9009" # query (/prometheus) and push API
+    networks:
+      - telemetry
+    mem_limit: 512m
+    restart: unless-stopped
+    logging: *logging
+
+  tempo:
+    profiles: ["apps"]
+    image: grafana/tempo:2.10.10@sha256:12b0820f13ffa10ce956b6e9acc3b03f3cffded99109be6cc09d106fe56e5d38
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./telemetry/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo:/var/tempo
+    ports:
+      - "127.0.0.1:${RUUM_TEMPO_PORT:-3200}:3200" # query API (its OTLP receiver is not published)
+    networks:
+      - telemetry
+    mem_limit: 384m
+    restart: unless-stopped
+    logging: *logging
+
+  otel-collector:
+    profiles: ["apps"]
+    image: otel/opentelemetry-collector-contrib:0.165.0@sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea
+    command: ["--config=/etc/otelcol/collector.yaml"]
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol/collector.yaml:ro
+    ports:
+      - "127.0.0.1:${RUUM_OTLP_GRPC_PORT:-4317}:4317" # OTLP gRPC (from the processor only)
+      - "127.0.0.1:${RUUM_OTLP_HTTP_PORT:-4318}:4318" # OTLP HTTP (from the processor only)
+    networks:
+      - telemetry
+    depends_on:
+      - loki
+      - mimir
+      - tempo
+    mem_limit: 256m
+    restart: unless-stopped
+    logging: *logging
+  # End of the profile apps.
+  # ---------------------------------------------------------------------------------------------
+
 networks:
   data:
   # Zitadel and the mock OIDC provider. Zitadel's HTTP client refuses private addresses (its
@@ -358,6 +436,8 @@ networks:
     ipam:
       config:
         - subnet: 203.0.113.0/24
+  # The telemetry stores and the Collector (profile apps, card I-5). No app network joins it.
+  telemetry:
 
 volumes:
   postgres:
@@ -369,3 +449,7 @@ volumes:
   caddy-data:
   caddy-config:
   forgejo:
+  # Profile apps (card I-5): the telemetry stores. `dev.sh clean` deletes them.
+  loki:
+  mimir:
+  tempo:
