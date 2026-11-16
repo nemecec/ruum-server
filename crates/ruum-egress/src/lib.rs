@@ -119,6 +119,7 @@ pub async fn start(config: Config, opts: Options) -> std::io::Result<Running> {
         log: opts.log,
         connect_timeout: config.connect_timeout,
         head_timeout: config.head_timeout,
+        unknown: ProxyState::unknown_slots(),
     });
     let max = config.max_connections;
     let proxy_task = tokio::spawn(proxy::serve(listener, state, max));

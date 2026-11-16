@@ -10,16 +10,21 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::addr::{BadHost, Host, canonical, parse_host};
 use crate::api::{DENY_HEADER, DenyReason, WorkloadIdentity};
+use crate::limits::ConnectionPermit;
 use crate::policy::{Decision, EgressPolicy, Identified};
 use crate::resolver::Resolver;
 use crate::usage::Usage;
 
 /// The largest request head the proxy reads.
 pub const MAX_HEAD: usize = 8 * 1024;
+
+/// Client connections at once from sources in no registered network (all of them together). In
+/// normal operation there are none; the cap keeps them from taking the global connection cap.
+pub const MAX_UNKNOWN_CONNECTIONS: usize = 64;
 
 /// Everything a request needs.
 pub struct ProxyState {
@@ -31,6 +36,15 @@ pub struct ProxyState {
     pub connect_timeout: Duration,
     /// The request head must arrive within this time.
     pub head_timeout: Duration,
+    /// The slots of [`MAX_UNKNOWN_CONNECTIONS`] (see [`ProxyState::unknown_slots`]).
+    pub unknown: Arc<Semaphore>,
+}
+
+impl ProxyState {
+    /// The slots for connections from unknown sources.
+    pub fn unknown_slots() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_UNKNOWN_CONNECTIONS))
+    }
 }
 
 /// One line per request. It holds no path, query string, header or body.
@@ -120,7 +134,9 @@ impl LogSink for MemoryLog {
 }
 
 /// Accepts connections until the listener fails. At most `max_connections` at once over all
-/// sources; a connection above it is closed at once.
+/// sources; a connection above it is closed at once. Each accepted connection is admitted
+/// (identified by its source and counted against its identity's connection cap, see [`admit`])
+/// in this loop, before its request head is read.
 pub async fn serve(listener: TcpListener, state: Arc<ProxyState>, max_connections: usize) {
     let slots = Arc::new(Semaphore::new(max_connections));
     loop {
@@ -137,9 +153,10 @@ pub async fn serve(listener: TcpListener, state: Arc<ProxyState>, max_connection
             continue;
         };
         let _ = stream.set_nodelay(true);
+        let admission = admit(&state, peer);
         let state = state.clone();
         tokio::spawn(async move {
-            handle(&state, peer, stream).await;
+            run(&state, peer, admission, stream).await;
             drop(slot);
         });
     }
@@ -238,8 +255,57 @@ async fn read_head<S: AsyncRead + Unpin>(
     tokio::time::timeout(timeout, read).await.ok().flatten()
 }
 
-/// Handles one client connection from `peer`.
-pub async fn handle<S>(state: &ProxyState, peer: SocketAddr, mut client: S)
+/// What [`admit`] decided for one connection, before its request head is read.
+pub enum Admission {
+    /// The connection holds a slot: its identity's connection slot, or one of the unknown
+    /// sources' slots (`who` is `None`).
+    Admitted { who: Option<Identified>, slot: Slot },
+    /// No slot was free: the identity holds `max_tunnels + PENDING_ALLOWANCE` connections, or
+    /// the unknown sources hold [`MAX_UNKNOWN_CONNECTIONS`]. The connection is refused at once,
+    /// without waiting for its head.
+    Full { who: Option<Identified> },
+}
+
+/// The slot an admitted connection holds until it closes.
+pub enum Slot {
+    Identity(ConnectionPermit),
+    Unknown(OwnedSemaphorePermit),
+}
+
+/// Identifies a new connection by its source address (only the network it came from) and takes
+/// a connection slot for it. Called right after accept and before anything is read, so a
+/// connection that sends nothing counts against its own identity, never against other apps.
+pub fn admit(state: &ProxyState, peer: SocketAddr) -> Admission {
+    let who = state.policy.identify(canonical(peer.ip()));
+    match who {
+        Some(w) => match w.limit_state.try_open_connection(&w.limits) {
+            Some(p) => Admission::Admitted {
+                who: Some(w),
+                slot: Slot::Identity(p),
+            },
+            None => Admission::Full { who: Some(w) },
+        },
+        None => match state.unknown.clone().try_acquire_owned() {
+            Ok(p) => Admission::Admitted {
+                who: None,
+                slot: Slot::Unknown(p),
+            },
+            Err(_) => Admission::Full { who: None },
+        },
+    }
+}
+
+/// Handles one client connection from `peer`: [`admit`], then [`run`].
+pub async fn handle<S>(state: &ProxyState, peer: SocketAddr, client: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let admission = admit(state, peer);
+    run(state, peer, admission, client).await;
+}
+
+/// Handles one admitted (or refused) client connection from `peer`.
+pub async fn run<S>(state: &ProxyState, peer: SocketAddr, admission: Admission, mut client: S)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -251,6 +317,22 @@ where
         port: 0,
         resolved: None,
     };
+    let _slot = match admission {
+        Admission::Admitted { who, slot } => {
+            ctx.who = who;
+            slot
+        }
+        Admission::Full { who } => {
+            // Answered at once (the head is not read) and closed.
+            let reason = if who.is_some() {
+                DenyReason::Limit
+            } else {
+                DenyReason::UnknownSource
+            };
+            ctx.who = who;
+            return deny(state, &ctx, &mut client, reason).await;
+        }
+    };
     let Some((head, rest)) = read_head(&mut client, state.head_timeout).await else {
         return;
     };
@@ -261,9 +343,8 @@ where
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or_default();
 
-    // 1. Who: only the network the connection came from.
-    let source = ctx.source;
-    ctx.who = state.policy.identify(source);
+    // 1. Who: only the network the connection came from, decided at accept (`admit`), never
+    // from anything in the head.
     let Some(who) = ctx.who.clone() else {
         return deny(state, &ctx, &mut client, DenyReason::UnknownSource).await;
     };

@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 
 use crate::api::Limits;
 
+/// Client connections an identity may hold open beyond its tunnels: connections that are still
+/// sending their request head (or are being refused). With the tunnels, this bounds what one app
+/// can take from the proxy's global connection cap, so connections that send nothing (slowloris)
+/// cannot stop the egress of other apps.
+pub const PENDING_ALLOWANCE: u32 = 16;
+
 /// The limits of one identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LimitConfig {
@@ -55,6 +61,8 @@ impl LimitConfig {
 #[derive(Debug)]
 pub struct LimitState {
     open: AtomicU32,
+    /// Client connections from the identity's networks, from accept to close.
+    connections: AtomicU32,
     bucket: Mutex<Bucket>,
 }
 
@@ -71,6 +79,7 @@ impl LimitState {
     pub fn new(cfg: &LimitConfig) -> Arc<LimitState> {
         Arc::new(LimitState {
             open: AtomicU32::new(0),
+            connections: AtomicU32::new(0),
             bucket: Mutex::new(Bucket {
                 tokens: f64::from(cfg.burst),
                 last: Instant::now(),
@@ -109,6 +118,33 @@ impl LimitState {
     pub fn open_tunnels(&self) -> u32 {
         self.open.load(Ordering::Acquire)
     }
+
+    /// Takes a connection slot at accept, before the request head is read: at most
+    /// `max_tunnels + PENDING_ALLOWANCE` client connections of the identity at once. The slot is
+    /// given back when the permit is dropped (the connection closes).
+    pub fn try_open_connection(self: &Arc<Self>, cfg: &LimitConfig) -> Option<ConnectionPermit> {
+        let max = cfg.max_tunnels.saturating_add(PENDING_ALLOWANCE);
+        self.connections
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| ConnectionPermit(self.clone()))
+    }
+
+    pub fn open_connections(&self) -> u32 {
+        self.connections.load(Ordering::Acquire)
+    }
+}
+
+/// One open client connection of an identity.
+#[derive(Debug)]
+pub struct ConnectionPermit(Arc<LimitState>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One open tunnel of an identity.
@@ -142,6 +178,23 @@ mod tests {
         drop(_c);
         assert!(s.try_acquire(&cfg).is_none(), "the bucket is empty");
         assert_eq!(s.open_tunnels(), 1);
+    }
+
+    #[test]
+    fn connections_beyond_tunnels() {
+        let cfg = LimitConfig {
+            max_tunnels: 2,
+            ..LimitConfig::default()
+        };
+        let s = LimitState::new(&cfg);
+        let held: Vec<_> = (0..2 + PENDING_ALLOWANCE)
+            .map(|_| s.try_open_connection(&cfg).unwrap())
+            .collect();
+        assert!(s.try_open_connection(&cfg).is_none(), "over the cap");
+        assert_eq!(s.open_connections(), 2 + PENDING_ALLOWANCE);
+        drop(held);
+        assert_eq!(s.open_connections(), 0);
+        assert!(s.try_open_connection(&cfg).is_some(), "a slot came back");
     }
 
     #[test]
