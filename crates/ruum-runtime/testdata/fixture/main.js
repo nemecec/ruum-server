@@ -79,9 +79,15 @@ function udp(host, port) {
 
 function metadataGet() {
   return new Promise((resolve) => {
+    // The app's default agent: with NODE_USE_ENV_PROXY=1 and HTTP_PROXY (the egress route) the
+    // request goes to the egress proxy, whose own refusal (deny header) is not an answer of the
+    // metadata service.
     const req = http.get({ host: '169.254.169.254', path: '/latest/meta-data/', timeout: T }, (res) => {
       res.resume();
-      resolve({ reached: true, outcome: 'connected', detail: `HTTP ${res.statusCode}` });
+      const deny = res.headers['x-ruum-egress-deny'] || null;
+      resolve(deny
+        ? { reached: false, outcome: 'denied', deny, status: res.statusCode, detail: `proxy ${res.statusCode} deny=${deny}` }
+        : { reached: true, outcome: 'connected', detail: `HTTP ${res.statusCode}` });
     });
     req.once('timeout', () => { req.destroy(); resolve({ reached: false, outcome: 'timeout', detail: 'timeout' }); });
     req.once('error', (e) => resolve({ reached: false, outcome: 'error', detail: e.code || e.message }));
@@ -92,7 +98,8 @@ function metadataGet() {
 function viaProxy(proxy, target) {
   const [phost, pport] = proxy.replace(/^http:\/\//, '').split(':');
   return new Promise((resolve) => {
-    const req = http.request({ host: phost, port: Number(pport), method: 'CONNECT', path: target, timeout: 8000 });
+    // agent: false: talk to the proxy itself, not through the env-proxy agent of NODE_USE_ENV_PROXY.
+    const req = http.request({ host: phost, port: Number(pport), method: 'CONNECT', path: target, timeout: 8000, agent: false });
     req.once('connect', (res, socket) => {
       socket.destroy();
       const deny = res.headers['x-ruum-egress-deny'] || null;
@@ -296,7 +303,8 @@ async function main(args) {
       case 'token-kept': out(`kept=${kept}\n`); break;
       case 'udp-echo': udpEcho(Number(rest)); break;
       case 'probe': await probe(JSON.parse(rest)); out('probe-done\n'); break;
-      case 'hold': return new Promise(() => {});
+      // A timer keeps the event loop (and the process) alive: a bare pending promise does not.
+      case 'hold': setInterval(() => {}, 1 << 30); return new Promise(() => {});
       default: err(`unknown step ${verb}\n`); process.exit(64);
     }
   }

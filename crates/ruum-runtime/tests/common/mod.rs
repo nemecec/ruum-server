@@ -248,9 +248,9 @@ impl Harness {
         let ctl = dir.join("ctl");
         std::fs::create_dir_all(&ctl).map_err(|e| e.to_string())?;
         let token = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
+            "{:032x}{:032x}",
+            rand::random::<u128>(),
+            rand::random::<u128>()
         );
         let token_file = dir.join("token");
         std::fs::write(&token_file, &token).map_err(|e| e.to_string())?;
@@ -289,6 +289,12 @@ impl Harness {
             "no-new-privileges",
             "--user",
             &user,
+            // A shared container is the only hop between app networks: it forwards nothing
+            // (I-4 starts the production container with the same sysctls).
+            "--sysctl",
+            "net.ipv4.ip_forward=0",
+            "--sysctl",
+            "net.ipv6.conf.all.forwarding=0",
             "-v",
             &ctl_mount,
             "-v",
