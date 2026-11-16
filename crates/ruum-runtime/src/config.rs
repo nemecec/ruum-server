@@ -149,25 +149,10 @@ impl DockerConfig {
         }
     }
 
-    /// Reads the settings of the environment: `RUUM_DOCKER_HOST`, `RUUM_RUNTIME_DRIVER`
-    /// (default `docker`), `RUUM_REGISTRY` and `RUUM_RUNTIME_STATE_DIR` are required or have the
-    /// defaults named; the shared containers are added by the wiring (I-4).
-    pub fn from_env() -> Result<Self, RuntimeError> {
-        let need = |name: &str| {
-            std::env::var(name).map_err(|_| RuntimeError::Internal {
-                reason: format!("{name} is not set"),
-            })
-        };
-        let mut c = Self::new(
-            need("RUUM_DOCKER_HOST")?,
-            need("RUUM_REGISTRY")?,
-            PathBuf::from(need("RUUM_RUNTIME_STATE_DIR")?),
-        );
-        if let Ok(v) = std::env::var("RUUM_RUNTIME_DRIVER") {
-            c.runtime = RuntimeKind::parse(&v)?;
-        }
-        Ok(c)
-    }
+    // No `from_env` here: the server's wiring (I-4) reads `RUUM_DOCKER_HOST`,
+    // `RUUM_RUNTIME_DRIVER`, `RUUM_REGISTRY` and `RUUM_RUNTIME_STATE_DIR`, lists them in
+    // `crates/ruum-server/env-names.txt` (the staging guard compares that list with the code) and
+    // builds this configuration with [`DockerConfig::new`] and [`RuntimeKind::parse`].
 
     pub(crate) fn check(&self) -> Result<(), RuntimeError> {
         let bad = |reason: String| Err(RuntimeError::Internal { reason });

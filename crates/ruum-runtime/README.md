@@ -13,6 +13,9 @@ through `bollard` 0.21.1 (features `http` and `pipe` only: no TLS). The OCI runt
 | `RUUM_REGISTRY` | The local registry (`host:port`). The driver pulls `RUUM_REGISTRY/ruum/<tenant>/<app>@<digest>` only. |
 | `RUUM_RUNTIME_STATE_DIR` | A folder on the engine's host for the workload token files (0700 per instance). |
 
+The crate reads no environment itself: the server's wiring (I-4) reads these settings, adds them
+to `crates/ruum-server/env-names.txt` and builds `DockerConfig`. Only the tests read them here.
+
 The shared containers per route (egress proxy, internal gateway, pooler: container, alias,
 port) come from the wiring (`DockerConfig::routes`), never from a spec.
 
