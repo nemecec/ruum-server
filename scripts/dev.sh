@@ -396,7 +396,7 @@ main() {
       clean_sqlite
       log "volumes, deploy/dev/.state (with the local KEK file) and deploy/dev/data/sqlite deleted (deploy/dev/.env is kept)"
       ;;
-    logs) compose logs -f --tail=200 "$@" ;;
+    logs) compose "${ALL_PROFILES[@]}" logs -f --tail=200 "$@" ;;
     status) compose "${ALL_PROFILES[@]}" ps --format 'table {{.Service}}\t{{.Status}}\t{{.Ports}}' ;;
     psql)
       load_env

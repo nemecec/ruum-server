@@ -421,7 +421,9 @@ services:
       - loki
       - mimir
       - tempo
-    mem_limit: 256m
+    # 384 MB: memory_limiter holds the Go heap at 160 MiB, but the container (heap, runtime and
+    # page cache) was seen at 224 MiB, too close to the earlier 256 MB limit.
+    mem_limit: 384m
     restart: unless-stopped
     logging: *logging
   # End of the profile apps.

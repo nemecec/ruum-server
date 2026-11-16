@@ -17,7 +17,7 @@ You need Docker with Compose, `openssl`, `curl` and `jq`.
 | `scripts/dev.sh idps check` | Starts the flow of each provider on the Zitadel login page without a password and stops at the provider. See "Sign-in providers". |
 | `scripts/dev.sh down` | Stops the stack, with the services of every profile (`step4`, `sso-mock`, `apps`). The data stays. |
 | `scripts/dev.sh clean` | Stops the stack and deletes all volumes (the telemetry volumes of the profile `apps` too) and `deploy/dev/.state/`, with the local KEK file, and the local SQLite files in `deploy/dev/data/sqlite/`. It keeps `.env`. |
-| `scripts/dev.sh logs [service]` | Follows the logs. |
+| `scripts/dev.sh logs [service]` | Follows the logs (of the running services of every profile). |
 | `scripts/dev.sh status` | Shows the services and their health. |
 | `scripts/dev.sh psql [db]` | Opens `psql` as the `ruum` role. The default database is `ruum`. |
 | `scripts/dev.sh seed` | Creates the missing roles, databases and extensions, and runs the set-up of the data cluster again. The seed of tenants, users, an agent key and sample files comes with the core service. |
@@ -413,6 +413,14 @@ header (see below), or point a Grafana of your own at the URLs with the header s
 - Loki (`auth_enabled: true`), Mimir (`multitenancy_enabled: true`) and Tempo
   (`multitenancy_enabled: true`) need the header on every write and every query. A request
   without it gets 401 (Tempo's OTLP write: 400 "no org id"). There is no default tenant.
+- One tenant ID per request. The stores have cross-tenant queries off (Loki
+  `querier.multi_tenant_queries_enabled: false`, Mimir `tenant_federation.enabled: false`, Tempo
+  `query_frontend.multi_tenant_queries_enabled: false`; Tempo 2.10 has them on by default, the
+  other two are set so that a later default cannot open them). A header that joins tenants with
+  `|` (`t-b|t-a`) is refused for writes and queries in all three stores. Queries: Loki 500
+  "multiple org IDs present" (after its query retries, about 17 seconds), Mimir 422, Tempo 400.
+  Writes through the Collector: the sender gets 400 from Loki and Tempo, and 500 for Mimir's
+  422. A reader never builds the header from input.
 - The processor role of `ruum-server` (card O-1b) is the only writer. It decides the tenant from
   the workload identity, never from what an app sends, and sends it in `X-Scope-OrgID`.
 - The Collector only forwards (decision 0006 answer 4). It copies `X-Scope-OrgID` from the
@@ -456,21 +464,32 @@ The ports come from `RUUM_OTLP_HTTP_PORT`, `RUUM_OTLP_GRPC_PORT`, `RUUM_LOKI_POR
   per trace).
 - Data: the named volumes `loki`, `mimir` and `tempo`. `dev.sh clean` deletes them.
 - Container logs: 3 files of 10 MB each, as every service of the stack.
-- Memory: the limits are Loki 384 MB, Mimir 512 MB, Tempo 384 MB and the Collector 256 MB, so
-  1.5 GB at most for the profile. Measured on the build server with `docker stats` after four
-  runs of the check (2026-11-15): Loki 88 MiB, Mimir 48 MiB, Tempo 57 MiB, the Collector
-  42 MiB, about 235 MiB together.
+- Memory: the limits are Loki 384 MB, Mimir 512 MB, Tempo 384 MB and the Collector 384 MB, so
+  about 1.66 GB at most for the profile. The Collector's `memory_limiter` holds its Go heap at
+  160 MiB; its limit was 256 MB until one sample showed the container at 224 MiB (heap, runtime
+  and page cache), so it got the headroom. Measured on the build server with `docker stats`
+  after runs of the check:
+
+  | Date | When | Loki | Mimir | Tempo | Collector | Together |
+  |---|---|---|---|---|---|---|
+  | 2026-11-15 | after four runs | 88 MiB | 48 MiB | 57 MiB | 42 MiB | about 235 MiB |
+  | 2026-11-16 | after one run (the highest sample) | 152 MiB | 140 MiB | 103 MiB | 224 MiB | about 620 MiB |
+  | 2026-11-16 | after three runs, new stack | 114 MiB | 99 MiB | 90 MiB | 82 MiB | about 385 MiB |
+
+  Plan for about 650 MiB in use and 1.66 GB at the limits.
 
 ### The check
 
 `scripts/telemetry_check.sh` writes one log line, one metric point and one span through the
 Collector with `X-Scope-OrgID: t-a`, and the same for `t-b`. It reads each record back from its
-store: found with its own tenant, not found with the other tenant, and refused without the
-header. "Not found" counts only after the same query found the record with its own tenant, and the
-script waits for ingestion for at most `RUUM_TELEMETRY_TIMEOUT` seconds (default 60). It also
-checks that a write without the header is refused, that every published port binds to 127.0.0.1
-only, and that the services are on the network `telemetry` only. It prints `PASS` or `FAIL` per
-check and exits non-zero on a failure. It needs `curl`, `jq`, `openssl` and `docker`.
+store: found with its own tenant, not found with the other tenant, not found with both tenants in
+one header (`t-b|t-a`), and refused without the header. "Not found" counts only after the same
+query found the record with its own tenant, and the script waits for ingestion for at most
+`RUUM_TELEMETRY_TIMEOUT` seconds (default 60). It also checks that a write without the header is
+refused (a 4xx), that every published port binds to 127.0.0.1 only, and that the services are on
+the network `telemetry` only. It prints `PASS` or `FAIL` per check and exits non-zero on a
+failure. A run takes about 40 seconds (Loki's refusal of a two-tenant query is slow). It needs
+`curl`, `jq`, `openssl` and `docker`.
 
 ```sh
 scripts/dev.sh up --apps
