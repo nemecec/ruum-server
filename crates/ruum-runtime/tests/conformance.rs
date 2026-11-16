@@ -6,7 +6,7 @@
 mod common;
 
 use async_trait::async_trait;
-use common::{Harness, engine_or_skip, new_usage};
+use common::{Harness, engine_or_skip, new_usage, show};
 use ruum_core::runtime::conformance::{self, DriverFixture, Timing};
 use ruum_core::runtime::{ImageRef, MemoryUsage, RuntimeDriver, WorkloadIdentity};
 use std::sync::Arc;
@@ -53,6 +53,10 @@ async fn the_docker_driver_passes_the_conformance_suite() {
         usage,
     };
     let report = conformance::run(&f).await;
-    println!("{}", report.summary());
+    show(&format!(
+        "conformance [{}]\n{}",
+        f.driver.name(),
+        report.summary()
+    ));
     report.assert_ok();
 }

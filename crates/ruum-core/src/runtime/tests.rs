@@ -7,8 +7,9 @@ use super::memory::{
 };
 use super::program::{self, Step};
 use super::redact::{
-    LineRedactor, MAX_LINE_BYTES, MAX_SECRET_VALUE_BYTES, REDACTED, check_secret_value,
-    find_matches, find_matches_naive, redact,
+    LineRedactor, MAX_LINE_BYTES, MAX_SECRET_TOTAL_BYTES, MAX_SECRET_VALUE_BYTES,
+    MAX_SECRET_VALUES, REDACTED, check_secret_set, check_secret_value, find_matches,
+    find_matches_naive, marker_for, redact,
 };
 use super::*;
 use bytes::Bytes;
@@ -729,6 +730,111 @@ fn a_value_the_marker_rebuilds_hides_the_line() {
     let mut lines = texts(r.push("ok\nsecret>xx\n", at()));
     lines.extend(texts(r.finish(at())));
     assert_eq!(lines, vec!["ok".to_owned(), REDACTED.to_owned()]);
+}
+
+#[test]
+fn a_value_inside_the_marker_never_comes_out() {
+    // Kimi review of R-2a, finding 5: "secret" is part of "<hidden secret>", so the marker
+    // would show the value again. The redactor then uses a marker without it.
+    for value in [
+        "secret",
+        "hidden",
+        "<hidden secret>",
+        "e",
+        "<",
+        "*",
+        "hidden secret",
+    ] {
+        let text = format!("a {value} b\nok 42\n{value}{value}\n");
+        let whole = redact(&text, &[value]);
+        assert!(!whole.contains(value), "{value:?}: {whole:?}");
+        assert!(whole.contains("ok 42"), "{value:?}: {whole:?}");
+        let mut r = LineRedactor::new([value]);
+        let mut lines = Vec::new();
+        for b in text.as_bytes() {
+            lines.extend(texts(r.push_bytes(&[*b], at())));
+        }
+        lines.extend(texts(r.finish(at())));
+        assert!(
+            lines.iter().all(|l| !l.contains(value)),
+            "{value:?}: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l == "ok 42"), "{value:?}: {lines:?}");
+    }
+    assert_eq!(marker_for(&["token-value"]), REDACTED);
+    assert_eq!(marker_for(&["secret"]), "<hidden>");
+    assert_eq!(marker_for(&["hidden", "*"]), "");
+    // A value added later changes the marker too.
+    let mut r = LineRedactor::new(["first-token"]);
+    r.add("secret");
+    let lines = texts(r.push("first-token secret\n", at()));
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.contains("secret") && !l.contains("first-token"))
+    );
+}
+
+#[test]
+fn the_secret_set_is_bounded() {
+    let many: Vec<String> = (0..=MAX_SECRET_VALUES).map(|i| format!("v{i}")).collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(check_secret_set(&refs[..MAX_SECRET_VALUES]).is_ok());
+    assert!(matches!(
+        check_secret_set(&refs),
+        Err(RuntimeError::InvalidSpec { .. })
+    ));
+    let big = "x".repeat(MAX_SECRET_VALUE_BYTES);
+    let n = MAX_SECRET_TOTAL_BYTES / MAX_SECRET_VALUE_BYTES;
+    let fits: Vec<&str> = std::iter::repeat_n(big.as_str(), n).collect();
+    assert!(check_secret_set(&fits).is_ok());
+    let over: Vec<&str> = std::iter::repeat_n(big.as_str(), n + 1).collect();
+    assert!(matches!(
+        check_secret_set(&over),
+        Err(RuntimeError::InvalidSpec { .. })
+    ));
+}
+
+#[test]
+fn replaced_values_are_redacted_from_then_on() {
+    let mut r = LineRedactor::new(["old-token", "keep-me"]);
+    assert!(r.push("old-tok", at()).is_empty());
+    r.set_values(["new-token", "keep-me"]);
+    let lines = texts(r.push("en new-token keep-me\n", at()));
+    // The dropped value is no longer redacted; the held-back text went through the new set.
+    assert_eq!(lines, vec![format!("old-token {REDACTED} {REDACTED}")]);
+}
+
+#[test]
+fn many_values_that_are_suffixes_of_one_another_cost_bounded_time() {
+    // Kimi review of R-2a, finding 6: values "a", "aa", ... are each a suffix of the next, so
+    // every "a" of the output ends a match of each of them. The set is bounded
+    // (MAX_SECRET_VALUES), and the line check is one pass through the automaton, not one
+    // search per value, so 64 KiB of "a" in one-byte writes stays fast.
+    let values: Vec<String> = (1..=MAX_SECRET_VALUES).map(|n| "a".repeat(n)).collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    assert!(check_secret_set(&refs).is_ok());
+    let mut text = String::new();
+    while text.len() < 64 * 1024 {
+        text.push_str(&"a".repeat(1000));
+        text.push_str("x\n");
+    }
+    let mut r = LineRedactor::new(refs.iter().copied());
+    let begun = std::time::Instant::now();
+    let mut out = Vec::new();
+    for b in text.as_bytes() {
+        out.extend(texts(r.push(std::str::from_utf8(&[*b]).unwrap(), at())));
+    }
+    out.extend(texts(r.finish(at())));
+    let took = begun.elapsed();
+    assert!(
+        took < Duration::from_secs(4),
+        "64 KiB with {MAX_SECRET_VALUES} suffix values took {took:?}"
+    );
+    assert!(out.iter().all(|l| !l.contains('a')), "{:?}", out.first());
+    let whole = redact(&text, &refs);
+    let whole = whole.strip_suffix('\n').unwrap_or(&whole);
+    assert_eq!(out, whole.split('\n').collect::<Vec<_>>());
 }
 
 #[test]

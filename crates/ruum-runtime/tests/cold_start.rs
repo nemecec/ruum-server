@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Harness, engine_or_skip, new_usage};
+use common::{Harness, engine_or_skip, new_usage, show};
 use ruum_core::ids::{NodeId, TenantId};
 use ruum_core::runtime::program::{self, Step};
 use ruum_core::runtime::{
@@ -84,13 +84,13 @@ async fn a_stopped_service_answers_within_three_seconds() {
     times.sort();
     let median = times[WAKES / 2];
     let p95 = times[((WAKES as f64 * 0.95).ceil() as usize).min(WAKES) - 1];
-    println!(
+    show(&format!(
         "cold start [{}]: {WAKES} wakes, median {:.3} s, p95 {:.3} s, min {:.3} s, max {:.3} s",
         driver.name(),
         median.as_secs_f64(),
         p95.as_secs_f64(),
         times[0].as_secs_f64(),
         times[WAKES - 1].as_secs_f64()
-    );
+    ));
     assert!(p95 <= Duration::from_secs(3), "p95 {p95:?} is over 3 s");
 }

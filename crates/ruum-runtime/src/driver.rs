@@ -17,14 +17,14 @@ use bollard::query_parameters::{
 };
 use futures::StreamExt;
 use ruum_core::ids::TenantId;
-use ruum_core::runtime::redact::{check_secret_value, redact};
+use ruum_core::runtime::redact::{MAX_KEPT_TOKENS, check_secret_set, check_secret_value, redact};
 use ruum_core::runtime::{
     Applied, EnvValue, ExitReason, ExitStatus, Health, ImageRef, InstanceId, InstanceState,
     InstanceStatus, Limits, LogLine, LogStream, NetworkId, OciDigest, Route, RuntimeDriver,
     RuntimeError, RuntimeUsage, RuntimeUsageSink, SecretValue, TOKEN_FILE, TOKEN_FILE_ENV,
     WorkloadIdentity, WorkloadKind, WorkloadSpec,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
@@ -58,6 +58,12 @@ pub const RESERVED_ENV: &[&str] = &[
 const INHIBIT_IPV4: &str = "com.docker.network.bridge.inhibit_ipv4";
 const TICK: Duration = Duration::from_millis(100);
 const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
+/// How often the supervisor sends SIGKILL again while a container does not end.
+const KILL_RETRY: Duration = Duration::from_secs(1);
+/// How long after the first SIGKILL the supervisor removes a container that still runs.
+const FORCE_AFTER: Duration = Duration::from_secs(10);
+/// The tries of one egress unregistration before the network is kept for a later try.
+const UNREGISTER_TRIES: u32 = 3;
 
 /// The registry repository of a tenant and app: `ruum/<tenant>/<app>`. Builders push there; the
 /// driver pulls only from there.
@@ -90,11 +96,17 @@ enum Intent {
 struct St {
     state: InstanceState,
     intent: Intent,
+    /// When `intent` was last set (the supervisor escalates a stop or kill that does not end
+    /// the container).
+    intent_at: Instant,
     last_touch: Instant,
     run_started: Instant,
     ring: Ring,
-    /// Every value to redact: the spec's secrets, previous values and every token so far.
-    secrets: Vec<String>,
+    /// The spec's secret values and previous values (redacted for the instance's life).
+    base: Vec<String>,
+    /// The workload tokens, oldest first: the spec's and each rotation's, at most
+    /// [`MAX_KEPT_TOKENS`] (an older token is no longer redacted).
+    tokens: VecDeque<String>,
     redactors: Option<Arc<Mutex<Redactors>>>,
     supervisor: Option<JoinHandle<()>>,
     torn_down: bool,
@@ -114,13 +126,29 @@ struct Instance {
     st: Mutex<St>,
 }
 
+impl St {
+    /// Every value to redact: the spec's secrets, previous values and the kept tokens.
+    fn secrets(&self) -> Vec<String> {
+        self.base
+            .iter()
+            .chain(self.tokens.iter())
+            .cloned()
+            .collect()
+    }
+
+    fn set_intent(&mut self, intent: Intent) {
+        self.intent = intent;
+        self.intent_at = Instant::now();
+    }
+}
+
 impl Instance {
     fn lock(&self) -> std::sync::MutexGuard<'_, St> {
         self.st.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn secrets(&self) -> Vec<String> {
-        self.lock().secrets.clone()
+        self.lock().secrets()
     }
 
     fn health_check(&self) -> bool {
@@ -146,6 +174,16 @@ struct Inner {
     http: reqwest::Client,
     instances: Mutex<HashMap<InstanceId, Arc<Instance>>>,
     networks: tokio::sync::Mutex<HashMap<String, NetState>>,
+    /// Networks whose egress unregistration failed: kept (so their subnet stays taken and no
+    /// new network gets an overlapping one) and tried again at the next network creation.
+    /// Taken only while `networks` is held.
+    stale: Mutex<Vec<StaleNet>>,
+}
+
+struct StaleNet {
+    name: String,
+    id: String,
+    routes: Vec<Route>,
 }
 
 /// The Docker runtime driver (card R-2a). See the crate documentation for the sandbox it
@@ -172,6 +210,20 @@ fn status_of(e: &bollard::errors::Error) -> Option<u16> {
         bollard::errors::Error::DockerResponseServerError { status_code, .. } => Some(*status_code),
         _ => None,
     }
+}
+
+/// True when the network endpoint `(id, c)` is the container `want` (its name or its full ID;
+/// never a prefix, which a name could look like).
+fn same_container(id: &str, c: &bollard::models::EndpointResource, want: &str) -> bool {
+    c.name.as_deref().map(|n| n.trim_start_matches('/')) == Some(want) || id == want
+}
+
+fn is_attached(
+    containers: &HashMap<String, bollard::models::EndpointResource>,
+    container: &str,
+) -> bool {
+    let want = container.trim_start_matches('/');
+    containers.iter().any(|(id, c)| same_container(id, c, want))
 }
 
 impl DockerDriver {
@@ -216,6 +268,20 @@ impl DockerDriver {
                         .to_owned(),
                 });
             }
+            // Without --oci-seccomp, runsc does not apply Docker's seccomp profile inside the
+            // sandbox (gVisor's own kernel filters the calls instead). Infrastructure (I-6)
+            // decides on the flag; the driver says which way the engine runs.
+            let oci_seccomp = info
+                .runtimes
+                .as_ref()
+                .and_then(|r| r.get("runsc"))
+                .and_then(|r| r.runtime_args.as_ref())
+                .is_some_and(|a| a.iter().any(|x| x == "--oci-seccomp"));
+            if !oci_seccomp {
+                tracing::warn!(
+                    "runsc runs without --oci-seccomp: Docker's seccomp profile is not applied inside gVisor"
+                );
+            }
         }
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -240,6 +306,7 @@ impl DockerDriver {
                 http,
                 instances: Mutex::new(HashMap::new()),
                 networks: tokio::sync::Mutex::new(HashMap::new()),
+                stale: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -313,6 +380,16 @@ impl Inner {
             check_secret_value("previous_secrets", s.expose())?;
         }
         check_secret_value("workload_token", spec.workload_token.expose())?;
+        check_secret_set(&spec.redacted_values())?;
+        // Docker takes the limits as signed 64-bit numbers: a larger one would wrap.
+        for (field, v) in [
+            ("limits.memory_bytes", spec.limits.memory_bytes),
+            ("limits.disk_bytes", spec.limits.disk_bytes),
+        ] {
+            if i64::try_from(v).is_err() {
+                return Err(RuntimeError::invalid(field, "too large"));
+            }
+        }
         match &spec.kind {
             WorkloadKind::Service(_) | WorkloadKind::Job(_) => {}
             other => {
@@ -388,9 +465,32 @@ impl Inner {
         Ok(())
     }
 
+    /// Refuses an image that declares volumes: Docker would give each `VOLUME` path an
+    /// anonymous, writable volume on the engine's disk, with no size limit, also under a
+    /// read-only root. [`Inner::verify`] checks the container's mounts too.
+    async fn check_image(&self, reference: &str) -> Result<(), RuntimeError> {
+        let image = self
+            .docker
+            .inspect_image(reference)
+            .await
+            .map_err(|e| self.docker_err("inspecting the image", &e, &[]))?;
+        let volumes = image.config.and_then(|c| c.volumes).unwrap_or_default();
+        if !volumes.is_empty() {
+            return Err(RuntimeError::UnsupportedImage {
+                reason: format!(
+                    "the image declares volumes ({}); a sandbox has no writable folder but /tmp",
+                    volumes.join(", ")
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Joins the instance to the network of its app and environment, creating it (and attaching
     /// the shared containers of its routes, and registering it with the egress proxy) when it is
-    /// the first.
+    /// the first. A network of the same name that an earlier run of the server left (a restart)
+    /// is adopted when its labels name this app and environment and it reads back as the driver
+    /// makes it.
     async fn acquire_network(
         &self,
         id: InstanceId,
@@ -406,9 +506,14 @@ impl Inner {
                     "another instance of this app and environment runs with other routes",
                 ));
             }
+            // The addresses again: a shared container that restarted can have a new one.
+            if !routes.is_empty() {
+                n.hosts = self.shared_hosts(&name, &routes).await?;
+            }
             n.users.insert(id);
             return Ok((name, n.hosts.clone()));
         }
+        self.retry_stale().await;
         let mut labels = self.labels(&spec.identity);
         labels.remove(LABEL_INSTANCE);
         let req = NetworkCreateRequest {
@@ -423,15 +528,20 @@ impl Inner {
             labels: Some(labels),
             ..Default::default()
         };
-        let created = self
-            .docker
-            .create_network(req)
-            .await
-            .map_err(|e| self.docker_err("creating the network", &e, &[]))?;
-        let net_id = created.id;
+        let (net_id, adopted) = match self.docker.create_network(req).await {
+            Ok(created) => (created.id, false),
+            Err(e) if status_of(&e) == Some(409) => {
+                (self.adopt_network(&name, &spec.identity).await?, true)
+            }
+            Err(e) => return Err(self.docker_err("creating the network", &e, &[])),
+        };
         let result = self.finish_network(&name, &net_id, spec, &routes).await;
         match result {
             Ok((egress, hosts)) => {
+                self.stale
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|s| s.id != net_id);
                 nets.insert(
                     name.clone(),
                     NetState {
@@ -445,9 +555,58 @@ impl Inner {
                 Ok((name, hosts))
             }
             Err(e) => {
-                self.drop_network(&name, &net_id, &routes, false).await;
+                // An adopted network may still hold containers of the earlier run: leave it.
+                // A new one goes, with an unregistration in case the proxy took the
+                // registration but its answer was lost (DELETE is idempotent).
+                if !adopted {
+                    let egress = routes.contains(&Route::EgressProxy);
+                    self.drop_network(&name, &net_id, &routes, egress).await;
+                }
                 Err(e)
             }
+        }
+    }
+
+    /// The ID of an existing network of this name, when it is the driver's network of this app
+    /// and environment (its labels); [`Inner::finish_network`] then reads its settings back.
+    async fn adopt_network(
+        &self,
+        name: &str,
+        identity: &WorkloadIdentity,
+    ) -> Result<String, RuntimeError> {
+        let n = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|e| self.docker_err("inspecting the existing network", &e, &[]))?;
+        let have = n.labels.unwrap_or_default();
+        let want = self.labels(identity);
+        let ours = [LABEL_MANAGED, LABEL_TENANT, LABEL_APP, LABEL_ENV]
+            .iter()
+            .all(|k| have.contains_key(*k) && have.get(*k) == want.get(*k));
+        if !ours || n.driver.as_deref() != Some("bridge") {
+            return Err(RuntimeError::Internal {
+                reason: format!(
+                    "network {name} exists and is not the driver's network of this app and environment"
+                ),
+            });
+        }
+        tracing::info!(network = name, "adopting the network of an earlier run");
+        n.id.ok_or_else(|| RuntimeError::Internal {
+            reason: format!("network {name} has no ID"),
+        })
+    }
+
+    /// Tries the unregistration of the kept networks again (once each); a network whose
+    /// unregistration passes is removed.
+    async fn retry_stale(&self) {
+        let stale = std::mem::take(&mut *self.stale.lock().unwrap_or_else(|p| p.into_inner()));
+        for s in stale {
+            self.drop_network_tries(&s.name, &s.id, &s.routes, true, 1)
+                .await;
         }
     }
 
@@ -490,8 +649,27 @@ impl Inner {
             .ok_or_else(|| RuntimeError::Internal {
                 reason: format!("network {name} has no subnet"),
             })?;
+        let attached = inspect.containers.unwrap_or_default();
+        // An adopted network can hold shared containers of other routes: they leave.
+        for (r, shared) in &self.cfg.routes {
+            if !routes.contains(r) && is_attached(&attached, &shared.container) {
+                self.docker
+                    .disconnect_network(
+                        net_id,
+                        NetworkDisconnectRequest {
+                            container: shared.container.clone(),
+                            force: Some(true),
+                        },
+                    )
+                    .await
+                    .map_err(|e| self.docker_err(&format!("detaching {}", r.as_str()), &e, &[]))?;
+            }
+        }
         for r in routes {
             let shared = &self.cfg.routes[r];
+            if is_attached(&attached, &shared.container) {
+                continue;
+            }
             self.docker
                 .connect_network(
                     net_id,
@@ -547,10 +725,7 @@ impl Inner {
             let want = shared.container.trim_start_matches('/');
             let ip = containers
                 .iter()
-                .find(|(id, c)| {
-                    c.name.as_deref().map(|n| n.trim_start_matches('/')) == Some(want)
-                        || id.starts_with(want)
-                })
+                .find(|(id, c)| same_container(id, c, want))
                 .and_then(|(_, c)| c.ipv4_address.as_deref())
                 .and_then(|a| a.split('/').next())
                 .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
@@ -570,8 +745,49 @@ impl Inner {
     }
 
     async fn drop_network(&self, name: &str, net_id: &str, routes: &[Route], egress: bool) {
-        if egress && let Err(e) = self.egress.unregister(net_id).await {
-            tracing::warn!(network = name, error = %e, "unregistering the network at the egress proxy");
+        self.drop_network_tries(name, net_id, routes, egress, UNREGISTER_TRIES)
+            .await;
+    }
+
+    /// Unregisters the network at the egress proxy (up to `tries` times), then detaches the
+    /// shared containers and removes it. When the unregistration keeps failing, the network
+    /// stays (its subnet stays taken, so no new network gets an overlapping one that the proxy
+    /// would refuse) and goes to `stale` for a later try.
+    async fn drop_network_tries(
+        &self,
+        name: &str,
+        net_id: &str,
+        routes: &[Route],
+        egress: bool,
+        tries: u32,
+    ) {
+        if egress {
+            let mut done = false;
+            for attempt in 0..tries {
+                match self.egress.unregister(net_id).await {
+                    Ok(()) => {
+                        done = true;
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(network = name, attempt, error = %e, "unregistering the network at the egress proxy");
+                        if attempt + 1 < tries {
+                            tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+                        }
+                    }
+                }
+            }
+            if !done {
+                self.stale
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(StaleNet {
+                        name: name.to_owned(),
+                        id: net_id.to_owned(),
+                        routes: routes.to_vec(),
+                    });
+                return;
+            }
         }
         for r in routes {
             if let Some(shared) = self.cfg.routes.get(r) {
@@ -814,6 +1030,16 @@ impl Inner {
             h.binds.as_deref() == Some(&[format!("{}:{TOKEN_FILE}:ro", token_file.display())][..]),
             "only the token file bound",
         );
+        // The mounts the engine made: the token bind only. An anonymous volume (an image
+        // `VOLUME`) shows only here, not in `HostConfig.Mounts` or `Binds`; tmpfs is not here.
+        let mounts = c.mounts.as_deref().unwrap_or_default();
+        let mounts_ok = mounts.len() == 1
+            && mounts.iter().all(|m| {
+                m.typ.as_deref() == Some("bind")
+                    && m.destination.as_deref() == Some(TOKEN_FILE)
+                    && m.rw == Some(false)
+            });
+        want(mounts_ok, "only the token file mounted (no volume)");
         want(h.pids_limit == Some(self.cfg.pids_limit), "pids limit");
         want(h.memory_swap == h.memory, "swap equals memory");
         want(
@@ -906,7 +1132,7 @@ impl Inner {
         {
             let mut st = inst.lock();
             st.state = InstanceState::Running;
-            st.intent = Intent::None;
+            st.set_intent(Intent::None);
             st.run_started = Instant::now();
             st.last_touch = Instant::now();
             st.redactors = Some(redactors);
@@ -1006,20 +1232,97 @@ async fn pump(
     push(&inst, LogStream::Stderr, err);
 }
 
+impl Inner {
+    /// Sends SIGKILL; an error other than "gone" or "not running" is logged.
+    async fn kill(&self, name: &str) {
+        let opts = KillContainerOptionsBuilder::new().signal("SIGKILL").build();
+        if let Err(e) = self.docker.kill_container(name, Some(opts)).await
+            && !matches!(status_of(&e), Some(404 | 409))
+        {
+            tracing::warn!(container = name, error = %e, "killing a container");
+        }
+    }
+
+    /// Asks the container to stop (SIGTERM, SIGKILL after the stop timeout). When the engine
+    /// refuses, SIGKILL at once; the supervisor escalates further.
+    async fn stop_container(&self, name: &str) {
+        let t = self.cfg.stop_timeout.as_secs() as i32;
+        let opts = StopContainerOptionsBuilder::new().t(t).build();
+        if let Err(e) = self.docker.stop_container(name, Some(opts)).await
+            && !matches!(status_of(&e), Some(304 | 404))
+        {
+            tracing::warn!(container = name, error = %e, "stopping a container");
+            self.kill(name).await;
+        }
+    }
+
+    /// True unless the engine says the container is gone or not running. An engine that does
+    /// not answer counts as running: the supervisor waits again.
+    async fn still_running(&self, name: &str) -> bool {
+        match self
+            .docker
+            .inspect_container(
+                name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(c) => c.state.and_then(|s| s.running) == Some(true),
+            Err(e) => status_of(&e) != Some(404),
+        }
+    }
+
+    /// How long a supervisor can take to end after a stop, a scale to zero or a kill: the stop
+    /// timeout, the SIGKILL retries and the forced removal, with a margin.
+    fn end_bound(&self) -> Duration {
+        self.cfg.stop_timeout + KILL_RETRY * 2 + FORCE_AFTER + Duration::from_secs(10)
+    }
+}
+
+/// Waits for a supervisor, at most `bound`; false (and the task aborted) when it did not end.
+async fn join_bounded(mut task: JoinHandle<()>, bound: Duration) -> bool {
+    match tokio::time::timeout(bound, &mut task).await {
+        Ok(_) => true,
+        Err(_) => {
+            task.abort();
+            false
+        }
+    }
+}
+
 /// Watches one run: the job timeout, the idle timer of a service, the end of the process.
+/// A stop, scale to zero or kill that does not end the container is escalated: SIGKILL again
+/// each [`KILL_RETRY`], and after [`FORCE_AFTER`] the container is removed by force. An error
+/// on the wait stream (a short failure of the engine or its socket proxy) ends the run only
+/// when the container no longer runs.
 async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>) {
     let Some(name) = inst.container.clone() else {
         return;
     };
-    let mut wait = Box::pin(inner.docker.wait_container(
-        &name,
-        None::<bollard::query_parameters::WaitContainerOptions>,
-    ));
+    let new_wait = || {
+        Box::pin(inner.docker.wait_container(
+            &name,
+            None::<bollard::query_parameters::WaitContainerOptions>,
+        ))
+    };
+    let mut wait = new_wait();
     let mut tick = tokio::time::interval(TICK);
     let mut ready = !inst.health_check();
+    let mut last_kill: Option<Instant> = None;
+    let mut forced = false;
     loop {
         tokio::select! {
-            _ = wait.next() => break,
+            item = wait.next() => {
+                // A non-zero exit is an error item too; the engine's state decides.
+                let clean = matches!(item, Some(Ok(_)));
+                if !clean && !forced && inner.still_running(&name).await {
+                    tracing::warn!(container = %name, "the wait stream ended while the container runs; waiting again");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    wait = new_wait();
+                    continue;
+                }
+                break;
+            }
             _ = tick.tick() => {
                 // The idle clock of a service starts when the run is ready (its first passing
                 // health check), so a slow start (runsc at a small CPU limit) is not taken for
@@ -1040,12 +1343,12 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
                     } else {
                         match &inst.kind {
                             WorkloadKind::Job(j) if st.run_started.elapsed() >= j.timeout => {
-                                st.intent = Intent::Timeout;
+                                st.set_intent(Intent::Timeout);
                                 Some(Intent::Timeout)
                             }
                             WorkloadKind::Service(s) => match s.idle_timeout {
                                 Some(idle) if ready && st.last_touch.elapsed() >= idle => {
-                                    st.intent = Intent::ScaleToZero;
+                                    st.set_intent(Intent::ScaleToZero);
                                     Some(Intent::ScaleToZero)
                                 }
                                 _ => None,
@@ -1056,15 +1359,35 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
                 };
                 match action {
                     Some(Intent::Timeout) => {
-                        let opts = KillContainerOptionsBuilder::new().signal("SIGKILL").build();
-                        let _ = inner.docker.kill_container(&name, Some(opts)).await;
+                        inner.kill(&name).await;
+                        last_kill = Some(Instant::now());
                     }
-                    Some(Intent::ScaleToZero) => {
-                        let t = inner.cfg.stop_timeout.as_secs() as i32;
-                        let opts = StopContainerOptionsBuilder::new().t(t).build();
-                        let _ = inner.docker.stop_container(&name, Some(opts)).await;
-                    }
+                    Some(Intent::ScaleToZero) => inner.stop_container(&name).await,
                     _ => {}
+                }
+                // Escalation of an end that does not come.
+                let pending = {
+                    let st = inst.lock();
+                    (st.intent != Intent::None).then(|| (st.intent, st.intent_at.elapsed()))
+                };
+                if let Some((intent, since)) = pending
+                    && !forced
+                {
+                    let kill_after = if intent == Intent::Timeout {
+                        Duration::ZERO
+                    } else {
+                        inner.cfg.stop_timeout + KILL_RETRY * 2
+                    };
+                    if since >= kill_after + FORCE_AFTER {
+                        tracing::warn!(container = %name, "the container did not end after SIGKILL; removing it");
+                        inner.remove_container(&name).await;
+                        forced = true;
+                    } else if since >= kill_after
+                        && last_kill.is_none_or(|t| t.elapsed() >= KILL_RETRY)
+                    {
+                        inner.kill(&name).await;
+                        last_kill = Some(Instant::now());
+                    }
                 }
             }
         }
@@ -1095,6 +1418,8 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
     });
     let next = match intent {
         Intent::Stop => InstanceState::Stopped,
+        // The container was removed by force: nothing is left to wake.
+        Intent::ScaleToZero if forced => InstanceState::Exited(ExitStatus::of(ExitReason::Killed)),
         Intent::ScaleToZero => InstanceState::ScaledToZero,
         Intent::Timeout => InstanceState::Exited(ExitStatus::of(ExitReason::TimedOut)),
         Intent::None if oom => InstanceState::Exited(ExitStatus::of(ExitReason::OutOfMemory)),
@@ -1105,7 +1430,7 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
     }
     let mut st = inst.lock();
     st.state = next;
-    st.intent = Intent::None;
+    st.set_intent(Intent::None);
     st.redactors = None;
 }
 
@@ -1125,13 +1450,17 @@ impl RuntimeDriver for DockerDriver {
             .into_iter()
             .map(str::to_owned)
             .collect();
+        let token = spec.workload_token.expose().to_owned();
+        let base: Vec<String> = secrets.iter().filter(|v| **v != token).cloned().collect();
         let new_st = |state| St {
             state,
             intent: Intent::None,
+            intent_at: Instant::now(),
             last_touch: Instant::now(),
             run_started: Instant::now(),
             ring: Ring::new(inner.cfg.log_lines, MAX_LOG_BYTES, inner.cfg.max_line_bytes),
-            secrets: secrets.clone(),
+            base: base.clone(),
+            tokens: VecDeque::from([token.clone()]),
             redactors: None,
             supervisor: None,
             torn_down: false,
@@ -1174,6 +1503,7 @@ impl RuntimeDriver for DockerDriver {
             digest
         );
         inner.ensure_image(&reference, &digest).await?;
+        inner.check_image(&reference).await?;
 
         let token_dir = inner.cfg.state_dir.join(id.0.simple().to_string());
         std::fs::DirBuilder::new()
@@ -1218,7 +1548,7 @@ impl RuntimeDriver for DockerDriver {
             return Err(match status_of(&e) {
                 Some(400) => {
                     let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
-                    RuntimeError::invalid("limits", redact(&e.to_string(), &refs))
+                    RuntimeError::invalid("spec", redact(&e.to_string(), &refs))
                 }
                 _ => inner.docker_err("creating the container", &e, &secrets),
             });
@@ -1273,20 +1603,21 @@ impl RuntimeDriver for DockerDriver {
             let mut st = inst.lock();
             let s = st.state;
             if matches!(s, InstanceState::Running | InstanceState::Starting) {
-                st.intent = Intent::Stop;
+                st.set_intent(Intent::Stop);
             }
             (s, st.supervisor.take())
         };
+        let bound = inner.end_bound();
         match state {
             InstanceState::Stopped | InstanceState::Exited(_) => {
                 if let Some(s) = sup {
-                    let _ = s.await;
+                    join_bounded(s, bound).await;
                 }
                 Ok(())
             }
             InstanceState::ScaledToZero => {
                 if let Some(s) = sup {
-                    let _ = s.await;
+                    join_bounded(s, bound).await;
                 }
                 inner.teardown(&inst).await;
                 inst.lock().state = InstanceState::Stopped;
@@ -1298,16 +1629,24 @@ impl RuntimeDriver for DockerDriver {
                     return Ok(());
                 }
                 let name = inst.container.clone().unwrap_or_default();
-                let t = inner.cfg.stop_timeout.as_secs() as i32;
-                let opts = StopContainerOptionsBuilder::new().t(t).build();
-                let _ = inner.docker.stop_container(&name, Some(opts)).await;
-                if let Some(s) = sup {
-                    let _ = s.await;
-                }
-                // A scale to zero that won the race already ended the run.
+                inner.stop_container(&name).await;
+                let ended = match sup {
+                    Some(s) => join_bounded(s, bound).await,
+                    None => true,
+                };
+                // A scale to zero that won the race already ended the run. Teardown removes
+                // the container by force when the supervisor did not end.
                 inner.teardown(&inst).await;
                 inst.lock().state = InstanceState::Stopped;
-                Ok(())
+                if ended {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::Unavailable {
+                        reason:
+                            "the engine did not end the container in time; it was removed by force"
+                                .to_owned(),
+                    })
+                }
             }
         }
     }
@@ -1350,8 +1689,12 @@ impl RuntimeDriver for DockerDriver {
                 None
             }
         };
-        if let Some(p) = pending {
-            let _ = p.await;
+        if let Some(p) = pending
+            && !join_bounded(p, inner.end_bound()).await
+        {
+            return Err(RuntimeError::Unavailable {
+                reason: "the scale to zero did not end in time".to_owned(),
+            });
         }
         let state = inst.lock().state;
         match state {
@@ -1363,8 +1706,12 @@ impl RuntimeDriver for DockerDriver {
             s => return Err(state_err("wake", &s)),
         }
         let old = inst.lock().supervisor.take();
-        if let Some(old) = old {
-            let _ = old.await;
+        if let Some(old) = old
+            && !join_bounded(old, inner.end_bound()).await
+        {
+            return Err(RuntimeError::Unavailable {
+                reason: "the last run did not end in time".to_owned(),
+            });
         }
         inner.begin_run(&inst).await?;
         // Hold until the service answers its health check (or runs, without one).
@@ -1412,14 +1759,17 @@ impl RuntimeDriver for DockerDriver {
         ) {
             return Err(state_err("rotate the token of", &state));
         }
-        // Redact the new value before the process can read it.
+        // Redact the new value before the process can read it. The oldest kept token goes
+        // when there are more than MAX_KEPT_TOKENS (it expired long before).
         {
             let mut st = inst.lock();
-            st.secrets.push(token.expose().to_owned());
+            st.tokens.push_back(token.expose().to_owned());
+            while st.tokens.len() > MAX_KEPT_TOKENS {
+                st.tokens.pop_front();
+            }
+            let all = st.secrets();
             if let Some(r) = &st.redactors {
-                r.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .add(token.expose());
+                r.lock().unwrap_or_else(|p| p.into_inner()).set(&all);
             }
         }
         if let Some(dir) = &inst.token_dir {

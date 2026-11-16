@@ -30,21 +30,21 @@ create calls carry the label in their body; `images/create` names only
 |---|---|
 | `GET /_ping`, `GET /version` | connect (version negotiation) |
 | `GET /info` | connect, for `runsc` only (is the runtime registered) |
-| `GET /images/{ref}/json` | start: is the image local |
+| `GET /images/{ref}/json` | start: is the image local; after the pull, its `Config.Volumes` (an image with a `VOLUME` is refused) |
 | `POST /images/create?fromImage={RUUM_REGISTRY}/ruum/{tenant}/{app}@{digest}` | start: pull |
-| `POST /networks/create` | first instance of an app and environment |
-| `GET /networks/{name}` | after create (read back `internal`, `inhibit_ipv4`, IPv6, subnet) and after attaching the shared containers (their addresses) |
-| `POST /networks/{id}/connect` | attach a shared container of a route (with its alias) |
-| `POST /networks/{id}/disconnect` | last instance gone |
-| `DELETE /networks/{id}` | last instance gone |
+| `POST /networks/create` | first instance of an app and environment (a 409 there: the network of an earlier run, adopted when its labels match) |
+| `GET /networks/{name}` | after create or on adoption (labels; read back `internal`, `inhibit_ipv4`, IPv6, subnet, the attached containers), after attaching the shared containers and at each start (their addresses) |
+| `POST /networks/{id}/connect` | attach a shared container of a route (with its alias), unless it is attached already |
+| `POST /networks/{id}/disconnect` | last instance gone; on adoption, a shared container of a route the spec does not have |
+| `DELETE /networks/{id}` | last instance gone (after the egress unregistration passed) |
 | `POST /containers/create?name=ruum-i-{instance}` | start |
-| `GET /containers/{name}/json` | after create (read back every flag and limit), health, exit |
+| `GET /containers/{name}/json` | after create (read back every flag, limit and mount), health, exit, an error on the wait stream (does it still run) |
 | `POST /containers/{name}/attach?stream=1&stdout=1&stderr=1` | before each start (logs) |
 | `POST /containers/{name}/start` | start, wake |
-| `POST /containers/{name}/wait` | each run (its end) |
+| `POST /containers/{name}/wait` | each run (its end; again after an error while the container runs) |
 | `POST /containers/{name}/stop?t={stop timeout}` | stop, scale to zero |
-| `POST /containers/{name}/kill?signal=SIGKILL` | job timeout |
-| `DELETE /containers/{name}?force=1&v=1` | stop, end of a job, failed start |
+| `POST /containers/{name}/kill?signal=SIGKILL` | job timeout; a refused stop; again each second while a stopped or killed container does not end |
+| `DELETE /containers/{name}?force=1&v=1` | stop, end of a job, failed start; 10 s after the first SIGKILL when the container still runs |
 
 Outside the engine: `HEAD {registry}/v2/ruum/{tenant}/{app}/manifests/{digest}` (the repository
 check) and, with the egress route, the egress proxy's control listener (`PUT` and `DELETE
@@ -73,7 +73,12 @@ RUUM_RUNTIME_DRIVER=runsc cargo test -p ruum-runtime --test conformance    # gVi
 RUUM_SANDBOX_FULL=1 cargo test -p ruum-runtime --test sandbox -- --nocapture
 RUUM_SANDBOX_FULL=1 RUUM_RUNTIME_DRIVER=runsc cargo test -p ruum-runtime --test sandbox -- --nocapture
 cargo test -p ruum-runtime --test cold_start -- --nocapture                # prints median and p95
+cargo test -p ruum-runtime --test restart                                  # a new driver adopts the network
 ```
+
+The conformance summary, the sandbox report (target set and every row) and the cold start
+numbers go to standard error past the test harness's capture, so the CI log shows them also
+when the tests pass. With `CI` set the sandbox suite refuses `RUUM_SANDBOX_CASES`.
 
 The tests build `testdata/fixture` (the conformance program and the sandbox probes on
 `node:22-alpine`, pinned by digest), start a `registry:2` (pinned by digest) and stand-in shared
@@ -87,7 +92,32 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   is so, so nobody takes it for more.
 - Under runsc, Docker's seccomp profile is not applied inside the sandbox unless runsc runs with
   `--oci-seccomp` (a root setting in `daemon.json`); `unshare -U` then works inside gVisor's own
-  kernel. The sandbox suite records it as a finding.
+  kernel. The sandbox suite records it as a finding, and the driver logs a warning at connect
+  when the engine's `runsc` has no `--oci-seccomp` in its runtime arguments. Infrastructure
+  (I-6) decides on the flag (decision 0006 G point 5 wants user namespaces under runsc for
+  Railpack).
+- An image that declares a `VOLUME` is refused (`unsupported_image`): Docker would give the path
+  an anonymous, writable volume on the engine's disk with no size limit. `verify` also requires
+  that the container's mounts are the token bind only.
+- Secret values are in the container's `Config.Env`, so `GET /containers/{name}/json` shows
+  them. I-4's socket proxy gives that call (and every other) to the server only; whoever can
+  call the engine API can also run code in every container, so it is a root boundary either way.
+- Redaction bounds: at most 256 values and 256 KiB per spec (`check_secret_set`), 16 KiB per
+  value, and the newest 16 workload tokens of an instance (the current one and 15 earlier); an
+  older token is no longer redacted. When a value is part of the marker `<hidden secret>`, a
+  shorter marker is used, and at last an empty one.
+- A server restart: the driver keeps its instances in memory. The next start of an app whose
+  network an earlier run left adopts that network (labels `ruum.managed`, `ruum.tenant`,
+  `ruum.app`, `ruum.env` must match, and the read-back must pass), attaches the missing shared
+  containers, detaches the ones of other routes and registers it at the egress proxy again. The
+  old containers keep running unmanaged and their usage is lost until the full reconciliation
+  at connect (backlog R2A-1).
+- A failed egress unregistration is tried three times; then the network stays (its subnet stays
+  taken, so no new network gets an overlapping one that the proxy would refuse) and the driver
+  tries again at the next network creation.
+- A stop, scale to zero or job kill that does not end the container: SIGKILL again each second,
+  and 10 s after the first SIGKILL the container is removed by force. `stop` and `wake` wait for
+  the end at most the stop timeout plus 22 s, then answer `unavailable`.
 - Under runsc, the pids limit bounds the sandbox's host threads (gVisor's own included), not the
   app's processes one by one: below about 64 the sandbox does not start.
 - The token file is rewritten in place (the same inode, which the bind mount pins); a read at the
@@ -96,6 +126,7 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   the engine gave on the app network), not by Docker's embedded DNS: under runsc the sandbox
   cannot reach 127.0.0.11, so there an app resolves no other name (under runc the embedded DNS
   answers for the containers of the same network only).
-- The spec has no `egress.allow`: the driver registers an empty allow list (every host passes the
-  allow step; the address rules still apply). A network holds one app and environment; its
+- The spec has no `egress.allow`: the driver registers no allow list (`None`: every public host
+  passes the allow step; the address rules still apply). In R-2e's API an empty list
+  (`Some(vec![])`) would let no host pass. A network holds one app and environment; its
   registration carries the deployment of its first instance.

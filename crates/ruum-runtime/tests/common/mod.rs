@@ -95,7 +95,7 @@ pub struct Harness {
     pub state_dir: PathBuf,
     pub shared: HashMap<Route, SharedContainer>,
     pub shared_network: String,
-    pushed: Mutex<HashMap<(uuid::Uuid, uuid::Uuid), String>>,
+    pushed: Mutex<HashMap<(uuid::Uuid, uuid::Uuid, String), String>>,
     /// The real egress proxy (card R-2e), when [`Harness::start_egress`] ran.
     pub egress: Option<Egress>,
 }
@@ -369,7 +369,28 @@ impl Harness {
 
     /// Pushes the fixture image to the repository of the identity's tenant and app; the digest.
     pub fn push(&self, identity: &WorkloadIdentity) -> Result<ImageRef, String> {
-        let key = (identity.tenant.0, identity.app.0);
+        let image = self.fixture_image.clone();
+        self.push_image(identity, &image)
+    }
+
+    /// Builds a variant of the fixture from `testdata/fixture/<dockerfile>` (same context);
+    /// the local image name.
+    pub fn build_variant(&self, dockerfile: &str) -> Result<String, String> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/fixture");
+        let tag = format!(
+            "ruum-r2a-fixture-{}:test",
+            dockerfile.replace('.', "-").to_lowercase()
+        );
+        let file = format!("{dir}/{dockerfile}");
+        docker(&[
+            "build", "-q", "--label", LABEL, "-f", &file, "-t", &tag, dir,
+        ])?;
+        Ok(tag)
+    }
+
+    /// Pushes a local image to the repository of the identity's tenant and app; the digest.
+    pub fn push_image(&self, identity: &WorkloadIdentity, image: &str) -> Result<ImageRef, String> {
+        let key = (identity.tenant.0, identity.app.0, image.to_owned());
         if let Some(d) = self.pushed.lock().unwrap().get(&key) {
             return Ok(ImageRef::Oci(
                 OciDigest::parse(d).map_err(|e| e.to_string())?,
@@ -380,7 +401,7 @@ impl Harness {
             self.registry,
             ruum_runtime::repository(identity)
         );
-        docker(&["tag", &self.fixture_image, &target])?;
+        docker(&["tag", image, &target])?;
         let out = docker(&["push", &target])?;
         let digest = out
             .split_whitespace()
@@ -395,6 +416,18 @@ impl Harness {
             OciDigest::parse(&digest).map_err(|e| e.to_string())?,
         ))
     }
+}
+
+/// Writes a report to the test's standard error directly, past the test harness's capture, so
+/// the CI log shows it also when the test passes (card R-2a review, change 3).
+pub fn show(text: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(text.as_bytes());
+    if !text.ends_with('\n') {
+        let _ = err.write_all(b"\n");
+    }
+    let _ = err.flush();
 }
 
 pub fn new_usage() -> Arc<MemoryUsage> {

@@ -50,7 +50,7 @@ impl RuntimeKind {
 /// container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedContainer {
-    /// The container name or ID at the engine.
+    /// The container name or full ID at the engine (matched exactly, never as a prefix).
     pub container: String,
     /// The name the app reaches it by on the app network (a network alias), such as
     /// `ruum-egress` or `ruum.internal`.

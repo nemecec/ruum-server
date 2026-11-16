@@ -16,11 +16,13 @@
 //! address, the host (its addresses and through the app bridge), another app, another tenant,
 //! the Docker socket (file and TCP), UDP, IPv6 link-local and DNS. The test prints which ran.
 //! `RUUM_SANDBOX_CASES` (comma-separated case names) runs some cases only, for the mutation
-//! checks; a full run sets nothing.
+//! checks; a full run sets nothing, and with `CI` set the filter is refused (a skip under CI
+//! fails, backlog T-26). The report goes to standard error past the test harness's capture, so
+//! the CI log shows the target set and every row.
 
 mod common;
 
-use common::{Harness, LABEL, docker, engine_or_skip, new_usage};
+use common::{Harness, LABEL, docker, engine_or_skip, new_usage, show};
 use ruum_core::ids::{NodeId, TenantId};
 use ruum_core::runtime::redact::REDACTED;
 use ruum_core::runtime::{
@@ -55,18 +57,19 @@ impl Report {
         self.rows.iter().filter(|r| !r.1).collect()
     }
     fn print(&self, title: &str) {
-        println!("== {title}");
+        let mut out = format!("== {title}\n");
         for (n, ok, d) in &self.rows {
-            println!(
-                "  {}  {n}{}",
+            out.push_str(&format!(
+                "  {}  {n}{}\n",
                 if *ok { "pass" } else { "FAIL" },
                 if d.is_empty() {
                     String::new()
                 } else {
                     format!(" ({d})")
                 }
-            );
+            ));
         }
+        show(&out);
     }
 }
 
@@ -414,6 +417,14 @@ async fn the_sandbox_holds() {
     if !engine_or_skip("sandbox") {
         return;
     }
+    if std::env::var_os("CI").is_some() {
+        assert!(
+            std::env::var("RUUM_SANDBOX_CASES")
+                .unwrap_or_default()
+                .is_empty(),
+            "RUUM_SANDBOX_CASES skips cases; it must not be set when CI is set (T-26)"
+        );
+    }
     let mut h = Harness::start();
     let mut r = Report::default();
     // The full run uses R-2e's egress proxy (its image from this tree) in place of the stand-in.
@@ -451,6 +462,9 @@ async fn the_sandbox_holds() {
     );
     if wanted("privilege") {
         privilege(&c, &mut r).await;
+    }
+    if wanted("volumes") {
+        volumes(&c, &mut r).await;
     }
     if wanted("forkbomb") {
         forkbomb(&c, &mut r).await;
@@ -603,6 +617,62 @@ async fn privilege(c: &Ctx, r: &mut Report) {
                 .any(|k| k == "DATABASE_URL" || (k.starts_with("RUUM_") && k != "RUUM_TOKEN_FILE")),
         keys.join(" "),
     );
+}
+
+/// An image that declares a `VOLUME` is refused (card R-2a review, change 1): Docker would give
+/// the path an anonymous, writable volume on the engine's disk with no size limit, also under a
+/// read-only root. The control: the image really declares the volume.
+async fn volumes(c: &Ctx, r: &mut Report) {
+    let id = identity(TenantId::new(), NodeId::new());
+    let built =
+        c.h.build_variant("Dockerfile.volume")
+            .and_then(|tag| c.h.push_image(&id, &tag).map(|image| (tag, image)));
+    let (tag, image) = match built {
+        Ok(x) => x,
+        Err(e) => {
+            r.check("volumes: the variant image builds", false, e);
+            return;
+        }
+    };
+    let declared =
+        docker(&["image", "inspect", "-f", "{{json .Config.Volumes}}", &tag]).unwrap_or_default();
+    r.check(
+        "volumes: control: the variant image declares VOLUME /data",
+        declared.contains("/data"),
+        declared.clone(),
+    );
+    let spec = WorkloadSpec {
+        image,
+        ..c.job(
+            id,
+            vec![format!("probe:{}", json!({ "self": {} }))],
+            Vec::new(),
+        )
+    };
+    let started = c.driver.start(spec).await;
+    let left = docker(&[
+        "ps",
+        "-aq",
+        "--filter",
+        &format!("label=ruum.app={}", id.app.0),
+    ])
+    .unwrap_or_default();
+    r.check(
+        "volumes: an image with a VOLUME does not start",
+        started.is_err(),
+        match &started {
+            Ok(s) => format!("started: {:?}", s.state),
+            Err(e) => e.to_string(),
+        },
+    );
+    r.check(
+        "volumes: no container is left",
+        left.is_empty(),
+        left.replace('\n', " "),
+    );
+    if let Ok(s) = started {
+        let _ = c.driver.stop(id.tenant, s.id).await;
+    }
 }
 
 /// A fork bomb stops at the pids limit: the engine never counts more processes than the limit,
