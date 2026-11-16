@@ -8,6 +8,12 @@
 multitenancy_enabled: true
 stream_over_http_enabled: true
 
+# Cross-tenant queries off. Tempo 2.10 has them on by default: a query with the header
+# "X-Scope-OrgID: t-b|t-a" reads both tenants. Off, a header with "|" is refused, so a record is
+# readable only with its own tenant (scripts/telemetry_check.sh checks it).
+query_frontend:
+  multi_tenant_queries_enabled: false
+
 server:
   http_listen_port: 3200
   grpc_listen_port: 9095

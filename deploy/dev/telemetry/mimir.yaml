@@ -8,6 +8,12 @@
 target: all
 multitenancy_enabled: true
 
+# Cross-tenant queries off ("X-Scope-OrgID: t-b|t-a" is refused). This is the default of Mimir 3.2;
+# it is set here so that a later default cannot open it silently (scripts/telemetry_check.sh
+# checks it).
+tenant_federation:
+  enabled: false
+
 server:
   http_listen_port: 9009
   grpc_listen_port: 9095
