@@ -102,8 +102,14 @@ pub async fn run(f: &dyn PrivacyFixture) -> Report {
             format!("tenant_isolation_{n}"),
             tenant_isolation(f, s).await,
         );
+        r.add(format!("numeric_secret_{n}"), numeric_secret(f, s).await);
+        r.add(
+            format!("personal_data_in_keys_{n}"),
+            personal_data_in_keys(f, s).await,
+        );
     }
     r.add("metric_labels_dropped", metric_labels(f).await);
+    r.add("metric_names_checked", metric_names(f).await);
     r.add("free_text_patterns_logs", free_text_logs(f).await);
     r.add("free_text_patterns_traces", free_text_traces(f).await);
     r.add("free_text_time_bound", free_text_time_bound(f).await);
@@ -139,6 +145,11 @@ pub fn fixture_secrets() -> Vec<String> {
     ]
 }
 
+/// A secret of digits only (a numeric PIN or client secret), which an app can log as a number.
+pub fn fixture_numeric_secret() -> String {
+    ["7305", "9182", "64"].concat()
+}
+
 /// A token of a known prefix that no matcher knows (the scrubber must catch it in free text).
 pub fn fixture_live_key() -> String {
     ["sk_", "live_", "Ruum0Fixture0Only0Not0Real"].concat()
@@ -153,8 +164,10 @@ fn fixture_secret_values() -> Vec<SecretValue> {
 
 /// The forms of a value that the scan looks for: raw, base64 (standard and URL-safe, the
 /// characters that only the value decides at each of the three alignments), hex (both cases),
-/// percent-encoding (both cases, and `+` for a space) and JSON-escaped. Forms shorter than
-/// 8 characters are left out. Its own encoders, separate from the secret matcher.
+/// percent-encoding (both cases, and `+` for a space; also the partial forms of JS
+/// `encodeURI`, which keeps the reserved characters, and of Python `quote`, which keeps `/`)
+/// and JSON-escaped. Forms shorter than 8 characters are left out. Its own encoders, separate
+/// from the secret matcher.
 pub fn secret_forms(value: &str) -> Vec<(String, String)> {
     let b = value.as_bytes();
     let mut forms: Vec<(String, String)> = vec![("raw".into(), value.to_owned())];
@@ -177,15 +190,30 @@ pub fn secret_forms(value: &str) -> Vec<(String, String)> {
     forms.push(("HEX".into(), hex::encode_upper(b)));
     let mut pct_upper = String::new();
     let mut pct_lower = String::new();
+    let mut pct_uri = String::new();
+    let mut pct_path = String::new();
     for &c in b {
-        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~') {
+        let unreserved = c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~');
+        if unreserved {
             pct_upper.push(c as char);
             pct_lower.push(c as char);
         } else {
             pct_upper.push_str(&format!("%{c:02X}"));
             pct_lower.push_str(&format!("%{c:02x}"));
         }
+        if unreserved || b";,/?:@&=+$#!'()*".contains(&c) {
+            pct_uri.push(c as char);
+        } else {
+            pct_uri.push_str(&format!("%{c:02X}"));
+        }
+        if unreserved || c == b'/' {
+            pct_path.push(c as char);
+        } else {
+            pct_path.push_str(&format!("%{c:02X}"));
+        }
     }
+    forms.push(("percent encodeURI".into(), pct_uri));
+    forms.push(("percent keeps slash".into(), pct_path));
     forms.push(("percent form".into(), pct_upper.replace("%20", "+")));
     forms.push(("percent".into(), pct_upper));
     forms.push(("percent lower".into(), pct_lower));
@@ -917,6 +945,158 @@ async fn metric_labels(f: &dyn PrivacyFixture) -> CaseResultT {
         format!(
             "the report counts {} dropped labels, expected 4",
             report.labels_dropped
+        )
+    })
+}
+
+/// Metric names are attacker text: a name without the OTel instrument name syntax, or with an
+/// email or a card number in it, drops the record; a normal name is stored.
+async fn metric_names(f: &dyn PrivacyFixture) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let card = ["4111", "1111", "1111", "1111"].concat();
+    let email = ["alice", "@example.org"].concat();
+    let good = "http.server.request.duration";
+    let batch = Batch {
+        metrics: vec![
+            metric_with(&format!("orders_{card}_total"), vec![]),
+            metric_with(&format!("orders_{email}_total"), vec![]),
+            metric_with("bad\"}\nname{x=\"1\"", vec![]),
+            metric_with(&"a".repeat(256), vec![]),
+            metric_with(good, vec![]),
+        ],
+        ..Default::default()
+    };
+    let report = ingest(f, &id, batch).await?;
+    let stored = read_stored(f, &id, Signal::Metrics, 1).await?;
+    let names: Vec<&str> = stored.metrics.iter().map(|m| m.name.as_str()).collect();
+    need(names == [good], || {
+        format!(
+            "expected only the metric {good} stored, found {} metrics",
+            names.len()
+        )
+    })?;
+    need(
+        report.dropped(DropReason::InvalidName) >= 3
+            && report.dropped(DropReason::PatternInName) >= 1,
+        || {
+            format!(
+                "the report counts {} invalid and {} pattern names, expected 3 and 1",
+                report.dropped(DropReason::InvalidName),
+                report.dropped(DropReason::PatternInName)
+            )
+        },
+    )?;
+    let dump = f.dump().await.map_err(|e| format!("dump failed: {e}"))?;
+    let dump = String::from_utf8_lossy(&dump);
+    need(
+        !dump.contains(&format!("orders_{card}")) && !dump.contains(&email),
+        || "a card number or an email of a metric name is in the store".into(),
+    )
+}
+
+/// A secret of digits only is hidden (a dropped label) also when it arrives as a number, in a
+/// normal and in a personal field.
+async fn numeric_secret(f: &dyn PrivacyFixture, s: Signal) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let kind = kind_of(s);
+    let digits = fixture_numeric_secret();
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| "the numeric fixture is not a number")?;
+    f.set_secrets(id.tenant, id.app, vec![SecretValue::new(digits.clone())])
+        .await;
+    for (key, class) in [
+        ("note", FieldClass::Normal),
+        ("who", FieldClass::Personal),
+        ("ratio", FieldClass::Normal),
+        ("count", FieldClass::Normal),
+    ] {
+        f.set_class(
+            id.tenant,
+            id.app,
+            kind,
+            key,
+            FieldClassEntry::confirmed(class),
+        )
+        .await;
+    }
+    let attrs = vec![
+        Attribute::new("note", n),
+        Attribute::new("who", n),
+        Attribute::new("ratio", n as f64),
+        Attribute::new("count", 42i64),
+    ];
+    let report = ingest(f, &id, batch_with(s, attrs)).await?;
+    let stored = read_stored(f, &id, s, 1).await?;
+    let sets = stored_sets(&stored, s);
+    for key in ["note", "who", "ratio"] {
+        expect_hidden(&sets, key, s)?;
+    }
+    need(
+        matches!(value_of(&sets, "count"), Some(StoredValue::Int(42))),
+        || "count: the normal number was not kept".into(),
+    )?;
+    need(report.secrets_redacted >= 3, || {
+        format!(
+            "the report counts {} redacted secrets, expected 3",
+            report.secrets_redacted
+        )
+    })?;
+    scan_store(f, &[digits]).await
+}
+
+/// Attribute keys are stored verbatim (and become series names), so a key with a card number
+/// or an IBAN in it is dropped, wherever a record carries attributes.
+async fn personal_data_in_keys(f: &dyn PrivacyFixture, s: Signal) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let kind = kind_of(s);
+    let card_key = ["card_4111", "1111", "1111", "1111"].concat();
+    let iban_key = ["iban_GB82", "WEST", "12345698765432"].concat();
+    f.set_class(
+        id.tenant,
+        id.app,
+        kind,
+        "route",
+        FieldClassEntry::confirmed(FieldClass::Normal),
+    )
+    .await;
+    let attrs = || {
+        vec![
+            Attribute::new(card_key.as_str(), "x"),
+            Attribute::new(iban_key.as_str(), "y"),
+            Attribute::new("route", "/k"),
+        ]
+    };
+    let mut batch = batch_with(s, attrs());
+    match s {
+        Signal::Logs => batch.logs[0].attributes = attrs(),
+        Signal::Metrics => {}
+        Signal::Traces => {
+            let span = &mut batch.spans[0];
+            span.events.push(SpanEvent {
+                time: crate::now(),
+                name: "ev".into(),
+                attributes: attrs(),
+            });
+            span.links.push(SpanLink {
+                trace_id: trace_id(),
+                span_id: span_id(),
+                attributes: attrs(),
+            });
+        }
+    }
+    let report = ingest(f, &id, batch).await?;
+    let stored = read_stored(f, &id, s, 1).await?;
+    expect_text(&stored_sets(&stored, s), "route", "/k")?;
+    let text = serde_json::to_string(&stored).map_err(|e| format!("serialise: {e}"))?;
+    need(
+        !text.contains(card_key.as_str()) && !text.contains(iban_key.as_str()),
+        || "an attribute key with a card number or an IBAN was stored".into(),
+    )?;
+    need(report.invalid_names_dropped >= 2, || {
+        format!(
+            "the report counts {} dropped names, expected at least 2",
+            report.invalid_names_dropped
         )
     })
 }
