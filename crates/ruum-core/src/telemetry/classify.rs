@@ -26,7 +26,7 @@
 use super::scrub;
 use super::secrets::SecretMatcher;
 use super::*;
-use crate::privacy::{Pseudonymizer, SqlValue};
+use crate::privacy::{Pseudonymizer, SqlValue, canonical_text};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,26 @@ pub fn is_attribute_key(name: &str) -> bool {
         && b[1..]
             .iter()
             .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+}
+
+/// Whether a metric name has the OTel instrument name syntax
+/// (`^[A-Za-z][A-Za-z0-9_.\-/]{0,254}$`). Other names drop the record: a name is attacker text,
+/// and the stores and query languages of card O-1b and O-2 must not have to escape it.
+pub fn is_metric_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 255
+        && b[0].is_ascii_alphabetic()
+        && b[1..]
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-' | b'/'))
+}
+
+/// Whether a name (an attribute key or a metric name) holds a match of a free-text pattern
+/// (an email, IBAN, card or phone number, a token): such a name is dropped, because names are
+/// stored verbatim and become series names.
+pub fn name_has_pattern(name: &str) -> bool {
+    !scrub::find(name).is_empty()
 }
 
 /// Whether a key is in the reserved namespace `ruum.*` (any case).
@@ -278,10 +298,9 @@ impl Pipeline<'_> {
 
     /// One value of a field, attribute or label. `None` drops it.
     fn value(&mut self, kind: FieldKind, key: &str, value: &AttrValue) -> Option<StoredValue> {
-        // 1. Secrets first: before the classes, the pseudonym and the raw copy.
-        if let AttrValue::Str(s) = value
-            && self.secrets.contains(s)
-        {
+        // 1. Secrets first: before the classes, the pseudonym and the raw copy. Numbers and
+        // bools are matched by their text (a secret of digits only can arrive as an `Int`).
+        if self.holds_secret(value) {
             self.report.secrets_redacted += 1;
             if kind == FieldKind::MetricLabel {
                 self.report.labels_dropped += 1;
@@ -292,6 +311,22 @@ impl Pipeline<'_> {
         // 2 and 3. The deny-list and the classes.
         let class = effective_class(key, kind, self.classes);
         self.apply_class(kind, key, class, value)
+    }
+
+    /// Whether the secret matcher finds a secret in the text of a value: a string as it is,
+    /// an `Int` in decimal, a `Float` in its canonical text and in Rust's shortest form, a
+    /// `Bool` as `true` or `false`.
+    fn holds_secret(&self, value: &AttrValue) -> bool {
+        match value {
+            AttrValue::Str(s) => self.secrets.contains(s),
+            AttrValue::Int(i) => self.secrets.contains(&i.to_string()),
+            AttrValue::Float(f) => {
+                self.secrets
+                    .contains(&canonical_text(&SqlValue::Float8(*f)))
+                    || self.secrets.contains(&f.to_string())
+            }
+            AttrValue::Bool(b) => self.secrets.contains(if *b { "true" } else { "false" }),
+        }
     }
 
     fn apply_class(
@@ -357,8 +392,9 @@ impl Pipeline<'_> {
         out
     }
 
-    /// The attributes of a record: `ruum.*` and invalid keys dropped, keys with a secret
-    /// dropped, each value through [`Self::value`].
+    /// The attributes of a record: `ruum.*` and invalid keys dropped, keys with a secret or a
+    /// free-text pattern (a card number, an email) dropped, each value through
+    /// [`Self::value`].
     fn attributes(&mut self, kind: FieldKind, attrs: Vec<Attribute>) -> Vec<StoredAttribute> {
         let mut out = Vec::with_capacity(attrs.len());
         for a in attrs {
@@ -372,6 +408,10 @@ impl Pipeline<'_> {
             }
             if self.secrets.contains(&a.key) {
                 self.report.secrets_redacted += 1;
+                continue;
+            }
+            if name_has_pattern(&a.key) {
+                self.report.invalid_names_dropped += 1;
                 continue;
             }
             if self.classes.get(kind, &a.key).is_none() && is_field_name(&a.key) {
@@ -419,6 +459,14 @@ impl Pipeline<'_> {
         if self.secrets.contains(&rec.name) {
             self.report.secrets_redacted += 1;
             self.report.drop(DropReason::SecretInIdentifier);
+            return None;
+        }
+        if !is_metric_name(&rec.name) {
+            self.report.drop(DropReason::InvalidName);
+            return None;
+        }
+        if name_has_pattern(&rec.name) {
+            self.report.drop(DropReason::PatternInName);
             return None;
         }
         let mut labels = self.attributes(FieldKind::MetricLabel, rec.labels);

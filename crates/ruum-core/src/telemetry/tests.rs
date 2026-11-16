@@ -251,6 +251,18 @@ fn names_and_reserved_keys() {
     assert!(classify::is_attribute_key("http.request.header.x-api-key"));
     assert!(!classify::is_attribute_key("alice@example.org"));
     assert!(!classify::is_attribute_key(""));
+    assert!(classify::is_metric_name("http.server.request.duration"));
+    assert!(classify::is_metric_name("jvm/memory-used_bytes"));
+    assert!(!classify::is_metric_name("_x"));
+    assert!(!classify::is_metric_name("orders_alice@example.org_total"));
+    assert!(!classify::is_metric_name("bad\"}\nname"));
+    assert!(!classify::is_metric_name(&"a".repeat(256)));
+    assert!(classify::is_metric_name(&"a".repeat(255)));
+    assert!(classify::name_has_pattern("card_4111111111111111"));
+    assert!(classify::name_has_pattern("orders_4111111111111111_total"));
+    assert!(!classify::name_has_pattern("http.request.header.x-api-key"));
+    assert!(!classify::name_has_pattern("http_requests_total"));
+    assert!(!classify::name_has_pattern("user_37"));
     assert!(classify::is_reserved("ruum.tenant"));
     assert!(classify::is_reserved("RUUM.Tenant"));
     assert!(!classify::is_reserved("ruumx.tenant"));
@@ -301,6 +313,14 @@ fn the_matcher_finds_each_encoding() {
     samples.push("q=Fx7pQ2%2Fwire%2B9Lm3%20Zt8v-k5Rb%22q%5C".into());
     samples.push("q=Fx7pQ2%2fwire%2b9Lm3%20Zt8v-k5Rb%22q%5c".into());
     samples.push("q=Fx7pQ2%2Fwire%2B9Lm3+Zt8v-k5Rb%22q%5C".into());
+    // Partial percent-encodings (JS `encodeURI`, Python `quote`), double encoding, percent-
+    // encoded base64 and JSON `\u` escapes: found through the decoded forms.
+    samples.push("https://x/cb?k=Fx7pQ2/wire+9Lm3%20Zt8v-k5Rb%22q%5C".into());
+    samples.push("https://x/cb?k=Fx7pQ2/wire%2B9Lm3%20Zt8v-k5Rb%22q%5C".into());
+    samples.push("q=Fx7pQ2%252Fwire%252B9Lm3%2520Zt8v-k5Rb%2522q%255C".into());
+    let b64 = STANDARD.encode(&v);
+    samples.push(format!("t={}", b64.replace('+', "%2B").replace('/', "%2F")));
+    samples.push(r#"{"k":"Fx7pQ2\u002fwire\u002B9Lm3 Zt8v-k5Rb\u0022q\u005c"}"#.into());
     for (i, s) in samples.iter().enumerate() {
         let text = format!("before {s} after");
         assert!(m.contains(&text), "sample {i}");
@@ -309,6 +329,27 @@ fn the_matcher_finds_each_encoding() {
         assert!(red.contains(crate::runtime::redact::REDACTED), "sample {i}");
     }
     assert!(m.redact("nothing secret").is_none());
+    // A decoded match that no single word holds: the whole text becomes the marker.
+    let split = "k=Fx7pQ2/wire%2B9Lm3 Zt8v-k5Rb%22q%5C";
+    assert!(m.contains(split));
+    assert_eq!(
+        m.redact(split).as_deref(),
+        Some(crate::runtime::redact::REDACTED)
+    );
+    // Only the word that holds a decoded match is replaced.
+    let red = m
+        .redact("keep this https://x/?k=Fx7pQ2/wire+9Lm3%20Zt8v-k5Rb%22q%5C and that")
+        .unwrap();
+    assert_eq!(
+        red,
+        format!("keep this {} and that", crate::runtime::redact::REDACTED)
+    );
+    // Decoding does not make ordinary text match.
+    assert!(!m.contains("100% sure+certain \\u0041 %zz %4"));
+    // Numbers: a secret of digits matches the decimal text.
+    let digits = SecretMatcher::new(["98765432"]);
+    assert!(digits.contains(&98765432i64.to_string()));
+    assert!(!digits.contains(&9876543i64.to_string()));
     // Values shorter than the minimum are not matched.
     assert!(SecretMatcher::new(["abc"]).is_empty());
     assert!(format!("{m:?}").starts_with("SecretMatcher("));
