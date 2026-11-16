@@ -1043,7 +1043,7 @@ async fn network(c: &Ctx, r: &mut Report) {
     }
     // The bridge's IPv6 link-local address, if it has one.
     let net_id = docker(&["network", "inspect", "-f", "{{.Id}}", &a_net]).unwrap_or_default();
-    let bridge = format!("br-{}", &net_id.get(..12).unwrap_or(""));
+    let bridge = format!("br-{}", net_id.get(..12).unwrap_or(""));
     let ll = std::process::Command::new("ip")
         .args(["-6", "-o", "addr", "show", "dev", &bridge, "scope", "link"])
         .output()
