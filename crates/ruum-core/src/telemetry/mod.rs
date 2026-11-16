@@ -594,7 +594,9 @@ impl ClassifiedBatch {
 
     /// The bytes that the meter counts: the JSON form of the records.
     pub fn byte_size(&self) -> usize {
-        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
+        serde_json::to_vec(self)
+            .expect("stored telemetry records serialise to JSON")
+            .len()
     }
 }
 
@@ -663,6 +665,11 @@ pub enum DropReason {
     InvalidId,
     /// A trace or span ID, or a metric name, holds a secret value.
     SecretInIdentifier,
+    /// A metric name does not have the OTel instrument name syntax
+    /// ([`classify::is_metric_name`]).
+    InvalidName,
+    /// A metric name holds a match of a free-text pattern (an email, a card number, a token).
+    PatternInName,
 }
 
 /// What one ingest did. Counts and names only; never a value.
@@ -682,7 +689,8 @@ pub struct IngestReport {
     pub labels_dropped: u64,
     /// `ruum.*` attributes of records that were dropped (the pipeline writes its own).
     pub reserved_dropped: u64,
-    /// Attributes whose name is not a valid field name.
+    /// Attributes whose name is not a valid attribute key, or holds a match of a free-text
+    /// pattern (a card number, a token).
     pub invalid_names_dropped: u64,
     /// Fields that the class source does not know ("seen"), so card O-2 can write
     /// `first_seen_at`. Only names of the `telemetry_fields` pattern.
