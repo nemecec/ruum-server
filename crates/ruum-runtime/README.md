@@ -30,7 +30,7 @@ create calls carry the label in their body; `images/create` names only
 | `GET /images/{ref}/json` | start: is the image local |
 | `POST /images/create?fromImage={RUUM_REGISTRY}/ruum/{tenant}/{app}@{digest}` | start: pull |
 | `POST /networks/create` | first instance of an app and environment |
-| `GET /networks/{name}` | after create (read back `internal`, `inhibit_ipv4`, IPv6, subnet) |
+| `GET /networks/{name}` | after create (read back `internal`, `inhibit_ipv4`, IPv6, subnet) and after attaching the shared containers (their addresses) |
 | `POST /networks/{id}/connect` | attach a shared container of a route (with its alias) |
 | `POST /networks/{id}/disconnect` | last instance gone |
 | `DELETE /networks/{id}` | last instance gone |
@@ -89,6 +89,10 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   app's processes one by one: below about 64 the sandbox does not start.
 - The token file is rewritten in place (the same inode, which the bind mount pins); a read at the
   same moment can see a partial token. Apps read it again on an authentication failure.
+- The sandbox finds the shared containers by `/etc/hosts` (`ExtraHosts`: alias and the address
+  the engine gave on the app network), not by Docker's embedded DNS: under runsc the sandbox
+  cannot reach 127.0.0.11, so there an app resolves no other name (under runc the embedded DNS
+  answers for the containers of the same network only).
 - The spec has no `egress.allow`: the driver registers an empty allow list (every host passes the
   allow step; the address rules still apply). A network holds one app and environment; its
   registration carries the deployment of its first instance.

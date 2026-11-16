@@ -3039,6 +3039,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "rand",
  "reqwest",
  "ruum-core",
  "ruum-egress",

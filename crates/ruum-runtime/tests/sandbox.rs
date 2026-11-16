@@ -255,6 +255,23 @@ fn host_tcp(addr: &str, port: u16) -> String {
     } else {
         format!("{addr}:{port}")
     };
+    // A scoped link-local address (fe80::1%br-x): the scope is the interface's index.
+    if let Some((ip, scope)) = addr.split_once('%') {
+        let Ok(ip) = ip.parse::<std::net::Ipv6Addr>() else {
+            return format!("bad address {addr}");
+        };
+        let Some(index) = std::fs::read_to_string(format!("/sys/class/net/{scope}/ifindex"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        else {
+            return format!("no interface {scope}");
+        };
+        let sock = SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, index));
+        return match TcpStream::connect_timeout(&sock, Duration::from_secs(3)) {
+            Ok(_) => "connected".to_owned(),
+            Err(e) => e.kind().to_string(),
+        };
+    }
     let sock: SocketAddr = match target.parse() {
         Ok(s) => s,
         Err(_) => {
@@ -1244,9 +1261,13 @@ async fn network(c: &Ctx, r: &mut Report) {
         }
     }
     let mv = res.get("metadata HTTP GET");
+    let mdeny = mv
+        .and_then(|v| v.get("deny"))
+        .and_then(Value::as_str)
+        .is_some();
     r.check(
-        "network: metadata HTTP GET is not answered",
-        meta_ctl && mv.is_some() && !reached(mv),
+        "network: metadata HTTP GET is not answered (not reached, or the egress proxy's own refusal)",
+        meta_ctl && mv.is_some() && (!reached(mv) || mdeny),
         format!(
             "{}; control {}",
             detail(mv),
@@ -1473,6 +1494,13 @@ async fn egress(c: &Ctx, r: &mut Report) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Loopback sockets (Docker's embedded DNS on 127.0.0.11) are not on an app network.
+    let loopback = |s: &Value| {
+        s.get("addr").and_then(Value::as_str).is_some_and(|a| {
+            (a.ends_with("7F") && a.len() == 8) || a == "00000000000000000000000001000000"
+        })
+    };
+    let socks: Vec<Value> = socks.into_iter().filter(|s| !loopback(s)).collect();
     let only_service = !socks.is_empty()
         && socks.iter().all(|s| {
             s.get("proto")
@@ -1481,7 +1509,7 @@ async fn egress(c: &Ctx, r: &mut Report) {
                 && s.get("port") == Some(&json!(3128))
         });
     r.check(
-        "egress: the proxy container listens only on its service port (TCP 3128), no UDP",
+        "egress: on app networks the proxy container listens only on its service port (TCP 3128), no UDP",
         only_service,
         Value::Array(socks).to_string(),
     );
