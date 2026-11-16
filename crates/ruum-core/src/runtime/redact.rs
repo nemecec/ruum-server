@@ -19,9 +19,15 @@
 //! one character per line) is not found. That is the known limit of rule 7 at this layer; the
 //! telemetry pipeline (card O-1a) looks for encoded forms.
 //!
-//! A value is at most [`MAX_SECRET_VALUE_BYTES`] long. Drivers refuse a longer secret value or
-//! workload token before they start anything, so the automaton and the held-back text stay
-//! small.
+//! A value is at most [`MAX_SECRET_VALUE_BYTES`] long, and an instance has at most
+//! [`MAX_SECRET_VALUES`] values of at most [`MAX_SECRET_TOTAL_BYTES`] together. Drivers refuse
+//! more before they start anything ([`check_secret_value`], [`check_secret_set`]) and keep only
+//! the newest [`MAX_KEPT_TOKENS`] workload tokens of an instance, so the automaton, the
+//! held-back text and the matches that end at one byte (one step each, at most one per value)
+//! stay bounded.
+//!
+//! The marker never holds a value: when a value is part of [`REDACTED`] (a value such as
+//! `secret`), the redactor uses a shorter marker, and at last an empty one ([`marker_for`]).
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -40,6 +46,54 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// ([`check_secret_value`]).
 pub const MAX_SECRET_VALUE_BYTES: usize = 16 * 1024;
 
+/// The most values to redact in one instance (secret values, previous values and workload
+/// tokens). Drivers refuse a spec with more ([`check_secret_set`]).
+pub const MAX_SECRET_VALUES: usize = 256;
+
+/// The most bytes of all values of one spec together (256 KiB).
+pub const MAX_SECRET_TOTAL_BYTES: usize = 256 * 1024;
+
+/// The workload tokens a driver keeps redacting per instance: the current one and the newest
+/// earlier ones. An older token is no longer redacted (it expired long before).
+pub const MAX_KEPT_TOKENS: usize = 16;
+
+/// The markers in order of preference: the first one that holds no value is used.
+const MARKERS: &[&str] = &[REDACTED, "<hidden>", "***", ""];
+
+/// The marker for a set of values: [`REDACTED`], or a shorter one when a value is part of it
+/// (the empty marker holds no value).
+pub fn marker_for<S: AsRef<str>>(values: &[S]) -> &'static str {
+    MARKERS
+        .iter()
+        .copied()
+        .find(|m| {
+            !values
+                .iter()
+                .any(|v| !v.as_ref().is_empty() && m.contains(v.as_ref()))
+        })
+        .unwrap_or("")
+}
+
+/// Checks the values of one spec together: at most [`MAX_SECRET_VALUES`] values and
+/// [`MAX_SECRET_TOTAL_BYTES`] bytes. A driver calls it with
+/// [`super::WorkloadSpec::redacted_values`] before it starts anything.
+pub fn check_secret_set(values: &[&str]) -> Result<(), super::RuntimeError> {
+    if values.len() > MAX_SECRET_VALUES {
+        return Err(super::RuntimeError::invalid(
+            "env",
+            format!("at most {MAX_SECRET_VALUES} secret values, previous values and tokens"),
+        ));
+    }
+    let total: usize = values.iter().map(|v| v.len()).sum();
+    if total > MAX_SECRET_TOTAL_BYTES {
+        return Err(super::RuntimeError::invalid(
+            "env",
+            format!("the secret values are at most {MAX_SECRET_TOTAL_BYTES} bytes together"),
+        ));
+    }
+    Ok(())
+}
+
 /// Checks the length of a value to redact: at most [`MAX_SECRET_VALUE_BYTES`]. A driver calls it
 /// for every secret value, previous value and workload token before it starts anything.
 pub fn check_secret_value(field: &str, value: &str) -> Result<(), super::RuntimeError> {
@@ -52,22 +106,24 @@ pub fn check_secret_value(field: &str, value: &str) -> Result<(), super::Runtime
     Ok(())
 }
 
-/// Replaces every exact match of a value in `text` with [`REDACTED`]. At each position the
-/// longest value wins. A line in which a value appears again after the replacement (a value
-/// that overlaps the marker text) becomes the marker as a whole.
+/// Replaces every exact match of a value in `text` with the marker ([`REDACTED`], or
+/// [`marker_for`] the values). At each position the longest value wins. A line in which a value
+/// appears again after the replacement (a value that overlaps the marker text) becomes the
+/// marker as a whole.
 pub fn redact(text: &str, values: &[&str]) -> String {
     let values = normalize(values.iter().copied());
+    let marker = marker_for(&values);
     let ac = Automaton::new(&values);
     let matches = ac.find_all(text.as_bytes());
-    let out = replace(text, &matches);
-    if !contains_any(&out, &values) {
+    let out = replace(text, &matches, marker);
+    if !ac.any(out.as_bytes()) {
         return out;
     }
-    let lines: Vec<String> = out.split('\n').map(|l| scrub(l, &values)).collect();
+    let lines: Vec<String> = out.split('\n').map(|l| scrub(l, &ac, marker)).collect();
     let out = lines.join("\n");
-    if contains_any(&out, &values) {
+    if ac.any(out.as_bytes()) {
         // A value with a line end that the marker rebuilt across two lines.
-        return REDACTED.to_owned();
+        return marker.to_owned();
     }
     out
 }
@@ -197,6 +253,19 @@ impl Automaton {
         }
     }
 
+    /// True when a value occurs in `text`: one pass, one step per byte (amortized), whatever
+    /// the number of values.
+    fn any(&self, text: &[u8]) -> bool {
+        let mut n = ROOT;
+        for &b in text {
+            n = self.step(n, b);
+            if self.terminal[n as usize] || self.dict[n as usize] != NONE {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Calls `found(len)` for each value that ends at the state `n`, longest first.
     fn matches_at(&self, n: u32, mut found: impl FnMut(usize)) {
         if self.terminal[n as usize] {
@@ -258,26 +327,23 @@ fn greedy(best: &[u32], from: usize, to: usize) -> Vec<Range<usize>> {
     out
 }
 
-fn replace(text: &str, matches: &[Range<usize>]) -> String {
+fn replace(text: &str, matches: &[Range<usize>], marker: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for m in matches {
         out.push_str(&text[at..m.start]);
-        out.push_str(REDACTED);
+        out.push_str(marker);
         at = m.end;
     }
     out.push_str(&text[at..]);
     out
 }
 
-fn contains_any(text: &str, values: &[String]) -> bool {
-    values.iter().any(|v| text.contains(v.as_str()))
-}
-
-/// The line, or the marker when a value still appears in it.
-fn scrub(line: &str, values: &[String]) -> String {
-    if contains_any(line, values) {
-        REDACTED.to_owned()
+/// The line, or the marker when a value still appears in it (one pass through the automaton,
+/// not one search per value).
+fn scrub(line: &str, ac: &Automaton, marker: &str) -> String {
+    if ac.any(line.as_bytes()) {
+        marker.to_owned()
     } else {
         line.to_owned()
     }
@@ -303,6 +369,7 @@ fn containing(ranges: &[Range<usize>], p: usize) -> Option<&Range<usize>> {
 /// - `checked`: no line end before it is a cut point (each one is inside a match).
 pub struct LineRedactor {
     values: Vec<String>,
+    marker: &'static str,
     ac: Automaton,
     longest: usize,
     pending: String,
@@ -319,10 +386,12 @@ pub struct LineRedactor {
 impl LineRedactor {
     pub fn new<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
         let values = normalize(values);
+        let marker = marker_for(&values);
         let ac = Automaton::new(&values);
         let longest = ac.longest();
         Self {
             values,
+            marker,
             ac,
             longest,
             pending: String::new(),
@@ -335,11 +404,18 @@ impl LineRedactor {
         }
     }
 
-    /// Adds a value to redact from now on (a renewed token). Values are never removed.
+    /// Adds a value to redact from now on (a renewed token).
     pub fn add(&mut self, value: &str) {
-        let mut all: Vec<&str> = self.values.iter().map(String::as_str).collect();
-        all.push(value);
-        self.values = normalize(all);
+        let mut all: Vec<String> = self.values.clone();
+        all.push(value.to_owned());
+        self.set_values(all.iter().map(String::as_str));
+    }
+
+    /// Replaces the values to redact from now on (a renewed token, with the oldest kept token
+    /// dropped: [`MAX_KEPT_TOKENS`]). The held-back text goes through the new values.
+    pub fn set_values<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) {
+        self.values = normalize(values);
+        self.marker = marker_for(&self.values);
         self.ac = Automaton::new(&self.values);
         self.longest = self.ac.longest();
         // Feed the held-back text through the new automaton (once per renewal).
@@ -490,14 +566,14 @@ impl LineRedactor {
         }
         self.scan = self.scan.max(cut) - cut;
         self.checked = safe - cut;
-        let text = replace(&head, &head_matches);
+        let text = replace(&head, &head_matches, self.marker);
         self.lines(&text, at)
     }
 
     fn lines(&self, text: &str, at: OffsetDateTime) -> Vec<(OffsetDateTime, String)> {
         let text = text.strip_suffix('\n').unwrap_or(text);
         text.split('\n')
-            .map(|l| (at, scrub(l, &self.values)))
+            .map(|l| (at, scrub(l, &self.ac, self.marker)))
             .collect()
     }
 
@@ -516,7 +592,7 @@ impl LineRedactor {
             return Vec::new();
         }
         let matches = self.ac.find_all(rest.as_bytes());
-        let text = replace(&rest, &matches);
+        let text = replace(&rest, &matches, self.marker);
         self.lines(&text, at)
     }
 }

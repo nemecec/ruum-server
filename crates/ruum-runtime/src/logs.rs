@@ -70,8 +70,8 @@ impl Ring {
     }
 }
 
-/// The two redactors of one run (standard output and standard error). A rotated token is added
-/// to both, so a run that started before the rotation redacts the new token too.
+/// The two redactors of one run (standard output and standard error). A rotation sets the new
+/// value set on both, so a run that started before the rotation redacts the new token too.
 pub(crate) struct Redactors {
     pub(crate) out: LineRedactor,
     pub(crate) err: LineRedactor,
@@ -85,8 +85,8 @@ impl Redactors {
         }
     }
 
-    pub(crate) fn add(&mut self, value: &str) {
-        self.out.add(value);
-        self.err.add(value);
+    pub(crate) fn set(&mut self, values: &[String]) {
+        self.out.set_values(values.iter().map(String::as_str));
+        self.err.set_values(values.iter().map(String::as_str));
     }
 }
