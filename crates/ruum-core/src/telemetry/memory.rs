@@ -26,7 +26,7 @@ impl MemoryTelemetryStore {
     /// Everything the store holds, as JSON (the privacy suite scans it for secrets).
     pub fn dump(&self) -> Vec<u8> {
         let tenants = self.tenants.lock().expect("telemetry store lock");
-        serde_json::to_vec(&*tenants).unwrap_or_default()
+        serde_json::to_vec(&*tenants).expect("the telemetry store serialises to JSON")
     }
 
     /// The tenants that have a storage tenant.
