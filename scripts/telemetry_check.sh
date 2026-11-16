@@ -7,9 +7,10 @@
 # For each signal (logs, metrics, traces) the script writes one record through the Collector's
 # OTLP endpoint with the header X-Scope-OrgID: t-a and one with t-b, and reads each back from its
 # store. A record must be found with its own tenant, not found with the other tenant, and the
-# query without the header must be refused. A write without the header must be refused too. It
-# also checks that every published port of the stack binds to 127.0.0.1 only and that the stores
-# and the Collector are on the network `telemetry` only.
+# query without the header must be refused. A query with two tenants in the header ("t-b|t-a")
+# must not find it either (cross-tenant queries are off). A write without the header must be
+# refused too. It also checks that every published port of the stack binds to 127.0.0.1 only and
+# that the stores and the Collector are on the network `telemetry` only.
 #
 # No check passes on silence: "not found" counts only after the same query found the record with
 # its own tenant. The script waits for ingestion with a bounded retry (RUUM_TELEMETRY_TIMEOUT,
@@ -27,6 +28,7 @@ MIMIR="${RUUM_MIMIR_URL:-http://127.0.0.1:9009}"
 TEMPO="${RUUM_TEMPO_URL:-http://127.0.0.1:3200}"
 PROJECT="${COMPOSE_PROJECT_NAME:-ruum}"
 TIMEOUT="${RUUM_TELEMETRY_TIMEOUT:-60}"
+CURL_MAX=10 # seconds per request; the two-tenant query raises it (Loki retries before it refuses)
 SERVICES=(loki mimir tempo otel-collector)
 HEADER=X-Scope-OrgID
 
@@ -49,7 +51,7 @@ http() {
   shift 3
   local hdr=()
   [[ -n "$tenant" ]] && hdr=(-H "$HEADER: $tenant")
-  curl -sS -m 10 -X "$method" ${hdr[@]+"${hdr[@]}"} -w '\n%{http_code}' "$@" "$url" || printf '\n000'
+  curl -sS -m "$CURL_MAX" -X "$method" ${hdr[@]+"${hdr[@]}"} -w '\n%{http_code}' "$@" "$url" || printf '\n000'
 }
 status_of() { tail -n1 <<<"$1"; }
 body_of() { sed '$d' <<<"$1"; }
@@ -105,16 +107,23 @@ write_refused() { # <what> <path> <json>
   local res code
   res="$(otlp_post "$2" "" "$3")"
   code="$(status_of "$res")"
-  if [[ "$code" == 4* || "$code" == 5* ]]; then
+  # The stores refuse it with 401 (Tempo 400). Only a 4xx counts: a 5xx does not show that the
+  # store refused the record (it may have stored it and failed later), and 000 is no answer.
+  if [[ "$code" == 4* ]]; then
     pass "$1: write without $HEADER refused ($code)"
   else
-    fail "$1: write without $HEADER got $code (want a refusal)"
+    fail "$1: write without $HEADER got $code (want a 4xx refusal)"
   fi
 }
 
 # ---- reads ----------------------------------------------------------------------------------
 # Each query function takes the tenant ("" for none) and the record; it prints the status code
-# and "found" or "empty".
+# and "found" or "empty". After a 5xx it adds "refused" when the body is the store's refusal of a
+# two-tenant header (Loki answers "multiple org IDs present" with 500).
+refusal() { # <response>: prints " refused" for a 5xx whose body refuses a two-tenant header
+  [[ "$(status_of "$1")" == 5* ]] && body_of "$1" | grep -qiE 'multiple org ids|too many tenant ids' && printf ' refused'
+  return 0
+}
 
 query_log() { # <tenant> <nonce>
   local q res code n
@@ -124,7 +133,7 @@ query_log() { # <tenant> <nonce>
     --data-urlencode limit=10)"
   code="$(status_of "$res")"
   n="$(body_of "$res" | jq -r --arg nonce "$2" '[.data.result[]?.values[]?[1] | select(contains($nonce))] | length' 2>/dev/null || echo 0)"
-  printf '%s %s\n' "$code" "$([[ "${n:-0}" -gt 0 ]] && echo found || echo empty)"
+  printf '%s %s%s\n' "$code" "$([[ "${n:-0}" -gt 0 ]] && echo found || echo empty)" "$(refusal "$res")"
 }
 
 query_metric() { # <tenant> <nonce>
@@ -133,7 +142,7 @@ query_metric() { # <tenant> <nonce>
     --data-urlencode "query=ruum_telemetry_check{check_nonce=\"$2\"}")"
   code="$(status_of "$res")"
   n="$(body_of "$res" | jq -r '.data.result | length' 2>/dev/null || echo 0)"
-  printf '%s %s\n' "$code" "$([[ "${n:-0}" -gt 0 ]] && echo found || echo empty)"
+  printf '%s %s%s\n' "$code" "$([[ "${n:-0}" -gt 0 ]] && echo found || echo empty)" "$(refusal "$res")"
 }
 
 query_trace() { # <tenant> <trace id>
@@ -141,7 +150,7 @@ query_trace() { # <tenant> <trace id>
   res="$(http GET "$TEMPO/api/v2/traces/$2" "$1")"
   code="$(status_of "$res")"
   n="$(body_of "$res" | jq -r '[(.trace.resourceSpans // .batches // [])[]?.scopeSpans[]?.spans[]?] | length' 2>/dev/null || echo 0)"
-  printf '%s %s\n' "$code" "$([[ "${n:-0}" -gt 0 ]] && echo found || echo empty)"
+  printf '%s %s%s\n' "$code" "$([[ "${n:-0}" -gt 0 ]] && echo found || echo empty)" "$(refusal "$res")"
 }
 
 # isolated <what> <query function> <record> <own tenant> <other tenant>
@@ -163,6 +172,15 @@ isolated() {
   case "$out" in
     "200 empty" | "404 empty") pass "$what: not found with $HEADER: $other ($out)" ;;
     *) fail "$what: with $HEADER: $other got \"$out\" (want not found)" ;;
+  esac
+  # A header with two tenants ("other|own") must not read the record: the stores have
+  # cross-tenant queries off. A refusal (4xx: Mimir 422, Tempo 400; or Loki's 500 "multiple org
+  # IDs present", which comes after its query retries, about 17 seconds) or an empty answer
+  # passes; "found", no answer (000) or another 5xx fails.
+  out="$(CURL_MAX=60 "$fn" "$other|$own" "$rec")"
+  case "$out" in
+    "200 empty" | "404 empty" | 4[0-9][0-9]" empty" | 5[0-9][0-9]" empty refused") pass "$what: not found with $HEADER: $other|$own ($out)" ;;
+    *) fail "$what: with $HEADER: $other|$own got \"$out\" (want refused or not found)" ;;
   esac
   out="$("$fn" "" "$rec")"
   case "$out" in

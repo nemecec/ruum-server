@@ -58,5 +58,11 @@ compactor:
 ruler:
   enable_api: false
 
+# Cross-tenant queries off ("X-Scope-OrgID: t-b|t-a" is refused). This is the default of Loki 3.7;
+# it is set here so that a later default cannot open it silently (scripts/telemetry_check.sh
+# checks it).
+querier:
+  multi_tenant_queries_enabled: false
+
 analytics:
   reporting_enabled: false
