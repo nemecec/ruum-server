@@ -123,14 +123,26 @@ impl MemoryPolicy {
         false
     }
 
-    /// Whether one resolved address may be a destination: its canonical form is public and on
-    /// no deny entry.
+    /// Whether one resolved address may be a destination: its canonical form is in no
+    /// registered app subnet, public and on no deny entry.
     fn address_allowed(&self, ip: IpAddr, port: u16) -> bool {
         let c = canonical(ip);
+        // The proxy is attached to every app network, so it is the only hop between them
+        // (decision 0006 G): an address of any registered network is never a destination, also
+        // when the network's subnet is in a public range. Checked first, also before the test
+        // switch, and against the registrations as they are now.
+        if self.in_registered_subnet(c) {
+            return false;
+        }
         if self.is_test_public(c, port) {
             return true;
         }
         is_public(c) && !self.deny.contains(c)
+    }
+
+    fn in_registered_subnet(&self, ip: IpAddr) -> bool {
+        let g = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        g.iter().any(|e| e.subnet.contains(ip))
     }
 
     fn current(&self, network: &str) -> Option<Arc<Entry>> {
@@ -217,9 +229,14 @@ impl EgressPolicy for MemoryPolicy {
             }
         };
         let limits = self.limits.lowered_by(reg.limits.as_ref());
-        if limits.max_tunnels == 0 || limits.burst == 0 {
+        if limits.max_tunnels == 0
+            || limits.burst == 0
+            || limits.idle_timeout.is_zero()
+            || limits.max_lifetime.is_zero()
+        {
             return Err(RegisterError::Invalid(
-                "limits: max_tunnels and burst must be at least 1".into(),
+                "limits: max_tunnels, burst, idle_timeout_secs and max_lifetime_secs must be at least 1"
+                    .into(),
             ));
         }
         let mut g = self.entries.write().unwrap_or_else(|p| p.into_inner());
