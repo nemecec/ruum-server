@@ -33,6 +33,22 @@ Plain `http://` is not proxied: an app that calls a plain HTTP API through the p
 A refusal counts only with the deny header (decision 0006 G); a test that sees a `502` or a
 timeout has not seen a refusal.
 
+### Connections per source
+
+The proxy identifies a connection by its source address right after accept, before it reads the
+request head, and counts it against that identity at once:
+
+- An identity holds at most `max_tunnels + 16` client connections (tunnels plus connections that
+  are still sending their head). A connection above that gets `403` with `deny=limit` at once,
+  without its head being read, and is closed (over TCP the client may see only the close).
+- Sources in no registered network share 64 connections. Above that, a connection gets
+  `deny=unknown_source` at once and is closed.
+- `RUUM_EGRESS_MAX_CONNECTIONS` stays the last bound over all sources.
+
+So connections that send nothing (slowloris) use up only their own app's share, never the
+egress of other apps. Size `RUUM_EGRESS_MAX_CONNECTIONS` for the expected number of apps: each
+identity can hold up to `max_tunnels + 16` of it.
+
 ### Address rules (decision 0006 G point 1)
 
 Checked after resolution on every answer, and on IP literals the same way. Host names given as
@@ -54,6 +70,10 @@ hex `0xa9fea9fe`, short forms `127.1`) and then checked like any answer. The pro
   form, so `::ffff:<host IP>` meets the deny entry `<host IP>`.
 - Every entry of `EGRESS_DENY`: the platform ranges and the host's public addresses (addresses
   or CIDR prefixes; the host's IPv6 is a `/64`).
+- Every address inside a registered app subnet (the registrations as they are at the request),
+  also when the subnet is in a public range. The proxy is attached to every app network, so it
+  is the only hop between them (decision 0006 G); an app never reaches another app's (or its
+  own) containers through it.
 
 ## Control listener
 
@@ -93,9 +113,19 @@ driver uses the Docker network name or id).
   host passes the allow step. `[]`: no host passes. `*.example.com` matches one or more labels
   below `example.com`, never `example.com` itself and never `evilexample.com`. Matching ignores
   case and one trailing dot. The address rules still apply after the allow step.
-- `limits` is optional; each field may only lower the proxy's configured limit.
+- `limits` is optional; each field may only lower the proxy's configured limit. Every value must
+  be at least 1 (`0` is `400 invalid_request`).
+- Unknown fields are refused (`400`), so a misspelled `allow` never means "every host". So a
+  new optional field needs a rollout order: upgrade the proxy first, then let the server send
+  the field.
 - Answers: `204` (registered), `400 invalid_request`, `401 unauthorized`, `409 subnet_overlap`
   (another id holds an overlapping subnet), `409 too_many_networks` (`RUUM_EGRESS_MAX_NETWORKS`).
+
+Registrations live only in the proxy's memory. After a proxy restart every app gets
+`deny=unknown_source` until the runtime driver registers its networks again. The driver (or the
+deployment, card I-4) must reconcile: register every live network again when the proxy
+restarts, and on `409 subnet_overlap` delete the stale registration that holds the subnet (a
+network Docker removed whose subnet it gave to a new network). The proxy fails closed meanwhile.
 
 ### `DELETE /v1/networks/{id}`
 
@@ -138,7 +168,7 @@ Errors use the API's form: `{"error": {"code": "...", "message": "...", "hint": 
 | `RUUM_EGRESS_MAX_LIFETIME_SECS` | `3600` | A tunnel closes after this long. |
 | `RUUM_EGRESS_CONNECT_TIMEOUT_SECS` | `10` | Resolving plus connecting to the upstream. |
 | `RUUM_EGRESS_MAX_NETWORKS` | `4096` | Registered networks at most. |
-| `RUUM_EGRESS_MAX_CONNECTIONS` | `4096` | Client connections at once, all sources together (the proxy's memory bound). |
+| `RUUM_EGRESS_MAX_CONNECTIONS` | `4096` | Client connections at once, all sources together (the proxy's memory bound). Each identity also has its own cap of `max_tunnels + 16`, unknown sources 64 together. |
 | `RUUM_EGRESS_LOG` | `info` | The log filter (`tracing` syntax). |
 
 The request head must arrive within 10 seconds and be at most 8 KiB.

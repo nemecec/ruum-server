@@ -35,9 +35,9 @@ use crate::api::{
 };
 use crate::config::{Config, ConfigError};
 use crate::control::{ControlState, ControlToken, router};
-use crate::limits::LimitConfig;
+use crate::limits::{LimitConfig, PENDING_ALLOWANCE};
 use crate::policy::MemoryPolicy;
-use crate::proxy::{MemoryLog, ProxyState, handle};
+use crate::proxy::{MAX_UNKNOWN_CONNECTIONS, MemoryLog, ProxyState, admit, run};
 use crate::resolver::FakeResolver;
 use crate::usage::Usage;
 use crate::{Options, Running, start};
@@ -718,6 +718,34 @@ pub async fn case_registration_checks(env: &Env) {
             .await;
         assert_eq!(status, 400, "subnet {subnet}");
     }
+    for (limits, what) in [
+        (
+            Limits {
+                idle_timeout_secs: Some(0),
+                ..Limits::default()
+            },
+            "idle timeout 0",
+        ),
+        (
+            Limits {
+                max_lifetime_secs: Some(0),
+                ..Limits::default()
+            },
+            "lifetime 0",
+        ),
+        (
+            Limits {
+                max_tunnels: Some(0),
+                ..Limits::default()
+            },
+            "max_tunnels 0",
+        ),
+    ] {
+        let status = env
+            .register_status("x", "127.0.0.2/32", identity(1), None, Some(limits))
+            .await;
+        assert_eq!(status, 400, "{what}");
+    }
     let (status, _) = env
         .h
         .control(
@@ -1018,6 +1046,215 @@ pub async fn case_limit_lifetime(env: &Env) {
     assert!(
         took >= Duration::from_millis(700),
         "closed after {took:?}, before its lifetime"
+    );
+}
+
+/// A connection that may not be admitted: refused at once with `deny=<reason>`, or closed at
+/// once (the proxy answers before it reads the head, so over TCP the answer can be lost to a
+/// reset). Never a tunnel, and never silence: the close must come well within the head timeout.
+async fn refused_at_once(env: &Env, source: IpAddr, host: &str, reason: DenyReason, what: &str) {
+    let mut s = env
+        .h
+        .connect(source)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: connect to the proxy: {e}"));
+    let head = format!(
+        "CONNECT {host}:{p} HTTP/1.1\r\nHost: {host}:{p}\r\n\r\n",
+        p = env.port
+    );
+    // The proxy may have closed already: a failed write is not a failure.
+    let _ = s.write_all(head.as_bytes()).await;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 1024];
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(until, s.read(&mut buf)).await {
+            Err(_) => panic!(
+                "{what}: no answer and no close within 3 s (silence); expected deny={}",
+                reason.as_str()
+            ),
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    let text = String::from_utf8_lossy(&got);
+    if !text.is_empty() {
+        let status: u16 = text
+            .split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        assert_eq!(status, reason.status(), "{what}: status ({text:?})");
+        let want = format!("{DENY_HEADER}: {}\r\n", reason.as_str());
+        assert!(text.contains(&want), "{what}: deny reason ({text:?})");
+    }
+}
+
+/// Connections that send no request head (slowloris) count against their own identity from
+/// accept on: identity A holds `max_tunnels + PENDING_ALLOWANCE` of them, and B still reaches
+/// the public upstream while A's next connection is refused at once. Unknown sources share
+/// their own small cap. The slots come back when the connections close.
+pub async fn case_slow_heads(env: &Env) {
+    let limits = Limits {
+        max_tunnels: Some(1),
+        ..Limits::default()
+    };
+    env.register("a", SOURCE_A, identity(1), None, Some(limits))
+        .await;
+    env.register("b", SOURCE_B, identity(2), None, None).await;
+    env.resolver.set("s.example.net", vec![vec![PUBLIC_IP]]);
+
+    let mut held = Vec::new();
+    for i in 0..(1 + PENDING_ALLOWANCE) {
+        held.push(
+            env.h
+                .connect(SOURCE_A)
+                .await
+                .unwrap_or_else(|e| panic!("A's silent connection {i}: {e}")),
+        );
+    }
+    drop(
+        env.connect(SOURCE_B, "s.example.net", env.port)
+            .await
+            .reached(&env.public, "B while A holds its connections")
+            .await,
+    );
+    refused_at_once(
+        env,
+        SOURCE_A,
+        "s.example.net",
+        DenyReason::Limit,
+        "A over its connection cap",
+    )
+    .await;
+    env.wait_log(&["source=127.0.0.2", "deny=limit"]).await;
+
+    let mut unknown = Vec::new();
+    for i in 0..MAX_UNKNOWN_CONNECTIONS {
+        unknown.push(
+            env.h
+                .connect(SOURCE_UNKNOWN)
+                .await
+                .unwrap_or_else(|e| panic!("unknown silent connection {i}: {e}")),
+        );
+    }
+    drop(
+        env.connect(SOURCE_B, "s.example.net", env.port)
+            .await
+            .reached(
+                &env.public,
+                "B while unknown sources hold their connections",
+            )
+            .await,
+    );
+    refused_at_once(
+        env,
+        SOURCE_UNKNOWN,
+        "s.example.net",
+        DenyReason::UnknownSource,
+        "an unknown source over the unknown cap",
+    )
+    .await;
+
+    // The slots come back when the connections close.
+    drop(held);
+    drop(unknown);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut s = env.h.connect(SOURCE_A).await.unwrap();
+        let head = format!(
+            "CONNECT s.example.net:{p} HTTP/1.1\r\nHost: s.example.net:{p}\r\n\r\n",
+            p = env.port
+        );
+        let wrote = s.write_all(head.as_bytes()).await.is_ok();
+        let answer = if wrote { read_head(&mut s).await } else { None };
+        match answer {
+            Some(a) if a.starts_with("HTTP/1.1 200") => {
+                drop(
+                    Outcome::Tunnel(s)
+                        .reached(&env.public, "A after its connections closed")
+                        .await,
+                );
+                break;
+            }
+            other if Instant::now() < until => {
+                assert!(
+                    other.as_deref().is_none_or(|a| a.contains(": limit")),
+                    "A after its connections closed: {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("A's slots did not come back: {other:?}"),
+        }
+    }
+}
+
+/// An address inside a registered app subnet is never a destination, also when the subnet is in
+/// a public range (the proxy is the only hop between app networks). B's network holds the
+/// "public" upstream: A cannot reach it by name, literal or mapped form until B is removed. An
+/// IPv6 network with a global prefix is refused the same way.
+pub async fn case_registered_subnet_not_destination(env: &Env) {
+    env.register("a", SOURCE_A, identity(1), None, None).await;
+    env.resolver.set("b-app.example.net", vec![vec![PUBLIC_IP]]);
+    drop(
+        env.connect(SOURCE_A, "b-app.example.net", env.port)
+            .await
+            .reached(&env.public, "before B's network holds the address")
+            .await,
+    );
+    let before = env.public.accepted();
+
+    let status = env
+        .register_status("b", &format!("{PUBLIC_IP}/32"), identity(2), None, None)
+        .await;
+    assert_eq!(
+        status, 204,
+        "registering B's network on the upstream's address"
+    );
+    env.connect(SOURCE_A, "b-app.example.net", env.port)
+        .await
+        .denied(DenyReason::Address, "a name resolving into B's network");
+    env.connect(SOURCE_A, &PUBLIC_IP.to_string(), env.port)
+        .await
+        .denied(DenyReason::Address, "a literal in B's network");
+    env.resolver.set(
+        "b-mapped.example.net",
+        vec![vec!["::ffff:127.0.0.5".parse().unwrap()]],
+    );
+    env.connect(SOURCE_A, "b-mapped.example.net", env.port)
+        .await
+        .denied(DenyReason::Address, "a mapped answer in B's network");
+    assert_eq!(
+        env.public.accepted(),
+        before,
+        "no connection into B's network"
+    );
+
+    let status = env
+        .register_status("c", "2a00:1450:4001::/48", identity(3), None, None)
+        .await;
+    assert_eq!(status, 204, "registering C's global IPv6 network");
+    env.resolver.set(
+        "c-app.example.net",
+        vec![vec!["2a00:1450:4001::1b".parse().unwrap()]],
+    );
+    env.connect(SOURCE_A, "c-app.example.net", env.port)
+        .await
+        .denied(
+            DenyReason::Address,
+            "a name resolving into C's IPv6 network",
+        );
+    env.connect(SOURCE_A, "[2a00:1450:4001::1b]", env.port)
+        .await
+        .denied(DenyReason::Address, "an IPv6 literal in C's network");
+
+    // The rule follows the registrations as they are now.
+    env.unregister("b").await;
+    drop(
+        env.connect(SOURCE_A, "b-app.example.net", env.port)
+            .await
+            .reached(&env.public, "after B's network was removed")
+            .await,
     );
 }
 
@@ -1366,6 +1603,7 @@ pub async fn memory_harness(setup: Setup) -> Box<dyn Harness> {
         log: setup.log,
         connect_timeout: Duration::from_secs(2),
         head_timeout: Duration::from_secs(5),
+        unknown: ProxyState::unknown_slots(),
     });
     Box::new(MemoryHarness {
         state,
@@ -1404,8 +1642,10 @@ impl Harness for MemoryHarness {
     async fn connect(&self, source: IpAddr) -> io::Result<Box<dyn Stream>> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let peer = SocketAddr::new(source, self.next_port.fetch_add(1, Ordering::SeqCst));
+        // Admitted here, before `connect` returns, as the binary's accept loop admits in order.
+        let admission = admit(&self.state, peer);
         let state = self.state.clone();
-        tokio::spawn(async move { handle(&state, peer, server).await });
+        tokio::spawn(async move { run(&state, peer, admission, server).await });
         Ok(Box::new(client))
     }
 }
@@ -1546,6 +1786,8 @@ macro_rules! conformance_tests {
             limit_rate => case_limit_rate,
             limit_idle => case_limit_idle,
             limit_lifetime => case_limit_lifetime,
+            slow_heads => case_slow_heads,
+            registered_subnet_not_destination => case_registered_subnet_not_destination,
             counters => case_counters,
             logs => case_logs,
             control_auth => case_control_auth,
