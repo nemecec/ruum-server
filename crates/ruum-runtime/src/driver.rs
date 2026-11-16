@@ -133,6 +133,9 @@ struct NetState {
     routes: Vec<Route>,
     users: HashSet<InstanceId>,
     egress: bool,
+    /// `alias:ip` of each attached shared container, for the sandbox's `/etc/hosts`: gVisor
+    /// does not reach Docker's embedded DNS (127.0.0.11), so names must not depend on it.
+    hosts: Vec<String>,
 }
 
 struct Inner {
@@ -392,7 +395,7 @@ impl Inner {
         &self,
         id: InstanceId,
         spec: &WorkloadSpec,
-    ) -> Result<String, RuntimeError> {
+    ) -> Result<(String, Vec<String>), RuntimeError> {
         let name = network_name(&spec.identity);
         let routes = sorted(&spec.routes);
         let mut nets = self.networks.lock().await;
@@ -404,7 +407,7 @@ impl Inner {
                 ));
             }
             n.users.insert(id);
-            return Ok(name);
+            return Ok((name, n.hosts.clone()));
         }
         let mut labels = self.labels(&spec.identity);
         labels.remove(LABEL_INSTANCE);
@@ -428,7 +431,7 @@ impl Inner {
         let net_id = created.id;
         let result = self.finish_network(&name, &net_id, spec, &routes).await;
         match result {
-            Ok(egress) => {
+            Ok((egress, hosts)) => {
                 nets.insert(
                     name.clone(),
                     NetState {
@@ -436,9 +439,10 @@ impl Inner {
                         routes,
                         users: HashSet::from([id]),
                         egress,
+                        hosts: hosts.clone(),
                     },
                 );
-                Ok(name)
+                Ok((name, hosts))
             }
             Err(e) => {
                 self.drop_network(&name, &net_id, &routes, false).await;
@@ -453,7 +457,7 @@ impl Inner {
         net_id: &str,
         spec: &WorkloadSpec,
         routes: &[Route],
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<(bool, Vec<String>), RuntimeError> {
         let inspect = self
             .docker
             .inspect_network(
@@ -502,6 +506,11 @@ impl Inner {
                 .await
                 .map_err(|e| self.docker_err(&format!("attaching {}", r.as_str()), &e, &[]))?;
         }
+        let hosts = if routes.is_empty() {
+            Vec::new()
+        } else {
+            self.shared_hosts(name, routes).await?
+        };
         if routes.contains(&Route::EgressProxy) {
             self.egress
                 .register(&EgressNetwork {
@@ -511,9 +520,53 @@ impl Inner {
                     allow: None,
                 })
                 .await?;
-            return Ok(true);
+            return Ok((true, hosts));
         }
-        Ok(false)
+        Ok((false, hosts))
+    }
+
+    /// Reads the addresses of the attached shared containers back from the engine, as
+    /// `alias:ip` lines for the sandbox's `/etc/hosts`.
+    async fn shared_hosts(
+        &self,
+        name: &str,
+        routes: &[Route],
+    ) -> Result<Vec<String>, RuntimeError> {
+        let inspect = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|e| self.docker_err("inspecting the network", &e, &[]))?;
+        let containers = inspect.containers.unwrap_or_default();
+        let mut hosts = Vec::new();
+        for r in routes {
+            let shared = &self.cfg.routes[r];
+            let want = shared.container.trim_start_matches('/');
+            let ip = containers
+                .iter()
+                .find(|(id, c)| {
+                    c.name.as_deref().map(|n| n.trim_start_matches('/')) == Some(want)
+                        || id.starts_with(want)
+                })
+                .and_then(|(_, c)| c.ipv4_address.as_deref())
+                .and_then(|a| a.split('/').next())
+                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+                .ok_or_else(|| RuntimeError::Internal {
+                    reason: format!(
+                        "{} ({want}) has no address on network {name} (attached: {:?})",
+                        r.as_str(),
+                        containers
+                            .values()
+                            .map(|c| (c.name.clone(), c.ipv4_address.clone()))
+                            .collect::<Vec<_>>()
+                    ),
+                })?;
+            hosts.push(format!("{}:{ip}", shared.alias));
+        }
+        Ok(hosts)
     }
 
     async fn drop_network(&self, name: &str, net_id: &str, routes: &[Route], egress: bool) {
@@ -575,6 +628,7 @@ impl Inner {
         spec: &WorkloadSpec,
         image: &str,
         network: &str,
+        hosts: &[String],
         token_file: &std::path::Path,
         id: InstanceId,
     ) -> ContainerCreateBody {
@@ -649,6 +703,11 @@ impl Inner {
             )])),
             binds: Some(vec![format!("{}:{TOKEN_FILE}:ro", token_file.display())]),
             network_mode: Some(network.to_owned()),
+            extra_hosts: if hosts.is_empty() {
+                None
+            } else {
+                Some(hosts.to_vec())
+            },
             ipc_mode: Some("private".to_owned()),
             init: Some(true),
             publish_all_ports: Some(false),
@@ -688,6 +747,7 @@ impl Inner {
         c: &ContainerInspectResponse,
         spec: &WorkloadSpec,
         network: &str,
+        hosts: &[String],
         token_file: &std::path::Path,
     ) -> Result<Limits, String> {
         let h = c.host_config.as_ref().ok_or("no host config")?;
@@ -735,6 +795,10 @@ impl Inner {
             "no host user namespace",
         );
         want(h.ipc_mode.as_deref() == Some("private"), "private IPC");
+        want(
+            h.extra_hosts.as_deref().unwrap_or_default() == hosts,
+            "only the shared containers in /etc/hosts",
+        );
         want(h.init == Some(true), "init");
         want(h.publish_all_ports != Some(true), "no published ports");
         want(
@@ -1125,7 +1189,7 @@ impl RuntimeDriver for DockerDriver {
                 reason: format!("the token file: {e}"),
             });
         }
-        let network = match inner.acquire_network(id, &spec).await {
+        let (network, hosts) = match inner.acquire_network(id, &spec).await {
             Ok(n) => n,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&token_dir);
@@ -1146,7 +1210,7 @@ impl RuntimeDriver for DockerDriver {
             op: tokio::sync::Mutex::new(()),
             st: Mutex::new(new_st(InstanceState::Starting)),
         });
-        let body = inner.container_body(&spec, &reference, &network, &token_file, id);
+        let body = inner.container_body(&spec, &reference, &network, &hosts, &token_file, id);
         let opts = CreateContainerOptionsBuilder::new().name(&name).build();
         let created = inner.docker.create_container(Some(opts), body).await;
         if let Err(e) = created {
@@ -1168,7 +1232,7 @@ impl RuntimeDriver for DockerDriver {
             .await
         {
             Ok(c) => inner
-                .verify(&c, &spec, &network, &token_file)
+                .verify(&c, &spec, &network, &hosts, &token_file)
                 .map_err(|what| RuntimeError::Internal {
                     reason: format!("the engine did not apply the sandbox: {what}"),
                 }),
