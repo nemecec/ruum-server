@@ -1,0 +1,12 @@
+{
+  "name": "ruum-fixture-hostile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Card R-2b: a hostile build. It installs ms from the npm registry through the egress proxy; its postinstall tries every forbidden target of targets.json.",
+  "dependencies": {
+    "ms": "2.1.3"
+  },
+  "scripts": {
+    "postinstall": "node probe.js"
+  }
+}

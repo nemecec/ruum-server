@@ -352,6 +352,35 @@ async fn the_suite_notices_a_builder_that_leaks_its_secrets() {
 }
 
 #[tokio::test]
+async fn the_suite_notices_a_leak_that_log_redaction_hides() {
+    // Backlog S-37: a builder that redacts its own secrets from the build log by exact match
+    // still leaks them to the build; the hex-encoded environment report shows them.
+    let failed = builder_failed_with(
+        BuilderFaults {
+            leak_host_secrets: true,
+            redacts_logs: true,
+            ..BuilderFaults::default()
+        },
+        &["build_sees_no_platform_secrets"],
+    )
+    .await;
+    assert_eq!(failed, ["build_sees_no_platform_secrets"]);
+}
+
+#[tokio::test]
+async fn the_suite_passes_a_builder_that_only_redacts() {
+    let failed = builder_failed_with(
+        BuilderFaults {
+            redacts_logs: true,
+            ..BuilderFaults::default()
+        },
+        &["build_sees_no_platform_secrets"],
+    )
+    .await;
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+#[tokio::test]
 async fn the_suite_notices_a_builder_without_a_timeout() {
     let failed = builder_failed_with(
         BuilderFaults {
