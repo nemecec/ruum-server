@@ -1005,8 +1005,9 @@ async fn a_masked_copy_refuses_a_rename_or_a_swap_after_its_plan() {
 /// `NOT VALID` check that reads no masked column and calls `leak()`, which copies the tokens of
 /// `z_secrets` into `a_leak`; `z_secrets.token` is masked last. The `UPDATE` of
 /// `people.token` would run the check on each row and put the raw tokens into the masked
-/// `a_leak`. The copy is refused and names the check; so it is for an index expression and for
-/// a domain of a secret column that call `leak()`. A secret column of a tenant enum with a
+/// `a_leak`. The copy is refused and names the check; so it is for an index expression, a
+/// domain of a secret column, a generated column and a check of an inheritance child that call
+/// `leak()`, and for a GiST index on a range type whose subtype difference calls it. A secret column of a tenant enum with a
 /// tenant cast to `text` does not run the cast: the copy goes through, the cast left no mark,
 /// and the value is `NULL`. Without the check, the copy goes through with no token in clear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1043,7 +1044,7 @@ async fn a_masked_copy_runs_no_tenant_code_on_values_in_clear() {
         "INSERT INTO people VALUES (1, 'tok_people')",
         "INSERT INTO z_secrets VALUES (1, 'tok_z')",
     ];
-    let cases: [(&str, &str, &str); 3] = [
+    let cases: [(&str, &str, &str); 6] = [
         (
             "a check that reads no masked column",
             "ALTER TABLE people ADD CONSTRAINT people_leak CHECK (public.leak(id)) NOT VALID;",
@@ -1059,6 +1060,34 @@ async fn a_masked_copy_runs_no_tenant_code_on_values_in_clear() {
             "CREATE DOMAIN public.leaky AS text CHECK (public.leak(1));
              ALTER TABLE people ALTER COLUMN token TYPE public.leaky;",
             "the type of column token of people",
+        ),
+        (
+            // No expression and a built-in operator class, but each insert into the GiST index
+            // calls the range's subtype difference (R2-1 of the second review of the run 10
+            // fixes). Postgres 17 builds an index with a safe `search_path`, so every name is
+            // qualified.
+            "a GiST index on a range type with a subtype difference of the tenant",
+            "CREATE FUNCTION public.fr_diff(a float8, b float8) RETURNS float8 LANGUAGE plpgsql
+               IMMUTABLE AS $f$
+             BEGIN
+               PERFORM public.leak(1);
+               RETURN a - b;
+             END $f$;
+             CREATE TYPE public.fr AS RANGE (subtype = float8, subtype_diff = public.fr_diff);
+             ALTER TABLE people ADD COLUMN span public.fr;
+             CREATE INDEX people_span ON people USING gist (span);",
+            "index people_span",
+        ),
+        (
+            "a generated column",
+            "ALTER TABLE people ADD COLUMN g integer GENERATED ALWAYS AS (public.leak_imm(id)) STORED;",
+            "generated column g of people",
+        ),
+        (
+            "a check of an inheritance child",
+            "CREATE TABLE people_child () INHERITS (people);
+             ALTER TABLE people_child ADD CONSTRAINT child_leak CHECK (public.leak(id)) NOT VALID;",
+            "check child_leak of people_child",
         ),
     ];
     for (case, extra, named) in cases {

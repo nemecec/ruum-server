@@ -24,7 +24,8 @@
 //! back in its old state afterwards. So tenant code runs at most with the rights of the copy's
 //! `owner`, which a migration of the copy has anyway. A masked copy also runs no tenant code
 //! while values are still in clear: it refuses a table whose checks, index expressions,
-//! generated columns or secret columns' domains would call one (`refuse_code_in_the_masking`),
+//! generated columns or secret columns' domains would call one, or whose index holds a range
+//! type with a tenant's canonical or subtype-difference function (`refuse_code_in_the_masking`),
 //! and it casts no value of a tenant type (FU1-R10-1 of the Kimi review of run 10). Then
 //! `ruum_dbhost` installs the copy's key and builds the lens views.
 //!
@@ -999,6 +1000,11 @@ struct FoundColumn<'p> {
 /// - every generated column of the table;
 /// - the checks of the domains that a secret column's type reaches (the `SET ... = NULL`
 ///   coerces to the domain);
+/// - the canonical and subtype-difference functions of a range type that a key of an index of
+///   the table holds (also through domains, arrays, multiranges and composite types): each
+///   insert into a GiST index on a range calls the subtype difference to rank the pages, and
+///   the range union calls the canonical function (second review of the run 10 fixes, R2-1). An
+///   exclusion constraint is an index too;
 ///
 /// and the same for each inheritance child or partition of the table (an `UPDATE` without
 /// `ONLY` reaches them). Code there that calls a function of the tenant can read a table that
@@ -1053,6 +1059,17 @@ code_types(oid) as (
   union
   select e.src from type_edges e join code_types c on c.oid operator(pg_catalog.=) e.dst
 ),
+code_ranges(oid) as (
+  select r.rngtypid from pg_catalog.pg_range r
+   where (r.rngsubdiff::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+          and not exists (select 1 from allowed a
+                           where a.oid operator(pg_catalog.=) r.rngsubdiff::pg_catalog.oid))
+      or (r.rngcanonical::pg_catalog.oid operator(pg_catalog.>=) 16384::pg_catalog.oid
+          and not exists (select 1 from allowed a
+                           where a.oid operator(pg_catalog.=) r.rngcanonical::pg_catalog.oid))
+  union
+  select e.src from type_edges e join code_ranges c on c.oid operator(pg_catalog.=) e.dst
+),
 planned(oid) as (
   select r::pg_catalog.oid from pg_catalog.unnest($1::pg_catalog.text[]) t, pg_catalog.to_regclass(t) r
    where r is not null
@@ -1073,7 +1090,7 @@ found(what) as (
   select pg_catalog.format('index %s', i.indexrelid::pg_catalog.regclass)
     from pg_catalog.pg_index i
    where i.indrelid operator(pg_catalog.=) any (array(select t.oid from touched t))
-     and ({index_calls} or {index_types})
+     and ({index_calls} or {index_types} or {index_ranges})
   union all
   select pg_catalog.format('generated column %I of %s', a.attname, ad.adrelid::pg_catalog.regclass)
     from pg_catalog.pg_attrdef ad
@@ -1100,6 +1117,7 @@ select coalesce(pg_catalog.string_agg(what, ', ' order by what), '') from found"
         check_types = allow::coerces_to("k.conbin::pg_catalog.text", "code_types"),
         index_calls = allow::unlisted_calls(INDEX_TREE),
         index_types = allow::coerces_to(INDEX_TREE, "code_types"),
+        index_ranges = INDEX_RANGES,
         generated_calls = allow::unlisted_calls("ad.adbin::pg_catalog.text"),
         generated_types = allow::coerces_to("ad.adbin::pg_catalog.text", "code_types"),
     );
@@ -1124,6 +1142,20 @@ select coalesce(pg_catalog.string_agg(what, ', ' order by what), '') from found"
 /// The stored trees of an index (`pg_index i`): its expressions and its predicate.
 const INDEX_TREE: &str =
     "pg_catalog.concat_ws(' ', i.indexprs::pg_catalog.text, i.indpred::pg_catalog.text)";
+
+/// A SQL condition on an index (`pg_index i`, with the CTE `code_ranges` in scope): a column of
+/// the index (a key or an `INCLUDE` column) or one of its expressions has a type in
+/// `code_ranges`, a range type with a canonical or subtype-difference function of the tenant
+/// (second review of the run 10 fixes, R2-1).
+const INDEX_RANGES: &str = "(exists (select 1 from pg_catalog.unnest(i.indkey::pg_catalog.int2[]) as k(n)
+                 join pg_catalog.pg_attribute a
+                   on a.attrelid operator(pg_catalog.=) i.indrelid
+                  and a.attnum operator(pg_catalog.=) k.n
+                where a.atttypid operator(pg_catalog.=) any (array(select c.oid from code_ranges c)))
+        or exists (select 1 from pg_catalog.regexp_matches(
+                            pg_catalog.concat_ws(' ', i.indexprs::pg_catalog.text, i.indpred::pg_catalog.text),
+                            ':(?:vartype|resulttype|funcresulttype|opresulttype|consttype) ([1-9][0-9]*)', 'g') as m(g)
+                    where m.g[1]::pg_catalog.oid operator(pg_catalog.=) any (array(select c.oid from code_ranges c))))";
 
 /// Refuses a masked copy whose tables of the own schema do not have exactly the columns of the
 /// catalog of the plan, with the same identity (review FU-1-3 of Kimi, FU1-R10-2 of its run 10
