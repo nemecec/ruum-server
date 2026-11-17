@@ -111,8 +111,13 @@ pub async fn run(f: &dyn PrivacyFixture) -> Report {
             format!("free_text_attributes_confirmed_normal_{n}"),
             free_text_confirmed_normal(f, s).await,
         );
+        r.add(
+            format!("short_and_mixed_case_secrets_{n}"),
+            short_and_mixed_case_secrets(f, s).await,
+        );
     }
     r.add("metric_labels_dropped", metric_labels(f).await);
+    r.add("metric_point_values_checked", metric_values(f).await);
     r.add("metric_names_checked", metric_names(f).await);
     r.add("free_text_patterns_logs", free_text_logs(f).await);
     r.add("free_text_patterns_traces", free_text_traces(f).await);
@@ -152,6 +157,31 @@ pub fn fixture_secrets() -> Vec<String> {
 /// A secret of digits only (a numeric PIN or client secret), which an app can log as a number.
 pub fn fixture_numeric_secret() -> String {
     ["7305", "9182", "64"].concat()
+}
+
+/// A secret shorter than the matcher's substring minimum: it matches as a whole value or word.
+pub fn fixture_short_secret() -> String {
+    ["q7", "Z"].concat()
+}
+
+/// A secret of 4 bytes: its base64 cores are shorter than 8 characters.
+pub fn fixture_four_byte_secret() -> String {
+    ["k9", "Wd"].concat()
+}
+
+/// The hex form of a value in mixed case (every third character upper case).
+pub fn mixed_case_hex(value: &str) -> String {
+    hex::encode(value.as_bytes())
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 3 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// A token of a known prefix that no matcher knows (the scrubber must catch it in free text).
@@ -228,12 +258,17 @@ pub fn secret_forms(value: &str) -> Vec<(String, String)> {
 }
 
 /// Scans bytes (a serialised store) for the secrets in every form of [`secret_forms`], also as
-/// the inside of a JSON string. Returns one line per finding, naming the secret by its index
-/// and the form, never the value.
+/// the inside of a JSON string, and for the hex form in any mix of cases. Returns one line per
+/// finding, naming the secret by its index and the form, never the value.
 pub fn scan_for_secrets(haystack: &[u8], secrets: &[String]) -> Vec<String> {
     let text = String::from_utf8_lossy(haystack);
+    let lower = text.to_ascii_lowercase();
     let mut found = Vec::new();
     for (i, s) in secrets.iter().enumerate() {
+        let hex = hex::encode(s.as_bytes());
+        if hex.len() >= 8 && lower.contains(&hex) {
+            found.push(format!("secret #{i} found in form hex (any case)"));
+        }
         for (name, form) in secret_forms(s) {
             let json = serde_json::to_string(&form).unwrap_or_default();
             let json_inner = &json[1..json.len() - 1];
@@ -259,6 +294,7 @@ fn encoded_values(value: &str) -> Vec<String> {
     }
     out.push(hex::encode(b));
     out.push(hex::encode_upper(b));
+    out.push(mixed_case_hex(value));
     for (_, form) in secret_forms(value) {
         if form.contains('%') || form.contains('\\') {
             out.push(format!("pre {form} post"));
@@ -1049,6 +1085,121 @@ async fn numeric_secret(f: &dyn PrivacyFixture, s: Signal) -> CaseResultT {
     scan_store(f, &[digits]).await
 }
 
+/// A metric point whose value is a numeric secret is dropped (a number cannot hold the
+/// marker); a point with another value is stored.
+async fn metric_values(f: &dyn PrivacyFixture) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let digits = fixture_numeric_secret();
+    let n: f64 = digits
+        .parse()
+        .map_err(|_| "the numeric fixture is not a number")?;
+    f.set_secrets(id.tenant, id.app, vec![SecretValue::new(digits.clone())])
+        .await;
+    let point = |value: f64| MetricPoint {
+        value,
+        ..metric_with("jobs_total", vec![])
+    };
+    let report = ingest(
+        f,
+        &id,
+        Batch {
+            metrics: vec![point(n), point(42.0)],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let stored = read_stored(f, &id, Signal::Metrics, 1).await?;
+    need(stored.metrics.len() == 1, || {
+        format!("expected 1 stored point, found {}", stored.metrics.len())
+    })?;
+    need(stored.metrics[0].value == 42.0, || {
+        "the point with the ordinary value was not the one stored".into()
+    })?;
+    need(report.dropped(DropReason::SecretInValue) == 1, || {
+        format!(
+            "expected 1 point dropped for a secret value, the report counts {}",
+            report.dropped(DropReason::SecretInValue)
+        )
+    })?;
+    scan_store(f, &[digits]).await
+}
+
+/// Short secrets (under 4 bytes) and the short forms of a 4-byte secret match as a whole value
+/// or word, and a hex form in mixed case matches too (review Kimi K1, K2).
+async fn short_and_mixed_case_secrets(f: &dyn PrivacyFixture, s: Signal) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let kind = kind_of(s);
+    let short = fixture_short_secret();
+    let four = fixture_four_byte_secret();
+    let long = fixture_secrets().remove(0);
+    let four_b64 = STANDARD.encode(four.as_bytes());
+    let mixed = mixed_case_hex(&long);
+    f.set_secrets(
+        id.tenant,
+        id.app,
+        vec![
+            SecretValue::new(short.clone()),
+            SecretValue::new(four.clone()),
+            SecretValue::new(long.clone()),
+        ],
+    )
+    .await;
+    for key in ["s_raw", "s_word", "f_b64", "l_hex", "ok"] {
+        f.set_class(
+            id.tenant,
+            id.app,
+            kind,
+            key,
+            FieldClassEntry::confirmed(FieldClass::Normal),
+        )
+        .await;
+    }
+    let attrs = vec![
+        Attribute::new("s_raw", short.as_str()),
+        Attribute::new("s_word", format!("pin={short};")),
+        Attribute::new("f_b64", format!("auth {four_b64}")),
+        Attribute::new("l_hex", mixed.as_str()),
+        Attribute::new("ok", "plain"),
+    ];
+    let text = format!("pin {short} key {mixed} auth {four_b64} done");
+    let mut batch = batch_with(s, attrs);
+    match s {
+        Signal::Logs => batch.logs.push(log_text(text.clone())),
+        Signal::Traces => batch.spans[0].name = text.clone(),
+        Signal::Metrics => {}
+    }
+    ingest(f, &id, batch).await?;
+    let stored = read_stored(f, &id, s, 1).await?;
+    let sets = stored_sets(&stored, s);
+    for key in ["s_raw", "s_word", "f_b64", "l_hex"] {
+        expect_hidden(&sets, key, s)?;
+    }
+    expect_text(&sets, "ok", "plain")?;
+    let free = match s {
+        Signal::Logs => stored.logs.iter().find_map(|l| l.text.clone()),
+        Signal::Traces => Some(stored.spans[0].name.clone()),
+        Signal::Metrics => None,
+    };
+    if let Some(free) = free {
+        need(free.contains("done"), || "the free text was lost".into())?;
+        need(
+            !free.contains(&short) && !free.contains(&four_b64) && !free.contains(&mixed),
+            || "a short or mixed-case secret form stayed in the free text".into(),
+        )?;
+    }
+    let dump = f.dump().await?;
+    let text = String::from_utf8_lossy(&dump);
+    let leaked: Vec<&str> = [("short", &short), ("base64", &four_b64)]
+        .into_iter()
+        .filter(|(_, v)| text.contains(v.as_str()))
+        .map(|(n, _)| n)
+        .collect();
+    need(leaked.is_empty(), || {
+        format!("forms in the store: {}", leaked.join(", "))
+    })?;
+    scan_store(f, &[long]).await
+}
+
 /// Attribute keys are stored verbatim (and become series names), so a key with a card number
 /// or an IBAN in it is dropped, wherever a record carries attributes.
 async fn personal_data_in_keys(f: &dyn PrivacyFixture, s: Signal) -> CaseResultT {
@@ -1318,6 +1469,8 @@ fn free_text_samples() -> Vec<(String, Option<scrub::Found>)> {
             ["QmFzZTY0IGZpeHR1cmUg", "b25seSwgbm90IHJlYWwgOkQ1"].concat(),
             Some(Hidden),
         ),
+        ("4155552671".into(), Some(Pseudonym)),
+        ("415.555.2671".into(), Some(Pseudonym)),
         ("order 12345 shipped".into(), None),
         ("4111 1111 1111 1112".into(), None),
         ("user@localhost".into(), None),

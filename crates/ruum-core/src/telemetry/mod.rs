@@ -670,6 +670,8 @@ pub enum DropReason {
     InvalidName,
     /// A metric name holds a match of a free-text pattern (an email, a card number, a token).
     PatternInName,
+    /// A metric point value holds a secret value (a secret of digits only).
+    SecretInValue,
 }
 
 /// What one ingest did. Counts and names only; never a value.
@@ -864,7 +866,9 @@ impl TelemetryIngest for PipelineIngest {
         if !out.is_empty() {
             let bytes = out.byte_size();
             report.bytes = bytes as u64;
-            self.store.write(&target, out).await?;
+            // Meter first: when metering fails, nothing is stored (no stored telemetry without
+            // usage). A store failure after this charges bytes that were not stored; that is
+            // the safe side for budgets and hard caps (design 21.5).
             self.usage
                 .record(UsageEvent {
                     tenant: identity.tenant,
@@ -876,6 +880,7 @@ impl TelemetryIngest for PipelineIngest {
                     at: crate::now(),
                 })
                 .await?;
+            self.store.write(&target, out).await?;
         }
         Ok(report)
     }
