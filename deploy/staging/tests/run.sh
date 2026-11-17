@@ -3,6 +3,7 @@
 # and on the Mac):
 #
 #   deploy/staging/tests/run.sh            all tests that the installed tools allow
+#   deploy/staging/tests/run.sh --rbac-only  offline RBAC fixtures and fake kubectl only
 #
 # - check-plan.sh accepts a good plan and refuses each bad variant (zone resource, labels,
 #   firewall, user_data, DNS names, build server, size, unknown type, variables in the JSON),
@@ -78,6 +79,16 @@ expect() {
   got=$?
   if [[ "$got" == "$want" ]]; then ok "$what"; else bad "$what (exit $got, want $want)"; sed 's/^/     /' "$TMP/out" | head -20; fi
 }
+
+# A strictly offline subset: only static fixtures and the generated fake kubectl.
+if [[ "${1:-}" == --rbac-only ]]; then
+  awk '/^echo "== observer static completeness/ {copy=1}
+       /^echo "== the deploy controller image/ {copy=0}
+       copy {print}' "$HERE/run.sh" >"$TMP/rbac-tests.sh"
+  # shellcheck disable=SC1091 # generated from this file above
+  source "$TMP/rbac-tests.sh"
+  exit "$failed"
+fi
 
 # mutate NAME JQ: a variant of the good plan.
 mutate() { jq "$2" "$FIX/plan-good.json" >"$TMP/$1.json"; echo "$TMP/$1.json"; }
@@ -1179,15 +1190,15 @@ echo "== observer static completeness (no Helm required)"
 for template in observer deployer; do
   echo '---' >>"$TMP/observer-static.yaml"
   awk '
-    /^{{- range / { loop=1; next }
-    /^{{- end / { loop=0; next }
+    index($0, "{{- range ") == 1 { loop=1; next }
+    index($0, "{{- end ") == 1 { loop=0; next }
     !loop { print }
   ' "$STG/charts/platform/templates/$template-rbac.yaml" >>"$TMP/observer-static.yaml"
   for ns in ruum edge ruum-deploy; do
     awk -v ns="$ns" '
-      /^{{- range / { loop=1; next }
-      /^{{- end / { loop=0; next }
-      loop { gsub(/{{ \. }}/, ns); print }
+      index($0, "{{- range ") == 1 { loop=1; next }
+      index($0, "{{- end ") == 1 { loop=0; next }
+      loop { gsub(/\{\{ \. \}\}/, ns); print }
     ' "$STG/charts/platform/templates/$template-rbac.yaml" >>"$TMP/observer-static.yaml"
   done
 done
@@ -1226,10 +1237,11 @@ case "$*" in
   'get clusterrolebindings -o json') cat "$FAKE_BINDINGS"; exit ;;
 esac
 [[ "$1 $2" == "auth can-i" ]] || { echo "fake kubectl: unexpected $*" >&2; exit 3; }
-verb="$3" res="$4" sub="-" ns="-" as="" groups=" "
-shift 4
+verb="$3" res="" sub="-" ns="-" as="" groups=" " output="table"
+if [[ "$verb" == --list ]]; then shift 3; else res="$4"; shift 4; fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -o) output="$2"; shift 2 ;;
     --subresource) sub="$2"; shift 2 ;;
     -n) ns="$2"; shift 2 ;;
     --all-namespaces) ns="*"; shift ;;
@@ -1244,6 +1256,45 @@ for group in system:serviceaccounts "system:serviceaccounts:$account_ns" system:
   [[ "$groups" == *" $group "* ]] || { echo "missing impersonation group $group"; exit 3; }
 done
 echo "$as $ns $verb $res $sub" >>"$FAKE_QUERIES"
+if [[ "$verb" == --list ]]; then
+  if [[ "${FAKE_FORMAT:-table}" == table && "$output" == json ]]; then
+    echo "error: unknown shorthand flag: 'o' in -o" >&2; exit 1
+  fi
+  case "${FAKE_LIST_MODE:-}" in
+    error) echo 'review unavailable' >&2; exit 1 ;;
+    malformed) echo '{bad json'; exit 0 ;;
+    incomplete) echo '{"status":{"incomplete":true,"resourceRules":[],"nonResourceRules":[]}}'; exit 0 ;;
+    warning) echo 'Warning: the list may be incomplete' ;;
+  esac
+  if [[ -n "${FAKE_TABLE_DIR:-}" && "$as" == system:serviceaccount:ruum:deployer ]]; then
+    case "$ns" in
+      ruum|ruum-deploy) cat "$FAKE_TABLE_DIR/can-i-list-deployer-$ns.txt"; exit ;;
+    esac
+  fi
+  # Model each direct/group grant, with * denoting cluster scope. Named resources
+  # use resource/name while SUB separately denotes a real subresource. The fake
+  # kubeconfig defaults to ruum when -n is omitted, as real kubectl can do.
+  rules="$(jq -Rn --arg as "$as" --arg groups "$groups" --arg ns "$ns" '
+    [inputs | split(" ") | . as $g |
+      select($g[0]==$as or (($g[0]|startswith("group:")) and
+        (($groups|split(" ")|index($g[0]|ltrimstr("group:"))) != null))) |
+      select(.[1]==(if $ns=="-" then "ruum" else $ns end) or .[1]=="*") |
+      .[2] as $verb | .[3] as $res | .[4] as $sub |
+      if ($res|startswith("/")) then {nonResourceURLs:[$res],verbs:[$verb]}
+      else ($res|split("/")) as $named | ($named[0]|split(".")) as $parts |
+        {apiGroups:[($parts[1:]|join("."))], resources:[$parts[0]+(if $sub=="-" then "" else "/"+$sub end)],
+         resourceNames:$named[1:],verbs:[$verb]} end]
+  ' "$FAKE_ALLOW")" || exit 3
+  if [[ "${FAKE_FORMAT:-table}" == json ]]; then
+    jq -n --argjson rules "$rules" '{status:{incomplete:false,resourceRules:[$rules[]|select(.resources)],nonResourceRules:[$rules[]|select(.nonResourceURLs)]}}'
+  else
+    printf '%-64s%-44s%-32s%s\n' Resources 'Non-Resource URLs' 'Resource Names' Verbs
+    jq -r '.[] | [(if .resources then .resources[0]+(if .apiGroups[0]=="" then "" else "."+.apiGroups[0] end) else "" end),
+      "["+((.nonResourceURLs // [])|join(" "))+"]", "["+((.resourceNames // [])|join(" "))+"]", "["+(.verbs|join(" "))+"]"] | .[0] + (" " * (64 - (.[0]|length))) + .[1] + (" " * (44 - (.[1]|length))) + .[2] + (" " * (32 - (.[2]|length))) + .[3]' <<<"$rules"
+  fi
+  exit
+fi
+
 allow=$'\n'"$(<"$FAKE_ALLOW")"$'\n'
 if [[ "$allow" == *$'\n'"$as $ns $verb $res $sub"$'\n'* ]]; then echo yes; exit 0; fi
 for group in $groups; do
@@ -1266,47 +1317,138 @@ for ns in ruum edge ruum-deploy; do
   done
   echo "$O $ns get pods log" >>"$FA/allow"
 done
-printf '%s\n' '{"items":[{"metadata":{"name":"ruum"}},{"metadata":{"name":"edge"}},{"metadata":{"name":"ruum-deploy"}},{"metadata":{"name":"data"}},{"metadata":{"name":"new-tenant"}}]}' >"$FA/namespaces"
-echo '{"items":[]}' >"$FA/bindings"
+# All remaining grants in the deployer template, independently enumerated.
+for ns in ruum edge ruum-deploy; do
+  case "$ns" in
+    ruum) resources="pods services events deployments.apps replicasets.apps daemonsets.apps jobs.batch" ;;
+    edge) resources="pods events daemonsets.apps" ;;
+    ruum-deploy) resources="configmaps pods events deployments.apps replicasets.apps" ;;
+  esac
+  for resource in $resources; do
+    for verb in get list watch; do echo "$D $ns $verb $resource -" >>"$FA/allow"; done
+  done
+done
+echo "$D ruum get leases.coordination.k8s.io/ruum-deploy -" >>"$FA/allow"
+# Default authenticated grants are cluster-wide and apply to both identities.
+for resource in selfsubjectaccessreviews.authorization.k8s.io selfsubjectrulesreviews.authorization.k8s.io selfsubjectreviews.authentication.k8s.io; do
+  echo "group:system:authenticated * create $resource -" >>"$FA/allow"
+done
+for url in /api '/api/*' /apis '/apis/*' /healthz /livez /readyz /version /version/ /openapi '/openapi/*'; do
+  echo "group:system:authenticated * get $url -" >>"$FA/allow"
+done
+printf '%s\n' '{"items":[{"metadata":{"name":"ruum"}},{"metadata":{"name":"edge"}},{"metadata":{"name":"ruum-deploy"}},{"metadata":{"name":"data"}},{"metadata":{"name":"auth"}},{"metadata":{"name":"new-tenant"}}]}' >"$FA/namespaces"
+# Standard ServiceAccount grants also apply to both identities in every namespace.
+for verb in get list watch; do
+  echo "group:system:serviceaccounts * $verb clustertrustbundles.certificates.k8s.io -" >>"$FA/allow"
+done
+for url in /.well-known/openid-configuration /.well-known/openid-configuration/ /openid/v1/jwks /openid/v1/jwks/; do
+  echo "group:system:serviceaccounts * get $url -" >>"$FA/allow"
+done
+jq -n '{items:(["system:basic-user", "system:discovery", "system:public-info-viewer",
+  "system:cluster-trust-bundle-discovery", "system:service-account-issuer-discovery"] | map(. as $name |
+  {metadata:{name:$name}, roleRef:{apiGroup:"rbac.authorization.k8s.io",kind:"ClusterRole",name:$name},
+   subjects:((if $name == "system:public-info-viewer" then ["system:authenticated","system:unauthenticated"]
+     elif $name == "system:basic-user" or $name == "system:discovery" then ["system:authenticated"]
+     else ["system:serviceaccounts"] end) | map({kind:"Group",name:.}))}))}' >"$FA/bindings"
+cp "$FA/bindings" "$FA/standard-bindings"
 livecheck() (
   # Source the fake in a subshell to avoid an executable launch for every matrix entry.
   # The function is exported only to this check; no real kubectl can be reached.
   # shellcheck disable=SC1090 # generated fake above
   kubectl() ( source "$FAKE_KUBECTL" "$@"; )
   export -f kubectl
-  FAKE_KUBECTL="$FA/bin/kubectl" FAKE_NAMESPACES="$FA/namespaces" FAKE_BINDINGS="$FA/bindings" \
+  FAKE_TABLE_DIR="${FAKE_TABLE_DIR:-}" FAKE_LIST_MODE="${FAKE_LIST_MODE:-}" FAKE_FORMAT="${FAKE_FORMAT:-table}" FAKE_KUBECTL="$FA/bin/kubectl" FAKE_NAMESPACES="$FA/namespaces" FAKE_BINDINGS="$FA/bindings" \
     FAKE_QUERIES="$FA/queries" PATH="$FA/bin:$PATH" FAKE_ALLOW="$1" bash "$STG/ops/rbac-check.sh" live
 )
 expect 0 "the live check passes when the deployer may only write release requests" livecheck "$FA/allow"
-# Verify the complete negative matrix from the passing run, without rerunning it for each tuple.
-for ns in ruum edge ruum-deploy data new-tenant; do
-  for resource in secrets configmaps; do
-    for verb in get list watch; do
-      grep -qxF "$O $ns $verb $resource -" "$FA/queries" || bad "missing observer deny query $ns $verb $resource"
-    done
+# Every namespace and a no-namespace review must be requested for both accounts.
+for identity in "$O" "$D"; do
+  for ns in ruum edge ruum-deploy data auth new-tenant -; do
+    grep -qxF "$identity $ns --list  -" "$FA/queries" || bad "missing effective review $identity $ns"
   done
-  for resource in pods deployments.apps daemonsets.apps replicasets.apps jobs.batch events events.events.k8s.io; do
-    for verb in create update patch delete deletecollection; do
-      grep -qxF "$O $ns $verb $resource -" "$FA/queries" || bad "missing observer write query $ns $verb $resource"
-    done
-    case "$ns" in
-      data | new-tenant)
-        for verb in get list watch; do
-          grep -qxF "$O $ns $verb $resource -" "$FA/queries" || bad "missing observer outside read query $ns $verb $resource"
-        done ;;
-    esac
-  done
-  for extra in "create pods exec" "get pods exec" "create pods attach" "get pods attach" \
-    "create pods portforward" "get pods portforward" "get pods ephemeralcontainers" \
-    "update pods ephemeralcontainers" "patch pods ephemeralcontainers" "create serviceaccounts token"; do
-    grep -qxF "$O $ns $extra" "$FA/queries" || bad "missing observer subresource query $ns $extra"
-  done
-  case "$ns" in
-    data | new-tenant)
-      for verb in get list watch; do
-        grep -qxF "$O $ns $verb pods log" "$FA/queries" || bad "missing observer outside log query $ns $verb"
-      done ;;
+done
+FAKE_FORMAT=table expect 0 "table-only kubectl audits allowed rights" livecheck "$FA/allow"
+FAKE_FORMAT=json expect 0 "JSON reviews remain supported by the normalizer" livecheck "$FA/allow"
+# Real kubectl fixtures stay untouched; each output has its own header offsets.
+for ns in ruum ruum-deploy; do
+  expect 0 "parse real $ns table" jq -Rse -f "$STG/ops/rbac-rules.jq" "$FIX/can-i-list-deployer-$ns.txt"
+  cp "$TMP/out" "$FA/parsed-$ns.json"
+  expect 0 "real $ns URL and duplicate rows" jq -e '
+    any(.[]; .resources == [] and .apiGroups == [] and .nonResourceURLs == ["/api/*"] and .verbs == ["get"]) and
+    ([.[] | select(.nonResourceURLs == ["/healthz"])] | length == 2) and
+    any(.[]; .resources == ["pods"] and .apiGroups == [""] and .verbs == ["get","list","watch"])
+  ' "$FA/parsed-$ns.json"
+done
+expect 0 "real ruum named resource rows and rule count" jq -e '
+  length == 33 and
+  any(.[]; .resources == ["configmaps"] and .resourceNames == ["ruum-release"] and .verbs == ["get"]) and
+  any(.[]; .resources == ["leases"] and .apiGroups == ["coordination.k8s.io"] and .resourceNames == ["ruum-deploy"] and .verbs == ["get"])
+' "$FA/parsed-ruum.json"
+expect 0 "real request namespace grants and rule count" jq -e '
+  length == 29 and any(.[]; .resources == ["configmaps"] and .apiGroups == [""] and .resourceNames == [] and .verbs == ["create","get","list","watch"])
+' "$FA/parsed-ruum-deploy.json"
+FAKE_TABLE_DIR="$FIX" expect 0 "live deployer audit accepts both real tables" livecheck "$FA/allow"
+mkdir -p "$FA/tables"
+cp "$FIX"/can-i-list-deployer-*.txt "$FA/tables/"
+# Use the fixture header offsets for the extra grant, too.
+awk 'NR == 1 { urls=index($0,"Non-Resource URLs"); names=index($0,"Resource Names"); verbs=index($0,"Verbs") }
+  END { printf "%-*s%-*s%-*s%s\n", urls-1,"secrets",names-urls,"[]",verbs-names,"[]","[create]" }
+' "$FIX/can-i-list-deployer-ruum.txt" >>"$FA/tables/can-i-list-deployer-ruum.txt"
+FAKE_TABLE_DIR="$FA/tables" expect 1 "real table plus create secrets fails live audit" livecheck "$FA/allow"
+grep -qF 'forbidden effective rules' "$TMP/out" || bad "extra fixture grant must fail the audit, not parsing"
+expect 0 "all five standard bindings and their rights pass" livecheck "$FA/allow"
+for mutation in role-name role-kind role-group binding-name; do
+  jq --arg mutation "$mutation" '
+    (.items[] | select(.metadata.name == "system:discovery")) |=
+      (if $mutation == "role-name" then .roleRef.name = "other-role"
+       elif $mutation == "role-kind" then .roleRef.kind = "Role"
+       elif $mutation == "role-group" then .roleRef.apiGroup = "other.example"
+       else .metadata.name = "other-discovery" end)' "$FA/standard-bindings" >"$FA/bindings"
+  expect 1 "standard binding rejects changed $mutation" livecheck "$FA/allow"
+  grep -qF "observer has forbidden ClusterRoleBindings" "$TMP/out" || bad "missing binding diagnostic for $mutation"
+done
+cp "$FA/standard-bindings" "$FA/bindings"
+# Exercise the real derivation, including the template loop, with each available awk.
+# Source only function definitions; the command dispatch is excluded.
+# shellcheck disable=SC2329 # invoked through expect
+allowlist_with_awk() (
+  case "$1" in
+    busybox) awk() { busybox awk "$@"; } ;;
+    *) AWK_BINARY="$1"; awk() { "$AWK_BINARY" "$@"; } ;;
   esac
+  # Keep the real template path in the extracted definitions.
+  # shellcheck disable=SC2016 # literal shell patterns
+  sed -e '/^case "${1:-}" in/,$d' \
+    -e 's@^  template=.*@  template="$STG/charts/platform/templates/deployer-rbac.yaml"@' "$STG/ops/rbac-check.sh" >"$FA/definitions.sh"
+  # shellcheck disable=SC1091 # generated definitions
+  source "$FA/definitions.sh"
+  effective_allowlist >"$FA/derived-$2" || return 1
+  jq -se 'length == 10 and (map(.namespace)|unique) == ["edge","ruum","ruum-deploy"] and
+    any(.[]; .namespace == "ruum" and .resourceNames == ["ruum-release"])' "$FA/derived-$2" >/dev/null
+)
+for awk_impl in /usr/bin/awk gawk mawk busybox; do
+  if command -v "$awk_impl" >/dev/null 2>&1; then
+    expect 0 "deployer allow-list derives with $awk_impl" allowlist_with_awk "$awk_impl" "${awk_impl##*/}"
+  else
+    echo "SKIP deployer allow-list with $awk_impl: not installed"
+  fi
+done
+
+for mode in error malformed incomplete warning; do
+  FAKE_LIST_MODE="$mode" expect 1 "effective review fails closed on $mode" livecheck "$FA/allow"
+done
+FAKE_FORMAT=table FAKE_LIST_MODE=warning expect 1 "table review fails closed on incomplete warning" livecheck "$FA/allow"
+for extra in "$O ruum create secrets -" "$O edge get services -" \
+  "group:system:authenticated * delete namespaces -" "group:system:authenticated * get /debug -" \
+  "$D edge get services -" "$D ruum get configmaps -" "$D ruum get configmaps/other -" \
+  "$O ruum update clustertrustbundles.certificates.k8s.io -" "$O ruum get clustertrustbundles.other.io -" \
+  "group:system:serviceaccounts * get /openid/v1/jwks/extra -" "group:system:serviceaccounts * post /.well-known/openid-configuration -" \
+  "$O ruum get pods.other.io -" "$O ruum * pods -" "$O ruum get *.apps -"; do
+  { cat "$FA/allow"; echo "$extra"; } >"$FA/more"
+  expect 1 "effective audit refuses $extra" livecheck "$FA/more"
+  grep -qF "forbidden effective rules" "$TMP/out" || bad "missing forbidden-rule diagnostic for $extra"
+  FAKE_FORMAT=table expect 1 "table effective audit refuses $extra" livecheck "$FA/more"
+  grep -qF "forbidden effective rules" "$TMP/out" || bad "missing table forbidden-rule diagnostic for $extra"
 done
 for extra in "$O ruum list secrets -" "$O edge watch configmaps -" "$O ruum-deploy delete pods -" \
   "$O edge update pods ephemeralcontainers" "$O new-tenant list events.events.k8s.io -"; do
@@ -1319,7 +1461,7 @@ for group in system:serviceaccounts system:serviceaccounts:ruum system:authentic
 done
 # A harmless ClusterRole still must not be bound to the observer or its SA groups.
 for subject in 'ServiceAccount observer ruum' 'User system:serviceaccount:ruum:observer -' \
-  'Group system:serviceaccounts:ruum -' 'Group system:serviceaccounts -'; do
+  'Group system:serviceaccounts:ruum -' 'Group system:serviceaccounts -' 'Group system:authenticated -'; do
   read -r kind name ns <<<"$subject"
   jq -n --arg kind "$kind" --arg name "$name" --arg ns "$ns" \
     '{items:[{metadata:{name:"unexpected"},subjects:[{kind:$kind,name:$name,namespace:$ns}]}]}' >"$FA/bindings"
