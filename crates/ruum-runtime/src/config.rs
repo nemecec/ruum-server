@@ -101,6 +101,19 @@ pub struct DockerConfig {
     pub extra_labels: BTreeMap<String, String>,
     /// The timeout of one Docker API call (not of the long-lived attach and wait streams).
     pub api_timeout: Duration,
+    /// The most instances the driver keeps, running and ended together. A start beyond it first
+    /// forgets the oldest ended instances; when every kept instance still runs, the start is
+    /// `unavailable` (backlog R2A-5, Kimi review of run 11, finding 3).
+    pub max_instances: usize,
+    /// How long the driver keeps an ended (stopped or exited) instance and its log ring.
+    pub ended_retention: Duration,
+    /// How long the driver keeps an ended instance after its logs were read to the end.
+    pub drained_retention: Duration,
+    /// The most ended instances the driver keeps; the oldest are forgotten first.
+    pub max_ended_instances: usize,
+    /// The most log bytes the driver keeps for ended instances together; the oldest instances
+    /// are forgotten first.
+    pub max_ended_log_bytes: usize,
 }
 
 /// The default health check: busybox `wget` without a proxy, quiet, output discarded, a 2 s
@@ -146,6 +159,11 @@ impl DockerConfig {
             start_period: Duration::from_secs(10),
             extra_labels: BTreeMap::new(),
             api_timeout: Duration::from_secs(120),
+            max_instances: 4096,
+            ended_retention: Duration::from_secs(15 * 60),
+            drained_retention: Duration::from_secs(60),
+            max_ended_instances: 1024,
+            max_ended_log_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -167,6 +185,9 @@ impl DockerConfig {
         }
         if self.max_line_bytes > ruum_core::runtime::redact::MAX_LINE_BYTES {
             return bad("the line cap is at most the redactor's line size".to_owned());
+        }
+        if self.max_instances == 0 {
+            return bad("the instance cap must be above zero".to_owned());
         }
         if self.health_command.first().map(String::as_str) != Some("CMD") {
             return bad("the health command starts with CMD (no shell)".to_owned());

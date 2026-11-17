@@ -969,7 +969,10 @@ pub trait RuntimeDriver: Send + Sync {
     ) -> Result<InstanceStatus, RuntimeError>;
 
     /// Stops the instance and frees its sandbox. Stopping a stopped instance does nothing. The
-    /// logs stay readable while the driver keeps the instance.
+    /// logs stay readable while the driver keeps the instance. A driver may forget an ended
+    /// (stopped or exited) instance after its logs were read to the end, after a retention
+    /// time, or when it keeps too many; then every call is [`RuntimeError::NotFound`]. The
+    /// Docker driver's bounds are in its README (backlog R2A-5).
     async fn stop(&self, tenant: TenantId, instance: InstanceId) -> Result<(), RuntimeError>;
 
     /// Records a request to a service (the gateway calls it), which restarts its idle timer. On

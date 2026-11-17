@@ -63,6 +63,16 @@ impl Ring {
         }
     }
 
+    /// The memory the lines take: their text and one [`LogLine`] each.
+    pub(crate) fn memory(&self) -> usize {
+        self.bytes + self.lines.len() * std::mem::size_of::<LogLine>()
+    }
+
+    /// The `seq` of the newest line (0 before the first).
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.next_seq - 1
+    }
+
     pub(crate) fn after(&self, after: Option<u64>, limit: usize) -> Vec<LogLine> {
         let from = after.map_or(0, |a| a + 1);
         let start = self.lines.partition_point(|l| l.seq < from);

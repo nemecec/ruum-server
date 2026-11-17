@@ -110,6 +110,12 @@ struct St {
     redactors: Option<Arc<Mutex<Redactors>>>,
     supervisor: Option<JoinHandle<()>>,
     torn_down: bool,
+    /// When the instance ended (stopped or exited, its sandbox freed): the start of its
+    /// retention ([`DockerConfig::ended_retention`]).
+    ended: Option<Instant>,
+    /// When the logs of the ended instance were read to the end
+    /// ([`DockerConfig::drained_retention`]).
+    drained: Option<Instant>,
 }
 
 struct Instance {
@@ -140,6 +146,23 @@ impl St {
         self.intent = intent;
         self.intent_at = Instant::now();
     }
+
+    /// True when nothing of the instance runs any more: stopped or exited, its sandbox freed
+    /// (or it never had one), its supervisor done. Only such an instance can be forgotten.
+    fn is_ended(&self, has_container: bool) -> bool {
+        matches!(
+            self.state,
+            InstanceState::Stopped | InstanceState::Exited(_)
+        ) && (self.torn_down || !has_container)
+            && self.supervisor.as_ref().is_none_or(|s| s.is_finished())
+    }
+
+    /// Notes the end of the instance (once).
+    fn mark_ended(&mut self, has_container: bool) {
+        if self.ended.is_none() && self.is_ended(has_container) {
+            self.ended = Some(Instant::now());
+        }
+    }
 }
 
 impl Instance {
@@ -149,6 +172,13 @@ impl Instance {
 
     fn secrets(&self) -> Vec<String> {
         self.lock().secrets()
+    }
+
+    /// Sets the state `stopped` after a stop and notes the end.
+    fn stopped(&self) {
+        let mut st = self.lock();
+        st.state = InstanceState::Stopped;
+        st.mark_ended(self.container.is_some());
     }
 
     fn health_check(&self) -> bool {
@@ -309,6 +339,28 @@ impl DockerDriver {
                 stale: Mutex::new(Vec::new()),
             }),
         })
+    }
+
+    /// The instances the driver keeps, running and ended (for tests and operations).
+    pub fn kept_instances(&self) -> usize {
+        self.inner
+            .instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    /// The memory of the log rings of every kept instance (for tests and operations).
+    pub fn kept_log_bytes(&self) -> usize {
+        let all: Vec<Arc<Instance>> = self
+            .inner
+            .instances
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        all.iter().map(|i| i.lock().ring.memory()).sum()
     }
 
     /// The container name of an instance (for tests and operations; never for an app).
@@ -1142,6 +1194,92 @@ impl Inner {
         Ok(())
     }
 
+    /// Forgets ended instances (backlog R2A-5): those past [`DockerConfig::ended_retention`],
+    /// or past [`DockerConfig::drained_retention`] after their logs were read to the end; then
+    /// the oldest ended ones while more than [`DockerConfig::max_ended_instances`] are kept or
+    /// their logs take more than [`DockerConfig::max_ended_log_bytes`]. With `room`, also the
+    /// oldest ended ones until fewer than [`DockerConfig::max_instances`] are kept. An instance
+    /// with an operation in progress is left alone. Called with the map held.
+    fn sweep(&self, map: &mut HashMap<InstanceId, Arc<Instance>>, room: bool) {
+        let now = Instant::now();
+        let cfg = &self.cfg;
+        let mut evict = Vec::new();
+        let mut ended: Vec<(Instant, InstanceId, usize)> = Vec::new();
+        for (id, inst) in map.iter() {
+            let Ok(_op) = inst.op.try_lock() else {
+                continue;
+            };
+            let mut st = inst.lock();
+            st.mark_ended(inst.container.is_some());
+            let Some(at) = st.ended else {
+                continue;
+            };
+            let expired = now.duration_since(at) >= cfg.ended_retention
+                || st
+                    .drained
+                    .is_some_and(|d| now.duration_since(d) >= cfg.drained_retention);
+            if expired {
+                evict.push(*id);
+            } else {
+                ended.push((at, *id, st.ring.memory()));
+            }
+        }
+        ended.sort_by_key(|(at, _, _)| *at);
+        let mut count = ended.len();
+        let mut bytes: usize = ended.iter().map(|(_, _, b)| b).sum();
+        let mut kept = map.len() - evict.len();
+        for (_, id, b) in ended {
+            let over = count > cfg.max_ended_instances
+                || bytes > cfg.max_ended_log_bytes
+                || (room && kept >= cfg.max_instances);
+            if !over {
+                break;
+            }
+            evict.push(id);
+            count -= 1;
+            bytes -= b;
+            kept -= 1;
+        }
+        for id in evict {
+            map.remove(&id);
+        }
+    }
+
+    /// Forgets the ended instances that are due ([`Inner::sweep`]).
+    fn sweep_now(&self) {
+        let mut map = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        self.sweep(&mut map, false);
+    }
+
+    /// Makes room for one more instance: `unavailable` when [`DockerConfig::max_instances`]
+    /// instances still run.
+    fn check_room(&self) -> Result<(), RuntimeError> {
+        let mut map = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        self.sweep(&mut map, true);
+        self.room_in(&map)
+    }
+
+    fn room_in(&self, map: &HashMap<InstanceId, Arc<Instance>>) -> Result<(), RuntimeError> {
+        if map.len() >= self.cfg.max_instances {
+            return Err(RuntimeError::Unavailable {
+                reason: format!(
+                    "the driver runs its maximum of {} instances",
+                    self.cfg.max_instances
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Keeps a new instance, within [`DockerConfig::max_instances`].
+    fn keep(&self, inst: &Arc<Instance>) -> Result<(), RuntimeError> {
+        let mut map = self.instances.lock().unwrap_or_else(|p| p.into_inner());
+        self.sweep(&mut map, true);
+        self.room_in(&map)?;
+        map.insert(inst.id, inst.clone());
+        Ok(())
+    }
+
     async fn health(&self, inst: &Instance) -> Health {
         let Some(c) = &inst.container else {
             return Health::Healthy;
@@ -1439,10 +1577,17 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
     if next != InstanceState::ScaledToZero {
         inner.teardown(&inst).await;
     }
-    let mut st = inst.lock();
-    st.state = next;
-    st.set_intent(Intent::None);
-    st.redactors = None;
+    {
+        let mut st = inst.lock();
+        st.state = next;
+        st.set_intent(Intent::None);
+        st.redactors = None;
+        if next != InstanceState::ScaledToZero {
+            // The supervisor (this task) is about to end.
+            st.ended.get_or_insert_with(Instant::now);
+        }
+    }
+    inner.sweep_now();
 }
 
 #[async_trait]
@@ -1455,6 +1600,8 @@ impl RuntimeDriver for DockerDriver {
         spec.validate()?;
         let inner = &self.inner;
         inner.check_spec(&spec)?;
+        // Refused before any engine work when the driver is full of running instances.
+        inner.check_room()?;
         let id = InstanceId::new();
         let secrets: Vec<String> = spec
             .redacted_values()
@@ -1475,6 +1622,8 @@ impl RuntimeDriver for DockerDriver {
             redactors: None,
             supervisor: None,
             torn_down: false,
+            ended: None,
+            drained: None,
         };
         let digest = match &spec.image {
             ImageRef::Static(_) => {
@@ -1492,11 +1641,7 @@ impl RuntimeDriver for DockerDriver {
                     op: tokio::sync::Mutex::new(()),
                     st: Mutex::new(new_st(InstanceState::Running)),
                 });
-                inner
-                    .instances
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(id, inst.clone());
+                inner.keep(&inst)?;
                 return Ok(inner.status(&inst).await);
             }
             ImageRef::Oci(d) => d.clone(),
@@ -1583,11 +1728,10 @@ impl RuntimeDriver for DockerDriver {
             inner.teardown(&inst).await;
             return Err(e);
         }
-        inner
-            .instances
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id, inst.clone());
+        if let Err(e) = inner.keep(&inst) {
+            inner.teardown(&inst).await;
+            return Err(e);
+        }
         let _op = inst.op.lock().await;
         if let Err(e) = inner.begin_run(&inst).await {
             inner.teardown(&inst).await;
@@ -1631,12 +1775,12 @@ impl RuntimeDriver for DockerDriver {
                     join_bounded(s, bound).await;
                 }
                 inner.teardown(&inst).await;
-                inst.lock().state = InstanceState::Stopped;
+                inst.stopped();
                 Ok(())
             }
             InstanceState::Running | InstanceState::Starting => {
                 if inst.container.is_none() {
-                    inst.lock().state = InstanceState::Stopped;
+                    inst.stopped();
                     return Ok(());
                 }
                 let name = inst.container.clone().unwrap_or_default();
@@ -1648,7 +1792,7 @@ impl RuntimeDriver for DockerDriver {
                 // A scale to zero that won the race already ended the run. Teardown removes
                 // the container by force when the supervisor did not end.
                 inner.teardown(&inst).await;
-                inst.lock().state = InstanceState::Stopped;
+                inst.stopped();
                 if ended {
                     Ok(())
                 } else {
@@ -1747,8 +1891,15 @@ impl RuntimeDriver for DockerDriver {
         limit: usize,
     ) -> Result<Vec<LogLine>, RuntimeError> {
         let inst = self.inner.get_for(tenant, instance)?;
-        let st = inst.lock();
-        Ok(st.ring.after(after, limit))
+        let mut st = inst.lock();
+        let lines = st.ring.after(after, limit);
+        // An ended instance whose logs were read to the end is kept only a short time more.
+        let read_to = lines.last().map_or(after.unwrap_or(0), |l| l.seq);
+        st.mark_ended(inst.container.is_some());
+        if st.ended.is_some() && st.drained.is_none() && read_to >= st.ring.last_seq() {
+            st.drained = Some(Instant::now());
+        }
+        Ok(lines)
     }
 
     async fn rotate_token(
@@ -1804,4 +1955,229 @@ pub fn label_keys() -> BTreeMap<&'static str, &'static str> {
         (LABEL_INSTANCE, "the instance ID (containers)"),
         (LABEL_MANAGED, "ruum-runtime (networks and containers)"),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    //! The retention of ended instances (backlog R2A-5, Kimi review of run 11, finding 3), on
+    //! static instances: they need no engine, so the driver runs here without one.
+
+    use super::*;
+    use crate::egress::NoEgress;
+    use ruum_core::ids::NodeId;
+    use ruum_core::runtime::{Environment, MemoryUsage, ServiceSpec, StaticFile, StaticImage};
+
+    fn offline(cfg: DockerConfig) -> DockerDriver {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("a client (it never connects here)");
+        DockerDriver {
+            inner: Arc::new(Inner {
+                docker,
+                cfg,
+                usage: Arc::new(MemoryUsage::new()),
+                egress: Arc::new(NoEgress),
+                http: reqwest::Client::new(),
+                instances: Mutex::new(HashMap::new()),
+                networks: tokio::sync::Mutex::new(HashMap::new()),
+                stale: Mutex::new(Vec::new()),
+            }),
+        }
+    }
+
+    fn config() -> DockerConfig {
+        DockerConfig::new(
+            "http://127.0.0.1:9",
+            "127.0.0.1:5000",
+            std::env::temp_dir().join("ruum-runtime-retention-unused"),
+        )
+    }
+
+    fn spec(tenant: TenantId) -> WorkloadSpec {
+        WorkloadSpec {
+            identity: WorkloadIdentity {
+                tenant,
+                app: NodeId::new(),
+                deployment: uuid::Uuid::now_v7(),
+                environment: Environment::Live,
+            },
+            kind: WorkloadKind::Service(ServiceSpec {
+                port: 8080,
+                health: None,
+                idle_timeout: None,
+            }),
+            image: ImageRef::Static(StaticImage::new(vec![StaticFile {
+                path: "index.html".to_owned(),
+                content: ruum_core::blobs::Hash::of(b"<h1>hi</h1>"),
+                size: 11,
+            }])),
+            command: Vec::new(),
+            env: Vec::new(),
+            previous_secrets: Vec::new(),
+            workload_token: SecretValue::new(format!("wt_{}", uuid::Uuid::now_v7().simple())),
+            limits: Limits {
+                cpu_millis: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_bytes: 16 * 1024 * 1024,
+            },
+            routes: Vec::new(),
+        }
+    }
+
+    /// Fills the ring of an instance with `lines` lines of 1 KiB, as the pump would.
+    fn fill(d: &DockerDriver, id: InstanceId, lines: usize) {
+        let inst = d.inner.get(id).expect("kept");
+        let mut st = inst.lock();
+        for _ in 0..lines {
+            st.ring.push(
+                inst.id,
+                inst.identity,
+                LogStream::Stdout,
+                OffsetDateTime::now_utc(),
+                "x".repeat(1024),
+            );
+        }
+    }
+
+    /// Starts a static instance, gives it `lines` log lines and stops it.
+    async fn start_and_end(d: &DockerDriver, tenant: TenantId, lines: usize) -> InstanceId {
+        let s = d.start(spec(tenant)).await.expect("start");
+        fill(d, s.id, lines);
+        d.stop(tenant, s.id).await.expect("stop");
+        s.id
+    }
+
+    fn gone(r: Result<InstanceStatus, RuntimeError>) -> bool {
+        matches!(r, Err(RuntimeError::NotFound { .. }))
+    }
+
+    #[tokio::test]
+    async fn repeated_start_and_exit_keeps_memory_bounded() {
+        let mut cfg = config();
+        cfg.max_ended_instances = 8;
+        let d = offline(cfg);
+        let tenant = TenantId::new();
+        start_and_end(&d, tenant, 64).await;
+        let one = d.kept_log_bytes();
+        let first = d.kept_instances();
+        assert_eq!(first, 1);
+        let mut ids = Vec::new();
+        for i in 0..3000 {
+            ids.push(start_and_end(&d, tenant, 64).await);
+            let kept = d.kept_instances();
+            assert!(kept <= 9, "round {i}: {kept} instances kept");
+            assert!(
+                d.kept_log_bytes() <= 9 * one,
+                "round {i}: {} log bytes kept",
+                d.kept_log_bytes()
+            );
+        }
+        // The oldest are forgotten, the newest still answer.
+        assert!(gone(d.status(tenant, ids[0]).await));
+        let last = *ids.last().unwrap();
+        assert_eq!(
+            d.status(tenant, last).await.expect("kept").state,
+            InstanceState::Stopped
+        );
+        assert_eq!(d.logs(tenant, last, None, 1000).await.unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn ended_log_bytes_are_capped() {
+        let mut cfg = config();
+        let tenant = TenantId::new();
+        // Room for the logs of about three ended instances.
+        let probe = offline(config());
+        let id = start_and_end(&probe, tenant, 100).await;
+        let one = probe.inner.get(id).unwrap().lock().ring.memory();
+        cfg.max_ended_log_bytes = 3 * one + one / 2;
+        let d = offline(cfg);
+        for _ in 0..50 {
+            start_and_end(&d, tenant, 100).await;
+        }
+        // The sweep runs at the next start: three ended and the new one.
+        let s = d.start(spec(tenant)).await.unwrap();
+        assert_eq!(d.kept_instances(), 4);
+        assert!(d.kept_log_bytes() <= 3 * one + one / 2);
+        assert_eq!(
+            d.status(tenant, s.id).await.unwrap().state,
+            InstanceState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn read_logs_shorten_the_retention() {
+        let mut cfg = config();
+        cfg.drained_retention = Duration::ZERO;
+        let d = offline(cfg);
+        let tenant = TenantId::new();
+        let read = start_and_end(&d, tenant, 10).await;
+        let unread = start_and_end(&d, tenant, 10).await;
+        // Read only part of the logs: not drained yet.
+        let part = d.logs(tenant, read, None, 4).await.unwrap();
+        d.start(spec(tenant)).await.unwrap();
+        assert!(!gone(d.status(tenant, read).await), "read in part");
+        // Read to the end: forgotten at the next sweep.
+        let rest = d
+            .logs(tenant, read, part.last().map(|l| l.seq), 100)
+            .await
+            .unwrap();
+        assert_eq!(part.len() + rest.len(), 10);
+        d.start(spec(tenant)).await.unwrap();
+        assert!(gone(d.status(tenant, read).await), "read to the end");
+        assert!(!gone(d.status(tenant, unread).await), "never read");
+        // Logs read while the instance runs do not count.
+        let s = d.start(spec(tenant)).await.unwrap();
+        d.logs(tenant, s.id, None, 100).await.unwrap();
+        d.start(spec(tenant)).await.unwrap();
+        assert_eq!(
+            d.status(tenant, s.id).await.unwrap().state,
+            InstanceState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_instances_go_after_the_retention() {
+        let mut cfg = config();
+        cfg.ended_retention = Duration::ZERO;
+        let d = offline(cfg);
+        let tenant = TenantId::new();
+        let ended = start_and_end(&d, tenant, 1).await;
+        let running = d.start(spec(tenant)).await.unwrap().id;
+        assert!(gone(d.status(tenant, ended).await));
+        d.start(spec(tenant)).await.unwrap();
+        assert_eq!(
+            d.status(tenant, running).await.unwrap().state,
+            InstanceState::Running,
+            "a running instance is never forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_driver_refuses_a_start() {
+        let mut cfg = config();
+        cfg.max_instances = 3;
+        let d = offline(cfg);
+        let tenant = TenantId::new();
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            running.push(d.start(spec(tenant)).await.unwrap().id);
+        }
+        assert!(matches!(
+            d.start(spec(tenant)).await,
+            Err(RuntimeError::Unavailable { .. })
+        ));
+        assert_eq!(d.kept_instances(), 3);
+        // An ended instance makes room, also within its retention.
+        d.stop(tenant, running[0]).await.unwrap();
+        d.start(spec(tenant)).await.expect("room after a stop");
+        assert_eq!(d.kept_instances(), 3);
+        assert!(gone(d.status(tenant, running[0]).await));
+        for id in &running[1..] {
+            assert_eq!(
+                d.status(tenant, *id).await.unwrap().state,
+                InstanceState::Running
+            );
+        }
+    }
 }

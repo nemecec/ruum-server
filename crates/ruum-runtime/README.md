@@ -106,6 +106,14 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   value, and the newest 16 workload tokens of an instance (the current one and 15 earlier); an
   older token is no longer redacted. When a value is part of the marker `<hidden secret>`, a
   shorter marker is used, and at last an empty one.
+- Ended instances (stopped or exited, the sandbox freed) are forgotten with their log rings
+  (backlog R2A-5): after `ended_retention` (15 min), or `drained_retention` (60 s) after their
+  logs were read to the end; at once, oldest first, when more than `max_ended_instances` (1024)
+  are kept or their logs take more than `max_ended_log_bytes` (256 MiB). A forgotten instance
+  is `instance_not_found`. At most `max_instances` (4096) instances are kept, running and ended
+  together: a start beyond it first forgets ended ones, and is `unavailable` when all of them
+  run. The sweep runs at each start and each end of an instance, so nothing runs while the
+  driver is idle; the caps hold anyway.
 - A server restart: the driver keeps its instances in memory. The next start of an app whose
   network an earlier run left adopts that network (labels `ruum.managed`, `ruum.tenant`,
   `ruum.app`, `ruum.env` must match, and the read-back must pass), attaches the missing shared
