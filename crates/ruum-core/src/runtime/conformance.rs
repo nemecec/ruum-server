@@ -81,12 +81,24 @@ pub trait BuilderFixture: Send + Sync {
     /// The times of the timeout case.
     fn build_timing(&self) -> BuildTiming;
     /// An archive whose build succeeds and writes to the build log the line `env-dump:begin`,
-    /// its whole environment (one `NAME=value` line each) and the content of every credential
-    /// file it can read, then the line `env-dump:end`.
+    /// its whole environment as one `NAME=<hex(value)>` line each (the value hex-encoded, so a
+    /// builder whose log redaction hides a canary cannot pass; backlog S-37) and the content of
+    /// every credential file it can read (`FILE:<path>=<hex(content)>`), then the line
+    /// `env-dump:end`.
     fn env_dump_archive(&self) -> Bytes;
     /// Values the fixture planted in the builder's own environment and credentials (for
-    /// example the registry push credential). No build may see one.
+    /// example the registry push credential). No build may see one, and no built image may
+    /// hold one.
     fn canaries(&self) -> Vec<String>;
+    /// The content of a built image that the build added: its config and every new layer,
+    /// uncompressed. `None` when the builder's images have no content (the in-memory builder).
+    fn image_content<'a>(
+        &'a self,
+        _identity: &'a WorkloadIdentity,
+        _image: &'a ImageRef,
+    ) -> BoxFuture<'a, Result<Option<Vec<Bytes>>, String>> {
+        Box::pin(async { Ok(None) })
+    }
     fn skip(&self, _case: &str) -> Option<String> {
         None
     }
@@ -1876,26 +1888,69 @@ async fn build_times_out(f: &dyn BuilderFixture) -> CaseResult {
     Ok(())
 }
 
+/// Whether `haystack` holds `needle` (bytes).
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// A build sees nothing of the builder's own environment and credentials: none of the values
-/// the fixture planted appears in the build's own report of its environment.
+/// the fixture planted appears in the build's own report of its environment, neither as it is
+/// nor hex-encoded (the report writes each value in hex, so a log redaction that hides the
+/// plain value does not hide it; backlog S-37). The built image (config and new layers, when
+/// the builder's images have content) holds no canary either, plain or hex.
 async fn build_sees_no_platform_secrets(f: &dyn BuilderFixture) -> CaseResult {
     let canaries = f.canaries();
     check!(!canaries.is_empty(), "the fixture planted no canaries");
+    let input = build_input(f, f.env_dump_archive());
+    let identity = input.identity;
     let out = f
         .builder()
-        .build(build_input(f, f.env_dump_archive()))
+        .build(input)
         .await
         .map_err(|e| fail(format!("the build failed: {e}")))?;
     let lines: Vec<&str> = out.logs.iter().map(|l| l.text.as_str()).collect();
+    let begin = lines.iter().position(|l| *l == "env-dump:begin");
+    let end = lines.iter().position(|l| *l == "env-dump:end");
+    let (Some(begin), Some(end)) = (begin, end) else {
+        return Err(fail(format!(
+            "the build log has no environment report: {lines:?}"
+        )));
+    };
+    let dump = &lines[begin + 1..end.max(begin + 1)];
+    check!(!dump.is_empty(), "the environment report is empty");
+    // Every line is NAME=<lowercase hex>: the report really is hex-encoded.
+    let hex_line = |l: &str| {
+        l.split_once('=').is_some_and(|(k, v)| {
+            !k.is_empty()
+                && v.len() % 2 == 0
+                && v.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+    };
     check!(
-        lines.contains(&"env-dump:begin") && lines.contains(&"env-dump:end"),
-        "the build log has no environment report: {lines:?}"
+        dump.iter().all(|l| hex_line(l)),
+        "the environment report is not NAME=<hex(value)>: {dump:?}"
     );
+    let content = f
+        .image_content(&identity, &out.image)
+        .await
+        .map_err(|e| fail(format!("reading the built image: {e}")))?;
     for (i, canary) in canaries.iter().enumerate() {
+        let hex = hex::encode(canary.as_bytes());
         check!(
             !lines.iter().any(|l| l.contains(canary.as_str())),
             "the build saw canary {i} of the builder's own secrets"
         );
+        check!(
+            !lines.iter().any(|l| l.contains(hex.as_str())),
+            "the build saw canary {i} of the builder's own secrets (hex in the environment report)"
+        );
+        for blob in content.iter().flatten() {
+            check!(
+                !holds(blob, canary.as_bytes()) && !holds(blob, hex.as_bytes()),
+                "the built image holds canary {i} of the builder's own secrets"
+            );
+        }
     }
     Ok(())
 }

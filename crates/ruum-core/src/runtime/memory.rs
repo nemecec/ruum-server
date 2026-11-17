@@ -88,6 +88,10 @@ pub(crate) struct BuilderFaults {
     pub leak_host_secrets: bool,
     /// Ignores the build timeout.
     pub no_timeout: bool,
+    /// Redacts its own secrets from the build log by exact match (a real builder's log
+    /// redaction): with [`BuilderFaults::leak_host_secrets`] the hex-encoded report still
+    /// shows them (backlog S-37).
+    pub redacts_logs: bool,
 }
 
 /// The runtimes the in-memory builder accepts.
@@ -155,16 +159,26 @@ impl Builder for MemoryBuilder {
             input.runtime
         ))];
         if contains(&input.archive, ENV_DUMP_ARCHIVE_MARKER) {
+            // The report of the env dump archive: NAME=<hex(value)> (backlog S-37).
             logs.push(line("env-dump:begin".to_owned()));
             for (k, v) in BUILD_ENV {
-                logs.push(line(format!("{k}={v}")));
+                logs.push(line(format!("{k}={}", hex::encode(v))));
             }
             if self.faults.leak_host_secrets {
                 for (i, s) in self.own_secrets.iter().enumerate() {
-                    logs.push(line(format!("BUILDER_SECRET_{i}={}", s.expose())));
+                    logs.push(line(format!(
+                        "BUILDER_SECRET_{i}={}",
+                        hex::encode(s.expose())
+                    )));
                 }
             }
             logs.push(line("env-dump:end".to_owned()));
+        }
+        if self.faults.redacts_logs {
+            let own: Vec<&str> = self.own_secrets.iter().map(|s| s.expose()).collect();
+            for l in &mut logs {
+                l.text = super::redact::redact(&l.text, &own);
+            }
         }
         // A build takes some time; the usage record must not be zero.
         let work = if contains(&input.archive, SLOW_ARCHIVE_MARKER) {
