@@ -141,3 +141,157 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   passes the allow step; the address rules still apply). In R-2e's API an empty list
   (`Some(vec![])`) would let no host pass. A network holds one app and environment; its
   registration carries the deployment of its first instance.
+
+## Builder
+
+Card R-2b. `DockerBuilder` (`src/builder/`) implements `ruum_core::runtime::Builder` for
+`runtime: node22` with the **fixed recipe** of decision 0006 G point 5 (spike S-2: rootless
+BuildKit does not start under the driver's flags with runc, and not with runsc either, see
+"Known limits of the builder"). Any other runtime is `unsupported_runtime`. No new dependency: the tar reader
+and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspace.
+
+### The recipe
+
+1. **Checks.** `BuildInput::validate`; the runtime is `node22`; the build waits for a slot:
+   at most `RUUM_BUILD_MAX_PARALLEL` builds at once (default 4) and at most
+   `RUUM_BUILD_TENANT_MAX` of one tenant (default 2), so one tenant cannot hold every slot
+   (backlog S-61). A build takes its tenant's slot before a global one.
+2. **The archive** is unpacked in memory by W-2s's reader (`ruum_core::apps::archive::unpack`;
+   decision 0006 H: no `..`, no absolute path, no `\`, no drive letter, no link or device;
+   size limit: the build's disk limit and `RUUM_BUILD_OUTPUT_MAX`). `app.yaml` at the root must
+   say `runtime: node22` and give `start` (the command that listens on `$PORT`); `build` is
+   optional. A refused archive or manifest is `build_failed` with the reason.
+3. **The job**: one sandbox container per build (`ruum-b-<build>`) from the base image, with
+   the hardening of an app instance of the driver (read-only root, `cap-drop ALL`,
+   `no-new-privileges`, user `10001:10001`, the driver's pids limit, the build's CPU and memory
+   limits with swap = memory, `init`, private IPC, no published ports, the default seccomp and
+   AppArmor profiles, the same OCI runtime, log driver `none`). Its only writable folders are
+   two `tmpfs` mounts of the build's disk limit each: `/work` (`exec`, the source and its
+   `node_modules`) and `/tmp` (`noexec`, npm's cache). No bind mount, no volume, no Docker
+   socket, no secret: the environment is a fixed list (`HOME`, npm settings, the proxy
+   variables, `RUUM_SOURCE_BYTES`, and `RUUM_BUILD_COMMAND` when the manifest has `build`). The
+   script (`builder::RECIPE`) reads the source tar from standard input (`head -c`), runs
+   `npm ci --ignore-scripts=false --foreground-scripts --no-audit --no-fund` (postinstall
+   scripts run: they are the hostile part), then `sh -c "$RUUM_BUILD_COMMAND"` if set, then
+   writes `tar -c -f - -C /work/app .` to standard output. No value of the app is part of the
+   script. The builder reads the container back before it starts it and refuses it when a flag
+   or a limit differs.
+4. **The network**: one per build (`ruum-build-<build>`), `internal`, `inhibit_ipv4`, IPv6 off,
+   with only the egress proxy attached (alias and port from `DockerConfig::routes`, an
+   `/etc/hosts` line in the job). It is registered at the proxy with the build's identity and
+   the allow list **`registry.npmjs.org`** only (`BuilderConfig::npm_hosts`): packages come
+   through the build's own registration. The routes a build reports are `BUILD_ROUTES` (the
+   egress proxy).
+5. **The output** leaves through the job's standard output, read by the builder under the byte
+   cap `RUUM_BUILD_OUTPUT_MAX` (default 256 MiB): past it the job is killed and the build is
+   `build_failed`. Why standard output and not `GET /containers/{id}/archive`: the archive API
+   does not read `tmpfs` mounts reliably (and runsc keeps them inside the sandbox), and it would
+   need the container to stay after its end; a stream is capped while it is read. The tar is
+   read by the builder's own reader (`builder::output`), which never follows a link and never
+   writes a file. **The rule**: regular files (mode cut to `0o755` bits: no setuid, setgid,
+   sticky, group or world write), folders, and symbolic links whose target is relative and stays
+   inside the output are kept; a name with `..`, an absolute name, an empty or `.` segment or a
+   NUL, a link that is absolute or leaves the output, a hard link, a device, a FIFO and every
+   other entry type are **dropped** and named in the build log (`ruum-build: dropped output
+   entry ...`); an entry below a file or a link is dropped; a broken tar fails the build. File
+   names are bytes: spaces, newlines, a leading `-`, `\` and `$(...)` stay data (backlog S-42).
+6. **The image**, without a daemon (`builder::oci`): the base is `node:22-alpine` pinned by the
+   digest of its multi-arch index (`NODE22_BASE_INDEX`, the index is embedded and checked), the
+   platform of the engine (`GET /info`: `arm64` on the build server, `amd64` on staging and CI),
+   read from `RUUM_REGISTRY/ruum-base/node22@<platform digest>`. One new layer: the output under
+   `/app`, owner 10001, mtime 0, entries sorted, folders first, PAX records for long names,
+   gzip with mtime 0. The config keeps the base's `Env`, sets `User: 10001`,
+   `WorkingDir: /app`, no `Entrypoint`, `Cmd: ["/bin/sh", "-c", <start>]`, removes `Volumes`,
+   `Healthcheck`, `OnBuild`, `ExposedPorts` and `StopSignal`, and carries the labels `ruum.app`,
+   `ruum.tenant`, `ruum.build`, `ruum.managed=ruum-builder` (and the configured extra labels).
+7. **The push** (`builder::registry::RepositoryPush`): to `ruum/<tenant>/<app>` of the build's
+   identity only (the push has no repository parameter): the base layers by cross-repository
+   mount from `ruum-base/node22` (a copy when the registry refuses the mount), the new layer and
+   config, then the manifest **by digest**, once (a second manifest push of the same build is
+   refused). An upload address outside `/v2/<repo>/blobs/uploads/` stops the push. With a
+   credential (`BuilderConfig::credential`) and a `Bearer` challenge, the token is asked for
+   `repository:<repo>:push,pull` and `repository:ruum-base/node22:pull`. The credential lives
+   only in the builder process.
+8. **Cleanup and usage**: after every outcome (success, failure, timeout) the container is
+   removed by force, the network is unregistered at the proxy (three tries) and removed; the
+   work data lives only in the job's `tmpfs`. A failed build pushes nothing. One
+   `RuntimeUsage::Build` with the build's identity per build. The build log is a bounded tail
+   (`MAX_BUILD_LOG_LINES`, 4096 bytes per line); a failure reason is cut at
+   `MAX_BUILD_FAILED_REASON_BYTES`. `DockerBuilder::prune_images` removes the engine's images
+   labelled `ruum.build` and `ruum.managed=ruum-builder` that no container uses (the driver
+   pulled them); the registry's size cap and prune job are I-4's.
+
+### Settings
+
+| Variable | What |
+|---|---|
+| `RUUM_DOCKER_HOST`, `RUUM_RUNTIME_DRIVER`, `RUUM_REGISTRY` | As for the driver (`BuilderConfig::docker`). |
+| `RUUM_BUILD_MAX_PARALLEL` | The most builds at once (default 4). |
+| `RUUM_BUILD_TENANT_MAX` | The most builds of one tenant at once (default 2, at most the above). |
+| `RUUM_BUILD_OUTPUT_MAX` | The byte cap of a build's output (default 256 MiB). |
+
+The crate reads none of these: the server's wiring (I-4) does and builds `BuilderConfig`. The
+egress proxy of the builds is `DockerConfig::routes[EgressProxy]`; the push credential is
+`BuilderConfig::credential` (I-4 issues one scoped to pushes).
+
+### Docker API calls of the builder (for I-4's socket proxy)
+
+Every object carries `ruum.app`, `ruum.tenant`, `ruum.env`, `ruum.deployment`, `ruum.build` and
+`ruum.managed=ruum-builder`.
+
+| Method and path | When |
+|---|---|
+| `GET /_ping`, `GET /version`, `GET /info` | connect (version, the platform, is `runsc` registered) |
+| `GET /images/{RUUM_REGISTRY}/ruum-base/node22@{digest}/json` | each build: is the base image local |
+| `POST /images/create?fromImage={RUUM_REGISTRY}/ruum-base/node22@{digest}` | pull the base image (a local registry reference only) |
+| `POST /networks/create` | each build |
+| `GET /networks/{name}` | after create (read back `internal`, `inhibit_ipv4`, IPv6, the subnet), after attaching the proxy (its address, nothing else attached) |
+| `POST /networks/{id}/connect` | attach the egress proxy |
+| `POST /containers/create?name=ruum-b-{build}` | each build |
+| `GET /containers/{name}/json` | after create (read back every flag and limit) |
+| `POST /containers/{name}/attach?stream=1&stdin=1&stdout=1&stderr=1` | before start (source in, output and log out) |
+| `POST /containers/{name}/start` | each build |
+| `POST /containers/{name}/kill?signal=SIGKILL` | the output went over the cap |
+| `POST /containers/{name}/wait` | the exit code |
+| `DELETE /containers/{name}?force=1&v=1` | after every outcome |
+| `POST /networks/{name}/disconnect` | detach the egress proxy (after the unregistration) |
+| `DELETE /networks/{name}` | after every outcome |
+| `GET /images/json?filters={"label":["ruum.build","ruum.managed=ruum-builder",...]}` | `prune_images` |
+| `DELETE /images/{id}` | `prune_images` (not forced) |
+
+Outside the engine: the registry (`GET` and `HEAD` under `/v2/ruum-base/node22/`, `POST`,
+`PUT`, `HEAD` under `/v2/ruum/<tenant>/<app>/`, and the token realm of a `Bearer` challenge)
+and the egress proxy's control listener (`PUT` and `DELETE /v1/networks/{id}`).
+
+### Tests
+
+```sh
+cargo test -p ruum-runtime --lib builder                                    # tar, OCI, push (wiremock), slots
+cargo test -p ruum-runtime --test build -- --nocapture                      # runc, stand-in egress
+RUUM_SANDBOX_FULL=1 cargo test -p ruum-runtime --test build -- --nocapture  # + R-2e's proxy and the hostile network case
+RUUM_SANDBOX_FULL=1 RUUM_RUNTIME_DRIVER=runsc cargo test -p ruum-runtime --test build -- --nocapture
+```
+
+`tests/build.rs` labels everything `ruum.test=r2b-<random>` and removes only that (backlog
+T-53). It mirrors the base image of the engine's platform from Docker Hub into its own
+`registry:2` (blobs cached in `CARGO_TARGET_TMPDIR`). The fixtures are `testdata/build/`.
+`RUUM_BUILD_CASES` runs some cases only (the mutation checks); it is refused when `CI` is set.
+
+### Known limits of the builder
+
+- Rootless BuildKit (and so Railpack) does not start under the driver's flags with runsc
+  either: `rootlesskit` makes the user namespace inside gVisor, but `newuidmap` is a setuid
+  helper, which `no-new-privileges` and `cap-drop ALL` stop (`fork/exec /usr/bin/newuidmap:
+  operation not permitted`; probe of 2026-11-18, `moby/buildkit:v0.23.2-rootless`). The fixed
+  recipe stays the builder.
+- The base image's platform image must be in the local registry (`ruum-base/node22@<digest>`);
+  the builder never pulls from the internet. A different pin (`BuilderConfig::base_index`) needs
+  the whole index there.
+- The output and the new layer are held in memory (at most `RUUM_BUILD_OUTPUT_MAX` each per
+  build, times `RUUM_BUILD_MAX_PARALLEL`).
+- Under runsc the pids limit bounds the sandbox's host threads: a fork bomb ends the whole job
+  (the build fails without the job's own report).
+- A build without `build` in `app.yaml` runs no build script (no `npm run build` by default).
+- The job needs a `package-lock.json` (`npm ci`); without one the build fails with npm's
+  message.
+- The `NODE_USE_ENV_PROXY=1` variable makes Node 22 print an "experimental" warning in the log.
