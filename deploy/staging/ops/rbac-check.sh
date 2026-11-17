@@ -269,6 +269,13 @@ audit_rights() {
     problem "unreadable or incomplete rights for $identity in $ns"
     return
   fi
+  # An empty review (a header-only table, an empty JSON list) would make the audit below pass
+  # without checking anything: every authenticated identity has at least the self-review and
+  # discovery rules, so no rules means the listing did not work (Kimi, third O-51 review).
+  if ! jq -e 'length > 0' >/dev/null 2>&1 <<<"$rules"; then
+    problem "empty rights listing for $identity in $ns (expected at least the standard rules)"
+    return
+  fi
   if ! rejected="$(jq -c --arg identity "${identity##*:}" --arg ns "$ns" \
     --argjson deployer "$(printf '%s\n' "$allowed" | jq -s .)" \
     -f "$(dirname "${BASH_SOURCE[0]}")/rbac-audit.jq" <<<"$rules")"; then

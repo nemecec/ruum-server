@@ -1391,11 +1391,19 @@ FAKE_TABLE_DIR="$FIX" expect 0 "live deployer audit accepts both real tables" li
 mkdir -p "$FA/tables"
 cp "$FIX"/can-i-list-deployer-*.txt "$FA/tables/"
 # Use the fixture header offsets for the extra grant, too.
-awk 'NR == 1 { urls=index($0,"Non-Resource URLs"); names=index($0,"Resource Names"); verbs=index($0,"Verbs") }
-  END { printf "%-*s%-*s%-*s%s\n", urls-1,"secrets",names-urls,"[]",verbs-names,"[]","[create]" }
+# Padding by concatenation: BusyBox awk has no %-*s (Kimi, third O-51 review).
+awk 'function pad(s, w) { while (length(s) < w) s = s " "; return s }
+  NR == 1 { urls=index($0,"Non-Resource URLs"); names=index($0,"Resource Names"); verbs=index($0,"Verbs") }
+  END { print pad("secrets", urls-1) pad("[]", names-urls) pad("[]", verbs-names) "[create]" }
 ' "$FIX/can-i-list-deployer-ruum.txt" >>"$FA/tables/can-i-list-deployer-ruum.txt"
+grep -q '^secrets  *\[\]  *\[\]  *\[create\]$' "$FA/tables/can-i-list-deployer-ruum.txt" || bad "the extra create secrets row was not appended"
+# Empty listings must fail, not pass vacuously.
+mkdir -p "$FA/empty"
+for f in "$FIX"/can-i-list-deployer-*.txt; do head -n 1 "$f" >"$FA/empty/$(basename "$f")"; done
 FAKE_TABLE_DIR="$FA/tables" expect 1 "real table plus create secrets fails live audit" livecheck "$FA/allow"
 grep -qF 'forbidden effective rules' "$TMP/out" || bad "extra fixture grant must fail the audit, not parsing"
+FAKE_TABLE_DIR="$FA/empty" expect 1 "header-only rights listings fail the live audit" livecheck "$FA/allow"
+grep -qF 'empty rights listing' "$TMP/out" || bad "a header-only listing must fail as empty, not pass"
 expect 0 "all five standard bindings and their rights pass" livecheck "$FA/allow"
 for mutation in role-name role-kind role-group binding-name; do
   jq --arg mutation "$mutation" '
