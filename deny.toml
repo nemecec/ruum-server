@@ -15,6 +15,12 @@ unsound = "all"
 yanked = "deny"
 ignore = [
     # { id = "RUSTSEC-0000-0000", reason = "why it does not apply, and until when" },
+    # chrono was declared unmaintained on 2026-11-16 (chronotope/chrono#1768); no upgrade exists.
+    # Ruum's own code uses `time`; chrono comes only through dav-server, object_store, rmcp and
+    # schemars, and humantime (through object_store) wraps it. Both are "unmaintained" notices,
+    # not vulnerabilities. Remove both lines when those crates move to jiff or time (backlog O-52).
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; only transitive (dav-server, object_store, rmcp, schemars); no upgrade; until O-52" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime wraps chrono (RUSTSEC-2026-0543); only through object_store; until O-52" },
 ]
 
 [licenses]
