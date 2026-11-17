@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +252,43 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Integration of run 11 (2026-11-17; step 3 wave 3; four branches rebased onto `main` `616e34e` in
+one stack, each tip checked on the build server, pushed as `integ11/<name>`, green in GitHub CI,
+then fast-forwarded in this order; linear history, no merge commit, no co-author line). The
+digest is `docs/digests/2026-11-15-run11.md`; new backlog items are in
+`docs/backlog/2026-11-15-run11.md` (and the card's own `docs/backlog/2026-11-17-r2a.md`). Before
+this integration `main` already held the Kimi run 11 fixes of W-2s and the deploy controller
+(`ae469cf..616e34e`, backlog W2S-3).
+
+| Branch (pushed as) | What it adds | Review |
+|---|---|---|
+| (integrator) `integ11/deny-chrono` | `deny.toml` ignores RUSTSEC-2026-0543 (`chrono` unmaintained, 2026-11-16) and RUSTSEC-2026-0542 (`humantime`, which wraps it), with reasons: no upgrade exists, and chrono comes only through `dav-server`, `object_store`, `rmcp` and `schemars`. `cargo-deny` failed on `main` and on every branch without it. Backlog O-52 (the person may veto). | integrator; `cargo deny check` passes |
+| `s3/r-2a-r9` (`integ11/r-2a-2`) | Card R-2a with S-36, and card R-2e's first commits (the branch carried them): **the egress proxy** (crate and binary `ruum-egress`, image recipe `deploy/images/ruum-egress`): CONNECT only, address rules after resolution, per-app allow lists, limits, byte counters, a control listener, one conformance suite for the in-memory and the running proxy. **The Docker runtime driver** (crate `ruum-runtime`, `bollard` 0.21.1, runc or gVisor `runsc`): per-app internal networks, read-only root, the token file as the only mount, images with `VOLUME` refused, restart adoption of an app's network, kill escalation, shared containers by `/etc/hosts` (gVisor has no embedded DNS), registration at the egress proxy. The hostile sandbox suite (`tests/sandbox.rs`), conformance, restart and cold start tests (runc median 0.62 s, runsc 0.61 s). S-36: linear-time streaming redaction (an Aho-Corasick automaton), at most 256 secret values and 256 KiB per spec, the newest 16 workload tokens kept. Not wired: `wiring.rs` keeps the in-memory driver until I-4. 13 mutations (`runtime-docker-*`). Deferred: R2A-1 to R2A-8. | review-r2a (4 changes), Kimi CHANGES REQUESTED (2 high, 5 medium), review-r2a-2 accept (notes A to G) |
+| `s3/r-2e-r9` (`integ11/r-2e-2`) | Card R-2e review fixes (the other R-2e commits came with R-2a, the rebase dropped them as already applied): a connection is identified at accept and counted against a per-identity cap before its head is read (slow heads cannot fill the global cap); no destination inside a registered app subnet; zero limits refused. | review-r2e (2 changes), Kimi **no verdict** (stopped early), review-r2e-2 accept |
+| `s3/i-5-r9` (`integ11/i-5-2`) | Card I-5, the telemetry stack on the laptop (Compose profile `apps`): OpenTelemetry Collector 0.165, Loki 3.7, Mimir 3.2, Tempo 2.10, each multi-tenant with cross-tenant queries off (Tempo federated `a\|b` by default), `scripts/telemetry_check.sh`, `dev.sh` profile handling, measured memory in `docs/DEVSTACK.md`. No Rust change. | review-i5 (2 changes), Kimi APPROVE, review-i5-2 approve |
+
+Not merged: card O-1a (`s3/o-1a-r9`): review-o1a-2 asks for two changes from Kimi's late verdict
+(K3, K4; backlog S-58).
+
+Fixes made during this integration:
+
+- `cargo-deny` (above). The first CI runs of `integ11/r-2a`, `integ11/r-2e` and `integ11/i-5`
+  failed or were cancelled for it; the stack was rebased onto the fix and pushed under `-2`
+  names (no force push).
+- The `RuntimeDriver::rotate_token` doc states the token cap (review-r2a-2 note C, backlog
+  S-57).
+- Review-r2a-2 note G asked to merge R-2e's fix first; the task order put R-2a first. The final
+  tree is the same (R-2a does not touch `crates/ruum-egress`), and the R-2e tip was checked with
+  the full sandbox suite on runc and runsc, because R-2e's new subnet rule runs under its
+  egress cases.
+- The build server's data cluster of the key `integ11` was OOM-killed during the first R-2e check
+  (278 leftover test databases, 768 MiB limit; backlog B-35); the check ran again on a fresh
+  cluster. The runtime tests share one Docker label, so two runs on one engine break each other
+  (backlog T-53); the 13 `runtime-docker-*` mutations ran alone.
+- Pushed (no force push): `integ11/deny-chrono`, `integ11/r-2a-2`, `integ11/r-2e-2`,
+  `integ11/i-5-2` (merged) and `integ11/r-2a`, `integ11/r-2e`, `integ11/i-5` (the first pushes,
+  before the `cargo-deny` fix; not merged).
 
 Integration of run 10 (2026-11-13 to 11-14; five branches rebased onto `main` `f69e22a` in one
 stack, each tip checked on the build server, pushed as `integ10/<name>`, green in GitHub CI, then
@@ -546,7 +583,10 @@ operations, 19 are built (cards D-1, K-1, A-1, Q-1, A-2 and D-3a); the other 5 a
 W-1: `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`, `getAppDeployment`; card
 W-2s: `createAppDeployment`, `publishAppDeployment`; card B-2: `listAppRoles`,
 `listAppRoleGrants`, `addAppRoleGrant`, `removeAppRoleGrant`); 42 operations are still `planned`
-in all. The app gateway (`ruum-gateway`, card G-1a) serves static apps; it is not deployed yet.
+in all. The app gateway (`ruum-gateway`, card G-1a) serves static apps; it is not deployed yet. The egress proxy
+(`ruum-egress`, R-2e) and the Docker runtime driver (`ruum-runtime`, R-2a) are built and tested but not
+wired into `ruum-server` and not deployed (I-4, I-6); the laptop telemetry stack (I-5) runs with
+`scripts/dev.sh up --apps`.
 
 | Area | What works |
 |---|---|
@@ -704,6 +744,34 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-17, `main` after the integration of run 11, on the build server)
+
+`main` is `4d991cc` before this documentation commit (which adds one doc comment to
+`crates/ruum-core/src/runtime/mod.rs`; the final check ran with it). Each tip was checked with the
+key `integ11`, one full check at a time; the strict mutation check ran in shards on the keys
+`integ11m1`, `integ11mc`, `integ11md`, `integ11me` (no Docker) and `integ11m2` (the 13
+`runtime-docker-*` mutations, alone on the engine, backlog T-53).
+
+| Tip | `cargo test --workspace` | Isolation (memory = Postgres) | Permission matrix | Privacy (memory / Postgres) | Trashed | Browser |
+|---|---|---|---|---|---|---|
+| main before (`616e34e`) | 1073 / 0 / 3 ignored | 375 passed, 128 planned | 2032 passed, 624 planned | 99 planned / 38 passed, 61 planned | 112 | |
+| R-2a (checked as `integ11/r-2a`; `-2` adds only `deny.toml`) | 1143 / 0 / 3 | every test kit binary passes on both backends | | | | 172 passed, 1 skipped |
+| R-2e fix | 1148 / 0 / 3 | 375, 128 | 2032, 624 | same | 112 | 172 passed, 1 skipped |
+| I-5 | 1148 / 0 / 3 | 375, 128 | 2032, 624 | same | 112 | 172 passed, 1 skipped |
+| final | **1148 / 0 / 3** | **375 passed, 128 planned** | **2032 passed, 624 planned** | **99 planned / 38 passed, 61 planned** | **112** | |
+
+On the final tree: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked
+-- -D warnings` clean; `cargo test -p ruum-testkit` with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and Postgres, 0 operations without a case (the memory run failed once with no test output while
+three mutation shards started cold builds, most likely a build killed for memory, backlog B-34;
+alone it passed); `scripts/e2e_smoke.sh`: `PASSED: 59 checks`. Also:
+
+- The R-2e tip: the sandbox suite with every case (`RUUM_SANDBOX_FULL=1`) passes on runc and runsc.
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: all 235 mutations killed, none survived, skipped or broken (210 before; 25 new: 13 `runtime-docker-*` of R-2a and 12 `egress-*` of R-2e). Mutations ran on the I-5 tree (the final code minus one doc comment) in five shards; one mutation that was BROKEN while three cold builds started (`databases-classes-redefined`) was KILLED when run again alone.
+- `deploy/staging/tests/run.sh` on the Mac: 486 checks passed on each of the three tips.
+- GitHub CI: green on `integ11/deny-chrono`, `integ11/r-2a-2`, `integ11/r-2e-2`, `integ11/i-5-2`
+  (`ci` runs 44079061186, 44079068972, 44079076282, 44079081699), every job, first try.
 
 ## Checks (2026-11-14, `main` after the Kimi review fixes of run 10, on the build server)
 

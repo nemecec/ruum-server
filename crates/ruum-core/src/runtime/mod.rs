@@ -1001,6 +1001,9 @@ pub trait RuntimeDriver: Send + Sync {
     /// Gives an instance a new workload token (renewal): the driver rewrites [`TOKEN_FILE`] in
     /// place, so the running process reads the new token at its next read, and a cold start
     /// after a scale to zero gets the new token too. The driver keeps redacting the old token.
+    /// A driver may bound how many old tokens it keeps redacting: the Docker driver keeps the
+    /// newest 16 (`MAX_KEPT_TOKENS`), so a token issuer must keep a token's lifetime shorter than
+    /// 15 rotation intervals, or a valid old token can show unredacted in the logs.
     async fn rotate_token(
         &self,
         tenant: TenantId,
