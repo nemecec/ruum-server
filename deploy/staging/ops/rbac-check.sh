@@ -223,33 +223,63 @@ want() { # want yes|no AS NAMESPACE VERB RESOURCE [SUBRESOURCE]
   [[ "$got" == "$w" ]] || problem "kubectl auth can-i $3 $4${5:+ --subresource $5} -n $2 --as $1: $got (want $w)"
 }
 
+# Render the fixed namespace loop without Helm. Refuse new template syntax rather than
+# silently ignoring it. The deployer allow-list comes from these rendered Role rules.
+effective_allowlist() {
+  local template rendered records t doc line ns groups resources names verbs
+  template="$(dirname "${BASH_SOURCE[0]}")/../charts/platform/templates/deployer-rbac.yaml"
+  rendered="$(awk '
+    $0 == "{{- range list \"ruum-deploy\" \"ruum\" \"edge\" }}" { loop=1; next }
+    $0 == "{{- end }}" {
+      split("ruum-deploy ruum edge", ns, " ")
+      for (i=1;i<=3;i++) { out=body; gsub(/\{\{ \. \}\}/, ns[i], out); printf "%s", out }
+      body=""; loop=0; next
+    }
+    loop { body=body $0 "\n"; next }
+    { print }
+    END { if (loop) exit 1 }
+  ' "$template")" || return 1
+  [[ "$rendered" != *'{{'* ]] || return 1
+  records="$(docs /dev/stdin <<<"$rendered")" || return 1
+  while IFS=$'\t' read -r t doc line; do
+    [[ "$t" == L ]] || continue
+    ns="$(awk -F'\t' -v d="$doc" '$1=="D" && $2==d && $3=="Role" && $5=="deployer" {print $4}' <<<"$records")"
+    [[ -n "$ns" && "$line" =~ $RULE_RE ]] || return 1
+    groups="${BASH_REMATCH[1]}" resources="${BASH_REMATCH[2]}" names="${BASH_REMATCH[4]}" verbs="${BASH_REMATCH[5]}"
+    jq -cn --arg ns "$ns" --arg g "$groups" --arg r "$resources" --arg n "$names" --arg v "$verbs" '
+      def parts: split(",") | map(gsub("^ +| +$"; "") | gsub("^[\"\u0027]|[\"\u0027]$"; ""));
+      {namespace:$ns, apiGroups:($g|parts),resources:($r|parts),
+       resourceNames:(if $n=="" then [] else $n|parts end),verbs:($v|parts)}' || return 1
+  done <<<"$records"
+}
+
+audit_rights() {
+  local identity="$1" ns="$2" allowed="$3" output rules rejected account_ns args=()
+  account_ns="${identity#system:serviceaccount:}"
+  account_ns="${account_ns%%:*}"
+  [[ "$ns" == - ]] || args+=(-n "$ns")
+  args+=(--as "$identity" --as-group system:serviceaccounts --as-group "system:serviceaccounts:$account_ns" --as-group system:authenticated)
+  # The supported can-i --list interface is a table (including kubectl v1.37.2).
+  # The normalizer also accepts a complete JSON review if a future client supplies it.
+  if ! output="$(kubectl auth can-i --list "${args[@]}" 2>&1)"; then
+    problem "cannot list rights for $identity in $ns"
+    return
+  fi
+  if ! rules="$(printf '%s\n' "$output" | jq -Rse -f "$(dirname "${BASH_SOURCE[0]}")/rbac-rules.jq")"; then
+    problem "unreadable or incomplete rights for $identity in $ns"
+    return
+  fi
+  if ! rejected="$(jq -c --arg identity "${identity##*:}" --arg ns "$ns" \
+    --argjson deployer "$(printf '%s\n' "$allowed" | jq -s .)" \
+    -f "$(dirname "${BASH_SOURCE[0]}")/rbac-audit.jq" <<<"$rules")"; then
+    problem "cannot audit rights for $identity in $ns"
+    return
+  fi
+  [[ -z "$rejected" ]] || problem "forbidden effective rules for $identity in $ns: $rejected"
+}
+
 live() {
   local d="system:serviceaccount:$DEPLOYER_NS:$DEPLOYER" c="system:serviceaccount:$CONTROLLER_NS:$CONTROLLER" ns
-  for ns in ruum edge ruum-deploy data auth authz nats ops default kube-system; do
-    for x in "create pods" "create jobs.batch" "create cronjobs.batch" "create deployments.apps" "patch deployments.apps" \
-      "update deployments.apps" "create daemonsets.apps" "patch daemonsets.apps" "create statefulsets.apps" \
-      "create replicasets.apps" "create replicationcontrollers" "create podtemplates" "get secrets" "list secrets" "watch secrets" \
-      "create serviceaccounts" "update serviceaccounts" "impersonate serviceaccounts" "create roles.rbac.authorization.k8s.io" \
-      "create rolebindings.rbac.authorization.k8s.io" "update leases.coordination.k8s.io" "create backups.postgresql.cnpg.io" \
-      "delete configmaps" "update configmaps" "patch configmaps"; do
-      # shellcheck disable=SC2086 # verb and resource
-      want no "$d" "$ns" $x
-    done
-    # Pod logs through the subresource (backlog O-50): `kubectl auth can-i get pods/log` reads
-    # `log` as the name of a pod, so it answers yes for anyone who may get pods. Only
-    # `--subresource log` asks for the logs.
-    want no "$d" "$ns" get pods log
-    want no "$d" "$ns" create pods exec
-    want no "$d" "$ns" create pods attach
-    want no "$d" "$ns" create pods portforward
-    want no "$d" "$ns" patch pods ephemeralcontainers
-    want no "$d" "$ns" create serviceaccounts token
-    [[ "$ns" == "$REQUESTS_NS" ]] || want no "$d" "$ns" create configmaps
-  done
-  want no "$d" - create clusterrolebindings.rbac.authorization.k8s.io
-  want no "$d" - impersonate users
-  want no "$d" - get nodes proxy
-  want no "$d" ruum list configmaps
   want yes "$d" "$REQUESTS_NS" create configmaps
   want yes "$d" ruum get configmaps/ruum-release
   # The controller has what the deploy needs, and no Secret either.
@@ -274,7 +304,7 @@ live() {
     want yes "$o" "$ns" get pods log
   done
   # Query the inventory as the admin; an unreadable inventory must never pass.
-  local namespaces bindings forbidden_bindings sub
+  local namespaces bindings forbidden_bindings
   if ! namespaces="$(kubectl get ns -o json | jq -er '.items | map(.metadata.name) | .[]')"; then
     problem "cannot list live namespaces"
     return 1
@@ -283,47 +313,41 @@ live() {
     problem "cannot list live ClusterRoleBindings"
     return 1
   fi
-  # system:authenticated normally has discovery bindings. Its resource grants are checked
-  # through can-i below; direct and ServiceAccount-group cluster bindings are forbidden.
+  # Only the five standard group bindings can grant cluster rights to the observer.
+  # Their names and complete roleRefs must match. The rule audit also checks their rights.
   if ! forbidden_bindings="$(jq -er --arg ns "$OBSERVER_NS" --arg name "$OBSERVER" --arg user "$o" '
     [.items[] | select(any(.subjects[]?;
       (.kind == "ServiceAccount" and .name == $name and .namespace == $ns) or
       (.kind == "User" and .name == $user) or
-      (.kind == "Group" and (.name == "system:serviceaccounts" or .name == ("system:serviceaccounts:" + $ns)))
-    )) | .metadata.name] | join(", ")' <<<"$bindings")"; then
+      (.kind == "Group" and (.name == "system:serviceaccounts" or .name == ("system:serviceaccounts:" + $ns) or .name == "system:authenticated"))
+    )) | select((
+      (.metadata.name as $binding | ["system:basic-user", "system:discovery",
+        "system:public-info-viewer", "system:cluster-trust-bundle-discovery",
+        "system:service-account-issuer-discovery"] | index($binding)) != null and
+      .roleRef == {apiGroup:"rbac.authorization.k8s.io", kind:"ClusterRole", name:.metadata.name} and
+      (.metadata.name as $binding | all(.subjects[]; .kind == "Group" and
+        (if $binding == "system:cluster-trust-bundle-discovery" or $binding == "system:service-account-issuer-discovery" then
+          .name == "system:serviceaccounts"
+        elif $binding == "system:public-info-viewer" then
+          .name == "system:authenticated" or .name == "system:unauthenticated"
+        else .name == "system:authenticated" end)))
+    ) | not) | .metadata.name] | join(", ")' <<<"$bindings")"; then
     problem "cannot parse live ClusterRoleBindings"
     return 1
   fi
   [[ -z "$forbidden_bindings" ]] || problem "observer has forbidden ClusterRoleBindings: $forbidden_bindings"
   # Include the required namespaces even if the inventory unexpectedly omits one.
   namespaces="$(printf '%s\n' ruum edge ruum-deploy "$namespaces" | sort -u)"
-  for ns in $namespaces; do
-    for resource in secrets configmaps; do
-      for verb in get list watch; do
-        want no "$o" "$ns" "$verb" "$resource"
-      done
+  local allowed identity
+  if ! allowed="$(effective_allowlist)"; then
+    problem "cannot derive effective-rights allow-list"
+    return 1
+  fi
+  for identity in "$o" "$d"; do
+    for ns in $namespaces; do
+      audit_rights "$identity" "$ns" "$allowed"
     done
-    for resource in pods deployments.apps daemonsets.apps replicasets.apps jobs.batch events events.events.k8s.io; do
-      for verb in create update patch delete deletecollection; do
-        want no "$o" "$ns" "$verb" "$resource"
-      done
-      case "$ns" in
-        ruum | edge | ruum-deploy) ;;
-        *) for verb in get list watch; do want no "$o" "$ns" "$verb" "$resource"; done ;;
-      esac
-    done
-    for sub in exec attach portforward; do
-      want no "$o" "$ns" create pods "$sub"
-      want no "$o" "$ns" get pods "$sub"
-    done
-    for verb in get update patch; do
-      want no "$o" "$ns" "$verb" pods ephemeralcontainers
-    done
-    want no "$o" "$ns" create serviceaccounts token
-    case "$ns" in
-      ruum | edge | ruum-deploy) ;;
-      *) for verb in get list watch; do want no "$o" "$ns" "$verb" pods log; done ;;
-    esac
+    audit_rights "$identity" - "$allowed"
   done
   [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only"
   return "$fail"
