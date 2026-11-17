@@ -111,12 +111,13 @@ check_rule() {
 
 # Only these API group/resource/verb combinations belong to the observer.
 check_observer_rule() {
-  local ns="$1" line="$2" groups resources verbs g r v
+  local ns="$1" line="$2" groups resources verbs g r v name_restriction
   if [[ ! "$line" =~ $RULE_RE ]]; then
     problem "observer Role in $ns: unreadable rule: $line"
     return
   fi
   groups="${BASH_REMATCH[1]}" resources="${BASH_REMATCH[2]}" verbs="${BASH_REMATCH[5]}"
+  name_restriction="${BASH_REMATCH[3]}"
   [[ "$line" != *'*'* ]] || { problem "observer Role in $ns: wildcard: $line"; return; }
   while IFS= read -r g; do
     while IFS= read -r r; do
@@ -131,14 +132,26 @@ check_observer_rule() {
           *:get | *:list | *:watch) ;;
           *) problem "observer Role in $ns: forbidden verb $v" ;;
         esac
+        # A name-restricted grant does not provide the required namespace-wide reads.
+        [[ -n "$name_restriction" ]] || observer_tuples="$observer_tuples $g:$r:$v "
       done < <(items "$verbs")
     done < <(items "$resources")
   done < <(items "$groups")
 }
 
+require_observer_tuples() {
+  local ns="$1" tuple verb
+  for tuple in :pods :events events.k8s.io:events apps:deployments apps:daemonsets apps:replicasets batch:jobs; do
+    for verb in get list watch; do
+      [[ "$observer_tuples" == *" $tuple:$verb "* ]] || problem "observer Role in $ns: missing $tuple:$verb"
+    done
+  done
+  [[ "$observer_tuples" == *" :pods/log:get "* ]] || problem "observer Role in $ns: missing :pods/log:get"
+}
+
 check_bindings() {
   local identity="$1" identity_ns="$2" checker="$3"
-  local rec t doc kind ns name sk sn sns rk rn d line bound=0 seen=" "
+  local rec t doc kind ns name sk sn sns rk rn d line bound=0 seen=" " observer_tuples=""
   # Check direct, user and group bindings for this identity.
   while IFS=$'\t' read -r t doc sk sn sns; do
     [[ "$t" == S ]] || continue
@@ -166,9 +179,11 @@ check_bindings() {
       esac
     fi
     bound=$((bound + 1))
+    observer_tuples=""
     while IFS=$'\t' read -r t d line; do
       [[ "$t" == L && "$d" == "$rec" ]] && "$checker" "$ns" "$line"
     done <<<"$recs"
+    [[ "$identity" != "$OBSERVER" ]] || require_observer_tuples "$ns"
   done <<<"$recs"
   [[ $bound -gt 0 ]] || problem "no RoleBinding of the $identity found (wrong files?)"
   if [[ "$identity" == "$OBSERVER" ]]; then
@@ -193,6 +208,11 @@ can() {
   local as="$1" ns="$2" verb="$3" res="$4" sub="${5:-}" args=()
   [[ -n "$sub" ]] && args+=(--subresource "$sub")
   [[ "$ns" == - ]] && args+=(--all-namespaces) || args+=(-n "$ns")
+  if [[ "$as" == system:serviceaccount:* ]]; then
+    local account_ns="${as#system:serviceaccount:}"
+    account_ns="${account_ns%%:*}"
+    args+=(--as-group system:serviceaccounts --as-group "system:serviceaccounts:$account_ns" --as-group system:authenticated)
+  fi
   kubectl auth can-i "$verb" "$res" ${args[@]+"${args[@]}"} --as "$as" 2>&1 | tail -n 1
 }
 
@@ -253,19 +273,56 @@ live() {
     done
     want yes "$o" "$ns" get pods log
   done
-  for ns in ruum edge ruum-deploy data auth authz nats ops default kube-system; do
-    want no "$o" "$ns" get secrets
-    want no "$o" "$ns" get configmaps
-    want no "$o" "$ns" create pods
-    want no "$o" "$ns" create pods exec
-    want no "$o" "$ns" create pods attach
-    want no "$o" "$ns" create pods portforward
-    want no "$o" "$ns" patch pods ephemeralcontainers
+  # Query the inventory as the admin; an unreadable inventory must never pass.
+  local namespaces bindings forbidden_bindings sub
+  if ! namespaces="$(kubectl get ns -o json | jq -er '.items | map(.metadata.name) | .[]')"; then
+    problem "cannot list live namespaces"
+    return 1
+  fi
+  if ! bindings="$(kubectl get clusterrolebindings -o json)"; then
+    problem "cannot list live ClusterRoleBindings"
+    return 1
+  fi
+  # system:authenticated normally has discovery bindings. Its resource grants are checked
+  # through can-i below; direct and ServiceAccount-group cluster bindings are forbidden.
+  if ! forbidden_bindings="$(jq -er --arg ns "$OBSERVER_NS" --arg name "$OBSERVER" --arg user "$o" '
+    [.items[] | select(any(.subjects[]?;
+      (.kind == "ServiceAccount" and .name == $name and .namespace == $ns) or
+      (.kind == "User" and .name == $user) or
+      (.kind == "Group" and (.name == "system:serviceaccounts" or .name == ("system:serviceaccounts:" + $ns)))
+    )) | .metadata.name] | join(", ")' <<<"$bindings")"; then
+    problem "cannot parse live ClusterRoleBindings"
+    return 1
+  fi
+  [[ -z "$forbidden_bindings" ]] || problem "observer has forbidden ClusterRoleBindings: $forbidden_bindings"
+  # Include the required namespaces even if the inventory unexpectedly omits one.
+  namespaces="$(printf '%s\n' ruum edge ruum-deploy "$namespaces" | sort -u)"
+  for ns in $namespaces; do
+    for resource in secrets configmaps; do
+      for verb in get list watch; do
+        want no "$o" "$ns" "$verb" "$resource"
+      done
+    done
+    for resource in pods deployments.apps daemonsets.apps replicasets.apps jobs.batch events events.events.k8s.io; do
+      for verb in create update patch delete deletecollection; do
+        want no "$o" "$ns" "$verb" "$resource"
+      done
+      case "$ns" in
+        ruum | edge | ruum-deploy) ;;
+        *) for verb in get list watch; do want no "$o" "$ns" "$verb" "$resource"; done ;;
+      esac
+    done
+    for sub in exec attach portforward; do
+      want no "$o" "$ns" create pods "$sub"
+      want no "$o" "$ns" get pods "$sub"
+    done
+    for verb in get update patch; do
+      want no "$o" "$ns" "$verb" pods ephemeralcontainers
+    done
     want no "$o" "$ns" create serviceaccounts token
-    want no "$o" "$ns" patch deployments.apps
     case "$ns" in
       ruum | edge | ruum-deploy) ;;
-      *) want no "$o" "$ns" get pods; want no "$o" "$ns" get pods log ;;
+      *) for verb in get list watch; do want no "$o" "$ns" "$verb" pods log; done ;;
     esac
   done
   [[ $fail == 0 ]] && echo "rbac-check: the live deployer may only write release requests; the controller has the deploy rights and no Secret; the observer is read-only"

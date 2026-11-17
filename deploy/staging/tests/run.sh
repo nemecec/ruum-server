@@ -1174,15 +1174,59 @@ if command -v git >/dev/null; then
   [[ "$(drift "$CD" "$c3" "$c1")" == deploy/staging/charts/ruum/templates/x.yaml ]] && ok "chart drift names the chart of a rollback target older than the controller's" || bad "chart drift (rollback): $(drift "$CD" "$c3" "$c1")"
 fi
 
+echo "== observer static completeness (no Helm required)"
+# Expand only the fixed namespace loop in this template; no chart tool or cluster is needed.
+for template in observer deployer; do
+  echo '---' >>"$TMP/observer-static.yaml"
+  awk '
+    /^{{- range / { loop=1; next }
+    /^{{- end / { loop=0; next }
+    !loop { print }
+  ' "$STG/charts/platform/templates/$template-rbac.yaml" >>"$TMP/observer-static.yaml"
+  for ns in ruum edge ruum-deploy; do
+    awk -v ns="$ns" '
+      /^{{- range / { loop=1; next }
+      /^{{- end / { loop=0; next }
+      loop { gsub(/{{ \. }}/, ns); print }
+    ' "$STG/charts/platform/templates/$template-rbac.yaml" >>"$TMP/observer-static.yaml"
+  done
+done
+rc="$STG/ops/rbac-check.sh"
+expect 0 "static observer fixture has complete rights" bash "$rc" static "$TMP/observer-static.yaml"
+for ns in ruum edge ruum-deploy; do
+  for mutation in empty missing-rule missing-verb missing-log named-only; do
+    awk -v ns="$ns" -v mutation="$mutation" '
+      /^---/ { role=0; observer=0; target=0 }
+      /^kind: Role$/ { role=1 }
+      /^  name: observer$/ { observer=1 }
+      /^  namespace:/ { target=role && observer && $2 == ns }
+      target && /^rules:/ && mutation == "empty" { print "rules: []"; next }
+      target && /^  - \{ apiGroups:/ {
+        if (mutation == "empty") next
+        if (mutation == "missing-rule" && /resources: \[jobs\]/) next
+        if (mutation == "missing-log" && /resources: \[pods\/log\]/) next
+        if (mutation == "missing-verb" && /resources: \[jobs\]/) sub(/get, list, watch/, "get, list")
+        if (mutation == "named-only" && /resources: \[pods\/log\]/) sub(/verbs:/, "resourceNames: [one-pod], verbs:")
+      }
+      { print }
+    ' "$TMP/observer-static.yaml" >"$TMP/observer-incomplete.yaml"
+    expect 1 "static check refuses $mutation in observer Role $ns" bash "$rc" static "$TMP/observer-incomplete.yaml"
+  done
+done
+
 echo "== live rights check (ops/rbac-check.sh live, a fake kubectl)"
 FA="$TMP/fakeauth"
 mkdir -p "$FA/bin"
 cat >"$FA/bin/kubectl" <<'FAKE'
 #!/usr/bin/env bash
 # kubectl auth can-i VERB RESOURCE [--subresource S] (-n NS | --all-namespaces) --as AS: yes when
-# the line "AS NS VERB RESOURCE SUB" is in $FAKE_ALLOW.
+# the line "AS NS VERB RESOURCE SUB" (or "group:GROUP NS VERB RESOURCE SUB") is in $FAKE_ALLOW.
+case "$*" in
+  'get ns -o json') cat "$FAKE_NAMESPACES"; exit ;;
+  'get clusterrolebindings -o json') cat "$FAKE_BINDINGS"; exit ;;
+esac
 [[ "$1 $2" == "auth can-i" ]] || { echo "fake kubectl: unexpected $*" >&2; exit 3; }
-verb="$3" res="$4" sub="-" ns="-" as=""
+verb="$3" res="$4" sub="-" ns="-" as="" groups=" "
 shift 4
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1190,10 +1234,23 @@ while [[ $# -gt 0 ]]; do
     -n) ns="$2"; shift 2 ;;
     --all-namespaces) ns="*"; shift ;;
     --as) as="$2"; shift 2 ;;
+    --as-group) groups="$groups$2 "; shift 2 ;;
     *) echo "fake kubectl: unexpected $1" >&2; exit 3 ;;
   esac
 done
-if grep -qxF "$as $ns $verb $res $sub" "$FAKE_ALLOW"; then echo yes; else echo no; exit 1; fi
+account_ns="${as#system:serviceaccount:}"
+account_ns="${account_ns%%:*}"
+for group in system:serviceaccounts "system:serviceaccounts:$account_ns" system:authenticated; do
+  [[ "$groups" == *" $group "* ]] || { echo "missing impersonation group $group"; exit 3; }
+done
+echo "$as $ns $verb $res $sub" >>"$FAKE_QUERIES"
+allow=$'\n'"$(<"$FAKE_ALLOW")"$'\n'
+if [[ "$allow" == *$'\n'"$as $ns $verb $res $sub"$'\n'* ]]; then echo yes; exit 0; fi
+for group in $groups; do
+  if [[ "$allow" == *$'\n'"group:$group $ns $verb $res $sub"$'\n'* ]]; then echo yes; exit 0; fi
+done
+echo no
+exit 1
 FAKE
 chmod +x "$FA/bin/kubectl"
 D=system:serviceaccount:ruum:deployer K=system:serviceaccount:ruum-deploy:deploy-controller
@@ -1209,8 +1266,73 @@ for ns in ruum edge ruum-deploy; do
   done
   echo "$O $ns get pods log" >>"$FA/allow"
 done
-livecheck() { PATH="$FA/bin:$PATH" FAKE_ALLOW="$1" bash "$STG/ops/rbac-check.sh" live; }
+printf '%s\n' '{"items":[{"metadata":{"name":"ruum"}},{"metadata":{"name":"edge"}},{"metadata":{"name":"ruum-deploy"}},{"metadata":{"name":"data"}},{"metadata":{"name":"new-tenant"}}]}' >"$FA/namespaces"
+echo '{"items":[]}' >"$FA/bindings"
+livecheck() (
+  # Source the fake in a subshell to avoid an executable launch for every matrix entry.
+  # The function is exported only to this check; no real kubectl can be reached.
+  # shellcheck disable=SC1090 # generated fake above
+  kubectl() ( source "$FAKE_KUBECTL" "$@"; )
+  export -f kubectl
+  FAKE_KUBECTL="$FA/bin/kubectl" FAKE_NAMESPACES="$FA/namespaces" FAKE_BINDINGS="$FA/bindings" \
+    FAKE_QUERIES="$FA/queries" PATH="$FA/bin:$PATH" FAKE_ALLOW="$1" bash "$STG/ops/rbac-check.sh" live
+)
 expect 0 "the live check passes when the deployer may only write release requests" livecheck "$FA/allow"
+# Verify the complete negative matrix from the passing run, without rerunning it for each tuple.
+for ns in ruum edge ruum-deploy data new-tenant; do
+  for resource in secrets configmaps; do
+    for verb in get list watch; do
+      grep -qxF "$O $ns $verb $resource -" "$FA/queries" || bad "missing observer deny query $ns $verb $resource"
+    done
+  done
+  for resource in pods deployments.apps daemonsets.apps replicasets.apps jobs.batch events events.events.k8s.io; do
+    for verb in create update patch delete deletecollection; do
+      grep -qxF "$O $ns $verb $resource -" "$FA/queries" || bad "missing observer write query $ns $verb $resource"
+    done
+    case "$ns" in
+      data | new-tenant)
+        for verb in get list watch; do
+          grep -qxF "$O $ns $verb $resource -" "$FA/queries" || bad "missing observer outside read query $ns $verb $resource"
+        done ;;
+    esac
+  done
+  for extra in "create pods exec" "get pods exec" "create pods attach" "get pods attach" \
+    "create pods portforward" "get pods portforward" "get pods ephemeralcontainers" \
+    "update pods ephemeralcontainers" "patch pods ephemeralcontainers" "create serviceaccounts token"; do
+    grep -qxF "$O $ns $extra" "$FA/queries" || bad "missing observer subresource query $ns $extra"
+  done
+  case "$ns" in
+    data | new-tenant)
+      for verb in get list watch; do
+        grep -qxF "$O $ns $verb pods log" "$FA/queries" || bad "missing observer outside log query $ns $verb"
+      done ;;
+  esac
+done
+for extra in "$O ruum list secrets -" "$O edge watch configmaps -" "$O ruum-deploy delete pods -" \
+  "$O edge update pods ephemeralcontainers" "$O new-tenant list events.events.k8s.io -"; do
+  { cat "$FA/allow"; echo "$extra"; } >"$FA/more"
+  expect 1 "observer live regression refuses $extra" livecheck "$FA/more"
+done
+for group in system:serviceaccounts system:serviceaccounts:ruum system:authenticated; do
+  { cat "$FA/allow"; echo "group:$group ruum get secrets -"; } >"$FA/more"
+  expect 1 "live check refuses group-only Secret access through $group" livecheck "$FA/more"
+done
+# A harmless ClusterRole still must not be bound to the observer or its SA groups.
+for subject in 'ServiceAccount observer ruum' 'User system:serviceaccount:ruum:observer -' \
+  'Group system:serviceaccounts:ruum -' 'Group system:serviceaccounts -'; do
+  read -r kind name ns <<<"$subject"
+  jq -n --arg kind "$kind" --arg name "$name" --arg ns "$ns" \
+    '{items:[{metadata:{name:"unexpected"},subjects:[{kind:$kind,name:$name,namespace:$ns}]}]}' >"$FA/bindings"
+  expect 1 "observer rejects ClusterRoleBinding for $subject" livecheck "$FA/allow"
+done
+echo '{"items":[]}' >"$FA/bindings"
+cp "$FA/namespaces" "$FA/namespaces-good"
+echo 'not json' >"$FA/namespaces"
+expect 1 "live check fails closed on unreadable namespaces" livecheck "$FA/allow"
+mv "$FA/namespaces-good" "$FA/namespaces"
+echo 'not json' >"$FA/bindings"
+expect 1 "live check fails closed on unreadable ClusterRoleBindings" livecheck "$FA/allow"
+echo '{"items":[]}' >"$FA/bindings"
 for extra in "$D ruum create pods -" "$D ruum create jobs.batch -" "$D ruum get secrets -" "$D ruum get pods log" \
   "$D edge patch daemonsets.apps -" "$D ruum-deploy update configmaps -" "$D ruum update leases.coordination.k8s.io -" \
   "$D auth create pods -" "$D ruum create serviceaccounts token" "$D * create clusterrolebindings.rbac.authorization.k8s.io -" \
