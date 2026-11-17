@@ -107,6 +107,10 @@ pub async fn run(f: &dyn PrivacyFixture) -> Report {
             format!("personal_data_in_keys_{n}"),
             personal_data_in_keys(f, s).await,
         );
+        r.add(
+            format!("free_text_attributes_confirmed_normal_{n}"),
+            free_text_confirmed_normal(f, s).await,
+        );
     }
     r.add("metric_labels_dropped", metric_labels(f).await);
     r.add("metric_names_checked", metric_names(f).await);
@@ -1425,6 +1429,87 @@ async fn free_text_traces(f: &dyn PrivacyFixture) -> CaseResultT {
         msg.unwrap_or_default(),
     )
     .map_err(|e| format!("exception.message: {e}"))
+}
+
+/// A free-text attribute (`exception.message`, `exception.stacktrace`) that a person confirmed
+/// as `normal` is still scrubbed: free text is `personal` (review K3). As a metric label it is
+/// dropped. In traces the span event attributes are checked too.
+async fn free_text_confirmed_normal(f: &dyn PrivacyFixture, s: Signal) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let kind = kind_of(s);
+    let email = "bob@example.org";
+    let card = "4111 1111 1111 1111";
+    let message = format!("no user {email} for card {card} declined");
+    let stack = format!("at pay (user {email} card {card}) in pay.rs");
+    for name in ["order_id", "exception.message", "exception.stacktrace"] {
+        f.set_class(
+            id.tenant,
+            id.app,
+            kind,
+            name,
+            FieldClassEntry::confirmed(FieldClass::Normal),
+        )
+        .await;
+    }
+    let attrs = || {
+        vec![
+            Attribute::new("order_id", "A-1001"),
+            Attribute::new("exception.message", message.clone()),
+            Attribute::new("exception.stacktrace", stack.clone()),
+        ]
+    };
+    let mut batch = batch_with(s, attrs());
+    if let Some(span) = batch.spans.first_mut() {
+        span.events.push(SpanEvent {
+            time: crate::now(),
+            name: "exception".into(),
+            attributes: attrs(),
+        });
+    }
+    ingest(f, &id, batch).await?;
+    let stored = read_stored(f, &id, s, 1).await?;
+    let mut sets = stored_sets(&stored, s);
+    expect_text(&sets, "order_id", "A-1001")?;
+    if s == Signal::Metrics {
+        for name in ["exception.message", "exception.stacktrace"] {
+            let v = value_of(&sets, name);
+            need(v.is_none(), || {
+                format!("label {name}: expected dropped, was {}", describe(v))
+            })?;
+        }
+        return Ok(());
+    }
+    if s == Signal::Traces {
+        let ev = stored.spans[0]
+            .events
+            .first()
+            .ok_or("the event was not stored")?;
+        sets.push(ev.attributes.clone());
+    }
+    for set in &sets {
+        for name in ["exception.message", "exception.stacktrace"] {
+            let text = attr(set, name)
+                .and_then(StoredValue::as_text)
+                .ok_or_else(|| {
+                    format!(
+                        "{name}: expected scrubbed text, was {}",
+                        describe(attr(set, name))
+                    )
+                })?;
+            check_free_text(email, Some(scrub::Found::Pseudonym), text)
+                .map_err(|e| format!("{name}: {e}"))?;
+            check_free_text(card, Some(scrub::Found::Hidden), text)
+                .map_err(|e| format!("{name}: {e}"))?;
+        }
+    }
+    let dump = f.dump().await?;
+    let leaked: Vec<&str> = [email, card]
+        .into_iter()
+        .filter(|v| dump.windows(v.len()).any(|w| w == v.as_bytes()))
+        .collect();
+    need(leaked.is_empty(), || {
+        format!("{} sample(s) of free text are in the store", leaked.len())
+    })
 }
 
 /// A long adversarial free text is scrubbed within a time bound (the scanner is linear).
