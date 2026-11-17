@@ -8,7 +8,10 @@
 //! - standard and URL-safe base64, with and without padding, at the three alignments (the
 //!   characters that only the value's bytes decide, so the value matches also inside a longer
 //!   base64 text such as `user:value` in a `Basic` header);
-//! - lower and upper case hex;
+//! - the full base64 form with padding (standard and URL-safe), so the form of a 4 or 5 byte
+//!   value is long enough to match;
+//! - hex, in any mix of upper and lower case (the lower case needle is also looked for in an
+//!   ASCII-lowercased copy of a text that has upper case letters);
 //! - percent-encoding (upper and lower case escapes, and the form variant with `+` for a space);
 //! - JSON string escaping (once and twice, and with `\/`).
 //!
@@ -19,6 +22,16 @@
 //! Python `quote` keeps `/`), a percent-encoded base64 form and a JSON `\uXXXX` escape all match
 //! without a needle of their own.
 //!
+//! # Short secrets and short forms
+//!
+//! A secret shorter than [`MIN_RAW_BYTES`] and an encoded form shorter than
+//! [`MIN_ENCODED_BYTES`] would hide too much ordinary text as a substring. They match as a
+//! *whole*: a value (trimmed) that equals one, a whitespace-separated word that equals one, or
+//! a run of letters and digits that equals one (`pin=abc`, `"abc"`). For a short secret the
+//! forms are the raw value and its encodings of at least [`MIN_RAW_BYTES`] characters (`YWI=`
+//! yes, `YQ` no). This over-matches: a secret `abc` hides every value and every word `abc`.
+//! That is a hidden value, never a leak.
+//!
 //! # What it cannot catch
 //!
 //! - A value split across two records or two values (`"sk_" + rest` in two fields).
@@ -26,56 +39,93 @@
 //!   reversed, upper-cased, or in an encoding not listed above (base32, UTF-16, a custom
 //!   escape, more than two rounds of percent-encoding, a mix of two encodings other than the
 //!   decoded forms above).
-//! - Values shorter than [`MIN_RAW_BYTES`], and encodings shorter than [`MIN_ENCODED_BYTES`]
-//!   (they would hide too much ordinary text).
+//! - A short secret or a short form inside a longer run of letters and digits (`xabcx` for the
+//!   secret `abc`), and the 1-character encodings of a 1-byte secret. The real fix is a minimum
+//!   length when a secret is entered (a contract change, for the panel).
 //! - Secrets that are not given to it (the app's own keys from elsewhere): the deny-list and the
 //!   token patterns of the free-text scrubber cover part of those.
 
 use crate::runtime::redact;
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use std::collections::HashSet;
 use std::fmt;
 
-/// A secret shorter than this is not matched (it would hide ordinary text).
+/// A secret shorter than this matches only as a whole value or word (see the module doc).
 pub const MIN_RAW_BYTES: usize = 4;
-/// An encoded form shorter than this is not matched.
+/// An encoded form shorter than this matches only as a whole value or word.
 pub const MIN_ENCODED_BYTES: usize = 8;
 
-/// Finds the secret values and their encodings in text. `Debug` shows the count only.
+/// Finds the secret values and their encodings in text. `Debug` shows the counts only.
 #[derive(Clone, Default)]
 pub struct SecretMatcher {
+    /// Found anywhere in a text.
     needles: Vec<String>,
+    /// The lower case hex form of each secret: also found in an ASCII-lowercased copy of the
+    /// text (mixed-case hex).
+    hex: Vec<String>,
+    /// Short secrets and short forms: found only as a whole value, word or run of letters and
+    /// digits.
+    whole: HashSet<String>,
 }
 
 impl fmt::Debug for SecretMatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretMatcher({} needles)", self.needles.len())
+        write!(
+            f,
+            "SecretMatcher({} needles, {} whole forms)",
+            self.needles.len(),
+            self.whole.len()
+        )
     }
 }
 
 impl SecretMatcher {
     pub fn new<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
         let mut needles = Vec::new();
+        let mut hex = Vec::new();
+        let mut whole = HashSet::new();
         for v in values {
+            if v.is_empty() {
+                continue;
+            }
             if v.len() < MIN_RAW_BYTES {
+                whole.insert(v.to_owned());
+                whole.extend(
+                    all_encodings(v)
+                        .into_iter()
+                        .filter(|e| e.len() >= MIN_RAW_BYTES),
+                );
                 continue;
             }
             needles.push(v.to_owned());
             needles.extend(encodings(v));
+            whole.extend(
+                all_encodings(v)
+                    .into_iter()
+                    .filter(|e| e.len() < MIN_ENCODED_BYTES),
+            );
+            hex.push(hex::encode(v.as_bytes()));
         }
         needles.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         needles.dedup();
-        SecretMatcher { needles }
+        hex.sort();
+        hex.dedup();
+        SecretMatcher {
+            needles,
+            hex,
+            whole,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.needles.is_empty()
+        self.needles.is_empty() && self.whole.is_empty()
     }
 
     /// Whether the text holds a secret in any form: a needle in the text or in one of its
     /// decoded forms ([`decoded`]).
     pub fn contains(&self, text: &str) -> bool {
-        if self.needles.is_empty() {
+        if self.is_empty() {
             return false;
         }
         self.contains_needle(text) || decoded(text).iter().any(|d| self.contains_needle(d))
@@ -83,17 +133,46 @@ impl SecretMatcher {
 
     fn contains_needle(&self, text: &str) -> bool {
         self.needles.iter().any(|n| text.contains(n.as_str()))
+            || self.mixed_case_hex(text)
+            || self.whole_match(text)
+    }
+
+    /// A hex form in any mix of cases (`5275756D...6f`).
+    fn mixed_case_hex(&self, text: &str) -> bool {
+        if self.hex.is_empty() || !text.bytes().any(|c| c.is_ascii_uppercase()) {
+            return false;
+        }
+        let lower = text.to_ascii_lowercase();
+        self.hex.iter().any(|h| lower.contains(h.as_str()))
+    }
+
+    /// A short secret or short form as the whole (trimmed) text, a whitespace-separated word
+    /// or a run of letters and digits.
+    fn whole_match(&self, text: &str) -> bool {
+        if self.whole.is_empty() {
+            return false;
+        }
+        let t = text.trim();
+        self.whole.contains(t)
+            || t.split_whitespace().any(|w| self.whole.contains(w))
+            || t.split(|c: char| !c.is_alphanumeric())
+                .any(|w| !w.is_empty() && self.whole.contains(w))
     }
 
     /// The text with every match replaced by [`redact::REDACTED`]; `None` when there is no
-    /// match. A secret that only a decoded form shows: the whitespace-separated word that holds
-    /// it becomes the marker; when no single word holds it, the whole text does.
+    /// match. A secret that only a decoded form, the mixed-case hex check or a whole match
+    /// shows: the whitespace-separated word that holds it becomes the marker; when no single
+    /// word holds it, the whole text does.
     pub fn redact(&self, text: &str) -> Option<String> {
         if !self.contains(text) {
             return None;
         }
-        let refs: Vec<&str> = self.needles.iter().map(String::as_str).collect();
-        let out = redact::redact(text, &refs);
+        let out = if self.needles.is_empty() {
+            text.to_owned()
+        } else {
+            let refs: Vec<&str> = self.needles.iter().map(String::as_str).collect();
+            redact::redact(text, &refs)
+        };
         if !self.contains(&out) {
             return Some(out);
         }
@@ -244,6 +323,13 @@ fn unicode_escape(esc: &str) -> Option<(char, usize)> {
 /// The encoded forms of a value (without the value itself), each at least
 /// [`MIN_ENCODED_BYTES`] long and different from the value.
 pub fn encodings(value: &str) -> Vec<String> {
+    let mut out = all_encodings(value);
+    out.retain(|e| e.len() >= MIN_ENCODED_BYTES);
+    out
+}
+
+/// Every encoded form of a value, of any length, non-empty and different from the value.
+fn all_encodings(value: &str) -> Vec<String> {
     let bytes = value.as_bytes();
     let mut out = Vec::new();
     for engine in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
@@ -251,6 +337,12 @@ pub fn encodings(value: &str) -> Vec<String> {
             out.push(base64_core(engine, bytes, shift));
         }
     }
+    // The full forms with padding: for a value of 4 or 5 bytes the cores are shorter than
+    // `MIN_ENCODED_BYTES`, but the padded form (`YWJjZA==`) is not.
+    out.push(STANDARD.encode(bytes));
+    out.push(URL_SAFE.encode(bytes));
+    out.push(STANDARD_NO_PAD.encode(bytes));
+    out.push(URL_SAFE_NO_PAD.encode(bytes));
     out.push(hex::encode(bytes));
     out.push(hex::encode_upper(bytes));
     let pct = percent(bytes, true);
@@ -261,7 +353,7 @@ pub fn encodings(value: &str) -> Vec<String> {
     out.push(json_escape(&json));
     out.push(json.replace('/', "\\/"));
     out.push(json);
-    out.retain(|e| e.len() >= MIN_ENCODED_BYTES && e != value);
+    out.retain(|e| !e.is_empty() && e != value);
     out.sort();
     out.dedup();
     out

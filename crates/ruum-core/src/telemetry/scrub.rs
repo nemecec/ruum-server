@@ -10,7 +10,7 @@
 //! | Emails | pseudonym |
 //! | IBANs (mod-97 checked, with or without group spaces) | pseudonym |
 //! | Payment card numbers (13 to 19 digits, Luhn checked, with spaces or dashes) | hidden |
-//! | Phone numbers (E.164 `+` and 8 to 15 digits; national forms of 9 to 15 digits with spaces, dashes or an area code in parentheses, or with a leading `0`) | pseudonym |
+//! | Phone numbers (E.164 `+` and 8 to 15 digits; national forms of 9 to 15 digits with spaces, dashes or an area code in parentheses, or with a leading `0`; North American numbers of 10 digits without separators or as `415.555.2671`, with a valid area code and exchange, not part of a decimal number) | pseudonym |
 //! | Long hex runs (32 or more, with a digit and a letter) | hidden |
 //! | Long base64 runs (40 or more, with a digit, an upper and a lower case letter) | hidden |
 //!
@@ -453,6 +453,36 @@ fn phone_sep(c: u8) -> bool {
     matches!(c, b' ' | b'-')
 }
 
+/// Ten digits of the North American plan: the area code and the exchange start with 2 to 9.
+/// (Unix times in seconds start with `1` until 2033.)
+fn nanp(digits: &[u8]) -> bool {
+    digits.len() == 10 && (b'2'..=b'9').contains(&digits[0]) && (b'2'..=b'9').contains(&digits[3])
+}
+
+/// Whether the number at `start..end` is part of a decimal number or a version
+/// (`1.4155552671`, `4155552671.5`).
+fn in_decimal(b: &[u8], start: usize, end: usize) -> bool {
+    (end + 1 < b.len() && b[end] == b'.' && b[end + 1].is_ascii_digit())
+        || (start >= 2 && b[start - 1] == b'.' && b[start - 2].is_ascii_digit())
+}
+
+/// `415.555.2671` at `i`: the end, when it is a North American number that stands alone.
+fn dotted_nanp(b: &[u8], i: usize) -> Option<usize> {
+    let end = i + 12;
+    let s = b.get(i..end)?;
+    let digit_at = |k: usize| s[k].is_ascii_digit();
+    let shape = (0..3).all(digit_at)
+        && s[3] == b'.'
+        && (4..7).all(digit_at)
+        && s[7] == b'.'
+        && (8..12).all(digit_at);
+    if !shape || (end < b.len() && is_alnum(b[end])) || in_decimal(b, i, end) {
+        return None;
+    }
+    let digits: Vec<u8> = s.iter().copied().filter(u8::is_ascii_digit).collect();
+    nanp(&digits).then_some(end)
+}
+
 fn phones(b: &[u8], out: &mut Vec<Match>) {
     let mut i = 0;
     while i < b.len() {
@@ -478,6 +508,15 @@ fn phones(b: &[u8], out: &mut Vec<Match>) {
         let digit_start = c.is_ascii_digit()
             && !prev_is(b, i, |p| is_alnum(p) || p == b'+')
             && !continues_number(b, i);
+        if digit_start && let Some(end) = dotted_nanp(b, i) {
+            out.push(Match {
+                start: i,
+                end,
+                pattern: Pattern::Phone,
+            });
+            i = end;
+            continue;
+        }
         if paren || digit_start {
             let mut j = if paren { i + 1 } else { i };
             let (mut digits, mut end, mut seps, mut more) = digit_group(b, j, 15, phone_sep);
@@ -500,7 +539,9 @@ fn phones(b: &[u8], out: &mut Vec<Match>) {
             let ok = !more
                 && !(end < b.len() && is_alnum(b[end]))
                 && (9..=15).contains(&digits.len())
-                && (seps >= 1 || leading_zero);
+                && (seps >= 1
+                    || leading_zero
+                    || (nanp(&digits) && !paren && !in_decimal(b, i, end)));
             if ok {
                 out.push(Match {
                     start: i,

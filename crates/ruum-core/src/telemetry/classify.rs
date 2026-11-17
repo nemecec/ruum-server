@@ -503,6 +503,13 @@ impl Pipeline<'_> {
             self.report.drop(DropReason::PatternInName);
             return None;
         }
+        // The point value is a number an app chose: a secret of digits only can arrive here
+        // too. A number cannot hold the marker, so the point is dropped.
+        if self.holds_secret(&AttrValue::Float(rec.value)) {
+            self.report.secrets_redacted += 1;
+            self.report.drop(DropReason::SecretInValue);
+            return None;
+        }
         let mut labels = self.attributes(FieldKind::MetricLabel, rec.labels);
         labels.extend(identity_attributes(self.identity));
         Some(StoredMetric {
