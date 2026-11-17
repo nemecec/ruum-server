@@ -6,12 +6,54 @@
 //! add a world step first, the body fails with [`plan`], which names the steps: the card that
 //! removes the `PENDING` line writes the body (it can never pass by accident).
 
+use super::echo::{WsOpen, ws_open};
 use super::{
-    Access, Ctx, Echo, Env, Fail, GatewayCase, Relation, Req, SIGN_IN_OR_REFUSED, echoed,
-    echoed_header, expect_refusal, files, is_echo, page, scene,
+    Access, Ctx, Echo, Env, Fail, GatewayCase, REQUEST_TIMEOUT, Relation, Req, SIGN_IN_OR_REFUSED,
+    WsEcho, check_security_headers, echoed, echoed_header, echoed_headers, expect_refusal, files,
+    is_echo, page, scene,
 };
-use crate::gw_check;
+use crate::{gw_check, gw_fail};
 use serde_json::json;
+use std::time::{Duration, Instant};
+
+/// A trace ID sent by the visitor, which must never reach the app.
+const SENT_TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+
+/// Decision 25: a cold start is answered within 3 s.
+const COLD_START: Duration = Duration::from_secs(3);
+
+/// A WebSocket upgrade of `host` from `origin`.
+fn upgrade(host: &str, origin: &str) -> Req {
+    Req::get(host, "/ws")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("Origin", origin)
+}
+
+/// A live platform app `slug` of a new tenant `tenant_slug` whose node22 deployment answers as
+/// `upstream`, and its member `mari` with `view`, signed in. Returns the host and the cookie.
+async fn sandbox_scene(
+    cx: &Ctx,
+    tenant_slug: &str,
+    slug: &str,
+    upstream: &str,
+) -> Result<(String, String, super::Deployment), Fail> {
+    let w = &cx.world;
+    let t = w.seed_tenant(tenant_slug).await?;
+    let u = w.seed_user(&t, "mari").await?;
+    let a = w.seed_app(&t, slug, Access::Platform).await?;
+    let d = w.seed_node_deployment(&a, Env::Live, upstream).await?;
+    w.set_live(&a, &d).await?;
+    w.grant(&u, &a, &Relation::View).await?;
+    let host = cx.live_host(&a);
+    let (jar, _) = cx.sign_in(&u, &host).await?;
+    let cookie = jar
+        .header_for(&host, "/")
+        .ok_or_else(|| Fail::Failed(format!("the sign-in on {host} left no cookie")))?;
+    Ok((host, cookie, d))
+}
 
 macro_rules! case {
     ($name:expr, $rule:expr, $source:expr, [$($op:expr),* $(,)?], |$cx:ident| $body:block) => {
@@ -44,13 +86,132 @@ pub fn cases() -> Vec<GatewayCase> {
             "STEP3 area 4 \"Gateway\" (G-1b); gateway.openapi.yaml \"The check of every request\" \
              3 and 4",
             [],
-            |_cx| {
-                plan(
-                    "G-1b",
-                    "seed a node22 deployment whose app echoes its request (a world step \
-                     seed_node_deployment), set it live, repeat request_headers_are_cleaned and \
-                     app_set_cookie_for_ruum_names_is_dropped against the sandbox",
-                )
+            |cx| {
+                let e = Echo::start().await;
+                let (host, cookie, _) = sandbox_scene(&cx, "acme", "garden", &e.url).await?;
+                // request_headers_are_cleaned, against the sandbox.
+                let forged_user = "forged-user-token-t6";
+                let req = Req::get(&host, "/hello?x=1")
+                    .header("Cookie", &format!("{cookie}; theme=dark"))
+                    .header("Ruum-User", forged_user)
+                    .header("ruum-tenant", "t6forged-tenant")
+                    .header("RUUM-Request-Id", "t6forged-request-id")
+                    .header("Ruum_User", "t6forged-underscore")
+                    .header("X-Forwarded-For", "203.0.113.7")
+                    .header("X-Forwarded-Host", "t6forged.example")
+                    .header("Forwarded", "for=203.0.113.7;host=t6forged.example")
+                    .header("X-Real-IP", "203.0.113.7")
+                    .header("tracestate", "t6=forged")
+                    .header("baggage", "t6forged=1")
+                    .header(
+                        "traceparent",
+                        &format!("00-{SENT_TRACE_ID}-b7ad6b7169203331-01"),
+                    )
+                    .header("Keep-Alive", "timeout=5")
+                    .header("Proxy-Authorization", "Basic dDZmb3JnZWQ6eA==")
+                    .header("TE", "trailers")
+                    .header("Upgrade", "h2c")
+                    .header("Connection", "close, X-Drop-Me, Ruum-User, traceparent")
+                    .header("X-Drop-Me", "t6forged-dropme")
+                    .header("X-Keep", "t6-kept");
+                let label = req.label();
+                let resp = cx.send(req).await?;
+                let v = echoed(&label, &resp)?;
+                gw_check!(
+                    v["target"] == "/hello?x=1",
+                    "{label}: the app got the target {}",
+                    v["target"]
+                );
+                for (n, val) in echoed_headers(&v) {
+                    let l = n.to_ascii_lowercase();
+                    if (l.starts_with("ruum-") || l.starts_with("ruum_"))
+                        && l != "ruum-user"
+                        && l != "ruum-request-id"
+                    {
+                        gw_fail!("{label}: the app got the header {n}");
+                    }
+                    for dropped in [
+                        "x-forwarded-",
+                        "forwarded",
+                        "x-real-ip",
+                        "tracestate",
+                        "baggage",
+                        "keep-alive",
+                        "proxy-authorization",
+                        "te",
+                        "x-drop-me",
+                        "upgrade",
+                    ] {
+                        let hit = if dropped.ends_with('-') {
+                            l.starts_with(dropped)
+                        } else {
+                            l == dropped
+                        };
+                        gw_check!(!hit, "{label}: the app got the header {n}");
+                    }
+                    gw_check!(
+                        !val.contains("t6forged")
+                            && !val.contains(forged_user)
+                            && !val.contains("203.0.113.7")
+                            && !val.contains(SENT_TRACE_ID),
+                        "{label}: the app got a forged value in {n}"
+                    );
+                    if l == "cookie" {
+                        gw_check!(
+                            !val.to_ascii_lowercase().contains("ruum"),
+                            "{label}: the app got a gateway cookie"
+                        );
+                    }
+                }
+                for own in ["ruum-user", "ruum-request-id", "traceparent"] {
+                    let n = echoed_header(&v, own).len();
+                    gw_check!(n == 1, "{label}: the app got {n} {own} headers");
+                }
+                gw_check!(
+                    echoed_header(&v, "x-keep") == vec!["t6-kept".to_string()],
+                    "{label}: an ordinary header did not pass unchanged"
+                );
+                gw_check!(
+                    echoed_header(&v, "cookie") == vec!["theme=dark".to_string()],
+                    "{label}: the app's own cookie did not pass alone: {:?}",
+                    echoed_header(&v, "cookie")
+                );
+                gw_check!(
+                    echoed_header(&v, "host") == vec![host.clone()],
+                    "{label}: the app got the Host {:?}, expected its own host name",
+                    echoed_header(&v, "host")
+                );
+                // app_set_cookie_for_ruum_names_is_dropped, against the sandbox.
+                e.reply_with(&[
+                    ("Set-Cookie", "ruum_app=t6bad1; Path=/"),
+                    ("Set-Cookie", "__Host-ruum_app=t6bad2; Path=/; Secure"),
+                    ("Set-Cookie", "RUUM_session=t6bad3"),
+                    ("Set-Cookie", "=ruum_app=t6bad6"),
+                    ("Set-Cookie", "t6bad8"),
+                    ("Set-Cookie", "theme=t6ok1; Path=/"),
+                    ("Content-Security-Policy", "default-src 'self'"),
+                ]);
+                let req = Req::get(&host, "/set").header("Cookie", &cookie);
+                let label = req.label();
+                let resp = cx.send(req).await?;
+                echoed(&label, &resp)?;
+                let sc = resp.set_cookies();
+                gw_check!(
+                    sc.iter().all(|c| !c.contains("t6bad")),
+                    "{label}: the browser got an app cookie with a gateway name"
+                );
+                gw_check!(
+                    sc.iter().any(|c| c.starts_with("theme=t6ok1")),
+                    "{label}: the app's ordinary cookie did not pass"
+                );
+                check_security_headers(&label, &resp, Env::Live, &cx.gw.ui_origin)?;
+                // Both answers came from the sandbox's app, and nothing else reached it.
+                gw_check!(
+                    e.hits() == 2,
+                    "the app got {} requests, expected 2",
+                    e.hits()
+                );
+                Ok(())
             }
         ),
         case!(
@@ -70,10 +231,65 @@ pub fn cases() -> Vec<GatewayCase> {
                 let resp = cx.send(req).await?;
                 expect_refusal(&label, &resp, SIGN_IN_OR_REFUSED)?;
                 gw_check!(s.echo().hits() == 0, "{label}: the app got the upgrade");
-                plan(
-                    "G-1b",
-                    "with the session: expect 101 from a WebSocket echo upstream",
-                )
+                // A sandbox whose app is a WebSocket echo.
+                let ws = WsEcho::start().await;
+                let (host, cookie, _) = sandbox_scene(&cx, "beta", "orchard", &ws.url).await?;
+                let own = format!("https://{host}");
+                // Without a session: refused before the app.
+                let req = upgrade(&host, &own);
+                let label = format!("{} without a session (sandbox)", req.label());
+                let resp = cx.send(req).await?;
+                expect_refusal(&label, &resp, SIGN_IN_OR_REFUSED)?;
+                gw_check!(ws.hits() == 0, "{label}: the app got the upgrade");
+                // With the session: 101, and a frame comes back from the app.
+                let req = upgrade(&host, &own).header("Cookie", &cookie);
+                let label = format!("{} with the session", req.label());
+                let mut c = match ws_open(cx.gw.addr, &req, REQUEST_TIMEOUT)
+                    .await
+                    .map_err(|e| Fail::Failed(format!("{label}: {e}")))?
+                {
+                    WsOpen::Open(_, c) => c,
+                    WsOpen::Refused(r) => {
+                        gw_fail!("{label}: expected 101, got {} {}", r.status, r.short_body())
+                    }
+                };
+                c.send_text("t6-hello")
+                    .await
+                    .map_err(|e| Fail::Failed(format!("{label}: {e}")))?;
+                let f = c
+                    .recv(Duration::from_secs(5))
+                    .await
+                    .map_err(|e| Fail::Failed(format!("{label}: {e}")))?;
+                gw_check!(
+                    f.as_ref().map(|f| (f.opcode, f.text())) == Some((1, "t6-hello".to_string())),
+                    "{label}: the echoed frame did not come back: {f:?}"
+                );
+                let seen = ws.seen();
+                let up = seen.last().expect("the app saw the upgrade");
+                gw_check!(
+                    up.header_all("ruum-user").len() == 1,
+                    "{label}: the app got {} Ruum-User headers",
+                    up.header_all("ruum-user").len()
+                );
+                gw_check!(
+                    up.header_all("cookie")
+                        .iter()
+                        .all(|c| !c.to_ascii_lowercase().contains("ruum")),
+                    "{label}: the app got the gateway's cookie"
+                );
+                // From another origin, with the session: the gateway's 403.
+                let before = ws.hits();
+                for origin in ["https://evil.example", "null"] {
+                    let req = upgrade(&host, origin).header("Cookie", &cookie);
+                    let label = format!("{} from {origin}", req.label());
+                    let resp = cx.send(req).await?;
+                    expect_refusal(&label, &resp, &[403])?;
+                }
+                gw_check!(
+                    ws.hits() == before,
+                    "an upgrade from another origin reached the app"
+                );
+                Ok(())
             }
         ),
         case!(
@@ -82,11 +298,37 @@ pub fn cases() -> Vec<GatewayCase> {
              never dropped",
             "STEP3 area 4 \"Gateway\" (G-1b); decision 0006 G point 3",
             [],
-            |_cx| {
-                plan(
-                    "G-1b",
-                    "stop the app's instance (world step), send a request, expect 200",
-                )
+            |cx| {
+                let e = Echo::start().await;
+                let (host, cookie, d) = sandbox_scene(&cx, "acme", "garden", &e.url).await?;
+                // Positive control: the running app answers.
+                let req = Req::get(&host, "/before").header("Cookie", &cookie);
+                let label = req.label();
+                echoed(&label, &cx.send(req).await?)?;
+                cx.world.stop_instance(&d).await?;
+                let req = Req::get(&host, "/after-stop").header("Cookie", &cookie);
+                let label = format!("{} after the stop", req.label());
+                let t = Instant::now();
+                let resp = cx.send(req).await?;
+                let took = t.elapsed();
+                let v = echoed(&label, &resp)?;
+                gw_check!(
+                    v["target"] == "/after-stop",
+                    "{label}: the app got {}",
+                    v["target"]
+                );
+                gw_check!(
+                    took <= COLD_START,
+                    "{label}: answered after {} ms, decision 25 says {} ms",
+                    took.as_millis(),
+                    COLD_START.as_millis()
+                );
+                gw_check!(
+                    e.hits() == 2,
+                    "the app got {} requests, expected 2",
+                    e.hits()
+                );
+                Ok(())
             }
         ),
         // ---- G-2 --------------------------------------------------------------------------

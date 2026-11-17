@@ -14,9 +14,12 @@
 //!   `ruum_core::identity::app_sign_in::wire`). The gateway holds no tenant keys and no general
 //!   system access (decision 0006-1), so it asks the core: what a deployment is (`deployment`),
 //!   redeem a sign-in code once (`redeem`), whether an app session is live and may use the app
-//!   (`session`), end a session (`session/end`), and what a bearer token is (`agent`). The
-//!   answers name only what the gateway needs: IDs, flags and the pairwise subjects of design
-//!   9.4, never a platform user ID or an email.
+//!   (`session`), end a session (`session/end`), what a bearer token is (`agent`), and where the
+//!   instance of a sandbox deployment runs (`upstream`, card G-1b: the core's
+//!   `SandboxDirectory` answers from its own deployment record; without a directory the answer
+//!   is `not_running`). The answers name only what the gateway needs: IDs, flags, the pairwise
+//!   subjects of design 9.4 and an instance's `http://<host>:<port>`, never a platform user ID or
+//!   an email.
 
 use crate::state::AppState;
 use axum::Router;
@@ -100,7 +103,7 @@ pub mod gateway {
     use ruum_core::authz::{ObjectRef, Role, SubjectRef};
     use ruum_core::identity::app_sign_in::wire::{
         AgentAnswer, AgentRequest, DeploymentInfo, DeploymentQuery, EndSessionRequest, PREFIX,
-        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest,
+        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, UpstreamAnswer, UpstreamQuery,
     };
     use ruum_core::identity::app_sign_in::{AppBinding, AppEnv, pairwise};
     use ruum_core::{NodeId, TenantId, UserId};
@@ -114,6 +117,7 @@ pub mod gateway {
             .route(&format!("{PREFIX}/session"), post(session))
             .route(&format!("{PREFIX}/session/end"), post(end_session))
             .route(&format!("{PREFIX}/agent"), post(agent))
+            .route(&format!("{PREFIX}/upstream"), post(upstream))
             // Each request gets its own authz freshness floor, as on the public router (decision
             // 0002-4). Without it the floor helpers do nothing here, and a check falls back to
             // this process's own last token: a revoke made on another replica could still pass.
@@ -173,7 +177,21 @@ pub mod gateway {
             },
             public_approved,
             serving,
+            sandbox: ruum_core::apps::sandboxes::is_sandbox(dep.manifest.as_ref()),
         }))
+    }
+
+    /// Where the instance of a sandbox deployment runs (card G-1b). The core's directory reads
+    /// the deployment record by the query's tenant, app and deployment and checks its
+    /// environment; without a directory (the server until I-4) the answer is `not_running`.
+    async fn upstream(State(s): State<AppState>, Json(q): Json<UpstreamQuery>) -> Response {
+        let Some(dir) = s.services.sandboxes.clone() else {
+            return Json(UpstreamAnswer::NotRunning).into_response();
+        };
+        match dir.upstream(&q).await {
+            Ok(a) => Json(a).into_response(),
+            Err(e) => failed("upstream", e),
+        }
     }
 
     async fn deployment(State(s): State<AppState>, Json(q): Json<DeploymentQuery>) -> Response {
@@ -503,6 +521,259 @@ mod tests {
         assert_eq!(ask(&app, &hb).await, StatusCode::TOO_MANY_REQUESTS);
         // The host allowed before stays allowed.
         assert_eq!(ask(&app, &ha).await, StatusCode::OK);
+    }
+
+    /// The `upstream` route of the gateway (card G-1b).
+    mod upstream_route {
+        use super::*;
+        use ruum_core::actor::{Actor, Context};
+        use ruum_core::apps::sandboxes::{Locator, SandboxDirectory, Upstream};
+        use ruum_core::apps::store::{
+            Archive, DeploymentSource, DeploymentState, Environment, NewDeployment,
+        };
+        use ruum_core::identity::app_sign_in::AppEnv;
+        use ruum_core::identity::app_sign_in::wire::{PREFIX, UpstreamAnswer, UpstreamQuery};
+        use ruum_core::nodes::OnConflict;
+        use ruum_core::runtime::{
+            ImageRef, InstanceStatus, Limits, MemoryDriver, MemoryRegistry, MemoryUsage, OciDigest,
+            RuntimeDriver, SecretValue, ServiceSpec, WorkloadIdentity, WorkloadKind, WorkloadSpec,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Seed {
+            query: UpstreamQuery,
+            other_tenant: ruum_core::TenantId,
+        }
+
+        async fn seed(state: &AppState, runtime: &str) -> Seed {
+            let owner = state
+                .services
+                .identity
+                .upsert_from_login(&VerifiedLogin {
+                    issuer: "https://issuer.example".into(),
+                    subject: format!("g1b-{}", uuid::Uuid::now_v7()),
+                    email: Some(format!("g1b-{}@example.test", uuid::Uuid::now_v7())),
+                    email_verified: true,
+                    name: None,
+                    id_token: None,
+                })
+                .await
+                .unwrap();
+            let run = uuid::Uuid::now_v7().simple().to_string();
+            let slug = format!("g1b{}", &run[run.len() - 10..]);
+            let team = state
+                .services
+                .tenants
+                .create_team(&Actor::user(owner.id), slug.clone())
+                .await
+                .unwrap();
+            let store = state.services.apps.store();
+            store
+                .ensure_tenant_settings(team.id, &[slug])
+                .await
+                .unwrap();
+            let ctx = Context {
+                tenant: team.id,
+                actor: Actor::user(owner.id),
+                scope: None,
+                idempotency_key: None,
+            };
+            let app = state
+                .services
+                .apps
+                .create(
+                    &ctx,
+                    ruum_core::apps::CreateApp {
+                        parent_id: team.root_node_id,
+                        name: "garden".into(),
+                        settings: None,
+                        on_conflict: OnConflict::Fail,
+                    },
+                )
+                .await
+                .unwrap()
+                .value;
+            let id = uuid::Uuid::now_v7();
+            store
+                .insert_deployment(
+                    &ctx,
+                    NewDeployment {
+                        id,
+                        app_node_id: app.node.id,
+                        environment: Environment::Preview,
+                        state: DeploymentState::Ready,
+                        short_id: ruum_core::apps::slugs::short_id(),
+                        label: None,
+                        draft: None,
+                        new_chunks: Vec::new(),
+                        source: DeploymentSource {
+                            kind: "folder".into(),
+                            node_id: None,
+                            version_id: None,
+                            files: Some(Vec::new()),
+                        },
+                        archive: Archive {
+                            content_hash: [7u8; 32],
+                            size: 1,
+                            chunks: Vec::new(),
+                        },
+                        manifest: Some(serde_json::json!({ "runtime": runtime, "start": "x" })),
+                        stages: serde_json::json!([]),
+                        published_from: None,
+                        expires_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+            Seed {
+                query: UpstreamQuery {
+                    tenant_id: team.id,
+                    app_id: app.node.id,
+                    deployment_id: id,
+                    environment: AppEnv::Preview,
+                },
+                // The owner's personal tenant: a real tenant that does not own the app.
+                other_tenant: owner.home_tenant_id,
+            }
+        }
+
+        async fn ask(app: &Router, q: &UpstreamQuery) -> (StatusCode, Option<UpstreamAnswer>) {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("{PREFIX}/upstream"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(q).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            (status, serde_json::from_slice(&body).ok())
+        }
+
+        fn routes(state: AppState) -> Router {
+            router(
+                state,
+                TlsAskConfig::for_content_url("https://content.example.test", 20),
+            )
+        }
+
+        #[tokio::test]
+        async fn without_a_directory_the_answer_is_not_running() {
+            let state = AppState::in_memory();
+            let s = seed(&state, "node22").await;
+            let app = routes(state);
+            assert_eq!(
+                ask(&app, &s.query).await,
+                (StatusCode::OK, Some(UpstreamAnswer::NotRunning))
+            );
+        }
+
+        #[tokio::test]
+        async fn the_answer_comes_from_the_cores_record() {
+            let mut state = AppState::in_memory();
+            let s = seed(&state, "node22").await;
+            let q = s.query.clone();
+            let registry = MemoryRegistry::new();
+            let driver = Arc::new(MemoryDriver::new(
+                registry.clone(),
+                Arc::new(MemoryUsage::new()),
+            ));
+            let identity = WorkloadIdentity {
+                tenant: q.tenant_id,
+                app: q.app_id,
+                deployment: q.deployment_id,
+                environment: ruum_core::runtime::Environment::Preview,
+            };
+            let digest = OciDigest::of(b"g1b route image");
+            registry.push(&identity, &digest);
+            let st = driver
+                .start(WorkloadSpec {
+                    identity,
+                    kind: WorkloadKind::Service(ServiceSpec {
+                        port: 3000,
+                        health: None,
+                        idle_timeout: None,
+                    }),
+                    image: ImageRef::Oci(digest),
+                    command: Vec::new(),
+                    env: Vec::new(),
+                    previous_secrets: Vec::new(),
+                    workload_token: SecretValue::new("g1b-route-token"),
+                    limits: Limits {
+                        cpu_millis: 100,
+                        memory_bytes: 1 << 26,
+                        disk_bytes: 1 << 26,
+                    },
+                    routes: Vec::new(),
+                })
+                .await
+                .unwrap();
+            // The locator notes whether it runs inside the request's freshness scope.
+            let in_request = Arc::new(AtomicBool::new(false));
+            let seen = in_request.clone();
+            let locator: Locator = Arc::new(move |_st: &InstanceStatus| {
+                seen.store(ruum_core::authz::in_request(), Ordering::SeqCst);
+                Some(Upstream {
+                    host: "10.89.0.7".into(),
+                    port: 3000,
+                })
+            });
+            let dir = SandboxDirectory::new(state.services.apps.store().clone(), driver, locator);
+            dir.register(q.tenant_id, st.id).await.unwrap();
+            state.services.sandboxes = Some(Arc::new(dir));
+            let app = routes(state);
+            assert_eq!(
+                ask(&app, &q).await,
+                (
+                    StatusCode::OK,
+                    Some(UpstreamAnswer::Ready {
+                        url: "http://10.89.0.7:3000".into()
+                    })
+                )
+            );
+            assert!(
+                in_request.load(Ordering::SeqCst),
+                "the upstream route runs outside with_request_freshness"
+            );
+            // Another tenant, a forged deployment, the other environment: no upstream.
+            for bad in [
+                UpstreamQuery {
+                    tenant_id: s.other_tenant,
+                    ..q.clone()
+                },
+                UpstreamQuery {
+                    deployment_id: uuid::Uuid::now_v7(),
+                    ..q.clone()
+                },
+                UpstreamQuery {
+                    environment: AppEnv::Live,
+                    ..q.clone()
+                },
+            ] {
+                assert_eq!(
+                    ask(&app, &bad).await,
+                    (StatusCode::OK, Some(UpstreamAnswer::NotRunning)),
+                    "{bad:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_deployment_route_says_whether_it_is_a_sandbox() {
+            let state = AppState::in_memory();
+            let node = seed(&state, "node22").await.query;
+            let stat = seed(&state, "static").await.query;
+            for (q, want) in [(node, true), (stat, false)] {
+                let info = gateway::deployment_info(&state, q.tenant_id, q.app_id, q.deployment_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(info.sandbox, want);
+            }
+        }
     }
 
     #[test]

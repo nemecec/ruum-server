@@ -20,14 +20,24 @@
 //!   `garage`), `RUUM_GATEWAY_S3_ACCESS_KEY_ID`, `RUUM_GATEWAY_S3_SECRET_ACCESS_KEY_FILE`: the
 //!   read-only object store credential of the static sites. Without `RUUM_GATEWAY_S3_BUCKET` the
 //!   gateway serves no static file (an empty in-process store) and says so at start.
+//! - Sandboxes (card G-1b; whole seconds or counts, each above zero): `RUUM_GATEWAY_WAKE_HOLD`
+//!   (default 10): how long a request is held while its app starts; `RUUM_GATEWAY_HOLD_PER_APP`
+//!   (64) and `RUUM_GATEWAY_HOLD_GLOBAL` (1024): held requests per deployment and in all;
+//!   `RUUM_GATEWAY_WS_PER_APP` (256) and `RUUM_GATEWAY_WS_GLOBAL` (8192): open WebSockets per
+//!   deployment and in all; `RUUM_GATEWAY_UPSTREAM_TIMEOUT` (60): until the head of an app's
+//!   answer; `RUUM_GATEWAY_WS_IDLE` (600): an idle WebSocket closes. Where an instance runs comes
+//!   from the core's internal listener (`RUUM_GATEWAY_INTERNAL_URL`), never from a setting.
 
 use ruum_core::apps::static_site::StaticSites;
 use ruum_gateway::core_api::HttpCore;
 use ruum_gateway::host::PgHostLookup;
+use ruum_gateway::proxy::ProxyConfig;
+use ruum_gateway::sandbox::{HoldConfig, HttpSandboxes};
 use ruum_gateway::token::UserTokenSigner;
 use ruum_gateway::{Config, Gateway};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name)
@@ -38,6 +48,46 @@ fn var(name: &str) -> Option<String> {
 
 fn required(name: &str) -> Result<String, String> {
     var(name).ok_or_else(|| format!("{name} is not set"))
+}
+
+/// A whole number above zero, or `default` when the setting is not there.
+fn count(name: &str, default: u64) -> Result<u64, String> {
+    match var(name) {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("{name} must be a whole number above zero")),
+    }
+}
+
+fn hold_config() -> Result<HoldConfig, String> {
+    let d = HoldConfig::default();
+    let size = |name: &str, default: usize| {
+        count(name, default as u64)
+            .and_then(|n| usize::try_from(n).map_err(|_| format!("{name} is too large")))
+    };
+    Ok(HoldConfig {
+        hold: Duration::from_secs(count("RUUM_GATEWAY_WAKE_HOLD", d.hold.as_secs())?),
+        per_app: size("RUUM_GATEWAY_HOLD_PER_APP", d.per_app)?,
+        global: size("RUUM_GATEWAY_HOLD_GLOBAL", d.global)?,
+        ws_per_app: size("RUUM_GATEWAY_WS_PER_APP", d.ws_per_app)?,
+        ws_global: size("RUUM_GATEWAY_WS_GLOBAL", d.ws_global)?,
+        retry: d.retry,
+    })
+}
+
+fn proxy_config() -> Result<ProxyConfig, String> {
+    let d = ProxyConfig::default();
+    Ok(ProxyConfig {
+        first_byte: Duration::from_secs(count(
+            "RUUM_GATEWAY_UPSTREAM_TIMEOUT",
+            d.first_byte.as_secs(),
+        )?),
+        ws_idle: Duration::from_secs(count("RUUM_GATEWAY_WS_IDLE", d.ws_idle.as_secs())?),
+        ..d
+    })
 }
 
 fn static_sites() -> Result<StaticSites, String> {
@@ -84,14 +134,20 @@ async fn run() -> Result<(), String> {
         .max_connections(8)
         .connect_lazy(&required("RUUM_GATEWAY_DATABASE_URL")?)
         .map_err(|e| format!("RUUM_GATEWAY_DATABASE_URL: {e}"))?;
-    let core = HttpCore::new(&required("RUUM_GATEWAY_INTERNAL_URL")?).map_err(|e| e.to_string())?;
-    let gw = Arc::new(Gateway::new(
-        config,
-        Arc::new(PgHostLookup::new(pool)),
-        Arc::new(core),
-        tokens,
-        static_sites()?,
-    ));
+    let internal = required("RUUM_GATEWAY_INTERNAL_URL")?;
+    let core = HttpCore::new(&internal).map_err(|e| e.to_string())?;
+    let sandboxes = HttpSandboxes::new(&internal).map_err(|e| e.to_string())?;
+    let gw = Arc::new(
+        Gateway::new(
+            config,
+            Arc::new(PgHostLookup::new(pool)),
+            Arc::new(core),
+            tokens,
+            static_sites()?,
+        )
+        .with_sandboxes(Arc::new(sandboxes), hold_config()?)
+        .with_proxy(proxy_config()?),
+    );
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| format!("cannot listen on {bind}: {e}"))?;

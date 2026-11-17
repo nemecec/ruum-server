@@ -71,3 +71,61 @@ pub fn unavailable(look: Look) -> Response {
         look.1,
     )
 }
+
+/// How long a visitor waits before trying a starting app again (`Retry-After`, seconds).
+pub const RETRY_AFTER_SECS: u64 = 5;
+
+/// The app is starting and did not answer within the hold limit, or too many requests of this
+/// app wait already (card G-1b): `503` with `Retry-After`.
+pub fn starting(look: Look) -> Response {
+    let mut r = page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "This app is starting. Try again in a moment.",
+        look.0,
+        look.1,
+    );
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
+    r
+}
+
+/// The app is not running (no instance, or none can start), or the gateway refused the address
+/// the core gave: `502`. A page of the gateway: no text of the app or the runtime.
+pub fn not_running(look: Look) -> Response {
+    page(
+        StatusCode::BAD_GATEWAY,
+        "This app is not running right now.",
+        look.0,
+        look.1,
+    )
+}
+
+/// The app's process ended by itself: `502`, without any text of the app or the runtime.
+pub fn crashed(look: Look) -> Response {
+    page(
+        StatusCode::BAD_GATEWAY,
+        "This app stopped because of an error. The people who run it can see why.",
+        look.0,
+        look.1,
+    )
+}
+
+/// The app did not answer in time: `504`.
+pub fn timeout(look: Look) -> Response {
+    page(
+        StatusCode::GATEWAY_TIMEOUT,
+        "The app did not answer in time.",
+        look.0,
+        look.1,
+    )
+}
+
+/// The request body is over the gateway's limit: `413`.
+pub fn too_large(look: Look) -> Response {
+    page(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "This request is too large.",
+        look.0,
+        look.1,
+    )
+}
