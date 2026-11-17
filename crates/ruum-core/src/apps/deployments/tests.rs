@@ -1260,3 +1260,306 @@ async fn a_tenant_runs_a_bounded_number_of_deployments() {
     }
     assert_eq!(w.s.apps.deploy_slots.busy_tenants(), 0);
 }
+
+// ------------------------------------------------- quota and collection of static sites (W2S-1)
+
+/// True when the tenant stores a file object with `data`.
+async fn stores(w: &World, data: &[u8]) -> bool {
+    let contents = [(crate::blobs::Hash::of(data), data.len() as u64)];
+    w.s.apps
+        .sites()
+        .missing_bytes(w.team.id, &contents)
+        .await
+        .unwrap()
+        == 0
+}
+
+/// The page `/` of a deployment's site.
+async fn page(w: &World, id: Uuid) -> Option<bytes::Bytes> {
+    let sites = w.s.apps.sites();
+    let index = sites.read_index(w.team.id, id).await.unwrap()?;
+    let (_, e) = index.resolve("", false)?;
+    Some(sites.read_file(w.team.id, e, 1 << 20).await.unwrap())
+}
+
+async fn collect(w: &World) -> crate::apps::static_site::SiteGcReport {
+    w.s.apps
+        .collect_static(
+            w.team.id,
+            time::Duration::ZERO,
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+}
+
+async fn end(w: &World, id: Uuid) {
+    assert!(
+        w.s.apps
+            .store()
+            .set_deployment_state(w.team.id, id, DeploymentState::Expired)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn static_objects_count_against_the_storage_quota() {
+    let w = world().await;
+    let app = w.app("Quota").await;
+    let first = w
+        .folder("first", &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    w.preview(app, first, None).await;
+    let stored = w.s.apps.sites().stored_bytes(w.team.id).await.unwrap();
+    assert!(stored > INDEX.len() as u64, "{stored}");
+    // The space has 4 bytes left: a site with 22 new bytes is refused before the 202, and no
+    // deployment row is left.
+    w.s.apps.set_storage_limit(Some(stored as i64 + 4));
+    assert_eq!(w.s.apps.static_free_bytes(w.team.id).await.unwrap(), 4);
+    let bigger = w
+        .folder(
+            "bigger",
+            &[
+                ("app.yaml", MANIFEST),
+                ("index.html", b"<h1>A larger page</h1>"),
+            ],
+        )
+        .await;
+    let count = || async {
+        w.s.apps
+            .store()
+            .list_deployments(w.team.id, app, None, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .len()
+    };
+    let before = count().await;
+    let err = w.deploy(&w.m(), app, bigger, None).await.unwrap_err();
+    match &err {
+        Error::Api(a) => {
+            assert_eq!(a.code, ErrorCode::QuotaExceeded, "{a:?}");
+            let details = a.details.as_deref().unwrap();
+            assert_eq!(details["stage"], "image");
+            assert_eq!(details["needed_bytes"], 22);
+            assert_eq!(details["free_bytes"], 4);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(count().await, before);
+    assert!(!stores(&w, b"<h1>A larger page</h1>").await);
+    // The same site again needs no new storage: it deploys at the limit.
+    w.s.apps.set_storage_limit(Some(stored as i64));
+    let again = w.preview(app, first, None).await;
+    assert_eq!(page(&w, again.id).await.unwrap(), INDEX);
+    // With room, the bigger site deploys.
+    w.s.apps.set_storage_limit(None);
+    w.preview(app, bigger, None).await;
+    assert!(stores(&w, b"<h1>A larger page</h1>").await);
+}
+
+#[tokio::test]
+async fn static_gc_keeps_the_live_and_rollback_releases() {
+    let w = world().await;
+    let app = w.app("Releases").await;
+    let site = |name: &'static str, body: &'static [u8]| {
+        let w = &w;
+        async move {
+            w.folder(name, &[("app.yaml", MANIFEST), ("index.html", body)])
+                .await
+        }
+    };
+    let (v1, v2, v3) = (
+        site("v1", b"<h1>One</h1>").await,
+        site("v2", b"<h1>Two</h1>").await,
+        site("v3", b"<h1>Three</h1>").await,
+    );
+    let p1 = w.preview(app, v1, None).await;
+    let Published::Live(l1) = w.publish(&w.m(), app, p1.id).await.unwrap() else {
+        panic!("not live")
+    };
+    let p2 = w.preview(app, v2, None).await;
+    let Published::Live(l2) = w.publish(&w.m(), app, p2.id).await.unwrap() else {
+        panic!("not live")
+    };
+    let p3 = w.preview(app, v3, None).await;
+    let running = w.preview(app, v2, Some("draft")).await;
+    // Every preview but one ends: only the releases hold the files of v1 and v2, nothing
+    // holds the file of v3.
+    for id in [p1.id, p2.id, p3.id] {
+        end(&w, id).await;
+    }
+    let r = collect(&w).await;
+    assert_eq!((r.indexes_deleted, r.files_deleted), (3, 1), "{r:?}");
+    // The live release and the earlier one (a rollback) still serve; the open preview too.
+    assert_eq!(w.live(app).await, Some(l2.id));
+    assert_eq!(&page(&w, l2.id).await.unwrap()[..], b"<h1>Two</h1>");
+    assert_eq!(&page(&w, l1.id).await.unwrap()[..], b"<h1>One</h1>");
+    assert_eq!(&page(&w, running.id).await.unwrap()[..], b"<h1>Two</h1>");
+    for ended in [p1.id, p2.id, p3.id] {
+        assert!(page(&w, ended).await.is_none());
+    }
+    assert!(!stores(&w, b"<h1>Three</h1>").await);
+    // A second run frees nothing more.
+    assert_eq!(collect(&w).await.files_deleted, 0);
+    // The rollback after the collection deploys the old files again.
+    let Published::Live(back) = w.publish(&w.m(), app, l1.id).await.unwrap() else {
+        panic!("not live")
+    };
+    assert_eq!(w.live(app).await, Some(back.id));
+    assert_eq!(&page(&w, back.id).await.unwrap()[..], b"<h1>One</h1>");
+    collect(&w).await;
+    assert_eq!(&page(&w, l2.id).await.unwrap()[..], b"<h1>Two</h1>");
+}
+
+#[tokio::test]
+async fn static_gc_after_purge_deletes_the_apps_objects() {
+    let w = world().await;
+    let gone = w.app("Gone").await;
+    let kept = w.app("Kept").await;
+    const SHARED: &[u8] = b"<h1>Shared</h1>";
+    const ONLY: &[u8] = b"only()";
+    let gone_site = w
+        .folder(
+            "gone site",
+            &[
+                ("app.yaml", MANIFEST),
+                ("index.html", SHARED),
+                ("only.js", ONLY),
+            ],
+        )
+        .await;
+    let kept_site = w
+        .folder(
+            "kept site",
+            &[("app.yaml", MANIFEST), ("index.html", SHARED)],
+        )
+        .await;
+    let pg = w.preview(gone, gone_site, None).await;
+    let Published::Live(lg) = w.publish(&w.m(), gone, pg.id).await.unwrap() else {
+        panic!("not live")
+    };
+    let pk = w.preview(kept, kept_site, None).await;
+    w.s.nodes.trash(&w.o(), gone, None).await.unwrap();
+    // In the trash the app keeps its objects (it can be restored).
+    collect(&w).await;
+    assert!(page(&w, lg.id).await.is_some());
+    assert!(stores(&w, ONLY).await);
+    w.s.nodes.purge(&w.o(), gone).await.unwrap();
+    crate::providers::deliveries::DeliveryWorker::new(
+        w.s.typed_nodes.clone(),
+        w.s.providers.clone(),
+        crate::providers::deliveries::Backoff::default(),
+    )
+    .run_once(100)
+    .await
+    .unwrap();
+    assert!(
+        w.s.apps
+            .store()
+            .get_app(w.team.id, gone)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The purge deleted the app's indexes at once; its young files wait for the grace period.
+    assert!(page(&w, pg.id).await.is_none());
+    assert!(page(&w, lg.id).await.is_none());
+    assert!(stores(&w, ONLY).await);
+    // The next collection frees the files only the purged app used.
+    let r = collect(&w).await;
+    assert_eq!(r.files_deleted, 1, "{r:?}");
+    assert!(!stores(&w, ONLY).await);
+    assert!(stores(&w, SHARED).await);
+    assert_eq!(&page(&w, pk.id).await.unwrap()[..], SHARED);
+}
+
+#[tokio::test]
+async fn static_gc_waits_for_a_site_writer() {
+    let w = world().await;
+    let held =
+        w.s.apps
+            .lock_sites(w.team.id, false, Duration::from_secs(1))
+            .await
+            .unwrap();
+    // Another writer shares the lock; the collection does not get it.
+    let other =
+        w.s.apps
+            .lock_sites(w.team.id, false, Duration::from_secs(1))
+            .await
+            .unwrap();
+    let busy =
+        w.s.apps
+            .collect_static(
+                w.team.id,
+                time::Duration::ZERO,
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(&busy, Error::Api(a) if a.code == ErrorCode::Conflict),
+        "{busy:?}"
+    );
+    drop((held, other));
+    collect(&w).await;
+}
+
+#[tokio::test]
+async fn the_static_quota_counts_files_members_and_static_objects() {
+    use crate::apps::store::StorageUsage;
+    let w = world().await;
+    let t = w.team.id;
+    // A service over a memory store whose file usage the test sets.
+    let store = Arc::new(crate::apps::store::memory::MemoryAppStore::new(None));
+    let mut deps = w.s.apps.deps().clone();
+    deps.store = store.clone();
+    let apps = AppService::new(deps);
+    let limit = |members| crate::tenants::limits::tenant_limits(w.team.plan, members).storage_bytes;
+    store.set_storage_usage(
+        t,
+        StorageUsage {
+            file_bytes: limit(2) - 10_000,
+            members: 2,
+        },
+    );
+    assert_eq!(apps.static_free_bytes(t).await.unwrap(), 10_000);
+    // Static objects take from the same storage.
+    let page = vec![("index.html".to_string(), bytes::Bytes::from_static(INDEX))];
+    apps.sites()
+        .write_site(t, Uuid::now_v7(), &page, None)
+        .await
+        .unwrap();
+    let stored = apps.sites().stored_bytes(t).await.unwrap();
+    assert_eq!(apps.static_free_bytes(t).await.unwrap(), 10_000 - stored);
+    // A new byte does not fit when the files fill the storage; content stored already does.
+    store.set_storage_usage(
+        t,
+        StorageUsage {
+            file_bytes: limit(2),
+            members: 2,
+        },
+    );
+    assert_eq!(apps.static_free_bytes(t).await.unwrap(), 0);
+    let new = [(crate::blobs::Hash::of(b"x"), 1)];
+    let err = apps.check_static_quota(t, &new).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Api(a) if a.code == ErrorCode::QuotaExceeded),
+        "{err:?}"
+    );
+    apps.check_static_quota(t, &crate::apps::static_site::site_contents(&page))
+        .await
+        .unwrap();
+    // A team's storage grows with its members.
+    store.set_storage_usage(
+        t,
+        StorageUsage {
+            file_bytes: limit(2),
+            members: 3,
+        },
+    );
+    apps.check_static_quota(t, &new).await.unwrap();
+}

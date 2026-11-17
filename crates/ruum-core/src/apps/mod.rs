@@ -36,6 +36,7 @@ pub mod plan;
 pub mod provider;
 pub mod settings;
 pub mod slugs;
+pub mod static_gc;
 pub mod static_site;
 pub mod store;
 
@@ -390,6 +391,11 @@ pub fn build(
         .deps
         .provider
         .add_purge_hook(Arc::new(service.role_purge()));
+    // A purge deletes the app's site indexes and the file objects only it used (W2S-1).
+    service
+        .deps
+        .provider
+        .add_purge_hook(Arc::new(service.static_purge()));
     // A member or guest who leaves loses the app role grants (backlog S-43).
     service
         .deps
@@ -410,6 +416,12 @@ pub struct AppService {
     /// The live-switch locks of this process, one per app (Kimi W-2s run 10b, 1); the store's
     /// lock serializes the processes.
     live_locks: deployments::LiveLocks,
+    /// The site locks of this process, one per tenant (backlog W2S-1); the store's lock
+    /// serializes the processes.
+    site_locks: static_gc::SiteLocks,
+    /// A storage limit for every tenant instead of the plan's (the tests of the static quota).
+    #[cfg(test)]
+    storage_limit_override: std::sync::Mutex<Option<i64>>,
 }
 
 /// Share-link bearers call no app operation (`403 user_required`).
@@ -498,6 +510,9 @@ impl AppService {
                 deployments::DEPLOY_SLOT_WAIT,
             ),
             live_locks: deployments::LiveLocks::default(),
+            site_locks: static_gc::SiteLocks::default(),
+            #[cfg(test)]
+            storage_limit_override: std::sync::Mutex::new(None),
         }
     }
 

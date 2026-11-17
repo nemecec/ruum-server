@@ -19,7 +19,14 @@ pub struct PgAppStore {
     /// never use up the connections that the holders (or other tenants) need. Made on first
     /// use, with the connect options of `pool`.
     locks: std::sync::Arc<std::sync::OnceLock<sqlx::PgPool>>,
+    /// The pool of the site locks (backlog W2S-1), apart from `pool` and `locks` for the same
+    /// reason: a publish holds its live switch while it takes the site lock.
+    site_locks: std::sync::Arc<std::sync::OnceLock<sqlx::PgPool>>,
 }
+
+/// At most this many site locks are held at the same time in one process (the deployments
+/// that write a site, the publishes that copy an index, the garbage collection).
+pub(crate) const SITE_LOCK_CONNECTIONS: u32 = 8;
 
 /// At most this many live switches run at the same time in one process (each holds one
 /// connection of the lock pool); more wait, up to the wait of the switch, then get
@@ -31,7 +38,18 @@ impl PgAppStore {
         Self {
             pool,
             locks: std::sync::Arc::default(),
+            site_locks: std::sync::Arc::default(),
         }
+    }
+
+    fn site_lock_pool(&self) -> &sqlx::PgPool {
+        self.site_locks.get_or_init(|| {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(SITE_LOCK_CONNECTIONS)
+                .min_connections(0)
+                .idle_timeout(std::time::Duration::from_secs(60))
+                .connect_lazy_with((*self.pool.connect_options()).clone())
+        })
     }
 
     fn lock_pool(&self) -> &sqlx::PgPool {
@@ -444,6 +462,17 @@ async fn ensure_in(
 
 /// The advisory lock key of the live switch of one app: 8 bytes of a keyed hash of the tenant
 /// and the app (a clash only makes two apps wait for each other).
+/// The advisory lock key of the site lock of a tenant.
+fn site_lock_key(tenant: TenantId) -> i64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ruum.apps.static_sites.v1");
+    h.update(tenant.0.as_bytes());
+    let b = h.finalize();
+    let mut k = [0u8; 8];
+    k.copy_from_slice(&b.as_bytes()[..8]);
+    i64::from_be_bytes(k)
+}
+
 fn live_switch_key(tenant: TenantId, app: NodeId) -> i64 {
     let mut h = blake3::Hasher::new();
     h.update(b"ruum.apps.live_switch.v1");
@@ -1160,5 +1189,86 @@ impl AppStore for PgAppStore {
                 })
             })
             .collect()
+    }
+    async fn static_deployments(&self, tenant: TenantId) -> Result<Vec<StaticDeployment>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(
+            "select id, app_node_id, (environment = 'live' \
+             or state in ('pending', 'running', 'ready')) as reachable \
+             from app_deployments where tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter()
+            .map(|r| {
+                Ok(StaticDeployment {
+                    id: r.try_get("id")?,
+                    app_node_id: r.try_get("app_node_id")?,
+                    reachable: r.try_get("reachable")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn storage_usage(&self, tenant: TenantId) -> Result<StorageUsage> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let r = sqlx::query(
+            "select (select coalesce(sum(size_bytes), 0)::bigint from nodes \
+               where tenant_id = $1) as files, \
+             (select count(*) from memberships where tenant_id = $1 and role <> 'guest') \
+               as members",
+        )
+        .bind(tenant)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let members: i64 = r.try_get("members")?;
+        Ok(StorageUsage {
+            file_bytes: r.try_get("files")?,
+            members: u32::try_from(members).unwrap_or(u32::MAX),
+        })
+    }
+
+    async fn lock_static_sites(
+        &self,
+        tenant: TenantId,
+        exclusive: bool,
+        wait: std::time::Duration,
+    ) -> Result<LiveSwitchLock> {
+        // As `lock_live_switch`: a transaction-level advisory lock (shared for writers,
+        // exclusive for the collection) on a pool of its own, tried in a loop so that a
+        // waiting caller holds no connection.
+        let key = site_lock_key(tenant);
+        let sql = if exclusive {
+            "select pg_try_advisory_xact_lock($1)"
+        } else {
+            "select pg_try_advisory_xact_lock_shared($1)"
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let mut tx = tokio::time::timeout_at(deadline, self.site_lock_pool().begin())
+                .await
+                .map_err(|_| sites_busy())??;
+            let got: bool = tokio::time::timeout_at(
+                deadline,
+                sqlx::query_scalar(sql).bind(key).fetch_one(&mut *tx),
+            )
+            .await
+            .map_err(|_| sites_busy())??;
+            if got {
+                return Ok(LiveSwitchLock::held(Box::new(tx)));
+            }
+            tokio::time::timeout_at(deadline, tx.rollback())
+                .await
+                .map_err(|_| sites_busy())??;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(sites_busy());
+            }
+            tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(50)))
+                .await;
+        }
     }
 }

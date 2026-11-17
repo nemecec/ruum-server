@@ -18,6 +18,8 @@ struct Inner {
     /// The release versions of each app node, oldest first, with their deployment.
     versions: HashMap<(TenantId, NodeId), Vec<(Version, Uuid)>>,
     approvals: HashMap<(TenantId, Uuid), ApprovalRow>,
+    /// What [`MemoryAppStore::set_storage_usage`] stored (tests).
+    storage: HashMap<TenantId, StorageUsage>,
 }
 
 /// The in-memory store. With a journal, `update_settings` appends its entry there.
@@ -32,6 +34,12 @@ impl MemoryAppStore {
             journal,
             inner: Mutex::new(Inner::default()),
         }
+    }
+
+    /// Sets what [`AppStore::storage_usage`] answers for `tenant` (the in-memory store sees no
+    /// files; tests of the static quota set it).
+    pub fn set_storage_usage(&self, tenant: TenantId, usage: StorageUsage) {
+        self.st().storage.insert(tenant, usage);
     }
 
     fn st(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -637,5 +645,39 @@ impl AppStore for MemoryAppStore {
             }
         }
         Ok(out)
+    }
+
+    async fn static_deployments(&self, tenant: TenantId) -> Result<Vec<StaticDeployment>> {
+        let st = self.st();
+        Ok(st
+            .deployments
+            .values()
+            .filter(|d| d.tenant_id == tenant)
+            .map(|d| StaticDeployment {
+                id: d.id,
+                app_node_id: d.app_node_id,
+                reachable: d.environment == Environment::Live
+                    || matches!(
+                        d.state,
+                        DeploymentState::Pending
+                            | DeploymentState::Running
+                            | DeploymentState::Ready
+                    ),
+            })
+            .collect())
+    }
+
+    async fn storage_usage(&self, tenant: TenantId) -> Result<StorageUsage> {
+        Ok(self.st().storage.get(&tenant).copied().unwrap_or_default())
+    }
+
+    async fn lock_static_sites(
+        &self,
+        _tenant: TenantId,
+        _exclusive: bool,
+        _wait: std::time::Duration,
+    ) -> Result<LiveSwitchLock> {
+        // One process: the service's own lock serializes the writers and the collection.
+        Ok(LiveSwitchLock::unheld())
     }
 }
