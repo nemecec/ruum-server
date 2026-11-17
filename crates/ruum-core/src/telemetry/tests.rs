@@ -377,8 +377,56 @@ fn the_matcher_finds_each_encoding() {
     let digits = SecretMatcher::new(["98765432"]);
     assert!(digits.contains(&98765432i64.to_string()));
     assert!(!digits.contains(&9876543i64.to_string()));
-    // Values shorter than the minimum are not matched.
-    assert!(SecretMatcher::new(["abc"]).is_empty());
+    // Mixed-case hex (review Kimi K1): found and redacted.
+    let mixed: String = hex::encode(&v)
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i % 3 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    assert!(mixed.chars().any(|c| c.is_ascii_uppercase()));
+    assert!(mixed.chars().any(|c| ('a'..='f').contains(&c)));
+    let text = format!("k={mixed} end");
+    assert!(m.contains(&text));
+    let red = m.redact(&text).unwrap();
+    assert!(!m.contains(&red) && !red.contains(&mixed), "{red}");
+    assert!(!m.contains("DEADbeef CAFE 0123456789ABCdef"));
+    // Short secrets (review Kimi K2): a whole value, word or run of letters and digits, raw or
+    // in an encoding of at least 4 characters; not inside a longer run.
+    let short = SecretMatcher::new(["q7Z"]);
+    assert!(!short.is_empty());
+    for hit in [
+        "q7Z",
+        " q7Z ",
+        "pin q7Z ok",
+        "pin=q7Z;",
+        "\"q7Z\"",
+        "cTda",
+        "cTda ok",
+        "71375a",
+        "x 71375A",
+    ] {
+        assert!(short.contains(hit), "{hit:?}");
+        let red = short.redact(hit).unwrap();
+        assert!(!short.contains(&red), "{hit:?} -> {red:?}");
+    }
+    for miss in ["xq7Zx", "q7Zq7Z", "Q7Z", "nothing", "cTdax"] {
+        assert!(!short.contains(miss), "{miss:?}");
+    }
+    // A 4-byte secret: its base64 cores are short, the padded form is a needle (`azlXZA==`),
+    // and the cores match as whole words.
+    let four = SecretMatcher::new(["k9Wd"]);
+    for hit in ["t=azlXZA==", "Basic azlXZA== x", "azlXZA", "azlXZ"] {
+        assert!(four.contains(hit), "{hit:?}");
+    }
+    assert!(!four.contains("xazlXZx"));
+    // An empty secret matches nothing.
+    assert!(SecretMatcher::new([""]).is_empty());
     assert!(format!("{m:?}").starts_with("SecretMatcher("));
     assert!(!format!("{m:?}").contains("wire"));
 }
@@ -427,6 +475,9 @@ fn scrub_pattern_table() {
         ("call (020) 7946 0958".into(), Phone),
         ("call 0612345678".into(), Phone),
         ("call 555-123-4567".into(), Phone),
+        ("call 4155552671 now".into(), Phone),
+        ("call 415.555.2671.".into(), Phone),
+        ("tel:2125550123".into(), Phone),
         ("iban DE89 3704 0044 0532 0130 00".into(), Iban),
         ("iban GB82WEST12345698765432 ok".into(), Iban),
         ("card 4111 1111 1111 1111".into(), Card),
@@ -477,6 +528,13 @@ fn scrub_pattern_table() {
         "snake_case_identifier_that_is_quite_long_indeed",
         "iban DE89 3704 0044 0532 0130 01x",
         "count 123456789",
+        "at 1700000000 seconds",
+        "id 4155552671x",
+        "ratio 4155552671.5",
+        "v 1.4155552671",
+        "v 415.555.2671.9",
+        "n 4151552671",
+        "ip 192.168.100.200",
         "id 0198c2e4-6a2b-7c3d-8e4f-123456789abc",
         "short deadbeef",
         "AKIASHORT",
@@ -524,8 +582,24 @@ fn luhn_and_mod97() {
 fn scrub_is_linear_on_adversarial_input() {
     let p = pz();
     let units = [
-        "a@", "a.", "+1 ", "4111 ", "eyJ.", "DE00 ", "bearer ", "(0", "AKIA", "sk_live_", "0-",
-        "ab@cd.", "@a.bc ", "1 ", "aB3", "-",
+        "a@",
+        "a.",
+        "+1 ",
+        "4111 ",
+        "eyJ.",
+        "DE00 ",
+        "bearer ",
+        "(0",
+        "AKIA",
+        "sk_live_",
+        "0-",
+        "ab@cd.",
+        "@a.bc ",
+        "1 ",
+        "aB3",
+        "-",
+        "415.555.",
+        "2125550123.",
     ];
     for u in units {
         let small = u.repeat(1024 / u.len());
@@ -880,6 +954,44 @@ async fn telemetry_bytes_are_metered_to_the_app() {
             .total(id2.tenant, id2.app, Charged::App, Meter::TelemetryBytes),
         0
     );
+}
+
+/// Metering comes before the store write: when the usage sink fails, the ingest fails and
+/// nothing is stored (review Kimi run 12, finding 4).
+#[tokio::test]
+async fn a_metering_failure_stores_nothing() {
+    struct FailingSink;
+    #[async_trait]
+    impl crate::usage::UsageSink for FailingSink {
+        async fn record(&self, _: crate::usage::UsageEvent) -> Result<()> {
+            Err(crate::error::Error::Internal("metering is down".into()))
+        }
+    }
+    let store = Arc::new(MemoryTelemetryStore::new());
+    let ingest = PipelineIngest::new(
+        store.clone(),
+        Arc::new(MemoryFieldClasses::new()),
+        Arc::new(MemorySecretSource::new()),
+        tenant_keys(),
+        Arc::new(FailingSink),
+    );
+    let id = identity();
+    let result = ingest
+        .ingest(
+            &id,
+            Batch {
+                logs: vec![text_log("hello")],
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    let stored = store
+        .read(id.tenant, &TelemetryFilter::app(id.app))
+        .await
+        .unwrap();
+    assert!(stored.is_empty(), "telemetry was stored without usage");
+    assert!(store.tenants().is_empty(), "the store has a storage tenant");
 }
 
 #[tokio::test]
