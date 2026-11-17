@@ -1,7 +1,7 @@
 //! The conformance suites of the runtime: the same cases for every [`RuntimeDriver`]
 //! ([`run`]) and every [`Builder`] ([`run_builder`]). The in-memory driver and builder pass
 //! them here; card R-2a runs [`run`] unchanged against the Docker driver, plain and with runsc,
-//! and R-2b runs [`run_builder`] against the Railpack builder.
+//! and R-2b runs [`run_builder`] against the node22 builder (`ruum_runtime::DockerBuilder`).
 //!
 //! The suite sees a driver only through the trait and a fixture. The "code" of the workloads is
 //! the conformance program ([`super::program`]): the fixture gives an image that interprets it.
