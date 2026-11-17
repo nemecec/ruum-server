@@ -28,6 +28,15 @@
 //!
 //! The marker never holds a value: when a value is part of [`REDACTED`] (a value such as
 //! `secret`), the redactor uses a shorter marker, and at last an empty one ([`marker_for`]).
+//!
+//! The replacement itself can build a value again: with the values `"a<hidden secret>\nb"` and
+//! `"x"`, the output `"ax\nb\n"` becomes the lines `"a<hidden secret>"` and `"b"`, and the two
+//! lines joined hold the first value (Kimi review of run 11, finding 2). Whole-text [`redact`]
+//! checks the complete result. The [`LineRedactor`] checks every line it lets out against the
+//! end of what it let out before, in two forms of the stream: the lines joined with line ends
+//! (as a log reader shows them), and the output as written (the pieces of a long line joined
+//! without a line end). A line that would complete a value becomes the marker; when the marker
+//! would complete one too, the line becomes empty, and at last it is left out.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -253,6 +262,18 @@ impl Automaton {
         }
     }
 
+    /// The state after `text` from the state `n`, or `None` when a value ends inside `text`
+    /// (a value that began before `text` counts too). One step per byte (amortized).
+    fn feed(&self, mut n: u32, text: &[u8]) -> Option<u32> {
+        for &b in text {
+            n = self.step(n, b);
+            if self.terminal[n as usize] || self.dict[n as usize] != NONE {
+                return None;
+            }
+        }
+        Some(n)
+    }
+
     /// True when a value occurs in `text`: one pass, one step per byte (amortized), whatever
     /// the number of values.
     fn any(&self, text: &[u8]) -> bool {
@@ -339,6 +360,47 @@ fn replace(text: &str, matches: &[Range<usize>], marker: &str) -> String {
     out
 }
 
+/// One form of the stream of lines a [`LineRedactor`] let out: the automaton state after it,
+/// and its last bytes (as many as the longest value), so that a new set of values can take the
+/// state up again.
+#[derive(Default)]
+struct Emitted {
+    state: u32,
+    tail: VecDeque<u8>,
+}
+
+impl Emitted {
+    /// The state after `text` and then `end`, or `None` when that completes a value.
+    fn try_feed(&self, ac: &Automaton, text: &str, end: &str) -> Option<u32> {
+        let n = ac.feed(self.state, text.as_bytes())?;
+        ac.feed(n, end.as_bytes())
+    }
+
+    fn commit(&mut self, state: u32, text: &str, end: &str, keep: usize) {
+        self.state = state;
+        for part in [text.as_bytes(), end.as_bytes()] {
+            let from = part.len().saturating_sub(keep);
+            self.tail.extend(&part[from..]);
+        }
+        while self.tail.len() > keep {
+            self.tail.pop_front();
+        }
+    }
+
+    /// Takes the state up again with a new automaton (a new set of values).
+    fn rebase(&mut self, ac: &Automaton, keep: usize) {
+        while self.tail.len() > keep {
+            self.tail.pop_front();
+        }
+        self.state = self.tail.iter().fold(ROOT, |n, &b| ac.step(n, b));
+    }
+
+    fn reset(&mut self) {
+        self.state = ROOT;
+        self.tail.clear();
+    }
+}
+
 /// The line, or the marker when a value still appears in it (one pass through the automaton,
 /// not one search per value).
 fn scrub(line: &str, ac: &Automaton, marker: &str) -> String {
@@ -381,6 +443,10 @@ pub struct LineRedactor {
     matches: Vec<Range<usize>>,
     scan: usize,
     checked: usize,
+    /// The lines let out so far, joined with line ends.
+    joined: Emitted,
+    /// The output let out so far as written: the pieces of a long line without a line end.
+    written: Emitted,
 }
 
 impl LineRedactor {
@@ -401,6 +467,8 @@ impl LineRedactor {
             matches: Vec::new(),
             scan: 0,
             checked: 0,
+            joined: Emitted::default(),
+            written: Emitted::default(),
         }
     }
 
@@ -418,6 +486,8 @@ impl LineRedactor {
         self.marker = marker_for(&self.values);
         self.ac = Automaton::new(&self.values);
         self.longest = self.ac.longest();
+        self.joined.rebase(&self.ac, self.longest);
+        self.written.rebase(&self.ac, self.longest);
         // Feed the held-back text through the new automaton (once per renewal).
         self.state = ROOT;
         self.best.clear();
@@ -567,14 +637,59 @@ impl LineRedactor {
         self.scan = self.scan.max(cut) - cut;
         self.checked = safe - cut;
         let text = replace(&head, &head_matches, self.marker);
-        self.lines(&text, at)
+        self.lines(&text, at, false)
     }
 
-    fn lines(&self, text: &str, at: OffsetDateTime) -> Vec<(OffsetDateTime, String)> {
+    /// Splits replaced text into lines and checks each against what was let out before.
+    fn lines(
+        &mut self,
+        text: &str,
+        at: OffsetDateTime,
+        at_finish: bool,
+    ) -> Vec<(OffsetDateTime, String)> {
+        let ended = text.ends_with('\n');
         let text = text.strip_suffix('\n').unwrap_or(text);
-        text.split('\n')
-            .map(|l| (at, scrub(l, &self.ac, self.marker)))
-            .collect()
+        let count = text.split('\n').count();
+        let mut out = Vec::with_capacity(count);
+        for (i, line) in text.split('\n').enumerate() {
+            let last = i + 1 == count;
+            let ends_line = !last || ended;
+            if let Some(l) = self.emit(line, ends_line, at_finish && last) {
+                out.push((at, l));
+            }
+        }
+        out
+    }
+
+    /// The text to let out for one line: the line itself, or the marker, or an empty line,
+    /// whichever first completes no value in either form of the stream; `None` when even the
+    /// empty line would (the line is left out).
+    ///
+    /// In the joined form every line is followed by a line end, except the last line of the
+    /// output, so a value that a line end after this line would complete is found now, before
+    /// a later line can no longer help. In the written form only a line that ended with a line
+    /// end in the output gets one; a piece of a long line does not.
+    fn emit(&mut self, line: &str, ends_line: bool, final_line: bool) -> Option<String> {
+        let joined_end = if ends_line || !final_line { "\n" } else { "" };
+        let written_end = if ends_line { "\n" } else { "" };
+        let mut seen: Vec<&str> = Vec::with_capacity(3);
+        for candidate in [line, self.marker, ""] {
+            if seen.contains(&candidate) {
+                continue;
+            }
+            seen.push(candidate);
+            let Some(j) = self.joined.try_feed(&self.ac, candidate, joined_end) else {
+                continue;
+            };
+            let Some(w) = self.written.try_feed(&self.ac, candidate, written_end) else {
+                continue;
+            };
+            let keep = self.longest;
+            self.joined.commit(j, candidate, joined_end, keep);
+            self.written.commit(w, candidate, written_end, keep);
+            return Some(candidate.to_owned());
+        }
+        None
     }
 
     /// The end of the output: returns the rest as lines, redacted.
@@ -589,11 +704,16 @@ impl LineRedactor {
         self.scan = 0;
         self.checked = 0;
         if rest.is_empty() {
+            self.joined.reset();
+            self.written.reset();
             return Vec::new();
         }
         let matches = self.ac.find_all(rest.as_bytes());
         let text = replace(&rest, &matches, self.marker);
-        self.lines(&text, at)
+        let out = self.lines(&text, at, true);
+        self.joined.reset();
+        self.written.reset();
+        out
     }
 }
 

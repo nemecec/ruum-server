@@ -775,6 +775,102 @@ fn a_value_inside_the_marker_never_comes_out() {
     );
 }
 
+/// Runs `text` through a fresh redactor in pieces cut at `splits` and returns the lines.
+fn stream_lines(values: &[&str], pieces: &[&str]) -> Vec<String> {
+    let mut r = LineRedactor::new(values.iter().copied());
+    let mut lines = Vec::new();
+    for p in pieces {
+        lines.extend(texts(r.push(p, at())));
+    }
+    lines.extend(texts(r.finish(at())));
+    lines
+}
+
+/// No value in the lines joined with line ends (as a log reader shows them) or joined without
+/// them (the pieces of a long line as written).
+fn assert_no_value_in_stream(lines: &[String], values: &[&str], what: &str) {
+    let joined = lines.join("\n");
+    let concat = lines.concat();
+    for v in values {
+        assert!(
+            !joined.contains(v),
+            "{what}: {v:?} in joined lines {lines:?}"
+        );
+        assert!(
+            !concat.contains(v),
+            "{what}: {v:?} in concatenated lines {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn a_value_the_marker_rebuilds_across_two_lines_never_comes_out() {
+    // Kimi review of run 11, finding 2: "ax\nb\n" becomes "a<hidden secret>" and "b", and the
+    // two lines joined are the first value. Whole-text redaction already checked the complete
+    // result; the streaming redactor must check across line ends too.
+    let secret = "a<hidden secret>\nb";
+    let values = [secret, "x"];
+    let text = "ax\nb\n";
+    assert_eq!(redact(text, &values), REDACTED);
+    for split in 0..=text.len() {
+        let lines = stream_lines(&values, &[&text[..split], &text[split..]]);
+        assert_no_value_in_stream(&lines, &values, &format!("split at {split}"));
+        assert_eq!(lines.len(), 2, "split at {split}: {lines:?}");
+        assert_eq!(lines[1], REDACTED, "split at {split}");
+    }
+    let bytes: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+    let refs: Vec<&str> = bytes.iter().map(String::as_str).collect();
+    let lines = stream_lines(&values, &refs);
+    assert_no_value_in_stream(&lines, &values, "one byte at a time");
+    // The same with a line between: the lines let out earlier still count.
+    let lines = stream_lines(&values, &["ax\n", "b\n", "ok\n"]);
+    assert_no_value_in_stream(&lines, &values, "in three pieces");
+    assert_eq!(lines.last().map(String::as_str), Some("ok"));
+}
+
+#[test]
+fn a_value_the_empty_marker_rebuilds_across_two_lines_never_comes_out() {
+    // "hidden" and "*" force the empty marker, so removing "x" joins "abc" and "def" back into
+    // the first value across the line end.
+    let values = ["abc\ndef", "x", "hidden", "*"];
+    assert_eq!(marker_for(&values), "");
+    let text = "abc\nxdef\n";
+    assert!(!redact(text, &values).contains("abc\ndef"));
+    for split in 0..=text.len() {
+        let lines = stream_lines(&values, &[&text[..split], &text[split..]]);
+        assert_no_value_in_stream(&lines, &values, &format!("split at {split}"));
+        assert_eq!(lines[0], "abc", "split at {split}");
+    }
+}
+
+#[test]
+fn a_value_the_marker_rebuilds_across_a_long_line_piece_never_comes_out() {
+    // A long line is let out in pieces (MAX_LINE_BYTES). The piece ends with the marker of
+    // "Q", and the next piece starts with "Z": written without a line end they are
+    // "<hidden secret>Z"; joined with one they are "<hidden secret>\nZ".
+    let long = format!("{}Q", "y".repeat(MAX_LINE_BYTES + 10));
+    for second in ["<hidden secret>Z", "<hidden secret>\nZ"] {
+        let values = ["Q", second];
+        let lines = stream_lines(&values, &[&long, "Z\n", "ok\n"]);
+        assert!(lines.len() >= 3, "{second:?}: the long line was not cut");
+        assert_no_value_in_stream(&lines, &values, second);
+        assert!(lines[0].ends_with(REDACTED), "{second:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("ok"), "{second:?}");
+    }
+}
+
+#[test]
+fn a_value_rebuilt_across_a_renewal_never_comes_out() {
+    // The lines let out before a new set of values still count after it.
+    let secret = "a<hidden secret>\nb";
+    let mut r = LineRedactor::new([secret, "x"]);
+    let mut lines = texts(r.push("ax\n", at()));
+    r.set_values([secret, "x", "renewed-token"]);
+    lines.extend(texts(r.push("b\n", at())));
+    lines.extend(texts(r.finish(at())));
+    assert_no_value_in_stream(&lines, &[secret, "x", "renewed-token"], "renewal");
+}
+
 #[test]
 fn the_secret_set_is_bounded() {
     let many: Vec<String> = (0..=MAX_SECRET_VALUES).map(|i| format!("v{i}")).collect();
