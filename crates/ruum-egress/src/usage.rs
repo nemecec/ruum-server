@@ -76,9 +76,15 @@ impl Usage {
     }
 
     pub fn add_denied(&self, id: &WorkloadIdentity) {
+        self.add_denied_many(id, 1);
+    }
+
+    /// Counts `n` refused requests at once (connections refused over the rate, counted in the
+    /// limit state and added here with their log line).
+    pub fn add_denied_many(&self, id: &WorkloadIdentity, n: u64) {
         self.with(id, |c, _| {
             if let Some(c) = c {
-                c.denied += 1;
+                c.denied = c.denied.saturating_add(n);
             }
         });
     }

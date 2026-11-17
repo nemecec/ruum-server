@@ -37,7 +37,7 @@ use crate::config::{Config, ConfigError};
 use crate::control::{ControlState, ControlToken, router};
 use crate::limits::{LimitConfig, PENDING_ALLOWANCE};
 use crate::policy::MemoryPolicy;
-use crate::proxy::{MAX_UNKNOWN_CONNECTIONS, MemoryLog, ProxyState, admit, run};
+use crate::proxy::{MAX_UNKNOWN_CONNECTIONS, MemoryLog, ProxyState, UNKNOWN_RATE, admit, run};
 use crate::resolver::FakeResolver;
 use crate::usage::Usage;
 use crate::{Options, Running, start};
@@ -959,7 +959,8 @@ pub async fn case_limit_concurrency(env: &Env) {
     }
 }
 
-/// A token bucket per identity: a burst, then `limit`.
+/// A token bucket per identity: a burst, then `limit`. The connection over the rate is refused
+/// at accept, before its head is read (an answer or a close), and logged by source.
 pub async fn case_limit_rate(env: &Env) {
     let limits = Limits {
         burst: Some(2),
@@ -977,10 +978,157 @@ pub async fn case_limit_rate(env: &Env) {
                 .await,
         );
     }
-    env.connect(SOURCE_A, "r.example.net", env.port)
-        .await
-        .denied(DenyReason::Limit, "over the rate");
-    env.wait_log(&["host=r.example.net", "deny=limit"]).await;
+    refused_at_once(
+        env,
+        SOURCE_A,
+        "r.example.net",
+        DenyReason::Limit,
+        "over the rate",
+    )
+    .await;
+    env.wait_log(&["source=127.0.0.2", "deny=limit", "refused=1"])
+        .await;
+}
+
+/// Kimi review of run 11, finding 1: every connection pays the identity's connection rate at
+/// accept, so refused requests (a wrong method, port or host) use up the bucket too, and a flood
+/// of them is refused at accept with one sampled log line, not one line each. Another identity
+/// is not affected. Unknown sources share one bucket ([`UNKNOWN_RATE`]).
+pub async fn case_refused_floods(env: &Env) {
+    let limits = Limits {
+        burst: Some(6),
+        per_minute: Some(1),
+        ..Limits::default()
+    };
+    env.register(
+        "a",
+        SOURCE_A,
+        identity(1),
+        Some(&["ok.example.net"]),
+        Some(limits),
+    )
+    .await;
+    env.register("b", SOURCE_B, identity(2), None, None).await;
+    env.resolver.set("ok.example.net", vec![vec![PUBLIC_IP]]);
+    env.resolver.set("other.example.net", vec![vec![PUBLIC_IP]]);
+    let method = "GET http://ok.example.net/x HTTP/1.1\r\nHost: ok.example.net\r\n\r\n".to_string();
+    let port = "CONNECT ok.example.net:22 HTTP/1.1\r\nHost: ok.example.net:22\r\n\r\n".to_string();
+    let allow = format!(
+        "CONNECT other.example.net:{p} HTTP/1.1\r\nHost: other.example.net:{p}\r\n\r\n",
+        p = env.port
+    );
+    let kinds = [
+        (&method, DenyReason::Method),
+        (&port, DenyReason::Port),
+        (&allow, DenyReason::Allow),
+    ];
+    // The burst: two refusals of each kind, each with its own reason.
+    for i in 0..2 {
+        for (head, reason) in kinds {
+            env.request(SOURCE_A, head)
+                .await
+                .denied(reason, &format!("{} {i} within the burst", reason.as_str()));
+        }
+    }
+    // The refused requests paid: a valid tunnel is over the rate now.
+    refused_at_once(
+        env,
+        SOURCE_A,
+        "ok.example.net",
+        DenyReason::Limit,
+        "a valid tunnel after six refused requests",
+    )
+    .await;
+    env.wait_log(&["source=127.0.0.2", "deny=limit", "refused=1"])
+        .await;
+    // A flood of each kind: all refused at accept, none logged on its own.
+    for i in 0..300 {
+        let (head, _) = kinds[i % kinds.len()];
+        refused_head_at_once(
+            env,
+            SOURCE_A,
+            head,
+            DenyReason::Limit,
+            &format!("flood {i}"),
+        )
+        .await;
+    }
+    // B is not affected.
+    drop(
+        env.connect(SOURCE_B, "ok.example.net", env.port)
+            .await
+            .reached(&env.public, "B after A's flood")
+            .await,
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = env.log.lines();
+    let a_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("source=127.0.0.2 "))
+        .collect();
+    let sampled = a_lines.iter().filter(|l| l.contains(" refused=")).count();
+    assert_eq!(
+        a_lines.len() - sampled,
+        6,
+        "one line for each refusal within the burst, none for the flood: {a_lines:#?}"
+    );
+    // One sampled line per RATE_REPORT_INTERVAL (a second one only on a very slow run).
+    assert!(
+        (1..=2).contains(&sampled),
+        "sampled lines for 301 connections over the rate: {a_lines:#?}"
+    );
+    // No resolution for a refused request: the port and the rate come first.
+    assert_eq!(env.resolver.calls("ok.example.net"), 1, "only B's tunnel");
+    assert_eq!(env.resolver.calls("other.example.net"), 0);
+    // The counters hold the six refusals and those of the sampled lines; the others come with
+    // the next sampled line.
+    let report = env.usage().await;
+    let denied: u64 = report
+        .entries
+        .iter()
+        .filter(|e| e.identity == identity(1))
+        .map(|e| e.denied)
+        .sum();
+    if sampled == 1 {
+        assert_eq!(denied, 7, "A's refusals counted");
+    } else {
+        assert!(
+            (8..=307).contains(&denied),
+            "A's refusals counted: {denied}"
+        );
+    }
+
+    // Unknown sources: the shared bucket refuses most of a flood at accept.
+    let unknown_head = format!(
+        "CONNECT ok.example.net:{p} HTTP/1.1\r\nHost: ok.example.net:{p}\r\n\r\n",
+        p = env.port
+    );
+    let flood = 3 * UNKNOWN_RATE.burst as usize;
+    for i in 0..flood {
+        refused_head_at_once(
+            env,
+            SOURCE_UNKNOWN,
+            &unknown_head,
+            DenyReason::UnknownSource,
+            &format!("unknown flood {i}"),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = env.log.lines();
+    let unknown: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("source=127.0.0.9 "))
+        .collect();
+    assert!(
+        unknown.len() < 2 * UNKNOWN_RATE.burst as usize,
+        "{} log lines for {flood} connections from unknown sources",
+        unknown.len()
+    );
+    assert!(
+        unknown.iter().any(|l| l.contains(" refused=")),
+        "a sampled line for the unknown sources"
+    );
 }
 
 /// A tunnel without bytes closes after the idle timeout.
@@ -1053,15 +1201,26 @@ pub async fn case_limit_lifetime(env: &Env) {
 /// once (the proxy answers before it reads the head, so over TCP the answer can be lost to a
 /// reset). Never a tunnel, and never silence: the close must come well within the head timeout.
 async fn refused_at_once(env: &Env, source: IpAddr, host: &str, reason: DenyReason, what: &str) {
+    let head = format!(
+        "CONNECT {host}:{p} HTTP/1.1\r\nHost: {host}:{p}\r\n\r\n",
+        p = env.port
+    );
+    refused_head_at_once(env, source, &head, reason, what).await;
+}
+
+/// [`refused_at_once`] with any request head.
+async fn refused_head_at_once(
+    env: &Env,
+    source: IpAddr,
+    head: &str,
+    reason: DenyReason,
+    what: &str,
+) {
     let mut s = env
         .h
         .connect(source)
         .await
         .unwrap_or_else(|e| panic!("{what}: connect to the proxy: {e}"));
-    let head = format!(
-        "CONNECT {host}:{p} HTTP/1.1\r\nHost: {host}:{p}\r\n\r\n",
-        p = env.port
-    );
     // The proxy may have closed already: a failed write is not a failure.
     let _ = s.write_all(head.as_bytes()).await;
     let mut got = Vec::new();
@@ -1604,6 +1763,7 @@ pub async fn memory_harness(setup: Setup) -> Box<dyn Harness> {
         connect_timeout: Duration::from_secs(2),
         head_timeout: Duration::from_secs(5),
         unknown: ProxyState::unknown_slots(),
+        unknown_rate: ProxyState::unknown_rate(),
     });
     Box::new(MemoryHarness {
         state,
@@ -1784,6 +1944,7 @@ macro_rules! conformance_tests {
             identity_by_network => case_identity_by_network,
             limit_concurrency => case_limit_concurrency,
             limit_rate => case_limit_rate,
+            refused_floods => case_refused_floods,
             limit_idle => case_limit_idle,
             limit_lifetime => case_limit_lifetime,
             slow_heads => case_slow_heads,

@@ -1,5 +1,13 @@
 //! The proxy listener: `CONNECT host:port` only, the checks in order, the connect to the checked
 //! address, the relay with its limits, the byte counters and one log line per request.
+//!
+//! Every connection pays a token of its identity's connection rate at accept, before its head is
+//! read ([`admit`]); connections from unknown sources share one bucket ([`UNKNOWN_RATE`]). A
+//! connection over the rate gets a fixed answer written without waiting and is closed in the
+//! accept loop: no task, no head read, and one log line per
+//! [`crate::limits::RATE_REPORT_INTERVAL`] with the number of such refusals instead of one line
+//! each. So a flood of refused requests costs the proxy, its log and the usage counters no more
+//! than the rate allows.
 
 use std::fmt;
 use std::io;
@@ -14,7 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::addr::{BadHost, Host, canonical, parse_host};
 use crate::api::{DENY_HEADER, DenyReason, WorkloadIdentity};
-use crate::limits::ConnectionPermit;
+use crate::limits::{ConnectionPermit, LimitConfig, LimitState};
 use crate::policy::{Decision, EgressPolicy, Identified};
 use crate::resolver::Resolver;
 use crate::usage::Usage;
@@ -25,6 +33,17 @@ pub const MAX_HEAD: usize = 8 * 1024;
 /// Client connections at once from sources in no registered network (all of them together). In
 /// normal operation there are none; the cap keeps them from taking the global connection cap.
 pub const MAX_UNKNOWN_CONNECTIONS: usize = 64;
+
+/// The connection rate of all sources in no registered network together: 600 a minute, 128 at
+/// once. In normal operation there are none; the bucket keeps a flood from them from costing the
+/// proxy and its log more than that.
+pub const UNKNOWN_RATE: LimitConfig = LimitConfig {
+    max_tunnels: 0,
+    per_minute: 600,
+    burst: 128,
+    idle_timeout: Duration::from_secs(1),
+    max_lifetime: Duration::from_secs(1),
+};
 
 /// Everything a request needs.
 pub struct ProxyState {
@@ -38,12 +57,19 @@ pub struct ProxyState {
     pub head_timeout: Duration,
     /// The slots of [`MAX_UNKNOWN_CONNECTIONS`] (see [`ProxyState::unknown_slots`]).
     pub unknown: Arc<Semaphore>,
+    /// The token bucket of [`UNKNOWN_RATE`] (see [`ProxyState::unknown_rate`]).
+    pub unknown_rate: Arc<LimitState>,
 }
 
 impl ProxyState {
     /// The slots for connections from unknown sources.
     pub fn unknown_slots() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_UNKNOWN_CONNECTIONS))
+    }
+
+    /// The connection rate of unknown sources.
+    pub fn unknown_rate() -> Arc<LimitState> {
+        LimitState::new(&UNKNOWN_RATE)
     }
 }
 
@@ -63,6 +89,9 @@ pub struct TunnelLog {
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub duration: Duration,
+    /// For connections refused over the rate: how many this line stands for (the refusals since
+    /// the last such line of the identity). `None` on the line of one request.
+    pub refused: Option<u64>,
 }
 
 impl fmt::Display for TunnelLog {
@@ -94,7 +123,11 @@ impl fmt::Display for TunnelLog {
             self.bytes_up,
             self.bytes_down,
             self.duration.as_millis()
-        )
+        )?;
+        if let Some(n) = self.refused {
+            write!(f, " refused={n}")?;
+        }
+        Ok(())
     }
 }
 
@@ -152,8 +185,19 @@ pub async fn serve(listener: TcpListener, state: Arc<ProxyState>, max_connection
             drop(stream);
             continue;
         };
+        let admission = match admit(&state, peer) {
+            Admission::OverRate { who, report } => {
+                // Refused in this loop: the fixed answer if the socket takes it now, then
+                // closed. No task and no read.
+                let answer = over_rate(&state, peer, who, report);
+                let _ = stream.try_write(answer);
+                drop(stream);
+                drop(slot);
+                continue;
+            }
+            a => a,
+        };
         let _ = stream.set_nodelay(true);
-        let admission = admit(&state, peer);
         let state = state.clone();
         tokio::spawn(async move {
             run(&state, peer, admission, stream).await;
@@ -185,6 +229,7 @@ impl Ctx {
             bytes_up: up,
             bytes_down: down,
             duration: self.start.elapsed(),
+            refused: None,
         }
     }
 }
@@ -221,6 +266,55 @@ async fn plain<S: AsyncWrite + Unpin>(state: &ProxyState, ctx: &Ctx, client: &mu
     let _ = client.write_all(answer.as_bytes()).await;
     let _ = client.shutdown().await;
     state.log.tunnel(&ctx.record(status, None, 0, 0));
+}
+
+/// The fixed answers to a connection over the rate.
+static OVER_RATE_LIMIT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| fixed_deny(DenyReason::Limit));
+static OVER_RATE_UNKNOWN: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| fixed_deny(DenyReason::UnknownSource));
+
+fn fixed_deny(r: DenyReason) -> String {
+    format!(
+        "HTTP/1.1 {} Forbidden\r\n{DENY_HEADER}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        r.status(),
+        r.as_str()
+    )
+}
+
+/// A connection over the rate: writes the sampled log line (and adds its refusals to the usage
+/// counters) when `report` says so, and returns the fixed answer. Nothing here waits.
+fn over_rate(
+    state: &ProxyState,
+    peer: SocketAddr,
+    who: Option<Identified>,
+    report: Option<u64>,
+) -> &'static [u8] {
+    let reason = if who.is_some() {
+        DenyReason::Limit
+    } else {
+        DenyReason::UnknownSource
+    };
+    if let Some(n) = report {
+        if let Some(w) = &who {
+            state.usage.add_denied_many(&w.identity, n);
+        }
+        let ctx = Ctx {
+            start: Instant::now(),
+            source: canonical(peer.ip()),
+            who,
+            host: "-".to_string(),
+            port: 0,
+            resolved: None,
+        };
+        let mut rec = ctx.record(reason.status(), Some(reason), 0, 0);
+        rec.refused = Some(n);
+        state.log.tunnel(&rec);
+    }
+    match reason {
+        DenyReason::Limit => OVER_RATE_LIMIT.as_bytes(),
+        _ => OVER_RATE_UNKNOWN.as_bytes(),
+    }
 }
 
 /// Reads the request head (to the empty line). Returns the head and the bytes after it, or
@@ -264,6 +358,14 @@ pub enum Admission {
     /// the unknown sources hold [`MAX_UNKNOWN_CONNECTIONS`]. The connection is refused at once,
     /// without waiting for its head.
     Full { who: Option<Identified> },
+    /// The connection rate is used up (the identity's bucket, or [`UNKNOWN_RATE`]): refused
+    /// at once with a fixed answer. `report` is the number of such refusals to log now, at most
+    /// once per [`crate::limits::RATE_REPORT_INTERVAL`]
+    /// ([`LimitState::take_connection_token`]).
+    OverRate {
+        who: Option<Identified>,
+        report: Option<u64>,
+    },
 }
 
 /// The slot an admitted connection holds until it closes.
@@ -272,11 +374,19 @@ pub enum Slot {
     Unknown(OwnedSemaphorePermit),
 }
 
-/// Identifies a new connection by its source address (only the network it came from) and takes
-/// a connection slot for it. Called right after accept and before anything is read, so a
-/// connection that sends nothing counts against its own identity, never against other apps.
+/// Identifies a new connection by its source address (only the network it came from), takes a
+/// token of its connection rate and a connection slot for it. Called right after accept and
+/// before anything is read, so a connection that sends nothing, or a request that will be
+/// refused, counts against its own identity, never against other apps.
 pub fn admit(state: &ProxyState, peer: SocketAddr) -> Admission {
     let who = state.policy.identify(canonical(peer.ip()));
+    let bucket = match &who {
+        Some(w) => w.limit_state.take_connection_token(&w.limits),
+        None => state.unknown_rate.take_connection_token(&UNKNOWN_RATE),
+    };
+    if let Err(report) = bucket {
+        return Admission::OverRate { who, report };
+    }
     match who {
         Some(w) => match w.limit_state.try_open_connection(&w.limits) {
             Some(p) => Admission::Admitted {
@@ -332,6 +442,12 @@ where
             ctx.who = who;
             return deny(state, &ctx, &mut client, reason).await;
         }
+        Admission::OverRate { who, report } => {
+            let answer = over_rate(state, peer, who, report);
+            let _ = client.write_all(answer).await;
+            let _ = client.shutdown().await;
+            return;
+        }
     };
     let Some((head, rest)) = read_head(&mut client, state.head_timeout).await else {
         return;
@@ -381,7 +497,7 @@ where
         return deny(state, &ctx, &mut client, r).await;
     }
 
-    // 5. The limits of the identity.
+    // 5. The tunnels of the identity at once (the connection paid its rate token at accept).
     let Some(permit) = who.limit_state.try_acquire(&who.limits) else {
         return deny(state, &ctx, &mut client, DenyReason::Limit).await;
     };

@@ -82,10 +82,11 @@ pub struct Limits {
     /// Open tunnels at the same time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tunnels: Option<u32>,
-    /// New tunnels per minute (the refill of a token bucket).
+    /// New client connections per minute, refused requests included (the refill of a token
+    /// bucket).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_minute: Option<u32>,
-    /// The size of the token bucket: new tunnels at once.
+    /// The size of the token bucket: new client connections at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst: Option<u32>,
     /// A tunnel with no byte in either direction for this long is closed.

@@ -14,6 +14,12 @@ and section G, STEP3 "How an app runs" rule 2). A small Rust `CONNECT` proxy:
   resolution, which all passed the rules.)
 - It limits tunnels per identity (at once, and a rate), closes idle and old tunnels, counts bytes
   per identity and hour, and logs one line per tunnel (no path, no query string, no header).
+- The rate counts every client connection of an identity at accept, before the request head is
+  read, so refused requests (a wrong method, port or host) use it up too. A connection over the
+  rate gets a fixed `403` (`limit`, or `unknown_source` for sources in no registered network,
+  which share one bucket of 600 a minute, 128 at once) written without waiting, or a reset, and
+  is closed in the accept loop. Such refusals are logged as one line per identity and 10 s with
+  `refused=<count>`, and counted as denied with that line.
 
 Plain `http://` is not proxied: an app that calls a plain HTTP API through the proxy gets `405`
 (absolute-form requests carry the path). UDP is not proxied at all.
@@ -162,8 +168,8 @@ Errors use the API's form: `{"error": {"code": "...", "message": "...", "hint": 
 | `EGRESS_DENY` | required, unless dev mode | The platform ranges and the host's public addresses: addresses or CIDR prefixes, separated by commas or spaces. An entry that does not parse stops the start. |
 | `RUUM_EGRESS_DEV` | unset | `1` allows an empty `EGRESS_DENY` (the start log says dev mode). |
 | `RUUM_EGRESS_MAX_TUNNELS` | `64` | Open tunnels per identity at once. |
-| `RUUM_EGRESS_PER_MINUTE` | `120` | New tunnels per identity per minute (token bucket refill). |
-| `RUUM_EGRESS_BURST` | `30` | New tunnels per identity at once (token bucket size). |
+| `RUUM_EGRESS_PER_MINUTE` | `120` | New client connections per identity per minute (token bucket refill), refused requests included. |
+| `RUUM_EGRESS_BURST` | `30` | New client connections per identity at once (token bucket size). |
 | `RUUM_EGRESS_IDLE_TIMEOUT_SECS` | `300` | A tunnel with no bytes for this long closes. |
 | `RUUM_EGRESS_MAX_LIFETIME_SECS` | `3600` | A tunnel closes after this long. |
 | `RUUM_EGRESS_CONNECT_TIMEOUT_SECS` | `10` | Resolving plus connecting to the upstream. |
