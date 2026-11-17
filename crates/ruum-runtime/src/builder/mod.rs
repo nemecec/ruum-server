@@ -1,0 +1,730 @@
+//! The `node22` builder (card R-2b): [`DockerBuilder`] implements
+//! [`ruum_core::runtime::Builder`] with the fixed recipe of decision 0006 G point 5. Spike S-2
+//! showed that rootless BuildKit does not start under the driver's flags with runc, so a build
+//! is a **sandbox job** (`npm ci` with postinstall scripts, then the optional `build` command
+//! of the manifest) followed by **daemonless image assembly** and **one push** to the build's
+//! own repository. The crate README ("Builder") lists the settings and every Docker API call.
+//!
+//! A build, in order:
+//!
+//! 1. the input is checked ([`BuildInput::validate`]), the runtime must be `node22`
+//!    (`unsupported_runtime` otherwise), and the build waits for a slot: at most
+//!    [`BuilderConfig::max_parallel`] builds run at once, at most
+//!    [`BuilderConfig::per_tenant`] of one tenant (backlog S-61);
+//! 2. the archive is unpacked in memory by W-2s's reader (`ruum_core::apps::archive`; decision
+//!    0006 H: no `..`, no absolute path, no `\`, no drive letter, no link or device) and
+//!    `app.yaml` is read (`runtime: node22` and `start` required; `build` optional); a refused
+//!    archive or manifest is `build_failed` with the reason;
+//! 3. the job runs in the sandbox ([`job`]) on a network of its own, registered at the egress
+//!    proxy; its output leaves as a byte-capped tar on standard output ([`output`]);
+//! 4. the image is assembled without a daemon ([`oci`]) on the base image pinned by the digest
+//!    of its multi-arch index ([`NODE22_BASE_INDEX`]), the platform of the engine;
+//! 5. the blobs and then the manifest are pushed to `ruum/<tenant>/<app>` only
+//!    ([`registry::RepositoryPush`]);
+//! 6. the container, the network (unregistered at the proxy first) and the work data are
+//!    removed after every outcome, also after a timeout; a failed build pushes nothing; the
+//!    build time goes to the usage sink for every outcome.
+//!
+//! **No secret reaches a build**: the job's environment is a fixed list ([`job::job_env`]); the
+//! registry credential and the egress control token live only in this process; the job has no
+//! bind mount and no Docker socket. The conformance case `build_sees_no_platform_secrets`
+//! checks it with canaries, hex-encoded too (backlog S-37), and the built image's config and
+//! layer must not hold one.
+
+pub mod job;
+pub mod oci;
+pub mod output;
+pub mod registry;
+
+use crate::config::DockerConfig;
+use crate::driver::repository;
+use crate::egress::EgressRegistry;
+use async_trait::async_trait;
+use bollard::Docker;
+use bytes::Bytes;
+use ruum_core::apps::archive;
+use ruum_core::ids::TenantId;
+use ruum_core::runtime::builder::{MAX_BUILD_FAILED_REASON_BYTES, MAX_BUILD_LOG_LINES};
+use ruum_core::runtime::{
+    BUILD_ROUTES, BuildInput, BuildLogLine, BuildOutput, Builder, ImageRef, OciDigest,
+    RuntimeError, RuntimeUsage, RuntimeUsageSink,
+};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub use job::{LABEL_BUILD, MANAGED_BY, RECIPE};
+pub use registry::RegistryCredential;
+
+/// The digest of the multi-arch index of `node:22-alpine` the builder builds on (as in
+/// `testdata/fixture/Dockerfile`). The index itself is embedded (`node22-index.json`, checked
+/// against this digest at connect), so the local registry needs only the platform's image.
+pub const NODE22_BASE_INDEX: &str =
+    "sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a";
+
+/// The base repository in the local registry (`RUUM_REGISTRY/ruum-base/node22@<digest>`).
+pub const BASE_REPOSITORY: &str = "ruum-base/node22";
+
+/// The default cap of a build's output (`RUUM_BUILD_OUTPUT_MAX`): 256 MiB.
+pub const BUILD_OUTPUT_MAX: u64 = 256 * 1024 * 1024;
+
+/// The longest build log line the builder keeps, in bytes.
+pub const MAX_BUILD_LOG_LINE_BYTES: usize = 4096;
+
+/// The npm registry, the only host of a build's allow list by default.
+pub const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
+
+const EMBEDDED_INDEX: &[u8] = include_bytes!("node22-index.json");
+
+/// The settings of [`DockerBuilder`].
+#[derive(Clone, Debug)]
+pub struct BuilderConfig {
+    /// The engine, the OCI runtime, the registry, the egress proxy (`routes`, only
+    /// [`ruum_core::runtime::Route::EgressProxy`] is used), the pids limit, the extra labels
+    /// and the API timeout: the same settings as the driver's.
+    pub docker: DockerConfig,
+    /// The repository of the base image in the local registry.
+    pub base_repository: String,
+    /// The pinned index of the base image.
+    pub base_index: String,
+    /// The cap of the output copied out of a job (`RUUM_BUILD_OUTPUT_MAX`).
+    pub output_max: u64,
+    /// The most builds at once (`RUUM_BUILD_MAX_PARALLEL`).
+    pub max_parallel: usize,
+    /// The most builds of one tenant at once (`RUUM_BUILD_TENANT_MAX`; at most
+    /// `max_parallel`).
+    pub per_tenant: usize,
+    /// The allow list of a build at the egress proxy: the npm registry hosts.
+    pub npm_hosts: Vec<String>,
+    /// The npm registry URL the job uses.
+    pub npm_registry: String,
+    /// The push credential (I-4); `None` for a registry without auth.
+    pub credential: Option<RegistryCredential>,
+}
+
+impl BuilderConfig {
+    pub fn new(docker: DockerConfig) -> Self {
+        Self {
+            docker,
+            base_repository: BASE_REPOSITORY.to_owned(),
+            base_index: NODE22_BASE_INDEX.to_owned(),
+            output_max: BUILD_OUTPUT_MAX,
+            max_parallel: 4,
+            per_tenant: 2,
+            npm_hosts: vec!["registry.npmjs.org".to_owned()],
+            npm_registry: NPM_REGISTRY.to_owned(),
+            credential: None,
+        }
+    }
+
+    fn check(&self) -> Result<(), RuntimeError> {
+        let bad = |reason: &str| {
+            Err(RuntimeError::Internal {
+                reason: reason.to_owned(),
+            })
+        };
+        self.docker.check()?;
+        if self.max_parallel == 0 || self.per_tenant == 0 || self.per_tenant > self.max_parallel {
+            return bad("the build slots: 0 < per_tenant <= max_parallel");
+        }
+        if self.output_max == 0 {
+            return bad("the output cap must be above zero");
+        }
+        if self.npm_hosts.is_empty() {
+            return bad("a build needs the npm registry on its allow list");
+        }
+        if !self
+            .docker
+            .routes
+            .contains_key(&ruum_core::runtime::Route::EgressProxy)
+        {
+            return bad("the builder needs the egress proxy (DockerConfig::routes)");
+        }
+        OciDigest::parse(&self.base_index)?;
+        Ok(())
+    }
+}
+
+/// The build slots (backlog S-61): a global cap and a per-tenant share of it. A build takes its
+/// tenant's slot first, so builds of one tenant that wait do not hold global slots.
+pub struct Slots {
+    global: Arc<tokio::sync::Semaphore>,
+    per_tenant: usize,
+    tenants: Mutex<HashMap<TenantId, Arc<tokio::sync::Semaphore>>>,
+}
+
+/// A held slot; dropping it frees it.
+pub struct Slot {
+    _tenant: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Slots {
+    pub fn new(max_parallel: usize, per_tenant: usize) -> Self {
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(max_parallel)),
+            per_tenant,
+            tenants: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn acquire(&self, tenant: TenantId) -> Slot {
+        let t = {
+            let mut m = self.tenants.lock().unwrap_or_else(|p| p.into_inner());
+            // Forget the tenants with no build (every permit back).
+            m.retain(|_, s| s.available_permits() < self.per_tenant);
+            m.entry(tenant)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_tenant)))
+                .clone()
+        };
+        // The semaphores are never closed.
+        let tenant = t.acquire_owned().await.expect("open semaphore");
+        let global = self
+            .global
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("open semaphore");
+        Slot {
+            _tenant: tenant,
+            _global: global,
+        }
+    }
+}
+
+/// The builder (see the module docs).
+pub struct DockerBuilder {
+    docker: Docker,
+    cfg: BuilderConfig,
+    usage: Arc<dyn RuntimeUsageSink>,
+    egress: Arc<dyn EgressRegistry>,
+    slots: Slots,
+    /// The image manifest of the base for the engine's platform.
+    base_manifest: OciDigest,
+}
+
+fn failed(reason: impl Into<String>) -> RuntimeError {
+    RuntimeError::BuildFailed {
+        reason: bounded(reason.into()),
+    }
+}
+
+/// Cuts a reason at [`MAX_BUILD_FAILED_REASON_BYTES`] on a character boundary.
+fn bounded(mut s: String) -> String {
+    if s.len() > MAX_BUILD_FAILED_REASON_BYTES {
+        let mut cut = MAX_BUILD_FAILED_REASON_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+    s
+}
+
+/// What `app.yaml` gives the builder.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Recipe {
+    pub start: String,
+    pub build: Option<String>,
+}
+
+/// Reads `app.yaml` of the archive: `runtime` must be `node22` and `start` a non-empty
+/// string of at most 500 bytes; `build` is optional (at most 500 bytes).
+pub fn read_manifest(files: &archive::Unpacked) -> Result<Recipe, String> {
+    let entry = files
+        .get("app.yaml")
+        .ok_or("the archive has no app.yaml at its root")?;
+    let text = std::str::from_utf8(&entry.data).map_err(|_| "app.yaml is not UTF-8")?;
+    let v = ruum_core::apps::deployments::yaml::parse(text)
+        .map_err(|e| format!("app.yaml cannot be read: {e}"))?;
+    let runtime = v.get("runtime").and_then(|r| r.as_str());
+    if runtime != Some("node22") {
+        return Err("app.yaml: runtime must be node22 for this builder".to_owned());
+    }
+    let field = |name: &str| -> Result<Option<String>, String> {
+        match v.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) if s.len() <= 500 && !s.contains('\0') => {
+                Ok(Some(s.clone()))
+            }
+            Some(_) => Err(format!(
+                "app.yaml: {name} must be a string of at most 500 bytes"
+            )),
+        }
+    };
+    let start = field("start")?
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("app.yaml: start is required for node22 (the command that listens on $PORT)")?;
+    let build = field("build")?.filter(|s| !s.trim().is_empty());
+    Ok(Recipe { start, build })
+}
+
+/// The source tar the job unpacks: the checked files of the archive, folders first.
+fn source_tar(files: &archive::Unpacked) -> Bytes {
+    let mut dirs: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut entries: BTreeMap<Vec<u8>, &Bytes> = BTreeMap::new();
+    for e in &files.entries {
+        let p = e.name.as_bytes();
+        for (i, b) in p.iter().enumerate() {
+            if *b == b'/' {
+                dirs.insert(p[..i].to_vec());
+            }
+        }
+        entries.insert(p.to_vec(), &e.data);
+    }
+    let mut w = oci::TarWriter::new();
+    for d in &dirs {
+        w.dir(d);
+    }
+    for (p, data) in entries {
+        w.file(&p, 0o644, data);
+    }
+    Bytes::from(w.finish())
+}
+
+/// The state a build's cleanup needs, also when the build future was dropped at its timeout.
+#[derive(Default)]
+struct Trace {
+    network: Mutex<Option<String>>,
+}
+
+impl DockerBuilder {
+    /// Connects to the engine, checks the configuration and the embedded base index, and picks
+    /// the base image of the engine's platform.
+    pub async fn connect(
+        cfg: BuilderConfig,
+        usage: Arc<dyn RuntimeUsageSink>,
+        egress: Arc<dyn EgressRegistry>,
+    ) -> Result<Self, RuntimeError> {
+        cfg.check()?;
+        let unavailable = |what: &str, e: bollard::errors::Error| RuntimeError::Unavailable {
+            reason: format!("{what}: {e}"),
+        };
+        let timeout = cfg.docker.api_timeout.as_secs().max(1);
+        let host = &cfg.docker.docker_host;
+        let docker = if let Some(path) = host.strip_prefix("unix://") {
+            Docker::connect_with_unix(path, timeout, bollard::API_DEFAULT_VERSION)
+        } else if host.starts_with("tcp://") || host.starts_with("http://") {
+            Docker::connect_with_http(host, timeout, bollard::API_DEFAULT_VERSION)
+        } else {
+            return Err(RuntimeError::Internal {
+                reason: "RUUM_DOCKER_HOST must start with unix://, tcp:// or http://".to_owned(),
+            });
+        }
+        .map_err(|e| unavailable("the Docker engine", e))?
+        .negotiate_version()
+        .await
+        .map_err(|e| unavailable("the Docker engine", e))?;
+        let info = docker
+            .info()
+            .await
+            .map_err(|e| unavailable("the Docker engine", e))?;
+        if cfg.docker.runtime == crate::RuntimeKind::Runsc
+            && !info
+                .runtimes
+                .as_ref()
+                .is_some_and(|r| r.contains_key("runsc"))
+        {
+            return Err(RuntimeError::Unavailable {
+                reason: "RUUM_RUNTIME_DRIVER=runsc, but the engine has no runtime runsc".to_owned(),
+            });
+        }
+        let arch = oci::engine_architecture(info.architecture.as_deref().unwrap_or(""))?;
+        let index = if cfg.base_index == NODE22_BASE_INDEX {
+            if OciDigest::of(EMBEDDED_INDEX).as_str() != NODE22_BASE_INDEX {
+                return Err(RuntimeError::Internal {
+                    reason: "the embedded base index does not match its pin".to_owned(),
+                });
+            }
+            Bytes::from_static(EMBEDDED_INDEX)
+        } else {
+            // Another pin: the index comes from the local registry, checked against the pin.
+            let p = registry::RepositoryPush::new(
+                &cfg.docker.registry_url,
+                String::new(),
+                cfg.base_repository.clone(),
+                cfg.credential.clone(),
+            )?;
+            p.base_manifest(&OciDigest::parse(&cfg.base_index)?)
+                .await?
+                .1
+        };
+        let d = oci::select_manifest(&index, arch)?;
+        let base_manifest = OciDigest::parse(&d.digest)?;
+        Ok(Self {
+            docker,
+            slots: Slots::new(cfg.max_parallel, cfg.per_tenant),
+            cfg,
+            usage,
+            egress,
+            base_manifest,
+        })
+    }
+
+    /// The engine reference of the base image (the job runs from it).
+    pub fn base_image(&self) -> String {
+        format!(
+            "{}/{}@{}",
+            self.cfg.docker.registry, self.cfg.base_repository, self.base_manifest
+        )
+    }
+
+    /// Pulls the base image into the engine unless it is there (only a local registry
+    /// reference, as I-4's socket proxy requires).
+    async fn ensure_base(&self) -> Result<(), RuntimeError> {
+        use futures::StreamExt;
+        let reference = self.base_image();
+        if self.docker.inspect_image(&reference).await.is_ok() {
+            return Ok(());
+        }
+        let opts = bollard::query_parameters::CreateImageOptionsBuilder::new()
+            .from_image(&reference)
+            .build();
+        let mut pull = self.docker.create_image(Some(opts), None, None);
+        while let Some(item) = pull.next().await {
+            item.map_err(|e| RuntimeError::Unavailable {
+                reason: format!("pulling the base image: {e}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Removes the images of builds that the engine holds (the driver pulled them), when no
+    /// container uses them: images labelled [`LABEL_BUILD`] and [`crate::LABEL_MANAGED`] =
+    /// [`MANAGED_BY`], plus every extra label of the configuration, created more than `age`
+    /// ago. The count of removed images.
+    pub async fn prune_images(&self, age: Duration) -> Result<usize, RuntimeError> {
+        let mut labels = vec![
+            LABEL_BUILD.to_owned(),
+            format!("{}={MANAGED_BY}", crate::LABEL_MANAGED),
+        ];
+        for (k, v) in &self.cfg.docker.extra_labels {
+            labels.push(format!("{k}={v}"));
+        }
+        let filters = HashMap::from([("label".to_owned(), labels)]);
+        let opts = bollard::query_parameters::ListImagesOptionsBuilder::new()
+            .filters(&filters)
+            .build();
+        let images =
+            self.docker
+                .list_images(Some(opts))
+                .await
+                .map_err(|e| RuntimeError::Unavailable {
+                    reason: format!("listing build images: {e}"),
+                })?;
+        let before = time::OffsetDateTime::now_utc().unix_timestamp() - age.as_secs() as i64;
+        let mut removed = 0;
+        for i in images {
+            if i.created > before || i.containers > 0 {
+                continue;
+            }
+            let opts = bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                .force(false)
+                .build();
+            if self
+                .docker
+                .remove_image(&i.id, Some(opts), None)
+                .await
+                .is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn cleanup(&self, build: uuid::Uuid, trace: &Trace) {
+        job::remove_container(&self.docker, build).await;
+        let registered = trace
+            .network
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        job::remove_network(
+            &self.docker,
+            &self.cfg,
+            self.egress.as_ref(),
+            build,
+            registered,
+        )
+        .await;
+    }
+
+    /// The build up to the push; the caller times it out and cleans up.
+    async fn run(
+        &self,
+        input: &BuildInput,
+        build: uuid::Uuid,
+        trace: &Trace,
+        log: &Mutex<job::LogTail>,
+    ) -> Result<OciDigest, RuntimeError> {
+        let limits = archive::Limits {
+            max_total_bytes: self.cfg.output_max.min(input.limits.disk_bytes),
+            max_entry_bytes: self.cfg.output_max.min(input.limits.disk_bytes),
+            max_files: 100_000,
+            max_ratio: 200,
+        };
+        let files = archive::unpack(&input.archive, &limits).map_err(|r| match r {
+            archive::Refusal::Hostile { entry, reason } => failed(format!(
+                "the archive entry {:?} is refused: {reason}",
+                entry.escape_debug().take(200).collect::<String>()
+            )),
+            archive::Refusal::Corrupt { reason } => {
+                failed(format!("the archive cannot be read: {reason}"))
+            }
+            archive::Refusal::Limit { what, limit } => {
+                failed(format!("the archive is over the limit of {what} ({limit})"))
+            }
+        })?;
+        let recipe = read_manifest(&files).map_err(failed)?;
+        let source = source_tar(&files);
+        drop(files);
+        self.ensure_base().await?;
+        let network = job::create_network(
+            &self.docker,
+            &self.cfg,
+            self.egress.as_ref(),
+            input,
+            build,
+            &trace.network,
+        )
+        .await?;
+        let end = job::run(
+            &self.docker,
+            &self.cfg,
+            input,
+            build,
+            &self.base_image(),
+            &network,
+            source,
+            recipe.build.as_deref(),
+            log,
+        )
+        .await?;
+        let output = match end {
+            job::JobEnd::OutputOverCap => {
+                return Err(failed(format!(
+                    "the build's output is over the cap of {} bytes",
+                    self.cfg.output_max
+                )));
+            }
+            job::JobEnd::Exited { code, output } if code != 0 => {
+                let _ = output;
+                return Err(failed(format!(
+                    "the build exited with code {code}: {}",
+                    tail_text(log)
+                )));
+            }
+            job::JobEnd::Exited { output, .. } => output,
+        };
+        // The job's work is done: free its sandbox before the assembly.
+        self.cleanup(build, trace).await;
+        *trace.network.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let out = output::read_output(output, self.cfg.output_max)
+            .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
+        {
+            let mut l = log.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, why) in out.dropped.iter().take(100) {
+                l.note(&format!(
+                    "ruum-build: dropped output entry \"{name}\": {why}"
+                ));
+            }
+            if out.dropped.len() > 100 {
+                l.note(&format!(
+                    "ruum-build: dropped {} more output entries",
+                    out.dropped.len() - 100
+                ));
+            }
+        }
+        let push = registry::RepositoryPush::new(
+            &self.cfg.docker.registry_url,
+            repository(&input.identity),
+            self.cfg.base_repository.clone(),
+            self.cfg.credential.clone(),
+        )?;
+        let (_, base_manifest) = push.base_manifest(&self.base_manifest).await?;
+        let base = oci::parse_manifest(&base_manifest)?;
+        let base_config = push
+            .base_blob(&OciDigest::parse(&base.config.digest)?)
+            .await?;
+        let layer = oci::build_layer(&out.entries);
+        drop(out);
+        let mut labels: BTreeMap<String, String> = self.cfg.docker.extra_labels.clone();
+        labels.insert(
+            crate::LABEL_APP.to_owned(),
+            input.identity.app.0.to_string(),
+        );
+        labels.insert(
+            crate::LABEL_TENANT.to_owned(),
+            input.identity.tenant.0.to_string(),
+        );
+        labels.insert(LABEL_BUILD.to_owned(), build.to_string());
+        labels.insert(crate::LABEL_MANAGED.to_owned(), MANAGED_BY.to_owned());
+        let config = oci::image_config(&base_config, &layer, &recipe.start, &labels)?;
+        let manifest = oci::image_manifest(&base.layers, &config, &layer);
+        for d in &base.layers {
+            push.bring_base_blob(&OciDigest::parse(&d.digest)?).await?;
+        }
+        push.push_blob(&layer.digest, layer.gz.clone()).await?;
+        push.push_blob(&OciDigest::of(&config), config.clone())
+            .await?;
+        let digest = push.push_manifest(registry::OCI_MANIFEST, manifest).await?;
+        log.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note(&format!("ruum-build: image {digest}"));
+        Ok(digest)
+    }
+}
+
+fn tail_text(log: &Mutex<job::LogTail>) -> String {
+    let lines = log.lock().unwrap_or_else(|p| p.into_inner()).lines();
+    let mut out = String::new();
+    for (_, l) in lines.iter().rev() {
+        if out.len() + l.len() + 1 > MAX_BUILD_FAILED_REASON_BYTES - 200 {
+            break;
+        }
+        out = if out.is_empty() {
+            l.clone()
+        } else {
+            format!("{l}\n{out}")
+        };
+    }
+    out
+}
+
+#[async_trait]
+impl Builder for DockerBuilder {
+    fn name(&self) -> &str {
+        match self.cfg.docker.runtime {
+            crate::RuntimeKind::Runc => "docker-node22",
+            crate::RuntimeKind::Runsc => "docker-runsc-node22",
+        }
+    }
+
+    async fn build(&self, input: BuildInput) -> Result<BuildOutput, RuntimeError> {
+        input.validate()?;
+        if input.runtime != "node22" {
+            return Err(RuntimeError::UnsupportedRuntime {
+                runtime: input.runtime,
+            });
+        }
+        let _slot = self.slots.acquire(input.identity.tenant).await;
+        let begun = Instant::now();
+        let build = uuid::Uuid::now_v7();
+        let trace = Trace::default();
+        let log = Mutex::new(job::LogTail::new(
+            MAX_BUILD_LOG_LINES,
+            MAX_BUILD_LOG_LINE_BYTES,
+        ));
+        let result = match tokio::time::timeout(
+            input.timeout,
+            self.run(&input, build, &trace, &log),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(RuntimeError::BuildTimedOut),
+        };
+        self.cleanup(build, &trace).await;
+        let took = begun.elapsed().max(Duration::from_millis(1));
+        self.usage.record(RuntimeUsage::Build {
+            identity: input.identity,
+            took,
+        });
+        let digest = result?;
+        let logs = log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lines()
+            .into_iter()
+            .map(|(at, text)| BuildLogLine { at, text })
+            .collect();
+        Ok(BuildOutput {
+            image: ImageRef::Oci(digest),
+            logs,
+            took,
+            routes: BUILD_ROUTES.to_vec(),
+            limits: input.limits,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_tenant_cannot_hold_every_slot() {
+        let slots = Arc::new(Slots::new(3, 2));
+        let a = TenantId::new();
+        let b = TenantId::new();
+        let a1 = slots.acquire(a).await;
+        let a2 = slots.acquire(a).await;
+        // A third build of tenant A waits for A's share.
+        let s = slots.clone();
+        let mut a3 = tokio::spawn(async move { s.acquire(a).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!a3.is_finished(), "tenant A got a third slot");
+        // Tenant B still gets the slot that is left.
+        let b1 = tokio::time::timeout(Duration::from_secs(1), slots.acquire(b))
+            .await
+            .expect("tenant B gets a slot while A waits");
+        drop(a1);
+        let a3 = tokio::time::timeout(Duration::from_secs(1), &mut a3)
+            .await
+            .expect("A's third build starts when one of A's ends")
+            .expect("task");
+        drop((a2, a3, b1));
+    }
+
+    #[test]
+    fn the_manifest_needs_node22_and_start() {
+        let files = |yaml: &str| archive::Unpacked {
+            entries: vec![archive::Entry {
+                name: "app.yaml".to_owned(),
+                data: Bytes::from(yaml.to_owned()),
+            }],
+        };
+        assert_eq!(
+            read_manifest(&files(
+                "runtime: node22\nstart: node server.js\nbuild: npm run build\n"
+            )),
+            Ok(Recipe {
+                start: "node server.js".to_owned(),
+                build: Some("npm run build".to_owned())
+            })
+        );
+        assert!(read_manifest(&files("runtime: node22\n")).is_err());
+        assert!(read_manifest(&files("runtime: static\nstart: x\n")).is_err());
+        assert!(read_manifest(&files("runtime: node22\nstart: [a]\n")).is_err());
+        assert!(read_manifest(&archive::Unpacked::default()).is_err());
+    }
+
+    #[test]
+    fn a_reason_is_bounded_on_a_character_boundary() {
+        let s = bounded("ä".repeat(MAX_BUILD_FAILED_REASON_BYTES));
+        assert!(s.len() <= MAX_BUILD_FAILED_REASON_BYTES);
+        assert!(s.chars().all(|c| c == 'ä'));
+    }
+
+    #[test]
+    fn the_job_environment_holds_no_credential() {
+        let mut d = DockerConfig::new("unix:///x", "127.0.0.1:5000", "/tmp".into());
+        d.routes.insert(
+            ruum_core::runtime::Route::EgressProxy,
+            crate::SharedContainer {
+                container: "egress".to_owned(),
+                alias: "ruum-egress".to_owned(),
+                port: 3128,
+            },
+        );
+        let mut cfg = BuilderConfig::new(d);
+        cfg.credential = Some(RegistryCredential {
+            username: "canary-user".to_owned(),
+            password: ruum_core::runtime::SecretValue::new("canary-pass".to_owned()),
+        });
+        let env = job::job_env(&cfg, 10, Some("npm run build"));
+        assert!(env.iter().all(|e| !e.contains("canary")));
+        assert!(env.contains(&"HTTPS_PROXY=http://ruum-egress:3128".to_owned()));
+    }
+}
