@@ -1394,18 +1394,29 @@ async fn supervise(inner: Arc<Inner>, inst: Arc<Instance>, pump: JoinHandle<()>)
     }
     // Every line of the run is in the ring before the state says the run ended.
     let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
-    let inspect = inner
-        .docker
-        .inspect_container(
-            &name,
-            None::<bollard::query_parameters::InspectContainerOptions>,
-        )
-        .await
-        .ok();
-    let (code, oom) = inspect
-        .and_then(|c| c.state)
-        .map(|s| (s.exit_code.unwrap_or(-1), s.oom_killed == Some(true)))
-        .unwrap_or((-1, false));
+    // The engine can report the exit before it handles the out-of-memory event, so a SIGKILL
+    // exit (137) without the flag is read again for a short time.
+    let mut exit = (-1, false);
+    for attempt in 0..10 {
+        let inspect = inner
+            .docker
+            .inspect_container(
+                &name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .ok();
+        exit = inspect
+            .and_then(|c| c.state)
+            .map(|s| (s.exit_code.unwrap_or(-1), s.oom_killed == Some(true)))
+            .unwrap_or((-1, false));
+        let unsure = exit == (137, false) && inst.lock().intent == Intent::None && !forced;
+        if !unsure || attempt == 9 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (code, oom) = exit;
     let (intent, ran) = {
         let st = inst.lock();
         (st.intent, st.run_started.elapsed())
