@@ -17,6 +17,15 @@ trait Harness: Send + Sync {
     async fn append(&self, ctx: &Context, entry: NewEntry) -> JournalEntry;
     async fn prune_before(&self, tenant: TenantId, seq: i64);
     fn journal(&self) -> Arc<dyn Journal>;
+    /// Writes an entry of a type that this release does not know, as a newer release would
+    /// (backlog P-57). Returns its `seq`.
+    async fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    ) -> i64;
 }
 
 struct Memory(Arc<MemoryJournal>);
@@ -34,6 +43,15 @@ impl Harness for Memory {
     }
     fn journal(&self) -> Arc<dyn Journal> {
         self.0.clone()
+    }
+    async fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    ) -> i64 {
+        self.0.append_as_newer_release(ctx, node, type_name, data)
     }
 }
 
@@ -74,6 +92,20 @@ impl Harness for Pg {
     }
     fn journal(&self) -> Arc<dyn Journal> {
         Arc::new(PgJournal::new(self.0.clone()))
+    }
+    async fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    ) -> i64 {
+        let mut tx = postgres::begin_tenant(&self.0, ctx.tenant).await.unwrap();
+        let seq = postgres::append_as_newer_release(&mut tx, ctx, node, type_name, data)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        seq
     }
 }
 
@@ -547,6 +579,126 @@ async fn the_feed_keeps_a_trash_from_access_that_began_after_it(h: &dyn Harness)
     assert_eq!(got, vec![g.seq], "only the grant on /a");
 }
 
+/// Backlog P-57, design 12.7: during a rolling deploy a newer release writes a type that this
+/// (older) release does not know. Reading the journal, the node entries and the changes feed
+/// never fail on it: the entry comes in the generic shape (the type as written, `data` empty)
+/// and follows the visibility rules of any entry on its node.
+async fn an_old_reader_passes_a_new_type_on(h: &dyn Harness) {
+    use super::feed::{ChangesQuery, FeedAccess, list_changes};
+
+    /// A caller who sees the given nodes now, and is a member or not.
+    struct Sees(Vec<NodeId>, bool);
+    #[async_trait]
+    impl FeedAccess for Sees {
+        async fn can_view(&self, n: NodeId) -> Result<bool> {
+            Ok(self.0.contains(&n))
+        }
+        async fn ancestors(&self, _: NodeId) -> Result<Option<Vec<NodeId>>> {
+            Ok(Some(Vec::new()))
+        }
+        async fn is_member(&self) -> Result<bool> {
+            Ok(self.1)
+        }
+        async fn member_since(&self) -> Result<Option<time::OffsetDateTime>> {
+            Ok(self.1.then_some(time::OffsetDateTime::UNIX_EPOCH))
+        }
+        async fn manager_since(&self) -> Result<Option<time::OffsetDateTime>> {
+            self.member_since().await
+        }
+    }
+
+    const NEW_TYPE: &str = "app.from_a_newer_release";
+    let t = h.tenant().await;
+    let ctx = user_ctx(t);
+    let (root, a, hidden) = (NodeId::new(), NodeId::new(), NodeId::new());
+    let first = h.append(&ctx, created(a, root)).await;
+    let new_on_a = h
+        .append_as_newer_release(
+            &ctx,
+            Some(a),
+            NEW_TYPE,
+            json!({ "secret_name": "DB_PASSWORD", "parent_id": hidden }),
+        )
+        .await;
+    let new_on_hidden = h
+        .append_as_newer_release(&ctx, Some(hidden), NEW_TYPE, json!({ "x": 1 }))
+        .await;
+    let new_tenant_level = h
+        .append_as_newer_release(&ctx, None, "tenant.from_a_newer_release", json!({}))
+        .await;
+    let last = h.append(&ctx, moved(a, root, root)).await;
+    let j = h.journal();
+
+    // The journal reads every entry, in order; the unknown ones in the generic shape.
+    let page = j.read(&ctx, None, 100).await.unwrap();
+    let seqs: Vec<i64> = page.items.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![
+            first.seq,
+            new_on_a,
+            new_on_hidden,
+            new_tenant_level,
+            last.seq
+        ]
+    );
+    let unknown = &page.items[1];
+    assert_eq!(unknown.event, EventType::Unknown(NEW_TYPE));
+    assert_eq!(unknown.node_id, Some(a));
+    assert_eq!(unknown.actor, ctx.actor);
+    assert_eq!(unknown.data, json!({}));
+    assert_eq!(page.items[3].event.as_str(), "tenant.from_a_newer_release");
+    assert_eq!(page.items[4].event, EventType::NodeMoved);
+    // A page of only unknown entries moves the cursor past them.
+    let one = j.read(&ctx, Some(first.seq), 1).await.unwrap();
+    assert_eq!(one.items.len(), 1);
+    assert_eq!(one.next_cursor, Some(encode_cursor(new_on_a)));
+    // The node entries and the last parent skip a type they do not ask for.
+    let parents = j
+        .node_entries(&ctx, a, i64::MAX, PARENT_EVENTS, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        parents.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![last.seq, first.seq]
+    );
+    assert_eq!(j.last_parent(&ctx, a, last.seq).await.unwrap(), Some(root));
+
+    // The changes feed: the entry on a node the caller sees, in the generic shape, and the
+    // tenant-level entry for a member; never the entry on a node the caller does not see.
+    let page = list_changes(
+        j.as_ref(),
+        &Sees(vec![root, a], true),
+        &ctx,
+        ChangesQuery::default(),
+    )
+    .await
+    .unwrap();
+    let got: Vec<i64> = page.items.iter().map(|e| e.seq).collect();
+    assert_eq!(got, vec![first.seq, new_on_a, new_tenant_level, last.seq]);
+    assert!(page.resync.is_empty());
+    let wire = serde_json::to_value(&page).unwrap();
+    assert_eq!(wire["items"][1]["type"], NEW_TYPE);
+    assert_eq!(wire["items"][1]["data"], json!({}));
+    assert_eq!(wire["items"][2]["type"], "tenant.from_a_newer_release");
+    assert_eq!(wire["items"][2]["node_id"], serde_json::Value::Null);
+    // A guest who sees nothing gets an empty page, and the cursor moves on.
+    let page = list_changes(
+        j.as_ref(),
+        &Sees(Vec::new(), false),
+        &ctx,
+        ChangesQuery {
+            after: Some(first.seq),
+            limit: Some(3),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(page.items.is_empty());
+    assert_eq!(page.next_cursor, encode_cursor(new_tenant_level).0);
+}
+
 async fn run_all(h: Arc<dyn Harness>) {
     an_empty_journal(h.as_ref()).await;
     appends_get_gapless_seqs_and_keep_both_principals(h.as_ref()).await;
@@ -557,6 +709,7 @@ async fn run_all(h: Arc<dyn Harness>) {
     node_entries_filter_by_node_type_and_seq(h.as_ref()).await;
     the_feed_sends_a_purge_only_to_who_saw_the_node(h.as_ref()).await;
     the_feed_keeps_a_trash_from_access_that_began_after_it(h.as_ref()).await;
+    an_old_reader_passes_a_new_type_on(h.as_ref()).await;
     wait_for_wakes_on_append(h).await;
 }
 

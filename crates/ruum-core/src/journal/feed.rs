@@ -29,6 +29,12 @@
 //!
 //! "Now" is the state at the time of the read, not the state right after the change. This is the
 //! step 1 rule; a client that follows the feed sees each change close to when it happens.
+//!
+//! A type that this release does not know (a newer release wrote it during a rolling deploy,
+//! backlog P-57) never fails the feed. Its entry follows the rules of any entry on its node (sent
+//! when the caller sees the node now; a tenant-level entry to members only) and goes out in the
+//! generic shape: the envelope with the type as written and `data` empty
+//! ([`JournalEntry::generic_if_unknown`]). It gives no resync marker.
 
 use super::{
     Access, EventType, GRANT_EVENTS, Journal, JournalEntry, ResyncMarker, decode_cursor,
@@ -807,7 +813,7 @@ pub async fn list_changes_filtered(
             }
             let mut markers = Vec::new();
             if memo.classify(&entry, &mut markers).await? {
-                items.push(entry);
+                items.push(entry.generic_if_unknown());
             }
             resync.extend(markers);
         }

@@ -32,6 +32,33 @@ impl MemoryJournal {
     /// Appends one entry at once and returns it with its `seq`. The tenant and the actor come
     /// from `ctx`.
     pub fn append(&self, ctx: &Context, entry: NewEntry) -> Result<JournalEntry> {
+        super::refuse_unknown(&entry)?;
+        Ok(self.push(ctx, entry))
+    }
+
+    /// Appends an entry of a type by its wire name, as a newer release would write a type that
+    /// this release does not know. Only for the tests of backlog P-57.
+    #[cfg(test)]
+    pub(crate) fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node_id: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    ) -> i64 {
+        self.push(
+            ctx,
+            NewEntry {
+                node_id,
+                revision: node_id.map(|_| 1),
+                event: EventType::from_wire(type_name),
+                data,
+            },
+        )
+        .seq
+    }
+
+    fn push(&self, ctx: &Context, entry: NewEntry) -> JournalEntry {
         let written = {
             let mut tenants = self.tenants.lock().expect("journal lock");
             let t = tenants.entry(ctx.tenant).or_default();
@@ -50,7 +77,7 @@ impl MemoryJournal {
             written
         };
         self.appended.notify_waiters();
-        Ok(written)
+        written
     }
 
     /// Drops the entries of the tenant with a `seq` below `seq`, as the journal retention does.
@@ -100,6 +127,7 @@ impl Journal for MemoryJournal {
             .filter(|e| e.seq > after)
             .take(limit.max(1) as usize)
             .cloned()
+            .map(JournalEntry::generic_if_unknown)
             .collect();
         let next_cursor = Some(encode_cursor(items.last().map_or(after, |e| e.seq)));
         Ok(Page { items, next_cursor })
@@ -129,6 +157,7 @@ impl Journal for MemoryJournal {
                     })
                     .take(limit as usize)
                     .cloned()
+                    .map(JournalEntry::generic_if_unknown)
                     .collect()
             })
             .unwrap_or_default())
