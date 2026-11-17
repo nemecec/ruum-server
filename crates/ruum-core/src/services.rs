@@ -74,6 +74,10 @@ pub struct Services {
     pub databases: Arc<DatabaseService>,
     /// The provider `ruum.webapp` and the app operations of card W-1 (`crate::apps::install`).
     pub apps: Arc<crate::apps::AppService>,
+    /// Where the instances of sandbox deployments run, for the gateway's `upstream` route (card
+    /// G-1b). `None` until the Docker wiring (I-4) gives one: the route then answers
+    /// `not_running` and the gateway shows its status page (fail closed).
+    pub sandboxes: Option<Arc<crate::apps::sandboxes::SandboxDirectory>>,
 }
 
 /// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
@@ -233,6 +237,7 @@ impl Services {
             providers,
             databases,
             apps,
+            sandboxes: None,
         };
         (services, handles)
     }

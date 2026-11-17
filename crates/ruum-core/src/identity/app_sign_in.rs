@@ -197,6 +197,38 @@ pub mod wire {
         /// The deployment serves: the live deployment of the app, or a ready preview that has not
         /// expired.
         pub serving: bool,
+        /// The deployment runs in a sandbox (its manifest's `runtime` is not `static`): the
+        /// gateway asks [`UpstreamQuery`] where its instance is (card G-1b). Absent in the answer
+        /// of an older core: a static site.
+        #[serde(default)]
+        pub sandbox: bool,
+    }
+
+    /// `POST /upstream`: where the instance of a sandbox deployment is (card G-1b). The core
+    /// checks every value against its own deployment record: the tenant, the app and the
+    /// environment of the deployment must match, or the answer is `not_running`.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub struct UpstreamQuery {
+        pub tenant_id: TenantId,
+        pub app_id: NodeId,
+        pub deployment_id: Uuid,
+        pub environment: AppEnv,
+    }
+
+    /// The answer of `POST /upstream`.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum UpstreamAnswer {
+        /// The instance runs at `url` (`http://<host>:<port>`, nothing else; the gateway refuses
+        /// any other form).
+        Ready { url: String },
+        /// A cold start is under way: ask again.
+        Starting,
+        /// No instance runs and none can start (a static or unknown deployment, a deployment that
+        /// does not serve, no sandbox directory).
+        NotRunning,
+        /// The instance ended by itself.
+        Crashed,
     }
 
     /// `POST /redeem`: redeem a sign-in code for an app session.

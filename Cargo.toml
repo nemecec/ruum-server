@@ -39,6 +39,9 @@ tower-http = { version = "0.7.1", features = ["trace", "cors", "request-id", "li
 http = "1.5"
 http-body-util = "0.1"
 hyper = "1"
+# The Tokio adapter of hyper's upgraded connections: the gateway joins WebSockets (card G-1b).
+# Already in the tree through axum and reqwest.
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 bytes = "1.12"
 futures = "0.3.34"
 async-trait = "0.1.92"
