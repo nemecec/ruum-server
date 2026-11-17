@@ -196,6 +196,14 @@ struct NetState {
     hosts: Vec<String>,
 }
 
+/// The ended instances of one tenant in a sweep ([`Inner::sweep`]): `(ended at, id, log
+/// bytes)`, and the sum of their log bytes.
+#[derive(Default)]
+struct Ended {
+    list: Vec<(Instant, InstanceId, usize)>,
+    bytes: usize,
+}
+
 struct Inner {
     docker: Docker,
     cfg: DockerConfig,
@@ -1195,16 +1203,19 @@ impl Inner {
     }
 
     /// Forgets ended instances (backlog R2A-5): those past [`DockerConfig::ended_retention`],
-    /// or past [`DockerConfig::drained_retention`] after their logs were read to the end; then
-    /// the oldest ended ones while more than [`DockerConfig::max_ended_instances`] are kept or
-    /// their logs take more than [`DockerConfig::max_ended_log_bytes`]. With `room`, also the
-    /// oldest ended ones until fewer than [`DockerConfig::max_instances`] are kept. An instance
-    /// with an operation in progress is left alone. Called with the map held.
+    /// or past [`DockerConfig::drained_retention`] after their logs were read to the end; then,
+    /// while more than [`DockerConfig::max_ended_instances`] are kept or their logs take more
+    /// than [`DockerConfig::max_ended_log_bytes`] (and with `room`, while
+    /// [`DockerConfig::max_instances`] or more are kept), the oldest ended instance of the
+    /// tenant with the largest share: the most ended log bytes when the byte cap is over, else
+    /// the most ended instances. So one tenant's load evicts its own ended instances first,
+    /// not another tenant's (S-61). An instance with an operation in progress is left alone.
+    /// Called with the map held.
     fn sweep(&self, map: &mut HashMap<InstanceId, Arc<Instance>>, room: bool) {
         let now = Instant::now();
         let cfg = &self.cfg;
         let mut evict = Vec::new();
-        let mut ended: Vec<(Instant, InstanceId, usize)> = Vec::new();
+        let mut ended: HashMap<TenantId, Ended> = HashMap::new();
         for (id, inst) in map.iter() {
             let Ok(_op) = inst.op.try_lock() else {
                 continue;
@@ -1221,20 +1232,42 @@ impl Inner {
             if expired {
                 evict.push(*id);
             } else {
-                ended.push((at, *id, st.ring.memory()));
+                let e = ended.entry(inst.identity.tenant).or_default();
+                let b = st.ring.memory();
+                e.list.push((at, *id, b));
+                e.bytes += b;
             }
         }
-        ended.sort_by_key(|(at, _, _)| *at);
-        let mut count = ended.len();
-        let mut bytes: usize = ended.iter().map(|(_, _, b)| b).sum();
+        for e in ended.values_mut() {
+            // Newest first, so the oldest is popped from the end.
+            e.list.sort_by_key(|(at, _, _)| std::cmp::Reverse(*at));
+        }
+        let mut count: usize = ended.values().map(|e| e.list.len()).sum();
+        let mut bytes: usize = ended.values().map(|e| e.bytes).sum();
         let mut kept = map.len() - evict.len();
-        for (_, id, b) in ended {
-            let over = count > cfg.max_ended_instances
-                || bytes > cfg.max_ended_log_bytes
-                || (room && kept >= cfg.max_instances);
+        loop {
+            let by_bytes = bytes > cfg.max_ended_log_bytes;
+            let over =
+                by_bytes || count > cfg.max_ended_instances || (room && kept >= cfg.max_instances);
             if !over {
                 break;
             }
+            // The tenant with the largest share; on a tie, the one with the oldest instance.
+            let Some(e) = ended
+                .values_mut()
+                .filter(|e| !e.list.is_empty())
+                .max_by_key(|e| {
+                    let share = if by_bytes { e.bytes } else { e.list.len() };
+                    let oldest = e.list.last().map(|(at, _, _)| std::cmp::Reverse(*at));
+                    (share, oldest)
+                })
+            else {
+                break;
+            };
+            let Some((_, id, b)) = e.list.pop() else {
+                break;
+            };
+            e.bytes -= b;
             evict.push(id);
             count -= 1;
             bytes -= b;
@@ -2080,6 +2113,44 @@ mod tests {
             InstanceState::Stopped
         );
         assert_eq!(d.logs(tenant, last, None, 1000).await.unwrap().len(), 64);
+    }
+
+    /// One tenant's load evicts its own ended instances, not another tenant's (review of K11,
+    /// S-61): tenant B's ended instance, unread and within its retention, stays while tenant A
+    /// fills the count cap, the byte cap and the instance cap.
+    #[tokio::test]
+    async fn eviction_takes_from_the_largest_tenant_first() {
+        let a = TenantId::new();
+        let b = TenantId::new();
+        let probe = offline(config());
+        let id = start_and_end(&probe, a, 100).await;
+        let one = probe.inner.get(id).unwrap().lock().ring.memory();
+        for (count, bytes, max) in [
+            (4, usize::MAX, usize::MAX),
+            (usize::MAX, 3 * one + one / 2, usize::MAX),
+            (usize::MAX, usize::MAX, 6),
+        ] {
+            let mut cfg = config();
+            cfg.max_ended_instances = count;
+            cfg.max_ended_log_bytes = bytes;
+            cfg.max_instances = max;
+            let d = offline(cfg);
+            // B's instance is the oldest and holds a smaller share than A's.
+            let kept = start_and_end(&d, b, 10).await;
+            let mut ids = Vec::new();
+            for _ in 0..40 {
+                ids.push(start_and_end(&d, a, 100).await);
+            }
+            d.start(spec(a)).await.expect("start");
+            assert!(gone(d.status(a, ids[0]).await), "A's oldest went");
+            assert!(!gone(d.status(a, *ids.last().unwrap()).await));
+            assert_eq!(
+                d.status(b, kept).await.expect("B's instance is kept").state,
+                InstanceState::Stopped
+            );
+            assert_eq!(d.logs(b, kept, None, 100).await.unwrap().len(), 10);
+            assert!(d.kept_instances() <= 6, "{count} {bytes} {max}");
+        }
     }
 
     #[tokio::test]

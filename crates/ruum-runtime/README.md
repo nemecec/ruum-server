@@ -108,12 +108,15 @@ they run with plain Docker; without an engine they fail when `CI` is set.
   shorter marker is used, and at last an empty one.
 - Ended instances (stopped or exited, the sandbox freed) are forgotten with their log rings
   (backlog R2A-5): after `ended_retention` (15 min), or `drained_retention` (60 s) after their
-  logs were read to the end; at once, oldest first, when more than `max_ended_instances` (1024)
-  are kept or their logs take more than `max_ended_log_bytes` (256 MiB). A forgotten instance
-  is `instance_not_found`. At most `max_instances` (4096) instances are kept, running and ended
-  together: a start beyond it first forgets ended ones, and is `unavailable` when all of them
-  run. The sweep runs at each start and each end of an instance, so nothing runs while the
-  driver is idle; the caps hold anyway.
+  logs were read to the end; at once when more than `max_ended_instances` (1024) are kept or
+  their logs take more than `max_ended_log_bytes` (256 MiB). Under a cap the driver forgets the
+  oldest ended instance of the tenant with the largest share (the most ended log bytes for the
+  byte cap, else the most ended instances), so one tenant's load forgets its own ended instances
+  first, not another tenant's (S-61). A forgotten instance is `instance_not_found`. At most
+  `max_instances` (4096) instances are kept, running and ended together: a start beyond it
+  first forgets ended ones (by the same rule), and is `unavailable` when all of them run. That
+  cap is global; a per-tenant share of it is backlog R2A-9. The sweep runs at each start and
+  each end of an instance, so nothing runs while the driver is idle; the caps hold anyway.
 - A server restart: the driver keeps its instances in memory. The next start of an app whose
   network an earlier run left adopts that network (labels `ruum.managed`, `ruum.tenant`,
   `ruum.app`, `ruum.env` must match, and the read-back must pass), attaches the missing shared

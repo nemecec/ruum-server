@@ -37,6 +37,15 @@
 //! (as a log reader shows them), and the output as written (the pieces of a long line joined
 //! without a line end). A line that would complete a value becomes the marker; when the marker
 //! would complete one too, the line becomes empty, and at last it is left out.
+//!
+//! That check covers one stream of one run. A driver has one [`LineRedactor`] for stdout and one
+//! for stderr, and each run (a wake after a scale to zero) starts new ones, so a reader that
+//! joins lines of both streams, or of two runs, in one order can still see a multiline value
+//! rebuilt from pieces that each pass. No value is replaced there; only the exact-match
+//! guarantee within one stream is lost. After [`LineRedactor::set_values`], the check against
+//! earlier output reaches back only as far as the longest earlier value: a new, longer value
+//! whose start was let out before it was known is not caught. That text was let out before the
+//! value was known, so no redactor could have held it back.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -480,7 +489,9 @@ impl LineRedactor {
     }
 
     /// Replaces the values to redact from now on (a renewed token, with the oldest kept token
-    /// dropped: [`MAX_KEPT_TOKENS`]). The held-back text goes through the new values.
+    /// dropped: [`MAX_KEPT_TOKENS`]). The held-back text goes through the new values. The
+    /// check against the lines let out before keeps only the last bytes as long as the longest
+    /// earlier value (see the module doc).
     pub fn set_values<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) {
         self.values = normalize(values);
         self.marker = marker_for(&self.values);

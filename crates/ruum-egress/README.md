@@ -17,8 +17,9 @@ and section G, STEP3 "How an app runs" rule 2). A small Rust `CONNECT` proxy:
 - The rate counts every client connection of an identity at accept, before the request head is
   read, so refused requests (a wrong method, port or host) use it up too. A connection over the
   rate gets a fixed `403` (`limit`, or `unknown_source` for sources in no registered network,
-  which share one bucket of 600 a minute, 128 at once) written without waiting, or a reset, and
-  is closed in the accept loop. Such refusals are logged as one line per identity and 10 s with
+  which share one bucket of 600 a minute, 128 at once) only if the new socket takes it without
+  waiting, and is closed in the accept loop. The socket is usually not yet known writable then,
+  so the client usually sees a close, or a reset when its head was already sent. Such refusals are logged as one line per identity and 10 s with
   `refused=<count>`, and counted as denied with that line.
 
 Plain `http://` is not proxied: an app that calls a plain HTTP API through the proxy gets `405`

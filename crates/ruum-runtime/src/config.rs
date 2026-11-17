@@ -102,17 +102,19 @@ pub struct DockerConfig {
     /// The timeout of one Docker API call (not of the long-lived attach and wait streams).
     pub api_timeout: Duration,
     /// The most instances the driver keeps, running and ended together. A start beyond it first
-    /// forgets the oldest ended instances; when every kept instance still runs, the start is
-    /// `unavailable` (backlog R2A-5, Kimi review of run 11, finding 3).
+    /// forgets ended instances (the oldest of the tenant with the most); when every kept
+    /// instance still runs, the start is `unavailable` (backlog R2A-5, Kimi review of run 11,
+    /// finding 3). The cap is global; a per-tenant share is backlog R2A-9.
     pub max_instances: usize,
     /// How long the driver keeps an ended (stopped or exited) instance and its log ring.
     pub ended_retention: Duration,
     /// How long the driver keeps an ended instance after its logs were read to the end.
     pub drained_retention: Duration,
-    /// The most ended instances the driver keeps; the oldest are forgotten first.
+    /// The most ended instances the driver keeps; the oldest of the tenant with the most ended
+    /// instances is forgotten first.
     pub max_ended_instances: usize,
-    /// The most log bytes the driver keeps for ended instances together; the oldest instances
-    /// are forgotten first.
+    /// The most log bytes the driver keeps for ended instances together; the oldest instance of
+    /// the tenant with the most ended log bytes is forgotten first.
     pub max_ended_log_bytes: usize,
 }
 
