@@ -1,6 +1,6 @@
 {
  "generated_by": "crates/ruum-mcp/scripts/gen-tools.mjs",
- "openapi_sha256": "4617ad912b3253b9a9f8df31ec9617c3fadc99e7fc9742020866108d9b11d6a0",
+ "openapi_sha256": "f6354a58c152b0dc1f406d4e0d10a0423e2785af4e6e062e278e94e68efad3a4",
  "tools_sha256": "7c0f87dbfe0d213331bcdb9ae2540b089901de39717aa2e9b49baa162111d966",
  "tools": [
   {
