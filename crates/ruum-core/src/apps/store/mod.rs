@@ -341,6 +341,31 @@ pub struct ExpiredPreview {
     pub id: Uuid,
 }
 
+/// A deployment as the garbage collection of static sites sees it
+/// ([`AppStore::static_deployments`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticDeployment {
+    pub id: Uuid,
+    pub app_node_id: NodeId,
+    /// The site of the deployment may still be served or deployed again: a live deployment
+    /// (the one that serves and every earlier release, which a rollback deploys again; the
+    /// release history is the rollback list, as for the archive chunks), or a preview that has
+    /// not ended (`pending`, `running`, `ready`). A failed, expired or superseded preview never
+    /// comes back.
+    pub reachable: bool,
+}
+
+/// The storage a tenant uses outside the apps area, for the quota of static sites
+/// ([`AppStore::storage_usage`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageUsage {
+    /// The bytes of the tenant's files (the sum of the node sizes, as the blob store counts
+    /// them for its own quota check).
+    pub file_bytes: i64,
+    /// The members of the tenant who count for a team plan's storage (not guests).
+    pub members: u32,
+}
+
 /// The encoding of a release version (decision 0006-2).
 pub const RELEASE_ENCODING: &str = "app_release_v1";
 
@@ -637,6 +662,41 @@ pub trait AppStore: Send + Sync {
     /// tenant call.
     async fn expire_previews(&self, now: OffsetDateTime, limit: u32)
     -> Result<Vec<ExpiredPreview>>;
+
+    /// Every deployment of the tenant, with whether its static site is still reachable (see
+    /// [`StaticDeployment::reachable`]). For the garbage collection of static sites (backlog
+    /// W2S-1). No permission check.
+    async fn static_deployments(&self, tenant: TenantId) -> Result<Vec<StaticDeployment>>;
+
+    /// The storage the tenant uses for its files, and its member count (backlog W2S-1: the
+    /// quota of static sites). The in-memory store sees no files: it answers what
+    /// `set_storage_usage` (tests) stored, else nothing used.
+    async fn storage_usage(&self, tenant: TenantId) -> Result<StorageUsage>;
+
+    /// Takes the site lock of the tenant across processes and holds it until the guard drops:
+    /// shared (`exclusive` false) while a deployment writes a site or copies an index, exclusive
+    /// while the garbage collection of the tenant's static objects runs (backlog W2S-1). Waits
+    /// at most `wait`, then `409 conflict`. The in-memory store lives in one process, where the
+    /// service's own lock is enough, so its guard holds nothing.
+    async fn lock_static_sites(
+        &self,
+        tenant: TenantId,
+        exclusive: bool,
+        wait: std::time::Duration,
+    ) -> Result<LiveSwitchLock>;
+}
+
+/// `409 conflict` when the site lock of a tenant stays taken (a site is written, or the
+/// garbage collection of static sites runs).
+pub(crate) fn sites_busy() -> Error {
+    Error::Api(
+        crate::error::ApiError::new(
+            crate::error::ErrorCode::Conflict,
+            "the static sites of this space are being cleaned up or written",
+        )
+        .with_hint("try again in a minute")
+        .with_retry_after(30),
+    )
 }
 
 // ---------------------------------------------------------------------------- cursors
@@ -705,7 +765,8 @@ pub(crate) fn version_page(items: &mut Vec<Version>, limit: usize) -> Page<Versi
     }
 }
 
-/// The guard of [`AppStore::lock_live_switch`]: the lock is held until it drops.
+/// The guard of [`AppStore::lock_live_switch`] and [`AppStore::lock_static_sites`]: the lock
+/// is held until it drops.
 pub struct LiveSwitchLock {
     _held: Option<Box<dyn std::any::Any + Send>>,
 }
