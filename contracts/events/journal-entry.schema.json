@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ruum.space/contracts/events/journal-entry.schema.json",
   "title": "Journal entry",
-  "description": "One change in the tenant journal (docs/DESIGN.md, section 2.5). The changes feed (GET /v1/changes), agent activity, the outbox to the event bus and webhooks all carry this envelope. `seq` grows by one per change in the tenant. `data` depends on `type`.",
+  "description": "One change in the tenant journal (docs/DESIGN.md, section 2.5). The changes feed (GET /v1/changes), agent activity, the outbox to the event bus and webhooks all carry this envelope. `seq` grows by one per change in the tenant. `data` depends on `type`. The list of types grows: a reader accepts a type it does not know as a change of `node_id` with no details, and never fails on it. During a rolling deploy (design 12.7, backlog P-57) a server of the previous release passes such an entry on with the envelope as written and `data` as `{}`.",
   "type": "object",
   "required": [
     "tenant_id",

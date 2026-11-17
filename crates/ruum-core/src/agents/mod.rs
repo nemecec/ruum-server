@@ -210,6 +210,9 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         AppDeployed | AppDeploymentFailed | AppRolledBack => None,
         AppRoleGranted => Some("remove the app role grant"),
         AppRoleRevoked => Some("add the app role grant again"),
+        // A type of a newer release (rolling deploy, backlog P-57): this release does not know
+        // its inverse, so the undo skips it as irreversible.
+        Unknown(_) => None,
     }
 }
 

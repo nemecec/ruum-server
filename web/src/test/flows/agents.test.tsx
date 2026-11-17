@@ -1,5 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
+import type { Schemas } from '../../api/client'
 import { db } from '../../mocks/db'
 import { dialog, ids, personal, renderApp } from '../render'
 import { recordRequests } from '../requests'
@@ -103,6 +104,27 @@ describe('agents', () => {
     // The undone row stays in the list, marked, and cannot be picked again.
     expect(await within(activity).findByText('Undone')).toBeInTheDocument()
     expect(within(activity).getByRole('checkbox', { name: 'Select: Renamed todo.txt to plan.txt' })).toBeDisabled()
+  })
+
+  it('shows an entry of an event type it does not know as a plain change (P-57)', async () => {
+    // A newer server writes a type this build does not know; during a rolling deploy an older
+    // server passes it on in the generic shape (data empty). The page must not fail on it.
+    db.journal.push({
+      tenant_id: ids.personal,
+      seq: 45,
+      node_id: ids.plan,
+      revision: 2,
+      type: 'app.from_a_newer_release' as Schemas['EventType'],
+      actor: { kind: 'agent', id: ids.agentClaude, display_name: 'Claude Desktop' },
+      on_behalf_of: ids.ada,
+      at: '2026-11-05T16:30:00Z',
+      data: {},
+    })
+    renderApp(`${personal}/agents/${ids.agentClaude}`)
+    const activity = await screen.findByRole('region', { name: 'Activity' })
+    expect(await within(activity).findByRole('checkbox', { name: 'Select: Changed plan.txt' })).toBeInTheDocument()
+    // The known entries still show as before.
+    expect(within(activity).getByRole('checkbox', { name: 'Select: Renamed todo.txt to plan.txt' })).toBeInTheDocument()
   })
 
   it('names who changed an item later, when the undo skips it (C-11)', async () => {

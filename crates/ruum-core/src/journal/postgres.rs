@@ -31,6 +31,7 @@ pub async fn append(
     ctx: &Context,
     entry: NewEntry,
 ) -> Result<JournalEntry> {
+    super::refuse_unknown(&entry)?;
     let seq = match next_seq(conn, ctx.tenant).await? {
         Some(seq) => seq,
         None => {
@@ -105,10 +106,12 @@ macro_rules! columns {
     };
 }
 
-fn entry_from_row(row: &PgRow) -> Result<JournalEntry> {
+/// One journal row. A type that this release does not know (a newer release wrote it during a
+/// rolling deploy) never fails the read: the entry comes in the generic shape
+/// ([`JournalEntry::generic_if_unknown`], backlog P-57).
+pub(crate) fn entry_from_row(row: &PgRow) -> Result<JournalEntry> {
     let event: String = row.try_get("type")?;
-    let event = super::EventType::parse(&event)
-        .ok_or_else(|| Error::Internal(format!("unknown journal event type {event}")))?;
+    let event = EventType::from_wire(&event);
     let kind: PrincipalKind = row.try_get("actor_kind")?;
     Ok(JournalEntry {
         tenant_id: TenantId(row.try_get::<Uuid, _>("tenant_id")?),
@@ -125,7 +128,52 @@ fn entry_from_row(row: &PgRow) -> Result<JournalEntry> {
         },
         at: row.try_get::<OffsetDateTime, _>("at")?,
         data: row.try_get("data")?,
-    })
+    }
+    .generic_if_unknown())
+}
+
+/// Writes an entry of a type by its wire name, as a newer release would write a type that this
+/// release does not know. Only for the tests of backlog P-57 (an old reader and a new type).
+#[cfg(test)]
+pub(crate) async fn append_as_newer_release(
+    conn: &mut PgConnection,
+    ctx: &Context,
+    node_id: Option<NodeId>,
+    type_name: &str,
+    data: serde_json::Value,
+) -> Result<i64> {
+    let seq = match next_seq(conn, ctx.tenant).await? {
+        Some(seq) => seq,
+        None => {
+            sqlx::query(
+                "insert into journal_counters (tenant_id) values ($1) on conflict do nothing",
+            )
+            .bind(ctx.tenant.0)
+            .execute(&mut *conn)
+            .await?;
+            next_seq(conn, ctx.tenant)
+                .await?
+                .ok_or_else(|| Error::Internal("journal counter row is missing".into()))?
+        }
+    };
+    sqlx::query(
+        "insert into journal \
+             (tenant_id, seq, node_id, revision, type, actor_kind, actor, on_behalf_of, at, data) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(ctx.tenant.0)
+    .bind(seq)
+    .bind(node_id.map(|n| n.0))
+    .bind(node_id.map(|_| 1_i64))
+    .bind(type_name)
+    .bind(ctx.actor.actor.kind)
+    .bind(ctx.actor.actor.id.0)
+    .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+    .bind(crate::now())
+    .bind(&data)
+    .execute(&mut *conn)
+    .await?;
+    Ok(seq)
 }
 
 /// The read side of the journal on Postgres.

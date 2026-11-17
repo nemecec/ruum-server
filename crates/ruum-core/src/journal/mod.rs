@@ -34,64 +34,45 @@ use time::OffsetDateTime;
 
 /// The type of a journal event. The wire names (`node.created`, ...) match the event schemas in
 /// `contracts/events/`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// [`EventType::Unknown`] is a type that a newer release writes and this release does not know
+/// (backlog P-57, design 12.7): during a rolling deploy old and new pods share one journal. The
+/// readers never fail on it ([`EventType::from_wire`]); they pass the entry on in a generic shape
+/// ([`JournalEntry::generic_if_unknown`]: the envelope as written, `data` empty). This release
+/// never writes it. On the wire it is the type name as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EventType {
-    #[serde(rename = "node.created")]
     NodeCreated,
-    #[serde(rename = "node.renamed")]
     NodeRenamed,
-    #[serde(rename = "node.moved")]
     NodeMoved,
-    #[serde(rename = "node.copied")]
     NodeCopied,
-    #[serde(rename = "node.trashed")]
     NodeTrashed,
-    #[serde(rename = "node.restored")]
     NodeRestored,
-    #[serde(rename = "node.purged")]
     NodePurged,
-    #[serde(rename = "version.created")]
     VersionCreated,
-    #[serde(rename = "version.restored")]
     VersionRestored,
-    #[serde(rename = "version.labeled")]
     VersionLabeled,
-    #[serde(rename = "tag.attached")]
     TagAttached,
-    #[serde(rename = "tag.detached")]
     TagDetached,
-    #[serde(rename = "grant.added")]
     GrantAdded,
-    #[serde(rename = "grant.updated")]
     GrantUpdated,
-    #[serde(rename = "grant.removed")]
     GrantRemoved,
-    #[serde(rename = "share_link.created")]
     ShareLinkCreated,
-    #[serde(rename = "share_link.revoked")]
     ShareLinkRevoked,
-    #[serde(rename = "node.sharing_updated")]
     NodeSharingUpdated,
-    #[serde(rename = "database.columns_confirmed")]
     DatabaseColumnsConfirmed,
-    #[serde(rename = "database.grant_created")]
     DatabaseGrantCreated,
-    #[serde(rename = "database.grant_revoked")]
     DatabaseGrantRevoked,
-    #[serde(rename = "database.approval_decided")]
     DatabaseApprovalDecided,
-    #[serde(rename = "app.settings_changed")]
     AppSettingsChanged,
-    #[serde(rename = "app.deployed")]
     AppDeployed,
-    #[serde(rename = "app.deployment_failed")]
     AppDeploymentFailed,
-    #[serde(rename = "app.rolled_back")]
     AppRolledBack,
-    #[serde(rename = "app.role_granted")]
     AppRoleGranted,
-    #[serde(rename = "app.role_revoked")]
     AppRoleRevoked,
+    /// A type written by a newer release; the name as written (interned, see
+    /// [`EventType::from_wire`]).
+    Unknown(&'static str),
 }
 
 impl EventType {
@@ -159,12 +140,77 @@ impl EventType {
             AppRolledBack => "app.rolled_back",
             AppRoleGranted => "app.role_granted",
             AppRoleRevoked => "app.role_revoked",
+            Unknown(name) => name,
         }
     }
 
-    /// The event type of a wire name.
+    /// The event type of a wire name this release knows, or `None`.
     pub fn parse(s: &str) -> Option<EventType> {
         Self::ALL.iter().copied().find(|e| e.as_str() == s)
+    }
+
+    /// The event type of a wire name read from the journal: a known type, or
+    /// [`EventType::Unknown`] for a type of a newer release. Never fails, so an old pod reads a
+    /// journal that a new pod writes to (backlog P-57).
+    pub fn from_wire(s: &str) -> EventType {
+        Self::parse(s).unwrap_or_else(|| EventType::Unknown(intern_unknown(s)))
+    }
+
+    /// Whether this release knows the type (every type but [`EventType::Unknown`]).
+    pub fn is_known(self) -> bool {
+        !matches!(self, EventType::Unknown(_))
+    }
+}
+
+/// The name of an unknown type whose wire name is not well formed, or when the table of
+/// unknown names is full.
+pub const UNKNOWN_EVENT_NAME: &str = "unknown";
+
+/// The most distinct unknown names one process keeps.
+const MAX_UNKNOWN_NAMES: usize = 64;
+
+/// The longest wire name kept as written.
+const MAX_EVENT_NAME_LEN: usize = 64;
+
+/// A `'static` copy of an unknown wire name, so [`EventType`] stays `Copy`. Only the release's
+/// own writers fill the `type` column, so the names are few; the table is capped anyway, and a
+/// name that is not of the form `area.event` (lowercase letters, digits, `_`) becomes
+/// [`UNKNOWN_EVENT_NAME`].
+fn intern_unknown(name: &str) -> &'static str {
+    use std::sync::Mutex;
+    static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let well_formed = !name.is_empty()
+        && name.len() <= MAX_EVENT_NAME_LEN
+        && name.contains('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.');
+    if !well_formed {
+        return UNKNOWN_EVENT_NAME;
+    }
+    let mut names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(n) = names.iter().find(|n| **n == name) {
+        return n;
+    }
+    if names.len() >= MAX_UNKNOWN_NAMES {
+        return UNKNOWN_EVENT_NAME;
+    }
+    let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.push(kept);
+    kept
+}
+
+impl Serialize for EventType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventType {
+    /// Lenient, like the journal readers: an unknown name gives [`EventType::Unknown`].
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let name = std::borrow::Cow::<'de, str>::deserialize(d)?;
+        Ok(EventType::from_wire(&name))
     }
 }
 
@@ -186,6 +232,19 @@ pub struct JournalEntry {
     pub at: OffsetDateTime,
     /// Event-specific data, as in the event schema.
     pub data: serde_json::Value,
+}
+
+impl JournalEntry {
+    /// The generic shape of an entry whose type this release does not know (backlog P-57): the
+    /// envelope as written and `data` empty (`{}`). This release cannot tell what the data of
+    /// such a type holds, or who may read it, so it passes on only that the node changed; the
+    /// client reads the node again. Entries of known types are returned as they are.
+    pub fn generic_if_unknown(mut self) -> Self {
+        if !self.event.is_known() {
+            self.data = serde_json::Value::Object(serde_json::Map::new());
+        }
+        self
+    }
 }
 
 /// Whether the caller gained or lost access to a subtree.
@@ -231,6 +290,18 @@ pub struct NewEntry {
     pub revision: Option<i64>,
     pub event: EventType,
     pub data: serde_json::Value,
+}
+
+/// A release writes only the types it knows; [`EventType::Unknown`] exists for reading.
+pub(crate) fn refuse_unknown(entry: &NewEntry) -> Result<()> {
+    if entry.event.is_known() {
+        Ok(())
+    } else {
+        Err(Error::Internal(format!(
+            "a journal entry of unknown type {} cannot be written",
+            entry.event.as_str()
+        )))
+    }
 }
 
 /// The read side of the journal. Appending is not in this trait: it must run in the
@@ -544,6 +615,106 @@ mod tests {
             assert_eq!(EventType::parse(e.as_str()), Some(*e));
         }
         assert_eq!(EventType::parse("node.exploded"), None);
+    }
+
+    /// Backlog P-57: a type that a newer release writes reads as [`EventType::Unknown`], keeps
+    /// its name on the wire and never fails.
+    #[test]
+    fn a_type_of_a_newer_release_reads_without_failing() {
+        let e = EventType::from_wire("app.from_a_newer_release");
+        assert_eq!(e, EventType::Unknown("app.from_a_newer_release"));
+        assert!(!e.is_known());
+        assert_eq!(e.as_str(), "app.from_a_newer_release");
+        assert_eq!(EventType::parse("app.from_a_newer_release"), None);
+        // One copy per name.
+        let again = EventType::from_wire("app.from_a_newer_release");
+        assert!(std::ptr::eq(e.as_str(), again.as_str()));
+        // Known names stay known, in both directions of serde.
+        for k in EventType::ALL {
+            assert!(k.is_known());
+            assert_eq!(EventType::from_wire(k.as_str()), *k);
+            let back: EventType = serde_json::from_value(serde_json::to_value(k).unwrap()).unwrap();
+            assert_eq!(back, *k);
+        }
+        // Serde is lenient too, and writes the name as it was read.
+        let read: EventType = serde_json::from_str("\"issue.reveal_requested_v2\"").unwrap();
+        assert_eq!(read.as_str(), "issue.reveal_requested_v2");
+        assert_eq!(
+            serde_json::to_value(read).unwrap(),
+            serde_json::json!("issue.reveal_requested_v2")
+        );
+        // A name that is not of the form `area.event` is never kept as written.
+        let long = format!("a.{}", "b".repeat(MAX_EVENT_NAME_LEN));
+        for odd in [
+            "",
+            "nodot",
+            "Node.Created",
+            "node.created;drop",
+            "x.\u{e9}",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                EventType::from_wire(odd),
+                EventType::Unknown(UNKNOWN_EVENT_NAME),
+                "{odd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_entry_has_the_generic_shape() {
+        let schema = schema();
+        let entry = |event| JournalEntry {
+            tenant_id: TenantId(Uuid::now_v7()),
+            seq: 7,
+            node_id: Some(NodeId(Uuid::now_v7())),
+            revision: Some(3),
+            event,
+            actor: Actor::user(UserId(Uuid::now_v7())),
+            at: OffsetDateTime::UNIX_EPOCH,
+            data: serde_json::json!({ "secret_name": "DB_PASSWORD" }),
+        };
+        let known = entry(EventType::NodeRenamed).generic_if_unknown();
+        assert_eq!(known.data["secret_name"], "DB_PASSWORD");
+        let generic = entry(EventType::from_wire("app.secret_rotated")).generic_if_unknown();
+        let value = serde_json::to_value(&generic).unwrap();
+        assert_eq!(value["type"], "app.secret_rotated");
+        assert_eq!(value["data"], serde_json::json!({}));
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["revision"], 3);
+        // The envelope fields are all there, as for a known type.
+        let keys: BTreeSet<String> = value.as_object().unwrap().keys().cloned().collect();
+        for r in schema["required"].as_array().unwrap() {
+            assert!(keys.contains(r.as_str().unwrap()), "{r}");
+        }
+        // A client that reads it back gets the same entry.
+        let back: JournalEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(back.event.as_str(), "app.secret_rotated");
+    }
+
+    /// A release writes only the types it knows.
+    #[test]
+    fn an_unknown_type_is_never_written() {
+        let j = memory::MemoryJournal::default();
+        let ctx = Context {
+            tenant: TenantId(Uuid::now_v7()),
+            actor: Actor::user(UserId(Uuid::now_v7())),
+            scope: None,
+            idempotency_key: None,
+        };
+        let err = j
+            .append(
+                &ctx,
+                NewEntry {
+                    node_id: None,
+                    revision: None,
+                    event: EventType::from_wire("node.exploded"),
+                    data: serde_json::json!({}),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        assert!(j.entries(ctx.tenant).is_empty());
     }
 
     #[test]

@@ -754,13 +754,14 @@ impl AgentStore for PgAgentStore {
                 let event: String = r.try_get("type")?;
                 let kind: PrincipalKind = r.try_get("actor_kind")?;
                 let actor: Uuid = r.try_get("actor")?;
+                // A type of a newer release (rolling deploy) comes in the generic shape and
+                // never fails the read (backlog P-57).
                 Ok(JournalEntry {
                     tenant_id: r.try_get("tenant_id")?,
                     seq: r.try_get("seq")?,
                     node_id: r.try_get("node_id")?,
                     revision: r.try_get("revision")?,
-                    event: serde_json::from_value(serde_json::Value::String(event))
-                        .map_err(|e| Error::Internal(e.to_string()))?,
+                    event: crate::journal::EventType::from_wire(&event),
                     actor: Actor {
                         actor: crate::actor::PrincipalRef {
                             kind,
@@ -770,7 +771,8 @@ impl AgentStore for PgAgentStore {
                     },
                     at: r.try_get("at")?,
                     data: r.try_get("data")?,
-                })
+                }
+                .generic_if_unknown())
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(page(items, off, limit))

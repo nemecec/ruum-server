@@ -1040,6 +1040,47 @@ fn unique_agent_names_skip_taken_suffixes() {
     assert!(n.ends_with(" (2)"));
 }
 
+/// Backlog P-57: the activity of an agent reads a type that a newer release wrote (rolling
+/// deploy) in the generic shape instead of failing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn activity_reads_a_type_of_a_newer_release(pool: sqlx::PgPool) {
+    let a = crate::identity::tests::postgres(pool.clone());
+    let t = team(&a).await;
+    let mc = ctx(t.tenant.id, t.member.id);
+    let agent = a
+        .agents
+        .register(&mc, new_agent("bot", None))
+        .await
+        .unwrap();
+    let ac = as_agent(t.tenant.id, &agent);
+    let node = NodeId::new();
+    let mut tx = crate::journal::postgres::begin_tenant(&pool, t.tenant.id)
+        .await
+        .unwrap();
+    let seq = crate::journal::postgres::append_as_newer_release(
+        &mut tx,
+        &ac,
+        Some(node),
+        "app.from_a_newer_release",
+        serde_json::json!({ "secret_name": "DB_PASSWORD" }),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let page = a
+        .agents
+        .activity(&mc, agent.id, None, PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    let e = &page.items[0];
+    assert_eq!(e.seq, seq);
+    assert_eq!(e.node_id, Some(node));
+    assert_eq!(e.event.as_str(), "app.from_a_newer_release");
+    assert!(!e.event.is_known());
+    assert_eq!(e.data, serde_json::json!({}));
+}
+
 /// Migration 0003 renames the duplicate agent names that exist before the unique index: the
 /// oldest keeps its name, the others are numbered by age, skipping names that are taken.
 #[sqlx::test(migrations = "../../migrations")]

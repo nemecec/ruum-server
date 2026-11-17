@@ -426,6 +426,8 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
         AppDeployed | AppDeploymentFailed | AppRolledBack => return Ok(None),
         // `undo_action` gives `None`: only a person decides an approval.
         DatabaseApprovalDecided => return Ok(None),
+        // `undo_action` gives `None`: a type of a newer release (backlog P-57).
+        Unknown(_) => return Ok(None),
     };
     Ok(Some(change))
 }
@@ -595,6 +597,97 @@ mod tests {
         let e = last(s, ctx).await;
         assert_eq!(e.event, event);
         invert(s, ctx, &e).await.unwrap()
+    }
+
+    /// Backlog P-57: an agent's entry of a type that a newer release wrote (rolling deploy) is
+    /// skipped as irreversible; the undo does not fail and still reverts the other entries.
+    #[tokio::test]
+    async fn an_entry_of_a_newer_release_is_skipped_as_irreversible() {
+        let (s, h) = Services::in_memory_with_handles();
+        let login = crate::identity::VerifiedLogin {
+            issuer: "https://idp.ruum.test".into(),
+            subject: format!("undo-{}", Uuid::now_v7()),
+            email: Some(format!("undo-{}@example.test", Uuid::now_v7())),
+            email_verified: true,
+            name: Some("Undo".into()),
+            id_token: None,
+        };
+        let user = s.identity.upsert_from_login(&login).await.unwrap();
+        let (tenant, _) = s.tenants.list_for_user(user.id).await.unwrap().remove(0);
+        let ctx = Context {
+            tenant: tenant.id,
+            actor: Actor::user(user.id),
+            scope: None,
+            idempotency_key: None,
+        };
+        let agent = s
+            .agents
+            .register(
+                &ctx,
+                super::super::NewAgent {
+                    name: "bot".into(),
+                    description: None,
+                    scope: super::super::AgentScope {
+                        subtree: None,
+                        max_role: Role::Edit,
+                        expires_at: None,
+                        budget: Default::default(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let ac = Context {
+            tenant: tenant.id,
+            actor: Actor {
+                actor: crate::actor::PrincipalRef {
+                    kind: crate::actor::PrincipalKind::Agent,
+                    id: agent.id.into(),
+                },
+                on_behalf_of: Some(user.id),
+            },
+            scope: Some(agent.scope.as_scope()),
+            idempotency_key: None,
+        };
+        let a = s
+            .nodes
+            .create(&ac, new_node(tenant.root_node_id, "A", NodeKind::Folder))
+            .await
+            .unwrap()
+            .value;
+        let created = s.journal.latest_seq(&ctx).await.unwrap();
+        let newer = h.journal.append_as_newer_release(
+            &ac,
+            Some(a.id),
+            "app.from_a_newer_release",
+            serde_json::json!({}),
+        );
+        let report = undo(
+            &s,
+            &ctx,
+            agent.id,
+            UndoRequest {
+                since: None,
+                until: None,
+                seqs: Some(vec![created, newer]),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.reverted.iter().map(|i| i.seq).collect::<Vec<_>>(),
+            vec![created]
+        );
+        assert_eq!(report.skipped.len(), 1);
+        let skipped = &report.skipped[0];
+        assert_eq!(skipped.seq, newer);
+        assert_eq!(skipped.reason, Some(UndoSkipReason::Irreversible));
+        assert_eq!(
+            serde_json::to_value(skipped).unwrap()["type"],
+            "app.from_a_newer_release"
+        );
+        assert!(s.nodes.get(&ctx, a.id).await.unwrap().trashed_at.is_some());
     }
 
     #[tokio::test]

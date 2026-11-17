@@ -2270,6 +2270,9 @@ export interface paths {
          *     IDs in `data` may name nodes that the caller cannot see, also nodes that are gone (for
          *     example `old_parent_id` of a move); resolve them with `getNode`, which answers `404`.
          *     Names, paths and every other attribute of such a node never appear (decision 0003-8).
+         *
+         *     An entry of a type that the client does not know is a change of its node with no
+         *     details (see `EventType`); the client reads the node again and follows on.
          */
         get: operations["listChanges"];
         put?: never;
@@ -5754,6 +5757,14 @@ export interface components {
          *     `$defs/planned_types` of `contracts/events/journal-entry.schema.json` (step 2 and the
          *     step 3 types `app.*`, `issue.*`, `template.*`, `project.*`) are planned: specified, not
          *     written by the server yet (decision 0004-21).
+         *
+         *     The list grows. A client accepts an entry whose type is not in this list and treats it
+         *     as a change of its node (`node_id`) with no details: it reads the node again, and does
+         *     not fail. During a rolling deploy (design 12.7, backlog P-57) a server of the previous
+         *     release passes on an entry of a type it does not know in this generic shape: the
+         *     envelope as written (`seq`, `node_id`, `revision`, `type`, `actor`, `at`) and `data` as
+         *     `{}`. It sends such an entry when the caller sees its node now (an entry without a node:
+         *     to members), and gives no `resync` marker for it.
          * @enum {string}
          */
         EventType: "node.created" | "node.renamed" | "node.moved" | "node.copied" | "node.trashed" | "node.restored" | "node.purged" | "version.created" | "version.restored" | "version.labeled" | "tag.attached" | "tag.detached" | "grant.added" | "grant.updated" | "grant.removed" | "share_link.created" | "share_link.revoked" | "node.sharing_updated" | "typed_node.status_changed" | "database.columns_confirmed" | "database.migration_applied" | "database.migration_failed" | "database.branch_created" | "database.restore_started" | "database.restored" | "database.restore_failed" | "database.grant_created" | "database.grant_revoked" | "database.approval_decided" | "app.deployed" | "app.deployment_failed" | "app.rolled_back" | "app.settings_changed" | "app.binding_granted" | "app.binding_revoked" | "app.role_granted" | "app.role_revoked" | "app.secret_changed" | "app.domain_added" | "app.domain_removed" | "app.api_key_created" | "app.api_key_revoked" | "app.approval_decided" | "app.telemetry_fields_confirmed" | "issue.created" | "issue.status_changed" | "issue.reveal_requested" | "issue.reveal_decided" | "template.instantiated" | "project.publication_changed";
