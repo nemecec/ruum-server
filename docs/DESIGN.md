@@ -1908,6 +1908,10 @@ every restart); this section is the target before real users.
   - drop a column or table: only when the release before no longer reads or writes it;
   - constraints and indexes on large tables: `CREATE INDEX CONCURRENTLY`, constraints added
     `NOT VALID` and validated later, so no long lock.
+- Journal event types follow the same split. A release reads unknown types in a generic shape
+  (every envelope field, `data` as `{}`; P-57). A release that writes a new type ships only after
+  the release before it reads unknown types. A type is never renamed or dropped while the release
+  before still writes it.
 - Migrations only go forward. A migration that drops data (the contract step) needs the
   backup before it, and is reviewed as risky (section 18).
 - **CI checks the rule**: the test suite of the previous release (the commit live on staging, or the
@@ -2130,7 +2134,8 @@ The step 1 contract decisions (roles and the `share` permission, tenant header, 
 42. **Updates without downtime** (section 12.7). *Decided 2026-11-12: every migration keeps the
     previous release working (expand, then contract), checked in CI with the previous release's
     tests; migrations as a step before a rolling update; open tabs get a reload notice, forced
-    only for a client the API no longer supports.*
+    only for a client the API no longer supports. Journal event types split the same way: readers
+    pass unknown types on first, writers of a new type ship a release later (12.7, P-57).*
 43. **Sharing apps between tenants** (section 9.13). *Provisional 2026-11-12: every installation
     is a fork with an upstream link; updates arrive through git, merged by agents, and are
     always approved downstream (later delegable to an agent), never pushed; agents on both sides

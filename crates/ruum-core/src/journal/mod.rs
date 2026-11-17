@@ -208,6 +208,9 @@ impl Serialize for EventType {
 
 impl<'de> Deserialize<'de> for EventType {
     /// Lenient, like the journal readers: an unknown name gives [`EventType::Unknown`].
+    /// Only for stored rows and responses. A request field of this type (for example a webhook
+    /// or event filter) must validate with [`EventType::parse`] instead, so a client cannot name
+    /// a type this release does not know.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let name = std::borrow::Cow::<'de, str>::deserialize(d)?;
         Ok(EventType::from_wire(&name))

@@ -8816,9 +8816,10 @@ components:
         The list grows. A client accepts an entry whose type is not in this list and treats it
         as a change of its node (`node_id`) with no details: it reads the node again, and does
         not fail. During a rolling deploy (design 12.7, backlog P-57) a server of the previous
-        release passes on an entry of a type it does not know in this generic shape: the
-        envelope as written (`seq`, `node_id`, `revision`, `type`, `actor`, `at`) and `data` as
-        `{}`. It sends such an entry when the caller sees its node now (an entry without a node:
+        release passes on an entry of a type it does not know in this generic shape: every
+        envelope field as written (`seq`, `tenant_id`, `node_id`, `revision`, `type`, `actor`,
+        `on_behalf_of`, `on_behalf_of_display_name` when filled, `at`); only `data` is `{}`.
+        It sends such an entry when the caller sees its node now (an entry without a node:
         to members), and gives no `resync` marker for it.
       enum:
         - node.created
