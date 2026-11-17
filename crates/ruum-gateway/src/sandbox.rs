@@ -528,7 +528,12 @@ mod tests {
         // App C is over the global cap (A 2 + B 1).
         assert_eq!(rc.0, Route::Busy);
         assert!(rc.1 < Duration::from_millis(100));
-        assert!(started.elapsed() >= Duration::from_millis(400));
+        // A hold ends at its limit, or one retry interval before it when no retry fits.
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(hold.held(), 0);
         // WebSocket shares.
         let hold = SandboxHold::new(
