@@ -676,6 +676,77 @@ pub(crate) async fn deployments_stay_in_their_tenant(h: &dyn Harness) {
 }
 
 /// Runs every case.
+/// The garbage collection of static sites reads which deployments may still be served or
+/// deployed again: live ones (also superseded releases, a rollback deploys them again) and
+/// previews that have not ended; only the tenant's own (backlog W2S-1).
+pub(crate) async fn static_deployments_say_what_is_reachable(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let c = ctx(a, ua);
+    s.insert_app(&c, app(n, &unique("static")))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for (env, state) in [
+        (Environment::Preview, DeploymentState::Pending),
+        (Environment::Preview, DeploymentState::Running),
+        (Environment::Preview, DeploymentState::Ready),
+        (Environment::Live, DeploymentState::Live),
+        (Environment::Live, DeploymentState::Live),
+    ] {
+        let d = s
+            .insert_deployment(&c, deployment(n, env, state))
+            .await
+            .unwrap();
+        ids.insert(d.id, true);
+    }
+    for state in [
+        DeploymentState::Failed,
+        DeploymentState::Expired,
+        DeploymentState::Superseded,
+    ] {
+        let d = s
+            .insert_deployment(
+                &c,
+                deployment(n, Environment::Preview, DeploymentState::Running),
+            )
+            .await
+            .unwrap();
+        assert!(s.set_deployment_state(a, d.id, state).await.unwrap());
+        ids.insert(d.id, false);
+    }
+    let got: std::collections::HashMap<Uuid, bool> = s
+        .static_deployments(a)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| {
+            assert_eq!(d.app_node_id, n);
+            (d.id, d.reachable)
+        })
+        .collect();
+    // The first live release is superseded by the second, and still reachable.
+    assert_eq!(got, ids);
+    // Another tenant sees none of them; its usage starts empty.
+    let other = h.app_node(b, ub).await;
+    s.insert_app(&ctx(b, ub), app(other, &unique("static")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(s.static_deployments(b).await.unwrap().is_empty());
+    assert_eq!(s.storage_usage(b).await.unwrap().file_bytes, 0);
+    // The site lock can be taken and dropped, shared and exclusive.
+    let wait = std::time::Duration::from_secs(5);
+    let one = s.lock_static_sites(a, false, wait).await.unwrap();
+    let two = s.lock_static_sites(a, false, wait).await.unwrap();
+    drop((one, two));
+    let all = s.lock_static_sites(a, true, wait).await.unwrap();
+    drop(all);
+}
+
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
     apps_stay_in_their_tenant(h).await;
@@ -683,6 +754,7 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     deployments_list_and_releases(h).await;
     previews_releases_and_versions(h).await;
     deployments_stay_in_their_tenant(h).await;
+    static_deployments_say_what_is_reachable(h).await;
 }
 
 #[cfg(test)]
@@ -843,6 +915,91 @@ mod tests {
             pool,
         };
         run_all(&h).await;
+    }
+
+    /// The site lock of a tenant is held across connections (processes): writers share it,
+    /// the garbage collection takes it alone, and another tenant is not held up (W2S-1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_site_lock_is_shared_by_writers_and_exclusive_for_the_collection(
+        pool: sqlx::PgPool,
+    ) {
+        use std::time::Duration;
+        let (t, _) = pg_tenant(&pool).await;
+        let (other, _) = pg_tenant(&pool).await;
+        let one = PgAppStore::new(pool.clone());
+        let two = PgAppStore::new(pool.clone());
+        let short = Duration::from_millis(200);
+        let writer = one.lock_static_sites(t, false, short).await.unwrap();
+        let second = two.lock_static_sites(t, false, short).await.unwrap();
+        let busy = two
+            .lock_static_sites(t, true, short)
+            .await
+            .err()
+            .expect("writers hold the lock");
+        assert!(
+            matches!(&busy, Error::Api(e) if e.code == crate::error::ErrorCode::Conflict),
+            "{busy:?}"
+        );
+        let elsewhere = two.lock_static_sites(other, true, short).await.unwrap();
+        drop((writer, second));
+        let gc = two
+            .lock_static_sites(t, true, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(one.lock_static_sites(t, false, short).await.is_err());
+        drop((gc, elsewhere));
+        one.lock_static_sites(t, false, Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    /// The file usage of a tenant is the sum of its node sizes, and its member count leaves
+    /// out guests (the quota of static sites, W2S-1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_storage_usage_counts_files_and_members(pool: sqlx::PgPool) {
+        let (t, u) = pg_tenant(&pool).await;
+        let store = PgAppStore::new(pool.clone());
+        assert_eq!(
+            store.storage_usage(t).await.unwrap(),
+            StorageUsage::default()
+        );
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for size in [1000_i64, 234] {
+            sqlx::query(
+                "insert into nodes (id, tenant_id, parent_id, name, kind, size_bytes, owner_id, \
+                 created_kind, created_by, updated_kind, updated_by) \
+                 select $1, $2, root_node_id, $3, 'file', $4, $5, 'user', $5, 'user', $5 \
+                 from tenants where id = $2",
+            )
+            .bind(NodeId::new())
+            .bind(t)
+            .bind(format!("f{size}"))
+            .bind(size)
+            .bind(u.0)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "insert into memberships (tenant_id, user_id, role, created_kind, created_by) \
+             values ($1, $2, 'owner', 'user', $2)",
+        )
+        .bind(t)
+        .bind(u.0)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let usage = store.storage_usage(t).await.unwrap();
+        assert_eq!(usage.file_bytes, 1234);
+        assert_eq!(usage.members, 1);
+        // Another tenant's files are not counted.
+        let (other, _) = pg_tenant(&pool).await;
+        assert_eq!(store.storage_usage(other).await.unwrap().file_bytes, 0);
     }
 
     /// The live switch of one app is held across connections (processes) until the guard

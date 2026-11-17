@@ -335,18 +335,40 @@ impl AppService {
             .pointer("/static/spa_fallback")
             .and_then(Value::as_str)
             .map(|s| s.trim_start_matches("./").to_string());
-        let written = self
-            .deps
-            .sites
-            .write_site(tenant, run.id, &run.files, spa)
-            .await
-            .map_err(|err| {
-                tracing::warn!(%tenant, deployment = %run.id, error = %err, "the image stage failed");
-                Box::new((
-                    StageError::new("image", "image_failed", "the static files could not be stored"),
-                    None,
-                ))
-            })?;
+        // Under the tenant's site lock (shared), with the free storage as the budget: the
+        // garbage collection never deletes an object that this write found and did not store
+        // again, and the quota holds (backlog W2S-1).
+        let written = async {
+            let _sites = self
+                .lock_sites(tenant, false, crate::apps::static_gc::SITE_LOCK_WAIT)
+                .await?;
+            let free = self.static_free_bytes(tenant).await?;
+            self.deps
+                .sites
+                .write_site_within(tenant, run.id, &run.files, spa, Some(free))
+                .await
+        }
+        .await
+        .map_err(|err| {
+            if let crate::error::Error::Api(a) = &err
+                && a.code == ErrorCode::QuotaExceeded
+            {
+                let mut e = StageError::new("image", "quota_exceeded", a.message.clone());
+                e.code = ErrorCode::QuotaExceeded;
+                e.hint = a.hint.clone();
+                e.details = a.details.as_deref().cloned().unwrap_or(Value::Null);
+                return Box::new((e, None));
+            }
+            tracing::warn!(%tenant, deployment = %run.id, error = %err, "the image stage failed");
+            Box::new((
+                StageError::new(
+                    "image",
+                    "image_failed",
+                    "the static files could not be stored",
+                ),
+                None,
+            ))
+        })?;
         // The files are stored: free their memory and the slot that bounds it.
         run.files = Vec::new();
         run.slot = None;
