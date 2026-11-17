@@ -9,6 +9,10 @@
 //!    when it is stricter).
 //! 4. A suggestion stricter than the class from 2 or 3 applies at once (`secret` over `normal`
 //!    or `personal`, `personal` over `normal`); a looser suggestion waits for a person.
+//! 5. A free-text attribute ([`FREE_TEXT_ATTRIBUTES`]) is at least `personal`, also when a
+//!    person confirmed it as `normal`: free text is `personal` and scrubbed (card O-1a, pipeline
+//!    step 4), like the log text, the span name and the event name, whose class nobody can
+//!    relax either.
 //!
 //! # What a class does to a value
 //!
@@ -31,8 +35,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Attributes whose value is free text (OTel semantic conventions): a `personal` value is
-/// scrubbed with patterns instead of becoming one pseudonym.
+/// scrubbed with patterns instead of becoming one pseudonym. Their class is never looser than
+/// `personal` ([`effective_class`]).
 pub const FREE_TEXT_ATTRIBUTES: &[&str] = &["exception.message", "exception.stacktrace"];
+
+/// Whether a key is a free-text attribute ([`FREE_TEXT_ATTRIBUTES`], any case).
+pub fn is_free_text_attribute(key: &str) -> bool {
+    FREE_TEXT_ATTRIBUTES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(key))
+}
 
 /// The effective class of a field (the rules of the module docs).
 pub fn effective_class(name: &str, kind: FieldKind, classes: &FieldClasses) -> FieldClass {
@@ -47,9 +59,15 @@ pub fn effective_class(name: &str, kind: FieldKind, classes: &FieldClasses) -> F
     } else {
         entry.class.max(FieldClass::Personal)
     };
-    match entry.suggested {
+    let class = match entry.suggested {
         Some(s) if s > base => s,
         _ => base,
+    };
+    // Free text is at least personal (rule 5), whatever a person confirmed.
+    if is_free_text_attribute(name) {
+        class.max(FieldClass::Personal)
+    } else {
+        class
     }
 }
 
@@ -177,8 +195,20 @@ struct Pipeline<'a> {
     report: IngestReport,
 }
 
+/// The bytes the batch size cap counts for each value (attribute, field, label, event, link)
+/// on top of its key and text: about the size of one stored pseudonym attribute in memory
+/// and in JSON. So the batch byte cap also bounds the output; an empty value never costs
+/// nothing (review K4: 256 empty fields per record made about 50 times the input).
+pub const VALUE_OVERHEAD: usize = 64;
+
+/// The bytes the batch size cap counts for each record on top of its values: the record frame
+/// and the four identity attributes the pipeline adds.
+pub const RECORD_OVERHEAD: usize = 256;
+
 fn attrs_size(a: &[Attribute]) -> usize {
-    a.iter().map(|a| a.key.len() + a.value.size()).sum()
+    a.iter()
+        .map(|a| VALUE_OVERHEAD + a.key.len() + a.value.size())
+        .sum()
 }
 
 fn attrs_max(a: &[Attribute]) -> usize {
@@ -189,7 +219,8 @@ fn attrs_max(a: &[Attribute]) -> usize {
 }
 
 fn log_size(r: &LogRecord) -> usize {
-    16 + attrs_size(&r.attributes)
+    RECORD_OVERHEAD
+        + attrs_size(&r.attributes)
         + match &r.body {
             LogBody::Template { template, fields } => template.len() + attrs_size(fields),
             LogBody::Text(t) => t.len(),
@@ -212,22 +243,25 @@ fn log_longest(r: &LogRecord) -> usize {
 }
 
 fn metric_size(r: &MetricPoint) -> usize {
-    16 + r.name.len() + attrs_size(&r.labels)
+    RECORD_OVERHEAD + r.name.len() + attrs_size(&r.labels)
 }
 
 fn span_size(r: &Span) -> usize {
-    32 + r.trace_id.len()
+    RECORD_OVERHEAD
+        + r.trace_id.len()
         + r.span_id.len()
         + r.name.len()
         + r.status_message.as_ref().map_or(0, String::len)
         + attrs_size(&r.attributes)
         + r.events
             .iter()
-            .map(|e| e.name.len() + attrs_size(&e.attributes))
+            .map(|e| VALUE_OVERHEAD + e.name.len() + attrs_size(&e.attributes))
             .sum::<usize>()
         + r.links
             .iter()
-            .map(|l| l.trace_id.len() + l.span_id.len() + attrs_size(&l.attributes))
+            .map(|l| {
+                VALUE_OVERHEAD + l.trace_id.len() + l.span_id.len() + attrs_size(&l.attributes)
+            })
             .sum::<usize>()
 }
 
@@ -350,7 +384,7 @@ impl Pipeline<'_> {
                 // end user, goes here, after the secret matcher. Nothing keeps the raw value
                 // in card O-1a.
                 if let AttrValue::Str(s) = value
-                    && FREE_TEXT_ATTRIBUTES.contains(&key)
+                    && is_free_text_attribute(key)
                 {
                     return Some(StoredValue::Text(self.free_text(s)));
                 }

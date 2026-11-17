@@ -239,6 +239,33 @@ fn class_precedence_table() {
         classify::effective_class("route", FieldKind::SpanAttribute, &c),
         Normal
     );
+    // A free-text attribute is at least personal, also confirmed normal (review K3); a
+    // stricter class or suggestion still wins.
+    for kind in [
+        FieldKind::LogField,
+        FieldKind::SpanAttribute,
+        FieldKind::MetricLabel,
+    ] {
+        for name in [
+            "exception.message",
+            "exception.stacktrace",
+            "Exception.Message",
+        ] {
+            let mut c = FieldClasses::new();
+            c.set(kind, name, FieldClassEntry::confirmed(Normal));
+            assert_eq!(
+                classify::effective_class(name, kind, &c),
+                Personal,
+                "{name}"
+            );
+            c.set(
+                kind,
+                name,
+                FieldClassEntry::confirmed(Normal).with_suggestion(Secret),
+            );
+            assert_eq!(classify::effective_class(name, kind, &c), Secret, "{name}");
+        }
+    }
 }
 
 #[test]
@@ -624,8 +651,9 @@ fn caps_drop_whole_records_with_a_reason() {
     assert_eq!(report.dropped(DropReason::TooManyFields), 1);
     assert_eq!(report.dropped(DropReason::TooManyRecords), 1);
 
+    // Each text log counts the record overhead and its 10 bytes: one fits, two do not.
     let small = Limits {
-        max_batch_bytes: 40,
+        max_batch_bytes: classify::RECORD_OVERHEAD + 20,
         ..limits
     };
     let batch = Batch {
@@ -642,6 +670,88 @@ fn caps_drop_whole_records_with_a_reason() {
     );
     assert_eq!(out.logs.len(), 1);
     assert_eq!(report.dropped(DropReason::BatchTooLarge), 1);
+}
+
+/// The worst case of review K4: records full of empty, unclassified fields. Each becomes a
+/// pseudonym attribute, so without a per-value cost a small batch makes a large output. The
+/// output must stay within twice the batch byte cap, with the default caps and a small cap.
+#[test]
+fn empty_fields_do_not_amplify_the_output() {
+    let id = identity();
+    let run = |limits: Limits, records: usize| {
+        let empty =
+            |n: usize| -> Vec<Attribute> { (0..n).map(|_| Attribute::new("a", "")).collect() };
+        let t = crate::now();
+        let batch = Batch {
+            logs: (0..records)
+                .map(|_| LogRecord {
+                    time: t,
+                    severity: Severity::Info,
+                    body: LogBody::Template {
+                        template: "t".into(),
+                        fields: empty(limits.max_fields),
+                    },
+                    attributes: vec![],
+                })
+                .collect(),
+            spans: (0..records)
+                .map(|i| Span {
+                    trace_id: format!("{:032x}", i + 1),
+                    span_id: format!("{:016x}", i + 1),
+                    parent_span_id: None,
+                    name: "n".into(),
+                    kind: SpanKind::Internal,
+                    start: t,
+                    end: t,
+                    status: StatusCode::Unset,
+                    status_message: None,
+                    attributes: empty(limits.max_fields),
+                    events: vec![],
+                    links: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (out, report) = classify::process(
+            &id,
+            batch,
+            &FieldClasses::new(),
+            &pz(),
+            &SecretMatcher::default(),
+            &limits,
+        );
+        // Not silent: records were stored, and the cap dropped the rest.
+        assert!(report.stored_logs > 0, "no log was stored");
+        assert!(
+            report.dropped(DropReason::BatchTooLarge) > 0,
+            "the batch cap dropped nothing"
+        );
+        let values: usize = out
+            .logs
+            .iter()
+            .map(|r| r.fields.len() + r.attributes.len())
+            .chain(out.spans.iter().map(|r| r.attributes.len()))
+            .sum();
+        assert!(
+            values * classify::VALUE_OVERHEAD <= limits.max_batch_bytes + 4 * 1024,
+            "{values} stored values for a cap of {} bytes",
+            limits.max_batch_bytes
+        );
+        let bytes = out.byte_size();
+        assert!(
+            bytes <= 2 * limits.max_batch_bytes,
+            "{bytes} output bytes for a cap of {} bytes",
+            limits.max_batch_bytes
+        );
+    };
+    run(Limits::default(), 600);
+    run(
+        Limits {
+            max_batch_bytes: 64 * 1024,
+            ..Limits::default()
+        },
+        300,
+    );
 }
 
 #[test]

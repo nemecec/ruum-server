@@ -716,7 +716,9 @@ impl IngestReport {
 pub struct Limits {
     /// The records of one batch.
     pub max_records: usize,
-    /// The bytes of one batch (strings by length, numbers as 8 bytes).
+    /// The bytes of one batch: strings by length, numbers as 8 bytes, plus a fixed overhead
+    /// per value and per record (`classify::VALUE_OVERHEAD`, `classify::RECORD_OVERHEAD`), so
+    /// the cap also bounds what the pipeline makes of the batch.
     pub max_batch_bytes: usize,
     /// The values of one record (fields, attributes, labels, events, links and their
     /// attributes).
