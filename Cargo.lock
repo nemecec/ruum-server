@@ -3037,6 +3037,7 @@ dependencies = [
  "base64 0.23.1",
  "bollard",
  "bytes",
+ "flate2",
  "futures",
  "hex",
  "rand",
@@ -3045,10 +3046,12 @@ dependencies = [
  "ruum-egress",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "time",
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

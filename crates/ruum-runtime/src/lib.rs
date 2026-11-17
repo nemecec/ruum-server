@@ -44,6 +44,7 @@
 //!
 //! The crate README lists every call the driver makes and the labels it sets.
 
+pub mod builder;
 mod config;
 mod driver;
 mod egress;
@@ -55,3 +56,5 @@ pub use driver::{
     LABEL_TENANT, RESERVED_ENV, SANDBOX_USER, label_keys, network_name, repository,
 };
 pub use egress::{EgressNetwork, EgressRegistry, HttpEgressRegistry, NoEgress};
+
+pub use builder::{BuilderConfig, DockerBuilder, RegistryCredential};
