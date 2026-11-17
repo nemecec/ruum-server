@@ -296,6 +296,7 @@ mod tests {
                 access: "platform".into(),
                 public_approved: false,
                 serving: true,
+                sandbox: false,
             }))
         }
         async fn redeem(&self, _: &RedeemRequest) -> CoreResult<Option<RedeemResponse>> {

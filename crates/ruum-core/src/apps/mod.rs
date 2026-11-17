@@ -47,6 +47,7 @@ pub mod check;
 pub mod deployments;
 pub mod domains;
 pub mod roles;
+pub mod sandboxes;
 pub mod secrets;
 
 #[cfg(test)]

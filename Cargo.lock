@@ -2987,6 +2987,8 @@ dependencies = [
  "bytes",
  "futures",
  "http",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "object_store",
  "rand",

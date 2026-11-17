@@ -23,6 +23,9 @@ blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
 http.workspace = true
+# WebSockets (card G-1b): the upgrade of the visitor's connection and its Tokio adapter.
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util.workspace = true
 jsonwebtoken.workspace = true
 object_store.workspace = true
 rand.workspace = true

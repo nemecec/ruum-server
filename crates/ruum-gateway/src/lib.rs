@@ -12,9 +12,14 @@
 //!    the app origin, logout; the rest answers `404` and never reaches the app.
 //! 4. The access check ([`check::check`]): `use` on live hosts, `open_preview` on previews, agent
 //!    tokens on previews only, public apps while approved.
-//! 5. The answer: a static file of the deployment ([`static_files`]) or, for the cleaning cases,
-//!    the fixed test upstream ([`proxy`]), with a fresh `Ruum-User` token ([`token`]), cleaned
-//!    both ways. Card G-1b adds the proxy to a running sandbox.
+//! 5. The answer: a static file of the deployment ([`static_files`]), or for a sandbox
+//!    deployment (card G-1b) the proxy to its instance: the core says where it runs and wakes
+//!    it while the gateway holds the request ([`sandbox`]), and [`proxy::send`] streams the
+//!    request and the answer, cleaned both ways, with a fresh `Ruum-User` token ([`token`]);
+//!    WebSockets pass the same check and are checked again while open. The fixed test upstream
+//!    of the cleaning cases goes through the same [`proxy::send`]. When the instance does not
+//!    run, the gateway answers with its own status pages ([`pages`]): starting (`503` with
+//!    `Retry-After`), not running or crashed (`502`), timeout (`504`).
 //!
 //! The gateway holds **no tenant keys and no general system access**: the host lookup (its
 //! database role may only execute `ruum_app_host_lookup`), the core's small internal API
@@ -23,7 +28,8 @@
 //! sites.
 //!
 //! The module tree of `docs/STEP3.md` "Shared files": `host`, `session`, `check`, `token`,
-//! `static_files`, `proxy`, `telemetry` (G-2), `reports` (G-4), `domains` (W-5).
+//! `static_files`, `proxy`, `sandbox` (G-1b), `telemetry` (G-2), `reports` (G-4), `domains`
+//! (W-5).
 
 pub mod check;
 pub mod core_api;
@@ -32,6 +38,7 @@ pub mod host;
 pub mod pages;
 pub mod proxy;
 pub mod reports;
+pub mod sandbox;
 pub mod session;
 pub mod static_files;
 pub mod telemetry;
@@ -40,17 +47,16 @@ pub mod token;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
-use futures::TryStreamExt;
 use host::{AppHost, HostCache, Resolved};
-use proxy::Frame;
+use proxy::{Frame, Outgoing, Sent};
 use ruum_core::apps::static_site::StaticSites;
-use ruum_core::identity::app_sign_in::wire::{DeploymentInfo, DeploymentQuery};
+use ruum_core::identity::app_sign_in::wire::{DeploymentInfo, DeploymentQuery, UpstreamQuery};
 use ruum_core::identity::app_sign_in::{AppBinding, AppEnv};
+use sandbox::{HoldConfig, Route, SandboxHold, Sandboxes};
 use std::sync::Arc;
 use token::{TokenSubject, UserTokenSigner};
-use uuid::Uuid;
 
 /// The settings of a gateway.
 #[derive(Clone, Debug)]
@@ -110,7 +116,11 @@ pub struct Gateway {
     pub sites: StaticSites,
     pub upstreams: proxy::TestUpstreams,
     pub visits: session::Visits,
-    http: reqwest::Client,
+    /// The core's answers where sandboxes run, and the hold of cold starts (card G-1b).
+    pub sandboxes: SandboxHold,
+    /// The settings of the proxy to an upstream.
+    pub proxy: proxy::ProxyConfig,
+    upstream_http: reqwest::Client,
 }
 
 impl Gateway {
@@ -121,11 +131,7 @@ impl Gateway {
         tokens: UserTokenSigner,
         sites: StaticSites,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .expect("an HTTP client without TLS settings builds");
+        let proxy = proxy::ProxyConfig::default();
         Self {
             config,
             hosts: HostCache::new(hosts),
@@ -134,8 +140,24 @@ impl Gateway {
             sites,
             upstreams: proxy::TestUpstreams::default(),
             visits: session::Visits::default(),
-            http,
+            sandboxes: SandboxHold::new(Arc::new(sandbox::NoSandboxes), HoldConfig::default()),
+            upstream_http: proxy::client(&proxy),
+            proxy,
         }
+    }
+
+    /// Asks `sandboxes` where sandbox deployments run, with the hold limits of `hold`. Without
+    /// it every sandbox deployment answers the `502` page.
+    pub fn with_sandboxes(mut self, sandboxes: Arc<dyn Sandboxes>, hold: HoldConfig) -> Self {
+        self.sandboxes = SandboxHold::new(sandboxes, hold);
+        self
+    }
+
+    /// The settings of the proxy (timeouts, the body limit, WebSockets).
+    pub fn with_proxy(mut self, proxy: proxy::ProxyConfig) -> Self {
+        self.upstream_http = proxy::client(&proxy);
+        self.proxy = proxy;
+        self
     }
 }
 
@@ -150,7 +172,7 @@ fn no_site(gw: &Gateway) -> pages::Look<'_> {
 }
 
 /// Resolves the host of a request (steps 1 and 2 of the crate docs). `Err` is the answer.
-async fn site_of(gw: &Gateway, raw_host: &str) -> Result<Site, Box<Response>> {
+pub(crate) async fn site_of(gw: &Gateway, raw_host: &str) -> Result<Site, Box<Response>> {
     let Some(app_host) = host::parse(raw_host, &gw.config.apps_domain) else {
         return Err(Box::new(pages::not_found(no_site(gw))));
     };
@@ -258,8 +280,14 @@ pub async fn handle(State(gw): State<Arc<Gateway>>, req: Request) -> Response {
         check::Outcome::BadRequest => return pages::bad_request(site.look()),
     };
     let (visit, new_visit) = session::visit_of(req.headers());
+    let from = proxy::Sender {
+        visitor: &visitor,
+        visit: &visit,
+        strip_authorization,
+    };
     let mut resp = match gw.upstreams.get(site.resolved.deployment_id) {
-        Some(url) => forward(&gw, &site, &visitor, &visit, strip_authorization, &url, req).await,
+        Some(url) => forward_fixed(&gw, &site, &from, &url, req).await,
+        None if site.info.sandbox => forward_sandbox(&gw, &site, &from, req).await,
         None => {
             let (parts, _) = req.into_parts();
             static_files::serve(&gw, &site, &parts.method, &path, &parts.headers).await
@@ -272,7 +300,7 @@ pub async fn handle(State(gw): State<Arc<Gateway>>, req: Request) -> Response {
 }
 
 /// The subject of the user token of a visitor.
-fn subject_of(visitor: &check::Visitor, visit: &str) -> TokenSubject {
+pub(crate) fn subject_of(visitor: &check::Visitor, visit: &str) -> TokenSubject {
     match visitor {
         check::Visitor::Anonymous => TokenSubject {
             sub: session::anonymous_subject(visit),
@@ -295,85 +323,84 @@ fn subject_of(visitor: &check::Visitor, visit: &str) -> TokenSubject {
     }
 }
 
-/// The largest request body that the fixed test upstream takes.
-pub const MAX_FORWARD_BODY: usize = 16 * 1024 * 1024;
-
-/// Forwards a request that passed the check to `upstream`, cleaned both ways.
-async fn forward(
-    gw: &Gateway,
+/// The fixed test upstream of the cleaning cases: the same [`proxy::send`] as a sandbox.
+async fn forward_fixed(
+    gw: &Arc<Gateway>,
     site: &Site,
-    visitor: &check::Visitor,
-    visit: &str,
-    strip_authorization: bool,
+    from: &proxy::Sender<'_>,
     upstream: &str,
     req: Request,
 ) -> Response {
-    let (parts, body) = req.into_parts();
-    // The fixed test upstream takes the whole body (G-1b streams to sandboxes). The body was
-    // read by one framing (hyper refuses conflicting lengths; chunked wins over a length), and
-    // the forwarded request has its own length, never the client's framing headers.
-    let body = match axum::body::to_bytes(body, MAX_FORWARD_BODY).await {
-        Ok(b) => b,
-        Err(_) => {
-            return pages::page(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "This request is too large.",
-                site.frame(),
-                &gw.config.ui_origin,
-            );
+    let out = match Outgoing::new(req, site, gw.proxy.max_body) {
+        Ok(o) => o,
+        Err(r) => return *r,
+    };
+    match proxy::send(gw, site, from, out, upstream).await {
+        Sent::Answer(r) => r,
+        Sent::NoConnection(_) => pages::not_running(site.look()),
+    }
+}
+
+/// The query of a site's sandbox: only the values the gateway resolved from the host.
+fn upstream_query(site: &Site) -> UpstreamQuery {
+    UpstreamQuery {
+        tenant_id: site.resolved.tenant_id,
+        app_id: site.resolved.app_id,
+        deployment_id: site.resolved.deployment_id,
+        environment: site.info.environment,
+    }
+}
+
+/// A request of a sandbox deployment: where the core says its instance runs, held while it
+/// starts (see [`sandbox`]).
+async fn forward_sandbox(
+    gw: &Arc<Gateway>,
+    site: &Site,
+    from: &proxy::Sender<'_>,
+    req: Request,
+) -> Response {
+    let q = upstream_query(site);
+    let mut out = match Outgoing::new(req, site, gw.proxy.max_body) {
+        Ok(o) => o,
+        Err(r) => return *r,
+    };
+    // A second try only when the first address took no connection and nothing was sent.
+    for _ in 0..2 {
+        let url = match gw.sandboxes.route(&q).await {
+            Route::Ready(u) => u,
+            Route::Busy | Route::Starting => return pages::starting(site.look()),
+            Route::NotRunning => return pages::not_running(site.look()),
+            Route::Crashed => return pages::crashed(site.look()),
+            Route::Unavailable => return pages::unavailable(site.look()),
+        };
+        match proxy::send(gw, site, from, out, &url).await {
+            Sent::Answer(r) => return r,
+            Sent::NoConnection(back) => {
+                gw.sandboxes.forget(&q);
+                match back {
+                    Some(o) => out = o,
+                    None => return pages::not_running(site.look()),
+                }
+            }
         }
+    }
+    pages::not_running(site.look())
+}
+
+/// Whether an open WebSocket of `site` may stay open: the host still resolves to the same
+/// deployment, which serves, and the request's credentials still pass the check (the answers
+/// come through the caches of at most 3 s). Any error closes it (fail closed).
+pub(crate) async fn still_allowed(gw: &Gateway, site: &Site, headers: &HeaderMap) -> bool {
+    let Ok(now) = site_of(gw, &site.name).await else {
+        return false;
     };
-    let subject = subject_of(visitor, visit);
-    let claims = gw.tokens.claims(
-        site.audience(),
-        site.info.environment.as_str(),
-        &site.host.tenant_slug,
-        &subject,
-    );
-    let Ok(user_token) = gw.tokens.sign(&claims) else {
-        return pages::unavailable(site.look());
-    };
-    let (traceparent, trace_id) = proxy::new_traceparent();
-    let session = match visitor {
-        check::Visitor::User { session, .. } => Some(session.as_str()),
-        _ => None,
-    };
-    gw.visits.record(visit, session, trace_id);
-    let mut headers = proxy::clean_request(&parts.headers, strip_authorization);
-    headers.remove(header::CONTENT_LENGTH);
-    proxy::add_gateway_headers(&mut headers, &user_token, Uuid::now_v7(), &traceparent);
-    let target = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    let url = format!("{upstream}{target}");
-    let sent = gw
-        .http
-        .request(parts.method.clone(), url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await;
-    let up = match sent {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "ruum::gateway", error = %e.without_url(), "the upstream did not answer");
-            return pages::page(
-                StatusCode::BAD_GATEWAY,
-                "The app did not answer.",
-                site.frame(),
-                &gw.config.ui_origin,
-            );
-        }
-    };
-    let status = up.status();
-    let headers = proxy::clean_response(up.headers(), site.frame(), &gw.config.ui_origin);
-    let stream = up.bytes_stream().map_err(std::io::Error::other);
-    let mut r = Response::new(Body::from_stream(stream));
-    *r.status_mut() = status;
-    *r.headers_mut() = headers;
-    r
+    if now.resolved != site.resolved {
+        return false;
+    }
+    matches!(
+        check::check(gw, &now, headers).await,
+        check::Outcome::Pass { .. }
+    )
 }
 
 /// Serves `gw` on `listener` until the future ends.

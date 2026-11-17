@@ -54,7 +54,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use echo::Echo;
+pub use echo::{Echo, WsEcho};
 pub use http::{Jar, Req, Resp, SetCookie};
 
 /// The text of the gateway contract.
@@ -72,13 +72,6 @@ pub const CARDS: &[&str] = &[
 /// named removes the line when its code makes the case pass. Without a world a case reports
 /// planned first.
 pub const PENDING: &[(&str, &str)] = &[
-    // Proxy to a sandbox, WebSockets and cold start: G-1b.
-    (
-        "proxy_reaches_a_running_sandbox",
-        "G-1b: the proxy to a sandbox",
-    ),
-    ("websockets_pass_after_the_check", "G-1b: WebSockets"),
-    ("a_cold_start_is_held_and_answered", "G-1b: cold start"),
     // The browser script and telemetry: G-2.
     ("the_browser_script_is_served", "G-2: the browser script"),
     (
@@ -380,6 +373,32 @@ pub trait GatewayWorld: Send + Sync {
     /// Sends the requests of `deployment` to `url` (the echo app) instead of its static files:
     /// the fixed test upstream of the cleaning cases, before G-1b exists.
     async fn set_upstream(&self, deployment: &Deployment, url: &str) -> WorldResult<()>;
+    /// A `ready` deployment of `app` whose manifest runs `node22` in a sandbox (card G-1b). Its
+    /// instance answers as the server at `upstream` (the case's echo app): the world runs the
+    /// instance in its runtime driver, and the core's sandbox directory gives the gateway an
+    /// address that reaches `upstream` while the instance runs. A preview is running and
+    /// reachable at once on its preview host; a live one after [`GatewayWorld::set_live`].
+    /// A world without sandboxes (the meta worlds of this crate's tests) fails the case.
+    async fn seed_node_deployment(
+        &self,
+        app: &App,
+        env: Env,
+        upstream: &str,
+    ) -> WorldResult<Deployment> {
+        let _ = (app, env, upstream);
+        Err(WorldError::Failed(
+            "this world runs no sandbox deployments (card G-1b)".into(),
+        ))
+    }
+    /// Stops the running instance of a sandbox deployment (as a scale to zero or a stop in the
+    /// runtime): its address takes no connection until the core starts it again. A world without
+    /// sandboxes fails the case.
+    async fn stop_instance(&self, deployment: &Deployment) -> WorldResult<()> {
+        let _ = deployment;
+        Err(WorldError::Failed(
+            "this world runs no sandbox deployments (card G-1b)".into(),
+        ))
+    }
     /// The tenant's public approval of public apps (backlog S-33).
     async fn set_public_approval(&self, tenant: &Tenant, approved: bool) -> WorldResult<()>;
     /// Removes `removed` and gives its host name to `new` (same tenant), past the retired-slug
@@ -490,6 +509,20 @@ impl GatewayWorld for Guard {
     }
     async fn set_upstream(&self, deployment: &Deployment, url: &str) -> WorldResult<()> {
         guarded("set_upstream", self.0.set_upstream(deployment, url).await)
+    }
+    async fn seed_node_deployment(
+        &self,
+        app: &App,
+        env: Env,
+        upstream: &str,
+    ) -> WorldResult<Deployment> {
+        guarded(
+            "seed_node_deployment",
+            self.0.seed_node_deployment(app, env, upstream).await,
+        )
+    }
+    async fn stop_instance(&self, deployment: &Deployment) -> WorldResult<()> {
+        guarded("stop_instance", self.0.stop_instance(deployment).await)
     }
     async fn set_public_approval(&self, tenant: &Tenant, approved: bool) -> WorldResult<()> {
         guarded(
