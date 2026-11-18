@@ -1183,7 +1183,10 @@ impl Inner {
             .attach_container(&name, Some(opts))
             .await
             .map_err(|e| self.docker_err("attaching to the container", &e, &secrets))?;
-        let redactors = Arc::new(Mutex::new(Redactors::new(&secrets)));
+        let redactors = Arc::new(Mutex::new(Redactors::new(
+            &secrets,
+            self.cfg.max_line_bytes,
+        )));
         let pump = tokio::spawn(pump(inst.clone(), redactors.clone(), attached.output));
         if let Err(e) = self.docker.start_container(&name, None).await {
             pump.abort();
@@ -1205,18 +1208,32 @@ impl Inner {
     /// Forgets ended instances (backlog R2A-5): those past [`DockerConfig::ended_retention`],
     /// or past [`DockerConfig::drained_retention`] after their logs were read to the end; then,
     /// while more than [`DockerConfig::max_ended_instances`] are kept or their logs take more
-    /// than [`DockerConfig::max_ended_log_bytes`] (and with `room`, while
-    /// [`DockerConfig::max_instances`] or more are kept), the oldest ended instance of the
-    /// tenant with the largest share: the most ended log bytes when the byte cap is over, else
-    /// the most ended instances. So one tenant's load evicts its own ended instances first,
-    /// not another tenant's (S-61). An instance with an operation in progress is left alone.
-    /// Called with the map held.
-    fn sweep(&self, map: &mut HashMap<InstanceId, Arc<Instance>>, room: bool) {
+    /// than [`DockerConfig::max_ended_log_bytes`], the oldest ended instance of the tenant with
+    /// the largest share: the most ended log bytes when the byte cap is over, else the most
+    /// ended instances. So one tenant's load evicts its own ended instances first, not another
+    /// tenant's (S-61).
+    ///
+    /// With `room` (the tenant that starts an instance), while [`DockerConfig::max_instances`]
+    /// or more are kept: the oldest ended instance of the tenant that keeps the most instances,
+    /// running and ended, with the new one counted for the starting tenant; when that tenant
+    /// has no ended instance, only one of the starting tenant's own. So a tenant that fills the
+    /// driver with running instances does not forget another tenant's ended instance (its status
+    /// and logs); its start is `unavailable` instead (Kimi review of run 12, K11 finding 3,
+    /// backlog S-67).
+    ///
+    /// An instance with an operation in progress is left alone. Called with the map held.
+    fn sweep(&self, map: &mut HashMap<InstanceId, Arc<Instance>>, room: Option<TenantId>) {
         let now = Instant::now();
         let cfg = &self.cfg;
         let mut evict = Vec::new();
         let mut ended: HashMap<TenantId, Ended> = HashMap::new();
+        // The instances each tenant keeps after this sweep, running and ended.
+        let mut totals: HashMap<TenantId, usize> = HashMap::new();
+        if let Some(t) = room {
+            totals.insert(t, 0);
+        }
         for (id, inst) in map.iter() {
+            *totals.entry(inst.identity.tenant).or_default() += 1;
             let Ok(_op) = inst.op.try_lock() else {
                 continue;
             };
@@ -1231,6 +1248,9 @@ impl Inner {
                     .is_some_and(|d| now.duration_since(d) >= cfg.drained_retention);
             if expired {
                 evict.push(*id);
+                if let Some(n) = totals.get_mut(&inst.identity.tenant) {
+                    *n -= 1;
+                }
             } else {
                 let e = ended.entry(inst.identity.tenant).or_default();
                 let b = st.ring.memory();
@@ -1245,29 +1265,55 @@ impl Inner {
         let mut count: usize = ended.values().map(|e| e.list.len()).sum();
         let mut bytes: usize = ended.values().map(|e| e.bytes).sum();
         let mut kept = map.len() - evict.len();
+        let oldest = |e: &Ended| e.list.last().map(|(at, _, _)| std::cmp::Reverse(*at));
         loop {
             let by_bytes = bytes > cfg.max_ended_log_bytes;
-            let over =
-                by_bytes || count > cfg.max_ended_instances || (room && kept >= cfg.max_instances);
-            if !over {
+            let by_count = count > cfg.max_ended_instances;
+            let victim = if by_bytes || by_count {
+                // The tenant with the largest ended share; on a tie, the one with the oldest
+                // instance.
+                ended
+                    .iter()
+                    .filter(|(_, e)| !e.list.is_empty())
+                    .max_by_key(|(_, e)| {
+                        let share = if by_bytes { e.bytes } else { e.list.len() };
+                        (share, oldest(e))
+                    })
+                    .map(|(t, _)| *t)
+            } else if let Some(starter) = room
+                && kept >= cfg.max_instances
+            {
+                let has_ended = |t: &TenantId| ended.get(t).is_some_and(|e| !e.list.is_empty());
+                // The tenant that keeps the most, the new instance counted for the starter; on
+                // a tie, one with an ended instance, then the one with the oldest.
+                let top = totals
+                    .iter()
+                    .max_by_key(|(t, n)| {
+                        let n = **n + usize::from(**t == starter);
+                        (n, has_ended(t), ended.get(*t).and_then(oldest))
+                    })
+                    .map(|(t, _)| *t);
+                match top {
+                    Some(t) if has_ended(&t) => Some(t),
+                    _ if has_ended(&starter) => Some(starter),
+                    _ => None,
+                }
+            } else {
                 break;
-            }
-            // The tenant with the largest share; on a tie, the one with the oldest instance.
-            let Some(e) = ended
-                .values_mut()
-                .filter(|e| !e.list.is_empty())
-                .max_by_key(|e| {
-                    let share = if by_bytes { e.bytes } else { e.list.len() };
-                    let oldest = e.list.last().map(|(at, _, _)| std::cmp::Reverse(*at));
-                    (share, oldest)
-                })
-            else {
+            };
+            let Some(tenant) = victim else {
+                break;
+            };
+            let Some(e) = ended.get_mut(&tenant) else {
                 break;
             };
             let Some((_, id, b)) = e.list.pop() else {
                 break;
             };
             e.bytes -= b;
+            if let Some(n) = totals.get_mut(&tenant) {
+                *n -= 1;
+            }
             evict.push(id);
             count -= 1;
             bytes -= b;
@@ -1281,14 +1327,15 @@ impl Inner {
     /// Forgets the ended instances that are due ([`Inner::sweep`]).
     fn sweep_now(&self) {
         let mut map = self.instances.lock().unwrap_or_else(|p| p.into_inner());
-        self.sweep(&mut map, false);
+        self.sweep(&mut map, None);
     }
 
-    /// Makes room for one more instance: `unavailable` when [`DockerConfig::max_instances`]
-    /// instances still run.
-    fn check_room(&self) -> Result<(), RuntimeError> {
+    /// Makes room for one more instance of `tenant`: `unavailable` when
+    /// [`DockerConfig::max_instances`] instances are kept and none of them may be forgotten for
+    /// it ([`Inner::sweep`]).
+    fn check_room(&self, tenant: TenantId) -> Result<(), RuntimeError> {
         let mut map = self.instances.lock().unwrap_or_else(|p| p.into_inner());
-        self.sweep(&mut map, true);
+        self.sweep(&mut map, Some(tenant));
         self.room_in(&map)
     }
 
@@ -1296,7 +1343,7 @@ impl Inner {
         if map.len() >= self.cfg.max_instances {
             return Err(RuntimeError::Unavailable {
                 reason: format!(
-                    "the driver runs its maximum of {} instances",
+                    "the driver keeps its maximum of {} instances",
                     self.cfg.max_instances
                 ),
             });
@@ -1307,7 +1354,7 @@ impl Inner {
     /// Keeps a new instance, within [`DockerConfig::max_instances`].
     fn keep(&self, inst: &Arc<Instance>) -> Result<(), RuntimeError> {
         let mut map = self.instances.lock().unwrap_or_else(|p| p.into_inner());
-        self.sweep(&mut map, true);
+        self.sweep(&mut map, Some(inst.identity.tenant));
         self.room_in(&map)?;
         map.insert(inst.id, inst.clone());
         Ok(())
@@ -1634,7 +1681,7 @@ impl RuntimeDriver for DockerDriver {
         let inner = &self.inner;
         inner.check_spec(&spec)?;
         // Refused before any engine work when the driver is full of running instances.
-        inner.check_room()?;
+        inner.check_room(spec.identity.tenant)?;
         let id = InstanceId::new();
         let secrets: Vec<String> = spec
             .redacted_values()
@@ -2222,6 +2269,51 @@ mod tests {
             InstanceState::Running,
             "a running instance is never forgotten"
         );
+    }
+
+    /// A tenant whose running instances fill the driver does not forget another tenant's ended
+    /// instance to start one more (Kimi review of run 12, K11 finding 3, S-67): its start is
+    /// `unavailable`, and the other tenant's status and logs stay. The other tenant may still
+    /// give up its own ended instance for a start.
+    #[tokio::test]
+    async fn room_is_not_taken_from_another_tenant() {
+        let mut cfg = config();
+        cfg.max_instances = 3;
+        let d = offline(cfg);
+        let a = TenantId::new();
+        let b = TenantId::new();
+        let kept = start_and_end(&d, b, 10).await;
+        d.start(spec(a)).await.expect("A's first");
+        d.start(spec(a)).await.expect("A's second");
+        assert!(matches!(
+            d.start(spec(a)).await,
+            Err(RuntimeError::Unavailable { .. })
+        ));
+        assert_eq!(
+            d.status(b, kept).await.expect("B's instance is kept").state,
+            InstanceState::Stopped
+        );
+        assert_eq!(d.logs(b, kept, None, 100).await.unwrap().len(), 10);
+        // B starts again: its own ended instance makes the room.
+        let again = d.start(spec(b)).await.expect("B's start");
+        assert!(gone(d.status(b, kept).await));
+        assert_eq!(
+            d.status(b, again.id).await.unwrap().state,
+            InstanceState::Running
+        );
+        assert_eq!(d.kept_instances(), 3);
+        // A tenant that keeps more than the starter gives up its ended instances first.
+        let c = TenantId::new();
+        let mut cfg = config();
+        cfg.max_instances = 4;
+        let d = offline(cfg);
+        let a_ended = start_and_end(&d, a, 1).await;
+        start_and_end(&d, a, 1).await;
+        d.start(spec(a)).await.unwrap();
+        let b_ended = start_and_end(&d, b, 1).await;
+        d.start(spec(c)).await.expect("room from A");
+        assert!(gone(d.status(a, a_ended).await), "A keeps the most");
+        assert!(!gone(d.status(b, b_ended).await), "B keeps one");
     }
 
     #[tokio::test]
