@@ -56,6 +56,11 @@ pub const MIN_RAW_BYTES: usize = 4;
 /// An encoded form shorter than this matches only as a whole value or word.
 pub const MIN_ENCODED_BYTES: usize = 8;
 
+/// The markers in order of preference, the same list as `runtime::redact`: the matcher uses
+/// the first one in which it finds no secret in any form, so a marker never shows a secret
+/// (the secret `secret`, Kimi review of run 12, finding 1). The empty marker holds none.
+const MARKERS: [&str; 4] = [redact::REDACTED, "<hidden>", "***", ""];
+
 /// Finds the secret values and their encodings in text. `Debug` shows the counts only.
 #[derive(Clone, Default)]
 pub struct SecretMatcher {
@@ -159,10 +164,21 @@ impl SecretMatcher {
                 .any(|w| !w.is_empty() && self.whole.contains(w))
     }
 
-    /// The text with every match replaced by [`redact::REDACTED`]; `None` when there is no
-    /// match. A secret that only a decoded form, the mixed-case hex check or a whole match
-    /// shows: the whitespace-separated word that holds it becomes the marker; when no single
-    /// word holds it, the whole text does.
+    /// The marker of this matcher: the first of [`MARKERS`] in which [`Self::contains`] finds
+    /// nothing.
+    pub fn marker(&self) -> &'static str {
+        MARKERS
+            .into_iter()
+            .find(|m| !self.contains(m))
+            .unwrap_or("")
+    }
+
+    /// The text with every match replaced by the marker ([`redact::REDACTED`], or
+    /// [`Self::marker`] when a secret is part of it); `None` when there is no match. A secret
+    /// that only a decoded form, the mixed-case hex check or a whole match shows: the
+    /// whitespace-separated word that holds it becomes the marker; when no single word holds
+    /// it, the whole text does. The result never holds a secret in a form that
+    /// [`Self::contains`] finds.
     pub fn redact(&self, text: &str) -> Option<String> {
         if !self.contains(text) {
             return None;
@@ -176,18 +192,19 @@ impl SecretMatcher {
         if !self.contains(&out) {
             return Some(out);
         }
+        let marker = self.marker();
         let mut words = String::with_capacity(out.len());
         for piece in out.split_inclusive(char::is_whitespace) {
             let (word, space) = piece.split_at(piece.trim_end_matches(char::is_whitespace).len());
             if !word.is_empty() && self.contains(word) {
-                words.push_str(redact::REDACTED);
+                words.push_str(marker);
             } else {
                 words.push_str(word);
             }
             words.push_str(space);
         }
         if self.contains(&words) {
-            return Some(redact::REDACTED.to_owned());
+            return Some(marker.to_owned());
         }
         Some(words)
     }

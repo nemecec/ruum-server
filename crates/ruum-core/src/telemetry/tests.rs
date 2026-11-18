@@ -320,6 +320,71 @@ async fn the_class_cache_reads_once_per_ttl() {
     assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 4);
 }
 
+/// Kimi review of run 12, finding 4: a slow read of the old classes that ends after a newer
+/// read must not replace the newer classes in the cache.
+#[tokio::test]
+async fn a_slow_old_class_read_does_not_replace_a_newer_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Racy {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl FieldClassSource for Racy {
+        async fn classes(&self, _: TenantId, _: NodeId) -> Result<Arc<FieldClasses>> {
+            let mut c = FieldClasses::new();
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The first read sees the old class and is slow.
+                self.started.notify_one();
+                self.release.notified().await;
+                c.set(
+                    FieldKind::LogField,
+                    "email",
+                    FieldClassEntry::confirmed(FieldClass::Normal),
+                );
+            } else {
+                c.set(
+                    FieldKind::LogField,
+                    "email",
+                    FieldClassEntry::confirmed(FieldClass::Personal),
+                );
+            }
+            Ok(Arc::new(c))
+        }
+    }
+    let inner = Arc::new(Racy {
+        calls: AtomicUsize::new(0),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let cached = Arc::new(classify::CachedFieldClasses::new(
+        inner.clone(),
+        std::time::Duration::from_secs(600),
+    ));
+    let (t, a) = (TenantId::new(), NodeId::new());
+    let class = |c: &FieldClasses| c.get(FieldKind::LogField, "email").map(|e| e.class);
+    let slow = tokio::spawn({
+        let cached = cached.clone();
+        async move { cached.classes(t, a).await.unwrap() }
+    });
+    inner.started.notified().await;
+    // A newer read starts after the slow one and ends first.
+    let newer = cached.classes(t, a).await.unwrap();
+    assert_eq!(class(&newer), Some(FieldClass::Personal));
+    inner.release.notify_one();
+    let late = slow.await.unwrap();
+    // The slow caller gets the newer classes too.
+    assert_eq!(class(&late), Some(FieldClass::Personal));
+    let after = cached.classes(t, a).await.unwrap();
+    assert_eq!(
+        class(&after),
+        Some(FieldClass::Personal),
+        "the slow read of the old class replaced the newer one"
+    );
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+}
+
 // ---------------------------------------------------------------------------- secrets
 
 #[test]
@@ -431,6 +496,39 @@ fn the_matcher_finds_each_encoding() {
     assert!(!format!("{m:?}").contains("wire"));
 }
 
+/// Kimi review of run 12, finding 1: when a secret is part of `<hidden secret>`, the marker
+/// of a fallback redaction (a match that only a decoded form shows) must not show it.
+#[test]
+fn the_marker_never_shows_a_secret() {
+    let cases: &[(&str, &str)] = &[
+        ("secret", "sec%72et"),
+        ("secret", "sec%72et and more"),
+        ("secret", "token=sec%72et"),
+        ("hidden", "hid%64en"),
+        ("<hidden secret>", "%3Chidden%20secret%3E"),
+        ("<hidden secret>", "x <hidden secret> y"),
+        ("hidden secret", "hidden%20secret"),
+        ("secret", "a secret b"),
+    ];
+    for (secret, text) in cases {
+        let m = SecretMatcher::new([*secret]);
+        let out = m
+            .redact(text)
+            .unwrap_or_else(|| panic!("{text:?} holds {secret:?}"));
+        assert!(
+            !m.contains(&out),
+            "secret {secret:?}, text {text:?}: the redaction {out:?} still holds it"
+        );
+        assert!(!out.contains(secret), "{out:?} shows {secret:?}");
+    }
+    // A secret that is not part of the marker keeps the usual marker.
+    let m = SecretMatcher::new(["Fx7pQ2wire"]);
+    assert_eq!(m.marker(), crate::runtime::redact::REDACTED);
+    assert_eq!(SecretMatcher::new(["secret"]).marker(), "<hidden>");
+    assert_eq!(SecretMatcher::new(["hidden"]).marker(), "***");
+    assert_eq!(SecretMatcher::new(["hidden", "***"]).marker(), "");
+}
+
 #[test]
 fn base64_cores_hold_only_the_value() {
     use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -477,6 +575,9 @@ fn scrub_pattern_table() {
         ("call 555-123-4567".into(), Phone),
         ("call 4155552671 now".into(), Phone),
         ("call 415.555.2671.".into(), Phone),
+        ("call 14155552671".into(), Phone),
+        ("call 14155552671 now".into(), Phone),
+        ("call 1.415.555.2671 now".into(), Phone),
         ("tel:2125550123".into(), Phone),
         ("iban DE89 3704 0044 0532 0130 00".into(), Iban),
         ("iban GB82WEST12345698765432 ok".into(), Iban),
@@ -534,6 +635,12 @@ fn scrub_pattern_table() {
         "v 1.4155552671",
         "v 415.555.2671.9",
         "n 4151552671",
+        "n 14151552671",
+        "n 24155552671",
+        "n 11155552671",
+        "id 14155552671x",
+        "ratio 14155552671.5",
+        "v 2.1.415.555.2671",
         "ip 192.168.100.200",
         "id 0198c2e4-6a2b-7c3d-8e4f-123456789abc",
         "short deadbeef",
@@ -1087,4 +1194,89 @@ async fn reads_filter_by_time_severity_and_fields() {
         .await,
         0
     );
+}
+
+/// Kimi review of run 12, finding 5: reads return the records oldest first by record time,
+/// and the limit keeps the oldest, whatever the order of writing.
+#[tokio::test]
+async fn reads_are_oldest_first_by_record_time() {
+    let f = Fixture::new();
+    let id = identity();
+    let t0 = crate::now();
+    let at = |dt: i64| t0 + time::Duration::seconds(dt);
+    let log = |name: &str, dt: i64| LogRecord {
+        time: at(dt),
+        ..text_log(name)
+    };
+    let metric = |v: f64, dt: i64| MetricPoint {
+        time: at(dt),
+        name: "m".into(),
+        kind: MetricKind::Gauge,
+        value: v,
+        labels: vec![],
+    };
+    let span = |name: &str, dt: i64, sid: &str| Span {
+        trace_id: "0af7651916cd43dd8448eb211c80319c".into(),
+        span_id: sid.into(),
+        parent_span_id: None,
+        name: name.into(),
+        kind: SpanKind::Internal,
+        start: at(dt),
+        end: at(dt),
+        status: StatusCode::Unset,
+        status_message: None,
+        attributes: vec![],
+        events: vec![],
+        links: vec![],
+    };
+    // Two batches, each out of order, the second older than the first.
+    f.ingest
+        .ingest(
+            &id,
+            Batch {
+                logs: vec![log("third", 20), log("fourth", 30)],
+                metrics: vec![metric(3.0, 20), metric(4.0, 30)],
+                spans: vec![
+                    span("third", 20, "b7ad6b7169203333"),
+                    span("fourth", 30, "b7ad6b7169203334"),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    f.ingest
+        .ingest(
+            &id,
+            Batch {
+                logs: vec![log("second", 10), log("first", 0)],
+                metrics: vec![metric(2.0, 10), metric(1.0, 0)],
+                spans: vec![
+                    span("second", 10, "b7ad6b7169203332"),
+                    span("first", 0, "b7ad6b7169203331"),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    for limit in [None, Some(2)] {
+        let filter = TelemetryFilter {
+            limit,
+            ..TelemetryFilter::app(id.app)
+        };
+        let read = f.store.read(id.tenant, &filter).await.unwrap();
+        let want: &[&str] = match limit {
+            None => &["first", "second", "third", "fourth"],
+            Some(_) => &["first", "second"],
+        };
+        let logs: Vec<&str> = read.logs.iter().filter_map(|r| r.text.as_deref()).collect();
+        assert_eq!(logs, want, "logs, limit {limit:?}");
+        let spans: Vec<&str> = read.spans.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(spans, want, "spans, limit {limit:?}");
+        let metrics: Vec<f64> = read.metrics.iter().map(|r| r.value).collect();
+        let want_m: &[f64] = match limit {
+            None => &[1.0, 2.0, 3.0, 4.0],
+            Some(_) => &[1.0, 2.0],
+        };
+        assert_eq!(metrics, want_m, "metrics, limit {limit:?}");
+    }
 }

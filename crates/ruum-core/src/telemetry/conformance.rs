@@ -122,6 +122,10 @@ pub async fn run(f: &dyn PrivacyFixture) -> Report {
     r.add("free_text_patterns_logs", free_text_logs(f).await);
     r.add("free_text_patterns_traces", free_text_traces(f).await);
     r.add("free_text_time_bound", free_text_time_bound(f).await);
+    r.add(
+        "free_text_scrub_rebuilds_no_secret",
+        free_text_scrub_rebuilds_no_secret(f).await,
+    );
     r.add("whole_store_scan", whole_store_scan(f).await);
     r
 }
@@ -1693,6 +1697,54 @@ async fn free_text_time_bound(f: &dyn PrivacyFixture) -> CaseResultT {
     need(took < Duration::from_secs(10), || {
         format!("scrubbing {n} adversarial texts of 30 KiB took {took:?}")
     })
+}
+
+/// A replacement of the scrubber must not build a secret, and must not be one (Kimi review of
+/// run 12, finding 2): a secret that holds the marker `<hidden secret>`, and a secret that is
+/// part of it, in log text and span text.
+async fn free_text_scrub_rebuilds_no_secret(f: &dyn PrivacyFixture) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let token = ["sk_", "live_", "abcdefgh1234"].concat();
+    let rebuilt = format!("prefix {} suffix", crate::runtime::redact::REDACTED);
+    let secrets = vec![rebuilt.clone(), "secret".to_owned()];
+    f.set_secrets(
+        id.tenant,
+        id.app,
+        secrets.iter().cloned().map(SecretValue::new).collect(),
+    )
+    .await;
+    let text = format!("prefix {token} suffix");
+    let mut span = span_with(vec![]);
+    span.name = text.clone();
+    span.status = StatusCode::Error;
+    span.status_message = Some(text.clone());
+    ingest(
+        f,
+        &id,
+        Batch {
+            logs: vec![log_text(text.clone())],
+            spans: vec![span],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let logs = read_stored(f, &id, Signal::Logs, 1).await?;
+    let spans = read_stored(f, &id, Signal::Traces, 1).await?;
+    let mut texts: Vec<&str> = logs.logs.iter().filter_map(|r| r.text.as_deref()).collect();
+    for s in &spans.spans {
+        texts.push(&s.name);
+        texts.extend(s.status_message.as_deref());
+    }
+    need(texts.len() >= 3, || {
+        format!("expected 3 stored texts, found {texts:?}")
+    })?;
+    for t in texts {
+        let found = scan_for_secrets(t.as_bytes(), &secrets);
+        need(found.is_empty() && !t.contains(&token), || {
+            format!("the stored text {t:?} holds a secret ({found:?}) or the token")
+        })?;
+    }
+    Ok(())
 }
 
 /// After all cases: no fixture secret in any form anywhere in the store.

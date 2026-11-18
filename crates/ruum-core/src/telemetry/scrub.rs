@@ -10,7 +10,7 @@
 //! | Emails | pseudonym |
 //! | IBANs (mod-97 checked, with or without group spaces) | pseudonym |
 //! | Payment card numbers (13 to 19 digits, Luhn checked, with spaces or dashes) | hidden |
-//! | Phone numbers (E.164 `+` and 8 to 15 digits; national forms of 9 to 15 digits with spaces, dashes or an area code in parentheses, or with a leading `0`; North American numbers of 10 digits without separators or as `415.555.2671`, with a valid area code and exchange, not part of a decimal number) | pseudonym |
+//! | Phone numbers (E.164 `+` and 8 to 15 digits; national forms of 9 to 15 digits with spaces, dashes or an area code in parentheses, or with a leading `0`; North American numbers of 10 digits, or `1` and 10 digits, without separators or as `415.555.2671` or `1.415.555.2671`, with a valid area code and exchange, not part of a decimal number) | pseudonym |
 //! | Long hex runs (32 or more, with a digit and a letter) | hidden |
 //! | Long base64 runs (40 or more, with a digit, an upper and a lower case letter) | hidden |
 //!
@@ -453,10 +453,13 @@ fn phone_sep(c: u8) -> bool {
     matches!(c, b' ' | b'-')
 }
 
-/// Ten digits of the North American plan: the area code and the exchange start with 2 to 9.
-/// (Unix times in seconds start with `1` until 2033.)
+/// A number of the North American plan: ten digits whose area code and exchange start with 2
+/// to 9, or the country code `1` and such ten digits (`14155552671`, Kimi review of run 12,
+/// finding 3). (Unix times in seconds have ten digits and start with `1` until 2033.)
 fn nanp(digits: &[u8]) -> bool {
-    digits.len() == 10 && (b'2'..=b'9').contains(&digits[0]) && (b'2'..=b'9').contains(&digits[3])
+    let ten =
+        |d: &[u8]| d.len() == 10 && (b'2'..=b'9').contains(&d[0]) && (b'2'..=b'9').contains(&d[3]);
+    ten(digits) || (digits.len() == 11 && digits[0] == b'1' && ten(&digits[1..]))
 }
 
 /// Whether the number at `start..end` is part of a decimal number or a version
@@ -466,10 +469,16 @@ fn in_decimal(b: &[u8], start: usize, end: usize) -> bool {
         || (start >= 2 && b[start - 1] == b'.' && b[start - 2].is_ascii_digit())
 }
 
-/// `415.555.2671` at `i`: the end, when it is a North American number that stands alone.
+/// `415.555.2671` or `1.415.555.2671` at `i`: the end, when it is a North American number
+/// that stands alone.
 fn dotted_nanp(b: &[u8], i: usize) -> Option<usize> {
-    let end = i + 12;
-    let s = b.get(i..end)?;
+    let at = if b.get(i..i + 2) == Some(b"1.") {
+        i + 2
+    } else {
+        i
+    };
+    let end = at + 12;
+    let s = b.get(at..end)?;
     let digit_at = |k: usize| s[k].is_ascii_digit();
     let shape = (0..3).all(digit_at)
         && s[3] == b'.'
