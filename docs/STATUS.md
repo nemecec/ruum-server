@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +252,35 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Integration of run 12 (2026-11-18; seven branches rebased onto `main` `1d0326f` in one stack,
+each tip checked on the build server, pushed as `integ12/<name>`, green in GitHub CI, then
+fast-forwarded in this order; linear history, no merge commit, no co-author line). The digest is
+`docs/digests/2026-11-17-run12.md`; new backlog items are in `docs/backlog/2026-11-17-run12.md`
+(the cards' own rows: R2A-9 in `docs/backlog/2026-11-17-r2a.md`, W2S-3 to W2S-6 in
+`docs/backlog/2026-11-13-w2s.md`). The second-model gate is open for every card but FU-1
+(backlog S-63): the orchestrator chose to integrate on two Claude reviews each.
+
+| Branch (pushed as) | What it adds | Review |
+|---|---|---|
+| `fix/k11` (`integ12/k11`) | The three Kimi findings of run 11: the egress proxy charges its rate at accept for every connection (a flood of bad requests is closed cheaply, logged as samples); the log redactor checks each line against the lines it let out, so a secret split over two lines is hidden; the Docker driver forgets ended instances under caps on count and log bytes, taking from the tenant with the largest share first. | review-k11 (changes: eviction was global oldest first), Kimi **did not finish** (no verdict), review-k11-2 approved (observations 1 to 4) |
+| `f/fu-1-r12` (`integ12/fu-1-r12`) | Card FU-1 (backlog S-7 to S-17 items): DQS off in SQLite, names only where the contract types a principal (`principal_paths.json`, made from the contract, hash test), untrusted marks, `current_setting` revoked from `PUBLIC` (expand then contract, `RUUM_DATA_KEEP_SETTING_READERS`), masked copies that make views and materialized views again, change each masked column's type (no statistics stay), pin each planned column, run no tenant code on rows in clear, and (run 12) refuse an index on a range type with tenant functions. | rfu1 reviews, Kimi **APPROVE** (run 12), rfu1-5 accept (notes 1 to 4) |
+| `f/p-57` (`integ12/p-57-2`) | Readers pass on a journal entry of an unknown type with its envelope and empty `data` instead of failing the feed (design 12.7: a release that writes a new type ships after one that reads unknown types). The integrator added one commit: `principal_paths.json` made again for P-57's contract text. | review-p57 (2 text changes), Kimi **not run**, review-p57-2 accept |
+| `f/w2s-1` (`integ12/w2s-1-2`) | Static sites count against the storage quota, checked before the deploy is accepted and before files are stored; a garbage collection frees site files that no deployment can serve, with a rolling-upgrade guard. No migration. | review-w2s1 (4 changes), Kimi **no verdict** (usage limit; draft findings fixed or tracked), review-w2s1-2 accept (follow-ups A to C) |
+| `s3/o-1a-r12` (`integ12/o-1a-r12-2`) | The telemetry privacy core (`ruum-core` `telemetry/`): field classes, deny list, secret matcher with encoded forms, pseudonyms, a byte cap that bounds the output, the privacy suite; Kimi K3, K4 (run 11) and the five run 12 findings closed. Not wired (O-1b). | revo1a3 accept, Kimi **CHANGES REQUESTED** on `3eccf5c` (fixed in `5561357`, not seen by Kimi), revo1a4 accept |
+| `s3/g-1b` (`integ12/g-1b-2`) | The gateway in front of sandboxes: asks the core where an app runs (`SandboxDirectory`, one internal route), wakes it (holds up to `RUUM_GATEWAY_WAKE_HOLD`, then a "starting" page), proxies HTTP and WebSockets after the access check, rechecks each WebSocket every second against the handshake's visitor, limits held requests and sockets per deployment, app, tenant and in total. Until I-4 every sandbox request answers `502`. New dependency `hyper-util` 0.1.21. | review-g1b (3 changes), Kimi **did not finish** (no verdict), review-g1b-2 accept (note G) |
+| `s3/r-2b-r2` (`integ12/r-2b-r2-2`) | The node22 builder: a build runs in its own sandbox job (R-2a hardening, one internal network with only the egress proxy and `registry.npmjs.org`); the image is assembled without a Docker daemon and pushed once by digest to the app's own repository; refuses cut or padded output, keeps registry credentials to the registry's origin, caps every body read, cleans up a cancelled build. Not wired (I-4). | review-r2b (5 changes), Kimi **CHANGES REQUESTED** (3 high, 4 medium; all closed in `2bb8ad6`, not seen by Kimi), review-r2b-2 ACCEPT |
+
+Fixes made during this integration:
+
+- P-57 changed the contract text and FU-1 added the hash test of `principal_paths.json`: the
+  rebase was clean, the test failed. One commit on P-57 makes the file again; P-57 and the four
+  branches above it were pushed again under `-2` names (no force push; backlog M-57).
+- Three mutations had gone stale with FU-1 (two skipped, one survived). One integrator commit
+  moves them to the current code; all three are killed (backlog T-57).
+- The tip checks ran detached on the server (`setsid nohup`), because SSH drops killed remote runs
+  (B-40); the first integrating agent crashed mid-way and a second one finished
+  (`panel/retro-integ12-recovery.md`).
 
 Integration of run 11 (2026-11-17; step 3 wave 3; four branches rebased onto `main` `616e34e` in
 one stack, each tip checked on the build server, pushed as `integ11/<name>`, green in GitHub CI,
@@ -745,6 +774,40 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
 
+## Checks (2026-11-18, `main` after the integration of run 12, on the build server)
+
+`main` is `c886ab8` before this documentation commit. Each tip was checked with the key
+`integ12`, one full check at a time (`integ12-check.sh`: fmt, clippy, the workspace without
+`ruum-dbengine`, `ruum-dbengine` with 4 threads, the test kit on both backends with
+`RUUM_REQUIRE_IMPLEMENTED=1`, the browser tests). Failures were run again alone on a fresh data
+cluster. The strict mutation check ran in two shards (`integ12m1`, `integ12m2`) and the 20 Docker
+mutations alone on the engine.
+
+| Tip | `cargo test --workspace` | Rerun alone | Isolation (memory = Postgres) | Permission matrix | Privacy (memory / Postgres) | Trashed | Browser |
+|---|---|---|---|---|---|---|---|
+| main before (`1d0326f`) | 1148 / 0 / 3 ignored | | 375 passed, 128 planned | 2032 passed, 624 planned | 99 planned / 38 passed, 61 planned | 112 | 172 passed, 1 skipped |
+| K11 | 1161 / 1 / 3 | the 1 passes (timing under load, T-54) | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| FU-1 | 1177 / 0 / 2 | | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| P-57 | 1179 / 3 / 2 | the 3 pass (a busy sqlx test database; the Docker registry, T-53) | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| W2S-1 | 1189 / 2 / 2 | the 2 Docker tests pass (T-53) | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| O-1a | 1198 / 16 / 2 | 155 `databases::` tests pass (data cluster in recovery mode, B-39) | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| G-1b | 1232 / 16 / 2 | same as O-1a | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| R-2b and the mutation fix (final) | **1274 / 0 / 2** | (none needed) | **375 passed, 128 planned** | **2032 passed, 624 planned** | **99 planned / 38 passed, 61 planned** | **112** | **172 passed, 1 skipped** |
+
+On the final tree: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` clean; the test kit with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and Postgres, 0 operations without a case; `scripts/e2e_smoke.sh`: `PASSED: 59 checks`. Also:
+
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: all 304 mutations killed (235
+  before). In the shards, two skipped and one survived because FU-1 had moved the guarded code;
+  moved to the current code, all three are killed (T-57). The 20 Docker mutations: 20 killed.
+- The first full check of the final tree compiled stale code (cargo reused the G-1b build because
+  `run.sh` keeps old file times, B-41) and is not counted.
+- `deploy/staging/tests/run.sh` on the Mac: 640 checks passed on the final tree, and on each of the seven tips.
+- GitHub CI: green on the seven pushed heads `integ12/k11`, `integ12/fu-1-r12`, `integ12/p-57-2`,
+  `integ12/w2s-1-2`, `integ12/o-1a-r12-2` (second attempt, T-54), `integ12/g-1b-2`,
+  `integ12/r-2b-r2-2` (`ci` runs 44248618185, 44248623658, 44251468482, 44251472256, 44251475494,
+  44251479149, 44251482894).
+
 ## Checks (2026-11-17, `main` after the integration of run 11, on the build server)
 
 `main` is `4d991cc` before this documentation commit (which adds one doc comment to
@@ -1089,7 +1152,7 @@ backlog 2026-11-10-run8 S-29 (the raw `up` of a migration approval).
    personal column; no `USAGE` on `ruum_mask` for the copy's owner; names only in
    `PrincipalRef` fields; the remaining untrusted marks; rule 10 walks the query of
    `CREATE TABLE ... AS` and `CREATE VIEW ... AS`; one line on "names, not relations".
-   Items 0 and 1 are built on `f/fu-1-r12` (card FU-1, review pending; `panel/impl-fu1.md`).
+   Items 0 and 1 are built on `f/fu-1-r12` (card FU-1), merged in run 12 (2026-11-18).
    Review fixes (`panel/review-fu1-fix.md`, run 10): a masked copy makes every materialized view
    again, changes each masked column's type (a personal one to `text`, a secret one to its own
    type; both drop its statistics, also for a statistics target of 0 and a table with no row)
