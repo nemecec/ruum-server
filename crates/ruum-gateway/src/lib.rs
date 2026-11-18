@@ -364,9 +364,11 @@ async fn forward_sandbox(
         Ok(o) => o,
         Err(r) => return *r,
     };
-    // A second try only when the first address took no connection and nothing was sent.
+    // A second try only when the first address took no connection and nothing was sent. Both
+    // tries share one hold (kimi-run12-g1b 2: the second one may wait for the app to listen).
+    let deadline = tokio::time::Instant::now() + gw.sandboxes.config.hold;
     for _ in 0..2 {
-        let url = match gw.sandboxes.route(&q).await {
+        let url = match gw.sandboxes.route_until(&q, deadline).await {
             Route::Ready(u) => u,
             Route::Busy | Route::Starting => return pages::starting(site.look()),
             Route::NotRunning => return pages::not_running(site.look()),

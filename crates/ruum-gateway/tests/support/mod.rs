@@ -199,11 +199,19 @@ pub struct Instances {
     targets: Mutex<HashMap<Uuid, SocketAddr>>,
     /// instance -> (its port, the tasks that serve it)
     ports: Mutex<HashMap<InstanceId, (u16, Tasks)>>,
+    /// How long a new instance's port stays closed after the instance runs (an app that is
+    /// still booting; kimi-run12-g1b 2).
+    listen_delay: Mutex<Duration>,
 }
 
 type Tasks = Vec<tokio::task::JoinHandle<()>>;
 
 impl Instances {
+    /// How long each later instance's port stays closed after it runs.
+    pub fn set_listen_delay(&self, d: Duration) {
+        *self.listen_delay.lock().expect("listen delay") = d;
+    }
+
     fn set_target(&self, deployment: Uuid, url: &str) -> WorldResult<()> {
         let addr: SocketAddr = url
             .trim_start_matches("http://")
@@ -236,7 +244,14 @@ impl Instances {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         std_listener.set_nonblocking(true).ok()?;
         let port = std_listener.local_addr().ok()?.port();
-        let listener = tokio::net::TcpListener::from_std(std_listener).ok()?;
+        let delay = *self.listen_delay.lock().expect("listen delay");
+        // With a listen delay the port is closed (nothing listens) until the app is up.
+        let early = if delay.is_zero() {
+            Some(tokio::net::TcpListener::from_std(std_listener).ok()?)
+        } else {
+            drop(std_listener);
+            None
+        };
         let me = self.clone();
         let id = st.id;
         // The entry first, so every connection task is recorded and ends at `close`.
@@ -245,6 +260,16 @@ impl Instances {
             .expect("ports")
             .insert(id, (port, Vec::new()));
         let accept = tokio::spawn(async move {
+            let listener = match early {
+                Some(l) => l,
+                None => {
+                    tokio::time::sleep(delay).await;
+                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    }
+                }
+            };
             while let Ok((mut inbound, _)) = listener.accept().await {
                 let t = tokio::spawn(async move {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {

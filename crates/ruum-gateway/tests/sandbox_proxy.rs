@@ -450,6 +450,40 @@ async fn twenty_requests_to_a_stopped_app_cause_one_start() {
     assert_eq!(app.hits(), 21);
 }
 
+/// kimi-run12-g1b 2: the runtime reports the instance as running before its app listens. The
+/// first request is held until the app takes connections and then answered, with one start;
+/// a request with a body too (its body can be sent only once).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cold_start_is_held_until_the_app_listens() {
+    let w = World::new().await.unwrap();
+    let app = TestApp::start("/").await;
+    let (host, d, _) = public_sandbox(&w, "acme", "garden", &app.url).await;
+    // Positive control: the running app answers.
+    assert_eq!(send(&w, Req::get(&host, "/")).await.status, 200);
+    let hits = app.hits.load(Ordering::SeqCst);
+    w.stop_instance(&d).await.unwrap();
+    // Past the ready cache, so both requests ask the core (a stopped instance's cached address
+    // is the other path: backlog row of kimi-run12-g1b).
+    tokio::time::sleep(ruum_gateway::sandbox::READY_TTL + Duration::from_millis(100)).await;
+    w.instances.set_listen_delay(Duration::from_millis(800));
+    let before = w.driver.starts();
+    let t = Instant::now();
+    let (get, post) = tokio::join!(
+        send(&w, Req::get(&host, "/after-start")),
+        send(&w, Req::post(&host, "/body").body(vec![b'a'; 100])),
+    );
+    assert_eq!(get.status, 200, "{}", get.text());
+    assert_eq!(post.status, 200, "{}", post.text());
+    assert!(
+        t.elapsed() >= Duration::from_millis(700),
+        "answered before the app listened: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(w.driver.starts() - before, 1, "one start");
+    assert_eq!(app.hits.load(Ordering::SeqCst) - hits, 2);
+    assert_eq!(*app.bodies.lock().unwrap(), vec![100]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_slower_than_the_hold_gets_the_starting_page() {
     let w = World::with(Opts {
