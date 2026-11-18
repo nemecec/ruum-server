@@ -353,6 +353,9 @@ pub struct StaticDeployment {
     /// not ended (`pending`, `running`, `ready`). A failed, expired or superseded preview never
     /// comes back.
     pub reachable: bool,
+    /// When the deployment was created, while it is `pending` or `running` (its stages may
+    /// still write its site); `None` in every other state.
+    pub in_flight_since: Option<OffsetDateTime>,
 }
 
 /// The storage a tenant uses outside the apps area, for the quota of static sites

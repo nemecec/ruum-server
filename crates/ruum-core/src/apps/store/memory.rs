@@ -663,6 +663,11 @@ impl AppStore for MemoryAppStore {
                             | DeploymentState::Running
                             | DeploymentState::Ready
                     ),
+                in_flight_since: matches!(
+                    d.state,
+                    DeploymentState::Pending | DeploymentState::Running
+                )
+                .then_some(d.created_at),
             })
             .collect())
     }
