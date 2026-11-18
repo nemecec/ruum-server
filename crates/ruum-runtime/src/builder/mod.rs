@@ -266,27 +266,51 @@ pub fn read_manifest(files: &archive::Unpacked) -> Result<Recipe, String> {
     Ok(Recipe { start, build })
 }
 
-/// The source tar the job unpacks: the checked files of the archive, folders first.
-fn source_tar(files: &archive::Unpacked) -> Bytes {
-    let mut dirs: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-    let mut entries: BTreeMap<Vec<u8>, &Bytes> = BTreeMap::new();
+/// The most bytes of the source's names, with the folders above them, in the source tar
+/// (the same bound as the output's, [`output::MAX_NAME_TOTAL_BYTES`]).
+pub const MAX_SOURCE_NAME_TOTAL_BYTES: usize = output::MAX_NAME_TOTAL_BYTES;
+
+/// The source tar the job unpacks: the checked files of the archive, folders first. The folders
+/// above the files are added once each, walking up from a file only to the first folder that is
+/// already there, and all names together (folders included) stay under `max_names` bytes: a deep
+/// path cannot make the builder copy each of its parents for every file (Kimi, run 12).
+fn source_tar(files: &archive::Unpacked, max_names: usize) -> Result<Bytes, String> {
+    let mut dirs: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
+    let mut entries: BTreeMap<&[u8], &Bytes> = BTreeMap::new();
+    let mut name_bytes: usize = 0;
+    let over = || {
+        format!(
+            "the archive's paths, with the folders above them, are over {max_names} bytes in all"
+        )
+    };
     for e in &files.entries {
         let p = e.name.as_bytes();
-        for (i, b) in p.iter().enumerate() {
-            if *b == b'/' {
-                dirs.insert(p[..i].to_vec());
-            }
+        name_bytes += p.len();
+        if name_bytes > max_names {
+            return Err(over());
         }
-        entries.insert(p.to_vec(), &e.data);
+        let mut end = p.len();
+        while let Some(i) = p[..end].iter().rposition(|b| *b == b'/') {
+            if !dirs.insert(&p[..i]) {
+                // This folder was added with every folder above it.
+                break;
+            }
+            name_bytes += i;
+            if name_bytes > max_names {
+                return Err(over());
+            }
+            end = i;
+        }
+        entries.insert(p, &e.data);
     }
     let mut w = oci::TarWriter::new();
     for d in &dirs {
         w.dir(d);
     }
     for (p, data) in entries {
-        w.file(&p, 0o644, data);
+        w.file(p, 0o644, data);
     }
-    Bytes::from(w.finish())
+    Ok(Bytes::from(w.finish()))
 }
 
 /// The state a build's cleanup needs, also when the build future was dropped at its timeout
@@ -559,21 +583,27 @@ impl DockerBuilder {
             max_files: 100_000,
             max_ratio: 200,
         };
-        let files = archive::unpack(&input.archive, &limits).map_err(|r| match r {
-            archive::Refusal::Hostile { entry, reason } => failed(format!(
-                "the archive entry {:?} is refused: {reason}",
-                entry.escape_debug().take(200).collect::<String>()
-            )),
-            archive::Refusal::Corrupt { reason } => {
-                failed(format!("the archive cannot be read: {reason}"))
-            }
-            archive::Refusal::Limit { what, limit } => {
-                failed(format!("the archive is over the limit of {what} ({limit})"))
-            }
-        })?;
-        let recipe = read_manifest(&files).map_err(failed)?;
-        let source = source_tar(&files);
-        drop(files);
+        // Unpacking and the source tar are CPU work over up to the archive limit: off the async
+        // workers, so the build's timeout still ends the build.
+        let archive_bytes = input.archive.clone();
+        let (recipe, source) = blocking(move || {
+            let files = archive::unpack(&archive_bytes, &limits).map_err(|r| match r {
+                archive::Refusal::Hostile { entry, reason } => failed(format!(
+                    "the archive entry {:?} is refused: {reason}",
+                    entry.escape_debug().take(200).collect::<String>()
+                )),
+                archive::Refusal::Corrupt { reason } => {
+                    failed(format!("the archive cannot be read: {reason}"))
+                }
+                archive::Refusal::Limit { what, limit } => {
+                    failed(format!("the archive is over the limit of {what} ({limit})"))
+                }
+            })?;
+            let recipe = read_manifest(&files).map_err(failed)?;
+            let source = source_tar(&files, MAX_SOURCE_NAME_TOTAL_BYTES).map_err(failed)?;
+            Ok::<_, RuntimeError>((recipe, source))
+        })
+        .await??;
         self.ensure_base().await?;
         let network = job::create_network(
             &self.docker,
@@ -823,6 +853,57 @@ mod tests {
         assert!(read_manifest(&files("runtime: static\nstart: x\n")).is_err());
         assert!(read_manifest(&files("runtime: node22\nstart: [a]\n")).is_err());
         assert!(read_manifest(&archive::Unpacked::default()).is_err());
+    }
+
+    fn unpacked(names: impl IntoIterator<Item = String>) -> archive::Unpacked {
+        archive::Unpacked {
+            entries: names
+                .into_iter()
+                .map(|name| archive::Entry {
+                    name,
+                    data: Bytes::from_static(b"x"),
+                })
+                .collect(),
+        }
+    }
+
+    /// The folder entries of a source tar, in order.
+    fn tar_dirs(tar: &[u8]) -> Vec<String> {
+        let out = output::read_output(Bytes::copy_from_slice(tar), u64::MAX).expect("a valid tar");
+        out.entries
+            .iter()
+            .filter(|e| matches!(e.kind, output::Kind::Dir))
+            .map(|e| String::from_utf8(e.path.clone()).expect("UTF-8"))
+            .collect()
+    }
+
+    #[test]
+    fn the_source_tar_adds_each_folder_once() {
+        let files = unpacked(
+            ["app.yaml", "src/a/b.js", "src/a/c.js", "src/d.js"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let tar = source_tar(&files, MAX_SOURCE_NAME_TOTAL_BYTES).expect("small source");
+        assert_eq!(tar_dirs(&tar), ["src", "src/a"]);
+    }
+
+    #[test]
+    fn deep_source_paths_cannot_amplify_the_source_tar() {
+        // A small cap: the name fits, its folders do not.
+        let files = unpacked(["a/b/c/d/e/f".to_owned()]);
+        assert!(source_tar(&files, 11).is_err());
+        assert!(source_tar(&files, 11 + 9 + 7 + 5 + 3 + 1).is_ok());
+        // Each name is under the archive's 1024-byte cap, but its 500 folders are distinct from
+        // every other name's: about 250 KiB of folder names per file. 600 such files (600 KiB of
+        // names in the archive) would make about 150 MiB of folder names in the source tar.
+        let deep = |i: usize| format!("d{i:04}/{}f", "x/".repeat(500));
+        let files = unpacked((0..600).map(deep));
+        let names: usize = files.entries.iter().map(|e| e.name.len()).sum();
+        assert!(names < 1024 * 1024);
+        let err = source_tar(&files, MAX_SOURCE_NAME_TOTAL_BYTES)
+            .expect_err("folder names over the cap are refused");
+        assert!(err.contains("over"), "{err}");
     }
 
     #[test]
