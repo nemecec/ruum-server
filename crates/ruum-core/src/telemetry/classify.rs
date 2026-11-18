@@ -411,7 +411,10 @@ impl Pipeline<'_> {
         StoredValue::Pseudonym(p)
     }
 
-    /// Free text: secrets first, then the patterns.
+    /// Free text: secrets first, then the patterns, then the secrets once more. A replacement
+    /// of the scrubber (`<hidden secret>`, `<person ...>`) can build a secret again, or be one
+    /// (Kimi review of run 12, finding 2); the second pass catches that, and its result holds
+    /// no secret ([`SecretMatcher::redact`]).
     fn free_text(&mut self, text: &str) -> String {
         let text = match self.secrets.redact(text) {
             Some(r) => {
@@ -423,7 +426,13 @@ impl Pipeline<'_> {
         let (out, counts) = scrub::scrub(&text, self.pseudonymizer);
         self.report.hidden += counts.hidden;
         self.report.pseudonymized += counts.pseudonymized;
-        out
+        match self.secrets.redact(&out) {
+            Some(r) => {
+                self.report.secrets_redacted += 1;
+                r
+            }
+            None => out,
+        }
     }
 
     /// The attributes of a record: `ruum.*` and invalid keys dropped, keys with a secret or a
@@ -595,14 +604,17 @@ impl Pipeline<'_> {
 // ---------------------------------------------------------------------------- cache
 
 /// A short cache in front of a [`FieldClassSource`]: the classes of an app are read at most
-/// once per `ttl`. A stricter class reaches the pipeline within `ttl`.
+/// once per `ttl`. A stricter class reaches the pipeline within `ttl` of the first read that
+/// starts after the change. An entry's age counts from the start of its read, and a read
+/// never replaces an entry of a read that started later, so a slow read of the old classes
+/// that ends after a newer read cannot keep them (Kimi review of run 12, finding 4).
 pub struct CachedFieldClasses {
     inner: Arc<dyn FieldClassSource>,
     ttl: Duration,
     cache: Mutex<HashMap<(TenantId, NodeId), CachedRead>>,
 }
 
-/// When the classes were read, and the classes.
+/// When the read of the classes started, and the classes.
 type CachedRead = (Instant, Arc<FieldClasses>);
 
 impl CachedFieldClasses {
@@ -629,10 +641,17 @@ impl FieldClassSource for CachedFieldClasses {
                 return Ok(c.clone());
             }
         }
+        let started = Instant::now();
         let fresh = self.inner.classes(tenant, app).await?;
         let mut cache = self.cache.lock().expect("class cache lock");
         cache.retain(|_, (at, _)| at.elapsed() < self.ttl);
-        cache.insert((tenant, app), (Instant::now(), fresh.clone()));
-        Ok(fresh)
+        match cache.get(&(tenant, app)) {
+            // A read that started later already stored its classes: they are newer.
+            Some((at, newer)) if *at >= started => Ok(newer.clone()),
+            _ => {
+                cache.insert((tenant, app), (started, fresh.clone()));
+                Ok(fresh)
+            }
+        }
     }
 }

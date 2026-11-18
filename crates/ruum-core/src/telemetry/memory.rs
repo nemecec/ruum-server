@@ -73,6 +73,8 @@ impl TelemetryStore for MemoryTelemetryStore {
             return Ok(ClassifiedBatch::default());
         };
         let limit = f.limit.unwrap_or(usize::MAX);
+        // Oldest first by record time, then in the order written; the limit keeps the oldest
+        // (Kimi review of run 12, finding 5).
         let want = |s: Signal| f.signal.is_none_or(|w| w == s);
         let mut out = ClassifiedBatch::default();
         if want(Signal::Logs) {
@@ -85,7 +87,6 @@ impl TelemetryStore for MemoryTelemetryStore {
                         && f.min_severity.is_none_or(|s| r.severity >= s)
                         && fields_match(f, &[&r.fields, &r.attributes])
                 })
-                .take(limit)
                 .cloned()
                 .collect();
         }
@@ -98,7 +99,6 @@ impl TelemetryStore for MemoryTelemetryStore {
                         && time_matches(r.time, f)
                         && fields_match(f, &[&r.labels])
                 })
-                .take(limit)
                 .cloned()
                 .collect();
         }
@@ -111,10 +111,15 @@ impl TelemetryStore for MemoryTelemetryStore {
                         && time_matches(r.start, f)
                         && fields_match(f, &[&r.attributes])
                 })
-                .take(limit)
                 .cloned()
                 .collect();
         }
+        out.logs.sort_by_key(|r| r.time);
+        out.logs.truncate(limit);
+        out.metrics.sort_by_key(|r| r.time);
+        out.metrics.truncate(limit);
+        out.spans.sort_by_key(|r| r.start);
+        out.spans.truncate(limit);
         Ok(out)
     }
 }
