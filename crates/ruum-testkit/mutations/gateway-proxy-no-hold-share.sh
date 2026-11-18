@@ -3,6 +3,6 @@
 # WebSockets) cannot take the slots of other apps.
 DESCRIPTION="the per-app hold share is gone"
 FILE="crates/ruum-gateway/src/sandbox.rs"
-PERL='s/if mine >= per \|\| st\.1 >= global \{/if st.1 >= global {/'
+PERL='s/if mine >= lim\.per_key \|\| tenants >= lim\.per_tenant/if tenants >= lim.per_tenant/'
 TESTS="-p ruum-gateway --lib --test sandbox_proxy"
 PLACEHOLDER=0

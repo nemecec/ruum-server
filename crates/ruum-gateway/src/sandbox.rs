@@ -20,10 +20,13 @@
 //!   then the visitor gets the `503` page with `Retry-After`.
 //! - **Fair share** (backlog S-61). A request that is not answered from the short cache of ready
 //!   answers takes a hold slot: at most [`HoldConfig::per_app`] (`RUUM_GATEWAY_HOLD_PER_APP`,
-//!   default 64) per deployment and [`HoldConfig::global`] (`RUUM_GATEWAY_HOLD_GLOBAL`, default
-//!   1024) in all. Over either, the visitor gets the `503` page at once, so one app's cold starts
-//!   cannot take the slots of other apps (the per-app share is far below the global cap). Open
-//!   WebSockets have their own shares ([`HoldConfig::ws_per_app`], [`HoldConfig::ws_global`]).
+//!   default 64) per deployment, [`HoldConfig::per_tenant`] (`RUUM_GATEWAY_HOLD_PER_TENANT`,
+//!   default 256) per tenant and [`HoldConfig::global`] (`RUUM_GATEWAY_HOLD_GLOBAL`, default
+//!   1024) in all. Over any of them, the visitor gets the `503` page at once, so the cold starts
+//!   of one app, or of many deployments of one tenant, cannot take the slots of other tenants
+//!   (both shares are far below the global cap). Open WebSockets have their own shares: per app
+//!   ([`HoldConfig::ws_per_app`], all deployments of the app together), per tenant
+//!   ([`HoldConfig::ws_per_tenant`]) and in all ([`HoldConfig::ws_global`]) (review-g1b 3).
 //! - **A short cache of ready answers** ([`READY_TTL`]), so a busy app does not cost one core
 //!   question per request. A request that cannot connect to a cached address forgets it
 //!   ([`SandboxHold::forget`]): the instance may have scaled to zero.
@@ -138,10 +141,14 @@ pub struct HoldConfig {
     pub hold: Duration,
     /// Held requests per deployment (`RUUM_GATEWAY_HOLD_PER_APP`).
     pub per_app: usize,
+    /// Held requests per tenant (`RUUM_GATEWAY_HOLD_PER_TENANT`).
+    pub per_tenant: usize,
     /// Held requests in all (`RUUM_GATEWAY_HOLD_GLOBAL`).
     pub global: usize,
-    /// Open WebSockets per deployment (`RUUM_GATEWAY_WS_PER_APP`).
+    /// Open WebSockets per app, all its deployments together (`RUUM_GATEWAY_WS_PER_APP`).
     pub ws_per_app: usize,
+    /// Open WebSockets per tenant (`RUUM_GATEWAY_WS_PER_TENANT`).
+    pub ws_per_tenant: usize,
     /// Open WebSockets in all (`RUUM_GATEWAY_WS_GLOBAL`).
     pub ws_global: usize,
     /// How long a held request waits before it asks again after `starting`.
@@ -153,8 +160,10 @@ impl Default for HoldConfig {
         Self {
             hold: Duration::from_secs(10),
             per_app: 64,
+            per_tenant: 256,
             global: 1024,
             ws_per_app: 256,
+            ws_per_tenant: 2048,
             ws_global: 8192,
             retry: Duration::from_millis(100),
         }
@@ -190,52 +199,82 @@ fn key_of(q: &UpstreamQuery) -> Key {
 
 type Asked = Shared<BoxFuture<'static, Result<UpstreamAnswer, String>>>;
 
-/// Counts slots per deployment and in all.
+/// The limits of one kind of slot: per share key (a deployment or an app), per tenant and in
+/// all.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    per_key: usize,
+    per_tenant: usize,
+    global: usize,
+}
+
+#[derive(Default)]
+struct Counts {
+    per_key: HashMap<Uuid, usize>,
+    per_tenant: HashMap<ruum_core::TenantId, usize>,
+    total: usize,
+}
+
+/// Counts slots per share key, per tenant and in all.
 #[derive(Default)]
 struct Counter {
-    state: Mutex<(HashMap<Uuid, usize>, usize)>,
+    state: Mutex<Counts>,
+}
+
+fn take_one<K: std::hash::Hash + Eq>(m: &mut HashMap<K, usize>, k: &K) {
+    if let Some(n) = m.get_mut(k) {
+        *n -= 1;
+        if *n == 0 {
+            m.remove(k);
+        }
+    }
 }
 
 impl Counter {
-    fn acquire(self: &Arc<Self>, deployment: Uuid, per: usize, global: usize) -> Option<Slot> {
+    fn acquire(
+        self: &Arc<Self>,
+        tenant: ruum_core::TenantId,
+        key: Uuid,
+        lim: Limits,
+    ) -> Option<Slot> {
         let mut st = self.state.lock().expect("slot lock");
-        let mine = st.0.get(&deployment).copied().unwrap_or(0);
-        if mine >= per || st.1 >= global {
+        let mine = st.per_key.get(&key).copied().unwrap_or(0);
+        let tenants = st.per_tenant.get(&tenant).copied().unwrap_or(0);
+        if mine >= lim.per_key || tenants >= lim.per_tenant || st.total >= lim.global {
             return None;
         }
-        st.0.insert(deployment, mine + 1);
-        st.1 += 1;
+        st.per_key.insert(key, mine + 1);
+        st.per_tenant.insert(tenant, tenants + 1);
+        st.total += 1;
         Some(Slot {
             counter: self.clone(),
-            deployment,
+            tenant,
+            key,
         })
     }
 
-    fn release(&self, deployment: Uuid) {
+    fn release(&self, tenant: ruum_core::TenantId, key: Uuid) {
         let mut st = self.state.lock().expect("slot lock");
-        if let Some(n) = st.0.get_mut(&deployment) {
-            *n -= 1;
-            if *n == 0 {
-                st.0.remove(&deployment);
-            }
-        }
-        st.1 = st.1.saturating_sub(1);
+        take_one(&mut st.per_key, &key);
+        take_one(&mut st.per_tenant, &tenant);
+        st.total = st.total.saturating_sub(1);
     }
 
     fn total(&self) -> usize {
-        self.state.lock().expect("slot lock").1
+        self.state.lock().expect("slot lock").total
     }
 }
 
 /// A taken slot (a held request or an open WebSocket); dropped, it is free again.
 pub struct Slot {
     counter: Arc<Counter>,
-    deployment: Uuid,
+    tenant: ruum_core::TenantId,
+    key: Uuid,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.counter.release(self.deployment);
+        self.counter.release(self.tenant, self.key);
     }
 }
 
@@ -271,10 +310,18 @@ impl SandboxHold {
         self.sockets.total()
     }
 
-    /// Takes a WebSocket slot of the deployment, or `None` over its share or the global cap.
-    pub fn open_socket(&self, deployment: Uuid) -> Option<Slot> {
-        self.sockets
-            .acquire(deployment, self.config.ws_per_app, self.config.ws_global)
+    /// Takes a WebSocket slot of the app of `tenant`, or `None` over the app's share, the
+    /// tenant's share or the global cap.
+    pub fn open_socket(&self, tenant: ruum_core::TenantId, app: ruum_core::NodeId) -> Option<Slot> {
+        self.sockets.acquire(
+            tenant,
+            app.0,
+            Limits {
+                per_key: self.config.ws_per_app,
+                per_tenant: self.config.ws_per_tenant,
+                global: self.config.ws_global,
+            },
+        )
     }
 
     /// Forgets the cached address of a query (the instance did not take a connection).
@@ -325,11 +372,13 @@ impl SandboxHold {
         if let Some(url) = self.cached(&k) {
             return Route::Ready(url);
         }
-        let Some(_slot) =
-            self.held
-                .acquire(q.deployment_id, self.config.per_app, self.config.global)
-        else {
-            tracing::warn!(target: "ruum::gateway", "the hold share of an app is full");
+        let limits = Limits {
+            per_key: self.config.per_app,
+            per_tenant: self.config.per_tenant,
+            global: self.config.global,
+        };
+        let Some(_slot) = self.held.acquire(q.tenant_id, q.deployment_id, limits) else {
+            tracing::warn!(target: "ruum::gateway", "the hold share of an app or a tenant is full");
             return Route::Busy;
         };
         let deadline = tokio::time::Instant::now() + self.config.hold;
@@ -535,21 +584,80 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(hold.held(), 0);
-        // WebSocket shares.
+        // WebSocket shares: per app (all its deployments), per tenant, in all.
         let hold = SandboxHold::new(
             Arc::new(NoSandboxes),
             HoldConfig {
                 ws_per_app: 1,
-                ws_global: 2,
+                ws_per_tenant: 2,
+                ws_global: 3,
                 ..HoldConfig::default()
             },
         );
-        let d1 = Uuid::now_v7();
-        let s1 = hold.open_socket(d1).unwrap();
-        assert!(hold.open_socket(d1).is_none());
-        let _s2 = hold.open_socket(Uuid::now_v7()).unwrap();
-        assert!(hold.open_socket(Uuid::now_v7()).is_none());
+        let (t1, t2, t3) = (TenantId::new(), TenantId::new(), TenantId::new());
+        let app1 = NodeId::new();
+        let s1 = hold.open_socket(t1, app1).unwrap();
+        assert!(hold.open_socket(t1, app1).is_none(), "over the app's share");
+        let _s2 = hold.open_socket(t1, NodeId::new()).unwrap();
+        assert!(
+            hold.open_socket(t1, NodeId::new()).is_none(),
+            "over the tenant's share"
+        );
+        let _s3 = hold.open_socket(t2, NodeId::new()).unwrap();
+        assert!(
+            hold.open_socket(t3, NodeId::new()).is_none(),
+            "over the global cap"
+        );
         drop(s1);
-        assert!(hold.open_socket(d1).is_some());
+        assert!(hold.open_socket(t1, app1).is_some());
+    }
+
+    #[tokio::test]
+    async fn one_tenants_deployments_cannot_take_the_global_hold() {
+        let core = Arc::new(Slow {
+            asks: AtomicUsize::new(0),
+            ready_after: usize::MAX,
+            delay: Duration::from_millis(10),
+        });
+        let config = HoldConfig {
+            hold: Duration::from_millis(400),
+            per_app: 2,
+            per_tenant: 3,
+            global: 10,
+            ..HoldConfig::default()
+        };
+        let hold = Arc::new(SandboxHold::new(core, config));
+        let tenant = TenantId::new();
+        let of_tenant = || UpstreamQuery {
+            tenant_id: tenant,
+            ..q()
+        };
+        // Deployment A holds 2 (its share), B 1: the tenant's share of 3 is full.
+        let (a, b, c) = (of_tenant(), of_tenant(), of_tenant());
+        let other = q();
+        let (ra1, ra2, rb, rc, rother) = tokio::join!(
+            hold.route(&a),
+            hold.route(&a),
+            hold.route(&b),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let t = Instant::now();
+                (hold.route(&c).await, t.elapsed())
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                hold.route(&other).await
+            },
+        );
+        assert_eq!(
+            (ra1, ra2, rb),
+            (Route::Starting, Route::Starting, Route::Starting)
+        );
+        // A third deployment of the same tenant is within its own share, but over the tenant's.
+        assert_eq!(rc.0, Route::Busy);
+        assert!(rc.1 < Duration::from_millis(100), "{:?}", rc.1);
+        // Another tenant is still held (not busy), far below the global cap.
+        assert_eq!(rother, Route::Starting);
+        assert_eq!(hold.held(), 0);
     }
 }

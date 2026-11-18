@@ -387,23 +387,106 @@ async fn forward_sandbox(
     pages::not_running(site.look())
 }
 
+/// Whether a recheck found the visitor of the handshake (review-g1b 1): the same person with
+/// the same app roles (in any order), the same agent acting for the same person, or anonymous
+/// again. These are the values of the handshake's `Ruum-User` token ([`subject_of`]), which the
+/// app keeps acting on while the WebSocket is open.
+pub(crate) fn same_visitor(then: &check::Visitor, now: &check::Visitor) -> bool {
+    use check::Visitor::{Agent, Anonymous, User};
+    match (then, now) {
+        (Anonymous, Anonymous) => true,
+        (User { info: a, .. }, User { info: b, .. }) => {
+            let roles = |r: &[String]| {
+                let mut v = r.to_vec();
+                v.sort();
+                v.dedup();
+                v
+            };
+            a.sub == b.sub && roles(&a.roles) == roles(&b.roles)
+        }
+        (
+            Agent {
+                sub: a,
+                on_behalf_of: x,
+            },
+            Agent {
+                sub: b,
+                on_behalf_of: y,
+            },
+        ) => a == b && x == y,
+        _ => false,
+    }
+}
+
 /// Whether an open WebSocket of `site` may stay open: the host still resolves to the same
-/// deployment, which serves, and the request's credentials still pass the check (the answers
-/// come through the caches of at most 3 s). Any error closes it (fail closed).
-pub(crate) async fn still_allowed(gw: &Gateway, site: &Site, headers: &HeaderMap) -> bool {
+/// deployment, which serves, and the request's credentials still pass the check as the same
+/// `visitor` as at the handshake ([`same_visitor`]; the answers come through the caches of at
+/// most 3 s). Any error closes it (fail closed).
+pub(crate) async fn still_allowed(
+    gw: &Gateway,
+    site: &Site,
+    headers: &HeaderMap,
+    visitor: &check::Visitor,
+) -> bool {
     let Ok(now) = site_of(gw, &site.name).await else {
         return false;
     };
     if now.resolved != site.resolved {
         return false;
     }
-    matches!(
-        check::check(gw, &now, headers).await,
-        check::Outcome::Pass { .. }
-    )
+    match check::check(gw, &now, headers).await {
+        check::Outcome::Pass { visitor: again, .. } => same_visitor(visitor, &again),
+        _ => false,
+    }
 }
 
 /// Serves `gw` on `listener` until the future ends.
 pub async fn serve(listener: tokio::net::TcpListener, gw: Arc<Gateway>) -> std::io::Result<()> {
     axum::serve(listener, router(gw)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use check::Visitor;
+    use ruum_core::identity::app_sign_in::wire::SessionInfo;
+
+    fn user(sub: &str, roles: &[&str]) -> Visitor {
+        Visitor::User {
+            info: SessionInfo {
+                sub: sub.into(),
+                allowed: true,
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+            },
+            session: "s".into(),
+        }
+    }
+
+    fn agent(sub: &str, on_behalf_of: &str) -> Visitor {
+        Visitor::Agent {
+            sub: sub.into(),
+            on_behalf_of: on_behalf_of.into(),
+        }
+    }
+
+    #[test]
+    fn a_recheck_must_find_the_visitor_of_the_handshake() {
+        // The same visitor (roles in another order).
+        assert!(same_visitor(&Visitor::Anonymous, &Visitor::Anonymous));
+        assert!(same_visitor(
+            &user("p1", &["member", "approver"]),
+            &user("p1", &["approver", "member"])
+        ));
+        assert!(same_visitor(&agent("a1", "p1"), &agent("a1", "p1")));
+        // A signed-out person who now passes as anonymous on a public app.
+        assert!(!same_visitor(&user("p1", &[]), &Visitor::Anonymous));
+        assert!(!same_visitor(&Visitor::Anonymous, &user("p1", &[])));
+        // A removed or added role, another person, another agent or another principal.
+        assert!(!same_visitor(&user("p1", &["member"]), &user("p1", &[])));
+        assert!(!same_visitor(&user("p1", &[]), &user("p1", &["member"])));
+        assert!(!same_visitor(&user("p1", &[]), &user("p2", &[])));
+        assert!(!same_visitor(&agent("a1", "p1"), &agent("a2", "p1")));
+        assert!(!same_visitor(&agent("a1", "p1"), &agent("a1", "p2")));
+        assert!(!same_visitor(&agent("a1", "p1"), &user("a1", &[])));
+    }
 }
