@@ -460,9 +460,8 @@ async fn ensure_in(
     Err(no_free_slug())
 }
 
-/// The advisory lock key of the live switch of one app: 8 bytes of a keyed hash of the tenant
-/// and the app (a clash only makes two apps wait for each other).
-/// The advisory lock key of the site lock of a tenant.
+/// The advisory lock key of the site lock of a tenant: 8 bytes of a keyed hash of the tenant
+/// (a clash only makes two tenants wait for each other).
 fn site_lock_key(tenant: TenantId) -> i64 {
     let mut h = blake3::Hasher::new();
     h.update(b"ruum.apps.static_sites.v1");
@@ -473,6 +472,8 @@ fn site_lock_key(tenant: TenantId) -> i64 {
     i64::from_be_bytes(k)
 }
 
+/// The advisory lock key of the live switch of one app: 8 bytes of a keyed hash of the tenant
+/// and the app (a clash only makes two apps wait for each other).
 fn live_switch_key(tenant: TenantId, app: NodeId) -> i64 {
     let mut h = blake3::Hasher::new();
     h.update(b"ruum.apps.live_switch.v1");
@@ -1190,11 +1191,13 @@ impl AppStore for PgAppStore {
             })
             .collect()
     }
+
     async fn static_deployments(&self, tenant: TenantId) -> Result<Vec<StaticDeployment>> {
         let mut tx = begin_tenant(&self.pool, tenant).await?;
         let rows = sqlx::query(
             "select id, app_node_id, (environment = 'live' \
-             or state in ('pending', 'running', 'ready')) as reachable \
+             or state in ('pending', 'running', 'ready')) as reachable, \
+             case when state in ('pending', 'running') then created_at end as in_flight_since \
              from app_deployments where tenant_id = $1",
         )
         .bind(tenant)
@@ -1207,6 +1210,7 @@ impl AppStore for PgAppStore {
                     id: r.try_get("id")?,
                     app_node_id: r.try_get("app_node_id")?,
                     reachable: r.try_get("reachable")?,
+                    in_flight_since: r.try_get("in_flight_since")?,
                 })
             })
             .collect()

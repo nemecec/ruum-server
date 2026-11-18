@@ -264,6 +264,14 @@ pub fn check_site(index: &SiteIndex, manifest: &Value) -> CheckOutcome {
     }
 }
 
+/// The SPA fallback file of a manifest (`/static/spa_fallback`, relative to the site root).
+pub(crate) fn spa_fallback(manifest: &Value) -> Option<String> {
+    manifest
+        .pointer("/static/spa_fallback")
+        .and_then(Value::as_str)
+        .map(|s| s.trim_start_matches("./").to_string())
+}
+
 impl AppService {
     /// The stages after the `202` of a preview. Every failure ends in a `failed` deployment
     /// with `app.deployment_failed`; nothing here answers a request.
@@ -330,11 +338,7 @@ impl AppService {
             e.details = json!({ "pointer": "/static/root" });
             return Err(Box::new((e, None)));
         }
-        let spa = run
-            .manifest
-            .pointer("/static/spa_fallback")
-            .and_then(Value::as_str)
-            .map(|s| s.trim_start_matches("./").to_string());
+        let spa = spa_fallback(&run.manifest);
         // Under the tenant's site lock (shared), with the free storage as the budget: the
         // garbage collection never deletes an object that this write found and did not store
         // again, and the quota holds (backlog W2S-1).

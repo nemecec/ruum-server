@@ -623,17 +623,18 @@ impl AppService {
         // the blocking pool and never stalls the async workers.
         // The slot goes into the blocking task and comes back with its result: a cancelled
         // request cannot free the slot while the unpacking still runs (Kimi W-2s run 11, 4).
-        let ((packed, manifest, files, contents), slot) = blocking_with_slot(slot, move || {
+        let ((packed, manifest, files, need), slot) = blocking_with_slot(slot, move || {
             let unpacked = archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
             let manifest = checked_manifest(&unpacked, &plan)?;
             let files = site_files(&unpacked, &manifest);
-            let contents = super::static_site::site_contents(&files);
-            Ok::<_, Error>((packed, manifest, files, contents))
+            let need = super::static_site::SiteNeed::of(&files, stages::spa_fallback(&manifest))?;
+            Ok::<_, Error>((packed, manifest, files, need))
         })
         .await?;
-        // The storage quota (backlog W2S-1): a site whose new objects do not fit is a direct
-        // `403 quota_exceeded`; the image stage checks again under the site lock.
-        self.check_static_quota(ctx.tenant, &contents).await?;
+        // The storage quota (backlog W2S-1): a site whose new objects (files and index) do
+        // not fit is a direct `403 quota_exceeded`; the image stage checks again under the
+        // site lock.
+        self.check_static_quota(ctx.tenant, &need).await?;
         // The tenant slug is fixed by now (W-1 makes it with the first app).
         self.ensure_tenant(ctx.tenant).await?;
         let archive_bytes = bytes::Bytes::from(packed.bytes);
@@ -932,12 +933,17 @@ impl AppService {
         // deployment keeps serving until the store switches.
         // Under the tenant's site lock (shared): the garbage collection never deletes a file
         // of the old index while the copy checks it (backlog W2S-1). The new index has no row
-        // until the release; the collection keeps such an index for its grace period.
+        // until the release; the collection keeps such an index for its grace period. The
+        // copy counts against the storage quota (`403 quota_exceeded` when it does not fit).
         let index = {
             let _sites = self
                 .lock_sites(ctx.tenant, false, super::static_gc::SITE_LOCK_WAIT)
                 .await?;
-            self.deps.sites.copy_site(ctx.tenant, dep.id, id).await?
+            let free = self.static_free_bytes(ctx.tenant).await?;
+            self.deps
+                .sites
+                .copy_site_within(ctx.tenant, dep.id, id, Some(free))
+                .await?
         };
         let checked = async {
             let image = index.image()?;
@@ -1104,23 +1110,15 @@ impl AppService {
         Ok(total)
     }
 
-    /// Runs [`AppService::sweep_previews`] now and then every `every` (for the server), and
-    /// the garbage collection of static sites of every tenant now and then every
-    /// [`super::static_gc::STATIC_GC_EVERY`] (backlog W2S-1).
+    /// Runs [`AppService::sweep_previews`] now and then every `every` (for the server). It
+    /// also starts the garbage collection of static sites
+    /// ([`AppService::run_static_gc`], backlog W2S-1) in a task of its own, so a long
+    /// collection never holds up the expiry of previews.
     pub async fn run_sweeper(self: Arc<Self>, every: std::time::Duration) {
-        let mut last_gc: Option<tokio::time::Instant> = None;
+        tokio::spawn(self.clone().run_static_gc());
         loop {
             if let Err(e) = self.sweep_previews().await {
                 tracing::warn!(error = %e, "the preview sweeper failed");
-            }
-            if last_gc.is_none_or(|t| t.elapsed() >= super::static_gc::STATIC_GC_EVERY) {
-                last_gc = Some(tokio::time::Instant::now());
-                if let Err(e) = self
-                    .collect_static_all(super::static_gc::STATIC_GC_GRACE)
-                    .await
-                {
-                    tracing::warn!(error = %e, "the collection of static sites failed");
-                }
             }
             tokio::time::sleep(every).await;
         }

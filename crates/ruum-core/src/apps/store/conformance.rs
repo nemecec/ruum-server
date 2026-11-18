@@ -675,10 +675,10 @@ pub(crate) async fn deployments_stay_in_their_tenant(h: &dyn Harness) {
     );
 }
 
-/// Runs every case.
 /// The garbage collection of static sites reads which deployments may still be served or
 /// deployed again: live ones (also superseded releases, a rollback deploys them again) and
-/// previews that have not ended; only the tenant's own (backlog W2S-1).
+/// previews that have not ended, and which may still write their site (pending and running
+/// ones, with their creation time); only the tenant's own (backlog W2S-1).
 pub(crate) async fn static_deployments_say_what_is_reachable(h: &dyn Harness) {
     let s = h.store();
     let (a, ua) = h.tenant().await;
@@ -701,7 +701,8 @@ pub(crate) async fn static_deployments_say_what_is_reachable(h: &dyn Harness) {
             .insert_deployment(&c, deployment(n, env, state))
             .await
             .unwrap();
-        ids.insert(d.id, true);
+        let writing = matches!(state, DeploymentState::Pending | DeploymentState::Running);
+        ids.insert(d.id, (true, writing));
     }
     for state in [
         DeploymentState::Failed,
@@ -716,16 +717,20 @@ pub(crate) async fn static_deployments_say_what_is_reachable(h: &dyn Harness) {
             .await
             .unwrap();
         assert!(s.set_deployment_state(a, d.id, state).await.unwrap());
-        ids.insert(d.id, false);
+        ids.insert(d.id, (false, false));
     }
-    let got: std::collections::HashMap<Uuid, bool> = s
+    let start = crate::now() - time::Duration::minutes(5);
+    let got: std::collections::HashMap<Uuid, (bool, bool)> = s
         .static_deployments(a)
         .await
         .unwrap()
         .into_iter()
         .map(|d| {
             assert_eq!(d.app_node_id, n);
-            (d.id, d.reachable)
+            if let Some(t) = d.in_flight_since {
+                assert!(t > start, "{t}");
+            }
+            (d.id, (d.reachable, d.in_flight_since.is_some()))
         })
         .collect();
     // The first live release is superseded by the second, and still reachable.
@@ -747,6 +752,7 @@ pub(crate) async fn static_deployments_say_what_is_reachable(h: &dyn Harness) {
     drop(all);
 }
 
+/// Runs every case.
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
     apps_stay_in_their_tenant(h).await;
