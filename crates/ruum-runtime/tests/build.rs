@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,8 @@ struct Recording {
     inner: Arc<dyn EgressRegistry>,
     active: Mutex<HashSet<String>>,
     seen: Mutex<Vec<EgressNetwork>>,
+    /// The next unregistrations that fail (a fault of the proxy's control listener).
+    fail_unregister: AtomicUsize,
 }
 
 #[async_trait]
@@ -91,6 +94,15 @@ impl EgressRegistry for Recording {
         Ok(())
     }
     async fn unregister(&self, network: &str) -> Result<(), RuntimeError> {
+        if self
+            .fail_unregister
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(RuntimeError::Unavailable {
+                reason: "the egress proxy does not answer (a fault of the test)".to_owned(),
+            });
+        }
         self.inner.unregister(network).await?;
         self.active.lock().unwrap().remove(network);
         Ok(())
@@ -209,6 +221,7 @@ impl Run {
                 inner: Arc::new(NoEgress),
                 active: Mutex::new(HashSet::new()),
                 seen: Mutex::new(Vec::new()),
+                fail_unregister: AtomicUsize::new(0),
             }),
             canaries: vec![password, credential.username.clone()],
             credential,
@@ -348,6 +361,7 @@ impl Run {
             inner: Arc::new(registry),
             active: Mutex::new(HashSet::new()),
             seen: Mutex::new(Vec::new()),
+            fail_unregister: AtomicUsize::new(0),
         });
         Ok(token)
     }
@@ -838,6 +852,12 @@ async fn the_builder_holds() {
     if wanted("failure") {
         failure(&c, &mut r).await;
     }
+    if wanted("cancel") {
+        cancel(&c, &mut r).await;
+    }
+    if wanted("unregister") {
+        unregister_retry(&c, &mut r).await;
+    }
     if wanted("names") {
         names(&c, &mut r).await;
     }
@@ -1269,6 +1289,77 @@ async fn hardening(c: &Ctx, r: &mut Report, app: Option<&App>) {
         Ctx::is_failed(&res),
     );
     c.after(r, "timeout", &id);
+}
+
+/// A build whose future the caller drops (a cancelled request, an aborted task) leaves nothing:
+/// the builder's drop guard removes the job and the network, unregisters the network at the
+/// egress proxy and records the usage (review of R-2b, card point 9).
+async fn cancel(c: &Ctx, r: &mut Report) {
+    let id = new_identity();
+    let b = c.builder.clone();
+    let job = tokio::spawn(async move {
+        b.build(input(id, archive("slow", &[]), Duration::from_secs(300)))
+            .await
+    });
+    let f1 = format!("label={}", c.run.label_arg());
+    let f2 = format!("label=ruum.managed={MANAGED_BY}");
+    let mut running = false;
+    for _ in 0..240 {
+        let ps = docker(&["ps", "-q", "--filter", &f1, "--filter", &f2]).unwrap_or_default();
+        if !ps.trim().is_empty() {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    r.check("cancel: the build job runs before the cancel", running, "");
+    let registered = !c.run.egress.active.lock().unwrap().is_empty();
+    r.check(
+        "cancel: the build network is registered before the cancel",
+        registered,
+        "",
+    );
+    // Drop the build future.
+    job.abort();
+    let res = job.await;
+    r.check(
+        "cancel: the build task is cancelled",
+        res.as_ref().is_err_and(|e| e.is_cancelled()),
+        format!("{:?}", res.as_ref().err()),
+    );
+    // The guard cleans up on the runtime: give it the time of a normal cleanup.
+    for _ in 0..120 {
+        let (cs, ns) = c.run.leftovers();
+        if cs.is_empty()
+            && ns.is_empty()
+            && c.run.egress.active.lock().unwrap().is_empty()
+            && usage_of(&c.usage, &id) == 1
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    c.after(r, "cancel", &id);
+}
+
+/// When the egress proxy does not answer the unregistration after the job (every try of the
+/// first cleanup fails), the build keeps the network and its registration together and the
+/// final cleanup tries again: no registration outlives its network, nothing is left (review of
+/// R-2b).
+async fn unregister_retry(c: &Ctx, r: &mut Report) {
+    let id = new_identity();
+    c.run.egress.fail_unregister.store(3, Ordering::SeqCst);
+    let res = c
+        .builder
+        .build(input(id, archive("hello", &[]), Duration::from_secs(300)))
+        .await;
+    let left = c.run.egress.fail_unregister.swap(0, Ordering::SeqCst);
+    r.check(
+        "unregister: the build succeeds although the first unregistration failed",
+        res.is_ok() && left == 0,
+        format!("{}, faults left {left}", Ctx::is_failed(&res)),
+    );
+    c.after(r, "unregister", &id);
 }
 
 /// A failing build is `build_failed` with the end of its log; nothing is pushed.

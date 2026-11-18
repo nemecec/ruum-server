@@ -15,12 +15,33 @@
 //! - **dropped** (and named in the build log): a name with a `..` segment, an absolute name, a
 //!   name with an empty segment or a NUL byte, a symbolic link whose target is absolute or
 //!   leaves the output tree, hard links, devices, FIFOs and every other entry type;
-//! - **refused** (the build fails): a broken tar (bad checksum, an entry past the end).
+//! - **dropped** too: a name or a link target over [`MAX_NAME_BYTES`] (the kernel's `PATH_MAX`);
+//! - **refused** (the build fails): a broken tar (bad checksum, an entry past the end), a tar
+//!   without its end-of-archive marker (a cut stream must never become an image with files
+//!   missing), bytes other than zeros after that marker, more than [`MAX_ENTRIES`] entries, or
+//!   names (with the folders above them) of more than [`MAX_NAME_TOTAL_BYTES`] in all. These
+//!   bounds keep the reading and the layer linear in the output: a deep path cannot make the
+//!   builder copy each of its parents (review of R-2b).
+//!
+//! The link rule is **lexical**: a target is resolved segment by segment on the names, not on
+//! a disk. A `..` after a segment that is itself a kept link can therefore end elsewhere when
+//! the kernel resolves it in the app's container (`a/b/s -> ../..` and `a/b/t -> s/../..`). The
+//! builder never resolves a link itself and drops every entry below a link, so such a link can
+//! only point elsewhere inside the app's own image, never into the builder or another tenant.
 //!
 //! A later entry of the same name replaces an earlier one (tar semantics).
 
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// The longest name or link target kept (Linux `PATH_MAX`).
+pub const MAX_NAME_BYTES: usize = 4096;
+/// The most entries an output may hold.
+pub const MAX_ENTRIES: usize = 500_000;
+/// The most bytes of all names of an output, with the folders the layer adds above them.
+pub const MAX_NAME_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// The most dropped entries kept by name (the rest are only counted).
+pub const MAX_DROPPED_SHOWN: usize = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -37,11 +58,29 @@ pub struct OutEntry {
     pub kind: Kind,
 }
 
-/// The kept entries (sorted by path) and the dropped ones with the reason.
+/// The kept entries (sorted by path; every folder above an entry is an entry too) and the
+/// dropped ones with the reason (the first [`MAX_DROPPED_SHOWN`]; `dropped_total` counts all).
 #[derive(Debug, Default)]
 pub struct Output {
     pub entries: Vec<OutEntry>,
     pub dropped: Vec<(String, &'static str)>,
+    pub dropped_total: usize,
+}
+
+/// The dropped entries: the first few by name, all counted.
+#[derive(Default)]
+struct Dropped {
+    shown: Vec<(String, &'static str)>,
+    total: usize,
+}
+
+impl Dropped {
+    fn push(&mut self, name: &[u8], why: &'static str) {
+        self.total += 1;
+        if self.shown.len() < MAX_DROPPED_SHOWN {
+            self.shown.push((shown(name), why));
+        }
+    }
 }
 
 /// Shows a name in a log line: control bytes and bad UTF-8 escaped, at most 200 characters.
@@ -121,6 +160,9 @@ fn clean(name: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
     if name.starts_with(b"/") {
         return Err("an absolute name");
     }
+    if name.len() > MAX_NAME_BYTES {
+        return Err("a name over 4096 bytes");
+    }
     let mut n = name;
     while let Some(r) = n.strip_prefix(b"./") {
         n = r;
@@ -143,7 +185,11 @@ fn clean(name: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
 /// Whether a symbolic link at `path` with `target` stays inside the tree (lexically; nothing
 /// is resolved on a disk).
 fn link_inside(path: &[u8], target: &[u8]) -> bool {
-    if target.is_empty() || target.starts_with(b"/") || target.contains(&0) {
+    if target.is_empty()
+        || target.len() > MAX_NAME_BYTES
+        || target.starts_with(b"/")
+        || target.contains(&0)
+    {
         return false;
     }
     let mut stack: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
@@ -167,21 +213,32 @@ fn link_inside(path: &[u8], target: &[u8]) -> bool {
 pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
     let mut at = 0usize;
     let mut kept: BTreeMap<Vec<u8>, OutEntry> = BTreeMap::new();
-    let mut dropped = Vec::new();
+    let mut dropped = Dropped::default();
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
     let mut total: u64 = 0;
+    let mut headers: usize = 0;
     loop {
         if at + 512 > tar.len() {
-            // A tar that ends without its end blocks: what was read is complete entries.
-            if at == tar.len() {
-                break;
-            }
-            return Err("the output ends in the middle of a header".to_owned());
+            // No end-of-archive marker: the stream was cut (also at an entry boundary).
+            return Err(if at == tar.len() {
+                "the output ends without its end-of-archive marker".to_owned()
+            } else {
+                "the output ends in the middle of a header".to_owned()
+            });
         }
         let h = &tar[at..at + 512];
         if h.iter().all(|b| *b == 0) {
+            // The end-of-archive marker; tar pads its last record with zeros, nothing else may
+            // follow (a second archive appended to the first is refused).
+            if tar[at..].iter().any(|b| *b != 0) {
+                return Err("the output has data after its end-of-archive marker".to_owned());
+            }
             break;
+        }
+        headers += 1;
+        if headers > 2 * MAX_ENTRIES {
+            return Err(format!("the output has more than {MAX_ENTRIES} entries"));
         }
         let want = octal(&h[148..156])?;
         let sum: u64 = h
@@ -257,7 +314,7 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
             Ok(Some(p)) => p,
             Ok(None) => continue,
             Err(why) => {
-                dropped.push((shown(&name), why));
+                dropped.push(&name, why);
                 continue;
             }
         };
@@ -273,25 +330,25 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
             b'5' => Kind::Dir,
             b'2' => {
                 if !link_inside(&path, &link) {
-                    dropped.push((shown(&path), "a link that leaves the output"));
+                    dropped.push(&path, "a link that leaves the output");
                     continue;
                 }
                 Kind::Symlink(link)
             }
             b'1' => {
-                dropped.push((shown(&path), "a hard link"));
+                dropped.push(&path, "a hard link");
                 continue;
             }
             b'3' | b'4' => {
-                dropped.push((shown(&path), "a device"));
+                dropped.push(&path, "a device");
                 continue;
             }
             b'6' => {
-                dropped.push((shown(&path), "a FIFO"));
+                dropped.push(&path, "a FIFO");
                 continue;
             }
             _ => {
-                dropped.push((shown(&path), "an unknown entry type"));
+                dropped.push(&path, "an unknown entry type");
                 continue;
             }
         };
@@ -301,30 +358,101 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
             mode | 0o400
         };
         kept.insert(path.clone(), OutEntry { path, mode, kind });
+        if kept.len() > MAX_ENTRIES {
+            return Err(format!("the output has more than {MAX_ENTRIES} entries"));
+        }
     }
-    // An entry below a non-folder (a file or a link named like a folder) would write through
-    // it at unpack time: drop it.
-    let names: Vec<Vec<u8>> = kept.keys().cloned().collect();
-    for n in names {
-        let mut bad = false;
-        for (i, b) in n.iter().enumerate() {
-            if *b == b'/'
-                && kept
-                    .get(&n[..i])
-                    .is_some_and(|p| !matches!(p.kind, Kind::Dir))
-            {
-                bad = true;
-                break;
+    complete(kept, dropped)
+}
+
+/// What a name is in the finished tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Node {
+    /// A folder (kept or added above an entry).
+    Dir,
+    /// A file or a link: nothing may be below it.
+    Leaf,
+    /// Dropped (below a leaf): everything below it is dropped too.
+    Gone,
+}
+
+/// Drops every entry below a file or a link (it would write through it at unpack time) and adds
+/// each folder that is above an entry but not in the tar, so the layer needs no parent walk.
+/// Linear: names are visited in sorted order (a parent sorts before what it holds), each name
+/// looks up only its parent, and a missing parent is added once (memoized), under
+/// [`MAX_NAME_TOTAL_BYTES`].
+fn complete(kept: BTreeMap<Vec<u8>, OutEntry>, mut dropped: Dropped) -> Result<Output, String> {
+    let mut nodes: HashMap<Vec<u8>, Node> = HashMap::with_capacity(kept.len());
+    let mut added: Vec<Vec<u8>> = Vec::new();
+    let mut name_bytes: usize = 0;
+    let over = || format!("the output's names are over {MAX_NAME_TOTAL_BYTES} bytes in all");
+    let mut entries: Vec<OutEntry> = Vec::with_capacity(kept.len());
+    for (path, e) in kept {
+        // The node of the parent, adding the missing folders above it (top-down).
+        let parent = match path.iter().rposition(|b| *b == b'/') {
+            None => Node::Dir,
+            Some(i) => {
+                let mut missing: Vec<usize> = Vec::new();
+                let mut cut = i;
+                let mut found = Node::Dir;
+                loop {
+                    if let Some(n) = nodes.get(&path[..cut]) {
+                        found = *n;
+                        break;
+                    }
+                    missing.push(cut);
+                    match path[..cut].iter().rposition(|b| *b == b'/') {
+                        Some(j) => cut = j,
+                        None => break,
+                    }
+                }
+                for cut in missing.into_iter().rev() {
+                    let node = if found == Node::Dir {
+                        Node::Dir
+                    } else {
+                        Node::Gone
+                    };
+                    name_bytes += cut;
+                    if name_bytes > MAX_NAME_TOTAL_BYTES {
+                        return Err(over());
+                    }
+                    nodes.insert(path[..cut].to_vec(), node);
+                    if node == Node::Dir {
+                        added.push(path[..cut].to_vec());
+                    }
+                    found = node;
+                }
+                found
             }
+        };
+        name_bytes += path.len();
+        if name_bytes > MAX_NAME_TOTAL_BYTES {
+            return Err(over());
         }
-        if bad {
-            kept.remove(&n);
-            dropped.push((shown(&n), "an entry below a file or a link"));
+        if parent != Node::Dir {
+            dropped.push(&path, "an entry below a file or a link");
+            nodes.insert(path, Node::Gone);
+            continue;
         }
+        let node = if matches!(e.kind, Kind::Dir) {
+            Node::Dir
+        } else {
+            Node::Leaf
+        };
+        nodes.insert(path, node);
+        entries.push(e);
     }
+    drop(nodes);
+    entries.extend(added.into_iter().map(|path| OutEntry {
+        path,
+        mode: 0o755,
+        kind: Kind::Dir,
+    }));
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Output {
-        entries: kept.into_values().collect(),
-        dropped,
+        entries,
+        dropped: dropped.shown,
+        dropped_total: dropped.total,
     })
 }
 
@@ -352,6 +480,13 @@ mod tests {
         let pad = |out: &mut Vec<u8>, n: usize| {
             out.extend(std::iter::repeat_n(0u8, (512 - n % 512) % 512))
         };
+        if link.len() > 100 {
+            let mut l = link.to_vec();
+            l.push(0);
+            out.extend_from_slice(&hdr(b"././@LongLink", b'K', b"", l.len()));
+            out.extend_from_slice(&l);
+            pad(out, l.len());
+        }
         if name.len() > 100 {
             let mut n = name.to_vec();
             n.push(0);
@@ -459,8 +594,14 @@ mod tests {
         t.extend_from_slice(&h);
         t.extend(std::iter::repeat_n(0u8, 1024));
         let o = read_output(Bytes::from(t), 1 << 30).expect("reads");
-        assert_eq!(o.entries.len(), 2);
+        // The file, the folder above it (added by the reader) and the setuid file.
+        assert_eq!(o.entries.len(), 3);
         assert!(o.entries.iter().any(|e| e.path.len() == long.len() - 2));
+        assert!(
+            o.entries
+                .iter()
+                .any(|e| e.path == "d".repeat(120).into_bytes() && e.kind == Kind::Dir)
+        );
         let suid = o.entries.iter().find(|e| e.path == b"suid").unwrap();
         assert_eq!(suid.mode, 0o755);
     }
@@ -475,5 +616,94 @@ mod tests {
         assert!(read_output(Bytes::from(t.clone()), 1000).is_err());
         let cut = Bytes::from(t[..1000].to_vec());
         assert!(read_output(cut, 1 << 30).is_err());
+    }
+
+    /// A stream cut after a whole entry (no end-of-archive marker) is refused: a cut attach
+    /// connection must not become an image with files missing (review of R-2b).
+    #[test]
+    fn a_tar_cut_at_an_entry_boundary_is_refused() {
+        let mut t = Vec::new();
+        gnu(&mut t, b"./a", b'0', b"", b"aaa");
+        gnu(&mut t, b"./b", b'0', b"", b"bbb");
+        let whole = {
+            let mut w = t.clone();
+            w.extend(std::iter::repeat_n(0u8, 1024));
+            w
+        };
+        assert_eq!(
+            read_output(Bytes::from(whole.clone()), 1 << 30)
+                .expect("a whole tar reads")
+                .entries
+                .len(),
+            2
+        );
+        let e = read_output(Bytes::from(t.clone()), 1 << 30).expect_err("no end marker");
+        assert!(e.contains("end-of-archive"), "{e}");
+        // Cut after the first entry, exactly at the boundary.
+        let e = read_output(Bytes::from(t[..1024].to_vec()), 1 << 30).expect_err("cut");
+        assert!(e.contains("end-of-archive"), "{e}");
+        // One zero block is a marker (some writers stop there); padding zeros are fine.
+        let mut one = t.clone();
+        one.extend(std::iter::repeat_n(0u8, 512));
+        assert!(read_output(Bytes::from(one), 1 << 30).is_ok());
+        let mut padded = whole.clone();
+        padded.extend(std::iter::repeat_n(0u8, 8192));
+        assert!(read_output(Bytes::from(padded), 1 << 30).is_ok());
+        // A second archive after the marker (a script writing its own tar first) is refused.
+        let mut twice = whole.clone();
+        twice.extend_from_slice(&whole);
+        let e = read_output(Bytes::from(twice), 1 << 30).expect_err("data after the marker");
+        assert!(e.contains("after its end-of-archive"), "{e}");
+    }
+
+    /// Deep paths stay linear: a name over 4096 bytes is dropped, the folders above an entry are
+    /// added once, and many distinct deep chains end the build instead of copying every parent
+    /// (Kimi review of R-2b: a host-memory amplification).
+    #[test]
+    fn deep_paths_are_bounded() {
+        // 40,000 segments in one name: dropped, nothing copied.
+        let deep = "a/".repeat(40_000) + "f";
+        let o = read(&[(deep.as_bytes(), b'0', b"", b"x")]);
+        assert!(o.entries.is_empty());
+        assert_eq!(o.dropped_total, 1);
+        // A name just under the limit: its 2,000 folders are added, once each.
+        let ok = "a/".repeat(2_000) + "f";
+        let o = read(&[
+            (ok.as_bytes(), b'0', b"", b"x"),
+            ((ok.clone() + "2").as_bytes(), b'0', b"", b"y"),
+        ]);
+        assert_eq!(o.entries.len(), 2_000 + 2);
+        assert!(
+            o.entries.windows(2).all(|w| w[0].path < w[1].path),
+            "sorted, no duplicate"
+        );
+        // Distinct deep chains: the sum of the names (with their folders) is bounded.
+        let started = std::time::Instant::now();
+        let mut t = Vec::new();
+        for i in 0..64 {
+            let name = format!("{i}/") + &"a/".repeat(2_000) + "f";
+            gnu(&mut t, name.as_bytes(), b'0', b"", b"x");
+        }
+        t.extend(std::iter::repeat_n(0u8, 1024));
+        let e = read_output(Bytes::from(t), 1 << 30).expect_err("over the name bound");
+        assert!(e.contains("names are over"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // A link target over the limit is dropped.
+        let o = read(&[(b"./l", b'2', "a/".repeat(2_100).as_bytes(), b"")]);
+        assert!(o.entries.is_empty());
+    }
+
+    #[test]
+    fn dropped_entries_are_counted_past_the_shown_ones() {
+        let names: Vec<String> = (0..MAX_DROPPED_SHOWN + 5)
+            .map(|i| format!("./f{i}"))
+            .collect();
+        let specs: Vec<Spec<'_>> = names
+            .iter()
+            .map(|n| (n.as_bytes(), b'6', &b""[..], &b""[..]))
+            .collect();
+        let o = read(&specs);
+        assert_eq!(o.dropped.len(), MAX_DROPPED_SHOWN);
+        assert_eq!(o.dropped_total, MAX_DROPPED_SHOWN + 5);
     }
 }
