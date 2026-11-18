@@ -845,8 +845,9 @@ impl StaticSites {
         }
         drop(list);
         let mut deleted = 0u64;
-        for batch in found.chunks(DELETE_BATCH) {
-            let paths = batch.to_vec().into_iter().map(Ok);
+        while !found.is_empty() {
+            let batch: Vec<Path> = found.drain(..found.len().min(DELETE_BATCH)).collect();
+            let paths = batch.into_iter().map(Ok);
             let mut s = self
                 .store
                 .delete_stream(futures::stream::iter(paths).boxed());
