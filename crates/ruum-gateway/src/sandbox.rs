@@ -27,9 +27,17 @@
 //!   (both shares are far below the global cap). Open WebSockets have their own shares: per app
 //!   ([`HoldConfig::ws_per_app`], all deployments of the app together), per tenant
 //!   ([`HoldConfig::ws_per_tenant`]) and in all ([`HoldConfig::ws_global`]) (review-g1b 3).
+//! - **Ready means it takes a connection** (kimi-run12-g1b 2). A runtime reports an instance
+//!   as running when its process runs, which can be before the app listens on its port. So
+//!   before the gateway uses an address that the core answered, it connects to it (TCP, then
+//!   closed), with a short backoff, until the hold limit. Until it takes a connection the
+//!   request is held as for `starting`; at the limit the visitor gets the `503` page. The check
+//!   runs once per question to the core (single flight), not once per request.
 //! - **A short cache of ready answers** ([`READY_TTL`]), so a busy app does not cost one core
 //!   question per request. A request that cannot connect to a cached address forgets it
-//!   ([`SandboxHold::forget`]): the instance may have scaled to zero.
+//!   ([`SandboxHold::forget`]): the instance may have scaled to zero. Each new entry first drops
+//!   the expired ones, and the cache holds at most [`READY_MAX`] entries (kimi-run12-g1b 3), so
+//!   many deployments that are asked for once each do not grow it without end.
 
 use crate::core_api::{CoreError, CoreResult};
 use async_trait::async_trait;
@@ -43,6 +51,13 @@ use uuid::Uuid;
 
 /// How long a ready answer of the core is reused.
 pub const READY_TTL: Duration = Duration::from_secs(2);
+/// The most ready answers cached at a time; over it, a new answer is used but not cached.
+pub const READY_MAX: usize = 4096;
+/// The first wait between two connection checks of a new address (it doubles up to
+/// [`HoldConfig::retry`]).
+const PROBE_FIRST_STEP: Duration = Duration::from_millis(10);
+/// The longest one connection check of a new address may take.
+const PROBE_CONNECT: Duration = Duration::from_secs(1);
 
 /// The question the gateway asks the core about sandboxes.
 #[async_trait]
@@ -132,6 +147,34 @@ pub fn upstream_url(raw: &str) -> Option<String> {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
     };
     host_ok.then(|| format!("http://{host}:{port}"))
+}
+
+/// Whether `url` (`http://<host>:<port>`, as [`upstream_url`] gives it) takes a TCP connection
+/// within `limit`: tries again after a short wait that doubles up to `max_step`.
+pub async fn takes_connection(url: &str, limit: Duration, max_step: Duration) -> bool {
+    let Some(addr) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut step = PROBE_FIRST_STEP;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let attempt = tokio::time::timeout(
+            left.min(PROBE_CONNECT),
+            tokio::net::TcpStream::connect(addr),
+        );
+        if let Ok(Ok(_)) = attempt.await {
+            return true;
+        }
+        if tokio::time::Instant::now() + step >= deadline {
+            return false;
+        }
+        tokio::time::sleep(step).await;
+        step = (step * 2).min(max_step.max(PROBE_FIRST_STEP));
+    }
 }
 
 /// The limits of the hold (see the module docs).
@@ -329,6 +372,22 @@ impl SandboxHold {
         self.ready.lock().expect("ready lock").remove(&key_of(q));
     }
 
+    /// Cached ready answers now (for tests).
+    pub fn cached_answers(&self) -> usize {
+        self.ready.lock().expect("ready lock").len()
+    }
+
+    /// Caches a ready answer: first drops the expired entries, then adds it while there is room.
+    fn remember(&self, k: Key, url: &str) {
+        let mut m = self.ready.lock().expect("ready lock");
+        m.retain(|_, (_, at)| at.elapsed() < READY_TTL);
+        if m.len() < READY_MAX || m.contains_key(&k) {
+            m.insert(k, (url.to_string(), Instant::now()));
+        } else {
+            tracing::debug!(target: "ruum::gateway", "the ready cache is full");
+        }
+    }
+
     fn cached(&self, k: &Key) -> Option<String> {
         let mut m = self.ready.lock().expect("ready lock");
         match m.get(k) {
@@ -351,8 +410,18 @@ impl SandboxHold {
         let inner = self.inner.clone();
         let asked = self.asked.clone();
         let query = q.clone();
+        let (limit, max_step) = (self.config.hold, self.config.retry);
         let task = tokio::spawn(async move {
-            let r = inner.upstream(&query).await.map_err(|e| e.to_string());
+            let mut r = inner.upstream(&query).await.map_err(|e| e.to_string());
+            // A running instance whose app does not listen yet is still starting (see the
+            // module docs). An address of another form is refused by `route`.
+            if let Ok(UpstreamAnswer::Ready { url }) = &r
+                && let Some(u) = upstream_url(url)
+                && !takes_connection(&u, limit, max_step).await
+            {
+                tracing::debug!(target: "ruum::gateway", "a sandbox does not take connections yet");
+                r = Ok(UpstreamAnswer::Starting);
+            }
             asked.lock().expect("asked lock").remove(&key_of(&query));
             r
         });
@@ -368,6 +437,13 @@ impl SandboxHold {
 
     /// Where a request of `q` goes (see the module docs).
     pub async fn route(&self, q: &UpstreamQuery) -> Route {
+        self.route_until(q, tokio::time::Instant::now() + self.config.hold)
+            .await
+    }
+
+    /// [`Self::route`] with the hold ending at `deadline` (or at the hold limit, if sooner), so
+    /// a second try of one request does not get a second hold.
+    pub async fn route_until(&self, q: &UpstreamQuery, deadline: tokio::time::Instant) -> Route {
         let k = key_of(q);
         if let Some(url) = self.cached(&k) {
             return Route::Ready(url);
@@ -381,7 +457,7 @@ impl SandboxHold {
             tracing::warn!(target: "ruum::gateway", "the hold share of an app or a tenant is full");
             return Route::Busy;
         };
-        let deadline = tokio::time::Instant::now() + self.config.hold;
+        let deadline = deadline.min(tokio::time::Instant::now() + self.config.hold);
         loop {
             let answer = match tokio::time::timeout_at(deadline, self.ask(q)).await {
                 Err(_) => return Route::Starting,
@@ -395,10 +471,7 @@ impl SandboxHold {
                 UpstreamAnswer::Ready { url } => {
                     return match upstream_url(&url) {
                         Some(u) => {
-                            self.ready
-                                .lock()
-                                .expect("ready lock")
-                                .insert(k, (u.clone(), Instant::now()));
+                            self.remember(k, &u);
                             Route::Ready(u)
                         }
                         None => {
@@ -466,11 +539,13 @@ mod tests {
         }
     }
 
-    /// A core that answers `starting` until `ready_after` questions, counting them.
+    /// A core that answers `starting` until `ready_after` questions, counting them; then
+    /// `ready` with `url`.
     struct Slow {
         asks: AtomicUsize,
         ready_after: usize,
         delay: Duration,
+        url: String,
     }
 
     #[async_trait]
@@ -480,12 +555,33 @@ mod tests {
             let n = self.asks.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(if n >= self.ready_after {
                 UpstreamAnswer::Ready {
-                    url: "http://127.0.0.1:9".into(),
+                    url: self.url.clone(),
                 }
             } else {
                 UpstreamAnswer::Starting
             })
         }
+    }
+
+    /// A listener on 127.0.0.1 that takes every connection and closes it; its URL.
+    async fn listening() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { while l.accept().await.is_ok() {} });
+        url
+    }
+
+    /// A free port on 127.0.0.1 that starts to listen after `after`; its URL.
+    fn listening_after(after: Duration) -> String {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let l = tokio::net::TcpListener::bind(addr).await.unwrap();
+            while l.accept().await.is_ok() {}
+        });
+        format!("http://{addr}")
     }
 
     fn q() -> UpstreamQuery {
@@ -499,10 +595,12 @@ mod tests {
 
     #[tokio::test]
     async fn many_requests_share_one_question_and_the_answer_is_cached() {
+        let url = listening().await;
         let core = Arc::new(Slow {
             asks: AtomicUsize::new(0),
             ready_after: 1,
             delay: Duration::from_millis(200),
+            url: url.clone(),
         });
         let hold = Arc::new(SandboxHold::new(core.clone(), HoldConfig::default()));
         let query = q();
@@ -512,16 +610,9 @@ mod tests {
             async move { h.route(&q).await }
         }))
         .await;
-        assert!(
-            routes
-                .iter()
-                .all(|r| *r == Route::Ready("http://127.0.0.1:9".into()))
-        );
+        assert!(routes.iter().all(|r| *r == Route::Ready(url.clone())));
         assert_eq!(core.asks.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            hold.route(&query).await,
-            Route::Ready("http://127.0.0.1:9".into())
-        );
+        assert_eq!(hold.route(&query).await, Route::Ready(url.clone()));
         assert_eq!(
             core.asks.load(Ordering::SeqCst),
             1,
@@ -539,6 +630,7 @@ mod tests {
             asks: AtomicUsize::new(0),
             ready_after: usize::MAX,
             delay: Duration::from_millis(10),
+            url: String::new(),
         });
         let config = HoldConfig {
             hold: Duration::from_millis(400),
@@ -618,6 +710,7 @@ mod tests {
             asks: AtomicUsize::new(0),
             ready_after: usize::MAX,
             delay: Duration::from_millis(10),
+            url: String::new(),
         });
         let config = HoldConfig {
             hold: Duration::from_millis(400),
@@ -659,5 +752,94 @@ mod tests {
         // Another tenant is still held (not busy), far below the global cap.
         assert_eq!(rother, Route::Starting);
         assert_eq!(hold.held(), 0);
+    }
+
+    /// kimi-run12-g1b 2: the core says ready when the instance runs, before its app listens.
+    /// The hold lasts until the address takes a connection, with one question to the core.
+    #[tokio::test]
+    async fn ready_waits_until_the_address_takes_a_connection() {
+        let url = listening_after(Duration::from_millis(400));
+        let core = Arc::new(Slow {
+            asks: AtomicUsize::new(0),
+            ready_after: 1,
+            delay: Duration::ZERO,
+            url: url.clone(),
+        });
+        let hold = Arc::new(SandboxHold::new(core.clone(), HoldConfig::default()));
+        let query = q();
+        let routes = futures::future::join_all((0..5).map(|_| {
+            let h = hold.clone();
+            let q = query.clone();
+            async move { h.route(&q).await }
+        }))
+        .await;
+        assert!(routes.iter().all(|r| *r == Route::Ready(url.clone())));
+        // The address takes a connection when the route is answered.
+        let addr = url.strip_prefix("http://").unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_ok(),
+            "ready before the app listens"
+        );
+        assert_eq!(core.asks.load(Ordering::SeqCst), 1, "one question");
+        assert_eq!(hold.held(), 0);
+    }
+
+    /// An address that never takes a connection is held to the limit and gets the starting
+    /// page, not the address.
+    #[tokio::test]
+    async fn an_address_that_never_listens_is_still_starting_at_the_limit() {
+        let url = listening_after(Duration::from_secs(3600));
+        let core = Arc::new(Slow {
+            asks: AtomicUsize::new(0),
+            ready_after: 1,
+            delay: Duration::ZERO,
+            url,
+        });
+        let hold = SandboxHold::new(
+            core,
+            HoldConfig {
+                hold: Duration::from_millis(500),
+                ..HoldConfig::default()
+            },
+        );
+        let t = Instant::now();
+        assert_eq!(hold.route(&q()).await, Route::Starting);
+        assert!(
+            t.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(hold.cached_answers(), 0);
+        assert_eq!(hold.held(), 0);
+    }
+
+    /// kimi-run12-g1b 3: deployments asked for once each leave no entry after the TTL, and the
+    /// cache never holds more than [`READY_MAX`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ready_cache_drops_expired_entries_and_has_a_cap() {
+        let url = listening().await;
+        let core = Arc::new(Slow {
+            asks: AtomicUsize::new(0),
+            ready_after: 1,
+            delay: Duration::ZERO,
+            url: url.clone(),
+        });
+        let hold = SandboxHold::new(core, HoldConfig::default());
+        for _ in 0..50 {
+            assert_eq!(hold.route(&q()).await, Route::Ready(url.clone()));
+        }
+        assert_eq!(hold.cached_answers(), 50);
+        tokio::time::sleep(READY_TTL + Duration::from_millis(100)).await;
+        assert_eq!(hold.route(&q()).await, Route::Ready(url.clone()));
+        assert_eq!(hold.cached_answers(), 1, "the expired entries are gone");
+        // The cap (straight through `remember`, so no entry expires on a slow machine).
+        for _ in 0..READY_MAX + 10 {
+            hold.remember(key_of(&q()), &url);
+        }
+        assert_eq!(hold.cached_answers(), READY_MAX);
+        // An answer past the cap is still used, only not cached.
+        assert_eq!(hold.route(&q()).await, Route::Ready(url.clone()));
+        assert_eq!(hold.cached_answers(), READY_MAX);
     }
 }
