@@ -901,6 +901,23 @@ fn a_value_rebuilt_across_a_renewal_never_comes_out() {
 }
 
 #[test]
+fn a_line_cap_applies_before_the_check() {
+    // Kimi review of run 12, K11 finding 2: a store that keeps only "abc" of "abcX" would join
+    // it to the next line "de". The redactor cuts first, so its check sees "abc" too.
+    let secret = "abc\nde";
+    let mut r = LineRedactor::new([secret]).with_max_line_bytes(3);
+    let mut lines = texts(r.push("abcX\n", at()));
+    lines.extend(texts(r.push("de\n", at())));
+    lines.extend(texts(r.finish(at())));
+    assert!(lines.iter().all(|l| l.len() <= 3), "{lines:?}");
+    assert_eq!(lines[0], "abc");
+    assert_no_value_in_stream(&lines, &[secret], "cut at 3");
+    // A cut never splits a character.
+    let mut r = LineRedactor::new(["zz"]).with_max_line_bytes(4);
+    assert_eq!(texts(r.push("ab\u{20ac}c\n", at())), vec!["ab"]);
+}
+
+#[test]
 fn the_secret_set_is_bounded() {
     let many: Vec<String> = (0..=MAX_SECRET_VALUES).map(|i| format!("v{i}")).collect();
     let refs: Vec<&str> = many.iter().map(String::as_str).collect();

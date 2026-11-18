@@ -85,7 +85,8 @@ pub struct DockerConfig {
     pub stop_timeout: Duration,
     /// The log lines kept per instance (the ring; the oldest go first).
     pub log_lines: usize,
-    /// The longest log line in bytes; a longer one is cut at the cap.
+    /// The longest log line in bytes; a longer one is cut at the cap, by the redactor before its
+    /// check (so a cut cannot rebuild a secret) and again by the ring.
     pub max_line_bytes: usize,
     /// The health check command inside the sandbox; the URL of the check is appended as the
     /// last argument. The default is busybox `wget` with the proxy off (`-Y off`: the egress
@@ -102,9 +103,10 @@ pub struct DockerConfig {
     /// The timeout of one Docker API call (not of the long-lived attach and wait streams).
     pub api_timeout: Duration,
     /// The most instances the driver keeps, running and ended together. A start beyond it first
-    /// forgets ended instances (the oldest of the tenant with the most); when every kept
-    /// instance still runs, the start is `unavailable` (backlog R2A-5, Kimi review of run 11,
-    /// finding 3). The cap is global; a per-tenant share is backlog R2A-9.
+    /// forgets an ended instance: the oldest of the tenant that keeps the most instances, else
+    /// one of the starting tenant's own; otherwise the start is `unavailable` (backlog R2A-5,
+    /// Kimi reviews of run 11, finding 3, and of run 12, K11 finding 3). The cap is global; a
+    /// per-tenant share is backlog R2A-9.
     pub max_instances: usize,
     /// How long the driver keeps an ended (stopped or exited) instance and its log ring.
     pub ended_retention: Duration,

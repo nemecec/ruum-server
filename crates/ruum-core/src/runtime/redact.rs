@@ -46,6 +46,12 @@
 //! earlier output reaches back only as far as the longest earlier value: a new, longer value
 //! whose start was let out before it was known is not caught. That text was let out before the
 //! value was known, so no redactor could have held it back.
+//!
+//! A store that cuts long lines (the Docker driver's log ring) must give its cap to the
+//! redactor ([`LineRedactor::with_max_line_bytes`]): the redactor then cuts each line itself,
+//! before the check, so the check sees the bytes that are stored. Cutting a line after the
+//! check can join a kept start of one line to the next line and rebuild a multiline value
+//! (Kimi review of run 12, K11 finding 2).
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -58,6 +64,18 @@ pub const REDACTED: &str = "<hidden secret>";
 
 /// A line longer than this is let out in pieces (each still redacted).
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// `line` cut to at most `max` bytes, at a character boundary.
+fn cut_line(line: &str, max: usize) -> &str {
+    if line.len() <= max {
+        return line;
+    }
+    let mut cut = max;
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &line[..cut]
+}
 
 /// The longest secret value (or workload token) a driver accepts, in bytes (16 KiB: room for a
 /// PEM private key of RSA 4096). Drivers refuse a longer one with `invalid_spec`
@@ -456,6 +474,9 @@ pub struct LineRedactor {
     joined: Emitted,
     /// The output let out so far as written: the pieces of a long line without a line end.
     written: Emitted,
+    /// The longest line let out; a longer one is cut (at a character boundary) before the
+    /// check against the earlier output.
+    max_out: usize,
 }
 
 impl LineRedactor {
@@ -478,7 +499,17 @@ impl LineRedactor {
             checked: 0,
             joined: Emitted::default(),
             written: Emitted::default(),
+            max_out: usize::MAX,
         }
+    }
+
+    /// Cuts every line it lets out to at most `max` bytes (at a character boundary; at least
+    /// one byte), before the line is checked against the earlier output. A store with a line
+    /// cap sets it, so what the check sees is what the store keeps (see the module doc).
+    #[must_use]
+    pub fn with_max_line_bytes(mut self, max: usize) -> Self {
+        self.max_out = max.max(1);
+        self
     }
 
     /// Adds a value to redact from now on (a renewed token).
@@ -684,7 +715,8 @@ impl LineRedactor {
         let joined_end = if ends_line || !final_line { "\n" } else { "" };
         let written_end = if ends_line { "\n" } else { "" };
         let mut seen: Vec<&str> = Vec::with_capacity(3);
-        for candidate in [line, self.marker, ""] {
+        let max = self.max_out;
+        for candidate in [line, self.marker, ""].map(|c| cut_line(c, max)) {
             if seen.contains(&candidate) {
                 continue;
             }
