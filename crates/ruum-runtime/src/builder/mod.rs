@@ -20,10 +20,12 @@
 //! 4. the image is assembled without a daemon ([`oci`]) on the base image pinned by the digest
 //!    of its multi-arch index ([`NODE22_BASE_INDEX`]), the platform of the engine;
 //! 5. the blobs and then the manifest are pushed to `ruum/<tenant>/<app>` only
-//!    ([`registry::RepositoryPush`]);
+//!    ([`registry::RepositoryPush`]); the manifest push is the commit point: it runs after the
+//!    build's timeout (with a short bound of its own), so a timeout never cuts it half-way;
 //! 6. the container, the network (unregistered at the proxy first) and the work data are
-//!    removed after every outcome, also after a timeout; a failed build pushes nothing; the
-//!    build time goes to the usage sink for every outcome.
+//!    removed after every outcome, also after a timeout and when the caller drops the build
+//!    (a drop guard spawns the cleanup); a failed build pushes nothing; the build time goes to
+//!    the usage sink for every outcome.
 //!
 //! **No secret reaches a build**: the job's environment is a fixed list ([`job::job_env`]); the
 //! registry credential and the egress control token live only in this process; the job has no
@@ -100,6 +102,9 @@ pub struct BuilderConfig {
     pub npm_registry: String,
     /// The push credential (I-4); `None` for a registry without auth.
     pub credential: Option<RegistryCredential>,
+    /// The token service of the registry when it is not on the registry's own origin (an
+    /// `https` URL, I-4). A `Bearer` challenge naming any other realm gets no credential.
+    pub token_realm: Option<String>,
 }
 
 impl BuilderConfig {
@@ -114,6 +119,7 @@ impl BuilderConfig {
             npm_hosts: vec!["registry.npmjs.org".to_owned()],
             npm_registry: NPM_REGISTRY.to_owned(),
             credential: None,
+            token_realm: None,
         }
     }
 
@@ -171,8 +177,9 @@ impl Slots {
     pub async fn acquire(&self, tenant: TenantId) -> Slot {
         let t = {
             let mut m = self.tenants.lock().unwrap_or_else(|p| p.into_inner());
-            // Forget the tenants with no build (every permit back).
-            m.retain(|_, s| s.available_permits() < self.per_tenant);
+            // Forget the tenants with no build: every permit back and no build about to take
+            // one (a waiting or starting build holds a clone of the semaphore).
+            m.retain(|_, s| Arc::strong_count(s) > 1 || s.available_permits() < self.per_tenant);
             m.entry(tenant)
                 .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_tenant)))
                 .clone()
@@ -282,10 +289,111 @@ fn source_tar(files: &archive::Unpacked) -> Bytes {
     Bytes::from(w.finish())
 }
 
-/// The state a build's cleanup needs, also when the build future was dropped at its timeout.
+/// The state a build's cleanup needs, also when the build future was dropped at its timeout
+/// or by the caller: the network to unregister, kept until its unregistration is done.
 #[derive(Default)]
 struct Trace {
     network: Mutex<Option<String>>,
+}
+
+/// Removes the job container and the build network (unregistered first). The network's ID
+/// stays in the trace when its unregistration failed, so a later cleanup tries again.
+async fn cleanup(
+    docker: &Docker,
+    cfg: &BuilderConfig,
+    egress: &dyn EgressRegistry,
+    build: uuid::Uuid,
+    trace: &Trace,
+) {
+    job::remove_container(docker, build).await;
+    let registered = trace
+        .network
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if job::remove_network(docker, cfg, egress, build, registered).await {
+        *trace.network.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// The end of a build, after every outcome: the cleanup and the usage record. When the build
+/// future is dropped before [`Finish::run`] completes (the caller cancelled, the task was
+/// aborted), `Drop` spawns them on the runtime, so the job, the network and the egress
+/// registration never outlive a cancelled build (card point 9). It holds the build's slot until
+/// the cleanup is done.
+struct Finish {
+    docker: Docker,
+    cfg: BuilderConfig,
+    egress: Arc<dyn EgressRegistry>,
+    usage: Arc<dyn RuntimeUsageSink>,
+    build: uuid::Uuid,
+    identity: ruum_core::runtime::WorkloadIdentity,
+    begun: Instant,
+    trace: Arc<Trace>,
+    slot: Option<Slot>,
+    done: bool,
+}
+
+impl Finish {
+    /// Cleans up and records the usage; the time the build took.
+    async fn run(&mut self) -> Duration {
+        cleanup(
+            &self.docker,
+            &self.cfg,
+            self.egress.as_ref(),
+            self.build,
+            &self.trace,
+        )
+        .await;
+        let took = self.begun.elapsed().max(Duration::from_millis(1));
+        self.usage.record(RuntimeUsage::Build {
+            identity: self.identity,
+            took,
+        });
+        self.done = true;
+        self.slot = None;
+        took
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let docker = self.docker.clone();
+        let cfg = self.cfg.clone();
+        let egress = self.egress.clone();
+        let usage = self.usage.clone();
+        let (build, identity, begun) = (self.build, self.identity, self.begun);
+        let trace = self.trace.clone();
+        let slot = self.slot.take();
+        let record = move || {
+            usage.record(RuntimeUsage::Build {
+                identity,
+                took: begun.elapsed().max(Duration::from_millis(1)),
+            });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    cleanup(&docker, &cfg, egress.as_ref(), build, &trace).await;
+                    record();
+                    drop(slot);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(build = %build, "a build was dropped outside a runtime: its job and network are left");
+                record();
+            }
+        }
+    }
+}
+
+/// What the build has ready when its timeout ends: the push and the manifest to commit.
+struct Ready {
+    push: registry::RepositoryPush,
+    manifest: Bytes,
 }
 
 impl DockerBuilder {
@@ -344,6 +452,7 @@ impl DockerBuilder {
                 String::new(),
                 cfg.base_repository.clone(),
                 cfg.credential.clone(),
+                cfg.token_realm.as_deref(),
             )?;
             p.base_manifest(&OciDigest::parse(&cfg.base_index)?)
                 .await?
@@ -415,6 +524,8 @@ impl DockerBuilder {
         let before = time::OffsetDateTime::now_utc().unix_timestamp() - age.as_secs() as i64;
         let mut removed = 0;
         for i in images {
+            // `containers` is -1 unless the engine counts it (shared-size option): the delete
+            // below is not forced, so the engine refuses an image a container uses.
             if i.created > before || i.containers > 0 {
                 continue;
             }
@@ -433,31 +544,15 @@ impl DockerBuilder {
         Ok(removed)
     }
 
-    async fn cleanup(&self, build: uuid::Uuid, trace: &Trace) {
-        job::remove_container(&self.docker, build).await;
-        let registered = trace
-            .network
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        job::remove_network(
-            &self.docker,
-            &self.cfg,
-            self.egress.as_ref(),
-            build,
-            registered,
-        )
-        .await;
-    }
-
-    /// The build up to the push; the caller times it out and cleans up.
+    /// The build up to its manifest push; the caller times it out, commits the manifest and
+    /// cleans up.
     async fn run(
         &self,
         input: &BuildInput,
         build: uuid::Uuid,
         trace: &Trace,
         log: &Mutex<job::LogTail>,
-    ) -> Result<OciDigest, RuntimeError> {
+    ) -> Result<Ready, RuntimeError> {
         let limits = archive::Limits {
             max_total_bytes: self.cfg.output_max.min(input.limits.disk_bytes),
             max_entry_bytes: self.cfg.output_max.min(input.limits.disk_bytes),
@@ -517,10 +612,14 @@ impl DockerBuilder {
             }
             job::JobEnd::Exited { output, .. } => output,
         };
-        // The job's work is done: free its sandbox before the assembly.
-        self.cleanup(build, trace).await;
-        *trace.network.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        let out = output::read_output(output, self.cfg.output_max)
+        // The job's work is done: free its sandbox before the assembly (the network's ID stays
+        // in the trace when its unregistration failed: the final cleanup tries again).
+        cleanup(&self.docker, &self.cfg, self.egress.as_ref(), build, trace).await;
+        // Reading the output and making the layer are CPU work over up to the output cap: off
+        // the async workers, so the build's timeout still ends the build.
+        let cap = self.cfg.output_max;
+        let out = blocking(move || output::read_output(output, cap))
+            .await?
             .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
         {
             let mut l = log.lock().unwrap_or_else(|p| p.into_inner());
@@ -529,10 +628,10 @@ impl DockerBuilder {
                     "ruum-build: dropped output entry \"{name}\": {why}"
                 ));
             }
-            if out.dropped.len() > 100 {
+            if out.dropped_total > 100 {
                 l.note(&format!(
                     "ruum-build: dropped {} more output entries",
-                    out.dropped.len() - 100
+                    out.dropped_total - 100
                 ));
             }
         }
@@ -541,14 +640,14 @@ impl DockerBuilder {
             repository(&input.identity),
             self.cfg.base_repository.clone(),
             self.cfg.credential.clone(),
+            self.cfg.token_realm.as_deref(),
         )?;
         let (_, base_manifest) = push.base_manifest(&self.base_manifest).await?;
         let base = oci::parse_manifest(&base_manifest)?;
         let base_config = push
             .base_blob(&OciDigest::parse(&base.config.digest)?)
             .await?;
-        let layer = oci::build_layer(&out.entries);
-        drop(out);
+        let layer = blocking(move || oci::build_layer(&out.entries)).await?;
         let mut labels: BTreeMap<String, String> = self.cfg.docker.extra_labels.clone();
         labels.insert(
             crate::LABEL_APP.to_owned(),
@@ -563,17 +662,25 @@ impl DockerBuilder {
         let config = oci::image_config(&base_config, &layer, &recipe.start, &labels)?;
         let manifest = oci::image_manifest(&base.layers, &config, &layer);
         for d in &base.layers {
-            push.bring_base_blob(&OciDigest::parse(&d.digest)?).await?;
+            push.bring_base_blob(&OciDigest::parse(&d.digest)?, d.size)
+                .await?;
         }
         push.push_blob(&layer.digest, layer.gz.clone()).await?;
         push.push_blob(&OciDigest::of(&config), config.clone())
             .await?;
-        let digest = push.push_manifest(registry::OCI_MANIFEST, manifest).await?;
-        log.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .note(&format!("ruum-build: image {digest}"));
-        Ok(digest)
+        Ok(Ready { push, manifest })
     }
+}
+
+/// Runs CPU work on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, RuntimeError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| RuntimeError::Internal {
+            reason: format!("the build's assembly: {e}"),
+        })
 }
 
 fn tail_text(log: &Mutex<job::LogTail>) -> String {
@@ -608,29 +715,47 @@ impl Builder for DockerBuilder {
                 runtime: input.runtime,
             });
         }
-        let _slot = self.slots.acquire(input.identity.tenant).await;
-        let begun = Instant::now();
+        let slot = self.slots.acquire(input.identity.tenant).await;
         let build = uuid::Uuid::now_v7();
-        let trace = Trace::default();
+        let trace = Arc::new(Trace::default());
+        // From here on, every outcome (also a drop of this future) cleans up and records.
+        let mut finish = Finish {
+            docker: self.docker.clone(),
+            cfg: self.cfg.clone(),
+            egress: self.egress.clone(),
+            usage: self.usage.clone(),
+            build,
+            identity: input.identity,
+            begun: Instant::now(),
+            trace: trace.clone(),
+            slot: Some(slot),
+            done: false,
+        };
         let log = Mutex::new(job::LogTail::new(
             MAX_BUILD_LOG_LINES,
             MAX_BUILD_LOG_LINE_BYTES,
         ));
-        let result = match tokio::time::timeout(
-            input.timeout,
-            self.run(&input, build, &trace, &log),
-        )
-        .await
+        let ready = match tokio::time::timeout(input.timeout, self.run(&input, build, &trace, &log))
+            .await
         {
             Ok(r) => r,
             Err(_) => Err(RuntimeError::BuildTimedOut),
         };
-        self.cleanup(build, &trace).await;
-        let took = begun.elapsed().max(Duration::from_millis(1));
-        self.usage.record(RuntimeUsage::Build {
-            identity: input.identity,
-            took,
-        });
+        // The commit point, outside the timeout: a manifest is pushed whole or not at all by
+        // this build, never cut by the timeout after the registry stored it.
+        let result = match ready {
+            Ok(r) => r
+                .push
+                .push_manifest(registry::OCI_MANIFEST, r.manifest)
+                .await
+                .inspect(|digest| {
+                    log.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .note(&format!("ruum-build: image {digest}"));
+                }),
+            Err(e) => Err(e),
+        };
+        let took = finish.run().await;
         let digest = result?;
         let logs = log
             .lock()

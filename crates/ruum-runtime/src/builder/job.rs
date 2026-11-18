@@ -49,17 +49,18 @@ pub const MANAGED_BY: &str = "ruum-builder";
 const INHIBIT_IPV4: &str = "com.docker.network.bridge.inhibit_ipv4";
 
 /// The fixed recipe. `$RUUM_SOURCE_BYTES` and `$RUUM_BUILD_COMMAND` are set by the builder;
-/// no value of the app is in this text.
+/// no value of the app is in this text. File descriptor 3 (the output) is closed for npm, its
+/// scripts and the build command: only the recipe's own `tar` writes the output.
 pub const RECIPE: &str = r#"set -eu
 exec 3>&1 1>&2
 mkdir /work/app
-head -c "$RUUM_SOURCE_BYTES" | tar -x -f - -C /work/app
+head -c "$RUUM_SOURCE_BYTES" | tar -x -f - -C /work/app 3>&-
 cd /work/app
 echo "ruum-build: npm ci"
-npm ci --ignore-scripts=false --foreground-scripts --no-audit --no-fund
+npm ci --ignore-scripts=false --foreground-scripts --no-audit --no-fund 3>&-
 if [ -n "${RUUM_BUILD_COMMAND:-}" ]; then
   echo "ruum-build: the build command"
-  sh -c "$RUUM_BUILD_COMMAND"
+  sh -c "$RUUM_BUILD_COMMAND" 3>&-
 fi
 echo "ruum-build: output"
 tar -c -f - -C /work/app . >&3
@@ -246,15 +247,18 @@ pub async fn create_network(
 }
 
 /// Unregisters the network at the egress proxy (three tries), detaches the proxy and removes
-/// the network. A network whose unregistration keeps failing is left (its subnet stays taken,
-/// so the proxy never sees an overlapping one); the next prune removes it.
+/// the network. Whether it is done: a network whose unregistration keeps failing is **left**,
+/// registered (its subnet stays taken, so the proxy never sees an overlapping one, and a
+/// registration never outlives its network), and `false` tells the caller to keep its ID and
+/// try again at the build's final cleanup. A network left after that stays until an operator
+/// or a sweep removes it: there is no network sweep yet (follow-up of T-53, for I-4).
 pub async fn remove_network(
     docker: &Docker,
     cfg: &BuilderConfig,
     egress: &dyn EgressRegistry,
     build: uuid::Uuid,
     registered: Option<String>,
-) {
+) -> bool {
     let name = network_name(build);
     if let Some(id) = &registered {
         let mut done = false;
@@ -271,7 +275,7 @@ pub async fn remove_network(
             }
         }
         if !done {
-            return;
+            return false;
         }
     }
     if let Some(p) = cfg.docker.routes.get(&Route::EgressProxy) {
@@ -290,6 +294,7 @@ pub async fn remove_network(
     {
         tracing::warn!(network = %name, error = %e, "removing a build network");
     }
+    true
 }
 
 /// The variables of the job: a fixed list (no value of the builder's own environment).
@@ -623,8 +628,17 @@ pub async fn run(
     let mut out: Vec<u8> = Vec::new();
     let mut over = false;
     let mut stream = attached.output;
+    let mut broken: Option<bollard::errors::Error> = None;
     while let Some(item) = stream.next().await {
-        let Ok(item) = item else { break };
+        // A broken attach stream is never taken for the end of the output: the bytes read so
+        // far may stop at an entry boundary, and the exit code could still be 0.
+        let item = match item {
+            Ok(item) => item,
+            Err(e) => {
+                broken = Some(e);
+                break;
+            }
+        };
         match item {
             bollard::container::LogOutput::StdOut { message } => {
                 if over {
@@ -651,6 +665,9 @@ pub async fn run(
     log.lock().unwrap_or_else(|p| p.into_inner()).finish();
     if over {
         return Ok(JobEnd::OutputOverCap);
+    }
+    if let Some(e) = broken {
+        return Err(engine("reading the build job's output", e));
     }
     let code = exit_code(docker, &name).await?;
     Ok(JobEnd::Exited {
