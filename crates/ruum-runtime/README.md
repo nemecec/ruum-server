@@ -173,8 +173,9 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
    script (`builder::RECIPE`) reads the source tar from standard input (`head -c`), runs
    `npm ci --ignore-scripts=false --foreground-scripts --no-audit --no-fund` (postinstall
    scripts run: they are the hostile part), then `sh -c "$RUUM_BUILD_COMMAND"` if set, then
-   writes `tar -c -f - -C /work/app .` to standard output. No value of the app is part of the
-   script. The builder reads the container back before it starts it and refuses it when a flag
+   writes `tar -c -f - -C /work/app .` to standard output. npm, its scripts and the build
+   command run with that output closed (`3>&-`): only the recipe's `tar` writes it. No value of
+   the app is part of the script. The builder reads the container back before it starts it and refuses it when a flag
    or a limit differs.
 4. **The network**: one per build (`ruum-build-<build>`), `internal`, `inhibit_ipv4`, IPv6 off,
    with only the egress proxy attached (alias and port from `DockerConfig::routes`, an
@@ -191,10 +192,20 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
    writes a file. **The rule**: regular files (mode cut to `0o755` bits: no setuid, setgid,
    sticky, group or world write), folders, and symbolic links whose target is relative and stays
    inside the output are kept; a name with `..`, an absolute name, an empty or `.` segment or a
-   NUL, a link that is absolute or leaves the output, a hard link, a device, a FIFO and every
-   other entry type are **dropped** and named in the build log (`ruum-build: dropped output
-   entry ...`); an entry below a file or a link is dropped; a broken tar fails the build. File
-   names are bytes: spaces, newlines, a leading `-`, `\` and `$(...)` stay data (backlog S-42).
+   NUL, a name or link target over 4096 bytes, a link that is absolute or leaves the output, a
+   hard link, a device, a FIFO and every other entry type are **dropped** and named in the build
+   log (`ruum-build: dropped output entry ...`); an entry below a file or a link is dropped. The
+   build **fails** on a broken tar, a tar without its end-of-archive marker (a cut stream or a
+   broken attach connection never becomes an image with files missing), data after that marker,
+   more than 500,000 entries, or more than 64 MiB of names (with the folders above them): the
+   reading and the layer stay linear in the output, so a deep path cannot make the builder copy
+   every parent. The link check is **lexical** (the names, not a disk): a `..` after a segment
+   that is itself a link (`a/b/s -> ../..`, `a/b/t -> s/../..`) can end elsewhere when the
+   kernel resolves it in the app's container. The builder never resolves a link and drops every
+   entry below a link, so such a link points only inside the app's own image. File names are
+   bytes: spaces, newlines, a leading `-`, `\` and `$(...)` stay data (backlog S-42). Reading
+   the output and making the layer run on the blocking pool, so the build's timeout still ends
+   the build.
 6. **The image**, without a daemon (`builder::oci`): the base is `node:22-alpine` pinned by the
    digest of its multi-arch index (`NODE22_BASE_INDEX`, the index is embedded and checked), the
    platform of the engine (`GET /info`: `arm64` on the build server, `amd64` on staging and CI),
@@ -208,13 +219,24 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
    identity only (the push has no repository parameter): the base layers by cross-repository
    mount from `ruum-base/node22` (a copy when the registry refuses the mount), the new layer and
    config, then the manifest **by digest**, once (a second manifest push of the same build is
-   refused). An upload address outside `/v2/<repo>/blobs/uploads/` stops the push. With a
-   credential (`BuilderConfig::credential`) and a `Bearer` challenge, the token is asked for
-   `repository:<repo>:push,pull` and `repository:ruum-base/node22:pull`. The credential lives
-   only in the builder process.
-8. **Cleanup and usage**: after every outcome (success, failure, timeout) the container is
-   removed by force, the network is unregistered at the proxy (three tries) and removed; the
-   work data lives only in the job's `tmpfs`. A failed build pushes nothing. One
+   refused). An upload address (`Location`) is parsed and normalized as the request will send
+   it: its scheme, host and port must be the registry's and its path must be under
+   `/v2/<repo>/blobs/uploads/`, or the push stops; an address with `%2e`, `%2f`, `%5c`, a `\`,
+   a fragment or user info is refused before parsing. Every answer is read under a cap
+   (manifests and configs 4 MiB, a token 64 KiB, a copied base layer the size its manifest
+   gives). With a credential (`BuilderConfig::credential`) and a `Bearer` challenge, the token
+   is asked for `repository:<repo>:push,pull` and `repository:ruum-base/node22:pull`, and only
+   from the registry's own origin or the realm `BuilderConfig::token_realm` names (an `https`
+   URL, I-4): a challenge that names any other realm gets no request and no credential. The
+   credential lives only in the builder process. The manifest push is the commit point: it runs
+   after the build's timeout, with a bound of its own (60 s), so the timeout never cuts it after
+   the registry stored the manifest.
+8. **Cleanup and usage**: after every outcome (success, failure, timeout, and a build future
+   that the caller drops: a drop guard spawns the cleanup and the usage record on the runtime)
+   the container is removed by force, the network is unregistered at the proxy (three tries)
+   and removed; the work data lives only in the job's `tmpfs`. A network whose unregistration
+   fails is kept with its registration (never removed under a live registration) and the final
+   cleanup tries again. A failed build pushes nothing. One
    `RuntimeUsage::Build` with the build's identity per build. The build log is a bounded tail
    (`MAX_BUILD_LOG_LINES`, 4096 bytes per line); a failure reason is cut at
    `MAX_BUILD_FAILED_REASON_BYTES`. `DockerBuilder::prune_images` removes the engine's images
@@ -232,7 +254,8 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
 
 The crate reads none of these: the server's wiring (I-4) does and builds `BuilderConfig`. The
 egress proxy of the builds is `DockerConfig::routes[EgressProxy]`; the push credential is
-`BuilderConfig::credential` (I-4 issues one scoped to pushes).
+`BuilderConfig::credential` (I-4 issues one scoped to pushes), and a token service that is not
+on the registry's own origin is `BuilderConfig::token_realm`.
 
 ### Docker API calls of the builder (for I-4's socket proxy)
 
@@ -288,7 +311,15 @@ T-53). It mirrors the base image of the engine's platform from Docker Hub into i
   the builder never pulls from the internet. A different pin (`BuilderConfig::base_index`) needs
   the whole index there.
 - The output and the new layer are held in memory (at most `RUUM_BUILD_OUTPUT_MAX` each per
-  build, times `RUUM_BUILD_MAX_PARALLEL`).
+  build, times `RUUM_BUILD_MAX_PARALLEL`; the uncompressed layer is dropped once its digest is
+  known).
+- A network whose unregistration fails at both cleanups is left, still registered, until an
+  operator removes it: there is no sweep of build networks yet (T-53 follow-up, for I-4). The
+  test label sweep of objects older than a day is missing in both suites too.
+- When the registry stores the manifest but its answer fails (or the caller drops the build
+  during the manifest push), the build reports an error although the manifest is in the
+  build's own repository: by digest only, never tagged, never referenced by a deployment.
+- The wait for a build slot is not part of `BuildInput::timeout`: the caller (I-4) bounds it.
 - Under runsc the pids limit bounds the sandbox's host threads: a fork bomb ends the whole job
   (the build fails without the job's own report).
 - A build without `build` in `app.yaml` runs no build script (no `npm run build` by default).

@@ -94,13 +94,12 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, RuntimeError> {
     })
 }
 
-/// The new layer: gzip bytes, their digest and the digest of the uncompressed tar.
+/// The new layer: gzip bytes, their digest and the digest of the uncompressed tar (the tar
+/// itself is not kept: the tests read the pushed layer back).
 pub struct Layer {
     pub gz: Bytes,
     pub digest: OciDigest,
     pub diff_id: OciDigest,
-    /// The uncompressed tar (kept for the canary check of the tests).
-    pub tar: Bytes,
 }
 
 /// A tar writer with deterministic headers: mtime 0, owner and group [`LAYER_UID`], no user or
@@ -123,6 +122,11 @@ impl TarWriter {
 
     fn octal(field: &mut [u8], v: u64) {
         let digits = field.len() - 1;
+        // The output cap keeps every size far below 8 GiB (11 octal digits).
+        debug_assert!(
+            u32::try_from(digits * 3).is_ok_and(|bits| bits >= 64 || v < 1u64 << bits),
+            "a tar header field cannot hold {v}"
+        );
         let s = format!("{v:0digits$o}");
         let s = &s.as_bytes()[s.len().saturating_sub(digits)..];
         field[..s.len()].copy_from_slice(s);
@@ -242,18 +246,23 @@ impl TarWriter {
 }
 
 /// The new layer: every output entry under `app/`, with the folders above each entry, sorted
-/// by path bytes (a folder comes before what it holds).
+/// by path bytes (a folder comes before what it holds). The walk up from an entry stops at the
+/// first folder that is already there (every name in the map has all its folders), so an
+/// output whose folders are entries (the reader adds them) costs one lookup per entry.
 pub fn build_layer(entries: &[OutEntry]) -> Layer {
     let mut all: BTreeMap<Vec<u8>, Option<&OutEntry>> = BTreeMap::new();
     all.insert(b"app".to_vec(), None);
     for e in entries {
         let mut full = b"app/".to_vec();
         full.extend_from_slice(&e.path);
-        // The folders above it.
-        for (i, b) in full.iter().enumerate() {
-            if *b == b'/' {
-                all.entry(full[..i].to_vec()).or_insert(None);
+        // The folders above it, from the nearest one up to the first one already there.
+        let mut end = full.len();
+        while let Some(i) = full[..end].iter().rposition(|b| *b == b'/') {
+            if all.contains_key(&full[..i]) {
+                break;
             }
+            all.insert(full[..i].to_vec(), None);
+            end = i;
         }
         all.insert(full, Some(e));
     }
@@ -272,12 +281,12 @@ pub fn build_layer(entries: &[OutEntry]) -> Layer {
         .write(Vec::new(), flate2::Compression::default());
     // Writing to a Vec cannot fail.
     let _ = gz.write_all(&tar);
+    drop(tar);
     let gz = gz.finish().unwrap_or_default();
     Layer {
         digest: OciDigest::of(&gz),
         diff_id,
         gz: Bytes::from(gz),
-        tar: Bytes::from(tar),
     }
 }
 
@@ -365,6 +374,17 @@ pub fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    /// The uncompressed tar of a layer, checked against its diff ID.
+    fn tar_of(l: &Layer) -> Bytes {
+        let mut t = Vec::new();
+        flate2::read::GzDecoder::new(&l.gz[..])
+            .read_to_end(&mut t)
+            .expect("gunzip");
+        assert_eq!(OciDigest::of(&t), l.diff_id);
+        Bytes::from(t)
+    }
 
     fn entry(path: &str, kind: Kind) -> OutEntry {
         OutEntry {
@@ -389,7 +409,7 @@ mod tests {
         let lb = build_layer(&b);
         assert_eq!(la.digest, lb.digest, "the same output gives the same layer");
         assert_eq!(la.diff_id, lb.diff_id);
-        let names = super::super::output::read_output(la.tar.clone(), u64::MAX)
+        let names = super::super::output::read_output(tar_of(&la), u64::MAX)
             .expect("the layer reads back")
             .entries
             .into_iter()
@@ -415,7 +435,7 @@ mod tests {
             entry(&long, Kind::File(Bytes::from_static(b"z"))),
             entry("link", Kind::Symlink(target.as_bytes().to_vec())),
         ]);
-        let back = super::super::output::read_output(l.tar.clone(), u64::MAX).expect("reads");
+        let back = super::super::output::read_output(tar_of(&l), u64::MAX).expect("reads");
         assert!(
             back.entries
                 .iter()
