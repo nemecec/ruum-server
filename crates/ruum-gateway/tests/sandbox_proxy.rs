@@ -732,3 +732,302 @@ async fn websockets_keep_the_origin_rule_their_share_and_the_public_approval() {
         "another tenant's WebSocket closed"
     );
 }
+
+/// review-g1b 1: on a public app every visitor passes the check, so the recheck must find the
+/// visitor of the handshake again. A person who signs out of Ruum (and would now pass as
+/// anonymous) and a person whose app role is removed (and would now pass with other roles) lose
+/// their WebSockets within 5 s; an anonymous WebSocket on the same app stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_public_app_a_sign_out_or_a_removed_role_ends_the_websocket() {
+    let w = World::new().await.unwrap();
+    let ws = WsEcho::start().await;
+    let (host, d, t) = public_sandbox(&w, "acme", "garden", &ws.url).await;
+    let a = App {
+        id: w.query(&d).unwrap().app_id.to_string(),
+        slug: "garden".into(),
+        tenant: t.clone(),
+    };
+    let own = format!("https://{host}");
+    let leaving = w.seed_user(&t, "leaving").await.unwrap();
+    let demoted = w.seed_user(&t, "demoted").await.unwrap();
+    let member = Relation::Role("member".into());
+    w.grant(&demoted, &a, &member).await.unwrap();
+    let leaving_cookie = session(&w, &leaving, &host).await;
+    let demoted_cookie = session(&w, &demoted, &host).await;
+    let mut lc = open(&w, upgrade(&host, &own).header("Cookie", &leaving_cookie)).await;
+    let mut dc = open(&w, upgrade(&host, &own).header("Cookie", &demoted_cookie)).await;
+    let mut anon = open(&w, upgrade(&host, &own)).await;
+    assert!(echoes(&mut lc, "l1").await);
+    assert!(echoes(&mut dc, "d1").await);
+    assert!(echoes(&mut anon, "a1").await);
+    // The handshakes carried the person and the role (the app acts on them).
+    let tokens: Vec<String> = ws
+        .seen()
+        .iter()
+        .map(|s| s.header_all("ruum-user").concat())
+        .collect();
+    assert_eq!(tokens.len(), 3);
+    w.sign_out_platform(&leaving).await.unwrap();
+    w.revoke(&demoted, &a, &member).await.unwrap();
+    let since = Instant::now();
+    for (label, c) in [("signed out", &mut lc), ("role removed", &mut dc)] {
+        let took = closed_after(c, since, Duration::from_secs(6))
+            .await
+            .unwrap_or_else(|| panic!("the WebSocket stayed open ({label})"));
+        assert!(
+            took <= Duration::from_secs(5) + gateway::POLL_ALLOWANCE,
+            "{label}: {took:?}"
+        );
+    }
+    // Positive control: the anonymous WebSocket of the same app is open over the same time.
+    while since.elapsed() < Duration::from_secs(6) {
+        assert!(
+            echoes(&mut anon, "a2").await,
+            "the anonymous WebSocket closed"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The handshake of a WebSocket on a raw connection: the `101` head is read, nothing more.
+async fn raw_upgrade(w: &World, host: &str) -> TcpStream {
+    let mut s = TcpStream::connect(w.gateway).await.unwrap();
+    s.write_all(
+        format!(
+            "GET /ws HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Origin: https://{host}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(T, s.read(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(n > 0, "the gateway closed the handshake");
+        head.push(b[0]);
+    }
+    assert_eq!(
+        status_of(&head),
+        Some(101),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    s
+}
+
+/// review-g1b 2: a visitor that sends and never reads fills the buffers both ways (the echo app
+/// stops reading once it cannot write back), so a copy of the gateway waits on a write that
+/// never ends. The recheck still runs: a withdrawn approval closes the connection and frees its
+/// WebSocket slot within 5 s. Positive control: a reading visitor of another tenant keeps its
+/// WebSocket over the same time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visitor_that_stops_reading_cannot_outlive_the_recheck() {
+    let w = World::new().await.unwrap();
+    let ws_a = WsEcho::start().await;
+    let ws_b = WsEcho::start().await;
+    let (host_a, _, t_a) = public_sandbox(&w, "acme", "garden", &ws_a.url).await;
+    let (host_b, _, _) = public_sandbox(&w, "beta", "orchard", &ws_b.url).await;
+    let mut reader = open(&w, upgrade(&host_b, &format!("https://{host_b}"))).await;
+    assert!(echoes(&mut reader, "b1").await);
+    let s = raw_upgrade(&w, &host_a).await;
+    assert_eq!(w.gw.sandboxes.open_sockets(), 2);
+    let (rd, mut wr) = s.into_split();
+    // Masked binary frames (mask 0) of 60000 bytes, sent until the connection blocks or ends.
+    let written = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let written = written.clone();
+        tokio::spawn(async move {
+            let mut frame = vec![0x82, 0x80 | 126];
+            frame.extend_from_slice(&60000u16.to_be_bytes());
+            frame.extend_from_slice(&[0, 0, 0, 0]);
+            frame.extend(std::iter::repeat_n(b'x', 60000));
+            while wr.write_all(&frame).await.is_ok() {
+                written.fetch_add(frame.len(), Ordering::SeqCst);
+            }
+        })
+    };
+    // Wait until the writes stall (no progress for 1 s).
+    let mut seen = 0;
+    let stall = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = written.load(Ordering::SeqCst);
+        if now == seen && now > 0 {
+            break;
+        }
+        seen = now;
+        assert!(stall.elapsed() < T, "the writes never stalled");
+    }
+    assert_eq!(
+        w.gw.sandboxes.open_sockets(),
+        2,
+        "the stalled WebSocket is open"
+    );
+    w.set_public_approval(&t_a, false).await.unwrap();
+    let since = Instant::now();
+    while w.gw.sandboxes.open_sockets() > 1 {
+        assert!(
+            since.elapsed() <= Duration::from_secs(5) + gateway::POLL_ALLOWANCE,
+            "the stalled WebSocket kept its slot after the approval was withdrawn"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Positive control: the reading WebSocket is open over the same time.
+    while since.elapsed() < Duration::from_secs(6) {
+        assert!(
+            echoes(&mut reader, "b2").await,
+            "the reading WebSocket closed"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(w.gw.sandboxes.open_sockets(), 1);
+    writer.abort();
+    drop(rd);
+}
+
+/// review-g1b 3: the shares hold per tenant too, over all its apps and deployments. Tenant A
+/// with two apps reaches its WebSocket share; a third app of A gets `503`, while tenant B still
+/// opens one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_tenant_cannot_take_the_websockets_of_another() {
+    let w = World::with(Opts {
+        hold: HoldConfig {
+            ws_per_app: 2,
+            ws_per_tenant: 3,
+            ..HoldConfig::default()
+        },
+        ..Opts::default()
+    })
+    .await
+    .unwrap();
+    let echo = WsEcho::start().await;
+    let (host_a1, _, t_a) = public_sandbox(&w, "acme", "garden", &echo.url).await;
+    let a2 = w.seed_app(&t_a, "orchard", Access::Public).await.unwrap();
+    let d2 = w
+        .seed_node_deployment(&a2, Env::Live, &echo.url)
+        .await
+        .unwrap();
+    w.set_live(&a2, &d2).await.unwrap();
+    let host_a2 = format!("orchard.acme.{APPS_DOMAIN}");
+    let a3 = w.seed_app(&t_a, "meadow", Access::Public).await.unwrap();
+    let d3 = w
+        .seed_node_deployment(&a3, Env::Live, &echo.url)
+        .await
+        .unwrap();
+    w.set_live(&a3, &d3).await.unwrap();
+    let host_a3 = format!("meadow.acme.{APPS_DOMAIN}");
+    let (host_b, _, _) = public_sandbox(&w, "beta", "grove", &echo.url).await;
+    let own = |h: &str| format!("https://{h}");
+    let mut kept = Vec::new();
+    for h in [&host_a1, &host_a1, &host_a2] {
+        let mut c = open(&w, upgrade(h, &own(h))).await;
+        assert!(echoes(&mut c, "a").await);
+        kept.push(c);
+    }
+    // App A1 is at its share of 2 (the per-app share counts per app).
+    let r = send(&w, upgrade(&host_a1, &own(&host_a1))).await;
+    assert_eq!(r.status, 503);
+    // App A3 has no socket, but tenant A is at its share of 3.
+    let upgrades = echo.upgrades();
+    let r = send(&w, upgrade(&host_a3, &own(&host_a3))).await;
+    assert_eq!(r.status, 503);
+    assert_eq!(
+        echo.upgrades(),
+        upgrades,
+        "the app was asked over the share"
+    );
+    // Tenant B still opens one (positive control).
+    let mut cb = open(&w, upgrade(&host_b, &own(&host_b))).await;
+    assert!(echoes(&mut cb, "b").await);
+    assert_eq!(w.gw.sandboxes.open_sockets(), 4);
+    // A freed socket of tenant A makes room for app A3.
+    drop(kept.pop());
+    let since = Instant::now();
+    while w.gw.sandboxes.open_sockets() > 3 {
+        assert!(
+            since.elapsed() < Duration::from_secs(5),
+            "the slot was not freed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut c3 = open(&w, upgrade(&host_a3, &own(&host_a3))).await;
+    assert!(echoes(&mut c3, "a3").await);
+}
+
+/// review-g1b 3: the hold share of a tenant holds over its deployments: two cold deployments of
+/// tenant A fill its share, a third gets `503` at once, while tenant B's cold request is held
+/// and answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_tenants_cold_starts_cannot_take_the_hold_of_another() {
+    let w = World::with(Opts {
+        hold: HoldConfig {
+            hold: Duration::from_secs(8),
+            per_app: 2,
+            per_tenant: 2,
+            ..HoldConfig::default()
+        },
+        ..Opts::default()
+    })
+    .await
+    .unwrap();
+    let echo = Echo::start().await;
+    let (host_a1, da1, t_a) = public_sandbox(&w, "acme", "garden", &echo.url).await;
+    let a2 = w.seed_app(&t_a, "orchard", Access::Public).await.unwrap();
+    let da2 = w
+        .seed_node_deployment(&a2, Env::Live, &echo.url)
+        .await
+        .unwrap();
+    w.set_live(&a2, &da2).await.unwrap();
+    let host_a2 = format!("orchard.acme.{APPS_DOMAIN}");
+    let a3 = w.seed_app(&t_a, "meadow", Access::Public).await.unwrap();
+    let da3 = w
+        .seed_node_deployment(&a3, Env::Live, &echo.url)
+        .await
+        .unwrap();
+    w.set_live(&a3, &da3).await.unwrap();
+    let host_a3 = format!("meadow.acme.{APPS_DOMAIN}");
+    let (host_b, db, _) = public_sandbox(&w, "beta", "grove", &echo.url).await;
+    for d in [&da1, &da2, &da3, &db] {
+        w.stop_instance(d).await.unwrap();
+    }
+    w.driver.set_delay(Duration::from_millis(1500));
+    let addr = w.gateway;
+    let held: Vec<_> = [&host_a1, &host_a2]
+        .into_iter()
+        .map(|h| {
+            let req = Req::get(h, "/held");
+            tokio::spawn(async move { gateway::http::send(addr, &req, T).await.unwrap() })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let b = {
+        let req = Req::get(&host_b, "/b");
+        tokio::spawn(async move { gateway::http::send(addr, &req, T).await.unwrap() })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A third deployment of tenant A is within its app's share, but over the tenant's: 503 at
+    // once.
+    let t = Instant::now();
+    let over = send(&w, Req::get(&host_a3, "/over")).await;
+    assert_eq!(over.status, 503);
+    assert!(over.header("retry-after").is_some());
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t.elapsed()
+    );
+    // Tenant B's held request is answered, and so are tenant A's two.
+    let rb = b.await.unwrap();
+    assert!(gateway::is_echo(&rb), "{} {}", rb.status, rb.text());
+    for h in held {
+        let r = h.await.unwrap();
+        assert!(gateway::is_echo(&r), "{} {}", r.status, r.text());
+    }
+    assert_eq!(w.gw.sandboxes.held(), 0);
+}
