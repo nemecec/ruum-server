@@ -1539,6 +1539,252 @@ async fn static_gc_waits_for_a_site_writer() {
     collect(&w).await;
 }
 
+/// Kimi run 12, W2S-1 finding 1: during a rolling upgrade a server of the previous release
+/// writes sites without the site lock, after the collection has read the rows. A new server
+/// does not collect at its start: its first run waits for the end of the rollout.
+#[tokio::test]
+async fn static_gc_does_not_run_at_the_start_of_a_server() {
+    use crate::apps::static_gc::{STATIC_GC_EVERY, STATIC_GC_FIRST_DELAY};
+    let w = world().await;
+    let app = w.app("Start").await;
+    let site = w
+        .folder(
+            "start site",
+            &[("app.yaml", MANIFEST), ("index.html", INDEX)],
+        )
+        .await;
+    let ended = w.preview(app, site, Some("ended")).await;
+    end(&w, ended.id).await;
+    let has_index = || async {
+        w.s.apps
+            .sites()
+            .read_index(w.team.id, ended.id)
+            .await
+            .unwrap()
+            .is_some()
+    };
+    assert!(has_index().await);
+    // The server's collection task: nothing is collected right after the start.
+    let task = tokio::spawn(w.s.apps.clone().run_static_gc());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        has_index().await,
+        "the first collection ran at the start of the server"
+    );
+    task.abort();
+    assert!(STATIC_GC_FIRST_DELAY >= STATIC_GC_EVERY);
+    // After the delay the run collects (the index of the ended preview goes).
+    let task = tokio::spawn(w.s.apps.clone().run_static_gc_after(Duration::ZERO));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while has_index().await {
+        assert!(tokio::time::Instant::now() < deadline, "no collection ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    task.abort();
+}
+
+/// An object store whose deletes take `delay` each, one after the other, and are counted (the
+/// purge tests: a slow object store).
+#[derive(Debug)]
+struct SlowDeletes {
+    inner: Arc<dyn object_store::ObjectStore>,
+    delay: Duration,
+    deletes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Display for SlowDeletes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowDeletes({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for SlowDeletes {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        use futures::StreamExt;
+        let (inner, delay, deletes) = (self.inner.clone(), self.delay, self.deletes.clone());
+        locations
+            .then(move |location| {
+                let (inner, deletes) = (inner.clone(), deletes.clone());
+                async move {
+                    let location = location?;
+                    tokio::time::sleep(delay).await;
+                    deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut one =
+                        inner.delete_stream(futures::stream::iter([Ok(location.clone())]).boxed());
+                    while let Some(r) = one.next().await {
+                        r?;
+                    }
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// The world's app service over the same stores, with deletes of site objects that take
+/// `delay` each.
+fn slow_deletes(
+    w: &World,
+    delay: Duration,
+) -> (Arc<AppService>, Arc<std::sync::atomic::AtomicUsize>) {
+    let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut deps = w.s.apps.deps().clone();
+    deps.sites = crate::apps::static_site::StaticSites::new(Arc::new(SlowDeletes {
+        inner: w.s.apps.sites().object_store(),
+        delay,
+        deletes: deletes.clone(),
+    }));
+    (Arc::new(AppService::new(deps)), deletes)
+}
+
+/// Previews of `app` under distinct drafts, each with its own index.
+async fn previews(w: &World, app: NodeId, name: &str, n: usize) -> Vec<Uuid> {
+    let site = w
+        .folder(name, &[("app.yaml", MANIFEST), ("index.html", INDEX)])
+        .await;
+    let mut ids = Vec::new();
+    for i in 0..n {
+        ids.push(w.preview(app, site, Some(&format!("d{i}"))).await.id);
+    }
+    for id in &ids {
+        assert!(page(w, *id).await.is_some());
+    }
+    ids
+}
+
+/// Kimi run 12, W2S-1 finding 2: the purge hook of an app with many deployments on a slow
+/// object store. Each delivery is cut at a timeout shorter than one full pass; every
+/// delivery must make progress, so the purge ends after a few deliveries.
+#[tokio::test]
+async fn a_purge_of_many_sites_makes_progress_on_every_delivery() {
+    use crate::apps::provider::PurgeHook;
+    let w = world().await;
+    let app = w.app("Many").await;
+    let ids = previews(&w, app, "many site", 40).await;
+    // 40 deletes of 10 ms: one pass takes 400 ms, a delivery is cut after 250 ms.
+    let (svc, deletes) = slow_deletes(&w, Duration::from_millis(10));
+    let hook = svc.static_purge();
+    let mut finished = false;
+    for _ in 0..6 {
+        match tokio::time::timeout(Duration::from_millis(250), hook.app_purged(w.team.id, app))
+            .await
+        {
+            Ok(Ok(())) => {
+                finished = true;
+                break;
+            }
+            Ok(Err(e)) => panic!("{e:?}"),
+            Err(_) => {}
+        }
+    }
+    assert!(
+        finished,
+        "the purge never ended ({} deletes sent)",
+        deletes.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    for id in ids {
+        assert!(page(&w, id).await.is_none());
+    }
+    // No index deleted twice: one request per index.
+    assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 40);
+}
+
+/// The purge of static sites stops at its budget with `503 unavailable` (the platform delivers
+/// the hook again), and the next call deletes only what is left.
+#[tokio::test]
+async fn a_purge_stops_at_its_budget_and_goes_on_at_the_next_call() {
+    let w = world().await;
+    let app = w.app("Budget").await;
+    let other = w.app("Other").await;
+    let ids = previews(&w, app, "budget site", 20).await;
+    let kept = previews(&w, other, "other site", 1).await;
+    let (svc, deletes) = slow_deletes(&w, Duration::from_millis(20));
+    let err = svc
+        .delete_app_sites_within(w.team.id, app, Duration::from_millis(150))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Api(a) if a.code == ErrorCode::Unavailable),
+        "{err:?}"
+    );
+    assert_eq!(err.http_status(), 503);
+    let first = deletes.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(first > 0 && first < 20, "{first}");
+    let n = svc
+        .delete_app_sites_within(w.team.id, app, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(n >= (20 - first) as u64, "{n} after {first}");
+    for id in ids {
+        assert!(page(&w, id).await.is_none());
+    }
+    assert!(page(&w, kept[0]).await.is_some());
+    // Nothing is left: a call after the end sends no delete.
+    let before = deletes.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        svc.delete_app_sites_within(w.team.id, app, Duration::from_secs(10))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
 #[tokio::test]
 async fn the_static_quota_counts_files_members_and_static_objects() {
     use crate::apps::store::StorageUsage;
