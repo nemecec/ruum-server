@@ -34,7 +34,9 @@
 //! backlog P-57) never fails the feed. Its entry follows the rules of any entry on its node (sent
 //! when the caller sees the node now; a tenant-level entry to members only) and goes out in the
 //! generic shape: the envelope with the type as written and `data` empty
-//! ([`JournalEntry::generic_if_unknown`]). It gives no resync marker.
+//! ([`JournalEntry::generic_if_unknown`]). It gives no resync marker. So a new type that can
+//! change who sees a node must not be written while a release without its rule here still runs
+//! (design 12.7): the cursor moves past the entry, and no later page can send the `lost` marker.
 
 use super::{
     Access, EventType, GRANT_EVENTS, Journal, JournalEntry, ResyncMarker, decode_cursor,

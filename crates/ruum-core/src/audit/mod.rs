@@ -23,7 +23,7 @@ mod conformance;
 use crate::actor::{Actor, Context, require_user_actor};
 use crate::error::{ApiError, Error, ErrorCode, Result};
 use crate::ids::UserId;
-use crate::journal::JournalEntry;
+use crate::journal::{EventType, JournalEntry};
 use crate::paging::{Cursor, Page, PageRequest};
 use crate::tenants::{MemberRole, TenantStore};
 use async_trait::async_trait;
@@ -177,10 +177,13 @@ pub fn journal_audit_id(seq: i64) -> Uuid {
     Uuid::from_u128((0x8000u128 << 64) | (0x8000u128 << 48) | (seq as u128 & 0xffff_ffff_ffff))
 }
 
-/// A journal entry as an audit entry.
+/// A journal entry as an audit entry. An entry of a type this release does not know (a newer
+/// release wrote it during a rolling deploy, backlog P-57) keeps only `seq` and `revision` in
+/// `data`, as the generic shape of the changes feed: this release cannot tell what the data of
+/// such a type holds, or who may read it (design 12.7). Admin-only access does not change that.
 pub fn from_journal(e: &JournalEntry) -> AuditEntry {
     let mut data = match &e.data {
-        serde_json::Value::Object(m) => m.clone(),
+        serde_json::Value::Object(m) if e.event.is_known() => m.clone(),
         _ => serde_json::Map::new(),
     };
     data.insert("seq".into(), e.seq.into());
@@ -198,6 +201,22 @@ pub fn from_journal(e: &JournalEntry) -> AuditEntry {
         data: serde_json::Value::Object(data),
         at: e.at,
     }
+}
+
+/// The generic shape of an audit entry read from a journal row (backlog P-57): when this release
+/// does not know the row's type (its `action`), `data` keeps only the `seq` and `revision` that
+/// the reader added, as [`from_journal`] does. Rows of known types are returned as they are.
+pub(crate) fn generic_if_unknown_journal(mut e: AuditEntry) -> AuditEntry {
+    if EventType::parse(&e.action).is_none() {
+        let mut data = serde_json::Map::new();
+        for key in ["seq", "revision"] {
+            if let Some(v) = e.data.get(key) {
+                data.insert(key.into(), v.clone());
+            }
+        }
+        e.data = serde_json::Value::Object(data);
+    }
+    e
 }
 
 const CURSOR_PREFIX: &str = "a1.";

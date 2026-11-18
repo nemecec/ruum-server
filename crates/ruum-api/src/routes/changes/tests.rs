@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use ruum_core::actor::{Actor, PrincipalKind, PrincipalRef};
 use ruum_core::journal::memory::MemoryJournal;
-use ruum_core::journal::{EventType, NewEntry, encode_cursor};
+use ruum_core::journal::{EventType, JournalEntry, NewEntry, encode_cursor};
 use ruum_core::{PrincipalId, Result, TenantId, UserId};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -325,6 +325,41 @@ async fn the_validator_catches_a_bad_entry() {
     let mut extra = good.clone();
     extra["secret"] = json!(1);
     assert!(!errors(&validator, &extra).is_empty());
+}
+
+/// Backlog P-57, design 12.7: a server of the previous release passes on an entry of a type it
+/// does not know with `data` as `{}`. The type can be one the contract already lists with
+/// required fields (here `app.secret_changed`, planned and not known to this release), so the
+/// generic shape must validate against the envelope for every type. Non-empty data still
+/// follows the type's schema.
+#[tokio::test]
+async fn the_generic_shape_of_an_unknown_type_validates_against_the_contract() {
+    let validator = envelope_validator();
+    let planned = "app.secret_changed";
+    assert!(
+        EventType::parse(planned).is_none(),
+        "pick a planned type this release does not know"
+    );
+    let written: JournalEntry = serde_json::from_value(json!({
+        "tenant_id": Uuid::now_v7(), "seq": 9, "node_id": Uuid::now_v7(), "revision": 4,
+        "type": planned, "actor": { "kind": "user", "id": Uuid::now_v7() },
+        "on_behalf_of": null, "at": "2026-11-18T10:15:00Z",
+        "data": { "name": "DB_PASSWORD", "kind": "entered", "action": "rotated" }
+    }))
+    .unwrap();
+    let generic = serde_json::to_value(written.generic_if_unknown()).unwrap();
+    assert_eq!(generic["type"], planned);
+    assert_eq!(generic["data"], json!({}));
+    let errs = errors(&validator, &generic);
+    assert!(errs.is_empty(), "{generic}\n{}", errs.join("\n"));
+    // The same for a known type: `{}` is the generic shape, valid for every type.
+    let mut known = generic.clone();
+    known["type"] = json!("node.renamed");
+    assert!(errors(&validator, &known).is_empty());
+    // Data with content still follows the type's schema.
+    let mut bad = generic.clone();
+    bad["data"] = json!({ "name": 1 });
+    assert!(!errors(&validator, &bad).is_empty());
 }
 
 #[tokio::test]

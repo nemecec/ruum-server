@@ -18,6 +18,14 @@ use std::time::Duration;
 trait Harness: Send + Sync {
     async fn tenant(&self) -> TenantId;
     async fn append(&self, ctx: &Context, entry: NewEntry);
+    /// Writes a journal entry of a type by its wire name, as a newer release would (P-57).
+    async fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    );
     fn log(&self) -> &dyn AuditLog;
 }
 
@@ -33,6 +41,16 @@ impl Harness for Memory {
     }
     async fn append(&self, ctx: &Context, entry: NewEntry) {
         self.journal.append(ctx, entry).unwrap();
+    }
+    async fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    ) {
+        self.journal
+            .append_as_newer_release(ctx, node, type_name, data);
     }
     fn log(&self) -> &dyn AuditLog {
         &self.log
@@ -64,6 +82,19 @@ impl Harness for Pg {
     async fn append(&self, ctx: &Context, entry: NewEntry) {
         let mut tx = pgj::begin_tenant(&self.pool, ctx.tenant).await.unwrap();
         pgj::append(&mut tx, ctx, entry).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    async fn append_as_newer_release(
+        &self,
+        ctx: &Context,
+        node: Option<NodeId>,
+        type_name: &str,
+        data: serde_json::Value,
+    ) {
+        let mut tx = pgj::begin_tenant(&self.pool, ctx.tenant).await.unwrap();
+        pgj::append_as_newer_release(&mut tx, ctx, node, type_name, data)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
     fn log(&self) -> &dyn AuditLog {
@@ -354,12 +385,85 @@ async fn the_first_use_of_a_session_is_recorded_once(h: &dyn Harness) {
     assert_eq!(b.len(), 1);
 }
 
+/// Backlog P-57, design 12.7: a journal entry of a type this release does not know (a newer
+/// release wrote it during a rolling deploy) reaches the audit log in the generic shape: the
+/// action as written, the target, and in `data` only `seq` and `revision`. This release cannot
+/// tell what the data holds or who may read it, admins included. Known types keep their data.
+async fn a_type_of_a_newer_release_has_the_generic_shape(h: &dyn Harness) {
+    let t = h.tenant().await;
+    let user = UserId::new();
+    let uc = ctx(t, Actor::user(user));
+    let node = NodeId::new();
+    h.append_as_newer_release(
+        &uc,
+        Some(node),
+        "app.secret_rotated",
+        json!({ "name": "DB_PASSWORD", "value": "sensitive-marker" }),
+    )
+    .await;
+    tick().await;
+    h.append_as_newer_release(&uc, None, "tenant.from_a_newer_release", json!({ "x": 1 }))
+        .await;
+    tick().await;
+    h.append(
+        &uc,
+        NewEntry {
+            node_id: Some(node),
+            revision: Some(2),
+            event: EventType::NodeRenamed,
+            data: json!({ "parent_id": NodeId::new(), "old_name": "a", "new_name": "b" }),
+        },
+    )
+    .await;
+
+    let items = all(h.log(), &uc, AuditQuery::default()).await;
+    let actions: Vec<&str> = items.iter().map(|e| e.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "node.renamed",
+            "tenant.from_a_newer_release",
+            "app.secret_rotated"
+        ]
+    );
+    let renamed = &items[0];
+    assert_eq!(renamed.data["new_name"], json!("b"));
+    let tenant_level = &items[1];
+    assert_eq!(tenant_level.data, json!({ "seq": 2 }));
+    assert_eq!(tenant_level.target_type, None);
+    let rotated = &items[2];
+    assert_eq!(rotated.data, json!({ "seq": 1, "revision": 1 }));
+    assert_eq!(rotated.id, journal_audit_id(1));
+    assert_eq!(rotated.target_type.as_deref(), Some("node"));
+    assert_eq!(rotated.target_id, Some(node.to_string()));
+    assert_eq!(rotated.actor, Actor::user(user));
+    for e in &items {
+        assert!(
+            !e.data.to_string().contains("sensitive-marker"),
+            "the payload of an unknown type leaked: {e:?}"
+        );
+    }
+    // The action filter still finds it by its name.
+    let only = all(
+        h.log(),
+        &uc,
+        AuditQuery {
+            action: Some("app.".into()),
+            ..AuditQuery::default()
+        },
+    )
+    .await;
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0].data, json!({ "seq": 1, "revision": 1 }));
+}
+
 async fn run_all(h: &dyn Harness) {
     records_and_lists_newest_first_with_the_journal(h).await;
     filters(h).await;
     pages_without_gaps_or_repeats(h).await;
     tenants_are_apart(h).await;
     the_first_use_of_a_session_is_recorded_once(h).await;
+    a_type_of_a_newer_release_has_the_generic_shape(h).await;
 }
 
 #[tokio::test]

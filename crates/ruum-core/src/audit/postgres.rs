@@ -164,10 +164,16 @@ impl AuditLog for PgAuditLog {
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
+        // A journal row of a type this release does not know goes out in the generic shape
+        // (backlog P-57, [`generic_if_unknown_journal`]).
         let mut items = audit_rows
             .iter()
-            .chain(journal_rows.iter())
             .map(entry_from_row)
+            .chain(
+                journal_rows
+                    .iter()
+                    .map(|r| entry_from_row(r).map(generic_if_unknown_journal)),
+            )
             .collect::<Result<Vec<_>>>()?;
         items.sort_by_key(|e| std::cmp::Reverse((e.at, e.id)));
         let more = items.len() > limit as usize;

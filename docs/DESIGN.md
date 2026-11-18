@@ -1912,6 +1912,13 @@ every restart); this section is the target before real users.
   (every envelope field, `data` as `{}`; P-57). A release that writes a new type ships only after
   the release before it reads unknown types. A type is never renamed or dropped while the release
   before still writes it.
+- A new type that can change who sees a node (like a grant, a move, a trash or a member link: it
+  needs a "before" rule or a `resync` marker in the changes feed) takes one more release. Release
+  N teaches the feed the type's visibility rule and does not write the type; release N+1 writes
+  it. Reason: an old release sends an unknown entry only to callers who see its node now, and
+  gives no `lost` marker. A client that read past it there keeps the node in its cache, and the
+  new release cannot send the marker later, because the client's cursor is past the entry
+  (Kimi review of P-57). New types that change no access need only the rule above.
 - Migrations only go forward. A migration that drops data (the contract step) needs the
   backup before it, and is reviewed as risky (section 18).
 - **CI checks the rule**: the test suite of the previous release (the commit live on staging, or the

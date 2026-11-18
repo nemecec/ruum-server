@@ -144,7 +144,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -163,7 +170,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.renamed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.renamed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -182,7 +196,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.moved.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.moved.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -201,7 +222,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.copied.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.copied.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -220,7 +248,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.trashed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.trashed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -239,7 +274,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.restored.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.restored.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -258,7 +300,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.purged.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.purged.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -277,7 +326,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "version.created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "version.created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -296,7 +352,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "version.restored.schema.json"
+            "anyOf": [
+              {
+                "$ref": "version.restored.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -315,7 +378,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "version.labeled.schema.json"
+            "anyOf": [
+              {
+                "$ref": "version.labeled.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -334,7 +404,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "tag.attached.schema.json"
+            "anyOf": [
+              {
+                "$ref": "tag.attached.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -353,7 +430,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "tag.detached.schema.json"
+            "anyOf": [
+              {
+                "$ref": "tag.detached.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -372,7 +456,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "grant.added.schema.json"
+            "anyOf": [
+              {
+                "$ref": "grant.added.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -391,7 +482,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "grant.updated.schema.json"
+            "anyOf": [
+              {
+                "$ref": "grant.updated.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -410,7 +508,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "grant.removed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "grant.removed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -429,7 +534,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "share_link.created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "share_link.created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -448,7 +560,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "share_link.revoked.schema.json"
+            "anyOf": [
+              {
+                "$ref": "share_link.revoked.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -467,7 +586,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "node.sharing_updated.schema.json"
+            "anyOf": [
+              {
+                "$ref": "node.sharing_updated.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -486,7 +612,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "typed_node.status_changed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "typed_node.status_changed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -505,7 +638,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.columns_confirmed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.columns_confirmed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -524,7 +664,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.migration_applied.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.migration_applied.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -543,7 +690,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.migration_failed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.migration_failed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -562,7 +716,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.branch_created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.branch_created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -581,7 +742,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.restore_started.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.restore_started.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -600,7 +768,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.restored.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.restored.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -619,7 +794,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.restore_failed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.restore_failed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -638,7 +820,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.grant_created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.grant_created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -657,7 +846,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.grant_revoked.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.grant_revoked.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -676,7 +872,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "database.approval_decided.schema.json"
+            "anyOf": [
+              {
+                "$ref": "database.approval_decided.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -695,7 +898,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.deployed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.deployed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -714,7 +924,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.deployment_failed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.deployment_failed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -733,7 +950,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.rolled_back.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.rolled_back.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -752,7 +976,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.settings_changed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.settings_changed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -771,7 +1002,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.binding_granted.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.binding_granted.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -790,7 +1028,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.binding_revoked.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.binding_revoked.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -809,7 +1054,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.role_granted.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.role_granted.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -828,7 +1080,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.role_revoked.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.role_revoked.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -847,7 +1106,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.secret_changed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.secret_changed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -866,7 +1132,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.domain_added.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.domain_added.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -885,7 +1158,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.domain_removed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.domain_removed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -904,7 +1184,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.api_key_created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.api_key_created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -923,7 +1210,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.api_key_revoked.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.api_key_revoked.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -942,7 +1236,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.approval_decided.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.approval_decided.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -961,7 +1262,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "app.telemetry_fields_confirmed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "app.telemetry_fields_confirmed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -980,7 +1288,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "issue.created.schema.json"
+            "anyOf": [
+              {
+                "$ref": "issue.created.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -999,7 +1314,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "issue.status_changed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "issue.status_changed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -1018,7 +1340,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "issue.reveal_requested.schema.json"
+            "anyOf": [
+              {
+                "$ref": "issue.reveal_requested.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -1037,7 +1366,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "issue.reveal_decided.schema.json"
+            "anyOf": [
+              {
+                "$ref": "issue.reveal_decided.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -1056,7 +1392,14 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "template.instantiated.schema.json"
+            "anyOf": [
+              {
+                "$ref": "template.instantiated.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
@@ -1075,13 +1418,25 @@
       "then": {
         "properties": {
           "data": {
-            "$ref": "project.publication_changed.schema.json"
+            "anyOf": [
+              {
+                "$ref": "project.publication_changed.schema.json"
+              },
+              {
+                "$ref": "#/$defs/generic_data"
+              }
+            ]
           }
         }
       }
     }
   ],
   "$defs": {
+    "generic_data": {
+      "description": "The generic shape of `data` (design 12.7, backlog P-57): during a rolling deploy a server of the previous release passes on an entry of a type it does not know with the envelope as written and `data` as `{}`. That type can be one this schema already lists, so `{}` is valid for every type.",
+      "type": "object",
+      "maxProperties": 0
+    },
     "planned_types": {
       "description": "Event types that are specified but not written yet (decision 0004-21). Not used for validation; the envelope test of ruum-core keeps `EventType` equal to the `type` enum minus this list.",
       "enum": [
