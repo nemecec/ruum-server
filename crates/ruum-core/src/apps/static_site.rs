@@ -37,8 +37,8 @@ use crate::error::{Error, Result};
 use crate::ids::TenantId;
 use crate::runtime::{StaticFile, StaticImage};
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
@@ -84,33 +84,90 @@ fn sites_prefix(tenant: TenantId) -> Path {
 /// The distinct contents of a site's files: `(hash, size)`, in order of first use. CPU work
 /// (BLAKE3 over every byte): call it on the blocking pool for a large site.
 pub fn site_contents(files: &[(String, Bytes)]) -> Vec<(Hash, u64)> {
-    let mut seen = std::collections::HashSet::new();
+    distinct_contents(&static_files(files))
+}
+
+/// The files of a site as entries of a static image (one BLAKE3 pass over every byte).
+fn static_files(files: &[(String, Bytes)]) -> Vec<StaticFile> {
     files
         .iter()
-        .map(|(_, data)| (Hash::of(data), data.len() as u64))
+        .map(|(path, data)| StaticFile {
+            path: path.clone(),
+            content: Hash::of(data),
+            size: data.len() as u64,
+        })
+        .collect()
+}
+
+/// The distinct contents of image entries, in order of first use.
+fn distinct_contents(list: &[StaticFile]) -> Vec<(Hash, u64)> {
+    let mut seen = std::collections::HashSet::new();
+    list.iter()
+        .map(|f| (f.content, f.size))
         .filter(|(h, _)| seen.insert(*h))
         .collect()
 }
 
+/// The serialized index of a site (what [`StaticSites::write_site`] stores last).
+fn index_bytes(index: &SiteIndex) -> Result<Bytes> {
+    serde_json::to_vec(index)
+        .map(Bytes::from)
+        .map_err(|e| Error::Internal(format!("site index: {e}")))
+}
+
+/// What a site needs from the storage quota (backlog W2S-1): the distinct contents of its
+/// files and the size of its index. A deployment stores the file objects that do not exist
+/// yet and always one new index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SiteNeed {
+    /// `(hash, size)` of each distinct content, in order of first use.
+    pub contents: Vec<(Hash, u64)>,
+    /// The bytes of the site's index object.
+    pub index_bytes: u64,
+}
+
+impl SiteNeed {
+    /// The need of a site with `files` (as [`StaticSites::write_site`] takes them). CPU work
+    /// (BLAKE3 over every byte): call it on the blocking pool for a large site.
+    pub fn of(files: &[(String, Bytes)], spa_fallback: Option<String>) -> Result<Self> {
+        let list = static_files(files);
+        let contents = distinct_contents(&list);
+        let index = SiteIndex::of(&StaticImage::new(list), spa_fallback);
+        Ok(Self {
+            contents,
+            index_bytes: index_bytes(&index)?.len() as u64,
+        })
+    }
+
+    /// The bytes of every content and the index, as if nothing were stored yet.
+    pub fn total_bytes(&self) -> u64 {
+        self.contents
+            .iter()
+            .fold(self.index_bytes, |t, (_, n)| t.saturating_add(*n))
+    }
+}
+
+/// How many object store requests one site write, check or copy sends at the same time.
+const OBJECT_CONCURRENCY: usize = 16;
+
 /// `403 quota_exceeded`: the new objects of a site do not fit into the tenant's storage.
-pub fn quota_exceeded(needed: u64, free: u64) -> Error {
+/// Only the bytes the site needs are named: the free storage of the tenant is not shown,
+/// because every caller with `edit` on the app reads a stage error, guests too, and a guest
+/// may not read the tenant's usage (`getLimits` needs a member).
+pub fn quota_exceeded(needed: u64) -> Error {
     Error::Api(
         crate::error::ApiError::new(
             crate::error::ErrorCode::QuotaExceeded,
             format!(
                 "the space has no storage left for the files of this site \
-                 ({needed} new bytes, {free} bytes free)"
+                 ({needed} new bytes)"
             ),
         )
         .with_hint(
             "delete files (and empty the trash) or apps you do not need, or ask the tenant owner \
              about a larger plan",
         )
-        .with_details(serde_json::json!({
-            "stage": "image",
-            "needed_bytes": needed,
-            "free_bytes": free,
-        })),
+        .with_details(serde_json::json!({ "needed_bytes": needed })),
     )
 }
 
@@ -136,6 +193,9 @@ pub struct SiteGcReport {
     pub bytes_freed: u64,
     pub indexes_kept: u64,
     pub files_kept: u64,
+    /// Tenants whose file sweep waited for a deployment that may still write its site (see
+    /// [`StaticSites::collect`]).
+    pub file_sweeps_skipped: u64,
 }
 
 impl std::ops::AddAssign for SiteGcReport {
@@ -145,6 +205,17 @@ impl std::ops::AddAssign for SiteGcReport {
         self.bytes_freed += o.bytes_freed;
         self.indexes_kept += o.indexes_kept;
         self.files_kept += o.files_kept;
+        self.file_sweeps_skipped += o.file_sweeps_skipped;
+    }
+}
+
+/// The size of an object, `None` when it does not exist. Takes owned values, so many of these
+/// run at the same time inside a future that must be `Send`.
+async fn object_size(store: Arc<dyn ObjectStore>, key: Path) -> Result<Option<u64>> {
+    match store.head(&key).await {
+        Ok(m) => Ok(Some(m.size)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -366,8 +437,8 @@ impl StaticSites {
     }
 
     /// [`StaticSites::write_site`] with a storage budget: when the file objects that do not
-    /// exist yet need more than `budget` bytes, nothing is stored and the answer is
-    /// [`quota_exceeded`]. `None` is no budget.
+    /// exist yet and the new index need more than `budget` bytes, nothing is stored and the
+    /// answer is [`quota_exceeded`]. `None` is no budget.
     pub async fn write_site_within(
         &self,
         tenant: TenantId,
@@ -376,47 +447,54 @@ impl StaticSites {
         spa_fallback: Option<String>,
         budget: Option<u64>,
     ) -> Result<WrittenSite> {
-        let list: Vec<StaticFile> = files
+        let list = static_files(files);
+        let data: std::collections::HashMap<Hash, &Bytes> = list
             .iter()
-            .map(|(path, data)| StaticFile {
-                path: path.clone(),
-                content: Hash::of(data),
-                size: data.len() as u64,
-            })
+            .zip(files)
+            .map(|(f, (_, d))| (f.content, d))
             .collect();
+        let contents = distinct_contents(&list);
         let image = StaticImage::new(list);
         // Check the paths before anything is stored.
         image
             .verify()
             .map_err(|e| Error::Internal(format!("the static image is not valid: {e}")))?;
-        // The objects that are missing, found before anything is stored (the budget check).
-        let mut missing = Vec::new();
-        let mut done = std::collections::HashSet::new();
-        for (_, data) in files {
-            let hash = Hash::of(data);
-            if !done.insert(hash) {
-                continue;
-            }
-            if !self.has_file(tenant, &hash, data.len() as u64).await? {
-                missing.push((hash, data));
-            }
-        }
-        let new_bytes: u64 = missing.iter().map(|(_, d)| d.len() as u64).sum();
-        if let Some(free) = budget
-            && new_bytes > free
-        {
-            return Err(quota_exceeded(new_bytes, free));
-        }
-        for (hash, data) in missing {
-            self.store
-                .put(
-                    &file_key(tenant, &hash),
-                    PutPayload::from_bytes(data.clone()),
-                )
-                .await?;
-        }
         let index = SiteIndex::of(&image, spa_fallback);
-        self.put_index(tenant, deployment, &index).await?;
+        let index_body = index_bytes(&index)?;
+        // The objects that are missing, found before anything is stored (the budget check).
+        let missing = self.missing(tenant, &contents).await?;
+        let new_bytes: u64 = missing.iter().map(|(_, n)| *n).sum();
+        if let Some(free) = budget {
+            let needed = new_bytes.saturating_add(index_body.len() as u64);
+            if needed > free {
+                return Err(quota_exceeded(needed));
+            }
+        }
+        // Owned futures (no borrow in the stream: the stage future must stay `Send`).
+        let puts: Vec<_> = missing
+            .iter()
+            .filter_map(|(h, _)| data.get(h).map(|d| (file_key(tenant, h), (*d).clone())))
+            .map(|(key, d)| {
+                let store = self.store.clone();
+                async move {
+                    store
+                        .put(&key, PutPayload::from_bytes(d))
+                        .await
+                        .map(|_| ())
+                        .map_err(Error::from)
+                }
+            })
+            .collect();
+        futures::stream::iter(puts)
+            .buffer_unordered(OBJECT_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
+        self.store
+            .put(
+                &index_key(tenant, deployment),
+                PutPayload::from_bytes(index_body),
+            )
+            .await?;
         Ok(WrittenSite {
             index,
             image,
@@ -424,25 +502,43 @@ impl StaticSites {
         })
     }
 
-    /// True when the file object of `hash` exists with `size` bytes.
+    /// True when the file object of `hash` exists with `size` bytes (tests).
+    #[cfg(test)]
     async fn has_file(&self, tenant: TenantId, hash: &Hash, size: u64) -> Result<bool> {
-        match self.store.head(&file_key(tenant, hash)).await {
-            Ok(m) => Ok(m.size == size),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        Ok(object_size(self.store.clone(), file_key(tenant, hash)).await? == Some(size))
+    }
+
+    /// The contents of `contents` whose file objects do not exist yet, in their order. The
+    /// checks run [`OBJECT_CONCURRENCY`] at a time (a site has up to 10,000 files).
+    async fn missing(
+        &self,
+        tenant: TenantId,
+        contents: &[(Hash, u64)],
+    ) -> Result<Vec<(Hash, u64)>> {
+        let heads: Vec<_> = contents
+            .iter()
+            .map(|(hash, _)| object_size(self.store.clone(), file_key(tenant, hash)))
+            .collect();
+        let found: Vec<Option<u64>> = futures::stream::iter(heads)
+            .buffered(OBJECT_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(contents
+            .iter()
+            .zip(found)
+            .filter(|((_, size), f)| *f != Some(*size))
+            .map(|(c, _)| *c)
+            .collect())
     }
 
     /// The bytes that the file objects of `contents` ([`site_contents`]) that do not exist yet
     /// would add.
     pub async fn missing_bytes(&self, tenant: TenantId, contents: &[(Hash, u64)]) -> Result<u64> {
-        let mut total = 0u64;
-        for (hash, size) in contents {
-            if !self.has_file(tenant, hash, *size).await? {
-                total = total.saturating_add(*size);
-            }
-        }
-        Ok(total)
+        Ok(self
+            .missing(tenant, contents)
+            .await?
+            .iter()
+            .fold(0u64, |t, (_, n)| t.saturating_add(*n)))
     }
 
     /// The bytes of every static object of the tenant (file objects and indexes): what counts
@@ -478,22 +574,26 @@ impl StaticSites {
     /// cannot be read stops the run before any file is deleted (a file is never freed on a
     /// list that could not be read). Objects whose names do not follow the layout are left
     /// alone.
+    ///
+    /// `in_flight`: deployments that may still be writing their site. When one of them has no
+    /// index yet, no file is deleted in this run (the indexes are still collected): a writer
+    /// that does not take the site lock (a server of the previous release during a rolling
+    /// upgrade) may have found a file that no index names yet and skipped its upload.
     pub async fn collect(
         &self,
         tenant: TenantId,
         fate: &(dyn Fn(Uuid) -> IndexFate + Send + Sync),
+        in_flight: &std::collections::HashSet<Uuid>,
         cutoff: time::OffsetDateTime,
     ) -> Result<SiteGcReport> {
         let cutoff_ms = cutoff.unix_timestamp_nanos() / 1_000_000;
         let mut report = SiteGcReport::default();
         let mut marked = std::collections::HashSet::new();
-        // The indexes: mark or delete.
+        // The indexes: mark or delete. Only their names and sizes are held.
         let mut indexes = Vec::new();
         let mut list = self.store.list(Some(&sites_prefix(tenant)));
         while let Some(meta) = list.next().await {
-            indexes.push(meta?);
-        }
-        for meta in indexes {
+            let meta = meta?;
             let Some(id) = meta
                 .location
                 .filename()
@@ -502,6 +602,13 @@ impl StaticSites {
             else {
                 continue;
             };
+            indexes.push((id, meta));
+        }
+        drop(list);
+        let writing = in_flight
+            .iter()
+            .any(|d| !indexes.iter().any(|(id, _)| id == d));
+        for (id, meta) in indexes {
             let delete = match fate(id) {
                 IndexFate::Keep => false,
                 IndexFate::Delete => true,
@@ -521,13 +628,15 @@ impl StaticSites {
             }
             report.indexes_kept += 1;
         }
-        // The files: sweep what no kept index names.
-        let mut files = Vec::new();
+        if writing {
+            report.file_sweeps_skipped += 1;
+            return Ok(report);
+        }
+        // The files: sweep what no kept index names, as the listing streams (no list of every
+        // file is held).
         let mut list = self.store.list(Some(&files_prefix(tenant)));
         while let Some(meta) = list.next().await {
-            files.push(meta?);
-        }
-        for meta in files {
+            let meta = meta?;
             let Some(hash) = meta
                 .location
                 .filename()
@@ -552,36 +661,52 @@ impl StaticSites {
     /// Writes the index of `to` with the files of the index of `from` (a publish or a rollback
     /// deploys the same files again under a new deployment). The file objects are shared.
     pub async fn copy_site(&self, tenant: TenantId, from: Uuid, to: Uuid) -> Result<SiteIndex> {
+        self.copy_site_within(tenant, from, to, None).await
+    }
+
+    /// [`StaticSites::copy_site`] with a storage budget: when the new index needs more than
+    /// `budget` bytes, nothing is stored and the answer is [`quota_exceeded`]. `None` is no
+    /// budget.
+    pub async fn copy_site_within(
+        &self,
+        tenant: TenantId,
+        from: Uuid,
+        to: Uuid,
+        budget: Option<u64>,
+    ) -> Result<SiteIndex> {
         let index = self
             .read_index(tenant, from)
             .await?
             .ok_or_else(|| Error::Internal(format!("deployment {from} has no site index")))?;
-        // Every file is still there (objects are never deleted while an index names them).
-        for e in index.files.values() {
-            match self.store.head(&file_key(tenant, &e.content_hash()?)).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {
-                    return Err(Error::Internal(format!(
-                        "a file of the site of deployment {from} is missing"
-                    )));
-                }
-                Err(e) => return Err(e.into()),
-            }
+        let body = index_bytes(&index)?;
+        if let Some(free) = budget
+            && body.len() as u64 > free
+        {
+            return Err(quota_exceeded(body.len() as u64));
         }
-        self.put_index(tenant, to, &index).await?;
-        Ok(index)
-    }
-
-    async fn put_index(&self, tenant: TenantId, deployment: Uuid, index: &SiteIndex) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(index).map_err(|e| Error::Internal(format!("site index: {e}")))?;
-        self.store
-            .put(
-                &index_key(tenant, deployment),
-                PutPayload::from_bytes(Bytes::from(bytes)),
-            )
+        // Every file is still there (objects are never deleted while an index names them).
+        let hashes = index
+            .files
+            .values()
+            .map(IndexEntry::content_hash)
+            .collect::<Result<std::collections::HashSet<Hash>>>()?;
+        let heads: Vec<_> = hashes
+            .iter()
+            .map(|hash| object_size(self.store.clone(), file_key(tenant, hash)))
+            .collect();
+        let found: Vec<Option<u64>> = futures::stream::iter(heads)
+            .buffer_unordered(OBJECT_CONCURRENCY)
+            .try_collect()
             .await?;
-        Ok(())
+        if found.iter().any(Option::is_none) {
+            return Err(Error::Internal(format!(
+                "a file of the site of deployment {from} is missing"
+            )));
+        }
+        self.store
+            .put(&index_key(tenant, to), PutPayload::from_bytes(body))
+            .await?;
+        Ok(index)
     }
 
     /// The index of a deployment of the tenant; `None` when it has none (not deployed yet, not
@@ -793,44 +918,72 @@ mod tests {
         let sites = StaticSites::in_memory();
         let t = TenantId(Uuid::now_v7());
         let d = Uuid::now_v7();
-        // 38 new bytes do not fit into 37.
+        let need = SiteNeed::of(&files(), None).unwrap();
+        assert_eq!(need.contents, site_contents(&files()));
+        assert!(need.index_bytes > 0);
+        // 38 new file bytes and the index do not fit into one byte less.
+        let full = 38 + need.index_bytes;
+        assert_eq!(need.total_bytes(), full);
         let err = sites
-            .write_site_within(t, d, &files(), None, Some(37))
+            .write_site_within(t, d, &files(), None, Some(full - 1))
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, Error::Api(a) if a.code == crate::error::ErrorCode::QuotaExceeded),
-            "{err:?}"
-        );
+        match &err {
+            Error::Api(a) => {
+                assert_eq!(a.code, crate::error::ErrorCode::QuotaExceeded);
+                // The tenant's free storage is not shown.
+                let details = a.details.as_deref().unwrap();
+                assert_eq!(details, &serde_json::json!({ "needed_bytes": full }));
+                assert!(!a.message.contains("free"), "{}", a.message);
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(sites.stored_bytes(t).await.unwrap(), 0);
         assert!(sites.read_index(t, d).await.unwrap().is_none());
-        assert_eq!(
-            sites
-                .missing_bytes(t, &site_contents(&files()))
-                .await
-                .unwrap(),
-            38
-        );
-        // They fit into 38; the same files again need nothing, whatever the budget.
+        assert_eq!(sites.missing_bytes(t, &need.contents).await.unwrap(), 38);
+        // They fit exactly.
         sites
-            .write_site_within(t, d, &files(), None, Some(38))
+            .write_site_within(t, d, &files(), None, Some(full))
             .await
             .unwrap();
+        assert_eq!(sites.stored_bytes(t).await.unwrap(), full);
+        // The same files again need no file bytes, but a new index costs its bytes.
+        assert!(
+            sites
+                .write_site_within(
+                    t,
+                    Uuid::now_v7(),
+                    &files(),
+                    None,
+                    Some(need.index_bytes - 1)
+                )
+                .await
+                .is_err()
+        );
         let again = sites
-            .write_site_within(t, Uuid::now_v7(), &files(), None, Some(0))
+            .write_site_within(t, Uuid::now_v7(), &files(), None, Some(need.index_bytes))
             .await
             .unwrap();
         assert_eq!(again.new_bytes, 0);
-        assert_eq!(
+        assert_eq!(sites.missing_bytes(t, &need.contents).await.unwrap(), 0);
+        // A copy of an index needs the bytes of the index.
+        let copy = Uuid::now_v7();
+        assert!(
             sites
-                .missing_bytes(t, &site_contents(&files()))
+                .copy_site_within(t, d, copy, Some(need.index_bytes - 1))
                 .await
-                .unwrap(),
-            0
+                .is_err()
         );
-        // Stored: the three files and the two indexes; another tenant has nothing.
-        let stored = sites.stored_bytes(t).await.unwrap();
-        assert!(stored > 38, "{stored}");
+        assert!(sites.read_index(t, copy).await.unwrap().is_none());
+        sites
+            .copy_site_within(t, d, copy, Some(need.index_bytes))
+            .await
+            .unwrap();
+        // Stored: the three files and the three indexes; another tenant has nothing.
+        assert_eq!(
+            sites.stored_bytes(t).await.unwrap(),
+            38 + 3 * need.index_bytes
+        );
         assert_eq!(
             sites.stored_bytes(TenantId(Uuid::now_v7())).await.unwrap(),
             0
@@ -877,8 +1030,9 @@ mod tests {
             }
         };
         // Within the grace period: the ended index goes, the row-less one and its file stay.
+        let none = std::collections::HashSet::new();
         let r = sites
-            .collect(t, &fate, crate::now() - time::Duration::hours(1))
+            .collect(t, &fate, &none, crate::now() - time::Duration::hours(1))
             .await
             .unwrap();
         assert_eq!((r.indexes_deleted, r.files_deleted), (1, 0));
@@ -890,9 +1044,31 @@ mod tests {
             async move { sites.has_file(tenant, &h, n).await.unwrap() }
         };
         assert!(has(t, &only_gone.1).await, "young objects stay");
-        // After the grace period: the row-less index goes too, and the files only they named.
-        let r = sites.collect(t, &fate, crate::now()).await.unwrap();
-        assert_eq!((r.indexes_deleted, r.files_deleted), (1, 2));
+        // A deployment that may still write its site and has no index yet: the indexes are
+        // collected, the files wait.
+        let writer = std::collections::HashSet::from([Uuid::now_v7()]);
+        let r = sites
+            .collect(t, &fate, &writer, crate::now())
+            .await
+            .unwrap();
+        assert_eq!((r.indexes_deleted, r.files_deleted), (1, 0), "{r:?}");
+        assert_eq!(r.file_sweeps_skipped, 1);
+        assert!(sites.read_index(t, rowless).await.unwrap().is_none());
+        assert!(has(t, &only_gone.1).await);
+        // Once it has an index (or is not in flight), the files only ended indexes named go.
+        let r = sites
+            .collect(
+                t,
+                &fate,
+                &std::collections::HashSet::from([keep]),
+                crate::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.indexes_deleted, r.files_deleted, r.file_sweeps_skipped),
+            (0, 2, 0)
+        );
         assert!(r.bytes_freed >= 13);
         assert!(has(t, &shared.1).await);
         assert!(!has(t, &only_gone.1).await);

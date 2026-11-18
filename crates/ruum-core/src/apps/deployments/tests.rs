@@ -1284,12 +1284,7 @@ async fn page(w: &World, id: Uuid) -> Option<bytes::Bytes> {
 
 async fn collect(w: &World) -> crate::apps::static_site::SiteGcReport {
     w.s.apps
-        .collect_static(
-            w.team.id,
-            time::Duration::ZERO,
-            None,
-            Duration::from_secs(5),
-        )
+        .collect_static(w.team.id, time::Duration::ZERO, Duration::from_secs(5))
         .await
         .unwrap()
 }
@@ -1314,8 +1309,8 @@ async fn static_objects_count_against_the_storage_quota() {
     w.preview(app, first, None).await;
     let stored = w.s.apps.sites().stored_bytes(w.team.id).await.unwrap();
     assert!(stored > INDEX.len() as u64, "{stored}");
-    // The space has 4 bytes left: a site with 22 new bytes is refused before the 202, and no
-    // deployment row is left.
+    // The space has 4 bytes left: a site with 22 new file bytes (and its index) is refused
+    // before the 202, and no deployment row is left.
     w.s.apps.set_storage_limit(Some(stored as i64 + 4));
     assert_eq!(w.s.apps.static_free_bytes(w.team.id).await.unwrap(), 4);
     let bigger = w
@@ -1341,19 +1336,60 @@ async fn static_objects_count_against_the_storage_quota() {
     match &err {
         Error::Api(a) => {
             assert_eq!(a.code, ErrorCode::QuotaExceeded, "{a:?}");
+            // Only what the site needs: the tenant's free storage is not shown (a guest with
+            // `edit` reads the stage errors, not the tenant's usage).
             let details = a.details.as_deref().unwrap();
-            assert_eq!(details["stage"], "image");
-            assert_eq!(details["needed_bytes"], 22);
-            assert_eq!(details["free_bytes"], 4);
+            let needed = details["needed_bytes"].as_u64().unwrap();
+            assert!(needed > 22, "{details}");
+            assert_eq!(details.as_object().unwrap().len(), 1, "{details}");
+            assert!(!a.message.contains("free"), "{}", a.message);
         }
         other => panic!("{other:?}"),
     }
     assert_eq!(count().await, before);
     assert!(!stores(&w, b"<h1>A larger page</h1>").await);
-    // The same site again needs no new storage: it deploys at the limit.
-    w.s.apps.set_storage_limit(Some(stored as i64));
+    // The same site again needs no new file storage, only the bytes of a new index: refused
+    // at the limit, deployed with room for the index.
+    w.s.apps.set_storage_limit(None);
+    let first_index = {
+        let p = w.preview(app, first, None).await;
+        let index =
+            w.s.apps
+                .sites()
+                .read_index(w.team.id, p.id)
+                .await
+                .unwrap()
+                .unwrap();
+        serde_json::to_vec(&index).unwrap().len() as i64
+    };
+    let stored = w.s.apps.sites().stored_bytes(w.team.id).await.unwrap() as i64;
+    w.s.apps.set_storage_limit(Some(stored + first_index - 1));
+    let err = w.deploy(&w.m(), app, first, None).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Api(a) if a.code == ErrorCode::QuotaExceeded),
+        "{err:?}"
+    );
+    w.s.apps.set_storage_limit(Some(stored + first_index));
     let again = w.preview(app, first, None).await;
     assert_eq!(page(&w, again.id).await.unwrap(), INDEX);
+    // A publish copies the index: refused when the copy does not fit, nothing goes live.
+    let stored = w.s.apps.sites().stored_bytes(w.team.id).await.unwrap() as i64;
+    w.s.apps.set_storage_limit(Some(stored + first_index - 1));
+    let err = w.publish(&w.m(), app, again.id).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Api(a) if a.code == ErrorCode::QuotaExceeded),
+        "{err:?}"
+    );
+    assert_eq!(w.live(app).await, None);
+    assert_eq!(
+        w.s.apps.sites().stored_bytes(w.team.id).await.unwrap() as i64,
+        stored
+    );
+    w.s.apps.set_storage_limit(Some(stored + first_index));
+    let Published::Live(live) = w.publish(&w.m(), app, again.id).await.unwrap() else {
+        panic!("not live")
+    };
+    assert_eq!(page(&w, live.id).await.unwrap(), INDEX);
     // With room, the bigger site deploys.
     w.s.apps.set_storage_limit(None);
     w.preview(app, bigger, None).await;
@@ -1492,12 +1528,7 @@ async fn static_gc_waits_for_a_site_writer() {
             .unwrap();
     let busy =
         w.s.apps
-            .collect_static(
-                w.team.id,
-                time::Duration::ZERO,
-                None,
-                Duration::from_millis(100),
-            )
+            .collect_static(w.team.id, time::Duration::ZERO, Duration::from_millis(100))
             .await
             .unwrap_err();
     assert!(
@@ -1544,15 +1575,20 @@ async fn the_static_quota_counts_files_members_and_static_objects() {
         },
     );
     assert_eq!(apps.static_free_bytes(t).await.unwrap(), 0);
-    let new = [(crate::blobs::Hash::of(b"x"), 1)];
+    let new = crate::apps::static_site::SiteNeed {
+        contents: vec![(crate::blobs::Hash::of(b"x"), 1)],
+        index_bytes: 0,
+    };
     let err = apps.check_static_quota(t, &new).await.unwrap_err();
     assert!(
         matches!(&err, Error::Api(a) if a.code == ErrorCode::QuotaExceeded),
         "{err:?}"
     );
-    apps.check_static_quota(t, &crate::apps::static_site::site_contents(&page))
-        .await
-        .unwrap();
+    // The stored content costs nothing; its new index does.
+    let mut same = crate::apps::static_site::SiteNeed::of(&page, None).unwrap();
+    assert!(apps.check_static_quota(t, &same).await.is_err());
+    same.index_bytes = 0;
+    apps.check_static_quota(t, &same).await.unwrap();
     // A team's storage grows with its members.
     store.set_storage_usage(
         t,

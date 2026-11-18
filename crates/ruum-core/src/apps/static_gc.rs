@@ -7,9 +7,15 @@
 //! member for a team). A deployment whose site needs more new bytes than the tenant has free
 //! is refused: before the `202` of `createAppDeployment` (a direct `403 quota_exceeded`, no
 //! deployment row), and again in the image stage, under the site lock, just before the objects
-//! are stored (the stage fails with `quota_exceeded`; two deployments of one tenant that run at
-//! the same time can each pass the first check). Content that the tenant stores already costs
-//! nothing (objects are content-addressed).
+//! are stored (the stage fails with `quota_exceeded`). Content that the tenant stores already
+//! costs nothing (objects are content-addressed), but every deployment writes a new index,
+//! which counts: a deployment needs the bytes of its index, and a publish or rollback, which
+//! copies an index, is refused with `403 quota_exceeded` when the copy does not fit.
+//!
+//! Writers hold the site lock shared, so two deployments of one tenant that run at the same
+//! time can each pass the check, and the quota can be exceeded by about one site per
+//! concurrent writer of the tenant. The upload of files has the same bound (its check reads
+//! the usage without a lock); a strict quota needs a recorded byte total (backlog W2S-3).
 //!
 //! # Garbage collection
 //!
@@ -18,22 +24,30 @@
 //! of every deployment whose site may still be served or deployed again (the live deployment,
 //! every earlier release, which a rollback deploys again, and previews that have not ended:
 //! [`super::store::StaticDeployment::reachable`]), deletes the indexes of deployments that
-//! ended for good (failed, expired and superseded previews) and of a purged app, deletes an
-//! index that no deployment row names once it is older than the grace period (a publish writes
-//! the index of its new deployment just before the row), and then deletes every file object
+//! ended for good (failed, expired and superseded previews), deletes an index that no
+//! deployment row names once it is older than the grace period (a publish writes the index of
+//! its new deployment just before the row; what is left of a purged app), and then deletes every file object
 //! that no kept index names and that is older than the grace period.
 //!
-//! It runs from the preview sweeper of the server every [`STATIC_GC_EVERY`] for every tenant
-//! with static objects ([`AppService::collect_static_all`]), and at the purge of an app
-//! ([`StaticPurge`], a purge hook of the provider), which deletes the app's indexes at once.
+//! No file is deleted while a deployment of the tenant that started in the last
+//! [`WRITER_WINDOW`] is pending or running and has no index yet: a server of the previous
+//! release (during a rolling upgrade) writes sites without the site lock, and may have found a
+//! file that no index names and skipped its upload (Kimi W2S-1, 1). A deployment that stopped
+//! with its process (it stays `pending` or `running`) holds the files back for that window
+//! only.
+//!
+//! It runs in a task of its own that the preview sweeper of the server starts, now and then
+//! every [`STATIC_GC_EVERY`], for every tenant with static objects
+//! ([`AppService::collect_static_all`]). At the purge of an app, [`StaticPurge`] (a purge hook
+//! of the provider) deletes the app's indexes at once; its files go at the next run.
 
 use super::AppService;
-use super::static_site::{IndexFate, SiteGcReport};
+use super::static_site::{IndexFate, SiteGcReport, SiteNeed};
 use super::store::{LiveSwitchLock, StorageUsage};
 use crate::error::Result;
 use crate::ids::{NodeId, TenantId};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -42,6 +56,10 @@ pub const STATIC_GC_GRACE: time::Duration = time::Duration::hours(1);
 
 /// How often the server collects the static objects of every tenant.
 pub const STATIC_GC_EVERY: Duration = Duration::from_secs(3600);
+
+/// A pending or running deployment younger than this may still write its site: while one has
+/// no index, the collection deletes no file of its tenant.
+pub const WRITER_WINDOW: time::Duration = time::Duration::hours(1);
 
 /// How long a deployment or a publish waits for the site lock of its tenant (the collection of
 /// one tenant holds it), then `409 conflict`.
@@ -152,54 +170,59 @@ impl AppService {
             .unwrap_or_else(|e| e.into_inner()) = limit;
     }
 
-    /// Refuses a site whose new objects (`contents`: [`super::static_site::site_contents`]) do
-    /// not fit into the tenant's free storage (`403 quota_exceeded`).
-    pub(crate) async fn check_static_quota(
-        &self,
-        tenant: TenantId,
-        contents: &[(crate::blobs::Hash, u64)],
-    ) -> Result<()> {
-        let needed = self.deps.sites.missing_bytes(tenant, contents).await?;
-        if needed == 0 {
+    /// Refuses a site whose new objects (its file objects that do not exist yet and its index:
+    /// `need`) do not fit into the tenant's free storage (`403 quota_exceeded`). When the
+    /// whole site fits, no file object is looked up.
+    pub(crate) async fn check_static_quota(&self, tenant: TenantId, need: &SiteNeed) -> Result<()> {
+        let free = self.static_free_bytes(tenant).await?;
+        if need.total_bytes() <= free {
             return Ok(());
         }
-        let free = self.static_free_bytes(tenant).await?;
+        let needed = self
+            .deps
+            .sites
+            .missing_bytes(tenant, &need.contents)
+            .await?
+            .saturating_add(need.index_bytes);
         if needed > free {
-            return Err(super::static_site::quota_exceeded(needed, free));
+            return Err(super::static_site::quota_exceeded(needed));
         }
         Ok(())
     }
 
-    /// The garbage collection of one tenant's static objects (see the module docs). `purged`:
-    /// an app whose indexes go now, whatever its rows say (the purge hook runs before the rows
-    /// go). Objects written in the last `grace` stay unless a row says they ended. Waits at
-    /// most `wait` for the site lock.
+    /// The garbage collection of one tenant's static objects (see the module docs). Objects
+    /// written in the last `grace` stay unless a row says they ended. Waits at most `wait` for
+    /// the site lock.
     pub async fn collect_static(
         &self,
         tenant: TenantId,
         grace: time::Duration,
-        purged: Option<NodeId>,
         wait: Duration,
     ) -> Result<SiteGcReport> {
         let _lock = self.lock_sites(tenant, true, wait).await?;
         // Read under the lock: a deployment that writes its site holds the lock shared, so its
         // row (inserted before its stages run) is in this list.
-        let rows: HashMap<uuid::Uuid, (NodeId, bool)> = self
-            .deps
-            .store
-            .static_deployments(tenant)
-            .await?
+        let now = crate::now();
+        let deployments = self.deps.store.static_deployments(tenant).await?;
+        let in_flight: HashSet<uuid::Uuid> = deployments
+            .iter()
+            .filter(|d| d.in_flight_since.is_some_and(|t| t > now - WRITER_WINDOW))
+            .map(|d| d.id)
+            .collect();
+        let rows: HashMap<uuid::Uuid, bool> = deployments
             .into_iter()
-            .map(|d| (d.id, (d.app_node_id, d.reachable)))
+            .map(|d| (d.id, d.reachable))
             .collect();
         let fate = move |id: uuid::Uuid| match rows.get(&id) {
-            Some((app, _)) if Some(*app) == purged => IndexFate::Delete,
-            Some((_, true)) => IndexFate::Keep,
-            Some((_, false)) => IndexFate::Delete,
+            Some(true) => IndexFate::Keep,
+            Some(false) => IndexFate::Delete,
             None => IndexFate::DeleteIfOld,
         };
-        let cutoff = crate::now() - grace;
-        let report = self.deps.sites.collect(tenant, &fate, cutoff).await?;
+        let report = self
+            .deps
+            .sites
+            .collect(tenant, &fate, &in_flight, now - grace)
+            .await?;
         if report.indexes_deleted > 0 || report.files_deleted > 0 {
             tracing::info!(%tenant, indexes = report.indexes_deleted, files = report.files_deleted,
                 bytes = report.bytes_freed, "collected static site objects");
@@ -212,7 +235,7 @@ impl AppService {
     pub async fn collect_static_all(&self, grace: time::Duration) -> Result<SiteGcReport> {
         let mut total = SiteGcReport::default();
         for tenant in self.deps.sites.tenants().await? {
-            match self.collect_static(tenant, grace, None, GC_LOCK_WAIT).await {
+            match self.collect_static(tenant, grace, GC_LOCK_WAIT).await {
                 Ok(r) => total += r,
                 Err(e) => {
                     tracing::warn!(%tenant, error = %e, "the collection of static sites failed");
@@ -220,6 +243,32 @@ impl AppService {
             }
         }
         Ok(total)
+    }
+
+    /// Runs [`AppService::collect_static_all`] now and then every [`STATIC_GC_EVERY`] (the
+    /// server: [`AppService::run_sweeper`] starts it in a task of its own, so a long collection
+    /// never holds up the expiry of previews).
+    pub async fn run_static_gc(self: Arc<Self>) {
+        loop {
+            if let Err(e) = self.collect_static_all(STATIC_GC_GRACE).await {
+                tracing::warn!(error = %e, "the collection of static sites failed");
+            }
+            tokio::time::sleep(STATIC_GC_EVERY).await;
+        }
+    }
+
+    /// Deletes the indexes of every deployment of `app` (the purge of the app). Takes no site
+    /// lock: no deployment of a purged app writes, and deleting an index never frees a file
+    /// under a writer. The file objects go at the next collection.
+    pub async fn delete_app_sites(&self, tenant: TenantId, app: NodeId) -> Result<u64> {
+        let mut n = 0;
+        for d in self.deps.store.static_deployments(tenant).await? {
+            if d.app_node_id == app {
+                self.deps.sites.delete_index(tenant, d.id).await?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// The purge hook of static sites (register it with the provider's purge hooks).
@@ -231,9 +280,12 @@ impl AppService {
 }
 
 /// The purge of an app (`super::provider::PurgeHook`): deletes the indexes of all its
-/// deployments and collects the tenant's static objects, so the file objects that only the app
-/// used go (those written in the last [`STATIC_GC_GRACE`] go at the next run). An error keeps
-/// the app rows, and the platform delivers the hook again.
+/// deployments, so the next collection frees the file objects that only the app used. It does
+/// not run the collection itself: that waits for the site lock and lists every object of the
+/// tenant, which can take longer than the delivery timeout of the hook (Kimi W2S-1, 7). An
+/// index that the app wrote without a row (a publish that failed before its release) goes at a
+/// collection after the grace period. An error keeps the app rows, and the platform delivers
+/// the hook again.
 pub struct StaticPurge {
     service: Weak<AppService>,
 }
@@ -245,9 +297,8 @@ impl super::provider::PurgeHook for StaticPurge {
         let Some(service) = self.service.upgrade() else {
             return Ok(());
         };
-        service
-            .collect_static(tenant, STATIC_GC_GRACE, Some(app), SITE_LOCK_WAIT)
-            .await?;
+        let n = service.delete_app_sites(tenant, app).await?;
+        tracing::debug!(%tenant, %app, indexes = n, "deleted the site indexes of a purged app");
         Ok(())
     }
 }
