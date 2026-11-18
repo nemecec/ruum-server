@@ -63,6 +63,10 @@ pub fn index_key(tenant: TenantId, deployment: Uuid) -> Path {
     Path::from(format!("apps/static/{tenant}/sites/{deployment}.json"))
 }
 
+/// How many indexes [`StaticSites::delete_indexes`] deletes in one request (the most that one
+/// bulk delete of S3 takes).
+pub const DELETE_BATCH: usize = 1000;
+
 /// The prefix of every static object of all tenants.
 const ROOT_PREFIX: &str = "apps/static";
 
@@ -796,6 +800,73 @@ impl StaticSites {
             out.extend_from_slice(&c?);
         }
         Ok(Bytes::from(out))
+    }
+
+    /// Deletes the indexes of `deployments` that exist (the purge of an app) and stops at
+    /// `deadline`. Returns how many it deleted and whether none of them is left.
+    ///
+    /// One listing of the tenant's indexes finds the ones that exist, so an index deleted by
+    /// an earlier call costs no request again: every call that gets past the listing makes
+    /// progress (Kimi run 12, W2S-1 finding 2). The listing has half of the time; what it found
+    /// by then is deleted. The deletes go in batches of [`DELETE_BATCH`] (one bulk request each
+    /// on S3).
+    pub async fn delete_indexes(
+        &self,
+        tenant: TenantId,
+        deployments: &std::collections::HashSet<Uuid>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(u64, bool)> {
+        if deployments.is_empty() {
+            return Ok((0, true));
+        }
+        let now = tokio::time::Instant::now();
+        let list_deadline = now + deadline.saturating_duration_since(now) / 2;
+        let mut found = Vec::new();
+        let mut complete = true;
+        let mut list = self.store.list(Some(&sites_prefix(tenant)));
+        loop {
+            let meta = match tokio::time::timeout_at(list_deadline, list.next()).await {
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(meta)) => meta?,
+            };
+            let named = meta
+                .location
+                .filename()
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(|n| n.parse::<Uuid>().ok())
+                .is_some_and(|id| deployments.contains(&id));
+            if named {
+                found.push(meta.location);
+            }
+        }
+        drop(list);
+        let mut deleted = 0u64;
+        for batch in found.chunks(DELETE_BATCH) {
+            let paths = batch.to_vec().into_iter().map(Ok);
+            let mut s = self
+                .store
+                .delete_stream(futures::stream::iter(paths).boxed());
+            loop {
+                match tokio::time::timeout_at(deadline, s.next()).await {
+                    Err(_) => return Ok((deleted, false)),
+                    Ok(None) => break,
+                    Ok(Some(Ok(_))) => deleted += 1,
+                    Ok(Some(Err(object_store::Error::NotFound { .. }))) => {}
+                    Ok(Some(Err(e))) => return Err(e.into()),
+                }
+            }
+        }
+        Ok((deleted, complete))
+    }
+
+    /// The object store under the sites (the tests wrap it).
+    #[cfg(test)]
+    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
     }
 
     /// Deletes the index of a deployment (an expired preview). The file objects stay.

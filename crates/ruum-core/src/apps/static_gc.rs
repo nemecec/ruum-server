@@ -36,15 +36,24 @@
 //! with its process (it stays `pending` or `running`) holds the files back for that window
 //! only.
 //!
-//! It runs in a task of its own that the preview sweeper of the server starts, now and then
-//! every [`STATIC_GC_EVERY`], for every tenant with static objects
-//! ([`AppService::collect_static_all`]). At the purge of an app, [`StaticPurge`] (a purge hook
-//! of the provider) deletes the app's indexes at once; its files go at the next run.
+//! That guard sees only the rows that exist when the collection reads them. A server of the
+//! previous release can insert its row after that read, or copy an index for a publish (no
+//! row until the index is written), while the collection deletes files. So a server makes its
+//! first collection only [`STATIC_GC_FIRST_DELAY`] after its start, when the rolling upgrade
+//! that started it has ended and no server without the site lock writes sites any more (Kimi
+//! run 12, W2S-1 finding 1). A rollout that takes longer than that delay must not run this
+//! release next to a release before W2S-1.
+//!
+//! It runs in a task of its own that the preview sweeper of the server starts, first after
+//! [`STATIC_GC_FIRST_DELAY`] and then every [`STATIC_GC_EVERY`], for every tenant with static
+//! objects ([`AppService::collect_static_all`]). At the purge of an app, [`StaticPurge`] (a
+//! purge hook of the provider) deletes the app's indexes, in more than one delivery when they
+//! do not fit into [`PURGE_BUDGET`]; its files go at the next run.
 
 use super::AppService;
 use super::static_site::{IndexFate, SiteGcReport, SiteNeed};
 use super::store::{LiveSwitchLock, StorageUsage};
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{NodeId, TenantId};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -56,6 +65,15 @@ pub const STATIC_GC_GRACE: time::Duration = time::Duration::hours(1);
 
 /// How often the server collects the static objects of every tenant.
 pub const STATIC_GC_EVERY: Duration = Duration::from_secs(3600);
+
+/// How long a server waits after its start before its first collection: longer than a rolling
+/// upgrade, so that no server of a release without the site lock still writes sites when it
+/// runs (Kimi run 12, W2S-1 finding 1).
+pub const STATIC_GC_FIRST_DELAY: Duration = STATIC_GC_EVERY;
+
+/// How long the purge hook of static sites works in one delivery before it answers
+/// `503 unavailable` and goes on at the next one (below `RegistryDeliver::TIMEOUT`, 30 s).
+pub const PURGE_BUDGET: Duration = Duration::from_secs(20);
 
 /// A pending or running deployment younger than this may still write its site: while one has
 /// no index, the collection deletes no file of its tenant.
@@ -245,10 +263,17 @@ impl AppService {
         Ok(total)
     }
 
-    /// Runs [`AppService::collect_static_all`] now and then every [`STATIC_GC_EVERY`] (the
-    /// server: [`AppService::run_sweeper`] starts it in a task of its own, so a long collection
-    /// never holds up the expiry of previews).
+    /// Runs [`AppService::collect_static_all`] after [`STATIC_GC_FIRST_DELAY`] and then every
+    /// [`STATIC_GC_EVERY`] (the server: [`AppService::run_sweeper`] starts it in a task of its
+    /// own, so a long collection never holds up the expiry of previews). The first run waits
+    /// for the end of a rolling upgrade (see the module docs).
     pub async fn run_static_gc(self: Arc<Self>) {
+        self.run_static_gc_after(STATIC_GC_FIRST_DELAY).await
+    }
+
+    /// [`AppService::run_static_gc`] with the first run after `first`.
+    pub(crate) async fn run_static_gc_after(self: Arc<Self>, first: Duration) {
+        tokio::time::sleep(first).await;
         loop {
             if let Err(e) = self.collect_static_all(STATIC_GC_GRACE).await {
                 tracing::warn!(error = %e, "the collection of static sites failed");
@@ -260,13 +285,45 @@ impl AppService {
     /// Deletes the indexes of every deployment of `app` (the purge of the app). Takes no site
     /// lock: no deployment of a purged app writes, and deleting an index never frees a file
     /// under a writer. The file objects go at the next collection.
+    ///
+    /// It stops after [`PURGE_BUDGET`], below the delivery timeout of the hook, and then
+    /// answers `503 unavailable`: the platform delivers the hook again, and the next call
+    /// deletes only the indexes that are left ([`super::static_site::StaticSites::delete_indexes`]),
+    /// so a purge of any number of deployments ends (Kimi run 12, W2S-1 finding 2).
     pub async fn delete_app_sites(&self, tenant: TenantId, app: NodeId) -> Result<u64> {
-        let mut n = 0;
-        for d in self.deps.store.static_deployments(tenant).await? {
-            if d.app_node_id == app {
-                self.deps.sites.delete_index(tenant, d.id).await?;
-                n += 1;
-            }
+        self.delete_app_sites_within(tenant, app, PURGE_BUDGET)
+            .await
+    }
+
+    /// [`AppService::delete_app_sites`] with a time budget of `budget`.
+    pub(crate) async fn delete_app_sites_within(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        budget: Duration,
+    ) -> Result<u64> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let ids: HashSet<uuid::Uuid> = self
+            .deps
+            .store
+            .static_deployments(tenant)
+            .await?
+            .into_iter()
+            .filter(|d| d.app_node_id == app)
+            .map(|d| d.id)
+            .collect();
+        let (n, done) = self
+            .deps
+            .sites
+            .delete_indexes(tenant, &ids, deadline)
+            .await?;
+        if !done {
+            tracing::info!(%tenant, %app, indexes = n,
+                "the purge of an app's site indexes continues at the next delivery");
+            return Err(Error::api(
+                ErrorCode::Unavailable,
+                "the purge of the app's sites is not finished; it continues at the next delivery",
+            ));
         }
         Ok(n)
     }
