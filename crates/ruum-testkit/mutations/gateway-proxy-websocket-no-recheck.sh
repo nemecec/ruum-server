@@ -3,6 +3,6 @@
 # withdrawn public approval closes an open WebSocket within 5 s.
 DESCRIPTION="an open WebSocket is not checked again"
 FILE="crates/ruum-gateway/src/proxy.rs"
-PERL='s/if !crate::still_allowed\(&gw, &site, &headers\)\.await \{/if false \&\& !crate::still_allowed(\&gw, \&site, \&headers).await {/'
+PERL='s/if !crate::still_allowed\(&gw, &site, &headers, &visitor\)\.await \{/if false \&\& !crate::still_allowed(\&gw, \&site, \&headers, \&visitor).await {/'
 TESTS="-p ruum-gateway --test sandbox_proxy"
 PLACEHOLDER=0

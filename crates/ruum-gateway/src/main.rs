@@ -22,9 +22,10 @@
 //!   gateway serves no static file (an empty in-process store) and says so at start.
 //! - Sandboxes (card G-1b; whole seconds or counts, each above zero): `RUUM_GATEWAY_WAKE_HOLD`
 //!   (default 10): how long a request is held while its app starts; `RUUM_GATEWAY_HOLD_PER_APP`
-//!   (64) and `RUUM_GATEWAY_HOLD_GLOBAL` (1024): held requests per deployment and in all;
-//!   `RUUM_GATEWAY_WS_PER_APP` (256) and `RUUM_GATEWAY_WS_GLOBAL` (8192): open WebSockets per
-//!   deployment and in all; `RUUM_GATEWAY_UPSTREAM_TIMEOUT` (60): until the head of an app's
+//!   (64), `RUUM_GATEWAY_HOLD_PER_TENANT` (256) and `RUUM_GATEWAY_HOLD_GLOBAL` (1024): held
+//!   requests per deployment, per tenant and in all; `RUUM_GATEWAY_WS_PER_APP` (256),
+//!   `RUUM_GATEWAY_WS_PER_TENANT` (2048) and `RUUM_GATEWAY_WS_GLOBAL` (8192): open WebSockets per
+//!   app, per tenant and in all; `RUUM_GATEWAY_UPSTREAM_TIMEOUT` (60): until the head of an app's
 //!   answer; `RUUM_GATEWAY_WS_IDLE` (600): an idle WebSocket closes. Where an instance runs comes
 //!   from the core's internal listener (`RUUM_GATEWAY_INTERNAL_URL`), never from a setting.
 
@@ -71,8 +72,10 @@ fn hold_config() -> Result<HoldConfig, String> {
     Ok(HoldConfig {
         hold: Duration::from_secs(count("RUUM_GATEWAY_WAKE_HOLD", d.hold.as_secs())?),
         per_app: size("RUUM_GATEWAY_HOLD_PER_APP", d.per_app)?,
+        per_tenant: size("RUUM_GATEWAY_HOLD_PER_TENANT", d.per_tenant)?,
         global: size("RUUM_GATEWAY_HOLD_GLOBAL", d.global)?,
         ws_per_app: size("RUUM_GATEWAY_WS_PER_APP", d.ws_per_app)?,
+        ws_per_tenant: size("RUUM_GATEWAY_WS_PER_TENANT", d.ws_per_tenant)?,
         ws_global: size("RUUM_GATEWAY_WS_GLOBAL", d.ws_global)?,
         retry: d.retry,
     })

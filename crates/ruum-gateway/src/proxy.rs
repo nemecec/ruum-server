@@ -49,15 +49,22 @@
 //!   origin (`https://<host>`) gets the gateway's `403`. A missing `Origin` (not a browser) passes
 //!   only for an agent token in `Authorization`, never with a cookie.
 //! - **Shares.** Each open WebSocket takes a slot of [`crate::sandbox::SandboxHold`]: a per-app
-//!   share and a global cap; over either, the `503` page before the app is asked.
+//!   share (all deployments of the app), a per-tenant share and a global cap; over any of them,
+//!   the `503` page before the app is asked.
 //! - **A removed right ends an open WebSocket.** While a WebSocket is open, the gateway checks the
 //!   host and the access again every [`ProxyConfig::ws_recheck`] (1 s; the answers come through
-//!   `CoreCache`, which keeps them at most 3 s). When the right or role is gone, the user signed
-//!   out of Ruum, the public approval was withdrawn, the host serves another deployment, or the
-//!   core cannot answer (fail closed), the gateway writes a close frame (`1008`) to the visitor
-//!   and drops both connections: within 5 s of the change. The close frame is written only
-//!   between two frames of the app ([`FrameTracker`]); in the middle of a frame the connections
-//!   are dropped without it.
+//!   `CoreCache`, which keeps them at most 3 s). The recheck must find **the same visitor** as
+//!   the handshake (review-g1b 1): the same person with the same app roles (what the handshake's
+//!   `Ruum-User` token said), the same agent for the same person, or anonymous again. So on a
+//!   public app a sign-out (the visitor would now pass as anonymous) or a removed role (the
+//!   person would pass with other roles) closes it too. When the right or role is gone, the user
+//!   signed out of Ruum, the public approval was withdrawn, the host serves another deployment,
+//!   or the core cannot answer (fail closed), the gateway writes a close frame (`1008`) to the
+//!   visitor and drops both connections: within 5 s of the change. The close frame is written
+//!   only between two frames of the app ([`FrameTracker`]); in the middle of a frame the
+//!   connections are dropped without it. Each direction is copied by its own task, so a side
+//!   that stops reading cannot hold back the recheck or the idle close; a visitor that does not
+//!   take the close frame within [`CLOSE_GRACE`] is dropped without it.
 //! - **Idle.** A WebSocket without a byte either way for [`ProxyConfig::ws_idle`]
 //!   (`RUUM_GATEWAY_WS_IDLE`) closes the same way (`1001`).
 
@@ -541,7 +548,10 @@ pub async fn send(
         return Sent::Answer(pages::forbidden(site.look()));
     }
     let socket = match &out.upgrade {
-        Some(_) => match gw.sandboxes.open_socket(site.resolved.deployment_id) {
+        Some(_) => match gw
+            .sandboxes
+            .open_socket(site.resolved.tenant_id, site.resolved.app_id)
+        {
             Some(slot) => Some(slot),
             None => {
                 tracing::warn!(target: "ruum::gateway", "the WebSocket share of an app is full");
@@ -629,6 +639,7 @@ pub async fn send(
             gw.clone(),
             site.clone(),
             out.headers,
+            from.visitor.clone(),
             visitor_side,
             up,
             slot,
@@ -710,72 +721,124 @@ impl FrameTracker {
     }
 }
 
+/// How long the gateway waits for the app-to-visitor copy to write its close frame and end,
+/// once the WebSocket closes; a visitor that does not read by then is dropped without one.
+pub const CLOSE_GRACE: Duration = Duration::from_millis(500);
+
 /// Joins the visitor's and the app's upgraded connections until one ends, the access ends or
 /// the WebSocket is idle (see the module docs).
+///
+/// Each direction is copied by its own task, and this loop only watches them, the recheck and
+/// the idle limit (review-g1b 2). So a side that stops reading stalls only its own copy: the
+/// recheck and the idle close still run on time, and closing aborts both copies, which frees the
+/// WebSocket slot.
 async fn splice(
     gw: Arc<Gateway>,
     site: Site,
     headers: HeaderMap,
+    visitor: Visitor,
     visitor_side: hyper::upgrade::OnUpgrade,
     app_side: reqwest::Response,
     _slot: Slot,
 ) {
     let cfg = gw.proxy.clone();
-    let (app, visitor) = match tokio::join!(app_side.upgrade(), visitor_side) {
+    let (app, visitor_io) = match tokio::join!(app_side.upgrade(), visitor_side) {
         (Ok(a), Ok(v)) => (a, hyper_util::rt::TokioIo::new(v)),
         _ => {
             tracing::warn!(target: "ruum::gateway", "a WebSocket upgrade did not complete");
             return;
         }
     };
-    let (mut vr, mut vw) = tokio::io::split(visitor);
+    let (mut vr, mut vw) = tokio::io::split(visitor_io);
     let (mut ar, mut aw) = tokio::io::split(app);
-    let mut frames = FrameTracker::default();
-    let mut from_visitor = vec![0u8; 16 * 1024];
-    let mut from_app = vec![0u8; 16 * 1024];
+    let started = tokio::time::Instant::now();
+    // The time of the last byte either way, in milliseconds after `started`.
+    let last = Arc::new(AtomicU64::new(0));
+    let touch = {
+        let last = last.clone();
+        move || {
+            let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            last.store(ms, Ordering::Relaxed);
+        }
+    };
+    let (close_tx, mut close_rx) = tokio::sync::watch::channel::<Option<[u8; 4]>>(None);
+    let mut up = tokio::spawn({
+        let touch = touch.clone();
+        async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match vr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if aw.write_all(&buf[..n]).await.is_err() || aw.flush().await.is_err() {
+                            break;
+                        }
+                        touch();
+                    }
+                }
+            }
+            let _ = aw.shutdown().await;
+        }
+    });
+    let mut down = tokio::spawn(async move {
+        let mut frames = FrameTracker::default();
+        let mut buf = vec![0u8; 16 * 1024];
+        let close = loop {
+            tokio::select! {
+                biased;
+                changed = close_rx.changed() => {
+                    break if changed.is_ok() { *close_rx.borrow() } else { None };
+                }
+                r = ar.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => {
+                        frames.feed(&buf[..n]);
+                        if vw.write_all(&buf[..n]).await.is_err() || vw.flush().await.is_err() {
+                            break None;
+                        }
+                        touch();
+                    }
+                },
+            }
+        };
+        // The close frame only between two frames of the app (see the module docs).
+        if let Some(frame) = close
+            && frames.at_border()
+        {
+            let _ = vw.write_all(&frame).await;
+            let _ = vw.flush().await;
+        }
+        let _ = vw.shutdown().await;
+    });
     let mut tick = tokio::time::interval(cfg.ws_recheck);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last = tokio::time::Instant::now();
     let close = loop {
         tokio::select! {
-            r = vr.read(&mut from_visitor) => match r {
-                Ok(0) | Err(_) => break None,
-                Ok(n) => {
-                    if aw.write_all(&from_visitor[..n]).await.is_err() || aw.flush().await.is_err() {
-                        break None;
-                    }
-                    last = tokio::time::Instant::now();
-                }
-            },
-            r = ar.read(&mut from_app) => match r {
-                Ok(0) | Err(_) => break None,
-                Ok(n) => {
-                    frames.feed(&from_app[..n]);
-                    if vw.write_all(&from_app[..n]).await.is_err() || vw.flush().await.is_err() {
-                        break None;
-                    }
-                    last = tokio::time::Instant::now();
-                }
-            },
+            _ = &mut up => break None,
+            _ = &mut down => break None,
             _ = tick.tick() => {
-                if last.elapsed() >= cfg.ws_idle {
+                let idle_ms = u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(last.load(Ordering::Relaxed));
+                if Duration::from_millis(idle_ms) >= cfg.ws_idle {
                     break Some(CLOSE_IDLE);
                 }
-                if !crate::still_allowed(&gw, &site, &headers).await {
+                if !crate::still_allowed(&gw, &site, &headers, &visitor).await {
                     tracing::info!(target: "ruum::gateway", "an open WebSocket lost its access");
                     break Some(CLOSE_POLICY);
                 }
             }
         }
     };
-    if let Some(frame) = close
-        && frames.at_border()
-    {
-        let _ = vw.write_all(&frame).await;
-        let _ = vw.flush().await;
+    up.abort();
+    if close.is_some() && !down.is_finished() {
+        let _ = close_tx.send(close);
+        if tokio::time::timeout(CLOSE_GRACE, &mut down).await.is_err() {
+            tracing::info!(target: "ruum::gateway", "a WebSocket visitor did not take the close");
+        }
     }
-    let _ = vw.shutdown().await;
-    let _ = aw.shutdown().await;
+    // An aborted copy drops its halves, and so both connections (a finished one did already).
+    down.abort();
 }
 
 #[cfg(test)]
