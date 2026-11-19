@@ -163,7 +163,11 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
    decision 0006 H: no `..`, no absolute path, no `\`, no drive letter, no link or device;
    size limit: the build's disk limit and `RUUM_BUILD_OUTPUT_MAX`). `app.yaml` at the root must
    say `runtime: node22` and give `start` (the command that listens on `$PORT`); `build` is
-   optional. A refused archive or manifest is `build_failed` with the reason.
+   optional. A refused archive or manifest is `build_failed` with the reason. The source tar
+   for the job adds each folder above a file once; the source's names with those folders may
+   be at most 64 MiB in all, or the build fails (a deep path in every file cannot make the
+   builder copy each parent per file; Kimi, run 12). Unpacking and the source tar run on the
+   blocking pool.
 3. **The job**: one sandbox container per build (`ruum-b-<build>`) from the base image, with
    the hardening of an app instance of the driver (read-only root, `cap-drop ALL`,
    `no-new-privileges`, user `10001:10001`, the driver's pids limit, the build's CPU and memory
@@ -199,10 +203,13 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
    hard link, a device, a FIFO and every other entry type are **dropped** and named in the build
    log (`ruum-build: dropped output entry ...`); an entry below a file or a link is dropped. The
    build **fails** on a broken tar, a tar without its end-of-archive marker (a cut stream or a
-   broken attach connection never becomes an image with files missing), data after that marker,
-   more than 500,000 entries, or more than 64 MiB of names (with the folders above them): the
-   reading and the layer stay linear in the output, so a deep path cannot make the builder copy
-   every parent. The link check is **lexical** (the names, not a disk): a `..` after a segment
+   broken attach connection never becomes an image with files missing), a long-name or PAX
+   record whose entry is missing before that marker, a malformed PAX record, data after that
+   marker, more than 500,000 entries (with the folders the builder adds above them), more than
+   64 MiB of names (with those folders; both bounds are checked while reading), or a new layer
+   over `RUUM_BUILD_OUTPUT_MAX`: the reading and the layer stay linear in the output, so a deep
+   or a wide path cannot make the builder copy every parent (Kimi, run 12). A long name record
+   is kept only up to 4097 bytes (and then dropped as too long). The link check is **lexical** (the names, not a disk): a `..` after a segment
    that is itself a link (`a/b/s -> ../..`, `a/b/t -> s/../..`) can end elsewhere when the
    kernel resolves it in the app's container. The builder never resolves a link and drops every
    entry below a link, so such a link points only inside the app's own image. File names are

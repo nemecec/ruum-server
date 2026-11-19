@@ -18,10 +18,14 @@
 //! - **dropped** too: a name or a link target over [`MAX_NAME_BYTES`] (the kernel's `PATH_MAX`);
 //! - **refused** (the build fails): a broken tar (bad checksum, an entry past the end), a tar
 //!   without its end-of-archive marker (a cut stream must never become an image with files
-//!   missing), bytes other than zeros after that marker, more than [`MAX_ENTRIES`] entries, or
-//!   names (with the folders above them) of more than [`MAX_NAME_TOTAL_BYTES`] in all. These
-//!   bounds keep the reading and the layer linear in the output: a deep path cannot make the
-//!   builder copy each of its parents (review of R-2b).
+//!   missing), a long-name or PAX record that no entry follows before that marker, a malformed
+//!   PAX record, bytes other than zeros after that marker, more than [`MAX_ENTRIES`] entries
+//!   (with the folders the reader adds above them), or names (with those folders) of more than
+//!   [`MAX_NAME_TOTAL_BYTES`] in all. These bounds keep the reading and the layer linear in the
+//!   output, and both are checked as the names are read, before the memory grows: a deep or a
+//!   wide path cannot make the builder copy each of its parents (reviews of R-2b, Kimi run 12).
+//!   A long name or link target is kept only up to one byte past [`MAX_NAME_BYTES`] (enough to
+//!   drop it), so one huge record is never copied whole.
 //!
 //! The link rule is **lexical**: a target is resolved segment by segment on the names, not on
 //! a disk. A `..` after a segment that is itself a kept link can therefore end elsewhere when
@@ -121,35 +125,43 @@ fn cstr(field: &[u8]) -> &[u8] {
     &field[..end]
 }
 
-/// PAX records (`path` and `linkpath` only).
-fn pax(data: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+/// A long name or link target as the reader keeps it: at most one byte past
+/// [`MAX_NAME_BYTES`], so a longer one is still dropped as too long but never copied whole.
+fn long_value(v: &[u8]) -> Vec<u8> {
+    v[..v.len().min(MAX_NAME_BYTES + 1)].to_vec()
+}
+
+/// The `path` and `linkpath` of a PAX header, when it gives them.
+type PaxNames = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// PAX records (`path` and `linkpath` only; values kept as [`long_value`]). A malformed record
+/// refuses the output: a reader that skipped it would fall back to other metadata.
+fn pax(data: &[u8]) -> Result<PaxNames, String> {
+    let bad = || "the output has a malformed PAX record".to_owned();
     let (mut path, mut link) = (None, None);
-    let mut rest = data;
+    // Writers pad the record block with NUL bytes.
+    let end = data.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    let mut rest = &data[..end];
     while !rest.is_empty() {
-        let Some(sp) = rest.iter().position(|b| *b == b' ') else {
-            break;
-        };
-        let Some(len) = std::str::from_utf8(&rest[..sp])
+        let sp = rest.iter().position(|b| *b == b' ').ok_or_else(bad)?;
+        let len = std::str::from_utf8(&rest[..sp])
             .ok()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|s| s.parse::<usize>().ok())
-        else {
-            break;
-        };
-        if len <= sp + 1 || len > rest.len() {
-            break;
+            .ok_or_else(bad)?;
+        if len <= sp + 1 || len > rest.len() || rest[len - 1] != b'\n' {
+            return Err(bad());
         }
-        let rec = &rest[sp + 1..len];
-        let rec = rec.strip_suffix(b"\n").unwrap_or(rec);
-        if let Some(eq) = rec.iter().position(|b| *b == b'=') {
-            match &rec[..eq] {
-                b"path" => path = Some(rec[eq + 1..].to_vec()),
-                b"linkpath" => link = Some(rec[eq + 1..].to_vec()),
-                _ => {}
-            }
+        let rec = &rest[sp + 1..len - 1];
+        let eq = rec.iter().position(|b| *b == b'=').ok_or_else(bad)?;
+        match &rec[..eq] {
+            b"path" => path = Some(long_value(&rec[eq + 1..])),
+            b"linkpath" => link = Some(long_value(&rec[eq + 1..])),
+            _ => {}
         }
         rest = &rest[len..];
     }
-    (path, link)
+    Ok((path, link))
 }
 
 /// The checked relative form of a name, or why it is dropped. `Ok(None)`: the root itself.
@@ -218,6 +230,7 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
     let mut long_link: Option<Vec<u8>> = None;
     let mut total: u64 = 0;
     let mut headers: usize = 0;
+    let mut kept_names: usize = 0;
     loop {
         if at + 512 > tar.len() {
             // No end-of-archive marker: the stream was cut (also at an entry boundary).
@@ -233,6 +246,12 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
             // follow (a second archive appended to the first is refused).
             if tar[at..].iter().any(|b| *b != 0) {
                 return Err("the output has data after its end-of-archive marker".to_owned());
+            }
+            // A long name or link that no entry used: the entry it was for is missing.
+            if long_name.is_some() || long_link.is_some() {
+                return Err(
+                    "the output ends after a long-name or PAX record without its entry".to_owned(),
+                );
             }
             break;
         }
@@ -268,15 +287,15 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
         at = data_end + ((512 - (size % 512) as usize) % 512);
         match typ {
             b'L' => {
-                long_name = Some(cstr(&data).to_vec());
+                long_name = Some(long_value(cstr(&data)));
                 continue;
             }
             b'K' => {
-                long_link = Some(cstr(&data).to_vec());
+                long_link = Some(long_value(cstr(&data)));
                 continue;
             }
             b'x' => {
-                let (p, l) = pax(&data);
+                let (p, l) = pax(&data)?;
                 if p.is_some() {
                     long_name = p;
                 }
@@ -357,7 +376,20 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
         } else {
             mode | 0o400
         };
-        kept.insert(path.clone(), OutEntry { path, mode, kind });
+        let len = path.len();
+        if kept
+            .insert(path.clone(), OutEntry { path, mode, kind })
+            .is_none()
+        {
+            // A new name: counted before the next one is read, so the names held here never
+            // pass the bound (`complete` counts them again with the folders above them).
+            kept_names += len;
+            if kept_names > MAX_NAME_TOTAL_BYTES {
+                return Err(format!(
+                    "the output's names are over {MAX_NAME_TOTAL_BYTES} bytes in all as read"
+                ));
+            }
+        }
         if kept.len() > MAX_ENTRIES {
             return Err(format!("the output has more than {MAX_ENTRIES} entries"));
         }
@@ -380,12 +412,20 @@ enum Node {
 /// each folder that is above an entry but not in the tar, so the layer needs no parent walk.
 /// Linear: names are visited in sorted order (a parent sorts before what it holds), each name
 /// looks up only its parent, and a missing parent is added once (memoized), under
-/// [`MAX_NAME_TOTAL_BYTES`].
+/// [`MAX_NAME_TOTAL_BYTES`] and [`MAX_ENTRIES`]: every name of the finished tree (kept, added or
+/// dropped below a leaf) counts, so a wide tree of short paths cannot add millions of folders
+/// to the layer (Kimi, run 12).
 fn complete(kept: BTreeMap<Vec<u8>, OutEntry>, mut dropped: Dropped) -> Result<Output, String> {
     let mut nodes: HashMap<Vec<u8>, Node> = HashMap::with_capacity(kept.len());
     let mut added: Vec<Vec<u8>> = Vec::new();
     let mut name_bytes: usize = 0;
-    let over = || format!("the output's names are over {MAX_NAME_TOTAL_BYTES} bytes in all");
+    let over = || {
+        format!(
+            "the output's names are over {MAX_NAME_TOTAL_BYTES} bytes in all, with the folders above them"
+        )
+    };
+    let too_many =
+        || format!("the output has more than {MAX_ENTRIES} entries with the folders above them");
     let mut entries: Vec<OutEntry> = Vec::with_capacity(kept.len());
     for (path, e) in kept {
         // The node of the parent, adding the missing folders above it (top-down).
@@ -416,6 +456,9 @@ fn complete(kept: BTreeMap<Vec<u8>, OutEntry>, mut dropped: Dropped) -> Result<O
                     if name_bytes > MAX_NAME_TOTAL_BYTES {
                         return Err(over());
                     }
+                    if nodes.len() >= MAX_ENTRIES {
+                        return Err(too_many());
+                    }
                     nodes.insert(path[..cut].to_vec(), node);
                     if node == Node::Dir {
                         added.push(path[..cut].to_vec());
@@ -428,6 +471,9 @@ fn complete(kept: BTreeMap<Vec<u8>, OutEntry>, mut dropped: Dropped) -> Result<O
         name_bytes += path.len();
         if name_bytes > MAX_NAME_TOTAL_BYTES {
             return Err(over());
+        }
+        if nodes.len() >= MAX_ENTRIES {
+            return Err(too_many());
         }
         if parent != Node::Dir {
             dropped.push(&path, "an entry below a file or a link");
@@ -691,6 +737,82 @@ mod tests {
         // A link target over the limit is dropped.
         let o = read(&[(b"./l", b'2', "a/".repeat(2_100).as_bytes(), b"")]);
         assert!(o.entries.is_empty());
+    }
+
+    /// Many short paths whose folders are not in the tar: the folders the reader adds count
+    /// against [`MAX_ENTRIES`], so a small output cannot become a layer of millions of folders
+    /// (Kimi, run 12: 100,000 files with 20 missing folders each made 2.1 million entries).
+    #[test]
+    fn added_folders_count_against_the_entry_cap() {
+        let mut t = Vec::new();
+        // 25,000 files, each with 20 folders of its own: 525,000 names, under the name bound
+        // (about 14 MiB) and the entry cap of the tar itself.
+        for i in 0..25_000u32 {
+            let name = format!("{i:05}/") + &"a/".repeat(19) + "f";
+            gnu(&mut t, name.as_bytes(), b'0', b"", b"");
+        }
+        t.extend(std::iter::repeat_n(0u8, 1024));
+        let e = read_output(Bytes::from(t), 1 << 30).expect_err("over the entry cap");
+        assert!(e.contains("entries with the folders"), "{e}");
+    }
+
+    /// The names are counted as they are read, not after the whole tar is held (Kimi, run 12).
+    #[test]
+    fn the_name_bound_holds_while_reading() {
+        // 20,000 distinct flat names of 4,000 bytes: 80 MB of names, no folder to add.
+        let mut t = Vec::new();
+        for i in 0..20_000u32 {
+            let name = format!("{i:05}") + &"n".repeat(3_995);
+            gnu(&mut t, name.as_bytes(), b'0', b"", b"");
+        }
+        t.extend(std::iter::repeat_n(0u8, 1024));
+        // The error comes from the reading, before the map holds every name (a reader that
+        // counts only in `complete`, with the folders, holds them all first).
+        let e = read_output(Bytes::from(t), 1 << 30).expect_err("over the name bound");
+        assert!(e.contains("as read"), "{e}");
+        // One long-name record far over the limit is kept only up to the limit (and dropped).
+        let huge = vec![b'x'; 1 << 20];
+        assert_eq!(long_value(&huge).len(), MAX_NAME_BYTES + 1);
+        let o = read(&[(&huge[..], b'0', b"", b"x")]);
+        assert!(o.entries.is_empty());
+        assert_eq!(o.dropped_total, 1);
+        assert!(o.dropped[0].0.chars().count() <= 200);
+    }
+
+    /// A long-name record at the end of the tar (its entry missing) and a malformed PAX record
+    /// refuse the output (Kimi, run 12): neither may become an image with a file missing or
+    /// named from fallback metadata.
+    #[test]
+    fn a_dangling_or_malformed_extension_is_refused() {
+        let mut t = Vec::new();
+        gnu(&mut t, b"./a", b'0', b"", b"aaa");
+        // Only the long-name record of the next entry: its own header is missing.
+        let long = format!("./{}", "b".repeat(150));
+        let mut next = Vec::new();
+        gnu(&mut next, long.as_bytes(), b'0', b"", b"");
+        t.extend_from_slice(&next[..1024]);
+        t.extend(std::iter::repeat_n(0u8, 1024));
+        let e = read_output(Bytes::from(t), 1 << 30).expect_err("dangling long name");
+        assert!(e.contains("without its entry"), "{e}");
+
+        let pax_tar = |records: &[u8]| {
+            let mut t = Vec::new();
+            gnu(&mut t, b"PaxHeader", b'x', b"", records);
+            gnu(&mut t, b"./fallback", b'0', b"", b"x");
+            t.extend(std::iter::repeat_n(0u8, 1024));
+            Bytes::from(t)
+        };
+        let o = read_output(pax_tar(b"15 path=./real\n"), 1 << 30).expect("a valid record");
+        assert_eq!(names(&o), ["real"]);
+        for bad in [
+            &b"15 path=./real"[..],   // no newline: the length is past the end
+            &b"14 path=./real\n"[..], // a length that cuts the record
+            &b"x5 path=./real\n"[..], // not a number
+            &b"15 path:./real\n"[..], // no '='
+        ] {
+            let e = read_output(pax_tar(bad), 1 << 30).expect_err("malformed PAX");
+            assert!(e.contains("malformed PAX"), "{e}");
+        }
     }
 
     #[test]
