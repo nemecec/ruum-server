@@ -845,6 +845,221 @@ pub(crate) async fn purge_pages_stay_in_their_app(h: &dyn Harness) {
     assert_eq!(s.static_purge_cursor(b, bn).await.unwrap(), Some(mine[0]));
 }
 
+fn new_binding(app: NodeId, dep: Uuid, name: &str, target: NodeId) -> NewBinding {
+    NewBinding {
+        id: Uuid::now_v7(),
+        app_node_id: app,
+        deployment_id: dep,
+        principal_id: dep,
+        name: name.into(),
+        kind: BindingKind::Node,
+        target_node_id: target,
+        role: Some(crate::authz::Role::View),
+        api: None,
+        scopes: Vec::new(),
+        on_behalf_of_user: false,
+    }
+}
+
+async fn app_sees(authz: &dyn crate::authz::Authz, principal: Uuid, node: NodeId) -> bool {
+    authz
+        .check(
+            &crate::authz::SubjectRef::object(crate::authz::ObjectRef::new("app", principal)),
+            "view",
+            &crate::authz::ObjectRef::node(node),
+            None,
+        )
+        .await
+        .unwrap()
+}
+
+/// Binding rows (card B-1): a grant writes the row, its entry and its tuple; a revoke marks
+/// the row and deletes the tuple only when no other active row of the principal implies it;
+/// ended previews, targets and tenants are listed; a purge deletes rows and tuples.
+pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
+    let s = h.store();
+    let authz = crate::authz::memory::MemoryAuthz::default();
+    let (t, u) = h.tenant().await;
+    let n = h.app_node(t, u).await;
+    let c = ctx(t, u);
+    s.insert_app(&c, app(n, &unique("bound")))
+        .await
+        .unwrap()
+        .unwrap();
+    let p = s
+        .insert_deployment(
+            &c,
+            deployment(n, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    // The app node is the target: a node of the tenant in both backends.
+    let rows = s
+        .grant_bindings(
+            &c,
+            &authz,
+            vec![
+                new_binding(n, p.id, "docs", n),
+                new_binding(n, p.id, "again", n),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|r| r.is_active() && r.granted_by == c.actor)
+    );
+    assert!(app_sees(&authz, p.id, n).await);
+    let listed = s
+        .list_bindings(
+            t,
+            &BindingQuery {
+                principal: Some(p.id),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed, rows);
+    // Two rows imply one tuple: it stays until the last goes.
+    let first = s
+        .revoke_bindings(&c, &authz, &[rows[0].id], RevokeReason::Dropped)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].revoke_reason, Some(RevokeReason::Dropped));
+    assert!(app_sees(&authz, p.id, n).await);
+    // A second revoke of the same row ends nothing.
+    assert!(
+        s.revoke_bindings(&c, &authz, &[rows[0].id], RevokeReason::Dropped)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(s.binding_targets(t, None, 10).await.unwrap(), vec![n]);
+    assert!(s.binding_targets(t, Some(n), 10).await.unwrap().is_empty());
+    assert!(s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
+    // The preview ends: its active row is listed as ended.
+    assert!(
+        s.ended_preview_bindings(t, Some(n), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    s.set_deployment_state(t, p.id, DeploymentState::Expired)
+        .await
+        .unwrap();
+    let ended = s.ended_preview_bindings(t, Some(n), 10).await.unwrap();
+    assert_eq!(ended.iter().map(|b| b.id).collect::<Vec<_>>(), [rows[1].id]);
+    s.revoke_bindings(&c, &authz, &[rows[1].id], RevokeReason::PreviewExpired)
+        .await
+        .unwrap();
+    assert!(!app_sees(&authz, p.id, n).await);
+    // A grant to a deployment of nothing is refused.
+    assert!(
+        s.grant_bindings(&c, &authz, vec![new_binding(n, Uuid::now_v7(), "x", n)])
+            .await
+            .is_err()
+    );
+    // The purge deletes every row.
+    let again = s
+        .grant_bindings(&c, &authz, vec![new_binding(n, p.id, "docs", n)])
+        .await
+        .unwrap();
+    assert!(app_sees(&authz, again[0].principal_id, n).await);
+    assert_eq!(s.delete_app_bindings(t, &authz, n).await.unwrap(), 3);
+    assert!(!app_sees(&authz, p.id, n).await);
+    assert!(
+        s.list_bindings(
+            t,
+            &BindingQuery {
+                limit: 10,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+}
+
+/// Binding rows stay in their tenant: another tenant lists, revokes and deletes nothing.
+pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
+    let s = h.store();
+    let authz = crate::authz::memory::MemoryAuthz::default();
+    let (a, ua) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let n = h.app_node(a, ua).await;
+    let (ca, cb) = (ctx(a, ua), ctx(b, ub));
+    s.insert_app(&ca, app(n, &unique("bound")))
+        .await
+        .unwrap()
+        .unwrap();
+    let p = s
+        .insert_deployment(
+            &ca,
+            deployment(n, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    let rows = s
+        .grant_bindings(&ca, &authz, vec![new_binding(n, p.id, "docs", n)])
+        .await
+        .unwrap();
+    // Tenant B cannot grant on A's deployment.
+    assert!(
+        s.grant_bindings(&cb, &authz, vec![new_binding(n, p.id, "docs", n)])
+            .await
+            .is_err()
+    );
+    let all = BindingQuery {
+        limit: 10,
+        ..Default::default()
+    };
+    for q in [
+        all.clone(),
+        BindingQuery {
+            principal: Some(p.id),
+            ..all.clone()
+        },
+        BindingQuery {
+            app: Some(n),
+            ..all.clone()
+        },
+        BindingQuery {
+            target: Some(n),
+            ..all.clone()
+        },
+        BindingQuery {
+            deployment: Some(p.id),
+            ..all.clone()
+        },
+    ] {
+        assert!(s.list_bindings(b, &q).await.unwrap().is_empty(), "{q:?}");
+    }
+    assert!(s.binding_targets(b, None, 10).await.unwrap().is_empty());
+    s.set_deployment_state(a, p.id, DeploymentState::Expired)
+        .await
+        .unwrap();
+    assert!(
+        s.ended_preview_bindings(b, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.revoke_bindings(&cb, &authz, &[rows[0].id], RevokeReason::Dropped)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(s.delete_app_bindings(b, &authz, n).await.unwrap(), 0);
+    assert!(app_sees(&authz, p.id, n).await);
+    assert_eq!(s.list_bindings(a, &all).await.unwrap().len(), 1);
+}
+
 /// Runs every case.
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
@@ -855,6 +1070,8 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     deployments_stay_in_their_tenant(h).await;
     static_deployments_say_what_is_reachable(h).await;
     purge_pages_stay_in_their_app(h).await;
+    bindings_rows_and_their_end(h).await;
+    bindings_stay_in_their_tenant(h).await;
 }
 
 #[cfg(test)]
@@ -1391,6 +1608,7 @@ mod tests {
             "app_deployments",
             "app_approvals",
             "app_purge_progress",
+            "app_bindings",
             "journal",
             "typed_nodes",
             "versions",
@@ -1411,5 +1629,6 @@ mod tests {
         used_slugs_are_never_given_again(&h).await;
         deployments_stay_in_their_tenant(&h).await;
         purge_pages_stay_in_their_app(&h).await;
+        bindings_stay_in_their_tenant(&h).await;
     }
 }

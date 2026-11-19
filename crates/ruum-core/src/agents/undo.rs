@@ -424,6 +424,8 @@ pub async fn invert(s: &Services, ctx: &Context, e: &JournalEntry) -> Result<Opt
         DatabaseGrantRevoked | AppSettingsChanged => return Ok(None),
         // `undo_action` gives `None` (card W-2s).
         AppDeployed | AppDeploymentFailed | AppRolledBack => return Ok(None),
+        // `undo_action` gives `None` (card B-1).
+        AppBindingGranted | AppBindingRevoked => return Ok(None),
         // `undo_action` gives `None`: only a person decides an approval.
         DatabaseApprovalDecided => return Ok(None),
         // `undo_action` gives `None`: a type of a newer release (backlog P-57).

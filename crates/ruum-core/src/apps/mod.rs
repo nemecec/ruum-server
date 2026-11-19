@@ -397,6 +397,10 @@ pub fn build(
         .deps
         .provider
         .add_purge_hook(Arc::new(service.static_purge()));
+    // A trash ends the app's bindings, a purge deletes their rows and tuples (card B-1).
+    let bindings = Arc::new(service.binding_hooks());
+    service.deps.provider.add_purge_hook(bindings.clone());
+    service.deps.provider.add_lifecycle_hook(bindings);
     // A member or guest who leaves loses the app role grants (backlog S-43).
     service
         .deps

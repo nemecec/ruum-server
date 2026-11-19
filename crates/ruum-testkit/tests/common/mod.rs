@@ -29,6 +29,7 @@ pub mod agents;
 pub mod api;
 pub mod apps;
 pub mod apps_archive;
+pub mod apps_bindings;
 pub mod apps_deploy;
 pub mod apps_publish;
 pub mod apps_roles;

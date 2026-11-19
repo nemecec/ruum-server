@@ -187,6 +187,14 @@ fn sample(event: EventType, user: UserId) -> Value {
             "from_deployment_id": id(), "to_deployment_id": id(), "reason": "manual",
             "error_rate_before": null, "error_rate_after": null
         }),
+        EventType::AppBindingGranted => json!({
+            "deployment_id": id(), "binding": "docs", "principal_id": id(),
+            "target_node_id": id(), "role": "view", "api": null, "scopes": []
+        }),
+        EventType::AppBindingRevoked => json!({
+            "binding": "docs", "principal_id": id(), "target_node_id": id(),
+            "reason": "dropped"
+        }),
         EventType::AppRoleGranted | EventType::AppRoleRevoked => json!({
             "role_grant_id": id(), "role": "approver",
             "grantee": { "type": "user", "id": id() }

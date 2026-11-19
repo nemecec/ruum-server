@@ -1333,4 +1333,374 @@ impl AppStore for PgAppStore {
                 .await;
         }
     }
+
+    async fn grant_bindings(
+        &self,
+        ctx: &Context,
+        authz: &dyn crate::authz::Authz,
+        rows: Vec<NewBinding>,
+    ) -> Result<Vec<BindingRow>> {
+        use crate::authz::RelationshipUpdate;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        let mut made = Vec::new();
+        for r in &rows {
+            let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "insert into app_bindings (tenant_id, id, app_node_id, deployment_id, \
+                 principal_id, name, kind, target_node_id, role, api, scopes, \
+                 on_behalf_of_user, granted_kind, granted_by, granted_obo) \
+                 values ($1, $2, $3, $4, $5, $6, $7::app_binding_kind, $8, $9, $10, $11, $12, \
+                 $13, $14, $15) returning {}",
+                binding_columns("")
+            )))
+            .bind(ctx.tenant)
+            .bind(r.id)
+            .bind(r.app_node_id)
+            .bind(r.deployment_id)
+            .bind(r.principal_id)
+            .bind(&r.name)
+            .bind(r.kind.as_str())
+            .bind(r.target_node_id)
+            .bind(r.role.map(role_text))
+            .bind(&r.api)
+            .bind(&r.scopes)
+            .bind(r.on_behalf_of_user)
+            .bind(ctx.actor.actor.kind)
+            .bind(ctx.actor.actor.id.0)
+            .bind(ctx.actor.on_behalf_of.map(|u| u.0))
+            .fetch_one(&mut *tx)
+            .await;
+            let row = match inserted {
+                Ok(row) => binding_row(&row)?,
+                Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23503") => {
+                    return Err(Error::not_found("node"));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            append(
+                &mut tx,
+                ctx,
+                NewEntry {
+                    node_id: Some(row.app_node_id),
+                    revision: None,
+                    event: EventType::AppBindingGranted,
+                    data: binding_granted_data(&row),
+                },
+            )
+            .await?;
+            made.push(row);
+        }
+        let mut touches = Vec::new();
+        for b in &made {
+            for t in
+                super::super::bindings::principal_tuples(ctx.tenant, b.app_node_id, b.principal_id)
+                    .into_iter()
+                    .chain(super::super::bindings::binding_tuple(b))
+            {
+                let u = RelationshipUpdate::Touch(t);
+                if !touches.contains(&u) {
+                    touches.push(u);
+                }
+            }
+        }
+        let ob = crate::authz::outbox::enqueue(&mut tx, ctx.tenant, &touches).await?;
+        tx.commit().await?;
+        self.apply_outbox(authz, ctx.tenant, ob).await;
+        Ok(made)
+    }
+
+    async fn revoke_bindings(
+        &self,
+        ctx: &Context,
+        authz: &dyn crate::authz::Authz,
+        ids: &[Uuid],
+        reason: RevokeReason,
+    ) -> Result<Vec<BindingRow>> {
+        use crate::authz::RelationshipUpdate;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = begin_tenant(&self.pool, ctx.tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update app_bindings set revoked_at = now(), revoke_reason = $3 \
+             where tenant_id = $1 and id = any($2) and revoked_at is null returning {}",
+            binding_columns("")
+        )))
+        .bind(ctx.tenant)
+        .bind(ids)
+        .bind(reason.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut ended = rows.iter().map(binding_row).collect::<Result<Vec<_>>>()?;
+        ended.sort_by_key(|b| b.id);
+        let mut deletes = Vec::new();
+        for b in &ended {
+            append(
+                &mut tx,
+                ctx,
+                NewEntry {
+                    node_id: Some(b.app_node_id),
+                    revision: None,
+                    event: EventType::AppBindingRevoked,
+                    data: binding_revoked_data(b, reason),
+                },
+            )
+            .await?;
+            let Some(t) = super::super::bindings::binding_tuple(b) else {
+                continue;
+            };
+            // A tuple goes only when no other active row of the principal implies it.
+            let kept: bool = sqlx::query_scalar(
+                "select exists (select 1 from app_bindings where tenant_id = $1 \
+                 and principal_id = $2 and target_node_id = $3 and kind <> 'api' \
+                 and role = $4 and revoked_at is null)",
+            )
+            .bind(ctx.tenant)
+            .bind(b.principal_id)
+            .bind(b.target_node_id)
+            .bind(b.role.map(role_text))
+            .fetch_one(&mut *tx)
+            .await?;
+            if !kept && !deletes.contains(&RelationshipUpdate::Delete(t.clone())) {
+                deletes.push(RelationshipUpdate::Delete(t));
+            }
+        }
+        let ob = if deletes.is_empty() {
+            None
+        } else {
+            Some(crate::authz::outbox::enqueue(&mut tx, ctx.tenant, &deletes).await?)
+        };
+        tx.commit().await?;
+        if let Some(ob) = ob {
+            self.apply_outbox(authz, ctx.tenant, ob).await;
+        }
+        Ok(ended)
+    }
+
+    async fn list_bindings(&self, tenant: TenantId, q: &BindingQuery) -> Result<Vec<BindingRow>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {} from app_bindings where tenant_id = $1 \
+             and ($2::uuid is null or app_node_id = $2) \
+             and ($3::uuid is null or principal_id = $3) \
+             and ($4::uuid is null or deployment_id = $4) \
+             and ($5::uuid is null or target_node_id = $5) \
+             and (not $6 or revoked_at is null) order by id limit $7",
+            binding_columns("")
+        )))
+        .bind(tenant)
+        .bind(q.app)
+        .bind(q.principal)
+        .bind(q.deployment)
+        .bind(q.target)
+        .bind(q.active_only)
+        .bind(i64::from(q.limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter().map(binding_row).collect()
+    }
+
+    async fn ended_preview_bindings(
+        &self,
+        tenant: TenantId,
+        app: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<BindingRow>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "select {} from app_bindings b where b.tenant_id = $1 \
+             and ($2::uuid is null or b.app_node_id = $2) and b.revoked_at is null \
+             and b.principal_id <> b.app_node_id \
+             and not exists (select 1 from app_deployments d where d.tenant_id = $1 \
+               and d.id = b.principal_id and d.state in ('pending', 'running', 'ready')) \
+             order by b.id limit $3",
+            binding_columns("b.")
+        )))
+        .bind(tenant)
+        .bind(app)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.iter().map(binding_row).collect()
+    }
+
+    async fn binding_targets(
+        &self,
+        tenant: TenantId,
+        after: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<NodeId>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows: Vec<NodeId> = sqlx::query_scalar(
+            "select distinct target_node_id from app_bindings where tenant_id = $1 \
+             and ($2::uuid is null or target_node_id > $2) order by target_node_id limit $3",
+        )
+        .bind(tenant)
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>> {
+        let mut tx = begin_system(&self.pool).await?;
+        let rows: Vec<TenantId> = sqlx::query_scalar(
+            "select distinct tenant_id from app_bindings \
+             where ($1::uuid is null or tenant_id > $1) order by tenant_id limit $2",
+        )
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    async fn delete_app_bindings(
+        &self,
+        tenant: TenantId,
+        authz: &dyn crate::authz::Authz,
+        app: NodeId,
+    ) -> Result<usize> {
+        use crate::authz::RelationshipUpdate;
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "delete from app_bindings where tenant_id = $1 and app_node_id = $2 returning {}",
+            binding_columns("")
+        )))
+        .bind(tenant)
+        .bind(app)
+        .fetch_all(&mut *tx)
+        .await?;
+        let gone = rows.iter().map(binding_row).collect::<Result<Vec<_>>>()?;
+        let mut deletes = Vec::new();
+        for b in &gone {
+            let tuples = super::super::bindings::principal_tuples(tenant, app, b.principal_id)
+                .into_iter()
+                .chain(
+                    b.is_active()
+                        .then(|| super::super::bindings::binding_tuple(b))
+                        .flatten(),
+                );
+            for t in tuples {
+                let u = RelationshipUpdate::Delete(t);
+                if !deletes.contains(&u) {
+                    deletes.push(u);
+                }
+            }
+        }
+        let ob = if deletes.is_empty() {
+            None
+        } else {
+            Some(crate::authz::outbox::enqueue(&mut tx, tenant, &deletes).await?)
+        };
+        tx.commit().await?;
+        if let Some(ob) = ob {
+            self.apply_outbox(authz, tenant, ob).await;
+        }
+        Ok(gone.len())
+    }
+}
+
+impl PgAppStore {
+    /// Applies an outbox row of a binding write after its commit; a failure leaves the row to
+    /// the outbox worker (the row and the tuple never stay apart for good).
+    async fn apply_outbox(&self, authz: &dyn crate::authz::Authz, tenant: TenantId, id: i64) {
+        if let Some(token) =
+            crate::authz::outbox::apply_after_commit(&self.pool, authz, tenant, &[id]).await
+        {
+            crate::authz::raise_request_floor(&token);
+        }
+    }
+}
+
+/// The columns of `app_bindings`, each with `prefix` (`""` or `"b."`).
+fn binding_columns(prefix: &str) -> String {
+    [
+        "tenant_id",
+        "id",
+        "app_node_id",
+        "deployment_id",
+        "principal_id",
+        "name",
+        "kind::text as kind",
+        "target_node_id",
+        "role",
+        "api",
+        "scopes",
+        "on_behalf_of_user",
+        "granted_kind",
+        "granted_by",
+        "granted_obo",
+        "created_at",
+        "revoked_at",
+        "revoke_reason",
+    ]
+    .iter()
+    .map(|c| format!("{prefix}{c}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// The stored text of a binding role.
+fn role_text(r: crate::authz::Role) -> &'static str {
+    match r {
+        crate::authz::Role::View => "view",
+        crate::authz::Role::Comment => "comment",
+        crate::authz::Role::Edit => "edit",
+        crate::authz::Role::Manage => "manage",
+    }
+}
+
+fn binding_row(r: &PgRow) -> Result<BindingRow> {
+    let kind: String = r.try_get("kind")?;
+    let role: Option<String> = r.try_get("role")?;
+    let reason: Option<String> = r.try_get("revoke_reason")?;
+    let role = match role.as_deref() {
+        None => None,
+        Some("view") => Some(crate::authz::Role::View),
+        Some("edit") => Some(crate::authz::Role::Edit),
+        Some(other) => {
+            return Err(Error::Internal(format!("a binding with the role {other}")));
+        }
+    };
+    Ok(BindingRow {
+        tenant_id: r.try_get("tenant_id")?,
+        id: r.try_get("id")?,
+        app_node_id: r.try_get("app_node_id")?,
+        deployment_id: r.try_get("deployment_id")?,
+        principal_id: r.try_get("principal_id")?,
+        name: r.try_get("name")?,
+        kind: BindingKind::parse(&kind)
+            .ok_or_else(|| Error::Internal(format!("a binding of the kind {kind}")))?,
+        target_node_id: r.try_get("target_node_id")?,
+        role,
+        api: r.try_get("api")?,
+        scopes: r.try_get("scopes")?,
+        on_behalf_of_user: r.try_get("on_behalf_of_user")?,
+        granted_by: Actor {
+            actor: crate::actor::PrincipalRef {
+                kind: r.try_get("granted_kind")?,
+                id: crate::ids::PrincipalId(r.try_get("granted_by")?),
+            },
+            on_behalf_of: r
+                .try_get::<Option<Uuid>, _>("granted_obo")?
+                .map(crate::ids::UserId),
+        },
+        created_at: r.try_get("created_at")?,
+        revoked_at: r.try_get("revoked_at")?,
+        revoke_reason: match reason {
+            None => None,
+            Some(s) => Some(
+                RevokeReason::parse(&s)
+                    .ok_or_else(|| Error::Internal(format!("a binding revoked for {s}")))?,
+            ),
+        },
+    })
 }

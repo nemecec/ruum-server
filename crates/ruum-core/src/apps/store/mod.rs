@@ -369,6 +369,156 @@ pub struct StorageUsage {
     pub members: u32,
 }
 
+// ---------------------------------------------------------------------------- bindings (B-1)
+
+/// `app_binding_kind`: what a binding row gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BindingKind {
+    /// A role on a node (`node#viewer|editor@app:<principal>`).
+    Node,
+    /// A preview's role on a branch of a bound database (card B-1d, after D-5).
+    DatabaseBranch,
+    /// Scopes of another app's API (`app_api_scope`, card B-3).
+    Api,
+}
+
+impl BindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BindingKind::Node => "node",
+            BindingKind::DatabaseBranch => "database_branch",
+            BindingKind::Api => "api",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "node" => BindingKind::Node,
+            "database_branch" => BindingKind::DatabaseBranch,
+            "api" => BindingKind::Api,
+            _ => return None,
+        })
+    }
+}
+
+/// Why a binding ended (`app_bindings.revoke_reason`, `app.binding_revoked.reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RevokeReason {
+    /// A published version no longer has the binding (or has it with another target).
+    Dropped,
+    /// The preview expired, was superseded or failed.
+    PreviewExpired,
+    /// The app went to the trash.
+    AppTrashed,
+    /// The target node is gone.
+    TargetGone,
+}
+
+impl RevokeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevokeReason::Dropped => "dropped",
+            RevokeReason::PreviewExpired => "preview_expired",
+            RevokeReason::AppTrashed => "app_trashed",
+            RevokeReason::TargetGone => "target_gone",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "dropped" => RevokeReason::Dropped,
+            "preview_expired" => RevokeReason::PreviewExpired,
+            "app_trashed" => RevokeReason::AppTrashed,
+            "target_gone" => RevokeReason::TargetGone,
+            _ => return None,
+        })
+    }
+}
+
+/// A row of `app_bindings`: the grant that one binding of a deployment gives its principal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BindingRow {
+    pub tenant_id: TenantId,
+    pub id: Uuid,
+    pub app_node_id: NodeId,
+    /// The deployment that granted the row (a kept live binding keeps its first deployment).
+    pub deployment_id: Uuid,
+    /// The app principal: the app node ID (live) or the preview's deployment ID.
+    pub principal_id: Uuid,
+    pub name: String,
+    pub kind: BindingKind,
+    pub target_node_id: NodeId,
+    /// `view` or `edit`; `None` for an API binding.
+    pub role: Option<crate::authz::Role>,
+    pub api: Option<String>,
+    pub scopes: Vec<String>,
+    pub on_behalf_of_user: bool,
+    /// The deployer (or publisher) who held the role (decision 0006-3).
+    pub granted_by: Actor,
+    pub created_at: OffsetDateTime,
+    pub revoked_at: Option<OffsetDateTime>,
+    pub revoke_reason: Option<RevokeReason>,
+}
+
+impl BindingRow {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+/// A new binding row ([`AppStore::grant_bindings`]); the grant records the caller as
+/// `granted_by`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewBinding {
+    pub id: Uuid,
+    pub app_node_id: NodeId,
+    pub deployment_id: Uuid,
+    pub principal_id: Uuid,
+    pub name: String,
+    pub kind: BindingKind,
+    pub target_node_id: NodeId,
+    pub role: Option<crate::authz::Role>,
+    pub api: Option<String>,
+    pub scopes: Vec<String>,
+    pub on_behalf_of_user: bool,
+}
+
+/// Which binding rows [`AppStore::list_bindings`] reads (every given field must match).
+#[derive(Clone, Debug, Default)]
+pub struct BindingQuery {
+    pub app: Option<NodeId>,
+    pub principal: Option<Uuid>,
+    pub deployment: Option<Uuid>,
+    pub target: Option<NodeId>,
+    /// Only rows that are not revoked.
+    pub active_only: bool,
+    /// At most this many rows, oldest first.
+    pub limit: u32,
+}
+
+/// The data of `app.binding_granted`.
+pub fn binding_granted_data(b: &BindingRow) -> Value {
+    serde_json::json!({
+        "deployment_id": b.deployment_id,
+        "binding": b.name,
+        "principal_id": b.principal_id,
+        "target_node_id": b.target_node_id,
+        "role": b.role,
+        "api": b.api,
+        "scopes": b.scopes,
+    })
+}
+
+/// The data of `app.binding_revoked`.
+pub fn binding_revoked_data(b: &BindingRow, reason: RevokeReason) -> Value {
+    serde_json::json!({
+        "binding": b.name,
+        "principal_id": b.principal_id,
+        "target_node_id": b.target_node_id,
+        "reason": reason.as_str(),
+    })
+}
+
 /// The encoding of a release version (decision 0006-2).
 pub const RELEASE_ENCODING: &str = "app_release_v1";
 
@@ -712,6 +862,67 @@ pub trait AppStore: Send + Sync {
         exclusive: bool,
         wait: std::time::Duration,
     ) -> Result<LiveSwitchLock>;
+
+    // ------------------------------------------------------------------ bindings (B-1)
+
+    /// Inserts binding rows (the caller is `granted_by`), an `app.binding_granted` entry for
+    /// each, and their tuples ([`super::bindings::binding_tuple`] and the principal tuples of
+    /// [`super::bindings::principal_tuples`]) in one unit: the Postgres store writes the tuples
+    /// through the outbox of the same transaction, so a row and its tuple never stay apart; the
+    /// in-memory store writes the engine after the rows and takes the rows back when the engine
+    /// refuses. `not_found` when a deployment or a target is not of the tenant.
+    async fn grant_bindings(
+        &self,
+        ctx: &Context,
+        authz: &dyn crate::authz::Authz,
+        rows: Vec<NewBinding>,
+    ) -> Result<Vec<BindingRow>>;
+
+    /// Ends the rows of `ids` that are still active: `revoked_at`, `revoke_reason`, an
+    /// `app.binding_revoked` entry each (the caller is the actor) and the delete of each tuple
+    /// that no other active row of the same principal still implies. The row is marked before
+    /// its tuple goes (Postgres: one transaction and its outbox). Returns the rows it ended.
+    async fn revoke_bindings(
+        &self,
+        ctx: &Context,
+        authz: &dyn crate::authz::Authz,
+        ids: &[Uuid],
+        reason: RevokeReason,
+    ) -> Result<Vec<BindingRow>>;
+
+    /// The binding rows of the tenant that match `q`, oldest first, at most `q.limit`.
+    async fn list_bindings(&self, tenant: TenantId, q: &BindingQuery) -> Result<Vec<BindingRow>>;
+
+    /// The active rows of the tenant's previews that ended (their deployment is not
+    /// `pending`, `running` or `ready`), of one app or of all, at most `limit`.
+    async fn ended_preview_bindings(
+        &self,
+        tenant: TenantId,
+        app: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<BindingRow>>;
+
+    /// The distinct targets of the tenant's binding rows (active or not), after `after`, at
+    /// most `limit`, in ID order (the repair pass of [`super::bindings`]).
+    async fn binding_targets(
+        &self,
+        tenant: TenantId,
+        after: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<NodeId>>;
+
+    /// The tenants with binding rows, after `after`, at most `limit`, in ID order. A platform
+    /// job (the repair pass), not a tenant call.
+    async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>>;
+
+    /// Deletes every binding row of a purged app and the tuples of its active rows and of its
+    /// principals (run by the purge hook before the app's rows go). Returns how many rows went.
+    async fn delete_app_bindings(
+        &self,
+        tenant: TenantId,
+        authz: &dyn crate::authz::Authz,
+        app: NodeId,
+    ) -> Result<usize>;
 }
 
 /// `409 conflict` when the site lock of a tenant stays taken (a site is written, or the
