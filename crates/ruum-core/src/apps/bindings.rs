@@ -69,7 +69,21 @@
 //! does both in one transaction with the outbox. The repair pass ([`AppService::repair_bindings`],
 //! run by the sweeper per tenant with a bound per round) deletes a binding tuple on a bound
 //! target whose row is revoked or missing, writes a missing tuple of an active row, and ends
-//! the rows of ended previews and of gone targets.
+//! the rows of ended previews, of gone targets and of apps in the trash whose trash hook did
+//! not run (a pod of the previous release took the delivery; the provider's state `suspended`,
+//! reason `trashed`, tells).
+//!
+//! The repair of one target reads the active rows, then the tuples, then the rows again
+//! ([`repair_updates`]): it deletes the binding tuples that the second read does not imply,
+//! and writes again only the tuples that both reads imply. A revocation that commits between
+//! the reads never gets its tuple back. One that commits after the second read deletes its
+//! tuple after its commit; if that delete ran before the repair's write, a third read of the
+//! rows after the write finds the row revoked and the repair takes its tuple back. A grant
+//! that races the delete branch loses its tuple until the next round (fail closed).
+//!
+//! The repair deletes every `node#viewer|editor@app:*` tuple on a bound target that no active
+//! row implies. Only this module writes such tuples today; a later card that writes them
+//! (B-1d, R-3) must write a row for each, or the repair removes it.
 
 use super::store::{BindingKind, BindingQuery, BindingRow, Environment, NewBinding, RevokeReason};
 use super::{AppService, NODE_TYPE};
@@ -381,17 +395,39 @@ pub fn has_bindings(m: &Value) -> bool {
         .is_some_and(|o| !o.is_empty())
 }
 
+/// A row as an `AppBinding` of the contract (`name`, `kind`, `target_node_id`, `role`, `api`,
+/// `scopes`, `granted_by`). `target_name` is left out: it is optional, and the caller may not
+/// see the target.
+pub fn app_binding_json(b: &BindingRow) -> Value {
+    json!({
+        "name": b.name,
+        "kind": b.kind.as_str(),
+        "target_node_id": b.target_node_id,
+        "role": b.role,
+        "api": b.api,
+        "scopes": b.scopes,
+        "granted_by": b.granted_by,
+    })
+}
+
 /// What an agent's publish request names about bindings (`AppApproval.changes`) and the
-/// bindings the approval is bound to: the names added and removed against the live manifest,
-/// and the preview's resolved rows.
+/// bindings the approval is bound to: the bindings added against the live manifest (as
+/// `AppBinding` objects, from the preview's rows), the names removed, and the preview's
+/// resolved rows. An added name without a row (none today: a database or API binding stops
+/// the preview before it is ready) is left out, because an `AppBinding` needs its target.
 pub fn approval_bindings(
     manifest: &Value,
     live: Option<&Value>,
     rows: &[BindingRow],
-) -> (Vec<String>, Vec<String>, Value) {
+) -> (Vec<Value>, Vec<String>, Value) {
     let new = binding_names(Some(manifest));
     let old = binding_names(live);
-    let added = new.iter().filter(|n| !old.contains(n)).cloned().collect();
+    let added = new
+        .iter()
+        .filter(|n| !old.contains(n))
+        .filter_map(|n| rows.iter().find(|b| &b.name == n))
+        .map(app_binding_json)
+        .collect();
     let removed = old.iter().filter(|n| !new.contains(n)).cloned().collect();
     let bound = rows
         .iter()
@@ -969,8 +1005,13 @@ impl AppService {
     }
 
     async fn repair_target(&self, tenant: TenantId, target: NodeId) -> Result<usize> {
-        let d = self.deps();
-        let rows = d
+        self.repair_target_with(tenant, target, &|_| Box::pin(async {}))
+            .await
+    }
+
+    /// The active rows on `target`.
+    async fn active_on(&self, tenant: TenantId, target: NodeId) -> Result<Vec<BindingRow>> {
+        self.deps()
             .store
             .list_bindings(
                 tenant,
@@ -981,7 +1022,20 @@ impl AppService {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+    }
+
+    /// [`Self::repair_target`] with `between_reads`, a test seam for the race of a revocation:
+    /// it runs with `1` after the first read of the rows (before the read of the tuples) and
+    /// with `2` after the second read of the rows (before the write).
+    pub(crate) async fn repair_target_with(
+        &self,
+        tenant: TenantId,
+        target: NodeId,
+        between_reads: &(dyn Fn(u8) -> futures::future::BoxFuture<'static, ()> + Send + Sync),
+    ) -> Result<usize> {
+        let d = self.deps();
+        let mut rows = self.active_on(tenant, target).await?;
         // A gone target: its rows end (the node store answers without a permission check).
         if let Some(first) = rows.first() {
             match d
@@ -1003,31 +1057,89 @@ impl AppService {
                 Err(e) => return Err(e),
             }
         }
-        let implied: Vec<Relationship> = rows.iter().filter_map(binding_tuple).collect();
+        // Rows of an app in the trash whose trash hook did not end them (a pod of the previous
+        // release took the delivery): they end now.
+        let trashed = self.rows_of_trashed_apps(tenant, &rows).await?;
+        let mut fixed = 0;
+        if !trashed.is_empty() {
+            fixed += revoke_grouped(
+                &*d.store,
+                &*d.authz,
+                tenant,
+                &trashed,
+                RevokeReason::AppTrashed,
+            )
+            .await?;
+            rows = self.active_on(tenant, target).await?;
+        }
+        between_reads(1).await;
         let have = d.authz.read(&ObjectRef::node(target)).await?;
-        let mut updates = Vec::new();
-        for rel in &have {
-            let is_binding = rel.subject.object.object_type == "app"
-                && rel.subject.relation.is_none()
-                && matches!(rel.relation.as_str(), "viewer" | "editor");
-            if is_binding && !implied.contains(rel) {
-                updates.push(RelationshipUpdate::Delete(rel.clone()));
-            }
-        }
-        for rel in &implied {
-            if !have.contains(rel) {
-                let u = RelationshipUpdate::Touch(rel.clone());
-                if !updates.contains(&u) {
-                    updates.push(u);
-                }
-            }
-        }
+        let again = self.active_on(tenant, target).await?;
+        between_reads(2).await;
+        let updates = repair_updates(&rows, &have, &again);
+        let touched: Vec<Relationship> = updates
+            .iter()
+            .filter_map(|u| match u {
+                RelationshipUpdate::Touch(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect();
         let n = updates.len();
         if n > 0 {
             tracing::warn!(%tenant, %target, fixes = n, "the binding repair fixed tuples");
             d.authz.write(updates).await?;
         }
-        Ok(n)
+        // A revocation that committed after the second read: its own delete of the tuple
+        // runs after its commit, so it may have run before the touch above. Read the rows a
+        // third time and take back every touched tuple that no active row implies now.
+        if !touched.is_empty() {
+            let last = self.active_on(tenant, target).await?;
+            let implied: Vec<Relationship> = last.iter().filter_map(binding_tuple).collect();
+            let undo: Vec<RelationshipUpdate> = touched
+                .into_iter()
+                .filter(|r| !implied.contains(r))
+                .map(RelationshipUpdate::Delete)
+                .collect();
+            if !undo.is_empty() {
+                d.authz.write(undo).await?;
+            }
+        }
+        Ok(fixed + n)
+    }
+
+    /// The rows in `rows` of apps that are in the trash. The repair runs as the platform and
+    /// cannot read a trashed node (that needs `manage`), so it reads the provider's state of
+    /// the app: `suspended` with the reason `trashed` is what the trash delivery reports, also
+    /// in a release before card B-1, and the restore delivery reports `ready`. Only rows
+    /// written before that report end: a row written after it belongs to a publish after a
+    /// restore whose delivery has not run yet.
+    async fn rows_of_trashed_apps(
+        &self,
+        tenant: TenantId,
+        rows: &[BindingRow],
+    ) -> Result<Vec<BindingRow>> {
+        let mut apps: BTreeMap<NodeId, Option<time::OffsetDateTime>> = BTreeMap::new();
+        for b in rows {
+            if apps.contains_key(&b.app_node_id) {
+                continue;
+            }
+            let since = self
+                .deps()
+                .typed
+                .get(tenant, b.app_node_id)
+                .await?
+                .filter(|t| {
+                    t.state == crate::providers::ProviderState::Suspended
+                        && t.reason.as_deref() == Some("trashed")
+                })
+                .map(|t| t.state_at);
+            apps.insert(b.app_node_id, since);
+        }
+        Ok(rows
+            .iter()
+            .filter(|b| matches!(apps.get(&b.app_node_id), Some(Some(at)) if b.created_at <= *at))
+            .cloned()
+            .collect())
     }
 
     /// One round of the repair pass over every tenant with bindings (the sweeper): each tenant
@@ -1075,6 +1187,43 @@ impl AppService {
             authz: self.deps().authz.clone(),
         }
     }
+}
+
+/// The tuple updates of the repair of one target: `first` and `again` are the active rows
+/// read before and after `have`, the binding tuples of the engine on the target.
+///
+/// - A binding tuple (`node#viewer|editor@app:*`) that no row of `again` implies goes. A
+///   tuple is applied only after its row commits, so a tuple in `have` that belongs to an
+///   active row has that row in `again`.
+/// - A tuple that both `first` and `again` imply and that is not in `have` comes back. A row
+///   revoked between the reads is not in `again`, so its tuple does not come back (a
+///   revocation is real); a row granted between the reads is not in `first`, and its own
+///   grant writes its tuple.
+pub fn repair_updates(
+    first: &[BindingRow],
+    have: &[Relationship],
+    again: &[BindingRow],
+) -> Vec<RelationshipUpdate> {
+    let first: Vec<Relationship> = first.iter().filter_map(binding_tuple).collect();
+    let again: Vec<Relationship> = again.iter().filter_map(binding_tuple).collect();
+    let mut updates = Vec::new();
+    for rel in have {
+        let is_binding = rel.subject.object.object_type == "app"
+            && rel.subject.relation.is_none()
+            && matches!(rel.relation.as_str(), "viewer" | "editor");
+        if is_binding && !again.contains(rel) {
+            updates.push(RelationshipUpdate::Delete(rel.clone()));
+        }
+    }
+    for rel in &again {
+        if first.contains(rel) && !have.contains(rel) {
+            let u = RelationshipUpdate::Touch(rel.clone());
+            if !updates.contains(&u) {
+                updates.push(u);
+            }
+        }
+    }
+    updates
 }
 
 /// The cursors of the repair pass, per tenant (this process).

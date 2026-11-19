@@ -8,6 +8,7 @@
 use super::apps::*;
 use super::{Case, Ctx, Fail};
 use crate::{case, check};
+use axum::http::Method;
 use ruum_testkit::client::RequestSpec;
 use ruum_testkit::fixtures::Who;
 use serde_json::Value;
@@ -70,6 +71,24 @@ async fn revoked(cx: &Ctx, app: &str) -> Result<Vec<ruum_core::journal::JournalE
         )
         .await
         .map_err(|e| Fail::Failed(format!("journal read: {e}")))
+}
+
+/// The binding rows (active or not) on `target` in tenant A.
+async fn rows_on(cx: &Ctx, target: &str) -> Result<Vec<ruum_core::apps::store::BindingRow>, Fail> {
+    cx.state
+        .services
+        .apps
+        .store()
+        .list_bindings(
+            cx.a().id,
+            &ruum_core::apps::store::BindingQuery {
+                target: Some(ruum_core::NodeId(uuid_of(target)?)),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| Fail::Failed(format!("binding rows: {e}")))
 }
 
 /// A manifest with the node binding `docs` (`view`) to `node`.
@@ -297,6 +316,152 @@ pub fn cases() -> Vec<Case> {
                     "no app.binding_revoked (app_trashed, by the app): {:?}",
                     entries.iter().map(|e| &e.data).collect::<Vec<_>>()
                 );
+                Ok(())
+            }
+        ),
+        case!(
+            "purge_of_a_bound_node_succeeds_and_the_repair_ends_its_rows",
+            [
+                "createApp",
+                "createNode",
+                "putContent",
+                "createAppDeployment",
+                "getAppDeployment",
+                "publishAppDeployment",
+                "trashNode",
+                "purgeNode",
+                "emptyTrash",
+                "listTrash"
+            ],
+            "a folder with an active and a revoked binding row is trashed and purged \
+             (purgeNode 200), and a folder above a file bound by a preview is trashed and \
+             purged by emptyTrash (200, every root): the purge does not stop at the rows; one \
+             round of the repair pass ends the active rows with target_gone and the app \
+             principals have no permission (review-b1 1)",
+            |cx| {
+                // A folder with a revoked row (the live app drops the binding) and an active
+                // row (a preview of another app).
+                let docs = new_folder(&cx, Who::Member, cx.a().projects, "purged docs").await?;
+                let live = live_app(
+                    &cx,
+                    cx.a().projects,
+                    "purge dropper",
+                    &bound(&format!("node:{docs}")),
+                )
+                .await?;
+                new_release(
+                    &cx,
+                    &live.id,
+                    cx.a().projects,
+                    "purge dropper v2",
+                    STATIC_MANIFEST,
+                )
+                .await?;
+                let other =
+                    app_id(&new_app(&cx, Who::Member, cx.a().projects, "purge viewer").await?)?;
+                let s = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "purge viewer site",
+                    &bound(&format!("node:{docs}")),
+                )
+                .await?;
+                let pid = str_at(
+                    &preview(&cx, Who::Member, &other, from_folder(&s.folder, None)).await?,
+                    "/id",
+                )?;
+                check!(
+                    app_sees(&cx, &pid, &docs).await?,
+                    "the preview cannot view the folder"
+                );
+                let rows = rows_on(&cx, &docs).await?;
+                check!(
+                    rows.iter().any(|b| b.is_active()) && rows.iter().any(|b| !b.is_active()),
+                    "the folder needs an active and a revoked row: {rows:?}"
+                );
+                // A folder above a file that a preview binds.
+                let above = new_folder(&cx, Who::Member, cx.a().projects, "purged above").await?;
+                let inner = site(&cx, Who::Member, &above, "inner", STATIC_MANIFEST).await?;
+                let file = inner.files[1].1.clone();
+                let s2 = site(
+                    &cx,
+                    Who::Member,
+                    cx.a().projects,
+                    "purge file site",
+                    &bound(&format!("node:{file}")),
+                )
+                .await?;
+                let pid2 = str_at(
+                    &preview(&cx, Who::Member, &other, from_folder(&s2.folder, None)).await?,
+                    "/id",
+                )?;
+                check!(
+                    app_sees(&cx, &pid2, &file).await?,
+                    "the preview cannot view the file"
+                );
+                for node in [&docs, &above] {
+                    cx.ok(
+                        Who::Owner,
+                        RequestSpec::post(format!("/v1/nodes/{node}/trash")).tenant(cx.a().id),
+                        &[200],
+                    )
+                    .await?;
+                }
+                cx.ok(
+                    Who::Owner,
+                    RequestSpec::new(Method::DELETE, format!("/v1/nodes/{docs}")).tenant(cx.a().id),
+                    &[200],
+                )
+                .await?;
+                let emptied = cx
+                    .ok(
+                        Who::Owner,
+                        RequestSpec::post("/v1/trash/empty").tenant(cx.a().id),
+                        &[200],
+                    )
+                    .await?;
+                check!(
+                    emptied["purged"].as_u64().unwrap_or(0) >= 1,
+                    "emptyTrash purged nothing: {emptied}"
+                );
+                let trash = cx
+                    .ok(
+                        Who::Owner,
+                        RequestSpec::get("/v1/trash").tenant(cx.a().id),
+                        &[200],
+                    )
+                    .await?;
+                check!(
+                    !trash.to_string().contains(&above),
+                    "the folder above the bound file is still in the trash: {trash}"
+                );
+                cx.state
+                    .services
+                    .apps
+                    .repair_bindings(
+                        cx.a().id,
+                        None,
+                        ruum_core::apps::bindings::REPAIR_TARGETS_PER_TENANT,
+                    )
+                    .await
+                    .map_err(|e| Fail::Failed(format!("the repair pass failed: {e}")))?;
+                for (target, principal) in [(&docs, &pid), (&file, &pid2)] {
+                    let rows = rows_on(&cx, target).await?;
+                    check!(
+                        !rows.is_empty() && rows.iter().all(|b| !b.is_active()),
+                        "rows on the purged {target} stay active: {rows:?}"
+                    );
+                    check!(
+                        rows.iter().any(|b| b.revoke_reason
+                            == Some(ruum_core::apps::store::RevokeReason::TargetGone)),
+                        "no row on {target} ended with target_gone: {rows:?}"
+                    );
+                    check!(
+                        !app_sees(&cx, principal, target).await?,
+                        "app:{principal} still views the purged {target}"
+                    );
+                }
                 Ok(())
             }
         ),
