@@ -65,6 +65,16 @@ variable "admin_cidrs" {
   }
 }
 
+variable "talos_endpoints" {
+  description = "The Talos API endpoint to keep per Talos resource (keys stg-N and bootstrap): the endpoint of the state for a resource that the plan does not create or change (steps.sh plan_cluster). Every other resource dials its node through the admin tunnel, 127.0.0.1:1500N (backlog O-21)."
+  type        = map(string)
+  default     = {}
+  validation {
+    condition     = alltrue([for k, v in var.talos_endpoints : can(regex("^(stg-[1-4]|bootstrap)$", k)) && can(regex("^(127\\.0\\.0\\.1:1500[1-4]|([0-9]{1,3}\\.){3}[0-9]{1,3})$", v))])
+    error_message = "talos_endpoints: keys stg-1 to stg-4 or bootstrap; values 127.0.0.1:1500N (the admin tunnel) or an IPv4 address (a node's own public address, kept from the state)."
+  }
+}
+
 variable "bucket_blobs" {
   description = "Hetzner bucket of the Ruum chunks (destroyed with staging)."
   type        = string

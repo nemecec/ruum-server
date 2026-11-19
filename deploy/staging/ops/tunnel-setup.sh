@@ -3,6 +3,12 @@
 #
 #   deploy/staging/ops/tunnel-setup.sh             key (only if missing), build-server user, host key, test
 #   deploy/staging/ops/tunnel-setup.sh --key-only  only make the key when it is missing
+#   deploy/staging/ops/tunnel-setup.sh --before-bootstrap
+#                                                  the same for new nodes (up.sh --apply of a fresh
+#                                                  create, backlog O-21): the test waits up to 10
+#                                                  minutes for their Talos API and does not check
+#                                                  stg-1's Kubernetes API, which starts after the
+#                                                  bootstrap
 #
 # 1. Makes the tunnel key ~/.config/ruum/staging_tunnel_ed25519 when it is missing (ed25519, no
 #    passphrase, 0600). The private key is never printed and never leaves the Mac.
@@ -27,8 +33,14 @@ ADMIN_USER=ruumadmin
 key_only=0
 case "${1:-}" in
   --key-only) key_only=1 ;;
+  --before-bootstrap)
+    # shellcheck disable=SC2034 # read by stg_tunnel_up in lib.sh
+    STG_TUNNEL_NO_KUBE_CHECK=1
+    # shellcheck disable=SC2034
+    STG_TUNNEL_WAIT=600
+    ;;
   "") ;;
-  -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
+  -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
   *) stg_die "unknown argument $1" ;;
 esac
 

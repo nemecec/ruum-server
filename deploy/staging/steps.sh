@@ -10,8 +10,13 @@
 #   ipv4-check ADDRESS   print ADDRESS/32 when it is a public IPv4 address (tests)
 #   tunnel-targets       print the build server and the nodes for the admin tunnel (tunnel.sh)
 #   plan                 tofu plan of both roots, check-plan, price
-#   apply          (rw)  image upload if missing, plan, check-plan, price, apply the exact plan,
-#                        user_data check, talosconfig; needs RUUM_STAGING_APPLY=yes
+#   talos-access         how the last plan reaches the Talos API: create, bootstrap, tunnel or
+#                        none (talos-access.sh kind; up.sh --apply picks its phases by it)
+#   apply [servers](rw)  image upload if missing, plan, check-plan, price, apply the exact plan,
+#                        user_data check, talosconfig; needs RUUM_STAGING_APPLY=yes. Talos
+#                        changes need the admin tunnel open (backlog O-21). "servers": only the
+#                        servers and what they need (a targeted plan), for a fresh create before
+#                        ops/tunnel-setup.sh
 #   talosconfig    (rw)  write the talosconfig from the state, then the kubeconfig (0600; both
 #                        through the admin tunnel, which the Mac opens first)
 #   kubeconfig     (rw)  write the kubeconfig with talosctl through the admin tunnel (0600)
@@ -52,6 +57,8 @@ umask 077
 KUBECONFIG_FILE="$WORK/kubeconfig"
 TALOSCONFIG_FILE="$WORK/talosconfig"
 TREE="${TMPDIR:-/tmp}/ruum-staging-tree"
+# Extra arguments of the cluster plan: -target for the servers phase of a fresh create.
+CLUSTER_TARGETS=()
 
 # The steps that create or change cloud resources run only when the person or the orchestrator
 # has set RUUM_STAGING_APPLY=yes on the Mac (lib.sh passes it only to rw steps).
@@ -202,13 +209,49 @@ plan_all() {
   export STG_BUILDBOX_ID
   for root in persistent cluster; do
     dir="$(prepare_root "$root" "$backend")"
-    (cd "$dir" && tofu plan -input=false -no-color -lock-timeout=60s ${lock[@]+"${lock[@]}"} -out="$WORK/$root.tfplan" >"$WORK/plan-$root.log" 2>&1) ||
-      { tail -40 "$WORK/plan-$root.log" >&2; die "tofu plan failed for $root"; }
-    (cd "$dir" && set -o pipefail && tofu show -json "$WORK/$root.tfplan" | jq -f "$HERE/plan-scrub.jq" >"$WORK/$root.json") ||
-      { rm -f "$WORK/$root.json"; die "tofu show -json failed for $root"; }
-    (cd "$dir" && tofu show -no-color "$WORK/$root.tfplan" >"$WORK/$root.txt")
+    if [[ "$root" == cluster ]]; then
+      plan_cluster "$dir" ${lock[@]+"${lock[@]}"}
+    else
+      plan_root "$root" "$dir" ${lock[@]+"${lock[@]}"}
+    fi
   done
   hapi pricing >"$WORK/pricing.json"
+}
+
+# plan_root ROOT DIR [TOFU PLAN ARGS...]: writes $WORK/ROOT.tfplan, the scrubbed .json and .txt.
+plan_root() {
+  local root="$1" dir="$2"
+  shift 2
+  (cd "$dir" && tofu plan -input=false -no-color -lock-timeout=60s "$@" -out="$WORK/$root.tfplan" >"$WORK/plan-$root.log" 2>&1) ||
+    { tail -40 "$WORK/plan-$root.log" >&2; die "tofu plan failed for $root"; }
+  (cd "$dir" && set -o pipefail && tofu show -json "$WORK/$root.tfplan" | jq -f "$HERE/plan-scrub.jq" >"$WORK/$root.json") ||
+    { rm -f "$WORK/$root.json"; die "tofu show -json failed for $root"; }
+  (cd "$dir" && tofu show -no-color "$WORK/$root.tfplan" >"$WORK/$root.txt")
+}
+
+# plan_cluster DIR [TOFU PLAN ARGS...] (backlog O-21): the Talos resources dial the nodes through
+# the admin tunnel (127.0.0.1:1500N, the default of talos_endpoints in tofu/cluster). A Talos
+# resource that the plan does not create or change keeps the endpoint of the state, so a plan
+# without a Talos change shows no change. When the plan creates or changes one, the root is
+# planned again with the tunnel endpoint for exactly those resources. The state JSON holds the
+# cluster secrets: it goes from `tofu show -json` straight into talos-access.sh in a pipe, which
+# prints only the endpoints; it never lands on disk.
+plan_cluster() {
+  local dir="$1" keep again
+  shift
+  keep="$(cd "$dir" && set -o pipefail && tofu show -json | bash "$HERE/talos-access.sh" state-endpoints)" ||
+    die "cannot read the Talos endpoints of the cluster state"
+  export TF_VAR_talos_endpoints="$keep"
+  plan_root cluster "$dir" "$@" ${CLUSTER_TARGETS[@]+"${CLUSTER_TARGETS[@]}"}
+  again="$(bash "$HERE/talos-access.sh" keep "$keep" "$WORK/cluster.json")"
+  if [[ "$again" != "$keep" ]]; then
+    log "the plan creates or changes Talos resources: planning again with the admin tunnel endpoint for them"
+    export TF_VAR_talos_endpoints="$again"
+    plan_root cluster "$dir" "$@" ${CLUSTER_TARGETS[@]+"${CLUSTER_TARGETS[@]}"}
+    [[ "$(bash "$HERE/talos-access.sh" keep "$again" "$WORK/cluster.json")" == "$again" ]] ||
+      die "the second plan changes other Talos resources than the first; nothing is applied"
+  fi
+  log "Talos endpoints kept from the state: $(jq -r 'keys | join(" ") | if . == "" then "none" else . end' <<<"$TF_VAR_talos_endpoints"); every other Talos resource uses the admin tunnel (127.0.0.1:1500N)"
 }
 
 report_plan() {
@@ -294,15 +337,12 @@ write_kubeconfig() {
   log "kubeconfig in $WORK (0600; https://127.0.0.1:$TUNNEL_KUBE_PORT through the build server)"
 }
 
-# The talos provider in tofu/cluster talks to the nodes' public addresses, which the firewall
-# now opens only to the build server. A plan that would create or change a machine config or the
-# bootstrap is refused before anything is applied (README 'Admin access', fresh create).
-refuse_talos_changes() {
-  local hits
-  hits="$(jq -r '.resource_changes[]? | select(.type | IN("talos_machine_configuration_apply","talos_machine_bootstrap"))
-    | select(.change.actions != ["no-op"] and .change.actions != ["read"] and .change.actions != ["delete"]) | "\(.address) (\(.change.actions | join(",")))"' "$WORK/cluster.json")"
-  [[ -z "$hits" ]] || die "the plan changes the Talos machine config or bootstrap, which needs the Talos API from the tools container (closed by the firewall; README 'Admin access'):
-$hits"
+# Backlog O-21: the Talos resources reach the nodes only through the admin tunnel, which the Mac
+# opens before this step (up.sh --apply). The full phase refuses a plan that creates servers (the
+# tunnel does not reach new addresses before ops/tunnel-setup.sh) and a Talos change on a node
+# whose tunnel port is not open; the servers phase refuses any Talos change.
+require_talos_access() {
+  bash "$HERE/talos-access.sh" check "$1" "$WORK/cluster.json" || die "nothing was applied"
 }
 
 k() { kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"; }
@@ -328,21 +368,44 @@ case "$STEP" in
     plan_all plan
     rc=0
     report_plan || rc=$?
-    (refuse_talos_changes) || echo "WARNING: up.sh --apply refuses this plan: it changes the Talos machine config or bootstrap (README 'Admin access')"
+    echo
+    echo "################ Talos access (backlog O-21) ################"
+    access="$(bash "$HERE/talos-access.sh" kind "$WORK/cluster.json")"
+    touched="$(bash "$HERE/talos-access.sh" touched "$WORK/cluster.json" | tr '\n' ' ')"
+    case "$access" in
+      create) echo "the plan creates servers: up.sh --apply applies the servers first (a targeted apply), runs ops/tunnel-setup.sh for their addresses, then applies the rest with the Talos API through the admin tunnel (${touched% })" ;;
+      bootstrap) echo "the plan bootstraps the cluster: up.sh --apply applies it through the admin tunnel (${touched% }) and waits for the Kubernetes API of stg-1" ;;
+      tunnel) echo "the plan changes Talos resources: up.sh --apply applies them through the admin tunnel (${touched% })" ;;
+      *) echo "no Talos resource is created or changed" ;;
+    esac
     exit "$rc"
+    ;;
+  talos-access)
+    read_secrets
+    [[ -s "$WORK/cluster.json" ]] || die "no plan in $WORK (step plan)"
+    bash "$HERE/talos-access.sh" kind "$WORK/cluster.json"
     ;;
   apply)
     require_apply
+    phase=full
+    case "${1:-}" in
+      servers) phase=servers ;;
+      "") ;;
+      *) die "unknown apply argument $1 (servers, or nothing)" ;;
+    esac
     read_secrets $TOFU_NAMES
     tofu_env
     upload_image
+    # A fresh create applies the servers and what they need first, so that ops/tunnel-setup.sh can
+    # let the tunnel reach their new addresses before the Talos resources dial them (O-21).
+    [[ "$phase" == servers ]] && CLUSTER_TARGETS=(-target=hcloud_server.node)
     plan_all apply
     report_plan || die "the plan was refused (check-plan or budget); nothing was applied"
-    refuse_talos_changes
+    require_talos_access "$phase"
     (cd "$TREE/tofu/persistent" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/persistent.tfplan")
     (cd "$TREE/tofu/cluster" && tofu apply -input=false -no-color -lock-timeout=60s "$WORK/cluster.tfplan")
     check_user_data
-    write_talosconfig
+    [[ "$phase" == servers ]] || write_talosconfig
     ;;
   talosconfig)
     read_secrets $TOFU_NAMES
@@ -420,6 +483,6 @@ case "$STEP" in
     bash "$HERE/ops/destroy-steps.sh" "$STEP" "$@"
     ;;
   *)
-    die "unknown step '$STEP' (admin-cidrs, ipv4-check, tunnel-targets, plan, kubeconfig, apply, talosconfig, platform, zitadel-bootstrap, check-backup, deploy, status, destroy-plan, destroy, sweep)"
+    die "unknown step '$STEP' (admin-cidrs, ipv4-check, tunnel-targets, plan, talos-access, kubeconfig, apply, talosconfig, platform, zitadel-bootstrap, check-backup, deploy, status, destroy-plan, destroy, sweep)"
     ;;
 esac

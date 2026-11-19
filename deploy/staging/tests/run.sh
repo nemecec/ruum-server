@@ -52,7 +52,12 @@
 #   off main, an older commit without a rollback...);
 # - with docker: the rendered Caddyfile adapts (caddy adapt --validate; without the storage
 #   block, which only the edge image has);
-# - with tofu: fmt and validate of both roots; with tofu and talosctl: the machine config of
+# - Talos through the admin tunnel (backlog O-21): talos-access.sh (the plan's kind, the touched
+#   Talos resources, the endpoints kept from the state without printing another state value, the
+#   checks of the servers and full phases), steps.sh and up.sh in the right order, the tunnel
+#   waits (Talos API of new nodes, Kubernetes API after the bootstrap);
+# - with tofu: fmt and validate of both roots; the Talos endpoints of tofu/cluster
+#   (tests/talos-endpoints.sh); with tofu and talosctl: the machine config of
 #   every node, rendered by the Talos provider, passes talosctl validate (tests/talos-validate.sh).
 # helm and tofu come from PATH (CI: setup.sh) or, when they are not there and Docker is, from the
 # tools image (tools-image.sh, the same pins).
@@ -380,7 +385,105 @@ fi
 grep -q 'sshd -t' "$bt" && grep -q 'systemctl reload' "$bt" && grep -q "chown root:root" "$bt" && grep -q 'install -d -o root -g root -m 0755' "$bt" &&
   ok "buildbox-tunnel-user.sh validates with sshd -t before the reload; root-owned key file" || bad "buildbox-tunnel-user.sh order or ownership"
 grep -q -- '--shell /usr/sbin/nologin' "$bt" && grep -q "usermod --password '\*'" "$bt" && ok "ruumtunnel: shell nologin, no password" || bad "ruumtunnel user"
-grep -q 'refuse_talos_changes' "$STG/steps.sh" && ok "apply refuses a plan that changes the Talos machine config (closed to the tools container)" || bad "refuse_talos_changes"
+echo "== Talos through the admin tunnel (backlog O-21)"
+ta="$STG/talos-access.sh"
+# tplan NAME CHANGES...: a scrubbed plan JSON with these resource changes ("ADDRESS TYPE INDEX ACTIONS";
+# INDEX - for none, ACTIONS comma separated).
+tplan() {
+  local name="$1" line addr type idx acts out="[]"
+  shift
+  for line in "$@"; do
+    read -r addr type idx acts <<<"$line"
+    out="$(jq -c --arg a "$addr" --arg t "$type" --arg i "$idx" --arg x "$acts" \
+      '. + [{address: $a, mode: "managed", type: $t, change: {actions: ($x | split(",")), before: {redacted: true}, after: {redacted: true}}}
+        + (if $i == "-" then {} else {index: $i} end)]' <<<"$out")"
+  done
+  jq -n --argjson rc "$out" '{format_version: "1.2", resource_changes: $rc}' >"$TMP/$name.json"
+  echo "$TMP/$name.json"
+}
+TA_NOOP=('talos_machine_configuration_apply.node["stg-1"] talos_machine_configuration_apply stg-1 no-op'
+  'talos_machine_configuration_apply.node["stg-2"] talos_machine_configuration_apply stg-2 no-op'
+  'talos_machine_configuration_apply.node["stg-3"] talos_machine_configuration_apply stg-3 no-op'
+  'talos_machine_bootstrap.this talos_machine_bootstrap - no-op'
+  'hcloud_server.node["stg-1"] hcloud_server stg-1 no-op')
+p_none="$(tplan none "${TA_NOOP[@]}" 'hcloud_zone_rrset.r["x"] hcloud_zone_rrset x update')"
+p_upd="$(tplan upd "${TA_NOOP[@]/stg-2 no-op/stg-2 update}")"
+p_boot="$(tplan boot 'talos_machine_configuration_apply.node["stg-1"] talos_machine_configuration_apply stg-1 create' 'talos_machine_bootstrap.this talos_machine_bootstrap - create' 'hcloud_server.node["stg-1"] hcloud_server stg-1 no-op')"
+p_new="$(tplan new 'hcloud_server.node["stg-1"] hcloud_server stg-1 create' 'talos_machine_configuration_apply.node["stg-1"] talos_machine_configuration_apply stg-1 create' 'talos_machine_bootstrap.this talos_machine_bootstrap - create')"
+p_srv="$(tplan srv 'hcloud_server.node["stg-1"] hcloud_server stg-1 create' 'hcloud_primary_ip.v4["stg-1"] hcloud_primary_ip stg-1 create')"
+p_repl="$(tplan repl "${TA_NOOP[@]/stg-3 no-op/stg-3 delete,create}")"
+p_del="$(tplan del "${TA_NOOP[@]/stg-3 no-op/stg-3 delete}")"
+for c in "none:$p_none" "tunnel:$p_upd" "bootstrap:$p_boot" "create:$p_new" "create:$p_srv" "tunnel:$p_repl" "none:$p_del"; do
+  got="$(bash "$ta" kind "${c#*:}" 2>&1)"
+  [[ "$got" == "${c%%:*}" ]] && ok "talos-access kind: $(basename "${c#*:}" .json) is ${c%%:*}" || bad "talos-access kind of $(basename "${c#*:}" .json): '$got', want ${c%%:*}"
+done
+[[ "$(bash "$ta" touched "$p_upd")" == stg-2 && "$(bash "$ta" touched "$p_boot" | tr '\n' ' ')" == "bootstrap stg-1 " &&
+  "$(bash "$ta" touched "$p_repl")" == stg-3 && -z "$(bash "$ta" touched "$p_none")" && -z "$(bash "$ta" touched "$p_del")" ]] &&
+  ok "talos-access touched: the Talos resources that a plan creates, updates or replaces (not a no-op or a delete)" || bad "talos-access touched"
+KEEP='{"bootstrap":"5.9.0.11","stg-1":"5.9.0.11","stg-2":"5.9.0.12","stg-3":"5.9.0.13"}'
+[[ "$(bash "$ta" keep "$KEEP" "$p_none")" == "$KEEP" ]] && ok "talos-access keep: no Talos change keeps every endpoint of the state (no change in the plan)" || bad "talos-access keep (no change)"
+[[ "$(bash "$ta" keep "$KEEP" "$p_upd")" == '{"bootstrap":"5.9.0.11","stg-1":"5.9.0.11","stg-3":"5.9.0.13"}' ]] &&
+  ok "talos-access keep: a changed node is planned again with its tunnel endpoint, the others keep theirs" || bad "talos-access keep (stg-2 changed): $(bash "$ta" keep "$KEEP" "$p_upd")"
+expect 1 "talos-access keep refuses a map that is not JSON" bash "$ta" keep 'stg-1=5.9.0.11' "$p_none"
+expect 1 "talos-access refuses a plan JSON with the prior state" bash "$ta" kind "$(mutate prior '. + {"prior_state":{}}')"
+# state-endpoints: only the endpoints leave the pipe; never another value of the state.
+jq -n '{format_version: "1.0", values: {root_module: {resources: [
+  {address: "talos_machine_secrets.this", mode: "managed", type: "talos_machine_secrets", values: {machine_secrets: {certs: {os: {key: "SECRET-PROBE-1"}}}}},
+  {address: "talos_machine_configuration_apply.node[\"stg-1\"]", mode: "managed", type: "talos_machine_configuration_apply", index: "stg-1", values: {endpoint: "5.9.0.11", node: "5.9.0.11", machine_configuration: "SECRET-PROBE-2", client_configuration: {client_key: "SECRET-PROBE-3"}}},
+  {address: "talos_machine_configuration_apply.node[\"stg-2\"]", mode: "managed", type: "talos_machine_configuration_apply", index: "stg-2", values: {endpoint: "127.0.0.1:15002", node: "5.9.0.12"}},
+  {address: "talos_machine_configuration_apply.node[\"stg-3\"]", mode: "managed", type: "talos_machine_configuration_apply", index: "stg-3", values: {endpoint: "evil.example:50000"}},
+  {address: "talos_machine_bootstrap.this", mode: "managed", type: "talos_machine_bootstrap", values: {endpoint: "5.9.0.11", node: "5.9.0.11"}},
+  {address: "data.talos_client_configuration.this", mode: "data", type: "talos_client_configuration", values: {endpoints: ["SECRET-PROBE-4"], talos_config: "SECRET-PROBE-5"}}]}}}' >"$TMP/state.json"
+got="$(bash "$ta" state-endpoints <"$TMP/state.json")"
+[[ "$got" == '{"bootstrap":"5.9.0.11","stg-1":"5.9.0.11","stg-2":"127.0.0.1:15002"}' ]] &&
+  ok "talos-access state-endpoints: the endpoints of the state, only of the allowed forms" || bad "talos-access state-endpoints: $got"
+grep -q SECRET-PROBE <<<"$got" && bad "talos-access state-endpoints prints a secret of the state" || ok "talos-access state-endpoints prints no other value of the state"
+[[ "$(echo '{"format_version":"1.0"}' | bash "$ta" state-endpoints)" == '{}' ]] && ok "talos-access state-endpoints: an empty state keeps nothing (a fresh create uses the tunnel)" || bad "talos-access state-endpoints of an empty state"
+# check: the servers phase touches no Talos resource; the full phase creates no server and needs
+# the tunnel port of every node it touches (the bootstrap: stg-1).
+expect 0 "check servers: a targeted plan of the servers passes" bash "$ta" check servers "$p_srv"
+expect 1 "check servers: refuses a Talos change" bash "$ta" check servers "$p_new"
+expect 1 "check full: refuses a plan that creates servers (tunnel-setup.sh comes first)" env STG_TUNNEL_PORTS="16443 15001 15002 15003" bash "$ta" check full "$p_new"
+grep -q 'tunnel-setup.sh' "$TMP/out" || bad "check full: the refusal names ops/tunnel-setup.sh"
+expect 0 "check full: no Talos change needs no tunnel" env -u STG_TUNNEL_PORTS bash "$ta" check full "$p_none"
+expect 1 "check full: refuses a Talos change without the tunnel" env -u STG_TUNNEL_PORTS bash "$ta" check full "$p_upd"
+expect 1 "check full: refuses a Talos change when that node's port is not open" env STG_TUNNEL_PORTS="16443 15001 15003" bash "$ta" check full "$p_upd"
+grep -q '15002' "$TMP/out" || bad "check full: the refusal names the port 15002"
+expect 0 "check full: a Talos change with the node's tunnel port open passes" env STG_TUNNEL_PORTS="16443 15001 15002 15003" bash "$ta" check full "$p_upd"
+expect 1 "check full: the bootstrap needs stg-1's port 15001" env STG_TUNNEL_PORTS="16443 15002 15003" bash "$ta" check full "$(tplan bootonly 'talos_machine_bootstrap.this talos_machine_bootstrap - create')"
+expect 1 "check needs a phase" bash "$ta" check later "$p_none"
+# steps.sh: the state goes from tofu show into talos-access.sh in a pipe; the apply checks the access
+# before it applies anything; the plan names how it reaches the Talos API.
+grep -qF 'tofu show -json | bash "$HERE/talos-access.sh" state-endpoints)' "$STG/steps.sh" &&
+  ok "steps.sh reads the state's Talos endpoints in a pipe (the state JSON never lands on disk)" || bad "steps.sh state-endpoints pipe"
+[[ "$(grep -v '^[[:space:]]*#' "$STG/steps.sh" | grep -c '&& tofu show -json')" == 2 ]] && [[ "$(grep -v '^[[:space:]]*#' "$STG/steps.sh" | grep -c 'tofu show -json [^|]*|')" == 2 ]] && ok "steps.sh has only the two tofu show -json pipes (plan-scrub.jq, talos-access.sh)" || bad "another tofu show -json in steps.sh"
+grep -q 'refuse_talos_changes' "$STG/steps.sh" && bad "steps.sh still refuses every Talos change" || ok "steps.sh no longer refuses Talos changes (they go through the tunnel)"
+awk '/^  apply\)$/,/^    ;;$/' "$STG/steps.sh" >"$TMP/apply-step.txt"
+[[ -s "$TMP/apply-step.txt" ]] && grep -q 'require_talos_access "$phase"' "$TMP/apply-step.txt" &&
+  [[ "$(grep -n 'require_talos_access "$phase"' "$TMP/apply-step.txt" | cut -d: -f1)" -lt "$(grep -n 'tofu apply' "$TMP/apply-step.txt" | head -1 | cut -d: -f1)" ]] &&
+  grep -qF 'CLUSTER_TARGETS=(-target=hcloud_server.node)' "$TMP/apply-step.txt" &&
+  ok "steps.sh apply checks the Talos access before any tofu apply; the servers phase is a targeted plan" || bad "steps.sh apply: Talos access check or servers phase"
+grep -qF 'bash "$HERE/talos-access.sh" check "$1" "$WORK/cluster.json"' "$STG/steps.sh" && ok "require_talos_access is talos-access.sh check" || bad "require_talos_access"
+# up.sh: a fresh create applies the servers, runs tunnel-setup.sh, opens the tunnel, then applies
+# the rest; every apply runs with the tunnel open; it waits for the Kubernetes API after a bootstrap.
+u="$STG/up.sh"
+ln_of() { grep -nF -- "$1" "$u" | head -1 | cut -d: -f1; }
+l_access="$(ln_of 'stg_run ro talos-access')" l_srv="$(ln_of 'stg_run rw apply servers')" l_ts="$(ln_of 'ops/tunnel-setup.sh" --before-bootstrap')"
+l_up="$(grep -nx 'stg_tunnel_up' "$u" | head -1 | cut -d: -f1)" l_apply="$(grep -nE 'stg_run rw apply$' "$u" | head -1 | cut -d: -f1)" l_wait="$(ln_of 'stg_tunnel_wait_kube 900')" l_kc="$(ln_of 'stg_run rw kubeconfig')"
+if [[ -n "$l_access" && -n "$l_srv" && -n "$l_ts" && -n "$l_up" && -n "$l_apply" && -n "$l_wait" && -n "$l_kc" ]] &&
+  ((l_access < l_srv && l_srv < l_ts && l_ts < l_up && l_up < l_apply && l_apply < l_wait && l_wait < l_kc)); then
+  ok "up.sh --apply: talos-access, servers phase, tunnel-setup.sh, tunnel, full apply, wait for the Kubernetes API, kubeconfig"
+else
+  bad "up.sh --apply order (access $l_access, servers $l_srv, tunnel-setup $l_ts, tunnel $l_up, apply $l_apply, wait $l_wait, kubeconfig $l_kc)"
+fi
+[[ "$(grep -c 'stg_run rw apply' "$u")" == 2 ]] && ok "up.sh applies only in the two phases" || bad "up.sh: another apply"
+# The tunnel port of tofu/cluster is the one of tunnel.sh.
+grep -qF '"127.0.0.1:${15000 + n.index}"' "$STG/tofu/cluster/talos.tf" && [[ "$TUNNEL_TALOS_BASE" == 15000 ]] &&
+  ok "talos.tf dials 127.0.0.1:(15000 + N), the Talos port of tunnel.sh" || bad "talos.tf and tunnel.sh disagree on the Talos tunnel port"
+awk '/^resource "talos_machine_(configuration_apply|bootstrap)"/,/^}/' "$STG/tofu/cluster/talos.tf" >"$TMP/talos-res.txt"
+[[ "$(grep -c 'precondition' "$TMP/talos-res.txt")" == 2 ]] && ! grep -qE '^\s*endpoint\s*=\s*hcloud_server' "$TMP/talos-res.txt" &&
+  [[ "$(grep -cE '^\s*node\s*=\s*hcloud_server\.node\[[^]]+\]\.ipv4_address$' "$TMP/talos-res.txt")" == 2 ]] &&
+  ok "talos.tf: endpoints from talos_endpoints or the tunnel, never the public address directly; a precondition on each; nodes by public IPv4" || bad "talos.tf Talos resources"
 
 echo "== admin tunnel: control socket and forward checks (Kimi review F4)"
 F4="$TMP/f4"
@@ -428,13 +531,31 @@ time.sleep(30)' 38443 38001 38002 38003 &
   if inlib "$V; ssh() { [[ \"\$*\" == *' -W '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then ok "stg_tunnel_verify passes when every forward listens and opens"; else bad "stg_tunnel_verify (all good)"; cat "$TMP/out"; fi
   if inlib "$V; ssh() { [[ \"\$*\" != *'-W 5.9.0.12:50000 '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then bad "stg_tunnel_verify passes when the build server cannot open a node port"; else grep -q '5.9.0.12:50000' "$TMP/out" && ok "stg_tunnel_verify fails when the build server cannot open a node port" || { bad "stg_tunnel_verify message"; cat "$TMP/out"; }; fi
   if inlib "TUNNEL_KUBE_PORT=38443; TUNNEL_TALOS_BASE=38010; STG_TUNNEL_OPTS=(-F /dev/null); tunnel_parse \"\$1\" >/dev/null; ssh() { return 0; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then bad "stg_tunnel_verify passes when a local port does not listen"; else grep -q 'nothing listens on 127.0.0.1:38011' "$TMP/out" && ok "stg_tunnel_verify fails when a local port does not listen" || { bad "stg_tunnel_verify listener message"; cat "$TMP/out"; }; fi
+  # Backlog O-21: before the bootstrap, the forward to stg-1:6443 listens but is not probed; the Talos ports are.
+  if inlib "$V; ssh() { [[ \"\$*\" != *'-W 5.9.0.11:6443 '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then bad "stg_tunnel_verify passes when the Kubernetes API does not answer"; else ok "stg_tunnel_verify fails when the Kubernetes API does not answer"; fi
+  if inlib "$V; STG_TUNNEL_NO_KUBE_CHECK=1; ssh() { [[ \"\$*\" != *'-W 5.9.0.11:6443 '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then ok "stg_tunnel_verify with STG_TUNNEL_NO_KUBE_CHECK=1 does not probe the Kubernetes API"; else bad "stg_tunnel_verify STG_TUNNEL_NO_KUBE_CHECK"; cat "$TMP/out"; fi
+  if inlib "$V; STG_TUNNEL_NO_KUBE_CHECK=1; ssh() { [[ \"\$*\" != *'-W 5.9.0.13:50000 '* ]]; }; stg_tunnel_verify" "$T1" >"$TMP/out" 2>&1; then bad "stg_tunnel_verify with STG_TUNNEL_NO_KUBE_CHECK=1 skips a Talos port"; else ok "stg_tunnel_verify with STG_TUNNEL_NO_KUBE_CHECK=1 still probes every Talos port"; fi
   kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null
 else
   echo "== admin tunnel: control socket and listener tests skipped (no python3)"
 fi
 awk '/^stg_tunnel_up\(\)/,/^}/' "$STG/lib.sh" >"$TMP/up.txt"
-grep -q 'stg_tunnel_verify ||' "$TMP/up.txt" && [[ "$(grep -n 'stg_tunnel_verify ||' "$TMP/up.txt" | cut -d: -f1)" -lt "$(grep -n 'STG_TUNNEL_PORTS="$(tunnel_ports)"' "$TMP/up.txt" | cut -d: -f1)" ]] &&
+# stg_tunnel_wait_verify is stg_tunnel_verify, retried for STG_TUNNEL_WAIT seconds (0: once; backlog O-21).
+grep -q 'stg_tunnel_wait_verify ||' "$TMP/up.txt" && [[ "$(grep -n 'stg_tunnel_wait_verify ||' "$TMP/up.txt" | cut -d: -f1)" -lt "$(grep -n 'STG_TUNNEL_PORTS="$(tunnel_ports)"' "$TMP/up.txt" | cut -d: -f1)" ]] &&
+  awk '/^stg_tunnel_wait_verify\(\)/,/^}/' "$STG/lib.sh" | grep -q 'stg_tunnel_verify && return 0' &&
   ok "stg_tunnel_up checks every forward before it sets STG_TUNNEL_PORTS" || bad "stg_tunnel_up does not verify the forwards first"
+W='sleep() { :; }; n=0; stg_tunnel_verify() { n=$((n + 1)); [[ $n -ge 3 ]]; }'
+inlib "$W; STG_TUNNEL_WAIT=600; stg_tunnel_wait_verify 2>/dev/null && echo \"passed after \$n\"" >"$TMP/out" 2>&1
+grep -qx 'passed after 3' "$TMP/out" && ok "stg_tunnel_wait_verify retries until the node APIs answer (STG_TUNNEL_WAIT)" || { bad "stg_tunnel_wait_verify retry"; cat "$TMP/out"; }
+inlib "$W; STG_TUNNEL_WAIT=0; stg_tunnel_wait_verify 2>/dev/null || echo \"failed after \$n\"" >"$TMP/out" 2>&1
+grep -qx 'failed after 1' "$TMP/out" && ok "stg_tunnel_wait_verify checks once without STG_TUNNEL_WAIT" || { bad "stg_tunnel_wait_verify once"; cat "$TMP/out"; }
+inlib 'sleep() { :; }; STG_TUNNEL_PORTS="16443 15001"; tunnel_parse "$1" >/dev/null; n=0; stg_tunnel_probe() { n=$((n + 1)); [[ "$1" == 5.9.0.11:6443 && $n -ge 2 ]]; }; stg_tunnel_wait_kube 900 2>/dev/null && echo "kube after $n $STG_TUNNEL_NO_KUBE_CHECK"' "$T1" >"$TMP/out" 2>&1
+grep -qx 'kube after 2 0' "$TMP/out" && ok "stg_tunnel_wait_kube waits for stg-1:6443 over the tunnel, then checks it again" || { bad "stg_tunnel_wait_kube"; cat "$TMP/out"; }
+inlib 'sleep() { :; }; SECONDS=0; STG_TUNNEL_PORTS="16443 15001"; tunnel_parse "$1" >/dev/null; stg_tunnel_probe() { SECONDS=$((SECONDS + 100)); return 1; }; stg_tunnel_wait_kube 300' "$T1" >"$TMP/out" 2>&1 &&
+  bad "stg_tunnel_wait_kube passes when the Kubernetes API never answers" || { grep -q 'did not answer within 300 s' "$TMP/out" && ok "stg_tunnel_wait_kube stops after its time" || { bad "stg_tunnel_wait_kube timeout"; cat "$TMP/out"; }; }
+grep -qE '^  --before-bootstrap\)$' "$STG/ops/tunnel-setup.sh" && awk '/--before-bootstrap\)$/,/;;/' "$STG/ops/tunnel-setup.sh" | grep -q 'STG_TUNNEL_NO_KUBE_CHECK=1' &&
+  awk '/--before-bootstrap\)$/,/;;/' "$STG/ops/tunnel-setup.sh" | grep -q 'STG_TUNNEL_WAIT=600' &&
+  ok "tunnel-setup.sh --before-bootstrap waits for the Talos API and skips the Kubernetes API (fresh create)" || bad "tunnel-setup.sh --before-bootstrap"
 grep -q 'if \[\[ "$STG_TUNNEL_FRESH" != 1 \]\] && ssh' "$TMP/up.txt" && grep -q 'stg_tunnel_close_others all' "$TMP/up.txt" &&
   awk '/^STG_TUNNEL_FRESH=1$/ {f=1} f && /^stg_tunnel_up$/ {ok=1} END {exit !ok}' "$STG/ops/tunnel-setup.sh" &&
   ok "tunnel-setup.sh closes every tunnel and tests a new one (never joins)" || bad "tunnel-setup.sh fresh tunnel"
@@ -883,6 +1004,14 @@ if has tofu; then
       expect 0 "tofu validate $r (tools image)" intools bash -c "$v"
     fi
   done
+  # The Talos API endpoints (backlog O-21): the tunnel by default, the state's where kept, and
+  # talos_endpoints refuses anything else.
+  if type -P tofu >/dev/null; then
+    expect 0 "the Talos endpoints of tofu/cluster (tests/talos-endpoints.sh)" bash "$STG/tests/talos-endpoints.sh"
+  else
+    expect 0 "the Talos endpoints of tofu/cluster (tests/talos-endpoints.sh, tools image)" intools bash "$STG/tests/talos-endpoints.sh"
+  fi
+  grep -E '^(ok|FAIL) ' "$TMP/out" | sed 's/^/     /'
   # The rendered machine configs of the Talos provider pass talosctl validate (Talos v1.14 moved
   # settings into their own documents; a setting in both places fails only at apply time).
   if type -P tofu >/dev/null && type -P talosctl >/dev/null; then

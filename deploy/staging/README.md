@@ -48,7 +48,7 @@ rule, so admin access goes through the build server, whose public IPv4 is fixed.
   the Hetzner API (server `ruum-buildbox`); it is not in the code. `check-plan.sh` accepts exactly
   that /32 and nothing wider, no IPv6.
 - **Tunnel.** `lib.sh stg_tunnel_up` opens an SSH local forward from the Mac, as the build-server
-  user `ruumtunnel`, around the steps that need the cluster (`up.sh --apply` after OpenTofu,
+  user `ruumtunnel`, around the steps that need the cluster (`up.sh --apply` before OpenTofu,
   `deploy.sh`, `status.sh`, `secrets-push.sh`, `tool.sh`), and closes it when the script ends.
   Ports on `127.0.0.1` of the Mac: `16443` to stg-1:6443, and `1500N` to stg-N:50000. The ssh
   options: only the key `~/.config/ruum/staging_tunnel_ed25519`, only the host key in
@@ -76,9 +76,30 @@ rule, so admin access goes through the build server, whose public IPv4 is fixed.
   printed), runs `ops/buildbox-tunnel-user.sh` on the build server as the admin user
   (`ssh -i ~/.config/ruum/buildbox_admin_ed25519 ruumadmin@<build server> 'sudo bash -s -- <key> <node IPs>'`),
   records the build server's host key that the script prints, and opens the tunnel once.
-- **OpenTofu and Talos.** The Talos provider of `tofu/cluster` talks to the nodes' public
-  addresses, which only the build server can reach. `up.sh --apply` refuses a plan that creates
-  or changes a machine config or the bootstrap (the plan prints a warning). See "Known gaps".
+- **OpenTofu and Talos** (backlog O-21). The Talos resources of `tofu/cluster`
+  (`talos_machine_configuration_apply`, `talos_machine_bootstrap`) reach the nodes through the
+  tunnel: `endpoint = 127.0.0.1:1500N` (relayed into the tools container), `node` = the node's
+  public IPv4, so the endpoint's apid relays to itself. The provider contacts a node only when it
+  creates or changes such a resource; a plan never does. A resource that the plan does not create
+  or change keeps the endpoint of the state (`steps.sh plan_cluster`: `tofu show -json` piped into
+  `talos-access.sh state-endpoints`, which prints only the endpoints, into the variable
+  `talos_endpoints`), so a plan without a Talos change shows no change; when the plan creates or
+  changes one, the root is planned again with the tunnel endpoint for exactly those resources. A
+  precondition allows only the node's own tunnel port or its own public address.
+  `up.sh --apply` reads how the plan reaches the Talos API (`steps.sh talos-access`):
+  - `none` or `tunnel` (a machine config change on running nodes): it opens the tunnel, then
+    applies. `steps.sh apply` refuses a Talos change whose node port is not open.
+  - `create` (a fresh create, a new node or a replaced server): the new public addresses are not
+    in the `ruumtunnel` key line yet. Phase 1 is a targeted apply of the servers and what they need
+    (`steps.sh apply servers`, `-target=hcloud_server.node`, with check-plan and price); then
+    `ops/tunnel-setup.sh --before-bootstrap` puts the new addresses on the build server and waits
+    up to 10 minutes for their Talos API (maintenance mode). Then the tunnel opens and the full
+    plan is applied: the machine configs and the bootstrap through the tunnel.
+  - `bootstrap` (servers exist, the bootstrap does not, for example after a create stopped
+    half-way): as `create` without phase 1.
+  After a bootstrap, `up.sh` waits up to 15 minutes until stg-1's Kubernetes API answers through
+  the tunnel (`stg_tunnel_wait_kube`); until then the tunnel does not probe that forward
+  (`STG_TUNNEL_NO_KUBE_CHECK`). The full apply refuses a plan that creates servers.
 
 Plan JSON is scrubbed in a pipe (`plan-scrub.jq`: no variables, no prior state, no sensitive or
 Talos values) before it is written, so no plan file holds the cluster secrets (code review F-5).
@@ -120,10 +141,10 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 |---|---|
 | `deploy/staging/up.sh [--out FILE]` | The priced plan: `tofu plan` of both roots, `check-plan.sh`, `price.sh`, and the platform preflight. Changes nothing, takes no state lock. |
 | `RUUM_STAGING_APPLY=yes deploy/staging/bootstrap-state.sh` | Creates the state bucket once. |
-| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices, applies the exact plan, checks that every node has empty user data, writes the talosconfig, opens the admin tunnel, writes the kubeconfig, installs the platform, and configures Zitadel. |
+| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices; for new servers applies them first and runs `ops/tunnel-setup.sh --before-bootstrap` ("Admin access", O-21); opens the admin tunnel, applies the exact plan (the Talos resources through the tunnel), checks that every node has empty user data, writes the talosconfig, waits for the Kubernetes API after a bootstrap, writes the kubeconfig, installs the platform, and configures Zitadel. |
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
 | `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply, the talosconfig and the kubeconfig. |
-| `deploy/staging/ops/tunnel-setup.sh` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). |
+| `deploy/staging/ops/tunnel-setup.sh [--before-bootstrap]` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). `--before-bootstrap` (up.sh runs it in a fresh create): the test waits for the Talos API of new nodes and skips stg-1's Kubernetes API. |
 | `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` stops with the admin path to go back further ("Going back past the previous release"); one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server and Zitadel. Not read-only (a temporary namespace, ephemeral containers). |
@@ -522,6 +543,7 @@ backup bucket; they cost cents and go with `destroy.sh --purge-backups`.
 | G-1 (code review 2) | `check-plan.sh` also refuses a known server firewall ID that is not the staging firewall of the plan, `apply_to` on a firewall with or without rules (also unknown; only an existing firewall may keep an unchanged `apply_to` that lists the plan's own servers, which Hetzner reports there), firewall rules unknown at plan time, and a primary IP assigned to a server outside the plan or to the build server. |
 | G-2 (code review 2) | No longer applies: `install-ops-user.sh` and its `allowed_signers` check are gone with the build-server mode. |
 | Mac only (2026-11-11) | `lib.sh`, `steps.sh`, `tools-image.sh`, `tool.sh`: every step on the Mac in the tools container; no ruum-ops, no credential on the build server; `STG_ADMIN_CIDRS` exactly one IPv4 /32 (`check-plan.sh`, the `admin_cidrs` validation in `tofu/cluster`). |
+| Talos through the tunnel (backlog O-21) | `tofu/cluster/talos.tf`: endpoints `127.0.0.1:1500N` (variable `talos_endpoints` keeps the state's endpoint of an untouched resource; a precondition per resource); `talos-access.sh`; `steps.sh plan_cluster`, `apply servers`, `talos-access`; `up.sh --apply` phases; `ops/tunnel-setup.sh --before-bootstrap`; `lib.sh` `STG_TUNNEL_NO_KUBE_CHECK`, `STG_TUNNEL_WAIT`, `stg_tunnel_wait_kube`. |
 | Admin tunnel (2026-11-11) | The firewall source is the build server's /32 from the Hetzner API (no Mac address detection); `tunnel.sh`, `lib.sh stg_tunnel_up`, `tunnel-relay.sh`, `ops/tunnel-setup.sh`, `ops/buildbox-tunnel-user.sh`: an SSH local forward as `ruumtunnel`, restricted to the node API ports; the credentials stay on the Mac. |
 | Kimi review (2026-11-11) | `check-plan.sh` refuses every `hcloud_firewall_attachment` change (deletes included), an in-place change of an existing server's `firewall_ids`, a server firewall ID unknown at plan time when the plan creates no firewall, `apply_to` that is cleared or loses a server, and `apply_to` on a replaced firewall. `lib.sh` names the control socket after a fingerprint of the build server, host key, key and forwards, closes other tunnels, and checks every forward before use; `tunnel-setup.sh` always tests a new tunnel. `buildbox-tunnel-user.sh` rolls back the key file and drop-in on any failure. `tunnel-relay.sh` runs the command only when every relay listens. |
 | S-1 | kube-network-policies, default deny per namespace, explicit allows; Postgres TLS `verify-full`; no service account token in workloads, except the edge's (Secrets and Leases of `edge` only, for the certificate storage, backlog O-26) and the deploy controller's (`ruum-deploy`, backlog O-34). |
@@ -583,13 +605,12 @@ PVC binds by itself when a node has the volume: the provisioner retries.
   tunnel port 16443 goes to stg-1's public IP. KubePrism covers the kubelets and pods, but joins
   and the Mac need stg-1. If stg-1 is lost (or reboots in an upgrade), the Kubernetes API through
   the tunnel is down until it is back; `tunnel_forward_args` in `tunnel.sh` picks stg-1.
-- A fresh create (and any change of the Talos machine config through OpenTofu) is not possible
-  from the Mac now: the Talos provider dials the nodes' public addresses, which only the build
-  server reaches, and the node addresses are new after a recreate (the `ruumtunnel` key line
-  lists them). `up.sh --apply` refuses such a plan before it applies anything. A recreate needs
-  either the Talos resources pointed at the tunnel (`endpoint = 127.0.0.1:1500N`, after a
-  targeted apply of the servers and `ops/tunnel-setup.sh` for the new addresses) or the build
-  server on the staging network; both are follow-ups.
+- A fresh create through the tunnel (backlog O-21, "Admin access") is written and tested
+  offline only; it has not run against real nodes yet. The first one should be watched: the
+  Talos provider sends the machine config to a node in maintenance mode through
+  `127.0.0.1:1500N`, with the node's public address as `node`. On the live nodes the state still
+  holds the public address as the endpoint; a node's resource moves to its tunnel endpoint with
+  its first machine config change through OpenTofu (for example backlog I-6).
 - `ops/buildbox-tunnel-user.sh` turns TCP forwarding off for every user of the build server
   except `ruumtunnel` (`AllowTcpForwarding no` before `Match User ruumtunnel`).
 - The provenance check with `cosign` in the tools container (`ops/image-check.sh`) is written for
