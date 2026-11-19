@@ -1,0 +1,21 @@
+-- A purged node may have binding rows (card B-1; review-b1 required change 1).
+--
+-- Contract step (design 12.7, decision 42): this drops a constraint and no data. The previous
+-- release keeps working: it writes no `app_bindings` rows (before card B-1 every binding was
+-- refused) and no reader depends on the constraint.
+--
+-- `app_bindings` kept a foreign key from `(tenant_id, target_node_id)` to `nodes`. Revoked
+-- rows stay for history, so the purge of a node that was ever a binding target (or of a folder
+-- above one) failed with SQLSTATE 23503, and "empty trash" stopped at that root. Without the
+-- key the purge goes through, and the repair pass of the bindings ends the active rows of a
+-- gone target (`target_gone`, the app as actor) and deletes their tuples. `on delete cascade`
+-- is not used: it would delete the rows with no `app.binding_revoked` entry.
+--
+-- The target stays in the caller's tenant without the key: a binding resolves through the
+-- tenant-filtered node store (mutation `apps-binding-cross-tenant-resolution`), and every
+-- query of `app_bindings` filters by `tenant_id` under row-level security.
+--
+-- The number leaves 0014 and 0015 to card W2S-4 (branch f/w2s-4), which runs in parallel; the
+-- integrator renumbers if needed.
+
+alter table app_bindings drop constraint if exists app_bindings_tenant_id_target_node_id_fkey;

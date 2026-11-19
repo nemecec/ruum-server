@@ -936,11 +936,12 @@ async fn path_tricks_stay_in_the_tenant() {
         );
         assert!(w.sees(d.id, w.docs).await, "{path}");
     }
-    // A member link to `Docs` in the app's folder, and a Cyrillic lookalike.
+    // A member link to `Docs` in the app's folder (made by the owner, who may share `Docs`;
+    // the probe fails when the link cannot be made), and a Cyrillic lookalike.
     let link =
         w.s.nodes
             .create(
-                &w.m(),
+                &w.o(),
                 NewNode {
                     parent_id: w.projects,
                     name: "Docs link".into(),
@@ -953,12 +954,16 @@ async fn path_tricks_stay_in_the_tenant() {
                     on_conflict: OnConflict::Fail,
                 },
             )
-            .await;
-    let mut refused = vec!["/../Projects/Docs", "../../../Docs", "/Pr\u{43e}jects/Docs"];
-    if link.is_ok() {
-        refused.push("../Docs link");
-    }
-    for path in refused {
+            .await
+            .expect("the member link of the probe")
+            .value;
+    assert_eq!(link.kind, NodeKind::Link);
+    for path in [
+        "/../Projects/Docs",
+        "../../../Docs",
+        "/Pr\u{43e}jects/Docs",
+        "../Docs link",
+    ] {
         let e = w
             .deploy(&w.m(), app, &binding(path, "view"), w.projects)
             .await
@@ -1158,4 +1163,244 @@ async fn a_gone_target_ends_its_rows() {
         .await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].revoke_reason, Some(RevokeReason::TargetGone));
+}
+
+/// A preview of `app` with a binding to `Docs`, whose tuple went missing (the repair writes
+/// it again). Returns the preview and its row.
+async fn preview_with_lost_tuple(w: &World, app: NodeId) -> (Uuid, BindingRow) {
+    let dep = w
+        .ready(&w.m(), app, &binding("../Docs", "view"), w.projects)
+        .await;
+    let row = w
+        .rows(BindingQuery {
+            principal: Some(dep),
+            active_only: true,
+            ..Default::default()
+        })
+        .await
+        .remove(0);
+    w.s.authz
+        .write(vec![RelationshipUpdate::Delete(
+            binding_tuple(&row).unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert!(!w.sees(dep, w.docs).await);
+    (dep, row)
+}
+
+/// A seam that revokes `row` (as its app) when the repair reaches `stage`.
+fn revoke_at(
+    w: &World,
+    stage: u8,
+    row: &BindingRow,
+) -> impl Fn(u8) -> futures::future::BoxFuture<'static, ()> + Send + Sync + use<> {
+    let store = w.s.apps.store().clone();
+    let authz = w.s.authz.clone();
+    let (tenant, app, id) = (w.team.id, row.app_node_id, row.id);
+    move |at| {
+        let (store, authz) = (store.clone(), authz.clone());
+        Box::pin(async move {
+            if at == stage {
+                let ended = store
+                    .revoke_bindings(
+                        &app_ctx(tenant, app),
+                        &*authz,
+                        &[id],
+                        RevokeReason::PreviewExpired,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(ended.len(), 1);
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_repair_never_brings_back_a_revoked_binding() {
+    let w = world().await;
+    let app = w.app_in(&w.m(), w.projects, "Planner").await;
+    // Control: without a revocation the repair writes the lost tuple again.
+    let (dep, _) = preview_with_lost_tuple(&w, app).await;
+    assert_eq!(
+        w.s.apps
+            .repair_target_with(w.team.id, w.docs, &|_| Box::pin(async {}))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(w.sees(dep, w.docs).await);
+    // A revocation between the first read of the rows and the read of the tuples.
+    for stage in [1, 2] {
+        let other = w
+            .app_in(&w.m(), w.projects, &format!("Racer {stage}"))
+            .await;
+        let (dep, row) = preview_with_lost_tuple(&w, other).await;
+        w.s.apps
+            .repair_target_with(w.team.id, w.docs, &revoke_at(&w, stage, &row))
+            .await
+            .unwrap();
+        assert!(
+            !w.sees(dep, w.docs).await,
+            "stage {stage}: the repair brought back the tuple of a revoked row"
+        );
+        let r = w
+            .rows(BindingQuery {
+                principal: Some(dep),
+                ..Default::default()
+            })
+            .await;
+        assert!(r.iter().all(|b| !b.is_active()), "stage {stage}: {r:?}");
+    }
+    // The pure rule: a row in the first read only gets no tuple; one in both reads does.
+    let (_, row) = preview_with_lost_tuple(&w, app).await;
+    assert!(repair_updates(std::slice::from_ref(&row), &[], &[]).is_empty());
+    assert_eq!(
+        repair_updates(std::slice::from_ref(&row), &[], std::slice::from_ref(&row)),
+        vec![RelationshipUpdate::Touch(binding_tuple(&row).unwrap())]
+    );
+    // A row granted between the reads: its own grant writes the tuple.
+    assert!(repair_updates(&[], &[], std::slice::from_ref(&row)).is_empty());
+}
+
+#[tokio::test]
+async fn the_repair_ends_the_bindings_of_a_trashed_app_whose_hook_did_not_run() {
+    let w = world().await;
+    let app = w.app_in(&w.m(), w.projects, "Planner").await;
+    let dep = w
+        .ready(&w.m(), app, &binding("../Docs", "view"), w.projects)
+        .await;
+    let live = w.publish(&w.m(), app, dep).await;
+    assert!(w.sees(app.0, w.docs).await && w.sees(dep, w.docs).await);
+    // The app goes to the trash; a pod of the previous release takes the delivery: it reports
+    // `suspended` / `trashed` and runs no binding hook.
+    w.s.nodes.trash(&w.m(), app, None).await.unwrap();
+    let report = |state, reason: Option<&str>| crate::providers::ProviderStatus {
+        node_id: app,
+        state,
+        generation: (crate::now().unix_timestamp_nanos() / 1_000) as i64,
+        observed_version_id: None,
+        reason: reason.map(str::to_string),
+        message: None,
+        detail: None,
+        export: None,
+        at: crate::now(),
+    };
+    // Control: before the report the repair ends nothing.
+    w.s.apps
+        .repair_bindings(w.team.id, None, REPAIR_TARGETS_PER_TENANT)
+        .await
+        .unwrap();
+    assert!(
+        w.sees(app.0, w.docs).await,
+        "the repair ended rows of an app it saw as live"
+    );
+    w.s.typed_nodes
+        .report(
+            w.team.id,
+            &report(crate::providers::ProviderState::Suspended, Some("trashed")),
+        )
+        .await
+        .unwrap();
+    w.s.apps
+        .repair_bindings(w.team.id, None, REPAIR_TARGETS_PER_TENANT)
+        .await
+        .unwrap();
+    assert!(!w.sees(app.0, w.docs).await, "the live tuple stays");
+    assert!(!w.sees(dep, w.docs).await, "the preview tuple stays");
+    let rows = w
+        .rows(BindingQuery {
+            app: Some(app),
+            ..Default::default()
+        })
+        .await;
+    assert!(rows.iter().all(|b| !b.is_active()), "{rows:?}");
+    let live_row = rows.iter().find(|b| b.principal_id == app.0).unwrap();
+    assert_eq!(live_row.revoke_reason, Some(RevokeReason::AppTrashed));
+    let revoked = w.entries(EventType::AppBindingRevoked);
+    assert!(revoked.iter().any(|e| e.data["reason"] == "app_trashed"));
+    assert!(revoked.iter().all(|e| e.actor.actor.id.0 == app.0));
+    // A restore whose delivery has not run yet (the state still says `trashed`), then a
+    // person's publish: the new rows were written after the report and stay.
+    w.s.nodes
+        .restore(&w.o(), app, crate::nodes::RestoreRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(w.publish(&w.m(), app, live).await, live);
+    assert!(w.sees(app.0, w.docs).await);
+    w.s.apps
+        .repair_bindings(w.team.id, None, REPAIR_TARGETS_PER_TENANT)
+        .await
+        .unwrap();
+    assert!(
+        w.sees(app.0, w.docs).await,
+        "the repair ended a grant made after the restore"
+    );
+}
+
+#[tokio::test]
+async fn an_agents_approval_names_the_added_bindings_as_app_bindings() {
+    let w = world().await;
+    let work = folder(&w.s, &w.m(), w.private, "Bot work").await;
+    let inside = folder(&w.s, &w.m(), work, "Inside").await;
+    let bot = w.agent(w.member, Some(work), Role::Manage).await;
+    let app = w.app_in(&w.m(), work, "Bot app").await;
+    let yaml = binding(&format!("node:{inside}"), "view");
+    let dep = w.deploy(&bot, app, &yaml, work).await.unwrap();
+    assert_eq!(
+        w.settled(&bot, app, dep.id).await.state,
+        DeploymentState::Ready
+    );
+    let v = match w
+        .s
+        .apps
+        .publish_deployment(
+            &bot,
+            app,
+            dep.id,
+            PublishDeployment::default(),
+            "https://ruum.test",
+        )
+        .await
+        .unwrap()
+    {
+        Published::ApprovalRequired(v) => v,
+        Published::Live(d) => panic!("an agent published without an approval: {d:?}"),
+    };
+    let changes = &v["approval"]["changes"];
+    assert_eq!(changes["bindings_removed"], json!([]), "{changes}");
+    let added = changes["bindings_added"].as_array().expect("an array");
+    assert_eq!(added.len(), 1, "{changes}");
+    // Every required field of `AppBinding` (contracts/openapi.yaml), with its type.
+    let b = added[0]
+        .as_object()
+        .expect("an AppBinding object, not a name");
+    for key in [
+        "name",
+        "kind",
+        "target_node_id",
+        "role",
+        "api",
+        "scopes",
+        "granted_by",
+    ] {
+        assert!(b.contains_key(key), "AppBinding without {key}: {b:?}");
+    }
+    assert_eq!(b["name"], "docs");
+    assert_eq!(b["kind"], "node");
+    assert_eq!(b["target_node_id"], json!(inside));
+    assert_eq!(b["role"], "view");
+    assert_eq!(b["api"], Value::Null);
+    assert_eq!(b["scopes"], json!([]));
+    assert_eq!(b["granted_by"]["actor"]["kind"], "agent", "{b:?}");
+    assert_eq!(b["granted_by"]["actor"]["id"], json!(bot.actor.actor.id));
+    assert_eq!(b["granted_by"]["on_behalf_of"], json!(w.member));
+    assert!(
+        b["target_node_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .is_ok()
+    );
 }
