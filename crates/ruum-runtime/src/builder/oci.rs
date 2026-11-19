@@ -120,6 +120,11 @@ impl TarWriter {
         Self { out: Vec::new() }
     }
 
+    /// The bytes written so far (without the end-of-archive marker).
+    pub fn written(&self) -> usize {
+        self.out.len()
+    }
+
     fn octal(field: &mut [u8], v: u64) {
         let digits = field.len() - 1;
         // The output cap keeps every size far below 8 GiB (11 octal digits).
