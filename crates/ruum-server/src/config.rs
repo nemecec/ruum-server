@@ -74,6 +74,8 @@ pub struct Config {
     /// `RUUM_SIGNUP_ALLOWED_EMAILS` and `RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS`: the allow-list of
     /// a closed server (`ruum_api::signup`). `None` when neither is set: open.
     pub signup: Option<ruum_api::signup::EmailAllowList>,
+    /// The telemetry role (card O-1b): `RUUM_TELEMETRY` and the `RUUM_TELEMETRY_*` settings.
+    pub telemetry: crate::telemetry::TelemetrySettings,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -139,8 +141,26 @@ impl Config {
                 var("RUUM_SIGNUP_ALLOWED_EMAILS").as_deref(),
                 var("RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS").as_deref(),
             ),
+            telemetry: telemetry_settings()?,
         })
     }
+}
+
+/// The settings of the telemetry role (card O-1b). Each has a safe default; the role starts in
+/// the serving process only with `RUUM_TELEMETRY=on`.
+fn telemetry_settings() -> anyhow::Result<crate::telemetry::TelemetrySettings> {
+    let d = crate::telemetry::TelemetrySettings::default();
+    Ok(crate::telemetry::TelemetrySettings {
+        enabled: crate::telemetry::parse_switch(var("RUUM_TELEMETRY").as_deref())?,
+        grpc_listen: var("RUUM_TELEMETRY_GRPC_LISTEN").unwrap_or(d.grpc_listen),
+        http_listen: var("RUUM_TELEMETRY_HTTP_LISTEN").unwrap_or(d.http_listen),
+        collector_url: var("RUUM_TELEMETRY_COLLECTOR_URL").unwrap_or(d.collector_url),
+        collector_token_file: var("RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE").map(PathBuf::from),
+        loki_url: var("RUUM_LOKI_URL").unwrap_or(d.loki_url),
+        mimir_url: var("RUUM_MIMIR_URL").unwrap_or(d.mimir_url),
+        tempo_url: var("RUUM_TEMPO_URL").unwrap_or(d.tempo_url),
+        shipper_state: var("RUUM_TELEMETRY_SHIPPER_STATE").map(PathBuf::from),
+    })
 }
 
 /// The URL of the WebDAV host when `RUUM_DAV_URL` is not set: `https://dav.<host>/` next to an

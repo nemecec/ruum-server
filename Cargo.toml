@@ -119,6 +119,13 @@ dav-server = { version = "0.11.0", default-features = false }
 # no BuildKit.
 bollard = { version = "0.21.1", default-features = false, features = ["http", "pipe"] }
 
+# OTLP for the telemetry processor (card O-1b; decision 0006 E-5 and F: OTLP protobuf with
+# tonic, approved). The generated messages, gRPC services and clients of opentelemetry-proto;
+# prost encodes and decodes them; tonic serves the gRPC receiver. No JSON OTLP (`with-serde`).
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace"] }
+prost = "0.14.4"
+tonic = { version = "0.14.6", default-features = false, features = ["transport", "router", "codegen"] }
+
 # Tests
 proptest = "1.12.0"
 wiremock = "0.6.5"

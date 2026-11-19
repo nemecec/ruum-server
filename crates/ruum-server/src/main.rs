@@ -7,12 +7,17 @@
 //!
 //! `ruum-server migrate` runs the pending migrations under an advisory lock and exits: the
 //! migration step before a rollout (design 12.7, see `migrate.rs`).
+//!
+//! `ruum-server telemetry` runs only the telemetry role: the OTLP receiver, the driver log
+//! shipper and the real telemetry store (card O-1b, see `telemetry.rs`). The serving process
+//! starts the same role next to the API only with `RUUM_TELEMETRY=on` (default `off`).
 
 mod app;
 mod config;
 mod migrate;
 mod seed;
 mod shutdown;
+mod telemetry;
 mod wiring;
 
 use anyhow::Context as _;
@@ -43,11 +48,13 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut seed_out = None;
     let mut migrate_only = false;
+    let mut telemetry_only = false;
     match args.as_slice() {
         [] => {}
         [cmd, out] if cmd == "seed-dev" => seed_out = Some(out.clone()),
         [cmd] if cmd == "migrate" => migrate_only = true,
-        _ => anyhow::bail!("usage: ruum-server [seed-dev <file> | migrate]"),
+        [cmd] if cmd == "telemetry" => telemetry_only = true,
+        _ => anyhow::bail!("usage: ruum-server [seed-dev <file> | migrate | telemetry]"),
     }
 
     // RUUM_MIGRATE=false without DATABASE_URL refuses to start (Kimi review of O-25, finding 6).
@@ -84,6 +91,15 @@ async fn main() -> anyhow::Result<()> {
     let services = wiring::services(&config.public_url, pool).await?;
     if let Some(out) = seed_out {
         return seed::run(&services, &config.public_url, &out).await;
+    }
+    if telemetry_only {
+        // The telemetry role alone (card O-1b): the receiver, the shipper and the real store.
+        let (stop_handle, stop) = shutdown::stop_pair();
+        tokio::spawn(async move {
+            shutdown::signal().await;
+            stop_handle.stop();
+        });
+        return telemetry::run(&config.telemetry, &services, stop).await;
     }
     // The delivery worker and the reconciler of typed nodes (card D-1).
     wiring::start_typed_node_tasks(&services);
@@ -140,6 +156,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %config.dav_bind, url = %config.dav_url, "WebDAV host listening");
     // One stop signal for every listener (SIGTERM from Kubernetes, or Ctrl-C).
     let (stop_handle, stop) = shutdown::stop_pair();
+    // The telemetry role next to the API, only with RUUM_TELEMETRY=on (card O-1b).
+    if telemetry::starts_with_server(&config.telemetry) {
+        let (settings, services, stop) = (config.telemetry.clone(), services.clone(), stop.clone());
+        tokio::spawn(async move {
+            if let Err(e) = telemetry::run(&settings, &services, stop).await {
+                tracing::error!(error = %e, "the telemetry role stopped");
+            }
+        });
+    }
     let grace = config.shutdown_grace;
     tokio::spawn(async move {
         shutdown::signal().await;

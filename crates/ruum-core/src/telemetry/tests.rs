@@ -1345,3 +1345,6 @@ async fn reads_are_oldest_first_by_record_time() {
         assert_eq!(metrics, want_m, "metrics, limit {limit:?}");
     }
 }
+
+// Card O-1b.
+mod o1b;

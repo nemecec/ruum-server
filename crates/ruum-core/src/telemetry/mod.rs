@@ -43,12 +43,15 @@ pub mod conformance;
 pub mod denylist;
 pub mod erasure;
 pub mod errors;
+pub mod lgtm;
 pub mod memory;
+pub mod otlp;
 pub mod processor;
 pub mod query;
 pub mod raw_copy;
 pub mod scrub;
 pub mod secrets;
+pub mod source;
 
 #[cfg(test)]
 mod tests;

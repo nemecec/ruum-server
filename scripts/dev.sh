@@ -24,6 +24,10 @@ STATE="$DEV/.state"
 # The local key-encryption key of the tenant pseudonym keys (decision 0004-16, docs/DEVSTACK.md).
 # It lives and dies with the platform database volume: `up` makes it, `clean` deletes it.
 KEK_FILE="$STATE/tenant-keys.kek"
+# The write token of the telemetry Collector (card O-1b): only the processor role of ruum-server
+# (RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE) writes to the Collector. deploy/dev/otel/compose.yaml
+# mounts it into the Collector; `up` makes it, `clean` deletes it.
+COLLECTOR_TOKEN_FILE="$STATE/otel/collector-token"
 # The SQLite files of the db host (docs/STEP2.md "Infrastructure work" 4): one directory per
 # tenant, one file per database. The litestream service replicates them to SQLITE_BUCKET.
 SQLITE_DIR="$DEV/data/sqlite"
@@ -32,7 +36,8 @@ ZITADEL_URL="http://localhost:8180"
 
 # No provenance attestation: it carries a build time, so every `up --build` would give the postgres
 # image a new ID and recreate the container (seen with buildx and the containerd image store).
-compose() { BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --project-directory "$DEV" -f "$DEV/docker-compose.yml" --env-file "$ENV_FILE" "$@"; }
+# deploy/dev/otel/compose.yaml adds the Collector's token mount (card O-1b).
+compose() { BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --project-directory "$DEV" -f "$DEV/docker-compose.yml" -f "$DEV/otel/compose.yaml" --env-file "$ENV_FILE" "$@"; }
 # Every profile, so that down, clean and status reach the services of each one.
 ALL_PROFILES=(--profile step4 --profile sso-mock --profile apps)
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
@@ -143,6 +148,20 @@ ensure_kek() {
   rm -f "$tmp"
 }
 
+# The Collector's write token: 32 random bytes as hex, made once. Mode 644: the Collector runs as
+# a non-root user in its container and reads it through a bind mount (a laptop secret only).
+ensure_collector_token() {
+  need openssl
+  mkdir -p "$(dirname "$COLLECTOR_TOKEN_FILE")"
+  [[ -s "$COLLECTOR_TOKEN_FILE" ]] && return
+  log "creating the Collector write token deploy/dev/.state/otel/collector-token"
+  local tmp
+  tmp="$(umask 077 && mktemp "$(dirname "$COLLECTOR_TOKEN_FILE")/.collector-token.XXXXXX")"
+  openssl rand -hex 32 >"$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$COLLECTOR_TOKEN_FILE"
+}
+
 # OpenBao transit with the key that wraps tenant keys in production (`ruum-tenant-keys`). Dev
 # OpenBao is in memory, so this runs at every `up`; the laptop server uses the KEK file instead.
 init_openbao() {
@@ -251,6 +270,7 @@ cmd_up() {
   need docker
   ensure_env
   ensure_kek
+  ensure_collector_token
   mkdir -p "$STATE/zitadel"
   # Made here, not by docker: a bind mount that docker creates belongs to root.
   mkdir -p "$SQLITE_DIR"
@@ -374,6 +394,8 @@ export RUUM_OTLP_GRPC_ENDPOINT=http://127.0.0.1:$OTLP_GRPC_PORT
 export RUUM_LOKI_URL=http://127.0.0.1:$LOKI_PORT
 export RUUM_MIMIR_URL=http://127.0.0.1:$MIMIR_PORT
 export RUUM_TEMPO_URL=http://127.0.0.1:$TEMPO_PORT
+export RUUM_TELEMETRY_COLLECTOR_URL=http://127.0.0.1:$OTLP_HTTP_PORT
+export RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE=$COLLECTOR_TOKEN_FILE
 EOF
 }
 

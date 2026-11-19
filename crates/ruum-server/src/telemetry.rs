@@ -1,0 +1,783 @@
+//! The telemetry role of `ruum-server` (card O-1b; decision 0006 answer 4): the OTLP receiver
+//! over gRPC (tonic) and HTTP/protobuf (axum), the driver log shipper, and the real store over
+//! the Collector and Loki, Mimir and Tempo (`ruum_core::telemetry::lgtm`).
+//!
+//! `ruum-server telemetry` runs only this role. The serving process starts it too, but only
+//! with `RUUM_TELEMETRY=on` (default `off`), so a deploy that does not set it does not change.
+//!
+//! # A request
+//!
+//! 1. **Authenticate** the source from facts the receiver saw itself: the peer address, the
+//!    listener, an optional bearer token ([`SourceFacts`]). Nothing of the request's content,
+//!    headers (other than the bearer token, which is refused until card R-3) or query decides
+//!    the identity. An unknown source gets `401` / `UNAUTHENTICATED`; nothing is read further.
+//! 2. **Budget**: one request of the identity's rate ([`FairBudget`]); `429` /
+//!    `RESOURCE_EXHAUSTED` when over.
+//! 3. **Read the body** (HTTP): capped at `Limits::max_batch_bytes` (`413`) and bounded in time
+//!    (`408` for a client that trickles bytes). gRPC: tonic's decoding size limit and the
+//!    request timeout.
+//! 4. **Decode and map** ([`otlp`]): malformed `400` / `INVALID_ARGUMENT`; too many records
+//!    `413` / `INVALID_ARGUMENT`.
+//! 5. **Bytes budget** of the identity and its tenant's share of the in-flight bytes.
+//! 6. **Ingest** with the authenticated identity ([`TelemetryIngest`]).
+//!
+//! The answers carry counts and reason names only (OTLP partial success), never an attribute
+//! name or value. The `tracing` events carry the identity, the listener, the peer address,
+//! the reason and the counts.
+//!
+//! # Wiring that waits for other cards
+//!
+//! - The source lookup on the Docker driver (container address on its app network) and the
+//!   app-network listeners: cards I-4 and I-6. Until then the role uses
+//!   [`NetworkSourceAuthenticator::refuse_all`]: every request is refused.
+//! - The secret lookup (`WorkloadSpec::redacted_values` of the running instances) and the
+//!   instance list of the shipper: the Docker driver of I-4/I-6. Until then: none.
+//! - The field classes: the in-memory class source with no rows, so every field is
+//!   unclassified and so `personal` (the safe default), until card O-2 adds the Postgres one.
+
+use anyhow::Context as _;
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
+    LogsService, LogsServiceServer,
+};
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
+    MetricsService, MetricsServiceServer,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{
+    TraceService, TraceServiceServer,
+};
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
+use prost::Message as _;
+use ruum_core::telemetry::otlp::{self, Mapped, Refusal};
+use ruum_core::telemetry::processor::{BudgetConfig, BudgetRefusal, FairBudget};
+use ruum_core::telemetry::source::{
+    BearerToken, ListenerId, SourceAuthenticator, SourceError, SourceFacts,
+};
+use ruum_core::telemetry::{IngestReport, Limits, Signal, SourceIdentity, TelemetryIngest};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------- settings
+
+/// The default gRPC listener of the receiver: not the Collector's 4317.
+pub const DEFAULT_GRPC_LISTEN: &str = "127.0.0.1:4417";
+/// The default HTTP listener of the receiver: not the Collector's 4318.
+pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:4418";
+/// How long a client may take to send a request body.
+pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The settings of the telemetry role (`crates/ruum-server/src/config.rs` reads them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelemetrySettings {
+    /// `RUUM_TELEMETRY` (`on` or `off`, default `off`): the serving process starts the role.
+    pub enabled: bool,
+    /// `RUUM_TELEMETRY_GRPC_LISTEN` (default [`DEFAULT_GRPC_LISTEN`]).
+    pub grpc_listen: String,
+    /// `RUUM_TELEMETRY_HTTP_LISTEN` (default [`DEFAULT_HTTP_LISTEN`]).
+    pub http_listen: String,
+    /// `RUUM_TELEMETRY_COLLECTOR_URL`: the Collector's OTLP/HTTP URL (default
+    /// `http://127.0.0.1:4318`, the laptop stack).
+    pub collector_url: String,
+    /// `RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE`: the file with the processor's Collector token
+    /// (`scripts/dev.sh` writes `deploy/dev/.state/otel/collector-token`). Without it every
+    /// write is refused by the Collector.
+    pub collector_token_file: Option<PathBuf>,
+    /// `RUUM_LOKI_URL`, `RUUM_MIMIR_URL`, `RUUM_TEMPO_URL` (the laptop stack's defaults).
+    pub loki_url: String,
+    pub mimir_url: String,
+    pub tempo_url: String,
+    /// `RUUM_TELEMETRY_SHIPPER_STATE`: the shipper's position file. Without it the positions
+    /// live in memory (a restart reads the driver's buffer again).
+    pub shipper_state: Option<PathBuf>,
+}
+
+impl Default for TelemetrySettings {
+    fn default() -> Self {
+        TelemetrySettings {
+            enabled: false,
+            grpc_listen: DEFAULT_GRPC_LISTEN.into(),
+            http_listen: DEFAULT_HTTP_LISTEN.into(),
+            collector_url: "http://127.0.0.1:4318".into(),
+            collector_token_file: None,
+            loki_url: "http://127.0.0.1:3100".into(),
+            mimir_url: "http://127.0.0.1:9009".into(),
+            tempo_url: "http://127.0.0.1:3200".into(),
+            shipper_state: None,
+        }
+    }
+}
+
+/// Whether the serving process starts the role next to the API: only with `RUUM_TELEMETRY=on`.
+pub fn starts_with_server(settings: &TelemetrySettings) -> bool {
+    settings.enabled
+}
+
+/// Reads `RUUM_TELEMETRY` (`on`/`off`, also `true`/`false`).
+pub fn parse_switch(value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "on" | "true" => Ok(true),
+            "off" | "false" => Ok(false),
+            _ => anyhow::bail!("RUUM_TELEMETRY must be on or off"),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------- receiver
+
+/// Why the receiver refused a request. Reasons only, never content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    Unauthenticated(SourceError),
+    Budget(BudgetRefusal),
+    Request(Refusal),
+    /// The body did not arrive within the body timeout.
+    SlowBody,
+    /// The content type or encoding is not OTLP protobuf without compression.
+    Unsupported,
+    /// The pipeline or the store failed.
+    Unavailable,
+}
+
+impl Refused {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Refused::Unauthenticated(e) => e.as_str(),
+            Refused::Budget(b) => b.as_str(),
+            Refused::Request(r) => r.as_str(),
+            Refused::SlowBody => "slow_body",
+            Refused::Unsupported => "unsupported_media_type",
+            Refused::Unavailable => "unavailable",
+        }
+    }
+
+    fn http_status(self) -> StatusCode {
+        match self {
+            Refused::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
+            Refused::Budget(_) => StatusCode::TOO_MANY_REQUESTS,
+            Refused::Request(Refusal::Malformed) => StatusCode::BAD_REQUEST,
+            Refused::Request(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Refused::SlowBody => StatusCode::REQUEST_TIMEOUT,
+            Refused::Unsupported => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Refused::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn grpc_status(self) -> tonic::Status {
+        let msg = self.reason();
+        match self {
+            Refused::Unauthenticated(_) => tonic::Status::unauthenticated(msg),
+            Refused::Budget(_) => tonic::Status::resource_exhausted(msg),
+            Refused::Request(_) | Refused::Unsupported | Refused::SlowBody => {
+                tonic::Status::invalid_argument(msg)
+            }
+            Refused::Unavailable => tonic::Status::unavailable(msg),
+        }
+    }
+}
+
+/// What an accepted request did: counts for the OTLP partial success.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Accepted {
+    pub records: u64,
+    pub stored: u64,
+    pub report: IngestReport,
+}
+
+impl Accepted {
+    pub fn rejected(&self) -> i64 {
+        i64::try_from(self.records.saturating_sub(self.stored)).unwrap_or(i64::MAX)
+    }
+
+    /// The partial-success message: drop reasons and counts, never a value or a name.
+    pub fn message(&self) -> String {
+        if self.rejected() == 0 {
+            return String::new();
+        }
+        let parts: Vec<String> = self
+            .report
+            .dropped
+            .iter()
+            .map(|(r, n)| {
+                let name = serde_json::to_value(r)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                format!("{name}={n}")
+            })
+            .collect();
+        format!("dropped records: {}", parts.join(", "))
+    }
+}
+
+/// The receiver: shared by the gRPC and the HTTP listeners.
+pub struct Receiver {
+    auth: Arc<dyn SourceAuthenticator>,
+    ingest: Arc<dyn TelemetryIngest>,
+    budget: Arc<FairBudget>,
+    limits: Limits,
+    body_timeout: Duration,
+}
+
+impl Receiver {
+    pub fn new(
+        auth: Arc<dyn SourceAuthenticator>,
+        ingest: Arc<dyn TelemetryIngest>,
+        budget: Arc<FairBudget>,
+        limits: Limits,
+    ) -> Arc<Self> {
+        Arc::new(Receiver {
+            auth,
+            ingest,
+            budget,
+            limits,
+            body_timeout: DEFAULT_BODY_TIMEOUT,
+        })
+    }
+
+    /// The same receiver with another body timeout (tests use a short one).
+    #[cfg(test)]
+    pub fn with_body_timeout(self: Arc<Self>, timeout: Duration) -> Arc<Self> {
+        Arc::new(Receiver {
+            auth: self.auth.clone(),
+            ingest: self.ingest.clone(),
+            budget: self.budget.clone(),
+            limits: self.limits,
+            body_timeout: timeout,
+        })
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Steps 1 and 2: the identity and one request of its rate.
+    async fn admit(&self, facts: &SourceFacts) -> Result<SourceIdentity, Refused> {
+        let identity = match self.auth.authenticate(facts).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::info!(
+                    listener = %facts.listener,
+                    peer = %facts.peer.ip(),
+                    reason = e.as_str(),
+                    "telemetry: request refused (no identity)"
+                );
+                return Err(Refused::Unauthenticated(e));
+            }
+        };
+        if let Err(b) = self.budget.admit_request(&identity) {
+            log_budget(&identity, b, 0, 0);
+            return Err(Refused::Budget(b));
+        }
+        Ok(identity)
+    }
+
+    /// Steps 5 and 6: the bytes budget and the pipeline.
+    async fn ingest(
+        &self,
+        identity: &SourceIdentity,
+        bytes: u64,
+        mapped: Mapped,
+    ) -> Result<Accepted, Refused> {
+        let records = mapped.records;
+        let _permit = match self.budget.admit_bytes(identity, bytes) {
+            Ok(p) => p,
+            Err(b) => {
+                log_budget(identity, b, bytes, records);
+                return Err(Refused::Budget(b));
+            }
+        };
+        let Mapped { batch, dropped, .. } = mapped;
+        let mut report = match self.ingest.ingest(identity, batch).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %identity.tenant,
+                    app = %identity.app,
+                    deployment = %identity.deployment,
+                    environment = identity.environment.as_str(),
+                    records,
+                    error = %e,
+                    "telemetry: the pipeline or the store failed"
+                );
+                return Err(Refused::Unavailable);
+            }
+        };
+        for (reason, n) in dropped {
+            *report.dropped.entry(reason).or_default() += n;
+        }
+        let stored = report.stored_logs + report.stored_metrics + report.stored_spans;
+        Ok(Accepted {
+            records,
+            stored,
+            report,
+        })
+    }
+
+    fn refuse_request(facts: &SourceFacts, identity: &SourceIdentity, r: Refusal) -> Refused {
+        tracing::info!(
+            listener = %facts.listener,
+            tenant = %identity.tenant,
+            app = %identity.app,
+            deployment = %identity.deployment,
+            reason = r.as_str(),
+            "telemetry: request refused"
+        );
+        Refused::Request(r)
+    }
+}
+
+fn log_budget(identity: &SourceIdentity, b: BudgetRefusal, bytes: u64, records: u64) {
+    tracing::warn!(
+        tenant = %identity.tenant,
+        app = %identity.app,
+        deployment = %identity.deployment,
+        environment = identity.environment.as_str(),
+        reason = b.as_str(),
+        bytes,
+        records,
+        "telemetry: request refused by the budget"
+    );
+}
+
+// ---------------------------------------------------------------------------- HTTP
+
+/// The HTTP/protobuf receiver: `POST /v1/logs`, `/v1/metrics`, `/v1/traces`.
+#[derive(Clone)]
+struct HttpState {
+    receiver: Arc<Receiver>,
+    listener: ListenerId,
+}
+
+/// The HTTP router of the receiver on one listener.
+pub fn http_router(receiver: Arc<Receiver>, listener: ListenerId) -> Router {
+    Router::new()
+        .route("/v1/logs", post(http_logs))
+        .route("/v1/metrics", post(http_metrics))
+        .route("/v1/traces", post(http_traces))
+        .with_state(HttpState { receiver, listener })
+}
+
+async fn http_logs(
+    State(s): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    http_export(s, peer, headers, body, Signal::Logs).await
+}
+
+async fn http_metrics(
+    State(s): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    http_export(s, peer, headers, body, Signal::Metrics).await
+}
+
+async fn http_traces(
+    State(s): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    http_export(s, peer, headers, body, Signal::Traces).await
+}
+
+/// The bearer token of an `Authorization` header, if any.
+fn bearer_of(headers: &HeaderMap) -> Option<BearerToken> {
+    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = v.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| BearerToken::new(token.trim()))
+}
+
+fn refused_response(r: Refused) -> Response {
+    let mut res = (r.http_status(), r.reason()).into_response();
+    if matches!(r, Refused::Budget(_)) {
+        res.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    res
+}
+
+async fn http_export(
+    s: HttpState,
+    peer: SocketAddr,
+    headers: HeaderMap,
+    body: Body,
+    signal: Signal,
+) -> Response {
+    let facts = SourceFacts {
+        peer,
+        listener: s.listener.clone(),
+        bearer: bearer_of(&headers),
+    };
+    let r = &s.receiver;
+    let identity = match r.admit(&facts).await {
+        Ok(id) => id,
+        Err(e) => return refused_response(e),
+    };
+    // OTLP protobuf without compression only (JSON OTLP is optional and not built).
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let encoded = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"));
+    if !content_type.starts_with("application/x-protobuf") || encoded {
+        return refused_response(Refused::Unsupported);
+    }
+    let cap = r.limits.max_batch_bytes;
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > cap) {
+        return refused_response(Receiver::refuse_request(
+            &facts,
+            &identity,
+            Refusal::BodyTooLarge,
+        ));
+    }
+    // A body over the cap is cut at cap + 1 bytes, so the decoder sees it is too large.
+    let bytes = match tokio::time::timeout(r.body_timeout, axum::body::to_bytes(body, cap + 1))
+        .await
+    {
+        Err(_) => {
+            tracing::info!(listener = %facts.listener, tenant = %identity.tenant, app = %identity.app, reason = "slow_body", "telemetry: request refused");
+            return refused_response(Refused::SlowBody);
+        }
+        Ok(Err(_)) => {
+            return refused_response(Receiver::refuse_request(
+                &facts,
+                &identity,
+                Refusal::BodyTooLarge,
+            ));
+        }
+        Ok(Ok(b)) => b,
+    };
+    let decoded = match signal {
+        Signal::Logs => otlp::decode_logs(&bytes, &r.limits),
+        Signal::Metrics => otlp::decode_metrics(&bytes, &r.limits),
+        Signal::Traces => otlp::decode_traces(&bytes, &r.limits),
+    };
+    let mapped = match decoded {
+        Ok(m) => m,
+        Err(e) => return refused_response(Receiver::refuse_request(&facts, &identity, e)),
+    };
+    match r.ingest(&identity, bytes.len() as u64, mapped).await {
+        Ok(a) => http_success(signal, &a),
+        Err(e) => refused_response(e),
+    }
+}
+
+fn http_success(signal: Signal, a: &Accepted) -> Response {
+    let partial = |rejected: i64, message: String| (rejected, message);
+    let (rejected, message) = partial(a.rejected(), a.message());
+    let body = match signal {
+        Signal::Logs => ExportLogsServiceResponse {
+            partial_success: (rejected > 0).then_some(ExportLogsPartialSuccess {
+                rejected_log_records: rejected,
+                error_message: message,
+            }),
+        }
+        .encode_to_vec(),
+        Signal::Metrics => ExportMetricsServiceResponse {
+            partial_success: (rejected > 0).then_some(ExportMetricsPartialSuccess {
+                rejected_data_points: rejected,
+                error_message: message,
+            }),
+        }
+        .encode_to_vec(),
+        Signal::Traces => ExportTraceServiceResponse {
+            partial_success: (rejected > 0).then_some(ExportTracePartialSuccess {
+                rejected_spans: rejected,
+                error_message: message,
+            }),
+        }
+        .encode_to_vec(),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-protobuf")],
+        body,
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------- gRPC
+
+/// The gRPC receiver on one listener.
+#[derive(Clone)]
+pub struct GrpcReceiver {
+    receiver: Arc<Receiver>,
+    listener: ListenerId,
+}
+
+impl GrpcReceiver {
+    pub fn new(receiver: Arc<Receiver>, listener: ListenerId) -> Self {
+        GrpcReceiver { receiver, listener }
+    }
+
+    fn facts<T>(&self, req: &tonic::Request<T>) -> Option<SourceFacts> {
+        let peer = req.remote_addr()?;
+        let bearer = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                let (scheme, token) = v.split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case("bearer")
+                    .then(|| BearerToken::new(token.trim()))
+            });
+        Some(SourceFacts {
+            peer,
+            listener: self.listener.clone(),
+            bearer,
+        })
+    }
+
+    /// Authenticates, maps and ingests one decoded request.
+    async fn export<T: prost::Message>(
+        &self,
+        req: tonic::Request<T>,
+        map: impl FnOnce(T, &Limits) -> Result<Mapped, Refusal>,
+    ) -> Result<Accepted, tonic::Status> {
+        // Without a peer address there is no identity.
+        let facts = self
+            .facts(&req)
+            .ok_or_else(|| Refused::Unauthenticated(SourceError::UnknownSource).grpc_status())?;
+        let r = &self.receiver;
+        let identity = r.admit(&facts).await.map_err(Refused::grpc_status)?;
+        let msg = req.into_inner();
+        let bytes = msg.encoded_len() as u64;
+        if bytes > r.limits.max_batch_bytes as u64 {
+            return Err(
+                Receiver::refuse_request(&facts, &identity, Refusal::BodyTooLarge).grpc_status(),
+            );
+        }
+        let mapped = map(msg, &r.limits)
+            .map_err(|e| Receiver::refuse_request(&facts, &identity, e).grpc_status())?;
+        r.ingest(&identity, bytes, mapped)
+            .await
+            .map_err(Refused::grpc_status)
+    }
+}
+
+#[tonic::async_trait]
+impl LogsService for GrpcReceiver {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportLogsServiceRequest>,
+    ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+        let a = GrpcReceiver::export(self, request, otlp::map_logs).await?;
+        let rejected = a.rejected();
+        Ok(tonic::Response::new(ExportLogsServiceResponse {
+            partial_success: (rejected > 0).then(|| ExportLogsPartialSuccess {
+                rejected_log_records: rejected,
+                error_message: a.message(),
+            }),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl MetricsService for GrpcReceiver {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        let a = GrpcReceiver::export(self, request, otlp::map_metrics).await?;
+        let rejected = a.rejected();
+        Ok(tonic::Response::new(ExportMetricsServiceResponse {
+            partial_success: (rejected > 0).then(|| ExportMetricsPartialSuccess {
+                rejected_data_points: rejected,
+                error_message: a.message(),
+            }),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl TraceService for GrpcReceiver {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportTraceServiceRequest>,
+    ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+        let a = GrpcReceiver::export(self, request, otlp::map_traces).await?;
+        let rejected = a.rejected();
+        Ok(tonic::Response::new(ExportTraceServiceResponse {
+            partial_success: (rejected > 0).then(|| ExportTracePartialSuccess {
+                rejected_spans: rejected,
+                error_message: a.message(),
+            }),
+        }))
+    }
+}
+
+/// The gRPC request timeout (a client that trickles a message is cut off).
+pub const GRPC_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Serves the gRPC receiver on `listener` until `stop` resolves.
+pub async fn serve_grpc(
+    receiver: Arc<Receiver>,
+    name: ListenerId,
+    listener: tokio::net::TcpListener,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let max = receiver.limits().max_batch_bytes;
+    let svc = GrpcReceiver::new(receiver, name);
+    tonic::transport::Server::builder()
+        .timeout(GRPC_TIMEOUT)
+        .concurrency_limit_per_connection(32)
+        .add_service(LogsServiceServer::new(svc.clone()).max_decoding_message_size(max))
+        .add_service(MetricsServiceServer::new(svc.clone()).max_decoding_message_size(max))
+        .add_service(TraceServiceServer::new(svc).max_decoding_message_size(max))
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            stop,
+        )
+        .await
+        .context("the telemetry gRPC receiver stopped")
+}
+
+/// Serves the HTTP receiver on `listener` until `stop` resolves.
+pub async fn serve_http(
+    receiver: Arc<Receiver>,
+    name: ListenerId,
+    listener: tokio::net::TcpListener,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let router = http_router(receiver, name);
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(stop)
+    .await
+    .context("the telemetry HTTP receiver stopped")
+}
+
+// ---------------------------------------------------------------------------- the role
+
+/// The local listener's name. App-network listeners (cards I-4, I-6) get their own names.
+pub const LOCAL_LISTENER: &str = "local";
+
+/// Builds and runs the role: the receiver on both listeners and the shipper, with the real
+/// store, until `stop` resolves.
+pub async fn run(
+    settings: &TelemetrySettings,
+    services: &ruum_core::Services,
+    stop: crate::shutdown::Stop,
+) -> anyhow::Result<()> {
+    use ruum_core::telemetry::lgtm::{LgtmConfig, LgtmStore};
+    use ruum_core::telemetry::memory::MemoryFieldClasses;
+    use ruum_core::telemetry::processor::{
+        FilePositions, LogShipper, MemoryPositions, PositionStore, ShipperConfig,
+        WorkloadSecretSource,
+    };
+    use ruum_core::telemetry::source::NetworkSourceAuthenticator;
+    use ruum_core::telemetry::{PipelineIngest, TelemetryStore};
+
+    let token = match &settings.collector_token_file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| {
+                format!(
+                    "read RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE ({})",
+                    path.display()
+                )
+            })?
+            .trim()
+            .to_owned(),
+        None => {
+            tracing::warn!(
+                "RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE is not set: the Collector refuses every write"
+            );
+            String::new()
+        }
+    };
+    let store: Arc<dyn TelemetryStore> = Arc::new(LgtmStore::new(LgtmConfig {
+        collector_url: settings.collector_url.clone(),
+        loki_url: settings.loki_url.clone(),
+        mimir_url: settings.mimir_url.clone(),
+        tempo_url: settings.tempo_url.clone(),
+        collector_token: ruum_core::runtime::SecretValue::new(token),
+        timeout: Duration::from_secs(30),
+    })?);
+    // No Postgres class source before card O-2: every field is unclassified, so `personal`.
+    let classes = Arc::new(MemoryFieldClasses::new());
+    // No driver lookup before cards I-4 and I-6: no secret values to match (the driver
+    // redacts its own log lines; the deny-list, classes and scrubber still run).
+    let secrets = Arc::new(WorkloadSecretSource::empty());
+    let ingest: Arc<dyn TelemetryIngest> = Arc::new(PipelineIngest::new(
+        store,
+        classes,
+        secrets,
+        (*services.tenant_keys).clone(),
+        services.apps.usage().clone(),
+    ));
+    // No source lookup before cards I-4 and I-6: every request is refused.
+    let auth = Arc::new(NetworkSourceAuthenticator::refuse_all());
+    let receiver = Receiver::new(
+        auth,
+        ingest.clone(),
+        FairBudget::new(BudgetConfig::default()),
+        Limits::default(),
+    );
+    let positions: Arc<dyn PositionStore> = match &settings.shipper_state {
+        Some(path) => Arc::new(FilePositions::new(path.clone())),
+        None => Arc::new(MemoryPositions::new()),
+    };
+    // The instance list of the Docker driver comes with cards I-4 and I-6.
+    let shipper = Arc::new(
+        LogShipper::new(
+            services.apps.deps().runtime.clone(),
+            Arc::new(Vec::new),
+            ingest,
+            positions,
+            ShipperConfig::default(),
+        )
+        .await?,
+    );
+
+    let grpc = tokio::net::TcpListener::bind(&settings.grpc_listen)
+        .await
+        .with_context(|| format!("bind {} (RUUM_TELEMETRY_GRPC_LISTEN)", settings.grpc_listen))?;
+    let http = tokio::net::TcpListener::bind(&settings.http_listen)
+        .await
+        .with_context(|| format!("bind {} (RUUM_TELEMETRY_HTTP_LISTEN)", settings.http_listen))?;
+    tracing::info!(grpc = %settings.grpc_listen, http = %settings.http_listen, "telemetry receiver listening");
+    let name = ListenerId::new(LOCAL_LISTENER);
+    let shipper_task = tokio::spawn(shipper.run(stop.clone().stopped()));
+    let r = tokio::try_join!(
+        serve_grpc(receiver.clone(), name.clone(), grpc, stop.clone().stopped()),
+        serve_http(receiver, name, http, stop.stopped()),
+    );
+    shipper_task.abort();
+    r.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests;

@@ -27,6 +27,9 @@ jsonwebtoken.workspace = true
 # The manifest schema of database nodes (card D-1): `contracts/manifests/database.schema.json`.
 jsonschema.workspace = true
 object_store.workspace = true
+# OTLP messages of the telemetry processor (card O-1b).
+opentelemetry-proto.workspace = true
+prost.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 reqwest.workspace = true
