@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use ruum_core::actor::{Actor, PrincipalKind, PrincipalRef};
 use ruum_core::journal::memory::MemoryJournal;
-use ruum_core::journal::{EventType, JournalEntry, NewEntry, encode_cursor};
+use ruum_core::journal::{EventType, JournalEntry, NewEntry, READ_ONLY_EVENTS, encode_cursor};
 use ruum_core::{PrincipalId, Result, TenantId, UserId};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -198,6 +198,31 @@ fn sample(event: EventType, user: UserId) -> Value {
 }
 
 /// A journal with one entry of every event type, by a user and by an agent.
+/// The event types this release writes: [`EventType::ALL`] without `read_only` (design 12.7:
+/// a type in `READ_ONLY_EVENTS` is known and read, never written).
+fn writable_events(read_only: &[EventType]) -> Vec<EventType> {
+    EventType::ALL
+        .iter()
+        .copied()
+        .filter(|e| !read_only.contains(e))
+        .collect()
+}
+
+#[test]
+fn writable_events_leave_out_read_only_types() {
+    let all = writable_events(&[]);
+    assert_eq!(all, EventType::ALL.to_vec());
+    let some = writable_events(&[EventType::GrantRemoved]);
+    assert_eq!(some.len(), EventType::ALL.len() - 1);
+    assert!(!some.contains(&EventType::GrantRemoved));
+    // The fixture appends exactly these, so a non-empty `READ_ONLY_EVENTS` never panics it.
+    assert_eq!(
+        writable_events(READ_ONLY_EVENTS).len(),
+        EventType::ALL.len() - READ_ONLY_EVENTS.len()
+    );
+}
+
+/// One entry of every type this release writes ([`writable_events`]), in that order.
 fn journal_with_every_event(tenant: TenantId, user: UserId) -> Arc<MemoryJournal> {
     let journal = Arc::new(MemoryJournal::default());
     let user_ctx = Context {
@@ -209,7 +234,7 @@ fn journal_with_every_event(tenant: TenantId, user: UserId) -> Arc<MemoryJournal
     let agent = agent_ctx(tenant, user);
     // One node for all entries, so the purge has a known last parent.
     let node = NodeId::new();
-    for (i, event) in EventType::ALL.iter().enumerate() {
+    for (i, event) in writable_events(READ_ONLY_EVENTS).iter().enumerate() {
         let purged = *event == EventType::NodePurged;
         journal
             .append(
@@ -292,7 +317,8 @@ async fn every_entry_of_a_real_response_validates_against_the_contract() {
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_changes_page(&page);
     let items = page["items"].as_array().unwrap();
-    assert_eq!(items.len(), EventType::ALL.len());
+    let written = writable_events(READ_ONLY_EVENTS);
+    assert_eq!(items.len(), written.len());
     for item in items {
         let errs = errors(&validator, item);
         assert!(errs.is_empty(), "{item}\n{}", errs.join("\n"));
@@ -302,7 +328,7 @@ async fn every_entry_of_a_real_response_validates_against_the_contract() {
 
     // Every event type is in the response; agents carry on_behalf_of.
     let types: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
-    let expected: Vec<&str> = EventType::ALL.iter().map(|e| e.as_str()).collect();
+    let expected: Vec<&str> = written.iter().map(|e| e.as_str()).collect();
     assert_eq!(types, expected);
     assert_eq!(items[1]["actor"]["kind"], "agent");
     assert_eq!(items[1]["on_behalf_of"], json!(user));
@@ -460,7 +486,7 @@ async fn the_latest_cursor_follows_from_now() {
     };
     let latest = feed::latest_cursor(journal.as_ref(), &ctx).await.unwrap();
     let body = serde_json::to_value(&latest).unwrap();
-    assert_eq!(body["seq"], EventType::ALL.len() as i64);
+    assert_eq!(body["seq"], writable_events(READ_ONLY_EVENTS).len() as i64);
     assert!(body["cursor"].is_string());
     let app = app(journal, ctx);
     let (_, page) = get_json(

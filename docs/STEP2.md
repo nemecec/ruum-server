@@ -471,7 +471,8 @@ cards that must be merged first. Every card that builds an operation also remove
 `x-ruum-status: planned` mark and its `PLANNED_OPERATIONS` entry, regenerates
 `crates/ruum-mcp/src/tools.json`, and seeds what its standard request needs in
 `crates/ruum-testkit/src/fixtures.rs` (the fixture field names stay); a card that writes the
-first entry of an event type adds it to `EventType` and removes it from `$defs/planned_types`. These
+first entry of an event type adds it to `EventType` and removes it from `$defs/planned_types` (a type
+that can change who sees a node does this one release earlier, with `READ_ONLY_EVENTS`; design 12.7). These
 files are not listed again under "May change".
 
 ```markdown

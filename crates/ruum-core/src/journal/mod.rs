@@ -507,7 +507,7 @@ mod tests {
         serde_json::from_str(ENVELOPE).unwrap()
     }
 
-    /// The event types of the envelope that are specified but not written yet
+    /// The event types of the envelope that are specified but not known to this release yet
     /// (`$defs/planned_types`, decision 0004-21). The task that builds the first reader rule
     /// (design 12.7) or the first writer of a type adds
     /// it to [`EventType`] and removes it from that list.
