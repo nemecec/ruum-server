@@ -1,13 +1,26 @@
 import { test } from "node:test";
+import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, statSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DevModeError, assertDevAllowed, devClaims, initDev, jwksOf, mintDevToken, privateKeyFromSeed, publicJwk } from "../src/dev.js";
+import {
+  DevModeError,
+  assertDevAllowed,
+  devClaims,
+  devJwksOf,
+  initDev,
+  jwksOf,
+  mintDevToken,
+  privateKeyFromSeed,
+  publicJwk,
+  signToken,
+} from "../src/dev.js";
 import { main } from "../src/cli.js";
-import { RuumTokenError, UserTokenVerifier, type RefusalReason } from "../src/verify.js";
-import { LIVE_A, PREVIEW_A } from "./helpers.js";
+import { RuumConfigError, RuumTokenError, UserTokenVerifier, type RefusalReason } from "../src/verify.js";
+import { DEV_KEY_MARK } from "../src/keys.js";
+import { ISSUER, LIVE_A, NOW, PREVIEW_A, claims, key } from "./helpers.js";
 
 const DEV_ENV = { RUUM_ENV: "preview", NODE_ENV: "development" } as NodeJS.ProcessEnv;
 
@@ -31,6 +44,41 @@ test("dev mode refuses RUUM_ENV=live and NODE_ENV=production", () => {
   }
 });
 
+test("dev mode refuses padded or upper-case RUUM_ENV=live and NODE_ENV=production", () => {
+  for (const env of [{ RUUM_ENV: " live " }, { RUUM_ENV: "live\n" }, { RUUM_ENV: "LIVE" }, { NODE_ENV: " production " }, { NODE_ENV: "Production" }]) {
+    assert.throws(() => assertDevAllowed(env), DevModeError, JSON.stringify(env));
+    const t = tmp();
+    try {
+      assert.throws(() => initDev(t.dir, env), DevModeError);
+      assert.equal(existsSync(t.dir), false, "nothing was written");
+      initDev(t.dir, DEV_ENV);
+      assert.throws(() => mintDevToken({ audience: LIVE_A }, t.dir, env), DevModeError);
+    } finally {
+      t.done();
+    }
+  }
+  // Control: padded dev values are allowed.
+  assert.doesNotThrow(() => assertDevAllowed({ RUUM_ENV: " preview ", NODE_ENV: " development " }));
+});
+
+test("a verifier with a real issuer refuses to start with a dev-marked key set", async () => {
+  const devKey = generateKeyPairSync("ed25519").privateKey;
+  const marked = devJwksOf(devKey);
+  assert.equal(marked.keys[0]?.[DEV_KEY_MARK], true);
+  // A dev token that claims the real issuer, signed by the dev key.
+  const forged = signToken(claims(), devKey);
+  for (const over of [{ jwks: marked }, { jwks: { keys: [...jwksOf(key).keys, ...marked.keys] } }]) {
+    assert.throws(() => new UserTokenVerifier({ issuer: ISSUER, audience: LIVE_A, env: "live", now: () => NOW, ...over }), RuumConfigError);
+  }
+  // Control: the same key set with a dev issuer verifies a dev token.
+  const local = new UserTokenVerifier({ issuer: "http://localhost:8080", audience: LIVE_A, env: "live", jwks: marked, now: () => NOW });
+  assert.equal((await local.verify(signToken(claims({ iss: "http://localhost:8080" }), devKey))).sub, "pairwise:visitor1");
+  // Control: an unmarked key set with the real issuer verifies; the forged token is refused there.
+  const real = new UserTokenVerifier({ issuer: ISSUER, audience: LIVE_A, env: "live", jwks: jwksOf(key), now: () => NOW });
+  assert.ok(await real.verify(signToken(claims(), key)));
+  await assert.rejects(real.verify(forged), (e) => (e as RuumTokenError).reason === "unknown_kid");
+});
+
 test("dev issuers are local http origins that a real RUUM_ISSUER never equals", () => {
   assert.equal(devClaims({ audience: LIVE_A })["iss"], "http://localhost");
   assert.equal(devClaims({ audience: LIVE_A, issuer: "http://localhost:8080" })["iss"], "http://localhost:8080");
@@ -50,6 +98,7 @@ test("init writes a private key (0600) and its JWKS; minted tokens verify locall
     const jwks = JSON.parse(readFileSync(f.jwksFile, "utf8"));
     assert.equal(jwks.keys.length, 1);
     assert.equal(jwks.keys[0].d, undefined, "the JWKS has no private part");
+    assert.equal(jwks.keys[0][DEV_KEY_MARK], true, "the JWKS marks the dev key");
     // A second init keeps the key.
     initDev(t.dir, DEV_ENV);
     assert.deepEqual(JSON.parse(readFileSync(f.jwksFile, "utf8")), jwks);
@@ -58,9 +107,11 @@ test("init writes a private key (0600) and its JWKS; minted tokens verify locall
     const local = new UserTokenVerifier({ issuer: "http://localhost", audience: PREVIEW_A, env: "preview", jwksFile: f.jwksFile });
     const user = await local.verify(tok);
     assert.deepEqual(user.roles, ["member"]);
-    // A real deployment (https issuer) refuses a dev token even if it had the dev key.
-    const real = new UserTokenVerifier({ issuer: "https://ruum.space", audience: PREVIEW_A, env: "preview", jwksFile: f.jwksFile });
-    await assert.rejects(real.verify(tok), (e) => (e as RuumTokenError).reason === "wrong_issuer");
+    // A real deployment (https issuer) pointed at the dev key file does not start at all.
+    assert.throws(
+      () => new UserTokenVerifier({ issuer: "https://ruum.space", audience: PREVIEW_A, env: "preview", jwksFile: f.jwksFile }),
+      RuumConfigError,
+    );
   } finally {
     t.done();
   }

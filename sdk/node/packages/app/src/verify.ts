@@ -4,7 +4,7 @@
  */
 
 import { verify as edVerify } from "node:crypto";
-import { KeySet, type Jwks } from "./keys.js";
+import { DevKeyError, KeySet, isDevIssuer, type Jwks } from "./keys.js";
 import { parseStrictJson, StrictJsonError } from "./json.js";
 
 /** The longest life of a user token (`exp - iat`), in seconds (the contract). */
@@ -161,6 +161,13 @@ function hasOwn(o: object, k: string): boolean {
   return Object.prototype.hasOwnProperty.call(o, k);
 }
 
+/** `roles` items, `on_behalf_of` and `chain` items (`user-token.schema.json`). */
+const ROLE = /^[a-z][a-z0-9_]{0,31}$/;
+const ON_BEHALF_OF = /^pairwise:[A-Za-z0-9_-]{1,64}$/;
+const CHAIN_APP = /^app:[0-9a-f-]{36}$/;
+/** The values of `node_roles` (`user-token.schema.json`). */
+const NODE_RIGHTS: readonly string[] = ["view", "comment", "edit", "manage"];
+
 /** Header members that point to keys elsewhere, or that this SDK cannot honour. Never followed. */
 const REFUSED_HEADER_MEMBERS = ["jku", "jwk", "x5u", "x5c", "crit", "b64", "zip", "enc"];
 
@@ -203,8 +210,14 @@ export class UserTokenVerifier {
         url,
         ...(config.minRefreshMs !== undefined ? { minRefreshMs: config.minRefreshMs } : {}),
         ...(config.fetchText ? { fetchText: config.fetchText } : {}),
+        allowDevKeys: isDevIssuer(issuer),
       });
     } catch (e) {
+      if (e instanceof DevKeyError) {
+        throw new RuumConfigError(
+          "the key set holds a dev-mode key (ruum-dev-token), but RUUM_ISSUER is not http://localhost: never ship .ruum-dev/ or set RUUM_APP_JWKS_FILE to it in a deployment",
+        );
+      }
       throw new RuumConfigError(`the key set cannot be loaded (${e instanceof Error ? e.name : "error"})`);
     }
     this.now = config.now ?? (() => Math.floor(Date.now() / 1000));
@@ -216,8 +229,9 @@ export class UserTokenVerifier {
    * Order of the checks: the JWT shape and size, the header (`alg: EdDSA` only, a `kid`, no
    * `jku`/`jwk`/`x5u`/`x5c`/`crit`), the signature, then `iss`, `aud` (exact), `typ`, `env`, numeric
    * `iat` and `exp`, `exp` after now, `exp - iat` from 1 to 60 s, `iat` at most 5 s in the future,
-   * and the types of the claims the user object needs. Unknown claims, actors and `sub` prefixes
-   * are accepted.
+   * and the known claims against `user-token.schema.json` (`sub`, `tenant`, `actor`, `roles`,
+   * `node_roles`, `jti`, and `name`, `email`, `locale`, `on_behalf_of`, `chain`, `scopes` when
+   * present). Unknown claims, actors and `sub` prefixes are accepted.
    */
   async verify(token: unknown): Promise<RuumUser> {
     if (token === undefined || token === null || token === "") throw new RuumTokenError("missing");
@@ -279,17 +293,30 @@ export class UserTokenVerifier {
     if (!isString(sub) || !/^[a-z][a-z_]{0,31}:[A-Za-z0-9_-]{1,64}$/.test(sub)) throw new RuumTokenError("bad_claims");
     if (!isString(tenant) || tenant === "") throw new RuumTokenError("bad_claims");
     if (!isString(actor) || !/^[a-z][a-z_]{0,31}$/.test(actor)) throw new RuumTokenError("bad_claims");
-    if (!Array.isArray(roles) || !roles.every(isString)) throw new RuumTokenError("bad_claims");
+    if (!Array.isArray(roles) || !roles.every((r) => isString(r) && ROLE.test(r))) throw new RuumTokenError("bad_claims");
     if (typeof nodeRoles !== "object" || nodeRoles === null || Array.isArray(nodeRoles)) {
       throw new RuumTokenError("bad_claims");
     }
     const nr: Record<string, string> = {};
     for (const [k, v] of Object.entries(nodeRoles)) {
-      if (!isString(v)) throw new RuumTokenError("bad_claims");
-      nr[k] = v;
+      if (!isString(v) || !NODE_RIGHTS.includes(v)) throw new RuumTokenError("bad_claims");
+      // defineProperty keeps a binding named `__proto__` as an own member.
+      Object.defineProperty(nr, k, { value: v, enumerable: true, writable: true, configurable: true });
     }
+    if (!isString(c["jti"])) throw new RuumTokenError("bad_claims");
     for (const k of ["name", "email", "locale", "on_behalf_of"]) {
       if (hasOwn(c, k) && !isString(c[k])) throw new RuumTokenError("bad_claims");
+    }
+    if (hasOwn(c, "on_behalf_of") && !ON_BEHALF_OF.test(c["on_behalf_of"] as string)) throw new RuumTokenError("bad_claims");
+    if (hasOwn(c, "chain")) {
+      const chain = c["chain"];
+      if (!Array.isArray(chain) || chain.length > 3 || !chain.every((a) => isString(a) && CHAIN_APP.test(a))) {
+        throw new RuumTokenError("bad_claims");
+      }
+    }
+    if (hasOwn(c, "scopes")) {
+      const scopes = c["scopes"];
+      if (!Array.isArray(scopes) || !scopes.every(isString)) throw new RuumTokenError("bad_claims");
     }
 
     const user: RuumUser = {
@@ -311,10 +338,16 @@ export class UserTokenVerifier {
 }
 
 let defaultVerifier: UserTokenVerifier | null = null;
+/** One verifier (and so one key set and one refresh rate limit) per config object. */
+const verifiers = new WeakMap<VerifierConfig, UserTokenVerifier>();
 
 /**
  * Verifies a `Ruum-User` token with the configuration from the environment (made on the first
  * call), or with `config` when given. Returns the user or throws {@link RuumTokenError}.
+ *
+ * The verifier of a `config` object is made once and kept for that object, so pass the same
+ * object every time (make it at start-up). Better: make one `new UserTokenVerifier(configFromEnv())`
+ * at start-up and call its `verify`.
  *
  * @example
  * import { verifyUserToken } from "@ruum/app";
@@ -322,7 +355,14 @@ let defaultVerifier: UserTokenVerifier | null = null;
  * if (!user.roles.includes("approver")) return forbidden();
  */
 export async function verifyUserToken(token: unknown, config?: VerifierConfig): Promise<RuumUser> {
-  if (config) return new UserTokenVerifier(config).verify(token);
+  if (config) {
+    let v = verifiers.get(config);
+    if (!v) {
+      v = new UserTokenVerifier(config);
+      verifiers.set(config, v);
+    }
+    return v.verify(token);
+  }
   defaultVerifier ??= new UserTokenVerifier(configFromEnv());
   return defaultVerifier.verify(token);
 }

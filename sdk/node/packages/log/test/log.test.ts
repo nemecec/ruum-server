@@ -114,3 +114,30 @@ test("values JSON cannot hold, cycles and errors are written safely", () => {
   assert.equal(f["nan"], "NaN");
   assert.equal(f["u"], null);
 });
+
+test("an error's name and message are cleaned like any field", () => {
+  const c = capture();
+  const log = createLogger({ sink: c.sink, now: fixed });
+  const odd = new Error("failed");
+  (odd as unknown as { name: unknown }).name = { access_token: "tok-secret-1" };
+  const oddMessage = new Error("x");
+  (oddMessage as unknown as { message: unknown }).message = { password: "pw-secret-2" };
+  log.error("failed", { err: odd, err2: oddMessage, plain: new TypeError("plain one") });
+  const raw = c.raw();
+  assert.ok(!raw.includes("tok-secret-1"));
+  assert.ok(!raw.includes("pw-secret-2"));
+  const f = c.lines()[0]?.["fields"] as Record<string, any>;
+  assert.equal(f["err"]["name"]["access_token"], HIDDEN);
+  assert.equal(f["err2"]["message"]["password"], HIDDEN);
+  // Control: a normal error keeps its name and message.
+  assert.equal(f["plain"]["name"], "TypeError");
+  assert.equal(f["plain"]["message"], "plain one");
+});
+
+test("a field named __proto__ stays in the line", () => {
+  const c = capture();
+  const log = createLogger({ sink: c.sink, now: fixed });
+  log.info("x", JSON.parse('{"__proto__":{"a":1},"b":2}'));
+  const f = c.lines()[0]?.["fields"] as Record<string, any>;
+  assert.deepEqual(Object.keys(f), ["__proto__", "b"]);
+});

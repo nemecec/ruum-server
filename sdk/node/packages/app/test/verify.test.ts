@@ -8,7 +8,9 @@ import {
   RuumTokenError,
   UserTokenVerifier,
   configFromEnv,
+  verifyUserToken,
   type RefusalReason,
+  type VerifierConfig,
 } from "../src/verify.js";
 import {
   APP_B,
@@ -298,6 +300,66 @@ test("claims the user object needs must have their types", async () => {
   await refused(v, token(claims({ email: 3 })), "bad_claims");
   await refused(v, token(without(claims(), "tenant")), "bad_claims");
   await accepted(v, token(claims()));
+});
+
+test("the known claims are checked against user-token.schema.json", async () => {
+  const v = verifier();
+  const bad: Record<string, unknown>[] = [
+    without(claims(), "jti"),
+    claims({ jti: 7 }),
+    claims({ roles: ["Admin"] }),
+    claims({ roles: ["member", "has space"] }),
+    claims({ node_roles: { db: "owner" } }),
+    claims({ node_roles: { db: "EDIT" } }),
+    claims({ on_behalf_of: "app:0190b6c4-a00d-7cc1-9a4b-00000000000b" }),
+    claims({ on_behalf_of: 5 }),
+    claims({ chain: "app:0190b6c4-a00d-7cc1-9a4b-00000000000b" }),
+    claims({ chain: ["pairwise:x"] }),
+    claims({ chain: Array.from({ length: 4 }, () => `app:${APP_B}`) }),
+    claims({ scopes: "read" }),
+    claims({ scopes: [1] }),
+  ];
+  for (const c of bad) await refused(v, token(c), "bad_claims");
+  // Positive control: every known optional claim with a valid value.
+  const user = await v.verify(
+    token(claims({ on_behalf_of: "pairwise:aa11", chain: [`app:${APP_B}`], scopes: ["nodes:read"], node_roles: { db: "manage", docs: "comment" } })),
+  );
+  assert.equal(user.on_behalf_of, "pairwise:aa11");
+  assert.deepEqual(user.node_roles, { db: "manage", docs: "comment" });
+});
+
+test("a node_roles binding named __proto__ is kept as an own member, never as a prototype", async () => {
+  const t = rawToken(
+    JSON.stringify({ typ: "JWT", alg: "EdDSA", kid }),
+    JSON.stringify(claims()).replace('"node_roles":{"db":"edit"}', '"node_roles":{"__proto__":"manage","db":"view"}'),
+  );
+  const user = await verifier().verify(t);
+  assert.deepEqual(Object.keys(user.node_roles), ["__proto__", "db"]);
+  assert.equal(Object.getPrototypeOf(user.node_roles), Object.prototype);
+});
+
+test("verifyUserToken with a config keeps one verifier per config, so the refresh limit holds", async () => {
+  let fetches = 0;
+  const config: VerifierConfig = {
+    issuer: ISSUER,
+    audience: LIVE_A,
+    env: "live",
+    now: () => NOW,
+    fetchText: async () => {
+      fetches++;
+      return JSON.stringify(jwksOf(key));
+    },
+  };
+  const t = token(claims());
+  for (let i = 0; i < 50; i++) await verifyUserToken(t, config);
+  // Made-up kids do not fetch again inside the interval either.
+  for (let i = 0; i < 20; i++) {
+    await assert.rejects(verifyUserToken(token(claims(), otherKey, { typ: "JWT", alg: "EdDSA", kid: `made-up-${i}` }), config));
+  }
+  assert.equal(fetches, 1, "50 calls with one config fetch the key set once");
+  // Control: a new config object is a new verifier and fetches.
+  await verifyUserToken(t, { ...config });
+  assert.equal(fetches, 2);
 });
 
 test("errors never hold the token or claim values", async () => {

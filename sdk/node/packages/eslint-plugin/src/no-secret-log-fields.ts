@@ -9,7 +9,8 @@
  *
  * It follows spread objects, computed keys that are string literals or plain template literals,
  * template literals, string concatenation, `JSON.stringify(...)`, local variables with an object
- * or `process.env` value, and aliased imports (`import { log as l } from "@ruum/log"`).
+ * or `process.env` value (also `const env = process.env; env.STRIPE_KEY`), method chains on a
+ * value (`process.env.STRIPE_KEY.trim()`), and aliased imports (`import { log as l } from "@ruum/log"`).
  */
 
 import type { Rule, Scope } from "eslint";
@@ -135,6 +136,17 @@ const rule: Rule.RuleModule = {
       return null;
     };
 
+    /** `process.env`, or a local variable whose single value is `process.env` (also through aliases). */
+    const isEnvObject = (node: ESTree.Node, depth = 0): boolean => {
+      if (depth > MAX_DEPTH) return false;
+      if (isProcessEnv(node)) return true;
+      if (node.type === "Identifier") {
+        const init = initOf(node);
+        return init !== null && isEnvObject(init, depth + 1);
+      }
+      return false;
+    };
+
     const check = (node: ESTree.Node | null | undefined, depth: number): void => {
       if (!node || depth > MAX_DEPTH) return;
       switch (node.type) {
@@ -161,11 +173,16 @@ const rule: Rule.RuleModule = {
             context.report({ node, messageId: "processEnv" });
             return;
           }
-          if (isProcessEnv(node.object)) {
+          if (isEnvObject(node.object)) {
             const name = propName(node.property, node.computed);
             if (name !== null && isSecretEnvName(name)) {
               context.report({ node, messageId: "envSecret", data: { name } });
             }
+            return;
+          }
+          // A chain on a value: `process.env.X.trim().length`.
+          if (node.object.type === "MemberExpression" || node.object.type === "CallExpression") {
+            check(node.object, depth + 1);
           }
           return;
         }
@@ -205,6 +222,12 @@ const rule: Rule.RuleModule = {
                 : "";
           if (fn === "JSON.stringify" || fn === "String" || fn === "Object.assign" || fn === "Object.entries" || fn === "Object.values") {
             for (const a of node.arguments) check(a, depth + 1);
+            return;
+          }
+          // A method of a value returns (a part of) that value: `process.env.STRIPE_KEY.trim()`,
+          // `key.toString()`. A method of process.env itself (`hasOwnProperty`) is not its value.
+          if (c.type === "MemberExpression" && c.object.type !== "Super" && !isEnvObject(c.object)) {
+            check(c.object, depth + 1);
           }
           return;
         }

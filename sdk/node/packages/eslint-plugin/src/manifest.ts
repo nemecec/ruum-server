@@ -1,7 +1,8 @@
 /**
  * Finds the secret names of the app's manifest (`secrets` in `app.yaml`), without a YAML
  * dependency. It reads the short form (a list of names) and the long form (a map whose keys are
- * the names), in block or flow style. Names follow the manifest schema: `^[A-Z][A-Z0-9_]{0,63}$`.
+ * the names), in block or flow style (a flow collection may span several lines). Names follow
+ * the manifest schema: `^[A-Z][A-Z0-9_]{0,63}$`.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -15,25 +16,73 @@ function unquote(s: string): string {
   return t;
 }
 
+/** The line without a `#` comment (a `#` after white space, outside quotes). */
+function stripComment(line: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i] as string;
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "#" && (i === 0 || /\s/.test(line[i - 1] as string))) return line.slice(0, i);
+  }
+  return line;
+}
+
 /** The secret names in the text of an `app.yaml`. */
 export function secretNamesFromManifest(text: string): string[] {
   const lines = text.split(/\r?\n/);
   const names: string[] = [];
   const add = (raw: string) => {
-    const n = unquote(raw.replace(/\s+#.*$/, ""));
+    const n = unquote(stripComment(raw));
     if (NAME.test(n) && !names.includes(n)) names.push(n);
   };
   for (let i = 0; i < lines.length; i++) {
     const m = /^secrets\s*:\s*(.*)$/.exec(lines[i] as string);
     if (!m) continue;
-    const rest = (m[1] as string).replace(/\s+#.*$/, "").trim();
+    const rest = stripComment(m[1] as string).trim();
     if (rest.startsWith("[") || rest.startsWith("{")) {
-      // Flow style on one line: [A, B] or {A: {...}, B: {...}} (top-level names only).
-      const inner = rest.slice(1, rest.lastIndexOf(rest.startsWith("[") ? "]" : "}"));
+      // Flow style, on one line or over several: [A, B] or {A: {...}, B: {...}} (top-level names
+      // only). The collection ends where its brackets balance, outside quotes.
+      const open = rest[0] as string;
+      let text = "";
       let depth = 0;
+      let quote: string | null = null;
+      let done = false;
+      for (let j = i; j < lines.length && !done; j++) {
+        const line = j === i ? rest : stripComment(lines[j] as string);
+        for (const ch of line) {
+          text += ch;
+          if (quote) {
+            if (ch === quote) quote = null;
+            continue;
+          }
+          if (ch === '"' || ch === "'") quote = ch;
+          else if (ch === "{" || ch === "[") depth++;
+          else if (ch === "}" || ch === "]") {
+            depth--;
+            if (depth === 0) {
+              done = true;
+              break;
+            }
+          }
+        }
+        text += "\n";
+      }
+      const inner = text.trim().slice(1, -1);
+      depth = 0;
+      quote = null;
       let cur = "";
       const parts: string[] = [];
       for (const ch of inner) {
+        if (quote) {
+          if (ch === quote) quote = null;
+          cur += ch;
+          continue;
+        }
+        if (ch === '"' || ch === "'") quote = ch;
         if (ch === "{" || ch === "[") depth++;
         if (ch === "}" || ch === "]") depth--;
         if (ch === "," && depth === 0) {
@@ -42,7 +91,7 @@ export function secretNamesFromManifest(text: string): string[] {
         } else cur += ch;
       }
       parts.push(cur);
-      for (const p of parts) add(rest.startsWith("[") ? p : (p.split(":")[0] ?? ""));
+      for (const p of parts) add(open === "[" ? p : (p.split(":")[0] ?? ""));
       continue;
     }
     // Block style: the lines indented under `secrets:`.

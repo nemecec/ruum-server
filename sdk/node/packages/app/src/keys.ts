@@ -25,6 +25,24 @@ export const MAX_JWKS_BYTES = 64 * 1024;
 /** The default shortest time between two refreshes, in milliseconds. */
 export const DEFAULT_MIN_REFRESH_MS = 30_000;
 
+/**
+ * The JWK member that marks a dev-mode key (`ruum-dev-token init` writes it). The gateway's keys
+ * never have it. A verifier trusts a marked key only for a dev issuer ({@link isDevIssuer}).
+ */
+export const DEV_KEY_MARK = "ruum_dev";
+
+/** Whether `issuer` is a local dev origin: `http://localhost` or `http://127.0.0.1`, optionally with a port. */
+export function isDevIssuer(issuer: string): boolean {
+  return /^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/.test(issuer);
+}
+
+/** Whether a key set holds a key with the dev mark. */
+export function hasDevKeys(jwks: unknown): boolean {
+  if (typeof jwks !== "object" || jwks === null) return false;
+  const keys = (jwks as { keys?: unknown }).keys;
+  return Array.isArray(keys) && keys.some((k) => typeof k === "object" && k !== null && DEV_KEY_MARK in k);
+}
+
 /** A JSON Web Key Set as the gateway publishes it. */
 export interface Jwks {
   keys: Record<string, unknown>[];
@@ -44,10 +62,18 @@ export interface KeySetOptions {
   fetchText?: (url: string) => Promise<string>;
   /** The clock in milliseconds (tests). */
   nowMs?: () => number;
+  /**
+   * Whether keys with the dev mark are trusted (only for a dev issuer). Default `false`: a static
+   * key set or a key file with a marked key is a start-up error, and a refresh drops marked keys.
+   */
+  allowDevKeys?: boolean;
 }
 
-/** Turns a key set into a map from `kid` to public key, keeping only usable Ed25519 keys. */
-export function keysFromJwks(jwks: unknown): Map<string, KeyObject> {
+/**
+ * Turns a key set into a map from `kid` to public key, keeping only usable Ed25519 keys. Keys with
+ * the dev mark ({@link DEV_KEY_MARK}) are dropped unless `allowDevKeys` is `true`.
+ */
+export function keysFromJwks(jwks: unknown, allowDevKeys = false): Map<string, KeyObject> {
   const out = new Map<string, KeyObject>();
   if (typeof jwks !== "object" || jwks === null) return out;
   const keys = (jwks as { keys?: unknown }).keys;
@@ -62,6 +88,7 @@ export function keysFromJwks(jwks: unknown): Map<string, KeyObject> {
     if (j["use"] !== undefined && j["use"] !== "sig") continue;
     if (typeof j["x"] !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(j["x"])) continue;
     if ("d" in j) continue; // never accept a private key as a verification key
+    if (DEV_KEY_MARK in j && !allowDevKeys) continue; // a dev key never verifies for a real issuer
     if (out.has(j["kid"])) continue;
     try {
       out.set(j["kid"], createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: j["x"] }, format: "jwk" }));
@@ -72,6 +99,14 @@ export function keysFromJwks(jwks: unknown): Map<string, KeyObject> {
   return out;
 }
 
+/** Thrown when a start-up key set holds a dev key but the issuer is not a dev issuer. */
+export class DevKeyError extends Error {
+  constructor() {
+    super("the key set holds a dev-mode key (ruum-dev-token), but RUUM_ISSUER is not a dev issuer");
+    this.name = "DevKeyError";
+  }
+}
+
 /** Holds the verification keys and refreshes them, with a bound and a rate limit. */
 export class KeySet {
   private keys = new Map<string, KeyObject>();
@@ -79,19 +114,29 @@ export class KeySet {
   private inflight: Promise<void> | null = null;
   private readonly minRefreshMs: number;
   private readonly nowMs: () => number;
+  private readonly allowDev: boolean;
 
   constructor(private readonly options: KeySetOptions) {
     this.minRefreshMs = options.minRefreshMs ?? DEFAULT_MIN_REFRESH_MS;
     this.nowMs = options.nowMs ?? Date.now;
+    this.allowDev = options.allowDevKeys === true;
     if (options.jwks) {
-      this.keys = keysFromJwks(options.jwks);
+      this.keys = this.startKeys(options.jwks);
     } else if (options.file) {
       // Read at start, so a missing or broken file shows at once (a start-up error).
-      this.keys = keysFromJwks(this.readFile(options.file));
+      this.keys = this.startKeys(this.readFile(options.file));
       this.lastRefreshMs = this.nowMs();
     } else if (!options.url) {
       throw new Error("a key set needs a static key set, RUUM_APP_JWKS_FILE or an https issuer");
     }
+  }
+
+  /** The keys of a start-up key set; a dev key for a real issuer is a start-up error. */
+  private startKeys(jwks: unknown): Map<string, KeyObject> {
+    if (!this.allowDev && hasDevKeys(jwks)) {
+      throw new DevKeyError();
+    }
+    return keysFromJwks(jwks, this.allowDev);
   }
 
   private readFile(file: string): unknown {
@@ -102,7 +147,7 @@ export class KeySet {
 
   private async load(): Promise<void> {
     if (this.options.file) {
-      this.keys = keysFromJwks(this.readFile(this.options.file));
+      this.keys = keysFromJwks(this.readFile(this.options.file), this.allowDev);
       return;
     }
     const url = this.options.url as string;
@@ -110,7 +155,7 @@ export class KeySet {
       ? await this.options.fetchText(url)
       : await httpsGet(url, { maxBytes: MAX_JWKS_BYTES, timeoutMs: 5000 });
     if (Buffer.byteLength(text) > MAX_JWKS_BYTES) throw new Error("the key set is too large");
-    this.keys = keysFromJwks(parseStrictJson(text));
+    this.keys = keysFromJwks(parseStrictJson(text), this.allowDev);
   }
 
   /** Refreshes now unless the last refresh was less than `minRefreshMs` ago. */
