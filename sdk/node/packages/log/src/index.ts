@@ -103,8 +103,18 @@ function clean(value: unknown, depth: number, seen: Set<object>): unknown {
       return Number.isNaN(obj.getTime()) ? "Invalid Date" : obj.toISOString();
     }
     if (obj instanceof Error) {
-      const out: Record<string, unknown> = { name: obj.name, message: clean(obj.message, depth + 1, seen) };
-      if (typeof obj.stack === "string") out["stack"] = clean(obj.stack, depth + 1, seen);
+      // `name` and `message` can be set to any value (also an object with a denied key), and a
+      // getter can throw: each one goes through clean.
+      const read = (k: "name" | "message" | "stack"): unknown => {
+        try {
+          return obj[k];
+        } catch {
+          return "[unreadable]";
+        }
+      };
+      const out: Record<string, unknown> = { name: clean(read("name"), depth + 1, seen), message: clean(read("message"), depth + 1, seen) };
+      const stack = read("stack");
+      if (typeof stack === "string") out["stack"] = clean(stack, depth + 1, seen);
       return out;
     }
     if (Array.isArray(obj)) {
@@ -123,7 +133,7 @@ function cleanFields(fields: Record<string, unknown>, depth: number, seen: Set<o
     if (n++ >= MAX_KEYS) break;
     // A getter could throw; a denied key is never read at all.
     if (isDenied(key)) {
-      out[key] = HIDDEN;
+      Object.defineProperty(out, key, { value: HIDDEN, enumerable: true, writable: true, configurable: true });
       continue;
     }
     let v: unknown;
@@ -132,7 +142,8 @@ function cleanFields(fields: Record<string, unknown>, depth: number, seen: Set<o
     } catch {
       v = "[unreadable]";
     }
-    out[key] = clean(v, depth, seen);
+    // defineProperty keeps a field named `__proto__` as an own member of the line.
+    Object.defineProperty(out, key, { value: clean(v, depth, seen), enumerable: true, writable: true, configurable: true });
   }
   return out;
 }

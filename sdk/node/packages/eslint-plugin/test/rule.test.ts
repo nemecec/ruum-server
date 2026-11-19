@@ -30,6 +30,12 @@ tester.run("no-secret-log-fields", rule, {
     // A computed key that is not a literal cannot be judged.
     { code: `${IMPORT}log.info("x", { [k]: 1 });` },
     { code: `${IMPORT}const f = { orderId: 1 }; log.info("x", f);` },
+    // Aliases of process.env and method chains: a name that is not secret is fine.
+    {
+      code: `const env = process.env; const e2 = env;\nconsole.log(env.NODE_ENV, e2.PORT, process.env.NODE_ENV.trim(), env.hasOwnProperty("STRIPE_KEY"));`,
+      options: [{ secrets: ["STRIPE_KEY"], manifest: false }],
+    },
+    { code: `${IMPORT}log.info("x", { n: order.items.length, s: status.trim() });` },
   ],
   invalid: [
     {
@@ -95,6 +101,17 @@ tester.run("no-secret-log-fields", rule, {
       code: `console.info({ ...process.env });`,
       errors: [{ messageId: "processEnv" }],
     },
+    {
+      // An alias of process.env (also an alias of the alias) and method chains on a secret value.
+      code: "const env = process.env; const e2 = env;\nconsole.log(env.STRIPE_KEY); console.log(e2['STRIPE_KEY']); console.log(process.env.STRIPE_KEY.trim()); console.log(env.STRIPE_KEY.slice(0, 4).toUpperCase());",
+      options: [{ secrets: ["STRIPE_KEY"], manifest: false }],
+      errors: [{ messageId: "envSecret" }, { messageId: "envSecret" }, { messageId: "envSecret" }, { messageId: "envSecret" }],
+    },
+    {
+      code: `${IMPORT}const k = process.env.STRIPE_KEY;\nlog.info("x", { prefix: k.slice(0, 4) });`,
+      options: [{ secrets: ["STRIPE_KEY"], manifest: false }],
+      errors: [{ messageId: "envSecret" }],
+    },
   ],
 });
 
@@ -110,6 +127,17 @@ describe("the manifest", () => {
     assert.deepEqual(secretNamesFromManifest("name: none\n"), []);
   });
 
+  it("reads flow collections that span several lines", () => {
+    assert.deepEqual(secretNamesFromManifest("secrets: [\n  STRIPE_KEY,\n  \"MAIL_PASS\"  # the mail\n]\nroles: [OTHER_X]\n"), ["STRIPE_KEY", "MAIL_PASS"]);
+    assert.deepEqual(secretNamesFromManifest("secrets: [\n  STRIPE_KEY\n]\n"), ["STRIPE_KEY"]);
+    assert.deepEqual(
+      secretNamesFromManifest("secrets: {\n  X_KEY: {generate: random-16-bytes},\n  Y_KEY: {\n    entered: true\n  }\n}\nbindings: {NOT_A_SECRET: 1}\n"),
+      ["X_KEY", "Y_KEY"],
+    );
+    // A bracket inside quotes or a comment does not end the collection.
+    assert.deepEqual(secretNamesFromManifest("secrets: [ # a ] comment\n  'A_KEY',\n  B_KEY\n]\n"), ["A_KEY", "B_KEY"]);
+  });
+
 });
 
 // The rule finds app.yaml above the linted file.
@@ -118,6 +146,16 @@ writeFileSync(join(manifestDir, "app.yaml"), "secrets:\n  - SHOP_API_PIN_CODE\n 
 mkdirSync(join(manifestDir, "src", "lib"), { recursive: true });
 const lintedFile = join(manifestDir, "src", "lib", "pay.js");
 after(() => rmSync(manifestDir, { recursive: true, force: true }));
+// A multi-line flow list in app.yaml.
+const flowDir = mkdtempSync(join(tmpdir(), "ruum-o5-lint-flow-"));
+writeFileSync(join(flowDir, "app.yaml"), "name: shop\nsecrets: [\n  STRIPE_KEY\n]\n");
+const flowFile = join(flowDir, "index.js");
+after(() => rmSync(flowDir, { recursive: true, force: true }));
+tester.run("manifest lookup, multi-line flow list", rule, {
+  valid: [{ code: `console.log(process.env.NODE_ENV);`, filename: flowFile }],
+  invalid: [{ code: `console.log(process.env.STRIPE_KEY);`, filename: flowFile, errors: [{ messageId: "envSecret" }] }],
+});
+
 tester.run("manifest lookup", rule, {
   valid: [{ code: `console.log({ webhook: 1 });`, filename: lintedFile }],
   invalid: [

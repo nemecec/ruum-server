@@ -84,17 +84,24 @@ import { withRuumUser } from "@ruum/app";
 http.createServer(withRuumUser((req, res, user) => res.end(`hello ${user.sub}`))).listen(8080);
 ```
 
-Without a framework:
+Without a framework, make one verifier at start-up (a missing variable fails there, not on the
+first request) and keep it:
 
 ```js
-import { verifyUserToken, RuumTokenError } from "@ruum/app";
+import { UserTokenVerifier, configFromEnv, RuumTokenError } from "@ruum/app";
+
+const verifier = new UserTokenVerifier(configFromEnv()); // at start-up
 
 try {
-  const user = await verifyUserToken(req.headers["ruum-user"]);
+  const user = await verifier.verify(req.headers["ruum-user"]);
 } catch (e) {
   if (e instanceof RuumTokenError) console.log(e.reason); // for example "wrong_audience"
 }
 ```
+
+`verifyUserToken(token)` does the same with one verifier made on the first call.
+`verifyUserToken(token, config)` keeps one verifier per `config` object: make the object once, never
+in the request handler.
 
 A request without `Ruum-User`, or with a refused token, gets `401` with
 `{"error":{"code":"unauthenticated",...}}`. Identity comes only from `Ruum-User`; the helpers never
@@ -131,7 +138,7 @@ never holds the token, a key or a claim value.
 | `exp` after now (no leeway) | `expired` | |
 | `exp - iat` from 1 to 60 s | `lifetime_too_long` | The contract's longest life. |
 | `iat` at most 5 s in the future | `issued_in_future` | The clock skew between the gateway and the app (`CLOCK_SKEW_SECONDS` = 5, as the test kit's reference verifier). |
-| `sub`, `tenant`, `actor`, `roles`, `node_roles` have their types | `bad_claims` | The user object needs them. |
+| The known claims match `user-token.schema.json`: `sub`, `tenant`, `actor`, `roles` (each `^[a-z][a-z0-9_]{0,31}$`), `node_roles` (`view`, `comment`, `edit` or `manage`), `jti`, and when present `name`, `email`, `locale`, `on_behalf_of` (`pairwise:<id>`), `chain` (at most 3 `app:<id>`), `scopes` (strings) | `bad_claims` | The same rules as the test kit's reference verifier. |
 
 Unknown claims, unknown `actor` values and unknown `sub` prefixes are accepted (the contract is
 open for later steps). `user.actorKnown` is `false` for an unknown actor: treat it like
@@ -142,7 +149,12 @@ open for later steps). `user.actorKnown` is `false` for an unknown actor: treat 
 The SDK takes the gateway's key set from, in this order: a key set given in code (tests), the file
 `RUUM_APP_JWKS_FILE` (read at start and again for an unknown `kid`), or an HTTPS GET of
 `<RUUM_ISSUER>/.well-known/app-jwks.json`. Only Ed25519 public keys with a `kid` are kept (at most
-16; a key set is at most 64 KiB).
+16; a key set is at most 64 KiB). For an unknown `kid` the SDK refreshes the set at most once per
+30 s. If the first fetch fails, every token is refused (`unknown_kid`) until a later refresh works:
+the SDK fails closed.
+
+The proxy support is made for the Ruum egress proxy: the SDK does not read `NO_PROXY` and sends no
+`Proxy-Authorization`, also when the `HTTPS_PROXY` URL holds credentials.
 
 Node 22's built-in `fetch` ignores `HTTPS_PROXY` unless the process runs with
 `NODE_USE_ENV_PROXY=1`. So the SDK does not use `fetch` for the key set: it opens an HTTP `CONNECT`
@@ -239,6 +251,11 @@ const token = mintDevToken({ audience: process.env.RUUM_AUDIENCE, roles: ["membe
   `RUUM_ISSUER` is an `https://` origin, so it refuses every dev token (`wrong_issuer`).
 - The key stays in `.ruum-dev/` (mode 0600). The folder gets a `.gitignore` of `*`, so it is never
   committed.
+- The key set in `.ruum-dev/jwks.json` marks its key as a dev key (`"ruum_dev": true`). A verifier
+  whose `RUUM_ISSUER` is not `http://localhost` or `http://127.0.0.1` refuses to start with such a key
+  set (`RuumConfigError`), and drops marked keys that appear in a key set later.
+- Keep dev mode out of images: put `.ruum-dev/` in `.dockerignore` (`.gitignore` does not stop
+  `COPY .`), and never set `RUUM_APP_JWKS_FILE` in a Dockerfile or a committed env file.
 
 ## Develop the SDK
 

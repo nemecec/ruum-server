@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { generateKeyPairSync } from "node:crypto";
 import { KeySet, keysFromJwks, MAX_KEYS } from "../src/keys.js";
 import { httpsGet } from "../src/proxy.js";
-import { jwksOf, publicJwk } from "../src/dev.js";
+import { devJwksOf, jwksOf, publicJwk } from "../src/dev.js";
 import { claims, key, otherKey, token, verifier, ISSUER, LIVE_A, NOW } from "./helpers.js";
 import { RuumTokenError, UserTokenVerifier } from "../src/verify.js";
 
@@ -48,6 +48,23 @@ test("a rotated key in RUUM_APP_JWKS_FILE is picked up on an unknown kid", async
     await assert.rejects(v.verify(token(claims(), otherKey)), (e) => (e as RuumTokenError).reason === "unknown_kid");
     writeFileSync(file, JSON.stringify({ keys: [...jwksOf(key).keys, ...jwksOf(otherKey).keys] }));
     assert.ok(await v.verify(token(claims(), otherKey)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a dev-marked key that appears in RUUM_APP_JWKS_FILE later is dropped for a real issuer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ruum-o5-jwks-"));
+  try {
+    const file = join(dir, "jwks.json");
+    writeFileSync(file, JSON.stringify(jwksOf(key)));
+    const v = new UserTokenVerifier({ issuer: ISSUER, audience: LIVE_A, env: "live", jwksFile: file, minRefreshMs: 0, now: () => NOW });
+    writeFileSync(file, JSON.stringify({ keys: [...jwksOf(key).keys, ...devJwksOf(otherKey).keys] }));
+    await assert.rejects(v.verify(token(claims(), otherKey)), (e) => (e as RuumTokenError).reason === "unknown_kid");
+    assert.ok(await v.verify(token(claims())), "control: the real key still verifies");
+    // keysFromJwks keeps a marked key only when asked to (a dev issuer).
+    assert.equal(keysFromJwks(devJwksOf(otherKey)).size, 0);
+    assert.equal(keysFromJwks(devJwksOf(otherKey), true).size, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

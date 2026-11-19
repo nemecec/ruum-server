@@ -15,7 +15,7 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, type KeyObject } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { Jwks } from "./keys.js";
+import { DEV_KEY_MARK, isDevIssuer, type Jwks } from "./keys.js";
 import { MAX_LIFETIME_SECONDS } from "./verify.js";
 
 /** The default dev folder. */
@@ -33,13 +33,16 @@ export class DevModeError extends Error {
 
 /** Throws unless dev mode may run here (not `RUUM_ENV=live`, not `NODE_ENV=production`). */
 export function assertDevAllowed(env: NodeJS.ProcessEnv = process.env): void {
-  if (env["RUUM_ENV"] === "live") throw new DevModeError("dev mode refuses to run with RUUM_ENV=live");
-  if (env["NODE_ENV"] === "production") throw new DevModeError("dev mode refuses to run with NODE_ENV=production");
+  // Trimmed and case-folded, like configFromEnv trims: " live " is live.
+  if (env["RUUM_ENV"]?.trim().toLowerCase() === "live") throw new DevModeError("dev mode refuses to run with RUUM_ENV=live");
+  if (env["NODE_ENV"]?.trim().toLowerCase() === "production") {
+    throw new DevModeError("dev mode refuses to run with NODE_ENV=production");
+  }
 }
 
 /** Throws unless `issuer` is a local `http://localhost` or `http://127.0.0.1` origin. */
 export function assertDevIssuer(issuer: string): void {
-  if (!/^http:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?$/.test(issuer)) {
+  if (!isDevIssuer(issuer)) {
     throw new DevModeError("a dev issuer must be http://localhost or http://127.0.0.1, optionally with a port");
   }
 }
@@ -64,6 +67,14 @@ export function publicJwk(key: KeyObject): Record<string, string> {
 /** The key set of one key. */
 export function jwksOf(key: KeyObject): Jwks {
   return { keys: [publicJwk(key)] };
+}
+
+/**
+ * The key set of a dev key: the key carries the dev mark ({@link DEV_KEY_MARK}), so a verifier
+ * with a real (`https://`) issuer refuses to start with it.
+ */
+export function devJwksOf(key: KeyObject): Jwks {
+  return { keys: [{ ...publicJwk(key), [DEV_KEY_MARK]: true }] };
 }
 
 /**
@@ -160,7 +171,7 @@ export function initDev(dir: string = DEV_DIR, env: NodeJS.ProcessEnv = process.
     writeFileSync(f.keyFile, privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
   }
   chmodSync(f.keyFile, 0o600);
-  writeFileSync(f.jwksFile, `${JSON.stringify(jwksOf(loadDevKey(dir)), null, 2)}\n`);
+  writeFileSync(f.jwksFile, `${JSON.stringify(devJwksOf(loadDevKey(dir)), null, 2)}\n`);
   return f;
 }
 
