@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +252,26 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Kimi review fixes of run 12 (2026-11-19; five fix branches rebased onto `main` `314bfad` in one
+stack, each tip checked on the build server, pushed as `integ12k/<name>`, green in GitHub CI,
+then fast-forwarded in this order, `314bfad..7912e15`; linear history, no merge commit, no
+co-author line). Kimi K3.1 Pro reviewed the merged run 12 code of the cards whose second-model
+gate was open (S-63); each fix had a Claude review and a Kimi re-check. The digest section
+"Kimi reviews and fixes (run 12)" in `docs/digests/2026-11-17-run12.md` has the findings. Not
+accepted: `fix/w2s1-kimi12` (no Kimi verdict on the fix; W2S-1 of run 12 stays as it was).
+
+| Branch (pushed as) | What it adds | Kimi |
+|---|---|---|
+| `fix/p57-kimi12` (`integ12k/p57`) | Audit readers keep only `seq` and `revision` (from the journal columns) for an unknown type; `journal-entry.schema.json` accepts the generic shape and unknown type names (empty data only); design 12.7: a new type that can change who sees a node is first read-only (`journal::READ_ONLY_EVENTS`) for one release. P-95, P-96. | run 12: CHANGES REQUESTED (3 Medium); four rounds; re-check of `c0c921b` **APPROVE** |
+| `fix/k11-kimi12` (`integ12k/k11`) | Docker driver: a cut log line keeps only the cap in memory; the redactor cuts at the cap before its check; room for a start never comes from another tenant's ended instance unless that tenant keeps the most (S-67 room pass). Three mutations. S-69. | run 12: CHANGES REQUESTED (1 High, 2 Medium, 1 Low); fix and re-check **APPROVE** |
+| `fix/g1b-kimi12` (`integ12k/g1b`) | Gateway: holds a request until the sandbox's address takes a TCP connection (then `503` starting at the hold limit); the ready cache drops expired entries and has a cap of 4096. Finding 1 rejected (P-93). Two mutations. P-91, P-92. | run 12: CHANGES REQUESTED (2 Medium, 1 Low); fix and re-check **APPROVE** |
+| `fix/o1a-kimi12` (`integ12k/o1a`) | Telemetry core: a marker that holds no secret, one more secret pass after the scrubber, 11-digit North American numbers, a read counter that orders field-class cache writes, the memory store reads oldest first. | run 12: CHANGES REQUESTED (2 High, 2 Medium, 1 Low); `f23d300` CHANGES REQUESTED (2); `a35248b` and re-check **APPROVE** |
+| `fix/r2b-kimi12` (`integ12k/r2b`) | Builder: the source tar has bounds on folders, names, entries (500,000) and bytes, built on the blocking pool; added output folders count against the entry cap and the layer is held to the output cap; names counted as read; dangling or malformed tar extensions refuse the output; the caps count the end marker. | run 12: CHANGES REQUESTED (2 High, 2 Medium); re-check 1 CHANGES REQUESTED (1 Medium, 1 Low); `5be54f8` **APPROVE** |
+
+Fix made during this integration: the backlog file conflicted (G-1b's P-91 to P-93 next to
+P-57's P-95 and P-96); both kept in number order. The P-57 head is `c0c921b`, one commit past the
+`a8c780a` that the task named (the Claude review's fix, re-checked by Kimi).
 
 Integration of run 12 (2026-11-18; seven branches rebased onto `main` `1d0326f` in one stack,
 each tip checked on the build server, pushed as `integ12/<name>`, green in GitHub CI, then
@@ -773,6 +793,36 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-19, `main` after the Kimi review fixes of run 12, on the build server)
+
+`main` is `7912e15` before this documentation commit. Each tip was checked with the key
+`integ12k`, one full check at a time (the run 12 check: fmt, clippy, the workspace without
+`ruum-dbengine`, `ruum-dbengine` with 4 threads, the test kit on both backends with
+`RUUM_REQUIRE_IMPLEMENTED=1`), each on a fresh data cluster after touching every file (B-41); the
+final tip also ran the browser tests. The strict mutation check ran in two shards (`integ12km1`,
+`integ12km2`) and the 22 Docker mutations alone on the engine.
+
+| Tip | `cargo test --workspace` (passed / failed / ignored) | Isolation (memory = Postgres) | Permission matrix (memory = Postgres) | Privacy (memory / Postgres) | Trashed | Browser |
+|---|---|---|---|---|---|---|
+| main before (`314bfad`, run 12 final) | 1274 / 0 / 2 | 375 passed, 128 planned | 2032 passed, 624 planned | 99 planned / 38 passed, 61 planned | 112 | 172 passed, 1 skipped |
+| P-57 (`c0c921b`) | 1277 / 0 / 2 | 375, 128 | 2032, 624 | same | 112 | not run |
+| K11 (`396054f`) | 1281 / 0 / 2 | 375, 128 | 2032, 624 | same | 112 | not run |
+| G-1b (`584f91c`) | 1285 / 0 / 2 | 375, 128 | 2032, 624 | same | 112 | not run |
+| O-1a (`9e065c2`) | 1289 / 0 / 2 | 375, 128 | 2032, 624 | same | 112 | not run |
+| R-2b (`7912e15`, final) | **1297 / 0 / 2** | **375 passed, 128 planned** | **2032 passed, 624 planned** | **99 planned / 38 passed, 61 planned** | **112** | **172 passed, 1 skipped** |
+
+Every tip passed every step at the first run: no failure, so no rerun was needed.
+
+On the final tree: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` clean; the test kit with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and Postgres, 0 operations without a case; `scripts/e2e_smoke.sh`: `PASSED: 59 checks`. Also:
+
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: all 309 mutations killed (304
+  before; K11 adds three, G-1b two): 144 + 143 in the shards, 22 Docker mutations alone.
+- `deploy/staging/tests/run.sh` on the Mac: 640 checks passed on each of the five tips.
+- GitHub CI: green on the five pushed heads `integ12k/p57`, `integ12k/k11`, `integ12k/g1b`,
+  `integ12k/o1a` (second attempt: Docker `memory_limit_enforced` exit 137, T-54), `integ12k/r2b`
+  (`ci` runs 44484239128, 44484243557, 44484247145, 44484250148, 44484254462).
 
 ## Checks (2026-11-18, `main` after the integration of run 12, on the build server)
 
