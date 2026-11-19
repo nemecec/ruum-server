@@ -249,7 +249,11 @@ impl TarWriter {
 /// by path bytes (a folder comes before what it holds). The walk up from an entry stops at the
 /// first folder that is already there (every name in the map has all its folders), so an
 /// output whose folders are entries (the reader adds them) costs one lookup per entry.
-pub fn build_layer(entries: &[OutEntry]) -> Layer {
+///
+/// The uncompressed layer is at most `cap` bytes (`RUUM_BUILD_OUTPUT_MAX`, as the README
+/// states): the tar is refused as soon as it grows past it, so headers of many small entries
+/// cannot make a layer far larger than the output (Kimi, run 12).
+pub fn build_layer(entries: &[OutEntry], cap: u64) -> Result<Layer, String> {
     let mut all: BTreeMap<Vec<u8>, Option<&OutEntry>> = BTreeMap::new();
     all.insert(b"app".to_vec(), None);
     for e in entries {
@@ -273,6 +277,12 @@ pub fn build_layer(entries: &[OutEntry]) -> Layer {
             Some(Kind::File(data)) => w.file(path, e.map_or(0o644, |e| e.mode), data),
             Some(Kind::Symlink(target)) => w.symlink(path, target),
         }
+        // Checked after each entry: the buffer passes the cap by at most one entry.
+        if w.out.len() as u64 > cap {
+            return Err(format!(
+                "the new layer is over the output cap of {cap} bytes"
+            ));
+        }
     }
     let tar = w.finish();
     let diff_id = OciDigest::of(&tar);
@@ -283,11 +293,11 @@ pub fn build_layer(entries: &[OutEntry]) -> Layer {
     let _ = gz.write_all(&tar);
     drop(tar);
     let gz = gz.finish().unwrap_or_default();
-    Layer {
+    Ok(Layer {
         digest: OciDigest::of(&gz),
         diff_id,
         gz: Bytes::from(gz),
-    }
+    })
 }
 
 /// The new image config from the base image's config (see the module docs).
@@ -405,8 +415,8 @@ mod tests {
         ];
         let mut b = a.clone();
         b.reverse();
-        let la = build_layer(&a);
-        let lb = build_layer(&b);
+        let la = build_layer(&a, u64::MAX).expect("layer");
+        let lb = build_layer(&b, u64::MAX).expect("layer");
         assert_eq!(la.digest, lb.digest, "the same output gives the same layer");
         assert_eq!(la.diff_id, lb.diff_id);
         let names = super::super::output::read_output(tar_of(&la), u64::MAX)
@@ -427,14 +437,34 @@ mod tests {
         );
     }
 
+    /// Many empty entries: the layer's headers alone pass the output cap, and the layer is
+    /// refused instead of growing to many times the output (Kimi, run 12).
+    #[test]
+    fn the_layer_is_held_to_the_output_cap() {
+        let entries: Vec<OutEntry> = (0..2_000)
+            .map(|i| entry(&format!("f{i:04}"), Kind::File(Bytes::new())))
+            .collect();
+        // 2,001 headers of 512 bytes, plus the end marker: about 1 MiB.
+        let l = build_layer(&entries, 2 * 1024 * 1024).expect("under the cap");
+        assert_eq!(tar_of(&l).len(), 2_001 * 512 + 1024);
+        let Err(e) = build_layer(&entries, 512 * 1024) else {
+            panic!("a layer over the cap was built");
+        };
+        assert!(e.contains("over the output cap"), "{e}");
+    }
+
     #[test]
     fn long_paths_and_links_use_pax_records() {
         let long = format!("{}/{}", "d".repeat(150), "f".repeat(120));
         let target = "t".repeat(130);
-        let l = build_layer(&[
-            entry(&long, Kind::File(Bytes::from_static(b"z"))),
-            entry("link", Kind::Symlink(target.as_bytes().to_vec())),
-        ]);
+        let l = build_layer(
+            &[
+                entry(&long, Kind::File(Bytes::from_static(b"z"))),
+                entry("link", Kind::Symlink(target.as_bytes().to_vec())),
+            ],
+            u64::MAX,
+        )
+        .expect("layer");
         let back = super::super::output::read_output(tar_of(&l), u64::MAX).expect("reads");
         assert!(
             back.entries
@@ -451,7 +481,7 @@ mod tests {
     #[test]
     fn the_config_has_no_volume_no_healthcheck_and_user_10001() {
         let base = br#"{"architecture":"arm64","os":"linux","config":{"Env":["PATH=/usr/bin"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["node"],"Volumes":{"/data":{}},"Healthcheck":{"Test":["CMD","x"]},"OnBuild":["RUN x"]},"rootfs":{"type":"layers","diff_ids":["sha256:aa"]},"history":[]}"#;
-        let l = build_layer(&[]);
+        let l = build_layer(&[], u64::MAX).expect("layer");
         let c = image_config(base, &l, "node server.js", &BTreeMap::new()).expect("config");
         let v: Value = serde_json::from_slice(&c).unwrap();
         let cfg = &v["config"];

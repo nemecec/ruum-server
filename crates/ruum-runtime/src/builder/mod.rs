@@ -677,7 +677,9 @@ impl DockerBuilder {
         let base_config = push
             .base_blob(&OciDigest::parse(&base.config.digest)?)
             .await?;
-        let layer = blocking(move || oci::build_layer(&out.entries)).await?;
+        let layer = blocking(move || oci::build_layer(&out.entries, cap))
+            .await?
+            .map_err(|e| failed(format!("the build's output is refused: {e}")))?;
         let mut labels: BTreeMap<String, String> = self.cfg.docker.extra_labels.clone();
         labels.insert(
             crate::LABEL_APP.to_owned(),
