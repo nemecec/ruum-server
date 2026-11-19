@@ -197,7 +197,6 @@ fn sample(event: EventType, user: UserId) -> Value {
     }
 }
 
-/// A journal with one entry of every event type, by a user and by an agent.
 /// The event types this release writes: [`EventType::ALL`] without `read_only` (design 12.7:
 /// a type in `READ_ONLY_EVENTS` is known and read, never written).
 fn writable_events(read_only: &[EventType]) -> Vec<EventType> {
@@ -222,7 +221,8 @@ fn writable_events_leave_out_read_only_types() {
     );
 }
 
-/// One entry of every type this release writes ([`writable_events`]), in that order.
+/// A journal with one entry of every type this release writes ([`writable_events`]), in that
+/// order, by a user and by an agent in turn.
 fn journal_with_every_event(tenant: TenantId, user: UserId) -> Arc<MemoryJournal> {
     let journal = Arc::new(MemoryJournal::default());
     let user_ctx = Context {
@@ -326,7 +326,7 @@ async fn every_entry_of_a_real_response_validates_against_the_contract() {
     // The member link and the grant to the caller give markers.
     assert!(!page["resync"].as_array().unwrap().is_empty());
 
-    // Every event type is in the response; agents carry on_behalf_of.
+    // Every writable event type is in the response; agents carry on_behalf_of.
     let types: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
     let expected: Vec<&str> = written.iter().map(|e| e.as_str()).collect();
     assert_eq!(types, expected);
