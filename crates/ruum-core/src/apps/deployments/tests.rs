@@ -1584,12 +1584,15 @@ async fn static_gc_does_not_run_at_the_start_of_a_server() {
 }
 
 /// An object store whose deletes take `delay` each, one after the other, and are counted (the
-/// purge tests: a slow object store).
+/// purge tests: a slow object store). Its listings take `list_delay` for each object and are
+/// counted too.
 #[derive(Debug)]
 struct SlowDeletes {
     inner: Arc<dyn object_store::ObjectStore>,
     delay: Duration,
     deletes: Arc<std::sync::atomic::AtomicUsize>,
+    list_delay: Duration,
+    lists: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Display for SlowDeletes {
@@ -1656,7 +1659,16 @@ impl object_store::ObjectStore for SlowDeletes {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list(prefix)
+        use futures::StreamExt;
+        self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = self.list_delay;
+        self.inner
+            .list(prefix)
+            .then(move |meta| async move {
+                tokio::time::sleep(delay).await;
+                meta
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(
@@ -1682,14 +1694,54 @@ fn slow_deletes(
     w: &World,
     delay: Duration,
 ) -> (Arc<AppService>, Arc<std::sync::atomic::AtomicUsize>) {
+    let (svc, deletes, _) = slow_store(w, delay, Duration::ZERO);
+    (svc, deletes)
+}
+
+/// [`slow_deletes`] whose listings also take `list_delay` per object; also answers the count
+/// of listings.
+fn slow_store(
+    w: &World,
+    delay: Duration,
+    list_delay: Duration,
+) -> (
+    Arc<AppService>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut deps = w.s.apps.deps().clone();
     deps.sites = crate::apps::static_site::StaticSites::new(Arc::new(SlowDeletes {
         inner: w.s.apps.sites().object_store(),
         delay,
         deletes: deletes.clone(),
+        list_delay,
+        lists: lists.clone(),
     }));
-    (Arc::new(AppService::new(deps)), deletes)
+    (Arc::new(AppService::new(deps)), deletes, lists)
+}
+
+/// Delivers the purge hook of `svc` for `app` up to `tries` times, each cut after `cut` (the
+/// delivery timeout); the number of deliveries until one answered success, or `None`.
+async fn deliver_purge(
+    svc: &Arc<AppService>,
+    tenant: crate::ids::TenantId,
+    app: NodeId,
+    cut: Duration,
+    tries: usize,
+) -> Option<usize> {
+    use crate::apps::provider::PurgeHook;
+    let hook = svc.static_purge();
+    for n in 1..=tries {
+        match tokio::time::timeout(cut, hook.app_purged(tenant, app)).await {
+            Ok(Ok(())) => return Some(n),
+            Ok(Err(e)) if e.http_status() == 503 => {}
+            Ok(Err(e)) => panic!("{e:?}"),
+            Err(_) => {}
+        }
+    }
+    None
 }
 
 /// Previews of `app` under distinct drafts, each with its own index.
@@ -1783,6 +1835,110 @@ async fn a_purge_stops_at_its_budget_and_goes_on_at_the_next_call() {
         0
     );
     assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
+/// Backlog W2S-4 (Kimi re-check of the W2S-1 fix, finding 2): the indexes of other apps sort
+/// before the purged app's (UUIDv7: they are older) and fill the first listing window. A purge
+/// that lists the tenant's indexes and starts again at the first one on every delivery never
+/// reaches the app's; the purge deletes by key, lists nothing and ends.
+#[tokio::test]
+async fn a_purge_ends_when_other_apps_fill_the_first_listing_window() {
+    let w = world().await;
+    let other = w.app("Older").await;
+    let app = w.app("Newer").await;
+    let kept = previews(&w, other, "older site", 12).await;
+    let ids = previews(&w, app, "newer site", 3).await;
+    // A listing takes 50 ms per object: a delivery cut after 250 ms sees at most 5 indexes,
+    // all of the other app.
+    let (svc, deletes, lists) =
+        slow_store(&w, Duration::from_millis(10), Duration::from_millis(50));
+    let n = deliver_purge(&svc, w.team.id, app, Duration::from_millis(250), 6).await;
+    assert!(
+        n.is_some(),
+        "the purge never ended ({} deletes sent)",
+        deletes.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    for id in ids {
+        assert!(page(&w, id).await.is_none());
+    }
+    for id in kept {
+        assert!(page(&w, id).await.is_some());
+    }
+    assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        lists.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the purge listed the tenant's objects"
+    );
+}
+
+/// Backlog W2S-4 (Kimi re-check of the W2S-1 fix, finding 1): an app with a long deployment
+/// history in a tenant with more rows. Each row read costs 10 ms and a delivery is cut after
+/// 250 ms, so reading the tenant's 40 rows (400 ms) on every delivery never reaches a delete,
+/// and even the app's own 30 rows (300 ms) do not fit into one delivery. The purge reads pages
+/// of its app's rows after its stored cursor, so each delivery goes on where the last one
+/// stopped.
+#[tokio::test]
+async fn a_purge_of_a_long_history_goes_on_from_its_stored_cursor() {
+    use crate::apps::store::conformance::{app as new_app, ctx as store_ctx, deployment};
+    use crate::apps::store::{AppStore, DeploymentState, Environment, memory::MemoryAppStore};
+    let w = world().await;
+    let t = w.team.id;
+    let store = Arc::new(MemoryAppStore::new(None));
+    let mut deps = w.s.apps.deps().clone();
+    deps.store = store.clone();
+    let svc = Arc::new(AppService::new(deps));
+    svc.set_purge_page(Some(4));
+    let c = store_ctx(t, w.owner);
+    let (app, other) = (NodeId::new(), NodeId::new());
+    store
+        .insert_app(&c, new_app(app, "history"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .insert_app(&c, new_app(other, "neighbour"))
+        .await
+        .unwrap()
+        .unwrap();
+    let files = [
+        ("app.yaml".to_string(), bytes::Bytes::from_static(MANIFEST)),
+        ("index.html".to_string(), bytes::Bytes::from_static(INDEX)),
+    ];
+    let (mut ids, mut kept) = (Vec::new(), Vec::new());
+    for i in 0..40 {
+        let node = if i % 4 == 3 { other } else { app };
+        let d = store
+            .insert_deployment(
+                &c,
+                deployment(node, Environment::Preview, DeploymentState::Ready),
+            )
+            .await
+            .unwrap();
+        svc.sites().write_site(t, d.id, &files, None).await.unwrap();
+        if node == app {
+            ids.push(d.id)
+        } else {
+            kept.push(d.id)
+        }
+    }
+    assert_eq!((ids.len(), kept.len()), (30, 10));
+    store.set_row_read_delay(Duration::from_millis(10));
+    let n = deliver_purge(&svc, t, app, Duration::from_millis(250), 10).await;
+    let n = n.expect("the purge never ended");
+    assert!(
+        n > 1,
+        "the purge ended in one delivery: the test does not cut it"
+    );
+    for id in ids {
+        assert!(page(&w, id).await.is_none());
+    }
+    for id in kept {
+        assert!(page(&w, id).await.is_some());
+    }
+    // The cursor goes with the app's rows.
+    store.remove_app(t, app).await.unwrap();
+    assert_eq!(store.static_purge_cursor(t, app).await.unwrap(), None);
 }
 
 #[tokio::test]

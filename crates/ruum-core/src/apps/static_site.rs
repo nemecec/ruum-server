@@ -64,8 +64,16 @@ pub fn index_key(tenant: TenantId, deployment: Uuid) -> Path {
 }
 
 /// How many indexes [`StaticSites::delete_indexes`] deletes in one request (the most that one
-/// bulk delete of S3 takes).
+/// bulk delete of S3 takes), and the page size of the purge of an app's sites.
 pub const DELETE_BATCH: usize = 1000;
+
+/// The deployment ID of an index key ([`index_key`]).
+fn index_id(path: &Path) -> Result<Uuid> {
+    path.filename()
+        .and_then(|n| n.strip_suffix(".json"))
+        .and_then(|n| n.parse::<Uuid>().ok())
+        .ok_or_else(|| Error::Internal(format!("not the key of a site index: {path}")))
+}
 
 /// The prefix of every static object of all tenants.
 const ROOT_PREFIX: &str = "apps/static";
@@ -802,66 +810,30 @@ impl StaticSites {
         Ok(Bytes::from(out))
     }
 
-    /// Deletes the indexes of `deployments` that exist (the purge of an app) and stops at
-    /// `deadline`. Returns how many it deleted and whether none of them is left.
-    ///
-    /// One listing of the tenant's indexes finds the ones that exist, so an index deleted by
-    /// an earlier call costs no request again: every call that gets past the listing makes
-    /// progress (Kimi run 12, W2S-1 finding 2). The listing has half of the time; what it found
-    /// by then is deleted. The deletes go in batches of [`DELETE_BATCH`] (one bulk request each
-    /// on S3).
-    pub async fn delete_indexes(
+    /// Deletes the indexes of `deployments` by their keys (the purge of an app, backlog
+    /// W2S-4). No listing: the cost of a call does not depend on the other objects of the
+    /// tenant, and the caller pages through the app's deployment rows. Yields, for each
+    /// deployment whose index is gone, its ID and whether this call deleted an object (an
+    /// index that never existed or went before is gone too), in any order. The deletes go in
+    /// batches of [`DELETE_BATCH`] (one bulk request each on S3).
+    pub fn delete_indexes(
         &self,
         tenant: TenantId,
-        deployments: &std::collections::HashSet<Uuid>,
-        deadline: tokio::time::Instant,
-    ) -> Result<(u64, bool)> {
-        if deployments.is_empty() {
-            return Ok((0, true));
-        }
-        let now = tokio::time::Instant::now();
-        let list_deadline = now + deadline.saturating_duration_since(now) / 2;
-        let mut found = Vec::new();
-        let mut complete = true;
-        let mut list = self.store.list(Some(&sites_prefix(tenant)));
-        loop {
-            let meta = match tokio::time::timeout_at(list_deadline, list.next()).await {
-                Err(_) => {
-                    complete = false;
-                    break;
+        deployments: Vec<Uuid>,
+    ) -> BoxStream<'static, Result<(Uuid, bool)>> {
+        let paths = deployments
+            .into_iter()
+            .map(move |id| Ok(index_key(tenant, id)));
+        self.store
+            .delete_stream(futures::stream::iter(paths).boxed())
+            .map(|r| match r {
+                Ok(path) => index_id(&path).map(|id| (id, true)),
+                Err(object_store::Error::NotFound { path, .. }) => {
+                    index_id(&Path::from(path)).map(|id| (id, false))
                 }
-                Ok(None) => break,
-                Ok(Some(meta)) => meta?,
-            };
-            let named = meta
-                .location
-                .filename()
-                .and_then(|n| n.strip_suffix(".json"))
-                .and_then(|n| n.parse::<Uuid>().ok())
-                .is_some_and(|id| deployments.contains(&id));
-            if named {
-                found.push(meta.location);
-            }
-        }
-        drop(list);
-        let mut deleted = 0u64;
-        while !found.is_empty() {
-            let batch: Vec<Path> = found.drain(..found.len().min(DELETE_BATCH)).collect();
-            let paths = batch.into_iter().map(Ok);
-            let mut s = self
-                .store
-                .delete_stream(futures::stream::iter(paths).boxed());
-            loop {
-                match tokio::time::timeout_at(deadline, s.next()).await {
-                    Err(_) => return Ok((deleted, false)),
-                    Ok(None) => break,
-                    Ok(Some(Ok(_))) => deleted += 1,
-                    Ok(Some(Err(object_store::Error::NotFound { .. }))) => {}
-                    Ok(Some(Err(e))) => return Err(e.into()),
-                }
-            }
-        }
-        Ok((deleted, complete))
+                Err(e) => Err(e.into()),
+            })
+            .boxed()
     }
 
     /// The object store under the sites (the tests wrap it).

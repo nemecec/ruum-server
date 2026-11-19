@@ -725,6 +725,7 @@ impl AppStore for PgAppStore {
             "delete from app_approvals where tenant_id = $1 and app_node_id = $2",
             "delete from app_deployments where tenant_id = $1 and app_node_id = $2",
             "delete from apps where tenant_id = $1 and node_id = $2",
+            "delete from app_purge_progress where tenant_id = $1 and app_node_id = $2",
         ] {
             sqlx::query(stmt)
                 .bind(tenant)
@@ -1214,6 +1215,63 @@ impl AppStore for PgAppStore {
                 })
             })
             .collect()
+    }
+
+    async fn app_deployment_ids_after(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>> {
+        // A range scan of `app_deployments_app_id_idx` (migration 0014).
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "select id from app_deployments where tenant_id = $1 and app_node_id = $2 \
+             and ($3::uuid is null or id > $3) order by id limit $4",
+        )
+        .bind(tenant)
+        .bind(app)
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    async fn static_purge_cursor(&self, tenant: TenantId, app: NodeId) -> Result<Option<Uuid>> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        let after: Option<Uuid> = sqlx::query_scalar(
+            "select static_after from app_purge_progress where tenant_id = $1 and app_node_id = $2",
+        )
+        .bind(tenant)
+        .bind(app)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(after)
+    }
+
+    async fn set_static_purge_cursor(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        after: Uuid,
+    ) -> Result<()> {
+        let mut tx = begin_tenant(&self.pool, tenant).await?;
+        sqlx::query(
+            "insert into app_purge_progress (tenant_id, app_node_id, static_after) \
+             values ($1, $2, $3) on conflict (tenant_id, app_node_id) \
+             do update set static_after = excluded.static_after, updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(app)
+        .bind(after)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn storage_usage(&self, tenant: TenantId) -> Result<StorageUsage> {

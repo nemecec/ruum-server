@@ -15,7 +15,7 @@ pub(crate) trait Harness: Send + Sync {
     async fn app_node(&self, tenant: TenantId, user: UserId) -> NodeId;
 }
 
-fn ctx(tenant: TenantId, user: UserId) -> Context {
+pub(crate) fn ctx(tenant: TenantId, user: UserId) -> Context {
     Context {
         tenant,
         actor: Actor::user(user),
@@ -24,7 +24,7 @@ fn ctx(tenant: TenantId, user: UserId) -> Context {
     }
 }
 
-fn app(node: NodeId, slug: &str) -> NewApp {
+pub(crate) fn app(node: NodeId, slug: &str) -> NewApp {
     NewApp {
         node_id: node,
         slug: slug.into(),
@@ -32,7 +32,7 @@ fn app(node: NodeId, slug: &str) -> NewApp {
     }
 }
 
-fn deployment(app: NodeId, env: Environment, state: DeploymentState) -> NewDeployment {
+pub(crate) fn deployment(app: NodeId, env: Environment, state: DeploymentState) -> NewDeployment {
     NewDeployment {
         id: Uuid::now_v7(),
         app_node_id: app,
@@ -752,6 +752,99 @@ pub(crate) async fn static_deployments_say_what_is_reachable(h: &dyn Harness) {
     drop(all);
 }
 
+/// The purge of an app's static sites reads keyset pages of that app's deployment IDs only, in
+/// ID order, and keeps its cursor per app until the app's rows go; another tenant sees neither
+/// (backlog W2S-4).
+pub(crate) async fn purge_pages_stay_in_their_app(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let c = ctx(a, ua);
+    let n = h.app_node(a, ua).await;
+    let other = h.app_node(a, ua).await;
+    s.insert_app(&c, app(n, &unique("purged")))
+        .await
+        .unwrap()
+        .unwrap();
+    s.insert_app(&c, app(other, &unique("kept")))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut mine = Vec::new();
+    for _ in 0..5 {
+        // Rows of the other app between the purged app's rows.
+        s.insert_deployment(
+            &c,
+            deployment(other, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+        let d = s
+            .insert_deployment(
+                &c,
+                deployment(n, Environment::Preview, DeploymentState::Ready),
+            )
+            .await
+            .unwrap();
+        mine.push(d.id);
+    }
+    mine.sort_unstable();
+    let first = s.app_deployment_ids_after(a, n, None, 2).await.unwrap();
+    assert_eq!(first, mine[..2]);
+    let second = s
+        .app_deployment_ids_after(a, n, Some(first[1]), 2)
+        .await
+        .unwrap();
+    assert_eq!(second, mine[2..4]);
+    let rest = s
+        .app_deployment_ids_after(a, n, Some(second[1]), 10)
+        .await
+        .unwrap();
+    assert_eq!(rest, mine[4..]);
+    assert!(
+        s.app_deployment_ids_after(a, n, Some(mine[4]), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The cursor: none at first, then the last stored one, per app.
+    assert_eq!(s.static_purge_cursor(a, n).await.unwrap(), None);
+    s.set_static_purge_cursor(a, n, mine[1]).await.unwrap();
+    s.set_static_purge_cursor(a, n, mine[3]).await.unwrap();
+    assert_eq!(s.static_purge_cursor(a, n).await.unwrap(), Some(mine[3]));
+    assert_eq!(s.static_purge_cursor(a, other).await.unwrap(), None);
+    // Another tenant sees no page and no cursor of tenant A's app, and its own cursor of the
+    // same app node ID stays apart.
+    assert!(
+        s.app_deployment_ids_after(b, n, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(s.static_purge_cursor(b, n).await.unwrap(), None);
+    let bn = h.app_node(b, ub).await;
+    s.set_static_purge_cursor(b, bn, mine[0]).await.unwrap();
+    assert_eq!(s.static_purge_cursor(a, bn).await.unwrap(), None);
+    assert_eq!(s.static_purge_cursor(b, bn).await.unwrap(), Some(mine[0]));
+    // The cursor goes with the app's rows; the other app keeps its rows.
+    s.remove_app(a, n).await.unwrap();
+    assert_eq!(s.static_purge_cursor(a, n).await.unwrap(), None);
+    assert!(
+        s.app_deployment_ids_after(a, n, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        s.app_deployment_ids_after(a, other, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(s.static_purge_cursor(b, bn).await.unwrap(), Some(mine[0]));
+}
+
 /// Runs every case.
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
@@ -761,6 +854,7 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     previews_releases_and_versions(h).await;
     deployments_stay_in_their_tenant(h).await;
     static_deployments_say_what_is_reachable(h).await;
+    purge_pages_stay_in_their_app(h).await;
 }
 
 #[cfg(test)]
@@ -1296,6 +1390,7 @@ mod tests {
             "retired_app_slugs",
             "app_deployments",
             "app_approvals",
+            "app_purge_progress",
             "journal",
             "typed_nodes",
             "versions",
@@ -1315,5 +1410,6 @@ mod tests {
         apps_stay_in_their_tenant(&h).await;
         used_slugs_are_never_given_again(&h).await;
         deployments_stay_in_their_tenant(&h).await;
+        purge_pages_stay_in_their_app(&h).await;
     }
 }

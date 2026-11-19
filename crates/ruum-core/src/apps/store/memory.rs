@@ -20,12 +20,17 @@ struct Inner {
     approvals: HashMap<(TenantId, Uuid), ApprovalRow>,
     /// What [`MemoryAppStore::set_storage_usage`] stored (tests).
     storage: HashMap<TenantId, StorageUsage>,
+    /// The cursors of the purges of static sites (`app_purge_progress`).
+    purge_cursors: HashMap<(TenantId, NodeId), Uuid>,
 }
 
 /// The in-memory store. With a journal, `update_settings` appends its entry there.
 pub struct MemoryAppStore {
     journal: Option<Arc<MemoryJournal>>,
     inner: Mutex<Inner>,
+    /// What one deployment row costs a read of the static sites' rows (tests: a store with a
+    /// long history; zero by default).
+    row_read_delay: Mutex<std::time::Duration>,
 }
 
 impl MemoryAppStore {
@@ -33,6 +38,21 @@ impl MemoryAppStore {
         Self {
             journal,
             inner: Mutex::new(Inner::default()),
+            row_read_delay: Mutex::new(std::time::Duration::ZERO),
+        }
+    }
+
+    /// Makes [`AppStore::static_deployments`] and [`AppStore::app_deployment_ids_after`] take
+    /// `delay` for each row they read (tests of the purge at scale, backlog W2S-4).
+    pub fn set_row_read_delay(&self, delay: std::time::Duration) {
+        *self.row_read_delay.lock().expect("row read delay") = delay;
+    }
+
+    /// Waits what reading `rows` deployment rows costs (see `set_row_read_delay`).
+    async fn read_rows(&self, rows: usize) {
+        let delay = *self.row_read_delay.lock().expect("row read delay");
+        if !delay.is_zero() {
+            tokio::time::sleep(delay.saturating_mul(u32::try_from(rows).unwrap_or(u32::MAX))).await;
         }
     }
 
@@ -323,6 +343,7 @@ impl AppStore for MemoryAppStore {
         st.deployments
             .retain(|(t, _), d| !(*t == tenant && d.app_node_id == node));
         st.apps.remove(&(tenant, node));
+        st.purge_cursors.remove(&(tenant, node));
         Ok(())
     }
 
@@ -648,8 +669,8 @@ impl AppStore for MemoryAppStore {
     }
 
     async fn static_deployments(&self, tenant: TenantId) -> Result<Vec<StaticDeployment>> {
-        let st = self.st();
-        Ok(st
+        let rows: Vec<StaticDeployment> = self
+            .st()
             .deployments
             .values()
             .filter(|d| d.tenant_id == tenant)
@@ -669,7 +690,44 @@ impl AppStore for MemoryAppStore {
                 )
                 .then_some(d.created_at),
             })
-            .collect())
+            .collect();
+        self.read_rows(rows.len()).await;
+        Ok(rows)
+    }
+
+    async fn app_deployment_ids_after(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>> {
+        let mut ids: Vec<Uuid> = self
+            .st()
+            .deployments
+            .values()
+            .filter(|d| d.tenant_id == tenant && d.app_node_id == app)
+            .map(|d| d.id)
+            .filter(|id| after.is_none_or(|a| *id > a))
+            .collect();
+        ids.sort_unstable();
+        ids.truncate(limit as usize);
+        self.read_rows(ids.len()).await;
+        Ok(ids)
+    }
+
+    async fn static_purge_cursor(&self, tenant: TenantId, app: NodeId) -> Result<Option<Uuid>> {
+        Ok(self.st().purge_cursors.get(&(tenant, app)).copied())
+    }
+
+    async fn set_static_purge_cursor(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        after: Uuid,
+    ) -> Result<()> {
+        self.st().purge_cursors.insert((tenant, app), after);
+        Ok(())
     }
 
     async fn storage_usage(&self, tenant: TenantId) -> Result<StorageUsage> {

@@ -48,7 +48,10 @@
 //! [`STATIC_GC_FIRST_DELAY`] and then every [`STATIC_GC_EVERY`], for every tenant with static
 //! objects ([`AppService::collect_static_all`]). At the purge of an app, [`StaticPurge`] (a
 //! purge hook of the provider) deletes the app's indexes, in more than one delivery when they
-//! do not fit into [`PURGE_BUDGET`]; its files go at the next run.
+//! do not fit into [`PURGE_BUDGET`]; its files go at the next run. It pages through the app's
+//! own deployment rows in ID order, deletes their indexes by key, and stores a cursor before
+//! each `503`, so no delivery repeats the work of an earlier one and no other app's rows or
+//! objects slow it down (backlog W2S-4).
 
 use super::AppService;
 use super::static_site::{IndexFate, SiteGcReport, SiteNeed};
@@ -56,6 +59,7 @@ use super::store::{LiveSwitchLock, StorageUsage};
 use crate::error::{Error, ErrorCode, Result};
 use crate::ids::{NodeId, TenantId};
 use async_trait::async_trait;
+use futures::{FutureExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -287,15 +291,47 @@ impl AppService {
     /// under a writer. The file objects go at the next collection.
     ///
     /// It stops after [`PURGE_BUDGET`], below the delivery timeout of the hook, and then
-    /// answers `503 unavailable`: the platform delivers the hook again, and the next call
-    /// deletes only the indexes that are left ([`super::static_site::StaticSites::delete_indexes`]),
-    /// so a purge of any number of deployments ends (Kimi run 12, W2S-1 finding 2).
+    /// answers `503 unavailable`: the platform delivers the hook again, and the next call goes
+    /// on where this one stopped, so a purge of any number of deployments ends (Kimi run 12,
+    /// W2S-1 finding 2; backlog W2S-4).
     pub async fn delete_app_sites(&self, tenant: TenantId, app: NodeId) -> Result<u64> {
         self.delete_app_sites_within(tenant, app, PURGE_BUDGET)
             .await
     }
 
+    /// The page size of the purge of an app's sites.
+    fn purge_page(&self) -> u32 {
+        #[cfg(test)]
+        if let Some(page) = *self
+            .purge_page_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return page;
+        }
+        super::static_site::DELETE_BATCH as u32
+    }
+
+    /// Sets the page size of the purge of an app's sites (tests; `None`: the default).
+    #[cfg(test)]
+    pub(crate) fn set_purge_page(&self, page: Option<u32>) {
+        *self
+            .purge_page_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = page;
+    }
+
     /// [`AppService::delete_app_sites`] with a time budget of `budget`.
+    ///
+    /// The work is app-scoped and keyset-paged (backlog W2S-4): it reads one page of the app's
+    /// deployment IDs in ID order after the stored cursor ([`AppStore::static_purge_cursor`]),
+    /// deletes their indexes by key (no listing of the tenant's objects), and stores the last
+    /// ID whose index is gone and before which every index is gone. It stores that cursor
+    /// before every wait on the object store, and so before it answers `503`; a delivery that
+    /// is cut from outside loses at most the deletes it was waiting for. Neither the
+    /// deployments of other apps nor the pages already done cost a later delivery anything.
+    ///
+    /// [`AppStore::static_purge_cursor`]: super::store::AppStore::static_purge_cursor
     pub(crate) async fn delete_app_sites_within(
         &self,
         tenant: TenantId,
@@ -303,29 +339,73 @@ impl AppService {
         budget: Duration,
     ) -> Result<u64> {
         let deadline = tokio::time::Instant::now() + budget;
-        let ids: HashSet<uuid::Uuid> = self
-            .deps
-            .store
-            .static_deployments(tenant)
-            .await?
-            .into_iter()
-            .filter(|d| d.app_node_id == app)
-            .map(|d| d.id)
-            .collect();
-        let (n, done) = self
-            .deps
-            .sites
-            .delete_indexes(tenant, &ids, deadline)
-            .await?;
-        if !done {
-            tracing::info!(%tenant, %app, indexes = n,
+        let store = &self.deps.store;
+        let unfinished = |deleted: u64| {
+            tracing::info!(%tenant, %app, indexes = deleted,
                 "the purge of an app's site indexes continues at the next delivery");
-            return Err(Error::api(
+            Error::api(
                 ErrorCode::Unavailable,
                 "the purge of the app's sites is not finished; it continues at the next delivery",
-            ));
+            )
+        };
+        let page = self.purge_page();
+        let mut deleted = 0u64;
+        let mut after = tokio::time::timeout_at(deadline, store.static_purge_cursor(tenant, app))
+            .await
+            .map_err(|_| unfinished(deleted))??;
+        loop {
+            let ids = tokio::time::timeout_at(
+                deadline,
+                store.app_deployment_ids_after(tenant, app, after, page),
+            )
+            .await
+            .map_err(|_| unfinished(deleted))??;
+            let Some(&last) = ids.last() else {
+                return Ok(deleted);
+            };
+            // `ids` is in ID order: `done` is the count of its first IDs whose indexes are all
+            // gone, `saved` the count the stored cursor covers.
+            let position: HashMap<uuid::Uuid, usize> =
+                ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+            let mut gone = vec![false; ids.len()];
+            let (mut done, mut saved) = (0usize, 0usize);
+            let mut s = self.deps.sites.delete_indexes(tenant, ids.clone());
+            loop {
+                let next = match s.next().now_or_never() {
+                    Some(next) => next,
+                    None => {
+                        // About to wait: store the progress first.
+                        if done > saved {
+                            store
+                                .set_static_purge_cursor(tenant, app, ids[done - 1])
+                                .await?;
+                            saved = done;
+                        }
+                        tokio::time::timeout_at(deadline, s.next())
+                            .await
+                            .map_err(|_| unfinished(deleted))?
+                    }
+                };
+                let Some(r) = next else { break };
+                let (id, removed) = r?;
+                deleted += u64::from(removed);
+                if let Some(&i) = position.get(&id) {
+                    gone[i] = true;
+                }
+                while done < gone.len() && gone[done] {
+                    done += 1;
+                }
+            }
+            if done < ids.len() {
+                return Err(Error::Internal(
+                    "the object store did not answer for every site index of a purge".into(),
+                ));
+            }
+            if saved < done {
+                store.set_static_purge_cursor(tenant, app, last).await?;
+            }
+            after = Some(last);
         }
-        Ok(n)
     }
 
     /// The purge hook of static sites (register it with the provider's purge hooks).

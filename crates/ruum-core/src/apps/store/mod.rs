@@ -671,6 +671,31 @@ pub trait AppStore: Send + Sync {
     /// W2S-1). No permission check.
     async fn static_deployments(&self, tenant: TenantId) -> Result<Vec<StaticDeployment>>;
 
+    /// The IDs of the deployments of `app` (only that app's), in ID order, after `after`
+    /// (`None`: from the first), at most `limit`. A keyset page for the purge of the app's
+    /// static sites (backlog W2S-4): its cost does not grow with the deployments of the tenant
+    /// or with the pages before it. No permission check.
+    async fn app_deployment_ids_after(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>>;
+
+    /// The cursor of the purge of `app`'s static sites: the last deployment ID (in ID order)
+    /// whose index is deleted, or `None` before the first page (backlog W2S-4).
+    async fn static_purge_cursor(&self, tenant: TenantId, app: NodeId) -> Result<Option<Uuid>>;
+
+    /// Stores the cursor of the purge of `app`'s static sites (committed when it returns).
+    /// [`AppStore::remove_app`] removes it with the app's rows.
+    async fn set_static_purge_cursor(
+        &self,
+        tenant: TenantId,
+        app: NodeId,
+        after: Uuid,
+    ) -> Result<()>;
+
     /// The storage the tenant uses for its files, and its member count (backlog W2S-1: the
     /// quota of static sites). The in-memory store sees no files: it answers what
     /// `set_storage_usage` (tests) stored, else nothing used.

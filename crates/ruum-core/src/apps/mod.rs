@@ -423,6 +423,10 @@ pub struct AppService {
     /// A storage limit for every tenant instead of the plan's (the tests of the static quota).
     #[cfg(test)]
     storage_limit_override: std::sync::Mutex<Option<i64>>,
+    /// A page size of the purge of static sites instead of `static_site::DELETE_BATCH` (the
+    /// tests of the purge at scale, backlog W2S-4).
+    #[cfg(test)]
+    purge_page_override: std::sync::Mutex<Option<u32>>,
 }
 
 /// Share-link bearers call no app operation (`403 user_required`).
@@ -514,6 +518,8 @@ impl AppService {
             site_locks: static_gc::SiteLocks::default(),
             #[cfg(test)]
             storage_limit_override: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            purge_page_override: std::sync::Mutex::new(None),
         }
     }
 
