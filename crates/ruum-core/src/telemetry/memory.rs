@@ -74,54 +74,61 @@ impl TelemetryStore for MemoryTelemetryStore {
         };
         let limit = f.limit.unwrap_or(usize::MAX);
         // Oldest first by record time, then in the order written; the limit keeps the oldest
-        // (Kimi review of run 12, finding 5).
+        // (Kimi review of run 12, finding 5). The matches are sorted as references and only
+        // the kept ones are cloned.
         let want = |s: Signal| f.signal.is_none_or(|w| w == s);
         let mut out = ClassifiedBatch::default();
         if want(Signal::Logs) {
-            out.logs = st
-                .logs
-                .iter()
-                .filter(|r| {
+            out.logs = oldest(
+                st.logs.iter().filter(|r| {
                     source_matches(&r.source, tenant, f)
                         && time_matches(r.time, f)
                         && f.min_severity.is_none_or(|s| r.severity >= s)
                         && fields_match(f, &[&r.fields, &r.attributes])
-                })
-                .cloned()
-                .collect();
+                }),
+                limit,
+                |r| r.time,
+            );
         }
         if want(Signal::Metrics) && f.min_severity.is_none() {
-            out.metrics = st
-                .metrics
-                .iter()
-                .filter(|r| {
+            out.metrics = oldest(
+                st.metrics.iter().filter(|r| {
                     source_matches(&r.source, tenant, f)
                         && time_matches(r.time, f)
                         && fields_match(f, &[&r.labels])
-                })
-                .cloned()
-                .collect();
+                }),
+                limit,
+                |r| r.time,
+            );
         }
         if want(Signal::Traces) && f.min_severity.is_none() {
-            out.spans = st
-                .spans
-                .iter()
-                .filter(|r| {
+            out.spans = oldest(
+                st.spans.iter().filter(|r| {
                     source_matches(&r.source, tenant, f)
                         && time_matches(r.start, f)
                         && fields_match(f, &[&r.attributes])
-                })
-                .cloned()
-                .collect();
+                }),
+                limit,
+                |r| r.start,
+            );
         }
-        out.logs.sort_by_key(|r| r.time);
-        out.logs.truncate(limit);
-        out.metrics.sort_by_key(|r| r.time);
-        out.metrics.truncate(limit);
-        out.spans.sort_by_key(|r| r.start);
-        out.spans.truncate(limit);
         Ok(out)
     }
+}
+
+/// The `limit` oldest of `matches` by `time` (a stable sort, so the order written breaks
+/// ties), cloned.
+fn oldest<'a, T: Clone + 'a>(
+    matches: impl Iterator<Item = &'a T>,
+    limit: usize,
+    time: impl Fn(&T) -> OffsetDateTime,
+) -> Vec<T> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut refs: Vec<&T> = matches.collect();
+    refs.sort_by_key(|r| time(r));
+    refs.into_iter().take(limit).cloned().collect()
 }
 
 /// [`FieldClassSource`] in memory.
