@@ -10,8 +10,10 @@
 #
 # Runs on the person's Mac (the secrets file and the credentials are here); every step runs in
 # the tools container with the secrets on stdin (lib.sh). The Talos and Kubernetes APIs are open
-# only to the build server's fixed IPv4 address; after the OpenTofu apply the Mac reaches them
-# through the SSH tunnel over the build server (lib.sh stg_tunnel_up, ops/tunnel-setup.sh). The plan is
+# only to the build server's fixed IPv4 address; the Mac reaches them through the SSH tunnel over
+# the build server (lib.sh stg_tunnel_up, ops/tunnel-setup.sh), the Talos resources of OpenTofu
+# included (backlog O-21). A fresh create applies the servers first (a targeted apply), runs
+# ops/tunnel-setup.sh for their new addresses, then applies the rest through the tunnel. The plan is
 # refused when check-plan.sh finds a resource outside staging, or when it costs more than EUR 50
 # per month (BUDGET_EUR_PER_MONTH). --apply also needs the environment variable
 # RUUM_STAGING_APPLY=yes: an agent cannot apply by passing a flag alone.
@@ -111,11 +113,38 @@ stg_audit plan ok
 
 # --- Apply ---
 bash "$STG_HERE/secrets-init.sh"
+# Backlog O-21: how the plan reaches the Talos API (steps.sh talos-access reads the plan above).
+access="$(printf '__END__\n' | stg_run ro talos-access)"
+case "$access" in
+  create)
+    # New servers have new public addresses, which the ruumtunnel key line on the build server
+    # does not list yet: apply them first, then let the tunnel reach them.
+    stg_log "apply, phase 1: the servers and what they need (a targeted OpenTofu apply)"
+    stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run rw apply servers
+    stg_audit apply "tofu servers ok"
+    stg_log "apply, phase 2: the admin tunnel for the new node addresses (ops/tunnel-setup.sh)"
+    bash "$STG_HERE/ops/tunnel-setup.sh" --before-bootstrap
+    stg_audit apply "tunnel-setup ok"
+    ;;
+  bootstrap | tunnel | none) ;;
+  *) stg_die "unexpected Talos access '$access' (steps.sh talos-access)" ;;
+esac
+if [[ "$access" == create || "$access" == bootstrap ]]; then
+  # The Kubernetes API of stg-1 starts only after the bootstrap, and new nodes need a few minutes
+  # before their Talos API listens.
+  STG_TUNNEL_NO_KUBE_CHECK=1
+  # shellcheck disable=SC2034 # read by stg_tunnel_up in lib.sh
+  STG_TUNNEL_WAIT=600
+fi
+stg_log "admin tunnel over the build server (the Talos resources of OpenTofu and the kubeconfig use it)"
+stg_tunnel_up
 stg_log "apply: snapshot, OpenTofu (exact reviewed plan), user_data check, talosconfig"
 stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run rw apply
 stg_audit apply "tofu ok"
+if [[ "$STG_TUNNEL_NO_KUBE_CHECK" == 1 ]]; then
+  stg_tunnel_wait_kube 900
+fi
 stg_log "kubeconfig through the admin tunnel over the build server"
-stg_tunnel_up
 printf '__END__\n' | stg_run rw kubeconfig
 if [[ $infra_only == 1 ]]; then
   stg_log "done (--infra-only). kubeconfig and talosconfig are in $STG_WORK"

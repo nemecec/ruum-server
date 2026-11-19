@@ -163,6 +163,13 @@ STG_TUNNEL_BASTION=""
 # STG_TUNNEL_FRESH=1 (ops/tunnel-setup.sh): close every open tunnel and open a new one, so the test
 # uses the key, host key and forwards that were just installed.
 STG_TUNNEL_FRESH=0
+# STG_TUNNEL_NO_KUBE_CHECK=1 (a fresh create, backlog O-21): the forward to stg-1's Kubernetes API
+# is opened but not checked, because that API starts only after the bootstrap
+# (stg_tunnel_wait_kube waits for it then). The Talos API forwards are always checked.
+STG_TUNNEL_NO_KUBE_CHECK=0
+# STG_TUNNEL_WAIT=SECONDS: retry the forward checks for that long (new nodes need a few minutes
+# before their Talos API listens). 0: check once.
+STG_TUNNEL_WAIT=0
 
 # The build server and the staging nodes, from the Hetzner API (in the tools container).
 stg_tunnel_targets() {
@@ -236,9 +243,43 @@ stg_tunnel_verify() {
     target="${spec#*:}"
     (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null ||
       { stg_warn "admin tunnel: nothing listens on 127.0.0.1:$port"; return 1; }
+    if [[ "$STG_TUNNEL_NO_KUBE_CHECK" == 1 && "$port" == "$TUNNEL_KUBE_PORT" ]]; then
+      stg_log "admin tunnel: not checking $target yet (the Kubernetes API starts after the bootstrap)"
+      continue
+    fi
     stg_tunnel_probe "$target" ||
       { stg_warn "admin tunnel: the build server cannot open $target (the forward of 127.0.0.1:$port)"; return 1; }
   done
+}
+
+# After tunnel_parse: stg_tunnel_verify, retried every 10 seconds for STG_TUNNEL_WAIT seconds.
+stg_tunnel_wait_verify() {
+  local deadline=$((SECONDS + STG_TUNNEL_WAIT))
+  while :; do
+    stg_tunnel_verify && return 0
+    ((SECONDS < deadline)) || return 1
+    stg_log "admin tunnel: a node API does not answer yet; checking again in 10 s (until $STG_TUNNEL_WAIT s have passed)"
+    sleep 10
+  done
+}
+
+# stg_tunnel_wait_kube SECONDS: after the bootstrap of a fresh create (backlog O-21), wait until the
+# build server can open stg-1's Kubernetes API (6443) over the open tunnel; then check it from now
+# on (STG_TUNNEL_NO_KUBE_CHECK=0).
+stg_tunnel_wait_kube() {
+  local deadline=$((SECONDS + $1)) target="" i
+  [[ -n "$STG_TUNNEL_PORTS" ]] || stg_die "stg_tunnel_wait_kube needs the open admin tunnel (stg_tunnel_up)"
+  for ((i = 0; i < ${#TUNNEL_NAMES[@]}; i++)); do
+    [[ "${TUNNEL_NAMES[i]}" != stg-1 ]] || target="${TUNNEL_PUBLIC[i]}:6443"
+  done
+  [[ -n "$target" ]] || stg_die "the admin tunnel has no stg-1"
+  until stg_tunnel_probe "$target"; do
+    ((SECONDS < deadline)) || stg_die "the Kubernetes API of stg-1 ($target) did not answer within $1 s after the bootstrap"
+    stg_log "waiting for the Kubernetes API of stg-1 (it starts after the bootstrap); checking again in 10 s"
+    sleep 10
+  done
+  STG_TUNNEL_NO_KUBE_CHECK=0
+  stg_log "the Kubernetes API of stg-1 answers through the admin tunnel"
 }
 
 # Opens the tunnel (or joins one that is up already with the same fingerprint) and sets
@@ -274,7 +315,7 @@ stg_tunnel_up() {
       stg_die "the admin tunnel over $TUNNEL_BASTION did not open (key installed? ops/tunnel-setup.sh)"
     stg_on_exit stg_tunnel_down
   fi
-  stg_tunnel_verify || stg_die "the admin tunnel over $TUNNEL_BASTION does not reach every node API (run deploy/staging/ops/tunnel-setup.sh after a node or key change)"
+  stg_tunnel_wait_verify || stg_die "the admin tunnel over $TUNNEL_BASTION does not reach every node API (run deploy/staging/ops/tunnel-setup.sh after a node or key change)"
   STG_TUNNEL_PORTS="$(tunnel_ports)"
 }
 
