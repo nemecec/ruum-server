@@ -1,0 +1,291 @@
+{
+  "about": "Ruum-User test vectors (card O-5). Made by sdk/node/scripts/make-vectors.mjs; checked by crates/ruum-gateway/tests/sdk_vectors.rs (the gateway signs the same claims and must give the same parts) and by the @ruum/app tests. The key is made from seed_phrase (its first 32 bytes as the Ed25519 seed): a test key, never a real one.",
+  "seed_phrase": "ruum sdk test vectors, not a key",
+  "issuer": "https://ruum.example",
+  "kid": "4X1N2eHN6lA7Y_auBcN4Brxp-6baCQFy1QcPJns7-4Q",
+  "now": 1762380000,
+  "live": {
+    "audience": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+    "env": "live"
+  },
+  "preview": {
+    "audience": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d/preview/0190b6c4-a00d-7cc1-9a4b-0000000000d1",
+    "env": "preview"
+  },
+  "vectors": [
+    {
+      "name": "live",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-live"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUwLCJqdGkiOiJ2LWxpdmUifQ",
+        "uMcu8STj-yojnjtNojxyLH5n8uS4FxbpnlIiYA3IG7_0TF6NibaWaU99mrmAK1aBdxuEEJQmZlgLgnHqpRO7BQ"
+      ],
+      "live": "accept",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "preview",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d/preview/0190b6c4-a00d-7cc1-9a4b-0000000000d1",
+        "typ": "app_user",
+        "env": "preview",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-preview"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QvcHJldmlldy8wMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0wMDAwMDAwMDAwZDEiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6InByZXZpZXciLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUwLCJqdGkiOiJ2LXByZXZpZXcifQ",
+        "hnlvoVWK5dpeFb2ZLq7GlxylGlwNv72Ewmo8hcpSZhEaQ9IdS9-TaQ5YUiK0isP2vT2vSBGAI0sSusKdpFRfCQ"
+      ],
+      "live": "wrong_audience",
+      "preview": "accept"
+    },
+    {
+      "name": "another app",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-00000000000b",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-other"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0wMDAwMDAwMDAwMGIiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUwLCJqdGkiOiJ2LW90aGVyIn0",
+        "3N548KCxA_la-t36bokI144TXcieVn2JOA1h2ElRu5H7dQVv6-___iDlp-GcaQZhzDYL9PjwvbGop3u94YRpDg"
+      ],
+      "live": "wrong_audience",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "live audience, preview env",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "preview",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-env"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6InByZXZpZXciLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUwLCJqdGkiOiJ2LWVudiJ9",
+        "FoUODXQsfnZBpe4fhZypQH65Au0cUKQDecBzVNFeNLMX0tydSp-qouH7wyLfSdhic_hq9FPjMXJSv8wnfY_LDw"
+      ],
+      "live": "wrong_env",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "expired",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379880,
+        "exp": 1762379940,
+        "jti": "v-expired"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTg4MCwiZXhwIjoxNzYyMzc5OTQwLCJqdGkiOiJ2LWV4cGlyZWQifQ",
+        "sfsn7AqTCb0F5PWC1o7uNHxVyU_XMpxMQ0I7MjC67Tnn1-yt2V35u5o0fFx5-CwqK6LN3auC3Hw7M4ZK1XZiBA"
+      ],
+      "live": "expired",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "exp - iat = 61",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380051,
+        "jti": "v-61"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUxLCJqdGkiOiJ2LTYxIn0",
+        "UOr_788BhZc9d3dTzP4TmBTjUMme3XM8y_1GRErtABY_7KKX8giyLz2nsFLBdMgTvrreldilBFy6jrVtvzbHBQ"
+      ],
+      "live": "lifetime_too_long",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "exp - iat = 60",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-60"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUwLCJqdGkiOiJ2LTYwIn0",
+        "U1PM2KL_hN0amVlDOILBrgTw1Gi2kildwGkDnFHoHMLELZvQ0wNbnNtPIDr6Q-j_4UCH1ygEKu99MDXd_BNCAA"
+      ],
+      "live": "accept",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "unknown actor and sub prefix, with on_behalf_of",
+      "gateway_signs": true,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "remote:z9",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "robot",
+        "on_behalf_of": "pairwise:aa11",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-actor"
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJyZW1vdGU6ejkiLCJ0ZW5hbnQiOiJhY21lIiwicm9sZXMiOlsibWVtYmVyIiwiYXBwcm92ZXIiXSwibm9kZV9yb2xlcyI6eyJkYiI6ImVkaXQifSwiYWN0b3IiOiJyb2JvdCIsIm9uX2JlaGFsZl9vZiI6InBhaXJ3aXNlOmFhMTEiLCJpYXQiOjE3NjIzNzk5OTAsImV4cCI6MTc2MjM4MDA1MCwianRpIjoidi1hY3RvciJ9",
+        "MlA8na_hkwe02F2yuIhBQ8cmpvvbtWyCOnGPDy6wBFqik9FYwCZb4rqDGbgJ_kkj0rVgnMZaESywFGedSa0ECw"
+      ],
+      "live": "accept",
+      "preview": "wrong_audience"
+    },
+    {
+      "name": "extra claim",
+      "gateway_signs": false,
+      "claims": {
+        "iss": "https://ruum.example",
+        "aud": "app:0190b6c4-a00d-7cc1-9a4b-1f2e3d4c5b7d",
+        "typ": "app_user",
+        "env": "live",
+        "sub": "pairwise:6f2c9a81d4",
+        "tenant": "acme",
+        "roles": [
+          "member",
+          "approver"
+        ],
+        "node_roles": {
+          "db": "edit"
+        },
+        "actor": "user",
+        "iat": 1762379990,
+        "exp": 1762380050,
+        "jti": "v-extra",
+        "x_later_step": {
+          "level": 2
+        }
+      },
+      "parts": [
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSIsImtpZCI6IjRYMU4yZUhONmxBN1lfYXVCY040QnJ4cC02YmFDUUZ5MVFjUEpuczctNFEifQ",
+        "eyJpc3MiOiJodHRwczovL3J1dW0uZXhhbXBsZSIsImF1ZCI6ImFwcDowMTkwYjZjNC1hMDBkLTdjYzEtOWE0Yi0xZjJlM2Q0YzViN2QiLCJ0eXAiOiJhcHBfdXNlciIsImVudiI6ImxpdmUiLCJzdWIiOiJwYWlyd2lzZTo2ZjJjOWE4MWQ0IiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbIm1lbWJlciIsImFwcHJvdmVyIl0sIm5vZGVfcm9sZXMiOnsiZGIiOiJlZGl0In0sImFjdG9yIjoidXNlciIsImlhdCI6MTc2MjM3OTk5MCwiZXhwIjoxNzYyMzgwMDUwLCJqdGkiOiJ2LWV4dHJhIiwieF9sYXRlcl9zdGVwIjp7ImxldmVsIjoyfX0",
+        "vQsH1mz_9NpihROVzOd85sRHcZI6S9c3Hv6VKCJEL3ht65rCjlxw_tCHCzZnzR-5xErZeOEZ4652NZ-W-FthAg"
+      ],
+      "live": "accept",
+      "preview": "wrong_audience"
+    }
+  ]
+}
