@@ -3,12 +3,21 @@
 //!
 //! # Rules
 //!
-//! - **Bounded before decoding.** [`decode_logs`], [`decode_metrics`] and [`decode_traces`]
-//!   refuse a body larger than [`Limits::max_batch_bytes`] before prost reads it, and a decoded
-//!   message with more records than [`Limits::max_records`] before it is mapped. The mapping
-//!   itself stops at the byte cap: resource and scope attributes are copied onto every record,
-//!   so a small request could otherwise grow without limit. Records past the cap are counted
-//!   as [`DropReason::BatchTooLarge`], never mapped.
+//! - **Bounded before decoding.** [`check`] (and so [`decode_logs`], [`decode_metrics`] and
+//!   [`decode_traces`]) refuses a body larger than [`Limits::max_batch_bytes`], then walks the
+//!   protobuf wire format (tags and lengths only, nothing allocated) before prost decodes it.
+//!   The walk counts the records (log records, metric points, spans) and estimates the heap
+//!   that prost will allocate: the size of the Rust struct of every message entry, plus the
+//!   bytes of strings and repeated numbers. An empty protobuf entry costs 2 bytes on the wire
+//!   but a whole struct in memory (a `LogRecord` is about 180 bytes), and an empty parent entry
+//!   counts no record, so the wire size alone does not bound the decode. More records than
+//!   [`Limits::max_records`] is [`Refusal::TooManyRecords`]; an estimate over
+//!   [`max_decoded_bytes`] is [`Refusal::BodyTooLarge`]; both before prost runs. The caller
+//!   can hold the estimate in its budget ([`Shape::decoded_bytes`]) before it calls
+//!   [`Checked::decode`]. The mapping itself stops at the byte cap: resource and scope
+//!   attributes are copied onto every record, so a small request could otherwise grow without
+//!   limit. Records past the cap are counted as [`DropReason::BatchTooLarge`], never mapped.
+//!   The walk refuses protobuf groups (wire types 3 and 4; OTLP has none) as malformed.
 //! - **One path for attributes.** Resource attributes, then scope attributes, then the record's
 //!   own attributes become the record's attributes (template fields of a log have no OTLP form;
 //!   see below). Every attribute goes into a list that the pipeline classifies; no value is
@@ -104,33 +113,413 @@ impl Mapped {
     }
 }
 
-fn check_body(body: &[u8], limits: &Limits) -> std::result::Result<(), Refusal> {
-    if body.len() > limits.max_batch_bytes {
-        Err(Refusal::BodyTooLarge)
-    } else {
-        Ok(())
+/// The decoded message may hold at most this many times [`Limits::max_batch_bytes`] (the
+/// estimate of [`check`]). Real OTLP batches decode to about 2 to 4 times their wire size;
+/// short attributes (a one-letter key and a small number) to about 7 times, which only a batch
+/// near the wire cap made of nothing else reaches.
+pub const DECODED_FACTOR: usize = 6;
+
+/// The cap of the decoded estimate: [`DECODED_FACTOR`] times [`Limits::max_batch_bytes`].
+pub fn max_decoded_bytes(limits: &Limits) -> u64 {
+    (limits.max_batch_bytes as u64).saturating_mul(DECODED_FACTOR as u64)
+}
+
+/// What the wire walk of [`check`] found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// The records of the request (log records, metric points or spans).
+    pub records: u64,
+    /// The estimate of the heap that decoding allocates.
+    pub decoded_bytes: u64,
+}
+
+/// A body that passed [`check`]: only this can be decoded.
+pub struct Checked<'a> {
+    signal: Signal,
+    body: &'a [u8],
+    shape: Shape,
+}
+
+impl Checked<'_> {
+    pub fn shape(&self) -> Shape {
+        self.shape
     }
+
+    /// Decodes and maps the checked body.
+    pub fn decode(self, limits: &Limits) -> std::result::Result<Mapped, Refusal> {
+        match self.signal {
+            Signal::Logs => {
+                let req =
+                    ExportLogsServiceRequest::decode(self.body).map_err(|_| Refusal::Malformed)?;
+                map_logs(req, limits)
+            }
+            Signal::Metrics => {
+                let req = ExportMetricsServiceRequest::decode(self.body)
+                    .map_err(|_| Refusal::Malformed)?;
+                map_metrics(req, limits)
+            }
+            Signal::Traces => {
+                let req =
+                    ExportTraceServiceRequest::decode(self.body).map_err(|_| Refusal::Malformed)?;
+                map_traces(req, limits)
+            }
+        }
+    }
+}
+
+/// The bounds before decoding (see the module docs): the body size, then the wire walk with
+/// the record count and the decoded estimate.
+pub fn check<'a>(
+    signal: Signal,
+    body: &'a [u8],
+    limits: &Limits,
+) -> std::result::Result<Checked<'a>, Refusal> {
+    if body.len() > limits.max_batch_bytes {
+        return Err(Refusal::BodyTooLarge);
+    }
+    let shape = prescan(signal, body, limits)?;
+    Ok(Checked {
+        signal,
+        body,
+        shape,
+    })
 }
 
 /// Decodes and maps an OTLP logs request (protobuf). See the module docs for the bounds.
 pub fn decode_logs(body: &[u8], limits: &Limits) -> std::result::Result<Mapped, Refusal> {
-    check_body(body, limits)?;
-    let req = ExportLogsServiceRequest::decode(body).map_err(|_| Refusal::Malformed)?;
-    map_logs(req, limits)
+    check(Signal::Logs, body, limits)?.decode(limits)
 }
 
 /// Decodes and maps an OTLP metrics request (protobuf).
 pub fn decode_metrics(body: &[u8], limits: &Limits) -> std::result::Result<Mapped, Refusal> {
-    check_body(body, limits)?;
-    let req = ExportMetricsServiceRequest::decode(body).map_err(|_| Refusal::Malformed)?;
-    map_metrics(req, limits)
+    check(Signal::Metrics, body, limits)?.decode(limits)
 }
 
 /// Decodes and maps an OTLP traces request (protobuf).
 pub fn decode_traces(body: &[u8], limits: &Limits) -> std::result::Result<Mapped, Refusal> {
-    check_body(body, limits)?;
-    let req = ExportTraceServiceRequest::decode(body).map_err(|_| Refusal::Malformed)?;
-    map_traces(req, limits)
+    check(Signal::Traces, body, limits)?.decode(limits)
+}
+
+// ---------------------------------------------------------------------------- wire walk
+
+/// The nesting the walk follows (prost's own recursion limit is 100).
+const MAX_DEPTH: u32 = 100;
+
+/// The OTLP messages of the three export requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum M {
+    LogsReq,
+    ResourceLogs,
+    ScopeLogs,
+    LogRecord,
+    MetricsReq,
+    ResourceMetrics,
+    ScopeMetrics,
+    Metric,
+    Gauge,
+    Sum,
+    Histogram,
+    ExpHistogram,
+    Summary,
+    NumberPoint,
+    HistogramPoint,
+    ExpHistogramPoint,
+    Buckets,
+    SummaryPoint,
+    Quantile,
+    Exemplar,
+    TracesReq,
+    ResourceSpans,
+    ScopeSpans,
+    Span,
+    Event,
+    Link,
+    Status,
+    Resource,
+    Scope,
+    EntityRef,
+    KeyValue,
+    AnyValue,
+    ArrayValue,
+    KvList,
+}
+
+/// What a field of a message is, for the walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum F {
+    /// A message (one entry of a repeated field, or an optional one).
+    Msg(M),
+    /// A string or bytes field: its bytes.
+    Bytes,
+    /// A repeated string: its bytes and a `String` per element.
+    RepBytes,
+    /// A repeated `fixed64` or `double`: 8 bytes per element, packed or not.
+    RepFixed,
+    /// A repeated varint: 8 bytes per element, packed or not.
+    RepVarint,
+    /// A scalar held inside the struct, or a field prost does not keep.
+    Inline,
+}
+
+impl M {
+    /// The size of the Rust struct prost allocates for one entry.
+    fn size(self) -> usize {
+        use opentelemetry_proto::tonic::{common::v1 as c, logs::v1 as l, metrics::v1 as m};
+        use opentelemetry_proto::tonic::{resource::v1 as r, trace::v1 as t};
+        use std::mem::size_of;
+        match self {
+            M::LogsReq => size_of::<ExportLogsServiceRequest>(),
+            M::ResourceLogs => size_of::<l::ResourceLogs>(),
+            M::ScopeLogs => size_of::<l::ScopeLogs>(),
+            M::LogRecord => size_of::<l::LogRecord>(),
+            M::MetricsReq => size_of::<ExportMetricsServiceRequest>(),
+            M::ResourceMetrics => size_of::<m::ResourceMetrics>(),
+            M::ScopeMetrics => size_of::<m::ScopeMetrics>(),
+            M::Metric => size_of::<m::Metric>(),
+            M::Gauge => size_of::<m::Gauge>(),
+            M::Sum => size_of::<m::Sum>(),
+            M::Histogram => size_of::<m::Histogram>(),
+            M::ExpHistogram => size_of::<m::ExponentialHistogram>(),
+            M::Summary => size_of::<m::Summary>(),
+            M::NumberPoint => size_of::<m::NumberDataPoint>(),
+            M::HistogramPoint => size_of::<m::HistogramDataPoint>(),
+            M::ExpHistogramPoint => size_of::<m::ExponentialHistogramDataPoint>(),
+            M::Buckets => size_of::<m::exponential_histogram_data_point::Buckets>(),
+            M::SummaryPoint => size_of::<m::SummaryDataPoint>(),
+            M::Quantile => size_of::<m::summary_data_point::ValueAtQuantile>(),
+            M::Exemplar => size_of::<m::Exemplar>(),
+            M::TracesReq => size_of::<ExportTraceServiceRequest>(),
+            M::ResourceSpans => size_of::<t::ResourceSpans>(),
+            M::ScopeSpans => size_of::<t::ScopeSpans>(),
+            M::Span => size_of::<t::Span>(),
+            M::Event => size_of::<t::span::Event>(),
+            M::Link => size_of::<t::span::Link>(),
+            M::Status => size_of::<t::Status>(),
+            M::Resource => size_of::<r::Resource>(),
+            M::Scope => size_of::<c::InstrumentationScope>(),
+            M::EntityRef => size_of::<c::EntityRef>(),
+            M::KeyValue => size_of::<c::KeyValue>(),
+            M::AnyValue => size_of::<c::AnyValue>(),
+            M::ArrayValue => size_of::<c::ArrayValue>(),
+            M::KvList => size_of::<c::KeyValueList>(),
+        }
+    }
+
+    /// Whether one entry is one record of [`Limits::max_records`].
+    fn is_record(self) -> bool {
+        matches!(
+            self,
+            M::LogRecord
+                | M::NumberPoint
+                | M::HistogramPoint
+                | M::ExpHistogramPoint
+                | M::SummaryPoint
+                | M::Span
+        )
+    }
+
+    /// The fields of the message, by tag (opentelemetry-proto 0.33). Every field that holds a
+    /// message is listed, so the walk sees every entry prost allocates.
+    fn field(self, tag: u64) -> F {
+        use F::*;
+        match (self, tag) {
+            (M::LogsReq, 1) => Msg(M::ResourceLogs),
+            (M::ResourceLogs, 1) => Msg(M::Resource),
+            (M::ResourceLogs, 2) => Msg(M::ScopeLogs),
+            (M::ScopeLogs, 1) => Msg(M::Scope),
+            (M::ScopeLogs, 2) => Msg(M::LogRecord),
+            (M::LogRecord, 5) => Msg(M::AnyValue),
+            (M::LogRecord, 6) => Msg(M::KeyValue),
+            (M::LogRecord, 3 | 9 | 10 | 12) => Bytes,
+
+            (M::MetricsReq, 1) => Msg(M::ResourceMetrics),
+            (M::ResourceMetrics, 1) => Msg(M::Resource),
+            (M::ResourceMetrics, 2) => Msg(M::ScopeMetrics),
+            (M::ScopeMetrics, 1) => Msg(M::Scope),
+            (M::ScopeMetrics, 2) => Msg(M::Metric),
+            (M::Metric, 1..=3) => Bytes,
+            (M::Metric, 5) => Msg(M::Gauge),
+            (M::Metric, 7) => Msg(M::Sum),
+            (M::Metric, 9) => Msg(M::Histogram),
+            (M::Metric, 10) => Msg(M::ExpHistogram),
+            (M::Metric, 11) => Msg(M::Summary),
+            (M::Metric, 12) => Msg(M::KeyValue),
+            (M::Gauge | M::Sum, 1) => Msg(M::NumberPoint),
+            (M::Histogram, 1) => Msg(M::HistogramPoint),
+            (M::ExpHistogram, 1) => Msg(M::ExpHistogramPoint),
+            (M::Summary, 1) => Msg(M::SummaryPoint),
+            (M::NumberPoint, 7) => Msg(M::KeyValue),
+            (M::NumberPoint, 5) => Msg(M::Exemplar),
+            (M::HistogramPoint, 9) => Msg(M::KeyValue),
+            (M::HistogramPoint, 6 | 7) => RepFixed,
+            (M::HistogramPoint, 8) => Msg(M::Exemplar),
+            (M::ExpHistogramPoint, 1) => Msg(M::KeyValue),
+            (M::ExpHistogramPoint, 8 | 9) => Msg(M::Buckets),
+            (M::ExpHistogramPoint, 11) => Msg(M::Exemplar),
+            (M::Buckets, 2) => RepVarint,
+            (M::SummaryPoint, 7) => Msg(M::KeyValue),
+            (M::SummaryPoint, 6) => Msg(M::Quantile),
+            (M::Exemplar, 7) => Msg(M::KeyValue),
+            (M::Exemplar, 4 | 5) => Bytes,
+
+            (M::TracesReq, 1) => Msg(M::ResourceSpans),
+            (M::ResourceSpans, 1) => Msg(M::Resource),
+            (M::ResourceSpans, 2) => Msg(M::ScopeSpans),
+            (M::ScopeSpans, 1) => Msg(M::Scope),
+            (M::ScopeSpans, 2) => Msg(M::Span),
+            (M::Span, 1..=5) => Bytes,
+            (M::Span, 9) => Msg(M::KeyValue),
+            (M::Span, 11) => Msg(M::Event),
+            (M::Span, 13) => Msg(M::Link),
+            (M::Span, 15) => Msg(M::Status),
+            (M::Event, 2) => Bytes,
+            (M::Event, 3) => Msg(M::KeyValue),
+            (M::Link, 1..=3) => Bytes,
+            (M::Link, 4) => Msg(M::KeyValue),
+            (M::Status, 2) => Bytes,
+
+            (M::ResourceLogs | M::ScopeLogs, 3)
+            | (M::ResourceMetrics | M::ScopeMetrics, 3)
+            | (M::ResourceSpans | M::ScopeSpans, 3) => Bytes,
+            (M::Resource, 1) => Msg(M::KeyValue),
+            (M::Resource, 3) => Msg(M::EntityRef),
+            (M::Scope, 1 | 2) => Bytes,
+            (M::Scope, 3) => Msg(M::KeyValue),
+            (M::EntityRef, 1 | 2) => Bytes,
+            (M::EntityRef, 3 | 4) => RepBytes,
+            (M::KeyValue, 1) => Bytes,
+            (M::KeyValue, 2) => Msg(M::AnyValue),
+            (M::AnyValue, 1 | 7) => Bytes,
+            (M::AnyValue, 5) => Msg(M::ArrayValue),
+            (M::AnyValue, 6) => Msg(M::KvList),
+            (M::ArrayValue, 1) => Msg(M::AnyValue),
+            (M::KvList, 1) => Msg(M::KeyValue),
+            _ => Inline,
+        }
+    }
+}
+
+/// The running totals of one walk, with the caps.
+struct Walk {
+    shape: Shape,
+    max_records: u64,
+    max_bytes: u64,
+}
+
+impl Walk {
+    fn add(&mut self, bytes: usize) -> std::result::Result<(), Refusal> {
+        self.shape.decoded_bytes = self.shape.decoded_bytes.saturating_add(bytes as u64);
+        if self.shape.decoded_bytes > self.max_bytes {
+            return Err(Refusal::BodyTooLarge);
+        }
+        Ok(())
+    }
+
+    fn entry(&mut self, m: M) -> std::result::Result<(), Refusal> {
+        if m.is_record() {
+            self.shape.records += 1;
+            if self.shape.records > self.max_records {
+                return Err(Refusal::TooManyRecords);
+            }
+        }
+        self.add(m.size())
+    }
+
+    fn message(&mut self, m: M, buf: &[u8], depth: u32) -> std::result::Result<(), Refusal> {
+        if depth > MAX_DEPTH {
+            return Err(Refusal::Malformed);
+        }
+        let mut i = 0;
+        while i < buf.len() {
+            let key = varint(buf, &mut i)?;
+            let tag = key >> 3;
+            if tag == 0 {
+                return Err(Refusal::Malformed);
+            }
+            let field = m.field(tag);
+            match key & 7 {
+                0 => {
+                    varint(buf, &mut i)?;
+                    if matches!(field, F::RepFixed | F::RepVarint) {
+                        self.add(8)?;
+                    }
+                }
+                1 => {
+                    skip(buf, &mut i, 8)?;
+                    if matches!(field, F::RepFixed | F::RepVarint) {
+                        self.add(8)?;
+                    }
+                }
+                5 => skip(buf, &mut i, 4)?,
+                2 => {
+                    let len =
+                        usize::try_from(varint(buf, &mut i)?).map_err(|_| Refusal::Malformed)?;
+                    let start = i;
+                    skip(buf, &mut i, len)?;
+                    let sub = &buf[start..i];
+                    match field {
+                        F::Msg(child) => {
+                            self.entry(child)?;
+                            self.message(child, sub, depth + 1)?;
+                        }
+                        F::Bytes | F::RepFixed => self.add(len)?,
+                        F::RepBytes => self.add(len + std::mem::size_of::<String>())?,
+                        // Packed varints: one element per byte without the high bit.
+                        F::RepVarint => self.add(8 * sub.iter().filter(|b| **b < 0x80).count())?,
+                        F::Inline => {}
+                    }
+                }
+                // Groups (3, 4) and the unused wire types: OTLP has none.
+                _ => return Err(Refusal::Malformed),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn varint(buf: &[u8], i: &mut usize) -> std::result::Result<u64, Refusal> {
+    let mut v: u64 = 0;
+    for shift in (0..64).step_by(7) {
+        let b = *buf.get(*i).ok_or(Refusal::Malformed)?;
+        *i += 1;
+        v |= u64::from(b & 0x7f) << shift;
+        if b < 0x80 {
+            return Ok(v);
+        }
+    }
+    Err(Refusal::Malformed)
+}
+
+fn skip(buf: &[u8], i: &mut usize, n: usize) -> std::result::Result<(), Refusal> {
+    match i.checked_add(n) {
+        Some(end) if end <= buf.len() => {
+            *i = end;
+            Ok(())
+        }
+        _ => Err(Refusal::Malformed),
+    }
+}
+
+/// The wire walk of [`check`]: the records and the decoded estimate of a body, without
+/// allocating. Refuses as soon as a cap is passed, so its time is linear in the body.
+pub fn prescan(
+    signal: Signal,
+    body: &[u8],
+    limits: &Limits,
+) -> std::result::Result<Shape, Refusal> {
+    let root = match signal {
+        Signal::Logs => M::LogsReq,
+        Signal::Metrics => M::MetricsReq,
+        Signal::Traces => M::TracesReq,
+    };
+    let mut walk = Walk {
+        shape: Shape::default(),
+        max_records: limits.max_records as u64,
+        max_bytes: max_decoded_bytes(limits),
+    };
+    walk.add(root.size())?;
+    walk.message(root, body, 0)?;
+    Ok(walk.shape)
 }
 
 /// The number of records of a logs request.

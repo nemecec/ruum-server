@@ -359,6 +359,118 @@ fn too_many_records_are_refused_before_mapping() {
     );
 }
 
+/// Wraps `inner` as the length-delimited field `field`.
+fn wrap(field: u8, inner: &[u8]) -> Vec<u8> {
+    let mut out = vec![(field << 3) | 2];
+    prost::encoding::encode_varint(inner.len() as u64, &mut out);
+    out.extend_from_slice(inner);
+    out
+}
+
+/// S-61 and T-56, the review of O-1b: the wire size alone does not bound the decode. Two
+/// hostile bodies of the full 8 MiB cap per signal, measured with prost at 426 MiB and 751 MiB
+/// of heap: empty top-level entries (no record at all) and empty records (or empty metrics,
+/// which count no point) in one scope. Both are refused by the wire walk, before prost runs.
+/// A mutation that skips the walk (`telemetry-processor-decode-unbounded`) makes the first
+/// body decode and pass.
+#[test]
+fn bodies_that_decode_far_larger_are_refused_before_decoding() {
+    let lim = Limits::default();
+    let cap = lim.max_batch_bytes;
+    let entries = [0x0a, 0x00].repeat(cap / 2);
+    let records = wrap(1, &wrap(2, &[0x12, 0x00].repeat(cap / 2 - 16)));
+    assert!(entries.len() <= cap && records.len() <= cap);
+    for signal in [Signal::Logs, Signal::Metrics, Signal::Traces] {
+        let started = Instant::now();
+        assert_eq!(
+            otlp::check(signal, &entries, &lim).err(),
+            Some(Refusal::BodyTooLarge),
+            "{signal:?}: empty top-level entries"
+        );
+        let want = if signal == Signal::Metrics {
+            // An empty `Metric` has no point: its struct size passes the decoded cap.
+            Refusal::BodyTooLarge
+        } else {
+            Refusal::TooManyRecords
+        };
+        assert_eq!(
+            otlp::check(signal, &records, &lim).err(),
+            Some(want),
+            "{signal:?}: empty records"
+        );
+        // The walk stops at the first cap: far below a decode of hundreds of MiB.
+        assert!(started.elapsed() < Duration::from_secs(2), "{signal:?}");
+    }
+    assert_eq!(
+        otlp::decode_logs(&entries, &lim).err(),
+        Some(Refusal::BodyTooLarge)
+    );
+    assert_eq!(
+        otlp::decode_metrics(&records, &lim).err(),
+        Some(Refusal::BodyTooLarge)
+    );
+    assert_eq!(
+        otlp::decode_traces(&records, &lim).err(),
+        Some(Refusal::TooManyRecords)
+    );
+}
+
+/// The walk's estimate grows with the entries and stays within the decoded cap for real
+/// batches: a full batch of ordinary records passes, and the estimate is at least the struct
+/// size of every record (positive controls of the walk).
+#[test]
+fn the_wire_walk_counts_records_and_estimates_the_decode() {
+    let lim = Limits::default();
+    let attrs = vec![skv("http.method", "GET"), skv("http.route", "/orders/{id}")];
+    let recs: Vec<ol::LogRecord> = (0..lim.max_records)
+        .map(|i| {
+            log_record(
+                &format!("order {i} shipped to the warehouse"),
+                attrs.clone(),
+            )
+        })
+        .collect();
+    let body = logs_request(attrs.clone(), recs);
+    let shape = otlp::check(Signal::Logs, &body, &lim).unwrap().shape();
+    assert_eq!(shape.records, lim.max_records as u64);
+    let structs = (lim.max_records * std::mem::size_of::<ol::LogRecord>()) as u64;
+    assert!(shape.decoded_bytes > structs, "{shape:?}");
+    assert!(shape.decoded_bytes <= otlp::max_decoded_bytes(&lim));
+    assert_eq!(
+        otlp::decode_logs(&body, &lim).unwrap().batch.logs.len(),
+        lim.max_records
+    );
+    let points = (0..100).map(|_| point(attrs.clone())).collect();
+    let shape = otlp::check(Signal::Metrics, &metrics_request(vec![], points), &lim)
+        .unwrap()
+        .shape();
+    assert_eq!(shape.records, 100);
+    let spans = (0..10).map(|_| span(attrs.clone(), 2, 1)).collect();
+    let shape = otlp::check(Signal::Traces, &traces_request(vec![], spans), &lim)
+        .unwrap()
+        .shape();
+    assert_eq!(shape.records, 10);
+    // Truncated or grouped wire data is malformed before prost sees it.
+    assert_eq!(
+        otlp::check(Signal::Logs, &body[..body.len() - 1], &lim).err(),
+        Some(Refusal::Malformed)
+    );
+    assert_eq!(
+        otlp::check(Signal::Logs, &[0x0b, 0x0c], &lim).err(),
+        Some(Refusal::Malformed)
+    );
+    // Nesting past prost's own limit.
+    let mut deep = vec![];
+    for _ in 0..200 {
+        deep = wrap(5, &wrap(1, &deep));
+    }
+    let nested = wrap(1, &wrap(2, &wrap(2, &wrap(6, &wrap(2, &deep)))));
+    assert_eq!(
+        otlp::check(Signal::Logs, &nested, &lim).err(),
+        Some(Refusal::Malformed)
+    );
+}
+
 /// The bytes a mapped batch holds (strings and values), for the bounded-output checks.
 fn mapped_bytes(b: &Batch) -> usize {
     fn attrs(a: &[Attribute]) -> usize {
@@ -581,6 +693,35 @@ fn a_flood_of_one_identity_leaves_room_for_another_tenant() {
     assert!(b_permit.is_ok(), "another tenant's batch is still taken");
     drop(held);
     assert!(budget.admit_bytes(&a3, 1).is_ok(), "the share comes back");
+}
+
+/// A permit grows while a body arrives and is refused at the tenant's share, keeping what it
+/// held; shrinking gives bytes back.
+#[test]
+fn a_held_permit_grows_within_the_tenant_share() {
+    let budget = FairBudget::new(BudgetConfig {
+        max_in_flight_bytes: 4000,
+        tenant_share: 4,
+        ..BudgetConfig::default()
+    });
+    let a = identity(Environment::Live);
+    let b = identity(Environment::Live);
+    let mut p = budget.hold(&a, 0).unwrap();
+    p.grow_to(600).unwrap();
+    p.grow(300).unwrap();
+    assert_eq!(p.bytes(), 900);
+    assert_eq!(p.grow(200), Err(BudgetRefusal::TenantShare));
+    assert_eq!(p.bytes(), 900, "a refused growth keeps what was held");
+    assert_eq!(
+        budget.hold(&a, 200).err(),
+        Some(BudgetRefusal::TenantShare),
+        "another request of A does not fit"
+    );
+    assert!(budget.hold(&b, 1000).is_ok(), "B is taken");
+    p.shrink_to(100);
+    assert!(budget.hold(&a, 800).is_ok(), "the share comes back");
+    // The byte rate is separate from the hold.
+    assert!(budget.take_bytes(&a, 10).is_ok());
 }
 
 #[test]
@@ -831,6 +972,91 @@ async fn the_shipper_shares_a_tick_between_tenants() {
         .await
         .unwrap();
     assert_eq!(b_got.logs.len(), 2, "tenant B is shipped in the same tick");
+}
+
+/// Review of O-1b: within one tenant the instances take turns. An instance that always has
+/// more lines than the tenant's share of a tick does not starve the instance listed after it.
+#[tokio::test]
+async fn a_busy_instance_does_not_starve_the_next_one() {
+    let f = Fixture::new();
+    let registry = MemoryRegistry::new();
+    let driver = Arc::new(MemoryDriver::new(
+        registry.clone(),
+        Arc::new(MemoryUsage::new()),
+    ));
+    let a = identity(Environment::Live);
+    let flood: Vec<String> = (0..100).map(|i| format!("busy {i}")).collect();
+    let busy = start_job(&driver, &registry, &workload(&a), "unused-secret-4", &flood).await;
+    wait_lines(&driver, a.tenant, busy, 101).await;
+    let quiet_id = SourceIdentity {
+        deployment: Uuid::now_v7(),
+        ..a
+    };
+    let quiet = start_job(
+        &driver,
+        &registry,
+        &workload(&quiet_id),
+        "unused-secret-5",
+        &["quiet line".into()],
+    )
+    .await;
+    wait_lines(&driver, a.tenant, quiet, 2).await;
+    // The busy instance first in the list, every tick.
+    let list = vec![(a.tenant, busy), (a.tenant, quiet)];
+    let shipper = LogShipper::new(
+        driver.clone(),
+        Arc::new(move || list.clone()),
+        f.ingest.clone(),
+        Arc::new(MemoryPositions::new()),
+        ShipperConfig {
+            lines_per_instance: 100,
+            lines_per_tick: 10,
+            ..ShipperConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let quiet_lines = || async {
+        f.store
+            .read(
+                a.tenant,
+                &TelemetryFilter {
+                    deployment: Some(quiet_id.deployment),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .logs
+            .len()
+    };
+    let first = shipper.tick().await;
+    assert_eq!(
+        first.lines, 10,
+        "positive control: the busy instance took the tick"
+    );
+    assert_eq!(quiet_lines().await, 0);
+    shipper.tick().await;
+    assert_eq!(
+        quiet_lines().await,
+        2,
+        "the quiet instance is shipped on the next tick"
+    );
+    // And the busy one continues after it.
+    let busy_got = f
+        .store
+        .read(
+            a.tenant,
+            &TelemetryFilter {
+                deployment: Some(a.deployment),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .logs
+        .len();
+    assert!(busy_got >= 18, "{busy_got}");
 }
 
 // ---------------------------------------------------------------------------- secrets
@@ -1103,9 +1329,10 @@ async fn wait_visible(store: &LgtmStore, id: &SourceIdentity, want: (u64, u64, u
                 return;
             }
         }
-        if Instant::now() > deadline {
-            return;
-        }
+        assert!(
+            Instant::now() <= deadline,
+            "the stores did not show {want:?} records of {id:?} within 90 s"
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }

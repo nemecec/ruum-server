@@ -3208,6 +3208,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
+ "futures",
+ "http-body-util",
  "opentelemetry-proto",
  "prost",
  "reqwest",

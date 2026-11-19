@@ -16,8 +16,11 @@
 # Three more refusals, each after the positive control (the same write with the token and one
 # tenant was accepted in the same run) and each timed: a write without the token (401 from the
 # Collector, for each signal), a write with the token and a pipe-joined tenant header "t-a|t-b"
-# (refused by each store: Loki and Tempo 400, Mimir's 422 reaches the sender as 500; any non-2xx
-# answer counts, no answer does not), and a write with the token and no tenant header.
+# (refused by each store: Loki and Tempo 400, Mimir's 422 reaches the sender as 500), and a write
+# with the token and no tenant header. A non-2xx answer to the pipe-joined write is not proof by
+# itself (a 5xx may come after the store kept the record), so each such record is also read
+# back with t-a and with t-b and must not be found. That read counts only after a control record,
+# written with t-a right after the refused write, was found by the same query.
 #
 # No check passes on silence: "not found" counts only after the same query found the record with
 # its own tenant. The script waits for ingestion with a bounded retry (RUUM_TELEMETRY_TIMEOUT,
@@ -96,8 +99,11 @@ write_pipe_tenant() { # <what> <path> <json>: a pipe-joined tenant header is ref
   local out code
   out="$(timed_post "$2" "t-a|t-b" "$TOKEN" "$3")"
   code="${out%% *}"
-  if [[ "$code" =~ ^[45][0-9][0-9]$ ]]; then
+  if [[ "$code" =~ ^4[0-9][0-9]$ ]]; then
     pass "$1: write with $HEADER: t-a|t-b refused ($code, ${out#* }s)"
+  elif [[ "$code" =~ ^5[0-9][0-9]$ ]]; then
+    # Not proof alone: pipe_absent reads the record back below.
+    pass "$1: write with $HEADER: t-a|t-b not accepted ($code, ${out#* }s; read back below)"
   else
     fail "$1: write with $HEADER: t-a|t-b got $code (want a refusal, ${out#* }s)"
   fi
@@ -230,6 +236,30 @@ isolated() {
   esac
 }
 
+# pipe_absent <what> <query function> <pipe record> <control record>: the record of the refused
+# pipe-joined write is found with neither t-a nor t-b. The control record was written with t-a
+# right after it; "not found" counts only once the same query has found the control.
+pipe_absent() {
+  local what=$1 fn=$2 rec=$3 ctl=$4 out tenant deadline=$((SECONDS + TIMEOUT))
+  while :; do
+    out="$("$fn" t-a "$ctl")"
+    [[ "$out" == "200 found" ]] && break
+    if ((SECONDS >= deadline)); then
+      fail "$what: the control written after the t-a|t-b write is not found with $HEADER: t-a within ${TIMEOUT}s (last: $out); the t-a|t-b record cannot be checked"
+      return
+    fi
+    sleep 2
+  done
+  pass "$what: the control written after the t-a|t-b write is found with $HEADER: t-a"
+  for tenant in t-a t-b; do
+    out="$("$fn" "$tenant" "$rec")"
+    case "$out" in
+      "200 empty" | "404 empty") pass "$what: the t-a|t-b record is not found with $HEADER: $tenant ($out)" ;;
+      *) fail "$what: the t-a|t-b record with $HEADER: $tenant got \"$out\" (want not found)" ;;
+    esac
+  done
+}
+
 # ---- network exposure -----------------------------------------------------------------------
 
 check_exposure() {
@@ -281,9 +311,13 @@ write_refused traces /v1/traces "$(span_json none "trace-n-$RUN" "$TRACE_N" "$(o
 write_no_token logs /v1/logs "$(log_json t-a "log-x-$RUN")"
 write_no_token metrics /v1/metrics "$(metric_json t-a "met-x-$RUN")"
 write_no_token traces /v1/traces "$(span_json t-a "trace-x-$RUN" "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
+TRACE_P="$(openssl rand -hex 16)" TRACE_Q="$(openssl rand -hex 16)"
 write_pipe_tenant logs /v1/logs "$(log_json t-a "log-p-$RUN")"
+write_ok "logs (control after t-a|t-b)" /v1/logs t-a "$(log_json t-a "log-q-$RUN")"
 write_pipe_tenant metrics /v1/metrics "$(metric_json t-a "met-p-$RUN")"
-write_pipe_tenant traces /v1/traces "$(span_json t-a "trace-p-$RUN" "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
+write_ok "metrics (control after t-a|t-b)" /v1/metrics t-a "$(metric_json t-a "met-q-$RUN")"
+write_pipe_tenant traces /v1/traces "$(span_json t-a "trace-p-$RUN" "$TRACE_P" "$(openssl rand -hex 8)")"
+write_ok "traces (control after t-a|t-b)" /v1/traces t-a "$(span_json t-a "trace-q-$RUN" "$TRACE_Q" "$(openssl rand -hex 8)")"
 
 isolated "logs (t-a record)" query_log "$LOG_A" t-a t-b
 isolated "logs (t-b record)" query_log "$LOG_B" t-b t-a
@@ -291,6 +325,9 @@ isolated "metrics (t-a record)" query_metric "$MET_A" t-a t-b
 isolated "metrics (t-b record)" query_metric "$MET_B" t-b t-a
 isolated "traces (t-a record)" query_trace "$TRACE_A" t-a t-b
 isolated "traces (t-b record)" query_trace "$TRACE_B" t-b t-a
+pipe_absent "logs (t-a|t-b record)" query_log "log-p-$RUN" "log-q-$RUN"
+pipe_absent "metrics (t-a|t-b record)" query_metric "met-p-$RUN" "met-q-$RUN"
+pipe_absent "traces (t-a|t-b record)" query_trace "$TRACE_P" "$TRACE_Q"
 
 if ((failures > 0)); then
   echo "telemetry check: $failures failure(s)"
