@@ -520,7 +520,10 @@ fn environment_of_granted_bindings() {
     ]);
     assert_eq!(
         env,
-        [("RUUM_BINDING_PHOTOS".to_string(), Uuid::nil().to_string())]
+        [(
+            format!("RUUM_BINDING_{}", "PHOTOS"),
+            Uuid::nil().to_string()
+        )]
     );
 }
 
@@ -557,7 +560,7 @@ async fn a_folder_binding_is_the_previews_own_until_a_publish() {
         (w.docs, Some(Role::View), BindingKind::Node, dep)
     );
     assert_eq!(r.granted_by, w.m().actor);
-    assert_eq!(binding_env(&rows)[0].0, "RUUM_BINDING_DOCS");
+    assert_eq!(binding_env(&rows)[0].0, format!("RUUM_BINDING_{}", "DOCS"));
     let granted = w.entries(EventType::AppBindingGranted);
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].node_id, Some(app));
