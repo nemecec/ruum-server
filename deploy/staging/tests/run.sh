@@ -477,6 +477,17 @@ else
   bad "up.sh --apply order (access $l_access, servers $l_srv, tunnel-setup $l_ts, tunnel $l_up, apply $l_apply, wait $l_wait, kubeconfig $l_kc)"
 fi
 [[ "$(grep -c 'stg_run rw apply' "$u")" == 2 ]] && ok "up.sh applies only in the two phases" || bad "up.sh: another apply"
+# Review O-21 change 1: tunnel-setup.sh runs for create and bootstrap alike (a create that stopped
+# after phase 1 comes back as bootstrap), so it sits in the create-or-bootstrap block, not in the case.
+l_esac="$(grep -nx 'esac' "$u" | awk -F: -v a="$l_access" '$1 > a {print $1; exit}')"
+l_cb="$(ln_of 'if [[ "$access" == create || "$access" == bootstrap ]]; then')"
+l_cbfi="$(awk -v s="$l_cb" 'NR > s && /^fi$/ {print NR; exit}' "$u")"
+if [[ -n "$l_esac" && -n "$l_cb" && -n "$l_cbfi" ]] && ((l_esac < l_cb && l_cb < l_ts && l_ts < l_cbfi && l_cbfi < l_up)) &&
+  [[ "$(grep -cF 'ops/tunnel-setup.sh" --before-bootstrap' "$u")" == 1 ]]; then
+  ok "up.sh --apply: tunnel-setup.sh runs for create and bootstrap, before the tunnel"
+else
+  bad "up.sh --apply: tunnel-setup.sh not in the create-or-bootstrap block (esac $l_esac, block $l_cb-$l_cbfi, tunnel-setup $l_ts)"
+fi
 # The tunnel port of tofu/cluster is the one of tunnel.sh.
 grep -qF '"127.0.0.1:${15000 + n.index}"' "$STG/tofu/cluster/talos.tf" && [[ "$TUNNEL_TALOS_BASE" == 15000 ]] &&
   ok "talos.tf dials 127.0.0.1:(15000 + N), the Talos port of tunnel.sh" || bad "talos.tf and tunnel.sh disagree on the Talos tunnel port"

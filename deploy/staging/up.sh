@@ -122,14 +122,16 @@ case "$access" in
     stg_log "apply, phase 1: the servers and what they need (a targeted OpenTofu apply)"
     stg_secret_stream "${STG_NAMES_TOFU[@]}" | stg_run rw apply servers
     stg_audit apply "tofu servers ok"
-    stg_log "apply, phase 2: the admin tunnel for the new node addresses (ops/tunnel-setup.sh)"
-    bash "$STG_HERE/ops/tunnel-setup.sh" --before-bootstrap
-    stg_audit apply "tunnel-setup ok"
     ;;
   bootstrap | tunnel | none) ;;
   *) stg_die "unexpected Talos access '$access' (steps.sh talos-access)" ;;
 esac
 if [[ "$access" == create || "$access" == bootstrap ]]; then
+  # Also for bootstrap: a create that stopped after phase 1 (tunnel-setup failed, Ctrl-C) comes back
+  # as bootstrap, and the ruumtunnel key line may still lack the new addresses. Idempotent.
+  stg_log "apply, phase 2: the admin tunnel for the node addresses (ops/tunnel-setup.sh)"
+  bash "$STG_HERE/ops/tunnel-setup.sh" --before-bootstrap
+  stg_audit apply "tunnel-setup ok"
   # The Kubernetes API of stg-1 starts only after the bootstrap, and new nodes need a few minutes
   # before their Talos API listens.
   STG_TUNNEL_NO_KUBE_CHECK=1
