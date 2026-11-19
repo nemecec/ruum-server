@@ -1,0 +1,8 @@
+# A compose override for the Collector of the profile apps (card O-1b): it mounts the
+# processor's write token, which scripts/dev.sh makes in deploy/dev/.state/otel/collector-token
+# (never committed). scripts/dev.sh passes this file after docker-compose.yml. Cards I-4 and I-6
+# own docker-compose.yml in step 3 wave 5; this mount can move there when they merge.
+services:
+  otel-collector:
+    volumes:
+      - ./.state/otel/collector-token:/etc/otelcol/collector-token:ro

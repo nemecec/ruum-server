@@ -421,7 +421,8 @@ header (see below), or point a Grafana of your own at the URLs with the header s
   "multiple org IDs present" (after its query retries, about 17 seconds), Mimir 422, Tempo 400.
   Writes through the Collector: the sender gets 400 from Loki and Tempo, and 500 for Mimir's
   422. A reader never builds the header from input.
-- The processor role of `ruum-server` (card O-1b) is the only writer. It decides the tenant from
+- The processor role of `ruum-server` (card O-1b) is the only writer (it holds the Collector's
+  write token, see below). It decides the tenant from
   the workload identity, never from what an app sends, and sends it in `X-Scope-OrgID`.
 - The Collector only forwards (decision 0006 answer 4). It copies `X-Scope-OrgID` from the
   incoming request to the request to the store (`include_metadata` on the OTLP receiver,
@@ -430,6 +431,48 @@ header (see below), or point a Grafana of your own at the URLs with the header s
 - A write without the header reaches the store without one; the store refuses it and the
   Collector returns the error to the sender. The exporters have no sending queue, so the request
   context with the header stays with the data and a refusal reaches the sender at once.
+
+### The write token (card O-1b)
+
+The Collector accepts writes only from the processor. Both OTLP receivers (gRPC and HTTP) use the
+extension `bearertokenauth/processor`: a request needs `Authorization: Bearer <token>`, else the
+Collector answers 401 (gRPC `Unauthenticated`) before any exporter runs. So a sandbox that could
+reach the Collector still cannot write past the processor.
+
+- `scripts/dev.sh up` makes the token once: 32 random bytes as hex in
+  `deploy/dev/.state/otel/collector-token` (never committed; `dev.sh clean` deletes it). The file
+  has mode 644, because the Collector reads it as a non-root user through a bind mount.
+- `deploy/dev/otel/compose.yaml` mounts it at `/etc/otelcol/collector-token`; `dev.sh` passes that
+  file after `docker-compose.yml` (cards I-4 and I-6 own `docker-compose.yml` in this wave; the
+  mount can move there).
+- `dev.sh env` prints `RUUM_TELEMETRY_COLLECTOR_URL` and `RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE`
+  for the processor.
+- A stack that was started before card O-1b has no token file: run `scripts/dev.sh up --apps`
+  again (it makes the file and recreates the Collector).
+
+### The telemetry role (card O-1b)
+
+`ruum-server telemetry` runs the processor alone: the OTLP receiver (gRPC and HTTP/protobuf),
+the driver log shipper and the store over the Collector, Loki, Mimir and Tempo. The serving
+process starts the same role only with `RUUM_TELEMETRY=on` (default `off`).
+
+| Variable | Default | What it is |
+|---|---|---|
+| `RUUM_TELEMETRY` | `off` | `on` starts the role in the serving process |
+| `RUUM_TELEMETRY_GRPC_LISTEN` | `127.0.0.1:4417` | The OTLP gRPC receiver (never the Collector's 4317) |
+| `RUUM_TELEMETRY_HTTP_LISTEN` | `127.0.0.1:4418` | The OTLP HTTP receiver: `POST /v1/logs`, `/v1/metrics`, `/v1/traces`, `application/x-protobuf` only |
+| `RUUM_TELEMETRY_COLLECTOR_URL` | `http://127.0.0.1:4318` | Where the store writes |
+| `RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE` | none | The write token; without it the Collector refuses every write |
+| `RUUM_TELEMETRY_SHIPPER_STATE` | none | The shipper's position file; without it the positions live in memory |
+
+Until cards I-4 and I-6 attach the processor to app networks and pass the Docker driver's
+lookups, the role knows no source: it refuses every request (401), and the shipper has no
+instances to read. The real-store tests run with the stack up:
+
+```sh
+eval "$(scripts/dev.sh env)"
+RUUM_TELEMETRY_REQUIRE_STORES=1 cargo test -p ruum-core --lib telemetry::tests::o1b -- --ignored
+```
 
 ### Network
 
@@ -448,6 +491,8 @@ host writes through the Collector's published port. Tempo's own OTLP receiver is
 | `RUUM_LOKI_URL` | `http://127.0.0.1:3100` | Loki query API (`/loki/api/v1/query_range`) |
 | `RUUM_MIMIR_URL` | `http://127.0.0.1:9009` | Mimir; the Prometheus query API is under `/prometheus/api/v1/` |
 | `RUUM_TEMPO_URL` | `http://127.0.0.1:3200` | Tempo query API (`/api/v2/traces/<trace id>`, `/api/search`) |
+| `RUUM_TELEMETRY_COLLECTOR_URL` | `http://127.0.0.1:4318` | The same as `RUUM_OTLP_ENDPOINT`, under the name the telemetry role reads |
+| `RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE` | `deploy/dev/.state/otel/collector-token` | The Collector's write token (card O-1b) |
 
 The ports come from `RUUM_OTLP_HTTP_PORT`, `RUUM_OTLP_GRPC_PORT`, `RUUM_LOKI_PORT`,
 `RUUM_MIMIR_PORT` and `RUUM_TEMPO_PORT` in `deploy/dev/.env`. A value in the environment wins over
@@ -487,7 +532,11 @@ one header (`t-b|t-a`), and refused without the header. "Not found" counts only 
 query found the record with its own tenant, and the script waits for ingestion for at most
 `RUUM_TELEMETRY_TIMEOUT` seconds (default 60). It also checks that a write without the header is
 refused (a 4xx), that every published port binds to 127.0.0.1 only, and that the services are on
-the network `telemetry` only. It prints `PASS` or `FAIL` per check and exits non-zero on a
+the network `telemetry` only. Every write carries the Collector's write token
+(`RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE`). Card O-1b added three timed refusals, each after the
+accepted write of the same signal: a write without the token (401), a write with the token and
+`X-Scope-OrgID: t-a|t-b` (Loki and Tempo 400, Mimir's 422 reaches the sender as 500; any non-2xx
+counts), and a write with the token and no tenant header. It prints `PASS` or `FAIL` per check and exits non-zero on a
 failure. A run takes about 40 seconds (Loki's refusal of a two-tenant query is slow). It needs
 `curl`, `jq`, `openssl` and `docker`.
 

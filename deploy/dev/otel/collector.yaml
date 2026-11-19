@@ -1,5 +1,5 @@
 # The OpenTelemetry Collector of the laptop stack (card I-5; docs/DEVSTACK.md "Telemetry stack
-# (profile apps)"). A skeleton: card O-1b extends it.
+# (profile apps)"); card O-1b added the write token.
 #
 # The Collector only forwards (decision 0006 answer 4). It has no classification, redaction or
 # pseudonym processor: the processor role of ruum-server does that before the data comes here.
@@ -11,10 +11,21 @@
 # without the header goes to the store without one, the store refuses it (401), and the Collector
 # returns the error to the sender: nothing is stored in a default tenant.
 #
+# Writer authentication (card O-1b): both receivers accept a request only with the processor's
+# bearer token (extension bearertokenauth/processor). The token is in the file
+# /etc/otelcol/collector-token, which scripts/dev.sh makes (deploy/dev/.state/otel/collector-token,
+# never committed) and deploy/dev/otel/compose.yaml mounts. So a sandbox that could reach the
+# Collector still cannot write past the processor. A request without the token gets 401
+# (gRPC: Unauthenticated) before any exporter runs. The test crates/ruum-server/src/telemetry/
+# tests.rs checks that both receivers keep the authenticator.
+#
 # The exporters send synchronously (no sending queue and no batch processor), so the request
 # context with the header stays with the data and a refusal reaches the sender.
 
 extensions:
+  bearertokenauth/processor:
+    scheme: Bearer
+    filename: /etc/otelcol/collector-token
   headers_setter:
     headers:
       - action: upsert
@@ -27,9 +38,13 @@ receivers:
       grpc:
         endpoint: 0.0.0.0:4317
         include_metadata: true
+        auth:
+          authenticator: bearertokenauth/processor
       http:
         endpoint: 0.0.0.0:4318
         include_metadata: true
+        auth:
+          authenticator: bearertokenauth/processor
 
 processors:
   memory_limiter:
@@ -67,7 +82,7 @@ exporters:
       max_elapsed_time: 15s
 
 service:
-  extensions: [headers_setter]
+  extensions: [bearertokenauth/processor, headers_setter]
   telemetry:
     logs:
       level: warn

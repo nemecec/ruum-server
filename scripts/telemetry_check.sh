@@ -12,13 +12,21 @@
 # refused too. It also checks that every published port of the stack binds to 127.0.0.1 only and
 # that the stores and the Collector are on the network `telemetry` only.
 #
+# The Collector's write token (card O-1b): every write above carries the processor's bearer token.
+# Three more refusals, each after the positive control (the same write with the token and one
+# tenant was accepted in the same run) and each timed: a write without the token (401 from the
+# Collector, for each signal), a write with the token and a pipe-joined tenant header "t-a|t-b"
+# (refused by each store: Loki and Tempo 400, Mimir's 422 reaches the sender as 500; any non-2xx
+# answer counts, no answer does not), and a write with the token and no tenant header.
+#
 # No check passes on silence: "not found" counts only after the same query found the record with
 # its own tenant. The script waits for ingestion with a bounded retry (RUUM_TELEMETRY_TIMEOUT,
 # default 60 seconds) and fails on the timeout. It prints PASS or FAIL per check and exits
 # non-zero on any failure.
 #
 # Settings (from `scripts/dev.sh env`): RUUM_OTLP_ENDPOINT (OTLP HTTP), RUUM_LOKI_URL,
-# RUUM_MIMIR_URL, RUUM_TEMPO_URL. COMPOSE_PROJECT_NAME selects the compose project (default ruum).
+# RUUM_MIMIR_URL, RUUM_TEMPO_URL, RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE (the write token).
+# COMPOSE_PROJECT_NAME selects the compose project (default ruum).
 # Needs curl, jq, openssl and docker.
 set -euo pipefail
 
@@ -31,10 +39,14 @@ TIMEOUT="${RUUM_TELEMETRY_TIMEOUT:-60}"
 CURL_MAX=10 # seconds per request; the two-tenant query raises it (Loki retries before it refuses)
 SERVICES=(loki mimir tempo otel-collector)
 HEADER=X-Scope-OrgID
+TOKEN_FILE="${RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE:-deploy/dev/.state/otel/collector-token}"
 
 for tool in curl jq openssl docker; do
   command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool is required" >&2; exit 2; }
 done
+
+[[ -s "$TOKEN_FILE" ]] || { echo "error: no Collector token in $TOKEN_FILE (scripts/dev.sh up makes it)" >&2; exit 2; }
+TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"
 
 failures=0
 pass() { printf 'PASS %s\n' "$*"; }
@@ -58,8 +70,37 @@ body_of() { sed '$d' <<<"$1"; }
 
 # ---- writes ---------------------------------------------------------------------------------
 
-otlp_post() { # <path> <tenant or ""> <json>
-  http POST "$OTLP$1" "$2" -H 'Content-Type: application/json' --data-binary "$3"
+otlp_post() { # <path> <tenant or ""> <json>: with the Collector's write token
+  http POST "$OTLP$1" "$2" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' --data-binary "$3"
+}
+
+# timed_post <path> <tenant or ""> <token or ""> <json>: prints "<status> <seconds>".
+timed_post() {
+  local hdr=(-H 'Content-Type: application/json')
+  [[ -n "$2" ]] && hdr+=(-H "$HEADER: $2")
+  [[ -n "$3" ]] && hdr+=(-H "Authorization: Bearer $3")
+  curl -sS -m 60 -o /dev/null -X POST "${hdr[@]}" -w '%{http_code} %{time_total}' --data-binary "$4" "$OTLP$1" 2>/dev/null || printf '000 0'
+}
+
+write_no_token() { # <what> <path> <json>: the Collector refuses a write without its token
+  local out
+  out="$(timed_post "$2" t-a "" "$3")"
+  if [[ "${out%% *}" == 401 ]]; then
+    pass "$1: write without the Collector token refused (${out%% *}, ${out#* }s)"
+  else
+    fail "$1: write without the Collector token got ${out%% *} (want 401, ${out#* }s)"
+  fi
+}
+
+write_pipe_tenant() { # <what> <path> <json>: a pipe-joined tenant header is refused (S-62)
+  local out code
+  out="$(timed_post "$2" "t-a|t-b" "$TOKEN" "$3")"
+  code="${out%% *}"
+  if [[ "$code" =~ ^[45][0-9][0-9]$ ]]; then
+    pass "$1: write with $HEADER: t-a|t-b refused ($code, ${out#* }s)"
+  else
+    fail "$1: write with $HEADER: t-a|t-b got $code (want a refusal, ${out#* }s)"
+  fi
 }
 
 log_json() { # <tenant> <nonce>
@@ -103,14 +144,14 @@ write_ok() { # <what> <path> <tenant> <json>
   fi
 }
 
-write_refused() { # <what> <path> <json>
-  local res code
+write_refused() { # <what> <path> <json>: with the token, without the tenant header
+  local res code start=$SECONDS
   res="$(otlp_post "$2" "" "$3")"
   code="$(status_of "$res")"
   # The stores refuse it with 401 (Tempo 400). Only a 4xx counts: a 5xx does not show that the
   # store refused the record (it may have stored it and failed later), and 000 is no answer.
   if [[ "$code" == 4* ]]; then
-    pass "$1: write without $HEADER refused ($code)"
+    pass "$1: write without $HEADER refused ($code, about $((SECONDS - start))s)"
   else
     fail "$1: write without $HEADER got $code (want a 4xx refusal)"
   fi
@@ -234,6 +275,15 @@ write_ok traces /v1/traces t-b "$(span_json t-b "trace-b-$RUN" "$TRACE_B" "$(ope
 write_refused logs /v1/logs "$(log_json none "log-n-$RUN")"
 write_refused metrics /v1/metrics "$(metric_json none "met-n-$RUN")"
 write_refused traces /v1/traces "$(span_json none "trace-n-$RUN" "$TRACE_N" "$(openssl rand -hex 8)")"
+
+# Card O-1b: the Collector's write token and the pipe-joined tenant. The positive control is the
+# accepted write_ok of each signal above (the same Collector, the token and one tenant).
+write_no_token logs /v1/logs "$(log_json t-a "log-x-$RUN")"
+write_no_token metrics /v1/metrics "$(metric_json t-a "met-x-$RUN")"
+write_no_token traces /v1/traces "$(span_json t-a "trace-x-$RUN" "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
+write_pipe_tenant logs /v1/logs "$(log_json t-a "log-p-$RUN")"
+write_pipe_tenant metrics /v1/metrics "$(metric_json t-a "met-p-$RUN")"
+write_pipe_tenant traces /v1/traces "$(span_json t-a "trace-p-$RUN" "$(openssl rand -hex 16)" "$(openssl rand -hex 8)")"
 
 isolated "logs (t-a record)" query_log "$LOG_A" t-a t-b
 isolated "logs (t-b record)" query_log "$LOG_B" t-b t-a

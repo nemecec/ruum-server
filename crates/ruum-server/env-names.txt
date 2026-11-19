@@ -75,3 +75,17 @@ RUUM_OPENBAO_TRANSIT_MOUNT optional
 RUUM_DBENGINE_REQUIRE_POSTGRES test
 RUUM_SUITE_RLS test
 RUUM_TEST_LOG_CHILD test
+
+# The telemetry role (card O-1b; crates/ruum-server/src/telemetry.rs). Off unless RUUM_TELEMETRY=on.
+RUUM_TELEMETRY optional
+RUUM_TELEMETRY_GRPC_LISTEN optional
+RUUM_TELEMETRY_HTTP_LISTEN optional
+RUUM_TELEMETRY_COLLECTOR_URL optional
+RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE optional
+RUUM_TELEMETRY_SHIPPER_STATE optional
+RUUM_LOKI_URL optional
+RUUM_MIMIR_URL optional
+RUUM_TEMPO_URL optional
+# The real-store tests of the telemetry privacy suite (crates/ruum-core/src/telemetry/tests/o1b.rs).
+RUUM_TELEMETRY_REQUIRE_STORES test
+RUUM_OTLP_ENDPOINT test
