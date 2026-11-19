@@ -1,0 +1,18 @@
+-- no-transaction
+--
+-- The index of the keyset pages of one app's deployments in ID order (backlog W2S-4): the
+-- purge hook of static sites reads `where tenant_id = $1 and app_node_id = $2 and id > $3
+-- order by id limit $4`.
+--
+-- Expand only (design 12.7, decision 42). The previous release serves while the migration step
+-- runs, so the index is built with `CONCURRENTLY`: a plain `create index` holds a SHARE lock
+-- on `app_deployments` while it builds and blocks every deployment, publish and purge write
+-- (Kimi review of W2S-4, finding 2). `CONCURRENTLY` cannot run in a transaction, so this file
+-- opts out of the migration transaction (the first line) and holds this one statement only:
+-- Postgres runs several statements of one simple query in one implicit transaction.
+--
+-- If the build fails, Postgres leaves an INVALID index of this name and sqlx records nothing,
+-- so the next migration step fails with "already exists". Repair: `drop index concurrently
+-- app_deployments_app_id_idx;` as the owner, then run the step again. The statement has no
+-- `if not exists` on purpose: that would accept the invalid index, which the planner ignores.
+create index concurrently app_deployments_app_id_idx on app_deployments (tenant_id, app_node_id, id);

@@ -1224,7 +1224,7 @@ impl AppStore for PgAppStore {
         after: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<Uuid>> {
-        // A range scan of `app_deployments_app_id_idx` (migration 0014).
+        // A range scan of `app_deployments_app_id_idx` (migration 0015).
         let mut tx = begin_tenant(&self.pool, tenant).await?;
         let ids: Vec<Uuid> = sqlx::query_scalar(
             "select id from app_deployments where tenant_id = $1 and app_node_id = $2 \

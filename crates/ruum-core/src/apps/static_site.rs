@@ -64,7 +64,8 @@ pub fn index_key(tenant: TenantId, deployment: Uuid) -> Path {
 }
 
 /// How many indexes [`StaticSites::delete_indexes`] deletes in one request (the most that one
-/// bulk delete of S3 takes), and the page size of the purge of an app's sites.
+/// bulk delete of S3 takes), the page size of the purge of an app's sites, and the largest
+/// delete request of that purge (its requests start at one key and double).
 pub const DELETE_BATCH: usize = 1000;
 
 /// The deployment ID of an index key ([`index_key`]).
@@ -813,9 +814,11 @@ impl StaticSites {
     /// Deletes the indexes of `deployments` by their keys (the purge of an app, backlog
     /// W2S-4). No listing: the cost of a call does not depend on the other objects of the
     /// tenant, and the caller pages through the app's deployment rows. Yields, for each
-    /// deployment whose index is gone, its ID and whether this call deleted an object (an
-    /// index that never existed or went before is gone too), in any order. The deletes go in
-    /// batches of [`DELETE_BATCH`] (one bulk request each on S3).
+    /// deployment whose index is gone, its ID and whether the store did not answer `NotFound`
+    /// for it, in any order. An index that never existed or went before is gone too. S3 and
+    /// the in-memory store answer success for a missing key, so the bool overstates the count
+    /// of deleted objects there; it only goes into logs. The deletes go in batches of
+    /// [`DELETE_BATCH`] (one bulk request each on S3).
     pub fn delete_indexes(
         &self,
         tenant: TenantId,

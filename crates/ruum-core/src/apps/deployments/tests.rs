@@ -1585,11 +1585,13 @@ async fn static_gc_does_not_run_at_the_start_of_a_server() {
 
 /// An object store whose deletes take `delay` each, one after the other, and are counted (the
 /// purge tests: a slow object store). Its listings take `list_delay` for each object and are
-/// counted too.
+/// counted too. With `bulk`, a delete request takes up to `DELETE_BATCH` keys, takes `delay`
+/// for each of them, and answers for none of them before all are done (S3 `DeleteObjects`).
 #[derive(Debug)]
 struct SlowDeletes {
     inner: Arc<dyn object_store::ObjectStore>,
     delay: Duration,
+    bulk: bool,
     deletes: Arc<std::sync::atomic::AtomicUsize>,
     list_delay: Duration,
     lists: Arc<std::sync::atomic::AtomicUsize>,
@@ -1637,6 +1639,35 @@ impl object_store::ObjectStore for SlowDeletes {
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
         use futures::StreamExt;
         let (inner, delay, deletes) = (self.inner.clone(), self.delay, self.deletes.clone());
+        if self.bulk {
+            return locations
+                .ready_chunks(crate::apps::static_site::DELETE_BATCH)
+                .then(move |batch| {
+                    let (inner, deletes) = (inner.clone(), deletes.clone());
+                    async move {
+                        tokio::time::sleep(delay * batch.len() as u32).await;
+                        let mut out = Vec::with_capacity(batch.len());
+                        for location in batch {
+                            let r = async {
+                                let location = location?;
+                                deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let mut one = inner.delete_stream(
+                                    futures::stream::iter([Ok(location.clone())]).boxed(),
+                                );
+                                while let Some(r) = one.next().await {
+                                    r?;
+                                }
+                                Ok(location)
+                            }
+                            .await;
+                            out.push(r);
+                        }
+                        futures::stream::iter(out)
+                    }
+                })
+                .flatten()
+                .boxed();
+        }
         locations
             .then(move |location| {
                 let (inner, deletes) = (inner.clone(), deletes.clone());
@@ -1698,6 +1729,25 @@ fn slow_deletes(
     (svc, deletes)
 }
 
+/// The world's app service over the same stores, with bulk deletes of site objects that take
+/// `delay` per key and answer only when the whole request is done.
+fn bulk_deletes(
+    w: &World,
+    delay: Duration,
+) -> (Arc<AppService>, Arc<std::sync::atomic::AtomicUsize>) {
+    let deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut deps = w.s.apps.deps().clone();
+    deps.sites = crate::apps::static_site::StaticSites::new(Arc::new(SlowDeletes {
+        inner: w.s.apps.sites().object_store(),
+        delay,
+        bulk: true,
+        deletes: deletes.clone(),
+        list_delay: Duration::ZERO,
+        lists: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    (Arc::new(AppService::new(deps)), deletes)
+}
+
 /// [`slow_deletes`] whose listings also take `list_delay` per object; also answers the count
 /// of listings.
 fn slow_store(
@@ -1715,6 +1765,7 @@ fn slow_store(
     deps.sites = crate::apps::static_site::StaticSites::new(Arc::new(SlowDeletes {
         inner: w.s.apps.sites().object_store(),
         delay,
+        bulk: false,
         deletes: deletes.clone(),
         list_delay,
         lists: lists.clone(),
@@ -1870,6 +1921,38 @@ async fn a_purge_ends_when_other_apps_fill_the_first_listing_window() {
         0,
         "the purge listed the tenant's objects"
     );
+}
+
+/// Kimi review of W2S-4, finding 1: a bulk delete answers only when all its keys are done
+/// (S3 `DeleteObjects`). One request of the whole page (40 keys of 10 ms: 400 ms) outlasts
+/// every delivery (cut after 250 ms), so a purge that sends a page in one request never moves
+/// its cursor. The purge's requests start at one key and double, so each delivery stores the
+/// requests that finished, and the purge ends. The page has the production size.
+#[tokio::test]
+async fn a_purge_ends_when_one_bulk_delete_of_a_page_outlasts_a_delivery() {
+    let w = world().await;
+    let app = w.app("Bulk").await;
+    let other = w.app("Bulk neighbour").await;
+    let ids = previews(&w, app, "bulk site", 40).await;
+    let kept = previews(&w, other, "bulk neighbour site", 1).await;
+    let (svc, deletes) = bulk_deletes(&w, Duration::from_millis(10));
+    let n = deliver_purge(&svc, w.team.id, app, Duration::from_millis(250), 8).await;
+    let n = n.unwrap_or_else(|| {
+        panic!(
+            "the purge never ended ({} deletes done)",
+            deletes.load(std::sync::atomic::Ordering::SeqCst)
+        )
+    });
+    assert!(
+        n > 1,
+        "the purge ended in one delivery: the test does not cut it"
+    );
+    for id in ids {
+        assert!(page(&w, id).await.is_none());
+    }
+    assert!(page(&w, kept[0]).await.is_some());
+    // A cut request deleted nothing in this store, and no finished request is sent again.
+    assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 40);
 }
 
 /// Backlog W2S-4 (Kimi re-check of the W2S-1 fix, finding 1): an app with a long deployment

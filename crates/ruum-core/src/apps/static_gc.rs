@@ -331,7 +331,15 @@ impl AppService {
     /// is cut from outside loses at most the deletes it was waiting for. Neither the
     /// deployments of other apps nor the pages already done cost a later delivery anything.
     ///
+    /// The deletes of a page go in requests that start small: the first request of a delivery
+    /// holds one key, and each finished request doubles the next one, up to [`DELETE_BATCH`].
+    /// A bulk request answers only when all its keys are done (S3 `DeleteObjects`), so one
+    /// request of a whole page that takes longer than a delivery would never move the cursor.
+    /// With the small first requests, every delivery in which one delete fits stores progress
+    /// (Kimi review of W2S-4, finding 1).
+    ///
     /// [`AppStore::static_purge_cursor`]: super::store::AppStore::static_purge_cursor
+    /// [`DELETE_BATCH`]: super::static_site::DELETE_BATCH
     pub(crate) async fn delete_app_sites_within(
         &self,
         tenant: TenantId,
@@ -350,6 +358,8 @@ impl AppService {
         };
         let page = self.purge_page();
         let mut deleted = 0u64;
+        // The number of keys of the next delete request.
+        let mut chunk = 1;
         let mut after = tokio::time::timeout_at(deadline, store.static_purge_cursor(tenant, app))
             .await
             .map_err(|_| unfinished(deleted))??;
@@ -369,32 +379,47 @@ impl AppService {
                 ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
             let mut gone = vec![false; ids.len()];
             let (mut done, mut saved) = (0usize, 0usize);
-            let mut s = self.deps.sites.delete_indexes(tenant, ids.clone());
-            loop {
-                let next = match s.next().now_or_never() {
-                    Some(next) => next,
-                    None => {
-                        // About to wait: store the progress first.
-                        if done > saved {
-                            store
-                                .set_static_purge_cursor(tenant, app, ids[done - 1])
-                                .await?;
-                            saved = done;
+            let mut start = 0;
+            while start < ids.len() {
+                let end = (start + chunk).min(ids.len());
+                let mut s = self
+                    .deps
+                    .sites
+                    .delete_indexes(tenant, ids[start..end].to_vec());
+                loop {
+                    // `now_or_never` polls once with a no-op waker. When that poll is pending,
+                    // the `timeout_at` below polls the stream again with the real waker, so no
+                    // wake-up is lost.
+                    let next = match s.next().now_or_never() {
+                        Some(next) => next,
+                        None => {
+                            // About to wait: store the progress first.
+                            if done > saved {
+                                tokio::time::timeout_at(
+                                    deadline,
+                                    store.set_static_purge_cursor(tenant, app, ids[done - 1]),
+                                )
+                                .await
+                                .map_err(|_| unfinished(deleted))??;
+                                saved = done;
+                            }
+                            tokio::time::timeout_at(deadline, s.next())
+                                .await
+                                .map_err(|_| unfinished(deleted))?
                         }
-                        tokio::time::timeout_at(deadline, s.next())
-                            .await
-                            .map_err(|_| unfinished(deleted))?
+                    };
+                    let Some(r) = next else { break };
+                    let (id, removed) = r?;
+                    deleted += u64::from(removed);
+                    if let Some(&i) = position.get(&id) {
+                        gone[i] = true;
                     }
-                };
-                let Some(r) = next else { break };
-                let (id, removed) = r?;
-                deleted += u64::from(removed);
-                if let Some(&i) = position.get(&id) {
-                    gone[i] = true;
+                    while done < gone.len() && gone[done] {
+                        done += 1;
+                    }
                 }
-                while done < gone.len() && gone[done] {
-                    done += 1;
-                }
+                start = end;
+                chunk = (chunk * 2).min(super::static_site::DELETE_BATCH);
             }
             if done < ids.len() {
                 return Err(Error::Internal(
@@ -402,7 +427,9 @@ impl AppService {
                 ));
             }
             if saved < done {
-                store.set_static_purge_cursor(tenant, app, last).await?;
+                tokio::time::timeout_at(deadline, store.set_static_purge_cursor(tenant, app, last))
+                    .await
+                    .map_err(|_| unfinished(deleted))??;
             }
             after = Some(last);
         }
