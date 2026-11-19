@@ -91,12 +91,15 @@ rule, so admin access goes through the build server, whose public IPv4 is fixed.
     applies. `steps.sh apply` refuses a Talos change whose node port is not open.
   - `create` (a fresh create, a new node or a replaced server): the new public addresses are not
     in the `ruumtunnel` key line yet. Phase 1 is a targeted apply of the servers and what they need
-    (`steps.sh apply servers`, `-target=hcloud_server.node`, with check-plan and price); then
+    (`steps.sh apply servers`: the whole persistent root, then the cluster root with
+    `-target=hcloud_server.node`, checked and priced together); then
     `ops/tunnel-setup.sh --before-bootstrap` puts the new addresses on the build server and waits
     up to 10 minutes for their Talos API (maintenance mode). Then the tunnel opens and the full
     plan is applied: the machine configs and the bootstrap through the tunnel.
   - `bootstrap` (servers exist, the bootstrap does not, for example after a create stopped
-    half-way): as `create` without phase 1.
+    half-way): as `create` without phase 1. `ops/tunnel-setup.sh --before-bootstrap` runs here
+    too, because a create that stopped after phase 1 has not put the new addresses on the build
+    server yet (the script is idempotent).
   After a bootstrap, `up.sh` waits up to 15 minutes until stg-1's Kubernetes API answers through
   the tunnel (`stg_tunnel_wait_kube`); until then the tunnel does not probe that forward
   (`STG_TUNNEL_NO_KUBE_CHECK`). The full apply refuses a plan that creates servers.
@@ -141,10 +144,10 @@ admin tunnel open while it runs (`--no-tunnel` skips it). The command gets no va
 |---|---|
 | `deploy/staging/up.sh [--out FILE]` | The priced plan: `tofu plan` of both roots, `check-plan.sh`, `price.sh`, and the platform preflight. Changes nothing, takes no state lock. |
 | `RUUM_STAGING_APPLY=yes deploy/staging/bootstrap-state.sh` | Creates the state bucket once. |
-| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices; for new servers applies them first and runs `ops/tunnel-setup.sh --before-bootstrap` ("Admin access", O-21); opens the admin tunnel, applies the exact plan (the Talos resources through the tunnel), checks that every node has empty user data, writes the talosconfig, waits for the Kubernetes API after a bootstrap, writes the kubeconfig, installs the platform, and configures Zitadel. |
+| `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply` | Generates the missing `STG_*` secrets (`secrets-init.sh`), uploads the Talos snapshot if missing, plans, checks, prices; for new servers applies them first; for new servers or a missing bootstrap runs `ops/tunnel-setup.sh --before-bootstrap` ("Admin access", O-21); opens the admin tunnel, applies the exact plan (the Talos resources through the tunnel), checks that every node has empty user data, writes the talosconfig, waits for the Kubernetes API after a bootstrap, writes the kubeconfig, installs the platform, and configures Zitadel. |
 | `... up.sh --apply --restore-from <generation>` | The same, with Postgres restored from an older backup path (disaster-recovery test). |
 | `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only` | Only the plan, the checks, the apply, the talosconfig and the kubeconfig. |
-| `deploy/staging/ops/tunnel-setup.sh [--before-bootstrap]` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). `--before-bootstrap` (up.sh runs it in a fresh create): the test waits for the Talos API of new nodes and skips stg-1's Kubernetes API. |
+| `deploy/staging/ops/tunnel-setup.sh [--before-bootstrap]` | The admin tunnel: the key (only if missing), the `ruumtunnel` user on the build server, the host key, a test ("Admin access"). `--before-bootstrap` (up.sh runs it in a fresh create and before a missing bootstrap): the test waits for the Talos API of new nodes and skips stg-1's Kubernetes API. |
 | `deploy/staging/deploy.sh <sha>` | Deploys a green commit of main by digest: checks it on the Mac (`gh`), then writes a release request that the deploy controller checks again by itself (`cosign`, GitHub) and runs ("The deploy controller"); `--rollback` to go back to the previous release on purpose, `--rollback-older` stops with the admin path to go back further ("Going back past the previous release"); one deploy at a time (Lease `ruum/ruum-deploy`); `--acme zerossl` to switch the CA. |
 | `deploy/staging/status.sh [--checks]` | What exists, its price, orphans, nodes, pods, backups, deployed commit; with `--checks` also the smoke checks and Zitadel drift. |
 | `deploy/staging/status.sh --netpol` | The network policy probe (`ops/netpol-probe.sh`): an unknown pod reaches no platform port; ruum-server reaches only Postgres, SpiceDB HTTP, NATS and Mailpit; the edge reaches only ruum-server and Zitadel. Not read-only (a temporary namespace, ephemeral containers). |
