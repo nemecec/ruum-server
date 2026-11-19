@@ -297,14 +297,31 @@ pub struct NewEntry {
 
 /// A release writes only the types it knows; [`EventType::Unknown`] exists for reading.
 pub(crate) fn refuse_unknown(entry: &NewEntry) -> Result<()> {
-    if entry.event.is_known() {
-        Ok(())
-    } else {
-        Err(Error::Internal(format!(
+    refuse_unwritable(entry.event, READ_ONLY_EVENTS)
+}
+
+/// The types this release knows and reads with their own rule, but does not write yet (design
+/// 12.7). A new type that can change who sees a node takes two releases: release N adds its
+/// [`EventType`] variant, its feed rule and an entry here (and takes it out of
+/// `$defs/planned_types`); release N+1 removes it from here and writes it. So no pod that runs
+/// during the rollout of N+1 meets the type as unknown. Empty today.
+pub const READ_ONLY_EVENTS: &[EventType] = &[];
+
+/// Refuses a type this release does not know, and a known type in `read_only`.
+fn refuse_unwritable(event: EventType, read_only: &[EventType]) -> Result<()> {
+    if !event.is_known() {
+        return Err(Error::Internal(format!(
             "a journal entry of unknown type {} cannot be written",
-            entry.event.as_str()
-        )))
+            event.as_str()
+        )));
     }
+    if read_only.contains(&event) {
+        return Err(Error::Internal(format!(
+            "type {} is read only in this release (design 12.7); the next release writes it",
+            event.as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// The read side of the journal. Appending is not in this trait: it must run in the
@@ -491,7 +508,8 @@ mod tests {
     }
 
     /// The event types of the envelope that are specified but not written yet
-    /// (`$defs/planned_types`, decision 0004-21). The task that builds the first writer of a type adds
+    /// (`$defs/planned_types`, decision 0004-21). The task that builds the first reader rule
+    /// (design 12.7) or the first writer of a type adds
     /// it to [`EventType`] and removes it from that list.
     fn planned_types(schema: &Value) -> BTreeSet<String> {
         schema["$defs"]["planned_types"]["enum"]
@@ -503,7 +521,7 @@ mod tests {
     #[test]
     fn event_types_match_the_envelope_schema() {
         let schema = schema();
-        let all_in_schema: BTreeSet<String> = schema["properties"]["type"]["enum"]
+        let all_in_schema: BTreeSet<String> = schema["$defs"]["known_types"]["enum"]
             .as_array()
             .unwrap()
             .iter()
@@ -520,12 +538,9 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|c| {
-                c["if"]["properties"]["type"]["const"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
+            // The one rule without a `const` is the generic shape of an unknown type.
+            .filter_map(|c| c["if"]["properties"]["type"]["const"].as_str())
+            .map(str::to_string)
             .collect();
         assert_eq!(with_payload, all_in_schema);
         let in_schema: BTreeSet<String> = all_in_schema.difference(&planned).cloned().collect();
@@ -718,6 +733,28 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "{err:?}");
         assert!(j.entries(ctx.tenant).is_empty());
+    }
+
+    /// Design 12.7: a type in [`READ_ONLY_EVENTS`] is read with its own rule, never written.
+    #[test]
+    fn a_read_only_type_is_never_written() {
+        let read_only = [EventType::GrantRemoved];
+        let err = refuse_unwritable(EventType::GrantRemoved, &read_only).unwrap_err();
+        assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        assert!(refuse_unwritable(EventType::GrantAdded, &read_only).is_ok());
+        assert!(refuse_unwritable(EventType::GrantRemoved, &[]).is_ok());
+        assert!(refuse_unwritable(EventType::from_wire("node.exploded"), &[]).is_err());
+        // The list holds known types only, and the writers check it.
+        for e in READ_ONLY_EVENTS {
+            assert!(EventType::ALL.contains(e), "{e:?}");
+            let entry = NewEntry {
+                node_id: None,
+                revision: None,
+                event: *e,
+                data: serde_json::json!({}),
+            };
+            assert!(refuse_unknown(&entry).is_err(), "{e:?}");
+        }
     }
 
     #[test]

@@ -53,7 +53,9 @@ fails. `matrix::PLANNED_OPERATIONS` lists them, and a test keeps the list equal 
 `gen-tools.mjs`, so its MCP tool appears); `every_operation_is_routed` fails when a planned
 operation answers anything but a missing route or `501`. The same holds for the step 2 event
 types (`$defs/planned_types` in `contracts/events/journal-entry.schema.json`): the card that writes
-the first entry of a type adds it to `EventType` and removes it from that list.
+the first entry of a type adds it to `EventType` and removes it from that list. A type that can
+change who sees a node leaves the list one release earlier, with its feed rule and an entry in
+`READ_ONLY_EVENTS` (design 12.7).
 
 ### Operations by area
 

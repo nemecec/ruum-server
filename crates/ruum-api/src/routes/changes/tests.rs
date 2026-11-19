@@ -360,6 +360,28 @@ async fn the_generic_shape_of_an_unknown_type_validates_against_the_contract() {
     let mut bad = generic.clone();
     bad["data"] = json!({ "name": 1 });
     assert!(!errors(&validator, &bad).is_empty());
+
+    // A type the contract does not list at all (a newer release wrote it): valid in the
+    // generic shape only, under the name the server keeps (`area.event`, or `unknown`).
+    for name in ["app.from_a_newer_release", "unknown"] {
+        let written: JournalEntry = serde_json::from_value(json!({
+            "tenant_id": Uuid::now_v7(), "seq": 10, "node_id": null, "revision": null,
+            "type": name, "actor": { "kind": "user", "id": Uuid::now_v7() },
+            "on_behalf_of": null, "at": "2026-11-18T10:16:00Z", "data": { "x": 1 }
+        }))
+        .unwrap();
+        let unknown = serde_json::to_value(written.generic_if_unknown()).unwrap();
+        assert_eq!(unknown["type"], name);
+        let errs = errors(&validator, &unknown);
+        assert!(errs.is_empty(), "{unknown}\n{}", errs.join("\n"));
+        let mut with_data = unknown.clone();
+        with_data["data"] = json!({ "x": 1 });
+        assert!(!errors(&validator, &with_data).is_empty(), "{with_data}");
+    }
+    // A name the server never sends stays invalid.
+    let mut odd = generic.clone();
+    odd["type"] = json!("Node.Created");
+    assert!(!errors(&validator, &odd).is_empty());
 }
 
 #[tokio::test]

@@ -1914,8 +1914,9 @@ every restart); this section is the target before real users.
   before still writes it.
 - A new type that can change who sees a node (like a grant, a move, a trash or a member link: it
   needs a "before" rule or a `resync` marker in the changes feed) takes one more release. Release
-  N teaches the feed the type's visibility rule and does not write the type; release N+1 writes
-  it. Reason: an old release sends an unknown entry only to callers who see its node now, and
+  N teaches the feed the type's visibility rule and does not write the type (the type is in
+  `EventType` and in `READ_ONLY_EVENTS`, which the writers refuse, and out of `planned_types`);
+  release N+1 takes it out of `READ_ONLY_EVENTS` and writes it. Reason: an old release sends an unknown entry only to callers who see its node now, and
   gives no `lost` marker. A client that read past it there keeps the node in its cache, and the
   new release cannot send the marker later, because the client's cursor is past the entry
   (Kimi review of P-57). New types that change no access need only the rule above.

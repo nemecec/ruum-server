@@ -47,59 +47,15 @@
       "description": "The revision of the node after the change (`nodes.revision`), so clients can order and dedupe per node. Null when the entry has no node or the node is purged."
     },
     "type": {
-      "enum": [
-        "node.created",
-        "node.renamed",
-        "node.moved",
-        "node.copied",
-        "node.trashed",
-        "node.restored",
-        "node.purged",
-        "version.created",
-        "version.restored",
-        "version.labeled",
-        "tag.attached",
-        "tag.detached",
-        "grant.added",
-        "grant.updated",
-        "grant.removed",
-        "share_link.created",
-        "share_link.revoked",
-        "node.sharing_updated",
-        "typed_node.status_changed",
-        "database.columns_confirmed",
-        "database.migration_applied",
-        "database.migration_failed",
-        "database.branch_created",
-        "database.restore_started",
-        "database.restored",
-        "database.restore_failed",
-        "database.grant_created",
-        "database.grant_revoked",
-        "database.approval_decided",
-        "app.deployed",
-        "app.deployment_failed",
-        "app.rolled_back",
-        "app.settings_changed",
-        "app.binding_granted",
-        "app.binding_revoked",
-        "app.role_granted",
-        "app.role_revoked",
-        "app.secret_changed",
-        "app.domain_added",
-        "app.domain_removed",
-        "app.api_key_created",
-        "app.api_key_revoked",
-        "app.approval_decided",
-        "app.telemetry_fields_confirmed",
-        "issue.created",
-        "issue.status_changed",
-        "issue.reveal_requested",
-        "issue.reveal_decided",
-        "template.instantiated",
-        "project.publication_changed"
-      ],
-      "description": "The event type. The types in `$defs/planned_types` (step 2 and step 3) are specified but not written by the server yet (decision 0004-21); the task that builds the first writer of a type removes it from that list."
+      "description": "The event type: one of `$defs/known_types`, or (only from a server of the previous release during a rolling deploy, design 12.7, backlog P-57) the name of a type that a newer release wrote, as `$defs/unknown_type`; such an entry has `data` as `{}`. The types in `$defs/planned_types` (step 2 and step 3) are specified but not known to the server yet (decision 0004-21); the task that first reads a type with its own rule (design 12.7: release N reads a type that can change who sees a node, release N+1 writes it) or builds its first writer removes it from that list.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/known_types"
+        },
+        {
+          "$ref": "#/$defs/unknown_type"
+        }
+      ]
     },
     "actor": {
       "$ref": "common.schema.json#/$defs/principal_ref",
@@ -1429,16 +1385,98 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "not": {
+              "$ref": "#/$defs/known_types"
+            }
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/generic_data"
+          }
+        }
+      }
     }
   ],
   "$defs": {
+    "known_types": {
+      "description": "The event types of this contract. The list grows: a reader accepts a type it does not know (`$defs/unknown_type`).",
+      "enum": [
+        "node.created",
+        "node.renamed",
+        "node.moved",
+        "node.copied",
+        "node.trashed",
+        "node.restored",
+        "node.purged",
+        "version.created",
+        "version.restored",
+        "version.labeled",
+        "tag.attached",
+        "tag.detached",
+        "grant.added",
+        "grant.updated",
+        "grant.removed",
+        "share_link.created",
+        "share_link.revoked",
+        "node.sharing_updated",
+        "typed_node.status_changed",
+        "database.columns_confirmed",
+        "database.migration_applied",
+        "database.migration_failed",
+        "database.branch_created",
+        "database.restore_started",
+        "database.restored",
+        "database.restore_failed",
+        "database.grant_created",
+        "database.grant_revoked",
+        "database.approval_decided",
+        "app.deployed",
+        "app.deployment_failed",
+        "app.rolled_back",
+        "app.settings_changed",
+        "app.binding_granted",
+        "app.binding_revoked",
+        "app.role_granted",
+        "app.role_revoked",
+        "app.secret_changed",
+        "app.domain_added",
+        "app.domain_removed",
+        "app.api_key_created",
+        "app.api_key_revoked",
+        "app.approval_decided",
+        "app.telemetry_fields_confirmed",
+        "issue.created",
+        "issue.status_changed",
+        "issue.reveal_requested",
+        "issue.reveal_decided",
+        "template.instantiated",
+        "project.publication_changed"
+      ]
+    },
+    "unknown_type": {
+      "description": "The name of a type that this contract does not list, as a server of the previous release passes it on (design 12.7, backlog P-57): a name of the form `area.event` (lowercase letters, digits, `_`, at most 64 bytes), or `unknown` when the written name was not of that form. Its `data` is always `{}`.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(unknown|[a-z0-9_.]*\\.[a-z0-9_.]*)$"
+    },
     "generic_data": {
       "description": "The generic shape of `data` (design 12.7, backlog P-57): during a rolling deploy a server of the previous release passes on an entry of a type it does not know with the envelope as written and `data` as `{}`. That type can be one this schema already lists, so `{}` is valid for every type.",
       "type": "object",
       "maxProperties": 0
     },
     "planned_types": {
-      "description": "Event types that are specified but not written yet (decision 0004-21). Not used for validation; the envelope test of ruum-core keeps `EventType` equal to the `type` enum minus this list.",
+      "description": "Event types that are specified but not known to the server yet (decision 0004-21). Not used for validation; the envelope test of ruum-core keeps `EventType` equal to `$defs/known_types` minus this list. A type leaves this list with its first reader rule or its first writer, whichever comes first (design 12.7).",
       "enum": [
         "typed_node.status_changed",
         "database.migration_applied",
