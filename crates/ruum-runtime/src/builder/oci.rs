@@ -102,6 +102,9 @@ pub struct Layer {
     pub diff_id: OciDigest,
 }
 
+/// The bytes of the end-of-archive marker that [`TarWriter::finish`] adds.
+pub const END_MARKER: u64 = 1024;
+
 /// A tar writer with deterministic headers: mtime 0, owner and group [`LAYER_UID`], no user or
 /// group name. A path over the ustar limits gets a PAX `path` record, a link target over 100
 /// bytes a PAX `linkpath` record.
@@ -120,7 +123,7 @@ impl TarWriter {
         Self { out: Vec::new() }
     }
 
-    /// The bytes written so far (without the end-of-archive marker).
+    /// The bytes written so far (without the end-of-archive marker, [`END_MARKER`] bytes).
     pub fn written(&self) -> usize {
         self.out.len()
     }
@@ -282,8 +285,9 @@ pub fn build_layer(entries: &[OutEntry], cap: u64) -> Result<Layer, String> {
             Some(Kind::File(data)) => w.file(path, e.map_or(0o644, |e| e.mode), data),
             Some(Kind::Symlink(target)) => w.symlink(path, target),
         }
-        // Checked after each entry: the buffer passes the cap by at most one entry.
-        if w.out.len() as u64 > cap {
+        // Checked after each entry, with the end-of-archive marker that `finish` adds: the
+        // buffer passes the cap by at most one entry, the finished layer never.
+        if w.out.len() as u64 + END_MARKER > cap {
             return Err(format!(
                 "the new layer is over the output cap of {cap} bytes"
             ));
@@ -452,6 +456,11 @@ mod tests {
         // 2,001 headers of 512 bytes, plus the end marker: about 1 MiB.
         let l = build_layer(&entries, 2 * 1024 * 1024).expect("under the cap");
         assert_eq!(tar_of(&l).len(), 2_001 * 512 + 1024);
+        // The bound is exact, the end-of-archive marker included.
+        let exact = (2_001 * 512 + 1024) as u64;
+        assert!(build_layer(&entries, exact).is_ok());
+        assert!(build_layer(&entries, exact - 1).is_err());
+        assert!(build_layer(&[], 512).is_err(), "the marker counts");
         let Err(e) = build_layer(&entries, 512 * 1024) else {
             panic!("a layer over the cap was built");
         };
