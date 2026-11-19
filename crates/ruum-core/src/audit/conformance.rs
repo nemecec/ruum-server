@@ -402,8 +402,14 @@ async fn a_type_of_a_newer_release_has_the_generic_shape(h: &dyn Harness) {
     )
     .await;
     tick().await;
-    h.append_as_newer_release(&uc, None, "tenant.from_a_newer_release", json!({ "x": 1 }))
-        .await;
+    // A payload key named like a field the reader adds is not passed on either.
+    h.append_as_newer_release(
+        &uc,
+        None,
+        "tenant.from_a_newer_release",
+        json!({ "x": 1, "revision": "sensitive-marker" }),
+    )
+    .await;
     tick().await;
     h.append(
         &uc,

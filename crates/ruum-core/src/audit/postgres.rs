@@ -131,10 +131,10 @@ impl AuditLog for PgAuditLog {
         .await?;
         let journal_rows = sqlx::query(
             "select id, action, actor_kind, actor, on_behalf_of, target_type, target_id, ip, \
-                    user_agent, data, at \
+                    user_agent, data, at, seq, revision \
              from ( \
                  select ('00000000-0000-8000-8000-' || lpad(to_hex(seq), 12, '0'))::uuid as id, \
-                        seq, type as action, actor_kind, actor, on_behalf_of, \
+                        seq, revision, type as action, actor_kind, actor, on_behalf_of, \
                         case when node_id is null then null else 'node' end as target_type, \
                         node_id::text as target_id, null::text as ip, null::text as user_agent, \
                         data || jsonb_build_object('seq', seq) \
@@ -169,11 +169,14 @@ impl AuditLog for PgAuditLog {
         let mut items = audit_rows
             .iter()
             .map(entry_from_row)
-            .chain(
-                journal_rows
-                    .iter()
-                    .map(|r| entry_from_row(r).map(generic_if_unknown_journal)),
-            )
+            .chain(journal_rows.iter().map(|r| -> Result<AuditEntry> {
+                let entry = entry_from_row(r)?;
+                Ok(generic_if_unknown_journal(
+                    entry,
+                    r.try_get("seq")?,
+                    r.try_get("revision")?,
+                ))
+            }))
             .collect::<Result<Vec<_>>>()?;
         items.sort_by_key(|e| std::cmp::Reverse((e.at, e.id)));
         let more = items.len() > limit as usize;

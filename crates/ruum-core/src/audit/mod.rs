@@ -204,15 +204,19 @@ pub fn from_journal(e: &JournalEntry) -> AuditEntry {
 }
 
 /// The generic shape of an audit entry read from a journal row (backlog P-57): when this release
-/// does not know the row's type (its `action`), `data` keeps only the `seq` and `revision` that
-/// the reader added, as [`from_journal`] does. Rows of known types are returned as they are.
-pub(crate) fn generic_if_unknown_journal(mut e: AuditEntry) -> AuditEntry {
+/// does not know the row's type (its `action`), `data` holds only the row's `seq` and `revision`
+/// (the columns, not keys of the payload), as [`from_journal`] does. Rows of known types are
+/// returned as they are.
+pub(crate) fn generic_if_unknown_journal(
+    mut e: AuditEntry,
+    seq: i64,
+    revision: Option<i64>,
+) -> AuditEntry {
     if EventType::parse(&e.action).is_none() {
         let mut data = serde_json::Map::new();
-        for key in ["seq", "revision"] {
-            if let Some(v) = e.data.get(key) {
-                data.insert(key.into(), v.clone());
-            }
+        data.insert("seq".into(), seq.into());
+        if let Some(r) = revision {
+            data.insert("revision".into(), r.into());
         }
         e.data = serde_json::Value::Object(data);
     }
