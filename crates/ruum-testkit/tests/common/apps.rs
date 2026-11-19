@@ -11,7 +11,7 @@
 //! when it unblocks the case. `tests/apps_meta.rs` checks the cases and this list.
 //!
 //! This module holds the requests and set-up steps; the cases are in `apps_settings`,
-//! `apps_deploy`, `apps_publish` and `apps_roles`.
+//! `apps_deploy`, `apps_publish`, `apps_roles` and `apps_bindings` (card B-1).
 
 use super::{Case, Ctx, Fail, Outcome, gate, operation_of, run_case};
 use crate::{check, fail};
@@ -29,25 +29,8 @@ use std::time::{Duration, Instant};
 /// A planned operation wins: such a case reports planned first.
 pub const PENDING: &[(&str, &str)] = &[
     (
-        "refused_binding_is_a_direct_403_naming_the_binding",
-        "needs the deployer check of bindings: B-1 (and database bindings of previews: D-3a)",
-    ),
-    (
-        "agent_binding_outside_its_scope_is_refused",
-        "needs the deployer check of bindings (an agent: its user's right intersected with its \
-         scope): B-1",
-    ),
-    (
-        "binding_to_another_tenants_node_fails_like_a_missing_node",
-        "needs binding resolution: B-1",
-    ),
-    (
-        "file_binding_with_edit_is_refused",
-        "needs binding rules: B-1; open question: 403 or 422 (the contract names no code)",
-    ),
-    (
         "rollback_across_a_migration_needs_force",
-        "needs migrations at publish: D-2 (and database bindings: B-1, D-3a)",
+        "needs migrations at publish: D-2 (and database bindings: B-1d, D-3a)",
     ),
     (
         "retired_slug_is_not_given_to_another_tenant",
@@ -81,6 +64,7 @@ pub fn all_cases() -> Vec<Case> {
     v.extend(super::apps_deploy::cases());
     v.extend(super::apps_publish::cases());
     v.extend(super::apps_roles::cases());
+    v.extend(super::apps_bindings::cases());
     v
 }
 

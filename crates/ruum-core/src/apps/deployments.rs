@@ -15,11 +15,13 @@
 //! The cheap stages run before the answer and leave no deployment row when they refuse:
 //! `unpack` ([`super::archive`], with the limits of the tenant's plan, P-58), `validate` (the
 //! YAML reader of [`yaml`], then [`super::manifest::validate`] with the tenant's plan; a bad
-//! manifest is `422` with `error.details.pointer`), and the fail-closed checks of the cards
-//! that are not built yet: `bindings` (`409`, hint `bindings_not_ready`: B-1), `migrations`
-//! (`migrations_not_ready`: D-2), a runtime other than `static` (`runtime_not_ready`: R-2a,
-//! R-2b) and `secrets` (`secrets_not_ready`: W-4). With no binding the stage `bindings` is
-//! `skipped`. `build` and `test` are always `skipped` in step 3.
+//! manifest is `422` with `error.details.pointer`), the fail-closed checks of the cards that
+//! are not built yet: `migrations` (`migrations_not_ready`: D-2), a runtime other than `static`
+//! (`runtime_not_ready`: R-2a, R-2b) and `secrets` (`secrets_not_ready`: W-4), and the
+//! bindings ([`super::bindings`], card B-1: the resolution and the deployer check, `403`
+//! `binding_not_allowed`, `422` for a role rule, `409 bindings_not_ready` for database and API
+//! bindings). With no binding the stage `bindings` is `skipped`; with node bindings it writes
+//! the preview's grants after the `202`. `build` and `test` are always `skipped` in step 3.
 //!
 //! A deployment holds a slot from before the source is read until its image stage has stored
 //! the files (or its run ends): at most
@@ -55,16 +57,20 @@
 //! (encoding `app_release_v1`, decision 0006-2), makes it live, supersedes the old live one and
 //! writes `version.created` (or `version.restored`), `app.deployed` and for a rollback
 //! `app.rolled_back` (reason `manual`), in one store transaction (P-62: a rollback answers with
-//! the new deployment, whose manifest is the old one's). Before the switch every
-//! [`LiveReleaseHook`] is called; a hook error fails the publish and the old live deployment
-//! keeps serving. Publishing the deployment that is live already changes nothing (`200`). The
+//! the new deployment, whose manifest is the old one's). Before the switch the bindings are
+//! checked again with the publisher for the live principal, and after it the live principal's
+//! rows follow the new manifest (card B-1, [`AppService::sync_live_bindings`]). Before the
+//! switch every [`LiveReleaseHook`] is called; a hook error fails the publish and the old live deployment
+//! keeps serving. Publishing the deployment that is live already changes nothing (`200`), except
+//! that a person's publish grants the live bindings again after a restore of the app (card
+//! B-1). The
 //! hooks, the switch and the repair after a failed switch run under the app's live switch (a
 //! lock of the process and of the store), so two publishes of one app take turns; a publish
 //! that waited and finds another live deployment answers `409 conflict`.
 //!
 //! An agent's publish answers `202` with a pending approval (`AppApprovalRequired`, decision
 //! 0006-4): the `app_approvals` row is bound to the archive hash, the hash of the parsed
-//! manifest and the resolved bindings (none until B-1); nothing goes live. A call with
+//! manifest and the preview's resolved bindings (card B-1); nothing goes live. A call with
 //! `approval_id` answers `409 conflict`, hint `approval_stale`, until card W-3b decides and uses
 //! approvals (fail closed). An agent's `restoreVersion` of an app version answers `403
 //! permission_denied`, hint `publishAppDeployment`, with the deployment in
@@ -423,9 +429,6 @@ pub(crate) fn fail_closed(m: &Value) -> Result<()> {
         Some(Value::Null) | None => false,
         Some(_) => true,
     };
-    if non_empty("bindings") {
-        return Err(not_ready("bindings", "bindings_not_ready", "/bindings"));
-    }
     if non_empty("migrations") {
         return Err(not_ready(
             "migrations at deploy",
@@ -631,6 +634,19 @@ impl AppService {
             Ok::<_, Error>((packed, manifest, files, need))
         })
         .await?;
+        // The bindings (card B-1): resolution and the deployer check before the answer; a
+        // refusal leaves nothing behind. The stage `bindings` runs the check again after it.
+        let resolved = self
+            .check_bindings(
+                ctx,
+                app,
+                &manifest,
+                Environment::Preview,
+                &std::collections::BTreeMap::new(),
+            )
+            .await?;
+        super::bindings::refuse_not_ready(&resolved)?;
+        let has_bindings = !resolved.is_empty();
         // The storage quota (backlog W2S-1): a site whose new objects (files and index) do
         // not fit is a direct `403 quota_exceeded`; the image stage checks again under the
         // site lock.
@@ -661,7 +677,7 @@ impl AppService {
             chunks: archive_manifest.encode(),
         };
         let now = crate::now();
-        let stages = stages::initial(now);
+        let stages = stages::initial(now, has_bindings);
         let mut row = None;
         for _ in 0..SHORT_ID_TRIES {
             let d = NewDeployment {
@@ -707,8 +723,12 @@ impl AppService {
             files,
             stages,
             slot: Some(slot),
+            bindings: has_bindings,
         };
-        tokio::spawn(async move { me.run_stages(ctx, run).await });
+        // The stages read what the request wrote (the freshness floor of the request).
+        tokio::spawn(crate::authz::in_current_request(async move {
+            me.run_stages(ctx, run).await
+        }));
         Ok(view)
     }
 
@@ -740,6 +760,18 @@ impl AppService {
         }
         let urls = self.urls(ctx.tenant, &node).await?;
         if row.live_deployment_id == Some(dep.id) {
+            // After a restore of the app its live bindings stay revoked until a person
+            // publishes again: the check runs with this publisher, and the node bindings that
+            // pass get their rows again (card B-1; database and API bindings get none, and the
+            // publish of the live deployment still changes nothing else).
+            if ctx.actor.is_user()
+                && let Some(m) = dep.manifest.as_ref()
+                && !self.live_bindings_complete(ctx.tenant, app, m).await?
+            {
+                let _switch = self.lock_live_switch(ctx.tenant, app).await?;
+                let planned = self.check_publish_bindings(ctx, app, dep.id, m).await?;
+                self.sync_live_bindings(ctx, app, dep.id, &planned).await?;
+            }
             return Ok(Published::Live(Box::new(deployment_view(
                 &dep, &urls, true,
             ))));
@@ -907,6 +939,12 @@ impl AppService {
             .ok_or_else(|| Error::Internal(format!("deployment {} has no manifest", dep.id)))?;
         // The rules of today, also for an old deployment.
         fail_closed(&manifest)?;
+        // The bindings with the publisher's right for the live principal (card B-1), on the
+        // targets the deployment recorded.
+        let planned = self
+            .check_publish_bindings(ctx, app.node_id, dep.id, &manifest)
+            .await?;
+        super::bindings::refuse_not_ready(&planned)?;
         // Held until this function returns: the hooks, the release and the repair.
         let _switch = self.lock_live_switch(ctx.tenant, app.node_id).await?;
         // A switch that ran while this one waited: no hook runs for a release that would fail.
@@ -991,7 +1029,7 @@ impl AppService {
                 source: dep.source.clone(),
                 archive: dep.archive.clone(),
                 manifest: Some(manifest.clone()),
-                stages: stages::release(now),
+                stages: stages::release(now, !planned.is_empty()),
                 published_from: Some(dep.id),
                 new_chunks: Vec::new(),
                 expires_at: None,
@@ -1014,6 +1052,16 @@ impl AppService {
         .await;
         match checked {
             Ok(r) => {
+                // The live principal's rows follow the new manifest (card B-1). The release is
+                // done; a failure here leaves the old rows, which the next publish or the
+                // repair pass sets right, and is logged.
+                if let Err(e) = self
+                    .sync_live_bindings(ctx, app.node_id, r.deployment.id, &planned)
+                    .await
+                {
+                    tracing::error!(tenant = %ctx.tenant, app = %app.node_id, error = %e,
+                        "the live bindings of a release could not be written");
+                }
                 self.notify_changed();
                 Ok(r)
             }
@@ -1055,9 +1103,12 @@ impl AppService {
                 .unwrap_or_default()
         };
         let (new_roles, old_roles) = (roles(Some(&manifest)), roles(live_manifest.as_ref()));
+        let rows = self.preview_rows(ctx.tenant, dep.id).await?;
+        let (bindings_added, bindings_removed, bound_bindings) =
+            super::bindings::approval_bindings(&manifest, live_manifest.as_ref(), &rows);
         let changes = json!({
-            "bindings_added": [],
-            "bindings_removed": [],
+            "bindings_added": bindings_added,
+            "bindings_removed": bindings_removed,
             "roles_added": new_roles.iter().filter(|r| !old_roles.contains(r)).collect::<Vec<_>>(),
             "roles_removed": old_roles.iter().filter(|r| !new_roles.contains(r)).collect::<Vec<_>>(),
             "secrets_missing": [],
@@ -1078,7 +1129,7 @@ impl AppService {
                     changes,
                     bound_archive_hash: dep.archive.content_hash,
                     bound_manifest_hash: *blake3::hash(&canonical(&manifest)).as_bytes(),
-                    bound_bindings: json!([]),
+                    bound_bindings,
                     expires_at: crate::now() + time::Duration::hours(APPROVAL_HOURS),
                 },
             )
@@ -1098,6 +1149,14 @@ impl AppService {
                     tracing::warn!(tenant = %p.tenant_id, deployment = %p.id, error = %e,
                         "could not delete the site index of an expired preview");
                 }
+                // An expired preview's bindings end (card B-1; the repair pass catches up).
+                if let Err(e) = self
+                    .end_preview_bindings(p.tenant_id, Some(p.app_node_id))
+                    .await
+                {
+                    tracing::warn!(tenant = %p.tenant_id, deployment = %p.id, error = %e,
+                        "could not end the bindings of an expired preview");
+                }
             }
             total += ended.len();
             if ended.len() < 500 {
@@ -1106,6 +1165,10 @@ impl AppService {
         }
         if total > 0 {
             self.notify_changed();
+        }
+        // The repair pass of bindings (card B-1), bounded per tenant.
+        if let Err(e) = self.repair_bindings_round().await {
+            tracing::warn!(error = %e, "the binding repair pass failed");
         }
         Ok(total)
     }

@@ -459,10 +459,12 @@ async fn refusals_come_before_the_answer_and_leave_nothing() {
             409,
             "migrations_not_ready",
         ),
+        // A binding whose target does not resolve (card B-1; a resolved node binding is
+        // granted now, see `apps::bindings::tests`).
         (
-            b"runtime: static\nbindings:\n  docs:\n    node: /Projects\n    role: view\n",
-            409,
-            "bindings_not_ready",
+            b"runtime: static\nbindings:\n  docs:\n    node: /Nowhere\n    role: view\n",
+            403,
+            "binding_not_allowed",
         ),
         (b"runtime: [static\n", 422, ""),
     ] {

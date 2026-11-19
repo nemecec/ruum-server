@@ -13,7 +13,9 @@
 //!   archive comes with card W-2: the provider records that intent in the status detail
 //!   (`copy_of`, `preview_from`), with no runtime call.
 //! - `trashed`: the app is `suspended` (reason `trashed`); the gateway answers a status page.
-//! - `restored`: the app is back (`ready` for the control plane).
+//!   The [`LifecycleHook`]s run first (card B-1: the app's bindings end, `app_trashed`).
+//! - `restored`: the app is back (`ready` for the control plane). The [`LifecycleHook`]s run
+//!   (card B-1 keeps the bindings revoked until a person publishes again).
 //! - `purged`: the purge hooks of later cards run first (stop the instances, delete the images;
 //!   nothing runs in W-1), then the rows of the app go. Its slug stays used.
 //!
@@ -51,6 +53,15 @@ pub trait PurgeHook: Send + Sync {
     async fn app_purged(&self, tenant: TenantId, app: NodeId) -> Result<()>;
 }
 
+/// What the trash and the restore of an app run besides the provider's status report (card
+/// B-1: the trash ends the app's bindings). A failure fails the hook, so the platform delivers
+/// it again; a hook must therefore tolerate a second call.
+#[async_trait]
+pub trait LifecycleHook: Send + Sync {
+    async fn app_trashed(&self, tenant: TenantId, app: NodeId) -> Result<()>;
+    async fn app_restored(&self, tenant: TenantId, app: NodeId) -> Result<()>;
+}
+
 /// The [`PlatformApi`] calls the provider does not make in W-1 (the check API, uploads).
 pub struct NoPlatformCalls;
 
@@ -80,6 +91,7 @@ pub struct WebAppProvider {
     typed: Arc<dyn TypedNodeStore>,
     platform: Arc<dyn PlatformApi>,
     purge_hooks: RwLock<Vec<Arc<dyn PurgeHook>>>,
+    lifecycle_hooks: RwLock<Vec<Arc<dyn LifecycleHook>>>,
 }
 
 impl WebAppProvider {
@@ -93,7 +105,23 @@ impl WebAppProvider {
             typed,
             platform,
             purge_hooks: RwLock::new(Vec::new()),
+            lifecycle_hooks: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Adds a trash and restore hook (card B-1's bindings).
+    pub fn add_lifecycle_hook(&self, hook: Arc<dyn LifecycleHook>) {
+        self.lifecycle_hooks
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(hook);
+    }
+
+    fn lifecycle_hooks(&self) -> Vec<Arc<dyn LifecycleHook>> {
+        self.lifecycle_hooks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Adds a purge hook (a later card's work at purge).
@@ -363,6 +391,10 @@ impl Provider for WebAppProvider {
                 if let Some(node) = hook.node_id
                     && self.store.get_app(tenant, node).await?.is_some()
                 {
+                    // The bindings end first: a trashed app keeps no grant (card B-1).
+                    for h in self.lifecycle_hooks() {
+                        h.app_trashed(tenant, node).await?;
+                    }
                     let observed = self.desired(tenant, node).await?;
                     self.report(
                         tenant,
@@ -383,6 +415,9 @@ impl Provider for WebAppProvider {
                     .ok_or_else(|| crate::providers::bad_request("restored needs node_id"))?;
                 if self.store.get_app(tenant, node).await?.is_none() {
                     return Err(node_not_found(node));
+                }
+                for h in self.lifecycle_hooks() {
+                    h.app_restored(tenant, node).await?;
                 }
                 let observed = self.desired(tenant, node).await?;
                 self.report(

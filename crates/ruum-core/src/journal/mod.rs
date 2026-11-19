@@ -68,6 +68,11 @@ pub enum EventType {
     AppDeployed,
     AppDeploymentFailed,
     AppRolledBack,
+    /// A binding gave an app principal a role on a node (card B-1). On the app node; it changes
+    /// no person's or agent's view of any node, so it needs no feed rule of its own.
+    AppBindingGranted,
+    /// A binding's grant ended (card B-1). On the app node, like [`EventType::AppBindingGranted`].
+    AppBindingRevoked,
     AppRoleGranted,
     AppRoleRevoked,
     /// A type written by a newer release; the name as written (interned, see
@@ -104,6 +109,8 @@ impl EventType {
         EventType::AppDeployed,
         EventType::AppDeploymentFailed,
         EventType::AppRolledBack,
+        EventType::AppBindingGranted,
+        EventType::AppBindingRevoked,
         EventType::AppRoleGranted,
         EventType::AppRoleRevoked,
     ];
@@ -138,6 +145,8 @@ impl EventType {
             AppDeployed => "app.deployed",
             AppDeploymentFailed => "app.deployment_failed",
             AppRolledBack => "app.rolled_back",
+            AppBindingGranted => "app.binding_granted",
+            AppBindingRevoked => "app.binding_revoked",
             AppRoleGranted => "app.role_granted",
             AppRoleRevoked => "app.role_revoked",
             Unknown(name) => name,
@@ -580,6 +589,12 @@ mod tests {
                         EventType::AppDeployed
                             | EventType::AppDeploymentFailed
                             | EventType::AppRolledBack
+                    )
+                    // A binding follows its deployment: a publish, an expiry or a trash ends it,
+                    // never an undo (card B-1).
+                    || matches!(
+                        e,
+                        EventType::AppBindingGranted | EventType::AppBindingRevoked
                     ),
                 "{e:?} has no inverse"
             );

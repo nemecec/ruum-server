@@ -41,29 +41,39 @@ fn stage(name: &str, state: &str, at: Option<OffsetDateTime>) -> Value {
     })
 }
 
-/// The stages of a new preview: the cheap ones ran before the answer.
-pub fn initial(now: OffsetDateTime) -> Value {
+/// The stages of a new preview: the cheap ones ran before the answer. The stage `bindings`
+/// writes the grants after the answer (card B-1); without bindings it has nothing to do (P-62:
+/// `skipped`).
+pub fn initial(now: OffsetDateTime, bindings: bool) -> Value {
     Value::Array(vec![
         stage("unpack", "done", Some(now)),
         stage("validate", "done", Some(now)),
         stage("build", "skipped", None),
         stage("test", "skipped", None),
-        // No binding before card B-1: the stage has nothing to do (P-62: `skipped`).
-        stage("bindings", "skipped", None),
+        if bindings {
+            stage("bindings", "pending", None)
+        } else {
+            stage("bindings", "skipped", None)
+        },
         stage("image", "pending", None),
         stage("start", "pending", None),
         stage("check", "pending", None),
     ])
 }
 
-/// The stages of a release (a publish or a rollback): every stage ran before the switch.
-pub fn release(now: OffsetDateTime) -> Value {
+/// The stages of a release (a publish or a rollback): every stage ran before the switch (the
+/// bindings of the live principal are checked before it and granted with it, card B-1).
+pub fn release(now: OffsetDateTime, bindings: bool) -> Value {
     Value::Array(vec![
         stage("unpack", "done", Some(now)),
         stage("validate", "done", Some(now)),
         stage("build", "skipped", None),
         stage("test", "skipped", None),
-        stage("bindings", "skipped", None),
+        if bindings {
+            stage("bindings", "done", Some(now))
+        } else {
+            stage("bindings", "skipped", None)
+        },
         stage("image", "done", Some(now)),
         stage("start", "done", Some(now)),
         stage("check", "done", Some(now)),
@@ -137,6 +147,39 @@ pub(crate) struct Run {
     /// The deployment slot ([`super::DeploySlots`]), held while the files are in memory and
     /// freed once the image stage has stored them (or the run ends).
     pub slot: Option<super::DeploySlot>,
+    /// The manifest has bindings: the stage `bindings` runs (card B-1).
+    pub bindings: bool,
+}
+
+impl StageError {
+    /// The failed stage `bindings` with the machine-readable error of its refusal (card B-1):
+    /// `permission_denied` (`binding_not_allowed`), `conflict` (`bindings_not_ready`) or
+    /// `validation_failed` with a pointer.
+    fn of_bindings(err: &crate::error::Error) -> Self {
+        match err {
+            crate::error::Error::Api(a) => {
+                let reason = match a.code {
+                    ErrorCode::PermissionDenied => "binding_not_allowed",
+                    ErrorCode::Conflict => "bindings_not_ready",
+                    ErrorCode::ValidationFailed => "binding_invalid",
+                    _ => "bindings_failed",
+                };
+                let mut e = StageError::new("bindings", reason, a.message.clone());
+                e.code = a.code;
+                e.hint = a.hint.clone();
+                e.details = a.details.as_deref().cloned().unwrap_or(Value::Null);
+                e
+            }
+            other => {
+                tracing::warn!(error = %other, "the bindings stage failed");
+                StageError::new(
+                    "bindings",
+                    "bindings_failed",
+                    "the bindings could not be granted",
+                )
+            }
+        }
+    }
 }
 
 /// The spec of a static image: a service that runs no code (R-1's rules).
@@ -300,6 +343,11 @@ impl AppService {
             tracing::warn!(tenant = %ctx.tenant, deployment = %run.id, error = %e,
                 "could not store the end of a deployment");
         }
+        // The rows of a preview that failed, or that this one superseded, end now (card B-1).
+        if let Err(e) = self.end_preview_bindings(ctx.tenant, Some(run.app)).await {
+            tracing::warn!(tenant = %ctx.tenant, deployment = %run.id, error = %e,
+                "could not end the bindings of ended previews; the repair pass will");
+        }
         self.notify_changed();
     }
 
@@ -324,6 +372,15 @@ impl AppService {
         run: &mut Run,
     ) -> Result<Value, Box<(StageError, Option<Value>)>> {
         let tenant = ctx.tenant;
+        // bindings (card B-1): the check again, then the rows and tuples of the preview.
+        if run.bindings {
+            set(&mut run.stages, "bindings", "running", None);
+            self.progress(ctx, run).await;
+            self.bindings_stage(ctx, run.app, run.id, &run.manifest)
+                .await
+                .map_err(|e| Box::new((StageError::of_bindings(&e), None)))?;
+            set(&mut run.stages, "bindings", "done", None);
+        }
         // image
         set(&mut run.stages, "image", "running", None);
         self.progress(ctx, run).await;

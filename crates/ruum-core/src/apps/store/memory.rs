@@ -20,6 +20,8 @@ struct Inner {
     approvals: HashMap<(TenantId, Uuid), ApprovalRow>,
     /// What [`MemoryAppStore::set_storage_usage`] stored (tests).
     storage: HashMap<TenantId, StorageUsage>,
+    /// The binding rows (card B-1), in ID order per tenant.
+    bindings: std::collections::BTreeMap<(TenantId, Uuid), BindingRow>,
 }
 
 /// The in-memory store. With a journal, `update_settings` appends its entry there.
@@ -684,5 +686,259 @@ impl AppStore for MemoryAppStore {
     ) -> Result<LiveSwitchLock> {
         // One process: the service's own lock serializes the writers and the collection.
         Ok(LiveSwitchLock::unheld())
+    }
+
+    async fn grant_bindings(
+        &self,
+        ctx: &Context,
+        authz: &dyn crate::authz::Authz,
+        rows: Vec<NewBinding>,
+    ) -> Result<Vec<BindingRow>> {
+        use crate::authz::RelationshipUpdate;
+        let tenant = ctx.tenant;
+        let now = crate::now();
+        let made: Vec<BindingRow> = {
+            let mut st = self.st();
+            for r in &rows {
+                if !st.deployments.contains_key(&(tenant, r.deployment_id)) {
+                    return Err(Error::not_found("deployment"));
+                }
+            }
+            let made: Vec<BindingRow> = rows
+                .into_iter()
+                .map(|r| BindingRow {
+                    tenant_id: tenant,
+                    id: r.id,
+                    app_node_id: r.app_node_id,
+                    deployment_id: r.deployment_id,
+                    principal_id: r.principal_id,
+                    name: r.name,
+                    kind: r.kind,
+                    target_node_id: r.target_node_id,
+                    role: r.role,
+                    api: r.api,
+                    scopes: r.scopes,
+                    on_behalf_of_user: r.on_behalf_of_user,
+                    granted_by: ctx.actor,
+                    created_at: now,
+                    revoked_at: None,
+                    revoke_reason: None,
+                })
+                .collect();
+            for b in &made {
+                st.bindings.insert((tenant, b.id), b.clone());
+            }
+            made
+        };
+        let mut touches = Vec::new();
+        for b in &made {
+            for t in super::super::bindings::principal_tuples(tenant, b.app_node_id, b.principal_id)
+                .into_iter()
+                .chain(super::super::bindings::binding_tuple(b))
+            {
+                let u = RelationshipUpdate::Touch(t);
+                if !touches.contains(&u) {
+                    touches.push(u);
+                }
+            }
+        }
+        let written = async {
+            if !touches.is_empty() {
+                authz.write(touches).await?;
+            }
+            for b in &made {
+                self.journal(
+                    ctx,
+                    b.app_node_id,
+                    vec![(EventType::AppBindingGranted, binding_granted_data(b))],
+                    now,
+                )?;
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(e) = written {
+            let mut st = self.st();
+            for b in &made {
+                st.bindings.remove(&(tenant, b.id));
+            }
+            return Err(e);
+        }
+        Ok(made)
+    }
+
+    async fn revoke_bindings(
+        &self,
+        ctx: &Context,
+        authz: &dyn crate::authz::Authz,
+        ids: &[Uuid],
+        reason: RevokeReason,
+    ) -> Result<Vec<BindingRow>> {
+        use crate::authz::RelationshipUpdate;
+        let tenant = ctx.tenant;
+        let now = crate::now();
+        let (ended, deletes) = {
+            let mut st = self.st();
+            let mut ended = Vec::new();
+            for id in ids {
+                if let Some(b) = st.bindings.get_mut(&(tenant, *id))
+                    && b.revoked_at.is_none()
+                {
+                    b.revoked_at = Some(now);
+                    b.revoke_reason = Some(reason);
+                    ended.push(b.clone());
+                }
+            }
+            // A tuple goes only when no other active row of the principal implies it.
+            let mut deletes = Vec::new();
+            for b in &ended {
+                let Some(t) = super::super::bindings::binding_tuple(b) else {
+                    continue;
+                };
+                let kept = st.bindings.values().any(|o| {
+                    o.tenant_id == tenant
+                        && o.is_active()
+                        && o.principal_id == b.principal_id
+                        && super::super::bindings::binding_tuple(o).as_ref() == Some(&t)
+                });
+                if !kept && !deletes.contains(&RelationshipUpdate::Delete(t.clone())) {
+                    deletes.push(RelationshipUpdate::Delete(t));
+                }
+            }
+            (ended, deletes)
+        };
+        for b in &ended {
+            self.journal(
+                ctx,
+                b.app_node_id,
+                vec![(
+                    EventType::AppBindingRevoked,
+                    binding_revoked_data(b, reason),
+                )],
+                now,
+            )?;
+        }
+        if !deletes.is_empty() {
+            authz.write(deletes).await?;
+        }
+        Ok(ended)
+    }
+
+    async fn list_bindings(&self, tenant: TenantId, q: &BindingQuery) -> Result<Vec<BindingRow>> {
+        let st = self.st();
+        Ok(st
+            .bindings
+            .values()
+            .filter(|b| {
+                b.tenant_id == tenant
+                    && q.app.is_none_or(|a| b.app_node_id == a)
+                    && q.principal.is_none_or(|p| b.principal_id == p)
+                    && q.deployment.is_none_or(|d| b.deployment_id == d)
+                    && q.target.is_none_or(|t| b.target_node_id == t)
+                    && (!q.active_only || b.is_active())
+            })
+            .take(q.limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn ended_preview_bindings(
+        &self,
+        tenant: TenantId,
+        app: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<BindingRow>> {
+        let st = self.st();
+        Ok(st
+            .bindings
+            .values()
+            .filter(|b| {
+                b.tenant_id == tenant
+                    && app.is_none_or(|a| b.app_node_id == a)
+                    && b.is_active()
+                    && b.principal_id != b.app_node_id.0
+                    && !st
+                        .deployments
+                        .get(&(tenant, b.principal_id))
+                        .is_some_and(|d| {
+                            matches!(
+                                d.state,
+                                DeploymentState::Pending
+                                    | DeploymentState::Running
+                                    | DeploymentState::Ready
+                            )
+                        })
+            })
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn binding_targets(
+        &self,
+        tenant: TenantId,
+        after: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<NodeId>> {
+        let st = self.st();
+        let set: std::collections::BTreeSet<NodeId> = st
+            .bindings
+            .values()
+            .filter(|b| b.tenant_id == tenant && after.is_none_or(|a| b.target_node_id > a))
+            .map(|b| b.target_node_id)
+            .collect();
+        Ok(set.into_iter().take(limit as usize).collect())
+    }
+
+    async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>> {
+        let st = self.st();
+        let set: std::collections::BTreeSet<TenantId> = st
+            .bindings
+            .keys()
+            .map(|(t, _)| *t)
+            .filter(|t| after.is_none_or(|a| *t > a))
+            .collect();
+        Ok(set.into_iter().take(limit as usize).collect())
+    }
+
+    async fn delete_app_bindings(
+        &self,
+        tenant: TenantId,
+        authz: &dyn crate::authz::Authz,
+        app: NodeId,
+    ) -> Result<usize> {
+        use crate::authz::RelationshipUpdate;
+        let gone: Vec<BindingRow> = {
+            let st = self.st();
+            st.bindings
+                .values()
+                .filter(|b| b.tenant_id == tenant && b.app_node_id == app)
+                .cloned()
+                .collect()
+        };
+        let mut deletes = Vec::new();
+        for b in &gone {
+            let tuples = super::super::bindings::principal_tuples(tenant, app, b.principal_id)
+                .into_iter()
+                .chain(
+                    b.is_active()
+                        .then(|| super::super::bindings::binding_tuple(b))
+                        .flatten(),
+                );
+            for t in tuples {
+                let u = RelationshipUpdate::Delete(t);
+                if !deletes.contains(&u) {
+                    deletes.push(u);
+                }
+            }
+        }
+        if !deletes.is_empty() {
+            authz.write(deletes).await?;
+        }
+        let mut st = self.st();
+        for b in &gone {
+            st.bindings.remove(&(tenant, b.id));
+        }
+        Ok(gone.len())
     }
 }

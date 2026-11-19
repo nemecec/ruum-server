@@ -208,6 +208,8 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         // An agent's preview expires on its own and a failed deployment changed nothing; only a
         // person publishes or rolls back (an agent's publish waits for a person, card W-2s).
         AppDeployed | AppDeploymentFailed | AppRolledBack => None,
+        // A binding follows its deployment: a publish, an expiry or a trash ends it (card B-1).
+        AppBindingGranted | AppBindingRevoked => None,
         AppRoleGranted => Some("remove the app role grant"),
         AppRoleRevoked => Some("add the app role grant again"),
         // A type of a newer release (rolling deploy, backlog P-57): this release does not know
