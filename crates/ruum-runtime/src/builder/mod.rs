@@ -270,17 +270,40 @@ pub fn read_manifest(files: &archive::Unpacked) -> Result<Recipe, String> {
 /// (the same bound as the output's, [`output::MAX_NAME_TOTAL_BYTES`]).
 pub const MAX_SOURCE_NAME_TOTAL_BYTES: usize = output::MAX_NAME_TOTAL_BYTES;
 
+/// The most entries of the source tar, folders included (the same bound as the output's,
+/// [`output::MAX_ENTRIES`]: a source over it could not come back as an output either).
+pub const MAX_SOURCE_ENTRIES: usize = output::MAX_ENTRIES;
+
+/// The bounds of the source tar: its names (folders included), its entries (folders included)
+/// and its own size in bytes (`RUUM_BUILD_OUTPUT_MAX`, as for the layer).
+#[derive(Clone, Copy, Debug)]
+struct SourceBounds {
+    names: usize,
+    entries: usize,
+    bytes: u64,
+}
+
 /// The source tar the job unpacks: the checked files of the archive, folders first. The folders
 /// above the files are added once each, walking up from a file only to the first folder that is
-/// already there, and all names together (folders included) stay under `max_names` bytes: a deep
-/// path cannot make the builder copy each of its parents for every file (Kimi, run 12).
-fn source_tar(files: &archive::Unpacked, max_names: usize) -> Result<Bytes, String> {
+/// already there, and all names together (folders included) stay under `bounds.names` bytes: a
+/// deep path cannot make the builder copy each of its parents for every file (Kimi, run 12).
+/// The entries (folders included) stay under `bounds.entries` and the tar itself under
+/// `bounds.bytes`, checked as it is written: many short paths with folders of their own cannot
+/// make a source tar of headers far larger than the archive (review of Kimi run 12 fixes).
+fn source_tar(files: &archive::Unpacked, bounds: SourceBounds) -> Result<Bytes, String> {
+    let max_names = bounds.names;
     let mut dirs: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
     let mut entries: BTreeMap<&[u8], &Bytes> = BTreeMap::new();
     let mut name_bytes: usize = 0;
     let over = || {
         format!(
             "the archive's paths, with the folders above them, are over {max_names} bytes in all"
+        )
+    };
+    let too_many = || {
+        format!(
+            "the archive has more than {} entries with the folders above them",
+            bounds.entries
         )
     };
     for e in &files.entries {
@@ -299,16 +322,35 @@ fn source_tar(files: &archive::Unpacked, max_names: usize) -> Result<Bytes, Stri
             if name_bytes > max_names {
                 return Err(over());
             }
+            if dirs.len() + entries.len() >= bounds.entries {
+                return Err(too_many());
+            }
             end = i;
         }
         entries.insert(p, &e.data);
+        if dirs.len() + entries.len() > bounds.entries {
+            return Err(too_many());
+        }
     }
     let mut w = oci::TarWriter::new();
+    let too_big = || {
+        format!(
+            "the source tar of the archive is over {} bytes",
+            bounds.bytes
+        )
+    };
     for d in &dirs {
         w.dir(d);
+        if w.written() as u64 > bounds.bytes {
+            return Err(too_big());
+        }
     }
     for (p, data) in entries {
         w.file(p, 0o644, data);
+        // Checked after each entry: the buffer passes the bound by at most one entry.
+        if w.written() as u64 > bounds.bytes {
+            return Err(too_big());
+        }
     }
     Ok(Bytes::from(w.finish()))
 }
@@ -586,6 +628,11 @@ impl DockerBuilder {
         // Unpacking and the source tar are CPU work over up to the archive limit: off the async
         // workers, so the build's timeout still ends the build.
         let archive_bytes = input.archive.clone();
+        let bounds = SourceBounds {
+            names: MAX_SOURCE_NAME_TOTAL_BYTES,
+            entries: MAX_SOURCE_ENTRIES,
+            bytes: self.cfg.output_max,
+        };
         let (recipe, source) = blocking(move || {
             let files = archive::unpack(&archive_bytes, &limits).map_err(|r| match r {
                 archive::Refusal::Hostile { entry, reason } => failed(format!(
@@ -600,7 +647,7 @@ impl DockerBuilder {
                 }
             })?;
             let recipe = read_manifest(&files).map_err(failed)?;
-            let source = source_tar(&files, MAX_SOURCE_NAME_TOTAL_BYTES).map_err(failed)?;
+            let source = source_tar(&files, bounds).map_err(failed)?;
             Ok::<_, RuntimeError>((recipe, source))
         })
         .await??;
@@ -869,6 +916,15 @@ mod tests {
         }
     }
 
+    /// The bounds of the build, with a name bound of `names` bytes.
+    fn names_bound(names: usize) -> SourceBounds {
+        SourceBounds {
+            names,
+            entries: MAX_SOURCE_ENTRIES,
+            bytes: u64::MAX,
+        }
+    }
+
     /// The folder entries of a source tar, in order.
     fn tar_dirs(tar: &[u8]) -> Vec<String> {
         let out = output::read_output(Bytes::copy_from_slice(tar), u64::MAX).expect("a valid tar");
@@ -886,7 +942,8 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned),
         );
-        let tar = source_tar(&files, MAX_SOURCE_NAME_TOTAL_BYTES).expect("small source");
+        let tar =
+            source_tar(&files, names_bound(MAX_SOURCE_NAME_TOTAL_BYTES)).expect("small source");
         assert_eq!(tar_dirs(&tar), ["src", "src/a"]);
     }
 
@@ -894,8 +951,8 @@ mod tests {
     fn deep_source_paths_cannot_amplify_the_source_tar() {
         // A small cap: the name fits, its folders do not.
         let files = unpacked(["a/b/c/d/e/f".to_owned()]);
-        assert!(source_tar(&files, 11).is_err());
-        assert!(source_tar(&files, 11 + 9 + 7 + 5 + 3 + 1).is_ok());
+        assert!(source_tar(&files, names_bound(11)).is_err());
+        assert!(source_tar(&files, names_bound(11 + 9 + 7 + 5 + 3 + 1)).is_ok());
         // Each name is under the archive's 1024-byte cap, but its 500 folders are distinct from
         // every other name's: about 250 KiB of folder names per file. 600 such files (600 KiB of
         // names in the archive) would make about 150 MiB of folder names in the source tar.
@@ -903,9 +960,45 @@ mod tests {
         let files = unpacked((0..600).map(deep));
         let names: usize = files.entries.iter().map(|e| e.name.len()).sum();
         assert!(names < 1024 * 1024);
-        let err = source_tar(&files, MAX_SOURCE_NAME_TOTAL_BYTES)
+        let err = source_tar(&files, names_bound(MAX_SOURCE_NAME_TOTAL_BYTES))
             .expect_err("folder names over the cap are refused");
         assert!(err.contains("over"), "{err}");
+    }
+
+    /// Many short paths, each with folders of its own: the names stay far under their bound,
+    /// but the folders count against the entry bound (100,000 files with 20 folders each would
+    /// make a source tar of about 1 GiB of headers from an archive of a few MiB).
+    #[test]
+    fn wide_source_paths_count_against_the_entry_bound() {
+        let wide = |i: usize| format!("{i:05}/{}f", "a/".repeat(19));
+        // 25,000 files with 20 folders each: 525,000 entries, about 13 MiB of names.
+        let files = unpacked((0..25_000).map(wide));
+        let err = source_tar(&files, names_bound(MAX_SOURCE_NAME_TOTAL_BYTES))
+            .expect_err("over the entry bound");
+        assert!(err.contains("entries with the folders"), "{err}");
+        // The bound is exact: 20 such files are 420 entries.
+        let files = unpacked((0..20).map(wide));
+        let entries = |entries| SourceBounds {
+            entries,
+            ..names_bound(MAX_SOURCE_NAME_TOTAL_BYTES)
+        };
+        assert!(source_tar(&files, entries(420)).is_ok());
+        assert!(source_tar(&files, entries(419)).is_err());
+    }
+
+    /// The source tar is held to its byte bound as it is written.
+    #[test]
+    fn the_source_tar_is_held_to_its_byte_bound() {
+        // 2,000 files of one byte: 2,000 headers and data blocks, about 2 MiB.
+        let files = unpacked((0..2_000).map(|i| format!("f{i:04}")));
+        let bounds = |bytes| SourceBounds {
+            bytes,
+            ..names_bound(MAX_SOURCE_NAME_TOTAL_BYTES)
+        };
+        let tar = source_tar(&files, bounds(4 * 1024 * 1024)).expect("under the bound");
+        assert_eq!(tar.len(), 2_000 * 1024 + 1024);
+        let err = source_tar(&files, bounds(1024 * 1024)).expect_err("over the byte bound");
+        assert!(err.contains("source tar of the archive is over"), "{err}");
     }
 
     #[test]

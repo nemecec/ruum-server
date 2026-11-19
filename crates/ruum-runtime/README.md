@@ -162,9 +162,11 @@ and writer are the crate's own, `flate2`, `sha2` and `hex` come from the workspa
    say `runtime: node22` and give `start` (the command that listens on `$PORT`); `build` is
    optional. A refused archive or manifest is `build_failed` with the reason. The source tar
    for the job adds each folder above a file once; the source's names with those folders may
-   be at most 64 MiB in all, or the build fails (a deep path in every file cannot make the
-   builder copy each parent per file; Kimi, run 12). Unpacking and the source tar run on the
-   blocking pool.
+   be at most 64 MiB in all, its entries (with those folders) at most 500,000, and the source
+   tar itself at most `RUUM_BUILD_OUTPUT_MAX`, or the build fails (a deep path in every file, or
+   many short paths with folders of their own, cannot make the builder copy each parent per file
+   or write a tar of headers far larger than the archive; Kimi, run 12). Unpacking and the
+   source tar run on the blocking pool.
 3. **The job**: one sandbox container per build (`ruum-b-<build>`) from the base image, with
    the hardening of an app instance of the driver (read-only root, `cap-drop ALL`,
    `no-new-privileges`, user `10001:10001`, the driver's pids limit, the build's CPU and memory
