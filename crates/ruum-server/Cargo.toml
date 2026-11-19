@@ -31,6 +31,10 @@ opentelemetry-proto.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
+# The receiver reads bodies frame by frame and holds their bytes in the budget (O-1b review).
+bytes.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
 # The drop reasons' snake_case names in OTLP partial-success messages.
 serde_json.workspace = true
 

@@ -10,8 +10,9 @@
 //!   workload got them, [`crate::runtime::WorkloadSpec::redacted_values`] of its instances, as
 //!   the driver holds them, through a lookup closure. It is not a secret store (OpenBao and
 //!   `SecretStore` are card W-4's, which gives a second implementation).
-//! - [`FairBudget`]: the per-identity rate and byte budget of the receiver and the shipper, with
-//!   a fair share of the in-flight bytes per tenant (S-61).
+//! - [`FairBudget`]: the per-identity rate and byte budget of the receiver, with a fair share
+//!   of the in-flight bytes per tenant (S-61). The shipper does not use it: its own caps per
+//!   tick bound it ([`ShipperConfig`]), and the lines come from the driver's bounded buffer.
 //!
 //! The OTLP mapping is in [`super::otlp`], the source authentication in [`super::source`], the
 //! real store in [`super::lgtm`], and the receiver in `crates/ruum-server/src/telemetry.rs`.
@@ -69,7 +70,9 @@ pub struct BudgetConfig {
     pub bytes_per_second: u64,
     /// The bucket holds this many seconds of the rates (the burst).
     pub burst_seconds: u32,
-    /// The bytes that all requests in flight may hold together.
+    /// The bytes that all requests in flight may hold together: the body from its first byte
+    /// (or its declared length), and the decoded estimate of the OTLP walk
+    /// ([`super::otlp::Shape::decoded_bytes`]) before prost decodes it.
     pub max_in_flight_bytes: u64,
     /// One tenant may hold at most `max_in_flight_bytes / tenant_share` of them.
     pub tenant_share: u64,
@@ -83,7 +86,10 @@ impl Default for BudgetConfig {
             requests_per_second: 20,
             bytes_per_second: 2 * 1024 * 1024,
             burst_seconds: 5,
-            max_in_flight_bytes: 64 * 1024 * 1024,
+            // One request holds at most 8 MiB of body and 48 MiB of decoded estimate
+            // (`otlp::DECODED_FACTOR`), so one tenant's share (a quarter) fits one request of
+            // the largest kind.
+            max_in_flight_bytes: 256 * 1024 * 1024,
             tenant_share: 4,
             max_identities: 10_000,
         }
@@ -143,23 +149,51 @@ pub struct FairBudget {
     state: Mutex<BudgetState>,
 }
 
-/// Bytes held in flight; dropping it gives them back.
+/// Bytes held in flight; dropping it gives them back. It can grow (each check of the tenant's
+/// share and the global cap again) and shrink while the request runs.
 pub struct BudgetPermit {
     budget: Arc<FairBudget>,
     tenant: TenantId,
     bytes: u64,
 }
 
+impl BudgetPermit {
+    /// The bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Holds `extra` bytes more, if the tenant's share and the global cap allow it. On a
+    /// refusal the permit keeps what it held.
+    pub fn grow(&mut self, extra: u64) -> std::result::Result<(), BudgetRefusal> {
+        let mut st = self.budget.state.lock().expect("budget lock");
+        self.budget.try_hold(&mut st, self.tenant, extra)?;
+        self.bytes += extra;
+        Ok(())
+    }
+
+    /// Holds `total` bytes in all, if it is more than now.
+    pub fn grow_to(&mut self, total: u64) -> std::result::Result<(), BudgetRefusal> {
+        match total.checked_sub(self.bytes) {
+            Some(extra) if extra > 0 => self.grow(extra),
+            _ => Ok(()),
+        }
+    }
+
+    /// Gives back what is held over `total`.
+    pub fn shrink_to(&mut self, total: u64) {
+        if total < self.bytes {
+            let mut st = self.budget.state.lock().expect("budget lock");
+            FairBudget::release(&mut st, self.tenant, self.bytes - total);
+            self.bytes = total;
+        }
+    }
+}
+
 impl Drop for BudgetPermit {
     fn drop(&mut self) {
         let mut st = self.budget.state.lock().expect("budget lock");
-        st.in_flight = st.in_flight.saturating_sub(self.bytes);
-        if let Some(n) = st.by_tenant.get_mut(&self.tenant) {
-            *n = n.saturating_sub(self.bytes);
-            if *n == 0 {
-                st.by_tenant.remove(&self.tenant);
-            }
-        }
+        FairBudget::release(&mut st, self.tenant, self.bytes);
     }
 }
 
@@ -200,25 +234,78 @@ impl FairBudget {
         if bucket.bytes < bytes as f64 {
             return Err(BudgetRefusal::IdentityBytes);
         }
-        let held = st.by_tenant.get(&id.tenant).copied().unwrap_or(0);
-        let share = self.cfg.max_in_flight_bytes / self.cfg.tenant_share.max(1);
-        if held + bytes > share {
-            return Err(BudgetRefusal::TenantShare);
-        }
-        if st.in_flight + bytes > self.cfg.max_in_flight_bytes {
-            return Err(BudgetRefusal::Global);
-        }
+        self.try_hold(&mut st, id.tenant, bytes)?;
         // Checked above: the bucket exists.
         if let Some(b) = st.buckets.get_mut(id) {
             b.bytes -= bytes as f64;
         }
-        st.in_flight += bytes;
-        *st.by_tenant.entry(id.tenant).or_default() += bytes;
         Ok(BudgetPermit {
             budget: self.clone(),
             tenant: id.tenant,
             bytes,
         })
+    }
+
+    /// Holds `bytes` in flight for the identity's tenant (its share and the global cap; not the
+    /// byte rate) until the permit drops. The receiver calls it before it reads a body, with
+    /// the declared length or 0, and grows the permit as the body arrives.
+    pub fn hold(
+        self: &Arc<Self>,
+        id: &SourceIdentity,
+        bytes: u64,
+    ) -> std::result::Result<BudgetPermit, BudgetRefusal> {
+        let mut st = self.state.lock().expect("budget lock");
+        self.try_hold(&mut st, id.tenant, bytes)?;
+        Ok(BudgetPermit {
+            budget: self.clone(),
+            tenant: id.tenant,
+            bytes,
+        })
+    }
+
+    /// Takes `bytes` of the identity's byte rate (once the body is read).
+    pub fn take_bytes(
+        &self,
+        id: &SourceIdentity,
+        bytes: u64,
+    ) -> std::result::Result<(), BudgetRefusal> {
+        let mut st = self.state.lock().expect("budget lock");
+        let bucket = self.bucket(&mut st, id, Instant::now())?;
+        if bucket.bytes < bytes as f64 {
+            return Err(BudgetRefusal::IdentityBytes);
+        }
+        bucket.bytes -= bytes as f64;
+        Ok(())
+    }
+
+    /// Adds `bytes` to the tenant's and the global in-flight bytes, if both caps allow it.
+    fn try_hold(
+        &self,
+        st: &mut BudgetState,
+        tenant: TenantId,
+        bytes: u64,
+    ) -> std::result::Result<(), BudgetRefusal> {
+        let held = st.by_tenant.get(&tenant).copied().unwrap_or(0);
+        let share = self.cfg.max_in_flight_bytes / self.cfg.tenant_share.max(1);
+        if held.saturating_add(bytes) > share {
+            return Err(BudgetRefusal::TenantShare);
+        }
+        if st.in_flight.saturating_add(bytes) > self.cfg.max_in_flight_bytes {
+            return Err(BudgetRefusal::Global);
+        }
+        st.in_flight += bytes;
+        *st.by_tenant.entry(tenant).or_default() += bytes;
+        Ok(())
+    }
+
+    fn release(st: &mut BudgetState, tenant: TenantId, bytes: u64) {
+        st.in_flight = st.in_flight.saturating_sub(bytes);
+        if let Some(n) = st.by_tenant.get_mut(&tenant) {
+            *n = n.saturating_sub(bytes);
+            if *n == 0 {
+                st.by_tenant.remove(&tenant);
+            }
+        }
     }
 
     /// The identity's bucket, refilled to `now`. A new identity gets a full bucket; when the
@@ -340,7 +427,9 @@ pub struct ShipperConfig {
     /// The lines read from one instance per tick (one batch).
     pub lines_per_instance: usize,
     /// The lines read from all instances per tick; split evenly between the tenants that have
-    /// instances (fair share, S-61), so the memory of one tick is bounded.
+    /// instances (fair share, S-61), so the memory of one tick is bounded. Within a tenant the
+    /// instances take turns: each tick starts at the first instance the last tick did not
+    /// reach, so a busy instance cannot starve the tenant's other instances.
     pub lines_per_tick: usize,
     /// The positions kept; positions of instances that are no longer listed go first.
     pub max_positions: usize,
@@ -378,6 +467,8 @@ pub struct LogShipper {
     ingest: Arc<dyn TelemetryIngest>,
     store: Arc<dyn PositionStore>,
     positions: tokio::sync::Mutex<HashMap<InstanceId, u64>>,
+    /// Per tenant: the index (in the tenant's instance list) where the next tick starts.
+    cursors: tokio::sync::Mutex<HashMap<TenantId, usize>>,
     cfg: ShipperConfig,
 }
 
@@ -397,6 +488,7 @@ impl LogShipper {
             ingest,
             store,
             positions: tokio::sync::Mutex::new(positions),
+            cursors: tokio::sync::Mutex::new(HashMap::new()),
             cfg,
         })
     }
@@ -417,12 +509,22 @@ impl LogShipper {
         let tenants = by_tenant.len().max(1);
         let tenant_lines = (self.cfg.lines_per_tick / tenants).max(1);
         let mut positions = self.positions.lock().await;
+        let mut cursors = self.cursors.lock().await;
+        let mut next_cursors = HashMap::with_capacity(by_tenant.len());
         for (tenant, instances) in &by_tenant {
+            let n = instances.len();
+            let start = cursors.get(tenant).copied().unwrap_or(0) % n;
+            // When every instance was reached, the next tick still starts one further on.
+            let mut next = (start + 1) % n;
             let mut left = tenant_lines;
-            for instance in instances {
+            let mut shipped = false;
+            for k in 0..n {
+                let idx = (start + k) % n;
                 if left == 0 {
+                    next = idx;
                     break;
                 }
+                let instance = &instances[idx];
                 report.instances += 1;
                 let limit = self.cfg.lines_per_instance.min(left).max(1);
                 let after = positions.get(instance).copied();
@@ -453,9 +555,7 @@ impl LogShipper {
                         report.stored += r.stored_logs;
                         report.secrets_redacted += r.secrets_redacted;
                         positions.insert(*instance, last);
-                        if let Err(e) = self.store.save(&positions).await {
-                            tracing::warn!(error = %e, "telemetry shipper: saving the positions failed");
-                        }
+                        shipped = true;
                     }
                     Err(e) => {
                         report.failed_batches += 1;
@@ -463,7 +563,14 @@ impl LogShipper {
                     }
                 }
             }
+            next_cursors.insert(*tenant, next);
+            // Saved once per tenant: a crash repeats at most the batches of one tenant's turn.
+            if shipped && let Err(e) = self.store.save(&positions).await {
+                tracing::warn!(error = %e, "telemetry shipper: saving the positions failed");
+            }
         }
+        // Only the listed tenants keep a cursor, so the map stays bounded.
+        *cursors = next_cursors;
         if positions.len() > self.cfg.max_positions {
             let listed: std::collections::HashSet<InstanceId> =
                 listed.iter().map(|(_, i)| *i).collect();

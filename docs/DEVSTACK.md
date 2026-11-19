@@ -535,8 +535,10 @@ refused (a 4xx), that every published port binds to 127.0.0.1 only, and that the
 the network `telemetry` only. Every write carries the Collector's write token
 (`RUUM_TELEMETRY_COLLECTOR_TOKEN_FILE`). Card O-1b added three timed refusals, each after the
 accepted write of the same signal: a write without the token (401), a write with the token and
-`X-Scope-OrgID: t-a|t-b` (Loki and Tempo 400, Mimir's 422 reaches the sender as 500; any non-2xx
-counts), and a write with the token and no tenant header. It prints `PASS` or `FAIL` per check and exits non-zero on a
+`X-Scope-OrgID: t-a|t-b` (Loki and Tempo 400, Mimir's 422 reaches the sender as 500), and a write
+with the token and no tenant header. A 5xx is no proof that nothing was stored, so each `t-a|t-b`
+record is read back with `t-a` and with `t-b` and must not be found; that read counts only after
+a control record, written with `t-a` right after it, was found by the same query. It prints `PASS` or `FAIL` per check and exits non-zero on a
 failure. A run takes about 40 seconds (Loki's refusal of a two-tenant query is slow). It needs
 `curl`, `jq`, `openssl` and `docker`.
 

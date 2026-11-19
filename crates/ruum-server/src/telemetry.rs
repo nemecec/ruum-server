@@ -10,16 +10,23 @@
 //! 1. **Authenticate** the source from facts the receiver saw itself: the peer address, the
 //!    listener, an optional bearer token ([`SourceFacts`]). Nothing of the request's content,
 //!    headers (other than the bearer token, which is refused until card R-3) or query decides
-//!    the identity. An unknown source gets `401` / `UNAUTHENTICATED`; nothing is read further.
+//!    the identity. An unknown source gets `401` / `UNAUTHENTICATED`; the body is not read,
+//!    over HTTP and over gRPC (the gRPC services are written here on tonic's `Grpc` with a
+//!    codec that hands over the raw message, so no message is decoded before this step).
 //! 2. **Budget**: one request of the identity's rate ([`FairBudget`]); `429` /
-//!    `RESOURCE_EXHAUSTED` when over.
-//! 3. **Read the body** (HTTP): capped at `Limits::max_batch_bytes` (`413`) and bounded in time
-//!    (`408` for a client that trickles bytes). gRPC: tonic's decoding size limit and the
-//!    request timeout.
-//! 4. **Decode and map** ([`otlp`]): malformed `400` / `INVALID_ARGUMENT`; too many records
-//!    `413` / `INVALID_ARGUMENT`.
-//! 5. **Bytes budget** of the identity and its tenant's share of the in-flight bytes.
-//! 6. **Ingest** with the authenticated identity ([`TelemetryIngest`]).
+//!    `RESOURCE_EXHAUSTED` when over. Then the in-flight bytes are held for the identity's
+//!    tenant from the first byte: the declared `Content-Length` before reading (HTTP), and
+//!    every frame as it arrives (HTTP and gRPC). A tenant over its share gets `429` /
+//!    `RESOURCE_EXHAUSTED` while the body is still arriving.
+//! 3. **Read the body**: capped at `Limits::max_batch_bytes` (`413`; gRPC `OUT_OF_RANGE`) and
+//!    bounded in time (HTTP `408` for a client that trickles bytes; gRPC the request timeout).
+//! 4. **Check before decoding** ([`otlp::check`]): the wire walk counts the records and
+//!    estimates the decoded size, `413` / `INVALID_ARGUMENT` over a cap. Then the byte rate of
+//!    the identity, and the decoded estimate is held in flight too (`429` /
+//!    `RESOURCE_EXHAUSTED` over the tenant's share).
+//! 5. **Decode and map** ([`otlp`]): malformed `400` / `INVALID_ARGUMENT`.
+//! 6. **Ingest** with the authenticated identity ([`TelemetryIngest`]). The held bytes are
+//!    given back when the request ends.
 //!
 //! The answers carry counts and reason names only (OTLP partial success), never an attribute
 //! name or value. The `tracing` events carry the identity, the listener, the peer address,
@@ -39,37 +46,32 @@ use anyhow::Context as _;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{self, HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
-    LogsService, LogsServiceServer,
-};
+use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
+use futures::StreamExt as _;
 use opentelemetry_proto::tonic::collector::logs::v1::{
-    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
-};
-use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
-    MetricsService, MetricsServiceServer,
+    ExportLogsPartialSuccess, ExportLogsServiceResponse,
 };
 use opentelemetry_proto::tonic::collector::metrics::v1::{
-    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-};
-use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{
-    TraceService, TraceServiceServer,
+    ExportMetricsPartialSuccess, ExportMetricsServiceResponse,
 };
 use opentelemetry_proto::tonic::collector::trace::v1::{
-    ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
+    ExportTracePartialSuccess, ExportTraceServiceResponse,
 };
 use prost::Message as _;
-use ruum_core::telemetry::otlp::{self, Mapped, Refusal};
-use ruum_core::telemetry::processor::{BudgetConfig, BudgetRefusal, FairBudget};
+use ruum_core::telemetry::otlp::{self, Refusal};
+use ruum_core::telemetry::processor::{BudgetConfig, BudgetPermit, BudgetRefusal, FairBudget};
 use ruum_core::telemetry::source::{
     BearerToken, ListenerId, SourceAuthenticator, SourceError, SourceFacts,
 };
 use ruum_core::telemetry::{IngestReport, Limits, Signal, SourceIdentity, TelemetryIngest};
+use std::convert::Infallible;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------- settings
@@ -149,6 +151,8 @@ pub enum Refused {
     Request(Refusal),
     /// The body did not arrive within the body timeout.
     SlowBody,
+    /// The body passed the size cap while it arrived (before any decoding).
+    BodyTooLarge,
     /// The content type or encoding is not OTLP protobuf without compression.
     Unsupported,
     /// The pipeline or the store failed.
@@ -162,6 +166,7 @@ impl Refused {
             Refused::Budget(b) => b.as_str(),
             Refused::Request(r) => r.as_str(),
             Refused::SlowBody => "slow_body",
+            Refused::BodyTooLarge => Refusal::BodyTooLarge.as_str(),
             Refused::Unsupported => "unsupported_media_type",
             Refused::Unavailable => "unavailable",
         }
@@ -172,7 +177,7 @@ impl Refused {
             Refused::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
             Refused::Budget(_) => StatusCode::TOO_MANY_REQUESTS,
             Refused::Request(Refusal::Malformed) => StatusCode::BAD_REQUEST,
-            Refused::Request(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Refused::Request(_) | Refused::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Refused::SlowBody => StatusCode::REQUEST_TIMEOUT,
             Refused::Unsupported => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Refused::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -187,6 +192,7 @@ impl Refused {
             Refused::Request(_) | Refused::Unsupported | Refused::SlowBody => {
                 tonic::Status::invalid_argument(msg)
             }
+            Refused::BodyTooLarge => tonic::Status::out_of_range(msg),
             Refused::Unavailable => tonic::Status::unavailable(msg),
         }
     }
@@ -263,10 +269,6 @@ impl Receiver {
         })
     }
 
-    pub fn limits(&self) -> Limits {
-        self.limits
-    }
-
     /// Steps 1 and 2: the identity and one request of its rate.
     async fn admit(&self, facts: &SourceFacts) -> Result<SourceIdentity, Refused> {
         let identity = match self.auth.authenticate(facts).await {
@@ -288,22 +290,46 @@ impl Receiver {
         Ok(identity)
     }
 
-    /// Steps 5 and 6: the bytes budget and the pipeline.
-    async fn ingest(
-        &self,
-        identity: &SourceIdentity,
-        bytes: u64,
-        mapped: Mapped,
-    ) -> Result<Accepted, Refused> {
-        let records = mapped.records;
-        let _permit = match self.budget.admit_bytes(identity, bytes) {
-            Ok(p) => p,
+    /// Holds `bytes` for the identity's tenant before the body is read (step 2).
+    fn hold(&self, identity: &SourceIdentity, bytes: u64) -> Result<SharedPermit, Refused> {
+        match self.budget.hold(identity, bytes) {
+            Ok(p) => Ok(Arc::new(Mutex::new(p))),
             Err(b) => {
-                log_budget(identity, b, bytes, records);
-                return Err(Refused::Budget(b));
+                log_budget(identity, b, bytes, 0);
+                Err(Refused::Budget(b))
             }
-        };
-        let Mapped { batch, dropped, .. } = mapped;
+        }
+    }
+
+    /// Steps 4 to 6 on a body that was read whole while `permit` held its bytes: the check
+    /// before decoding, the byte rate, the decoded estimate in flight, the mapping and the
+    /// pipeline.
+    async fn process(
+        &self,
+        facts: &SourceFacts,
+        identity: &SourceIdentity,
+        permit: &SharedPermit,
+        signal: Signal,
+        body: &[u8],
+    ) -> Result<Accepted, Refused> {
+        let bytes = body.len() as u64;
+        lock(permit).shrink_to(bytes);
+        let checked = otlp::check(signal, body, &self.limits)
+            .map_err(|e| Self::refuse_request(facts, identity, e))?;
+        let shape = checked.shape();
+        if let Err(b) = self.budget.take_bytes(identity, bytes) {
+            log_budget(identity, b, bytes, shape.records);
+            return Err(Refused::Budget(b));
+        }
+        if let Err(b) = lock(permit).grow(shape.decoded_bytes) {
+            log_budget(identity, b, bytes + shape.decoded_bytes, shape.records);
+            return Err(Refused::Budget(b));
+        }
+        let mapped = checked
+            .decode(&self.limits)
+            .map_err(|e| Self::refuse_request(facts, identity, e))?;
+        let records = mapped.records;
+        let otlp::Mapped { batch, dropped, .. } = mapped;
         let mut report = match self.ingest.ingest(identity, batch).await {
             Ok(r) => r,
             Err(e) => {
@@ -341,6 +367,13 @@ impl Receiver {
         );
         Refused::Request(r)
     }
+}
+
+/// The in-flight bytes of one request, shared by its body reader and its handler.
+type SharedPermit = Arc<Mutex<BudgetPermit>>;
+
+fn lock(p: &SharedPermit) -> std::sync::MutexGuard<'_, BudgetPermit> {
+    p.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn log_budget(identity: &SourceIdentity, b: BudgetRefusal, bytes: u64, records: u64) {
@@ -460,42 +493,69 @@ async fn http_export(
             Refusal::BodyTooLarge,
         ));
     }
-    // A body over the cap is cut at cap + 1 bytes, so the decoder sees it is too large.
-    let bytes = match tokio::time::timeout(r.body_timeout, axum::body::to_bytes(body, cap + 1))
-        .await
-    {
+    // The tenant holds the declared length before a byte is read, and every byte past it as
+    // it arrives.
+    let permit = match r.hold(&identity, declared.unwrap_or(0) as u64) {
+        Ok(p) => p,
+        Err(e) => return refused_response(e),
+    };
+    let read = read_body(body, cap, &permit, &identity);
+    let bytes = match tokio::time::timeout(r.body_timeout, read).await {
         Err(_) => {
             tracing::info!(listener = %facts.listener, tenant = %identity.tenant, app = %identity.app, reason = "slow_body", "telemetry: request refused");
             return refused_response(Refused::SlowBody);
         }
-        Ok(Err(_)) => {
-            return refused_response(Receiver::refuse_request(
-                &facts,
-                &identity,
-                Refusal::BodyTooLarge,
-            ));
+        Ok(Err(e)) => {
+            tracing::info!(listener = %facts.listener, tenant = %identity.tenant, app = %identity.app, reason = e.reason(), "telemetry: request refused");
+            return refused_response(e);
         }
         Ok(Ok(b)) => b,
     };
-    let decoded = match signal {
-        Signal::Logs => otlp::decode_logs(&bytes, &r.limits),
-        Signal::Metrics => otlp::decode_metrics(&bytes, &r.limits),
-        Signal::Traces => otlp::decode_traces(&bytes, &r.limits),
-    };
-    let mapped = match decoded {
-        Ok(m) => m,
-        Err(e) => return refused_response(Receiver::refuse_request(&facts, &identity, e)),
-    };
-    match r.ingest(&identity, bytes.len() as u64, mapped).await {
+    match r.process(&facts, &identity, &permit, signal, &bytes).await {
         Ok(a) => http_success(signal, &a),
         Err(e) => refused_response(e),
     }
 }
 
+/// Reads an HTTP body up to `cap` bytes, growing `permit` with every chunk.
+async fn read_body(
+    body: Body,
+    cap: usize,
+    permit: &SharedPermit,
+    identity: &SourceIdentity,
+) -> Result<Bytes, Refused> {
+    let mut stream = body.into_data_stream();
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        // The client went away or sent a broken body: nothing to decode.
+        let chunk = chunk.map_err(|_| Refused::Request(Refusal::Malformed))?;
+        let total = buf.len() + chunk.len();
+        if total > cap {
+            return Err(Refused::BodyTooLarge);
+        }
+        if let Err(b) = lock(permit).grow_to(total as u64) {
+            log_budget(identity, b, total as u64, 0);
+            return Err(Refused::Budget(b));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
 fn http_success(signal: Signal, a: &Accepted) -> Response {
-    let partial = |rejected: i64, message: String| (rejected, message);
-    let (rejected, message) = partial(a.rejected(), a.message());
-    let body = match signal {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-protobuf")],
+        encode_success(signal, a),
+    )
+        .into_response()
+}
+
+/// The OTLP export response of a signal, encoded: the partial success with counts and reason
+/// names only.
+fn encode_success(signal: Signal, a: &Accepted) -> Vec<u8> {
+    let (rejected, message) = (a.rejected(), a.message());
+    match signal {
         Signal::Logs => ExportLogsServiceResponse {
             partial_success: (rejected > 0).then_some(ExportLogsPartialSuccess {
                 rejected_log_records: rejected,
@@ -517,123 +577,255 @@ fn http_success(signal: Signal, a: &Accepted) -> Response {
             }),
         }
         .encode_to_vec(),
-    };
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/x-protobuf")],
-        body,
-    )
-        .into_response()
+    }
 }
 
 // ---------------------------------------------------------------------------- gRPC
 
-/// The gRPC receiver on one listener.
-#[derive(Clone)]
-pub struct GrpcReceiver {
-    receiver: Arc<Receiver>,
-    listener: ListenerId,
+/// One OTLP gRPC service: its name and its signal.
+pub trait OtlpService: Send + Sync + 'static {
+    const NAME: &'static str;
+    const SIGNAL: Signal;
 }
 
-impl GrpcReceiver {
+/// `opentelemetry.proto.collector.logs.v1.LogsService`.
+pub enum LogsService {}
+/// `opentelemetry.proto.collector.metrics.v1.MetricsService`.
+pub enum MetricsService {}
+/// `opentelemetry.proto.collector.trace.v1.TraceService`.
+pub enum TraceService {}
+
+impl OtlpService for LogsService {
+    const NAME: &'static str = "opentelemetry.proto.collector.logs.v1.LogsService";
+    const SIGNAL: Signal = Signal::Logs;
+}
+impl OtlpService for MetricsService {
+    const NAME: &'static str = "opentelemetry.proto.collector.metrics.v1.MetricsService";
+    const SIGNAL: Signal = Signal::Metrics;
+}
+impl OtlpService for TraceService {
+    const NAME: &'static str = "opentelemetry.proto.collector.trace.v1.TraceService";
+    const SIGNAL: Signal = Signal::Traces;
+}
+
+/// The gRPC receiver of one OTLP service on one listener. It is not the generated tonic
+/// server: that one decodes the message before the handler runs. This one authenticates and
+/// admits the request from its headers and its peer address first, then lets tonic read the
+/// message (as raw bytes, holding them in the budget frame by frame), then checks and decodes
+/// it like the HTTP receiver.
+pub struct GrpcReceiver<S> {
+    receiver: Arc<Receiver>,
+    listener: ListenerId,
+    _service: PhantomData<fn() -> S>,
+}
+
+impl<S> Clone for GrpcReceiver<S> {
+    fn clone(&self) -> Self {
+        GrpcReceiver {
+            receiver: self.receiver.clone(),
+            listener: self.listener.clone(),
+            _service: PhantomData,
+        }
+    }
+}
+
+impl<S: OtlpService> tonic::server::NamedService for GrpcReceiver<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+type GrpcResponse = http::Response<tonic::body::Body>;
+
+impl<S: OtlpService> GrpcReceiver<S> {
     pub fn new(receiver: Arc<Receiver>, listener: ListenerId) -> Self {
-        GrpcReceiver { receiver, listener }
+        GrpcReceiver {
+            receiver,
+            listener,
+            _service: PhantomData,
+        }
     }
 
-    fn facts<T>(&self, req: &tonic::Request<T>) -> Option<SourceFacts> {
-        let peer = req.remote_addr()?;
-        let bearer = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                let (scheme, token) = v.split_once(' ')?;
-                scheme
-                    .eq_ignore_ascii_case("bearer")
-                    .then(|| BearerToken::new(token.trim()))
-            });
+    /// The facts of the source: the peer address that tonic's transport saw, the listener, and
+    /// a bearer token from the headers.
+    fn facts<B>(&self, req: &http::Request<B>) -> Option<SourceFacts> {
+        let peer = req
+            .extensions()
+            .get::<tonic::transport::server::TcpConnectInfo>()?
+            .remote_addr()?;
         Some(SourceFacts {
             peer,
             listener: self.listener.clone(),
-            bearer,
+            bearer: bearer_of(req.headers()),
         })
     }
 
-    /// Authenticates, maps and ingests one decoded request.
-    async fn export<T: prost::Message>(
-        &self,
-        req: tonic::Request<T>,
-        map: impl FnOnce(T, &Limits) -> Result<Mapped, Refusal>,
-    ) -> Result<Accepted, tonic::Status> {
-        // Without a peer address there is no identity.
-        let facts = self
-            .facts(&req)
-            .ok_or_else(|| Refused::Unauthenticated(SourceError::UnknownSource).grpc_status())?;
-        let r = &self.receiver;
-        let identity = r.admit(&facts).await.map_err(Refused::grpc_status)?;
-        let msg = req.into_inner();
-        let bytes = msg.encoded_len() as u64;
-        if bytes > r.limits.max_batch_bytes as u64 {
-            return Err(
-                Receiver::refuse_request(&facts, &identity, Refusal::BodyTooLarge).grpc_status(),
-            );
+    async fn handle(self, req: http::Request<tonic::body::Body>) -> GrpcResponse {
+        if req
+            .uri()
+            .path()
+            .strip_prefix('/')
+            .and_then(|p| p.strip_suffix("/Export"))
+            != Some(S::NAME)
+        {
+            return tonic::Status::unimplemented("").into_http();
         }
-        let mapped = map(msg, &r.limits)
-            .map_err(|e| Receiver::refuse_request(&facts, &identity, e).grpc_status())?;
-        r.ingest(&identity, bytes, mapped)
+        // Steps 1 and 2, from the headers and the peer only: the body is not polled before.
+        // Without a peer address there is no identity.
+        let Some(facts) = self.facts(&req) else {
+            return Refused::Unauthenticated(SourceError::UnknownSource)
+                .grpc_status()
+                .into_http();
+        };
+        let r = self.receiver.clone();
+        let identity = match r.admit(&facts).await {
+            Ok(id) => id,
+            Err(e) => return e.grpc_status().into_http(),
+        };
+        let permit = match r.hold(&identity, 0) {
+            Ok(p) => p,
+            Err(e) => return e.grpc_status().into_http(),
+        };
+        let max = r.limits.max_batch_bytes;
+        let (parts, body) = req.into_parts();
+        // The message and its 5-byte gRPC frame header.
+        let body = metered_body(body, permit.clone(), identity, max + 5);
+        let req = http::Request::from_parts(parts, body);
+        let method = GrpcExport {
+            receiver: r,
+            facts,
+            identity,
+            permit,
+            signal: S::SIGNAL,
+        };
+        tonic::server::Grpc::new(RawCodec)
+            .apply_max_message_size_config(Some(max), None)
+            .unary(method, req)
             .await
-            .map_err(Refused::grpc_status)
     }
 }
 
-#[tonic::async_trait]
-impl LogsService for GrpcReceiver {
-    async fn export(
-        &self,
-        request: tonic::Request<ExportLogsServiceRequest>,
-    ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
-        let a = GrpcReceiver::export(self, request, otlp::map_logs).await?;
-        let rejected = a.rejected();
-        Ok(tonic::Response::new(ExportLogsServiceResponse {
-            partial_success: (rejected > 0).then(|| ExportLogsPartialSuccess {
-                rejected_log_records: rejected,
-                error_message: a.message(),
-            }),
-        }))
+impl<S: OtlpService> tonic::codegen::Service<http::Request<tonic::body::Body>> for GrpcReceiver<S> {
+    type Response = GrpcResponse;
+    type Error = Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<GrpcResponse, Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Infallible>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+        let this = self.clone();
+        Box::pin(async move { Ok(this.handle(req).await) })
     }
 }
 
-#[tonic::async_trait]
-impl MetricsService for GrpcReceiver {
-    async fn export(
-        &self,
-        request: tonic::Request<ExportMetricsServiceRequest>,
-    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
-        let a = GrpcReceiver::export(self, request, otlp::map_metrics).await?;
-        let rejected = a.rejected();
-        Ok(tonic::Response::new(ExportMetricsServiceResponse {
-            partial_success: (rejected > 0).then(|| ExportMetricsPartialSuccess {
-                rejected_data_points: rejected,
-                error_message: a.message(),
-            }),
-        }))
+/// A gRPC request body that holds its bytes in `permit` as they arrive and stops past `cap`.
+fn metered_body(
+    body: tonic::body::Body,
+    permit: SharedPermit,
+    identity: SourceIdentity,
+    cap: usize,
+) -> impl axum::body::HttpBody<Data = Bytes, Error = tonic::Status> + Send + 'static {
+    let mut total = 0usize;
+    let frames = http_body_util::BodyStream::new(body).map(move |frame| {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            total += data.len();
+            if total > cap {
+                return Err(Refused::BodyTooLarge.grpc_status());
+            }
+            if let Err(b) = lock(&permit).grow_to(total as u64) {
+                log_budget(&identity, b, total as u64, 0);
+                return Err(Refused::Budget(b).grpc_status());
+            }
+        }
+        Ok(frame)
+    });
+    http_body_util::StreamBody::new(frames)
+}
+
+/// The export call of one admitted gRPC request.
+struct GrpcExport {
+    receiver: Arc<Receiver>,
+    facts: SourceFacts,
+    identity: SourceIdentity,
+    permit: SharedPermit,
+    signal: Signal,
+}
+
+impl tonic::server::UnaryService<Bytes> for GrpcExport {
+    type Response = Vec<u8>;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<tonic::Response<Vec<u8>>, tonic::Status>>
+                + Send,
+        >,
+    >;
+
+    fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
+        let (receiver, facts, permit) = (
+            self.receiver.clone(),
+            self.facts.clone(),
+            self.permit.clone(),
+        );
+        let (identity, signal) = (self.identity, self.signal);
+        Box::pin(async move {
+            let body = request.into_inner();
+            let a = receiver
+                .process(&facts, &identity, &permit, signal, &body)
+                .await
+                .map_err(Refused::grpc_status)?;
+            Ok(tonic::Response::new(encode_success(signal, &a)))
+        })
     }
 }
 
-#[tonic::async_trait]
-impl TraceService for GrpcReceiver {
-    async fn export(
-        &self,
-        request: tonic::Request<ExportTraceServiceRequest>,
-    ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-        let a = GrpcReceiver::export(self, request, otlp::map_traces).await?;
-        let rejected = a.rejected();
-        Ok(tonic::Response::new(ExportTraceServiceResponse {
-            partial_success: (rejected > 0).then(|| ExportTracePartialSuccess {
-                rejected_spans: rejected,
-                error_message: a.message(),
-            }),
-        }))
+/// A gRPC codec that hands over the raw request message (decoded by [`otlp`] after the
+/// checks) and sends an already encoded response.
+struct RawCodec;
+
+impl tonic::codec::Codec for RawCodec {
+    type Encode = Vec<u8>;
+    type Decode = Bytes;
+    type Encoder = RawCodec;
+    type Decoder = RawCodec;
+
+    fn encoder(&mut self) -> RawCodec {
+        RawCodec
+    }
+
+    fn decoder(&mut self) -> RawCodec {
+        RawCodec
+    }
+}
+
+impl tonic::codec::Encoder for RawCodec {
+    type Item = Vec<u8>;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Vec<u8>,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), tonic::Status> {
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
+impl tonic::codec::Decoder for RawCodec {
+    type Item = Bytes;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Bytes>, tonic::Status> {
+        Ok(Some(src.copy_to_bytes(src.remaining())))
     }
 }
 
@@ -647,14 +839,18 @@ pub async fn serve_grpc(
     listener: tokio::net::TcpListener,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let max = receiver.limits().max_batch_bytes;
-    let svc = GrpcReceiver::new(receiver, name);
     tonic::transport::Server::builder()
         .timeout(GRPC_TIMEOUT)
         .concurrency_limit_per_connection(32)
-        .add_service(LogsServiceServer::new(svc.clone()).max_decoding_message_size(max))
-        .add_service(MetricsServiceServer::new(svc.clone()).max_decoding_message_size(max))
-        .add_service(TraceServiceServer::new(svc).max_decoding_message_size(max))
+        .add_service(GrpcReceiver::<LogsService>::new(
+            receiver.clone(),
+            name.clone(),
+        ))
+        .add_service(GrpcReceiver::<MetricsService>::new(
+            receiver.clone(),
+            name.clone(),
+        ))
+        .add_service(GrpcReceiver::<TraceService>::new(receiver, name))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             stop,
@@ -691,6 +887,23 @@ pub async fn run(
     settings: &TelemetrySettings,
     services: &ruum_core::Services,
     stop: crate::shutdown::Stop,
+) -> anyhow::Result<()> {
+    let grpc = tokio::net::TcpListener::bind(&settings.grpc_listen)
+        .await
+        .with_context(|| format!("bind {} (RUUM_TELEMETRY_GRPC_LISTEN)", settings.grpc_listen))?;
+    let http = tokio::net::TcpListener::bind(&settings.http_listen)
+        .await
+        .with_context(|| format!("bind {} (RUUM_TELEMETRY_HTTP_LISTEN)", settings.http_listen))?;
+    run_on(settings, services, stop, grpc, http).await
+}
+
+/// [`run`] on listeners that are already bound (the tests bind port 0).
+pub async fn run_on(
+    settings: &TelemetrySettings,
+    services: &ruum_core::Services,
+    stop: crate::shutdown::Stop,
+    grpc: tokio::net::TcpListener,
+    http: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     use ruum_core::telemetry::lgtm::{LgtmConfig, LgtmStore};
     use ruum_core::telemetry::memory::MemoryFieldClasses;
@@ -762,13 +975,11 @@ pub async fn run(
         .await?,
     );
 
-    let grpc = tokio::net::TcpListener::bind(&settings.grpc_listen)
-        .await
-        .with_context(|| format!("bind {} (RUUM_TELEMETRY_GRPC_LISTEN)", settings.grpc_listen))?;
-    let http = tokio::net::TcpListener::bind(&settings.http_listen)
-        .await
-        .with_context(|| format!("bind {} (RUUM_TELEMETRY_HTTP_LISTEN)", settings.http_listen))?;
-    tracing::info!(grpc = %settings.grpc_listen, http = %settings.http_listen, "telemetry receiver listening");
+    tracing::info!(
+        grpc = %grpc.local_addr().map_or_else(|_| settings.grpc_listen.clone(), |a| a.to_string()),
+        http = %http.local_addr().map_or_else(|_| settings.http_listen.clone(), |a| a.to_string()),
+        "telemetry receiver listening"
+    );
     let name = ListenerId::new(LOCAL_LISTENER);
     let shipper_task = tokio::spawn(shipper.run(stop.clone().stopped()));
     let r = tokio::try_join!(

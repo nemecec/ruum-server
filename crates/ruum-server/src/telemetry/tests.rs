@@ -6,7 +6,9 @@
 //! lookup maps an address to an identity, as the app-network lookup of cards I-4 and I-6 will.
 
 use super::*;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1 as ol;
@@ -575,6 +577,291 @@ async fn a_flood_of_one_tenant_leaves_room_for_another() {
     );
 }
 
+// ---------------------------------------------------------------------------- decoded size
+
+/// `n` bytes of empty top-level entries (`resource_logs`, `resource_metrics` or
+/// `resource_spans`: field 1 of each request): no record at all, but a whole struct per two
+/// bytes once prost decodes it.
+fn empty_entries(n: usize) -> Vec<u8> {
+    [0x0a, 0x00].repeat(n / 2)
+}
+
+/// About `n` bytes of empty records in one resource and one scope of `signal`: field 2 of
+/// `ScopeLogs` / `ScopeSpans`, or empty `Metric`s (field 2 of `ScopeMetrics`), which count no
+/// point.
+fn empty_records(_signal: Signal, n: usize) -> Vec<u8> {
+    fn wrap(field: u8, inner: &[u8]) -> Vec<u8> {
+        let mut out = vec![(field << 3) | 2];
+        prost::encoding::encode_varint(inner.len() as u64, &mut out);
+        out.extend_from_slice(inner);
+        out
+    }
+    let records = [0x12, 0x00].repeat(n / 2 - 16);
+    // ScopeX { field 2: [empty; N] } in ResourceX { field 2 } in the request { field 1 }: the
+    // same shape for the three signals.
+    wrap(1, &wrap(2, &records))
+}
+
+/// A gRPC message frame: no compression, the length, the message.
+fn grpc_frame(msg: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8];
+    out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    out.extend_from_slice(msg);
+    out
+}
+
+fn grpc_path(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+        Signal::Metrics => "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+        Signal::Traces => "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+    }
+}
+
+fn http_path(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "/v1/logs",
+        Signal::Metrics => "/v1/metrics",
+        Signal::Traces => "/v1/traces",
+    }
+}
+
+/// Sends a raw gRPC request (any body, also one that never ends) from `from` and returns the
+/// answer's status code: from the headers of a trailers-only answer, else from the trailers.
+async fn grpc_raw(
+    addr: SocketAddr,
+    from: Ipv4Addr,
+    path: &str,
+    body: tonic::body::Body,
+) -> tonic::Code {
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+    let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .local_address(Some(IpAddr::V4(from)))
+        .connect()
+        .await
+        .unwrap();
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(body)
+        .unwrap();
+    let res = ch.oneshot(req).await.unwrap();
+    if let Some(s) = res.headers().get("grpc-status") {
+        return tonic::Code::from_bytes(s.as_bytes());
+    }
+    let done = res.into_body().collect().await.unwrap();
+    let trailers = done.trailers().cloned().unwrap_or_default();
+    tonic::Code::from_bytes(
+        trailers
+            .get("grpc-status")
+            .map_or(b"2".as_slice(), |v| v.as_bytes()),
+    )
+}
+
+fn full_body(bytes: Vec<u8>) -> tonic::body::Body {
+    tonic::body::Body::new(http_body_util::Full::new(bytes::Bytes::from(bytes)))
+}
+
+/// A body that sends `first` and then never ends.
+fn stalled_body(first: Vec<u8>) -> tonic::body::Body {
+    let chunks = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(first))])
+        .chain(futures::stream::pending());
+    tonic::body::Body::new(axum::body::Body::from_stream(chunks))
+}
+
+/// S-61 and T-56: a request whose decoded size would be far larger than its body is refused
+/// before prost decodes it, for each signal, over HTTP and gRPC; from an unknown source the
+/// answer is 401 / UNAUTHENTICATED (no read, no decode). The 8 MiB bodies decode to hundreds
+/// of MiB (measured in the review of O-1b), so a decode would show in the test's time.
+#[tokio::test]
+async fn bodies_that_decode_far_larger_are_refused_before_decoding() {
+    let w = world(Arc::new(MemoryTelemetryStore::new()), Opts::default()).await;
+    let cap = Limits::default().max_batch_bytes;
+    // Positive control: a real request of each signal is taken.
+    assert_eq!(
+        post(
+            &w,
+            A_IP,
+            "/v1/logs",
+            logs_req(&w.a, "ok", 3).encode_to_vec()
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        grpc_raw(
+            w.grpc,
+            A_IP,
+            grpc_path(Signal::Traces),
+            full_body(grpc_frame(&traces_req(&w.a).encode_to_vec()))
+        )
+        .await,
+        tonic::Code::Ok
+    );
+    let started = std::time::Instant::now();
+    for signal in [Signal::Logs, Signal::Metrics, Signal::Traces] {
+        for body in [empty_entries(cap), empty_records(signal, cap)] {
+            assert!(body.len() <= cap);
+            assert_eq!(
+                post(&w, A_IP, http_path(signal), body.clone()).await,
+                413,
+                "{signal:?} over HTTP"
+            );
+            assert_eq!(
+                grpc_raw(
+                    w.grpc,
+                    A_IP,
+                    grpc_path(signal),
+                    full_body(grpc_frame(&body))
+                )
+                .await,
+                tonic::Code::InvalidArgument,
+                "{signal:?} over gRPC"
+            );
+            assert_eq!(
+                post(&w, STRANGER_IP, http_path(signal), body.clone()).await,
+                401
+            );
+            assert_eq!(
+                grpc_raw(
+                    w.grpc,
+                    STRANGER_IP,
+                    grpc_path(signal),
+                    full_body(grpc_frame(&body))
+                )
+                .await,
+                tonic::Code::Unauthenticated,
+                "{signal:?}: a stranger's message is not decoded"
+            );
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    let mine = read_all(&w, w.a.tenant).await;
+    assert_eq!((mine.logs.len(), mine.spans.len()), (3, 1));
+}
+
+/// A stranger's gRPC request is refused from its headers: the body is never read. The body
+/// here never ends; a receiver that read it first would answer only at the request timeout.
+#[tokio::test]
+async fn grpc_refuses_a_stranger_before_reading_the_message() {
+    let w = world(Arc::new(MemoryTelemetryStore::new()), Opts::default()).await;
+    let msg = logs_req(&w.a, "x", 1).encode_to_vec();
+    let mut first = grpc_frame(&msg);
+    // The frame header promises more than is sent.
+    first[1..5].copy_from_slice(&(1024u32 * 1024).to_be_bytes());
+    // Positive control: from A the same stalled request is read (and so not answered at once).
+    let a = tokio::time::timeout(
+        Duration::from_millis(1500),
+        grpc_raw(
+            w.grpc,
+            A_IP,
+            grpc_path(Signal::Logs),
+            stalled_body(first.clone()),
+        ),
+    )
+    .await;
+    assert!(a.is_err(), "A's request waits for its message: {a:?}");
+    let code = tokio::time::timeout(
+        Duration::from_secs(3),
+        grpc_raw(
+            w.grpc,
+            STRANGER_IP,
+            grpc_path(Signal::Logs),
+            stalled_body(first),
+        ),
+    )
+    .await
+    .expect("the stranger is answered without reading the body");
+    assert_eq!(code, tonic::Code::Unauthenticated);
+}
+
+/// S-61: the in-flight bytes are held from the first byte. Slow bodies of tenant A hold A's
+/// share; the next request of A is refused, and B is still served in the same moment.
+#[tokio::test]
+async fn slow_bodies_hold_the_tenant_share() {
+    let w = world(
+        Arc::new(MemoryTelemetryStore::new()),
+        Opts {
+            budget: BudgetConfig {
+                max_in_flight_bytes: 4_000_000,
+                tenant_share: 4,
+                ..BudgetConfig::default()
+            },
+            body_timeout: Duration::from_secs(10),
+            ..Opts::default()
+        },
+    )
+    .await;
+    // Positive control: A is served.
+    assert_eq!(
+        post(&w, A_IP, "/v1/logs", logs_req(&w.a, "a", 1).encode_to_vec()).await,
+        200
+    );
+    // Over HTTP: two slow bodies that declare 400 kB each (A's share is 1 MB), not sent yet.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind(SocketAddr::new(IpAddr::V4(A_IP), 0)).unwrap();
+        let mut s = sock.connect(w.http).await.unwrap();
+        s.write_all(
+            b"POST /v1/logs HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-protobuf\r\nContent-Length: 400000\r\n\r\n\x0a",
+        )
+        .await
+        .unwrap();
+        held.push(s);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A third one that declares 400 kB passes the share: refused before its body is read.
+    let big = logs_req(&w.a, &"x".repeat(300_000), 1).encode_to_vec();
+    assert_eq!(post(&w, A_IP, "/v1/logs", big.clone()).await, 429);
+    // B, in the same moment, is served.
+    assert_eq!(
+        post(&w, B_IP, "/v1/logs", logs_req(&w.b, "b", 1).encode_to_vec()).await,
+        200
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        post(&w, A_IP, "/v1/logs", big.clone()).await,
+        200,
+        "the share comes back"
+    );
+    // Over gRPC: a message that stalls after 600 kB holds them; the next 600 kB of A do not
+    // fit, B is served.
+    let huge = logs_req(&w.a, &"z".repeat(700_000), 1).encode_to_vec();
+    let mut first = grpc_frame(&huge);
+    first.truncate(600_000);
+    let stalled = tokio::spawn(grpc_raw(
+        w.grpc,
+        A_IP,
+        grpc_path(Signal::Logs),
+        stalled_body(first),
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut more = logs_req(&w.a, &"y".repeat(600_000), 1).encode_to_vec();
+    more = grpc_frame(&more);
+    assert_eq!(
+        grpc_raw(w.grpc, A_IP, grpc_path(Signal::Logs), full_body(more)).await,
+        tonic::Code::ResourceExhausted
+    );
+    assert!(
+        grpc_logs(&w, B_IP, logs_req(&w.b, "b", 1), None)
+            .await
+            .is_ok()
+    );
+    stalled.abort();
+    // B's two batches were stored while A held its share.
+    assert_eq!(read_all(&w, w.b.tenant).await.logs.len(), 2);
+}
+
 // ---------------------------------------------------------------------------- the store tenant
 
 #[derive(Default)]
@@ -679,6 +966,54 @@ fn the_serving_process_starts_nothing_without_the_switch() {
     // The receiver never takes the Collector's ports.
     assert!(!d.grpc_listen.ends_with(":4317") && !d.http_listen.ends_with(":4318"));
     assert!(d.grpc_listen.starts_with("127.0.0.1:") && d.http_listen.starts_with("127.0.0.1:"));
+}
+
+/// Done-when 4: the role started with the default settings refuses every request (no source
+/// lookup before cards I-4 and I-6), over HTTP and gRPC, and stops on the stop signal.
+#[tokio::test]
+async fn the_role_with_the_defaults_refuses_everything() {
+    let settings = TelemetrySettings::default();
+    let services = ruum_core::Services::in_memory();
+    let grpc_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (grpc, http) = (grpc_l.local_addr().unwrap(), http_l.local_addr().unwrap());
+    let (handle, stop) = crate::shutdown::stop_pair();
+    let role =
+        tokio::spawn(async move { run_on(&settings, &services, stop, grpc_l, http_l).await });
+    let me = Ipv4Addr::LOCALHOST;
+    let body = logs_req(&identity(Environment::Live), "x", 1).encode_to_vec();
+    for signal in [Signal::Logs, Signal::Metrics, Signal::Traces] {
+        let code = client(me)
+            .post(format!("http://{http}{}", http_path(signal)))
+            .header("Content-Type", "application/x-protobuf")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(code, 401, "{signal:?} over HTTP");
+        let code = grpc_raw(grpc, me, grpc_path(signal), full_body(grpc_frame(&body))).await;
+        assert_eq!(code, tonic::Code::Unauthenticated, "{signal:?} over gRPC");
+    }
+    // The generated client too (positive control of the gRPC path and framing).
+    let ch = tonic::transport::Endpoint::from_shared(format!("http://{grpc}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let e = LogsServiceClient::new(ch)
+        .export(logs_req(&identity(Environment::Live), "x", 1))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), tonic::Code::Unauthenticated);
+    assert_eq!(e.message(), "unknown_source");
+    handle.stop();
+    let ended = tokio::time::timeout(Duration::from_secs(10), role)
+        .await
+        .expect("the role stops on the stop signal")
+        .unwrap();
+    assert!(ended.is_ok(), "{ended:?}");
 }
 
 // ---------------------------------------------------------------------------- the Collector config
