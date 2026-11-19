@@ -1,0 +1,26 @@
+{
+  "name": "ruum-sdk-node",
+  "private": true,
+  "version": "0.0.0",
+  "description": "The Ruum SDK for Node: @ruum/app, @ruum/log and @ruum/eslint-plugin (card O-5). Vendored until a person publishes it (decision 0006 E-4).",
+  "type": "module",
+  "workspaces": [
+    "packages/log",
+    "packages/app",
+    "packages/eslint-plugin"
+  ],
+  "scripts": {
+    "build": "tsc -b packages/log packages/app packages/eslint-plugin",
+    "test": "npm run build && node --test \"packages/*/dist/test/*.test.js\"",
+    "vectors": "npm run build && node scripts/make-vectors.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "eslint": "9.39.5",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0"
+}

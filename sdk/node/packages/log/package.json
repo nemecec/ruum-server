@@ -1,0 +1,15 @@
+{
+  "name": "@ruum/log",
+  "version": "0.1.0",
+  "description": "Structured logs for Ruum apps: message templates with named fields, one JSON object per line on stdout.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/src/index.d.ts", "default": "./dist/src/index.js" },
+    "./denylist": { "types": "./dist/src/denylist.d.ts", "default": "./dist/src/denylist.js" }
+  },
+  "files": ["dist/src"],
+  "engines": { "node": ">=22" },
+  "license": "Apache-2.0"
+}
