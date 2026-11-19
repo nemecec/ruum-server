@@ -32,6 +32,7 @@ use super::secrets::SecretMatcher;
 use super::*;
 use crate::privacy::{Pseudonymizer, SqlValue, canonical_text};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 /// Attributes whose value is free text (OTel semantic conventions): a `personal` value is
@@ -605,28 +606,47 @@ impl Pipeline<'_> {
 
 /// A short cache in front of a [`FieldClassSource`]: the classes of an app are read at most
 /// once per `ttl`. A stricter class reaches the pipeline within `ttl` of the first read that
-/// starts after the change. An entry's age counts from the start of its read, and a read
-/// never replaces an entry of a read that started later, so a slow read of the old classes
-/// that ends after a newer read cannot keep them (Kimi review of run 12, finding 4).
+/// starts after the change. An entry's age counts from the start of its read. Each read takes
+/// a number from one counter when it starts, and a read never replaces an entry of a read
+/// with a higher number, so a slow read of the old classes that ends after a newer read cannot
+/// keep them (Kimi review of run 12, finding 4). The order uses the counter, not the time: two
+/// reads can start at the same `Instant` (Kimi's second review of the fix).
 pub struct CachedFieldClasses {
     inner: Arc<dyn FieldClassSource>,
     ttl: Duration,
     cache: Mutex<HashMap<(TenantId, NodeId), CachedRead>>,
+    next_read: AtomicU64,
+    clock: fn() -> Instant,
 }
 
-/// When the read of the classes started, and the classes.
-type CachedRead = (Instant, Arc<FieldClasses>);
+/// When the read of the classes started, its number, and the classes.
+type CachedRead = (Instant, u64, Arc<FieldClasses>);
 
 impl CachedFieldClasses {
     /// The default time a read stays valid.
     pub const DEFAULT_TTL: Duration = Duration::from_secs(5);
 
     pub fn new(inner: Arc<dyn FieldClassSource>, ttl: Duration) -> Self {
+        Self::with_clock(inner, ttl, Instant::now)
+    }
+
+    /// With another clock (tests: a clock that gives the same `Instant` to every read).
+    pub(crate) fn with_clock(
+        inner: Arc<dyn FieldClassSource>,
+        ttl: Duration,
+        clock: fn() -> Instant,
+    ) -> Self {
         CachedFieldClasses {
             inner,
             ttl,
             cache: Mutex::new(HashMap::new()),
+            next_read: AtomicU64::new(0),
+            clock,
         }
+    }
+
+    fn fresh(&self, at: Instant) -> bool {
+        (self.clock)().saturating_duration_since(at) < self.ttl
     }
 }
 
@@ -635,21 +655,22 @@ impl FieldClassSource for CachedFieldClasses {
     async fn classes(&self, tenant: TenantId, app: NodeId) -> Result<Arc<FieldClasses>> {
         {
             let cache = self.cache.lock().expect("class cache lock");
-            if let Some((at, c)) = cache.get(&(tenant, app))
-                && at.elapsed() < self.ttl
+            if let Some((at, _, c)) = cache.get(&(tenant, app))
+                && self.fresh(*at)
             {
                 return Ok(c.clone());
             }
         }
-        let started = Instant::now();
+        let started = (self.clock)();
+        let number = self.next_read.fetch_add(1, AtomicOrdering::SeqCst);
         let fresh = self.inner.classes(tenant, app).await?;
         let mut cache = self.cache.lock().expect("class cache lock");
-        cache.retain(|_, (at, _)| at.elapsed() < self.ttl);
+        cache.retain(|_, (at, _, _)| self.fresh(*at));
         match cache.get(&(tenant, app)) {
             // A read that started later already stored its classes: they are newer.
-            Some((at, newer)) if *at >= started => Ok(newer.clone()),
+            Some((_, n, newer)) if *n > number => Ok(newer.clone()),
             _ => {
-                cache.insert((tenant, app), (started, fresh.clone()));
+                cache.insert((tenant, app), (started, number, fresh.clone()));
                 Ok(fresh)
             }
         }

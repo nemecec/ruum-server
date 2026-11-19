@@ -385,6 +385,75 @@ async fn a_slow_old_class_read_does_not_replace_a_newer_one() {
     assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
 }
 
+/// Kimi's second review of the finding 4 fix: two reads that start at the same `Instant`. The
+/// older read (old class) ends first, the newer read (stricter class) ends later; the newer
+/// classes must win. The clock gives every read the same `Instant`.
+#[tokio::test]
+async fn reads_that_start_at_the_same_instant_keep_the_newer_classes() {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static FROZEN: OnceLock<std::time::Instant> = OnceLock::new();
+    fn frozen() -> std::time::Instant {
+        *FROZEN.get_or_init(std::time::Instant::now)
+    }
+    struct TwoReads {
+        calls: AtomicUsize,
+        started: [tokio::sync::Notify; 2],
+        release: [tokio::sync::Notify; 2],
+    }
+    #[async_trait]
+    impl FieldClassSource for TwoReads {
+        async fn classes(&self, _: TenantId, _: NodeId) -> Result<Arc<FieldClasses>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started[n].notify_one();
+            self.release[n].notified().await;
+            let class = if n == 0 {
+                FieldClass::Normal
+            } else {
+                FieldClass::Personal
+            };
+            let mut c = FieldClasses::new();
+            c.set(
+                FieldKind::LogField,
+                "email",
+                FieldClassEntry::confirmed(class),
+            );
+            Ok(Arc::new(c))
+        }
+    }
+    let inner = Arc::new(TwoReads {
+        calls: AtomicUsize::new(0),
+        started: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
+        release: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
+    });
+    let cached = Arc::new(classify::CachedFieldClasses::with_clock(
+        inner.clone(),
+        std::time::Duration::from_secs(600),
+        frozen,
+    ));
+    let (t, a) = (TenantId::new(), NodeId::new());
+    let class = |c: &FieldClasses| c.get(FieldKind::LogField, "email").map(|e| e.class);
+    let read = |cached: Arc<classify::CachedFieldClasses>| {
+        tokio::spawn(async move { cached.classes(t, a).await.unwrap() })
+    };
+    let older = read(cached.clone());
+    inner.started[0].notified().await;
+    let newer = read(cached.clone());
+    inner.started[1].notified().await;
+    // The older read ends first, then the newer one.
+    inner.release[0].notify_one();
+    assert_eq!(class(&older.await.unwrap()), Some(FieldClass::Normal));
+    inner.release[1].notify_one();
+    assert_eq!(class(&newer.await.unwrap()), Some(FieldClass::Personal));
+    let after = cached.classes(t, a).await.unwrap();
+    assert_eq!(
+        class(&after),
+        Some(FieldClass::Personal),
+        "a read that started at the same instant kept the older classes"
+    );
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+}
+
 // ---------------------------------------------------------------------------- secrets
 
 #[test]
@@ -1258,25 +1327,21 @@ async fn reads_are_oldest_first_by_record_time() {
         )
         .await
         .unwrap();
-    for limit in [None, Some(2)] {
+    for limit in [None, Some(2), Some(0)] {
         let filter = TelemetryFilter {
             limit,
             ..TelemetryFilter::app(id.app)
         };
         let read = f.store.read(id.tenant, &filter).await.unwrap();
-        let want: &[&str] = match limit {
-            None => &["first", "second", "third", "fourth"],
-            Some(_) => &["first", "second"],
-        };
+        let all = ["first", "second", "third", "fourth"];
+        let want = &all[..limit.unwrap_or(all.len())];
         let logs: Vec<&str> = read.logs.iter().filter_map(|r| r.text.as_deref()).collect();
         assert_eq!(logs, want, "logs, limit {limit:?}");
         let spans: Vec<&str> = read.spans.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(spans, want, "spans, limit {limit:?}");
         let metrics: Vec<f64> = read.metrics.iter().map(|r| r.value).collect();
-        let want_m: &[f64] = match limit {
-            None => &[1.0, 2.0, 3.0, 4.0],
-            Some(_) => &[1.0, 2.0],
-        };
+        let all_m = [1.0, 2.0, 3.0, 4.0];
+        let want_m = &all_m[..limit.unwrap_or(all_m.len())];
         assert_eq!(metrics, want_m, "metrics, limit {limit:?}");
     }
 }
