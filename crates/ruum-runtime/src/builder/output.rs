@@ -228,6 +228,9 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
     let mut dropped = Dropped::default();
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
+    // An extension record (`L`, `K` or a per-file `x`, also one with no name in it) whose entry
+    // header has not come yet.
+    let mut pending = false;
     let mut total: u64 = 0;
     let mut headers: usize = 0;
     let mut kept_names: usize = 0;
@@ -248,7 +251,7 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
                 return Err("the output has data after its end-of-archive marker".to_owned());
             }
             // A long name or link that no entry used: the entry it was for is missing.
-            if long_name.is_some() || long_link.is_some() {
+            if pending {
                 return Err(
                     "the output ends after a long-name or PAX record without its entry".to_owned(),
                 );
@@ -288,10 +291,12 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
         match typ {
             b'L' => {
                 long_name = Some(long_value(cstr(&data)));
+                pending = true;
                 continue;
             }
             b'K' => {
                 long_link = Some(long_value(cstr(&data)));
+                pending = true;
                 continue;
             }
             b'x' => {
@@ -302,11 +307,14 @@ pub fn read_output(tar: Bytes, cap: u64) -> Result<Output, String> {
                 if l.is_some() {
                     long_link = l;
                 }
+                pending = true;
                 continue;
             }
             b'g' => continue,
             _ => {}
         }
+        // The entry the extension records were for.
+        pending = false;
         let name = match long_name.take() {
             Some(n) => n,
             None => {
@@ -794,6 +802,20 @@ mod tests {
         t.extend(std::iter::repeat_n(0u8, 1024));
         let e = read_output(Bytes::from(t), 1 << 30).expect_err("dangling long name");
         assert!(e.contains("without its entry"), "{e}");
+        // A PAX record with no name in it (only `mtime`) whose entry is missing (Kimi recheck).
+        let mut t = Vec::new();
+        gnu(&mut t, b"./a", b'0', b"", b"aaa");
+        gnu(&mut t, b"PaxHeader", b'x', b"", b"13 mtime=1.0\n");
+        t.extend(std::iter::repeat_n(0u8, 1024));
+        let e = read_output(Bytes::from(t), 1 << 30).expect_err("dangling PAX record");
+        assert!(e.contains("without its entry"), "{e}");
+        // The same record with its entry is read.
+        let mut t = Vec::new();
+        gnu(&mut t, b"PaxHeader", b'x', b"", b"13 mtime=1.0\n");
+        gnu(&mut t, b"./a", b'0', b"", b"aaa");
+        t.extend(std::iter::repeat_n(0u8, 1024));
+        let o = read_output(Bytes::from(t), 1 << 30).expect("PAX record with its entry");
+        assert_eq!(names(&o), ["a"]);
 
         let pax_tar = |records: &[u8]| {
             let mut t = Vec::new();

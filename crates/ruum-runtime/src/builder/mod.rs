@@ -341,14 +341,15 @@ fn source_tar(files: &archive::Unpacked, bounds: SourceBounds) -> Result<Bytes, 
     };
     for d in &dirs {
         w.dir(d);
-        if w.written() as u64 > bounds.bytes {
+        if w.written() as u64 + oci::END_MARKER > bounds.bytes {
             return Err(too_big());
         }
     }
     for (p, data) in entries {
         w.file(p, 0o644, data);
-        // Checked after each entry: the buffer passes the bound by at most one entry.
-        if w.written() as u64 > bounds.bytes {
+        // Checked after each entry, with the end-of-archive marker: the buffer passes the bound
+        // by at most one entry, the finished tar never.
+        if w.written() as u64 + oci::END_MARKER > bounds.bytes {
             return Err(too_big());
         }
     }
@@ -997,6 +998,10 @@ mod tests {
         };
         let tar = source_tar(&files, bounds(4 * 1024 * 1024)).expect("under the bound");
         assert_eq!(tar.len(), 2_000 * 1024 + 1024);
+        // The bound is exact, the end-of-archive marker included.
+        let exact = (2_000 * 1024 + 1024) as u64;
+        assert!(source_tar(&files, bounds(exact)).is_ok());
+        assert!(source_tar(&files, bounds(exact - 1)).is_err());
         let err = source_tar(&files, bounds(1024 * 1024)).expect_err("over the byte bound");
         assert!(err.contains("source tar of the archive is over"), "{err}");
     }
