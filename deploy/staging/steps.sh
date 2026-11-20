@@ -10,8 +10,8 @@
 #   ipv4-check ADDRESS   print ADDRESS/32 when it is a public IPv4 address (tests)
 #   tunnel-targets       print the build server and the nodes for the admin tunnel (tunnel.sh)
 #   plan                 tofu plan of both roots, check-plan, price
-#   talos-access         how the last plan reaches the Talos API: create, bootstrap, tunnel or
-#                        none (talos-access.sh kind; up.sh --apply picks its phases by it)
+#   talos-access         how the last plan reaches the Talos API: create, bootstrap, setup, tunnel
+#                        or none (talos-access.sh kind; up.sh --apply picks its phases by it)
 #   apply [servers](rw)  image upload if missing, plan, check-plan, price, apply the exact plan,
 #                        user_data check, talosconfig; needs RUUM_STAGING_APPLY=yes. Talos
 #                        changes need the admin tunnel open (backlog O-21). "servers": only the
@@ -375,6 +375,7 @@ case "$STEP" in
     case "$access" in
       create) echo "the plan creates servers: up.sh --apply applies the servers first (a targeted apply), runs ops/tunnel-setup.sh for their addresses, then applies the rest with the Talos API through the admin tunnel (${touched% })" ;;
       bootstrap) echo "the plan bootstraps the cluster: up.sh --apply applies it through the admin tunnel (${touched% }) and waits for the Kubernetes API of stg-1" ;;
+      setup) echo "the plan configures a node whose server exists: up.sh --apply runs ops/tunnel-setup.sh for its address, then applies through the admin tunnel (${touched% })" ;;
       tunnel) echo "the plan changes Talos resources: up.sh --apply applies them through the admin tunnel (${touched% })" ;;
       *) echo "no Talos resource is created or changed" ;;
     esac

@@ -413,7 +413,10 @@ p_new="$(tplan new 'hcloud_server.node["stg-1"] hcloud_server stg-1 create' 'tal
 p_srv="$(tplan srv 'hcloud_server.node["stg-1"] hcloud_server stg-1 create' 'hcloud_primary_ip.v4["stg-1"] hcloud_primary_ip stg-1 create')"
 p_repl="$(tplan repl "${TA_NOOP[@]/stg-3 no-op/stg-3 delete,create}")"
 p_del="$(tplan del "${TA_NOOP[@]/stg-3 no-op/stg-3 delete}")"
-for c in "none:$p_none" "tunnel:$p_upd" "bootstrap:$p_boot" "create:$p_new" "create:$p_srv" "tunnel:$p_repl" "none:$p_del"; do
+# Kimi review of run 13: adding stg-4 to a running cluster stopped after phase 1 (its server exists,
+# the bootstrap too): only its machine config is created, so tunnel-setup.sh must run first.
+p_add="$(tplan add "${TA_NOOP[@]}" 'hcloud_server.node["stg-4"] hcloud_server stg-4 no-op' 'talos_machine_configuration_apply.node["stg-4"] talos_machine_configuration_apply stg-4 create')"
+for c in "none:$p_none" "tunnel:$p_upd" "bootstrap:$p_boot" "create:$p_new" "create:$p_srv" "tunnel:$p_repl" "none:$p_del" "setup:$p_add"; do
   got="$(bash "$ta" kind "${c#*:}" 2>&1)"
   [[ "$got" == "${c%%:*}" ]] && ok "talos-access kind: $(basename "${c#*:}" .json) is ${c%%:*}" || bad "talos-access kind of $(basename "${c#*:}" .json): '$got', want ${c%%:*}"
 done
@@ -480,14 +483,25 @@ fi
 # Review O-21 change 1: tunnel-setup.sh runs for create and bootstrap alike (a create that stopped
 # after phase 1 comes back as bootstrap), so it sits in the create-or-bootstrap block, not in the case.
 l_esac="$(grep -nx 'esac' "$u" | awk -F: -v a="$l_access" '$1 > a {print $1; exit}')"
-l_cb="$(ln_of 'if [[ "$access" == create || "$access" == bootstrap ]]; then')"
+l_cb="$(ln_of 'if [[ "$access" == create || "$access" == bootstrap || "$access" == setup ]]; then')"
 l_cbfi="$(awk -v s="$l_cb" 'NR > s && /^fi$/ {print NR; exit}' "$u")"
 if [[ -n "$l_esac" && -n "$l_cb" && -n "$l_cbfi" ]] && ((l_esac < l_cb && l_cb < l_ts && l_ts < l_cbfi && l_cbfi < l_up)) &&
   [[ "$(grep -cF 'ops/tunnel-setup.sh" --before-bootstrap' "$u")" == 1 ]]; then
-  ok "up.sh --apply: tunnel-setup.sh runs for create and bootstrap, before the tunnel"
+  ok "up.sh --apply: tunnel-setup.sh runs for create, bootstrap and setup, before the tunnel"
 else
-  bad "up.sh --apply: tunnel-setup.sh not in the create-or-bootstrap block (esac $l_esac, block $l_cb-$l_cbfi, tunnel-setup $l_ts)"
+  bad "up.sh --apply: tunnel-setup.sh not in the create-bootstrap-or-setup block (esac $l_esac, block $l_cb-$l_cbfi, tunnel-setup $l_ts)"
 fi
+# Kimi review of run 13: setup has a running cluster, so only create and bootstrap skip the probe of
+# stg-1's Kubernetes API; and every kind that talos-access.sh prints has a branch in up.sh.
+sed -n "${l_cb},${l_cbfi}p" "$u" >"$TMP/cb-block.txt"
+grep -qxF '  if [[ "$access" != setup ]]; then' "$TMP/cb-block.txt" &&
+  [[ "$(grep -c 'STG_TUNNEL_NO_KUBE_CHECK=1' "$TMP/cb-block.txt")" == 1 ]] &&
+  [[ "$(awk '/if \[\[ "\$access" != setup \]\]; then/,/^  fi$/' "$TMP/cb-block.txt" | grep -c 'STG_TUNNEL_NO_KUBE_CHECK=1')" == 1 ]] &&
+  ok "up.sh --apply: setup does not skip the Kubernetes API check" || bad "up.sh --apply: the Kubernetes API check for setup"
+kinds="$(grep -oE 'then \\"[a-z]+\\"|else \\"[a-z]+\\"' "$ta" | grep -oE '[a-z]+\\"$' | tr -d '\\"' | sort -u | tr '\n' ' ')"
+case_kinds="$(sed -n "${l_access},${l_esac}p" "$u" | grep -oE '^  [a-z| ]+\)' | tr -d ' )' | tr '|' '\n' | sort -u | tr '\n' ' ')"
+[[ -n "$kinds" && "$kinds" == "$case_kinds" ]] && ok "up.sh --apply has a branch for every kind of talos-access.sh ($kinds)" ||
+  bad "up.sh kinds ($case_kinds) differ from talos-access.sh kinds ($kinds)"
 # The tunnel port of tofu/cluster is the one of tunnel.sh.
 grep -qF '"127.0.0.1:${15000 + n.index}"' "$STG/tofu/cluster/talos.tf" && [[ "$TUNNEL_TALOS_BASE" == 15000 ]] &&
   ok "talos.tf dials 127.0.0.1:(15000 + N), the Talos port of tunnel.sh" || bad "talos.tf and tunnel.sh disagree on the Talos tunnel port"
