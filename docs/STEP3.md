@@ -38,7 +38,7 @@ Step 3 also uses decisions 19 (migrations at deploy time), 30 (previews on a dat
 | REST API | `contracts/openapi.yaml`, tags `apps`, `issues`, `templates` (45 operations, each with `x-ruum-area` and `x-ruum-status: planned`; 8 are users only) |
 | MCP tools | `contracts/mcp/tools.yaml` (35 tools, not offered while planned; the 8 user-only and the 2 receipt operations are not exposed) |
 | SpiceDB schema | `contracts/authz/schema.zed` (app principals, active app roles, `use`, `open_preview`, `deploy`, `publish`, `read_telemetry`, `configure`, `app_api_scope`, `anonymous:*`), `schema.test.yaml` (31 new relationships, 36 new assertions) |
-| SQL | `migrations/0011_apps.sql` (draft; the integrator renumbers it if another migration lands first) |
+| SQL | `migrations/0011_apps.sql` (draft; the integrator renumbers it if another migration lands first); later steps: `0013_app_host_lookup.sql`, `0014_app_purge_progress.sql` (W2S-4: the stored cursor of the site purge), `0015_app_deployments_app_id_idx.sql` (W2S-4: one `create index concurrently`, outside a transaction), `0016_app_bindings_target_fk.sql` (B-1: drops the foreign key of `app_bindings.target_node_id`, so a bound node can be purged) |
 | Journal events | `contracts/events/` (21 step 3 types in `$defs/planned_types`) |
 
 The step 1 and step 2 operations keep their shape. `oasdiff breaking` (CI's check, `--fail-on
@@ -512,7 +512,7 @@ person.
 |---|---|
 | Owns | `crates/ruum-core/src/apps/` (`mod`, `deployments`, `archive`, `settings`, `secrets`, `domains`, `approvals`, `check`), `crates/ruum-core/src/usage/` (the trait; each area emits its own meters), `crates/ruum-api/src/routes/apps/` (except `roles.rs`, `apis.rs`, `telemetry.rs`) |
 | Implements (OpenAPI) | area `apps` |
-| Tables | `apps`, `app_deployments`, `app_secrets`, `app_domains`, `app_approvals`, `tenant_app_settings`, `retired_app_slugs` |
+| Tables | `apps`, `app_deployments`, `app_secrets`, `app_domains`, `app_approvals`, `tenant_app_settings`, `retired_app_slugs`, `app_purge_progress` (W2S-4) |
 | Notes | The provider `ruum.webapp` implements `providers::Provider` (create, copy, trash = suspend, restore, purge = stop and delete images; `copied` makes a preview from the live archive). Manifest validation: the JSON Schema compiled in, plus the provider rules (plan limits, `env` vs `secrets`, one `default` role, one `grants_roles`, binding targets resolvable, `edit` only on databases, `preview_scopes` a subset of `scopes`). Secrets through a `SecretStore` trait (OpenBao KV v2; in-memory for tests). |
 
 ### 2. Bindings, roles and APIs
