@@ -1552,32 +1552,12 @@ impl AppStore for PgAppStore {
         Ok(rows)
     }
 
-    async fn revoked_binding_targets(
-        &self,
-        tenant: TenantId,
-        after: Option<NodeId>,
-        limit: u32,
-    ) -> Result<Vec<NodeId>> {
-        let mut tx = begin_tenant(&self.pool, tenant).await?;
-        let rows: Vec<NodeId> = sqlx::query_scalar(
-            "select target_node_id from app_bindings where tenant_id = $1 \
-             and ($2::uuid is null or target_node_id > $2) group by target_node_id \
-             having bool_and(revoked_at is not null) order by target_node_id limit $3",
-        )
-        .bind(tenant)
-        .bind(after)
-        .bind(i64::from(limit))
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(rows)
-    }
-
     async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>> {
         let mut tx = begin_system(&self.pool).await?;
         let rows: Vec<TenantId> = sqlx::query_scalar(
-            "select distinct tenant_id from app_bindings \
-             where ($1::uuid is null or tenant_id > $1) order by tenant_id limit $2",
+            "select t.id from tenants t where ($1::uuid is null or t.id > $1) \
+             and exists (select 1 from app_bindings b where b.tenant_id = t.id) \
+             order by t.id limit $2",
         )
         .bind(after)
         .bind(i64::from(limit))

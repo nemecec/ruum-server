@@ -74,9 +74,10 @@
 //! The row is written before its tuple and revoked before its tuple goes; the Postgres store
 //! does both in one transaction with the outbox. The repair pass ([`AppService::repair_bindings`],
 //! run by the sweeper per tenant with a bound per round) visits the targets with an active row
-//! each round, and a slow pass visits a few targets whose rows are all revoked per round from a
-//! cursor of its own ([`AppService::repair_revoked_targets`]), so an orphaned tuple there goes
-//! too while the work of a round does not grow with the history. On each it reads every active row
+//! each round, and a slow pass reads one page of the tenant's rows per round from a cursor of
+//! its own and repairs a few targets of revoked rows that have no active row
+//! ([`AppService::repair_revoked_targets`]), so an orphaned tuple there goes too while the
+//! work of a round does not grow with the history. On each it reads every active row
 //! (page by page), deletes a binding tuple whose row is revoked or missing, writes a missing
 //! tuple of an active row, and ends the rows of ended previews, of gone targets, of apps in
 //! the trash whose trash hook did not run (a pod of the previous release took the delivery;
@@ -120,8 +121,9 @@ pub const REPAIR_TENANTS_PER_PAGE: u32 = 100;
 /// the same bound in every round, so no tenant waits for another; a tenant with more targets
 /// goes on from its cursor in the next round.
 pub const REPAIR_TARGETS_PER_TENANT: u32 = 200;
-/// How many targets whose rows are all revoked one round of the repair pass checks per
-/// tenant (the slow pass; it goes on from its cursor in the next round).
+/// How many targets whose rows are all revoked one round of the slow repair pass repairs per
+/// tenant (it checks at most five times as many and reads one page of rows; it goes on from
+/// its cursor in the next round).
 pub const REPAIR_REVOKED_TARGETS_PER_TENANT: u32 = 10;
 /// The rows one query reads.
 const ROWS_PER_QUERY: u32 = 500;
@@ -1095,29 +1097,64 @@ impl AppService {
         Ok((fixed, next))
     }
 
-    /// The slow repair pass for one tenant: at most `budget` targets whose rows are all
-    /// revoked, after `after` (Kimi re-check of the run 13 B-1 fixes). Such a target has no
-    /// active row, so each binding tuple on it is an orphan (a crash, a stuck outbox, a
-    /// manual write) and goes, with the same three reads as the main pass. The work of a round
-    /// stays bounded however long the history is; the cursor goes round. Returns how many
-    /// fixes it made and the cursor of the next round (`None` at the end).
+    /// The slow repair pass for one tenant (Kimi re-checks of the run 13 B-1 fixes): it
+    /// reads one page of the tenant's binding rows in ID order after `after` (active or not;
+    /// the primary key serves it), and for each target of a revoked row in that page that has
+    /// no active row (the partial index), it runs the repair of the target. Such a target has
+    /// no active row, so each binding tuple on it is an orphan (a crash, a stuck outbox, a
+    /// manual write) and goes, with the same three reads as the main pass. One call reads at
+    /// most one page, checks at most `5 * budget` targets and repairs at most `budget`, so
+    /// the work of a round stays bounded however long the history is; the cursor goes round
+    /// the history. Returns how many fixes it made and the cursor of the next round (`None`
+    /// at the end).
     pub async fn repair_revoked_targets(
         &self,
         tenant: TenantId,
-        after: Option<NodeId>,
+        after: Option<Uuid>,
         budget: u32,
-    ) -> Result<(usize, Option<NodeId>)> {
-        let targets = self
-            .deps()
-            .store
-            .revoked_binding_targets(tenant, after, budget)
+    ) -> Result<(usize, Option<Uuid>)> {
+        let store = &self.deps().store;
+        let page = store
+            .list_bindings(
+                tenant,
+                &BindingQuery {
+                    after,
+                    limit: ROWS_PER_QUERY,
+                    ..Default::default()
+                },
+            )
             .await?;
-        let mut fixed = 0;
-        for target in &targets {
-            fixed += self.repair_target(tenant, *target).await?;
+        let mut seen = std::collections::HashSet::new();
+        let (mut fixed, mut repaired, mut checked) = (0, 0u32, 0u32);
+        let mut last = after;
+        for b in &page {
+            if !b.is_active() && !seen.contains(&b.target_node_id) {
+                if repaired >= budget || checked >= budget.saturating_mul(5) {
+                    // The next round starts at this row.
+                    return Ok((fixed, last));
+                }
+                seen.insert(b.target_node_id);
+                checked += 1;
+                let active = store
+                    .list_bindings(
+                        tenant,
+                        &BindingQuery {
+                            target: Some(b.target_node_id),
+                            active_only: true,
+                            limit: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                if active.is_empty() {
+                    fixed += self.repair_target(tenant, b.target_node_id).await?;
+                    repaired += 1;
+                }
+            }
+            last = Some(b.id);
         }
-        let next = if targets.len() as u32 >= budget {
-            targets.last().copied()
+        let next = if page.len() as u32 >= ROWS_PER_QUERY {
+            last
         } else {
             None
         };
@@ -1427,9 +1464,8 @@ fn repair_cursors() -> std::sync::MutexGuard<'static, std::collections::HashMap<
 
 /// The cursors of the slow repair pass over targets whose rows are all revoked, per tenant
 /// (this process).
-fn revoked_cursors() -> std::sync::MutexGuard<'static, std::collections::HashMap<TenantId, NodeId>>
-{
-    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<TenantId, NodeId>>> =
+fn revoked_cursors() -> std::sync::MutexGuard<'static, std::collections::HashMap<TenantId, Uuid>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<TenantId, Uuid>>> =
         std::sync::OnceLock::new();
     C.get_or_init(Default::default)
         .lock()

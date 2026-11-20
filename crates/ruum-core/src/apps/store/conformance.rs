@@ -954,13 +954,6 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
     );
     assert_eq!(s.binding_targets(t, None, 10).await.unwrap(), vec![n]);
     assert!(s.binding_targets(t, Some(n), 10).await.unwrap().is_empty());
-    // One active row keeps a target out of the slow pass.
-    assert!(
-        s.revoked_binding_targets(t, None, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
     assert!(s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
     // The preview ends: its active row is listed as ended.
     assert!(
@@ -979,18 +972,8 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
         .unwrap();
     assert!(!app_sees(&authz, p.id, n).await);
     // A target whose rows are all revoked leaves the main repair pass (Kimi run 13 B-1,
-    // finding 3) and is listed for the slow pass instead; its tenant stays listed.
+    // finding 3); its tenant stays listed for the slow pass.
     assert!(s.binding_targets(t, None, 10).await.unwrap().is_empty());
-    assert_eq!(
-        s.revoked_binding_targets(t, None, 10).await.unwrap(),
-        vec![n]
-    );
-    assert!(
-        s.revoked_binding_targets(t, Some(n), 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
     assert!(s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
     // A grant to a deployment of nothing is refused.
     assert!(
@@ -1074,16 +1057,14 @@ pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
             deployment: Some(p.id),
             ..all.clone()
         },
+        BindingQuery {
+            after: Some(Uuid::nil()),
+            ..all.clone()
+        },
     ] {
         assert!(s.list_bindings(b, &q).await.unwrap().is_empty(), "{q:?}");
     }
     assert!(s.binding_targets(b, None, 10).await.unwrap().is_empty());
-    assert!(
-        s.revoked_binding_targets(b, None, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
     s.set_deployment_state(a, p.id, DeploymentState::Expired)
         .await
         .unwrap();

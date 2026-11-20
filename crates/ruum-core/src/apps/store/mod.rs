@@ -908,7 +908,7 @@ pub trait AppStore: Send + Sync {
     /// The distinct targets of the tenant's active binding rows, after `after`, at most
     /// `limit`, in ID order (the main repair pass of [`super::bindings`]). A target whose rows
     /// are all revoked is not listed here, so the main pass does not grow with the revoked
-    /// history (Kimi run 13 B-1, finding 3); [`AppStore::revoked_binding_targets`] lists those.
+    /// history (Kimi run 13 B-1, finding 3); the slow pass finds those in pages of rows.
     async fn binding_targets(
         &self,
         tenant: TenantId,
@@ -916,19 +916,9 @@ pub trait AppStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<NodeId>>;
 
-    /// The distinct targets of the tenant whose binding rows are all revoked, after `after`,
-    /// at most `limit`, in ID order: the slow repair pass of [`super::bindings`] checks a few of
-    /// them each round, so a tuple left on such a target is still deleted (Kimi re-check of
-    /// the run 13 B-1 fixes).
-    async fn revoked_binding_targets(
-        &self,
-        tenant: TenantId,
-        after: Option<NodeId>,
-        limit: u32,
-    ) -> Result<Vec<NodeId>>;
-
     /// The tenants with binding rows (active or not), after `after`, at most `limit`, in ID
-    /// order. A platform job (the repair pass), not a tenant call.
+    /// order. A platform job (the repair pass), not a tenant call. Postgres walks the tenants
+    /// and asks for one row each, so the cost does not grow with the binding history.
     async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>>;
 
     /// Deletes the oldest `limit` binding rows of a purged app (active or not) and the tuples

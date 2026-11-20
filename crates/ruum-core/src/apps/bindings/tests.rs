@@ -1851,3 +1851,78 @@ async fn the_repair_round_deletes_a_tuple_on_a_target_whose_rows_are_all_revoked
     w.s.apps.repair_bindings_round().await.unwrap();
     assert!(!w.sees(dep, old).await, "the orphaned tuple stays");
 }
+
+/// Kimi second re-check of the run 13 B-1 fixes: the slow pass reads one page of rows and
+/// repairs at most its budget of revoked-only targets per call, then goes on from its cursor.
+#[tokio::test]
+async fn the_slow_repair_pass_is_bounded_and_goes_on_from_its_cursor() {
+    let w = world().await;
+    let app = w.app_in(&w.m(), w.projects, "Many old").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+        .await;
+    let mut granted = Vec::new();
+    for i in 0..12 {
+        let target = folder(&w.s, &w.m(), w.projects, &format!("Old {i}")).await;
+        let row = NewBinding {
+            id: Uuid::now_v7(),
+            app_node_id: app,
+            deployment_id: dep,
+            principal_id: Uuid::now_v7(),
+            name: "old".into(),
+            kind: BindingKind::Node,
+            target_node_id: target,
+            role: Some(Role::View),
+            api: None,
+            scopes: Vec::new(),
+            on_behalf_of_user: false,
+        };
+        granted.extend(
+            w.s.apps
+                .store()
+                .grant_bindings(&w.m(), &*w.s.authz, vec![row])
+                .await
+                .unwrap(),
+        );
+    }
+    let ids: Vec<Uuid> = granted.iter().map(|b| b.id).collect();
+    w.s.apps
+        .store()
+        .revoke_bindings(
+            &app_ctx(w.team.id, app),
+            &*w.s.authz,
+            &ids,
+            RevokeReason::PreviewExpired,
+        )
+        .await
+        .unwrap();
+    let tuples: Vec<Relationship> = granted.iter().filter_map(binding_tuple).collect();
+    w.s.authz
+        .write(
+            tuples
+                .iter()
+                .cloned()
+                .map(RelationshipUpdate::Touch)
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let (fixed, next) =
+        w.s.apps
+            .repair_revoked_targets(w.team.id, None, 10)
+            .await
+            .unwrap();
+    assert_eq!(fixed, 10, "one call repairs at most its budget");
+    assert!(next.is_some(), "the next call goes on from a cursor");
+    let (fixed, next) =
+        w.s.apps
+            .repair_revoked_targets(w.team.id, next, 10)
+            .await
+            .unwrap();
+    assert_eq!((fixed, next), (2, None));
+    for b in &granted {
+        assert!(!w.sees(b.principal_id, b.target_node_id).await);
+    }
+    // The preview's active row on `Docs` is not the slow pass's.
+    assert!(w.sees(dep, w.docs).await);
+}
