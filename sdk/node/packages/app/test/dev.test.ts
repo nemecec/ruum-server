@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, symlinkSync, writeFileSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,13 +12,14 @@ import {
   devJwksOf,
   initDev,
   jwksOf,
+  loadDevKey,
   mintDevToken,
   privateKeyFromSeed,
   publicJwk,
   signToken,
 } from "../src/dev.js";
 import { main } from "../src/cli.js";
-import { RuumConfigError, RuumTokenError, UserTokenVerifier, type RefusalReason } from "../src/verify.js";
+import { RuumConfigError, RuumTokenError, UserTokenVerifier, verifyUserToken, type RefusalReason, type VerifierConfig } from "../src/verify.js";
 import { DEV_KEY_MARK } from "../src/keys.js";
 import { ISSUER, LIVE_A, NOW, PREVIEW_A, claims, key } from "./helpers.js";
 
@@ -193,5 +194,113 @@ test("the gateway's token vectors (testdata/user-tokens.json) verify as the file
         await assert.rejects(verifier.verify(tok), (e) => (e as RuumTokenError).reason === (expected as RefusalReason), `${v.name}: ${expected}`);
       }
     }
+  }
+});
+
+test("a change to the config after start-up cannot move the issuer, audience or env past the start-up checks", async () => {
+  // Kimi review of O-5 (run 13), finding 3: the verifier allowed dev keys for the local issuer,
+  // then read the issuer from the caller's (changed) object, so a dev-signed token with the real
+  // issuer passed. The verifier now keeps copies of the checked values.
+  const devKey = generateKeyPairSync("ed25519").privateKey;
+  const local = "http://localhost";
+  const otherApp = "app:0190b6c4-a00d-7cc1-9a4b-00000000000b";
+  const make = (): VerifierConfig => ({ issuer: local, audience: LIVE_A, env: "live", jwks: devJwksOf(devKey), now: () => NOW });
+  const forged = signToken(claims({ iss: ISSUER }), devKey);
+  const localToken = signToken(claims({ iss: local }), devKey);
+  const otherAppToken = signToken(claims({ iss: local, aud: otherApp }), devKey);
+  const previewToken = signToken(claims({ iss: local, aud: PREVIEW_A, env: "preview" }), devKey);
+  const refused = (reason: RefusalReason) => (e: unknown) => e instanceof RuumTokenError && e.reason === reason;
+
+  // Direct construction.
+  const cfg = make();
+  const v = new UserTokenVerifier(cfg);
+  assert.equal((await v.verify(localToken)).sub, "pairwise:visitor1", "control: the local dev token passes");
+  cfg.issuer = ISSUER;
+  cfg.audience = otherApp;
+  await assert.rejects(v.verify(forged), refused("wrong_issuer"));
+  await assert.rejects(v.verify(otherAppToken), refused("wrong_audience"));
+  cfg.audience = PREVIEW_A;
+  cfg.env = "preview";
+  await assert.rejects(v.verify(previewToken), refused("wrong_audience"));
+  assert.equal((await v.verify(localToken)).sub, "pairwise:visitor1", "the verifier still checks the first values");
+
+  // verifyUserToken keeps one verifier per config object: the same holds for it.
+  const cfg2 = make();
+  assert.equal((await verifyUserToken(localToken, cfg2)).sub, "pairwise:visitor1");
+  cfg2.issuer = ISSUER;
+  cfg2.audience = otherApp;
+  await assert.rejects(verifyUserToken(forged, cfg2), refused("wrong_issuer"));
+  await assert.rejects(verifyUserToken(otherAppToken, cfg2), refused("wrong_audience"));
+  assert.equal((await verifyUserToken(localToken, cfg2)).sub, "pairwise:visitor1");
+});
+
+test("dev mode never follows a symbolic link at the dev folder or its files", () => {
+  // Kimi review of O-5 (run 13), finding 2: a checkout could plant symbolic links so that
+  // initDev puts the private key, or writes over a file, outside the dev folder.
+  const base = mkdtempSync(join(tmpdir(), "ruum-o5-link-"));
+  try {
+    const outside = join(base, "outside");
+    mkdirSync(outside);
+    const sentinel = join(outside, "sentinel.txt");
+    const keep = "do not touch\n";
+    const fresh = (name: string): string => {
+      const d = join(base, name, ".ruum-dev");
+      mkdirSync(d, { recursive: true });
+      return d;
+    };
+    const unchanged = () => assert.equal(readFileSync(sentinel, "utf8"), keep, "the outside file is unchanged");
+
+    // 1. A dangling key link: the key would be made at the target, outside the folder.
+    writeFileSync(sentinel, keep);
+    const d1 = fresh("dangling");
+    const target = join(outside, "key.pem");
+    symlinkSync(target, join(d1, "key.pem"));
+    assert.throws(() => initDev(d1, DEV_ENV), DevModeError);
+    assert.equal(existsSync(target), false, "no key was made outside the dev folder");
+
+    // 2. A key link to an existing file: neither read as the key nor chmod-ed.
+    const d2 = fresh("keylink");
+    symlinkSync(sentinel, join(d2, "key.pem"));
+    const modeBefore = statSync(sentinel).mode;
+    assert.throws(() => initDev(d2, DEV_ENV), DevModeError);
+    assert.throws(() => loadDevKey(d2), DevModeError);
+    assert.equal(statSync(sentinel).mode, modeBefore, "the outside file keeps its mode");
+    unchanged();
+
+    // 3. A .gitignore link: the outside file is not overwritten with "*".
+    const d3 = fresh("gitignore");
+    symlinkSync(sentinel, join(d3, ".gitignore"));
+    assert.throws(() => initDev(d3, DEV_ENV), DevModeError);
+    unchanged();
+
+    // 4. A jwks.json link: the outside file is not overwritten with the key set.
+    const d4 = fresh("jwks");
+    symlinkSync(sentinel, join(d4, "jwks.json"));
+    assert.throws(() => initDev(d4, DEV_ENV), DevModeError);
+    unchanged();
+
+    // 5. The dev folder itself is a link: nothing is written through it.
+    const d5parent = join(base, "dirlink");
+    mkdirSync(d5parent);
+    const d5 = join(d5parent, ".ruum-dev");
+    symlinkSync(outside, d5);
+    assert.throws(() => initDev(d5, DEV_ENV), DevModeError);
+    assert.throws(() => mintDevToken({ audience: LIVE_A }, d5, DEV_ENV), DevModeError);
+    assert.equal(existsSync(join(outside, ".gitignore")), false);
+    assert.equal(existsSync(join(outside, "key.pem")), false);
+    assert.equal(existsSync(join(outside, "jwks.json")), false);
+    unchanged();
+
+    // Control: a plain dev folder works, twice (the second run keeps the key), and its files are plain.
+    const d6 = join(base, "plain", ".ruum-dev");
+    const f = initDev(d6, DEV_ENV);
+    const first = readFileSync(f.keyFile, "utf8");
+    initDev(d6, DEV_ENV);
+    assert.equal(readFileSync(f.keyFile, "utf8"), first, "the key is kept");
+    assert.equal(statSync(f.keyFile).mode & 0o777, 0o600);
+    for (const p of [f.keyFile, f.jwksFile, join(f.dir, ".gitignore")]) assert.ok(lstatSync(p).isFile(), p);
+    assert.ok(mintDevToken({ audience: LIVE_A }, d6, DEV_ENV).split(".").length === 3);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
 });

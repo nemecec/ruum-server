@@ -65,6 +65,13 @@ export interface Logger {
 
 const MAX_DEPTH = 6;
 const MAX_STRING = 8192;
+/**
+ * What a string longer than {@link MAX_STRING} becomes. The whole string is dropped, never cut:
+ * the platform redacts a secret only when it sees the whole value (the runtime's log redactor and
+ * the telemetry processor match exact values), so a cut string could carry most of a secret past
+ * them (Kimi review of O-5, run 13, finding 1).
+ */
+export const TOO_LONG = "[too long]";
 const MAX_KEYS = 100;
 
 function isLevel(v: unknown): v is Level {
@@ -72,14 +79,14 @@ function isLevel(v: unknown): v is Level {
 }
 
 /**
- * Makes a value safe for JSON: hides denied keys at every depth, cuts long strings and deep
- * objects, and turns values that JSON cannot hold into text.
+ * Makes a value safe for JSON: hides denied keys at every depth, replaces long strings and deep
+ * objects with markers, and turns values that JSON cannot hold into text.
  */
 function clean(value: unknown, depth: number, seen: Set<object>): unknown {
   if (value === null) return null;
   switch (typeof value) {
     case "string":
-      return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}...` : value;
+      return value.length > MAX_STRING ? TOO_LONG : value;
     case "number":
       return Number.isFinite(value) ? value : String(value);
     case "boolean":

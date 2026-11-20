@@ -175,12 +175,19 @@ const REFUSED_HEADER_MEMBERS = ["jku", "jwk", "x5u", "x5c", "crit", "b64", "zip"
 export class UserTokenVerifier {
   private readonly keys: KeySet;
   private readonly now: () => number;
+  // Copies of the checked config values. The verifier never reads the caller's config object
+  // after the constructor: a later change to it must not move the issuer, audience or env past
+  // the start-up checks (or past the dev-key decision). Kimi review of O-5, run 13, finding 3.
+  private readonly issuer: string;
+  private readonly audience: string;
+  private readonly env: string;
 
   /**
-   * @param config what the app expects; usually {@link configFromEnv}.
+   * @param config what the app expects; usually {@link configFromEnv}. The verifier copies the
+   *   values it needs; a change to `config` after this call has no effect (make a new verifier).
    * @throws RuumConfigError for a missing value or a key set that cannot be loaded.
    */
-  constructor(private readonly config: VerifierConfig) {
+  constructor(config: VerifierConfig) {
     for (const k of ["issuer", "audience", "env"] as const) {
       if (!isString(config[k]) || config[k].trim() === "") {
         throw new RuumConfigError(`the verifier needs ${k}`);
@@ -221,6 +228,9 @@ export class UserTokenVerifier {
       throw new RuumConfigError(`the key set cannot be loaded (${e instanceof Error ? e.name : "error"})`);
     }
     this.now = config.now ?? (() => Math.floor(Date.now() / 1000));
+    this.issuer = issuer;
+    this.audience = config.audience;
+    this.env = config.env;
   }
 
   /**
@@ -270,11 +280,10 @@ export class UserTokenVerifier {
 
     // Claims.
     const c = json(pb, "malformed");
-    const issuer = this.config.issuer.replace(/\/+$/, "");
-    if (c["iss"] !== issuer) throw new RuumTokenError("wrong_issuer");
-    if (c["aud"] !== this.config.audience) throw new RuumTokenError("wrong_audience");
+    if (c["iss"] !== this.issuer) throw new RuumTokenError("wrong_issuer");
+    if (c["aud"] !== this.audience) throw new RuumTokenError("wrong_audience");
     if (c["typ"] !== "app_user") throw new RuumTokenError("wrong_type");
-    if (c["env"] !== this.config.env) throw new RuumTokenError("wrong_env");
+    if (c["env"] !== this.env) throw new RuumTokenError("wrong_env");
     const iat = c["iat"];
     const exp = c["exp"];
     if (typeof iat !== "number" || typeof exp !== "number" || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp)) {
@@ -346,7 +355,8 @@ const verifiers = new WeakMap<VerifierConfig, UserTokenVerifier>();
  * call), or with `config` when given. Returns the user or throws {@link RuumTokenError}.
  *
  * The verifier of a `config` object is made once and kept for that object, so pass the same
- * object every time (make it at start-up). Better: make one `new UserTokenVerifier(configFromEnv())`
+ * object every time (make it at start-up). The verifier copies the values at that first call: a
+ * later change to the object has no effect; pass a new object for a new configuration. Better: make one `new UserTokenVerifier(configFromEnv())`
  * at start-up and call its `verify`.
  *
  * @example

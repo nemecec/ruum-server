@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createLogger, HIDDEN, type Sink } from "../src/index.js";
+import { createLogger, HIDDEN, TOO_LONG, type Sink } from "../src/index.js";
 
 function capture(): { sink: Sink; lines: () => Record<string, unknown>[]; raw: () => string } {
   let out = "";
@@ -140,4 +140,32 @@ test("a field named __proto__ stays in the line", () => {
   log.info("x", JSON.parse('{"__proto__":{"a":1},"b":2}'));
   const f = c.lines()[0]?.["fields"] as Record<string, any>;
   assert.deepEqual(Object.keys(f), ["__proto__", "b"]);
+});
+
+test("a string over the limit is dropped whole, never cut, so no prefix of a secret is written", () => {
+  // Kimi review of O-5 (run 13), finding 1: an app secret may have 8192 characters
+  // (SetAppSecretRequest). The platform redacts only whole values, so a cut prefix would leak.
+  const secret = "S3cr".repeat(2048);
+  assert.equal(secret.length, 8192);
+  const long = `failed: ${secret}`;
+  const c = capture();
+  const log = createLogger({ sink: c.sink, now: fixed });
+  log.error(long, { detail: long, error: new Error(long), list: [long], nested: { deeper: long } });
+  const raw = c.raw();
+  // No 64-character piece of the secret is in the line (a cut would keep 8185 of 8192).
+  assert.ok(!raw.includes(secret.slice(0, 64)), "no prefix of the secret is written");
+  assert.ok(!raw.includes("S3crS3crS3crS3cr"), "no part of the secret is written");
+  const [a] = c.lines();
+  assert.equal(a?.["template"], TOO_LONG);
+  const f = a?.["fields"] as Record<string, unknown>;
+  assert.equal(f["detail"], TOO_LONG);
+  assert.equal((f["error"] as Record<string, unknown>)["message"], TOO_LONG);
+  assert.deepEqual(f["list"], [TOO_LONG]);
+  assert.deepEqual(f["nested"], { deeper: TOO_LONG });
+  // Control: a string of exactly the limit is written whole (the runtime redactor sees all of it).
+  const c2 = capture();
+  createLogger({ sink: c2.sink, now: fixed }).info("t", { detail: secret, short: "ok" });
+  const [b] = c2.lines();
+  assert.equal((b?.["fields"] as Record<string, unknown>)["detail"], secret);
+  assert.equal((b?.["fields"] as Record<string, unknown>)["short"], "ok");
 });

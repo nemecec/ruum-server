@@ -7,13 +7,15 @@
  *   deployment's `RUUM_ISSUER` is an `https://` origin and never equals it.
  * - The key stays in the local folder (default `.ruum-dev/`, with a `.gitignore` of `*`), with
  *   file mode 0600. Nothing in it is meant to be committed.
+ * - It never follows a symbolic link at the dev folder or at its files: a checkout could plant
+ *   `.ruum-dev/key.pem -> ../key.pem` and so put the key (or overwrite a file) outside the folder.
  *
  * The token format is the gateway's (`crates/ruum-gateway/src/token.rs`): the header
  * `{"typ":"JWT","alg":"EdDSA","kid":<RFC 7638 thumbprint>}` and the claims in the gateway's order.
  */
 
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, type KeyObject } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, writeFileSync, type Stats } from "node:fs";
 import { join, resolve } from "node:path";
 import { DEV_KEY_MARK, isDevIssuer, type Jwks } from "./keys.js";
 import { MAX_LIFETIME_SECONDS } from "./verify.js";
@@ -154,9 +156,61 @@ export function devFiles(dir: string = DEV_DIR): DevFiles {
   return { dir: d, keyFile: join(d, "key.pem"), jwksFile: join(d, "jwks.json") };
 }
 
+// O_NOFOLLOW is 0 where the platform has none (Windows); the lstat checks still hold there.
+const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+
+/** lstat, or undefined when nothing is at `path`. */
+function lstatOrNone(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+}
+
+function refuseLink(path: string): never {
+  throw new DevModeError(`dev mode refuses a symbolic link or a special file at ${path}`);
+}
+
+/**
+ * Opens `path` without following a symbolic link at its last part, and checks that it is a plain
+ * file. Kimi review of O-5 (run 13), finding 2.
+ */
+function openPlain(path: string, flags: number, mode?: number): number {
+  let fd: number;
+  try {
+    fd = openSync(path, flags | NOFOLLOW, mode);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    // ELOOP: a symbolic link (O_NOFOLLOW). EEXIST: something appeared at a new key's path.
+    if (code === "ELOOP" || code === "EMLINK" || code === "EEXIST") refuseLink(path);
+    throw e;
+  }
+  if (!fstatSync(fd).isFile()) {
+    closeSync(fd);
+    refuseLink(path);
+  }
+  return fd;
+}
+
+/** Writes `data` to the plain file `path` (made when missing), never through a symbolic link. */
+function writePlain(path: string, data: string, mode = 0o666): void {
+  const st = lstatOrNone(path);
+  if (st && !st.isFile()) refuseLink(path);
+  const fd = openPlain(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, mode);
+  try {
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Makes the dev folder with a new key (or keeps the existing key) and writes its key set.
  * Returns the paths; point `RUUM_APP_JWKS_FILE` at `jwksFile`.
+ *
+ * It refuses ({@link DevModeError}) a dev folder or a dev file that is a symbolic link.
  *
  * @example
  * const { jwksFile } = initDev();
@@ -164,20 +218,48 @@ export function devFiles(dir: string = DEV_DIR): DevFiles {
 export function initDev(dir: string = DEV_DIR, env: NodeJS.ProcessEnv = process.env): DevFiles {
   assertDevAllowed(env);
   const f = devFiles(dir);
-  mkdirSync(f.dir, { recursive: true, mode: 0o700 });
-  writeFileSync(join(f.dir, ".gitignore"), "*\n");
-  if (!existsSync(f.keyFile)) {
+  const d = lstatOrNone(f.dir);
+  if (d && !d.isDirectory()) refuseLink(f.dir);
+  if (!d) mkdirSync(f.dir, { recursive: true, mode: 0o700 });
+  if (!lstatSync(f.dir).isDirectory()) refuseLink(f.dir);
+  writePlain(join(f.dir, ".gitignore"), "*\n");
+  const k = lstatOrNone(f.keyFile);
+  if (k && !k.isFile()) refuseLink(f.keyFile);
+  if (!k) {
     const { privateKey } = generateKeyPairSync("ed25519");
-    writeFileSync(f.keyFile, privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
+    // O_EXCL: a new key never goes through something that appeared at the path.
+    const fd = openPlain(f.keyFile, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    try {
+      writeFileSync(fd, privateKey.export({ format: "pem", type: "pkcs8" }));
+      fchmodSync(fd, 0o600);
+    } finally {
+      closeSync(fd);
+    }
+  } else {
+    const fd = openPlain(f.keyFile, constants.O_RDONLY);
+    try {
+      fchmodSync(fd, 0o600);
+    } finally {
+      closeSync(fd);
+    }
   }
-  chmodSync(f.keyFile, 0o600);
-  writeFileSync(f.jwksFile, `${JSON.stringify(devJwksOf(loadDevKey(dir)), null, 2)}\n`);
+  writePlain(f.jwksFile, `${JSON.stringify(devJwksOf(loadDevKey(dir)), null, 2)}\n`);
   return f;
 }
 
-/** The private key of the dev folder. */
+/** The private key of the dev folder. It refuses a key file that is a symbolic link. */
 export function loadDevKey(dir: string = DEV_DIR): KeyObject {
-  const key = createPrivateKey(readFileSync(devFiles(dir).keyFile, "utf8"));
+  const f = devFiles(dir);
+  const d = lstatOrNone(f.dir);
+  if (d && !d.isDirectory()) refuseLink(f.dir);
+  const fd = openPlain(f.keyFile, constants.O_RDONLY);
+  let pem: string;
+  try {
+    pem = readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+  const key = createPrivateKey(pem);
   if (key.asymmetricKeyType !== "ed25519") throw new DevModeError("the dev key is not Ed25519");
   return key;
 }
