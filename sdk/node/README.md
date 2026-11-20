@@ -101,7 +101,8 @@ try {
 
 `verifyUserToken(token)` does the same with one verifier made on the first call.
 `verifyUserToken(token, config)` keeps one verifier per `config` object: make the object once, never
-in the request handler.
+in the request handler. A verifier copies the issuer, audience and env when it is made; a later
+change to the config object has no effect. For another configuration, make a new verifier.
 
 A request without `Ruum-User`, or with a refused token, gets `401` with
 `{"error":{"code":"unauthenticated",...}}`. Identity comes only from `Ruum-User`; the helpers never
@@ -199,6 +200,8 @@ One line per call:
   `session`, ... from `crates/ruum-core/src/telemetry/denylist.rs`) is written as
   `<hidden secret>`, at any depth. The platform's processor still decides; this is defence in depth.
   A test checks that the SDK's list equals the platform's.
+- A string longer than 8192 characters is written as `[too long]`, never cut. The platform
+  redacts a secret only when it sees the whole value, so a cut string could carry most of a secret.
 
 ## The lint rule (`@ruum/eslint-plugin`)
 
@@ -251,6 +254,8 @@ const token = mintDevToken({ audience: process.env.RUUM_AUDIENCE, roles: ["membe
   `RUUM_ISSUER` is an `https://` origin, so it refuses every dev token (`wrong_issuer`).
 - The key stays in `.ruum-dev/` (mode 0600). The folder gets a `.gitignore` of `*`, so it is never
   committed.
+- Dev mode refuses (`DevModeError`) a `.ruum-dev/` folder, key, `.gitignore` or `jwks.json` that is
+  a symbolic link, so a checkout cannot make it put the key or write a file outside the folder.
 - The key set in `.ruum-dev/jwks.json` marks its key as a dev key (`"ruum_dev": true`). A verifier
   whose `RUUM_ISSUER` is not `http://localhost` or `http://127.0.0.1` refuses to start with such a key
   set (`RuumConfigError`), and drops marked keys that appear in a key set later.
