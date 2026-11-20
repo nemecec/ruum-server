@@ -821,6 +821,13 @@ pub(crate) async fn purge_pages_stay_in_their_app(h: &dyn Harness) {
             .unwrap()
             .is_empty()
     );
+    // Also not after a cursor: the page after a cursor is its own statement on Postgres.
+    assert!(
+        s.app_deployment_ids_after(b, n, Some(Uuid::nil()), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(s.static_purge_cursor(b, n).await.unwrap(), None);
     let bn = h.app_node(b, ub).await;
     s.set_static_purge_cursor(b, bn, mine[0]).await.unwrap();
@@ -1232,6 +1239,114 @@ mod tests {
             pool,
         };
         run_all(&h).await;
+    }
+
+    /// The plan of one page of a prepared statement in its generic form, which Postgres may
+    /// choose after five runs and which sqlx's statement cache keeps (`EXPLAIN ANALYZE`, as
+    /// text). `params` are the SQL literals of the statement's parameters.
+    async fn generic_plan(
+        pool: &sqlx::PgPool,
+        tenant: TenantId,
+        sql: &str,
+        types: &str,
+        params: &str,
+    ) -> String {
+        let mut tx = crate::journal::postgres::begin_tenant(pool, tenant)
+            .await
+            .unwrap();
+        for setting in [
+            "set local plan_cache_mode = force_generic_plan",
+            // A test table is small: without these the planner may read it all at once.
+            "set local enable_seqscan = off",
+            "set local enable_bitmapscan = off",
+        ] {
+            sqlx::query(setting).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "prepare purge_page ({types}) as {sql}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let lines: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "explain (analyze, costs off, timing off, summary off) execute purge_page ({params})"
+        )))
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::raw_sql("deallocate purge_page")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        lines.join("\n")
+    }
+
+    /// A late page of the purge of a big app is a range scan from the cursor, also in the
+    /// generic plan of the prepared statement: the index bound includes `id > $3`, and no row
+    /// before the cursor is read and filtered out (Kimi run 13 of W2S-4: the form
+    /// `$3 is null or id > $3` is a filter in a generic plan, so a late page read the app's
+    /// whole history).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_purge_page_is_a_range_scan_from_the_cursor(pool: sqlx::PgPool) {
+        use crate::apps::store::postgres::deployment_ids_sql;
+        let (t, u) = pg_tenant(&pool).await;
+        let n = pg_app_node(&pool, t, u).await;
+        let store = PgAppStore::new(pool.clone());
+        let c = ctx(t, u);
+        store
+            .insert_app(&c, app(n, &unique("big")))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..40 {
+            let d = deployment(n, Environment::Preview, DeploymentState::Ready);
+            ids.push(store.insert_deployment(&c, d).await.unwrap().id);
+        }
+        ids.sort_unstable();
+        let cursor = ids[29];
+        // The store reads the page after the cursor and the first page.
+        assert_eq!(
+            store
+                .app_deployment_ids_after(t, n, Some(cursor), 5)
+                .await
+                .unwrap(),
+            ids[30..35]
+        );
+        assert_eq!(
+            store.app_deployment_ids_after(t, n, None, 5).await.unwrap(),
+            ids[..5]
+        );
+
+        let late = generic_plan(
+            &pool,
+            t,
+            deployment_ids_sql(true),
+            "uuid, uuid, uuid, bigint",
+            &format!("'{}', '{}', '{cursor}', 5", t.0, n),
+        )
+        .await;
+        assert!(late.contains("app_deployments_app_id_idx"), "{late}");
+        assert!(
+            late.lines()
+                .any(|l| l.contains("Index Cond:") && l.contains("(id > $3)")),
+            "the cursor is not an index bound:\n{late}"
+        );
+        assert!(
+            !late.contains("Rows Removed by Filter"),
+            "rows before the cursor were read and filtered out:\n{late}"
+        );
+        let first = generic_plan(
+            &pool,
+            t,
+            deployment_ids_sql(false),
+            "uuid, uuid, bigint",
+            &format!("'{}', '{}', 5", t.0, n),
+        )
+        .await;
+        assert!(first.contains("app_deployments_app_id_idx"), "{first}");
+        assert!(!first.contains("Rows Removed by Filter"), "{first}");
     }
 
     /// The site lock of a tenant is held across connections (processes): writers share it,
