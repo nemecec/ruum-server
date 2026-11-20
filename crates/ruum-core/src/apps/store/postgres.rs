@@ -485,6 +485,21 @@ fn live_switch_key(tenant: TenantId, app: NodeId) -> i64 {
     i64::from_be_bytes(k)
 }
 
+/// The statement of one keyset page of an app's deployment IDs: the first page, or the page
+/// after the cursor `$3` (`after`). The cursor has no `$3 is null or` form: in a generic plan
+/// of a prepared statement Postgres cannot use such a predicate as an index bound, so it scans
+/// every row before the cursor and filters it out, and a late page of a big app reads the
+/// whole history (Kimi run 13, W2S-4).
+pub(crate) fn deployment_ids_sql(after: bool) -> &'static str {
+    if after {
+        "select id from app_deployments where tenant_id = $1 and app_node_id = $2 \
+         and id > $3 order by id limit $4"
+    } else {
+        "select id from app_deployments where tenant_id = $1 and app_node_id = $2 \
+         order by id limit $3"
+    }
+}
+
 #[async_trait]
 impl AppStore for PgAppStore {
     async fn tenant_settings(&self, tenant: TenantId) -> Result<Option<TenantAppSettings>> {
@@ -1224,18 +1239,17 @@ impl AppStore for PgAppStore {
         after: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<Uuid>> {
-        // A range scan of `app_deployments_app_id_idx` (migration 0015).
+        // A range scan of `app_deployments_app_id_idx` (migration 0015). Two statements, so
+        // the cursor is always an index bound (Kimi run 13, W2S-4).
         let mut tx = begin_tenant(&self.pool, tenant).await?;
-        let ids: Vec<Uuid> = sqlx::query_scalar(
-            "select id from app_deployments where tenant_id = $1 and app_node_id = $2 \
-             and ($3::uuid is null or id > $3) order by id limit $4",
-        )
-        .bind(tenant)
-        .bind(app)
-        .bind(after)
-        .bind(i64::from(limit))
-        .fetch_all(&mut *tx)
-        .await?;
+        let query = sqlx::query_scalar(deployment_ids_sql(after.is_some()))
+            .bind(tenant)
+            .bind(app);
+        let query = match after {
+            Some(after) => query.bind(after),
+            None => query,
+        };
+        let ids: Vec<Uuid> = query.bind(i64::from(limit)).fetch_all(&mut *tx).await?;
         tx.commit().await?;
         Ok(ids)
     }
