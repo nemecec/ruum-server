@@ -58,8 +58,10 @@
 //! writes `version.created` (or `version.restored`), `app.deployed` and for a rollback
 //! `app.rolled_back` (reason `manual`), in one store transaction (P-62: a rollback answers with
 //! the new deployment, whose manifest is the old one's). Before the switch the bindings are
-//! checked again with the publisher for the live principal, and after it the live principal's
-//! rows follow the new manifest (card B-1, [`AppService::sync_live_bindings`]). Before the
+//! checked again with the publisher for the live principal, the live grants it drops end
+//! just before the switch commits, and after it the live principal's other rows follow the new
+//! manifest (card B-1, [`AppService::revoke_unplanned_live`] and
+//! [`AppService::sync_live_bindings`]). Before the
 //! switch every [`LiveReleaseHook`] is called; a hook error fails the publish and the old live deployment
 //! keeps serving. Publishing the deployment that is live already changes nothing (`200`), except
 //! that a person's publish grants the live bindings again after a restore of the app (card
@@ -1017,6 +1019,11 @@ impl AppService {
                 )
                 .await?;
             }
+            // The live grants that this release drops end before it commits (Kimi run 13
+            // B-1, finding 1): a failure here stops the release, so no committed release
+            // leaves a dropped grant active.
+            self.revoke_unplanned_live(ctx, app.node_id, &planned)
+                .await?;
             let now = crate::now();
             let d = NewDeployment {
                 id,
@@ -1052,9 +1059,12 @@ impl AppService {
         .await;
         match checked {
             Ok(r) => {
-                // The live principal's rows follow the new manifest (card B-1). The release is
-                // done; a failure here leaves the old rows, which the next publish or the
-                // repair pass sets right, and is logged.
+                // The live principal's rows follow the new manifest (card B-1): the new grants,
+                // and the end of the rows whose tuple a planned binding keeps. The dropped
+                // grants ended before the release. A failure here can only leave a grant
+                // missing (fail closed) or a row whose tuple stays implied; a person's publish
+                // of the live deployment sets both right ([`Self::live_bindings_complete`]),
+                // and the repair pass ends a row the live manifest does not plan. It is logged.
                 if let Err(e) = self
                     .sync_live_bindings(ctx, app.node_id, r.deployment.id, &planned)
                     .await

@@ -50,8 +50,14 @@
 //! `createAppDeployment` runs the check before its `202` ([`AppService::check_bindings`]); the
 //! stage `bindings` runs it again with the same deployer, writes the rows and tuples of the
 //! preview and fails closed when a target went to the trash meanwhile. A publish runs it again
-//! with the publisher for the live principal (the targets the preview recorded), writes the new
-//! rows and revokes the dropped ones ([`AppService::sync_live_bindings`]).
+//! with the publisher for the live principal (the targets the preview recorded). The live
+//! grants that the release drops (their tuple no planned binding implies) end before the
+//! release commits ([`AppService::revoke_unplanned_live`]); after it the new rows are written
+//! and the rows whose tuple stays implied end ([`AppService::sync_live_bindings`]). A failure
+//! after the commit can only leave a grant missing or a redundant row: a person's publish of
+//! the live deployment compares the rows with the manifest (name, role, `on_behalf_of_user`,
+//! no extra row) and syncs them, and the repair pass ends a live row that the live manifest
+//! does not plan (Kimi run 13 B-1, finding 1).
 //!
 //! # The end of bindings
 //!
@@ -63,15 +69,18 @@
 //! keeps its bindings revoked: the restore hook runs as the platform, which does not hold the
 //! deployer's right (an agent's scope, a role that may have changed); publishing the live
 //! deployment again (a person) runs the deployer check and grants them anew. A purge deletes the
-//! rows and their tuples.
+//! rows and their tuples, in batches of bounded transactions.
 //!
 //! The row is written before its tuple and revoked before its tuple goes; the Postgres store
 //! does both in one transaction with the outbox. The repair pass ([`AppService::repair_bindings`],
-//! run by the sweeper per tenant with a bound per round) deletes a binding tuple on a bound
-//! target whose row is revoked or missing, writes a missing tuple of an active row, and ends
-//! the rows of ended previews, of gone targets and of apps in the trash whose trash hook did
-//! not run (a pod of the previous release took the delivery; the provider's state `suspended`,
-//! reason `trashed`, tells).
+//! run by the sweeper per tenant with a bound per round) visits the targets with an active row
+//! (a target whose rows are all revoked had its tuples deleted through the outbox of the
+//! revocation, so the work does not grow with the history). On each it reads every active row
+//! (page by page), deletes a binding tuple whose row is revoked or missing, writes a missing
+//! tuple of an active row, and ends the rows of ended previews, of gone targets, of apps in
+//! the trash whose trash hook did not run (a pod of the previous release took the delivery;
+//! the provider's state `suspended`, reason `trashed`, tells) and of a live principal that its
+//! live manifest no longer plans.
 //!
 //! The repair of one target reads the active rows, then the tuples, then the rows again
 //! ([`repair_updates`]): it deletes the binding tuples that the second read does not imply,
@@ -114,6 +123,8 @@ pub const REPAIR_TARGETS_PER_TENANT: u32 = 200;
 const ROWS_PER_QUERY: u32 = 500;
 /// How many pages of ended rows one call revokes (a bound per call; the next round goes on).
 const PAGES_PER_CALL: usize = 20;
+/// The rows one transaction of an app's purge deletes (Kimi run 13 B-1, finding 4).
+const PURGE_ROWS_PER_CALL: u32 = 1000;
 
 // ---------------------------------------------------------------------------- tuples
 
@@ -386,6 +397,39 @@ fn binding_names(m: Option<&Value>) -> Vec<String> {
         .and_then(Value::as_object)
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// What a live manifest gives each node binding (`role`, `on_behalf_of_user`), by name: the
+/// shape that an active row of the live principal must have. A live row has the manifest's
+/// role (no cap) and flag ([`AppService::check_bindings`]); an API binding (no `role`) gets no
+/// row. The target is not here: it needs the deployer's right to resolve.
+fn live_shapes(m: &Value) -> BTreeMap<String, (Option<Role>, bool)> {
+    m.get("bindings")
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter(|(_, b)| b.get("api").is_none())
+                .map(|(name, b)| {
+                    let role = match b.get("role").and_then(Value::as_str) {
+                        Some("view") => Some(Role::View),
+                        Some("edit") => Some(Role::Edit),
+                        _ => None,
+                    };
+                    let obo = b
+                        .get("on_behalf_of_user")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    (name.clone(), (role, obo))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether an active row of the live principal is one that `shapes` (of the live manifest)
+/// still plans: its name is a node binding there with the same role and flag.
+fn planned_by(shapes: &BTreeMap<String, (Option<Role>, bool)>, b: &BindingRow) -> bool {
+    b.kind == BindingKind::Node && shapes.get(&b.name) == Some(&(b.role, b.on_behalf_of_user))
 }
 
 /// Whether a manifest has bindings.
@@ -858,6 +902,66 @@ impl AppService {
             .await
     }
 
+    /// The live principal's active rows (at most 30 bindings per manifest; more only after a
+    /// failure, which the next sync ends).
+    async fn active_live_rows(&self, tenant: TenantId, app: NodeId) -> Result<Vec<BindingRow>> {
+        self.deps()
+            .store
+            .list_bindings(
+                tenant,
+                &BindingQuery {
+                    app: Some(app),
+                    principal: Some(app.0),
+                    active_only: true,
+                    limit: ROWS_PER_QUERY,
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
+    /// The first half of a release's sync, run under the live switch before the release
+    /// commits (Kimi run 13 B-1, finding 1): every active row of the live principal whose
+    /// tuple no planned binding implies is revoked (`dropped`, the publisher as actor). When
+    /// this fails, the release does not happen; when the release fails after it, the old
+    /// version lost a grant it still plans (fail closed), which a person's publish of the
+    /// live deployment gives back ([`Self::live_bindings_complete`]). So a committed release
+    /// never leaves a dropped grant active. Rows whose tuple stays implied (a renamed binding,
+    /// a changed `on_behalf_of_user`) end after the release, in [`Self::sync_live_bindings`],
+    /// so the tuple never goes away in between.
+    pub(crate) async fn revoke_unplanned_live(
+        &self,
+        ctx: &Context,
+        app: NodeId,
+        planned: &[Resolved],
+    ) -> Result<()> {
+        let d = self.deps();
+        let implied: std::collections::HashSet<Relationship> = planned
+            .iter()
+            .filter(|r| r.kind == ResolvedKind::Node)
+            .filter_map(|r| {
+                Some(Relationship {
+                    object: ObjectRef::node(r.target),
+                    relation: r.role?.relation().to_string(),
+                    subject: app_subject(app.0),
+                })
+            })
+            .collect();
+        let dropped: Vec<Uuid> = self
+            .active_live_rows(ctx.tenant, app)
+            .await?
+            .iter()
+            .filter(|a| binding_tuple(a).is_none_or(|t| !implied.contains(&t)))
+            .map(|a| a.id)
+            .collect();
+        if !dropped.is_empty() {
+            d.store
+                .revoke_bindings(ctx, &*d.authz, &dropped, RevokeReason::Dropped)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Makes the live principal's rows follow `planned` (a publish or a rollback, or the
     /// publish of the live deployment again after a restore): a planned binding that has an
     /// active row stays; a new one gets a row and its tuple (deployment `live`); an active row
@@ -871,19 +975,7 @@ impl AppService {
         planned: &[Resolved],
     ) -> Result<()> {
         let d = self.deps();
-        let active = d
-            .store
-            .list_bindings(
-                ctx.tenant,
-                &BindingQuery {
-                    app: Some(app),
-                    principal: Some(app.0),
-                    active_only: true,
-                    limit: ROWS_PER_QUERY,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let active = self.active_live_rows(ctx.tenant, app).await?;
         let mut kept: Vec<Uuid> = Vec::new();
         let mut new = Vec::new();
         for r in planned.iter().filter(|r| r.kind == ResolvedKind::Node) {
@@ -923,32 +1015,24 @@ impl AppService {
         Ok(())
     }
 
-    /// Whether every planned node binding has an active row of the live principal.
+    /// Whether the live principal's active rows are exactly what `manifest` plans: one row
+    /// per binding with its role and `on_behalf_of_user`, and no other row (Kimi run 13 B-1,
+    /// finding 1: names alone let a stale or changed row pass, and a manifest without
+    /// bindings passed always). The target needs the deployer's right to resolve and is not
+    /// compared: a row whose target a release changed is revoked before that release commits
+    /// ([`Self::revoke_unplanned_live`]).
     pub(crate) async fn live_bindings_complete(
         &self,
         tenant: TenantId,
         app: NodeId,
         manifest: &Value,
     ) -> Result<bool> {
-        let names = binding_names(Some(manifest));
-        if names.is_empty() {
-            return Ok(true);
-        }
-        let active = self
-            .deps()
-            .store
-            .list_bindings(
-                tenant,
-                &BindingQuery {
-                    app: Some(app),
-                    principal: Some(app.0),
-                    active_only: true,
-                    limit: ROWS_PER_QUERY,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        Ok(names.iter().all(|n| active.iter().any(|a| &a.name == n)))
+        let want = live_shapes(manifest);
+        let active = self.active_live_rows(tenant, app).await?;
+        let names: std::collections::BTreeSet<&String> = active.iter().map(|a| &a.name).collect();
+        Ok(names.len() == active.len()
+            && active.len() == want.len()
+            && active.iter().all(|a| planned_by(&want, a)))
     }
 
     /// The rows of the preview `dep` (for the approval of an agent's publish).
@@ -1009,20 +1093,32 @@ impl AppService {
             .await
     }
 
-    /// The active rows on `target`.
+    /// Every active row on `target`, page by page (Kimi run 13 B-1, finding 2): the repair
+    /// deletes the tuples that these rows do not imply, so a truncated read would delete
+    /// valid grants.
     async fn active_on(&self, tenant: TenantId, target: NodeId) -> Result<Vec<BindingRow>> {
-        self.deps()
-            .store
-            .list_bindings(
-                tenant,
-                &BindingQuery {
-                    target: Some(target),
-                    active_only: true,
-                    limit: ROWS_PER_QUERY,
-                    ..Default::default()
-                },
-            )
-            .await
+        let mut all: Vec<BindingRow> = Vec::new();
+        loop {
+            let page = self
+                .deps()
+                .store
+                .list_bindings(
+                    tenant,
+                    &BindingQuery {
+                        target: Some(target),
+                        active_only: true,
+                        after: all.last().map(|b| b.id),
+                        limit: ROWS_PER_QUERY,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let full = page.len() as u32 >= ROWS_PER_QUERY;
+            all.extend(page);
+            if !full {
+                return Ok(all);
+            }
+        }
     }
 
     /// [`Self::repair_target`] with `between_reads`, a test seam for the race of a revocation:
@@ -1072,6 +1168,15 @@ impl AppService {
             .await?;
             rows = self.active_on(tenant, target).await?;
         }
+        // Rows of a live principal that its live manifest no longer plans (a release whose
+        // sync failed after it committed, or a release before the fix of Kimi run 13 B-1
+        // finding 1): they end now (`dropped`, the app as actor).
+        let stale = self.unplanned_live_rows(tenant, &rows).await?;
+        if !stale.is_empty() {
+            fixed +=
+                revoke_grouped(&*d.store, &*d.authz, tenant, &stale, RevokeReason::Dropped).await?;
+            rows = self.active_on(tenant, target).await?;
+        }
         between_reads(1).await;
         let have = d.authz.read(&ObjectRef::node(target)).await?;
         let again = self.active_on(tenant, target).await?;
@@ -1094,7 +1199,8 @@ impl AppService {
         // third time and take back every touched tuple that no active row implies now.
         if !touched.is_empty() {
             let last = self.active_on(tenant, target).await?;
-            let implied: Vec<Relationship> = last.iter().filter_map(binding_tuple).collect();
+            let implied: std::collections::HashSet<Relationship> =
+                last.iter().filter_map(binding_tuple).collect();
             let undo: Vec<RelationshipUpdate> = touched
                 .into_iter()
                 .filter(|r| !implied.contains(r))
@@ -1105,6 +1211,33 @@ impl AppService {
             }
         }
         Ok(fixed + n)
+    }
+
+    /// The rows in `rows` of a live principal that the app's live manifest does not plan
+    /// ([`planned_by`]). `rows` is read before the manifest: a row granted for a newer release
+    /// is granted after that release commits, so the manifest read here is at least as new as
+    /// the release of every row in `rows`, and a valid row is never ended. An app without a
+    /// live deployment keeps its rows (no live row exists without a release).
+    async fn unplanned_live_rows(
+        &self,
+        tenant: TenantId,
+        rows: &[BindingRow],
+    ) -> Result<Vec<BindingRow>> {
+        let mut shapes: BTreeMap<NodeId, Option<BTreeMap<String, (Option<Role>, bool)>>> =
+            BTreeMap::new();
+        let mut out = Vec::new();
+        for b in rows.iter().filter(|b| b.principal_id == b.app_node_id.0) {
+            if !shapes.contains_key(&b.app_node_id) {
+                let live = self.live_manifest_of(tenant, b.app_node_id).await?;
+                shapes.insert(b.app_node_id, live.as_ref().map(live_shapes));
+            }
+            if let Some(Some(want)) = shapes.get(&b.app_node_id)
+                && !planned_by(want, b)
+            {
+                out.push(b.clone());
+            }
+        }
+        Ok(out)
     }
 
     /// The rows in `rows` of apps that are in the trash. The repair runs as the platform and
@@ -1204,23 +1337,25 @@ pub fn repair_updates(
     have: &[Relationship],
     again: &[BindingRow],
 ) -> Vec<RelationshipUpdate> {
-    let first: Vec<Relationship> = first.iter().filter_map(binding_tuple).collect();
-    let again: Vec<Relationship> = again.iter().filter_map(binding_tuple).collect();
+    use std::collections::HashSet;
+    let first: HashSet<Relationship> = first.iter().filter_map(binding_tuple).collect();
+    let again_list: Vec<Relationship> = again.iter().filter_map(binding_tuple).collect();
+    let again: HashSet<&Relationship> = again_list.iter().collect();
+    let have_set: HashSet<&Relationship> = have.iter().collect();
     let mut updates = Vec::new();
+    let mut deleted = HashSet::new();
     for rel in have {
         let is_binding = rel.subject.object.object_type == "app"
             && rel.subject.relation.is_none()
             && matches!(rel.relation.as_str(), "viewer" | "editor");
-        if is_binding && !again.contains(rel) {
+        if is_binding && !again.contains(rel) && deleted.insert(rel) {
             updates.push(RelationshipUpdate::Delete(rel.clone()));
         }
     }
-    for rel in &again {
-        if first.contains(rel) && !have.contains(rel) {
-            let u = RelationshipUpdate::Touch(rel.clone());
-            if !updates.contains(&u) {
-                updates.push(u);
-            }
+    let mut touched = HashSet::new();
+    for rel in &again_list {
+        if first.contains(rel) && !have_set.contains(rel) && touched.insert(rel) {
+            updates.push(RelationshipUpdate::Touch(rel.clone()));
         }
     }
     updates
@@ -1334,10 +1469,16 @@ impl super::provider::LifecycleHook for BindingHooks {
 
 #[async_trait::async_trait]
 impl super::provider::PurgeHook for BindingHooks {
+    /// Deletes the rows in bounded batches, each in its own transaction, until none is left.
     async fn app_purged(&self, tenant: TenantId, app: NodeId) -> Result<()> {
-        self.store
-            .delete_app_bindings(tenant, &*self.authz, app)
-            .await
-            .map(|_| ())
+        loop {
+            let n = self
+                .store
+                .delete_app_bindings(tenant, &*self.authz, app, PURGE_ROWS_PER_CALL)
+                .await?;
+            if (n as u32) < PURGE_ROWS_PER_CALL {
+                return Ok(());
+            }
+        }
     }
 }

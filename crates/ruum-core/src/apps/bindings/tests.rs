@@ -1404,3 +1404,401 @@ async fn an_agents_approval_names_the_added_bindings_as_app_bindings() {
             .is_ok()
     );
 }
+
+// ------------------------------------------------------------------ Kimi run 13 B-1
+
+/// A world whose app service runs on a memory store that the test holds (for its fault
+/// seam). No app exists yet when the service is replaced.
+async fn world_with_store() -> (World, Arc<crate::apps::store::memory::MemoryAppStore>) {
+    let mut w = world().await;
+    let store = Arc::new(crate::apps::store::memory::MemoryAppStore::new(Some(
+        w.journal.clone(),
+    )));
+    let mut parts = crate::apps::AppParts::memory(Some(w.journal.clone()));
+    parts.store = store.clone();
+    crate::apps::install(&mut w.s, parts).unwrap();
+    (w, store)
+}
+
+/// The live deployment of `app`.
+async fn live_of(w: &World, app: NodeId) -> Option<Uuid> {
+    w.s.apps
+        .store()
+        .get_app(w.team.id, app)
+        .await
+        .unwrap()
+        .unwrap()
+        .live_deployment_id
+}
+
+/// A manifest with one node binding `name` (`view`) to `node`.
+fn named_binding(name: &str, node: NodeId) -> String {
+    format!("runtime: static\nbindings:\n  {name}:\n    node: \"node:{node}\"\n    role: view\n")
+}
+
+/// Writes an active row of the live principal of `app` (deployment `live`) that the live
+/// manifest does not plan: what a release before the fix left when its sync failed.
+async fn plant_live_row(w: &World, app: NodeId, live: Uuid, name: &str, target: NodeId) -> Uuid {
+    let rows =
+        w.s.apps
+            .store()
+            .grant_bindings(
+                &w.o(),
+                &*w.s.authz,
+                vec![NewBinding {
+                    id: Uuid::now_v7(),
+                    app_node_id: app,
+                    deployment_id: live,
+                    principal_id: app.0,
+                    name: name.into(),
+                    kind: BindingKind::Node,
+                    target_node_id: target,
+                    role: Some(Role::View),
+                    api: None,
+                    scopes: Vec::new(),
+                    on_behalf_of_user: false,
+                }],
+            )
+            .await
+            .unwrap();
+    assert!(w.sees(app.0, target).await);
+    rows[0].id
+}
+
+async fn row(w: &World, id: Uuid) -> BindingRow {
+    w.rows(BindingQuery::default())
+        .await
+        .into_iter()
+        .find(|b| b.id == id)
+        .expect("the row")
+}
+
+/// Kimi run 13 B-1, finding 1: a publish that drops the only binding while the revocation
+/// fails. The revocation runs before the release, so the release does not happen and the old
+/// version keeps serving with the grant it plans; the retry drops the grant for real.
+#[tokio::test]
+async fn a_failed_revocation_stops_the_release() {
+    let (w, store) = world_with_store().await;
+    let app = w.app_in(&w.m(), w.projects, "Planner").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+        .await;
+    let live = w.publish(&w.m(), app, dep).await;
+    assert!(w.sees(app.0, w.docs).await);
+    let plain = w.ready(&w.o(), app, "runtime: static\n", w.projects).await;
+    store.fail_revokes(RevokeReason::Dropped, 1);
+    let r =
+        w.s.apps
+            .publish_deployment(
+                &w.o(),
+                app,
+                plain,
+                PublishDeployment::default(),
+                "https://ruum.test",
+            )
+            .await;
+    assert!(
+        r.is_err(),
+        "the release committed although the dropped grant could not end"
+    );
+    assert_eq!(
+        live_of(&w, app).await,
+        Some(live),
+        "the old version is live"
+    );
+    assert!(
+        w.sees(app.0, w.docs).await,
+        "the live version still plans it"
+    );
+    // The retry goes live and the grant ends.
+    w.publish(&w.o(), app, plain).await;
+    assert_ne!(live_of(&w, app).await, Some(live));
+    assert!(!w.sees(app.0, w.docs).await);
+    let rows = w
+        .rows(BindingQuery {
+            principal: Some(app.0),
+            ..Default::default()
+        })
+        .await;
+    assert!(rows.iter().all(|b| !b.is_active()), "{rows:?}");
+}
+
+/// Kimi run 13 B-1, finding 1: a sync that fails after the release committed (here: the end
+/// of a renamed binding's old row, whose tuple the new row keeps). A person's publish of the
+/// live deployment compares the rows with the manifest, not only the names, and ends it; so
+/// does the repair pass in another app.
+#[tokio::test]
+async fn a_failed_sync_after_the_release_is_set_right_by_a_republish_and_the_repair() {
+    let (w, store) = world_with_store().await;
+    let mut old_rows = Vec::new();
+    let mut apps = Vec::new();
+    for name in ["By publish", "By repair"] {
+        let app = w.app_in(&w.m(), w.projects, name).await;
+        let dep = w
+            .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+            .await;
+        w.publish(&w.m(), app, dep).await;
+        let old = w
+            .rows(BindingQuery {
+                principal: Some(app.0),
+                active_only: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(old.len(), 1);
+        let renamed = w
+            .ready(&w.m(), app, &named_binding("papers", w.docs), w.projects)
+            .await;
+        store.fail_revokes(RevokeReason::Dropped, 1);
+        // The release is done; the failed end of the old row is logged.
+        w.publish(&w.m(), app, renamed).await;
+        assert!(
+            row(&w, old[0].id).await.is_active(),
+            "the fault did not hit"
+        );
+        assert!(w.sees(app.0, w.docs).await);
+        old_rows.push(old[0].id);
+        apps.push(app);
+    }
+    // A person publishes the live deployment again: the extra row ends.
+    let live = live_of(&w, apps[0]).await.unwrap();
+    assert_eq!(w.publish(&w.m(), apps[0], live).await, live);
+    let ended = row(&w, old_rows[0]).await;
+    assert_eq!(
+        ended.revoke_reason,
+        Some(RevokeReason::Dropped),
+        "{ended:?}"
+    );
+    assert!(
+        w.sees(apps[0].0, w.docs).await,
+        "the renamed binding keeps its tuple"
+    );
+    // The repair pass ends the other app's extra row (the app as actor).
+    w.s.apps
+        .repair_bindings(w.team.id, None, REPAIR_TARGETS_PER_TENANT)
+        .await
+        .unwrap();
+    let ended = row(&w, old_rows[1]).await;
+    assert_eq!(
+        ended.revoke_reason,
+        Some(RevokeReason::Dropped),
+        "{ended:?}"
+    );
+    assert!(
+        w.sees(apps[1].0, w.docs).await,
+        "the renamed binding keeps its tuple"
+    );
+    let last = w.entries(EventType::AppBindingRevoked).pop().unwrap();
+    assert_eq!(last.actor.actor.id.0, apps[1].0);
+}
+
+/// Kimi run 13 B-1, finding 1: a live row that the live manifest does not plan at all (left
+/// by a release before the fix, whose revocation failed). A manifest without bindings is not
+/// "complete" while such a row is active: a person's publish of the live deployment ends it,
+/// and so does the repair pass.
+#[tokio::test]
+async fn a_stale_live_grant_ends_by_a_republish_and_by_the_repair() {
+    let w = world().await;
+    let mut planted = Vec::new();
+    let mut apps = Vec::new();
+    for name in ["By publish", "By repair"] {
+        let app = w.app_in(&w.m(), w.projects, name).await;
+        let plain = w.ready(&w.m(), app, "runtime: static\n", w.projects).await;
+        let live = w.publish(&w.m(), app, plain).await;
+        planted.push(plant_live_row(&w, app, live, "docs", w.docs).await);
+        apps.push((app, live));
+    }
+    // Each planted grant is real before (`plant_live_row` checks it).
+    let (app, live) = apps[0];
+    assert_eq!(w.publish(&w.m(), app, live).await, live);
+    assert!(
+        !w.sees(app.0, w.docs).await,
+        "the republish kept a stale grant"
+    );
+    assert_eq!(
+        row(&w, planted[0]).await.revoke_reason,
+        Some(RevokeReason::Dropped)
+    );
+    let (app, _) = apps[1];
+    w.s.apps
+        .repair_bindings(w.team.id, None, REPAIR_TARGETS_PER_TENANT)
+        .await
+        .unwrap();
+    assert!(
+        !w.sees(app.0, w.docs).await,
+        "the repair kept a stale grant"
+    );
+    assert_eq!(
+        row(&w, planted[1]).await.revoke_reason,
+        Some(RevokeReason::Dropped)
+    );
+}
+
+/// Kimi run 13 B-1, finding 2: a target with more active rows than one read returns. The
+/// repair reads them all, so a principal past the first page keeps its tuple; a planted
+/// tuple without a row still goes. When the target is gone, every row ends.
+#[tokio::test]
+async fn the_repair_reads_every_active_row_of_a_target() {
+    let w = world().await;
+    let big = folder(&w.s, &w.m(), w.projects, "Big").await;
+    let app = w.app_in(&w.m(), w.projects, "Crowd").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+        .await;
+    let n = ROWS_PER_QUERY as usize + 20;
+    let mut principals = Vec::new();
+    for chunk in 0..n.div_ceil(30) {
+        let rows: Vec<NewBinding> = (0..30.min(n - chunk * 30))
+            .map(|_| {
+                let p = Uuid::now_v7();
+                principals.push(p);
+                NewBinding {
+                    id: Uuid::now_v7(),
+                    app_node_id: app,
+                    deployment_id: dep,
+                    principal_id: p,
+                    name: "docs".into(),
+                    kind: BindingKind::Node,
+                    target_node_id: big,
+                    role: Some(Role::View),
+                    api: None,
+                    scopes: Vec::new(),
+                    on_behalf_of_user: false,
+                }
+            })
+            .collect();
+        w.s.apps
+            .store()
+            .grant_bindings(&w.m(), &*w.s.authz, rows)
+            .await
+            .unwrap();
+    }
+    assert_eq!(principals.len(), n);
+    let planted = Relationship {
+        object: ObjectRef::node(big),
+        relation: "viewer".into(),
+        subject: SubjectRef::object(ObjectRef::new("app", Uuid::now_v7())),
+    };
+    w.s.authz
+        .write(vec![RelationshipUpdate::Touch(planted.clone())])
+        .await
+        .unwrap();
+    let fixed =
+        w.s.apps
+            .repair_target_with(w.team.id, big, &|_| Box::pin(async {}))
+            .await
+            .unwrap();
+    assert_eq!(fixed, 1, "only the planted tuple goes");
+    let have = w.s.authz.read(&ObjectRef::node(big)).await.unwrap();
+    assert!(!have.contains(&planted));
+    for p in &principals[ROWS_PER_QUERY as usize - 1..] {
+        assert!(
+            w.sees(*p, big).await,
+            "a principal past the first page lost its tuple"
+        );
+    }
+    // The target is gone: every row ends, not only the first page.
+    w.s.nodes.trash(&w.m(), big, None).await.unwrap();
+    w.s.nodes.purge(&w.o(), big).await.unwrap();
+    w.s.apps
+        .repair_target_with(w.team.id, big, &|_| Box::pin(async {}))
+        .await
+        .unwrap();
+    let left =
+        w.s.apps
+            .store()
+            .list_bindings(
+                w.team.id,
+                &BindingQuery {
+                    target: Some(big),
+                    active_only: true,
+                    limit: 10_000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    assert!(
+        left.is_empty(),
+        "{} rows of a gone target stay active",
+        left.len()
+    );
+}
+
+/// Kimi run 13 B-1, finding 4: the purge of an app with a long binding history (more than
+/// 10,000 rows, each preview its own principal) deletes every row and tuple in bounded
+/// batches.
+#[tokio::test]
+async fn the_purge_of_a_long_binding_history_deletes_everything() {
+    use crate::apps::provider::PurgeHook;
+    let w = world().await;
+    let app = w.app_in(&w.m(), w.projects, "Old app").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+        .await;
+    let n = 10_050;
+    let mut last = Uuid::nil();
+    for chunk in 0..n / 30 {
+        let rows: Vec<NewBinding> = (0..30)
+            .map(|i| {
+                last = Uuid::now_v7();
+                NewBinding {
+                    id: Uuid::now_v7(),
+                    app_node_id: app,
+                    deployment_id: dep,
+                    principal_id: last,
+                    name: format!("b{}", (chunk * 30 + i) % 30),
+                    kind: BindingKind::Node,
+                    target_node_id: w.docs,
+                    role: Some(Role::View),
+                    api: None,
+                    scopes: Vec::new(),
+                    on_behalf_of_user: false,
+                }
+            })
+            .collect();
+        let made =
+            w.s.apps
+                .store()
+                .grant_bindings(&w.m(), &*w.s.authz, rows)
+                .await
+                .unwrap();
+        // Part of the history is revoked (not the last chunk).
+        if chunk % 10 == 1 {
+            let ids: Vec<Uuid> = made.iter().map(|b| b.id).collect();
+            w.s.apps
+                .store()
+                .revoke_bindings(
+                    &app_ctx(w.team.id, app),
+                    &*w.s.authz,
+                    &ids,
+                    RevokeReason::PreviewExpired,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    assert!(w.sees(last, w.docs).await);
+    w.s.apps
+        .binding_hooks()
+        .app_purged(w.team.id, app)
+        .await
+        .unwrap();
+    assert!(
+        w.s.apps
+            .store()
+            .list_bindings(
+                w.team.id,
+                &BindingQuery {
+                    app: Some(app),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!w.sees(last, w.docs).await);
+    assert!(!w.sees(dep, w.docs).await);
+}

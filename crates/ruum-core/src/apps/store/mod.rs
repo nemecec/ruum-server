@@ -492,6 +492,9 @@ pub struct BindingQuery {
     pub target: Option<NodeId>,
     /// Only rows that are not revoked.
     pub active_only: bool,
+    /// Only rows with an ID after this one (a keyset page; IDs are UUIDv7, so ID order is
+    /// the order of the grants).
+    pub after: Option<Uuid>,
     /// At most this many rows, oldest first.
     pub limit: u32,
 }
@@ -902,8 +905,11 @@ pub trait AppStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<BindingRow>>;
 
-    /// The distinct targets of the tenant's binding rows (active or not), after `after`, at
-    /// most `limit`, in ID order (the repair pass of [`super::bindings`]).
+    /// The distinct targets of the tenant's active binding rows, after `after`, at most
+    /// `limit`, in ID order (the repair pass of [`super::bindings`]). A target whose rows are
+    /// all revoked is not listed: the revocation deleted its tuples through the outbox of the
+    /// same transaction, so it needs no repair, and the work of a round does not grow with the
+    /// revoked history (Kimi run 13 B-1, finding 3).
     async fn binding_targets(
         &self,
         tenant: TenantId,
@@ -911,17 +917,21 @@ pub trait AppStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<NodeId>>;
 
-    /// The tenants with binding rows, after `after`, at most `limit`, in ID order. A platform
-    /// job (the repair pass), not a tenant call.
+    /// The tenants with active binding rows, after `after`, at most `limit`, in ID order. A
+    /// platform job (the repair pass), not a tenant call.
     async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>>;
 
-    /// Deletes every binding row of a purged app and the tuples of its active rows and of its
-    /// principals (run by the purge hook before the app's rows go). Returns how many rows went.
+    /// Deletes the oldest `limit` binding rows of a purged app (active or not) and the tuples
+    /// of the active ones and of their principals, in one unit (Postgres: one transaction and
+    /// its outbox). Returns how many rows went; the purge hook calls it again until it returns
+    /// less than `limit`, so one transaction stays bounded however long the app's history is
+    /// (Kimi run 13 B-1, finding 4), and a retry goes on after the last committed batch.
     async fn delete_app_bindings(
         &self,
         tenant: TenantId,
         authz: &dyn crate::authz::Authz,
         app: NodeId,
+        limit: u32,
     ) -> Result<usize>;
 }
 

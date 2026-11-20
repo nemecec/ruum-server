@@ -1436,6 +1436,7 @@ impl AppStore for PgAppStore {
         let mut ended = rows.iter().map(binding_row).collect::<Result<Vec<_>>>()?;
         ended.sort_by_key(|b| b.id);
         let mut deletes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for b in &ended {
             append(
                 &mut tx,
@@ -1463,7 +1464,7 @@ impl AppStore for PgAppStore {
             .bind(b.role.map(role_text))
             .fetch_one(&mut *tx)
             .await?;
-            if !kept && !deletes.contains(&RelationshipUpdate::Delete(t.clone())) {
+            if !kept && seen.insert(t.clone()) {
                 deletes.push(RelationshipUpdate::Delete(t));
             }
         }
@@ -1487,7 +1488,8 @@ impl AppStore for PgAppStore {
              and ($3::uuid is null or principal_id = $3) \
              and ($4::uuid is null or deployment_id = $4) \
              and ($5::uuid is null or target_node_id = $5) \
-             and (not $6 or revoked_at is null) order by id limit $7",
+             and (not $6 or revoked_at is null) \
+             and ($8::uuid is null or id > $8) order by id limit $7",
             binding_columns("")
         )))
         .bind(tenant)
@@ -1497,6 +1499,7 @@ impl AppStore for PgAppStore {
         .bind(q.target)
         .bind(q.active_only)
         .bind(i64::from(q.limit))
+        .bind(q.after)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1537,6 +1540,7 @@ impl AppStore for PgAppStore {
         let mut tx = begin_tenant(&self.pool, tenant).await?;
         let rows: Vec<NodeId> = sqlx::query_scalar(
             "select distinct target_node_id from app_bindings where tenant_id = $1 \
+             and revoked_at is null \
              and ($2::uuid is null or target_node_id > $2) order by target_node_id limit $3",
         )
         .bind(tenant)
@@ -1551,8 +1555,8 @@ impl AppStore for PgAppStore {
     async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>> {
         let mut tx = begin_system(&self.pool).await?;
         let rows: Vec<TenantId> = sqlx::query_scalar(
-            "select distinct tenant_id from app_bindings \
-             where ($1::uuid is null or tenant_id > $1) order by tenant_id limit $2",
+            "select distinct tenant_id from app_bindings where revoked_at is null \
+             and ($1::uuid is null or tenant_id > $1) order by tenant_id limit $2",
         )
         .bind(after)
         .bind(i64::from(limit))
@@ -1567,19 +1571,24 @@ impl AppStore for PgAppStore {
         tenant: TenantId,
         authz: &dyn crate::authz::Authz,
         app: NodeId,
+        limit: u32,
     ) -> Result<usize> {
         use crate::authz::RelationshipUpdate;
         let mut tx = begin_tenant(&self.pool, tenant).await?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "delete from app_bindings where tenant_id = $1 and app_node_id = $2 returning {}",
+            "delete from app_bindings where tenant_id = $1 and id in (select id from \
+             app_bindings where tenant_id = $1 and app_node_id = $2 order by id limit $3) \
+             returning {}",
             binding_columns("")
         )))
         .bind(tenant)
         .bind(app)
+        .bind(i64::from(limit))
         .fetch_all(&mut *tx)
         .await?;
         let gone = rows.iter().map(binding_row).collect::<Result<Vec<_>>>()?;
         let mut deletes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for b in &gone {
             let tuples = super::super::bindings::principal_tuples(tenant, app, b.principal_id)
                 .into_iter()
@@ -1589,9 +1598,8 @@ impl AppStore for PgAppStore {
                         .flatten(),
                 );
             for t in tuples {
-                let u = RelationshipUpdate::Delete(t);
-                if !deletes.contains(&u) {
-                    deletes.push(u);
+                if seen.insert(t.clone()) {
+                    deletes.push(RelationshipUpdate::Delete(t));
                 }
             }
         }

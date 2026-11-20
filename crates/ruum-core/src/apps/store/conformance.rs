@@ -923,6 +923,20 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
         .await
         .unwrap();
     assert_eq!(listed, rows);
+    // A keyset page starts after the given row.
+    let after = s
+        .list_bindings(
+            t,
+            &BindingQuery {
+                principal: Some(p.id),
+                after: Some(rows[0].id),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after, rows[1..]);
     // Two rows imply one tuple: it stays until the last goes.
     let first = s
         .revoke_bindings(&c, &authz, &[rows[0].id], RevokeReason::Dropped)
@@ -957,6 +971,10 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
         .await
         .unwrap();
     assert!(!app_sees(&authz, p.id, n).await);
+    // A target and a tenant whose rows are all revoked leave the repair pass (Kimi run 13
+    // B-1, finding 3): the work of a round does not grow with the history.
+    assert!(s.binding_targets(t, None, 10).await.unwrap().is_empty());
+    assert!(!s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
     // A grant to a deployment of nothing is refused.
     assert!(
         s.grant_bindings(&c, &authz, vec![new_binding(n, Uuid::now_v7(), "x", n)])
@@ -969,7 +987,10 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
         .await
         .unwrap();
     assert!(app_sees(&authz, again[0].principal_id, n).await);
-    assert_eq!(s.delete_app_bindings(t, &authz, n).await.unwrap(), 3);
+    // In bounded batches, oldest first (Kimi run 13 B-1, finding 4).
+    assert_eq!(s.delete_app_bindings(t, &authz, n, 2).await.unwrap(), 2);
+    assert_eq!(s.delete_app_bindings(t, &authz, n, 2).await.unwrap(), 1);
+    assert_eq!(s.delete_app_bindings(t, &authz, n, 2).await.unwrap(), 0);
     assert!(!app_sees(&authz, p.id, n).await);
     assert!(
         s.list_bindings(
@@ -1055,7 +1076,7 @@ pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(s.delete_app_bindings(b, &authz, n).await.unwrap(), 0);
+    assert_eq!(s.delete_app_bindings(b, &authz, n, 10).await.unwrap(), 0);
     assert!(app_sees(&authz, p.id, n).await);
     assert_eq!(s.list_bindings(a, &all).await.unwrap().len(), 1);
 }

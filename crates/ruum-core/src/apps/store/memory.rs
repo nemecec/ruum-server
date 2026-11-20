@@ -33,6 +33,9 @@ pub struct MemoryAppStore {
     /// What one deployment row costs a read of the static sites' rows (tests: a store with a
     /// long history; zero by default).
     row_read_delay: Mutex<std::time::Duration>,
+    /// How many of the next calls of [`AppStore::revoke_bindings`] with this reason fail
+    /// before they change anything (tests: a database error in a revocation; none by default).
+    failing_revokes: Mutex<Option<(RevokeReason, u32)>>,
 }
 
 impl MemoryAppStore {
@@ -41,7 +44,15 @@ impl MemoryAppStore {
             journal,
             inner: Mutex::new(Inner::default()),
             row_read_delay: Mutex::new(std::time::Duration::ZERO),
+            failing_revokes: Mutex::new(None),
         }
+    }
+
+    /// Makes the next `n` calls of [`AppStore::revoke_bindings`] with `reason` fail with an
+    /// internal error before they change anything, as a Postgres transaction that rolls back
+    /// (tests of a failed revocation, Kimi run 13 B-1 finding 1).
+    pub fn fail_revokes(&self, reason: RevokeReason, n: u32) {
+        *self.failing_revokes.lock().expect("failing revokes") = Some((reason, n));
     }
 
     /// Makes [`AppStore::static_deployments`] and [`AppStore::app_deployment_ids_after`] take
@@ -833,6 +844,16 @@ impl AppStore for MemoryAppStore {
         reason: RevokeReason,
     ) -> Result<Vec<BindingRow>> {
         use crate::authz::RelationshipUpdate;
+        {
+            let mut failing = self.failing_revokes.lock().expect("failing revokes");
+            if let Some((r, n)) = failing.as_mut()
+                && *r == reason
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(Error::Internal("a revocation failed (test)".into()));
+            }
+        }
         let tenant = ctx.tenant;
         let now = crate::now();
         let (ended, deletes) = {
@@ -849,6 +870,7 @@ impl AppStore for MemoryAppStore {
             }
             // A tuple goes only when no other active row of the principal implies it.
             let mut deletes = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for b in &ended {
                 let Some(t) = super::super::bindings::binding_tuple(b) else {
                     continue;
@@ -859,7 +881,7 @@ impl AppStore for MemoryAppStore {
                         && o.principal_id == b.principal_id
                         && super::super::bindings::binding_tuple(o).as_ref() == Some(&t)
                 });
-                if !kept && !deletes.contains(&RelationshipUpdate::Delete(t.clone())) {
+                if !kept && seen.insert(t.clone()) {
                     deletes.push(RelationshipUpdate::Delete(t));
                 }
             }
@@ -893,6 +915,7 @@ impl AppStore for MemoryAppStore {
                     && q.principal.is_none_or(|p| b.principal_id == p)
                     && q.deployment.is_none_or(|d| b.deployment_id == d)
                     && q.target.is_none_or(|t| b.target_node_id == t)
+                    && q.after.is_none_or(|a| b.id > a)
                     && (!q.active_only || b.is_active())
             })
             .take(q.limit as usize)
@@ -942,7 +965,9 @@ impl AppStore for MemoryAppStore {
         let set: std::collections::BTreeSet<NodeId> = st
             .bindings
             .values()
-            .filter(|b| b.tenant_id == tenant && after.is_none_or(|a| b.target_node_id > a))
+            .filter(|b| {
+                b.tenant_id == tenant && b.is_active() && after.is_none_or(|a| b.target_node_id > a)
+            })
             .map(|b| b.target_node_id)
             .collect();
         Ok(set.into_iter().take(limit as usize).collect())
@@ -952,8 +977,9 @@ impl AppStore for MemoryAppStore {
         let st = self.st();
         let set: std::collections::BTreeSet<TenantId> = st
             .bindings
-            .keys()
-            .map(|(t, _)| *t)
+            .values()
+            .filter(|b| b.is_active())
+            .map(|b| b.tenant_id)
             .filter(|t| after.is_none_or(|a| *t > a))
             .collect();
         Ok(set.into_iter().take(limit as usize).collect())
@@ -964,6 +990,7 @@ impl AppStore for MemoryAppStore {
         tenant: TenantId,
         authz: &dyn crate::authz::Authz,
         app: NodeId,
+        limit: u32,
     ) -> Result<usize> {
         use crate::authz::RelationshipUpdate;
         let gone: Vec<BindingRow> = {
@@ -971,10 +998,12 @@ impl AppStore for MemoryAppStore {
             st.bindings
                 .values()
                 .filter(|b| b.tenant_id == tenant && b.app_node_id == app)
+                .take(limit as usize)
                 .cloned()
                 .collect()
         };
         let mut deletes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for b in &gone {
             let tuples = super::super::bindings::principal_tuples(tenant, app, b.principal_id)
                 .into_iter()
@@ -984,9 +1013,8 @@ impl AppStore for MemoryAppStore {
                         .flatten(),
                 );
             for t in tuples {
-                let u = RelationshipUpdate::Delete(t);
-                if !deletes.contains(&u) {
-                    deletes.push(u);
+                if seen.insert(t.clone()) {
+                    deletes.push(RelationshipUpdate::Delete(t));
                 }
             }
         }
