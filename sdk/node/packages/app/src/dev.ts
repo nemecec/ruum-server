@@ -9,6 +9,8 @@
  *   file mode 0600. Nothing in it is meant to be committed.
  * - It never follows a symbolic link at the dev folder or at its files: a checkout could plant
  *   `.ruum-dev/key.pem -> ../key.pem` and so put the key (or overwrite a file) outside the folder.
+ *   Limit: Node has no `openat`, so a process that swaps the folder for a link while `initDev`
+ *   runs is not stopped (backlog S-77); such a process can already change the code that runs.
  *
  * The token format is the gateway's (`crates/ruum-gateway/src/token.rs`): the header
  * `{"typ":"JWT","alg":"EdDSA","kid":<RFC 7638 thumbprint>}` and the claims in the gateway's order.
@@ -156,8 +158,19 @@ export function devFiles(dir: string = DEV_DIR): DevFiles {
   return { dir: d, keyFile: join(d, "key.pem"), jwksFile: join(d, "jwks.json") };
 }
 
-// O_NOFOLLOW is 0 where the platform has none (Windows); the lstat checks still hold there.
-const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+// O_NOFOLLOW is 0 where the platform has none (Windows): there only the lstat check in openPlain
+// refuses a link (Kimi re-check of O-5, run 13: loadDevKey had no lstat and followed a key link).
+let NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+
+/**
+ * For tests only: sets the no-follow open flag, so a test on macOS or Linux can run the path of a
+ * platform without `O_NOFOLLOW` (Windows). Returns the flag before. Not part of the SDK's API.
+ */
+export function setNoFollowForTests(flag: number): number {
+  const before = NOFOLLOW;
+  NOFOLLOW = flag;
+  return before;
+}
 
 /** lstat, or undefined when nothing is at `path`. */
 function lstatOrNone(path: string): Stats | undefined {
@@ -178,6 +191,9 @@ function refuseLink(path: string): never {
  * file. Kimi review of O-5 (run 13), finding 2.
  */
 function openPlain(path: string, flags: number, mode?: number): number {
+  // Every open checks first: without O_NOFOLLOW (Windows) this is what refuses a link.
+  const st = lstatOrNone(path);
+  if (st && !st.isFile()) refuseLink(path);
   let fd: number;
   try {
     fd = openSync(path, flags | NOFOLLOW, mode);
@@ -196,8 +212,6 @@ function openPlain(path: string, flags: number, mode?: number): number {
 
 /** Writes `data` to the plain file `path` (made when missing), never through a symbolic link. */
 function writePlain(path: string, data: string, mode = 0o666): void {
-  const st = lstatOrNone(path);
-  if (st && !st.isFile()) refuseLink(path);
   const fd = openPlain(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, mode);
   try {
     writeFileSync(fd, data);
