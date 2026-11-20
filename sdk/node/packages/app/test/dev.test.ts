@@ -14,6 +14,7 @@ import {
   jwksOf,
   loadDevKey,
   mintDevToken,
+  setNoFollowForTests,
   privateKeyFromSeed,
   publicJwk,
   signToken,
@@ -301,6 +302,43 @@ test("dev mode never follows a symbolic link at the dev folder or its files", ()
     for (const p of [f.keyFile, f.jwksFile, join(f.dir, ".gitignore")]) assert.ok(lstatSync(p).isFile(), p);
     assert.ok(mintDevToken({ audience: LIVE_A }, d6, DEV_ENV).split(".").length === 3);
   } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("without O_NOFOLLOW (Windows) a key link is still refused, also by loadDevKey and mintDevToken", () => {
+  // Kimi re-check of O-5 (run 13), finding 1: where O_NOFOLLOW is missing, loadDevKey opened the
+  // key without an lstat, so it followed .ruum-dev/key.pem to a valid key outside and signed with it.
+  const before = setNoFollowForTests(0);
+  const base = mkdtempSync(join(tmpdir(), "ruum-o5-nofollow-"));
+  try {
+    const outside = join(base, "outside");
+    mkdirSync(outside);
+    const outsideKey = join(outside, "other.pem");
+    const pem = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }) as string;
+    writeFileSync(outsideKey, pem, { mode: 0o644 });
+    const d = join(base, "app", ".ruum-dev");
+    mkdirSync(d, { recursive: true });
+    symlinkSync(outsideKey, join(d, "key.pem"));
+    assert.throws(() => loadDevKey(d), DevModeError);
+    assert.throws(() => mintDevToken({ audience: LIVE_A }, d, DEV_ENV), DevModeError);
+    assert.throws(() => initDev(d, DEV_ENV), DevModeError);
+    assert.equal(statSync(outsideKey).mode & 0o777, 0o644, "the outside key keeps its mode");
+    assert.equal(readFileSync(outsideKey, "utf8"), pem);
+    // .gitignore and jwks.json links are refused the same way.
+    const g = join(base, "app2", ".ruum-dev");
+    mkdirSync(g, { recursive: true });
+    const sentinel = join(outside, "sentinel.txt");
+    writeFileSync(sentinel, "keep\n");
+    symlinkSync(sentinel, join(g, ".gitignore"));
+    assert.throws(() => initDev(g, DEV_ENV), DevModeError);
+    assert.equal(readFileSync(sentinel, "utf8"), "keep\n");
+    // Control: a plain dev folder still works on this path.
+    const ok = join(base, "plain", ".ruum-dev");
+    initDev(ok, DEV_ENV);
+    assert.equal(mintDevToken({ audience: LIVE_A }, ok, DEV_ENV).split(".").length, 3);
+  } finally {
+    setNoFollowForTests(before);
     rmSync(base, { recursive: true, force: true });
   }
 });
