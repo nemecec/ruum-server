@@ -48,6 +48,11 @@
 //! - Any non-2xx answer of the Collector is a refusal of that signal's write (S-62).
 //! - A read returns at most [`MAX_READ`] records per signal; Tempo search is eventually
 //!   consistent (a trace is searchable after the ingester cuts it).
+//! - A read is bounded in memory (Kimi run 13 finding 2): a store answer is read as it arrives
+//!   and refused over [`MAX_ANSWER_BYTES`] (a Tempo trace over [`MAX_TRACE_BYTES`], whose
+//!   protobuf is walked before prost decodes it, as on the receiver: a trace over the bounds
+//!   is skipped and counted); Loki paging stops once the read has its `limit`, and the read
+//!   keeps at most `limit` records of a signal (the oldest) while it reads.
 
 use super::*;
 use crate::privacy::{HiddenValue, Pseudonym};
@@ -79,6 +84,13 @@ const LOKI_PAGE: usize = 5000;
 const LOKI_PAGES: usize = 20;
 /// The traces one Tempo search returns.
 const TEMPO_TRACES: usize = 1000;
+/// The largest store answer read (Loki, Mimir and Tempo search JSON).
+pub const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
+/// The largest Tempo trace answer read (Tempo's own `max_bytes_per_trace` is 5 MB by default).
+/// Its decoded size is bounded by [`otlp::check`] at [`otlp::DECODED_FACTOR`] times this.
+pub const MAX_TRACE_BYTES: usize = 8 * 1024 * 1024;
+/// The spans of one Tempo trace answer.
+const MAX_TRACE_SPANS: usize = 100_000;
 /// The spans per span set of a Tempo search (Tempo refuses more than 100).
 const TEMPO_SPANS_PER_SET: usize = 100;
 /// The resource attribute of the deployment and the environment (Loki: structured metadata
@@ -104,6 +116,9 @@ pub struct LgtmConfig {
 pub struct LgtmStore {
     cfg: LgtmConfig,
     http: reqwest::Client,
+    /// [`MAX_ANSWER_BYTES`] and [`MAX_TRACE_BYTES`]; smaller in tests.
+    answer_cap: usize,
+    trace_cap: usize,
 }
 
 /// The storage tenant header value: the tenant's UUID in canonical (lowercase, hyphenated)
@@ -315,6 +330,12 @@ struct WireLog {
     a: Vec<WireAttr>,
 }
 
+/// The Loki line of a stored log (tests of the read path on a fake Loki).
+#[cfg(test)]
+pub(crate) fn wire_log_line(r: &StoredLog) -> String {
+    serde_json::to_string(&WireLog::from_stored(r)).expect("a stored log serialises to JSON")
+}
+
 impl WireLog {
     fn from_stored(r: &StoredLog) -> Self {
         WireLog {
@@ -417,7 +438,39 @@ impl LgtmStore {
             .timeout(cfg.timeout)
             .build()
             .map_err(|_| store_error("cannot build the HTTP client"))?;
-        Ok(LgtmStore { cfg, http })
+        Ok(LgtmStore {
+            cfg,
+            http,
+            answer_cap: MAX_ANSWER_BYTES,
+            trace_cap: MAX_TRACE_BYTES,
+        })
+    }
+
+    /// Other caps of a store answer and of a Tempo trace answer (tests).
+    pub fn with_answer_caps(mut self, answer: usize, trace: usize) -> Self {
+        self.answer_cap = answer;
+        self.trace_cap = trace;
+        self
+    }
+
+    /// Reads an answer body as it arrives; with more than `cap` bytes it stops reading and
+    /// answers `None`.
+    async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Option<Vec<u8>>> {
+        if res.content_length().is_some_and(|n| n > cap as u64) {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        while let Some(chunk) = res
+            .chunk()
+            .await
+            .map_err(|_| store_error("a store answer was cut off"))?
+        {
+            if out.len() + chunk.len() > cap {
+                return Ok(None);
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(Some(out))
     }
 
     fn base(url: &str) -> &str {
@@ -468,10 +521,9 @@ impl LgtmStore {
                 status.as_u16()
             )));
         }
-        res.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|_| store_error("a store answer was cut off"))
+        Self::read_capped(res, self.answer_cap)
+            .await?
+            .ok_or_else(|| store_error("a store answer is larger than the read cap"))
     }
 
     fn logs_request(identity: &SourceIdentity, logs: &[StoredLog]) -> (Vec<u8>, usize) {
@@ -738,7 +790,14 @@ impl LgtmStore {
         }
     }
 
-    async fn read_logs(&self, tenant: TenantId, f: &TelemetryFilter) -> Result<Vec<StoredLog>> {
+    /// The `limit` oldest logs of the filter. Loki answers forward, oldest first, so the paging
+    /// stops once `limit` records are found.
+    async fn read_logs(
+        &self,
+        tenant: TenantId,
+        f: &TelemetryFilter,
+        limit: usize,
+    ) -> Result<Vec<StoredLog>> {
         let (from, to) = Self::range(f);
         let url = format!("{}/loki/api/v1/query_range", Self::base(&self.cfg.loki_url));
         let query = Self::logql(f);
@@ -783,7 +842,11 @@ impl LgtmStore {
                     }
                 }
             }
-            if n < LOKI_PAGE {
+            if out.len() > limit {
+                out.sort_by_key(|r| r.time);
+                out.truncate(limit);
+            }
+            if n < LOKI_PAGE || out.len() >= limit {
                 break;
             }
             start = last + 1;
@@ -858,14 +921,32 @@ impl LgtmStore {
         Ok(out)
     }
 
-    async fn read_spans(&self, tenant: TenantId, f: &TelemetryFilter) -> Result<Vec<StoredSpan>> {
+    /// The `limit` oldest spans of the filter (by start). Tempo search does not order its
+    /// traces by age, so every trace found is read, one at a time, and only the `limit`
+    /// oldest spans are kept between them.
+    async fn read_spans(
+        &self,
+        tenant: TenantId,
+        f: &TelemetryFilter,
+        limit: usize,
+    ) -> Result<Vec<StoredSpan>> {
         let (from, to) = Self::range(f);
         let ids = self.trace_ids(tenant, &Self::traceql(f), from, to).await?;
         let mut out = Vec::new();
         let mut dropped = 0u64;
+        let mut too_large = 0u64;
         for id in ids {
-            let Some(trace) = self.trace(tenant, &id).await? else {
-                continue;
+            if out.len() > limit {
+                out.sort_by_key(|r: &StoredSpan| r.start);
+                out.truncate(limit);
+            }
+            let trace = match self.trace(tenant, &id).await? {
+                Trace::Found(t) => t,
+                Trace::Missing => continue,
+                Trace::TooLarge => {
+                    too_large += 1;
+                    continue;
+                }
             };
             for rs in trace.resource_spans {
                 let attrs = rs.resource.map(|r| r.attributes).unwrap_or_default();
@@ -886,6 +967,9 @@ impl LgtmStore {
         }
         if dropped > 0 {
             tracing::warn!(tenant = %tenant, dropped, "telemetry store: Tempo returned spans that are not of the record encoding; they were dropped");
+        }
+        if too_large > 0 {
+            tracing::warn!(tenant = %tenant, traces = too_large, "telemetry store: Tempo traces over the read cap were skipped");
         }
         Ok(out)
     }
@@ -927,17 +1011,40 @@ impl LgtmStore {
     }
 
     /// One trace as OTLP (Tempo's protobuf answer: `tempopb.Trace`, whose field 1 is the
-    /// resource spans, as in `TracesData`). `None` when Tempo does not know it.
-    async fn trace(&self, tenant: TenantId, id: &str) -> Result<Option<otlp_trace::TracesData>> {
-        let Some(bytes) = self.trace_raw(tenant, id).await? else {
-            return Ok(None);
+    /// resource spans, as in `TracesData` and in the export request). The answer is read up to
+    /// the trace cap and walked like a received request ([`otlp::check`]) before prost decodes
+    /// it, so its decoded size is bounded too.
+    async fn trace(&self, tenant: TenantId, id: &str) -> Result<Trace> {
+        let raw = match self.trace_raw(tenant, id, self.trace_cap).await? {
+            Some(Some(raw)) => raw,
+            Some(None) => return Ok(Trace::TooLarge),
+            None => return Ok(Trace::Missing),
         };
-        otlp_trace::TracesData::decode(bytes.as_slice())
-            .map(Some)
+        let limits = Limits {
+            max_records: MAX_TRACE_SPANS,
+            max_batch_bytes: self.trace_cap,
+            ..Limits::default()
+        };
+        match otlp::check(Signal::Traces, &raw, &limits) {
+            Ok(_) => {}
+            Err(otlp::Refusal::BodyTooLarge | otlp::Refusal::TooManyRecords) => {
+                return Ok(Trace::TooLarge);
+            }
+            Err(_) => return Err(store_error("a Tempo trace answer")),
+        }
+        otlp_trace::TracesData::decode(raw.as_slice())
+            .map(Trace::Found)
             .map_err(|_| store_error("a Tempo trace answer"))
     }
 
-    async fn trace_raw(&self, tenant: TenantId, id: &str) -> Result<Option<Vec<u8>>> {
+    /// A trace answer: `None` when Tempo does not know it, `Some(None)` when it is larger than
+    /// `cap`.
+    async fn trace_raw(
+        &self,
+        tenant: TenantId,
+        id: &str,
+        cap: usize,
+    ) -> Result<Option<Option<Vec<u8>>>> {
         let url = format!("{}/api/traces/{id}", Self::base(&self.cfg.tempo_url));
         let res = self
             .http
@@ -949,11 +1056,7 @@ impl LgtmStore {
             .map_err(|_| store_error("Tempo cannot be reached"))?;
         match res.status().as_u16() {
             404 => Ok(None),
-            s if (200..300).contains(&s) => res
-                .bytes()
-                .await
-                .map(|b| Some(b.to_vec()))
-                .map_err(|_| store_error("a Tempo answer was cut off")),
+            s if (200..300).contains(&s) => Self::read_capped(res, cap).await.map(Some),
             s => Err(store_error(&format!(
                 "Tempo refused the read with status {s}"
             ))),
@@ -1002,9 +1105,16 @@ impl LgtmStore {
         out.extend_from_slice(&mimir);
         out.push(b'\n');
         for id in self.trace_ids(tenant, "{ }", from, to).await? {
-            if let Some(raw) = self.trace_raw(tenant, &id).await? {
-                out.extend_from_slice(&raw);
-                out.push(b'\n');
+            // The secret scan must see every trace: one over the cap fails the dump.
+            match self.trace_raw(tenant, &id, self.answer_cap).await? {
+                Some(Some(raw)) => {
+                    out.extend_from_slice(&raw);
+                    out.push(b'\n');
+                }
+                Some(None) => {
+                    return Err(store_error("a store answer is larger than the read cap"));
+                }
+                None => {}
             }
         }
         Ok(out)
@@ -1051,7 +1161,7 @@ impl TelemetryStore for LgtmStore {
             return Ok(out);
         }
         if want(Signal::Logs) {
-            let mut logs = self.read_logs(tenant, f).await?;
+            let mut logs = self.read_logs(tenant, f, limit).await?;
             logs.sort_by_key(|r| r.time);
             logs.truncate(limit);
             out.logs = logs;
@@ -1063,7 +1173,7 @@ impl TelemetryStore for LgtmStore {
             out.metrics = metrics;
         }
         if want(Signal::Traces) && f.min_severity.is_none() {
-            let mut spans = self.read_spans(tenant, f).await?;
+            let mut spans = self.read_spans(tenant, f, limit).await?;
             spans.sort_by_key(|r| r.start);
             spans.truncate(limit);
             out.spans = spans;
@@ -1073,6 +1183,15 @@ impl TelemetryStore for LgtmStore {
 }
 
 // ---------------------------------------------------------------------------- answers
+
+/// A Tempo trace answer.
+enum Trace {
+    Found(otlp_trace::TracesData),
+    /// Tempo does not know the trace.
+    Missing,
+    /// Over the trace cap or the span cap: skipped and counted.
+    TooLarge,
+}
 
 #[derive(Deserialize)]
 struct LokiAnswer {

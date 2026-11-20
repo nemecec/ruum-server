@@ -24,7 +24,10 @@
 //!    estimates the decoded size, `413` / `INVALID_ARGUMENT` over a cap. Then the byte rate of
 //!    the identity, and the decoded estimate is held in flight too (`429` /
 //!    `RESOURCE_EXHAUSTED` over the tenant's share).
-//! 5. **Decode and map** ([`otlp`]): malformed `400` / `INVALID_ARGUMENT`.
+//! 5. **Decode and map** ([`otlp`]): malformed `400` / `INVALID_ARGUMENT`. The bytes of the
+//!    mapped batch are held before the mapping allocates them (`429` / `RESOURCE_EXHAUSTED`
+//!    over the tenant's share); then the decoded estimate is given back, and the body and the
+//!    batch stay held.
 //! 6. **Ingest** with the authenticated identity ([`TelemetryIngest`]). The held bytes are
 //!    given back when the request ends.
 //!
@@ -325,9 +328,26 @@ impl Receiver {
             log_budget(identity, b, bytes + shape.decoded_bytes, shape.records);
             return Err(Refused::Budget(b));
         }
-        let mapped = checked
-            .decode(&self.limits)
-            .map_err(|e| Self::refuse_request(facts, identity, e))?;
+        // The mapped batch is held too, before the mapping allocates it (Kimi run 13 finding
+        // 1). Once mapped, the decoded message is gone: the permit keeps the body and the batch.
+        let mut not_held = None;
+        let decoded =
+            checked.decode_held(&self.limits, &mut |step| match lock(permit).grow(step) {
+                Ok(()) => true,
+                Err(b) => {
+                    not_held = Some(b);
+                    false
+                }
+            });
+        let mapped = match (decoded, not_held) {
+            (Err(Refusal::NotHeld), Some(b)) => {
+                let held = lock(permit).bytes();
+                log_budget(identity, b, held, shape.records);
+                return Err(Refused::Budget(b));
+            }
+            (r, _) => r.map_err(|e| Self::refuse_request(facts, identity, e))?,
+        };
+        lock(permit).shrink_to(bytes + mapped.bytes);
         let records = mapped.records;
         let otlp::Mapped { batch, dropped, .. } = mapped;
         let mut report = match self.ingest.ingest(identity, batch).await {
