@@ -973,13 +973,36 @@ impl AppStore for MemoryAppStore {
         Ok(set.into_iter().take(limit as usize).collect())
     }
 
+    async fn revoked_binding_targets(
+        &self,
+        tenant: TenantId,
+        after: Option<NodeId>,
+        limit: u32,
+    ) -> Result<Vec<NodeId>> {
+        let st = self.st();
+        let mut all_revoked: std::collections::BTreeMap<NodeId, bool> = Default::default();
+        for b in st
+            .bindings
+            .values()
+            .filter(|b| b.tenant_id == tenant && after.is_none_or(|a| b.target_node_id > a))
+        {
+            let e = all_revoked.entry(b.target_node_id).or_insert(true);
+            *e = *e && !b.is_active();
+        }
+        Ok(all_revoked
+            .into_iter()
+            .filter(|(_, revoked)| *revoked)
+            .map(|(t, _)| t)
+            .take(limit as usize)
+            .collect())
+    }
+
     async fn binding_tenants(&self, after: Option<TenantId>, limit: u32) -> Result<Vec<TenantId>> {
         let st = self.st();
         let set: std::collections::BTreeSet<TenantId> = st
             .bindings
-            .values()
-            .filter(|b| b.is_active())
-            .map(|b| b.tenant_id)
+            .keys()
+            .map(|(t, _)| *t)
             .filter(|t| after.is_none_or(|a| *t > a))
             .collect();
         Ok(set.into_iter().take(limit as usize).collect())

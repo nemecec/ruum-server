@@ -1802,3 +1802,52 @@ async fn the_purge_of_a_long_binding_history_deletes_everything() {
     assert!(!w.sees(last, w.docs).await);
     assert!(!w.sees(dep, w.docs).await);
 }
+
+/// Kimi re-check of the run 13 B-1 fixes: a target whose rows are all revoked is not in the
+/// main pass any more, so the slow pass of the repair round deletes a tuple left there.
+#[tokio::test]
+async fn the_repair_round_deletes_a_tuple_on_a_target_whose_rows_are_all_revoked() {
+    let w = world().await;
+    let old = folder(&w.s, &w.m(), w.projects, "Old").await;
+    let app = w.app_in(&w.m(), w.projects, "Gone app").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("old", old), w.projects)
+        .await;
+    let rows = w
+        .rows(BindingQuery {
+            target: Some(old),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(rows.len(), 1);
+    w.s.apps
+        .store()
+        .revoke_bindings(
+            &app_ctx(w.team.id, app),
+            &*w.s.authz,
+            &[rows[0].id],
+            RevokeReason::PreviewExpired,
+        )
+        .await
+        .unwrap();
+    assert!(!w.sees(dep, old).await);
+    // The tuple comes back (a crash, a stuck outbox, a manual write).
+    w.s.authz
+        .write(vec![RelationshipUpdate::Touch(
+            binding_tuple(&rows[0]).unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert!(w.sees(dep, old).await);
+    assert!(
+        !w.s.apps
+            .store()
+            .binding_targets(w.team.id, None, 1000)
+            .await
+            .unwrap()
+            .contains(&old),
+        "the main pass does not see the target"
+    );
+    w.s.apps.repair_bindings_round().await.unwrap();
+    assert!(!w.sees(dep, old).await, "the orphaned tuple stays");
+}

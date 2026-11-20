@@ -954,6 +954,13 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
     );
     assert_eq!(s.binding_targets(t, None, 10).await.unwrap(), vec![n]);
     assert!(s.binding_targets(t, Some(n), 10).await.unwrap().is_empty());
+    // One active row keeps a target out of the slow pass.
+    assert!(
+        s.revoked_binding_targets(t, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
     // The preview ends: its active row is listed as ended.
     assert!(
@@ -971,10 +978,20 @@ pub(crate) async fn bindings_rows_and_their_end(h: &dyn Harness) {
         .await
         .unwrap();
     assert!(!app_sees(&authz, p.id, n).await);
-    // A target and a tenant whose rows are all revoked leave the repair pass (Kimi run 13
-    // B-1, finding 3): the work of a round does not grow with the history.
+    // A target whose rows are all revoked leaves the main repair pass (Kimi run 13 B-1,
+    // finding 3) and is listed for the slow pass instead; its tenant stays listed.
     assert!(s.binding_targets(t, None, 10).await.unwrap().is_empty());
-    assert!(!s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
+    assert_eq!(
+        s.revoked_binding_targets(t, None, 10).await.unwrap(),
+        vec![n]
+    );
+    assert!(
+        s.revoked_binding_targets(t, Some(n), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(s.binding_tenants(None, 100_000).await.unwrap().contains(&t));
     // A grant to a deployment of nothing is refused.
     assert!(
         s.grant_bindings(&c, &authz, vec![new_binding(n, Uuid::now_v7(), "x", n)])
@@ -1061,6 +1078,12 @@ pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
         assert!(s.list_bindings(b, &q).await.unwrap().is_empty(), "{q:?}");
     }
     assert!(s.binding_targets(b, None, 10).await.unwrap().is_empty());
+    assert!(
+        s.revoked_binding_targets(b, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     s.set_deployment_state(a, p.id, DeploymentState::Expired)
         .await
         .unwrap();

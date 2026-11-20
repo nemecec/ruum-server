@@ -74,8 +74,9 @@
 //! The row is written before its tuple and revoked before its tuple goes; the Postgres store
 //! does both in one transaction with the outbox. The repair pass ([`AppService::repair_bindings`],
 //! run by the sweeper per tenant with a bound per round) visits the targets with an active row
-//! (a target whose rows are all revoked had its tuples deleted through the outbox of the
-//! revocation, so the work does not grow with the history). On each it reads every active row
+//! each round, and a slow pass visits a few targets whose rows are all revoked per round from a
+//! cursor of its own ([`AppService::repair_revoked_targets`]), so an orphaned tuple there goes
+//! too while the work of a round does not grow with the history. On each it reads every active row
 //! (page by page), deletes a binding tuple whose row is revoked or missing, writes a missing
 //! tuple of an active row, and ends the rows of ended previews, of gone targets, of apps in
 //! the trash whose trash hook did not run (a pod of the previous release took the delivery;
@@ -119,6 +120,9 @@ pub const REPAIR_TENANTS_PER_PAGE: u32 = 100;
 /// the same bound in every round, so no tenant waits for another; a tenant with more targets
 /// goes on from its cursor in the next round.
 pub const REPAIR_TARGETS_PER_TENANT: u32 = 200;
+/// How many targets whose rows are all revoked one round of the repair pass checks per
+/// tenant (the slow pass; it goes on from its cursor in the next round).
+pub const REPAIR_REVOKED_TARGETS_PER_TENANT: u32 = 10;
 /// The rows one query reads.
 const ROWS_PER_QUERY: u32 = 500;
 /// How many pages of ended rows one call revokes (a bound per call; the next round goes on).
@@ -1091,6 +1095,35 @@ impl AppService {
         Ok((fixed, next))
     }
 
+    /// The slow repair pass for one tenant: at most `budget` targets whose rows are all
+    /// revoked, after `after` (Kimi re-check of the run 13 B-1 fixes). Such a target has no
+    /// active row, so each binding tuple on it is an orphan (a crash, a stuck outbox, a
+    /// manual write) and goes, with the same three reads as the main pass. The work of a round
+    /// stays bounded however long the history is; the cursor goes round. Returns how many
+    /// fixes it made and the cursor of the next round (`None` at the end).
+    pub async fn repair_revoked_targets(
+        &self,
+        tenant: TenantId,
+        after: Option<NodeId>,
+        budget: u32,
+    ) -> Result<(usize, Option<NodeId>)> {
+        let targets = self
+            .deps()
+            .store
+            .revoked_binding_targets(tenant, after, budget)
+            .await?;
+        let mut fixed = 0;
+        for target in &targets {
+            fixed += self.repair_target(tenant, *target).await?;
+        }
+        let next = if targets.len() as u32 >= budget {
+            targets.last().copied()
+        } else {
+            None
+        };
+        Ok((fixed, next))
+    }
+
     async fn repair_target(&self, tenant: TenantId, target: NodeId) -> Result<usize> {
         self.repair_target_with(tenant, target, &|_| Box::pin(async {}))
             .await
@@ -1278,7 +1311,9 @@ impl AppService {
     }
 
     /// One round of the repair pass over every tenant with bindings (the sweeper): each tenant
-    /// gets [`REPAIR_TARGETS_PER_TENANT`] targets and goes on from its cursor next round.
+    /// gets [`REPAIR_TARGETS_PER_TENANT`] targets with an active row and
+    /// [`REPAIR_REVOKED_TARGETS_PER_TENANT`] targets whose rows are all revoked, and goes on
+    /// from its two cursors next round.
     pub async fn repair_bindings_round(&self) -> Result<usize> {
         let mut after = None;
         let mut fixed = 0;
@@ -1304,6 +1339,24 @@ impl AppService {
                     }
                     Err(e) => {
                         tracing::warn!(tenant = %t, error = %e, "the binding repair failed");
+                    }
+                }
+                let cursor = revoked_cursors().get(t).copied();
+                match self
+                    .repair_revoked_targets(*t, cursor, REPAIR_REVOKED_TARGETS_PER_TENANT)
+                    .await
+                {
+                    Ok((n, next)) => {
+                        fixed += n;
+                        let mut c = revoked_cursors();
+                        match next {
+                            Some(n) => c.insert(*t, n),
+                            None => c.remove(t),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::warn!(tenant = %t, error = %e,
+                            "the binding repair of revoked targets failed");
                     }
                 }
             }
@@ -1365,6 +1418,17 @@ pub fn repair_updates(
 
 /// The cursors of the repair pass, per tenant (this process).
 fn repair_cursors() -> std::sync::MutexGuard<'static, std::collections::HashMap<TenantId, NodeId>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<TenantId, NodeId>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The cursors of the slow repair pass over targets whose rows are all revoked, per tenant
+/// (this process).
+fn revoked_cursors() -> std::sync::MutexGuard<'static, std::collections::HashMap<TenantId, NodeId>>
+{
     static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<TenantId, NodeId>>> =
         std::sync::OnceLock::new();
     C.get_or_init(Default::default)
