@@ -20,6 +20,11 @@
 #                                                  ops/tunnel-setup.sh, then the rest)
 #                                       bootstrap  the plan creates the bootstrap (stg-1's Kubernetes
 #                                                  API starts only after it)
+#                                       setup      the plan creates the machine config of a node whose
+#                                                  server exists (a new node whose create stopped after
+#                                                  phase 1): ops/tunnel-setup.sh first, because the
+#                                                  ruumtunnel key line may still lack its address
+#                                                  (Kimi review of run 13)
 #                                       tunnel     the plan changes Talos resources of running nodes
 #                                       none       no Talos resource is created or changed
 #   talos-access.sh check PHASE PLAN    PHASE servers: the plan touches no Talos resource.
@@ -72,6 +77,7 @@ case "${1:-}" in
     jq -r "($TOUCHED) as \$t
       | if any(.resource_changes[]?; .mode == \"managed\" and .type == \"hcloud_server\" and ((.change.actions | index(\"create\")) != null)) then \"create\"
         elif any(.resource_changes[]?; .mode == \"managed\" and .type == \"talos_machine_bootstrap\" and ((.change.actions | index(\"create\")) != null)) then \"bootstrap\"
+        elif any(.resource_changes[]?; .mode == \"managed\" and .type == \"talos_machine_configuration_apply\" and .change.actions == [\"create\"]) then \"setup\"
         elif (\$t | length) > 0 then \"tunnel\"
         else \"none\" end" "$2"
     ;;
