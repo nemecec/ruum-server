@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import { generateKeyPairSync } from "node:crypto";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, symlinkSync, writeFileSync, lstatSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, symlinkSync, writeFileSync, lstatSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import {
   jwksOf,
   loadDevKey,
   mintDevToken,
+  setBeforeOpenForTests,
   setNoFollowForTests,
   privateKeyFromSeed,
   publicJwk,
@@ -338,6 +339,78 @@ test("without O_NOFOLLOW (Windows) a key link is still refused, also by loadDevK
     initDev(ok, DEV_ENV);
     assert.equal(mintDevToken({ audience: LIVE_A }, ok, DEV_ENV).split(".").length, 3);
   } finally {
+    setNoFollowForTests(before);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("without O_NOFOLLOW (Windows) a link swapped in between the check and the open is refused", () => {
+  // Kimi re-check of O-5 (run 13, on e268413): the lstat came before the open, so a process that
+  // put a link at the path in between made the open follow it (and O_TRUNC cut the target).
+  // openPlain now compares the file identity before and after the open, makes new files with
+  // O_EXCL and truncates only after the check.
+  const before = setNoFollowForTests(0);
+  const base = mkdtempSync(join(tmpdir(), "ruum-o5-swap-"));
+  try {
+    const outside = join(base, "outside");
+    mkdirSync(outside);
+    const sentinel = join(outside, "sentinel.txt");
+    writeFileSync(sentinel, "keep\n");
+    const outsideKey = join(outside, "other.pem");
+    const pem = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }) as string;
+    writeFileSync(outsideKey, pem);
+    const swapAt = (name: string, target: string) => (path: string) => {
+      if (path.endsWith(name)) {
+        try {
+          unlinkSync(path);
+        } catch {
+          // the file was missing: the link takes its place
+        }
+        symlinkSync(target, path);
+      }
+    };
+
+    // 1. key.pem is a plain file at the check, a link to a valid outside key at the open.
+    const d1 = join(base, "a", ".ruum-dev");
+    initDev(d1, DEV_ENV);
+    setBeforeOpenForTests(swapAt("key.pem", outsideKey));
+    assert.throws(() => loadDevKey(d1), DevModeError);
+    setBeforeOpenForTests(undefined);
+    assert.ok(lstatSync(join(d1, "key.pem")).isSymbolicLink(), "the swap happened");
+
+    // 2. .gitignore swapped for a link to an outside file: the file is neither cut nor written.
+    const d2 = join(base, "b", ".ruum-dev");
+    initDev(d2, DEV_ENV);
+    setBeforeOpenForTests(swapAt(".gitignore", sentinel));
+    assert.throws(() => initDev(d2, DEV_ENV), DevModeError);
+    setBeforeOpenForTests(undefined);
+    assert.equal(readFileSync(sentinel, "utf8"), "keep\n", "the outside file is unchanged");
+
+    // 3. jwks.json missing at the check, a link at the open: O_EXCL refuses it.
+    const d3 = join(base, "c", ".ruum-dev");
+    initDev(d3, DEV_ENV);
+    unlinkSync(join(d3, "jwks.json"));
+    setBeforeOpenForTests(swapAt("jwks.json", sentinel));
+    assert.throws(() => initDev(d3, DEV_ENV), DevModeError);
+    setBeforeOpenForTests(undefined);
+    assert.equal(readFileSync(sentinel, "utf8"), "keep\n", "the outside file is unchanged");
+
+    // 4. A new key: a link that appears at its path is refused (O_EXCL).
+    const outsideNew = join(outside, "new.pem");
+    const d4 = join(base, "d", ".ruum-dev");
+    setBeforeOpenForTests(swapAt("key.pem", outsideNew));
+    assert.throws(() => initDev(d4, DEV_ENV), DevModeError);
+    setBeforeOpenForTests(undefined);
+    assert.equal(existsSync(outsideNew), false, "no key was made outside the dev folder");
+
+    // Control: with the hook calling nothing harmful, the same path works.
+    const d5 = join(base, "e", ".ruum-dev");
+    setBeforeOpenForTests(() => {});
+    initDev(d5, DEV_ENV);
+    initDev(d5, DEV_ENV);
+    assert.equal(mintDevToken({ audience: LIVE_A }, d5, DEV_ENV).split(".").length, 3);
+  } finally {
+    setBeforeOpenForTests(undefined);
     setNoFollowForTests(before);
     rmSync(base, { recursive: true, force: true });
   }

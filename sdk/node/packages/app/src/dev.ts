@@ -17,7 +17,7 @@
  */
 
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, sign, type KeyObject } from "node:crypto";
-import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, writeFileSync, type Stats } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, writeFileSync, type BigIntStats } from "node:fs";
 import { join, resolve } from "node:path";
 import { DEV_KEY_MARK, isDevIssuer, type Jwks } from "./keys.js";
 import { MAX_LIFETIME_SECONDS } from "./verify.js";
@@ -158,9 +158,12 @@ export function devFiles(dir: string = DEV_DIR): DevFiles {
   return { dir: d, keyFile: join(d, "key.pem"), jwksFile: join(d, "jwks.json") };
 }
 
-// O_NOFOLLOW is 0 where the platform has none (Windows): there only the lstat check in openPlain
-// refuses a link (Kimi re-check of O-5, run 13: loadDevKey had no lstat and followed a key link).
+// O_NOFOLLOW is 0 where the platform has none (Windows). There openPlain refuses a link by its
+// lstat check before the open and by comparing the file identity (dev, ino) after it (Kimi
+// re-checks of O-5, run 13: loadDevKey followed a key link; a link swapped in between the check
+// and the open was followed).
 let NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+let beforeOpen: ((path: string) => void) | undefined;
 
 /**
  * For tests only: sets the no-follow open flag, so a test on macOS or Linux can run the path of a
@@ -172,10 +175,18 @@ export function setNoFollowForTests(flag: number): number {
   return before;
 }
 
+/**
+ * For tests only: a function called between the check of a dev file and its open, so a test can
+ * swap the file for a link at that moment. `undefined` removes it. Not part of the SDK's API.
+ */
+export function setBeforeOpenForTests(fn: ((path: string) => void) | undefined): void {
+  beforeOpen = fn;
+}
+
 /** lstat, or undefined when nothing is at `path`. */
-function lstatOrNone(path: string): Stats | undefined {
+function lstatOrNone(path: string): BigIntStats | undefined {
   try {
-    return lstatSync(path);
+    return lstatSync(path, { bigint: true });
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw e;
@@ -187,23 +198,30 @@ function refuseLink(path: string): never {
 }
 
 /**
- * Opens `path` without following a symbolic link at its last part, and checks that it is a plain
- * file. Kimi review of O-5 (run 13), finding 2.
+ * Opens the plain file `path` and never follows a symbolic link at its last part, also without
+ * O_NOFOLLOW: an existing file must be the same file (dev, ino) before and after the open, and a
+ * missing file is made with O_EXCL (which never follows a link). `create`: `false` opens only an
+ * existing file, `true` also makes a missing one, `"only"` makes a new file and refuses an existing one. The caller truncates through the descriptor, never with O_TRUNC, so nothing is cut before
+ * the check. Kimi review of O-5 (run 13), finding 2, and its re-checks.
  */
-function openPlain(path: string, flags: number, mode?: number): number {
-  // Every open checks first: without O_NOFOLLOW (Windows) this is what refuses a link.
+function openPlain(path: string, flags: number, create: boolean | "only" = false, mode?: number): number {
   const st = lstatOrNone(path);
-  if (st && !st.isFile()) refuseLink(path);
+  if (st && (!st.isFile() || create === "only")) refuseLink(path);
+  const made = !st && create !== false;
+  const open = flags | NOFOLLOW | (made ? constants.O_CREAT | constants.O_EXCL : 0);
+  beforeOpen?.(path);
   let fd: number;
   try {
-    fd = openSync(path, flags | NOFOLLOW, mode);
+    fd = openSync(path, open, mode);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
-    // ELOOP: a symbolic link (O_NOFOLLOW). EEXIST: something appeared at a new key's path.
+    // ELOOP: a symbolic link (O_NOFOLLOW). EEXIST: something appeared at the path of a new file.
     if (code === "ELOOP" || code === "EMLINK" || code === "EEXIST") refuseLink(path);
     throw e;
   }
-  if (!fstatSync(fd).isFile()) {
+  const after = fstatSync(fd, { bigint: true });
+  const same = made || (st !== undefined && after.dev === st.dev && after.ino === st.ino);
+  if (!after.isFile() || !same) {
     closeSync(fd);
     refuseLink(path);
   }
@@ -212,8 +230,9 @@ function openPlain(path: string, flags: number, mode?: number): number {
 
 /** Writes `data` to the plain file `path` (made when missing), never through a symbolic link. */
 function writePlain(path: string, data: string, mode = 0o666): void {
-  const fd = openPlain(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, mode);
+  const fd = openPlain(path, constants.O_WRONLY, true, mode);
   try {
+    ftruncateSync(fd, 0);
     writeFileSync(fd, data);
   } finally {
     closeSync(fd);
@@ -242,7 +261,7 @@ export function initDev(dir: string = DEV_DIR, env: NodeJS.ProcessEnv = process.
   if (!k) {
     const { privateKey } = generateKeyPairSync("ed25519");
     // O_EXCL: a new key never goes through something that appeared at the path.
-    const fd = openPlain(f.keyFile, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    const fd = openPlain(f.keyFile, constants.O_WRONLY, "only", 0o600);
     try {
       writeFileSync(fd, privateKey.export({ format: "pem", type: "pkcs8" }));
       fchmodSync(fd, 0o600);
