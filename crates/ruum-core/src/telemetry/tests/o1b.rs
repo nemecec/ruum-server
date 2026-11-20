@@ -1989,6 +1989,61 @@ async fn loki_paging_stops_at_the_limit() {
     );
 }
 
+/// Kimi run 13 re-check: a Mimir answer is read whole (up to the cap), but its points are
+/// kept as (time, value, series) and cut to the `limit` oldest as they come, so the name and
+/// labels are not cloned for every point; the result is still the `limit` oldest.
+#[tokio::test]
+async fn mimir_points_are_cut_to_the_limit_while_reading() {
+    let f = Fixture::new();
+    let a = identity(Environment::Live);
+    f.ingest
+        .ingest(
+            &a,
+            Batch {
+                metrics: vec![MetricPoint {
+                    time: crate::now(),
+                    name: "requests".into(),
+                    kind: MetricKind::Counter,
+                    value: 1.0,
+                    labels: vec![Attribute::new("route", "x".repeat(1500))],
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let stored = f
+        .store
+        .read(a.tenant, &TelemetryFilter::app(a.app))
+        .await
+        .unwrap()
+        .metrics
+        .remove(0);
+    let labels = crate::telemetry::lgtm::mimir_series_labels(&stored);
+    let base = (stored.time.unix_timestamp_nanos() / 1_000_000) as f64 / 1000.0 - 3600.0;
+    let n = 100_000usize;
+    // Newest first, so the oldest come last.
+    let values: Vec<serde_json::Value> = (0..n)
+        .rev()
+        .map(|i| serde_json::json!([base + i as f64 * 0.01, i.to_string()]))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "status": "success",
+        "data": {"resultType": "matrix", "result": [{"metric": labels, "values": values}]}
+    }))
+    .unwrap();
+    let (got, peak) = crate::telemetry::lgtm::select_mimir_answer(
+        &body,
+        a.tenant,
+        &TelemetryFilter::app(a.app),
+        3,
+    );
+    let vals: Vec<f64> = got.iter().map(|m| m.value).collect();
+    assert_eq!(vals, vec![0.0, 1.0, 2.0], "the 3 oldest points");
+    assert!(got.iter().all(|m| m.labels == stored.labels));
+    assert!(peak <= 1024, "{peak} points held at once for a limit of 3");
+}
+
 /// Ingest that waits until the stores show what it stored (the stores are eventually
 /// consistent; Tempo search sees a trace after the ingester cuts it).
 struct WaitingIngest {

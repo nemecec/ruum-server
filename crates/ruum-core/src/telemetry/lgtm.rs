@@ -857,10 +857,15 @@ impl LgtmStore {
         Ok(out)
     }
 
+    /// The `limit` oldest points of the filter. Every part of a match but the time is the
+    /// series', so a series is checked once; points are kept as (time, value, series) and the
+    /// name and labels are cloned only for the `limit` points returned (Kimi run 13 re-check:
+    /// the answer is capped, but cloning the labels for every point was not).
     async fn read_metrics(
         &self,
         tenant: TenantId,
         f: &TelemetryFilter,
+        limit: usize,
     ) -> Result<Vec<StoredMetric>> {
         let (from, to) = Self::range(f);
         let range_ms = ((to - from).whole_milliseconds() as i64).max(1);
@@ -883,38 +888,7 @@ impl LgtmStore {
             .await?;
         let ans: PromAnswer =
             serde_json::from_slice(&body).map_err(|_| store_error("a Mimir answer"))?;
-        let mut out = Vec::new();
-        let mut dropped = 0u64;
-        for series in ans.data.result {
-            let Some(head) = metric_head(&series.metric) else {
-                dropped += 1;
-                continue;
-            };
-            for (t, v) in series.values {
-                let ms = (t * 1000.0).round() as i128;
-                let Ok(time) = OffsetDateTime::from_unix_timestamp_nanos(ms * 1_000_000) else {
-                    continue;
-                };
-                let Ok(value) = v.parse::<f64>() else {
-                    continue;
-                };
-                let source = SourceIdentity {
-                    tenant,
-                    ..head.source
-                };
-                let r = StoredMetric {
-                    source,
-                    time,
-                    name: head.name.clone(),
-                    kind: head.kind,
-                    value,
-                    labels: head.labels.clone(),
-                };
-                if metric_matches(&r, tenant, f) {
-                    out.push(r);
-                }
-            }
-        }
+        let (out, dropped, _) = select_metrics(ans, tenant, f, limit);
         if dropped > 0 {
             tracing::warn!(tenant = %tenant, dropped, "telemetry store: Mimir returned series that are not of the record encoding; they were dropped");
         }
@@ -1167,7 +1141,7 @@ impl TelemetryStore for LgtmStore {
             out.logs = logs;
         }
         if want(Signal::Metrics) && f.min_severity.is_none() {
-            let mut metrics = self.read_metrics(tenant, f).await?;
+            let mut metrics = self.read_metrics(tenant, f, limit).await?;
             metrics.sort_by_key(|r| r.time);
             metrics.truncate(limit);
             out.metrics = metrics;
@@ -1258,6 +1232,118 @@ struct MetricHead {
     name: String,
     kind: MetricKind,
     labels: Vec<StoredAttribute>,
+}
+
+/// The `limit` oldest points of a Mimir answer, the series dropped as not of the record
+/// encoding, and the most points held at once (at most `max(2 * limit, 1024)`). See
+/// [`LgtmStore::read_metrics`].
+fn select_metrics(
+    ans: PromAnswer,
+    tenant: TenantId,
+    f: &TelemetryFilter,
+    limit: usize,
+) -> (Vec<StoredMetric>, u64, usize) {
+    let mut heads: Vec<MetricHead> = Vec::new();
+    // (time, value, index in `heads`); cut to the `limit` oldest at `max(2 * limit, 1024)`.
+    let mut points: Vec<(OffsetDateTime, f64, usize)> = Vec::new();
+    let mut dropped = 0u64;
+    let mut peak = 0usize;
+    for series in ans.data.result {
+        let Some(head) = metric_head(&series.metric) else {
+            dropped += 1;
+            continue;
+        };
+        let head = MetricHead {
+            source: SourceIdentity {
+                tenant,
+                ..head.source
+            },
+            ..head
+        };
+        let series_ok = source_ok(&head.source, tenant, f)
+            && identity_agrees(&head.labels, &head.source)
+            && fields_ok(f, &[&head.labels]);
+        if !series_ok {
+            continue;
+        }
+        let at = heads.len();
+        for (t, v) in series.values {
+            let ms = (t * 1000.0).round() as i128;
+            let Ok(time) = OffsetDateTime::from_unix_timestamp_nanos(ms * 1_000_000) else {
+                continue;
+            };
+            let Ok(value) = v.parse::<f64>() else {
+                continue;
+            };
+            if time_ok(time, f) {
+                points.push((time, value, at));
+            }
+            peak = peak.max(points.len());
+            if points.len() >= limit.saturating_mul(2).max(1024) {
+                points.sort_by_key(|p| p.0);
+                points.truncate(limit);
+            }
+        }
+        heads.push(head);
+    }
+    points.sort_by_key(|p| p.0);
+    points.truncate(limit);
+    let out: Vec<StoredMetric> = points
+        .into_iter()
+        .map(|(time, value, i)| {
+            let h = &heads[i];
+            StoredMetric {
+                source: h.source,
+                time,
+                name: h.name.clone(),
+                kind: h.kind,
+                value,
+                labels: h.labels.clone(),
+            }
+        })
+        // The whole check again on what is returned (the series check above is the same
+        // without the time).
+        .filter(|r| metric_matches(r, tenant, f))
+        .collect();
+    (out, dropped, peak)
+}
+
+/// [`select_metrics`] on a raw Mimir answer (tests).
+#[cfg(test)]
+pub(crate) fn select_mimir_answer(
+    body: &[u8],
+    tenant: TenantId,
+    f: &TelemetryFilter,
+    limit: usize,
+) -> (Vec<StoredMetric>, usize) {
+    let ans: PromAnswer = serde_json::from_slice(body).expect("a Mimir answer");
+    let (out, _, peak) = select_metrics(ans, tenant, f, limit);
+    (out, peak)
+}
+
+/// The Mimir series labels of a stored metric, as [`LgtmStore`] writes them (tests).
+#[cfg(test)]
+pub(crate) fn mimir_series_labels(m: &StoredMetric) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "ruum_app".to_owned(),
+            m.source.app.as_uuid().hyphenated().to_string(),
+        ),
+        (
+            "ruum_deployment".to_owned(),
+            m.source.deployment.hyphenated().to_string(),
+        ),
+        (
+            "ruum_environment".to_owned(),
+            m.source.environment.as_str().to_owned(),
+        ),
+        ("ruum_kind".to_owned(), metric_kind_name(m.kind).to_owned()),
+        ("ruum_name".to_owned(), m.name.clone()),
+        (
+            "ruum_labels".to_owned(),
+            serde_json::to_string(&wire_attrs(&m.labels)).expect("labels serialise"),
+        ),
+    ])
 }
 
 fn metric_head(m: &HashMap<String, String>) -> Option<MetricHead> {
