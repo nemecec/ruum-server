@@ -771,8 +771,22 @@ impl AppService {
                 && !self.live_bindings_complete(ctx.tenant, app, m).await?
             {
                 let _switch = self.lock_live_switch(ctx.tenant, app).await?;
-                let planned = self.check_publish_bindings(ctx, app, dep.id, m).await?;
-                self.sync_live_bindings(ctx, app, dep.id, &planned).await?;
+                // A release that ran while this one waited (Kimi re-check of the run 13 B-1
+                // fixes): this deployment is no longer live, and syncing its manifest would
+                // grant again what the newer release dropped.
+                let current = self
+                    .deps
+                    .store
+                    .get_app(ctx.tenant, app)
+                    .await?
+                    .ok_or_else(|| Error::not_found("app"))?;
+                if current.live_deployment_id != Some(dep.id) {
+                    return Err(store::live_changed());
+                }
+                if !self.live_bindings_complete(ctx.tenant, app, m).await? {
+                    let planned = self.check_publish_bindings(ctx, app, dep.id, m).await?;
+                    self.sync_live_bindings(ctx, app, dep.id, &planned).await?;
+                }
             }
             return Ok(Published::Live(Box::new(deployment_view(
                 &dep, &urls, true,

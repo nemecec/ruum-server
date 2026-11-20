@@ -1634,6 +1634,178 @@ async fn a_stale_live_grant_ends_by_a_republish_and_by_the_repair() {
     );
 }
 
+/// Kimi re-check of the run 13 B-1 fixes, finding 1: a person's publish of the live
+/// deployment L1 (incomplete after its row ended) waits for the live switch while another
+/// person's release of L2 drops the binding. Once it holds the switch, L1 is no longer live:
+/// it answers 409 and grants nothing, so L2's dropped grant does not come back. The tokio
+/// lock is fair, so the release (queued first) runs before the republish.
+#[tokio::test]
+async fn a_republish_that_waited_for_a_newer_release_grants_nothing() {
+    let w = world().await;
+    let app = w.app_in(&w.m(), w.projects, "Planner").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+        .await;
+    let l1 = w.publish(&w.m(), app, dep).await;
+    let rows = w
+        .rows(BindingQuery {
+            principal: Some(app.0),
+            active_only: true,
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(rows.len(), 1);
+    // The row ends (as after a restore of the app): L1 is incomplete now.
+    w.s.apps
+        .store()
+        .revoke_bindings(
+            &app_ctx(w.team.id, app),
+            &*w.s.authz,
+            &[rows[0].id],
+            RevokeReason::AppTrashed,
+        )
+        .await
+        .unwrap();
+    assert!(!w.sees(app.0, w.docs).await);
+    let plain = w.ready(&w.o(), app, "runtime: static\n", w.projects).await;
+    let held = w.s.apps.lock_live_switch(w.team.id, app).await.unwrap();
+    let release = {
+        let (apps, c) = (w.s.apps.clone(), w.o());
+        tokio::spawn(async move {
+            apps.publish_deployment(
+                &c,
+                app,
+                plain,
+                PublishDeployment::default(),
+                "https://ruum.test",
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let republish = {
+        let (apps, c) = (w.s.apps.clone(), w.m());
+        tokio::spawn(async move {
+            apps.publish_deployment(
+                &c,
+                app,
+                l1,
+                PublishDeployment::default(),
+                "https://ruum.test",
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !release.is_finished() && !republish.is_finished(),
+        "both wait for the switch"
+    );
+    drop(held);
+    let l2 = match release.await.unwrap().unwrap() {
+        Published::Live(d) => d.id,
+        Published::ApprovalRequired(v) => panic!("an approval: {v}"),
+    };
+    let r = republish.await.unwrap();
+    assert!(
+        r.is_err(),
+        "the republish of a deployment that is no longer live passed"
+    );
+    assert_eq!(live_of(&w, app).await, Some(l2));
+    assert!(
+        !w.sees(app.0, w.docs).await,
+        "the republish of L1 granted again what L2 dropped"
+    );
+    let active = w
+        .rows(BindingQuery {
+            principal: Some(app.0),
+            active_only: true,
+            ..Default::default()
+        })
+        .await;
+    assert!(active.is_empty(), "{active:?}");
+}
+
+/// Kimi re-check of the run 13 B-1 fixes, finding 2: the repair finds a live row that the
+/// live manifest (`papers`) does not plan (`docs`, left by a failed sync), and before it ends
+/// the row a rollback to the `docs` version keeps that row and ends `papers`. The repair ends
+/// stale rows under the live switch with the manifest read again, so the row the live
+/// manifest plans now stays, with its tuple.
+#[tokio::test]
+async fn the_repair_keeps_a_stale_row_that_a_rollback_adopted_meanwhile() {
+    let (w, store) = world_with_store().await;
+    let app = w.app_in(&w.m(), w.projects, "Planner").await;
+    let dep = w
+        .ready(&w.m(), app, &named_binding("docs", w.docs), w.projects)
+        .await;
+    let l1 = w.publish(&w.m(), app, dep).await;
+    let old = w
+        .rows(BindingQuery {
+            principal: Some(app.0),
+            active_only: true,
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(old.len(), 1);
+    let renamed = w
+        .ready(&w.m(), app, &named_binding("papers", w.docs), w.projects)
+        .await;
+    store.fail_revokes(RevokeReason::Dropped, 1);
+    w.publish(&w.m(), app, renamed).await;
+    assert!(
+        row(&w, old[0].id).await.is_active(),
+        "the fault did not hit"
+    );
+    // The rollback runs after the repair found `docs` unplanned, before it ends it.
+    let hook = {
+        let (apps, c) = (w.s.apps.clone(), w.m());
+        move |at: u8| {
+            let (apps, c) = (apps.clone(), c.clone());
+            Box::pin(async move {
+                if at == 0 {
+                    apps.publish_deployment(
+                        &c,
+                        app,
+                        l1,
+                        PublishDeployment::default(),
+                        "https://ruum.test",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }) as futures::future::BoxFuture<'static, ()>
+        }
+    };
+    w.s.apps
+        .repair_target_with(w.team.id, w.docs, &hook)
+        .await
+        .unwrap();
+    let docs = row(&w, old[0].id).await;
+    assert!(
+        docs.is_active(),
+        "the repair ended the row that the rolled back version plans: {docs:?}"
+    );
+    assert!(
+        w.sees(app.0, w.docs).await,
+        "the live version lost its grant"
+    );
+    assert!(
+        w.s.apps
+            .live_bindings_complete(w.team.id, app, &live_manifest(&w, app).await)
+            .await
+            .unwrap()
+    );
+}
+
+/// The manifest of the live deployment of `app`.
+async fn live_manifest(w: &World, app: NodeId) -> Value {
+    w.s.apps
+        .live_manifest_of(w.team.id, app)
+        .await
+        .unwrap()
+        .expect("a live manifest")
+}
+
 /// Kimi run 13 B-1, finding 2: a target with more active rows than one read returns. The
 /// repair reads them all, so a principal past the first page keeps its tuple; a planted
 /// tuple without a row still goes. When the target is gone, every row ends.

@@ -1196,7 +1196,8 @@ impl AppService {
 
     /// [`Self::repair_target`] with `between_reads`, a test seam for the race of a revocation:
     /// it runs with `1` after the first read of the rows (before the read of the tuples) and
-    /// with `2` after the second read of the rows (before the write).
+    /// with `2` after the second read of the rows (before the write); with `0` after live rows
+    /// that the live manifest does not plan were found (before they end, a release race).
     pub(crate) async fn repair_target_with(
         &self,
         tenant: TenantId,
@@ -1246,8 +1247,8 @@ impl AppService {
         // finding 1): they end now (`dropped`, the app as actor).
         let stale = self.unplanned_live_rows(tenant, &rows).await?;
         if !stale.is_empty() {
-            fixed +=
-                revoke_grouped(&*d.store, &*d.authz, tenant, &stale, RevokeReason::Dropped).await?;
+            between_reads(0).await;
+            fixed += self.end_unplanned_live_rows(tenant, &stale).await?;
             rows = self.active_on(tenant, target).await?;
         }
         between_reads(1).await;
@@ -1284,6 +1285,39 @@ impl AppService {
             }
         }
         Ok(fixed + n)
+    }
+
+    /// Ends the rows of `stale` (found by [`Self::unplanned_live_rows`] without a lock) that
+    /// are still active and still unplanned under the live switch of their app (Kimi re-check
+    /// of the run 13 B-1 fixes): a release that ran after they were found (a rollback whose
+    /// sync kept one of them) is seen here, so the repair never ends a row that the live
+    /// manifest plans now. Returns how many rows ended.
+    async fn end_unplanned_live_rows(
+        &self,
+        tenant: TenantId,
+        stale: &[BindingRow],
+    ) -> Result<usize> {
+        let d = self.deps();
+        let mut by_app: BTreeMap<NodeId, std::collections::HashSet<Uuid>> = BTreeMap::new();
+        for b in stale {
+            by_app.entry(b.app_node_id).or_default().insert(b.id);
+        }
+        let mut n = 0;
+        for (app, ids) in by_app {
+            let _switch = self.lock_live_switch(tenant, app).await?;
+            let current: Vec<BindingRow> = self
+                .active_live_rows(tenant, app)
+                .await?
+                .into_iter()
+                .filter(|b| ids.contains(&b.id))
+                .collect();
+            let still = self.unplanned_live_rows(tenant, &current).await?;
+            if !still.is_empty() {
+                n += revoke_grouped(&*d.store, &*d.authz, tenant, &still, RevokeReason::Dropped)
+                    .await?;
+            }
+        }
+        Ok(n)
     }
 
     /// The rows in `rows` of a live principal that the app's live manifest does not plan
