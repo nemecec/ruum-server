@@ -86,9 +86,9 @@ impl Default for BudgetConfig {
             requests_per_second: 20,
             bytes_per_second: 2 * 1024 * 1024,
             burst_seconds: 5,
-            // One request holds at most 8 MiB of body and 48 MiB of decoded estimate
-            // (`otlp::DECODED_FACTOR`), so one tenant's share (a quarter) fits one request of
-            // the largest kind.
+            // One request holds at most 8 MiB of body, 48 MiB of decoded estimate
+            // (`otlp::DECODED_FACTOR`) and 8 MiB of mapped batch (`Limits::max_batch_bytes`),
+            // so one tenant's share (a quarter, 64 MiB) fits one request of the largest kind.
             max_in_flight_bytes: 256 * 1024 * 1024,
             tenant_share: 4,
             max_identities: 10_000,
@@ -426,12 +426,20 @@ pub type InstanceList = Arc<dyn Fn() -> Vec<(TenantId, InstanceId)> + Send + Syn
 pub struct ShipperConfig {
     /// The lines read from one instance per tick (one batch).
     pub lines_per_instance: usize,
-    /// The lines read from all instances per tick; split evenly between the tenants that have
-    /// instances (fair share, S-61), so the memory of one tick is bounded. Within a tenant the
-    /// instances take turns: each tick starts at the first instance the last tick did not
-    /// reach, so a busy instance cannot starve the tenant's other instances.
+    /// The lines read from all instances per tick, a hard cap; split evenly between the
+    /// tenants that have instances (fair share, S-61), so the memory of one tick is bounded.
+    /// When there are more tenants than lines, each reached tenant gets one line and the
+    /// tenants take turns: the next tick starts at the first tenant this tick did not reach.
+    /// Within a tenant the instances take turns the same way, so a busy instance cannot starve
+    /// the tenant's other instances.
     pub lines_per_tick: usize,
-    /// The positions kept; positions of instances that are no longer listed go first.
+    /// The positions kept, a hard cap. Positions of instances that are no longer listed go
+    /// first. When the listed instances alone fill the cap, an instance without a position is
+    /// not read (its lines wait in the driver's buffer, [`ShipReport::skipped_instances`])
+    /// until a position is free, so no kept position is dropped and nothing is shipped twice.
+    /// Saved positions over the cap (the cap was lowered) are cut to the cap on load; an
+    /// instance whose position was cut is read from the start of its buffer again once it
+    /// gets a position, which repeats its buffered lines once.
     pub max_positions: usize,
     /// The time between ticks of [`LogShipper::run`].
     pub interval: Duration,
@@ -458,6 +466,28 @@ pub struct ShipReport {
     /// matcher, never by matching the redaction marker; S-60).
     pub secrets_redacted: u64,
     pub failed_batches: u64,
+    /// Listed instances that were not read because the positions are at
+    /// [`ShipperConfig::max_positions`].
+    pub skipped_instances: u64,
+    /// The positions could not be saved. The shipper ships nothing more until a save works
+    /// (each tick tries again first), so a restart repeats at most the batches of one
+    /// tenant's turn.
+    pub positions_unsaved: bool,
+}
+
+/// The positions and whether the last save of them failed.
+struct Positions {
+    map: HashMap<InstanceId, u64>,
+    unsaved: bool,
+}
+
+/// Where the next tick starts.
+#[derive(Default)]
+struct Turns {
+    /// Per tenant: the index (in the tenant's instance list) where the next tick starts.
+    instance: HashMap<TenantId, usize>,
+    /// The first tenant (in tenant order) of the next tick; `None` is the first tenant.
+    tenant: Option<TenantId>,
 }
 
 /// The driver log shipper. See the module docs.
@@ -466,14 +496,13 @@ pub struct LogShipper {
     instances: InstanceList,
     ingest: Arc<dyn TelemetryIngest>,
     store: Arc<dyn PositionStore>,
-    positions: tokio::sync::Mutex<HashMap<InstanceId, u64>>,
-    /// Per tenant: the index (in the tenant's instance list) where the next tick starts.
-    cursors: tokio::sync::Mutex<HashMap<TenantId, usize>>,
+    positions: tokio::sync::Mutex<Positions>,
+    turns: tokio::sync::Mutex<Turns>,
     cfg: ShipperConfig,
 }
 
 impl LogShipper {
-    /// Loads the saved positions.
+    /// Loads the saved positions, at most [`ShipperConfig::max_positions`] of them.
     pub async fn new(
         driver: Arc<dyn RuntimeDriver>,
         instances: InstanceList,
@@ -481,42 +510,104 @@ impl LogShipper {
         store: Arc<dyn PositionStore>,
         cfg: ShipperConfig,
     ) -> Result<Self> {
-        let positions = store.load().await?;
+        let mut map = store.load().await?;
+        if map.len() > cfg.max_positions {
+            let listed: std::collections::HashSet<InstanceId> =
+                (instances)().into_iter().map(|(_, i)| i).collect();
+            map.retain(|i, _| listed.contains(i));
+        }
+        if map.len() > cfg.max_positions {
+            let cut = map.len() - cfg.max_positions;
+            let drop: Vec<InstanceId> = map.keys().take(cut).copied().collect();
+            for i in drop {
+                map.remove(&i);
+            }
+            tracing::warn!(
+                cut,
+                kept = map.len(),
+                "telemetry shipper: more saved positions than max_positions; the rest were cut"
+            );
+        }
         Ok(LogShipper {
             driver,
             instances,
             ingest,
             store,
-            positions: tokio::sync::Mutex::new(positions),
-            cursors: tokio::sync::Mutex::new(HashMap::new()),
+            positions: tokio::sync::Mutex::new(Positions {
+                map,
+                unsaved: false,
+            }),
+            turns: tokio::sync::Mutex::new(Turns::default()),
             cfg,
         })
     }
 
     /// The saved position of an instance.
     pub async fn position(&self, instance: InstanceId) -> Option<u64> {
-        self.positions.lock().await.get(&instance).copied()
+        self.positions.lock().await.map.get(&instance).copied()
+    }
+
+    /// The number of positions held.
+    pub async fn positions_held(&self) -> usize {
+        self.positions.lock().await.map.len()
     }
 
     /// Reads and ships one batch per instance, within the caps.
     pub async fn tick(&self) -> ShipReport {
         let mut report = ShipReport::default();
+        let mut st = self.positions.lock().await;
+        // Nothing more is shipped while the positions are not saved: a restart would repeat
+        // every batch shipped since the last save.
+        if st.unsaved {
+            if let Err(e) = self.store.save(&st.map).await {
+                tracing::warn!(error = %e, "telemetry shipper: saving the positions failed again; nothing is shipped until it works");
+                report.positions_unsaved = true;
+                return report;
+            }
+            st.unsaved = false;
+        }
         let listed = (self.instances)();
         let mut by_tenant: BTreeMap<TenantId, Vec<InstanceId>> = BTreeMap::new();
         for (tenant, instance) in &listed {
             by_tenant.entry(*tenant).or_default().push(*instance);
         }
-        let tenants = by_tenant.len().max(1);
-        let tenant_lines = (self.cfg.lines_per_tick / tenants).max(1);
-        let mut positions = self.positions.lock().await;
-        let mut cursors = self.cursors.lock().await;
-        let mut next_cursors = HashMap::with_capacity(by_tenant.len());
-        for (tenant, instances) in &by_tenant {
+        // Positions of instances that are no longer listed go first, before this tick takes
+        // new ones.
+        if st.map.len() >= self.cfg.max_positions {
+            let listed: std::collections::HashSet<InstanceId> =
+                listed.iter().map(|(_, i)| *i).collect();
+            st.map.retain(|i, _| listed.contains(i));
+        }
+        let mut turns = self.turns.lock().await;
+        // The tenants in order, from the first one the last tick did not reach.
+        let order: Vec<(&TenantId, &Vec<InstanceId>)> = match turns.tenant {
+            Some(first) => by_tenant
+                .range(first..)
+                .chain(by_tenant.range(..first))
+                .collect(),
+            None => by_tenant.iter().collect(),
+        };
+        let share = (self.cfg.lines_per_tick / order.len().max(1)).max(1);
+        let mut remaining = self.cfg.lines_per_tick;
+        let mut next_tenant = None;
+        let mut next_instance = HashMap::with_capacity(by_tenant.len());
+        let mut stop = false;
+        for (ti, (tenant, instances)) in order.iter().enumerate() {
+            if stop || remaining == 0 {
+                next_tenant = Some(**tenant);
+                // The tenants not reached keep their turn.
+                for (t, _) in &order[ti..] {
+                    if let Some(c) = turns.instance.get(*t) {
+                        next_instance.insert(**t, *c);
+                    }
+                }
+                break;
+            }
             let n = instances.len();
-            let start = cursors.get(tenant).copied().unwrap_or(0) % n;
+            let start = turns.instance.get(*tenant).copied().unwrap_or(0) % n;
             // When every instance was reached, the next tick still starts one further on.
             let mut next = (start + 1) % n;
-            let mut left = tenant_lines;
+            let mut left = share.min(remaining);
             let mut shipped = false;
             for k in 0..n {
                 let idx = (start + k) % n;
@@ -525,13 +616,17 @@ impl LogShipper {
                     break;
                 }
                 let instance = &instances[idx];
+                let after = st.map.get(instance).copied();
+                if after.is_none() && st.map.len() >= self.cfg.max_positions {
+                    report.skipped_instances += 1;
+                    continue;
+                }
                 report.instances += 1;
                 let limit = self.cfg.lines_per_instance.min(left).max(1);
-                let after = positions.get(instance).copied();
-                let lines = match self.driver.logs(*tenant, *instance, after, limit).await {
+                let lines = match self.driver.logs(**tenant, *instance, after, limit).await {
                     Ok(lines) => lines,
                     Err(RuntimeError::NotFound { .. }) => {
-                        positions.remove(instance);
+                        st.map.remove(instance);
                         continue;
                     }
                     Err(e) => {
@@ -542,19 +637,20 @@ impl LogShipper {
                 // A driver that ignores `limit` cannot make the shipper hold more.
                 let lines: Vec<LogLine> = lines
                     .into_iter()
-                    .filter(|l| l.instance == *instance && l.identity.tenant == *tenant)
+                    .filter(|l| l.instance == *instance && l.identity.tenant == **tenant)
                     .take(limit)
                     .collect();
                 let Some(last) = lines.last().map(|l| l.seq) else {
                     continue;
                 };
                 left = left.saturating_sub(lines.len());
+                remaining = remaining.saturating_sub(lines.len());
                 report.lines += lines.len() as u64;
                 match self.ship(lines).await {
                     Ok(r) => {
                         report.stored += r.stored_logs;
                         report.secrets_redacted += r.secrets_redacted;
-                        positions.insert(*instance, last);
+                        st.map.insert(*instance, last);
                         shipped = true;
                     }
                     Err(e) => {
@@ -563,19 +659,20 @@ impl LogShipper {
                     }
                 }
             }
-            next_cursors.insert(*tenant, next);
+            next_instance.insert(**tenant, next);
             // Saved once per tenant: a crash repeats at most the batches of one tenant's turn.
-            if shipped && let Err(e) = self.store.save(&positions).await {
-                tracing::warn!(error = %e, "telemetry shipper: saving the positions failed");
+            // When the save fails, the tick stops and later ticks ship nothing until a save
+            // works, so that bound holds.
+            if shipped && let Err(e) = self.store.save(&st.map).await {
+                tracing::warn!(error = %e, "telemetry shipper: saving the positions failed; nothing is shipped until it works");
+                st.unsaved = true;
+                report.positions_unsaved = true;
+                stop = true;
             }
         }
-        // Only the listed tenants keep a cursor, so the map stays bounded.
-        *cursors = next_cursors;
-        if positions.len() > self.cfg.max_positions {
-            let listed: std::collections::HashSet<InstanceId> =
-                listed.iter().map(|(_, i)| *i).collect();
-            positions.retain(|i, _| listed.contains(i));
-        }
+        // Only the listed tenants keep a turn, so the map stays bounded.
+        turns.instance = next_instance;
+        turns.tenant = next_tenant;
         report
     }
 

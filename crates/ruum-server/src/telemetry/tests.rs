@@ -783,6 +783,59 @@ async fn grpc_refuses_a_stranger_before_reading_the_message() {
     assert_eq!(code, tonic::Code::Unauthenticated);
 }
 
+/// Kimi run 13 finding 1: the mapped batch is held in the tenant's share before the mapping
+/// allocates it. A small body whose resource attribute is copied onto every record maps to
+/// megabytes; over HTTP and gRPC it is refused when the share cannot hold them, and the same
+/// shape with a few records is served.
+#[tokio::test]
+async fn the_mapped_batch_is_held_in_the_tenant_share() {
+    let w = world(
+        Arc::new(MemoryTelemetryStore::new()),
+        Opts {
+            budget: BudgetConfig {
+                max_in_flight_bytes: 4_000_000,
+                tenant_share: 4,
+                ..BudgetConfig::default()
+            },
+            ..Opts::default()
+        },
+    )
+    .await;
+    let copied = |n: usize| {
+        let mut req = logs_req(&w.a, "r", n);
+        req.resource_logs[0]
+            .resource
+            .as_mut()
+            .unwrap()
+            .attributes
+            .push(skv("big", &"c".repeat(30_000)));
+        req
+    };
+    // 200 records of 30 kB each: about 6 MB mapped from a body of about 40 kB.
+    let large = copied(200);
+    assert!(large.encoded_len() < 100_000);
+    // Positive control: 10 records (about 300 kB mapped) fit A's share of 1 MB.
+    assert_eq!(
+        post(&w, A_IP, "/v1/logs", copied(10).encode_to_vec()).await,
+        200
+    );
+    assert_eq!(
+        post(&w, A_IP, "/v1/logs", large.encode_to_vec()).await,
+        429,
+        "the mapped batch does not fit the share"
+    );
+    let code = match grpc_logs(&w, A_IP, large, None).await {
+        Ok(_) => tonic::Code::Ok,
+        Err(s) => s.code(),
+    };
+    assert_eq!(code, tonic::Code::ResourceExhausted);
+    // The share is given back: A is served again.
+    assert_eq!(
+        post(&w, A_IP, "/v1/logs", copied(10).encode_to_vec()).await,
+        200
+    );
+}
+
 /// S-61: the in-flight bytes are held from the first byte. Slow bodies of tenant A hold A's
 /// share; the next request of A is refused, and B is still served in the same moment.
 #[tokio::test]

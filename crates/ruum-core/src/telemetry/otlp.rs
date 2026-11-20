@@ -69,6 +69,9 @@ pub enum Refusal {
     TooManyRecords,
     /// The body is not a valid OTLP protobuf message.
     Malformed,
+    /// The caller's budget did not hold the bytes of the mapped batch
+    /// ([`Checked::decode_held`]).
+    NotHeld,
 }
 
 impl Refusal {
@@ -78,6 +81,7 @@ impl Refusal {
             Refusal::BodyTooLarge => "body_too_large",
             Refusal::TooManyRecords => "too_many_records",
             Refusal::Malformed => "malformed",
+            Refusal::NotHeld => "not_held",
         }
     }
 
@@ -86,7 +90,7 @@ impl Refusal {
         match self {
             Refusal::BodyTooLarge => Some(DropReason::BatchTooLarge),
             Refusal::TooManyRecords => Some(DropReason::TooManyRecords),
-            Refusal::Malformed => None,
+            Refusal::Malformed | Refusal::NotHeld => None,
         }
     }
 }
@@ -98,6 +102,10 @@ pub struct Mapped {
     /// The records of the request, mapped or not.
     pub records: u64,
     pub dropped: BTreeMap<DropReason, u64>,
+    /// The mapping's count of the bytes the batch holds (at most [`Limits::max_batch_bytes`];
+    /// strings, rendered JSON text and the fixed costs per value and record). The receiver
+    /// holds it in its budget while the batch is in flight.
+    pub bytes: u64,
 }
 
 impl Mapped {
@@ -147,25 +155,41 @@ impl Checked<'_> {
 
     /// Decodes and maps the checked body.
     pub fn decode(self, limits: &Limits) -> std::result::Result<Mapped, Refusal> {
+        self.decode_held(limits, &mut |_| true)
+    }
+
+    /// Decodes and maps the checked body; `hold` is asked to hold the bytes of the mapped
+    /// batch before the mapping allocates them (in steps of [`HOLD_STEP`], at most
+    /// [`Limits::max_batch_bytes`] in all). When it refuses, the request is refused
+    /// ([`Refusal::NotHeld`]). Kimi run 13 finding 1: the receiver holds the decoded estimate,
+    /// and with this also the mapped batch.
+    pub fn decode_held(
+        self,
+        limits: &Limits,
+        hold: &mut dyn FnMut(u64) -> bool,
+    ) -> std::result::Result<Mapped, Refusal> {
         match self.signal {
             Signal::Logs => {
                 let req =
                     ExportLogsServiceRequest::decode(self.body).map_err(|_| Refusal::Malformed)?;
-                map_logs(req, limits)
+                map_logs_held(req, limits, hold)
             }
             Signal::Metrics => {
                 let req = ExportMetricsServiceRequest::decode(self.body)
                     .map_err(|_| Refusal::Malformed)?;
-                map_metrics(req, limits)
+                map_metrics_held(req, limits, hold)
             }
             Signal::Traces => {
                 let req =
                     ExportTraceServiceRequest::decode(self.body).map_err(|_| Refusal::Malformed)?;
-                map_traces(req, limits)
+                map_traces_held(req, limits, hold)
             }
         }
     }
 }
+
+/// The step in which [`Checked::decode_held`] asks for bytes to hold.
+pub const HOLD_STEP: u64 = 64 * 1024;
 
 /// The bounds before decoding (see the module docs): the body size, then the wire walk with
 /// the record count and the decoded estimate.
@@ -557,29 +581,64 @@ pub fn count_traces(req: &ExportTraceServiceRequest) -> u64 {
         .sum()
 }
 
-/// The byte budget of one mapping.
-struct Budget {
+/// The byte budget of one mapping, and the bytes the caller holds for it.
+struct Budget<'h> {
+    cap: usize,
     left: usize,
     exhausted: bool,
+    /// The bytes `hold` holds so far.
+    held: u64,
+    hold: &'h mut dyn FnMut(u64) -> bool,
+    /// `hold` refused: the request is refused.
+    not_held: bool,
 }
 
-impl Budget {
-    fn new(limits: &Limits) -> Self {
+impl<'h> Budget<'h> {
+    fn new(limits: &Limits, hold: &'h mut dyn FnMut(u64) -> bool) -> Self {
         Budget {
+            cap: limits.max_batch_bytes,
             left: limits.max_batch_bytes,
             exhausted: false,
+            held: 0,
+            hold,
+            not_held: false,
         }
     }
 
+    /// The bytes taken.
+    fn used(&self) -> u64 {
+        (self.cap - self.left) as u64
+    }
+
     /// Takes `cost` bytes; once a record does not fit, every later record is refused too, so
-    /// the drop is a clean tail.
+    /// the drop is a clean tail. Before the bytes are taken, the caller holds them.
     fn take(&mut self, cost: usize) -> bool {
-        if self.exhausted || cost > self.left {
+        if self.exhausted || self.not_held || cost > self.left {
             self.exhausted = true;
             return false;
         }
+        let need = self.used() + cost as u64;
+        if need > self.held {
+            let step = (need - self.held)
+                .max(HOLD_STEP)
+                .min(self.cap as u64 - self.held);
+            if !(self.hold)(step) {
+                self.not_held = true;
+                return false;
+            }
+            self.held += step;
+        }
         self.left -= cost;
         true
+    }
+
+    /// The refusal of the request when `hold` refused.
+    fn check(&self) -> std::result::Result<(), Refusal> {
+        if self.not_held {
+            Err(Refusal::NotHeld)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -589,15 +648,64 @@ fn kv_cost(kvs: &[KeyValue]) -> usize {
         .sum()
 }
 
+/// The bytes of a value as the mapping keeps it: a string as it is, bytes as hex, an array or
+/// a key value list as its JSON text ([`json_cost`]), another scalar as a fixed cost.
 fn value_cost(v: &AnyValue) -> usize {
     match &v.value {
         Some(any_value::Value::StringValue(s)) => s.len(),
         Some(any_value::Value::BytesValue(b)) => b.len() * 2,
-        Some(any_value::Value::ArrayValue(a)) => {
-            a.values.iter().map(value_cost).sum::<usize>() + a.values.len() * 2 + 2
-        }
-        Some(any_value::Value::KvlistValue(l)) => kv_cost(&l.values) + 2,
+        Some(any_value::Value::ArrayValue(_) | any_value::Value::KvlistValue(_)) => json_cost(v),
         _ => 8,
+    }
+}
+
+/// The bytes of a log body: a string body as it is, any other body as its JSON text.
+fn body_cost(v: &AnyValue) -> usize {
+    match &v.value {
+        Some(any_value::Value::StringValue(s)) => s.len(),
+        _ => json_cost(v),
+    }
+}
+
+/// The longest JSON text of an `i64` (`-9223372036854775808`) and of an `f64` (ryu's longest
+/// form, such as `-2.2250738585072014e-308`; NaN and the infinities are the strings `"NaN"`,
+/// `"inf"` and `"-inf"`).
+const JSON_INT: usize = 20;
+const JSON_FLOAT: usize = 24;
+
+/// An upper bound of the bytes of a JSON string literal of `s`: the quotes, and every byte
+/// that JSON escapes counted at its longest escape (`\u001f`). Kimi run 13 finding 1: the
+/// raw length undercounts a text of control characters six times.
+fn json_str_cost(s: &str) -> usize {
+    2 + s
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+
+/// An upper bound of the bytes of the compact JSON text of `v` ([`render_json`]).
+pub(crate) fn json_cost(v: &AnyValue) -> usize {
+    match &v.value {
+        Some(any_value::Value::StringValue(s)) => json_str_cost(s),
+        Some(any_value::Value::BoolValue(_)) => 5,
+        Some(any_value::Value::IntValue(_)) => JSON_INT,
+        Some(any_value::Value::DoubleValue(_)) => JSON_FLOAT,
+        Some(any_value::Value::BytesValue(b)) => 2 + b.len() * 2,
+        Some(any_value::Value::ArrayValue(a)) => {
+            2 + a.values.len() + a.values.iter().map(json_cost).sum::<usize>()
+        }
+        Some(any_value::Value::KvlistValue(l)) => {
+            2 + l
+                .values
+                .iter()
+                .map(|kv| json_str_cost(&kv.key) + 2 + kv.value.as_ref().map_or(4, json_cost))
+                .sum::<usize>()
+        }
+        Some(any_value::Value::StringValueStrindex(_)) | None => 4,
     }
 }
 
@@ -637,32 +745,59 @@ pub fn attr_value(v: AnyValue) -> Option<AttrValue> {
         any_value::Value::DoubleValue(f) => AttrValue::Float(f),
         any_value::Value::BytesValue(b) => AttrValue::Str(hex::encode(b)),
         other @ (any_value::Value::ArrayValue(_) | any_value::Value::KvlistValue(_)) => {
-            AttrValue::Str(render(&AnyValue { value: Some(other) }).to_string())
+            AttrValue::Str(render_json(&AnyValue { value: Some(other) }))
         }
         // A dictionary index of the profiles signal: no dictionary here, so no content.
         any_value::Value::StringValueStrindex(_) => return None,
     })
 }
 
-/// A value as JSON (for arrays and key value lists, and for a non-string log body).
-fn render(v: &AnyValue) -> serde_json::Value {
-    use serde_json::Value as J;
-    match &v.value {
-        Some(any_value::Value::StringValue(s)) => J::String(s.clone()),
-        Some(any_value::Value::BoolValue(b)) => J::Bool(*b),
-        Some(any_value::Value::IntValue(i)) => J::from(*i),
-        Some(any_value::Value::DoubleValue(f)) => {
-            serde_json::Number::from_f64(*f).map_or_else(|| J::String(f.to_string()), J::Number)
+/// A value as compact JSON text (for arrays and key value lists, and for a non-string log
+/// body), written straight into the text: no JSON tree is built in between (Kimi run 13
+/// finding 1), and the text is at most [`json_cost`] bytes. Key value lists are objects with
+/// their keys sorted, and a repeated key keeps its last value; a non-finite double is the
+/// string of its Rust form (`"NaN"`, `"inf"`, `"-inf"`); bytes are lowercase hex strings.
+pub(crate) fn render_json(v: &AnyValue) -> String {
+    let mut out = Vec::with_capacity(json_cost(v).min(64 * 1024));
+    serde_json::to_writer(&mut out, &Json(Some(v))).expect("an OTLP value serialises to JSON");
+    // serde_json writes UTF-8 only.
+    String::from_utf8(out).expect("JSON text is UTF-8")
+}
+
+/// [`serde::Serialize`] of an OTLP value, borrowed. `None` is `null`.
+struct Json<'a>(Option<&'a AnyValue>);
+
+impl serde::Serialize for Json<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0.and_then(|v| v.value.as_ref()) {
+            Some(any_value::Value::StringValue(x)) => s.serialize_str(x),
+            Some(any_value::Value::BoolValue(b)) => s.serialize_bool(*b),
+            Some(any_value::Value::IntValue(i)) => s.serialize_i64(*i),
+            Some(any_value::Value::DoubleValue(f)) if f.is_finite() => s.serialize_f64(*f),
+            Some(any_value::Value::DoubleValue(f)) => s.serialize_str(&f.to_string()),
+            Some(any_value::Value::BytesValue(b)) => s.serialize_str(&hex::encode(b)),
+            Some(any_value::Value::ArrayValue(a)) => {
+                let mut seq = s.serialize_seq(Some(a.values.len()))?;
+                for x in &a.values {
+                    seq.serialize_element(&Json(Some(x)))?;
+                }
+                seq.end()
+            }
+            Some(any_value::Value::KvlistValue(l)) => {
+                let sorted: BTreeMap<&str, Option<&AnyValue>> = l
+                    .values
+                    .iter()
+                    .map(|kv| (kv.key.as_str(), kv.value.as_ref()))
+                    .collect();
+                let mut map = s.serialize_map(Some(sorted.len()))?;
+                for (k, x) in sorted {
+                    map.serialize_entry(k, &Json(x))?;
+                }
+                map.end()
+            }
+            Some(any_value::Value::StringValueStrindex(_)) | None => s.serialize_unit(),
         }
-        Some(any_value::Value::BytesValue(b)) => J::String(hex::encode(b)),
-        Some(any_value::Value::ArrayValue(a)) => J::Array(a.values.iter().map(render).collect()),
-        Some(any_value::Value::KvlistValue(l)) => J::Object(
-            l.values
-                .iter()
-                .map(|kv| (kv.key.clone(), kv.value.as_ref().map_or(J::Null, render)))
-                .collect(),
-        ),
-        Some(any_value::Value::StringValueStrindex(_)) | None => J::Null,
     }
 }
 
@@ -696,6 +831,14 @@ pub fn map_logs(
     req: ExportLogsServiceRequest,
     limits: &Limits,
 ) -> std::result::Result<Mapped, Refusal> {
+    map_logs_held(req, limits, &mut |_| true)
+}
+
+fn map_logs_held(
+    req: ExportLogsServiceRequest,
+    limits: &Limits,
+    hold: &mut dyn FnMut(u64) -> bool,
+) -> std::result::Result<Mapped, Refusal> {
     let records = count_logs(&req);
     if records > limits.max_records as u64 {
         return Err(Refusal::TooManyRecords);
@@ -704,16 +847,17 @@ pub fn map_logs(
         records,
         ..Default::default()
     };
-    let mut budget = Budget::new(limits);
+    let mut budget = Budget::new(limits, hold);
     let now = crate::now();
     for rl in req.resource_logs {
         for sl in rl.scope_logs {
             let shared = shared_attrs(rl.resource.as_ref(), sl.scope.as_ref());
             let shared_cost = kv_cost(&shared);
             for rec in sl.log_records {
-                let body_cost = rec.body.as_ref().map_or(0, value_cost);
+                let body_cost = rec.body.as_ref().map_or(0, body_cost);
                 let cost = RECORD_COST + shared_cost + kv_cost(&rec.attributes) + body_cost;
                 if !budget.take(cost) {
+                    budget.check()?;
                     out.drop(DropReason::BatchTooLarge);
                     continue;
                 }
@@ -721,10 +865,10 @@ pub fn map_logs(
                     Some(AnyValue {
                         value: Some(any_value::Value::StringValue(s)),
                     }) => s,
-                    Some(v) => match render(&v) {
-                        serde_json::Value::Null => String::new(),
-                        j => j.to_string(),
-                    },
+                    Some(AnyValue {
+                        value: None | Some(any_value::Value::StringValueStrindex(_)),
+                    }) => String::new(),
+                    Some(v) => render_json(&v),
                     None => String::new(),
                 };
                 out.batch.logs.push(LogRecord {
@@ -738,6 +882,7 @@ pub fn map_logs(
             }
         }
     }
+    out.bytes = budget.used();
     Ok(out)
 }
 
@@ -745,6 +890,14 @@ pub fn map_logs(
 pub fn map_metrics(
     req: ExportMetricsServiceRequest,
     limits: &Limits,
+) -> std::result::Result<Mapped, Refusal> {
+    map_metrics_held(req, limits, &mut |_| true)
+}
+
+fn map_metrics_held(
+    req: ExportMetricsServiceRequest,
+    limits: &Limits,
+    hold: &mut dyn FnMut(u64) -> bool,
 ) -> std::result::Result<Mapped, Refusal> {
     let records = count_metrics(&req);
     if records > limits.max_records as u64 {
@@ -754,7 +907,7 @@ pub fn map_metrics(
         records,
         ..Default::default()
     };
-    let mut budget = Budget::new(limits);
+    let mut budget = Budget::new(limits, hold);
     let now = crate::now();
     for rm in req.resource_metrics {
         for sm in rm.scope_metrics {
@@ -805,6 +958,7 @@ pub fn map_metrics(
                 for (attrs, t, kind, value) in points {
                     let cost = RECORD_COST + m.name.len() + shared_cost + kv_cost(&attrs);
                     if !budget.take(cost) {
+                        budget.check()?;
                         out.drop(DropReason::BatchTooLarge);
                         continue;
                     }
@@ -819,6 +973,7 @@ pub fn map_metrics(
             }
         }
     }
+    out.bytes = budget.used();
     Ok(out)
 }
 
@@ -853,6 +1008,14 @@ pub fn map_traces(
     req: ExportTraceServiceRequest,
     limits: &Limits,
 ) -> std::result::Result<Mapped, Refusal> {
+    map_traces_held(req, limits, &mut |_| true)
+}
+
+fn map_traces_held(
+    req: ExportTraceServiceRequest,
+    limits: &Limits,
+    hold: &mut dyn FnMut(u64) -> bool,
+) -> std::result::Result<Mapped, Refusal> {
     let records = count_traces(&req);
     if records > limits.max_records as u64 {
         return Err(Refusal::TooManyRecords);
@@ -861,7 +1024,7 @@ pub fn map_traces(
         records,
         ..Default::default()
     };
-    let mut budget = Budget::new(limits);
+    let mut budget = Budget::new(limits, hold);
     let now = crate::now();
     for rs in req.resource_spans {
         for ss in rs.scope_spans {
@@ -887,6 +1050,7 @@ pub fn map_traces(
                     + links_cost
                     + status_cost;
                 if !budget.take(cost) {
+                    budget.check()?;
                     out.drop(DropReason::BatchTooLarge);
                     continue;
                 }
@@ -932,5 +1096,6 @@ pub fn map_traces(
             }
         }
     }
+    out.bytes = budget.used();
     Ok(out)
 }

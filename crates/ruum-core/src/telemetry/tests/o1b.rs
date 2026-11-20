@@ -11,7 +11,8 @@ use crate::runtime::{
 use crate::telemetry::lgtm::{LgtmConfig, LgtmStore, quote, tenant_header};
 use crate::telemetry::otlp::{self, Refusal};
 use crate::telemetry::processor::{
-    BudgetConfig, BudgetRefusal, FairBudget, LogShipper, MemoryPositions, ShipperConfig,
+    BudgetConfig, BudgetRefusal, FairBudget, LogShipper, MemoryPositions, PositionStore,
+    ShipperConfig,
 };
 use crate::telemetry::source::{
     BearerToken, ListenerId, MemorySourceAuthenticator, NetworkSourceAuthenticator,
@@ -578,6 +579,207 @@ fn the_mapping_is_bounded_per_signal() {
     }
 }
 
+fn av(v: any_value::Value) -> AnyValue {
+    AnyValue { value: Some(v) }
+}
+
+fn control_array(n: usize, len: usize) -> AnyValue {
+    av(any_value::Value::ArrayValue(
+        opentelemetry_proto::tonic::common::v1::ArrayValue {
+            values: (0..n)
+                .map(|_| av(any_value::Value::StringValue("\u{1}".repeat(len))))
+                .collect(),
+        },
+    ))
+}
+
+/// Kimi run 13 finding 1: arrays and key value lists become JSON text, in which a control
+/// character takes six bytes (`\u0001`). The mapping counts the JSON text, so the mapped
+/// batch stays within the cap for a log body and for attributes of each signal.
+#[test]
+fn json_text_of_control_characters_stays_within_the_mapping_cap() {
+    let cap = 16 * 1024;
+    let lim = Limits {
+        max_batch_bytes: cap,
+        ..Limits::default()
+    };
+    let arr = control_array(10, 100);
+    let attr = KeyValue {
+        key: "arr".into(),
+        value: Some(arr.clone()),
+        ..Default::default()
+    };
+    let mut body_records: Vec<ol::LogRecord> = (0..50).map(|_| log_record("x", vec![])).collect();
+    for r in &mut body_records {
+        r.body = Some(arr.clone());
+    }
+    let cases: Vec<(&str, otlp::Mapped)> = vec![
+        (
+            "log body",
+            otlp::map_logs(
+                ExportLogsServiceRequest::decode(logs_request(vec![], body_records).as_slice())
+                    .unwrap(),
+                &lim,
+            )
+            .unwrap(),
+        ),
+        (
+            "log attribute",
+            otlp::map_logs(
+                ExportLogsServiceRequest::decode(
+                    logs_request(
+                        vec![],
+                        (0..50)
+                            .map(|_| log_record("x", vec![attr.clone()]))
+                            .collect(),
+                    )
+                    .as_slice(),
+                )
+                .unwrap(),
+                &lim,
+            )
+            .unwrap(),
+        ),
+        (
+            "metric label",
+            otlp::map_metrics(
+                ExportMetricsServiceRequest::decode(
+                    metrics_request(vec![], (0..50).map(|_| point(vec![attr.clone()])).collect())
+                        .as_slice(),
+                )
+                .unwrap(),
+                &lim,
+            )
+            .unwrap(),
+        ),
+        (
+            "span attribute",
+            otlp::map_traces(
+                ExportTraceServiceRequest::decode(
+                    traces_request(
+                        vec![],
+                        (0..50).map(|_| span(vec![attr.clone()], 0, 0)).collect(),
+                    )
+                    .as_slice(),
+                )
+                .unwrap(),
+                &lim,
+            )
+            .unwrap(),
+        ),
+    ];
+    for (name, m) in cases {
+        assert!(m.batch.records() > 0, "{name}: some records are mapped");
+        assert!(
+            m.dropped
+                .get(&DropReason::BatchTooLarge)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "{name}: the rest is dropped"
+        );
+        let got = mapped_bytes(&m.batch);
+        assert!(
+            got <= m.bytes as usize && m.bytes as usize <= cap,
+            "{name}: mapped {got} bytes, counted {}, cap {cap}",
+            m.bytes
+        );
+    }
+}
+
+/// The JSON text of OTLP values is written without a tree in between, in the same form as
+/// before (sorted keys, the last of a repeated key, non-finite doubles as strings, bytes as
+/// hex), and never longer than its count.
+#[test]
+fn otlp_values_render_as_compact_json_within_their_count() {
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, KeyValueList};
+    let kv = |k: &str, v: Option<AnyValue>| KeyValue {
+        key: k.into(),
+        value: v,
+        ..Default::default()
+    };
+    let list = av(any_value::Value::KvlistValue(KeyValueList {
+        values: vec![
+            kv("b", Some(av(any_value::Value::DoubleValue(f64::NAN)))),
+            kv("a", Some(av(any_value::Value::IntValue(1)))),
+            kv("a", Some(av(any_value::Value::IntValue(2)))),
+            kv("c", None),
+            kv(
+                "d",
+                Some(av(any_value::Value::BytesValue(vec![0xab, 0x01]))),
+            ),
+            kv(
+                "e",
+                Some(av(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![
+                        av(any_value::Value::BoolValue(true)),
+                        av(any_value::Value::DoubleValue(1.5)),
+                        av(any_value::Value::StringValue("q\"\\\n\u{1}é".into())),
+                        AnyValue { value: None },
+                    ],
+                }))),
+            ),
+        ],
+    }));
+    assert_eq!(
+        otlp::render_json(&list),
+        r#"{"a":2,"b":"NaN","c":null,"d":"ab01","e":[true,1.5,"q\"\\\n\u0001é",null]}"#
+    );
+    let extremes = av(any_value::Value::ArrayValue(ArrayValue {
+        values: vec![
+            av(any_value::Value::IntValue(i64::MIN)),
+            av(any_value::Value::DoubleValue(-f64::MAX)),
+            av(any_value::Value::DoubleValue(-f64::MIN_POSITIVE)),
+            av(any_value::Value::DoubleValue(5e-324)),
+            av(any_value::Value::DoubleValue(f64::NEG_INFINITY)),
+            av(any_value::Value::StringValue("\u{1f}\u{7f}\"\\".repeat(50))),
+        ],
+    }));
+    for v in [list, extremes, control_array(20, 30)] {
+        let text = otlp::render_json(&v);
+        assert!(
+            text.len() <= otlp::json_cost(&v),
+            "{} > {}: {text}",
+            text.len(),
+            otlp::json_cost(&v)
+        );
+    }
+}
+
+/// The caller holds the mapped batch before it is mapped: in steps, never more than the cap,
+/// at least what the mapping counted; a refusal refuses the request.
+#[test]
+fn the_mapped_batch_is_held_before_it_is_mapped() {
+    let lim = Limits {
+        max_batch_bytes: 1024 * 1024,
+        ..Limits::default()
+    };
+    let body = logs_request(
+        vec![skv("big", &"r".repeat(4000))],
+        (0..100)
+            .map(|i| log_record(&i.to_string(), vec![]))
+            .collect(),
+    );
+    let mut held = 0u64;
+    let m = otlp::check(Signal::Logs, &body, &lim)
+        .unwrap()
+        .decode_held(&lim, &mut |n| {
+            held += n;
+            true
+        })
+        .unwrap();
+    assert_eq!(m.batch.records(), 100);
+    assert!(
+        held >= m.bytes && held <= lim.max_batch_bytes as u64,
+        "{held} {}",
+        m.bytes
+    );
+    let refused = otlp::check(Signal::Logs, &body, &lim)
+        .unwrap()
+        .decode_held(&lim, &mut |_| false);
+    assert_eq!(refused.err(), Some(Refusal::NotHeld));
+}
+
 // ---------------------------------------------------------------------------- sources
 
 fn facts(ip: [u8; 4], listener: &str, bearer: Option<&str>) -> SourceFacts {
@@ -1059,6 +1261,290 @@ async fn a_busy_instance_does_not_starve_the_next_one() {
     assert!(busy_got >= 18, "{busy_got}");
 }
 
+/// A [`PositionStore`] whose saves fail while `failing` is set (the disk is full, the volume
+/// is read-only).
+struct FlakyPositions {
+    inner: MemoryPositions,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl PositionStore for FlakyPositions {
+    async fn load(&self) -> Result<HashMap<InstanceId, u64>> {
+        self.inner.load().await
+    }
+
+    async fn save(&self, positions: &HashMap<InstanceId, u64>) -> Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::Error::Internal("test: the save fails".into()));
+        }
+        self.inner.save(positions).await
+    }
+}
+
+/// Kimi run 13 finding 3: when saving the positions fails, the shipper ships nothing more
+/// until a save works, so a restart repeats at most one batch, not every batch since the last
+/// save.
+#[tokio::test]
+async fn a_failed_position_save_stops_shipping_until_a_save_works() {
+    let f = Fixture::new();
+    let registry = MemoryRegistry::new();
+    let driver = Arc::new(MemoryDriver::new(
+        registry.clone(),
+        Arc::new(MemoryUsage::new()),
+    ));
+    let a = identity(Environment::Live);
+    let lines: Vec<String> = (0..11).map(|i| format!("line {i}")).collect();
+    let ia = start_job(&driver, &registry, &workload(&a), "unused-secret-6", &lines).await;
+    wait_lines(&driver, a.tenant, ia, 12).await;
+    let positions = Arc::new(FlakyPositions {
+        inner: MemoryPositions::new(),
+        failing: std::sync::atomic::AtomicBool::new(false),
+    });
+    let cfg = ShipperConfig {
+        lines_per_instance: 3,
+        ..ShipperConfig::default()
+    };
+    let list = vec![(a.tenant, ia)];
+    let l1 = list.clone();
+    let first = LogShipper::new(
+        driver.clone(),
+        Arc::new(move || l1.clone()),
+        f.ingest.clone(),
+        positions.clone(),
+        cfg,
+    )
+    .await
+    .unwrap();
+    let r = first.tick().await;
+    assert_eq!((r.lines, r.positions_unsaved), (3, false));
+    positions
+        .failing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = first.tick().await;
+    assert_eq!(r.lines, 3, "the batch of the failed save was shipped");
+    assert!(r.positions_unsaved);
+    for _ in 0..3 {
+        let r = first.tick().await;
+        assert_eq!(r.lines, 0, "nothing is shipped while the save fails");
+        assert!(r.positions_unsaved);
+    }
+    // A crash now, then a restart with a working disk: one batch (3 lines) is repeated.
+    drop(first);
+    positions
+        .failing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let second = LogShipper::new(
+        driver.clone(),
+        Arc::new(move || list.clone()),
+        f.ingest.clone(),
+        positions.clone(),
+        cfg,
+    )
+    .await
+    .unwrap();
+    while second.tick().await.lines > 0 {}
+    let got = f
+        .store
+        .read(a.tenant, &TelemetryFilter::app(a.app))
+        .await
+        .unwrap();
+    let mut texts: Vec<&str> = got.logs.iter().filter_map(|l| l.text.as_deref()).collect();
+    texts.sort();
+    let all = texts.len();
+    texts.dedup();
+    assert_eq!(texts.len(), 12, "every line is stored");
+    assert!(
+        all - texts.len() <= cfg.lines_per_instance,
+        "a restart repeats at most one batch: {} repeated",
+        all - texts.len()
+    );
+}
+
+/// Positive control of the test above: once the save works again, the same shipper goes on
+/// without repeating a line.
+#[tokio::test]
+async fn the_shipper_goes_on_once_the_save_works_again() {
+    let f = Fixture::new();
+    let registry = MemoryRegistry::new();
+    let driver = Arc::new(MemoryDriver::new(
+        registry.clone(),
+        Arc::new(MemoryUsage::new()),
+    ));
+    let a = identity(Environment::Live);
+    let lines: Vec<String> = (0..7).map(|i| format!("line {i}")).collect();
+    let ia = start_job(&driver, &registry, &workload(&a), "unused-secret-7", &lines).await;
+    wait_lines(&driver, a.tenant, ia, 8).await;
+    let positions = Arc::new(FlakyPositions {
+        inner: MemoryPositions::new(),
+        failing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let shipper = LogShipper::new(
+        driver.clone(),
+        Arc::new(move || vec![(a.tenant, ia)]),
+        f.ingest.clone(),
+        positions.clone(),
+        ShipperConfig {
+            lines_per_instance: 3,
+            ..ShipperConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(shipper.tick().await.positions_unsaved);
+    assert_eq!(shipper.tick().await.lines, 0);
+    positions
+        .failing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    while shipper.tick().await.lines > 0 {}
+    assert_eq!(
+        positions.inner.load().await.unwrap().get(&ia).copied(),
+        shipper.position(ia).await,
+        "the position is saved"
+    );
+    let got = f
+        .store
+        .read(a.tenant, &TelemetryFilter::app(a.app))
+        .await
+        .unwrap();
+    let mut texts: Vec<&str> = got.logs.iter().filter_map(|l| l.text.as_deref()).collect();
+    texts.sort();
+    let all = texts.len();
+    texts.dedup();
+    assert_eq!((all, texts.len()), (8, 8), "every line once");
+}
+
+/// Kimi run 13 finding 4: `lines_per_tick` is a hard cap also when there are more tenants
+/// than lines; the tenants take turns over the ticks, and a cap of 0 ships nothing.
+#[tokio::test]
+async fn lines_per_tick_holds_with_more_tenants_than_lines() {
+    let f = Fixture::new();
+    let registry = MemoryRegistry::new();
+    let driver = Arc::new(MemoryDriver::new(
+        registry.clone(),
+        Arc::new(MemoryUsage::new()),
+    ));
+    let mut list = Vec::new();
+    let mut ids = Vec::new();
+    for k in 0..3 {
+        let id = identity(Environment::Live);
+        let i = start_job(
+            &driver,
+            &registry,
+            &workload(&id),
+            "unused-secret-8",
+            &[format!("tenant {k}")],
+        )
+        .await;
+        wait_lines(&driver, id.tenant, i, 2).await;
+        list.push((id.tenant, i));
+        ids.push(id);
+    }
+    let shipper = |cap: usize| {
+        let list = list.clone();
+        let driver = driver.clone();
+        let ingest = f.ingest.clone();
+        async move {
+            LogShipper::new(
+                driver,
+                Arc::new(move || list.clone()),
+                ingest,
+                Arc::new(MemoryPositions::new()),
+                ShipperConfig {
+                    lines_per_instance: 100,
+                    lines_per_tick: cap,
+                    ..ShipperConfig::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let zero = shipper(0).await;
+    assert_eq!(zero.tick().await.lines, 0, "a cap of 0 ships nothing");
+    let two = shipper(2).await;
+    let mut ticks = Vec::new();
+    for _ in 0..3 {
+        ticks.push(two.tick().await.lines);
+    }
+    assert!(
+        ticks.iter().all(|n| *n <= 2),
+        "at most 2 lines per tick: {ticks:?}"
+    );
+    // Every tenant was reached within three ticks (each has 2 lines).
+    for id in &ids {
+        let got = f
+            .store
+            .read(id.tenant, &TelemetryFilter::default())
+            .await
+            .unwrap();
+        assert!(!got.logs.is_empty(), "every tenant gets a turn");
+    }
+}
+
+/// Kimi run 13 finding 5: `max_positions` is a hard cap, also when the listed instances alone
+/// are more, and on saved positions loaded at start.
+#[tokio::test]
+async fn max_positions_is_a_hard_cap() {
+    let f = Fixture::new();
+    let registry = MemoryRegistry::new();
+    let driver = Arc::new(MemoryDriver::new(
+        registry.clone(),
+        Arc::new(MemoryUsage::new()),
+    ));
+    let a = identity(Environment::Live);
+    let mut list = Vec::new();
+    for k in 0..3 {
+        let id = SourceIdentity {
+            deployment: Uuid::now_v7(),
+            ..a
+        };
+        let i = start_job(
+            &driver,
+            &registry,
+            &workload(&id),
+            "unused-secret-9",
+            &[format!("instance {k}")],
+        )
+        .await;
+        wait_lines(&driver, a.tenant, i, 2).await;
+        list.push((a.tenant, i));
+    }
+    let cfg = ShipperConfig {
+        max_positions: 2,
+        ..ShipperConfig::default()
+    };
+    let l1 = list.clone();
+    let shipper = LogShipper::new(
+        driver.clone(),
+        Arc::new(move || l1.clone()),
+        f.ingest.clone(),
+        Arc::new(MemoryPositions::new()),
+        cfg,
+    )
+    .await
+    .unwrap();
+    for _ in 0..3 {
+        let r = shipper.tick().await;
+        assert!(shipper.positions_held().await <= 2, "{r:?}");
+    }
+    assert_eq!(shipper.tick().await.skipped_instances, 1);
+    // Saved positions over the cap (the cap was lowered) are cut on load.
+    let saved = Arc::new(MemoryPositions::new());
+    let over: HashMap<InstanceId, u64> = list.iter().map(|(_, i)| (*i, 1)).collect();
+    saved.save(&over).await.unwrap();
+    let restarted = LogShipper::new(
+        driver.clone(),
+        Arc::new(move || list.clone()),
+        f.ingest.clone(),
+        saved,
+        cfg,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restarted.positions_held().await, 2);
+}
+
 // ---------------------------------------------------------------------------- secrets
 
 /// S-59 and T-44: the secret matcher on a hostile text of the value cap (many `%`, `+`, `\`)
@@ -1283,6 +1769,224 @@ fn real_store() -> Option<Arc<LgtmStore>> {
         })
         .unwrap(),
     ))
+}
+
+// ---------------------------------------------------------------------------- bounded reads
+
+/// How a fake store answers.
+enum FakeBody {
+    /// The whole body with its length.
+    Full(Vec<u8>),
+    /// Declares this length, sends a little and then nothing more.
+    Declared(u64),
+    /// Chunked, without end.
+    Endless,
+}
+
+/// A fake Loki, Mimir and Tempo on one port: `answer` maps a request path (with query) to a
+/// status and a body. Counts the requests.
+async fn fake_store(
+    answer: impl Fn(&str) -> (u16, FakeBody) + Send + Sync + 'static,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answer = Arc::new(answer);
+    let n = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let answer = answer.clone();
+            let n = n.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut b).await {
+                            Ok(1) => head.push(b[0]),
+                            _ => return,
+                        }
+                    }
+                    n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let path = head.split(' ').nth(1).unwrap_or("/").to_owned();
+                    let (status, body) = answer(&path);
+                    match body {
+                        FakeBody::Full(body) => {
+                            let h = format!(
+                                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            if sock.write_all(h.as_bytes()).await.is_err()
+                                || sock.write_all(&body).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        FakeBody::Declared(len) => {
+                            let h = format!("HTTP/1.1 {status} X\r\nContent-Length: {len}\r\n\r\n");
+                            let _ = sock.write_all(h.as_bytes()).await;
+                            let _ = sock.write_all(&[0u8; 1024]).await;
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                            return;
+                        }
+                        FakeBody::Endless => {
+                            let h = format!(
+                                "HTTP/1.1 {status} X\r\nTransfer-Encoding: chunked\r\n\r\n"
+                            );
+                            if sock.write_all(h.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            let chunk =
+                                [b"10000\r\n".as_slice(), &[0x0a; 0x10000], b"\r\n"].concat();
+                            while sock.write_all(&chunk).await.is_ok() {}
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (url, count)
+}
+
+fn fake_lgtm(url: &str, timeout: Duration) -> LgtmStore {
+    LgtmStore::new(LgtmConfig {
+        collector_url: url.to_owned(),
+        loki_url: url.to_owned(),
+        mimir_url: url.to_owned(),
+        tempo_url: url.to_owned(),
+        collector_token: SecretValue::new("unused-collector-token"),
+        timeout,
+    })
+    .unwrap()
+}
+
+/// Kimi run 13 finding 2: a store answer over the read cap is refused, whether it declares
+/// its length or not; a valid answer under the cap is read.
+#[tokio::test]
+async fn store_answers_over_the_read_cap_are_refused() {
+    let pad = "x".repeat(4096);
+    let body = format!(
+        r#"{{"status":"success","data":{{"resultType":"matrix","result":[]}},"pad":"{pad}"}}"#
+    );
+    let (url, _) = fake_store(move |_| (200, FakeBody::Full(body.clone().into_bytes()))).await;
+    let f = TelemetryFilter {
+        signal: Some(Signal::Metrics),
+        ..Default::default()
+    };
+    let tenant = TenantId::new();
+    let store = fake_lgtm(&url, Duration::from_secs(10)).with_answer_caps(1024, 1024);
+    assert!(
+        store.read(tenant, &f).await.is_err(),
+        "a 4 kB answer over a 1 kB cap is refused"
+    );
+    // Positive control: the same answer under a larger cap is read.
+    let roomy = fake_lgtm(&url, Duration::from_secs(10)).with_answer_caps(64 * 1024, 1024);
+    assert!(roomy.read(tenant, &f).await.unwrap().is_empty());
+}
+
+/// Kimi run 13 finding 2: a Tempo trace answer over the trace cap is skipped without being
+/// read whole: one that declares a huge length, and one that never ends. Without the cap the
+/// read would wait for the body until the timeout and fail.
+#[tokio::test]
+async fn tempo_traces_over_the_cap_are_skipped_without_reading_them() {
+    let (url, _) = fake_store(|path| {
+        if path.starts_with("/api/search") {
+            let ids = r#"{"traces":[{"traceID":"0af7651916cd43dd8448eb211c80319c"},{"traceID":"1af7651916cd43dd8448eb211c80319c"}]}"#;
+            (200, FakeBody::Full(ids.as_bytes().to_vec()))
+        } else if path.contains("0af76519") {
+            (200, FakeBody::Declared(1 << 30))
+        } else {
+            (200, FakeBody::Endless)
+        }
+    })
+    .await;
+    let store = fake_lgtm(&url, Duration::from_secs(5)).with_answer_caps(1024 * 1024, 256 * 1024);
+    let started = Instant::now();
+    let got = store
+        .read(
+            TenantId::new(),
+            &TelemetryFilter {
+                signal: Some(Signal::Traces),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the large traces are skipped, not an error");
+    assert!(got.spans.is_empty());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the bodies were not read to the end"
+    );
+}
+
+/// Kimi run 13 finding 2: Loki paging stops once the read has its `limit`; without it, the
+/// read takes all 20 pages of 5000 lines.
+#[tokio::test]
+async fn loki_paging_stops_at_the_limit() {
+    let f = Fixture::new();
+    let a = identity(Environment::Live);
+    f.ingest
+        .ingest(
+            &a,
+            Batch {
+                logs: vec![LogRecord {
+                    time: crate::now(),
+                    severity: Severity::Info,
+                    body: LogBody::Text("a line".into()),
+                    attributes: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let stored = f
+        .store
+        .read(a.tenant, &TelemetryFilter::app(a.app))
+        .await
+        .unwrap()
+        .logs
+        .remove(0);
+    let line = crate::telemetry::lgtm::wire_log_line(&stored);
+    let base = stored.time.unix_timestamp_nanos();
+    let page = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p = page.clone();
+    let (url, count) = fake_store(move |_| {
+        let k = p.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as i128;
+        let values: Vec<serde_json::Value> = (0..5000i128)
+            .map(|i| serde_json::json!([(base + k * 5000 + i).to_string(), line]))
+            .collect();
+        let body = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "streams", "result": [{"stream": {}, "values": values}]}
+        });
+        (200, FakeBody::Full(serde_json::to_vec(&body).unwrap()))
+    })
+    .await;
+    let store = fake_lgtm(&url, Duration::from_secs(30));
+    let got = store
+        .read(
+            a.tenant,
+            &TelemetryFilter {
+                signal: Some(Signal::Logs),
+                limit: Some(10),
+                ..TelemetryFilter::app(a.app)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.logs.len(), 10);
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one page holds the limit"
+    );
 }
 
 /// Ingest that waits until the stores show what it stored (the stores are eventually

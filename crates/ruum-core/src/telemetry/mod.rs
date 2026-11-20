@@ -595,11 +595,22 @@ impl ClassifiedBatch {
         self.records() == 0
     }
 
-    /// The bytes that the meter counts: the JSON form of the records.
+    /// The bytes that the meter counts: the JSON form of the records. Counted as it is
+    /// written, so the JSON text is never held in memory (Kimi run 13 finding 1).
     pub fn byte_size(&self) -> usize {
-        serde_json::to_vec(self)
-            .expect("stored telemetry records serialise to JSON")
-            .len()
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut n = Count(0);
+        serde_json::to_writer(&mut n, self).expect("stored telemetry records serialise to JSON");
+        n.0
     }
 }
 
