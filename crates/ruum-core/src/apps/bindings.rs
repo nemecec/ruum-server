@@ -399,11 +399,14 @@ fn binding_names(m: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The role and `on_behalf_of_user` of each node binding of a live manifest, by name.
+type Shapes = BTreeMap<String, (Option<Role>, bool)>;
+
 /// What a live manifest gives each node binding (`role`, `on_behalf_of_user`), by name: the
 /// shape that an active row of the live principal must have. A live row has the manifest's
 /// role (no cap) and flag ([`AppService::check_bindings`]); an API binding (no `role`) gets no
 /// row. The target is not here: it needs the deployer's right to resolve.
-fn live_shapes(m: &Value) -> BTreeMap<String, (Option<Role>, bool)> {
+fn live_shapes(m: &Value) -> Shapes {
     m.get("bindings")
         .and_then(Value::as_object)
         .map(|o| {
@@ -428,7 +431,7 @@ fn live_shapes(m: &Value) -> BTreeMap<String, (Option<Role>, bool)> {
 
 /// Whether an active row of the live principal is one that `shapes` (of the live manifest)
 /// still plans: its name is a node binding there with the same role and flag.
-fn planned_by(shapes: &BTreeMap<String, (Option<Role>, bool)>, b: &BindingRow) -> bool {
+fn planned_by(shapes: &Shapes, b: &BindingRow) -> bool {
     b.kind == BindingKind::Node && shapes.get(&b.name) == Some(&(b.role, b.on_behalf_of_user))
 }
 
@@ -1223,13 +1226,12 @@ impl AppService {
         tenant: TenantId,
         rows: &[BindingRow],
     ) -> Result<Vec<BindingRow>> {
-        let mut shapes: BTreeMap<NodeId, Option<BTreeMap<String, (Option<Role>, bool)>>> =
-            BTreeMap::new();
+        let mut shapes: BTreeMap<NodeId, Option<Shapes>> = BTreeMap::new();
         let mut out = Vec::new();
         for b in rows.iter().filter(|b| b.principal_id == b.app_node_id.0) {
-            if !shapes.contains_key(&b.app_node_id) {
+            if let std::collections::btree_map::Entry::Vacant(e) = shapes.entry(b.app_node_id) {
                 let live = self.live_manifest_of(tenant, b.app_node_id).await?;
-                shapes.insert(b.app_node_id, live.as_ref().map(live_shapes));
+                e.insert(live.as_ref().map(live_shapes));
             }
             if let Some(Some(want)) = shapes.get(&b.app_node_id)
                 && !planned_by(want, b)
