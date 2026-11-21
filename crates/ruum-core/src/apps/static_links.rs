@@ -221,7 +221,8 @@ pub fn bucket_settings(
             b.bucket
         ));
     }
-    let missing = |name: &str| format!("{name} is not set (and there is no blob store to take it from)");
+    let missing =
+        |name: &str| format!("{name} is not set (and there is no blob store to take it from)");
     Ok(Some(S3Settings {
         endpoint: get("RUUM_STATIC_S3_ENDPOINT").or_else(|| blob.and_then(|b| b.endpoint.clone())),
         region: get("RUUM_STATIC_S3_REGION")
@@ -636,6 +637,9 @@ mod tests {
         // collection's grace period), then deleted from the blob bucket.
         let r = move_sites(blobs.clone(), &sites, true).await.unwrap();
         assert_eq!((r.copied, r.deleted), (2, 2));
-        assert_eq!(move_sites(blobs.clone(), &sites, true).await.unwrap(), MoveReport::default());
+        assert_eq!(
+            move_sites(blobs.clone(), &sites, true).await.unwrap(),
+            MoveReport::default()
+        );
     }
 }
