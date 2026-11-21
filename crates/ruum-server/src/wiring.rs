@@ -100,12 +100,62 @@ pub async fn services_with(
     // takes `services.authz`, so it runs after the engine is chosen.
     install(&mut services, identity, pool.clone()).context("set up the identity area")?;
     install_databases(&mut services, pool.clone(), &handles).await?;
-    install_apps(&mut services, pool, &handles)?;
+    install_apps(&mut services, pool.clone(), &handles)?;
+    install_telemetry(&mut services, pool)?;
     services.workload_tokens = workload_tokens(
         &identity.public_url,
         &crate::config::WorkloadTokenSettings::from_env(),
     )?;
     Ok(services)
+}
+
+/// The telemetry of the services (card O-2): the classes over `telemetry_fields` with a pool
+/// (the memory store without), and the store that the read operations use: the real store
+/// (Loki, Mimir, Tempo) when `RUUM_LOKI_URL`, `RUUM_MIMIR_URL` and `RUUM_TEMPO_URL` are all
+/// set, else the memory store (no records: the reads answer empty pages). The telemetry role
+/// (`RUUM_TELEMETRY=on`, `telemetry.rs`) writes through the same classes. Runs after the apps
+/// area (deployments write their privacy file's suggestions into it).
+pub fn install_telemetry(
+    services: &mut Services,
+    pool: Option<sqlx::PgPool>,
+) -> anyhow::Result<()> {
+    use ruum_core::telemetry::lgtm::{LgtmConfig, LgtmStore};
+    use ruum_core::telemetry::{TelemetryStore, classes};
+    let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+    let store: Arc<dyn TelemetryStore> = match (
+        var("RUUM_LOKI_URL"),
+        var("RUUM_MIMIR_URL"),
+        var("RUUM_TEMPO_URL"),
+    ) {
+        (Some(loki_url), Some(mimir_url), Some(tempo_url)) => {
+            tracing::info!("telemetry reads: Loki, Mimir and Tempo");
+            Arc::new(
+                LgtmStore::new(LgtmConfig {
+                    // The read store never writes: no Collector credential.
+                    collector_url: var("RUUM_TELEMETRY_COLLECTOR_URL")
+                        .unwrap_or_else(|| "http://127.0.0.1:4318".into()),
+                    loki_url,
+                    mimir_url,
+                    tempo_url,
+                    collector_token: ruum_core::runtime::SecretValue::new(String::new()),
+                    timeout: Duration::from_secs(30),
+                })
+                .context("set up the telemetry read store")?,
+            )
+        }
+        _ => {
+            tracing::info!(
+                "telemetry reads: the memory store (RUUM_LOKI_URL, RUUM_MIMIR_URL or RUUM_TEMPO_URL is not set)"
+            );
+            services.telemetry.store().clone()
+        }
+    };
+    let fields: Arc<dyn classes::TelemetryFieldStore> = match pool {
+        Some(pool) => Arc::new(classes::PgFieldStore::new(pool)),
+        None => services.telemetry.fields().clone(),
+    };
+    ruum_core::telemetry::query::install(services, store, fields);
+    Ok(())
 }
 
 /// The database area of the server (see the module docs). Runs after the node, tenant and

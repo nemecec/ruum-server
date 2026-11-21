@@ -447,6 +447,9 @@ impl Pg {
         databases::install(&mut s, parts).expect("install the database area");
         ruum_core::apps::install(&mut s, ruum_core::apps::AppParts::postgres(pool.clone()))
             .expect("install the apps area");
+        // The classes of `telemetry_fields` over the world's database (card O-2); the records
+        // stay in the memory telemetry store of the services.
+        ruum_core::telemetry::query::install_postgres(&mut s, pool.clone());
         s
     }
 

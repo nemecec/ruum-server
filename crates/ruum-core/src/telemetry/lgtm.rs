@@ -734,6 +734,17 @@ impl LgtmStore {
             let key_json = serde_json::to_string(&eq.key).expect("a string serialises");
             q.push_str(&format!(" |= {}", quote(&format!("\"k\":{key_json}"))));
         }
+        // Card O-2: the words and the trace ID as line filters (`|=`, a plain substring, never a
+        // regex or a pipeline stage), each value through `quote`. They only narrow the read; the
+        // match itself is checked on the decoded record (`log_extra_matches`). A word that the
+        // JSON line would hold escaped (a quote, a backslash, a control character) gets no line
+        // filter, so the filter never misses a record that the check would keep.
+        for w in f.words.iter().filter(|w| line_safe(w)) {
+            q.push_str(&format!(" |= {}", quote(w)));
+        }
+        if let Some(t) = f.trace_id.as_deref().filter(|t| is_trace_id(t)) {
+            q.push_str(&format!(" |= {}", quote(t)));
+        }
         q
     }
 
@@ -798,6 +809,9 @@ impl LgtmStore {
         f: &TelemetryFilter,
         limit: usize,
     ) -> Result<Vec<StoredLog>> {
+        if f.newest {
+            return self.read_logs_newest(tenant, f, limit).await;
+        }
         let (from, to) = Self::range(f);
         let url = format!("{}/loki/api/v1/query_range", Self::base(&self.cfg.loki_url));
         let query = Self::logql(f);
@@ -857,6 +871,79 @@ impl LgtmStore {
         Ok(out)
     }
 
+    /// The `limit` newest logs of the filter (card O-2): Loki answers backward, newest first,
+    /// so the paging moves the end back and stops once `limit` records are found. A record at
+    /// the exact end of the previous page is read once.
+    async fn read_logs_newest(
+        &self,
+        tenant: TenantId,
+        f: &TelemetryFilter,
+        limit: usize,
+    ) -> Result<Vec<StoredLog>> {
+        let (from, to) = Self::range(f);
+        let url = format!("{}/loki/api/v1/query_range", Self::base(&self.cfg.loki_url));
+        let query = Self::logql(f);
+        let start = from.unix_timestamp_nanos();
+        let mut end = to.unix_timestamp_nanos();
+        let mut seen_before: Option<i128> = None;
+        let mut out: Vec<StoredLog> = Vec::new();
+        let mut dropped = 0u64;
+        for _ in 0..LOKI_PAGES {
+            if start >= end {
+                break;
+            }
+            let body = self
+                .get(
+                    &url,
+                    tenant,
+                    &[
+                        ("query", query.clone()),
+                        ("start", start.to_string()),
+                        ("end", end.to_string()),
+                        ("limit", LOKI_PAGE.to_string()),
+                        ("direction", "backward".to_owned()),
+                    ],
+                )
+                .await?;
+            let page: LokiAnswer =
+                serde_json::from_slice(&body).map_err(|_| store_error("a Loki answer"))?;
+            let mut n = 0usize;
+            let mut first = end;
+            for stream in page.data.result {
+                for entry in stream.values {
+                    n += 1;
+                    let ts: i128 = entry.0.parse().unwrap_or(end);
+                    first = first.min(ts);
+                    if seen_before.is_some_and(|b| ts >= b) {
+                        continue;
+                    }
+                    match serde_json::from_str::<WireLog>(&entry.1)
+                        .ok()
+                        .and_then(WireLog::into_stored)
+                    {
+                        Some(r) if log_matches(&r, tenant, f) => out.push(r),
+                        Some(r) if r.source.tenant != tenant => dropped += 1,
+                        Some(_) => {}
+                        None => dropped += 1,
+                    }
+                }
+            }
+            if out.len() > limit {
+                out.sort_by_key(|r| std::cmp::Reverse(r.time));
+                out.truncate(limit);
+            }
+            if n < LOKI_PAGE || out.len() >= limit {
+                break;
+            }
+            seen_before = Some(first);
+            end = first;
+        }
+        if dropped > 0 {
+            tracing::warn!(tenant = %tenant, dropped, "telemetry store: Loki returned records that are not of this tenant or not of the record encoding; they were dropped");
+        }
+        Ok(out)
+    }
+
     /// The `limit` oldest points of the filter. Every part of a match but the time is the
     /// series', so a series is checked once; points are kept as (time, value, series) and the
     /// name and labels are cloned only for the `limit` points returned (Kimi run 13 re-check:
@@ -905,7 +992,13 @@ impl LgtmStore {
         limit: usize,
     ) -> Result<Vec<StoredSpan>> {
         let (from, to) = Self::range(f);
-        let ids = self.trace_ids(tenant, &Self::traceql(f), from, to).await?;
+        // Card O-2: one trace is read by its ID, without a search; a trace ID that is not of
+        // the OTel form matches nothing.
+        let ids = match f.trace_id.as_deref() {
+            Some(t) if is_trace_id(t) => vec![t.to_owned()],
+            Some(_) => return Ok(Vec::new()),
+            None => self.trace_ids(tenant, &Self::traceql(f), from, to).await?,
+        };
         let mut out = Vec::new();
         let mut dropped = 0u64;
         let mut too_large = 0u64;
@@ -1134,22 +1227,27 @@ impl TelemetryStore for LgtmStore {
         if limit == 0 {
             return Ok(out);
         }
-        if want(Signal::Logs) {
+        // Card O-2: `newest` keeps the newest `limit` records. Logs page backward in Loki;
+        // metrics and spans are read up to MAX_READ and the newest kept.
+        let read_limit = if f.newest { MAX_READ } else { limit };
+        if want(Signal::Logs) && f.origin.is_none_or(|o| o == LogOrigin::Backend) {
             let mut logs = self.read_logs(tenant, f, limit).await?;
             logs.sort_by_key(|r| r.time);
-            logs.truncate(limit);
+            keep(&mut logs, limit, f.newest);
             out.logs = logs;
         }
-        if want(Signal::Metrics) && f.min_severity.is_none() {
-            let mut metrics = self.read_metrics(tenant, f, limit).await?;
+        // The filters of logs only (severity, words, origin) leave out the other signals.
+        let logs_only = f.min_severity.is_some() || !f.words.is_empty() || f.origin.is_some();
+        if want(Signal::Metrics) && !logs_only && f.trace_id.is_none() {
+            let mut metrics = self.read_metrics(tenant, f, read_limit).await?;
             metrics.sort_by_key(|r| r.time);
-            metrics.truncate(limit);
+            keep(&mut metrics, limit, f.newest);
             out.metrics = metrics;
         }
-        if want(Signal::Traces) && f.min_severity.is_none() {
-            let mut spans = self.read_spans(tenant, f, limit).await?;
+        if want(Signal::Traces) && !logs_only {
+            let mut spans = self.read_spans(tenant, f, read_limit).await?;
             spans.sort_by_key(|r| r.start);
-            spans.truncate(limit);
+            keep(&mut spans, limit, f.newest);
             out.spans = spans;
         }
         Ok(out)
@@ -1470,6 +1568,22 @@ fn log_matches(r: &StoredLog, tenant: TenantId, f: &TelemetryFilter) -> bool {
         && time_ok(r.time, f)
         && f.min_severity.is_none_or(|s| r.severity >= s)
         && fields_ok(f, &[&r.fields, &r.attributes])
+        && log_extra_matches(r, f)
+}
+
+/// Whether a word reads the same in the JSON log line (no character that JSON escapes), so a
+/// line filter on it never misses a record (card O-2).
+pub fn line_safe(w: &str) -> bool {
+    !w.is_empty() && !w.chars().any(|c| c == '"' || c == '\\' || c.is_control())
+}
+
+/// Keeps the `limit` oldest (or newest) of records sorted oldest first.
+fn keep<T>(v: &mut Vec<T>, limit: usize, newest: bool) {
+    if newest && v.len() > limit {
+        v.drain(..v.len() - limit);
+    } else {
+        v.truncate(limit);
+    }
 }
 
 fn metric_matches(r: &StoredMetric, tenant: TenantId, f: &TelemetryFilter) -> bool {
@@ -1484,4 +1598,86 @@ fn span_matches(r: &StoredSpan, tenant: TenantId, f: &TelemetryFilter) -> bool {
         && identity_agrees(&r.attributes, &r.source)
         && time_ok(r.start, f)
         && fields_ok(f, &[&r.attributes])
+        && span_extra_matches(r, f)
+}
+
+#[cfg(test)]
+mod o2_read_tests {
+    //! Card O-2: the words and the trace ID of a log read become `|=` line filters whose
+    //! values never leave their string literal.
+    use super::*;
+
+    /// The parts after the selector: each must be ` |= "<literal>"` (a Go string literal with
+    /// `\` escapes); returns the literals' raw texts, or `None` when the tail is anything else.
+    fn line_filters(tail: &str) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let mut rest = tail;
+        while !rest.is_empty() {
+            rest = rest.strip_prefix(" |= \"")?;
+            let mut lit = String::new();
+            let mut chars = rest.char_indices();
+            let end = loop {
+                let (i, c) = chars.next()?;
+                match c {
+                    '\\' => {
+                        let (_, n) = chars.next()?;
+                        lit.push('\\');
+                        lit.push(n);
+                    }
+                    '"' => break i,
+                    c if c.is_control() => return None,
+                    c => lit.push(c),
+                }
+            };
+            out.push(lit);
+            rest = &rest[end + 1..];
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn words_and_trace_ids_stay_inside_their_literals() {
+        let app = NodeId::new();
+        let head = format!("{{service_name=\"{app}\"}}");
+        let hostile = [
+            "\"",
+            "\\",
+            "`",
+            "|=",
+            "!~",
+            "}",
+            "x\" or \"1\"=\"1",
+            "{tenant=\"b\"}",
+            "{service_name=~\".+\"}",
+            "a\nb",
+            "| json | line_format \"{{.}}\"",
+            ".*",
+            "(?i)needle",
+            "needle",
+        ];
+        for w in hostile {
+            let f = TelemetryFilter {
+                app: Some(app),
+                words: vec![w.to_owned()],
+                trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
+                ..Default::default()
+            };
+            let q = LgtmStore::logql(&f);
+            let tail = q.strip_prefix(&head).unwrap_or_else(|| panic!("{q}"));
+            let lits = line_filters(tail).unwrap_or_else(|| panic!("word {w:?}: {q}"));
+            // A word that the JSON line holds as it is gets its literal; the trace ID too.
+            let want = if line_safe(w) { 2 } else { 1 };
+            assert_eq!(lits.len(), want, "word {w:?}: {q}");
+            if line_safe(w) {
+                assert_eq!(lits[0], w, "{q}");
+            }
+        }
+        // A trace ID not of the OTel form never reaches the query.
+        let f = TelemetryFilter {
+            app: Some(app),
+            trace_id: Some("\" |= \"x".into()),
+            ..Default::default()
+        };
+        assert_eq!(LgtmStore::logql(&f), head);
+    }
 }

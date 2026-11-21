@@ -1107,7 +1107,7 @@ pub(crate) async fn run_all(h: &dyn Harness) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::apps::store::memory::MemoryAppStore;
     use crate::apps::store::postgres::PgAppStore;

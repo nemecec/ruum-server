@@ -4990,7 +4990,6 @@ paths:
       tags: [apps]
       operationId: compareAppDeployment
       x-ruum-area: telemetry
-      x-ruum-status: planned
       summary: Compare a deployment with the one before it
       description: |
         Request rate, error rate, latency (p50, p95), cold starts and memory in the window after
@@ -5535,7 +5534,6 @@ paths:
       tags: [apps]
       operationId: searchAppLogs
       x-ruum-area: telemetry
-      x-ruum-status: planned
       summary: Search the logs of a web app
       description: |
         Backend (standard output, through the runtime) and frontend (the browser script) log
@@ -5604,7 +5602,6 @@ paths:
       tags: [apps]
       operationId: getAppMetrics
       x-ruum-area: telemetry
-      x-ruum-status: planned
       summary: Metric summaries of a web app
       description: |
         Request rate, error rate, latency (p50, p95, p99), CPU, memory, instances, cold starts,
@@ -5653,7 +5650,6 @@ paths:
       tags: [apps]
       operationId: getAppTrace
       x-ruum-area: telemetry
-      x-ruum-status: planned
       summary: One trace across the app and the apps it called
       description: |
         The spans of one OpenTelemetry trace in this app and in the apps it called through
@@ -5683,7 +5679,6 @@ paths:
       tags: [apps]
       operationId: listAppTelemetryFields
       x-ruum-area: telemetry
-      x-ruum-status: planned
       summary: List the telemetry fields with their classes
       description: |
         Every field of log templates, metric labels and span attributes that the app's
@@ -5723,7 +5718,6 @@ paths:
       tags: [apps]
       operationId: confirmAppTelemetryFields
       x-ruum-area: telemetry
-      x-ruum-status: planned
       x-ruum-user-only: true
       summary: Confirm the classes of telemetry fields
       description: |
@@ -5764,7 +5758,6 @@ paths:
       tags: [apps]
       operationId: computeAppPseudonym
       x-ruum-area: telemetry
-      x-ruum-status: planned
       x-ruum-user-only: true
       summary: The telemetry pseudonym of a known value
       description: |

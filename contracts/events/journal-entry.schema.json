@@ -1491,7 +1491,6 @@
         "app.api_key_created",
         "app.api_key_revoked",
         "app.approval_decided",
-        "app.telemetry_fields_confirmed",
         "issue.created",
         "issue.status_changed",
         "issue.reveal_requested",
