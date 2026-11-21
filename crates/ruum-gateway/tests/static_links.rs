@@ -271,36 +271,43 @@ async fn a_sandbox_deployment_gets_no_static_links() {
 async fn a_core_without_the_route_and_a_redirect_fail_closed() {
     let w = World::new().await.unwrap();
     let (app, d, _) = public_site(&w, &[("a.txt", b"aaa")]).await;
-    // A listener with no routes stands for the core of the earlier release.
+    // The real core's link of the file (a redirect below points at it, so following the
+    // redirect would succeed and the test would see it).
+    let core = HttpSiteFiles::new(&format!("http://{}", w.internal)).unwrap();
+    let q = query(&app, &d, "a.txt");
+    let LinkAnswer::File(mut link) = core.link(&q).await.unwrap() else {
+        panic!("a file");
+    };
+    let target = link.url.clone();
+    assert_eq!(
+        w.http.get(&target).send().await.unwrap().status().as_u16(),
+        200,
+        "the redirect target itself is a good link"
+    );
+    // A listener with only the redirect stands for the core of the earlier release (no
+    // static/file route) and for an object store that redirects.
     let old_l = listen().await;
     let old = old_l.local_addr().unwrap();
     let redirect = axum::Router::new().route(
         "/obj",
-        axum::routing::get(|| async {
-            (
-                axum::http::StatusCode::FOUND,
-                [("location", "http://127.0.0.1:9/elsewhere")],
-            )
+        axum::routing::get(move || {
+            let target = target.clone();
+            async move { (axum::http::StatusCode::FOUND, [("location", target)]) }
         }),
     );
     tokio::spawn(async move {
         let _ = axum::serve(old_l, redirect.into_make_service()).await;
     });
     let files = HttpSiteFiles::new(&format!("http://{old}")).unwrap();
-    let q = query(&app, &d, "a.txt");
     assert!(
         files.link(&q).await.is_err(),
         "a bare 404 is not 'not found'"
     );
     // The real core: its own 404 is "not found".
-    let core = HttpSiteFiles::new(&format!("http://{}", w.internal)).unwrap();
     assert_eq!(
         core.link(&query(&app, &d, "nope.txt")).await.unwrap(),
         LinkAnswer::NotFound
     );
-    let LinkAnswer::File(mut link) = core.link(&q).await.unwrap() else {
-        panic!("a file");
-    };
     link.url = format!("http://{old}/obj");
     assert!(
         core.open(&link).await.is_err(),
