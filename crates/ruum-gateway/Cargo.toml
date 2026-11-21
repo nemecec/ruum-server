@@ -27,7 +27,6 @@ http.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util.workspace = true
 jsonwebtoken.workspace = true
-object_store.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -41,6 +40,9 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The test world's stand-in of the object store and its link signer (decision 0008-4); the
+# gateway itself holds no object store client.
+object_store.workspace = true
 ruum-api.workspace = true
 ruum-testkit.workspace = true
 # `#[sqlx::test]` (one database per test) needs the `macros` feature. No `query!` macros are used.

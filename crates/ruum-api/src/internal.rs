@@ -24,7 +24,9 @@
 //!   (`session`), end a session (`session/end`), what a bearer token is (`agent`), and where the
 //!   instance of a sandbox deployment runs (`upstream`, card G-1b: the core's
 //!   `SandboxDirectory` answers from its own deployment record; without a directory the answer
-//!   is `not_running`). The answers name only what the gateway needs: IDs, flags, the pairwise
+//!   is `not_running`), and the file of a static site's path with a short-lived link to its
+//!   object (`static/file`, decision 0008-4: the gateway holds no object store key; only a
+//!   deployment that serves now and is static has files here). The answers name only what the gateway needs: IDs, flags, the pairwise
 //!   subjects of design 9.4 and an instance's `http://<host>:<port>`, never a platform user ID or
 //!   an email.
 //! - `POST /internal/runtime/v1/...`: the small internal API of the runtime API (card R-3;
@@ -206,7 +208,8 @@ pub mod gateway {
     use ruum_core::authz::{ObjectRef, Role, SubjectRef};
     use ruum_core::identity::app_sign_in::wire::{
         AgentAnswer, AgentRequest, DeploymentInfo, DeploymentQuery, EndSessionRequest, PREFIX,
-        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, UpstreamAnswer, UpstreamQuery,
+        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, StaticFileLink,
+        StaticFileQuery, UpstreamAnswer, UpstreamQuery,
     };
     use ruum_core::identity::app_sign_in::{AppBinding, AppEnv, pairwise};
     use ruum_core::{NodeId, TenantId, UserId};
@@ -221,6 +224,7 @@ pub mod gateway {
             .route(&format!("{PREFIX}/session/end"), post(end_session))
             .route(&format!("{PREFIX}/agent"), post(agent))
             .route(&format!("{PREFIX}/upstream"), post(upstream))
+            .route(&format!("{PREFIX}/static/file"), post(static_file))
             // Each request gets its own authz freshness floor, as on the public router (decision
             // 0002-4). Without it the floor helpers do nothing here, and a check falls back to
             // this process's own last token: a revoke made on another replica could still pass.
@@ -294,6 +298,64 @@ pub mod gateway {
         match dir.upstream(&q).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("upstream", e),
+        }
+    }
+
+    /// The file of a static site and a short-lived link to its object (decision 0008-4). Only
+    /// a deployment that serves now, runs no sandbox and whose app is not in the trash has files
+    /// here, so a gateway that is not what it should be reads no more than the sites that are
+    /// served anyway.
+    async fn static_file(State(s): State<AppState>, Json(q): Json<StaticFileQuery>) -> Response {
+        let sites = s.services.apps.sites();
+        if !sites.links_enabled() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        match deployment_info(&s, q.tenant_id, q.app_id, q.deployment_id).await {
+            Ok(Some(info)) if info.serving && !info.sandbox => {}
+            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return failed("static file", e),
+        }
+        // An app in the trash serves nothing (the host lookup leaves it out too).
+        match app_in_trash(&s, q.tenant_id, q.app_id).await {
+            Ok(false) => {}
+            Ok(true) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return failed("static file", e),
+        }
+        match sites
+            .link(q.tenant_id, q.deployment_id, &q.path, q.navigation)
+            .await
+        {
+            Ok(Some((entry, url))) => Json(StaticFileLink {
+                hash: entry.hash,
+                size: entry.size,
+                media_type: entry.media_type,
+                url: url.to_string(),
+            })
+            .into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => failed("static file", e),
+        }
+    }
+
+    /// Whether the app node is in the trash (or gone), read as the app itself (no permission
+    /// check, like the runtime API's check that an app still serves).
+    async fn app_in_trash(s: &AppState, tenant: TenantId, app: NodeId) -> ruum_core::Result<bool> {
+        let ctx = ruum_core::Context {
+            tenant,
+            actor: ruum_core::Actor {
+                actor: ruum_core::PrincipalRef {
+                    kind: ruum_core::PrincipalKind::App,
+                    id: ruum_core::PrincipalId(app.0),
+                },
+                on_behalf_of: None,
+            },
+            scope: None,
+            idempotency_key: None,
+        };
+        match s.services.nodes.is_trashed(&ctx, app).await {
+            Ok(t) => Ok(t),
+            Err(ruum_core::Error::Api(a)) if a.code == ruum_core::ErrorCode::NotFound => Ok(true),
+            Err(e) => Err(e),
         }
     }
 

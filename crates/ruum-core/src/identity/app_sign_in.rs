@@ -231,6 +231,35 @@ pub mod wire {
         Crashed,
     }
 
+    /// `POST /static/file`: the file of a request path of a static site (decision 0008-4). The
+    /// gateway holds no object store key: the core checks the deployment like
+    /// [`DeploymentQuery`] (it must serve and be static), looks the path up in the site's
+    /// index and signs a short-lived link to that one object.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StaticFileQuery {
+        pub tenant_id: TenantId,
+        pub app_id: NodeId,
+        pub deployment_id: Uuid,
+        /// The request path without its leading `/` (the gateway's `request_path`).
+        pub path: String,
+        /// A browser navigation (`spa_fallback` answers only those).
+        pub navigation: bool,
+    }
+
+    /// The answer of `POST /static/file` (`404` when the deployment does not serve a static
+    /// site or no file matches; `503` when the core has no static store that can sign links).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StaticFileLink {
+        /// The BLAKE3 hash of the file (lower-case hex), the `ETag`.
+        pub hash: String,
+        pub size: u64,
+        /// The `Content-Type`.
+        #[serde(rename = "type")]
+        pub media_type: String,
+        /// A link that reads the file's object with `GET`, valid for a minute.
+        pub url: String,
+    }
+
     /// `POST /redeem`: redeem a sign-in code for an app session.
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct RedeemRequest {

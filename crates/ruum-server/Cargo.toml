@@ -45,3 +45,5 @@ reqwest.workspace = true
 sqlx = { workspace = true, features = ["macros"] }
 serde_json.workspace = true
 tower.workspace = true
+# Deployment IDs in the static bucket test (decision 0008-4).
+uuid.workspace = true

@@ -109,6 +109,9 @@ spec:
             - { name: RUUM_S3_ENDPOINT, value: "https://hel1.your-objectstorage.com" }
             - { name: RUUM_S3_REGION, value: hel1 }
             - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs-768usm }
+            # Static app files in a bucket of their own (decision 0008-4; tofu/cluster). Only the
+            # server writes; the gateway gets short-lived links that the server signs.
+            - { name: RUUM_STATIC_S3_BUCKET, value: ruum-staging-static-768usm }
             - { name: RUUM_S3_FORCE_PATH_STYLE, value: "false" }
             - { name: SMTP_URL, value: "smtp://mailpit.ops.svc.cluster.local:1025" }
             - { name: RUUM_MAIL_FROM, value: "no-reply@notify.staging.ruum.space" }

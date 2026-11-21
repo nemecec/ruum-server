@@ -58,6 +58,8 @@ RUUM_S3_BUCKET required
 RUUM_S3_ACCESS_KEY_ID required
 RUUM_S3_SECRET_ACCESS_KEY required
 RUUM_S3_FORCE_PATH_STYLE required
+# The bucket of the static app files (decision 0008-4; blobs/object.rs, ruum-server wiring.rs).
+RUUM_STATIC_S3_BUCKET required
 
 # WebDAV host (ruum-webdav lib.rs)
 RUUM_DAV_SPOOL_DIR optional

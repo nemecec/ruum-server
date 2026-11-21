@@ -24,8 +24,9 @@
 //! The gateway holds **no tenant keys and no general system access**: the host lookup (its
 //! database role may only execute `ruum_app_host_lookup`), the core's small internal API
 //! ([`core_api`]; the core runs the SpiceDB checks and holds the pseudonym keys of the pairwise
-//! subjects), the user-token signing key, and a read-only object store credential for the static
-//! sites.
+//! subjects) and the user-token signing key. It holds no object store key: static files come
+//! through links that the core signs for one object and one minute ([`static_files`], decision
+//! 0008-4).
 //!
 //! The module tree of `docs/STEP3.md` "Shared files": `host`, `session`, `check`, `token`,
 //! `static_files`, `proxy`, `sandbox` (G-1b), `telemetry` (G-2), `reports` (G-4), `domains`
@@ -51,7 +52,6 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use host::{AppHost, HostCache, Resolved};
 use proxy::{Frame, Outgoing, Sent};
-use ruum_core::apps::static_site::StaticSites;
 use ruum_core::identity::app_sign_in::wire::{DeploymentInfo, DeploymentQuery, UpstreamQuery};
 use ruum_core::identity::app_sign_in::{AppBinding, AppEnv};
 use sandbox::{HoldConfig, Route, SandboxHold, Sandboxes};
@@ -113,7 +113,8 @@ pub struct Gateway {
     pub hosts: HostCache,
     pub core: core_api::CoreCache,
     pub tokens: UserTokenSigner,
-    pub sites: StaticSites,
+    /// Static files: the core's links, then the objects (decision 0008-4).
+    pub sites: Arc<dyn static_files::SiteFiles>,
     pub upstreams: proxy::TestUpstreams,
     pub visits: session::Visits,
     /// The core's answers where sandboxes run, and the hold of cold starts (card G-1b).
@@ -129,7 +130,7 @@ impl Gateway {
         hosts: Arc<dyn host::HostLookup>,
         core: Arc<dyn core_api::CoreApi>,
         tokens: UserTokenSigner,
-        sites: StaticSites,
+        sites: Arc<dyn static_files::SiteFiles>,
     ) -> Self {
         let proxy = proxy::ProxyConfig::default();
         Self {

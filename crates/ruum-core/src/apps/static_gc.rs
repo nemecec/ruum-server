@@ -267,6 +267,42 @@ impl AppService {
         Ok(total)
     }
 
+    /// Moves the static objects of every tenant from the blob bucket into the static bucket
+    /// ([`super::static_site::StaticSites::migrate_legacy`], decision 0008-4), each under the
+    /// tenant's site lock taken shared (the collection, which takes it exclusively, never runs
+    /// on a tenant while its objects move). `delete` removes the moved objects from the blob
+    /// bucket; the sweeper passes it only after [`STATIC_GC_FIRST_DELAY`], when no server of
+    /// an earlier release (which reads and writes the blob bucket) still runs. A tenant whose
+    /// move fails is left for the next run (logged).
+    pub async fn migrate_legacy_sites(
+        &self,
+        delete: bool,
+    ) -> Result<super::static_site::LegacyReport> {
+        let mut total = super::static_site::LegacyReport::default();
+        for tenant in self.deps.sites.legacy_tenants().await? {
+            let moved = async {
+                let _lock = self.lock_sites(tenant, false, GC_LOCK_WAIT).await?;
+                self.deps.sites.migrate_legacy(tenant, delete).await
+            }
+            .await;
+            match moved {
+                Ok(r) => {
+                    if r != Default::default() {
+                        tracing::info!(%tenant, indexes = r.indexes, files = r.files_copied,
+                            deleted = r.deleted, skipped = r.skipped,
+                            "moved static site objects out of the blob bucket");
+                    }
+                    total += r;
+                }
+                Err(e) => {
+                    tracing::warn!(%tenant, error = %e,
+                        "the move of static site objects out of the blob bucket failed");
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Runs [`AppService::collect_static_all`] after [`STATIC_GC_FIRST_DELAY`] and then every
     /// [`STATIC_GC_EVERY`] (the server: [`AppService::run_sweeper`] starts it in a task of its
     /// own, so a long collection never holds up the expiry of previews). The first run waits
