@@ -325,14 +325,16 @@ fn every_pending_entry_names_a_case_and_a_card() {
             "WORLD_PENDING names {case}, which is not a case"
         );
     }
-    // Every runtime API case waits for R-3 or G-3 (no runtime API world exists in this step).
+    // R-3 is merged: its world (`crates/ruum-runtime-api`) runs every runtime API case, so no
+    // case may wait for R-3 any more; a runtime API case that is still pending waits for G-3.
     for c in gateway::runtime_cases() {
-        let r = gateway::pending_reason(c.name).unwrap_or("");
-        assert!(
-            r.starts_with("R-3:") || r.starts_with("G-3:"),
-            "the runtime API case {} must be pending with R-3 or G-3",
-            c.name
-        );
+        if let Some(r) = gateway::pending_reason(c.name) {
+            assert!(
+                r.starts_with("G-3:"),
+                "the runtime API case {} is pending with {r:?}; only G-3 is still open",
+                c.name
+            );
+        }
     }
 }
 
