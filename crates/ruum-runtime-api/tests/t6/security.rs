@@ -658,6 +658,53 @@ async fn the_exchange_rules() {
         (c["env"].as_str(), c["sub"].as_str()),
         (Some("preview"), Some(seed.preview.to_string().as_str()))
     );
+    // Another preview of the same app: only the audience differs (the same env, tenant and
+    // pairwise subject), and the token is refused.
+    let owner = World::ctx(seed.tenant, seed.owner);
+    let other = w
+        .deploy(&owner, seed.app, &manifest(&[], ""), None)
+        .await
+        .unwrap();
+    let ow = w
+        .issuer
+        .issue(&ruum_core::runtime::WorkloadIdentity {
+            tenant: seed.tenant,
+            app: seed.app,
+            deployment: other,
+            environment: ruum_core::runtime::Environment::Preview,
+        })
+        .unwrap();
+    let pru2 = w
+        .user_token_of(&seed, Env::Preview, v, "user")
+        .await
+        .unwrap();
+    refused_with(
+        &w.exchange(ow.expose(), pru2.expose()).await.unwrap(),
+        401,
+        "unauthenticated",
+        "a preview's user token at another preview",
+    );
+    // The live audience with env preview: only the env differs.
+    let mut ce = w.users.claims(
+        format!("app:{}", seed.app.0),
+        "preview",
+        &seed.tenant_slug,
+        &ruum_gateway::token::TokenSubject {
+            sub: w.subject(&seed, v).await.unwrap(),
+            actor: "user",
+            on_behalf_of: None,
+            roles: vec![],
+        },
+    );
+    ce.jti = Uuid::now_v7().to_string();
+    refused_with(
+        &w.exchange(wt.expose(), &w.users.sign(&ce).unwrap())
+            .await
+            .unwrap(),
+        401,
+        "unauthenticated",
+        "the live audience with env preview",
+    );
     let obo = c["on_behalf_of"].as_str().unwrap();
     assert!(Uuid::parse_str(obo).is_ok());
     assert_ne!(

@@ -915,7 +915,7 @@ impl RuntimeApiService {
             Err(e) => return Err(e),
         };
         // 5. The user's right too.
-        if let Some(d) = &q.delegation {
+        if let Some(d) = q.delegation.as_ref() {
             let Some(ctx) = self.delegated_ctx(c, d).await? else {
                 return Ok(Err(Refusal::NotFound));
             };
