@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +252,26 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Kimi review fixes of run 13 (2026-11-21; four fix branches rebased onto `main` `106080e` in one
+stack, each tip checked, pushed as `integ13k/<name>`, green in GitHub CI, then fast-forwarded in
+this order, `106080e..f05f032`; linear history, no merge commit, no co-author line). Kimi K3.1 Pro
+reviewed the merged run 13 code of all five cards (S-70); each fix had a Claude review and a Kimi
+re-check. The digest section "Kimi reviews and fixes (run 13)" in
+`docs/digests/2026-11-19-run13.md` has the findings. Not accepted: `fix/o1b-kimi13` (the
+reviewer's Kimi re-check did not run; O-1b of run 13 stays as it was and its gate stays open).
+
+| Branch (pushed as) | What it adds | Kimi |
+|---|---|---|
+| `fix/b1-kimi13` (`integ13k/b-1`) | Bindings: a release revokes the live grants its manifest drops before it commits (a failed revocation fails the release); the republish of the live deployment checks name, role and `on_behalf_of_user` of every row, and under the live switch that it is still live (`409` conflict otherwise); the repair reads every row by key, ends live rows the live manifest does not plan (per app, under its switch), and a bounded slow pass covers targets whose rows are all revoked; the purge of bindings runs in batches of 1000. Six new mutations. S-76. | run 13: CHANGES REQUESTED (1 High, 3 Medium); three rounds, round 3 APPROVE; re-check of `96b2b7d` CHANGES REQUESTED (1 High, 1 Medium race); `7afe477` **APPROVE** |
+| `fix/o5-kimi13` (`integ13k/o-5`) | Node SDK: `@ruum/log` drops a string over 8192 characters whole (`"[too long]"`); dev mode never follows a symbolic link (`lstat` before, `O_NOFOLLOW`, a `dev`/`ino` compare after the open, new files only with `O_CREAT\|O_EXCL`, truncation after the check); the verifier copies its issuer, audience and env at construction. S-77. | run 13: CHANGES REQUESTED (2 Medium, 1 Low); two re-checks found 2 Medium more, fixed; `d1f5ce3` and the review's re-check **APPROVE** |
+| `fix/w2s4-kimi13` (`integ13k/w2s-4`) | The site purge's page after the cursor is its own static statement (`and id > $3`), an index bound also in a generic plan; a test forces a generic plan and checks the bound. One new mutation; the tenant-filter mutation hits both statements. | run 13: CHANGES REQUESTED (1 Medium); fix `2737494` **APPROVE** |
+| `fix/o21-kimi13` (`integ13k/o-21`) | Staging: a new kind `setup` (only a new node's machine configuration is created) runs `ops/tunnel-setup.sh` before the apply, so a stopped node addition can resume. Nothing applied to staging. | run 13: CHANGES REQUESTED (1 Medium); fix and re-check **APPROVE** |
+
+Fix made during this integration: the backlog file conflicted (B-1 and O-5 both added S-76); B-1
+keeps S-76, the O-5 row is S-77 and the `dev.ts` comment names S-77. The B-1 head is `7afe477`,
+one commit past the `96b2b7d` that the task named (the Claude reviewer's race fixes, approved by
+Kimi; M-69).
 
 Integration of run 13 (2026-11-20; five branches rebased onto `main` `5267efc` in one stack,
 each tip checked on the build server, pushed as `integ13/<name>`, green in GitHub CI, then
@@ -809,6 +829,40 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-21, `main` after the Kimi review fixes of run 13, on the build server)
+
+`main` is `f05f032` before this documentation commit. Each Rust tip was checked with its own key
+(`integ13kb` for B-1, `integ13k` for the final tip), one full check at a time
+(`panel/integ13k-check.sh`: fmt, clippy, the workspace without `ruum-dbengine`, `ruum-dbengine`
+with 4 threads, the test kit on both backends with `RUUM_REQUIRE_IMPLEMENTED=1`, the browser
+tests), each on a fresh key. O-5 changes only `sdk/node` and the backlog, so the B-1 check covers
+its Rust and web tree; its SDK tests ran on the build server (`npm ci && npm test` in `sdk/node`:
+91 of 91). O-21 changes only `deploy/staging`, so the final check covers the W2S-4 tip.
+
+| Tip | `cargo test --workspace` (passed / failed / ignored) | Isolation (memory = Postgres) | Permission matrix (memory = Postgres) | Privacy (memory / Postgres) | Trashed | Browser |
+|---|---|---|---|---|---|---|
+| main before (`106080e`, run 13) | 1360 / 0 / 5 | 375 passed, 128 planned | 2032 passed, 624 planned | 99 planned / 38 passed, 61 planned | 112 | 172 passed, 1 skipped |
+| B-1 (`7afe477`) and O-5 (`c7a342e`) | 1369 / 0 / 5 | 375, 128 | 2032, 624 | same | 112 | 172, 1 |
+| W2S-4 (`39eeeb7`) and O-21 (`f05f032`, final) | 1369 / 1 / 5 (the gateway test `twenty_requests_to_a_stopped_app_cause_one_start` got one `502`; it passed 5 of 5 alone and on the next run; T-65) | **375 passed, 128 planned** | **2032 passed, 624 planned** | **99 planned / 38 passed, 61 planned** | **112** | **172 passed, 1 skipped** |
+
+On `main` (`f05f032`, a second full run with the smoke test while mutation shards ran):
+`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`
+clean; the workspace 1354 / 16 / 5, where the 16 are the known `ruum-core` `databases::` tests
+that fail when the data cluster drops connections under load (B-39, B-42); all 155 `databases::`
+tests pass alone on a fresh data cluster, so the total is **1370 / 0 / 5**; the test kit with
+`RUUM_REQUIRE_IMPLEMENTED=1` passes on memory and Postgres (94 tests each), 0 operations without a
+case (the binding cases 7 of 7 on both); `scripts/e2e_smoke.sh`: `PASSED: 59 checks`. Also:
+
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: all 342 mutations killed
+  (335 before; B-1 adds six, W2S-4 one): 160 + 160 in two shards (with a helper key on shard 1's
+  tail), 22 Docker mutations alone. `dbengine-mask-copy-stats-kept` survived once under load and
+  is killed alone (T-64).
+- `deploy/staging/tests/run.sh` on the Mac: 682 checks passed on the B-1, O-5 and W2S-4 tips,
+  685 on the final tree (O-21 adds 3).
+- GitHub CI: green on the four pushed heads `integ13k/b-1`, `integ13k/o-5`, `integ13k/w2s-4`,
+  `integ13k/o-21` (`ci` runs 44791296396, 44791301849, 44791306444, 44791310626), each at the
+  first attempt.
 
 ## Checks (2026-11-20, `main` after the integration of run 13, on the build server)
 
