@@ -39,7 +39,10 @@
 //! server runs it at start and then every [`MOVE_EVERY`] ([`run_moves`]), so a site that a
 //! server of the previous release writes during a rolling upgrade moves too. The copies are
 //! new objects, younger than the grace period of the garbage collection, so the collection
-//! never deletes a moved file before its index arrives.
+//! never deletes a moved file before its index arrives. In its first [`MOVE_DELETE_AFTER`] a
+//! server only copies: servers of the previous release, which read sites from the blob bucket,
+//! may still run (a rolling upgrade, as the garbage collection assumes,
+//! [`super::static_gc::STATIC_GC_FIRST_DELAY`]).
 
 use super::static_site::{ROOT_PREFIX, StaticSites};
 use crate::blobs::object::S3Settings;
@@ -58,6 +61,10 @@ pub const LINK_TTL: Duration = Duration::from_secs(60);
 
 /// How often the server moves sites that are still in the blob bucket ([`run_moves`]).
 pub const MOVE_EVERY: Duration = Duration::from_secs(600);
+
+/// How long after its start a server only copies sites out of the blob bucket and deletes
+/// nothing there ([`run_moves`]): the rolling upgrade has ended by then.
+pub const MOVE_DELETE_AFTER: Duration = super::static_gc::STATIC_GC_FIRST_DELAY;
 
 /// Objects larger than this are copied in parts ([`move_sites`]).
 const COPY_IN_PARTS_ABOVE: u64 = 16 * 1024 * 1024;
@@ -190,52 +197,48 @@ impl SiteLinks for MemoryLinks {
 /// `RUUM_STATIC_S3_ENDPOINT`, `RUUM_STATIC_S3_REGION`, `RUUM_STATIC_S3_ACCESS_KEY_ID`,
 /// `RUUM_STATIC_S3_SECRET_ACCESS_KEY` and `RUUM_STATIC_S3_FORCE_PATH_STYLE` (read through
 /// `var`); each one but the bucket defaults to the blob store's (`blob`). `Ok(None)` without a
-/// static bucket. An error when the static bucket is the blob bucket (the same bucket at the
-/// same endpoint), or when it has no keys of its own and there is no blob store.
+/// static bucket. An error when the static bucket has the name of the blob bucket (at any
+/// endpoint: two spellings of one endpoint must not pass), or when it has no keys of its own
+/// and there is no blob store.
 pub fn bucket_settings(
     blob: Option<&S3Settings>,
     var: &dyn Fn(&str) -> Option<String>,
 ) -> std::result::Result<Option<S3Settings>, String> {
     let get = |name: &str| {
-        var(&format!("RUUM_STATIC_S3_{name}"))
+        var(name)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let Some(bucket) = get("BUCKET") else {
+    let Some(bucket) = get("RUUM_STATIC_S3_BUCKET") else {
         return Ok(None);
     };
-    let endpoint = get("ENDPOINT").or_else(|| blob.and_then(|b| b.endpoint.clone()));
-    let missing = |name: &str| {
-        format!("RUUM_STATIC_S3_{name} is not set (and there is no blob store to take it from)")
-    };
-    let settings = S3Settings {
-        region: get("REGION")
-            .or_else(|| blob.map(|b| b.region.clone()))
-            .unwrap_or_else(|| "garage".into()),
-        access_key_id: get("ACCESS_KEY_ID")
-            .or_else(|| blob.map(|b| b.access_key_id.clone()))
-            .ok_or_else(|| missing("ACCESS_KEY_ID"))?,
-        secret_access_key: get("SECRET_ACCESS_KEY")
-            .or_else(|| blob.map(|b| b.secret_access_key.clone()))
-            .ok_or_else(|| missing("SECRET_ACCESS_KEY"))?,
-        force_path_style: get("FORCE_PATH_STYLE")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .or_else(|| blob.map(|b| b.force_path_style))
-            .unwrap_or(true),
-        endpoint,
-        bucket,
-    };
     if let Some(b) = blob
-        && b.bucket == settings.bucket
-        && b.endpoint == settings.endpoint
+        && b.bucket == bucket
     {
         return Err(format!(
-            "RUUM_STATIC_S3_BUCKET is the tenant blob bucket {}: static app files have a bucket \
-             of their own (decision 0008-4)",
+            "RUUM_STATIC_S3_BUCKET names the tenant blob bucket {}: static app files have a \
+             bucket of their own (decision 0008-4)",
             b.bucket
         ));
     }
-    Ok(Some(settings))
+    let missing = |name: &str| format!("{name} is not set (and there is no blob store to take it from)");
+    Ok(Some(S3Settings {
+        endpoint: get("RUUM_STATIC_S3_ENDPOINT").or_else(|| blob.and_then(|b| b.endpoint.clone())),
+        region: get("RUUM_STATIC_S3_REGION")
+            .or_else(|| blob.map(|b| b.region.clone()))
+            .unwrap_or_else(|| "garage".into()),
+        access_key_id: get("RUUM_STATIC_S3_ACCESS_KEY_ID")
+            .or_else(|| blob.map(|b| b.access_key_id.clone()))
+            .ok_or_else(|| missing("RUUM_STATIC_S3_ACCESS_KEY_ID"))?,
+        secret_access_key: get("RUUM_STATIC_S3_SECRET_ACCESS_KEY")
+            .or_else(|| blob.map(|b| b.secret_access_key.clone()))
+            .ok_or_else(|| missing("RUUM_STATIC_S3_SECRET_ACCESS_KEY"))?,
+        force_path_style: get("RUUM_STATIC_S3_FORCE_PATH_STYLE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .or_else(|| blob.map(|b| b.force_path_style))
+            .unwrap_or(true),
+        bucket,
+    }))
 }
 
 /// What one run of [`move_sites`] did.
@@ -243,8 +246,6 @@ pub fn bucket_settings(
 pub struct MoveReport {
     /// Objects copied into the static bucket.
     pub copied: u64,
-    /// Objects that the static bucket had already (same size): not copied again.
-    pub present: u64,
     /// Objects deleted from the blob bucket.
     pub deleted: u64,
     /// The bytes copied.
@@ -278,10 +279,15 @@ async fn copy_object(
     Ok(true)
 }
 
-/// Moves every object under `apps/static/` of `from` (the blob bucket) into the store of
-/// `sites` (the static bucket); see the module docs. Nothing is deleted from `from` when a copy
-/// fails. Objects that are not under the prefix (the chunks of tenants' files) are never read.
-pub async fn move_sites(from: Arc<dyn ObjectStore>, sites: &StaticSites) -> Result<MoveReport> {
+/// Copies every object under `apps/static/` of `from` (the blob bucket) into the store of
+/// `sites` (the static bucket) and, when `delete`, then deletes the copied objects from `from`;
+/// see the module docs. Nothing is deleted when a copy fails. Objects that are not under the
+/// prefix (the chunks of tenants' files) are never read.
+pub async fn move_sites(
+    from: Arc<dyn ObjectStore>,
+    sites: &StaticSites,
+    delete: bool,
+) -> Result<MoveReport> {
     let to = sites.store();
     let mut report = MoveReport::default();
     let mut files = Vec::new();
@@ -301,22 +307,20 @@ pub async fn move_sites(from: Arc<dyn ObjectStore>, sites: &StaticSites) -> Resu
         }
     }
     drop(list);
+    // Every object is copied, also one that the static bucket has already: the copy is a new
+    // object, so the garbage collection, which deletes only unnamed files older than its grace
+    // period, cannot delete a file whose index is still on its way (a file that the static
+    // bucket had, old and unnamed, could go between a check and the copy of the index).
     let mut done = Vec::new();
     for meta in files.into_iter().chain(indexes) {
-        let present = match to.head(&meta.location).await {
-            Ok(m) => m.size == meta.size,
-            Err(object_store::Error::NotFound { .. }) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if present {
-            report.present += 1;
-        } else if copy_object(&from, &to, &meta.location).await? {
+        if copy_object(&from, &to, &meta.location).await? {
             report.copied += 1;
             report.bytes = report.bytes.saturating_add(meta.size);
-        } else {
-            continue;
+            done.push(meta.location);
         }
-        done.push(meta.location);
+    }
+    if !delete {
+        return Ok(report);
     }
     for path in done {
         match from.delete(&path).await {
@@ -328,15 +332,17 @@ pub async fn move_sites(from: Arc<dyn ObjectStore>, sites: &StaticSites) -> Resu
     Ok(report)
 }
 
-/// Runs [`move_sites`] now and then every `every`, for the life of the server. A failed run is
-/// logged and tried again at the next round.
+/// Runs [`move_sites`] now and then every `every`, for the life of the server; it deletes from
+/// the blob bucket only from [`MOVE_DELETE_AFTER`] after the start on. A failed run is logged
+/// and tried again at the next round.
 pub async fn run_moves(from: Arc<dyn ObjectStore>, sites: StaticSites, every: Duration) {
+    let started = std::time::Instant::now();
     loop {
-        match move_sites(from.clone(), &sites).await {
-            Ok(r) if r.copied + r.present + r.deleted > 0 => tracing::info!(
+        let delete = started.elapsed() >= MOVE_DELETE_AFTER;
+        match move_sites(from.clone(), &sites, delete).await {
+            Ok(r) if r.copied + r.deleted > 0 => tracing::info!(
                 target: "ruum::apps",
                 copied = r.copied,
-                present = r.present,
                 deleted = r.deleted,
                 bytes = r.bytes,
                 "static sites moved from the blob bucket to the static bucket"
@@ -402,11 +408,26 @@ mod tests {
         assert_eq!(s.endpoint, b.endpoint);
         assert_eq!(s.region, "hel1");
         assert!(!s.force_path_style);
-        // Its own keys and endpoint win; the same name at another endpoint is another bucket.
+        // The blob bucket's name is refused at any endpoint (two spellings of one endpoint
+        // must not pass).
+        for endpoint in ["https://HEL1.your-objectstorage.com/", "http://garage:3900"] {
+            assert!(
+                bucket_settings(
+                    Some(&b),
+                    &vars(&[
+                        ("RUUM_STATIC_S3_BUCKET", "ruum-staging-blobs"),
+                        ("RUUM_STATIC_S3_ENDPOINT", endpoint),
+                    ]),
+                )
+                .is_err(),
+                "{endpoint}"
+            );
+        }
+        // Its own keys and endpoint win.
         let s = bucket_settings(
             Some(&b),
             &vars(&[
-                ("RUUM_STATIC_S3_BUCKET", "ruum-staging-blobs"),
+                ("RUUM_STATIC_S3_BUCKET", "ruum-static"),
                 ("RUUM_STATIC_S3_ENDPOINT", "http://garage:3900"),
                 ("RUUM_STATIC_S3_ACCESS_KEY_ID", "GK1"),
                 ("RUUM_STATIC_S3_SECRET_ACCESS_KEY", "S1"),
@@ -587,8 +608,14 @@ mod tests {
             .await
             .unwrap();
         let sites = StaticSites::in_memory();
-        let r = move_sites(blobs.clone(), &sites).await.unwrap();
-        assert_eq!((r.copied, r.present, r.deleted), (3, 0, 3));
+        // Copies only (the first hour of a server): the blob bucket keeps the site, so a server
+        // of the previous release still serves it.
+        let r = move_sites(blobs.clone(), &sites, false).await.unwrap();
+        assert_eq!((r.copied, r.deleted), (3, 0));
+        assert!(old.read_index(t, d).await.unwrap().is_some());
+        assert!(sites.read_index(t, d).await.unwrap().is_some());
+        let r = move_sites(blobs.clone(), &sites, true).await.unwrap();
+        assert_eq!((r.copied, r.deleted), (3, 3));
         let index = sites.read_index(t, d).await.unwrap().unwrap();
         let (_, e) = index.resolve("big.bin", false).unwrap();
         assert_eq!(
@@ -599,13 +626,16 @@ mod tests {
         assert!(blobs.head(&chunk).await.is_ok(), "a chunk moved");
         // A second run finds nothing; an object the static bucket has already is not copied.
         assert_eq!(
-            move_sites(blobs.clone(), &sites).await.unwrap(),
+            move_sites(blobs.clone(), &sites, true).await.unwrap(),
             MoveReport::default()
         );
         old.write_site(t, Uuid::now_v7(), &files[..1], None)
             .await
             .unwrap();
-        let r = move_sites(blobs.clone(), &sites).await.unwrap();
-        assert_eq!((r.copied, r.present, r.deleted), (1, 1, 2));
+        // A file the static bucket has already is copied again (a new object for the garbage
+        // collection's grace period), then deleted from the blob bucket.
+        let r = move_sites(blobs.clone(), &sites, true).await.unwrap();
+        assert_eq!((r.copied, r.deleted), (2, 2));
+        assert_eq!(move_sites(blobs.clone(), &sites, true).await.unwrap(), MoveReport::default());
     }
 }

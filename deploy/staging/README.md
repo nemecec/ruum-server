@@ -544,8 +544,9 @@ Milestone M2 on staging: apps are served at `<app>.<tenant slug>.apps.staging.ru
   other settings and the key of `RUUM_S3_*`). Only ruum-server writes to it. For each static
   file the gateway asks ruum-server's internal listener, which checks that the deployment serves,
   looks the path up in the site index and answers a presigned link for that one file object,
-  `GET` only, valid for 60 seconds (`ruum_core::apps::static_links`). ruum-server moves the sites
-  of older releases out of the blob bucket at start and every 10 minutes. The egress proxy: one
+  `GET` only, valid for 60 seconds (`ruum_core::apps::static_links`). ruum-server copies the
+  sites of older releases out of the blob bucket at start and every 10 minutes, and deletes them
+  there from one hour after its start on (the rolling upgrade has ended). The egress proxy: one
   replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
   (the cluster ranges and every public address of staging and of the build server, ConfigMap
   `ruum/ruum-egress-deny`; the platform step stops when an API answer fails or misses a node, the
@@ -644,8 +645,9 @@ commit has none); the older ruum-server ignores `RUUM_APPS_DOMAIN` and gives no 
 app hosts. The runtime class, `ruum-apps`, the policies and the Secrets stay (the platform step of an
 older checkout removes the policies; the rest is harmless). The nodes keep gVisor. A
 ruum-server older than I6-3D reads and writes static sites in the blob bucket and does not see
-the ones in the static bucket: sites deployed after the move then answer `404` until the newer
-release is back (it moves the older release's sites over again, `ruum_core::apps::static_links`).
+the ones in the static bucket: sites deployed after the upgrade, and after the first hour every
+site, then answer `404` until the newer release is back (it moves the older release's sites over
+again, `ruum_core::apps::static_links`).
 
 ## Recreate
 
