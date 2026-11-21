@@ -246,17 +246,62 @@ pub fn install_apps(
             p
         }
     };
-    // Static sites go to the bucket of the blob store when there is one (card W-2s); the
-    // runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
+    // Static sites (card W-2s) go to a bucket of their own when there is S3 (decision 0008-4);
+    // the runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
     if let Some(s3) = ruum_core::blobs::object::S3Settings::from_env() {
-        let store = s3
-            .build()
-            .context("set up the object store of static sites")?;
-        parts.sites = ruum_core::apps::static_site::StaticSites::new(Arc::new(store));
+        parts.sites = static_sites(
+            &s3,
+            ruum_core::blobs::object::S3Settings::static_bucket_from_env().as_deref(),
+        )?;
     }
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
+}
+
+/// The static sites over S3 (decision 0008-4). With `static_bucket` (`RUUM_STATIC_S3_BUCKET`):
+/// that bucket, with the endpoint and the key of the blob store; the core signs the gateway's
+/// short-lived read links with that key, and the objects that an earlier release wrote into the
+/// blob bucket move over ([`ruum_core::apps::static_site::StaticSites::migrate_legacy`]). The
+/// static bucket must not be the blob bucket. Without it (a laptop stack set up before the
+/// static bucket existed), the sites stay in the blob bucket, and the gateway still gets only
+/// signed links, never a key.
+pub fn static_sites(
+    s3: &ruum_core::blobs::object::S3Settings,
+    static_bucket: Option<&str>,
+) -> anyhow::Result<ruum_core::apps::static_site::StaticSites> {
+    use ruum_core::apps::static_site::StaticSites;
+    let Some(bucket) = static_bucket else {
+        tracing::warn!(
+            "RUUM_STATIC_S3_BUCKET is not set: static sites stay in the blob bucket (decision \
+             0008-4 wants a bucket of their own)"
+        );
+        let store = Arc::new(
+            s3.build()
+                .context("set up the object store of static sites")?,
+        );
+        return Ok(StaticSites::new(store.clone()).with_links(store));
+    };
+    if bucket == s3.bucket {
+        anyhow::bail!(
+            "RUUM_STATIC_S3_BUCKET must not be the blob bucket RUUM_S3_BUCKET (decision 0008-4)"
+        );
+    }
+    let store = Arc::new(
+        s3.with_bucket(bucket)
+            .build()
+            .context("set up the object store of static sites")?,
+    );
+    let blobs = s3
+        .build()
+        .context("set up the blob bucket for the move of static sites")?;
+    tracing::info!(
+        bucket,
+        "static sites: a bucket of their own (decision 0008-4)"
+    );
+    Ok(StaticSites::new(store.clone())
+        .with_links(store)
+        .with_legacy(Arc::new(blobs)))
 }
 
 /// The workload token issuer (card R-3; `ruum_core::apps::workload_tokens`), with the key of
@@ -349,6 +394,95 @@ mod tests {
     use tower::ServiceExt;
 
     const URL: &str = "http://127.0.0.1:8490";
+
+    fn s3(bucket: &str) -> ruum_core::blobs::object::S3Settings {
+        ruum_core::blobs::object::S3Settings {
+            endpoint: Some("http://127.0.0.1:1".into()),
+            region: "garage".into(),
+            bucket: bucket.into(),
+            access_key_id: "test-key".into(),
+            secret_access_key: "test-secret".into(),
+            force_path_style: true,
+        }
+    }
+
+    /// Decision 0008-4: the static bucket is never the blob bucket; with it the core signs
+    /// links and moves what an earlier release wrote; without it the sites stay in the blob
+    /// bucket, still with signed links only.
+    #[test]
+    fn static_sites_get_a_bucket_of_their_own() {
+        let blobs = s3("ruum-blobs");
+        let err = static_sites(&blobs, Some("ruum-blobs")).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be the blob bucket"),
+            "{err}"
+        );
+        let own = static_sites(&blobs, Some("ruum-static")).unwrap();
+        assert!(own.links_enabled());
+        assert!(own.has_legacy());
+        assert!(format!("{own:?}").contains("ruum-static"), "{own:?}");
+        let shared = static_sites(&blobs, None).unwrap();
+        assert!(shared.links_enabled());
+        assert!(!shared.has_legacy());
+        assert!(format!("{shared:?}").contains("ruum-blobs"), "{shared:?}");
+    }
+
+    /// On Garage (the laptop stack and the build server; skipped without `RUUM_S3_*`): the
+    /// objects of an earlier release move out of the blob bucket, and a link that the core
+    /// signs reads exactly one object of the static bucket, without any key.
+    #[tokio::test]
+    async fn static_links_on_garage_read_one_object() {
+        use ruum_core::apps::static_site::{IndexFate, StaticSites};
+        let Some(blobs) = ruum_core::blobs::object::S3Settings::from_env() else {
+            eprintln!("skipped: no RUUM_S3_* settings (Garage)");
+            return;
+        };
+        // The static bucket of the stack (`scripts/dev.sh env`); the test writes only under
+        // its own tenant.
+        let Some(bucket) = ruum_core::blobs::object::S3Settings::static_bucket_from_env() else {
+            eprintln!("skipped: no RUUM_STATIC_S3_BUCKET (a Garage stack before decision 0008-4)");
+            return;
+        };
+        let sites = static_sites(&blobs, Some(&bucket)).unwrap();
+        let earlier = StaticSites::new(Arc::new(blobs.build().unwrap()));
+        let t = ruum_core::TenantId(uuid::Uuid::now_v7());
+        let (old, new) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let files = vec![(
+            "index.html".to_string(),
+            bytes::Bytes::from_static(b"<h1>garage</h1>"),
+        )];
+        earlier.write_site(t, old, &files, None).await.unwrap();
+        let r = sites.migrate_legacy(t, true).await.unwrap();
+        assert_eq!((r.indexes, r.files_copied, r.skipped), (1, 1, 0), "{r:?}");
+        assert!(earlier.read_index(t, old).await.unwrap().is_none());
+        assert!(sites.read_index(t, old).await.unwrap().is_some());
+        sites.write_site(t, new, &files, None).await.unwrap();
+        let (entry, url) = sites.link(t, new, "", false).await.unwrap().unwrap();
+        assert_eq!(entry.size, 15);
+        let link = url.to_string();
+        assert!(
+            link.contains(&bucket),
+            "path-style link to the static bucket"
+        );
+        assert!(link.contains("X-Amz-Expires=60"), "a one-minute link");
+        assert!(!link.contains(&blobs.secret_access_key));
+        let http = reqwest::Client::new();
+        let got = http.get(&link).send().await.unwrap();
+        assert_eq!(got.status().as_u16(), 200);
+        assert_eq!(&got.bytes().await.unwrap()[..], b"<h1>garage</h1>");
+        // The signature covers the key: the same link for another object is refused.
+        let other = link.replace(&entry.hash, &"0".repeat(64));
+        assert_eq!(
+            http.get(&other).send().await.unwrap().status().as_u16(),
+            403
+        );
+        // Clean up the test tenant.
+        let gone = |_: uuid::Uuid| IndexFate::Delete;
+        sites
+            .collect(t, &gone, &Default::default(), ruum_core::now())
+            .await
+            .unwrap();
+    }
 
     /// One server process: its own services (its own SpiceDB client and ZedTokens) on the shared
     /// database, and the platform router.

@@ -133,6 +133,23 @@ impl S3Settings {
         })
     }
 
+    /// The bucket of the static app files (decision 0008-4): `RUUM_STATIC_S3_BUCKET`. It has
+    /// the endpoint and the key of the blob store, never its bucket.
+    pub fn static_bucket_from_env() -> Option<String> {
+        std::env::var("RUUM_STATIC_S3_BUCKET")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// The same endpoint and key with another bucket.
+    pub fn with_bucket(&self, bucket: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            ..self.clone()
+        }
+    }
+
     /// The `object_store` S3 client.
     pub fn build(&self) -> Result<object_store::aws::AmazonS3> {
         let mut b = object_store::aws::AmazonS3Builder::new()

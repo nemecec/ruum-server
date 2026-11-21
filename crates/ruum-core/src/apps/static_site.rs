@@ -18,8 +18,25 @@
 //!   ([`request_path`]; decision 0006 G point 4).
 //!
 //! Everything goes through the `object_store` abstraction: `InMemory` in tests and on a server
-//! without S3, Garage or S3 for real (the bucket of the blob store; the `apps/` prefix never
-//! clashes with chunk paths, which start with a tenant ID).
+//! without S3, Garage or S3 for real.
+//!
+//! # A bucket of their own, and no key in the gateway (decision 0008-4)
+//!
+//! The objects live in a bucket of their own (`RUUM_STATIC_S3_BUCKET`), not in the tenant blob
+//! bucket. Only the core holds a key and writes. The Internet-facing gateway holds no object
+//! store key at all: for each request it asks the core's internal listener for the file of a
+//! path ([`StaticSites::link`]), and the core answers with the index entry and a link that it
+//! signs with its own key (S3 SigV4 query signing, `GET` of that one object, valid for
+//! [`LINK_TTL`]). The gateway fetches the bytes from the object store with that link. So a
+//! compromised gateway can read only the files of sites that serve now (the core checks the
+//! deployment first) and can change nothing. Hetzner keys cannot be limited to one bucket or to
+//! reads, so a "read-only gateway key" is not possible there without running Garage as well;
+//! a signed link needs no extra service and limits each grant to one object and one minute.
+//!
+//! A server of an earlier release wrote the objects under the same keys into the blob bucket.
+//! [`StaticSites::migrate_legacy`] copies them into the static bucket (the files of an index
+//! before the index) and, once no server of the earlier release can run any more, deletes them
+//! from the blob bucket.
 //!
 //! Objects stay when a preview expires (they may be shared with another deployment); the
 //! sweeper deletes only the index of an expired preview. The garbage collection of static sites
@@ -40,6 +57,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
+use object_store::signer::Signer;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -411,10 +429,42 @@ pub struct WrittenSite {
     pub new_bytes: u64,
 }
 
+/// How long a link of [`StaticSites::link`] is valid. The gateway fetches at once; the time
+/// only covers a slow first byte of the object store.
+pub const LINK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one run of [`StaticSites::migrate_legacy`] did for one tenant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LegacyReport {
+    /// Indexes that are now in the static bucket.
+    pub indexes: u64,
+    /// File objects copied into the static bucket.
+    pub files_copied: u64,
+    /// Objects deleted from the blob bucket.
+    pub deleted: u64,
+    /// Indexes left in the blob bucket: unreadable, or a file they name is missing.
+    pub skipped: u64,
+}
+
+impl std::ops::AddAssign for LegacyReport {
+    fn add_assign(&mut self, o: Self) {
+        self.indexes += o.indexes;
+        self.files_copied += o.files_copied;
+        self.deleted += o.deleted;
+        self.skipped += o.skipped;
+    }
+}
+
 /// The static sites over an object store.
 #[derive(Clone)]
 pub struct StaticSites {
     store: Arc<dyn ObjectStore>,
+    /// Signs the read links of [`StaticSites::link`] with the key of `store`. Set once, by the
+    /// wiring of the server (or a test world); without it no link is made.
+    links: Arc<std::sync::OnceLock<Arc<dyn Signer>>>,
+    /// The blob bucket, where a server of an earlier release wrote the same objects
+    /// ([`StaticSites::migrate_legacy`]).
+    legacy: Option<Arc<dyn ObjectStore>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -425,7 +475,41 @@ impl std::fmt::Debug for StaticSites {
 
 impl StaticSites {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            links: Arc::default(),
+            legacy: None,
+        }
+    }
+
+    /// The sites with `signer` for their read links. `signer` must sign for the same bucket
+    /// as the store (the server passes the same S3 client).
+    pub fn with_links(self, signer: Arc<dyn Signer>) -> Self {
+        self.set_links(signer);
+        self
+    }
+
+    /// Sets the signer of the read links once (every clone shares it); `false` when one was
+    /// set before (that one stays).
+    pub fn set_links(&self, signer: Arc<dyn Signer>) -> bool {
+        self.links.set(signer).is_ok()
+    }
+
+    /// True when the sites can sign read links (the gateway can serve their files).
+    pub fn links_enabled(&self) -> bool {
+        self.links.get().is_some()
+    }
+
+    /// The sites with `legacy`, the blob bucket that a server of an earlier release wrote the
+    /// same objects into ([`StaticSites::migrate_legacy`]).
+    pub fn with_legacy(mut self, legacy: Arc<dyn ObjectStore>) -> Self {
+        self.legacy = Some(legacy);
+        self
+    }
+
+    /// True when there is a blob bucket to migrate from.
+    pub fn has_legacy(&self) -> bool {
+        self.legacy.is_some()
     }
 
     /// Sites in an in-process object store, for tests and a server without S3.
@@ -839,10 +923,209 @@ impl StaticSites {
             .boxed()
     }
 
-    /// The object store under the sites (the tests wrap it).
-    #[cfg(test)]
-    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+    /// The object store under the sites (the tests wrap it or serve it).
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
+    }
+
+    /// The file of `path` in the site of `deployment` and a link that reads its object for
+    /// [`LINK_TTL`] (decision 0008-4). `path` is the request path without its leading `/`
+    /// (checked by [`request_path`] again here); it is looked up in the index
+    /// ([`SiteIndex::resolve`]) and never becomes part of a key. `Ok(None)`: no index, or no
+    /// file for the path. An error when no signer is set ([`StaticSites::links_enabled`]).
+    pub async fn link(
+        &self,
+        tenant: TenantId,
+        deployment: Uuid,
+        path: &str,
+        navigation: bool,
+    ) -> Result<Option<(IndexEntry, url::Url)>> {
+        let Some(signer) = self.links.get() else {
+            return Err(Error::Internal(
+                "the static sites have no link signer".into(),
+            ));
+        };
+        let raw = format!("/{path}");
+        if request_path(&raw) != Some(path) {
+            return Ok(None);
+        }
+        let Some(index) = self.read_index(tenant, deployment).await? else {
+            return Ok(None);
+        };
+        let Some((_, entry)) = index.resolve(path, navigation) else {
+            return Ok(None);
+        };
+        let key = file_key(tenant, &entry.content_hash()?);
+        let url = signer
+            .signed_url(object_store::signer::Method::GET, &key, LINK_TTL)
+            .await?;
+        Ok(Some((entry.clone(), url)))
+    }
+
+    /// The tenants with static objects in the blob bucket (empty without one).
+    pub async fn legacy_tenants(&self) -> Result<Vec<TenantId>> {
+        let Some(legacy) = &self.legacy else {
+            return Ok(Vec::new());
+        };
+        let root = Path::from(ROOT_PREFIX);
+        let r = legacy.list_with_delimiter(Some(&root)).await?;
+        Ok(r.common_prefixes
+            .iter()
+            .filter_map(|p| p.filename())
+            .filter_map(|n| n.parse::<Uuid>().ok())
+            .map(TenantId)
+            .collect())
+    }
+
+    /// Copies one object from the blob bucket into the static bucket unless the static bucket
+    /// has it with `size` bytes. `Ok(None)`: the blob bucket does not have it with that size.
+    /// `Ok(Some(true))`: copied.
+    async fn copy_legacy(
+        &self,
+        legacy: &Arc<dyn ObjectStore>,
+        key: &Path,
+        size: u64,
+    ) -> Result<Option<bool>> {
+        if object_size(self.store.clone(), key.clone()).await? == Some(size) {
+            return Ok(Some(false));
+        }
+        let r = match legacy.get(key).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if r.meta.size != size {
+            return Ok(None);
+        }
+        let body = r.bytes().await?;
+        if body.len() as u64 != size {
+            return Ok(None);
+        }
+        self.store.put(key, PutPayload::from_bytes(body)).await?;
+        Ok(Some(true))
+    }
+
+    /// Moves the static objects of `tenant` from the blob bucket into the static bucket (see
+    /// the module docs; the caller holds the tenant's site lock shared). Each index goes only
+    /// after every file it names is in the static bucket, so a reader that finds an index
+    /// finds its files. File objects that no index names are copied too (the collection of
+    /// the static bucket decides about them). With `delete`, the moved indexes and every file
+    /// object that the static bucket has with the same size are deleted from the blob bucket;
+    /// pass it only when no server of an earlier release can still write there. Objects whose
+    /// names do not follow the layout stay.
+    pub async fn migrate_legacy(&self, tenant: TenantId, delete: bool) -> Result<LegacyReport> {
+        let mut report = LegacyReport::default();
+        let Some(legacy) = self.legacy.clone() else {
+            return Ok(report);
+        };
+        // The indexes first, as they are now; an index written later is moved by a later run.
+        let mut indexes = Vec::new();
+        let mut list = legacy.list(Some(&sites_prefix(tenant)));
+        while let Some(meta) = list.next().await {
+            let meta = meta?;
+            if let Ok(id) = index_id(&meta.location) {
+                indexes.push((id, meta));
+            }
+        }
+        drop(list);
+        let mut moved = Vec::new();
+        for (id, meta) in indexes {
+            if meta.size > MAX_INDEX_BYTES {
+                report.skipped += 1;
+                continue;
+            }
+            let body = match legacy.get(&meta.location).await {
+                Ok(r) => r.bytes().await?,
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let index = match serde_json::from_slice::<SiteIndex>(&body) {
+                Ok(i) if i.v == LAYOUT_VERSION => i,
+                _ => {
+                    tracing::warn!(%tenant, deployment = %id,
+                        "a site index in the blob bucket cannot be read; it stays there");
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            let mut contents = std::collections::BTreeMap::new();
+            let mut whole = true;
+            for e in index.files.values() {
+                match e.content_hash() {
+                    Ok(h) => {
+                        contents.insert(h.to_hex(), (h, e.size));
+                    }
+                    Err(_) => whole = false,
+                }
+            }
+            for (hash, size) in contents.values() {
+                if !whole {
+                    break;
+                }
+                match self
+                    .copy_legacy(&legacy, &file_key(tenant, hash), *size)
+                    .await?
+                {
+                    Some(true) => report.files_copied += 1,
+                    Some(false) => {}
+                    None => whole = false,
+                }
+            }
+            if !whole {
+                tracing::warn!(%tenant, deployment = %id,
+                    "a file of a site index in the blob bucket is missing; the index stays there");
+                report.skipped += 1;
+                continue;
+            }
+            let key = index_key(tenant, id);
+            if object_size(self.store.clone(), key.clone())
+                .await?
+                .is_none()
+            {
+                self.store.put(&key, PutPayload::from_bytes(body)).await?;
+            }
+            report.indexes += 1;
+            moved.push(meta.location);
+        }
+        // File objects that no index named.
+        let mut files = Vec::new();
+        let mut list = legacy.list(Some(&files_prefix(tenant)));
+        while let Some(meta) = list.next().await {
+            let meta = meta?;
+            if meta
+                .location
+                .filename()
+                .and_then(|n| Hash::from_hex(n).ok())
+                .is_some()
+            {
+                files.push(meta);
+            }
+        }
+        drop(list);
+        for meta in &files {
+            if self.copy_legacy(&legacy, &meta.location, meta.size).await? == Some(true) {
+                report.files_copied += 1;
+            }
+        }
+        if !delete {
+            return Ok(report);
+        }
+        for key in moved {
+            match legacy.delete(&key).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => report.deleted += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for meta in files {
+            if object_size(self.store.clone(), meta.location.clone()).await? != Some(meta.size) {
+                continue;
+            }
+            match legacy.delete(&meta.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => report.deleted += 1,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(report)
     }
 
     /// Deletes the index of a deployment (an expired preview). The file objects stay.
@@ -1130,6 +1413,168 @@ mod tests {
         );
         assert!(has(other, &only_gone.1).await);
         assert!(sites.read_index(other, gone).await.unwrap().is_some());
+    }
+
+    /// A signer that names the key and the time in its link (no real signature).
+    #[derive(Debug)]
+    struct FakeSigner;
+
+    #[async_trait::async_trait]
+    impl Signer for FakeSigner {
+        async fn signed_url(
+            &self,
+            method: object_store::signer::Method,
+            path: &Path,
+            expires_in: std::time::Duration,
+        ) -> object_store::Result<url::Url> {
+            Ok(url::Url::parse(&format!(
+                "https://objects.test/{path}?method={method}&ttl={}",
+                expires_in.as_secs()
+            ))
+            .unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn links_name_only_the_object_of_an_indexed_file() {
+        let sites = StaticSites::in_memory();
+        let t = TenantId(Uuid::now_v7());
+        let d = Uuid::now_v7();
+        sites
+            .write_site(t, d, &files(), Some("index.html".into()))
+            .await
+            .unwrap();
+        // No signer: no link at all (the server without S3 serves no static file).
+        assert!(!sites.links_enabled());
+        assert!(sites.link(t, d, "index.html", false).await.is_err());
+        assert!(sites.clone().set_links(Arc::new(FakeSigner)));
+        assert!(sites.links_enabled(), "clones share the signer");
+        assert!(!sites.set_links(Arc::new(FakeSigner)), "set once");
+        let (entry, url) = sites
+            .link(t, d, "assets/app.js", false)
+            .await
+            .unwrap()
+            .unwrap();
+        let hash = Hash::of(b"console.log(1)");
+        assert_eq!(entry.hash, hash.to_hex());
+        assert_eq!(entry.size, 14);
+        assert_eq!(entry.media_type, "text/javascript; charset=utf-8");
+        assert_eq!(
+            url.as_str(),
+            format!(
+                "https://objects.test/{}?method=GET&ttl={}",
+                file_key(t, &hash),
+                LINK_TTL.as_secs()
+            )
+        );
+        // A folder, the root and a navigation resolve through the index.
+        let (e, _) = sites.link(t, d, "docs/", false).await.unwrap().unwrap();
+        assert_eq!(e.size, 13);
+        let (e, _) = sites.link(t, d, "", false).await.unwrap().unwrap();
+        assert_eq!(e.size, 11);
+        assert!(sites.link(t, d, "nope", false).await.unwrap().is_none());
+        assert!(sites.link(t, d, "nope", true).await.unwrap().is_some());
+        // A path that the gateway would refuse never reaches the index; another tenant or
+        // deployment has no site.
+        for bad in [
+            "../x",
+            "a//b",
+            "/index.html",
+            "%2e%2e/x",
+            "a\\b",
+            "./index.html",
+        ] {
+            assert!(
+                sites.link(t, d, bad, true).await.unwrap().is_none(),
+                "{bad:?}"
+            );
+        }
+        let other = TenantId(Uuid::now_v7());
+        assert!(
+            sites
+                .link(other, d, "index.html", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sites
+                .link(t, Uuid::now_v7(), "index.html", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_objects_move_into_the_static_bucket() {
+        // An earlier release wrote two sites into the blob bucket.
+        let blobs = StaticSites::in_memory();
+        let t = TenantId(Uuid::now_v7());
+        let (a, b, broken) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        blobs.write_site(t, a, &files(), None).await.unwrap();
+        let extra = vec![("x.css".to_string(), Bytes::from_static(b"body{}"))];
+        blobs.write_site(t, b, &extra, None).await.unwrap();
+        // An index whose file is gone stays where it is.
+        let lost = vec![("lost.txt".to_string(), Bytes::from_static(b"lost"))];
+        blobs.write_site(t, broken, &lost, None).await.unwrap();
+        blobs
+            .object_store()
+            .delete(&file_key(t, &Hash::of(b"lost")))
+            .await
+            .unwrap();
+        // A chunk of the blob store under its own prefix is never touched.
+        let chunk = Path::from(format!("{t}/chunks/abc"));
+        blobs
+            .object_store()
+            .put(&chunk, PutPayload::from_static(b"chunk"))
+            .await
+            .unwrap();
+        let sites = StaticSites::in_memory().with_legacy(blobs.object_store());
+        assert!(sites.has_legacy());
+        assert_eq!(sites.legacy_tenants().await.unwrap(), vec![t]);
+        // Without delete: everything readable is copied, nothing leaves the blob bucket.
+        let r = sites.migrate_legacy(t, false).await.unwrap();
+        assert_eq!(
+            (r.indexes, r.files_copied, r.deleted, r.skipped),
+            (2, 4, 0, 1),
+            "{r:?}"
+        );
+        assert_eq!(
+            sites.read_index(t, a).await.unwrap(),
+            blobs.read_index(t, a).await.unwrap()
+        );
+        assert!(sites.read_index(t, broken).await.unwrap().is_none());
+        let index = sites.read_index(t, b).await.unwrap().unwrap();
+        let (_, e) = index.resolve("x.css", false).unwrap();
+        assert_eq!(&sites.read_file(t, e, 64).await.unwrap()[..], b"body{}");
+        // Again: nothing new to copy.
+        let r = sites.migrate_legacy(t, false).await.unwrap();
+        assert_eq!((r.indexes, r.files_copied, r.deleted), (2, 0, 0), "{r:?}");
+        assert!(blobs.read_index(t, a).await.unwrap().is_some());
+        // With delete: the moved objects leave the blob bucket; the broken index and the
+        // chunk stay.
+        let r = sites.migrate_legacy(t, true).await.unwrap();
+        assert_eq!((r.indexes, r.deleted, r.skipped), (2, 6, 1), "{r:?}");
+        assert!(blobs.read_index(t, a).await.unwrap().is_none());
+        assert!(blobs.read_index(t, b).await.unwrap().is_none());
+        assert!(blobs.read_index(t, broken).await.unwrap().is_some());
+        assert!(blobs.object_store().head(&chunk).await.is_ok());
+        assert!(
+            blobs
+                .object_store()
+                .head(&file_key(t, &Hash::of(b"body{}")))
+                .await
+                .is_err()
+        );
+        assert!(sites.read_index(t, a).await.unwrap().is_some());
+        // Without a blob bucket nothing happens.
+        let none = StaticSites::in_memory();
+        assert_eq!(
+            none.migrate_legacy(t, true).await.unwrap(),
+            LegacyReport::default()
+        );
+        assert!(none.legacy_tenants().await.unwrap().is_empty());
     }
 
     #[test]

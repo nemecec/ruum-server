@@ -1,22 +1,162 @@
-//! Static files from the object store (plan seam 1, `ruum_core::apps::static_site`; decision 0006
-//! G point 4; backlog S-38).
+//! Static files (plan seam 1, `ruum_core::apps::static_site`; decision 0006 G point 4; backlog
+//! S-38; decision 0008-4).
 //!
-//! The gateway never builds an object key from the request path. It refuses a bad path first
-//! (`request_path`: an empty segment, `.`, `..`, a `%`, a `\`, a control byte: `400`), then looks
-//! the path up in the deployment's site index (an exact match, then `<path>/index.html`, then
-//! `spa_fallback` for a navigation); a miss is its own `404`. The file streams from its
-//! content-addressed object with a size limit, never read whole. `ETag` is the file's hash and
-//! `Content-Type` comes from the index.
+//! The gateway holds **no object store key** (decision 0008-4). For each request it refuses a
+//! bad path first (`request_path`: an empty segment, `.`, `..`, a `%`, a `\`, a control byte:
+//! `400`), then asks the core's internal listener for the file of that path
+//! ([`SiteFiles::link`], `POST /internal/gateway/v1/static/file`). The core checks that the
+//! deployment serves and is static, looks the path up in the deployment's site index (an exact
+//! match, then `<path>/index.html`, then `spa_fallback` for a navigation) and answers with the
+//! file's hash, size and media type and a link that reads that one object for a minute, signed
+//! with the core's key; a miss is the gateway's own `404`. The gateway never builds an object
+//! key. The file streams from the object store through the link with a size limit, never read
+//! whole. `ETag` is the file's hash and `Content-Type` comes from the index. A `HEAD` and an
+//! `If-None-Match` that matches fetch no object.
 
+use crate::core_api::{CoreError, CoreResult};
 use crate::{Gateway, Site, pages};
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
+use bytes::Bytes;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use ruum_core::apps::static_site::request_path;
+use ruum_core::identity::app_sign_in::wire::{PREFIX, StaticFileLink, StaticFileQuery};
+use std::time::Duration;
 
 /// The largest static file the gateway serves (the plan's file size limit is smaller).
 pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How long the gateway waits for the object store to start an answer.
+pub const OBJECT_FIRST_BYTE: Duration = Duration::from_secs(20);
+
+/// What the core answers for a path of a static site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkAnswer {
+    /// The file and a short-lived link to its object.
+    File(StaticFileLink),
+    /// No file for the path, or the deployment does not serve a static site.
+    NotFound,
+    /// The core has no static store that can sign links (the server without S3).
+    Unavailable,
+}
+
+/// The bytes of a static file as they arrive.
+pub type FileStream = BoxStream<'static, Result<Bytes, std::io::Error>>;
+
+/// Where the gateway gets static files: the core's link ([`SiteFiles::link`]), then the object
+/// through it ([`SiteFiles::open`]).
+#[async_trait]
+pub trait SiteFiles: Send + Sync {
+    async fn link(&self, q: &StaticFileQuery) -> CoreResult<LinkAnswer>;
+    /// Opens the object of `link` (`GET`, no redirect). Fails when the answer is not `200`,
+    /// when its length is not `link.size`, and stops a stream that delivers more.
+    async fn open(&self, link: &StaticFileLink) -> CoreResult<FileStream>;
+}
+
+/// [`SiteFiles`] over HTTP: the core's internal listener for links, the object store for bytes.
+pub struct HttpSiteFiles {
+    base: String,
+    core: reqwest::Client,
+    objects: reqwest::Client,
+}
+
+impl HttpSiteFiles {
+    /// Asks the internal listener at `base` (`RUUM_GATEWAY_INTERNAL_URL`).
+    pub fn new(base: &str) -> CoreResult<Self> {
+        let core = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| CoreError(e.to_string()))?;
+        let objects = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(OBJECT_FIRST_BYTE)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| CoreError(e.to_string()))?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            core,
+            objects,
+        })
+    }
+}
+
+#[async_trait]
+impl SiteFiles for HttpSiteFiles {
+    async fn link(&self, q: &StaticFileQuery) -> CoreResult<LinkAnswer> {
+        let r = self
+            .core
+            .post(format!("{}{PREFIX}/static/file", self.base))
+            .json(q)
+            .send()
+            .await
+            .map_err(|e| CoreError(format!("/static/file: {}", e.without_url())))?;
+        match r.status() {
+            reqwest::StatusCode::NOT_FOUND => Ok(LinkAnswer::NotFound),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE => Ok(LinkAnswer::Unavailable),
+            s if s.is_success() => r
+                .json::<StaticFileLink>()
+                .await
+                .map(LinkAnswer::File)
+                .map_err(|e| CoreError(format!("/static/file: {}", e.without_url()))),
+            s => Err(CoreError(format!("/static/file: status {s}"))),
+        }
+    }
+
+    async fn open(&self, link: &StaticFileLink) -> CoreResult<FileStream> {
+        let url = url::Url::parse(&link.url)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "https" | "http"))
+            .ok_or_else(|| CoreError("a static file link is not an http(s) URL".into()))?;
+        // The link's query is its signature: errors drop the URL, never print it.
+        let r = self
+            .objects
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| CoreError(format!("static object: {}", e.without_url())))?;
+        if r.status() != reqwest::StatusCode::OK {
+            return Err(CoreError(format!("static object: status {}", r.status())));
+        }
+        if r.content_length().is_some_and(|n| n != link.size) {
+            return Err(CoreError(
+                "a static object does not have the size of its index entry".into(),
+            ));
+        }
+        let limit = link.size;
+        let mut seen = 0u64;
+        Ok(r.bytes_stream()
+            .map(move |chunk| {
+                let chunk = chunk.map_err(|e| std::io::Error::other(e.without_url()))?;
+                seen += chunk.len() as u64;
+                if seen > limit {
+                    return Err(std::io::Error::other(
+                        "a static object is longer than its index entry",
+                    ));
+                }
+                Ok(chunk)
+            })
+            .boxed())
+    }
+}
+
+/// No static files: every path answers the `503` page (a gateway without a core in tests).
+pub struct NoSiteFiles;
+
+#[async_trait]
+impl SiteFiles for NoSiteFiles {
+    async fn link(&self, _: &StaticFileQuery) -> CoreResult<LinkAnswer> {
+        Ok(LinkAnswer::Unavailable)
+    }
+
+    async fn open(&self, _: &StaticFileLink) -> CoreResult<FileStream> {
+        Err(CoreError("no static files".into()))
+    }
+}
 
 /// Whether a request is a browser navigation (`spa_fallback` answers only those).
 pub fn is_navigation(method: &Method, headers: &HeaderMap) -> bool {
@@ -55,30 +195,37 @@ pub async fn serve(
     let Some(path) = request_path(path) else {
         return pages::bad_request(site.look());
     };
-    let tenant = site.resolved.tenant_id;
-    let index = match gw
-        .sites
-        .read_index(tenant, site.resolved.deployment_id)
-        .await
-    {
-        Ok(Some(i)) => i,
-        Ok(None) => return pages::not_found(site.look()),
+    let q = StaticFileQuery {
+        tenant_id: site.resolved.tenant_id,
+        app_id: site.resolved.app_id,
+        deployment_id: site.resolved.deployment_id,
+        path: path.to_string(),
+        navigation: is_navigation(method, headers),
+    };
+    let link = match gw.sites.link(&q).await {
+        Ok(LinkAnswer::File(l)) => l,
+        Ok(LinkAnswer::NotFound) => return pages::not_found(site.look()),
+        Ok(LinkAnswer::Unavailable) => {
+            tracing::warn!(target: "ruum::gateway", "the core serves no static files (no static store)");
+            return pages::unavailable(site.look());
+        }
         Err(e) => {
-            tracing::warn!(target: "ruum::gateway", error = %e, "a site index could not be read");
+            tracing::warn!(target: "ruum::gateway", error = %e, "a static file could not be looked up");
             return pages::unavailable(site.look());
         }
     };
-    let Some((_, entry)) = index.resolve(path, is_navigation(method, headers)) else {
-        return pages::not_found(site.look());
-    };
-    let etag = format!("\"{}\"", entry.hash);
+    if link.size > MAX_FILE_BYTES {
+        tracing::warn!(target: "ruum::gateway", size = link.size, "a static file is too large to serve");
+        return pages::unavailable(site.look());
+    }
+    let etag = format!("\"{}\"", link.hash);
     let mut r = Response::new(Body::empty());
     let h = r.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&etag) {
         h.insert(header::ETAG, v);
     }
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    if let Ok(v) = HeaderValue::from_str(&entry.media_type) {
+    if let Ok(v) = HeaderValue::from_str(&link.media_type) {
         h.insert(header::CONTENT_TYPE, v);
     }
     crate::proxy::security_headers(h, frame, &gw.config.ui_origin);
@@ -91,20 +238,18 @@ pub async fn serve(
         return r;
     }
     r.headers_mut()
-        .insert(header::CONTENT_LENGTH, HeaderValue::from(entry.size));
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(link.size));
     if method == Method::HEAD {
         return r;
     }
-    let stream = match gw.sites.open_file(tenant, entry, MAX_FILE_BYTES).await {
+    let stream = match gw.sites.open(&link).await {
         Ok(s) => s,
-        Err(ruum_core::Error::Api(_)) => return pages::not_found(site.look()),
         Err(e) => {
             tracing::warn!(target: "ruum::gateway", error = %e, "a static file could not be opened");
             return pages::unavailable(site.look());
         }
     };
-    *r.body_mut() =
-        Body::from_stream(stream.map(|c| c.map_err(|e| std::io::Error::other(e.to_string()))));
+    *r.body_mut() = Body::from_stream(stream);
     r
 }
 

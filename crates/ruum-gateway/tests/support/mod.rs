@@ -87,7 +87,10 @@ pub struct Seeds {
 pub struct World {
     pub state: AppState,
     pub hosts: Arc<MemoryHostLookup>,
+    /// The core's static sites (the gateway never holds them).
     pub sites: StaticSites,
+    /// The stand-in of the object store that the core's links point at.
+    pub objects: ObjectServer,
     pub gw: Arc<Gateway>,
     pub platform: SocketAddr,
     pub gateway: SocketAddr,
@@ -110,6 +113,8 @@ pub struct World {
 pub struct Opts {
     pub hold: HoldConfig,
     pub proxy: ProxyConfig,
+    /// The core gets no link signer: it serves no static file (the server without S3).
+    pub no_static_links: bool,
 }
 
 /// The memory driver, with counters of starts and wakes and a delay before each.
@@ -360,6 +365,112 @@ impl Drop for World {
     }
 }
 
+/// The stand-in of the object store for the core's links (decision 0008-4): `GET /<key>` of the
+/// core's own object store, only with an `expires` in the future and the `sig` that the
+/// signer made for that key and time. It counts the requests that reached it.
+#[derive(Clone)]
+pub struct ObjectServer {
+    store: Arc<dyn object_store::ObjectStore>,
+    addr: SocketAddr,
+    key: [u8; 32],
+    pub gets: Arc<AtomicUsize>,
+}
+
+/// The link signer of an [`ObjectServer`].
+#[derive(Debug)]
+pub struct ObjectSigner {
+    addr: SocketAddr,
+    key: [u8; 32],
+}
+
+fn object_sig(key: &[u8; 32], path: &str, expires: u64) -> String {
+    blake3::keyed_hash(key, format!("{path}\n{expires}").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+#[async_trait]
+impl object_store::signer::Signer for ObjectSigner {
+    async fn signed_url(
+        &self,
+        method: object_store::signer::Method,
+        path: &object_store::path::Path,
+        expires_in: Duration,
+    ) -> object_store::Result<url::Url> {
+        assert_eq!(
+            method,
+            object_store::signer::Method::GET,
+            "the core signs reads only"
+        );
+        let expires = ruum_core::now().unix_timestamp() as u64 + expires_in.as_secs();
+        let sig = object_sig(&self.key, path.as_ref(), expires);
+        Ok(url::Url::parse(&format!(
+            "http://{}/{path}?expires={expires}&sig={sig}",
+            self.addr
+        ))
+        .expect("url"))
+    }
+}
+
+impl ObjectServer {
+    pub fn new(store: Arc<dyn object_store::ObjectStore>, addr: SocketAddr) -> Self {
+        let mut key = [0u8; 32];
+        rand::fill(&mut key[..]);
+        Self {
+            store,
+            addr,
+            key,
+            gets: Arc::default(),
+        }
+    }
+
+    pub fn signer(&self) -> ObjectSigner {
+        ObjectSigner {
+            addr: self.addr,
+            key: self.key,
+        }
+    }
+
+    /// A link for `path` that expired `ago` seconds ago, signed like a real one.
+    pub fn expired_link(&self, path: &str, ago: u64) -> String {
+        let expires = ruum_core::now().unix_timestamp() as u64 - ago;
+        let sig = object_sig(&self.key, path, expires);
+        format!("http://{}/{path}?expires={expires}&sig={sig}", self.addr)
+    }
+
+    pub fn router(&self) -> axum::Router {
+        use axum::extract::{Path as AxPath, Query, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use object_store::ObjectStoreExt;
+        async fn get(
+            State(s): State<ObjectServer>,
+            AxPath(key): AxPath<String>,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> axum::response::Response {
+            s.gets.fetch_add(1, Ordering::SeqCst);
+            let expires = q.get("expires").and_then(|e| e.parse::<u64>().ok());
+            let ok = expires.is_some_and(|e| {
+                e > ruum_core::now().unix_timestamp() as u64
+                    && q.get("sig") == Some(&object_sig(&s.key, &key, e))
+            });
+            if !ok {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            match s.store.get(&object_store::path::Path::from(key)).await {
+                Ok(r) => match r.bytes().await {
+                    Ok(b) => b.into_response(),
+                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                },
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+        axum::Router::new()
+            .route("/{*key}", axum::routing::get(get))
+            .with_state(self.clone())
+    }
+}
+
 pub async fn listen() -> tokio::net::TcpListener {
     tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -398,7 +509,18 @@ impl World {
             ruum_api::internal::TlsAskConfig::for_content_url("https://content.ruumapps.net", 20),
         );
         let hosts = Arc::new(MemoryHostLookup::default());
-        let sites = StaticSites::in_memory();
+        // The core's static sites, with links to a small object server that stands for the
+        // object store (decision 0008-4: the gateway holds no key and reads only through them).
+        let sites = state.services.apps.sites().clone();
+        let objects_l = listen().await;
+        let objects =
+            ObjectServer::new(sites.object_store(), objects_l.local_addr().expect("addr"));
+        if !opts.no_static_links {
+            sites.set_links(Arc::new(objects.signer()));
+        }
+        let site_files =
+            ruum_gateway::static_files::HttpSiteFiles::new(&format!("http://{internal}"))
+                .map_err(|e| failed("the static file client", e))?;
         let core = ruum_gateway::core_api::HttpCore::new(&format!("http://{internal}"))
             .map_err(|e| failed("the core client", e))?;
         let sandboxes = HttpSandboxes::new(&format!("http://{internal}"))
@@ -413,7 +535,7 @@ impl World {
                 hosts.clone(),
                 Arc::new(core),
                 UserTokenSigner::generate(ISSUER),
-                sites.clone(),
+                Arc::new(site_files),
             )
             .with_sandboxes(Arc::new(sandboxes), opts.hold)
             .with_proxy(opts.proxy),
@@ -433,10 +555,15 @@ impl World {
         tasks.push(tokio::spawn(async move {
             let _ = ruum_gateway::serve(gateway_l, g).await;
         }));
+        let router = objects.router();
+        tasks.push(tokio::spawn(async move {
+            let _ = axum::serve(objects_l, router.into_make_service()).await;
+        }));
         Ok(World {
             state,
             hosts,
             sites,
+            objects,
             gw,
             platform,
             gateway,

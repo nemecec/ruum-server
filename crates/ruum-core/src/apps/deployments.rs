@@ -1263,9 +1263,18 @@ impl AppService {
     /// collection never holds up the expiry of previews.
     pub async fn run_sweeper(self: Arc<Self>, every: std::time::Duration) {
         tokio::spawn(self.clone().run_static_gc());
+        let started = tokio::time::Instant::now();
         loop {
             if let Err(e) = self.sweep_previews().await {
                 tracing::warn!(error = %e, "the preview sweeper failed");
+            }
+            // Static objects that a server of an earlier release wrote into the blob bucket
+            // (decision 0008-4); they leave it only after a rolling upgrade has surely ended.
+            if self.deps.sites.has_legacy() {
+                let delete = started.elapsed() >= super::static_gc::STATIC_GC_FIRST_DELAY;
+                if let Err(e) = self.migrate_legacy_sites(delete).await {
+                    tracing::warn!(error = %e, "the move of static sites out of the blob bucket failed");
+                }
             }
             tokio::time::sleep(every).await;
         }
