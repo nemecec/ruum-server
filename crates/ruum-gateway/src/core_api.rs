@@ -56,9 +56,12 @@ pub struct HttpCore {
 impl HttpCore {
     /// A client of the internal listener at `base` (`http://ruum-server:8081`).
     pub fn new(base: &str) -> CoreResult<Self> {
+        // Never through a proxy of the environment (`HTTP_PROXY`, `ALL_PROXY`): the answers
+        // carry session secrets (Kimi review of run 14, R-3 finding 1).
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| CoreError(e.to_string()))?;
         Ok(Self {
