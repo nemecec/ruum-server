@@ -88,6 +88,9 @@ spec:
             - { name: RUUM_DAV_URL, value: "https://{{ .Values.hosts.dav }}/" }
             - { name: RUUM_CONTENT_URL, value: "https://{{ .Values.hosts.content }}" }
             - { name: RUUM_OIDC_ISSUER, value: "https://{{ .Values.hosts.auth }}" }
+            # App addresses, the sign-in redirect to app origins and the certificates of app
+            # hosts (tls-ask); the same value as the gateway's (card I-6).
+            - { name: RUUM_APPS_DOMAIN, value: {{ .Values.hosts.apps | quote }} }
             - name: RUUM_OIDC_CLIENT_ID
               valueFrom: { secretKeyRef: { name: ruum-oidc, key: client-id } }
             # The Zitadel IdP IDs for /v1/auth/login?idp=google|microsoft (zitadel-bootstrap.sh
@@ -194,3 +197,6 @@ data:
   previous: {{ .Values.previousCommit | quote }}
   server: {{ .Values.images.server | quote }}
   edge: {{ .Values.images.edge | quote }}
+  # Empty for a release without the app runtime (card I-6).
+  gateway: {{ .Values.images.gateway | quote }}
+  egress: {{ .Values.images.egress | quote }}

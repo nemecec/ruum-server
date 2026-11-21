@@ -1,0 +1,16 @@
+# The runtime class of app sandboxes (card I-6; docs/STEP3.md "How an app runs" rule 1). The
+# handler runsc comes from the Talos system extension siderolabs/gvisor (talos/schematic.yaml),
+# which registers it with containerd on every node. k8s/apply.sh applies this file only after
+# ops/gvisor-check.sh found the extension on every node; a pod of this class on a node without
+# it would not start.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+# What gVisor's own processes (Sentry, Gofer) use per pod, so the scheduler counts it against
+# the node. An estimate: measure it with the first sandboxes (backlog I6-5).
+overhead:
+  podFixed:
+    memory: 64Mi
+    cpu: 50m

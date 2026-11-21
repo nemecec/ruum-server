@@ -248,10 +248,25 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// The settings of a server. The apps domain stays the default until the gateway card
-    /// (G-1a) adds its setting to the server settings and the staging chart together.
+    /// The settings of a server: `RUUM_APPS_DOMAIN` (the same value as the gateway's setting of
+    /// that name; staging: `apps.staging.ruumapps.net`), else the default `ruumapps.net`
+    /// (backlog G1A-4, card I-6). The sign-in redirect to an app origin and the app addresses in
+    /// answers use it, so a server and its gateway must agree.
     pub fn from_env() -> Self {
-        Self::default()
+        Self::with_apps_domain(std::env::var("RUUM_APPS_DOMAIN").ok().as_deref())
+    }
+
+    /// The settings with `domain` as the apps domain (lower case, without dots at the ends);
+    /// the default when it is missing or empty.
+    pub fn with_apps_domain(domain: Option<&str>) -> Self {
+        let mut c = Self::default();
+        if let Some(d) = domain
+            .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+        {
+            c.apps_domain = d;
+        }
+        c
     }
 }
 

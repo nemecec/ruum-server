@@ -49,9 +49,17 @@ for n in SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZN
   STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_RUUM_APP_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD \
   STG_SPICEDB_PRESHARED_KEY STG_RUUM_TOKEN_SIGNING_KEY STG_RUUM_CONTENT_SIGNING_KEY \
   STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS \
-  SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY; do
-  [[ -n "${!n:-}" ]] || die "$n is missing (secrets-push.sh sends it)"
+  SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY \
+  STG_PG_RUUM_GATEWAY_PASSWORD STG_GATEWAY_TOKEN_KEY STG_EGRESS_CONTROL_TOKEN STG_EGRESS_DENY; do
+  [[ -n "${!n:-}" ]] || die "$n is missing (secrets-push.sh sends it; steps.sh platform computes STG_EGRESS_DENY)"
 done
+# The gateway's read credential of the static sites' bucket (card I-6): both or neither.
+if [[ -n "${STG_GATEWAY_S3_ACCESS_KEY:-}" && -z "${STG_GATEWAY_S3_SECRET_KEY:-}" ]] ||
+  [[ -z "${STG_GATEWAY_S3_ACCESS_KEY:-}" && -n "${STG_GATEWAY_S3_SECRET_KEY:-}" ]]; then
+  die "STG_GATEWAY_S3_ACCESS_KEY and STG_GATEWAY_S3_SECRET_KEY go together (or neither)"
+fi
+# EGRESS_DENY of the egress proxy: comma-separated addresses or CIDR prefixes, nothing else.
+[[ "$STG_EGRESS_DENY" =~ ^[0-9a-fA-F.:/,]+$ ]] || die "STG_EGRESS_DENY is not a list of addresses and prefixes"
 
 # secret NAMESPACE NAME [TYPE]: KEY=value lines on stdin -> a Secret, applied without a file.
 secret() {
@@ -108,12 +116,18 @@ k apply -f "$HERE/manifests/namespaces.yaml" >/dev/null
 k apply -f "$HERE/manifests/kube-network-policies.yaml" >/dev/null
 k apply -f "$HERE/manifests/local-path-storage.yaml" >/dev/null
 k -n kube-system rollout status ds/kube-network-policies --timeout=5m >/dev/null
+# The runtime class of app sandboxes (card I-6) only when every node runs the gVisor extension
+# (ops/upgrade-talos.sh with the schematic of versions.env, before this step).
+log "the gVisor extension on every node, then the runtime class gvisor (card I-6)"
+bash "$STG/ops/gvisor-check.sh" --class-only >&2 ||
+  die "not every node runs the Talos extension gvisor: run deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh first (README \"The app runtime\")"
+k apply -f "$HERE/manifests/runtimeclass.yaml" >/dev/null
 
 log "secrets, one per consumer"
 # CNPG: the backup writer key only (object read/write, no delete; review 1 B-3).
 printf 'ACCESS_KEY_ID=%s\nACCESS_SECRET_KEY=%s\n' "$SCW_BACKUP_ACCESS_KEY" "$SCW_BACKUP_SECRET_KEY" | secret data pg-backup-s3
 # ruum owns the database ruum (the migration Job); ruum_app serves (no DDL; Kimi review of O-25).
-for role in ruum ruum_app zitadel spicedb; do
+for role in ruum ruum_app ruum_gateway zitadel spicedb; do
   var="STG_PG_${role^^}_PASSWORD"
   printf 'username=%s\npassword=%s\n' "$role" "${!var}" |
     k create secret generic "pg-role-${role//_/-}" -n data --type=kubernetes.io/basic-auth --from-env-file=/dev/stdin --dry-run=client -o yaml |
@@ -188,6 +202,32 @@ printf 'DATABASE_URL=postgres://ruum:%s@pg-rw.data.svc.cluster.local:5432/ruum?s
   [[ -z "${STG_ALLOWED_UNVERIFIED_EMAILS:-}" ]] || printf 'RUUM_SIGNUP_ALLOWED_UNVERIFIED_EMAILS=%s\n' "$STG_ALLOWED_UNVERIFIED_EMAILS"
 } | secret ruum ruum-server-env
 
+# The app runtime (card I-6). The gateway's role may only execute ruum_app_host_lookup; the grants
+# run before its DSN is written, and the file fails when the role can do more.
+log "database role ruum_gateway: grants (k8s/sql/ruum-gateway-grants.sql)"
+for _ in $(seq 1 60); do
+  [[ "$(k -n data exec "$primary" -c postgres -- psql -tAq -d ruum -c "select 1 from pg_roles where rolname = 'ruum_gateway'" 2>/dev/null)" == 1 ]] && break
+  sleep 5
+done
+k -n data exec -i "$primary" -c postgres -- psql -q -d ruum -f - <"$HERE/sql/ruum-gateway-grants.sql" >/dev/null ||
+  die "the grants of ruum_gateway failed (k8s/sql/ruum-gateway-grants.sql)"
+# The gateway: its DSN and the user-token key (an Ed25519 seed, base64url; a file in the pod).
+printf 'database-url=postgres://ruum_gateway:%s@pg-rw.data.svc.cluster.local:5432/ruum?sslmode=verify-full&sslrootcert=/pg-ca/ca.crt\ntoken-key=%s\n' \
+  "$STG_PG_RUUM_GATEWAY_PASSWORD" "$STG_GATEWAY_TOKEN_KEY" | secret ruum ruum-gateway
+# The static sites' read credential: only when the person made one (README "The app runtime").
+if [[ -n "${STG_GATEWAY_S3_ACCESS_KEY:-}" ]]; then
+  printf 'bucket=%s\naccess-key-id=%s\nsecret-access-key=%s\n' \
+    "ruum-staging-blobs-768usm" "$STG_GATEWAY_S3_ACCESS_KEY" "$STG_GATEWAY_S3_SECRET_KEY" | secret ruum ruum-gateway-s3
+else
+  k -n ruum delete secret ruum-gateway-s3 --ignore-not-found >/dev/null
+  log "no STG_GATEWAY_S3_*: the gateway serves no static file (secret ruum/ruum-gateway-s3 removed)"
+fi
+# The egress proxy: the control token (a file in the pod) and EGRESS_DENY (not secret).
+printf 'control-token=%s\n' "$STG_EGRESS_CONTROL_TOKEN" | secret ruum ruum-egress
+k -n ruum create configmap ruum-egress-deny --from-literal="deny=$STG_EGRESS_DENY" --dry-run=client -o yaml |
+  k apply -f - >/dev/null
+log "configmap ruum/ruum-egress-deny ($(tr ',' '\n' <<<"$STG_EGRESS_DENY" | wc -l | tr -d ' ') entries)"
+
 helmfile --file "$HERE/helmfile.yaml.gotmpl" sync
 
 log "deploy controller (namespace ruum-deploy, backlog O-34)"
@@ -195,6 +235,8 @@ k -n ruum-deploy rollout status deployment/deploy-controller --timeout=5m >/dev/
   die "the deploy controller did not start (deploy/staging/tool.sh kubectl -n ruum-deploy describe pods)"
 log "the deployer may only write release requests (ops/rbac-check.sh live)"
 bash "$STG/ops/rbac-check.sh" live || die "the deployer, observer or deploy controller has other rights than it should (above)"
+log "gVisor: a pod of the runtime class gvisor on every node, with a control pod (ops/gvisor-check.sh)"
+bash "$STG/ops/gvisor-check.sh" >&2 || die "the gVisor check failed (above)"
 log "deployer kubeconfig (namespaced, review 2 O-1)"
 bash "$STG/ops/deployer-kubeconfig.sh"
 log "observer kubeconfig (read-only troubleshooting, O-51)"

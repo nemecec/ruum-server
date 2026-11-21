@@ -1146,3 +1146,21 @@ async fn a_person_chooses_the_slug_of_a_personal_tenant() {
         (409, "app_slug_fixed".into())
     );
 }
+
+/// Card I-6 (backlog G1A-4): the apps domain of a server comes from `RUUM_APPS_DOMAIN`, the
+/// same value as the gateway's; empty or missing keeps `ruumapps.net`.
+#[test]
+fn the_apps_domain_follows_the_setting() {
+    assert_eq!(
+        AppConfig::with_apps_domain(Some(" Apps.Staging.RuumApps.net. ")).apps_domain,
+        "apps.staging.ruumapps.net"
+    );
+    assert_eq!(
+        AppConfig::with_apps_domain(Some("")).apps_domain,
+        "ruumapps.net"
+    );
+    assert_eq!(
+        AppConfig::with_apps_domain(None).apps_domain,
+        "ruumapps.net"
+    );
+}

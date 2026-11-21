@@ -92,3 +92,15 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/warn: restricted
+---
+# App sandboxes (card I-6): pods of the runtime class gvisor only (charts/platform networkpolicies:
+# no ingress but from the app gateway, no egress but to the egress proxy). Restricted like the
+# rest. Nothing runs here until a Kubernetes runtime driver exists (backlog I6-1).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ruum-apps
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted

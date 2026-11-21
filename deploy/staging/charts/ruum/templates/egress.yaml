@@ -1,0 +1,81 @@
+{{- if include "ruum.apps" . }}
+# The egress proxy (card I-6; crates/ruum-egress, card R-2e; docs/STEP3.md "How an app runs" rule
+# 2): the only way from a sandbox (namespace ruum-apps) to the internet, CONNECT on port 443 only,
+# with the address rules after resolution and EGRESS_DENY (the cluster ranges and every public
+# address of staging: ConfigMap ruum/ruum-egress-deny, k8s/apply.sh). Network policy: only pods of
+# ruum-apps reach it; it reaches DNS and public addresses on 443, never a private range.
+# The control listener is a Unix socket in the pod (an emptyDir): no network reaches it. The
+# runtime driver that registers app networks over it does not exist on Kubernetes yet (backlog
+# I6-1), so every connection gets deny=unknown_source until then: it fails closed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruum-egress
+  namespace: ruum
+  labels: { app: ruum-egress }
+  annotations:
+    ruum.space/commit: {{ .Values.commit | quote }}
+spec:
+  replicas: {{ .Values.egress.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels: { app: ruum-egress }
+  template:
+    metadata:
+      labels: { app: ruum-egress }
+      annotations:
+        ruum.space/commit: {{ .Values.commit | quote }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: egress
+          image: {{ include "ruum.appImage" (list "egress" .Values.images.egress) }}
+          env:
+            - { name: RUUM_EGRESS_LISTEN, value: "0.0.0.0:3128" }
+            - { name: RUUM_EGRESS_CONTROL, value: "unix:/run/ruum-egress/control.sock" }
+            - { name: RUUM_EGRESS_CONTROL_TOKEN_FILE, value: /secrets/control-token }
+            - { name: RUUM_EGRESS_PORTS, value: "443" }
+            - name: EGRESS_DENY
+              valueFrom: { configMapKeyRef: { name: ruum-egress-deny, key: deny } }
+          ports:
+            - { name: proxy, containerPort: 3128 }
+          readinessProbe:
+            tcpSocket: { port: proxy }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: proxy }
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.egress.resources | nindent 12 }}
+          {{- include "ruum.restricted" . | nindent 10 }}
+          volumeMounts:
+            - { name: control, mountPath: /run/ruum-egress }
+            - { name: token, mountPath: /secrets, readOnly: true }
+      volumes:
+        - name: control
+          emptyDir: { sizeLimit: 1Mi }
+        - name: token
+          secret: { secretName: ruum-egress, items: [{ key: control-token, path: control-token }] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruum-egress
+  namespace: ruum
+spec:
+  selector: { app: ruum-egress }
+  ports:
+    - { name: proxy, port: 3128, targetPort: proxy }
+{{- end }}

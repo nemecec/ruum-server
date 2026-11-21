@@ -3,8 +3,10 @@
 # - publish: only after a green `ci` run of a PUSH to main IN THIS REPOSITORY. A workflow_run
 #   also fires for pull requests (from forks too, whose head branch can be called `main`), so
 #   every condition below is required. The job checks out the exact commit that ci tested and
-#   never runs code from a pull request. It pushes ghcr.io/nemecec/ruum-server, ruum-edge and
-#   ruum-deploy-controller (backlog O-34) with the tags <full sha> and main, scans the pushed
+#   never runs code from a pull request. It pushes ghcr.io/nemecec/ruum-server, ruum-edge,
+#   ruum-deploy-controller (backlog O-34), ruum-gateway and ruum-egress (card I-6: the app
+#   runtime; ops/deploy-chart.sh resolves them from the tag <full sha>) with the tags <full sha>
+#   and main, scans the pushed
 #   digest, and only then adds the provenance attestation that deploy.sh, the deploy controller
 #   and ops/deploy-chart.sh verify before a deploy (and k8s/apply.sh before it installs the
 #   controller).
@@ -41,7 +43,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ruum-server, ruum-edge, ruum-deploy-controller]
+        # The egress proxy's recipe lives in its own folder (crates/ruum-egress/README.md).
+        include:
+          - { image: ruum-server, file: deploy/images/ruum-server.Dockerfile }
+          - { image: ruum-edge, file: deploy/images/ruum-edge.Dockerfile }
+          - { image: ruum-deploy-controller, file: deploy/images/ruum-deploy-controller.Dockerfile }
+          - { image: ruum-gateway, file: deploy/images/ruum-gateway.Dockerfile }
+          - { image: ruum-egress, file: deploy/images/ruum-egress/Dockerfile }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,7 +59,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: deploy/images/${{ matrix.image }}.Dockerfile
+          file: ${{ matrix.file }}
           platforms: linux/amd64
           push: false
           load: true
@@ -85,7 +93,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ruum-server, ruum-edge, ruum-deploy-controller]
+        # The egress proxy's recipe lives in its own folder (crates/ruum-egress/README.md).
+        include:
+          - { image: ruum-server, file: deploy/images/ruum-server.Dockerfile }
+          - { image: ruum-edge, file: deploy/images/ruum-edge.Dockerfile }
+          - { image: ruum-deploy-controller, file: deploy/images/ruum-deploy-controller.Dockerfile }
+          - { image: ruum-gateway, file: deploy/images/ruum-gateway.Dockerfile }
+          - { image: ruum-egress, file: deploy/images/ruum-egress/Dockerfile }
     env:
       SHA: ${{ github.event.workflow_run.head_sha }}
       IMAGE: ghcr.io/nemecec/${{ matrix.image }}
@@ -105,7 +119,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: deploy/images/${{ matrix.image }}.Dockerfile
+          file: ${{ matrix.file }}
           platforms: linux/amd64
           push: true
           tags: |

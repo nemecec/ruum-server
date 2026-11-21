@@ -135,6 +135,26 @@ tunnel_targets() {
   printf '%s\n' "$lines"
 }
 
+# EGRESS_DENY of the egress proxy (card I-6; crates/ruum-egress README "Address rules"): the
+# private network, the pod and service ranges of the cluster, and every public address of
+# staging and of the build server (nodes, load balancer, the build server's IPv4 and its IPv6
+# /64), from the Hetzner API. The proxy refuses private ranges by itself; the public addresses are
+# what only this list denies (a name such as <node IP>.nip.io resolves to one). Comma-separated.
+egress_deny() {
+  local list
+  list="$( {
+    printf '%s\n' 10.20.0.0/16 10.244.0.0/16 10.96.0.0/12
+    hapi "servers?label_selector=env%3Dstaging%2Crole%3Dnode" |
+      jq -r '.servers[].public_net | (.ipv4.ip // empty), (.ipv6.network // empty)'
+    hapi "load_balancers?label_selector=env%3Dstaging" |
+      jq -r '.load_balancers[].public_net | (.ipv4.ip // empty), (.ipv6.ip // empty)'
+    hapi "servers?name=ruum-buildbox" |
+      jq -r '.servers[].public_net | (.ipv4.ip // empty), (.ipv6.network // empty)'
+  } | grep -E '^[0-9a-fA-F.:/]+$' | sort -u | paste -sd, -)"
+  [[ "$list" == *,* ]] || die "EGRESS_DENY: no public address of staging from the Hetzner API"
+  printf '%s' "$list"
+}
+
 # The build server's Hetzner ID: check-plan.sh refuses any attachment or target that names it.
 # Empty when it does not exist.
 buildbox_id() {
@@ -142,8 +162,12 @@ buildbox_id() {
 }
 
 TALOS_PLACEHOLDER="pending-talos-snapshot"
+# The snapshot of this Talos version and schematic (card I-6: the schematic with gVisor). A
+# Hetzner label value has at most 63 characters, so the label holds the first 32 hex of the
+# schematic ID. Running nodes never take a new snapshot (tofu ignore_changes = [image]).
+TALOS_SCHEMATIC_LABEL="${TALOS_SCHEMATIC:0:32}"
 talos_image_id() {
-  hapi "images?type=snapshot&label_selector=os%3Dtalos%2Cversion%3D${TALOS_VERSION}%2Cenv%3Dstaging" |
+  hapi "images?type=snapshot&label_selector=os%3Dtalos%2Cversion%3D${TALOS_VERSION}%2Cschematic%3D${TALOS_SCHEMATIC_LABEL}%2Cenv%3Dstaging" |
     jq -r '[.images[] | select(.status == "available")] | sort_by(.created) | last | .id // empty'
 }
 
@@ -291,12 +315,12 @@ check_no_image_builder() {
 
 upload_image() {
   [[ -n "$(talos_image_id)" ]] && return
-  log "uploading the Talos $TALOS_VERSION snapshot (temporary $HCLOUD_SERVER_TYPE for about 10 minutes)"
+  log "uploading the Talos $TALOS_VERSION snapshot of schematic $TALOS_SCHEMATIC_LABEL... (temporary $HCLOUD_SERVER_TYPE for about 10 minutes)"
   HCLOUD_TOKEN="$HCLOUD_TOKEN" hcloud-upload-image upload \
     --image-url "$TALOS_IMAGE_URL" --compression xz \
     --location "$HCLOUD_LOCATION" --server-type "$HCLOUD_SERVER_TYPE" \
-    --description "talos $TALOS_VERSION staging" \
-    --labels "env=staging,managed-by=up.sh,project=ruum,os=talos,version=$TALOS_VERSION,role=image"
+    --description "talos $TALOS_VERSION schematic $TALOS_SCHEMATIC_LABEL staging" \
+    --labels "env=staging,managed-by=up.sh,project=ruum,os=talos,version=$TALOS_VERSION,schematic=$TALOS_SCHEMATIC_LABEL,role=image"
   check_no_image_builder
   [[ -n "$(talos_image_id)" ]] || die "the snapshot upload did not produce an image"
 }
@@ -347,7 +371,7 @@ require_talos_access() {
 
 k() { kubectl --kubeconfig "$KUBECONFIG_FILE" "$@"; }
 
-CLUSTER_SECRET_NAMES="SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_RUUM_APP_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD STG_SPICEDB_PRESHARED_KEY STG_RUUM_TOKEN_SIGNING_KEY STG_RUUM_CONTENT_SIGNING_KEY STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS STG_ALLOWED_UNVERIFIED_EMAILS STG_ACME_EMAIL SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY"
+CLUSTER_SECRET_NAMES="SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZNER_S3_SECRET_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_OAUTH_CLIENT_SECRET MS_OAUTH_CLIENT_ID MS_OAUTH_CLIENT_SECRET STG_ZITADEL_MASTERKEY STG_PG_RUUM_PASSWORD STG_PG_RUUM_APP_PASSWORD STG_PG_ZITADEL_PASSWORD STG_PG_SPICEDB_PASSWORD STG_SPICEDB_PRESHARED_KEY STG_RUUM_TOKEN_SIGNING_KEY STG_RUUM_CONTENT_SIGNING_KEY STG_RCLONE_CRYPT_PASSWORD STG_RCLONE_CRYPT_SALT STG_NATS_RUUM_PASSWORD STG_ALLOWED_EMAILS STG_ALLOWED_UNVERIFIED_EMAILS STG_ACME_EMAIL SCW_DEFAULT_PROJECT_ID SCW_SMTP_SECRET_KEY STG_PG_RUUM_GATEWAY_PASSWORD STG_GATEWAY_TOKEN_KEY STG_EGRESS_CONTROL_TOKEN STG_GATEWAY_S3_ACCESS_KEY STG_GATEWAY_S3_SECRET_KEY"
 
 case "$STEP" in
   admin-cidrs)
@@ -443,6 +467,8 @@ case "$STEP" in
       esac
     done
     [[ -n "$controller" ]] || die "the platform step needs --controller <commit> (the deploy controller image; secrets-push.sh passes it)"
+    STG_EGRESS_DENY="$(egress_deny)"
+    export STG_EGRESS_DENY
     KUBECONFIG="$KUBECONFIG_FILE" DEPLOY_CONTROLLER_COMMIT="$controller" RUUM_APPLY_IGNORE_RUNNING_DEPLOY="$ignore_running" \
       bash "$HERE/k8s/apply.sh" "$generation" "$restore_from"
     ;;
