@@ -529,9 +529,95 @@ mod tests {
             q.get("X-Amz-SignedHeaders").map(String::as_str),
             Some("host")
         );
-        assert!(q.contains_key("X-Amz-Signature"));
+        // The signature is for a GET of this one object, as an S3 server checks it (backlog
+        // I63D-5; Kimi review of I6-3D, 4): the same link does not sign a PUT, a DELETE or
+        // another key.
+        let sig = q.get("X-Amz-Signature").expect("a signature");
+        assert_eq!(&sigv4_query_signature(&url, "GET", "SK"), sig);
+        assert_ne!(&sigv4_query_signature(&url, "PUT", "SK"), sig);
+        assert_ne!(&sigv4_query_signature(&url, "DELETE", "SK"), sig);
+        let mut other = url.clone();
+        other.set_path("/apps/static/t/sites/abc");
+        assert_ne!(&sigv4_query_signature(&other, "GET", "SK"), sig);
         // The secret key itself is never in a link.
         assert!(!s.contains("SK"), "{s}");
+    }
+
+    /// The SigV4 signature that a presigned URL must carry for `method` under `secret`, written
+    /// from the AWS specification (the side of the S3 server that checks a link; "Authenticating
+    /// requests: using query parameters"), not from the signer of `object_store`.
+    fn sigv4_query_signature(url: &Url, method: &str, secret: &str) -> String {
+        use sha2::{Digest, Sha256};
+        fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
+            let mut k = [0u8; 64];
+            if key.len() > 64 {
+                k[..32].copy_from_slice(&Sha256::digest(key));
+            } else {
+                k[..key.len()].copy_from_slice(key);
+            }
+            let mut inner = Sha256::new();
+            inner.update(k.map(|b| b ^ 0x36));
+            inner.update(msg);
+            let mut outer = Sha256::new();
+            outer.update(k.map(|b| b ^ 0x5c));
+            outer.update(inner.finalize());
+            outer.finalize().to_vec()
+        }
+        // URI encoding of SigV4: every byte but A-Z, a-z, 0-9, `-`, `.`, `_` and `~`.
+        fn enc(s: &str) -> String {
+            s.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                        char::from(b).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect()
+        }
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        let value = |name: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name} is not in the link"))
+        };
+        let mut query: Vec<(String, String)> = pairs
+            .iter()
+            .filter(|(n, _)| n != "X-Amz-Signature")
+            .map(|(n, v)| (enc(n), enc(v)))
+            .collect();
+        query.sort();
+        let query = query
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let host = match url.port() {
+            Some(p) => format!("{}:{p}", url.host_str().expect("a host")),
+            None => url.host_str().expect("a host").to_string(),
+        };
+        assert_eq!(value("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
+        assert_eq!(value("X-Amz-SignedHeaders"), "host");
+        let canonical = format!(
+            "{method}\n{}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD",
+            url.path()
+        );
+        let credential = value("X-Amz-Credential");
+        let (_, scope) = credential.split_once('/').expect("a credential scope");
+        assert!(scope.ends_with("/s3/aws4_request"), "{scope}");
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
+            value("X-Amz-Date"),
+            hex::encode(Sha256::digest(canonical.as_bytes()))
+        );
+        // The signing key: date, region, service and `aws4_request`, the parts of the scope.
+        let mut key = format!("AWS4{secret}").into_bytes();
+        for part in scope.split('/') {
+            key = hmac(&key, part.as_bytes());
+        }
+        hex::encode(hmac(&key, to_sign.as_bytes()))
     }
 
     #[tokio::test]
