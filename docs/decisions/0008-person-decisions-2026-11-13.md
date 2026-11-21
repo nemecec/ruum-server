@@ -21,3 +21,11 @@ Decided by the person after the run 9 digest. Not provisional.
    reviewer checks those lines like code: they must only make the card's tests run (never skip,
    weaken or remove other jobs), and they name the card in a comment. Changes to CI beyond that
    (new jobs, triggers, permissions, secrets) stay a card of their own.
+4. **Static app files in their own bucket, read-only for the gateway (I6-3, 2026-11-21).** Static
+   app files (the published apps' HTML, JavaScript, CSS, images, fonts) move out of the tenant blob
+   bucket into a bucket of their own. Only the core writes to it; the Internet-facing gateway gets
+   a read-only key scoped to that bucket and nothing else, so a compromised gateway can read only
+   published app files and change nothing. Designed for production: on Hetzner, whose keys cannot
+   be scoped, the static bucket lives on Garage (self-hosted, read-only per-bucket keys) or the
+   gateway holds no key and fetches through short-lived links signed by the core. Until this card
+   lands, staging serves no static files (no gateway bucket key is made).
