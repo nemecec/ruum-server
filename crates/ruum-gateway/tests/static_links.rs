@@ -93,6 +93,45 @@ async fn the_core_gives_files_only_of_a_serving_deployment_of_the_named_tenant()
     let other = blake3::hash(b"not in this site").to_hex().to_string();
     let r = core_post(&w, "/static/content", &content(&acme.id, &other)).await;
     assert_eq!(r.status(), 404);
+    // A deployment of the same tenant and app whose row and index exist but that does not
+    // serve: a live release that a newer one replaced. First its positive control while it is
+    // the live release.
+    let old = w
+        .seed_deployment(&app, Env::Live, &files, None)
+        .await
+        .unwrap();
+    w.set_live(&app, &old).await.unwrap();
+    let mut q = file(&acme.id, "/secret.txt");
+    q["deployment_id"] = json!(old.id);
+    let a: StaticFileAnswer = core_post(&w, "/static/file", &q)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        matches!(a, StaticFileAnswer::Found { .. }),
+        "the live release: {a:?}"
+    );
+    let mut c = content(&acme.id, &entry.hash);
+    c["deployment_id"] = json!(old.id);
+    assert_eq!(core_post(&w, "/static/content", &c).await.status(), 200);
+    let new = w
+        .seed_deployment(&app, Env::Live, &files, None)
+        .await
+        .unwrap();
+    w.set_live(&app, &new).await.unwrap();
+    let a: StaticFileAnswer = core_post(&w, "/static/file", &q)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(a, StaticFileAnswer::NotServing, "a replaced live release");
+    let r = core_post(&w, "/static/content", &c).await;
+    assert_eq!(
+        r.status(),
+        404,
+        "no bytes of a deployment that does not serve"
+    );
 }
 
 /// A fake bucket: `/ok` holds `hello`, `/long` a longer object, `/gone` nothing.
