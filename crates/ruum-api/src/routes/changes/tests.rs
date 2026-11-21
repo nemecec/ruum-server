@@ -199,6 +199,9 @@ fn sample(event: EventType, user: UserId) -> Value {
             "role_grant_id": id(), "role": "approver",
             "grantee": { "type": "user", "id": id() }
         }),
+        EventType::AppTelemetryFieldsConfirmed => {
+            json!({ "normal": 2, "personal": 1, "secret": 0 })
+        }
         // Not in `EventType::ALL`: a type of a newer release is only read, never written, and
         // its generic shape has empty data (backlog P-57).
         EventType::Unknown(_) => json!({}),

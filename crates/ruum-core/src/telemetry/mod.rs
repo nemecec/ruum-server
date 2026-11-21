@@ -650,6 +650,107 @@ pub struct TelemetryFilter {
     /// All must match.
     pub fields: Vec<FieldEquals>,
     pub limit: Option<usize>,
+    /// Logs only: words that must all be in the record ([`log_has_words`]). Card O-2.
+    pub words: Vec<String>,
+    /// Logs: the record's [`LOG_TRACE_ID`] attribute; spans: the span's trace ID. Only 32
+    /// lower-case hex characters match anything ([`is_trace_id`]). Card O-2.
+    pub trace_id: Option<String>,
+    /// Logs only: the origin of the record ([`log_origin`]). Card O-2.
+    pub origin: Option<LogOrigin>,
+    /// Keep the newest `limit` matches instead of the oldest (the answer is still oldest
+    /// first). Card O-2 (`searchAppLogs` is newest first).
+    pub newest: bool,
+}
+
+/// Where a log record comes from (`AppLogRecord.origin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogOrigin {
+    /// Standard output and the OTel SDK of the app (through the runtime and the processor).
+    Backend,
+    /// The browser script (card G-2; no such record exists before it).
+    Frontend,
+    /// Build and deploy events of the platform (no such record exists yet).
+    Platform,
+}
+
+impl LogOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogOrigin::Backend => "backend",
+            LogOrigin::Frontend => "frontend",
+            LogOrigin::Platform => "platform",
+        }
+    }
+}
+
+/// The origin of a stored log record. Every record that the processor stores today comes from
+/// an app's backend: the browser script (G-2) and platform events will mark theirs when they
+/// come.
+pub fn log_origin(_r: &StoredLog) -> LogOrigin {
+    LogOrigin::Backend
+}
+
+/// The attribute of a log record that holds its trace ID (the OTLP log record's own trace ID
+/// is not kept by the mapping yet; the Node SDK writes this attribute).
+pub const LOG_TRACE_ID: &str = "trace_id";
+
+/// Whether `s` is an OTel trace ID in the form of the contract (`^[0-9a-f]{32}$`).
+pub fn is_trace_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The trace ID of a stored log record: its [`LOG_TRACE_ID`] attribute when it is readable
+/// text of the trace ID form.
+pub fn log_trace_id(r: &StoredLog) -> Option<&str> {
+    attr(&r.attributes, LOG_TRACE_ID)
+        .and_then(StoredValue::as_text)
+        .filter(|t| is_trace_id(t))
+}
+
+/// Whether every word of `words` is in the record (case-sensitive): in its template or free
+/// text, in a readable (`normal`) value of a field or attribute, or equal to the ID of a
+/// pseudonym the record holds (`p_...`). A hidden-value marker never matches. The identity
+/// attributes (`ruum.*`) are not searched.
+pub fn log_has_words(r: &StoredLog, words: &[String]) -> bool {
+    words.iter().all(|w| {
+        r.template
+            .as_deref()
+            .is_some_and(|t| t.contains(w.as_str()))
+            || r.text.as_deref().is_some_and(|t| t.contains(w.as_str()))
+            || r.fields
+                .iter()
+                .chain(
+                    r.attributes
+                        .iter()
+                        .filter(|a| !classify::is_reserved(&a.key)),
+                )
+                .any(|a| match &a.value {
+                    StoredValue::Text(s) => s.contains(w.as_str()),
+                    StoredValue::Int(i) => i.to_string() == *w,
+                    StoredValue::Float(f) => f.to_string() == *w,
+                    StoredValue::Bool(b) => b.to_string() == *w,
+                    StoredValue::Pseudonym(p) => p.id() == w,
+                    StoredValue::Hidden(_) => false,
+                })
+    })
+}
+
+/// The parts of a log filter that the stores apply alike on the decoded records: the words,
+/// the trace ID and the origin.
+pub fn log_extra_matches(r: &StoredLog, f: &TelemetryFilter) -> bool {
+    log_has_words(r, &f.words)
+        && f.trace_id
+            .as_deref()
+            .is_none_or(|t| is_trace_id(t) && log_trace_id(r) == Some(t))
+        && f.origin.is_none_or(|o| log_origin(r) == o)
+}
+
+/// The part of a span filter that the stores apply alike: the trace ID.
+pub fn span_extra_matches(r: &StoredSpan, f: &TelemetryFilter) -> bool {
+    f.trace_id
+        .as_deref()
+        .is_none_or(|t| is_trace_id(t) && r.trace_id == t)
 }
 
 impl TelemetryFilter {

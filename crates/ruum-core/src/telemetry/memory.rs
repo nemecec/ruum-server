@@ -79,36 +79,43 @@ impl TelemetryStore for MemoryTelemetryStore {
         let want = |s: Signal| f.signal.is_none_or(|w| w == s);
         let mut out = ClassifiedBatch::default();
         if want(Signal::Logs) {
-            out.logs = oldest(
+            out.logs = kept(
                 st.logs.iter().filter(|r| {
                     source_matches(&r.source, tenant, f)
                         && time_matches(r.time, f)
                         && f.min_severity.is_none_or(|s| r.severity >= s)
                         && fields_match(f, &[&r.fields, &r.attributes])
+                        && log_extra_matches(r, f)
                 }),
                 limit,
+                f.newest,
                 |r| r.time,
             );
         }
-        if want(Signal::Metrics) && f.min_severity.is_none() {
-            out.metrics = oldest(
+        // The filters of logs only (severity, words, origin) leave out the other signals.
+        let logs_only = f.min_severity.is_some() || !f.words.is_empty() || f.origin.is_some();
+        if want(Signal::Metrics) && !logs_only && f.trace_id.is_none() {
+            out.metrics = kept(
                 st.metrics.iter().filter(|r| {
                     source_matches(&r.source, tenant, f)
                         && time_matches(r.time, f)
                         && fields_match(f, &[&r.labels])
                 }),
                 limit,
+                f.newest,
                 |r| r.time,
             );
         }
-        if want(Signal::Traces) && f.min_severity.is_none() {
-            out.spans = oldest(
+        if want(Signal::Traces) && !logs_only {
+            out.spans = kept(
                 st.spans.iter().filter(|r| {
                     source_matches(&r.source, tenant, f)
                         && time_matches(r.start, f)
                         && fields_match(f, &[&r.attributes])
+                        && span_extra_matches(r, f)
                 }),
                 limit,
+                f.newest,
                 |r| r.start,
             );
         }
@@ -116,11 +123,12 @@ impl TelemetryStore for MemoryTelemetryStore {
     }
 }
 
-/// The `limit` oldest of `matches` by `time` (a stable sort, so the order written breaks
-/// ties), cloned.
-fn oldest<'a, T: Clone + 'a>(
+/// The `limit` oldest of `matches` by `time` (or the `limit` newest when `newest`), oldest
+/// first (a stable sort, so the order written breaks ties), cloned.
+fn kept<'a, T: Clone + 'a>(
     matches: impl Iterator<Item = &'a T>,
     limit: usize,
+    newest: bool,
     time: impl Fn(&T) -> OffsetDateTime,
 ) -> Vec<T> {
     if limit == 0 {
@@ -128,7 +136,12 @@ fn oldest<'a, T: Clone + 'a>(
     }
     let mut refs: Vec<&T> = matches.collect();
     refs.sort_by_key(|r| time(r));
-    refs.into_iter().take(limit).cloned().collect()
+    let skip = if newest {
+        refs.len().saturating_sub(limit)
+    } else {
+        0
+    };
+    refs.into_iter().skip(skip).take(limit).cloned().collect()
 }
 
 /// [`FieldClassSource`] in memory.

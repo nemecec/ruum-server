@@ -75,6 +75,10 @@ pub enum EventType {
     AppBindingRevoked,
     AppRoleGranted,
     AppRoleRevoked,
+    /// A person confirmed the classes of telemetry fields (card O-2). On the app node, counts
+    /// per class only; it changes no person's or agent's view of any node, so it needs no feed
+    /// rule of its own.
+    AppTelemetryFieldsConfirmed,
     /// A type written by a newer release; the name as written (interned, see
     /// [`EventType::from_wire`]).
     Unknown(&'static str),
@@ -113,6 +117,7 @@ impl EventType {
         EventType::AppBindingRevoked,
         EventType::AppRoleGranted,
         EventType::AppRoleRevoked,
+        EventType::AppTelemetryFieldsConfirmed,
     ];
 
     /// The wire name, for example `node.created` (column `journal.type`).
@@ -149,6 +154,7 @@ impl EventType {
             AppBindingRevoked => "app.binding_revoked",
             AppRoleGranted => "app.role_granted",
             AppRoleRevoked => "app.role_revoked",
+            AppTelemetryFieldsConfirmed => "app.telemetry_fields_confirmed",
             Unknown(name) => name,
         }
     }
@@ -579,6 +585,9 @@ mod tests {
                     // Only a person confirms classes (`confirmColumnClasses` is users only), so
                     // `undoAgent` never meets this entry among an agent's changes.
                     || *e == EventType::DatabaseColumnsConfirmed
+                    // Only a person confirms telemetry classes (`confirmAppTelemetryFields` is
+                    // users only, card O-2), so `undoAgent` never meets this entry.
+                    || *e == EventType::AppTelemetryFieldsConfirmed
                     // The entry names the new settings only (its schema), so there is nothing
                     // to set back; an agent can only lower settings anyway.
                     || *e == EventType::AppSettingsChanged

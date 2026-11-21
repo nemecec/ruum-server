@@ -127,6 +127,8 @@ pub async fn run(f: &dyn PrivacyFixture) -> Report {
         free_text_scrub_rebuilds_no_secret(f).await,
     );
     r.add("whole_store_scan", whole_store_scan(f).await);
+    r.add("read_filters_logs", read_filters_logs(f).await);
+    r.add("read_filters_traces", read_filters_traces(f).await);
     r
 }
 
@@ -1752,4 +1754,189 @@ async fn whole_store_scan(f: &dyn PrivacyFixture) -> CaseResultT {
     let mut all = fixture_secrets();
     all.push(fixture_live_key());
     scan_store(f, &all).await
+}
+
+// ---------------------------------------------------------------------------- read filters (O-2)
+
+/// The log orders of a read, by their `order_id` text.
+fn order_ids(b: &ClassifiedBatch) -> Vec<String> {
+    b.logs
+        .iter()
+        .filter_map(|r| attr(&r.fields, "order_id").and_then(StoredValue::as_text))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Card O-2: the words, trace ID, origin and `newest` of a log read, on every store. A filter
+/// that finds nothing first finds the record with a harmless one (decision 0006 G), and a
+/// hostile word (LogQL syntax) returns no error and no record of another app.
+async fn read_filters_logs(f: &dyn PrivacyFixture) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let other = sibling(&id);
+    for (k, n) in [
+        (FieldKind::LogField, "order_id"),
+        (FieldKind::LogField, LOG_TRACE_ID),
+    ] {
+        f.set_class(
+            id.tenant,
+            id.app,
+            k,
+            n,
+            FieldClassEntry::confirmed(FieldClass::Normal),
+        )
+        .await;
+    }
+    let trace = trace_id();
+    let t0 = crate::now() - time::Duration::seconds(20);
+    let rec = |tpl: &str, order: &str, at: OffsetDateTime, attrs: Vec<Attribute>| LogRecord {
+        time: at,
+        severity: Severity::Info,
+        body: LogBody::Template {
+            template: tpl.into(),
+            fields: vec![Attribute::new("order_id", order)],
+        },
+        attributes: attrs,
+    };
+    let batch = Batch {
+        logs: vec![
+            rec(
+                "alpha {order_id}",
+                "w-1",
+                t0,
+                vec![Attribute::new(LOG_TRACE_ID, trace.as_str())],
+            ),
+            rec(
+                "beta {order_id}",
+                "w-2",
+                t0 + time::Duration::seconds(5),
+                vec![],
+            ),
+        ],
+        ..Default::default()
+    };
+    ingest(f, &id, batch).await?;
+    let foreign = Batch {
+        logs: vec![rec("alpha {order_id}", "w-9", t0, vec![])],
+        ..Default::default()
+    };
+    ingest(f, &other, foreign).await?;
+    read_stored(f, &id, Signal::Logs, 2).await?;
+    let read = |filter: TelemetryFilter| async move {
+        f.store()
+            .read(id.tenant, &filter)
+            .await
+            .map(|b| order_ids(&b))
+            .map_err(|e| format!("read failed: {e}"))
+    };
+    let base = || TelemetryFilter {
+        signal: Some(Signal::Logs),
+        ..TelemetryFilter::app(id.app)
+    };
+    let words = |w: &[&str]| TelemetryFilter {
+        words: w.iter().map(|s| s.to_string()).collect(),
+        ..base()
+    };
+    let got = read(words(&["alpha"])).await?;
+    need(got == ["w-1"], || format!("words [alpha]: {got:?}"))?;
+    let got = read(words(&["w-2"])).await?;
+    need(got == ["w-2"], || {
+        format!("words [w-2] (a normal value): {got:?}")
+    })?;
+    let got = read(words(&["alpha", "w-2"])).await?;
+    need(got.is_empty(), || {
+        format!("words [alpha, w-2] (all must match): {got:?}")
+    })?;
+    for hostile in [
+        "\"",
+        "\\",
+        "`",
+        "} |= \"",
+        "{service_name=~\".+\"}",
+        "| json | line_format \"{{.}}\"",
+        ".*",
+        "alpha\nbeta",
+    ] {
+        let got = read(words(&[hostile])).await?;
+        need(got.is_empty(), || {
+            format!("hostile word {hostile:?} found {got:?}")
+        })?;
+    }
+    let got = read(TelemetryFilter {
+        trace_id: Some(trace.clone()),
+        ..base()
+    })
+    .await?;
+    need(got == ["w-1"], || format!("trace_id: {got:?}"))?;
+    let got = read(TelemetryFilter {
+        trace_id: Some(trace.to_uppercase()),
+        ..base()
+    })
+    .await?;
+    need(got.is_empty(), || {
+        format!("an upper-case trace_id: {got:?}")
+    })?;
+    let got = read(TelemetryFilter {
+        origin: Some(LogOrigin::Backend),
+        ..base()
+    })
+    .await?;
+    need(got.len() == 2, || format!("origin backend: {got:?}"))?;
+    let got = read(TelemetryFilter {
+        origin: Some(LogOrigin::Frontend),
+        ..base()
+    })
+    .await?;
+    need(got.is_empty(), || format!("origin frontend: {got:?}"))?;
+    let got = read(TelemetryFilter {
+        limit: Some(1),
+        newest: true,
+        ..base()
+    })
+    .await?;
+    need(got == ["w-2"], || format!("the newest one: {got:?}"))?;
+    let got = read(TelemetryFilter {
+        limit: Some(1),
+        ..base()
+    })
+    .await?;
+    need(got == ["w-1"], || format!("the oldest one: {got:?}"))?;
+    Ok(())
+}
+
+/// Card O-2: the trace ID of a span read, on every store.
+async fn read_filters_traces(f: &dyn PrivacyFixture) -> CaseResultT {
+    let id = fresh(Environment::Live);
+    let (a, b) = (span_with(vec![]), span_with(vec![]));
+    let (ta, tb) = (a.trace_id.clone(), b.trace_id.clone());
+    ingest(
+        f,
+        &id,
+        Batch {
+            spans: vec![a, b],
+            ..Default::default()
+        },
+    )
+    .await?;
+    read_stored(f, &id, Signal::Traces, 2).await?;
+    let read = |t: String| async move {
+        f.store()
+            .read(
+                id.tenant,
+                &TelemetryFilter {
+                    signal: Some(Signal::Traces),
+                    trace_id: Some(t),
+                    ..TelemetryFilter::app(id.app)
+                },
+            )
+            .await
+            .map(|b| b.spans.into_iter().map(|s| s.trace_id).collect::<Vec<_>>())
+            .map_err(|e| format!("read failed: {e}"))
+    };
+    let got = read(ta.clone()).await?;
+    need(got == [ta.clone()], || format!("trace {ta}: {got:?}"))?;
+    let got = read(tb.clone()).await?;
+    need(got == [tb.clone()], || format!("trace {tb}: {got:?}"))?;
+    let got = read("\" } || { true".into()).await?;
+    need(got.is_empty(), || format!("a hostile trace ID: {got:?}"))?;
+    Ok(())
 }
