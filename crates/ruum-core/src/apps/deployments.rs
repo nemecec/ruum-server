@@ -447,6 +447,44 @@ pub(crate) fn fail_closed(m: &Value) -> Result<()> {
 /// The privacy file of the telemetry at the archive root when the manifest names none.
 const DEFAULT_PRIVACY_FILE: &str = "telemetry-privacy.yaml";
 
+/// The suggestions of the archive's telemetry privacy file (card O-2): `telemetry.privacy_file`
+/// when the manifest names one (missing: `422` at `/telemetry/privacy_file`), else
+/// `telemetry-privacy.yaml` at the archive root when it is there. A file that does not follow
+/// its schema (a metric label that is not `normal`) is `422` with the pointer into the file
+/// and the file's path.
+pub(crate) fn privacy_file(
+    unpacked: &archive::Unpacked,
+    manifest: &Value,
+) -> Result<Option<Vec<crate::telemetry::classes::Suggestion>>> {
+    let named = manifest
+        .pointer("/telemetry/privacy_file")
+        .and_then(Value::as_str)
+        .map(normal_archive_path);
+    let path = named
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PRIVACY_FILE.to_string());
+    let Some(entry) = unpacked.get(&path) else {
+        return match named {
+            Some(_) => Err(validation(
+                "the telemetry privacy file named in app.yaml is not in the archive",
+                "/telemetry/privacy_file",
+            )),
+            None => Ok(None),
+        };
+    };
+    crate::telemetry::classes::privacy_suggestions(&entry.data)
+        .map(Some)
+        .map_err(|e| {
+            Error::Api(
+                ApiError::new(ErrorCode::ValidationFailed, e.message)
+                    .with_hint("fix the telemetry privacy file; a metric label must be normal")
+                    .with_details(
+                        json!({ "stage": "validate", "pointer": e.pointer, "file": path }),
+                    ),
+            )
+        })
+}
+
 /// The site files of a static manifest: the files under `static.root` (paths relative to it),
 /// without `app.yaml` of the archive root, the telemetry privacy file and the files of
 /// `telemetry.source_maps`, which the contract keeps private and never serves (review W-2s,
@@ -628,14 +666,19 @@ impl AppService {
         // the blocking pool and never stalls the async workers.
         // The slot goes into the blocking task and comes back with its result: a cancelled
         // request cannot free the slot while the unpacking still runs (Kimi W-2s run 11, 4).
-        let ((packed, manifest, files, need), slot) = blocking_with_slot(slot, move || {
-            let unpacked = archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
-            let manifest = checked_manifest(&unpacked, &plan)?;
-            let files = site_files(&unpacked, &manifest);
-            let need = super::static_site::SiteNeed::of(&files, stages::spa_fallback(&manifest))?;
-            Ok::<_, Error>((packed, manifest, files, need))
-        })
-        .await?;
+        let ((packed, manifest, files, need, privacy), slot) =
+            blocking_with_slot(slot, move || {
+                let unpacked =
+                    archive::unpack(&packed.bytes, &limits).map_err(|r| r.into_error())?;
+                let manifest = checked_manifest(&unpacked, &plan)?;
+                // Card O-2: the privacy file's suggestions (a direct `422` when it is bad).
+                let privacy = privacy_file(&unpacked, &manifest)?;
+                let files = site_files(&unpacked, &manifest);
+                let need =
+                    super::static_site::SiteNeed::of(&files, stages::spa_fallback(&manifest))?;
+                Ok::<_, Error>((packed, manifest, files, need, privacy))
+            })
+            .await?;
         // The bindings (card B-1): resolution and the deployer check before the answer; a
         // refusal leaves nothing behind. The stage `bindings` runs the check again after it.
         let resolved = self
@@ -714,6 +757,15 @@ impl AppService {
             )
         })?;
         self.notify_changed();
+        // Card O-2: the deployment passed its checks and its row exists, so the privacy file's
+        // suggestions go to the app's fields (per app, also from a preview). Suggestions only
+        // make a class stricter at once; a failed write keeps the fields `personal` and is
+        // logged, it does not fail the deployment.
+        if let (Some(list), Some(sink)) = (privacy, self.privacy_suggestions())
+            && let Err(e) = sink.suggest(ctx.tenant, app, &list).await
+        {
+            tracing::warn!(tenant = %ctx.tenant, app = %app, error = %e, "the suggestions of telemetry-privacy.yaml were not written");
+        }
         let urls = self.urls(ctx.tenant, &node).await?;
         let view = deployment_view(&row, &urls, true);
         let me = self.clone();

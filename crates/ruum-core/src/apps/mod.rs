@@ -416,6 +416,9 @@ pub struct AppService {
     changed: tokio::sync::Notify,
     /// The hooks called when the live deployment changes (card B-2; empty by default).
     hooks: std::sync::RwLock<Vec<Arc<dyn deployments::LiveReleaseHook>>>,
+    /// Where a deployment writes the suggestions of its `telemetry-privacy.yaml` (card O-2;
+    /// set by `telemetry::query::install`, none by default: the file is still checked).
+    privacy: std::sync::RwLock<Option<Arc<dyn crate::telemetry::classes::PrivacySuggestions>>>,
     /// The deployment slots of this process (Kimi W-2s run 10b, 2).
     deploy_slots: deployments::DeploySlots,
     /// The live-switch locks of this process, one per app (Kimi W-2s run 10b, 1); the store's
@@ -513,6 +516,7 @@ impl AppService {
             deps,
             changed: tokio::sync::Notify::new(),
             hooks: std::sync::RwLock::new(Vec::new()),
+            privacy: std::sync::RwLock::new(None),
             deploy_slots: deployments::DeploySlots::new(
                 deployments::TENANT_DEPLOYS,
                 deployments::GLOBAL_DEPLOYS,
@@ -531,6 +535,24 @@ impl AppService {
     /// [`deployments::LiveReleaseHook`]).
     pub fn add_live_hook(&self, hook: Arc<dyn deployments::LiveReleaseHook>) {
         self.hooks.write().expect("hook lock").push(hook);
+    }
+
+    /// Sets where deployments write the suggestions of `telemetry-privacy.yaml` (card O-2).
+    pub fn set_privacy_suggestions(
+        &self,
+        sink: Arc<dyn crate::telemetry::classes::PrivacySuggestions>,
+    ) {
+        *self.privacy.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    /// Where deployments write the suggestions of `telemetry-privacy.yaml`, if set.
+    pub(crate) fn privacy_suggestions(
+        &self,
+    ) -> Option<Arc<dyn crate::telemetry::classes::PrivacySuggestions>> {
+        self.privacy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The registered live hooks.

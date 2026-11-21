@@ -209,7 +209,10 @@ impl Services {
         let telemetry = Arc::new(crate::telemetry::query::TelemetryService::memory(
             (*parts.keys).clone(),
             apps.usage().clone(),
+            Some(journal.clone()),
         ));
+        // Deployments write the suggestions of their privacy file into it (card O-2).
+        apps.set_privacy_suggestions(telemetry.suggestions());
         let handles = MemoryHandles {
             authz: authz.clone(),
             journal: journal.clone(),

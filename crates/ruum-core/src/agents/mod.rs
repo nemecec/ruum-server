@@ -212,6 +212,8 @@ pub fn undo_action(event: crate::journal::EventType) -> Option<&'static str> {
         AppBindingGranted | AppBindingRevoked => None,
         AppRoleGranted => Some("remove the app role grant"),
         AppRoleRevoked => Some("add the app role grant again"),
+        // Only a person confirms telemetry classes (card O-2); an agent never wrote one.
+        AppTelemetryFieldsConfirmed => None,
         // A type of a newer release (rolling deploy, backlog P-57): this release does not know
         // its inverse, so the undo skips it as irreversible.
         Unknown(_) => None,

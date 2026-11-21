@@ -883,7 +883,7 @@ telemetry:
                 ("app.js", b"console.log(1)"),
                 ("app.js.map", b"{\"sourcesContent\":[\"secret\"]}"),
                 ("assets/vendor.js.map", b"{}"),
-                ("telemetry-privacy.yaml", b"fields: {}\n"),
+                ("telemetry-privacy.yaml", b"fields: []\n"),
             ],
         )
         .await;

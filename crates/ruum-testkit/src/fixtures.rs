@@ -377,7 +377,8 @@ pub struct TenantFixture {
     pub app_api_key: Uuid,
     /// A pending publish request of `agent` on the app.
     pub app_approval: Uuid,
-    /// A trace of the app in the telemetry store (32 hex characters).
+    /// A trace of the app in the telemetry store (32 hex characters): one span of W, seeded
+    /// through the pipeline with an error log that names `order_id` and `customer` (card O-2).
     pub app_trace: String,
     /// A `report` issue of the app in `Projects`, and its name.
     pub issue: NodeId,
@@ -1331,6 +1332,56 @@ mod seed {
                     },
                 )
                 .await
+        })
+        .await;
+
+        // W's telemetry (card O-2): one error log with the fields `order_id` and `customer`
+        // (so both are listed, unconfirmed) and one span of the trace `app_trace` (so the
+        // standard `getAppTrace` reads it), through the pipeline of the services.
+        let (s2, app, deployment, trace) =
+            (s.clone(), t.app, t.app_deployment, t.app_trace.clone());
+        step("app telemetry", async move {
+            use ruum_core::telemetry::{
+                AttrValue, Attribute, Batch, LogBody, LogRecord, Severity, SourceIdentity, Span,
+                SpanKind, StatusCode,
+            };
+            let now = ruum_core::now();
+            let source = SourceIdentity {
+                tenant: tid,
+                app,
+                deployment,
+                environment: ruum_core::runtime::Environment::Live,
+            };
+            let batch = Batch {
+                logs: vec![LogRecord {
+                    time: now - std::time::Duration::from_secs(60),
+                    severity: Severity::Error,
+                    body: LogBody::Template {
+                        template: "order {order_id} failed for {customer}".into(),
+                        fields: vec![
+                            Attribute::new("order_id", AttrValue::from("o-fixture-1")),
+                            Attribute::new("customer", AttrValue::from("kati@example.test")),
+                        ],
+                    },
+                    attributes: vec![],
+                }],
+                spans: vec![Span {
+                    trace_id: trace,
+                    span_id: "00f067aa0ba902b7".into(),
+                    parent_span_id: None,
+                    name: "GET /plants".into(),
+                    kind: SpanKind::Server,
+                    start: now - std::time::Duration::from_secs(60),
+                    end: now - std::time::Duration::from_millis(59_950),
+                    status: StatusCode::Ok,
+                    status_message: None,
+                    attributes: vec![],
+                    events: vec![],
+                    links: vec![],
+                }],
+                ..Default::default()
+            };
+            s2.telemetry.ingest(&source, batch).await
         })
         .await;
 

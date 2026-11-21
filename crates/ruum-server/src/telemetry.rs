@@ -925,14 +925,13 @@ pub async fn run_on(
     grpc: tokio::net::TcpListener,
     http: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
+    use ruum_core::telemetry::TelemetryStore;
     use ruum_core::telemetry::lgtm::{LgtmConfig, LgtmStore};
-    use ruum_core::telemetry::memory::MemoryFieldClasses;
     use ruum_core::telemetry::processor::{
         FilePositions, LogShipper, MemoryPositions, PositionStore, ShipperConfig,
         WorkloadSecretSource,
     };
     use ruum_core::telemetry::source::NetworkSourceAuthenticator;
-    use ruum_core::telemetry::{PipelineIngest, TelemetryStore};
 
     let token = match &settings.collector_token_file {
         Some(path) => std::fs::read_to_string(path)
@@ -959,18 +958,13 @@ pub async fn run_on(
         collector_token: ruum_core::runtime::SecretValue::new(token),
         timeout: Duration::from_secs(30),
     })?);
-    // No Postgres class source before card O-2: every field is unclassified, so `personal`.
-    let classes = Arc::new(MemoryFieldClasses::new());
     // No driver lookup before cards I-4 and I-6: no secret values to match (the driver
     // redacts its own log lines; the deny-list, classes and scrubber still run).
     let secrets = Arc::new(WorkloadSecretSource::empty());
-    let ingest: Arc<dyn TelemetryIngest> = Arc::new(PipelineIngest::new(
-        store,
-        classes,
-        secrets,
-        (*services.tenant_keys).clone(),
-        services.apps.usage().clone(),
-    ));
+    // Card O-2: the classes of `telemetry_fields` (the Postgres class source behind the bounded
+    // cache of the services, `wiring::install_telemetry`), and the fields the pipeline sees are
+    // written back as unconfirmed rows.
+    let ingest: Arc<dyn TelemetryIngest> = services.telemetry.pipeline(store, secrets);
     // No source lookup before cards I-4 and I-6: every request is refused.
     let auth = Arc::new(NetworkSourceAuthenticator::refuse_all());
     let receiver = Receiver::new(
