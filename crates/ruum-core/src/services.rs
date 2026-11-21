@@ -78,6 +78,9 @@ pub struct Services {
     /// G-1b). `None` until the Docker wiring (I-4) gives one: the route then answers
     /// `not_running` and the gateway shows its status page (fail closed).
     pub sandboxes: Option<Arc<crate::apps::sandboxes::SandboxDirectory>>,
+    /// The telemetry store, its class source and the read operations (card O-2): in memory
+    /// here; the server and the Postgres suites install the Postgres class source.
+    pub telemetry: Arc<crate::telemetry::query::TelemetryService>,
 }
 
 /// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
@@ -203,6 +206,10 @@ impl Services {
             },
         )
         .expect("the web app provider registers");
+        let telemetry = Arc::new(crate::telemetry::query::TelemetryService::memory(
+            (*parts.keys).clone(),
+            apps.usage().clone(),
+        ));
         let handles = MemoryHandles {
             authz: authz.clone(),
             journal: journal.clone(),
@@ -238,6 +245,7 @@ impl Services {
             databases,
             apps,
             sandboxes: None,
+            telemetry,
         };
         (services, handles)
     }
