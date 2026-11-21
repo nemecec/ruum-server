@@ -561,6 +561,22 @@ impl AppStore for PgAppStore {
         Ok(t)
     }
 
+    async fn app_host_known(&self, tenant_slug: &str, app_slug: &str) -> Result<bool> {
+        // Spans tenants (the system flag, for this transaction only); it reads one bit.
+        let mut tx = begin_system(&self.pool).await?;
+        let known: bool = sqlx::query_scalar(
+            "select exists (select 1 from tenant_app_settings s \
+             join apps a on a.tenant_id = s.tenant_id and a.slug = $2 \
+             where s.slug = $1)",
+        )
+        .bind(tenant_slug)
+        .bind(app_slug)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(known)
+    }
+
     async fn slug_state(&self, tenant: TenantId, slug: &str, node: NodeId) -> Result<SlugState> {
         let mut tx = begin_tenant(&self.pool, tenant).await?;
         // `gone`: the app's node is a purge tombstone (in the trash with the tenant root as

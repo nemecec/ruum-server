@@ -688,6 +688,12 @@ pub trait AppStore: Send + Sync {
     /// What `slug` is in the tenant for the app node `node`.
     async fn slug_state(&self, tenant: TenantId, slug: &str, node: NodeId) -> Result<SlugState>;
 
+    /// Whether a tenant has the tenant slug `tenant_slug` now and an app row with the slug
+    /// `app_slug` (in any state, also in the trash). Spans tenants: the edge asks it before it
+    /// gets a certificate for an app host (`ruum_api::internal` tls-ask, card I-6), so a name
+    /// that no app has never costs a certificate. It reveals one bit and no ID.
+    async fn app_host_known(&self, tenant_slug: &str, app_slug: &str) -> Result<bool>;
+
     /// Inserts the row of a new app and records its slug as used, in one unit. `None` when the
     /// slug is taken (by another app, or used before by another app): nothing is written.
     async fn insert_app(&self, ctx: &Context, app: NewApp) -> Result<Option<AppRow>>;

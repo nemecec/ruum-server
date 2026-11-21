@@ -1092,6 +1092,38 @@ pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
     assert_eq!(s.list_bindings(a, &all).await.unwrap().len(), 1);
 }
 
+/// Card I-6: the edge's question before a certificate. Only a tenant slug that a tenant has now
+/// together with an app slug of that tenant is known; another tenant's app slug, an unknown
+/// slug and a swapped pair are not.
+pub(crate) async fn app_hosts_are_known_only_for_real_apps(h: &dyn Harness) {
+    let s = h.store();
+    let (a, ua) = h.tenant().await;
+    let (b, _) = h.tenant().await;
+    let ta = unique("hosta");
+    let tb = unique("hostb");
+    s.ensure_tenant_settings(a, std::slice::from_ref(&ta))
+        .await
+        .unwrap();
+    s.ensure_tenant_settings(b, std::slice::from_ref(&tb))
+        .await
+        .unwrap();
+    let slug = unique("site");
+    let n = h.app_node(a, ua).await;
+    assert!(
+        s.insert_app(&ctx(a, ua), app(n, &slug))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(s.app_host_known(&ta, &slug).await.unwrap());
+    // The same app slug under another tenant's slug, an unknown app, an unknown tenant, the
+    // slugs swapped: not known.
+    assert!(!s.app_host_known(&tb, &slug).await.unwrap());
+    assert!(!s.app_host_known(&ta, &unique("none")).await.unwrap());
+    assert!(!s.app_host_known(&unique("nobody"), &slug).await.unwrap());
+    assert!(!s.app_host_known(&slug, &ta).await.unwrap());
+}
+
 /// Runs every case.
 pub(crate) async fn run_all(h: &dyn Harness) {
     tenant_slugs_span_tenants(h).await;
@@ -1104,6 +1136,7 @@ pub(crate) async fn run_all(h: &dyn Harness) {
     purge_pages_stay_in_their_app(h).await;
     bindings_rows_and_their_end(h).await;
     bindings_stay_in_their_tenant(h).await;
+    app_hosts_are_known_only_for_real_apps(h).await;
 }
 
 #[cfg(test)]

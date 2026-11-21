@@ -44,4 +44,10 @@ add STG_RUUM_CONTENT_SIGNING_KEY "$(openssl rand -base64 32 | tr -d '\n')"
 add STG_RCLONE_CRYPT_PASSWORD "$(rand_alnum 48)"
 add STG_RCLONE_CRYPT_SALT "$(rand_alnum 48)"
 add STG_NATS_RUUM_PASSWORD "$(rand_alnum 40)"
+# The app runtime (card I-6): the gateway's database role (it may only execute
+# ruum_app_host_lookup), the gateway's user-token key (an Ed25519 seed: 32 bytes, base64url) and
+# the egress proxy's control token (at least 32 bytes).
+add STG_PG_RUUM_GATEWAY_PASSWORD "$(rand_alnum 40)"
+add STG_GATEWAY_TOKEN_KEY "$(rand_b64url 32)"
+add STG_EGRESS_CONTROL_TOKEN "$(rand_alnum 48)"
 echo "secrets-init: done (names only above; keep a copy of TOFU_STATE_PASSPHRASE in the password manager)"

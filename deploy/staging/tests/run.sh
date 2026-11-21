@@ -972,7 +972,9 @@ YAML
     ok "the controller's Roles are bound to the controller only" || bad "a controller Role is bound to another subject"
   awk 'BEGIN{RS="---"} /kind: Role\n/ && /name: deploy-controller\n/ && /namespace: ruum-deploy\n/' "$TMP/controller.yaml" | grep -qF 'verbs: [get, list, watch, update, delete]' &&
     ok "the controller reads the requests and writes their outcome" || bad "the controller cannot write the outcome of a request"
-  awk '/^  name: default-deny-ingress$/ {getline; print}' "$TMP/platform.yaml" | grep -qx '  namespace: ruum-deploy' &&
+  # grep without -q reads the whole list: -q stops at the first match, and awk then fails on
+  # SIGPIPE under pipefail when a namespace follows ruum-deploy (ruum-apps, card I-6).
+  awk '/^  name: default-deny-ingress$/ {getline; print}' "$TMP/platform.yaml" | grep -x '  namespace: ruum-deploy' >/dev/null &&
     ok "ruum-deploy denies all ingress by default" || bad "ruum-deploy has no default deny"
   grep -A1 -x '  name: ruum-deploy' "$STG/k8s/manifests/namespaces.yaml" | tail -1 | grep -q labels &&
     grep -A3 -x '  name: ruum-deploy' "$STG/k8s/manifests/namespaces.yaml" | grep -qF 'pod-security.kubernetes.io/enforce: restricted' &&
@@ -995,9 +997,106 @@ YAML
   else
     echo "== Zitadel chart render: skipped (charts.zitadel.com not reachable: $(head -c 200 "$TMP/zitadel.err"))"
   fi
+  # The app runtime on staging (card I-6): the gateway and the egress proxy by digest, only both
+  # together, their settings, the apps site of the edge, the network policies of ruum-apps.
+  echo "== the app runtime (card I-6): charts"
+  g="ghcr.io/nemecec/ruum-gateway@sha256:$(printf '%064d' 3)"
+  x="ghcr.io/nemecec/ruum-egress@sha256:$(printf '%064d' 4)"
+  A=(--set "images.server=$d" --set "images.edge=$e" --set "images.gateway=$g" --set "images.egress=$x")
+  expect 0 "helm lint charts/ruum with the app runtime" helm lint "$STG/charts/ruum" "${A[@]}"
+  expect 0 "render charts/ruum with the app runtime" helm template ruum "$STG/charts/ruum" "${A[@]}"
+  cp "$TMP/out" "$TMP/ruum-apps.yaml"
+  doc_of() { # doc_of <file> <kind> <name>: the one document of that kind and name
+    awk -v kind="kind: $2" -v name="  name: $3" 'function out() { if (index(doc, "\n" kind "\n") && index(doc, "\n" name "\n")) printf "%s", doc; doc = "\n" }
+      BEGIN { doc = "\n" } /^---/ { out(); next } { doc = doc $0 "\n" } END { out() }' "$1"
+  }
+  doc_of "$TMP/ruum-apps.yaml" Deployment ruum-gateway >"$TMP/gw.yaml"
+  doc_of "$TMP/ruum-apps.yaml" Deployment ruum-egress >"$TMP/eg.yaml"
+  [[ -s "$TMP/gw.yaml" && -s "$TMP/eg.yaml" ]] && ok "the gateway and the egress proxy are Deployments in ruum" || bad "no ruum-gateway or ruum-egress Deployment"
+  grep -qF "image: $g" "$TMP/gw.yaml" && grep -qF "image: $x" "$TMP/eg.yaml" && ok "each runs its own image by digest" || bad "the gateway or egress image is not the digest given"
+  for n in ruum-gateway ruum-egress; do
+    grep -qF "name: $n" "$TMP/ruum.yaml" && bad "$n renders without its images" || true
+  done
+  grep -qF '*.*.apps.staging.ruumapps.net' "$TMP/ruum.yaml" && bad "the apps site renders without the app runtime" || ok "without the gateway and egress images: no gateway, no egress, no apps site (a commit before I-6)"
+  expect 1 "charts/ruum refuses the gateway without the egress proxy" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set "images.gateway=$g"
+  expect 1 "charts/ruum refuses the egress proxy without the gateway" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set "images.egress=$x"
+  expect 1 "charts/ruum refuses the gateway by tag" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set "images.gateway=ghcr.io/nemecec/ruum-gateway:main" --set "images.egress=$x"
+  expect 1 "charts/ruum refuses the egress image as the gateway" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set "images.gateway=$x" --set "images.egress=$x"
+  expect 1 "charts/ruum refuses a server image as the egress proxy" helm template ruum "$STG/charts/ruum" --set "images.server=$d" --set "images.edge=$e" --set "images.gateway=$g" --set "images.egress=$d"
+  expect 1 "charts/ruum refuses one gateway replica (design 12.7)" helm template ruum "$STG/charts/ruum" "${A[@]}" --set gateway.replicas=1
+  # Settings: every RUUM_* name of the gateway is one the gateway reads, and the required ones
+  # are set (crates/ruum-gateway/src/main.rs); the same for the egress proxy (config.rs).
+  grep -ohE '"(RUUM_[A-Z0-9_]+)"' "$ROOT/crates/ruum-gateway/src/main.rs" | tr -d '"' | sort -u >"$TMP/gw-reads"
+  grep -oE 'name: RUUM_[A-Z0-9_]+' "$TMP/gw.yaml" | cut -d' ' -f2 | sort -u >"$TMP/gw-sets"
+  extra="$(comm -13 "$TMP/gw-reads" "$TMP/gw-sets" | tr '\n' ' ')"
+  [[ -z "$extra" ]] && ok "the gateway Deployment sets only settings the gateway reads ($(wc -l <"$TMP/gw-sets" | tr -d ' '))" || bad "the gateway Deployment sets $extra, which the gateway does not read"
+  for n in RUUM_GATEWAY_BIND RUUM_GATEWAY_ISSUER RUUM_GATEWAY_INTERNAL_URL RUUM_GATEWAY_DATABASE_URL RUUM_GATEWAY_TOKEN_KEY_FILE RUUM_APPS_DOMAIN; do
+    grep -qx "$n" "$TMP/gw-sets" || bad "the gateway Deployment does not set $n"
+  done
+  { grep -ohE '"(RUUM_EGRESS_[A-Z0-9_]+|EGRESS_DENY)"' "$ROOT/crates/ruum-egress/src/"*.rs | tr -d '"'; } | sort -u >"$TMP/eg-reads"
+  grep -oE 'name: (RUUM_EGRESS_[A-Z0-9_]+|EGRESS_DENY)' "$TMP/eg.yaml" | cut -d' ' -f2 | sort -u >"$TMP/eg-sets"
+  extra="$(comm -13 "$TMP/eg-reads" "$TMP/eg-sets" | tr '\n' ' ')"
+  [[ -z "$extra" ]] && ok "the egress Deployment sets only settings the proxy reads ($(wc -l <"$TMP/eg-sets" | tr -d ' '))" || bad "the egress Deployment sets $extra, which the proxy does not read"
+  grep -qF 'RUUM_EGRESS_DEV' "$TMP/eg.yaml" && bad "the egress proxy runs in dev mode (an empty EGRESS_DENY passes)" || ok "the egress proxy is not in dev mode"
+  grep -qF 'configMapKeyRef: { name: ruum-egress-deny, key: deny }' "$TMP/eg.yaml" && ok "EGRESS_DENY comes from ruum/ruum-egress-deny (k8s/apply.sh)" || bad "EGRESS_DENY is not from ruum-egress-deny"
+  grep -qF 'value: "unix:/run/ruum-egress/control.sock"' "$TMP/eg.yaml" && ok "the egress control listener is a Unix socket in the pod (no network reaches it)" || bad "the egress control listener is not a Unix socket"
+  # The apps domain: the server and the gateway agree; the apps site goes to the gateway only.
+  sd="$(doc_of "$TMP/ruum-apps.yaml" Deployment ruum-server | grep -oE 'name: RUUM_APPS_DOMAIN, value: "[^"]*"' | head -1)"
+  gd="$(grep -oE 'name: RUUM_APPS_DOMAIN, value: "[^"]*"' "$TMP/gw.yaml" | head -1)"
+  [[ -n "$sd" && "$sd" == "$gd" && "$sd" == *'"apps.staging.ruumapps.net"' ]] && ok "ruum-server and the gateway have the same apps domain (apps.staging.ruumapps.net)" || bad "the apps domains differ: server '$sd', gateway '$gd'"
+  # Secrets: the user-token key and the egress token are files, never environment values; no
+  # service account token; restricted.
+  grep -qF '{ name: RUUM_GATEWAY_TOKEN_KEY_FILE, value: /keys/token-key }' "$TMP/gw.yaml" && grep -qF 'key: token-key, path: token-key' "$TMP/gw.yaml" &&
+    ok "the user-token key is a mounted file" || bad "the user-token key is not a mounted file"
+  grep -E 'secretKeyRef: \{ name: ruum-gateway, key: token-key' "$TMP/gw.yaml" && bad "the user-token key is an environment value" || ok "the user-token key is never an environment value"
+  grep -qF 'RUUM_EGRESS_CONTROL_TOKEN_FILE, value: /secrets/control-token' "$TMP/eg.yaml" && ok "the egress control token is a mounted file" || bad "the egress control token is not a file"
+  for f in "$TMP/gw.yaml" "$TMP/eg.yaml"; do
+    grep -qF 'automountServiceAccountToken: false' "$f" && grep -qF 'readOnlyRootFilesystem: true' "$f" && grep -qF 'drop: [ALL]' "$f" &&
+      grep -qF 'allowPrivilegeEscalation: false' "$f" || bad "$(basename "$f"): not restricted, or it mounts a service account token"
+  done
+  ok "the gateway and the egress proxy run restricted, without a service account token"
+  grep -qF 'secretKeyRef: { name: ruum-gateway-s3, key: bucket, optional: true }' "$TMP/gw.yaml" && ok "without ruum-gateway-s3 the gateway has no bucket (it serves no static file)" || bad "the bucket does not come from the optional ruum-gateway-s3"
+  doc_of "$TMP/ruum-apps.yaml" ConfigMap ruum-release | grep -E "^  gateway: \"$g\"$" >/dev/null && ok "ruum-release records the gateway image" || bad "ruum-release does not record the gateway image"
+  # The apps site of the edge.
+  awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum-apps.yaml" >"$TMP/Caddyfile-apps"
+  awk '/^\*\.\*\.apps\.staging\.ruumapps\.net \{$/ {on=1} on {print} on && /^\}$/ {exit}' "$TMP/Caddyfile-apps" >"$TMP/apps-site"
+  grep -qF 'reverse_proxy ruum-gateway.ruum.svc.cluster.local:8494' "$TMP/apps-site" && grep -qF 'on_demand' "$TMP/apps-site" &&
+    ok "the edge sends *.*.apps.staging.ruumapps.net to the gateway, with on-demand TLS" || bad "the apps site of the edge is missing or does not go to the gateway"
+  grep -q 'Strict-Transport-Security\|platform_headers' "$TMP/apps-site" && bad "the apps site sends HSTS (ruumapps.net must not get it)" || ok "no HSTS on the apps site"
+  [[ "$(grep -c 'ruum-gateway' "$TMP/Caddyfile-apps")" == 1 ]] && ok "only the apps site reaches the gateway" || bad "another site of the edge reaches the gateway"
+  # The network policies of the app runtime (charts/platform).
+  echo "== the app runtime (card I-6): network policies"
+  P="$TMP/platform.yaml"
+  doc_of "$P" NetworkPolicy sandboxes-only-to-egress >"$TMP/np-sb-out.yaml"
+  grep -qF 'namespace: ruum-apps' "$TMP/np-sb-out.yaml" && grep -qF 'policyTypes: [Egress]' "$TMP/np-sb-out.yaml" && grep -qF 'podSelector: {}' "$TMP/np-sb-out.yaml" &&
+    [[ "$(grep -c 'port:' "$TMP/np-sb-out.yaml")" == 1 ]] && grep -qF '{ protocol: TCP, port: 3128 }' "$TMP/np-sb-out.yaml" &&
+    grep -qF 'matchLabels: { app: ruum-egress }' "$TMP/np-sb-out.yaml" && ! grep -q 'ipBlock\|kube-dns' "$TMP/np-sb-out.yaml" &&
+    ok "sandboxes reach only the egress proxy on 3128 (no DNS, no address block)" || bad "the sandboxes' egress policy allows more than the egress proxy"
+  doc_of "$P" NetworkPolicy default-deny-ingress | grep . >/dev/null || bad "no default deny"
+  awk '/^  name: default-deny-ingress$/ {getline; print}' "$P" | grep -xF '  namespace: ruum-apps' >/dev/null && ok "ruum-apps denies all ingress by default" || bad "ruum-apps has no default deny ingress"
+  doc_of "$P" NetworkPolicy sandboxes-from-gateway >"$TMP/np-sb-in.yaml"
+  grep -qF 'matchLabels: { app: ruum-gateway }' "$TMP/np-sb-in.yaml" && [[ "$(grep -c 'podSelector:' "$TMP/np-sb-in.yaml")" == 2 ]] &&
+    ok "only the gateway reaches the sandboxes" || bad "the sandboxes' ingress allows more than the gateway"
+  doc_of "$P" NetworkPolicy gateway-from-edge >"$TMP/np-gw-in.yaml"
+  grep -qF 'matchLabels: { app: ruum-edge }' "$TMP/np-gw-in.yaml" && grep -qF '{ protocol: TCP, port: 8494 }' "$TMP/np-gw-in.yaml" && [[ "$(grep -c 'from:' "$TMP/np-gw-in.yaml")" == 1 ]] &&
+    ok "nothing reaches the gateway but the edge" || bad "the gateway's ingress allows more than the edge"
+  doc_of "$P" NetworkPolicy gateway-egress >"$TMP/np-gw-out.yaml"
+  grep -qF '{ protocol: TCP, port: 8493 }' "$TMP/np-gw-out.yaml" && grep -qF '{ protocol: TCP, port: 5432 }' "$TMP/np-gw-out.yaml" &&
+    grep -qF 'kubernetes.io/metadata.name: ruum-apps' "$TMP/np-gw-out.yaml" && ok "the gateway reaches the core's internal listener, Postgres and the sandboxes" || bad "the gateway's egress misses the core, Postgres or the sandboxes"
+  doc_of "$P" NetworkPolicy egress-proxy-out >"$TMP/np-eg-out.yaml"
+  for f in "$TMP/np-gw-out.yaml" "$TMP/np-eg-out.yaml"; do
+    for c in 10.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10; do
+      grep -qF "\"$c\"" "$f" || bad "an egress policy of the app runtime does not except $c"
+    done
+  done
+  ok "the gateway and the egress proxy reach no private range by address block"
+  doc_of "$P" NetworkPolicy egress-from-sandboxes | grep -F 'kubernetes.io/metadata.name: ruum-apps' >/dev/null && ok "only ruum-apps reaches the egress proxy" || bad "the egress proxy's ingress is not ruum-apps"
+  doc_of "$P" NetworkPolicy pg-clients | grep -F 'matchLabels: { app: ruum-gateway }' >/dev/null && ok "the gateway reaches Postgres (pg-clients)" || bad "pg-clients does not let the gateway in"
+  doc_of "$P" NetworkPolicy ruum-server-internal-from-gateway | grep -F '{ protocol: TCP, port: 8493 }' >/dev/null && ok "the gateway reaches ruum-server's internal listener only (8493)" || bad "no policy lets the gateway reach the internal listener"
+  doc_of "$P" Cluster pg | grep -A6 'name: ruum_gateway' | grep -F 'passwordSecret: { name: pg-role-ruum-gateway }' >/dev/null && ok "CNPG makes the role ruum_gateway" || bad "CNPG does not make ruum_gateway"
   if [[ $have_docker == 1 ]]; then
-    echo "== Caddyfile (caddy adapt --validate)"
-    awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum.yaml" >"$TMP/Caddyfile"
+    echo "== Caddyfile with the apps site of card I-6 (caddy adapt --validate)"
+    awk '/^  Caddyfile: \|/ {on=1; next} on && /^[^ ]/ {on=0} on && /^---/ {on=0} on {sub(/^    /, ""); print}' "$TMP/ruum-apps.yaml" >"$TMP/Caddyfile"
     # The stock image has no kubernetes_secret storage module (the edge image builds it in and
     # adapts it there, deploy/images/ruum-edge.Dockerfile); drop that block here.
     awk '/^\tstorage kubernetes_secret \{/ {skip=1; next} skip && /^\t\}/ {skip=0; next} !skip' "$TMP/Caddyfile" >"$TMP/Caddyfile.stock"
@@ -1684,7 +1783,7 @@ for f in deploy-chart.sh deploy-lock.sh image-check.sh release-floor.sh; do
   grep -qF "deploy/staging/ops/$f" "$DF" || bad "the controller image lacks ops/$f"
 done
 grep -qF 'go test -count=1 ./...' "$DF" && ok "the image build runs the controller's tests" || bad "the image build skips the controller's tests"
-[[ "$(grep -cF 'image: [ruum-server, ruum-edge, ruum-deploy-controller]' "$ROOT/.github/workflows/images.yml")" == 2 ]] &&
+[[ "$(grep -cF -e '- { image: ruum-deploy-controller, file: deploy/images/ruum-deploy-controller.Dockerfile }' "$ROOT/.github/workflows/images.yml")" == 2 ]] &&
   ok "images.yml builds and attests the controller image" || bad "images.yml does not build the controller image"
 # The floor is the same in the controller and in ops/release-floor.sh. The controller never runs a
 # rollback older (Kimi review of O-34, finding 1; its Go tests check the refusal).
@@ -1759,6 +1858,93 @@ if [[ $have_docker == 1 ]]; then
   fi
 else
   echo "== runtime role grants: skipped (no docker)"
+fi
+
+# The app runtime on staging (card I-6), without helm.
+echo "== the app runtime (card I-6): Talos, images, secrets, deploy"
+. "$STG/versions.env"
+sum="$( (shasum -a 256 2>/dev/null || sha256sum) <"$STG/talos/schematic.yaml" | cut -d' ' -f1)"
+[[ "$sum" == "$TALOS_SCHEMATIC" ]] && ok "TALOS_SCHEMATIC is the SHA-256 of talos/schematic.yaml (Image Factory's ID)" || bad "TALOS_SCHEMATIC $TALOS_SCHEMATIC is not the ID of talos/schematic.yaml ($sum)"
+grep -qxF '            - siderolabs/gvisor' "$STG/talos/schematic.yaml" && ok "the schematic has the extension siderolabs/gvisor" || bad "the schematic lacks siderolabs/gvisor"
+[[ "$TALOS_INSTALLER_IMAGE" == "factory.talos.dev/installer/$TALOS_SCHEMATIC:$TALOS_VERSION" && "$TALOS_IMAGE_URL" == *"/image/$TALOS_SCHEMATIC/$TALOS_VERSION/hcloud-amd64.raw.xz" ]] &&
+  ok "the installer image and the snapshot URL use the schematic" || bad "the installer image or the snapshot URL does not use TALOS_SCHEMATIC"
+grep -qF 'schematic%3D${TALOS_SCHEMATIC_LABEL}' "$STG/steps.sh" && grep -qF 'schematic=$TALOS_SCHEMATIC_LABEL' "$STG/steps.sh" &&
+  ok "the Talos snapshot is found and labelled by version and schematic" || bad "the Talos snapshot ignores the schematic (new nodes would boot without gVisor)"
+grep -qF 'ignore_changes = [image, ssh_keys]' "$STG/tofu/cluster/main.tf" && ok "a new snapshot never replaces running nodes" || bad "a new snapshot could replace the nodes"
+ut="$STG/ops/upgrade-talos.sh"
+grep -qF '"$schematic" == "$TALOS_SCHEMATIC"' "$ut" && grep -qF 'stopping before the next node' "$ut" &&
+  ok "upgrade-talos.sh upgrades a node whose schematic differs, and checks it before the next node" || bad "upgrade-talos.sh compares the version only"
+rc="$STG/k8s/manifests/runtimeclass.yaml"
+grep -qx 'handler: runsc' "$rc" && grep -qx '  name: gvisor' "$rc" && ok "the runtime class gvisor uses the handler runsc" || bad "no runtime class gvisor with handler runsc"
+gl="$(grep -nF 'ops/gvisor-check.sh" --class-only' "$STG/k8s/apply.sh" | cut -d: -f1)" rl="$(grep -nF 'manifests/runtimeclass.yaml' "$STG/k8s/apply.sh" | cut -d: -f1)"
+[[ -n "$gl" && -n "$rl" && "$gl" -lt "$rl" ]] && ok "apply.sh applies the runtime class only after every node runs the gVisor extension" || bad "apply.sh applies the runtime class before the extension check"
+awk '/^  name: ruum-apps$/ {on=1} on && /enforce: restricted/ {print; exit}' "$STG/k8s/manifests/namespaces.yaml" | grep -q . && ok "ruum-apps is a restricted namespace" || bad "ruum-apps is not restricted"
+for i in ruum-gateway ruum-egress; do
+  [[ "$(grep -cE "^ +- \{ image: $i, file: " "$ROOT/.github/workflows/images.yml")" == 2 ]] && ok "images.yml builds, scans and attests $i" || bad "images.yml does not publish $i"
+done
+grep -qF 'cargo build --release --locked -p ruum-gateway' "$ROOT/deploy/images/ruum-gateway.Dockerfile" && grep -qE '^FROM gcr\.io/distroless/cc-debian12:nonroot@sha256:[a-f0-9]{64}$' "$ROOT/deploy/images/ruum-gateway.Dockerfile" &&
+  ok "the gateway image: a release build on a distroless base pinned by digest" || bad "the gateway Dockerfile"
+# shellcheck source=../ops/image-check.sh
+( . "$STG/ops/image-check.sh"
+  [[ "ghcr.io/nemecec/ruum-gateway@sha256:$(printf '%064d' 3)" =~ $RUUM_APP_IMAGE_RE && "ghcr.io/nemecec/ruum-egress@sha256:$(printf '%064d' 4)" =~ $RUUM_APP_IMAGE_RE ]] || exit 1
+  [[ "ghcr.io/nemecec/ruum-server@sha256:$(printf '%064d' 0)" =~ $RUUM_APP_IMAGE_RE || "ghcr.io/nemecec/ruum-gateway:main" =~ $RUUM_APP_IMAGE_RE ]] && exit 1
+  [[ "ghcr.io/nemecec/ruum-gateway@sha256:$(printf '%064d' 3)" =~ $RUUM_IMAGE_RE ]] && exit 1
+  exit 0 ) && ok "RUUM_APP_IMAGE_RE takes the gateway and egress images by digest, nothing else (and the server pattern never takes them)" || bad "RUUM_APP_IMAGE_RE"
+dc="$STG/ops/deploy-chart.sh"
+grep -qF 'ghcr_digest "nemecec/ruum-$kind" "$commit"' "$dc" && grep -qF 'cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"' "$dc" &&
+  grep -qF 'images: { server: $server, edge: $edge, gateway: $gateway, egress: $egress }' "$dc" &&
+  ok "deploy-chart.sh takes the gateway and egress images from the tag <commit>, checks their provenance and passes them to helm" || bad "deploy-chart.sh does not resolve or check the app runtime images"
+grep -qF 'only one of ruum-gateway and ruum-egress has the tag' "$dc" && ok "deploy-chart.sh stops when only one of the two images exists" || bad "deploy-chart.sh deploys half the app runtime"
+for n in STG_PG_RUUM_GATEWAY_PASSWORD STG_GATEWAY_TOKEN_KEY STG_EGRESS_CONTROL_TOKEN; do
+  grep -qF "add $n " "$STG/secrets-init.sh" && grep -qx "$n" <<<"$(bash "$STG/secrets-push.sh" --list)" || bad "$n is not generated by secrets-init.sh and sent by secrets-push.sh"
+done
+grep -qF 'add STG_GATEWAY_S3' "$STG/secrets-init.sh" && bad "secrets-init.sh generates the gateway's S3 credential (the person makes it)" || ok "the gateway's secrets are generated and sent; its S3 credential comes from the person"
+grep -qF 'STG_EGRESS_DENY="$(egress_deny)"' "$STG/steps.sh" && ok "steps.sh platform computes EGRESS_DENY from the Hetzner API" || bad "EGRESS_DENY is not computed"
+ap="$STG/k8s/apply.sh"
+grl="$(grep -nF 'sql/ruum-gateway-grants.sql" >/dev/null' "$ap" | cut -d: -f1)" gsl="$(grep -nF 'secret ruum ruum-gateway$' "$ap" | cut -d: -f1)"
+[[ -z "$gsl" ]] && gsl="$(grep -nE '\| secret ruum ruum-gateway$' "$ap" | cut -d: -f1)"
+[[ -n "$grl" && -n "$gsl" && "$grl" -lt "$gsl" ]] && ok "apply.sh grants ruum_gateway its one right before the gateway gets its DSN" || bad "apply.sh writes the gateway's DSN before its grants"
+grep -B2 -E '\| secret ruum ruum-gateway$' "$ap" | grep -qF 'postgres://ruum_gateway:%s@' && ok "ruum/ruum-gateway holds ruum_gateway's DSN (never ruum_app's or the owner's)" || bad "ruum/ruum-gateway does not hold ruum_gateway's DSN"
+grep -qF 'for role in ruum ruum_app ruum_gateway zitadel spicedb; do' "$ap" && ok "apply.sh makes the password Secret of ruum_gateway" || bad "no password Secret for ruum_gateway"
+bash -n "$STG/ops/gvisor-check.sh" && grep -qF 'the check proves nothing on this node' "$STG/ops/gvisor-check.sh" &&
+  ok "gvisor-check.sh needs a control pod that sees the node's kernel (no pass on silence)" || bad "gvisor-check.sh"
+sa="$STG/ops/smoke-apps.sh"
+bash -n "$sa" && grep -qF 'BLOCKED' "$sa" && ok "smoke-apps.sh reports the node22 check as blocked until a Kubernetes runtime driver exists" || bad "smoke-apps.sh"
+if [[ $have_docker == 1 ]]; then
+  gg="$STG/k8s/sql/ruum-gateway-grants.sql"
+  pgc="ruum-stg-gw-grants-$$"
+  if docker run -d --rm --name "$pgc" -e POSTGRES_PASSWORD=probe postgres:17 >/dev/null 2>"$TMP/pg.err"; then
+    for _ in $(seq 1 90); do
+      [[ "$(docker logs "$pgc" 2>&1 | grep -c 'ready to accept connections')" -ge 2 ]] && break
+      sleep 1
+    done
+    pq() { docker exec -i "$pgc" psql -X -q -tA -v ON_ERROR_STOP=1 -U postgres "$@"; }
+    ggrants() { docker exec -i "$pgc" psql -X -q -v ON_ERROR_STOP=1 -U postgres -d ruum -f - <"$gg"; }
+    pq -d postgres -c "create role ruum login" -c "create role ruum_app login noinherit" -c "create role ruum_gateway login noinherit" -c "create database ruum owner ruum" >/dev/null
+    expect 0 "the gateway grants apply before the function exists (a fresh database)" ggrants
+    pq -d ruum -c "set role ruum" -c "create table apps (slug text)" -c "insert into apps values ('plants')" \
+      -c "create function ruum_app_host_lookup(a text, b text, c text default null) returns table (n bigint) language sql security definer set search_path = pg_catalog, pg_temp as \$\$ select count(*) from public.apps \$\$" \
+      -c "revoke all on function ruum_app_host_lookup(text, text, text) from public" >/dev/null
+    expect 0 "the gateway grants apply" ggrants
+    expect 0 "the gateway grants apply again (idempotent)" ggrants
+    expect 0 "ruum_gateway executes ruum_app_host_lookup" pq -d ruum -c "set role ruum_gateway" -c "select * from ruum_app_host_lookup('a', 'b')"
+    expect 1 "ruum_gateway cannot read a table" pq -d ruum -c "set role ruum_gateway" -c "select * from apps"
+    expect 1 "ruum_gateway cannot create a table" pq -d ruum -c "set role ruum_gateway" -c "create table x (id int)"
+    pq -d ruum -c "set role ruum" -c "grant select on apps to ruum_gateway" >/dev/null
+    expect 3 "the gateway grants fail when ruum_gateway can read a table" ggrants
+    pq -d ruum -c "set role ruum" -c "revoke select on apps from ruum_gateway" \
+      -c "create function other_definer() returns int language sql security definer as \$\$ select 1 \$\$" >/dev/null
+    expect 3 "the gateway grants fail when ruum_gateway may execute another security definer function" ggrants
+    pq -d ruum -c "set role ruum" -c "revoke all on function other_definer() from public" >/dev/null
+    expect 0 "... and pass again once only the host lookup is left" ggrants
+    pq -d postgres -c "grant ruum_app to ruum_gateway" >/dev/null
+    expect 3 "the gateway grants fail when ruum_gateway is a member of ruum_app" ggrants
+    docker rm -f "$pgc" >/dev/null 2>&1
+  else
+    echo "== gateway role grants: skipped (postgres:17 did not start: $(head -c 200 "$TMP/pg.err"))"
+  fi
+else
+  echo "== gateway role grants: skipped (no docker)"
 fi
 
 if [[ $failed == 0 ]]; then echo "staging tests: all passed"; else echo "staging tests: FAILED"; fi
