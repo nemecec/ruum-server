@@ -450,7 +450,8 @@ async fn read_index_in(
     Ok(Some(index))
 }
 
-/// The bytes of every static object of `tenant` in `store`.
+/// The bytes of every static object of `tenant` in `store` (tests).
+#[cfg(test)]
 async fn prefix_bytes(store: &Arc<dyn ObjectStore>, tenant: TenantId) -> Result<u64> {
     let mut list = store.list(Some(&tenant_prefix(tenant)));
     let mut total = 0u64;
@@ -507,9 +508,6 @@ pub struct StaticSites {
     legacy: Option<Arc<dyn ObjectStore>>,
     /// Signs read links in the blob bucket, for a site whose objects have not moved yet.
     legacy_links: Option<Arc<dyn Signer>>,
-    /// The tenants whose blob bucket objects this process has copied (the quota counts the
-    /// blob bucket's objects of every other tenant, [`StaticSites::stored_bytes`]).
-    migrated: Arc<std::sync::Mutex<std::collections::HashSet<TenantId>>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -525,7 +523,6 @@ impl StaticSites {
             links: Arc::default(),
             legacy: None,
             legacy_links: None,
-            migrated: Arc::default(),
         }
     }
 
@@ -695,23 +692,30 @@ impl StaticSites {
     /// The bytes of every static object of the tenant (file objects and indexes): what counts
     /// against its storage quota.
     pub async fn stored_bytes(&self, tenant: TenantId) -> Result<u64> {
-        let mut total = prefix_bytes(&self.store, tenant).await?;
-        // Until this process has copied the tenant's objects out of the blob bucket, they count
-        // too: more than the truth (a copied object counts twice), never less (Kimi k14i6, 3).
-        if let Some(legacy) = &self.legacy
-            && !self.is_migrated(tenant)
-        {
-            total = total.saturating_add(prefix_bytes(legacy, tenant).await?);
+        let mut total = 0u64;
+        let mut here = std::collections::HashSet::new();
+        let mut list = self.store.list(Some(&tenant_prefix(tenant)));
+        while let Some(meta) = list.next().await {
+            let meta = meta?;
+            total = total.saturating_add(meta.size);
+            if self.legacy.is_some() {
+                here.insert(meta.location);
+            }
+        }
+        drop(list);
+        // The tenant's objects in the blob bucket that the static bucket does not have (not
+        // copied yet, written there later by a server of an earlier release, or left there by a
+        // move that skipped them) count too: the union of both buckets (Kimi k14i6, 3).
+        if let Some(legacy) = &self.legacy {
+            let mut list = legacy.list(Some(&tenant_prefix(tenant)));
+            while let Some(meta) = list.next().await {
+                let meta = meta?;
+                if !here.contains(&meta.location) {
+                    total = total.saturating_add(meta.size);
+                }
+            }
         }
         Ok(total)
-    }
-
-    /// True when [`StaticSites::migrate_legacy`] has run for `tenant` in this process.
-    fn is_migrated(&self, tenant: TenantId) -> bool {
-        self.migrated
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&tenant)
     }
 
     /// The tenants that have static objects (for the garbage collection of every tenant).
@@ -1164,10 +1168,6 @@ impl StaticSites {
                 report.files_copied += 1;
             }
         }
-        self.migrated
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(tenant);
         if !delete {
             return Ok(report);
         }
@@ -1478,7 +1478,10 @@ mod tests {
 
     /// A signer that names the key and the time in its link (no real signature).
     #[derive(Debug)]
-    struct FakeSigner;
+    struct FakeSigner(&'static str);
+
+    /// The host of the static bucket's links in these tests.
+    const STATIC_HOST: &str = "objects.test";
 
     #[async_trait::async_trait]
     impl Signer for FakeSigner {
@@ -1489,7 +1492,8 @@ mod tests {
             expires_in: std::time::Duration,
         ) -> object_store::Result<url::Url> {
             Ok(url::Url::parse(&format!(
-                "https://objects.test/{path}?method={method}&ttl={}",
+                "https://{}/{path}?method={method}&ttl={}",
+                self.0,
                 expires_in.as_secs()
             ))
             .unwrap())
@@ -1508,9 +1512,12 @@ mod tests {
         // No signer: no link at all (the server without S3 serves no static file).
         assert!(!sites.links_enabled());
         assert!(sites.link(t, d, "index.html", false).await.is_err());
-        assert!(sites.clone().set_links(Arc::new(FakeSigner)));
+        assert!(sites.clone().set_links(Arc::new(FakeSigner(STATIC_HOST))));
         assert!(sites.links_enabled(), "clones share the signer");
-        assert!(!sites.set_links(Arc::new(FakeSigner)), "set once");
+        assert!(
+            !sites.set_links(Arc::new(FakeSigner(STATIC_HOST))),
+            "set once"
+        );
         let (entry, url) = sites
             .link(t, d, "assets/app.js", false)
             .await
@@ -1593,7 +1600,7 @@ mod tests {
             .unwrap();
         let sites = StaticSites::in_memory()
             .with_legacy(blobs.object_store())
-            .with_links(Arc::new(FakeSigner));
+            .with_links(Arc::new(FakeSigner(STATIC_HOST)));
         assert!(sites.has_legacy());
         assert_eq!(sites.legacy_tenants().await.unwrap(), vec![t]);
         // Before the move, without a signer of the blob bucket: no link for the old site.
@@ -1604,13 +1611,18 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let sites = sites.with_legacy_links(Arc::new(FakeSigner));
+        let sites = sites.with_legacy_links(Arc::new(FakeSigner("blobs.test")));
         let (e, url) = sites
             .link(t, a, "index.html", false)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(e.size, 11);
+        assert_eq!(
+            url.host_str(),
+            Some("blobs.test"),
+            "signed by the blob bucket"
+        );
         assert!(
             url.as_str()
                 .contains(&file_key(t, &Hash::of(b"<h1>Hi</h1>")).to_string())
@@ -1619,11 +1631,19 @@ mod tests {
         let legacy_bytes = blobs.stored_bytes(t).await.unwrap();
         assert!(legacy_bytes > 0);
         assert_eq!(sites.stored_bytes(t).await.unwrap(), legacy_bytes);
-        // Without delete: everything readable is copied, nothing leaves the blob bucket.
+        // Without delete: everything readable is copied, nothing leaves the blob bucket. The
+        // quota counts the copies and what stayed behind only in the blob bucket (the broken
+        // index), each object once.
+        let broken_bytes = blobs
+            .object_store()
+            .head(&index_key(t, broken))
+            .await
+            .unwrap()
+            .size;
         let r = sites.migrate_legacy(t, false).await.unwrap();
         assert_eq!(
             sites.stored_bytes(t).await.unwrap(),
-            prefix_bytes(&sites.object_store(), t).await.unwrap()
+            prefix_bytes(&sites.object_store(), t).await.unwrap() + broken_bytes
         );
         assert_eq!(
             (r.indexes, r.files_copied, r.deleted, r.skipped),
@@ -1638,14 +1658,34 @@ mod tests {
         let index = sites.read_index(t, b).await.unwrap().unwrap();
         let (_, e) = index.resolve("x.css", false).unwrap();
         assert_eq!(&sites.read_file(t, e, 64).await.unwrap()[..], b"body{}");
-        // Again: nothing new to copy.
+        // A copied site links through the static bucket's signer.
+        let (_, url) = sites
+            .link(t, a, "index.html", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(url.host_str(), Some("objects.test"));
+        // A site that a server of the earlier release writes after the copy counts at once.
+        let late = Uuid::now_v7();
+        let late_files = vec![("late.js".to_string(), Bytes::from_static(b"late()"))];
+        blobs.write_site(t, late, &late_files, None).await.unwrap();
+        let late_bytes = blobs.stored_bytes(t).await.unwrap() - legacy_bytes;
+        assert_eq!(
+            sites.stored_bytes(t).await.unwrap(),
+            prefix_bytes(&sites.object_store(), t).await.unwrap() + broken_bytes + late_bytes
+        );
+        // Again: only the late site is new.
         let r = sites.migrate_legacy(t, false).await.unwrap();
-        assert_eq!((r.indexes, r.files_copied, r.deleted), (2, 0, 0), "{r:?}");
+        assert_eq!((r.indexes, r.files_copied, r.deleted), (3, 1, 0), "{r:?}");
+        assert_eq!(
+            sites.stored_bytes(t).await.unwrap(),
+            prefix_bytes(&sites.object_store(), t).await.unwrap() + broken_bytes
+        );
         assert!(blobs.read_index(t, a).await.unwrap().is_some());
         // With delete: the moved objects leave the blob bucket; the broken index and the
         // chunk stay.
         let r = sites.migrate_legacy(t, true).await.unwrap();
-        assert_eq!((r.indexes, r.deleted, r.skipped), (2, 6, 1), "{r:?}");
+        assert_eq!((r.indexes, r.deleted, r.skipped), (3, 8, 1), "{r:?}");
         assert!(blobs.read_index(t, a).await.unwrap().is_none());
         assert!(blobs.read_index(t, b).await.unwrap().is_none());
         assert!(blobs.read_index(t, broken).await.unwrap().is_some());
