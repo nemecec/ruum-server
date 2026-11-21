@@ -101,6 +101,10 @@ pub async fn services_with(
     install(&mut services, identity, pool.clone()).context("set up the identity area")?;
     install_databases(&mut services, pool.clone(), &handles).await?;
     install_apps(&mut services, pool, &handles)?;
+    services.workload_tokens = workload_tokens(
+        &identity.public_url,
+        &crate::config::WorkloadTokenSettings::from_env(),
+    )?;
     Ok(services)
 }
 
@@ -203,6 +207,33 @@ pub fn install_apps(
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
+}
+
+/// The workload token issuer (card R-3; `ruum_core::apps::workload_tokens`), with the key of
+/// `RUUM_WORKLOAD_TOKEN_KEY_FILE`; its public key set goes to `RUUM_WORKLOAD_JWKS_FILE` for the
+/// runtime API. `None` without a key file. The renewal (`TokenRenewal`) needs the runtime
+/// driver of the sandboxes, which card I-4 wires: until then the server starts no instance
+/// and runs no renewal; I-4 builds `TokenRenewal::new(issuer, driver)`, calls `register` after
+/// each start and runs it every `RENEW_ROUND_EVERY`.
+pub fn workload_tokens(
+    public_url: &str,
+    settings: &crate::config::WorkloadTokenSettings,
+) -> anyhow::Result<Option<Arc<ruum_core::apps::workload_tokens::WorkloadTokenIssuer>>> {
+    let Some(key) = &settings.key_file else {
+        return Ok(None);
+    };
+    let issuer =
+        ruum_core::apps::workload_tokens::WorkloadTokenIssuer::from_key_file(public_url, key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(out) = &settings.jwks_file {
+        let jwks = serde_json::to_vec_pretty(&issuer.jwks())?;
+        std::fs::write(out, jwks).with_context(|| format!("cannot write {}", out.display()))?;
+    }
+    tracing::info!(
+        kid = issuer.kid(),
+        "workload tokens: the issuer is ready (no renewal runs until a runtime driver is wired)"
+    );
+    Ok(Some(Arc::new(issuer)))
 }
 
 /// How often the preview sweeper ends expired previews.
@@ -629,5 +660,45 @@ mod tests {
                 "round {round}: a revoked app role stays in the roles claim"
             );
         }
+    }
+}
+
+/// The workload token issuer of the server (card R-3).
+#[cfg(test)]
+mod workload_token_tests {
+    use super::*;
+    use crate::config::WorkloadTokenSettings;
+
+    #[test]
+    fn the_issuer_needs_its_key_file_and_writes_the_public_set() {
+        assert!(
+            workload_tokens("https://ruum.localhost", &WorkloadTokenSettings::default())
+                .unwrap()
+                .is_none()
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "ruum-r3-{}-{}",
+            std::process::id(),
+            ruum_core::TenantId::new()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("workload.key");
+        // 32 bytes of 9, base64url.
+        std::fs::write(&key, "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\n").unwrap();
+        let jwks = dir.join("workload-jwks.json");
+        let settings = WorkloadTokenSettings {
+            key_file: Some(key.clone()),
+            jwks_file: Some(jwks.clone()),
+        };
+        let issuer = workload_tokens("https://ruum.localhost/", &settings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(issuer.issuer(), "https://ruum.localhost");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&jwks).unwrap()).unwrap();
+        assert_eq!(written, issuer.jwks());
+        std::fs::write(&key, "short").unwrap();
+        assert!(workload_tokens("https://ruum.localhost", &settings).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

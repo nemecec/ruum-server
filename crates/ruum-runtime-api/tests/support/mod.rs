@@ -356,6 +356,8 @@ impl World {
             .await?;
         self.file(c, site, "app.yaml", manifest.as_bytes()).await?;
         self.file(c, site, "index.html", INDEX).await?;
+        self.file(c, site, "events.yaml", b"asyncapi: 3.0.0\n")
+            .await?;
         let d = self
             .state
             .services
@@ -651,6 +653,65 @@ impl World {
             .sign(&claims)
             .map(Secret)
             .map_err(|e| failed("a user token", e))
+    }
+
+    /// `POST /v1/token/exchange` with a workload token.
+    pub async fn exchange(&self, workload: &str, user_token: &str) -> WorldResult<Resp> {
+        self.send(
+            Req::post(INTERNAL_HOST, "/v1/token/exchange")
+                .header("Authorization", &format!("Bearer {workload}"))
+                .json(&serde_json::json!({ "user_token": user_token })),
+        )
+        .await
+    }
+
+    /// An API token of the REST API (an agent token of `user` in `tenant`).
+    pub async fn api_token(&self, tenant: TenantId, user: UserId) -> WorldResult<Secret> {
+        use ruum_core::agents::{AgentScope, NewAgent};
+        use ruum_core::identity::{AccessClaims, TokenType};
+        let n = self.next();
+        let agent = self
+            .state
+            .services
+            .agents
+            .register(
+                &Self::ctx(tenant, user),
+                NewAgent {
+                    name: format!("r3 agent {n}"),
+                    description: None,
+                    scope: AgentScope {
+                        subtree: None,
+                        max_role: Role::Manage,
+                        expires_at: None,
+                        budget: Default::default(),
+                    },
+                },
+            )
+            .await
+            .map_err(|e| failed("an agent", e))?;
+        let tokens = &self.state.services.tokens;
+        let mut c = AccessClaims::new(tokens.as_ref(), TokenType::Agent, agent.id.0, 300);
+        c.tid = Some(tenant);
+        c.agent = Some(agent.id);
+        c.obo = Some(user);
+        tokens
+            .issue(&c)
+            .map(Secret)
+            .map_err(|e| failed("an agent token", e))
+    }
+
+    /// Runs one round of the provider hook deliveries (the server's worker runs every 5 s).
+    pub async fn deliver(&self) -> WorldResult<()> {
+        use ruum_core::providers::deliveries::{Backoff, DeliveryWorker};
+        DeliveryWorker::new(
+            self.state.services.typed_nodes.clone(),
+            self.state.services.providers.clone(),
+            Backoff::default(),
+        )
+        .run_once(100)
+        .await
+        .map(|_| ())
+        .map_err(|e| failed("the deliveries", e))
     }
 
     /// Sends a request to the runtime API.

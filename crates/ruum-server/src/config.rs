@@ -146,6 +146,26 @@ impl Config {
     }
 }
 
+/// The workload token settings (card R-3): `RUUM_WORKLOAD_TOKEN_KEY_FILE`, the Ed25519 seed of
+/// the workload token issuer (a file, never an environment value), and
+/// `RUUM_WORKLOAD_JWKS_FILE`, where the server writes the public key set at start for the
+/// runtime API (`RUUM_RUNTIME_WORKLOAD_JWKS_FILE` there). Both optional: without a key the
+/// server issues no workload tokens.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkloadTokenSettings {
+    pub key_file: Option<PathBuf>,
+    pub jwks_file: Option<PathBuf>,
+}
+
+impl WorkloadTokenSettings {
+    pub fn from_env() -> Self {
+        Self {
+            key_file: var("RUUM_WORKLOAD_TOKEN_KEY_FILE").map(PathBuf::from),
+            jwks_file: var("RUUM_WORKLOAD_JWKS_FILE").map(PathBuf::from),
+        }
+    }
+}
+
 /// The settings of the telemetry role (card O-1b). Each has a safe default; the role starts in
 /// the serving process only with `RUUM_TELEMETRY=on`.
 fn telemetry_settings() -> anyhow::Result<crate::telemetry::TelemetrySettings> {

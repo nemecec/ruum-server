@@ -315,9 +315,12 @@ pub fn open(key: &[u8; 32], sealed: Uuid) -> Uuid {
 
 // ------------------------------------------------------------------------------- subjects
 
+/// Kept subjects of one tenant: (app, pairwise subject) -> (platform ID, when found).
+type TenantSubjects = HashMap<(NodeId, String), (Uuid, Instant)>;
+
 #[derive(Default)]
 struct Subjects {
-    by_tenant: HashMap<TenantId, HashMap<(NodeId, String), (Uuid, Instant)>>,
+    by_tenant: HashMap<TenantId, TenantSubjects>,
     total: usize,
 }
 

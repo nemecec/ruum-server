@@ -78,6 +78,9 @@ pub struct Services {
     /// G-1b). `None` until the Docker wiring (I-4) gives one: the route then answers
     /// `not_running` and the gateway shows its status page (fail closed).
     pub sandboxes: Option<Arc<crate::apps::sandboxes::SandboxDirectory>>,
+    /// The issuer of workload tokens (card R-3, `RUUM_WORKLOAD_TOKEN_KEY_FILE`): what the node
+    /// `SpecMaker` of card I-4 calls to fill `WorkloadSpec::workload_token`. `None` without a key.
+    pub workload_tokens: Option<Arc<crate::apps::workload_tokens::WorkloadTokenIssuer>>,
 }
 
 /// The concrete in-memory stores behind a [`Services::in_memory_with_handles`] set, for tests
@@ -238,6 +241,7 @@ impl Services {
             databases,
             apps,
             sandboxes: None,
+            workload_tokens: None,
         };
         (services, handles)
     }

@@ -71,6 +71,11 @@ RUUM_OPENBAO_ADDR optional
 RUUM_OPENBAO_TOKEN optional
 RUUM_OPENBAO_TRANSIT_MOUNT optional
 
+# Workload tokens (card R-3; config.rs, wiring.rs): the issuer's key file and where its public
+# key set goes. Off without the key file.
+RUUM_WORKLOAD_TOKEN_KEY_FILE optional
+RUUM_WORKLOAD_JWKS_FILE optional
+
 # Tests only
 RUUM_DBENGINE_REQUIRE_POSTGRES test
 RUUM_SUITE_RLS test

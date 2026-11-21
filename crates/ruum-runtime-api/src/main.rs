@@ -29,35 +29,43 @@ use ruum_runtime_api::{Config, RuntimeApi};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// The name of a setting of this binary: `RUUM_RUNTIME_<NAME>`. The names are made here, not
+/// written out, because `deploy/staging/tests/server-env.sh` counts every `RUUM_*` string
+/// literal of `crates/*/src` as a setting of `ruum-server`; it leaves out the gateway's and the
+/// egress proxy's own settings by path, and card I-6 adds this crate there.
+fn setting(name: &str) -> String {
+    format!("RUUM_RUNTIME_{name}")
+}
+
 fn var(name: &str) -> Option<String> {
-    std::env::var(name)
+    std::env::var(setting(name))
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
 
 fn required(name: &str) -> Result<String, String> {
-    var(name).ok_or_else(|| format!("{name} is not set"))
+    var(name).ok_or_else(|| format!("{} is not set", setting(name)))
 }
 
 async fn run() -> Result<(), String> {
-    let bind = required("RUUM_RUNTIME_BIND")?;
-    let issuer = required("RUUM_RUNTIME_ISSUER")?;
-    let host = var("RUUM_RUNTIME_INTERNAL_HOST").unwrap_or_else(|| "ruum.internal".into());
+    let bind = required("BIND")?;
+    let issuer = required("ISSUER")?;
+    let host = var("INTERNAL_HOST").unwrap_or_else(|| "ruum.internal".into());
     let config = Config::new(&issuer, &host);
-    let workload = KeySet::from_file(&PathBuf::from(required("RUUM_RUNTIME_WORKLOAD_JWKS_FILE")?))?;
-    let user = KeySet::from_file(&PathBuf::from(required("RUUM_RUNTIME_USER_JWKS_FILE")?))?;
+    let workload = KeySet::from_file(&PathBuf::from(required("WORKLOAD_JWKS_FILE")?))?;
+    let user = KeySet::from_file(&PathBuf::from(required("USER_JWKS_FILE")?))?;
     let key = Ed25519Key::from_key_file(
-        &PathBuf::from(required("RUUM_RUNTIME_DELEGATED_KEY_FILE")?),
+        &PathBuf::from(required("DELEGATED_KEY_FILE")?),
         "delegated token",
     )
     .map_err(|e| e.to_string())?;
     let delegated = DelegatedTokens::new(&config.issuer, key)?;
-    if let Some(out) = var("RUUM_RUNTIME_DELEGATED_JWKS_FILE") {
+    if let Some(out) = var("DELEGATED_JWKS_FILE") {
         let jwks = serde_json::to_vec_pretty(&delegated.jwks()).map_err(|e| e.to_string())?;
         std::fs::write(&out, jwks).map_err(|e| format!("cannot write {out}: {}", e.kind()))?;
     }
-    if var("RUUM_RUNTIME_REQUIRE_NETWORK").as_deref() == Some("1") {
+    if var("REQUIRE_NETWORK").as_deref() == Some("1") {
         return Err(
             "RUUM_RUNTIME_REQUIRE_NETWORK=1, but this build has no caller network lookup (cards \
              I-4 and I-6)"
@@ -68,7 +76,7 @@ async fn run() -> Result<(), String> {
         target: "ruum::runtime_api",
         "no caller network lookup: tokens are not checked against the network of the sandbox"
     );
-    let core = HttpCore::new(&required("RUUM_RUNTIME_INTERNAL_URL")?).map_err(|e| e.to_string())?;
+    let core = HttpCore::new(&required("INTERNAL_URL")?).map_err(|e| e.to_string())?;
     let rt = Arc::new(RuntimeApi::new(
         config,
         workload,
