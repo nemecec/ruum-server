@@ -75,6 +75,12 @@ variable "talos_endpoints" {
   }
 }
 
+variable "bucket_static" {
+  description = "Hetzner bucket of the static app files (decision 0008-4; destroyed with staging)."
+  type        = string
+  default     = "ruum-staging-static-768usm"
+}
+
 variable "bucket_blobs" {
   description = "Hetzner bucket of the Ruum chunks (destroyed with staging)."
   type        = string

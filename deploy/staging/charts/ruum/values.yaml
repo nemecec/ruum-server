@@ -96,11 +96,8 @@ gateway:
   holdPerTenant: 64
   wsGlobal: 1024
   wsPerTenant: 256
-  # The static sites' bucket (the blob bucket, card W-2s). The credential is the optional Secret
-  # ruum/ruum-gateway-s3 (k8s/apply.sh, from STG_GATEWAY_S3_*); without it the gateway serves
-  # no static file and says so at start.
-  s3Endpoint: https://hel1.your-objectstorage.com
-  s3Region: hel1
+  # No bucket setting: the gateway holds no key of the static sites' bucket; the core signs a
+  # read link per file (decision 0008-4).
 
 # The egress proxy (card R-2e, crates/ruum-egress): the only way from a sandbox to the internet.
 # Only pods of ruum-apps reach it (charts/platform networkpolicies.yaml).

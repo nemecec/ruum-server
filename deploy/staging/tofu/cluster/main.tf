@@ -195,6 +195,16 @@ resource "minio_s3_bucket" "blobs" {
   object_locking = false
 }
 
+# --- Hetzner Object Storage: static app files (decision 0008-4; destroyed with staging) ---
+# Only ruum-server writes it. The gateway holds no key: it reads one object at a time through
+# a link that the server signs for 30 seconds.
+resource "minio_s3_bucket" "static_sites" {
+  bucket         = var.bucket_static
+  acl            = "private"
+  force_destroy  = true
+  object_locking = false
+}
+
 # --- The generation of this cluster: a new CNPG backup path per create (review 2 R-2). ---
 resource "terraform_data" "generation" {
   input = formatdate("YYYYMMDDhhmm", timestamp())

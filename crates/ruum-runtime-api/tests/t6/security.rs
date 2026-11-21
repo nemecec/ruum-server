@@ -661,7 +661,10 @@ async fn the_core_routes_take_the_caller_only_from_the_token() {
     });
     assert_eq!(w.core_route("/content", Some(&at), &forged).await.0, 200);
     // exchange, holders and topic: no token and a foreign token are refused.
-    let ex = json!({ "caller": acme_caller, "sub": "x", "actor": "user", "on_behalf_of": null });
+    let ex = json!({
+        "caller": acme_caller, "sub": "x", "actor": "user", "on_behalf_of": null,
+        "jti": Uuid::now_v7().to_string(),
+    });
     let holders = json!({ "caller": acme_caller, "role": "member", "cursor": null, "limit": 10 });
     let topic = json!({ "caller": acme_caller, "topic": "orders" });
     for (route, body) in [
@@ -817,6 +820,45 @@ async fn one_tenant_cannot_hold_every_connection() {
     assert_eq!(
         raw_self(w.runtime, "127.0.0.1", ta.expose()).await,
         Some(200)
+    );
+}
+
+/// Kimi review of run 14, R-3 finding 2: a user token is exchanged once across runtime API
+/// processes (a rolling deploy runs two; a restart forgets the replay set). The core claims the
+/// token's `jti` in its shared store, so the second process gets `401`; a new token of the same
+/// user is exchanged there (the positive control).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_token_is_exchanged_once_across_runtime_api_processes() {
+    let w = World::new().await.unwrap();
+    let app = w
+        .seed_app("acme", "garden", &[file("doc", true)])
+        .await
+        .unwrap();
+    let seed = w.seed(&app).unwrap();
+    let wt = w.workload_token(&app, Env::Live).await.unwrap();
+    let v = w.visitor(&seed).await.unwrap();
+    let ut = w.user_token_of(&seed, Env::Live, v, "user").await.unwrap();
+    let other = w.second_runtime().await.unwrap();
+    let r = w.exchange(wt.expose(), ut.expose()).await.unwrap();
+    assert_eq!(r.status, 200, "{}", r.text());
+    refused_with(
+        &w.exchange_at(other, wt.expose(), ut.expose())
+            .await
+            .unwrap(),
+        401,
+        "unauthenticated",
+        "the same user token at a second runtime API process",
+    );
+    let fresh = w.user_token_of(&seed, Env::Live, v, "user").await.unwrap();
+    let r = w
+        .exchange_at(other, wt.expose(), fresh.expose())
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status,
+        200,
+        "a new token at the second process: {}",
+        r.text()
     );
 }
 

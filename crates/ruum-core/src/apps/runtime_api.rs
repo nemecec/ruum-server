@@ -201,6 +201,9 @@ pub mod wire {
         pub actor: String,
         /// The user token's `on_behalf_of` (the user of an agent).
         pub on_behalf_of: Option<String>,
+        /// The user token's `jti`: the core grants one exchange per `jti` across every runtime
+        /// API process and restart (Kimi review of run 14, R-3 finding 2).
+        pub jti: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +223,8 @@ pub mod wire {
         NoBinding,
         /// The token's subject is not a person (or agent) of the tenant.
         UnknownUser,
+        /// The user token was exchanged before (by any runtime API process).
+        Replayed,
         Gone,
     }
 
@@ -411,6 +416,9 @@ pub struct RuntimeApiService {
     s: Services,
     subjects: Arc<Mutex<Subjects>>,
 }
+
+/// The longest `jti` of a user token that an exchange takes (the gateway's are UUIDs).
+pub const MAX_JTI_BYTES: usize = 128;
 
 /// The context of the app principal: the actor is `app:<principal>`.
 pub fn principal_ctx(c: &Caller) -> Context {
@@ -873,6 +881,9 @@ impl RuntimeApiService {
         let Some((_, dep)) = self.serving(c).await? else {
             return Ok(ExchangeAnswer::Gone);
         };
+        if !self.first_exchange(c, &q.jti).await? {
+            return Ok(ExchangeAnswer::Replayed);
+        }
         let mut bindings: Vec<String> = self
             .active_rows(c)
             .await?
@@ -922,6 +933,34 @@ impl RuntimeApiService {
             agent,
             access_token,
         })
+    }
+
+    /// Claims the one exchange of the user token `jti` for the caller's app, in the shared
+    /// idempotency store (Postgres on a server), so a second runtime API process, or one that
+    /// restarted and lost its replay set, cannot exchange the same token again (Kimi review of
+    /// run 14, R-3 finding 2). The insert is atomic: of two concurrent claims, one wins. The
+    /// claim stays for the store's 24 hours, far longer than a user token lives (60 s), and it
+    /// stores no response (the delegated token is a secret). A `jti` that is empty, long or not
+    /// printable claims nothing (`false`).
+    async fn first_exchange(&self, c: &Caller, jti: &str) -> Result<bool> {
+        use crate::identity::idempotency::{Begin, KeyRef, request_hash};
+        if jti.is_empty() || jti.len() > MAX_JTI_BYTES || !jti.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Ok(false);
+        }
+        let key = KeyRef {
+            tenant: c.tenant_id,
+            actor: c.app_id.0,
+            key: format!("runtime-exchange:{jti}"),
+        };
+        let path = format!("{}/exchange", wire::PREFIX);
+        let hash = request_hash("POST", &path, None, jti.as_bytes());
+        match self.s.idempotency.begin(&key, "POST", &path, hash).await {
+            Ok(Begin::Fresh) => Ok(true),
+            // Exchanged before, or the first exchange still runs.
+            Ok(Begin::Replay(_)) | Err(Error::Api(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The context of the user of a delegation (an agent's context with its scope).

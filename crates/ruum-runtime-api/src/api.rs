@@ -510,7 +510,8 @@ pub async fn exchange(
         tracing::info!(target: "ruum::runtime_api", status = 401, app = %w.app, "a user token of another caller was refused");
         return Err(unauthenticated("the user token was not made for this app"));
     }
-    // Once per user token (until its exp).
+    // Once per user token (until its exp): here first, then in the core's shared store, so
+    // another runtime API process or a restart cannot exchange it again (Kimi run 14, R-3 2).
     match rt.replay.first_use(
         w.tenant,
         &user.jti,
@@ -545,6 +546,7 @@ pub async fn exchange(
                 sub: user.sub.clone(),
                 actor: user.actor.clone(),
                 on_behalf_of: user.on_behalf_of.clone(),
+                jti: user.jti.clone(),
             },
         )
         .await
@@ -557,6 +559,10 @@ pub async fn exchange(
         }
         ExchangeAnswer::UnknownUser => {
             return Err(unauthenticated("the user token names nobody of this space"));
+        }
+        ExchangeAnswer::Replayed => {
+            tracing::info!(target: "ruum::runtime_api", status = 401, app = %w.app, "a user token exchanged by another runtime API process was refused");
+            return Err(unauthenticated("the user token was exchanged before"));
         }
         ExchangeAnswer::Gone => return Err(refused("the principal no longer serves")),
     };

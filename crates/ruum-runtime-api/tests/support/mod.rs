@@ -729,6 +729,43 @@ impl World {
         .map_err(|e| failed("the deliveries", e))
     }
 
+    /// A second runtime API process of this world: the same keys and the same core, but its
+    /// own replay set and caps (a rolling deploy, or a restart). Its address.
+    pub async fn second_runtime(&self) -> WorldResult<SocketAddr> {
+        let core =
+            HttpCore::new(&format!("http://{}", self.internal)).map_err(|e| failed("core", e))?;
+        let rt = Arc::new(RuntimeApi::new(
+            Config::new(ISSUER, INTERNAL_HOST),
+            KeySet::from_jwks(&self.issuer.jwks()).map_err(|e| failed("workload keys", e))?,
+            KeySet::from_jwks(&self.users.jwks()).map_err(|e| failed("user keys", e))?,
+            Arc::new(core),
+        ));
+        let l = listen().await;
+        let addr = l.local_addr().map_err(|e| failed("addr", e))?;
+        self.tasks
+            .lock()
+            .expect("tasks")
+            .push(tokio::spawn(async move {
+                let _ = ruum_runtime_api::serve(l, rt).await;
+            }));
+        Ok(addr)
+    }
+
+    /// `POST /v1/token/exchange` at the runtime API process at `addr`.
+    pub async fn exchange_at(
+        &self,
+        addr: SocketAddr,
+        workload: &str,
+        user_token: &str,
+    ) -> WorldResult<Resp> {
+        let req = Req::post(INTERNAL_HOST, "/v1/token/exchange")
+            .header("Authorization", &format!("Bearer {workload}"))
+            .json(&serde_json::json!({ "user_token": user_token }));
+        ruum_testkit::gateway::http::send(addr, &req, Duration::from_secs(20))
+            .await
+            .map_err(|e| failed("a request to the runtime API", e))
+    }
+
     /// Sends a request to the runtime API.
     pub async fn send(&self, req: Req) -> WorldResult<Resp> {
         ruum_testkit::gateway::http::send(self.runtime, &req, Duration::from_secs(20))

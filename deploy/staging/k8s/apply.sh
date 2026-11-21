@@ -53,11 +53,6 @@ for n in SCW_BACKUP_ACCESS_KEY SCW_BACKUP_SECRET_KEY HETZNER_S3_ACCESS_KEY HETZN
   STG_PG_RUUM_GATEWAY_PASSWORD STG_GATEWAY_TOKEN_KEY STG_EGRESS_CONTROL_TOKEN STG_EGRESS_DENY; do
   [[ -n "${!n:-}" ]] || die "$n is missing (secrets-push.sh sends it; steps.sh platform computes STG_EGRESS_DENY)"
 done
-# The gateway's read credential of the static sites' bucket (card I-6): both or neither.
-if [[ -n "${STG_GATEWAY_S3_ACCESS_KEY:-}" && -z "${STG_GATEWAY_S3_SECRET_KEY:-}" ]] ||
-  [[ -z "${STG_GATEWAY_S3_ACCESS_KEY:-}" && -n "${STG_GATEWAY_S3_SECRET_KEY:-}" ]]; then
-  die "STG_GATEWAY_S3_ACCESS_KEY and STG_GATEWAY_S3_SECRET_KEY go together (or neither)"
-fi
 # EGRESS_DENY of the egress proxy: comma-separated addresses or CIDR prefixes, nothing else.
 [[ "$STG_EGRESS_DENY" =~ ^[0-9a-fA-F.:/,]+$ ]] || die "STG_EGRESS_DENY is not a list of addresses and prefixes"
 
@@ -214,14 +209,9 @@ k -n data exec -i "$primary" -c postgres -- psql -q -d ruum -f - <"$HERE/sql/ruu
 # The gateway: its DSN and the user-token key (an Ed25519 seed, base64url; a file in the pod).
 printf 'database-url=postgres://ruum_gateway:%s@pg-rw.data.svc.cluster.local:5432/ruum?sslmode=verify-full&sslrootcert=/pg-ca/ca.crt\ntoken-key=%s\n' \
   "$STG_PG_RUUM_GATEWAY_PASSWORD" "$STG_GATEWAY_TOKEN_KEY" | secret ruum ruum-gateway
-# The static sites' read credential: only when the person made one (README "The app runtime").
-if [[ -n "${STG_GATEWAY_S3_ACCESS_KEY:-}" ]]; then
-  printf 'bucket=%s\naccess-key-id=%s\nsecret-access-key=%s\n' \
-    "ruum-staging-blobs-768usm" "$STG_GATEWAY_S3_ACCESS_KEY" "$STG_GATEWAY_S3_SECRET_KEY" | secret ruum ruum-gateway-s3
-else
-  k -n ruum delete secret ruum-gateway-s3 --ignore-not-found >/dev/null
-  log "no STG_GATEWAY_S3_*: the gateway serves no static file (secret ruum/ruum-gateway-s3 removed)"
-fi
+# The gateway holds no key of the static sites' bucket (decision 0008-4): the server signs a
+# read link per file. A credential Secret of the earlier design (card I-6) goes.
+k -n ruum delete secret ruum-gateway-s3 --ignore-not-found >/dev/null
 # The egress proxy: the control token (a file in the pod) and EGRESS_DENY (not secret).
 printf 'control-token=%s\n' "$STG_EGRESS_CONTROL_TOKEN" | secret ruum ruum-egress
 deny_before="$(k -n ruum get configmap ruum-egress-deny -o jsonpath='{.data.deny}' 2>/dev/null || true)"

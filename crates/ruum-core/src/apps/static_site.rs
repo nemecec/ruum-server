@@ -18,8 +18,14 @@
 //!   ([`request_path`]; decision 0006 G point 4).
 //!
 //! Everything goes through the `object_store` abstraction: `InMemory` in tests and on a server
-//! without S3, Garage or S3 for real (the bucket of the blob store; the `apps/` prefix never
-//! clashes with chunk paths, which start with a tenant ID).
+//! without S3, Garage or S3 for real. The objects live in a bucket of their own, never in the
+//! tenant blob bucket (decision 0008-4; [`static_s3_settings`]). Only the core writes it. The
+//! Internet-facing gateway holds no key of it: it asks the core for each file
+//! ([`wire`]), and the core answers with a read link of that one object, signed for
+//! [`LINK_TTL`] ([`StaticSites::file_link`]), and only for a deployment that serves. So a
+//! compromised gateway can read only the files of serving apps and change nothing. Sites that
+//! card W-2s wrote into the blob bucket move over at the server's start
+//! ([`StaticSites::migrate_from`]).
 //!
 //! Objects stay when a preview expires (they may be shared with another deployment); the
 //! sweeper deletes only the index of an expired preview. The garbage collection of static sites
@@ -33,6 +39,7 @@
 //! site is written only when its new objects fit ([`StaticSites::write_site_within`]).
 
 use crate::blobs::Hash;
+use crate::blobs::object::S3Settings;
 use crate::error::{Error, Result};
 use crate::ids::TenantId;
 use crate::runtime::{StaticFile, StaticImage};
@@ -40,11 +47,127 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
+use object_store::signer::Signer;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// How long a read link of a file object lasts ([`StaticSites::file_link`]). The gateway uses
+/// it at once; a link that leaks reads one published file for this long.
+pub const LINK_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The settings of the bucket of static sites (decision 0008-4), from the environment:
+/// `RUUM_STATIC_S3_BUCKET`, and `RUUM_STATIC_S3_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID`,
+/// `_SECRET_ACCESS_KEY`, `_FORCE_PATH_STYLE`, each of which defaults to the blob store's own
+/// setting (`blob`). `None` without `RUUM_STATIC_S3_BUCKET`.
+pub fn static_s3_settings(blob: Option<&S3Settings>) -> Result<Option<S3Settings>> {
+    static_s3_settings_from(
+        |name| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        },
+        blob,
+    )
+}
+
+/// [`static_s3_settings`] over any source of settings (the tests give a map).
+pub fn static_s3_settings_from(
+    var: impl Fn(&str) -> Option<String>,
+    blob: Option<&S3Settings>,
+) -> Result<Option<S3Settings>> {
+    let Some(bucket) = var("RUUM_STATIC_S3_BUCKET") else {
+        return Ok(None);
+    };
+    let missing = |name: &str| {
+        Error::Internal(format!(
+            "RUUM_STATIC_S3_BUCKET is set but {name} is not (nor the blob store's own)"
+        ))
+    };
+    let settings = S3Settings {
+        endpoint: var("RUUM_STATIC_S3_ENDPOINT").or_else(|| blob.and_then(|b| b.endpoint.clone())),
+        region: var("RUUM_STATIC_S3_REGION")
+            .or_else(|| blob.map(|b| b.region.clone()))
+            .unwrap_or_else(|| "garage".into()),
+        bucket,
+        access_key_id: var("RUUM_STATIC_S3_ACCESS_KEY_ID")
+            .or_else(|| blob.map(|b| b.access_key_id.clone()))
+            .ok_or_else(|| missing("RUUM_STATIC_S3_ACCESS_KEY_ID"))?,
+        secret_access_key: var("RUUM_STATIC_S3_SECRET_ACCESS_KEY")
+            .or_else(|| blob.map(|b| b.secret_access_key.clone()))
+            .ok_or_else(|| missing("RUUM_STATIC_S3_SECRET_ACCESS_KEY"))?,
+        force_path_style: var("RUUM_STATIC_S3_FORCE_PATH_STYLE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .or_else(|| blob.map(|b| b.force_path_style))
+            .unwrap_or(true),
+    };
+    if let Some(b) = blob
+        && b.bucket == settings.bucket
+        && b.endpoint == settings.endpoint
+    {
+        return Err(Error::Internal(
+            "RUUM_STATIC_S3_BUCKET names the blob bucket: static sites need a bucket of their own \
+             (decision 0008-4)"
+                .into(),
+        ));
+    }
+    Ok(Some(settings))
+}
+
+/// The internal API that serves static files to the gateway (decision 0008-4; the routes are
+/// in `ruum-api`'s internal listener under `/internal/gateway/v1/static/`). The gateway holds
+/// no key of the bucket: it asks the core for a file, and the core answers with the index
+/// entry and a read link of that one object ([`StaticSites::file_link`]) when the deployment
+/// serves.
+pub mod wire {
+    use super::IndexEntry;
+    use crate::ids::{NodeId, TenantId};
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    /// `POST /internal/gateway/v1/static/file`: the file of a request path.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StaticFileQuery {
+        pub tenant_id: TenantId,
+        pub app_id: NodeId,
+        pub deployment_id: Uuid,
+        /// The request path as the gateway got it (with the leading `/`); the core checks it
+        /// again ([`super::request_path`]).
+        pub path: String,
+        /// Whether the request is a browser navigation (`spa_fallback` answers only those).
+        pub navigation: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum StaticFileAnswer {
+        /// The file: its entry, and a read link of its object valid for
+        /// [`super::LINK_TTL`]. `link` is `None` when the core's store cannot sign (tests, a
+        /// server without S3): the gateway then asks `/static/content`.
+        Found {
+            entry: IndexEntry,
+            link: Option<String>,
+        },
+        /// No such file (a bad path, no index, no entry): the gateway's `404`.
+        NotFound,
+        /// The deployment does not serve (gone, stopped, expired, not live, or a sandbox).
+        NotServing,
+    }
+
+    /// `POST /internal/gateway/v1/static/content`: the bytes of a file of a serving deployment
+    /// whose index names `hash`. Only when the core's store cannot sign links (`404`
+    /// otherwise).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StaticContentQuery {
+        pub tenant_id: TenantId,
+        pub app_id: NodeId,
+        pub deployment_id: Uuid,
+        pub hash: String,
+    }
+}
 
 /// The version of the layout and of the index JSON.
 pub const LAYOUT_VERSION: u32 = 1;
@@ -411,10 +534,66 @@ pub struct WrittenSite {
     pub new_bytes: u64,
 }
 
+/// What one run of [`StaticSites::migrate_from`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiteMigration {
+    /// Objects copied into the bucket of static sites (and deleted from the old bucket).
+    pub copied: u64,
+    /// Objects the bucket of static sites held already (deleted from the old bucket), or that
+    /// went from the old bucket while the run looked at them.
+    pub present: u64,
+}
+
+/// Moves one object of [`StaticSites::migrate_from`]: `true` when it was copied.
+async fn migrate_one(
+    legacy: &dyn ObjectStore,
+    store: &dyn ObjectStore,
+    meta: &object_store::ObjectMeta,
+) -> Result<bool> {
+    let present = match store.head(&meta.location).await {
+        Ok(m) => m.size == meta.size,
+        Err(object_store::Error::NotFound { .. }) => false,
+        Err(e) => return Err(e.into()),
+    };
+    let mut copied = false;
+    if !present {
+        let bytes = match legacy.get(&meta.location).await {
+            Ok(r) => r.bytes().await?,
+            // Another server moved it first.
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        if bytes.len() as u64 != meta.size {
+            return Err(Error::Internal(format!(
+                "a static object changed while it was moved: {}",
+                meta.location
+            )));
+        }
+        store
+            .put(&meta.location, PutPayload::from_bytes(bytes))
+            .await?;
+        let m = store.head(&meta.location).await?;
+        if m.size != meta.size {
+            return Err(Error::Internal(format!(
+                "a moved static object has another size: {}",
+                meta.location
+            )));
+        }
+        copied = true;
+    }
+    match legacy.delete(&meta.location).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(copied),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The static sites over an object store.
 #[derive(Clone)]
 pub struct StaticSites {
     store: Arc<dyn ObjectStore>,
+    /// Signs the short-lived read links of file objects ([`StaticSites::file_link`]); `None`
+    /// for a store that cannot sign (the in-process store).
+    signer: Option<Arc<dyn Signer>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -424,13 +603,93 @@ impl std::fmt::Debug for StaticSites {
 }
 
 impl StaticSites {
+    /// Sites in `store`, without signed links.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            signer: None,
+        }
+    }
+
+    /// Sites in the S3 bucket of `settings` (the bucket of static sites, decision 0008-4), with
+    /// signed links of its file objects.
+    pub fn s3(settings: &S3Settings) -> Result<Self> {
+        let s3 = Arc::new(settings.build()?);
+        Ok(Self {
+            store: s3.clone(),
+            signer: Some(s3),
+        })
     }
 
     /// Sites in an in-process object store, for tests and a server without S3.
     pub fn in_memory() -> Self {
         Self::new(Arc::new(object_store::memory::InMemory::new()))
+    }
+
+    /// Whether this store signs read links ([`StaticSites::file_link`]). Without it the core
+    /// streams a file itself (`/internal/gateway/v1/static/content`; tests and a server
+    /// without S3 only).
+    pub fn signs_links(&self) -> bool {
+        self.signer.is_some()
+    }
+
+    /// A read link of the file object of `entry`: a URL that allows `GET` of that one object for
+    /// `ttl` and nothing else (an S3 presigned URL, signed with the core's key; decision 0008-4).
+    /// `None` when the store cannot sign. The gateway fetches the file through it, so the
+    /// gateway holds no key of the bucket. The link is a credential while it lasts: it is never
+    /// logged.
+    pub async fn file_link(
+        &self,
+        tenant: TenantId,
+        entry: &IndexEntry,
+        ttl: std::time::Duration,
+    ) -> Result<Option<String>> {
+        let Some(signer) = &self.signer else {
+            return Ok(None);
+        };
+        let key = file_key(tenant, &entry.content_hash()?);
+        let url = signer
+            .signed_url(object_store::signer::Method::GET, &key, ttl)
+            .await?;
+        Ok(Some(url.to_string()))
+    }
+
+    /// Moves every static object out of the tenant blob bucket of `blob` (where card W-2s put
+    /// them before decision 0008-4) into this store: each object under `apps/static/` is copied
+    /// when this store does not hold it with the same size, then deleted from `legacy`. It is
+    /// safe to run on several servers at once and again after a stop: objects are
+    /// content-addressed or never change, a copy is checked before its source is deleted, and an
+    /// object that went in the meantime is skipped. A file is copied in one piece (static files
+    /// are smaller than the plan's file limit).
+    pub async fn migrate_from_blob_bucket(&self, blob: &S3Settings) -> Result<SiteMigration> {
+        self.migrate_from(Arc::new(blob.build()?)).await
+    }
+
+    /// [`StaticSites::migrate_from_blob_bucket`] from any object store.
+    pub async fn migrate_from(&self, legacy: Arc<dyn ObjectStore>) -> Result<SiteMigration> {
+        let mut report = SiteMigration::default();
+        let mut list = legacy.list(Some(&Path::from(ROOT_PREFIX)));
+        let mut metas = Vec::new();
+        while let Some(meta) = list.next().await {
+            metas.push(meta?);
+        }
+        let results: Vec<Result<bool>> = futures::stream::iter(metas)
+            .map(|meta| {
+                let legacy = legacy.clone();
+                let store = self.store.clone();
+                async move { migrate_one(legacy.as_ref(), store.as_ref(), &meta).await }
+            })
+            .buffer_unordered(OBJECT_CONCURRENCY)
+            .collect()
+            .await;
+        for r in results {
+            if r? {
+                report.copied += 1;
+            } else {
+                report.present += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// Stores each file as a content-addressed object (skipping objects that exist), then the
@@ -870,6 +1129,155 @@ mod tests {
                 Bytes::from_static(b"<h1>Docs</h1>"),
             ),
         ]
+    }
+
+    fn blob_settings() -> S3Settings {
+        S3Settings {
+            endpoint: Some("http://127.0.0.1:9".into()),
+            region: "garage".into(),
+            bucket: "ruum-blobs".into(),
+            access_key_id: "GKtest".into(),
+            secret_access_key: "not-a-secret".into(),
+            force_path_style: true,
+        }
+    }
+
+    fn settings_of(
+        pairs: &[(&str, &str)],
+        blob: Option<&S3Settings>,
+    ) -> Result<Option<S3Settings>> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        static_s3_settings_from(|n| map.get(n).cloned(), blob)
+    }
+
+    /// Decision 0008-4: static sites never share the tenant blob bucket.
+    #[test]
+    fn static_sites_need_a_bucket_of_their_own() {
+        let blob = blob_settings();
+        assert!(settings_of(&[], Some(&blob)).unwrap().is_none());
+        assert!(
+            settings_of(&[("RUUM_STATIC_S3_BUCKET", "ruum-blobs")], Some(&blob)).is_err(),
+            "the blob bucket is refused"
+        );
+        let s = settings_of(&[("RUUM_STATIC_S3_BUCKET", "ruum-static")], Some(&blob))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.bucket, "ruum-static");
+        assert_eq!(s.endpoint, blob.endpoint);
+        assert_eq!(s.access_key_id, blob.access_key_id);
+        let own = settings_of(
+            &[
+                ("RUUM_STATIC_S3_BUCKET", "ruum-static"),
+                ("RUUM_STATIC_S3_ACCESS_KEY_ID", "GKstatic"),
+            ],
+            Some(&blob),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(own.access_key_id, "GKstatic");
+        assert!(
+            settings_of(&[("RUUM_STATIC_S3_BUCKET", "ruum-static")], None).is_err(),
+            "no keys at all"
+        );
+    }
+
+    /// The gateway gets a link to one object, for `GET` only, for a short time; the link names
+    /// the bucket of static sites, never the blob bucket. Signing needs no network.
+    #[tokio::test]
+    async fn a_file_link_reads_one_object_of_the_static_bucket_for_a_short_time() {
+        let blob = blob_settings();
+        let settings = settings_of(&[("RUUM_STATIC_S3_BUCKET", "ruum-static")], Some(&blob))
+            .unwrap()
+            .unwrap();
+        let sites = StaticSites::s3(&settings).unwrap();
+        assert!(sites.signs_links());
+        let t = TenantId(Uuid::now_v7());
+        let h = Hash::of(b"<h1>Hi</h1>");
+        let entry = IndexEntry {
+            hash: h.to_hex(),
+            size: 11,
+            media_type: "text/html".into(),
+        };
+        let link = sites.file_link(t, &entry, LINK_TTL).await.unwrap().unwrap();
+        let url = url::Url::parse(&link).unwrap();
+        assert_eq!(
+            url.path(),
+            format!("/ruum-static/apps/static/{t}/files/{}", h.to_hex())
+        );
+        let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("X-Amz-Expires").map(String::as_str), Some("30"));
+        assert!(q.contains_key("X-Amz-Signature"));
+        assert!(
+            !link.contains("not-a-secret"),
+            "the secret key is not in the link"
+        );
+        assert!(!link.contains("ruum-blobs"));
+        // A bad hash in an index gets no link.
+        let bad = IndexEntry {
+            hash: "../x".into(),
+            ..entry.clone()
+        };
+        assert!(sites.file_link(t, &bad, LINK_TTL).await.is_err());
+        // The in-process store signs nothing.
+        assert!(!StaticSites::in_memory().signs_links());
+        assert!(
+            StaticSites::in_memory()
+                .file_link(t, &entry, LINK_TTL)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The move out of the blob bucket (decision 0008-4): static objects only, each one copied
+    /// and then deleted from the blob bucket; chunks stay; a second run does nothing.
+    #[tokio::test]
+    async fn the_migration_moves_static_objects_out_of_the_blob_bucket() {
+        let legacy: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let old = StaticSites::new(legacy.clone());
+        let t = TenantId(Uuid::now_v7());
+        let d = Uuid::now_v7();
+        old.write_site(t, d, &files(), None).await.unwrap();
+        let chunk = crate::blobs::object::chunk_path(t, &Hash::of(b"chunk"));
+        legacy
+            .put(&chunk, PutPayload::from_static(b"chunk"))
+            .await
+            .unwrap();
+        let sites = StaticSites::in_memory();
+        // One file is in the new bucket already (a deploy after the switch).
+        let index_html = file_key(t, &Hash::of(b"<h1>Hi</h1>"));
+        sites
+            .object_store()
+            .put(&index_html, PutPayload::from_static(b"<h1>Hi</h1>"))
+            .await
+            .unwrap();
+        let r = sites.migrate_from(legacy.clone()).await.unwrap();
+        assert_eq!(
+            r,
+            SiteMigration {
+                copied: 3,
+                present: 1
+            }
+        );
+        let index = sites.read_index(t, d).await.unwrap().unwrap();
+        let (_, e) = index.resolve("docs/", true).unwrap();
+        assert_eq!(
+            sites.read_file(t, e, 1024).await.unwrap(),
+            Bytes::from_static(b"<h1>Docs</h1>")
+        );
+        let left: Vec<_> = legacy
+            .list(None)
+            .map(|m| m.unwrap().location)
+            .collect()
+            .await;
+        assert_eq!(left, vec![chunk], "only the chunk stays in the blob bucket");
+        assert_eq!(
+            sites.migrate_from(legacy).await.unwrap(),
+            SiteMigration::default()
+        );
     }
 
     #[test]

@@ -58,6 +58,14 @@ RUUM_S3_BUCKET required
 RUUM_S3_ACCESS_KEY_ID required
 RUUM_S3_SECRET_ACCESS_KEY required
 RUUM_S3_FORCE_PATH_STYLE required
+# The bucket of static sites (decision 0008-4; apps/static_site.rs): never the blob bucket. The
+# other settings default to the blob store's (RUUM_S3_*).
+RUUM_STATIC_S3_BUCKET required
+RUUM_STATIC_S3_ENDPOINT optional
+RUUM_STATIC_S3_REGION optional
+RUUM_STATIC_S3_ACCESS_KEY_ID optional
+RUUM_STATIC_S3_SECRET_ACCESS_KEY optional
+RUUM_STATIC_S3_FORCE_PATH_STYLE optional
 
 # WebDAV host (ruum-webdav lib.rs)
 RUUM_DAV_SPOOL_DIR optional

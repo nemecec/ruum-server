@@ -26,7 +26,11 @@
 //!   `SandboxDirectory` answers from its own deployment record; without a directory the answer
 //!   is `not_running`). The answers name only what the gateway needs: IDs, flags, the pairwise
 //!   subjects of design 9.4 and an instance's `http://<host>:<port>`, never a platform user ID or
-//!   an email.
+//!   an email. Static files (decision 0008-4): the gateway holds no key of the static sites'
+//!   bucket, so it asks `static/file` for the index entry of a request path and gets a read
+//!   link of that one object, signed for `LINK_TTL`, only while the deployment serves and is
+//!   not a sandbox. Only a store that cannot sign (tests, a server without S3) answers
+//!   `static/content` with the bytes.
 //! - `POST /internal/runtime/v1/...`: the small internal API of the runtime API (card R-3;
 //!   `ruum_core::apps::runtime_api::wire`). Like the gateway, `ruum-runtime-api` holds no tenant
 //!   keys, no signing key and no database credential: it asks the core whether the principal
@@ -199,9 +203,15 @@ pub mod gateway {
     use axum::Router;
     use axum::extract::{Json, State};
     use axum::http::StatusCode;
+    use axum::http::{HeaderValue, header};
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
+    use futures::StreamExt;
     use ruum_core::apps::settings::Access;
+    use ruum_core::apps::static_site::wire::{
+        StaticContentQuery, StaticFileAnswer, StaticFileQuery,
+    };
+    use ruum_core::apps::static_site::{LINK_TTL, SiteIndex, request_path};
     use ruum_core::apps::store::{DeploymentState, Environment};
     use ruum_core::authz::{ObjectRef, Role, SubjectRef};
     use ruum_core::identity::app_sign_in::wire::{
@@ -212,6 +222,9 @@ pub mod gateway {
     use ruum_core::{NodeId, TenantId, UserId};
     use uuid::Uuid;
 
+    /// The largest static file the core streams (the gateway's own limit).
+    const MAX_STATIC_BYTES: u64 = 512 * 1024 * 1024;
+
     /// The routes under [`PREFIX`].
     pub fn router(app: AppState) -> Router {
         Router::new()
@@ -221,6 +234,8 @@ pub mod gateway {
             .route(&format!("{PREFIX}/session/end"), post(end_session))
             .route(&format!("{PREFIX}/agent"), post(agent))
             .route(&format!("{PREFIX}/upstream"), post(upstream))
+            .route(&format!("{PREFIX}/static/file"), post(static_file))
+            .route(&format!("{PREFIX}/static/content"), post(static_content))
             // Each request gets its own authz freshness floor, as on the public router (decision
             // 0002-4). Without it the floor helpers do nothing here, and a check falls back to
             // this process's own last token: a revoke made on another replica could still pass.
@@ -294,6 +309,89 @@ pub mod gateway {
         match dir.upstream(&q).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("upstream", e),
+        }
+    }
+
+    /// The index of a deployment that serves static files now, or why there is none: `Err` is
+    /// the answer (decision 0008-4: the core gives links only for files of serving
+    /// deployments, so a compromised gateway reads no other object).
+    async fn serving_index(
+        s: &AppState,
+        tenant: TenantId,
+        app: NodeId,
+        deployment: Uuid,
+    ) -> ruum_core::Result<Result<SiteIndex, StaticFileAnswer>> {
+        match deployment_info(s, tenant, app, deployment).await? {
+            Some(info) if info.serving && !info.sandbox => {}
+            _ => return Ok(Err(StaticFileAnswer::NotServing)),
+        }
+        Ok(s.services
+            .apps
+            .sites()
+            .read_index(tenant, deployment)
+            .await?
+            .ok_or(StaticFileAnswer::NotFound))
+    }
+
+    /// `static/file`: the entry of a request path and a read link of its object.
+    async fn static_file(State(s): State<AppState>, Json(q): Json<StaticFileQuery>) -> Response {
+        let Some(path) = request_path(&q.path) else {
+            return Json(StaticFileAnswer::NotFound).into_response();
+        };
+        let index = match serving_index(&s, q.tenant_id, q.app_id, q.deployment_id).await {
+            Ok(Ok(i)) => i,
+            Ok(Err(a)) => return Json(a).into_response(),
+            Err(e) => return failed("static file", e),
+        };
+        let Some((_, entry)) = index.resolve(path, q.navigation) else {
+            return Json(StaticFileAnswer::NotFound).into_response();
+        };
+        match s
+            .services
+            .apps
+            .sites()
+            .file_link(q.tenant_id, entry, LINK_TTL)
+            .await
+        {
+            Ok(link) => Json(StaticFileAnswer::Found {
+                entry: entry.clone(),
+                link,
+            })
+            .into_response(),
+            Err(e) => failed("static file link", e),
+        }
+    }
+
+    /// `static/content`: the bytes of a file whose hash the serving deployment's index names.
+    /// Only for a store that cannot sign links (tests, a server without S3); `404` otherwise,
+    /// so with a bucket the core never streams static files to the gateway.
+    async fn static_content(
+        State(s): State<AppState>,
+        Json(q): Json<StaticContentQuery>,
+    ) -> Response {
+        let sites = s.services.apps.sites();
+        if sites.signs_links() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let index = match serving_index(&s, q.tenant_id, q.app_id, q.deployment_id).await {
+            Ok(Ok(i)) => i,
+            Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return failed("static content", e),
+        };
+        let Some(entry) = index.files.values().find(|e| e.hash == q.hash) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        match sites.open_file(q.tenant_id, entry, MAX_STATIC_BYTES).await {
+            Ok(stream) => {
+                let mut resp = Response::new(axum::body::Body::from_stream(
+                    stream.map(|r| r.map_err(std::io::Error::other)),
+                ));
+                resp.headers_mut()
+                    .insert(header::CONTENT_LENGTH, HeaderValue::from(entry.size));
+                resp
+            }
+            Err(ruum_core::Error::Api(_)) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => failed("static content", e),
         }
     }
 

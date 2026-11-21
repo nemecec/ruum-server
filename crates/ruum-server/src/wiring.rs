@@ -246,16 +246,51 @@ pub fn install_apps(
             p
         }
     };
-    // Static sites go to the bucket of the blob store when there is one (card W-2s); the
-    // runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
-    if let Some(s3) = ruum_core::blobs::object::S3Settings::from_env() {
-        let store = s3
-            .build()
-            .context("set up the object store of static sites")?;
-        parts.sites = ruum_core::apps::static_site::StaticSites::new(Arc::new(store));
-    }
+    // Static sites go to a bucket of their own (decision 0008-4), never to the blob bucket;
+    // the runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
+    static_sites(&mut parts)?;
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
+    Ok(())
+}
+
+/// The store of static sites (decision 0008-4): the bucket of `RUUM_STATIC_S3_BUCKET`, with
+/// signed read links for the gateway. When the blob store is S3 too, the sites that card W-2s
+/// wrote into the blob bucket move over in the background. With S3 blobs but no
+/// `RUUM_STATIC_S3_BUCKET`, sites stay in this process's memory and the server says so on every
+/// start: they never go into the blob bucket again.
+fn static_sites(parts: &mut ruum_core::apps::AppParts) -> anyhow::Result<()> {
+    use ruum_core::apps::static_site::{StaticSites, static_s3_settings};
+    let blob = ruum_core::blobs::object::S3Settings::from_env();
+    let Some(settings) =
+        static_s3_settings(blob.as_ref()).context("the settings of the static sites' bucket")?
+    else {
+        if blob.is_some() {
+            tracing::error!(
+                "RUUM_STATIC_S3_BUCKET is not set: static sites stay in memory and end at a \
+                 restart (decision 0008-4: they need a bucket of their own)"
+            );
+        }
+        return Ok(());
+    };
+    let sites = StaticSites::s3(&settings).context("set up the bucket of static sites")?;
+    if let Some(blob) = blob {
+        let target = sites.clone();
+        tokio::spawn(async move {
+            match target.migrate_from_blob_bucket(&blob).await {
+                Ok(r) => tracing::info!(
+                    copied = r.copied,
+                    present = r.present,
+                    "static sites moved out of the blob bucket"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "static sites could not move out of the blob bucket; the next start tries again"
+                ),
+            }
+        });
+    }
+    parts.sites = sites;
     Ok(())
 }
 

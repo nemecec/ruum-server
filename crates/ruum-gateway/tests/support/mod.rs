@@ -398,9 +398,14 @@ impl World {
             ruum_api::internal::TlsAskConfig::for_content_url("https://content.ruumapps.net", 20),
         );
         let hosts = Arc::new(MemoryHostLookup::default());
-        let sites = StaticSites::in_memory();
+        // The core's own store of static sites: the gateway reads it only through the core
+        // (decision 0008-4); the in-process store signs no links, so files come from the core's
+        // `static/content`.
+        let sites = state.services.apps.sites().clone();
         let core = ruum_gateway::core_api::HttpCore::new(&format!("http://{internal}"))
             .map_err(|e| failed("the core client", e))?;
+        let statics = ruum_gateway::static_files::CoreStatic::new(&format!("http://{internal}"))
+            .map_err(|e| failed("the static client", e))?;
         let sandboxes = HttpSandboxes::new(&format!("http://{internal}"))
             .map_err(|e| failed("the sandbox client", e))?;
         let gw = Arc::new(
@@ -413,7 +418,7 @@ impl World {
                 hosts.clone(),
                 Arc::new(core),
                 UserTokenSigner::generate(ISSUER),
-                sites.clone(),
+                Arc::new(statics),
             )
             .with_sandboxes(Arc::new(sandboxes), opts.hold)
             .with_proxy(opts.proxy),
