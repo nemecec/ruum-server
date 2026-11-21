@@ -507,6 +507,19 @@ impl Drop for AbandonOnDrop {
     }
 }
 
+/// A write whose body the idempotency layer must not hash or store: `computeAppPseudonym`
+/// (`POST /v1/apps/{id}/pseudonyms`, card O-2). Its body holds the personal value, and an
+/// unkeyed hash of it in `idempotency_keys` would let a reader of the table test guessed values
+/// offline (decision 0006-8: the value is never stored). The operation writes only an audit
+/// entry, so a retry is harmless (it counts once more against the rate limit).
+fn keeps_no_request_hash(method: &Method, path: &str) -> bool {
+    *method == Method::POST
+        && path
+            .strip_prefix("/v1/apps/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, tail)| tail.trim_end_matches('/') == "pseudonyms")
+}
+
 /// The idempotency layer (`Idempotency-Key`, table `idempotency_keys`). For a write with the
 /// header from an authenticated caller it claims the key, runs the request and stores the
 /// response; a retry with the same request gets the stored response, another request with the
@@ -517,6 +530,7 @@ impl Drop for AbandonOnDrop {
 /// - A response that holds a secret shown once is not kept (see
 ///   `ruum_core::identity::idempotency::storable`); a retry gets `409 conflict`.
 /// - A handler that panics, or a client that goes away, gives the key up.
+/// - `computeAppPseudonym` runs without the replay guard ([`keeps_no_request_hash`]).
 pub async fn idempotency(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
@@ -529,7 +543,7 @@ pub async fn idempotency(
     let Some(key) = idempotency_key(req.headers()) else {
         return next.run(req).await;
     };
-    if is_safe(req.method()) {
+    if is_safe(req.method()) || keeps_no_request_hash(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
     let declared = req
@@ -674,6 +688,29 @@ mod tests {
         assert_eq!(cookie(&h, "ruum_session").as_deref(), Some("abc"));
         assert_eq!(cookie(&h, "ruum_csrf").as_deref(), Some("x"));
         assert_eq!(cookie(&h, "nope"), None);
+    }
+
+    #[test]
+    fn the_pseudonym_route_keeps_no_request_hash() {
+        let id = "0190b6c4-5f3e-7cc1-9a4b-1f2e3d4c5b6a";
+        assert!(keeps_no_request_hash(
+            &Method::POST,
+            &format!("/v1/apps/{id}/pseudonyms")
+        ));
+        // Every other write keeps the replay guard.
+        assert!(!keeps_no_request_hash(
+            &Method::PUT,
+            &format!("/v1/apps/{id}/pseudonyms")
+        ));
+        for path in [
+            format!("/v1/apps/{id}/telemetry-fields/confirm"),
+            format!("/v1/apps/{id}/deployments"),
+            format!("/v1/apps/{id}"),
+            "/v1/apps".to_string(),
+            format!("/v1/nodes/{id}/pseudonyms"),
+        ] {
+            assert!(!keeps_no_request_hash(&Method::POST, &path), "{path}");
+        }
     }
 
     #[test]

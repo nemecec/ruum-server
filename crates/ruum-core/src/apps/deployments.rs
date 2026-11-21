@@ -696,6 +696,23 @@ impl AppService {
         // not fit is a direct `403 quota_exceeded`; the image stage checks again under the
         // site lock.
         self.check_static_quota(ctx.tenant, &need).await?;
+        // Card O-2: the privacy file's suggestions go to the app's fields (per app, also from a
+        // preview) before the deployment exists, so its code never runs with classes less
+        // strict than its file asks (review O-2, Kimi 2). A write that fails, or a file with
+        // more new fields than the app can hold, fails the request and nothing is deployed.
+        // Suggestions only make classes stricter, so the rows of a request that fails later
+        // relax nothing.
+        if let (Some(list), Some(sink)) = (privacy, self.privacy_suggestions()) {
+            sink.suggest(ctx.tenant, app, &list)
+                .await
+                .map_err(|e| match e {
+                    Error::Api(e) if e.code == ErrorCode::ValidationFailed => validation(
+                        "the telemetry privacy file names more new fields than the app can hold",
+                        "/telemetry/privacy_file",
+                    ),
+                    e => e,
+                })?;
+        }
         // The tenant slug is fixed by now (W-1 makes it with the first app).
         self.ensure_tenant(ctx.tenant).await?;
         let archive_bytes = bytes::Bytes::from(packed.bytes);
@@ -757,15 +774,6 @@ impl AppService {
             )
         })?;
         self.notify_changed();
-        // Card O-2: the deployment passed its checks and its row exists, so the privacy file's
-        // suggestions go to the app's fields (per app, also from a preview). Suggestions only
-        // make a class stricter at once; a failed write keeps the fields `personal` and is
-        // logged, it does not fail the deployment.
-        if let (Some(list), Some(sink)) = (privacy, self.privacy_suggestions())
-            && let Err(e) = sink.suggest(ctx.tenant, app, &list).await
-        {
-            tracing::warn!(tenant = %ctx.tenant, app = %app, error = %e, "the suggestions of telemetry-privacy.yaml were not written");
-        }
         let urls = self.urls(ctx.tenant, &node).await?;
         let view = deployment_view(&row, &urls, true);
         let me = self.clone();
