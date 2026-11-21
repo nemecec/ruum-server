@@ -3,19 +3,27 @@
 //! (`POST /internal/runtime/v1/...` on the internal listener, [`wire`]) and the service that
 //! answers them ([`RuntimeApiService`]).
 //!
-//! The runtime API holds no tenant keys and no database credential, so it asks the core. It
-//! checks the workload token itself (signature, `typ`, `aud`, `iss`, times) and passes the
-//! verified principal as a [`wire::Caller`]; the core never takes a principal or a tenant from
-//! anything the app sent. Every store read here filters by the caller's tenant.
+//! The runtime API holds no tenant keys, no signing key and no database credential, so it asks
+//! the core. It checks the app's token itself and then passes it on: every internal route takes
+//! the app's workload token (or, for `content`, `children` and `principal`, its delegated token)
+//! as `Authorization: Bearer`, and the core checks it again with the workload key
+//! ([`RuntimeApiService::verify`]). The caller ([`wire::Caller`]) and the delegation of a
+//! request come only from that token: a request without a valid token is refused `401`, and so
+//! is one whose body names another caller than its token. So whoever reaches the core's internal
+//! listener (the gateway, the edge, any pod that the network policy lets through) still acts
+//! only as the app whose token it holds; the core never takes a principal or a tenant from
+//! anything the app or a peer sent. Without a workload key (`Services::workload_tokens`), every
+//! route refuses (fail closed). Every store read here filters by the caller's tenant.
 //!
 //! # The principal still serves
 //!
 //! [`RuntimeApiService::serving`]: the live principal (the app node ID) serves while its app
-//! row exists, the app's live deployment is `live`, and the app is not suspended (a trashed app
-//! is `suspended`, reason `trashed`, once its provider hook ran: the same delivery that ends its
-//! bindings); a preview principal (the deployment ID) serves while the deployment is a ready
-//! preview of that app that has not expired (a superseded preview is no longer `ready`). The
-//! runtime API keeps an answer for at most 3 seconds.
+//! row exists, the token's deployment (`dep`) is the app's live deployment and is `live`, the
+//! app node is not in the trash (read at once, without waiting for the provider hook), and the
+//! app is not suspended; a preview principal (the deployment ID) serves while the deployment is
+//! a ready preview of that app that has not expired (a superseded preview is no longer
+//! `ready`). The runtime API keeps an answer for at most 3 seconds, so a trashed app, a replaced
+//! live deployment and a stale preview stop within 5 seconds.
 //!
 //! # Bound content
 //!
@@ -59,6 +67,7 @@
 use crate::Services;
 use crate::actor::{Actor, Context, PrincipalKind, PrincipalRef};
 use crate::apps::AppService;
+use crate::apps::runtime_tokens::{Credential, Workload};
 use crate::apps::store::{AppRow, BindingKind, BindingQuery, BindingRow, DeploymentRow};
 use crate::apps::store::{DeploymentState, Environment as RecordEnv};
 use crate::authz::{self, ObjectRef, Role, SubjectRef};
@@ -116,6 +125,8 @@ pub mod wire {
         pub app_id: NodeId,
         /// The app node ID (live) or the deployment ID (preview).
         pub principal: Uuid,
+        /// The deployment the token was made for (`dep`; a preview's is its principal).
+        pub deployment_id: Uuid,
         pub environment: AppEnv,
     }
 
@@ -202,6 +213,8 @@ pub mod wire {
             user: Uuid,
             /// The sealed agent of an `agent` actor.
             agent: Option<Uuid>,
+            /// The delegated token, signed by the core with the workload key.
+            access_token: String,
         },
         /// No binding allows acting for the user.
         NoBinding,
@@ -426,6 +439,49 @@ fn record_env(e: AppEnv) -> RecordEnv {
     }
 }
 
+/// The caller of a verified token.
+pub fn caller_of(w: &Workload) -> Caller {
+    Caller {
+        tenant_id: w.tenant,
+        app_id: w.app,
+        principal: w.principal,
+        deployment_id: w.deployment,
+        environment: w.environment,
+    }
+}
+
+/// The principal of a caller, as a token names it.
+pub fn workload_of(c: &Caller) -> Workload {
+    Workload {
+        tenant: c.tenant_id,
+        app: c.app_id,
+        principal: c.principal,
+        deployment: c.deployment_id,
+        environment: c.environment,
+    }
+}
+
+/// The caller and the delegation of a verified credential.
+pub fn admitted(cred: &Credential) -> (Caller, Option<Delegation>) {
+    match cred {
+        Credential::Workload(w) => (caller_of(w), None),
+        Credential::Delegated(d) => (
+            caller_of(&d.caller),
+            Some(Delegation {
+                bindings: d.bindings.clone(),
+                user: d.user,
+                agent: d.agent,
+            }),
+        ),
+    }
+}
+
+/// Whether a request body names the caller of its token: the caller of a route is always the
+/// token's (`derived`), and a body that names another one is refused.
+pub fn same_caller(derived: &Caller, sent: &Caller) -> bool {
+    derived == sent
+}
+
 fn is_not_found(e: &Error) -> bool {
     matches!(e, Error::Api(a) if a.code == ErrorCode::NotFound)
 }
@@ -498,6 +554,26 @@ impl RuntimeApiService {
         Ok(())
     }
 
+    /// Checks the app's token of an internal route (see the module docs): a workload token, or
+    /// (when `delegated`) also a delegated token, of the core's workload key. `None` for a bad
+    /// token and when the core has no workload key. Log lines name the reason, never a value.
+    pub fn verify(&self, token: &str, delegated: bool) -> Option<(Caller, Option<Delegation>)> {
+        let Some(issuer) = &self.s.workload_tokens else {
+            tracing::warn!(
+                target: "ruum::runtime_api",
+                "a runtime route was refused: the core has no workload token key"
+            );
+            return None;
+        };
+        match issuer.verify(token, delegated) {
+            Ok(c) => Some(admitted(&c)),
+            Err(e) => {
+                tracing::info!(target: "ruum::runtime_api", reason = %e, "a runtime route refused a token");
+                None
+            }
+        }
+    }
+
     /// The app row and the deployment of a principal that still serves (see the module docs).
     pub async fn serving(&self, c: &Caller) -> Result<Option<(AppRow, DeploymentRow)>> {
         let store = self.apps().store();
@@ -505,12 +581,14 @@ impl RuntimeApiService {
             return Ok(None);
         };
         let dep_id = match c.environment {
+            // A live token serves only while its deployment is the live one.
             AppEnv::Live if c.principal == c.app_id.0 => match app.live_deployment_id {
-                Some(d) => d,
-                None => return Ok(None),
+                Some(d) if d == c.deployment_id => d,
+                _ => return Ok(None),
             },
             AppEnv::Live => return Ok(None),
-            AppEnv::Preview => c.principal,
+            AppEnv::Preview if c.deployment_id == c.principal => c.principal,
+            AppEnv::Preview => return Ok(None),
         };
         let Some(dep) = store.get_deployment(c.tenant_id, c.app_id, dep_id).await? else {
             return Ok(None);
@@ -529,6 +607,13 @@ impl RuntimeApiService {
             };
         if !serves {
             return Ok(None);
+        }
+        // The trash at once (the provider hook that suspends the app runs later).
+        match self.s.nodes.is_trashed(&principal_ctx(c), c.app_id).await {
+            Ok(false) => {}
+            Ok(true) => return Ok(None),
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e),
         }
         if let Some(t) = self.s.typed_nodes.get(c.tenant_id, c.app_id).await?
             && matches!(
@@ -567,7 +652,8 @@ impl RuntimeApiService {
                 name: b.name.clone(),
                 kind: b.kind.as_str().to_string(),
                 target_node_id: b.target_node_id,
-                role: b.role.map(|r| r.relation().to_string()),
+                // The manifest's names (`view`, `edit`), not the graph's relations.
+                role: b.role.map(|r| r.permission().to_string()),
                 address: None,
             })
             .collect();
@@ -593,8 +679,8 @@ impl RuntimeApiService {
     }
 
     /// The context that may list the people of the tenant (backlog P-69): the person who made
-    /// the caller's deployment (the publisher of the live one; the deployer of a preview, or
-    /// the user of the agent that deployed it). `None` when that is not a person.
+    /// the caller's deployment (`created_by`: who deployed it, live or preview; the user of an
+    /// agent that deployed it). `None` when that is not a person.
     fn lister_ctx(c: &Caller, dep: &DeploymentRow) -> Option<Context> {
         dep.created_by.effective_user().map(|u| Context {
             tenant: c.tenant_id,
@@ -822,10 +908,19 @@ impl RuntimeApiService {
                 None => return Ok(ExchangeAnswer::UnknownUser),
             },
         };
+        let user = seal(&sealing_key(key, c.app_id, "user"), user.0);
+        let Some(issuer) = &self.s.workload_tokens else {
+            return Err(Error::Internal("no workload token key".into()));
+        };
+        let access_token = issuer
+            .sign_delegated(&workload_of(c), bindings.clone(), user, agent)?
+            .expose()
+            .to_string();
         Ok(ExchangeAnswer::Granted {
             bindings,
-            user: seal(&sealing_key(key, c.app_id, "user"), user.0),
+            user,
             agent,
+            access_token,
         })
     }
 

@@ -5,9 +5,9 @@
 //!   `rest_api_status`) and its internal router (the runtime API's internal routes) listen on
 //!   127.0.0.1, so the runtime API and the world talk to them over HTTP, as in production.
 //! - The runtime API: [`ruum_runtime_api::serve`] on its own 127.0.0.1 listener, with the
-//!   workload key set of the core's issuer ([`WorkloadTokenIssuer`]), the gateway's user-token
-//!   key set (the gateway's own [`UserTokenSigner`] with the world's key) and its own
-//!   delegated key.
+//!   workload key set of the core's issuer ([`WorkloadTokenIssuer`], which the core also holds
+//!   in `Services::workload_tokens` to check tokens and sign delegated tokens) and the gateway's
+//!   user-token key set (the gateway's own [`UserTokenSigner`] with the world's key).
 //! - Seeding goes through the core's real paths: team tenants with exact slugs, apps through
 //!   `createApp`, deployments through `createAppDeployment` of a folder with `app.yaml` and
 //!   `publishAppDeployment` (so the bindings are B-1's: the deployer check, rows and tuples), a
@@ -27,7 +27,7 @@ use ruum_api::AppState;
 use ruum_core::actor::{Actor, Context};
 use ruum_core::apps::deployments::{CreateDeployment, PublishDeployment, Published, SourceRequest};
 use ruum_core::apps::store::DeploymentState;
-use ruum_core::apps::workload_tokens::{Ed25519Key, WorkloadTokenIssuer};
+use ruum_core::apps::workload_tokens::WorkloadTokenIssuer;
 use ruum_core::authz::{ObjectRef, Relationship, RelationshipUpdate, Role, SubjectRef};
 use ruum_core::identity::VerifiedLogin;
 use ruum_core::identity::app_sign_in::pairwise;
@@ -38,7 +38,7 @@ use ruum_gateway::token::{TokenSubject, UserTokenSigner, live_aud, preview_aud};
 use ruum_runtime_api::caller::CallerNetwork;
 use ruum_runtime_api::core_api::HttpCore;
 use ruum_runtime_api::limits::Caps;
-use ruum_runtime_api::token::{DelegatedTokens, KeySet};
+use ruum_runtime_api::token::KeySet;
 use ruum_runtime_api::{Config, RuntimeApi};
 use ruum_testkit::gateway::{
     Binding, BindingKind, Env, MakeRuntimeWorld, Req, Resp, RtApp, RuntimeApiWorld, RuntimeHandle,
@@ -159,7 +159,9 @@ impl World {
     }
 
     pub async fn with(opts: Opts) -> WorldResult<World> {
-        let state = AppState::in_memory();
+        let issuer = Arc::new(WorkloadTokenIssuer::generate(ISSUER));
+        let mut state = AppState::in_memory();
+        state.services.workload_tokens = Some(issuer.clone());
         let platform_l = listen().await;
         let internal_l = listen().await;
         let runtime_l = listen().await;
@@ -171,7 +173,6 @@ impl World {
             state.clone(),
             ruum_api::internal::TlsAskConfig::for_content_url("https://content.ruumapps.net", 20),
         );
-        let issuer = Arc::new(WorkloadTokenIssuer::generate(ISSUER));
         let users = Arc::new(UserTokenSigner::generate(ISSUER));
         let mut config = Config::new(ISSUER, INTERNAL_HOST);
         if let Some(c) = opts.caps {
@@ -182,8 +183,6 @@ impl World {
             config,
             KeySet::from_jwks(&issuer.jwks()).map_err(|e| failed("workload keys", e))?,
             KeySet::from_jwks(&users.jwks()).map_err(|e| failed("user keys", e))?,
-            DelegatedTokens::new(ISSUER, Ed25519Key::generate())
-                .map_err(|e| failed("delegated key", e))?,
             Arc::new(core),
         );
         if let Some(n) = opts.network {
@@ -737,6 +736,48 @@ impl World {
             .map_err(|e| failed("a request to the runtime API", e))
     }
 
+    /// A workload token of `app` in `tenant` for `deployment` (live or preview).
+    pub fn token_for(&self, seed: &AppSeed, deployment: Uuid, env: Env) -> String {
+        let id = WorkloadIdentity {
+            tenant: seed.tenant,
+            app: seed.app,
+            deployment,
+            environment: match env {
+                Env::Live => Environment::Live,
+                Env::Preview => Environment::Preview,
+            },
+        };
+        self.issuer
+            .issue(&id)
+            .expect("a workload token")
+            .expose()
+            .to_string()
+    }
+
+    /// `POST <route>` at the core's internal listener (the runtime API's routes), with `body`
+    /// and an optional bearer: (status, body).
+    pub async fn core_route(
+        &self,
+        route: &str,
+        bearer: Option<&str>,
+        body: &serde_json::Value,
+    ) -> (u16, String) {
+        let mut r = self
+            .http
+            .post(format!(
+                "http://{}{}{route}",
+                self.internal,
+                ruum_core::apps::runtime_api::wire::PREFIX
+            ))
+            .json(body);
+        if let Some(b) = bearer {
+            r = r.bearer_auth(b);
+        }
+        let resp = r.send().await.expect("the core's internal listener");
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap_or_default())
+    }
+
     /// `GET path` at the runtime API with a bearer.
     pub async fn get(&self, path: &str, bearer: &str) -> WorldResult<Resp> {
         self.send(
@@ -753,7 +794,8 @@ impl RuntimeApiWorld for World {
             addr: self.runtime,
             internal_host: INTERNAL_HOST.into(),
             issuer: ISSUER.into(),
-            delegated_jwks: self.rt.delegated.jwks(),
+            // The core signs delegated tokens with the workload key.
+            delegated_jwks: self.issuer.jwks(),
             user_token_jwks: self.users.jwks(),
         })
     }

@@ -256,6 +256,7 @@ mod postgres {
             tenant_id: a,
             app_id: n,
             principal: p.id,
+            deployment_id: p.id,
             environment: AppEnv::Preview,
         };
         assert_eq!(bound_rows(&store, &mine).await.unwrap().len(), 1);

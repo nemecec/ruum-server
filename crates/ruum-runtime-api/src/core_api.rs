@@ -2,7 +2,9 @@
 //! are in `ruum-api`'s internal listener, the types in `ruum_core::apps::runtime_api::wire`).
 //!
 //! [`CoreApi`] is the module border: [`HttpCore`] talks to the core's internal listener
-//! (`RUUM_RUNTIME_INTERNAL_URL`). [`PrincipalCache`] keeps the core's answer about a principal
+//! (`RUUM_RUNTIME_INTERNAL_URL`). Every call carries the app's own token (`token`) as
+//! `Authorization: Bearer`: the core checks it again and takes the caller only from it, so the
+//! body's caller is a claim the core compares, never trusts (review of R-3, required change 1). [`PrincipalCache`] keeps the core's answer about a principal
 //! for at most [`CHECK_TTL`], so a stopped preview, a trashed app or a deployment that is no
 //! longer live stops working within 5 seconds. Errors fail closed (`503`).
 
@@ -46,12 +48,13 @@ pub struct CoreContent {
 /// The questions the runtime API asks the core.
 #[async_trait]
 pub trait CoreApi: Send + Sync {
-    async fn principal(&self, c: &Caller) -> CoreResult<PrincipalAnswer>;
-    async fn holders(&self, q: &HoldersQuery) -> CoreResult<HoldersAnswer>;
-    async fn exchange(&self, q: &ExchangeQuery) -> CoreResult<ExchangeAnswer>;
-    async fn content(&self, q: &ReadQuery) -> CoreResult<Result<CoreContent, Refusal>>;
-    async fn children(&self, q: &ReadQuery) -> CoreResult<Result<ChildPage, Refusal>>;
-    async fn topic(&self, q: &TopicQuery) -> CoreResult<TopicAnswer>;
+    async fn principal(&self, token: &str, c: &Caller) -> CoreResult<PrincipalAnswer>;
+    async fn holders(&self, token: &str, q: &HoldersQuery) -> CoreResult<HoldersAnswer>;
+    async fn exchange(&self, token: &str, q: &ExchangeQuery) -> CoreResult<ExchangeAnswer>;
+    async fn content(&self, token: &str, q: &ReadQuery)
+    -> CoreResult<Result<CoreContent, Refusal>>;
+    async fn children(&self, token: &str, q: &ReadQuery) -> CoreResult<Result<ChildPage, Refusal>>;
+    async fn topic(&self, token: &str, q: &TopicQuery) -> CoreResult<TopicAnswer>;
 }
 
 /// The core's internal listener over HTTP.
@@ -87,10 +90,12 @@ impl HttpCore {
         &self,
         client: &reqwest::Client,
         path: &str,
+        token: &str,
         body: &B,
     ) -> CoreResult<reqwest::Response> {
         client
             .post(format!("{}{PREFIX}{path}", self.base))
+            .bearer_auth(token)
             .json(body)
             .send()
             .await
@@ -100,9 +105,10 @@ impl HttpCore {
     async fn json<T: serde::de::DeserializeOwned, B: serde::Serialize + Sync>(
         &self,
         path: &str,
+        token: &str,
         body: &B,
     ) -> CoreResult<T> {
-        let r = self.post(&self.client, path, body).await?;
+        let r = self.post(&self.client, path, token, body).await?;
         if !r.status().is_success() {
             return Err(CoreError(format!("{path}: status {}", r.status())));
         }
@@ -125,21 +131,25 @@ impl HttpCore {
 
 #[async_trait]
 impl CoreApi for HttpCore {
-    async fn principal(&self, c: &Caller) -> CoreResult<PrincipalAnswer> {
-        self.json("/principal", c).await
+    async fn principal(&self, token: &str, c: &Caller) -> CoreResult<PrincipalAnswer> {
+        self.json("/principal", token, c).await
     }
 
-    async fn holders(&self, q: &HoldersQuery) -> CoreResult<HoldersAnswer> {
-        self.json("/holders", q).await
+    async fn holders(&self, token: &str, q: &HoldersQuery) -> CoreResult<HoldersAnswer> {
+        self.json("/holders", token, q).await
     }
 
-    async fn exchange(&self, q: &ExchangeQuery) -> CoreResult<ExchangeAnswer> {
-        self.json("/exchange", q).await
+    async fn exchange(&self, token: &str, q: &ExchangeQuery) -> CoreResult<ExchangeAnswer> {
+        self.json("/exchange", token, q).await
     }
 
-    async fn content(&self, q: &ReadQuery) -> CoreResult<Result<CoreContent, Refusal>> {
+    async fn content(
+        &self,
+        token: &str,
+        q: &ReadQuery,
+    ) -> CoreResult<Result<CoreContent, Refusal>> {
         use futures::StreamExt;
-        let r = self.post(&self.streams, "/content", q).await?;
+        let r = self.post(&self.streams, "/content", token, q).await?;
         if !r.status().is_success() {
             return Self::refusal("/content", r.status()).map(Err);
         }
@@ -151,8 +161,8 @@ impl CoreApi for HttpCore {
         Ok(Ok(CoreContent { length, body }))
     }
 
-    async fn children(&self, q: &ReadQuery) -> CoreResult<Result<ChildPage, Refusal>> {
-        let r = self.post(&self.client, "/children", q).await?;
+    async fn children(&self, token: &str, q: &ReadQuery) -> CoreResult<Result<ChildPage, Refusal>> {
+        let r = self.post(&self.client, "/children", token, q).await?;
         if !r.status().is_success() {
             return Self::refusal("/children", r.status()).map(Err);
         }
@@ -162,8 +172,8 @@ impl CoreApi for HttpCore {
             .map_err(|e| CoreError(format!("/children: {}", e.without_url())))
     }
 
-    async fn topic(&self, q: &TopicQuery) -> CoreResult<TopicAnswer> {
-        self.json("/topic", q).await
+    async fn topic(&self, token: &str, q: &TopicQuery) -> CoreResult<TopicAnswer> {
+        self.json("/topic", token, q).await
     }
 }
 
@@ -273,6 +283,7 @@ mod tests {
             tenant_id: t,
             app_id: app,
             principal: app.0,
+            deployment_id: Uuid::now_v7(),
             environment: AppEnv::Live,
         }
     }

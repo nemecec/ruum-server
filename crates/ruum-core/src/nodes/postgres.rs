@@ -1896,4 +1896,8 @@ impl NodeStore for PgNodeStore {
         c.commit().await?;
         Ok(up.into_iter().map(|(n, _)| n).collect())
     }
+
+    async fn is_trashed(&self, ctx: &Context, id: NodeId) -> Result<bool> {
+        Ok(self.row(ctx, id).await?.node.trashed_at.is_some())
+    }
 }

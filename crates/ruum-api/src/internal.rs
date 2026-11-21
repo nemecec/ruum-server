@@ -22,13 +22,18 @@
 //!   an email.
 //! - `POST /internal/runtime/v1/...`: the small internal API of the runtime API (card R-3;
 //!   `ruum_core::apps::runtime_api::wire`). Like the gateway, `ruum-runtime-api` holds no tenant
-//!   keys and no database credential: it checks the workload token itself and asks the core,
-//!   with the verified principal, whether the principal still serves and who it is
-//!   (`principal`), one page of a role's holders (`holders`), the bindings a user may use
-//!   through the app (`exchange`), a read inside a binding (`content`, `children`) and whether
-//!   the live manifest declares a topic (`topic`). The answers name IDs, flags, pairwise
-//!   subjects, sealed subjects and the content itself, never a platform user ID or an email. The
-//!   network policy of this listener must let the runtime API reach it too (card I-6).
+//!   keys, no signing key and no database credential: it asks the core whether the principal
+//!   still serves and who it is (`principal`), one page of a role's holders (`holders`), the
+//!   bindings a user may use through the app and a delegated token (`exchange`), a read inside
+//!   a binding (`content`, `children`) and whether the live manifest declares a topic
+//!   (`topic`). **These routes do not trust whoever reaches this listener**: each one takes the
+//!   app's own workload token (or delegated token) as `Authorization: Bearer`, the core checks
+//!   it with the workload key, and the caller comes only from that token (`401` without one, or
+//!   when the body names another caller). So the gateway, the edge or another pod that reaches
+//!   the listener can act only as an app whose token it holds. The answers name IDs, flags,
+//!   pairwise subjects, sealed subjects and the content itself, never a platform user ID or an
+//!   email. The network policy of this listener must let the runtime API reach it too (card
+//!   I-6).
 
 use crate::state::AppState;
 use axum::Router;
@@ -389,22 +394,65 @@ pub mod gateway {
     }
 }
 
-/// The internal API of the runtime API (card R-3; see the module docs). Every route takes the
-/// principal as the runtime API verified it from the workload token (`wire::Caller`); the
-/// service filters every read by its tenant.
+/// The internal API of the runtime API (card R-3; see the module docs). Every route checks the
+/// app's token itself and takes the caller only from it ([`authed`]); the service filters every
+/// read by the caller's tenant.
 pub mod runtime {
     use crate::state::AppState;
     use axum::Router;
     use axum::body::Body;
     use axum::extract::{Json, State};
-    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use futures::StreamExt;
     use ruum_core::apps::runtime_api::wire::{
-        Caller, ExchangeQuery, HoldersQuery, PREFIX, ReadQuery, Refusal, TopicQuery,
+        Caller, Delegation, ExchangeQuery, HoldersQuery, PREFIX, ReadQuery, Refusal, TopicQuery,
     };
-    use ruum_core::apps::runtime_api::{RuntimeApiService, internal_error};
+    use ruum_core::apps::runtime_api::{RuntimeApiService, internal_error, same_caller};
+
+    fn unauthenticated() -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": {
+                "code": "unauthenticated",
+                "message": "the app's token is missing, not valid, or names another caller",
+            }})),
+        )
+            .into_response()
+    }
+
+    /// The caller of a request, from the app's token in `Authorization: Bearer` (exactly one
+    /// header), and the delegation of a delegated token (only where `delegated`). `None` (the
+    /// route answers `401`) without a valid token, and when the body's caller (`sent`) is not
+    /// the token's.
+    pub fn authed(
+        s: &RuntimeApiService,
+        headers: &HeaderMap,
+        sent: &Caller,
+        delegated: bool,
+    ) -> Option<(Caller, Option<Delegation>)> {
+        let mut all = headers.get_all(header::AUTHORIZATION).iter();
+        let (Some(v), None) = (all.next(), all.next()) else {
+            return None;
+        };
+        let token = v
+            .to_str()
+            .ok()
+            .and_then(|v| v.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, t)| t.trim())
+            .filter(|t| !t.is_empty())?;
+        let (caller, delegation) = s.verify(token, delegated)?;
+        if !same_caller(&caller, sent) {
+            tracing::warn!(
+                target: "ruum::runtime_api",
+                "a runtime route was refused: the body names another caller than its token"
+            );
+            return None;
+        }
+        Some((caller, delegation))
+    }
 
     /// The routes under [`PREFIX`].
     pub fn router(app: AppState) -> Router {
@@ -439,14 +487,29 @@ pub mod runtime {
         (status, Json(serde_json::json!({ "refusal": r }))).into_response()
     }
 
-    async fn principal(State(s): State<RuntimeApiService>, Json(c): Json<Caller>) -> Response {
+    async fn principal(
+        State(s): State<RuntimeApiService>,
+        headers: HeaderMap,
+        Json(c): Json<Caller>,
+    ) -> Response {
+        let Some((c, _)) = authed(&s, &headers, &c, true) else {
+            return unauthenticated();
+        };
         match s.principal(&c).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("runtime principal", &e),
         }
     }
 
-    async fn holders(State(s): State<RuntimeApiService>, Json(q): Json<HoldersQuery>) -> Response {
+    async fn holders(
+        State(s): State<RuntimeApiService>,
+        headers: HeaderMap,
+        Json(mut q): Json<HoldersQuery>,
+    ) -> Response {
+        let Some((c, _)) = authed(&s, &headers, &q.caller, false) else {
+            return unauthenticated();
+        };
+        q.caller = c;
         match s.holders(&q).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("runtime holders", &e),
@@ -455,8 +518,13 @@ pub mod runtime {
 
     async fn exchange(
         State(s): State<RuntimeApiService>,
-        Json(q): Json<ExchangeQuery>,
+        headers: HeaderMap,
+        Json(mut q): Json<ExchangeQuery>,
     ) -> Response {
+        let Some((c, _)) = authed(&s, &headers, &q.caller, false) else {
+            return unauthenticated();
+        };
+        q.caller = c;
         match s.exchange(&q).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("runtime exchange", &e),
@@ -464,7 +532,26 @@ pub mod runtime {
     }
 
     /// The head version of a bound file, streamed with its length.
-    async fn content(State(s): State<RuntimeApiService>, Json(q): Json<ReadQuery>) -> Response {
+    /// The caller and the delegation of a read come from its token, never from the body.
+    fn read_query(
+        s: &RuntimeApiService,
+        headers: &HeaderMap,
+        mut q: ReadQuery,
+    ) -> Option<ReadQuery> {
+        let (c, d) = authed(s, headers, &q.caller, true)?;
+        q.caller = c;
+        q.delegation = d;
+        Some(q)
+    }
+
+    async fn content(
+        State(s): State<RuntimeApiService>,
+        headers: HeaderMap,
+        Json(q): Json<ReadQuery>,
+    ) -> Response {
+        let Some(q) = read_query(&s, &headers, q) else {
+            return unauthenticated();
+        };
         match s.content(&q).await {
             Ok(Ok(c)) => {
                 let mut resp = Response::new(Body::from_stream(
@@ -488,7 +575,14 @@ pub mod runtime {
         }
     }
 
-    async fn children(State(s): State<RuntimeApiService>, Json(q): Json<ReadQuery>) -> Response {
+    async fn children(
+        State(s): State<RuntimeApiService>,
+        headers: HeaderMap,
+        Json(q): Json<ReadQuery>,
+    ) -> Response {
+        let Some(q) = read_query(&s, &headers, q) else {
+            return unauthenticated();
+        };
         match s.children(&q).await {
             Ok(Ok(p)) => Json(p).into_response(),
             Ok(Err(r)) => refused(r),
@@ -496,7 +590,15 @@ pub mod runtime {
         }
     }
 
-    async fn topic(State(s): State<RuntimeApiService>, Json(q): Json<TopicQuery>) -> Response {
+    async fn topic(
+        State(s): State<RuntimeApiService>,
+        headers: HeaderMap,
+        Json(mut q): Json<TopicQuery>,
+    ) -> Response {
+        let Some((c, _)) = authed(&s, &headers, &q.caller, false) else {
+            return unauthenticated();
+        };
+        q.caller = c;
         match s.topic(&q).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("runtime topic", &e),

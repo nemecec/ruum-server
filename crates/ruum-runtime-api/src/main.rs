@@ -9,12 +9,12 @@
 //! - `RUUM_RUNTIME_INTERNAL_URL` (required): the core's internal listener (`RUUM_INTERNAL_BIND`
 //!   of `ruum-server`).
 //! - `RUUM_RUNTIME_WORKLOAD_JWKS_FILE` (required): the public key set of workload tokens (what
-//!   `ruum-server` writes to `RUUM_WORKLOAD_JWKS_FILE`).
+//!   `ruum-server` writes to `RUUM_WORKLOAD_JWKS_FILE`); it also checks the delegated tokens
+//!   that the core signs with the same key.
 //! - `RUUM_RUNTIME_USER_JWKS_FILE` (required): the public key set of the gateway's user tokens
 //!   (`RUUM_GATEWAY_JWKS_FILE` of the gateway).
-//! - `RUUM_RUNTIME_DELEGATED_KEY_FILE` (required): the delegated-token key, a file with the
-//!   Ed25519 seed as base64url (never an environment value). `RUUM_RUNTIME_DELEGATED_JWKS_FILE`
-//!   (optional): where to write its public key set at start.
+//! - Delegated tokens need no setting: the core signs them with the workload key, and this
+//!   binary checks them with the workload key set. It holds no private key.
 //! - `RUUM_RUNTIME_REQUIRE_NETWORK=1`: refuse to start without a caller network lookup. This
 //!   card has no lookup for a real network (Docker: I-4, Cilium: I-6), so with it set the binary
 //!   does not start; without it, it logs once that it runs without network checks.
@@ -22,9 +22,8 @@
 //! Key rotation: the key sets are read at start; a new key means a restart (a later card may
 //! reload them).
 
-use ruum_core::apps::workload_tokens::Ed25519Key;
 use ruum_runtime_api::core_api::HttpCore;
-use ruum_runtime_api::token::{DelegatedTokens, KeySet};
+use ruum_runtime_api::token::KeySet;
 use ruum_runtime_api::{Config, RuntimeApi};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,16 +54,6 @@ async fn run() -> Result<(), String> {
     let config = Config::new(&issuer, &host);
     let workload = KeySet::from_file(&PathBuf::from(required("WORKLOAD_JWKS_FILE")?))?;
     let user = KeySet::from_file(&PathBuf::from(required("USER_JWKS_FILE")?))?;
-    let key = Ed25519Key::from_key_file(
-        &PathBuf::from(required("DELEGATED_KEY_FILE")?),
-        "delegated token",
-    )
-    .map_err(|e| e.to_string())?;
-    let delegated = DelegatedTokens::new(&config.issuer, key)?;
-    if let Some(out) = var("DELEGATED_JWKS_FILE") {
-        let jwks = serde_json::to_vec_pretty(&delegated.jwks()).map_err(|e| e.to_string())?;
-        std::fs::write(&out, jwks).map_err(|e| format!("cannot write {out}: {}", e.kind()))?;
-    }
     if var("REQUIRE_NETWORK").as_deref() == Some("1") {
         return Err(
             "RUUM_RUNTIME_REQUIRE_NETWORK=1, but this build has no caller network lookup (cards \
@@ -77,13 +66,7 @@ async fn run() -> Result<(), String> {
         "no caller network lookup: tokens are not checked against the network of the sandbox"
     );
     let core = HttpCore::new(&required("INTERNAL_URL")?).map_err(|e| e.to_string())?;
-    let rt = Arc::new(RuntimeApi::new(
-        config,
-        workload,
-        user,
-        delegated,
-        Arc::new(core),
-    ));
+    let rt = Arc::new(RuntimeApi::new(config, workload, user, Arc::new(core)));
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| format!("cannot listen on {bind}: {e}"))?;

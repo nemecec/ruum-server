@@ -3,8 +3,11 @@
 //! Every operation first finds the caller ([`authenticate`]): exactly one `Authorization:
 //! Bearer` header with a workload token (or, for `readBoundContent` and `listBoundChildren`, a
 //! delegated token) that passes its check (`crate::token`), from a peer whose network identity
-//! matches the token when a lookup is configured (`crate::caller`), of a principal that still
-//! serves (the core's answer, kept for at most 3 s). Then the caps (`crate::limits`). Errors
+//! matches the token when a lookup is configured (`crate::caller`); then the caps
+//! (`crate::limits`), before any call to the core, so a request over a cap never reaches it;
+//! then a principal that still serves (the core's answer, kept for at most 3 s). Every core
+//! call carries the app's token, which the core checks again. A request body (exchange, event)
+//! must arrive within [`crate::limits::Caps::body_timeout`] (`408`). Errors
 //! have the REST shape `{ "error": { "code", "message", "hint" } }` with existing codes; no
 //! answer and no log line holds a token or file content (log fields are IDs and statuses).
 //!
@@ -17,7 +20,7 @@
 //!   `aud`, `env` and `tenant` must be the caller's (`401`), its `actor` `user` or `agent`
 //!   (`403`; `delegate` comes with B-3 and G-3, so every other actor is `403` in step 3), and a
 //!   binding must have `on_behalf_of_user` (`403`). The delegated token names only those
-//!   bindings and lives 300 s.
+//!   bindings and lives 300 s; the core signs it with the workload key.
 //! - `readBoundContent`, `listBoundChildren`: the core's checks (bound content only, the
 //!   user's right for a delegated token); streamed with `Content-Length`, under the byte rates.
 //! - `publishAppEvent`: the topic pattern; `403` unless the live manifest declares the topic;
@@ -27,7 +30,7 @@
 
 use crate::RuntimeApi;
 use crate::core_api::CoreContent;
-use crate::token::{self, Delegated, Workload};
+use crate::token::{self, Credential, Workload};
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -37,8 +40,8 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use ruum_core::TenantId;
 use ruum_core::apps::runtime_api::wire::{
-    AppSelf, Caller, Delegation, ExchangeAnswer, ExchangeQuery, HoldersAnswer, HoldersQuery,
-    PrincipalAnswer, ReadQuery, Refusal, TopicAnswer, TopicQuery,
+    AppSelf, Caller, ExchangeAnswer, ExchangeQuery, HoldersAnswer, HoldersQuery, PrincipalAnswer,
+    ReadQuery, Refusal, TopicAnswer, TopicQuery,
 };
 use ruum_core::identity::app_sign_in::AppEnv;
 use serde::Deserialize;
@@ -46,7 +49,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// The largest event body (the contract: 256 KiB).
@@ -165,48 +168,25 @@ pub async fn host_only(State(rt): State<Arc<RuntimeApi>>, req: Request, next: Ne
 
 // ------------------------------------------------------------------------------ the caller
 
-/// A verified credential.
-#[derive(Clone, Debug)]
-pub enum Credential {
-    Workload(Workload),
-    Delegated(Delegated),
-}
-
-impl Credential {
-    fn workload(&self) -> &Workload {
-        match self {
-            Credential::Workload(w) => w,
-            Credential::Delegated(d) => &d.caller,
-        }
-    }
-
-    fn delegation(&self) -> Option<Delegation> {
-        match self {
-            Credential::Workload(_) => None,
-            Credential::Delegated(d) => Some(Delegation {
-                bindings: d.bindings.clone(),
-                user: d.user,
-                agent: d.agent,
-            }),
-        }
-    }
-}
-
 /// The caller of a request.
 pub struct Authed {
     pub credential: Credential,
     pub caller: Caller,
     pub app: AppSelf,
+    /// The app's token, passed on to the core (which checks it again). Never logged.
+    pub token: String,
     _permit: crate::limits::Permit,
 }
 
-fn caller_of(w: &Workload) -> Caller {
-    Caller {
-        tenant_id: w.tenant,
-        app_id: w.app,
-        principal: w.principal,
-        environment: w.environment,
+impl Authed {
+    /// The delegation of a delegated token (the core takes it from the token, not from this).
+    fn delegation(&self) -> Option<ruum_core::apps::runtime_api::wire::Delegation> {
+        ruum_core::apps::runtime_api::admitted(&self.credential).1
     }
+}
+
+fn caller_of(w: &Workload) -> Caller {
+    ruum_core::apps::runtime_api::caller_of(w)
 }
 
 /// The one bearer value of `Authorization` (two headers, another scheme or none: `401`).
@@ -229,6 +209,9 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
             "the Authorization header is not a bearer token",
         ));
     }
+    if token.len() > token::MAX_TOKEN_BYTES {
+        return Err(refused("the token is too long"));
+    }
     Ok(token)
 }
 
@@ -246,16 +229,9 @@ pub async fn authenticate(
     delegated: bool,
 ) -> Result<Authed, ApiError> {
     let token = bearer(headers)?;
-    let credential = match token::peek_typ(token).as_deref() {
-        Some(ruum_core::apps::workload_tokens::WORKLOAD_TYP) => Credential::Workload(
-            token::verify_workload(token, &rt.workload_keys, &rt.config.issuer)
-                .map_err(|e| refused(&e.0))?,
-        ),
-        Some(ruum_core::apps::workload_tokens::DELEGATED_TYP) if delegated => {
-            Credential::Delegated(rt.delegated.verify(token).map_err(|e| refused(&e.0))?)
-        }
-        _ => return Err(refused("not a token of this call")),
-    };
+    let credential =
+        token::verify_credential(token, &rt.workload_keys, &rt.config.issuer, delegated)
+            .map_err(|e| refused(&e.0))?;
     let w = credential.workload().clone();
     if let Some(net) = &rt.network {
         match net.identify(peer.ip()).await {
@@ -264,10 +240,7 @@ pub async fn authenticate(
         }
     }
     let caller = caller_of(&w);
-    let app = match principal(rt, &caller).await? {
-        PrincipalAnswer::Serving { app } => app,
-        PrincipalAnswer::Gone => return Err(refused("the principal no longer serves")),
-    };
+    // The caps come before the first core call: a request over a cap never reaches the core.
     let permit = rt.limiter.acquire(w.tenant, w.app).map_err(|which| {
         tracing::warn!(
             target: "ruum::runtime_api",
@@ -284,33 +257,50 @@ pub async fn authenticate(
         e.retry_after = Some(1);
         e
     })?;
+    let app = match principal(rt, token, &caller).await? {
+        PrincipalAnswer::Serving { app } => app,
+        PrincipalAnswer::Gone => return Err(refused("the principal no longer serves")),
+    };
     Ok(Authed {
         credential,
         caller,
         app,
+        token: token.to_string(),
         _permit: permit,
     })
 }
 
 /// The core's answer about a principal, kept for at most `CHECK_TTL`.
-async fn principal(rt: &RuntimeApi, c: &Caller) -> Result<PrincipalAnswer, ApiError> {
+async fn principal(rt: &RuntimeApi, token: &str, c: &Caller) -> Result<PrincipalAnswer, ApiError> {
     let now = Instant::now();
     if let Some(a) = rt.principals.get(c, now) {
         return Ok(a);
     }
-    let a = rt.core.principal(c).await.map_err(core_failed)?;
+    let a = rt.core.principal(token, c).await.map_err(core_failed)?;
     rt.principals.put(c, a.clone(), now);
     Ok(a)
 }
 
 // ------------------------------------------------------------------------------ replays
 
-/// The user tokens already exchanged, per tenant, each until its `exp` (backlog S-61: per
-/// tenant at most [`ReplaySet::PER_TENANT`]; when all tenants together hold
-/// [`ReplaySet::TOTAL`], a tenant at or over its fair share of that is refused first).
-#[derive(Default)]
+/// The user tokens already exchanged, per tenant, each until its `exp` (backlog S-61, M-59).
+///
+/// Per tenant at most [`ReplaySet::PER_TENANT`]. When all tenants together hold
+/// [`ReplaySet::TOTAL`] (after ended tokens are dropped), a tenant at or over its fair share
+/// (`TOTAL / tenants`) is refused first; tenants under their share still get in, up to the hard
+/// bound [`ReplaySet::HARD`], where every tenant is refused until tokens end. A live entry is
+/// never dropped to make room: that would let its token be exchanged twice. A refusal is `429`.
 pub struct ReplaySet {
     inner: Mutex<HashMap<TenantId, HashMap<String, i64>>>,
+    per_tenant: usize,
+    total: usize,
+    hard: usize,
+}
+
+impl Default for ReplaySet {
+    fn default() -> Self {
+        Self::with_limits(Self::PER_TENANT, Self::TOTAL, Self::HARD)
+    }
 }
 
 /// Whether a user token may be exchanged now.
@@ -324,31 +314,63 @@ pub enum FirstUse {
 impl ReplaySet {
     pub const PER_TENANT: usize = 10_000;
     pub const TOTAL: usize = 200_000;
+    /// The hard bound of all entries: [`Self::TOTAL`] and a quarter more for tenants under
+    /// their share.
+    pub const HARD: usize = Self::TOTAL + Self::TOTAL / 4;
+
+    /// A set with other limits (tests).
+    pub fn with_limits(per_tenant: usize, total: usize, hard: usize) -> Self {
+        Self {
+            inner: Mutex::default(),
+            per_tenant,
+            total,
+            hard: hard.max(total),
+        }
+    }
+
+    /// The entries of all tenants.
+    pub fn len(&self) -> usize {
+        let m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        m.values().map(HashMap::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Records the first use of `jti` (valid until `exp`) in `tenant`.
     pub fn first_use(&self, tenant: TenantId, jti: &str, exp: i64, now: i64) -> FirstUse {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let total: usize = m.values().map(HashMap::len).sum();
-        let tenants = m.len().max(1);
-        let set = m.entry(tenant).or_default();
-        if set.contains_key(jti) {
+        if m.get(&tenant).is_some_and(|s| s.contains_key(jti)) {
             return FirstUse::Replayed;
         }
-        if set.len() >= Self::PER_TENANT || total >= Self::TOTAL {
-            set.retain(|_, e| *e > now);
-        }
-        let share = Self::TOTAL / tenants;
-        if set.len() >= Self::PER_TENANT || (total >= Self::TOTAL && set.len() >= share) {
-            return FirstUse::Full;
-        }
-        set.insert(jti.to_string(), exp);
-        if total >= Self::TOTAL {
+        let mut total: usize = m.values().map(HashMap::len).sum();
+        if total >= self.total {
             // Every tenant drops its ended tokens, so the total shrinks again.
             for s in m.values_mut() {
                 s.retain(|_, e| *e > now);
             }
             m.retain(|_, s| !s.is_empty());
+            total = m.values().map(HashMap::len).sum();
         }
+        let tenants = m.len() + usize::from(!m.contains_key(&tenant));
+        let share = self.total / tenants.max(1);
+        let set = m.entry(tenant).or_default();
+        if set.len() >= self.per_tenant {
+            let before = set.len();
+            set.retain(|_, e| *e > now);
+            total -= before - set.len();
+        }
+        let full = set.len() >= self.per_tenant
+            || total >= self.hard
+            || (total >= self.total && set.len() >= share);
+        if full {
+            if set.is_empty() {
+                m.remove(&tenant);
+            }
+            return FirstUse::Full;
+        }
+        set.insert(jti.to_string(), exp);
         FirstUse::Yes
     }
 }
@@ -404,12 +426,15 @@ pub async fn list_app_self_users(
     }
     let answer = rt
         .core
-        .holders(&HoldersQuery {
-            caller: a.caller.clone(),
-            role,
-            cursor: q.cursor,
-            limit,
-        })
+        .holders(
+            &a.token,
+            &HoldersQuery {
+                caller: a.caller.clone(),
+                role,
+                cursor: q.cursor,
+                limit,
+            },
+        )
         .await
         .map_err(core_failed)?;
     match answer {
@@ -430,11 +455,21 @@ fn too_large(max: usize) -> ApiError {
     )
 }
 
-/// Reads a body with a cap, while reading: `413` past `max` bytes.
-async fn capped_body(body: Body, max: usize) -> Result<Bytes, ApiError> {
-    axum::body::to_bytes(body, max)
-        .await
-        .map_err(|_| too_large(max))
+/// Reads a body with a cap, while reading: `413` past `max` bytes, and `408` when the whole
+/// body has not arrived within `deadline` (a peer that trickles bytes holds its permit and its
+/// connection only that long; backlog S-71, M-59).
+async fn capped_body(body: Body, max: usize, deadline: Duration) -> Result<Bytes, ApiError> {
+    match tokio::time::timeout(deadline, axum::body::to_bytes(body, max)).await {
+        Ok(r) => r.map_err(|_| too_large(max)),
+        Err(_) => {
+            tracing::info!(target: "ruum::runtime_api", status = 408, "a request body was too slow");
+            Err(ApiError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                "bad_request",
+                "the request body did not arrive in time",
+            ))
+        }
+    }
 }
 
 fn content_length_over(headers: &HeaderMap, max: usize) -> bool {
@@ -459,7 +494,7 @@ pub async fn exchange(
     if content_length_over(&parts.headers, MAX_EXCHANGE_BYTES) {
         return Err(too_large(MAX_EXCHANGE_BYTES));
     }
-    let bytes = capped_body(body, MAX_EXCHANGE_BYTES).await?;
+    let bytes = capped_body(body, MAX_EXCHANGE_BYTES, rt.config.caps.body_timeout).await?;
     let v: Value =
         serde_json::from_slice(&bytes).map_err(|_| bad_request("the body is not JSON"))?;
     let Some(user_token) = v.get("user_token").and_then(Value::as_str) else {
@@ -503,20 +538,19 @@ pub async fn exchange(
     }
     let answer = rt
         .core
-        .exchange(&ExchangeQuery {
-            caller: a.caller.clone(),
-            sub: user.sub.clone(),
-            actor: user.actor.clone(),
-            on_behalf_of: user.on_behalf_of.clone(),
-        })
+        .exchange(
+            &a.token,
+            &ExchangeQuery {
+                caller: a.caller.clone(),
+                sub: user.sub.clone(),
+                actor: user.actor.clone(),
+                on_behalf_of: user.on_behalf_of.clone(),
+            },
+        )
         .await
         .map_err(core_failed)?;
-    let (bindings, sealed_user, agent) = match answer {
-        ExchangeAnswer::Granted {
-            bindings,
-            user,
-            agent,
-        } => (bindings, user, agent),
+    let t = match answer {
+        ExchangeAnswer::Granted { access_token, .. } => access_token,
         ExchangeAnswer::NoBinding => {
             return Err(denied("no binding of this app acts for the user")
                 .hint("bindings need on_behalf_of_user"));
@@ -526,13 +560,6 @@ pub async fn exchange(
         }
         ExchangeAnswer::Gone => return Err(refused("the principal no longer serves")),
     };
-    let t = rt
-        .delegated
-        .sign(w, bindings, sealed_user, agent)
-        .map_err(|e| {
-            tracing::error!(target: "ruum::runtime_api", error = %e, "a delegated token could not be signed");
-            unavailable()
-        })?;
     tracing::info!(target: "ruum::runtime_api", tenant = %w.tenant, app = %w.app, "a user token was exchanged");
     Ok(Json(json!({
         "access_token": t,
@@ -567,28 +594,34 @@ pub async fn read_bound_content(
     let q = ReadQuery {
         caller: a.caller.clone(),
         node_id: node,
-        delegation: a.credential.delegation(),
+        delegation: a.delegation(),
         cursor: None,
         limit: None,
     };
-    let CoreContent { length, body } = match rt.core.content(&q).await.map_err(core_failed)? {
-        Ok(c) => c,
-        Err(r) => return Err(read_refused(r)),
-    };
+    let CoreContent { length, body } =
+        match rt.core.content(&a.token, &q).await.map_err(core_failed)? {
+            Ok(c) => c,
+            Err(r) => return Err(read_refused(r)),
+        };
     let (tenant, app) = (a.caller.tenant_id, a.caller.app_id);
     let limiter = rt.limiter.clone();
     // The permit lives as long as the stream.
     let permit = a._permit;
+    // Each chunk first waits for its app's and tenant's buckets, then for the global one; a
+    // reservation that is dropped before its chunk goes (the client went away) gives its bytes
+    // back, so cancelled streams leave no debt for other tenants (crate::limits).
     let stream = body.then(move |chunk| {
         let limiter = limiter.clone();
         let _keep = &permit;
-        let wait = match &chunk {
-            Ok(b) => limiter.bytes(tenant, app, b.len() as u64, Instant::now()),
-            Err(_) => std::time::Duration::ZERO,
-        };
+        let n = chunk.as_ref().map_or(0, |b| b.len() as u64);
         async move {
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
+            if n > 0 {
+                let own = limiter.reserve_own(tenant, app, n, Instant::now());
+                own.wait().await;
+                let global = limiter.reserve_global(n, Instant::now());
+                global.wait().await;
+                own.commit();
+                global.commit();
             }
             chunk
         }
@@ -641,11 +674,11 @@ pub async fn list_bound_children(
     let r = ReadQuery {
         caller: a.caller.clone(),
         node_id: node,
-        delegation: a.credential.delegation(),
+        delegation: a.delegation(),
         cursor: q.cursor,
         limit: Some(limit),
     };
-    match rt.core.children(&r).await.map_err(core_failed)? {
+    match rt.core.children(&a.token, &r).await.map_err(core_failed)? {
         Ok(p) => Ok(Json(
             json!({ "items": p.items, "next_cursor": p.next_cursor }),
         )),
@@ -679,10 +712,13 @@ pub async fn publish_app_event(
     }
     match rt
         .core
-        .topic(&TopicQuery {
-            caller: a.caller.clone(),
-            topic: topic.clone(),
-        })
+        .topic(
+            &a.token,
+            &TopicQuery {
+                caller: a.caller.clone(),
+                topic: topic.clone(),
+            },
+        )
         .await
         .map_err(core_failed)?
     {
@@ -697,7 +733,7 @@ pub async fn publish_app_event(
     if content_length_over(&parts.headers, MAX_EVENT_BYTES) {
         return Err(too_large(MAX_EVENT_BYTES));
     }
-    let bytes = capped_body(body, MAX_EVENT_BYTES).await?;
+    let bytes = capped_body(body, MAX_EVENT_BYTES, rt.config.caps.body_timeout).await?;
     let v: Value =
         serde_json::from_slice(&bytes).map_err(|_| bad_request("the event is not JSON"))?;
     let Some(o) = v.as_object() else {
@@ -748,6 +784,32 @@ mod tests {
         assert_eq!(r.first_use(a, "later", 2000, 1001), FirstUse::Yes);
     }
 
+    /// Kimi review 6: the total is a hard bound, and a tenant under its share still gets in
+    /// until that bound, while a tenant over its share is refused first.
+    #[test]
+    fn the_replay_set_has_a_hard_bound() {
+        let r = ReplaySet::with_limits(100, 10, 15);
+        let big = TenantId(Uuid::now_v7());
+        for i in 0..10 {
+            assert_eq!(r.first_use(big, &format!("b{i}"), 1000, 10), FirstUse::Yes);
+        }
+        // At the total, the tenant over its share is refused first.
+        assert_eq!(r.first_use(big, "b-more", 1000, 10), FirstUse::Full);
+        // New tenants under their share still get in, up to the hard bound.
+        let mut admitted = 0;
+        for _ in 0..20 {
+            let other = TenantId(Uuid::now_v7());
+            if r.first_use(other, "o", 1000, 10) == FirstUse::Yes {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 5);
+        assert_eq!(r.len(), 15);
+        // Ended tokens make room again.
+        assert_eq!(r.first_use(big, "later", 3000, 2000), FirstUse::Yes);
+        assert_eq!(r.len(), 1);
+    }
+
     #[test]
     fn bearer_needs_one_header() {
         let mut h = HeaderMap::new();
@@ -765,6 +827,129 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
         assert!(bearer(&h).is_err());
+    }
+
+    /// A core whose `principal` is slow and counts the calls in flight.
+    struct SlowCore {
+        now: std::sync::atomic::AtomicUsize,
+        max: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::core_api::CoreApi for SlowCore {
+        async fn principal(
+            &self,
+            _token: &str,
+            _c: &Caller,
+        ) -> crate::core_api::CoreResult<PrincipalAnswer> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(n, SeqCst);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.now.fetch_sub(1, SeqCst);
+            Ok(PrincipalAnswer::Gone)
+        }
+        async fn holders(
+            &self,
+            _: &str,
+            _: &HoldersQuery,
+        ) -> crate::core_api::CoreResult<HoldersAnswer> {
+            Err(crate::core_api::CoreError("unused".into()))
+        }
+        async fn exchange(
+            &self,
+            _: &str,
+            _: &ExchangeQuery,
+        ) -> crate::core_api::CoreResult<ExchangeAnswer> {
+            Err(crate::core_api::CoreError("unused".into()))
+        }
+        async fn content(
+            &self,
+            _: &str,
+            _: &ReadQuery,
+        ) -> crate::core_api::CoreResult<Result<CoreContent, Refusal>> {
+            Err(crate::core_api::CoreError("unused".into()))
+        }
+        async fn children(
+            &self,
+            _: &str,
+            _: &ReadQuery,
+        ) -> crate::core_api::CoreResult<
+            Result<ruum_core::apps::runtime_api::wire::ChildPage, Refusal>,
+        > {
+            Err(crate::core_api::CoreError("unused".into()))
+        }
+        async fn topic(&self, _: &str, _: &TopicQuery) -> crate::core_api::CoreResult<TopicAnswer> {
+            Err(crate::core_api::CoreError("unused".into()))
+        }
+    }
+
+    /// The most `principal` calls in flight when 20 requests of one app arrive at once on an
+    /// empty principal cache, and how many were refused `429`.
+    async fn burst(per_app: usize) -> (usize, usize) {
+        use ruum_core::apps::workload_tokens::WorkloadTokenIssuer;
+        use ruum_core::runtime::{Environment, WorkloadIdentity};
+        const ISS: &str = "https://ruum.localhost";
+        let issuer = WorkloadTokenIssuer::generate(ISS);
+        let keys = token::KeySet::from_jwks(&issuer.jwks()).unwrap();
+        let core = Arc::new(SlowCore {
+            now: Default::default(),
+            max: Default::default(),
+        });
+        let mut config = crate::Config::new(ISS, "ruum.internal");
+        config.caps.per_app = per_app;
+        let rt = Arc::new(crate::RuntimeApi::new(
+            config,
+            keys.clone(),
+            keys,
+            core.clone(),
+        ));
+        let id = WorkloadIdentity {
+            tenant: TenantId(Uuid::now_v7()),
+            app: ruum_core::NodeId(Uuid::now_v7()),
+            deployment: Uuid::now_v7(),
+            environment: Environment::Live,
+        };
+        let t = issuer.issue(&id).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", t.expose())).unwrap(),
+        );
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let (rt, h) = (rt.clone(), h.clone());
+            tasks.push(tokio::spawn(async move {
+                authenticate(&rt, &h, peer, false)
+                    .await
+                    .err()
+                    .map(|e| e.status)
+            }));
+        }
+        let mut limited = 0;
+        for t in tasks {
+            if t.await.unwrap() == Some(StatusCode::TOO_MANY_REQUESTS) {
+                limited += 1;
+            }
+        }
+        (core.max.load(std::sync::atomic::Ordering::SeqCst), limited)
+    }
+
+    /// Kimi review 2: the caps come before the core call, so requests over the app's cap never
+    /// reach the core, also on an empty principal cache. Positive control: with a cap of 32,
+    /// the same burst reaches the core more than twice at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn requests_over_a_cap_never_reach_the_core() {
+        let (max, limited) = burst(2).await;
+        assert!(max <= 2, "{max} principal calls at once");
+        assert!(limited >= 1, "nothing was refused");
+        let (max, limited) = burst(32).await;
+        assert!(
+            max > 2,
+            "the positive control reached the core only {max} at once"
+        );
+        assert_eq!(limited, 0);
     }
 
     #[test]

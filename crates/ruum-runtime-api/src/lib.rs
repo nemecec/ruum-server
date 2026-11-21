@@ -1,10 +1,11 @@
 //! The runtime API (card R-3; `contracts/apps/runtime.openapi.yaml`, `docs/STEP3.md`
 //! "Processes" and "How an app runs"): what a running app may call at `http://ruum.internal`.
 //!
-//! Like the gateway (decision 0006-1), the binary holds **no tenant keys and no database
-//! credential**. It holds the public key set of workload tokens, the public key set of the
-//! gateway's user tokens, its own delegated-token signing key and the address of the core's
-//! internal listener; every question about a tenant goes to the core ([`core_api`]).
+//! Like the gateway (decision 0006-1), the binary holds **no tenant keys, no signing key and no
+//! database credential**. It holds the public key set of workload tokens (which also checks the
+//! delegated tokens that the core signs), the public key set of the gateway's user tokens and
+//! the address of the core's internal listener; every question about a tenant goes to the core
+//! ([`core_api`]), with the app's own token, which the core checks again.
 //!
 //! Modules (`docs/STEP3.md` "Shared files"):
 //!
@@ -39,7 +40,7 @@ use limits::{Caps, Limiter};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use token::{DelegatedTokens, KeySet};
+use token::KeySet;
 
 /// The settings of the runtime API.
 #[derive(Clone, Debug)]
@@ -66,7 +67,6 @@ pub struct RuntimeApi {
     pub config: Config,
     pub workload_keys: KeySet,
     pub user_keys: KeySet,
-    pub delegated: DelegatedTokens,
     pub core: Arc<dyn CoreApi>,
     /// The caller's network identity; `None`: no network checks (see [`caller`]).
     pub network: Option<Arc<dyn CallerNetwork>>,
@@ -80,7 +80,6 @@ impl RuntimeApi {
         config: Config,
         workload_keys: KeySet,
         user_keys: KeySet,
-        delegated: DelegatedTokens,
         core: Arc<dyn CoreApi>,
     ) -> Self {
         let limiter = Limiter::new(config.caps);
@@ -88,7 +87,6 @@ impl RuntimeApi {
             config,
             workload_keys,
             user_keys,
-            delegated,
             core,
             network: None,
             principals: PrincipalCache::default(),
@@ -124,37 +122,64 @@ pub fn router(rt: Arc<RuntimeApi>) -> Router {
         .with_state(rt)
 }
 
-/// The open connections of each peer address.
-#[derive(Default)]
-struct Peers(Mutex<HashMap<IpAddr, usize>>);
+/// Open connections by key (a peer address, a tenant).
+struct Slots<K>(Mutex<HashMap<K, usize>>);
 
-struct PeerSlot {
-    peers: Arc<Peers>,
-    ip: IpAddr,
+impl<K: std::hash::Hash + Eq + Copy> Slots<K> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(HashMap::new())))
+    }
+
+    /// One more connection of `key`, unless it has `cap` already.
+    fn take(self: &Arc<Self>, key: K, cap: usize) -> Option<Slot<K>> {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(key).or_default();
+        if *n >= cap {
+            if *n == 0 {
+                m.remove(&key);
+            }
+            return None;
+        }
+        *n += 1;
+        Some(Slot {
+            slots: self.clone(),
+            key,
+        })
+    }
 }
 
-impl Drop for PeerSlot {
+/// An open connection of a key; dropping it frees the place.
+struct Slot<K: std::hash::Hash + Eq + Copy> {
+    slots: Arc<Slots<K>>,
+    key: K,
+}
+
+impl<K: std::hash::Hash + Eq + Copy> Drop for Slot<K> {
     fn drop(&mut self) {
-        let mut m = self.peers.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = m.get_mut(&self.ip) {
+        let mut m = self.slots.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.key) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                m.remove(&self.ip);
+                m.remove(&self.key);
             }
         }
     }
 }
 
 /// Serves the API on `listener` (HTTP/1): a header read timeout, at most
-/// [`Caps::connections`] open connections and [`Caps::connections_per_peer`] per peer address
-/// (a connection over a cap is closed at once), the TCP peer of each request for
-/// [`caller`]. Runs until the listener fails.
+/// [`Caps::connections`] open connections and [`Caps::connections_per_peer`] per peer address,
+/// and with a caller network lookup [`Caps::connections_per_tenant`] per tenant (the peers the
+/// lookup does not know share one such share); a connection over a cap is closed at once (who is
+/// refused first: `crate::limits`). The TCP peer of each request goes to [`caller`]. Runs until
+/// the listener fails.
 pub async fn serve(listener: tokio::net::TcpListener, rt: Arc<RuntimeApi>) -> std::io::Result<()> {
     use tower::ServiceExt as _;
     let caps = rt.config.caps;
+    let network = rt.network.clone();
     let app = router(rt);
     let all = Arc::new(tokio::sync::Semaphore::new(caps.connections));
-    let peers = Arc::new(Peers::default());
+    let peers: Arc<Slots<IpAddr>> = Slots::new();
+    let tenants: Arc<Slots<Option<ruum_core::TenantId>>> = Slots::new();
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -168,23 +193,36 @@ pub async fn serve(listener: tokio::net::TcpListener, rt: Arc<RuntimeApi>) -> st
             tracing::warn!(target: "ruum::runtime_api", "a connection was closed at the connection cap");
             continue;
         };
-        let slot = {
-            let mut m = peers.0.lock().unwrap_or_else(|e| e.into_inner());
-            let n = m.entry(peer.ip()).or_default();
-            if *n >= caps.connections_per_peer {
-                tracing::warn!(target: "ruum::runtime_api", "a connection was closed at the peer's connection cap");
-                continue;
-            }
-            *n += 1;
-            PeerSlot {
-                peers: peers.clone(),
-                ip: peer.ip(),
-            }
+        let Some(slot) = peers.take(peer.ip(), caps.connections_per_peer) else {
+            tracing::warn!(target: "ruum::runtime_api", "a connection was closed at the peer's connection cap");
+            continue;
         };
         let app = app.clone();
+        let network = network.clone();
+        let tenants = tenants.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _slot = slot;
+            // With a lookup, the tenant's share of the connections (the lookup runs here, not
+            // in the accept loop, so a slow lookup never stops other peers' accepts).
+            // Peers the lookup does not know share one such share (their requests get `401`).
+            let _tenant_slot = match &network {
+                None => None,
+                Some(net) => {
+                    let tenant = net.identify(peer.ip()).await.map(|id| id.tenant);
+                    match tenants.take(tenant, caps.connections_per_tenant) {
+                        Some(s) => Some(s),
+                        None => {
+                            tracing::warn!(
+                                target: "ruum::runtime_api",
+                                tenant = ?tenant,
+                                "a connection was closed at the tenant's connection cap"
+                            );
+                            return;
+                        }
+                    }
+                }
+            };
             let service = hyper::service::service_fn(
                 move |mut req: hyper::Request<hyper::body::Incoming>| {
                     req.extensions_mut()

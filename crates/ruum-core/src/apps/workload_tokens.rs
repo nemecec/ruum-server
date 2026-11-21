@@ -5,10 +5,16 @@
 //!
 //! An EdDSA JWT with `typ` `app_workload`, `aud` `ruum.internal`, `iss` the instance origin,
 //! `sub` the app principal (the app node ID for the live app, the deployment ID for a preview),
-//! `tid` the tenant, `app` the app node, `env` (`live` or `preview`), `iat`, `nbf`, `exp` and a
-//! random `jti`. It lives [`WORKLOAD_TOKEN_LIFETIME`] (15 minutes, the contract's limit). The
-//! `app` claim is an extra claim (the contract allows them): a preview principal is a deployment
-//! ID, and every store read of the core names the app too.
+//! `tid` the tenant, `app` the app node, `dep` the deployment, `env` (`live` or `preview`),
+//! `iat`, `nbf`, `exp` and a random `jti`. It lives [`WORKLOAD_TOKEN_LIFETIME`] (15 minutes, the
+//! contract's limit). `app` and `dep` are extra claims (the contract allows them): a preview
+//! principal is a deployment ID, every store read of the core names the app too, and a live
+//! token serves only while `dep` is the app's live deployment.
+//!
+//! The same key signs the delegated tokens of `exchangeAppUserToken`
+//! ([`WorkloadTokenIssuer::sign_delegated`]; `delegated-token.schema.json`: "EdDSA, the
+//! workload-token keys"), and the core checks both kinds with it on its internal routes for the
+//! runtime API ([`WorkloadTokenIssuer::verify`], `crate::apps::runtime_tokens`).
 //!
 //! The key is set apart from the API keys and from the gateway's user-token key: an Ed25519
 //! seed in a file (`RUUM_WORKLOAD_TOKEN_KEY_FILE`, never an environment value), with a `kid`
@@ -163,6 +169,8 @@ pub struct WorkloadClaims {
     pub tid: TenantId,
     /// The app node.
     pub app: NodeId,
+    /// The deployment the token was made for.
+    pub dep: Uuid,
     /// `live` or `preview`.
     pub env: String,
     pub iat: i64,
@@ -192,6 +200,8 @@ pub fn env_name(e: Environment) -> &'static str {
 pub struct WorkloadTokenIssuer {
     issuer: String,
     key: Ed25519Key,
+    /// The public key set of `key` (`None` only if it could not be built: every check fails).
+    keys: Option<crate::apps::runtime_tokens::KeySet>,
     lifetime: Duration,
 }
 
@@ -207,9 +217,11 @@ impl std::fmt::Debug for WorkloadTokenIssuer {
 impl WorkloadTokenIssuer {
     /// An issuer for the instance origin `issuer` with `key`.
     pub fn new(issuer: &str, key: Ed25519Key) -> Self {
+        let keys = crate::apps::runtime_tokens::KeySet::from_jwks(&key.jwks()).ok();
         Self {
             issuer: issuer.trim_end_matches('/').to_string(),
             key,
+            keys,
             lifetime: WORKLOAD_TOKEN_LIFETIME,
         }
     }
@@ -256,6 +268,7 @@ impl WorkloadTokenIssuer {
             sub: principal_of(identity),
             tid: identity.tenant,
             app: identity.app,
+            dep: identity.deployment,
             env: env_name(identity.environment).into(),
             iat: now,
             nbf: now,
@@ -273,6 +286,43 @@ impl WorkloadTokenIssuer {
     /// `WorkloadSpec::workload_token`, and what the renewal rotates in).
     pub fn issue(&self, identity: &WorkloadIdentity) -> Result<SecretValue> {
         self.sign(&self.claims(identity))
+    }
+
+    /// A delegated token of `caller` acting for the sealed `user` through `bindings` (the core's
+    /// answer to `exchangeAppUserToken`), signed with the workload key, valid for
+    /// [`crate::apps::runtime_tokens::DELEGATED_SECONDS`].
+    pub fn sign_delegated(
+        &self,
+        caller: &crate::apps::runtime_tokens::Workload,
+        bindings: Vec<String>,
+        user: Uuid,
+        agent: Option<Uuid>,
+    ) -> Result<SecretValue> {
+        let claims = crate::apps::runtime_tokens::DelegatedClaims::new(
+            &self.issuer,
+            caller,
+            bindings,
+            user,
+            agent,
+        );
+        self.key.sign(&claims).map(SecretValue::new)
+    }
+
+    /// Checks a workload token, or (when `delegated`) also a delegated token, of this issuer.
+    pub fn verify(
+        &self,
+        token: &str,
+        delegated: bool,
+    ) -> std::result::Result<
+        crate::apps::runtime_tokens::Credential,
+        crate::apps::runtime_tokens::TokenError,
+    > {
+        let Some(keys) = &self.keys else {
+            return Err(crate::apps::runtime_tokens::TokenError(
+                "the issuer has no key set".into(),
+            ));
+        };
+        crate::apps::runtime_tokens::verify_credential(token, keys, &self.issuer, delegated)
     }
 }
 
@@ -507,6 +557,7 @@ mod tests {
         let c = issuer.claims(&live);
         assert_eq!(c.sub, live.app.0);
         assert_eq!(c.app, live.app);
+        assert_eq!(c.dep, live.deployment);
         assert_eq!(
             (c.typ.as_str(), c.aud.as_str()),
             (WORKLOAD_TYP, INTERNAL_AUDIENCE)

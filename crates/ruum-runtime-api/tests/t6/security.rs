@@ -458,10 +458,17 @@ async fn bound_content_only_at_every_edge() {
         .deploy(&owner, seed.app, &manifest(&[], ""), None)
         .await
         .unwrap();
-    w.publish(&owner, seed.app, dep).await.unwrap();
-    let (wr, aj) = (&w, &a_jpg);
+    let dep = w.publish(&owner, seed.app, dep).await.unwrap();
+    // The new live deployment's token (its instances get one) reads nothing of the dropped
+    // binding; the old deployment's token no longer serves at all.
+    let nt = w.token_for(&seed, dep, Env::Live);
+    let (wr, aj, ntr) = (&w, &a_jpg, &nt);
     within_5s("the dropped binding refused", move || async move {
-        content(wr, aj, t).await.status == 403
+        content(wr, aj, ntr).await.status == 403
+    })
+    .await;
+    within_5s("the old deployment's token refused", move || async move {
+        content(wr, aj, t).await.status == 401
     })
     .await;
     let still = w
@@ -526,26 +533,290 @@ async fn stale_principals_are_refused() {
         wr.get("/v1/self", t2r).await.unwrap().status == 401
     })
     .await;
-    // A trashed app (the provider hook runs in the delivery worker's round).
-    let live = w.workload_token(&app, Env::Live).await.unwrap();
-    assert_eq!(w.get("/v1/self", live.expose()).await.unwrap().status, 200);
+    // A replaced live deployment (Kimi review 1): the old live token stops, the new one works.
+    let old = w.token_for(&seed, seed.live, Env::Live);
+    let doc = node(&app, "doc");
+    assert_eq!(w.get("/v1/self", &old).await.unwrap().status, 200);
+    assert_eq!(content(&w, &doc, &old).await.status, 200);
+    let next = w
+        .deploy(
+            &owner,
+            seed.app,
+            &manifest(
+                &[format!(
+                    "  doc:\n    node: \"node:{doc}\"\n    role: view\n"
+                )],
+                "",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    let next = w.publish(&owner, seed.app, next).await.unwrap();
+    let new = w.token_for(&seed, next, Env::Live);
+    let (oldr, newr) = (&old, &new);
+    within_5s("the replaced live deployment refused", move || async move {
+        let r = wr.get("/v1/self", oldr).await.unwrap();
+        r.status == 401 && code(&r) == "unauthenticated"
+    })
+    .await;
+    refused_with(
+        &content(&w, &doc, &old).await,
+        401,
+        "unauthenticated",
+        "the replaced live deployment reads",
+    );
+    let r = w.get("/v1/self", newr).await.unwrap();
+    assert_eq!(r.status, 200, "the new live deployment: {}", r.text());
+    assert_eq!(
+        r.json().unwrap()["deployment_id"],
+        json!(next.to_string()),
+        "the new live deployment's self"
+    );
+    assert_eq!(content(&w, &doc, &new).await.status, 200);
+    // A trashed app: refused within 5 s without waiting for the provider hook (no delivery
+    // round runs in this test).
     w.state
         .services
         .nodes
         .trash(&owner, seed.app, None)
         .await
         .unwrap();
-    w.deliver().await.unwrap();
-    let lt = live.expose();
     within_5s("the trashed app refused", move || async move {
-        wr.get("/v1/self", lt).await.unwrap().status == 401
+        wr.get("/v1/self", newr).await.unwrap().status == 401
     })
     .await;
     refused_with(
-        &content(&w, &node(&app, "doc"), live.expose()).await,
+        &content(&w, &doc, &new).await,
         401,
         "unauthenticated",
         "a trashed app reads",
+    );
+}
+
+/// Review of R-3, required change 1: the core's internal routes for the runtime API trust no
+/// caller that a peer sends. Without the app's token, or with a token of another tenant than
+/// the body names, each route is `401`; the same request with the right token is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_core_routes_take_the_caller_only_from_the_token() {
+    let w = World::new().await.unwrap();
+    let acme = w
+        .seed_app("acme", "garden", &[file("doc", false)])
+        .await
+        .unwrap();
+    let globex = w
+        .seed_app("globex", "garden", &[file("doc", false)])
+        .await
+        .unwrap();
+    let (sa, sg) = (w.seed(&acme).unwrap(), w.seed(&globex).unwrap());
+    let at = w.token_for(&sa, sa.live, Env::Live);
+    let gt = w.token_for(&sg, sg.live, Env::Live);
+    let caller = |s: &AppSeed| {
+        json!({
+            "tenant_id": s.tenant,
+            "app_id": s.app,
+            "principal": s.app.0,
+            "deployment_id": s.live,
+            "environment": "live",
+        })
+    };
+    let acme_caller = caller(&sa);
+    // principal: no token, globex's token, a garbage token; then acme's own token.
+    assert_eq!(w.core_route("/principal", None, &acme_caller).await.0, 401);
+    assert_eq!(
+        w.core_route("/principal", Some(&gt), &acme_caller).await.0,
+        401,
+        "globex's token with acme's caller"
+    );
+    assert_eq!(
+        w.core_route("/principal", Some("not.a.token"), &acme_caller)
+            .await
+            .0,
+        401
+    );
+    let (status, body) = w.core_route("/principal", Some(&at), &acme_caller).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["state"], "serving");
+    assert_eq!(v["app"]["app_id"], json!(sa.app.to_string()));
+    // content: acme's bound file asked with globex's token and acme's caller.
+    let read = json!({
+        "caller": acme_caller,
+        "node_id": node(&acme, "doc"),
+        "delegation": null,
+    });
+    assert_eq!(w.core_route("/content", None, &read).await.0, 401);
+    assert_eq!(
+        w.core_route("/content", Some(&gt), &read).await.0,
+        401,
+        "globex's token reads acme's file"
+    );
+    let (status, body) = w.core_route("/content", Some(&at), &read).await;
+    assert_eq!((status, body.as_str()), (200, "R3-doc"));
+    // A delegation in the body never comes from a workload token: the read is the app's own.
+    let forged = json!({
+        "caller": acme_caller,
+        "node_id": node(&acme, "doc"),
+        "delegation": { "bindings": ["doc"], "user": Uuid::now_v7(), "agent": null },
+    });
+    assert_eq!(w.core_route("/content", Some(&at), &forged).await.0, 200);
+    // exchange, holders and topic: no token and a foreign token are refused.
+    let ex = json!({ "caller": acme_caller, "sub": "x", "actor": "user", "on_behalf_of": null });
+    let holders = json!({ "caller": acme_caller, "role": "member", "cursor": null, "limit": 10 });
+    let topic = json!({ "caller": acme_caller, "topic": "orders" });
+    for (route, body) in [
+        ("/exchange", &ex),
+        ("/holders", &holders),
+        ("/topic", &topic),
+    ] {
+        assert_eq!(w.core_route(route, None, body).await.0, 401, "{route}");
+        assert_eq!(w.core_route(route, Some(&gt), body).await.0, 401, "{route}");
+        assert_eq!(w.core_route(route, Some(&at), body).await.0, 200, "{route}");
+    }
+}
+
+/// `getAppSelf` names a binding's role as the manifest does (`view`), not as the graph does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_self_names_roles_as_the_manifest() {
+    let w = World::new().await.unwrap();
+    let app = w
+        .seed_app("acme", "garden", &[file("doc", false)])
+        .await
+        .unwrap();
+    let wt = w.workload_token(&app, Env::Live).await.unwrap();
+    let r = w.get("/v1/self", wt.expose()).await.unwrap();
+    assert_eq!(r.status, 200);
+    let v = r.json().unwrap();
+    assert_eq!(v["bindings"][0]["name"], "doc", "{v}");
+    assert_eq!(v["bindings"][0]["role"], "view", "{v}");
+}
+
+/// Review of R-3, required change 3: a request body that trickles in is cut off with `408`
+/// after the body deadline, and its permit is free again; a normal body in the same world is
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_body_is_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = World::with(Opts {
+        caps: Some(Caps {
+            per_app: 1,
+            body_timeout: Duration::from_millis(700),
+            ..Caps::default()
+        }),
+        ..Opts::default()
+    })
+    .await
+    .unwrap();
+    let app = w
+        .seed_app("acme", "garden", &[file("doc", true)])
+        .await
+        .unwrap();
+    let seed = w.seed(&app).unwrap();
+    let wt = w.workload_token(&app, Env::Live).await.unwrap();
+    // A normal body.
+    let user = w.visitor(&seed).await.unwrap();
+    let ut = w
+        .user_token_of(&seed, Env::Live, user, "user")
+        .await
+        .unwrap();
+    let r = w.exchange(wt.expose(), ut.expose()).await.unwrap();
+    assert_eq!(r.status, 200, "a normal exchange: {}", r.text());
+    // A body that never arrives in full.
+    let mut s = tokio::net::TcpStream::connect(w.runtime).await.unwrap();
+    let head = format!(
+        "POST /v1/token/exchange HTTP/1.1\r\nHost: ruum.internal\r\nAuthorization: Bearer {}\r\n\
+         Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{",
+        wt.expose()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    // While it trickles, it holds the app's one permit.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    refused_with(
+        &w.get("/v1/self", wt.expose()).await.unwrap(),
+        429,
+        "rate_limited",
+        "the permit held by the slow body",
+    );
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .expect("the slow body was not cut off")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]);
+    assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    // The permit is free again.
+    assert_eq!(w.get("/v1/self", wt.expose()).await.unwrap().status, 200);
+}
+
+/// One `GET /v1/self` from the source address `from`, on a fresh connection: the status, or
+/// `None` when the server closed the connection without an answer.
+async fn raw_self(to: std::net::SocketAddr, from: &str, token: &str) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(format!("{from}:0").parse().unwrap()).unwrap();
+    let mut s = sock.connect(to).await.unwrap();
+    let req = format!(
+        "GET /v1/self HTTP/1.1\r\nHost: ruum.internal\r\nAuthorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let _ = s.write_all(req.as_bytes()).await;
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    let text = String::from_utf8_lossy(&buf);
+    text.strip_prefix("HTTP/1.1 ")
+        .and_then(|t| t.get(..3))
+        .and_then(|c| c.parse().ok())
+}
+
+/// Kimi review 4: with a caller network lookup, one tenant's connections stop at its share,
+/// and another tenant still gets in; when the first tenant's connections end, it gets in again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_tenant_cannot_hold_every_connection() {
+    let net = Arc::new(MemoryCallerNetwork::new());
+    let w = World::with(Opts {
+        caps: Some(Caps {
+            connections_per_tenant: 2,
+            ..Caps::default()
+        }),
+        network: Some(net.clone()),
+    })
+    .await
+    .unwrap();
+    let a = w.seed_app("acme", "garden", &[]).await.unwrap();
+    let b = w.seed_app("globex", "garden", &[]).await.unwrap();
+    let (sa, sb) = (w.seed(&a).unwrap(), w.seed(&b).unwrap());
+    let ident = |s: &AppSeed| NetworkIdentity {
+        tenant: s.tenant,
+        app: s.app,
+        environment: None,
+    };
+    net.set("127.0.0.1".parse().unwrap(), ident(&sa));
+    net.set("127.0.0.2".parse().unwrap(), ident(&sb));
+    let ta = w.workload_token(&a, Env::Live).await.unwrap();
+    let tb = w.workload_token(&b, Env::Live).await.unwrap();
+    assert_eq!(
+        raw_self(w.runtime, "127.0.0.1", ta.expose()).await,
+        Some(200)
+    );
+    // Two idle connections of acme fill its share.
+    let hold1 = tokio::net::TcpStream::connect(w.runtime).await.unwrap();
+    let hold2 = tokio::net::TcpStream::connect(w.runtime).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        raw_self(w.runtime, "127.0.0.1", ta.expose()).await,
+        None,
+        "a third connection of acme"
+    );
+    // Globex is not touched by acme's share.
+    assert_eq!(
+        raw_self(w.runtime, "127.0.0.2", tb.expose()).await,
+        Some(200)
+    );
+    drop((hold1, hold2));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        raw_self(w.runtime, "127.0.0.1", ta.expose()).await,
+        Some(200)
     );
 }
 

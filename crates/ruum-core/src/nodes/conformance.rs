@@ -870,7 +870,12 @@ async fn trash_and_restore(w: &World, b: &dyn Backend) {
     let s = b.nodes();
     let bin = mk(b, &m, folder(w.root, "Bin")).await;
     let inner = mk(b, &m, file(bin.id, "inner.txt")).await;
+    // `is_trashed` (no permission check; the runtime API's principal check, card R-3).
+    let g = w.user(w.guest);
+    assert!(!s.is_trashed(&g, bin.id).await.unwrap());
     let t = s.trash(&m, bin.id, Some(1)).await.unwrap();
+    assert!(s.is_trashed(&g, bin.id).await.unwrap());
+    assert!(s.is_trashed(&g, inner.id).await.unwrap());
     assert!(t.change.seq.is_some());
     assert!(t.value.trashed_at.is_some());
     assert!(!names(b, &m, w.root).await.contains(&"Bin".to_string()));
@@ -1147,6 +1152,7 @@ async fn isolation(w: &World, b: &dyn Backend) {
         "404"
     );
     assert_eq!(code(s.ancestors(&ob, secret.id).await), "404");
+    assert_eq!(code(s.is_trashed(&ob, secret.id).await), "404");
     assert_eq!(code(s.trash(&ob, secret.id, None).await), "404");
     assert_eq!(
         code(

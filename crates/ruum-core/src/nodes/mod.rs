@@ -430,4 +430,14 @@ pub trait NodeStore: Send + Sync {
     /// The ancestors of a node, root first, without the node. No permission check: for
     /// [`crate::authz::require`] (scope subtrees) and the changes feed.
     async fn ancestors(&self, ctx: &Context, id: NodeId) -> Result<Vec<NodeId>>;
+    /// Whether a node of the context's tenant is in the trash (its own `trashed_at`; a trash
+    /// marks the whole subtree). No permission check: for the runtime API's check that an app
+    /// still serves (card R-3). `not_found` when the node does not exist in the tenant. Stores
+    /// that do not answer it refuse (fail closed).
+    async fn is_trashed(&self, ctx: &Context, id: NodeId) -> Result<bool> {
+        let _ = (ctx, id);
+        Err(crate::error::Error::Internal(
+            "nodes: is_trashed is not supported here".into(),
+        ))
+    }
 }
