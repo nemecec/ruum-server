@@ -521,7 +521,6 @@ pub async fn exchange(
             return Err(denied("no binding of this app acts for the user")
                 .hint("bindings need on_behalf_of_user"));
         }
-        ExchangeAnswer::ActorRefused => return Err(denied("this actor cannot be exchanged")),
         ExchangeAnswer::UnknownUser => {
             return Err(unauthenticated("the user token names nobody of this space"));
         }

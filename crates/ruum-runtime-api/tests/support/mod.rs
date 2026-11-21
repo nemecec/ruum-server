@@ -593,6 +593,22 @@ impl World {
         .await
     }
 
+    /// Writes (or deletes) the binding tuple `node:N#viewer@app:<principal>` by hand, without a
+    /// binding row (tests of the row and tuple rule).
+    pub async fn app_tuple(&self, principal: Uuid, node: NodeId, add: bool) -> WorldResult<()> {
+        let r = Relationship {
+            object: ObjectRef::node(node),
+            relation: Role::View.relation().into(),
+            subject: SubjectRef::object(ObjectRef::new("app", principal)),
+        };
+        self.write(if add {
+            RelationshipUpdate::Touch(r)
+        } else {
+            RelationshipUpdate::Delete(r)
+        })
+        .await
+    }
+
     async fn write(&self, u: RelationshipUpdate) -> WorldResult<()> {
         self.state
             .services

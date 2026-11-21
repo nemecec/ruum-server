@@ -840,3 +840,74 @@ async fn the_default_caps_let_requests_through() {
     assert_eq!(w.get("/v1/self", wt.expose()).await.unwrap().status, 200);
     let _: &Context = &World::ctx(w.seed(&app).unwrap().tenant, w.seed(&app).unwrap().owner);
 }
+
+/// Both the binding row and its tuple are needed: a tuple without a row (written by hand) reads
+/// nothing, and a row whose tuple is gone reads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_row_and_the_tuple_are_both_needed() {
+    let w = World::new().await.unwrap();
+    let app = w
+        .seed_app("acme", "garden", &[file("doc", false)])
+        .await
+        .unwrap();
+    let seed = w.seed(&app).unwrap();
+    let owner = World::ctx(seed.tenant, seed.owner);
+    let wt = w.workload_token(&app, Env::Live).await.unwrap();
+    let doc = node(&app, "doc");
+    assert_eq!(content(&w, &doc, wt.expose()).await.status, 200);
+    let root = w.root(seed.tenant).await.unwrap();
+    let stray = w
+        .file(&owner, root, "stray.txt", b"R3-stray")
+        .await
+        .unwrap();
+    w.app_tuple(seed.app.0, stray, true).await.unwrap();
+    refused_with(
+        &content(&w, &stray.to_string(), wt.expose()).await,
+        403,
+        "permission_denied",
+        "a tuple without a row",
+    );
+    w.app_tuple(seed.app.0, NodeId(doc.parse().unwrap()), false)
+        .await
+        .unwrap();
+    refused_with(
+        &content(&w, &doc, wt.expose()).await,
+        403,
+        "permission_denied",
+        "a row without its tuple",
+    );
+}
+
+/// Headers never choose the tenant or the app: a globex app that names acme's tenant and app in
+/// `Ruum-*` headers reads acme's bound file exactly as a missing node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headers_never_choose_the_tenant() {
+    let w = World::new().await.unwrap();
+    let acme = w
+        .seed_app("acme", "garden", &[file("doc", false)])
+        .await
+        .unwrap();
+    let globex = w
+        .seed_app("globex", "garden", &[file("doc", false)])
+        .await
+        .unwrap();
+    let (sa, sg) = (w.seed(&acme).unwrap(), w.seed(&globex).unwrap());
+    let gt = w.workload_token(&globex, Env::Live).await.unwrap();
+    let mine = node(&globex, "doc");
+    let theirs = node(&acme, "doc");
+    assert_eq!(content(&w, &mine, gt.expose()).await.status, 200);
+    let with_headers = |n: &str| {
+        Req::get(INTERNAL_HOST, &format!("/v1/nodes/{n}/content"))
+            .header("Authorization", &format!("Bearer {}", gt.expose()))
+            .header("Ruum-Tenant", &sa.tenant.to_string())
+            .header("Ruum-App", &sa.app.to_string())
+            .header("X-Forwarded-For", "10.0.0.9")
+    };
+    let a = w.send(with_headers(&theirs)).await.unwrap();
+    let b = content(&w, &Uuid::now_v7().to_string(), gt.expose()).await;
+    refused_with(&a, 404, "not_found", "acme's file with acme's headers");
+    assert_eq!(a.body, b.body);
+    // The headers do not stop globex's own reads either.
+    assert_eq!(w.send(with_headers(&mine)).await.unwrap().status, 200);
+    let _ = sg;
+}

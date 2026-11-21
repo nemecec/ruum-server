@@ -184,7 +184,9 @@ pub mod wire {
         pub caller: Caller,
         /// The user token's `sub` (a pairwise subject).
         pub sub: String,
-        /// `user` or `agent` (the runtime API refuses the others before it asks).
+        /// `user` or `agent`: the runtime API refuses every other actor before it asks (the
+        /// actor rule is the runtime API's; an `agent` is mapped through `on_behalf_of`, any
+        /// other value as a person).
         pub actor: String,
         /// The user token's `on_behalf_of` (the user of an agent).
         pub on_behalf_of: Option<String>,
@@ -203,8 +205,6 @@ pub mod wire {
         },
         /// No binding allows acting for the user.
         NoBinding,
-        /// The actor is not `user` or `agent`.
-        ActorRefused,
         /// The token's subject is not a person (or agent) of the tenant.
         UnknownUser,
         Gone,
@@ -449,6 +449,34 @@ pub fn topic_declared(manifest: &Value, topic: &str) -> bool {
         })
 }
 
+/// The active binding rows of the caller's principal. The store filters by the caller's tenant
+/// (its statement's `tenant_id = $1`; the mutation `runtime-api-tenant-filter-postgres` drops
+/// it), the app and the principal; this keeps only rows of that app and principal.
+pub async fn bound_rows(
+    store: &dyn crate::apps::store::AppStore,
+    c: &Caller,
+) -> Result<Vec<BindingRow>> {
+    store
+        .list_bindings(
+            c.tenant_id,
+            &BindingQuery {
+                app: Some(c.app_id),
+                principal: Some(c.principal),
+                active_only: true,
+                limit: ROWS_PER_PRINCIPAL,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| {
+                    r.principal_id == c.principal && r.app_node_id == c.app_id && r.is_active()
+                })
+                .collect()
+        })
+}
+
 impl RuntimeApiService {
     pub fn new(s: &Services) -> Self {
         Self {
@@ -513,31 +541,9 @@ impl RuntimeApiService {
         Ok(Some((app, dep)))
     }
 
-    /// The active rows of the principal (tenant, app and principal filtered by the store).
+    /// The active rows of the principal ([`bound_rows`]).
     pub async fn active_rows(&self, c: &Caller) -> Result<Vec<BindingRow>> {
-        self.apps()
-            .store()
-            .list_bindings(
-                c.tenant_id,
-                &BindingQuery {
-                    app: Some(c.app_id),
-                    principal: Some(c.principal),
-                    active_only: true,
-                    limit: ROWS_PER_PRINCIPAL,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map(|rows| {
-                rows.into_iter()
-                    .filter(|r| {
-                        r.tenant_id == c.tenant_id
-                            && r.principal_id == c.principal
-                            && r.app_node_id == c.app_id
-                            && r.is_active()
-                    })
-                    .collect()
-            })
+        bound_rows(&**self.apps().store(), c).await
     }
 
     /// `getAppSelf` (`POST /principal`).
@@ -781,9 +787,6 @@ impl RuntimeApiService {
         let Some((_, dep)) = self.serving(c).await? else {
             return Ok(ExchangeAnswer::Gone);
         };
-        if q.actor != "user" && q.actor != "agent" {
-            return Ok(ExchangeAnswer::ActorRefused);
-        }
         let mut bindings: Vec<String> = self
             .active_rows(c)
             .await?
