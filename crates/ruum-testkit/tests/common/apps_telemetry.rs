@@ -1239,7 +1239,8 @@ pub fn cases() -> Vec<Case> {
             "a trace runs through W and app X in Private: owner (edit on both) sees X's span in \
              full (positive control); guest_edit (edit on W only) sees X's spans as one opaque \
              span without attributes or name; with an edit grant on X it sees them in full; \
-             after the grant is removed, opaque again; a trace ID without a record of W is 404",
+             after the grant is removed, opaque again; a trace ID without a record of W is 404; \
+             5000 older spans of X in a trace do not crowd out W's span",
             |cx| {
                 let a = cx.a().clone();
                 let w = a.app.to_string();
@@ -1357,6 +1358,38 @@ pub fn cases() -> Vec<Case> {
                 cx.ok(Who::Owner, trace(&a, &x, &only_x), &[200]).await?;
                 cx.refused(Who::Owner, trace(&a, &w, &only_x), 404, &[])
                     .await?;
+                // Review O-2 (Kimi 4): X writes a read's worth of older spans into a trace
+                // before W's span; W's trace still has W's span (X cannot crowd it out).
+                let crowded = hex(32);
+                let root = hex(16);
+                ingest(
+                    &cx,
+                    &source_of(&a, &x, Uuid::now_v7())?,
+                    Batch {
+                        spans: (0..5000)
+                            .map(|_| span(&crowded, &hex(16), None, "flood", &[]))
+                            .collect(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                ingest(
+                    &cx,
+                    &w_source(&a),
+                    Batch {
+                        spans: vec![span(&crowded, &root, None, "checkout", &[])],
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let t = cx
+                    .ok(Who::GuestEdit, trace(&a, &w, &crowded), &[200])
+                    .await?;
+                check!(
+                    span_by(&t, &root).is_some_and(|s| s["opaque"] == false),
+                    "W's span is in a trace that X flooded: {t}"
+                );
+                opaque(&t)?;
                 Ok(())
             }
         ),
@@ -1365,7 +1398,8 @@ pub fn cases() -> Vec<Case> {
             ["computeAppPseudonym", "searchAppLogs", "createApp"],
             "an agent gets 403 user_required; a person's pseudonym of a value equals the one the \
              pipeline stored (searchAppLogs?q=p_... finds the record) and differs for another \
-             app; a secret field answers the hidden marker; a person over the rate limit gets 429",
+             app; an Idempotency-Key keeps nothing (the same key with another value computes \
+             again); a secret field answers the hidden marker; a person over the rate limit gets 429",
             |cx| {
                 let a = cx.a().clone();
                 let w = a.app.to_string();
@@ -1415,6 +1449,29 @@ pub fn cases() -> Vec<Case> {
                 check!(
                     q["id"] != p["id"],
                     "another app gives another pseudonym: {p} {q}"
+                );
+                // Review O-2, 3: the idempotency layer keeps nothing of this call (no hash of the
+                // value). The same key with another value is a new call, not a replay or 409.
+                let key = Uuid::new_v4().to_string();
+                let k1 = cx
+                    .ok(
+                        Who::Member,
+                        pseudonym(&a, &x, "customer", "kati@example.test")
+                            .header("idempotency-key", key.clone()),
+                        &[200],
+                    )
+                    .await?;
+                let k2 = cx
+                    .ok(
+                        Who::Member,
+                        pseudonym(&a, &x, "customer", "mari@example.test")
+                            .header("idempotency-key", key),
+                        &[200],
+                    )
+                    .await?;
+                check!(
+                    k1["id"] == q["id"] && k2["id"] != k1["id"],
+                    "the same Idempotency-Key with another value computes again: {k1} {k2}"
                 );
                 let s = cx
                     .ok(
