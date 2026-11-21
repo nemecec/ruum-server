@@ -252,6 +252,7 @@ pub fn install_apps(
     // and then every few minutes. The runtime driver stays the in-memory one until the runtime
     // cards (R-2a, I-4).
     let blob = ruum_core::blobs::object::S3Settings::from_env();
+    let mut move_from = None;
     let var = |name: &str| std::env::var(name).ok();
     match ruum_core::apps::static_links::bucket_settings(blob.as_ref(), &var)
         .map_err(anyhow::Error::msg)?
@@ -263,14 +264,10 @@ pub fn install_apps(
             parts.sites = ruum_core::apps::static_site::StaticSites::s3(store);
             tracing::info!(bucket = %s3.bucket, "static sites: the static bucket");
             if let Some(b) = &blob {
-                let from = b
-                    .build()
-                    .context("set up the blob bucket to move static sites from")?;
-                tokio::spawn(ruum_core::apps::static_links::run_moves(
-                    Arc::new(from),
-                    parts.sites.clone(),
-                    ruum_core::apps::static_links::MOVE_EVERY,
-                ));
+                move_from = Some(
+                    b.build()
+                        .context("set up the blob bucket to move static sites from")?,
+                );
             }
         }
         None if blob.is_some() => tracing::warn!(
@@ -280,6 +277,13 @@ pub fn install_apps(
         None => {}
     }
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
+    if let Some(from) = move_from {
+        tokio::spawn(ruum_core::apps::static_links::run_moves(
+            Arc::new(from),
+            services.apps.clone(),
+            ruum_core::apps::static_links::MOVE_EVERY,
+        ));
+    }
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));
     Ok(())
 }

@@ -314,6 +314,14 @@ pub mod gateway {
             Ok(_) => return StatusCode::NOT_FOUND.into_response(),
             Err(e) => return failed("static", e),
         }
+        // The host lookup leaves trashed apps out, but a gateway that calls this route directly
+        // does not go through it (Kimi review of I6-3D, 1): the trash and a stopped provider
+        // state are checked here too, as the runtime API does.
+        match app_stopped(&s, q.tenant_id, q.app_id).await {
+            Ok(false) => {}
+            Ok(true) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return failed("static", e),
+        }
         if ruum_core::apps::static_site::request_path(&q.path).is_none() {
             return StatusCode::BAD_REQUEST.into_response();
         }
@@ -328,6 +336,43 @@ pub mod gateway {
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
             Err(e) => failed("static", e),
         }
+    }
+
+    /// Whether the app node is in the trash, gone, or its provider state stops it (suspended,
+    /// deleted, failed): the rule of the runtime API's serving check.
+    async fn app_stopped(s: &AppState, tenant: TenantId, app: NodeId) -> ruum_core::Result<bool> {
+        use ruum_core::actor::{Actor, Context, PrincipalKind, PrincipalRef};
+        use ruum_core::providers::ProviderState;
+        let ctx = Context {
+            tenant,
+            actor: Actor {
+                actor: PrincipalRef {
+                    kind: PrincipalKind::App,
+                    id: ruum_core::ids::PrincipalId(app.0),
+                },
+                on_behalf_of: None,
+            },
+            scope: None,
+            idempotency_key: None,
+        };
+        match s.services.nodes.is_trashed(&ctx, app).await {
+            Ok(false) => {}
+            Ok(true) => return Ok(true),
+            Err(ruum_core::Error::Api(a)) if a.code == ruum_core::error::ErrorCode::NotFound => {
+                return Ok(true);
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(s.services
+            .typed_nodes
+            .get(tenant, app)
+            .await?
+            .is_some_and(|t| {
+                matches!(
+                    t.state,
+                    ProviderState::Suspended | ProviderState::Deleted | ProviderState::Failed
+                )
+            }))
     }
 
     async fn deployment(State(s): State<AppState>, Json(q): Json<DeploymentQuery>) -> Response {
@@ -1215,6 +1260,8 @@ mod tests {
         struct Seed {
             query: UpstreamQuery,
             other_tenant: ruum_core::TenantId,
+            /// The tenant owner's context (to trash the app).
+            owner: Context,
         }
 
         async fn seed(state: &AppState, runtime: &str) -> Seed {
@@ -1306,6 +1353,7 @@ mod tests {
                 },
                 // The owner's personal tenant: a real tenant that does not own the app.
                 other_tenant: owner.home_tenant_id,
+                owner: ctx,
             }
         }
 
@@ -1542,6 +1590,66 @@ mod tests {
                     ask_static(&app, &bad).await,
                     (StatusCode::BAD_REQUEST, None),
                     "{path}"
+                );
+            }
+        }
+
+        /// A static deployment that no longer serves (a failed preview) and an app in the trash
+        /// get no link, although their files are still stored (Kimi review of I6-3D, 1 and 4).
+        #[tokio::test]
+        async fn the_static_route_refuses_non_serving_and_trashed_apps() {
+            use ruum_core::identity::app_sign_in::wire::StaticQuery;
+            let state = AppState::in_memory();
+            let sites = state.services.apps.sites().clone();
+            sites
+                .memory_links()
+                .unwrap()
+                .set_base("http://127.0.0.1:1/o".parse().unwrap());
+            let files = vec![(
+                "index.html".to_string(),
+                bytes::Bytes::from_static(b"I6-3D page"),
+            )];
+            let failed = seed(&state, "static").await;
+            let trashed = seed(&state, "static").await;
+            let ask_of = |q: &UpstreamQuery| StaticQuery {
+                tenant_id: q.tenant_id,
+                app_id: q.app_id,
+                deployment_id: q.deployment_id,
+                path: "/".into(),
+                navigation: true,
+            };
+            for s in [&failed, &trashed] {
+                sites
+                    .write_site(s.query.tenant_id, s.query.deployment_id, &files, None)
+                    .await
+                    .unwrap();
+            }
+            let app = routes(state.clone());
+            for s in [&failed, &trashed] {
+                assert_eq!(ask_static(&app, &ask_of(&s.query)).await.0, StatusCode::OK);
+            }
+            state
+                .services
+                .apps
+                .store()
+                .set_deployment_state(
+                    failed.query.tenant_id,
+                    failed.query.deployment_id,
+                    DeploymentState::Failed,
+                )
+                .await
+                .unwrap();
+            state
+                .services
+                .nodes
+                .trash(&trashed.owner, trashed.query.app_id, None)
+                .await
+                .unwrap();
+            for (what, s) in [("failed", &failed), ("trashed", &trashed)] {
+                assert_eq!(
+                    ask_static(&app, &ask_of(&s.query)).await,
+                    (StatusCode::NOT_FOUND, None),
+                    "{what}"
                 );
             }
         }

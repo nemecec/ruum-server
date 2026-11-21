@@ -35,7 +35,9 @@
 //!
 //! Releases before I6-3D wrote sites to the blob bucket under `apps/static/`. [`move_sites`]
 //! copies each such object into the static bucket (file objects first, the indexes last, as a
-//! site is written) and deletes it from the blob bucket only after every copy succeeded. The
+//! site is written), one tenant at a time under the tenant's site lock (so the garbage
+//! collection does not run on it meanwhile), and deletes it from the blob bucket only after every
+//! copy of the tenant succeeded and each copied file is checked in the static bucket. The
 //! server runs it at start and then every [`MOVE_EVERY`] ([`run_moves`]), so a site that a
 //! server of the previous release writes during a rolling upgrade moves too. The copies are
 //! new objects, younger than the grace period of the garbage collection, so the collection
@@ -44,14 +46,18 @@
 //! may still run (a rolling upgrade, as the garbage collection assumes,
 //! [`super::static_gc::STATIC_GC_FIRST_DELAY`]).
 
+use super::AppService;
+use super::static_gc::SITE_LOCK_WAIT;
 use super::static_site::{ROOT_PREFIX, StaticSites};
 use crate::blobs::object::S3Settings;
 use crate::error::{Error, Result};
+use crate::ids::TenantId;
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use url::Url;
@@ -282,65 +288,130 @@ async fn copy_object(
 
 /// Copies every object under `apps/static/` of `from` (the blob bucket) into the store of
 /// `sites` (the static bucket) and, when `delete`, then deletes the copied objects from `from`;
-/// see the module docs. Nothing is deleted when a copy fails. Objects that are not under the
-/// prefix (the chunks of tenants' files) are never read.
+/// see the module docs. Without a lock: for tests and a server that runs no garbage collection
+/// of static sites. The server calls [`AppService::move_sites_locked`].
 pub async fn move_sites(
     from: Arc<dyn ObjectStore>,
     sites: &StaticSites,
     delete: bool,
 ) -> Result<MoveReport> {
-    let to = sites.store();
-    let mut report = MoveReport::default();
-    let mut files = Vec::new();
-    let mut indexes = Vec::new();
+    move_sites_with(from, sites, delete, None).await
+}
+
+/// The objects under `apps/static/` of `from`, by tenant (the third path segment when it is a
+/// tenant ID; `None` for any other name).
+async fn objects_by_tenant(
+    from: &Arc<dyn ObjectStore>,
+) -> Result<BTreeMap<Option<TenantId>, Vec<object_store::ObjectMeta>>> {
+    let mut by_tenant: BTreeMap<Option<TenantId>, Vec<object_store::ObjectMeta>> = BTreeMap::new();
     let mut list = from.list(Some(&Path::from(ROOT_PREFIX)));
     while let Some(meta) = list.next().await {
         let meta = meta?;
-        let is_index = meta
+        let tenant = meta
             .location
             .parts()
-            .nth(3)
-            .is_some_and(|p| p.as_ref() == "sites");
-        if is_index {
-            indexes.push(meta);
-        } else {
-            files.push(meta);
+            .nth(2)
+            .and_then(|p| p.as_ref().parse::<uuid::Uuid>().ok())
+            .map(TenantId);
+        by_tenant.entry(tenant).or_default().push(meta);
+    }
+    Ok(by_tenant)
+}
+
+/// The move of [`move_sites`], one tenant at a time; with `apps`, under that tenant's site lock
+/// held shared (as a deployment that writes a site holds it), so the garbage collection, which
+/// takes it exclusively, never runs on the tenant while its sites move (Kimi review of I6-3D, 3:
+/// a move longer than the grace period could lose files whose index had not arrived yet). Per
+/// tenant: every file object is copied, then every index, then (when `delete`) each copied file
+/// is checked in the static bucket (copied again from the blob bucket when it is missing) before
+/// the copied objects are deleted from the blob bucket. Nothing of a tenant is deleted when one
+/// of its copies fails. Objects outside the prefix (the chunks of tenants' files) are never read.
+async fn move_sites_with(
+    from: Arc<dyn ObjectStore>,
+    sites: &StaticSites,
+    delete: bool,
+    apps: Option<&AppService>,
+) -> Result<MoveReport> {
+    let to = sites.store();
+    let mut report = MoveReport::default();
+    for (tenant, metas) in objects_by_tenant(&from).await? {
+        let _lock = match (apps, tenant) {
+            (Some(a), Some(t)) => Some(a.lock_sites(t, false, SITE_LOCK_WAIT).await?),
+            _ => None,
+        };
+        let (indexes, files): (Vec<_>, Vec<_>) = metas.into_iter().partition(|m| {
+            m.location
+                .parts()
+                .nth(3)
+                .is_some_and(|p| p.as_ref() == "sites")
+        });
+        // Every object is copied, also one that the static bucket has already: the copy is a
+        // new object, younger than the grace period of the garbage collection.
+        let mut done = Vec::new();
+        let mut copied_files = Vec::new();
+        for (is_index, meta) in files
+            .into_iter()
+            .map(|m| (false, m))
+            .chain(indexes.into_iter().map(|m| (true, m)))
+        {
+            if copy_object(&from, &to, &meta.location).await? {
+                report.copied += 1;
+                report.bytes = report.bytes.saturating_add(meta.size);
+                if !is_index {
+                    copied_files.push(meta.location.clone());
+                }
+                done.push(meta.location);
+            }
         }
-    }
-    drop(list);
-    // Every object is copied, also one that the static bucket has already: the copy is a new
-    // object, so the garbage collection, which deletes only unnamed files older than its grace
-    // period, cannot delete a file whose index is still on its way (a file that the static
-    // bucket had, old and unnamed, could go between a check and the copy of the index).
-    let mut done = Vec::new();
-    for meta in files.into_iter().chain(indexes) {
-        if copy_object(&from, &to, &meta.location).await? {
-            report.copied += 1;
-            report.bytes = report.bytes.saturating_add(meta.size);
-            done.push(meta.location);
+        if !delete {
+            continue;
         }
-    }
-    if !delete {
-        return Ok(report);
-    }
-    for path in done {
-        match from.delete(&path).await {
-            Ok(()) => report.deleted += 1,
-            Err(object_store::Error::NotFound { .. }) => {}
-            Err(e) => return Err(e.into()),
+        // Each copied file is still in the static bucket before its source goes.
+        for path in &copied_files {
+            match to.head(path).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {
+                    if !copy_object(&from, &to, path).await? {
+                        return Err(Error::Internal(format!(
+                            "a moved static file is gone from both buckets: {path}"
+                        )));
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for path in done {
+            match from.delete(&path).await {
+                Ok(()) => report.deleted += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     Ok(report)
 }
 
-/// Runs [`move_sites`] now and then every `every`, for the life of the server; it deletes from
-/// the blob bucket only from [`MOVE_DELETE_AFTER`] after the start on. A failed run is logged
-/// and tried again at the next round.
-pub async fn run_moves(from: Arc<dyn ObjectStore>, sites: StaticSites, every: Duration) {
+impl AppService {
+    /// [`move_sites`] from `from` into this service's sites, each tenant under its site lock
+    /// (see [`move_sites_with`]).
+    pub async fn move_sites_locked(
+        &self,
+        from: Arc<dyn ObjectStore>,
+        delete: bool,
+    ) -> Result<MoveReport> {
+        let sites = self.sites().clone();
+        move_sites_with(from, &sites, delete, Some(self)).await
+    }
+}
+
+/// Runs [`AppService::move_sites_locked`] now and then every `every`, for the life of the
+/// server; it deletes from the blob bucket only from [`MOVE_DELETE_AFTER`] after the start on.
+/// A failed run is logged and tried again at the next round.
+pub async fn run_moves(from: Arc<dyn ObjectStore>, apps: Arc<AppService>, every: Duration) {
     let started = std::time::Instant::now();
     loop {
         let delete = started.elapsed() >= MOVE_DELETE_AFTER;
-        match move_sites(from.clone(), &sites, delete).await {
+        match apps.move_sites_locked(from.clone(), delete).await {
             Ok(r) if r.copied + r.deleted > 0 => tracing::info!(
                 target: "ruum::apps",
                 copied = r.copied,
@@ -586,6 +657,45 @@ mod tests {
         // Sites without links serve nothing.
         let bare = StaticSites::new(sites.store());
         assert!(bare.file_link(t, d, "/", false).await.is_err());
+    }
+
+    /// The server's move holds each tenant's site lock shared, so it waits while the garbage
+    /// collection holds it exclusively (Kimi review of I6-3D, 3).
+    #[tokio::test]
+    async fn the_move_waits_for_the_tenants_site_lock() {
+        let services = crate::Services::in_memory();
+        let apps = services.apps.clone();
+        let blobs: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let t = TenantId(Uuid::now_v7());
+        let d = Uuid::now_v7();
+        StaticSites::new(blobs.clone())
+            .write_site(
+                t,
+                d,
+                &[("index.html".to_string(), Bytes::from_static(b"hi"))],
+                None,
+            )
+            .await
+            .unwrap();
+        let gc = apps
+            .lock_sites(t, true, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let task = tokio::spawn({
+            let apps = apps.clone();
+            let blobs = blobs.clone();
+            async move { apps.move_sites_locked(blobs, true).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "the move ran under the collection's lock"
+        );
+        assert!(apps.sites().read_index(t, d).await.unwrap().is_none());
+        drop(gc);
+        let r = task.await.unwrap().unwrap();
+        assert_eq!((r.copied, r.deleted), (2, 2));
+        assert!(apps.sites().read_index(t, d).await.unwrap().is_some());
     }
 
     #[tokio::test]
