@@ -688,11 +688,23 @@ pub trait AppStore: Send + Sync {
     /// What `slug` is in the tenant for the app node `node`.
     async fn slug_state(&self, tenant: TenantId, slug: &str, node: NodeId) -> Result<SlugState>;
 
-    /// Whether a tenant has the tenant slug `tenant_slug` now and an app row with the slug
-    /// `app_slug` (in any state, also in the trash). Spans tenants: the edge asks it before it
-    /// gets a certificate for an app host (`ruum_api::internal` tls-ask, card I-6), so a name
-    /// that no app has never costs a certificate. It reveals one bit and no ID.
-    async fn app_host_known(&self, tenant_slug: &str, app_slug: &str) -> Result<bool>;
+    /// Whether an app host can serve, so it may get a certificate: a tenant has the tenant slug
+    /// `tenant_slug` now, it has an app with the slug `app_slug` that is not in the trash (the
+    /// in-memory store sees no trash), and
+    /// - without `short_id` (the live host): the app has a live deployment;
+    /// - with `short_id` (a preview host `<short id>--<app>`): a preview of *that* app has that
+    ///   short ID, is `pending`, `running` or `ready` (a fresh preview gets its certificate
+    ///   before its first request) and has not expired.
+    ///
+    /// Spans tenants: the edge asks it before it gets a certificate for an app host
+    /// (`ruum_api::internal` tls-ask, card I-6), so a made-up name (any short ID in front of a
+    /// known app, review of I-6 1) never costs a certificate. It reveals one bit and no ID.
+    async fn app_host_known(
+        &self,
+        tenant_slug: &str,
+        app_slug: &str,
+        short_id: Option<&str>,
+    ) -> Result<bool>;
 
     /// Inserts the row of a new app and records its slug as used, in one unit. `None` when the
     /// slug is taken (by another app, or used before by another app): nothing is written.

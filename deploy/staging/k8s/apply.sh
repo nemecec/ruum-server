@@ -224,9 +224,18 @@ else
 fi
 # The egress proxy: the control token (a file in the pod) and EGRESS_DENY (not secret).
 printf 'control-token=%s\n' "$STG_EGRESS_CONTROL_TOKEN" | secret ruum ruum-egress
+deny_before="$(k -n ruum get configmap ruum-egress-deny -o jsonpath='{.data.deny}' 2>/dev/null || true)"
 k -n ruum create configmap ruum-egress-deny --from-literal="deny=$STG_EGRESS_DENY" --dry-run=client -o yaml |
   k apply -f - >/dev/null
 log "configmap ruum/ruum-egress-deny ($(tr ',' '\n' <<<"$STG_EGRESS_DENY" | wc -l | tr -d ' ') entries)"
+# The proxy reads EGRESS_DENY once, at start (an env value): a changed list needs new pods
+# (review of I-6, Kimi 4). The Deployment exists after the first deploy of the app runtime.
+if [[ "$deny_before" != "$STG_EGRESS_DENY" ]] && k -n ruum get deployment ruum-egress >/dev/null 2>&1; then
+  log "EGRESS_DENY changed: restarting the egress proxy"
+  k -n ruum rollout restart deployment/ruum-egress >/dev/null
+  k -n ruum rollout status deployment/ruum-egress --timeout=5m >/dev/null ||
+    die "the egress proxy did not restart with the new EGRESS_DENY (deploy/staging/tool.sh kubectl -n ruum describe pods -l app=ruum-egress)"
+fi
 
 helmfile --file "$HERE/helmfile.yaml.gotmpl" sync
 

@@ -561,16 +561,31 @@ impl AppStore for PgAppStore {
         Ok(t)
     }
 
-    async fn app_host_known(&self, tenant_slug: &str, app_slug: &str) -> Result<bool> {
-        // Spans tenants (the system flag, for this transaction only); it reads one bit.
+    async fn app_host_known(
+        &self,
+        tenant_slug: &str,
+        app_slug: &str,
+        short_id: Option<&str>,
+    ) -> Result<bool> {
+        // Spans tenants (the system flag, for this transaction only); it reads one bit. The
+        // preview is found by the unique index (tenant_id, short_id).
         let mut tx = begin_system(&self.pool).await?;
         let known: bool = sqlx::query_scalar(
             "select exists (select 1 from tenant_app_settings s \
              join apps a on a.tenant_id = s.tenant_id and a.slug = $2 \
-             where s.slug = $1)",
+             join nodes n on n.tenant_id = a.tenant_id and n.id = a.node_id \
+                 and n.trashed_at is null \
+             where s.slug = $1 and case when $3::text is null \
+                 then a.live_deployment_id is not null \
+                 else exists (select 1 from app_deployments d \
+                     where d.tenant_id = a.tenant_id and d.short_id = $3 \
+                     and d.app_node_id = a.node_id and d.environment = 'preview' \
+                     and d.state in ('pending', 'running', 'ready') \
+                     and (d.expires_at is null or d.expires_at > now())) end)",
         )
         .bind(tenant_slug)
         .bind(app_slug)
+        .bind(short_id)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
