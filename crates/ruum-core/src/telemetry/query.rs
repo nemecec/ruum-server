@@ -1195,7 +1195,8 @@ impl TelemetryService {
     // ------------------------------------------------------------------------ pseudonym
 
     /// `computeAppPseudonym` (`edit`, users only, rate limited): the pseudonym the pipeline
-    /// stores for `value` in a `personal` field of `app` (the same key and function), or the
+    /// stores for `value` in a `personal` field of `app`'s live records (the same key and
+    /// function; a preview has a key of its own, `source_telemetry_key`), or the
     /// hidden-value marker for a `secret` field. The value is never stored, logged or echoed;
     /// the audit log records the lookup with the field name.
     pub async fn pseudonym(

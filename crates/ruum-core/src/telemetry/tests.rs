@@ -838,6 +838,83 @@ fn the_app_key_is_domain_separated() {
     assert_ne!(app_telemetry_key(&other, a).as_bytes(), ka.as_bytes());
 }
 
+/// Kimi run 14, O-2 finding 1 (P-107): a preview deployment pseudonymises with a key of its
+/// own. Otherwise an agent could deploy a preview that logs guessed values in a `personal`
+/// field and look the stored pseudonyms up in the live records with `q=p_...`.
+#[tokio::test]
+async fn a_preview_pseudonymises_with_its_own_key() {
+    let f = Fixture::new();
+    let live = identity();
+    let preview = SourceIdentity {
+        deployment: uuid::Uuid::now_v7(),
+        environment: Environment::Preview,
+        ..live
+    };
+    let preview2 = SourceIdentity {
+        deployment: uuid::Uuid::now_v7(),
+        ..preview
+    };
+    let guess = || Batch {
+        logs: vec![LogRecord {
+            body: LogBody::Template {
+                template: "t".into(),
+                // Unclassified, so `personal`: a pseudonym.
+                fields: vec![Attribute::new("customer", "kati@example.test")],
+            },
+            ..text_log("")
+        }],
+        ..Default::default()
+    };
+    let mut ids = Vec::new();
+    for id in [&live, &live, &preview, &preview2] {
+        f.ingest.ingest(id, guess()).await.unwrap();
+    }
+    let stored = f
+        .store
+        .read(live.tenant, &TelemetryFilter::app(live.app))
+        .await
+        .unwrap();
+    assert_eq!(stored.logs.len(), 4);
+    for dep in [live.deployment, preview.deployment, preview2.deployment] {
+        let mine: Vec<_> = stored
+            .logs
+            .iter()
+            .filter(|l| l.source.deployment == dep)
+            .map(|l| {
+                attr(&l.fields, "customer")
+                    .and_then(StoredValue::as_pseudonym)
+                    .expect("a pseudonym")
+                    .clone()
+            })
+            .collect();
+        assert!(!mine.is_empty());
+        assert!(
+            mine.iter().all(|p| *p == mine[0]),
+            "stable within a deployment"
+        );
+        ids.push(mine[0].clone());
+    }
+    assert_ne!(ids[0], ids[1], "a preview pseudonym matches the live one");
+    assert_ne!(ids[1], ids[2], "two previews share a pseudonym");
+    assert_ne!(ids[0], ids[2], "a preview pseudonym matches the live one");
+
+    // The key derivation: live is the app key, a preview is below it.
+    let tenant_key = PseudonymKey::from_bytes([9u8; 32]);
+    let app_key = app_telemetry_key(&tenant_key, live.app);
+    assert_eq!(
+        source_telemetry_key(&tenant_key, &live).as_bytes(),
+        app_key.as_bytes()
+    );
+    let msg = format!(
+        "ruum/telemetry/v1/preview/{}",
+        preview.deployment.hyphenated()
+    );
+    assert_eq!(
+        source_telemetry_key(&tenant_key, &preview).as_bytes(),
+        &hmac_sha256(app_key.as_bytes(), msg.as_bytes())
+    );
+}
+
 // ---------------------------------------------------------------------------- pipeline
 
 fn identity() -> SourceIdentity {

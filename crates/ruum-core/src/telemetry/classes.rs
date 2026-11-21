@@ -324,7 +324,15 @@ impl TelemetryFieldStore for MemoryFieldStore {
         let at = crate::now();
         let mut apps = self.lock();
         let mut rows = apps.get(&(ctx.tenant, app)).cloned().unwrap_or_default();
-        if rows.len() + list.len() > MAX_ROWS_PER_APP + MAX_NAMED_FIELDS {
+        // Only the rows that do not exist yet count against the bound: a confirmation of an
+        // existing field (for example to `secret`) adds no row and works at the bound (Kimi
+        // run 14, O-2 finding 2).
+        let new_rows: HashSet<RowKey> = list
+            .iter()
+            .map(|c| key(&c.field, c.kind))
+            .filter(|k| !rows.contains_key(k))
+            .collect();
+        if rows.len() + new_rows.len() > MAX_ROWS_PER_APP + MAX_NAMED_FIELDS {
             return Err(too_many_fields());
         }
         let mut out = Vec::with_capacity(list.len());
@@ -472,6 +480,30 @@ async fn row_count(tx: &mut sqlx::PgConnection, tenant: TenantId, app: NodeId) -
     Ok(usize::try_from(n).unwrap_or(usize::MAX))
 }
 
+/// The number of distinct `(field, kind)` pairs of the list that the app has no row for yet.
+async fn new_row_count(
+    tx: &mut sqlx::PgConnection,
+    tenant: TenantId,
+    app: NodeId,
+    fields: &[&str],
+    kinds: &[&str],
+) -> Result<usize> {
+    let n: i64 = sqlx::query_scalar(
+        "select count(*) from (select distinct field, kind \
+         from unnest($3::text[], $4::text[]) as n(field, kind)) n \
+         where not exists (select 1 from telemetry_fields t \
+         where t.tenant_id = $1 and t.app_node_id = $2 and t.field = n.field \
+         and t.kind = n.kind::telemetry_field_kind)",
+    )
+    .bind(tenant)
+    .bind(app)
+    .bind(fields)
+    .bind(kinds)
+    .fetch_one(&mut *tx)
+    .await?;
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 #[async_trait]
 impl TelemetryFieldStore for PgFieldStore {
     async fn page(
@@ -538,7 +570,14 @@ impl TelemetryFieldStore for PgFieldStore {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| Error::not_found("app"))?;
-        if row_count(&mut tx, tenant, app).await? + list.len() > MAX_ROWS_PER_APP + MAX_NAMED_FIELDS
+        // Only the rows that do not exist yet count (Kimi run 14, O-2 finding 2), as in
+        // `suggest`.
+        let fields: Vec<&str> = list.iter().map(|c| c.field.as_str()).collect();
+        let kinds: Vec<&str> = list.iter().map(|c| c.kind.as_str()).collect();
+        if row_count(&mut tx, tenant, app)
+            .await?
+            .saturating_add(new_row_count(&mut tx, tenant, app, &fields, &kinds).await?)
+            > MAX_ROWS_PER_APP + MAX_NAMED_FIELDS
         {
             return Err(too_many_fields());
         }
@@ -605,19 +644,7 @@ impl TelemetryFieldStore for PgFieldStore {
         let kinds: Vec<&str> = list.iter().map(|s| s.kind.as_str()).collect();
         let classes: Vec<&str> = list.iter().map(|s| class_name(s.class)).collect();
         let reasons: Vec<Option<&str>> = list.iter().map(|s| s.reason.as_deref()).collect();
-        let new_rows: i64 = sqlx::query_scalar(
-            "select count(*) from unnest($3::text[], $4::text[]) as n(field, kind) \
-             where not exists (select 1 from telemetry_fields t \
-             where t.tenant_id = $1 and t.app_node_id = $2 and t.field = n.field \
-             and t.kind = n.kind::telemetry_field_kind)",
-        )
-        .bind(tenant)
-        .bind(app)
-        .bind(&fields)
-        .bind(&kinds)
-        .fetch_one(&mut *tx)
-        .await?;
-        let new_rows = usize::try_from(new_rows).unwrap_or(usize::MAX);
+        let new_rows = new_row_count(&mut tx, tenant, app, &fields, &kinds).await?;
         if row_count(&mut tx, tenant, app)
             .await?
             .saturating_add(new_rows)
@@ -1549,6 +1576,75 @@ mod tests {
         let s: Arc<dyn TelemetryFieldStore> = Arc::new(PgFieldStore::new(pool.clone()));
         suggestions_go_up_and_only_a_person_relaxes(s.clone(), &ctx(a, ua), ua, na).await;
         suggestions_are_refused_not_cut(s, a, nb).await;
+    }
+
+    /// Kimi run 14, O-2 finding 2: at the row bound a person can still confirm a field that
+    /// exists (for example as `secret`), because that adds no row; a new field is refused.
+    async fn confirming_existing_fields_works_at_the_bound(
+        s: Arc<dyn TelemetryFieldStore>,
+        ctx: &Context,
+        by: UserId,
+        app: NodeId,
+    ) {
+        let t = ctx.tenant;
+        let bound = MAX_ROWS_PER_APP + MAX_NAMED_FIELDS;
+        let mut n = 0;
+        while n < bound {
+            let list: Vec<Suggestion> = (n..(n + MAX_NAMED_FIELDS).min(bound))
+                .map(|i| suggestion(&format!("f{i}"), FieldClass::Normal))
+                .collect();
+            n += list.len();
+            s.suggest(t, app, &list).await.unwrap();
+        }
+        let conf = |field: &str| Confirmation {
+            field: field.into(),
+            kind: FieldKind::LogField,
+            class: FieldClass::Secret,
+        };
+        // Positive control: the app is full, a new field is refused.
+        assert!(s.confirm(ctx, by, app, &[conf("card")]).await.is_err());
+        assert!(
+            s.confirm(ctx, by, app, &[conf("f1"), conf("card")])
+                .await
+                .is_err(),
+            "a list with one new field past the bound"
+        );
+        // A field that exists: confirmed, no new row.
+        let (rows, _) = s
+            .confirm(ctx, by, app, &[conf("f1"), conf("f2"), conf("f1")])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].effective_class(), FieldClass::Secret);
+        assert_eq!(piped(&s, t, app, "f1").await, FieldClass::Secret);
+        assert_eq!(piped(&s, t, app, "f2").await, FieldClass::Secret);
+        let all = s.all(t, app).await.unwrap();
+        assert_eq!(all.len(), bound);
+        assert!(all.iter().all(|r| r.field != "card"));
+    }
+
+    #[tokio::test]
+    async fn memory_confirming_existing_fields_works_at_the_bound() {
+        let (tenant, app) = t();
+        let by = UserId(uuid::Uuid::now_v7());
+        let ctx = crate::apps::store::conformance::ctx(tenant, by);
+        let s: Arc<dyn TelemetryFieldStore> = Arc::new(MemoryFieldStore::new(None));
+        confirming_existing_fields_works_at_the_bound(s, &ctx, by, app).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_confirming_existing_fields_works_at_the_bound(pool: sqlx::PgPool) {
+        use crate::apps::store::AppStore;
+        use crate::apps::store::conformance::tests::{pg_app_node, pg_tenant};
+        use crate::apps::store::conformance::{app, ctx};
+        let (a, ua) = pg_tenant(&pool).await;
+        let na = pg_app_node(&pool, a, ua).await;
+        let apps = crate::apps::store::postgres::PgAppStore::new(pool.clone());
+        apps.insert_app(&ctx(a, ua), app(na, "planner"))
+            .await
+            .unwrap()
+            .unwrap();
+        let s: Arc<dyn TelemetryFieldStore> = Arc::new(PgFieldStore::new(pool.clone()));
+        confirming_existing_fields_works_at_the_bound(s, &ctx(a, ua), ua, na).await;
     }
 
     #[tokio::test]
