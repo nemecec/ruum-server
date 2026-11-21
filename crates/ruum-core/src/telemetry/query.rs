@@ -823,6 +823,20 @@ struct LogCursor {
     s: usize,
 }
 
+impl LogCursor {
+    /// The exclusive end of the next page's window and the records to skip at `u`. The cursor
+    /// is not signed, so both numbers are checked (review O-2, 4): `u + 1` must be a time and
+    /// `s` at most what one read returns; else `422`, never an overflow.
+    fn position(&self) -> Result<(OffsetDateTime, usize)> {
+        if self.s > lgtm::MAX_READ {
+            return Err(bad_cursor());
+        }
+        let end = self.u.checked_add(1).ok_or_else(bad_cursor)?;
+        let to = OffsetDateTime::from_unix_timestamp_nanos(end).map_err(|_| bad_cursor())?;
+        Ok((to, self.s))
+    }
+}
+
 fn encode_json<T: Serialize>(v: &T) -> Cursor {
     Cursor(b64().encode(serde_json::to_vec(v).expect("a cursor serialises")))
 }
@@ -1272,18 +1286,16 @@ impl TelemetryService {
                 if lc.v != 1 || lc.t != ctx.tenant.0 || lc.a != app.0 || lc.f != hash {
                     return Err(bad_cursor());
                 }
-                (Some(lc.u), lc.s)
+                let (to, skip) = lc.position()?;
+                (Some((lc.u, to)), skip)
             }
         };
         let limit = q.page.limit() as usize;
         let to = match top {
-            Some(u) => {
-                let t =
-                    OffsetDateTime::from_unix_timestamp_nanos(u + 1).map_err(|_| bad_cursor())?;
-                t.min(until)
-            }
+            Some((_, t)) => t.min(until),
             None => until,
         };
+        let top = top.map(|(u, _)| u);
         let filter = TelemetryFilter {
             signal: Some(Signal::Logs),
             app: Some(app),
@@ -1493,19 +1505,31 @@ impl TelemetryService {
                 "trace_id",
             ));
         }
-        let filter = TelemetryFilter {
+        // Two reads: this app's spans first, under their own limit, then the other apps'. A
+        // called app that writes many spans into the trace can then crowd out only the other
+        // apps' spans, never this app's (review O-2, Kimi 4).
+        let own = TelemetryFilter {
             signal: Some(Signal::Traces),
+            app: Some(app),
             trace_id: Some(trace_id.to_owned()),
             limit: Some(lgtm::MAX_READ),
             ..Default::default()
         };
-        let read = {
-            let _permit = self.permit(ctx)?;
-            self.store.read(ctx.tenant, &filter).await?
+        let all = TelemetryFilter {
+            app: None,
+            ..own.clone()
         };
-        let spans: Vec<StoredSpan> = read
+        let (mine, rest) = {
+            let _permit = self.permit(ctx)?;
+            let mine = self.store.read(ctx.tenant, &own).await?;
+            let rest = self.store.read(ctx.tenant, &all).await?;
+            (mine, rest)
+        };
+        let spans: Vec<StoredSpan> = mine
             .spans
             .into_iter()
+            .filter(|sp| sp.source.app == app)
+            .chain(rest.spans.into_iter().filter(|sp| sp.source.app != app))
             .filter(|sp| sp.source.tenant == ctx.tenant && sp.trace_id == trace_id)
             .collect();
         if !spans.iter().any(|sp| sp.source.app == app) {
@@ -1688,6 +1712,25 @@ mod tests {
         });
         let back: LogCursor = decode_json(&c).unwrap();
         assert_eq!((back.u, back.s), (5, 1));
+        assert_eq!(back.position().unwrap().1, 1);
+        // Review O-2, 4: forged numbers are `422`, never an overflow.
+        for (u, s) in [
+            (i128::MAX, 0),
+            (i128::MIN, 0),
+            (5, usize::MAX),
+            (5, lgtm::MAX_READ + 1),
+        ] {
+            let forged = LogCursor {
+                v: 1,
+                t: Uuid::nil(),
+                a: Uuid::nil(),
+                f: "x".into(),
+                u,
+                s,
+            };
+            let back: LogCursor = decode_json(&encode_json(&forged)).unwrap();
+            assert!(back.position().is_err(), "u {u} s {s}");
+        }
         assert!(decode_json::<LogCursor>(&Cursor("not base64!".into())).is_err());
         let q1 = LogQuery {
             q: Some("a".into()),

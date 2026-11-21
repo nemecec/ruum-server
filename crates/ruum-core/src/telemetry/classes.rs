@@ -11,9 +11,14 @@
 //!   metric label, the column's check; an unconfirmed label is still dropped, because the
 //!   effective class of an unconfirmed row is at least `personal`), with `first_seen_at`.
 //! - **suggested** ([`TelemetryFieldStore::suggest`]): the archive's privacy file at deploy time
-//!   sets `suggested_class` and `suggestion_reason` only, never `class` or a confirmation.
+//!   sets `suggested_class` and `suggestion_reason` only, never `class` or a confirmation. A
+//!   suggestion never goes down: the row keeps the stricter of the stored and the new one, so
+//!   an archive (an agent can deploy a preview) cannot undo an earlier `secret` suggestion.
 //! - **confirmed** ([`TelemetryFieldStore::confirm`]): a person sets `class`, `confirmed_by`
-//!   and `confirmed_at` and the journal gets `app.telemetry_fields_confirmed`.
+//!   and `confirmed_at` and the journal gets `app.telemetry_fields_confirmed`. The confirmation
+//!   clears the suggestion, so a person can relax a class that a suggestion made stricter; a
+//!   later stricter suggestion applies at once again. A person's confirmation is the only way
+//!   down.
 //!
 //! The effective class is always [`classify::effective_class`] (deny-list first; a confirmed
 //! class; an unconfirmed row at least `personal`; a stricter suggestion applies at once). This
@@ -23,8 +28,9 @@
 //!
 //! - Every query filters by `tenant_id` (and the table has RLS).
 //! - Rows per app: seen rows are written only while the app has fewer than
-//!   [`MAX_ROWS_PER_APP`] rows; suggestions and confirmations add at most [`MAX_NAMED_FIELDS`]
-//!   rows per call and are refused or limited past [`MAX_ROWS_PER_APP`].
+//!   [`MAX_ROWS_PER_APP`] rows; suggestions and confirmations name at most [`MAX_NAMED_FIELDS`]
+//!   fields per call and are refused (never cut) when the app would pass
+//!   [`MAX_ROWS_PER_APP`] + [`MAX_NAMED_FIELDS`] rows.
 //! - Seen names per tenant per minute: [`SEEN_PER_TENANT_MINUTE`]; more are counted and
 //!   dropped, so one tenant's apps cannot fill the table or take the writes of another tenant.
 //! - The class cache ([`ClassCache`]): at most [`CLASS_TTL`] old, at most [`CACHE_PER_TENANT`]
@@ -180,6 +186,22 @@ fn too_many_fields() -> Error {
     )
 }
 
+/// The order of the classes (`normal` < `personal` < `secret`), written out so that no code
+/// depends on the order of an enum's variants or labels.
+fn strictness(c: FieldClass) -> u8 {
+    match c {
+        FieldClass::Normal => 0,
+        FieldClass::Personal => 1,
+        FieldClass::Secret => 2,
+    }
+}
+
+/// The suggestion a row keeps when `new` comes: the stricter one (a suggestion never goes
+/// down); `new` on a tie, so its reason is the current one.
+fn keeps_new_suggestion(stored: Option<FieldClass>, new: FieldClass) -> bool {
+    stored.is_none_or(|old| strictness(new) >= strictness(old))
+}
+
 // ---------------------------------------------------------------------------- the store
 
 /// The `telemetry_fields` rows. Every method works in one tenant.
@@ -200,8 +222,9 @@ pub trait TelemetryFieldStore: Send + Sync {
     async fn all(&self, tenant: TenantId, app: NodeId) -> Result<Vec<FieldRow>>;
 
     /// A person's classes, in one transaction with the journal entry
-    /// `app.telemetry_fields_confirmed` (counts per class). Returns the rows in the order of
-    /// `list`. The caller checks the rules (users only, the deny-list, metric labels).
+    /// `app.telemetry_fields_confirmed` (counts per class). Each confirmed row loses its
+    /// suggestion. Returns the rows in the order of `list`. The caller checks the rules (users
+    /// only, the deny-list, metric labels).
     async fn confirm(
         &self,
         ctx: &Context,
@@ -212,7 +235,9 @@ pub trait TelemetryFieldStore: Send + Sync {
 
     /// The suggestions of a privacy file, in one transaction: `suggested_class` and
     /// `suggestion_reason` of each field (new rows unconfirmed); never `class` or a
-    /// confirmation.
+    /// confirmation. A stored suggestion is replaced only by one at least as strict (a
+    /// suggestion never goes down). All or nothing: more than [`MAX_NAMED_FIELDS`] fields, or
+    /// more new rows than the app can hold, is refused (`422`) and writes nothing.
     async fn suggest(&self, tenant: TenantId, app: NodeId, list: &[Suggestion]) -> Result<()>;
 
     /// Rows for fields that ingestion saw, unconfirmed with `first_seen_at`; an existing row
@@ -310,6 +335,9 @@ impl TelemetryFieldStore for MemoryFieldStore {
             r.class = c.class;
             r.confirmed_by = Some(by);
             r.confirmed_at = Some(at);
+            // A person decided: an earlier suggestion no longer holds the class up.
+            r.suggested_class = None;
+            r.suggestion_reason = None;
             out.push(r.clone());
         }
         let entry = NewEntry {
@@ -336,19 +364,27 @@ impl TelemetryFieldStore for MemoryFieldStore {
     }
 
     async fn suggest(&self, tenant: TenantId, app: NodeId, list: &[Suggestion]) -> Result<()> {
+        if list.len() > MAX_NAMED_FIELDS {
+            return Err(too_many_fields());
+        }
         let mut apps = self.lock();
         let rows = apps.entry((tenant, app)).or_default();
-        let full = rows.len() >= MAX_ROWS_PER_APP;
-        for s in list.iter().take(MAX_NAMED_FIELDS) {
-            let k = key(&s.field, s.kind);
-            if full && !rows.contains_key(&k) {
-                continue;
-            }
+        let new_rows: HashSet<RowKey> = list
+            .iter()
+            .map(|s| key(&s.field, s.kind))
+            .filter(|k| !rows.contains_key(k))
+            .collect();
+        if rows.len() + new_rows.len() > MAX_ROWS_PER_APP + MAX_NAMED_FIELDS {
+            return Err(too_many_fields());
+        }
+        for s in list {
             let r = rows
-                .entry(k)
+                .entry(key(&s.field, s.kind))
                 .or_insert_with(|| FieldRow::new(&s.field, s.kind));
-            r.suggested_class = Some(s.class);
-            r.suggestion_reason = s.reason.clone();
+            if keeps_new_suggestion(r.suggested_class, s.class) {
+                r.suggested_class = Some(s.class);
+                r.suggestion_reason = s.reason.clone();
+            }
         }
         Ok(())
     }
@@ -515,7 +551,8 @@ impl TelemetryFieldStore for PgFieldStore {
                  values ($1, $2, $3, $4::telemetry_field_kind, $5::data_class, $6, $7) \
                  on conflict (tenant_id, app_node_id, field, kind) do update set \
                  class = excluded.class, confirmed_by = excluded.confirmed_by, \
-                 confirmed_at = excluded.confirmed_at \
+                 confirmed_at = excluded.confirmed_at, \
+                 suggested_class = null, suggestion_reason = null \
                  returning {ROW_COLUMNS}"
             )))
             .bind(tenant)
@@ -545,54 +582,75 @@ impl TelemetryFieldStore for PgFieldStore {
     }
 
     async fn suggest(&self, tenant: TenantId, app: NodeId, list: &[Suggestion]) -> Result<()> {
-        let list = &list[..list.len().min(MAX_NAMED_FIELDS)];
+        if list.len() > MAX_NAMED_FIELDS {
+            return Err(too_many_fields());
+        }
         if list.is_empty() {
             return Ok(());
         }
         let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
+        // One writer of the app's rows at a time, as in `confirm`: the count bound below holds
+        // against a concurrent suggestion or confirmation. No app row: nothing to write.
+        let locked =
+            sqlx::query("select 1 from apps where tenant_id = $1 and node_id = $2 for update")
+                .bind(tenant)
+                .bind(app)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            tx.commit().await?;
+            return Ok(());
+        }
         let fields: Vec<&str> = list.iter().map(|s| s.field.as_str()).collect();
         let kinds: Vec<&str> = list.iter().map(|s| s.kind.as_str()).collect();
         let classes: Vec<&str> = list.iter().map(|s| class_name(s.class)).collect();
         let reasons: Vec<Option<&str>> = list.iter().map(|s| s.reason.as_deref()).collect();
-        if row_count(&mut tx, tenant, app).await? >= MAX_ROWS_PER_APP {
-            // Full: only the rows that exist get the suggestion.
-            sqlx::query(
-                "update telemetry_fields t set suggested_class = n.class::data_class, \
-                 suggestion_reason = n.reason \
-                 from unnest($3::text[], $4::text[], $5::text[], $6::text[]) as n(field, kind, class, reason) \
-                 where t.tenant_id = $1 and t.app_node_id = $2 and t.field = n.field \
-                 and t.kind = n.kind::telemetry_field_kind",
-            )
-            .bind(tenant)
-            .bind(app)
-            .bind(&fields)
-            .bind(&kinds)
-            .bind(&classes)
-            .bind(&reasons)
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            sqlx::query(
-                "insert into telemetry_fields \
-                 (tenant_id, app_node_id, field, kind, class, suggested_class, suggestion_reason) \
-                 select $1, $2, n.field, n.kind::telemetry_field_kind, \
-                 (case when n.kind = 'metric_label' then 'normal' else 'personal' end)::data_class, \
-                 n.class::data_class, n.reason \
-                 from unnest($3::text[], $4::text[], $5::text[], $6::text[]) as n(field, kind, class, reason) \
-                 where exists (select 1 from apps where tenant_id = $1 and node_id = $2) \
-                 on conflict (tenant_id, app_node_id, field, kind) do update set \
-                 suggested_class = excluded.suggested_class, \
-                 suggestion_reason = excluded.suggestion_reason",
-            )
-            .bind(tenant)
-            .bind(app)
-            .bind(&fields)
-            .bind(&kinds)
-            .bind(&classes)
-            .bind(&reasons)
-            .execute(&mut *tx)
-            .await?;
+        let new_rows: i64 = sqlx::query_scalar(
+            "select count(*) from unnest($3::text[], $4::text[]) as n(field, kind) \
+             where not exists (select 1 from telemetry_fields t \
+             where t.tenant_id = $1 and t.app_node_id = $2 and t.field = n.field \
+             and t.kind = n.kind::telemetry_field_kind)",
+        )
+        .bind(tenant)
+        .bind(app)
+        .bind(&fields)
+        .bind(&kinds)
+        .fetch_one(&mut *tx)
+        .await?;
+        let new_rows = usize::try_from(new_rows).unwrap_or(usize::MAX);
+        if row_count(&mut tx, tenant, app)
+            .await?
+            .saturating_add(new_rows)
+            > MAX_ROWS_PER_APP + MAX_NAMED_FIELDS
+        {
+            return Err(too_many_fields());
         }
+        // A suggestion never goes down: the stored one is replaced only by one at least as
+        // strict. The order of the classes is written out (`strictness`), not taken from the
+        // order of the enum labels.
+        let stricter = "array_position(array['normal','personal','secret'], excluded.suggested_class::text) \
+             >= array_position(array['normal','personal','secret'], telemetry_fields.suggested_class::text)";
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "insert into telemetry_fields \
+             (tenant_id, app_node_id, field, kind, class, suggested_class, suggestion_reason) \
+             select $1, $2, n.field, n.kind::telemetry_field_kind, \
+             (case when n.kind = 'metric_label' then 'normal' else 'personal' end)::data_class, \
+             n.class::data_class, n.reason \
+             from unnest($3::text[], $4::text[], $5::text[], $6::text[]) as n(field, kind, class, reason) \
+             on conflict (tenant_id, app_node_id, field, kind) do update set \
+             suggested_class = case when telemetry_fields.suggested_class is null or {stricter} \
+             then excluded.suggested_class else telemetry_fields.suggested_class end, \
+             suggestion_reason = case when telemetry_fields.suggested_class is null or {stricter} \
+             then excluded.suggestion_reason else telemetry_fields.suggestion_reason end"
+        )))
+        .bind(tenant)
+        .bind(app)
+        .bind(&fields)
+        .bind(&kinds)
+        .bind(&classes)
+        .bind(&reasons)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1311,6 +1369,186 @@ mod tests {
         let again = s.all(a, na).await.unwrap();
         assert_eq!(again, mine, "B changed A's rows");
         assert!(s.all(b, nb).await.unwrap().is_empty());
+    }
+
+    fn suggestion(field: &str, class: FieldClass) -> Suggestion {
+        Suggestion {
+            field: field.into(),
+            kind: FieldKind::LogField,
+            class,
+            reason: Some(format!("{field} is {}", class_name(class))),
+        }
+    }
+
+    /// The effective class of `field` through the class source, as the pipeline reads it.
+    async fn piped(
+        s: &Arc<dyn TelemetryFieldStore>,
+        t: TenantId,
+        a: NodeId,
+        f: &str,
+    ) -> FieldClass {
+        let c = StoreClasses::new(s.clone()).classes(t, a).await.unwrap();
+        classify::effective_class(f, FieldKind::LogField, &c)
+    }
+
+    async fn listed(s: &Arc<dyn TelemetryFieldStore>, t: TenantId, a: NodeId, f: &str) -> FieldRow {
+        s.all(t, a)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.field == f)
+            .unwrap_or_else(|| panic!("no row {f}"))
+    }
+
+    /// Review O-2, 1 and 2, on one store: an archive never lowers a suggestion; a person's
+    /// confirmation relaxes a class that a suggestion made stricter; a later stricter
+    /// suggestion applies at once again. Both the listing (the row's effective class) and the
+    /// pipeline's class source are checked.
+    async fn suggestions_go_up_and_only_a_person_relaxes(
+        s: Arc<dyn TelemetryFieldStore>,
+        ctx: &Context,
+        by: UserId,
+        app: NodeId,
+    ) {
+        let t = ctx.tenant;
+        // Positive control: a secret suggestion applies at once.
+        s.suggest(t, app, &[suggestion("customer", FieldClass::Secret)])
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&s, t, app, "customer").await.effective_class(),
+            FieldClass::Secret
+        );
+        assert_eq!(piped(&s, t, app, "customer").await, FieldClass::Secret);
+        // A second archive suggests normal, then personal: the field stays secret.
+        for lower in [FieldClass::Normal, FieldClass::Personal] {
+            s.suggest(t, app, &[suggestion("customer", lower)])
+                .await
+                .unwrap();
+            let r = listed(&s, t, app, "customer").await;
+            assert_eq!(r.suggested_class, Some(FieldClass::Secret), "{r:?}");
+            assert_eq!(r.suggestion_reason.as_deref(), Some("customer is secret"));
+            assert_eq!(r.effective_class(), FieldClass::Secret);
+            assert_eq!(piped(&s, t, app, "customer").await, FieldClass::Secret);
+        }
+        // A person confirms normal: the listing and the pipeline say normal.
+        let conf = [Confirmation {
+            field: "customer".into(),
+            kind: FieldKind::LogField,
+            class: FieldClass::Normal,
+        }];
+        let (rows, _) = s.confirm(ctx, by, app, &conf).await.unwrap();
+        assert_eq!(
+            rows[0].effective_class(),
+            FieldClass::Normal,
+            "{:?}",
+            rows[0]
+        );
+        let r = listed(&s, t, app, "customer").await;
+        assert_eq!(
+            (r.suggested_class, r.suggestion_reason.as_deref()),
+            (None, None)
+        );
+        assert_eq!(r.effective_class(), FieldClass::Normal);
+        assert_eq!(piped(&s, t, app, "customer").await, FieldClass::Normal);
+        // A later archive suggests normal: nothing changes. Then secret: it applies at once,
+        // over the confirmed class.
+        s.suggest(t, app, &[suggestion("customer", FieldClass::Normal)])
+            .await
+            .unwrap();
+        assert_eq!(piped(&s, t, app, "customer").await, FieldClass::Normal);
+        s.suggest(t, app, &[suggestion("customer", FieldClass::Secret)])
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&s, t, app, "customer").await.effective_class(),
+            FieldClass::Secret
+        );
+        assert_eq!(piped(&s, t, app, "customer").await, FieldClass::Secret);
+        // And no archive brings it down from there.
+        s.suggest(t, app, &[suggestion("customer", FieldClass::Normal)])
+            .await
+            .unwrap();
+        assert_eq!(piped(&s, t, app, "customer").await, FieldClass::Secret);
+    }
+
+    /// Review O-2 (Kimi 2): a suggestion is all or nothing; it is never cut to fit.
+    async fn suggestions_are_refused_not_cut(
+        s: Arc<dyn TelemetryFieldStore>,
+        t: TenantId,
+        app: NodeId,
+    ) {
+        let too_many: Vec<Suggestion> = (0..=MAX_NAMED_FIELDS)
+            .map(|i| suggestion(&format!("f{i}"), FieldClass::Secret))
+            .collect();
+        assert!(s.suggest(t, app, &too_many).await.is_err());
+        assert!(
+            s.all(t, app).await.unwrap().is_empty(),
+            "a refused file wrote rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_suggestions_go_up_and_only_a_person_relaxes() {
+        let (tenant, app) = t();
+        let by = UserId(uuid::Uuid::now_v7());
+        let ctx = crate::apps::store::conformance::ctx(tenant, by);
+        let s: Arc<dyn TelemetryFieldStore> = Arc::new(MemoryFieldStore::new(None));
+        suggestions_go_up_and_only_a_person_relaxes(s.clone(), &ctx, by, app).await;
+        suggestions_are_refused_not_cut(s, tenant, NodeId::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_suggestions_past_the_app_bound_are_refused() {
+        let (tenant, app) = t();
+        let s = MemoryFieldStore::new(None);
+        // Fill the app to the bound with named fields (suggestions of earlier archives).
+        let mut n = 0;
+        while n < MAX_ROWS_PER_APP + MAX_NAMED_FIELDS {
+            let list: Vec<Suggestion> = (n..(n + MAX_NAMED_FIELDS)
+                .min(MAX_ROWS_PER_APP + MAX_NAMED_FIELDS))
+                .map(|i| suggestion(&format!("f{i}"), FieldClass::Personal))
+                .collect();
+            n += list.len();
+            s.suggest(tenant, app, &list).await.unwrap();
+        }
+        // A new field does not fit: refused, not skipped with success.
+        assert!(
+            s.suggest(tenant, app, &[suggestion("card", FieldClass::Secret)])
+                .await
+                .is_err()
+        );
+        // A field that exists still takes a stricter suggestion.
+        s.suggest(tenant, app, &[suggestion("f1", FieldClass::Secret)])
+            .await
+            .unwrap();
+        let rows = s.all(tenant, app).await.unwrap();
+        assert_eq!(rows.len(), MAX_ROWS_PER_APP + MAX_NAMED_FIELDS);
+        assert!(rows.iter().all(|r| r.field != "card"));
+        let f1 = rows.iter().find(|r| r.field == "f1").unwrap();
+        assert_eq!(f1.effective_class(), FieldClass::Secret);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_suggestions_go_up_and_only_a_person_relaxes(pool: sqlx::PgPool) {
+        use crate::apps::store::AppStore;
+        use crate::apps::store::conformance::tests::{pg_app_node, pg_tenant};
+        use crate::apps::store::conformance::{app, ctx};
+        let (a, ua) = pg_tenant(&pool).await;
+        let na = pg_app_node(&pool, a, ua).await;
+        let nb = pg_app_node(&pool, a, ua).await;
+        let apps = crate::apps::store::postgres::PgAppStore::new(pool.clone());
+        apps.insert_app(&ctx(a, ua), app(na, "planner"))
+            .await
+            .unwrap()
+            .unwrap();
+        apps.insert_app(&ctx(a, ua), app(nb, "other"))
+            .await
+            .unwrap()
+            .unwrap();
+        let s: Arc<dyn TelemetryFieldStore> = Arc::new(PgFieldStore::new(pool.clone()));
+        suggestions_go_up_and_only_a_person_relaxes(s.clone(), &ctx(a, ua), ua, na).await;
+        suggestions_are_refused_not_cut(s, a, nb).await;
     }
 
     #[tokio::test]
