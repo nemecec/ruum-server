@@ -450,6 +450,16 @@ async fn read_index_in(
     Ok(Some(index))
 }
 
+/// The bytes of every static object of `tenant` in `store`.
+async fn prefix_bytes(store: &Arc<dyn ObjectStore>, tenant: TenantId) -> Result<u64> {
+    let mut list = store.list(Some(&tenant_prefix(tenant)));
+    let mut total = 0u64;
+    while let Some(meta) = list.next().await {
+        total = total.saturating_add(meta?.size);
+    }
+    Ok(total)
+}
+
 /// What [`StaticSites::write_site`] did.
 #[derive(Clone, Debug)]
 pub struct WrittenSite {
@@ -497,6 +507,9 @@ pub struct StaticSites {
     legacy: Option<Arc<dyn ObjectStore>>,
     /// Signs read links in the blob bucket, for a site whose objects have not moved yet.
     legacy_links: Option<Arc<dyn Signer>>,
+    /// The tenants whose blob bucket objects this process has copied (the quota counts the
+    /// blob bucket's objects of every other tenant, [`StaticSites::stored_bytes`]).
+    migrated: Arc<std::sync::Mutex<std::collections::HashSet<TenantId>>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -512,6 +525,7 @@ impl StaticSites {
             links: Arc::default(),
             legacy: None,
             legacy_links: None,
+            migrated: Arc::default(),
         }
     }
 
@@ -681,12 +695,23 @@ impl StaticSites {
     /// The bytes of every static object of the tenant (file objects and indexes): what counts
     /// against its storage quota.
     pub async fn stored_bytes(&self, tenant: TenantId) -> Result<u64> {
-        let mut list = self.store.list(Some(&tenant_prefix(tenant)));
-        let mut total = 0u64;
-        while let Some(meta) = list.next().await {
-            total = total.saturating_add(meta?.size);
+        let mut total = prefix_bytes(&self.store, tenant).await?;
+        // Until this process has copied the tenant's objects out of the blob bucket, they count
+        // too: more than the truth (a copied object counts twice), never less (Kimi k14i6, 3).
+        if let Some(legacy) = &self.legacy
+            && !self.is_migrated(tenant)
+        {
+            total = total.saturating_add(prefix_bytes(legacy, tenant).await?);
         }
         Ok(total)
+    }
+
+    /// True when [`StaticSites::migrate_legacy`] has run for `tenant` in this process.
+    fn is_migrated(&self, tenant: TenantId) -> bool {
+        self.migrated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&tenant)
     }
 
     /// The tenants that have static objects (for the garbage collection of every tenant).
@@ -1139,6 +1164,10 @@ impl StaticSites {
                 report.files_copied += 1;
             }
         }
+        self.migrated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tenant);
         if !delete {
             return Ok(report);
         }
@@ -1586,8 +1615,16 @@ mod tests {
             url.as_str()
                 .contains(&file_key(t, &Hash::of(b"<h1>Hi</h1>")).to_string())
         );
+        // Before the move the quota counts the blob bucket's objects; after it, the copies.
+        let legacy_bytes = blobs.stored_bytes(t).await.unwrap();
+        assert!(legacy_bytes > 0);
+        assert_eq!(sites.stored_bytes(t).await.unwrap(), legacy_bytes);
         // Without delete: everything readable is copied, nothing leaves the blob bucket.
         let r = sites.migrate_legacy(t, false).await.unwrap();
+        assert_eq!(
+            sites.stored_bytes(t).await.unwrap(),
+            prefix_bytes(&sites.object_store(), t).await.unwrap()
+        );
         assert_eq!(
             (r.indexes, r.files_copied, r.deleted, r.skipped),
             (2, 4, 0, 1),
