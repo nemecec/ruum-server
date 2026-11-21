@@ -1,0 +1,42 @@
+[package]
+name = "ruum-runtime-api"
+description = "The runtime API at ruum.internal: what a running app may call (card R-3). No tenant keys, no database credential."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ruum-runtime-api"
+path = "src/main.rs"
+
+[dependencies]
+ruum-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures.workspace = true
+# The listener (card R-3): hyper's HTTP/1 connections with a header read timeout and a cap on
+# connections (backlog S-71), served by the axum router.
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "service"] }
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+ruum-api.workspace = true
+ruum-testkit.workspace = true
+# The T-6 world signs user tokens with the gateway's own signer (read only; card R-3).
+ruum-gateway = { path = "../ruum-gateway" }

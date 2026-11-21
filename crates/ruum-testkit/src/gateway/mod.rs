@@ -113,36 +113,7 @@ pub const PENDING: &[(&str, &str)] = &[
         "a_custom_domain_serves_only_when_verified",
         "W-5: custom domains",
     ),
-    // The runtime API: R-3, the internal gateway: G-3.
-    (
-        "get_app_self_needs_a_workload_token",
-        "R-3: the runtime API",
-    ),
-    (
-        "list_app_self_users_names_role_holders",
-        "R-3: the runtime API",
-    ),
-    (
-        "exchange_refuses_a_preview_token_for_the_live_app",
-        "R-3: the runtime API",
-    ),
-    (
-        "exchange_refuses_a_token_of_another_app",
-        "R-3: the runtime API",
-    ),
-    (
-        "exchange_refuses_an_actor_without_delegate",
-        "R-3: the runtime API",
-    ),
-    ("exchange_gives_a_delegated_token", "R-3: the runtime API"),
-    ("bound_content_only", "R-3: the runtime API"),
-    ("bound_children_only", "R-3: the runtime API"),
-    ("runtime_calls_never_cross_tenants", "R-3: the runtime API"),
-    ("publish_app_event_needs_the_topic", "R-3: the runtime API"),
-    (
-        "app_tokens_never_work_at_the_rest_api",
-        "R-3: the runtime API",
-    ),
+    // The internal gateway: G-3 (the runtime API cases of R-3 run with its world).
     (
         "the_internal_gateway_removes_the_workload_token",
         "G-3: the internal gateway",

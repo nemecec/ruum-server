@@ -20,6 +20,15 @@
 //!   is `not_running`). The answers name only what the gateway needs: IDs, flags, the pairwise
 //!   subjects of design 9.4 and an instance's `http://<host>:<port>`, never a platform user ID or
 //!   an email.
+//! - `POST /internal/runtime/v1/...`: the small internal API of the runtime API (card R-3;
+//!   `ruum_core::apps::runtime_api::wire`). Like the gateway, `ruum-runtime-api` holds no tenant
+//!   keys and no database credential: it checks the workload token itself and asks the core,
+//!   with the verified principal, whether the principal still serves and who it is
+//!   (`principal`), one page of a role's holders (`holders`), the bindings a user may use
+//!   through the app (`exchange`), a read inside a binding (`content`, `children`) and whether
+//!   the live manifest declares a topic (`topic`). The answers name IDs, flags, pairwise
+//!   subjects, sealed subjects and the content itself, never a platform user ID or an email. The
+//!   network policy of this listener must let the runtime API reach it too (card I-6).
 
 use crate::state::AppState;
 use axum::Router;
@@ -87,7 +96,8 @@ pub fn router(app: AppState, config: TlsAskConfig) -> Router {
             config,
             window: Arc::default(),
         })
-        .merge(gateway::router(app))
+        .merge(gateway::router(app.clone()))
+        .merge(runtime::router(app))
 }
 
 /// The internal API of the app gateway (see the module docs).
@@ -375,6 +385,121 @@ pub mod gateway {
         match agent_answer(&s, &r).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("agent", e),
+        }
+    }
+}
+
+/// The internal API of the runtime API (card R-3; see the module docs). Every route takes the
+/// principal as the runtime API verified it from the workload token (`wire::Caller`); the
+/// service filters every read by its tenant.
+pub mod runtime {
+    use crate::state::AppState;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::{Json, State};
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use futures::StreamExt;
+    use ruum_core::apps::runtime_api::wire::{
+        Caller, ExchangeQuery, HoldersQuery, PREFIX, ReadQuery, Refusal, TopicQuery,
+    };
+    use ruum_core::apps::runtime_api::{RuntimeApiService, internal_error};
+
+    /// The routes under [`PREFIX`].
+    pub fn router(app: AppState) -> Router {
+        let svc = RuntimeApiService::new(&app.services);
+        Router::new()
+            .route(&format!("{PREFIX}/principal"), post(principal))
+            .route(&format!("{PREFIX}/holders"), post(holders))
+            .route(&format!("{PREFIX}/exchange"), post(exchange))
+            .route(&format!("{PREFIX}/content"), post(content))
+            .route(&format!("{PREFIX}/children"), post(children))
+            .route(&format!("{PREFIX}/topic"), post(topic))
+            // Each request gets its own authz freshness floor (decision 0002-4), as the
+            // gateway's routes do.
+            .layer(axum::middleware::from_fn(request_freshness))
+            .with_state(svc)
+    }
+
+    async fn request_freshness(
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        ruum_core::authz::with_request_freshness(next.run(req)).await
+    }
+
+    fn failed(what: &str, e: &ruum_core::Error) -> Response {
+        let a = internal_error(what, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(a)).into_response()
+    }
+
+    fn refused(r: Refusal) -> Response {
+        let status = StatusCode::from_u16(r.status()).unwrap_or(StatusCode::FORBIDDEN);
+        (status, Json(serde_json::json!({ "refusal": r }))).into_response()
+    }
+
+    async fn principal(State(s): State<RuntimeApiService>, Json(c): Json<Caller>) -> Response {
+        match s.principal(&c).await {
+            Ok(a) => Json(a).into_response(),
+            Err(e) => failed("runtime principal", &e),
+        }
+    }
+
+    async fn holders(State(s): State<RuntimeApiService>, Json(q): Json<HoldersQuery>) -> Response {
+        match s.holders(&q).await {
+            Ok(a) => Json(a).into_response(),
+            Err(e) => failed("runtime holders", &e),
+        }
+    }
+
+    async fn exchange(
+        State(s): State<RuntimeApiService>,
+        Json(q): Json<ExchangeQuery>,
+    ) -> Response {
+        match s.exchange(&q).await {
+            Ok(a) => Json(a).into_response(),
+            Err(e) => failed("runtime exchange", &e),
+        }
+    }
+
+    /// The head version of a bound file, streamed with its length.
+    async fn content(State(s): State<RuntimeApiService>, Json(q): Json<ReadQuery>) -> Response {
+        match s.content(&q).await {
+            Ok(Ok(c)) => {
+                let mut resp = Response::new(Body::from_stream(
+                    c.body.map(|r| r.map_err(std::io::Error::other)),
+                ));
+                let h = resp.headers_mut();
+                if let Ok(v) = HeaderValue::from_str(&c.total_size.to_string()) {
+                    h.insert(header::CONTENT_LENGTH, v);
+                }
+                h.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                if let Ok(v) = HeaderValue::from_str(&c.version_id.to_string()) {
+                    h.insert("x-ruum-version", v);
+                }
+                resp
+            }
+            Ok(Err(r)) => refused(r),
+            Err(e) => failed("runtime content", &e),
+        }
+    }
+
+    async fn children(State(s): State<RuntimeApiService>, Json(q): Json<ReadQuery>) -> Response {
+        match s.children(&q).await {
+            Ok(Ok(p)) => Json(p).into_response(),
+            Ok(Err(r)) => refused(r),
+            Err(e) => failed("runtime children", &e),
+        }
+    }
+
+    async fn topic(State(s): State<RuntimeApiService>, Json(q): Json<TopicQuery>) -> Response {
+        match s.topic(&q).await {
+            Ok(a) => Json(a).into_response(),
+            Err(e) => failed("runtime topic", &e),
         }
     }
 }

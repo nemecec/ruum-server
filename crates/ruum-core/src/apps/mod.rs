@@ -48,8 +48,10 @@ pub mod check;
 pub mod deployments;
 pub mod domains;
 pub mod roles;
+pub mod runtime_api;
 pub mod sandboxes;
 pub mod secrets;
+pub mod workload_tokens;
 
 #[cfg(test)]
 mod tests;

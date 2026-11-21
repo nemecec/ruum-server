@@ -2,7 +2,8 @@
 //! [`super::PENDING`] with its card until a [`super::RuntimeApiWorld`] exists.
 
 use super::token::{
-    Expect, TestSigner, live_aud, user_claims, verify_delegated_token, verify_user_token,
+    Expect, TestSigner, decode_unverified, live_aud, user_claims, verify_delegated_token,
+    verify_user_token,
 };
 use super::{Binding, BindingKind, Echo, Env, Fail, Req, RtCtx, RuntimeCase, WorldError};
 use crate::{gw_check, gw_fail};
@@ -98,6 +99,69 @@ pub fn cases() -> Vec<RuntimeCase> {
                     ))
                     .await?;
                 gw_check!(resp.status == 404, "an unknown role: {}", resp.status);
+                // T6K-4: the person of a user token (a holder of the default role through
+                // B-2's rules) is listed as the pairwise ID its token carries; a role the
+                // person does not hold does not list it. The world's apps declare at least two
+                // roles (one default).
+                let u = cx.user_token(&app, Env::Live, "user").await?;
+                let Some(sub) = decode_unverified(u.expose())
+                    .ok()
+                    .and_then(|(_, c)| c["sub"].as_str().map(str::to_string))
+                else {
+                    gw_fail!("the user token has no sub");
+                };
+                let me = cx
+                    .send(bearer(Req::get(&h, "/v1/self"), tok.expose()))
+                    .await?;
+                gw_check!(me.status == 200, "GET /v1/self: {}", me.status);
+                let roles: Vec<String> = me.json().unwrap_or_default()["roles"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|r| r.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                gw_check!(
+                    roles.len() >= 2,
+                    "the world's app declares {} roles; the case needs two",
+                    roles.len()
+                );
+                let mut holding = Vec::new();
+                for role in &roles {
+                    let mut cursor: Option<String> = None;
+                    for _page in 0..50 {
+                        let path = match &cursor {
+                            None => format!("/v1/self/users?role={role}&limit=200"),
+                            Some(c) => format!("/v1/self/users?role={role}&limit=200&cursor={c}"),
+                        };
+                        let r = cx.send(bearer(Req::get(&h, &path), tok.expose())).await?;
+                        gw_check!(r.status == 200, "the holders of {role}: {}", r.status);
+                        let v = r.json().unwrap_or_default();
+                        for item in v["items"].as_array().cloned().unwrap_or_default() {
+                            let s = item["sub"].as_str().unwrap_or("");
+                            gw_check!(
+                                s.starts_with("pairwise:") || item["everyone"] == true,
+                                "a holder of {role} is not a pairwise ID"
+                            );
+                            if s == sub && !holding.contains(role) {
+                                holding.push(role.clone());
+                            }
+                        }
+                        cursor = v["next_cursor"].as_str().map(str::to_string);
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                }
+                gw_check!(
+                    !holding.is_empty(),
+                    "the user token's person is listed as a holder of no role"
+                );
+                gw_check!(
+                    holding.len() < roles.len(),
+                    "the user token's person is listed in every role, also one it does not hold"
+                );
                 Ok(())
             }
         ),
@@ -494,7 +558,26 @@ pub fn cases() -> Vec<RuntimeCase> {
                     delegate: false,
                 };
                 match cx.world.seed_app("globex", "shed", &[cross]).await {
-                    Err(WorldError::Failed(m)) if m.starts_with("refused") => {}
+                    // S-51 / T6K-2: the world's refusal is the core's own binding answer (B-1),
+                    // and the case's own request shows that globex's app reaches nothing of
+                    // acme's app.
+                    Err(WorldError::Failed(m)) if m.starts_with("refused") => {
+                        gw_check!(
+                            m.contains("binding_not_allowed") || m.contains("bindings_not_ready"),
+                            "the world refused the binding without the core's answer: {m}"
+                        );
+                        let r = cx
+                            .send(bearer(
+                                Req::get(&h, &format!("/v1/nodes/{}/content", acme.id)),
+                                g_w.expose(),
+                            ))
+                            .await?;
+                        gw_check!(
+                            matches!(r.status, 403 | 404) && echo.hits() == 0,
+                            "globex's app reached acme's app: {}",
+                            r.status
+                        );
+                    }
                     Err(e) => return Err(e.into()),
                     Ok(shed) => {
                         let w = cx.workload_token(&shed, Env::Live).await?;
