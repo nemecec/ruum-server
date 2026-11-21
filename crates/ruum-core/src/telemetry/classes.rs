@@ -697,6 +697,19 @@ impl TelemetryFieldStore for PgFieldStore {
             return Ok(0);
         }
         let mut tx = crate::journal::postgres::begin_tenant(&self.pool, tenant).await?;
+        // One writer of the app's rows at a time, as in `confirm` and `suggest`: without the
+        // lock a concurrent write can add rows between the count and the insert, and the app
+        // ends over the bound (Kimi run 14 re-check, O-2). No app row: nothing to write.
+        let locked =
+            sqlx::query("select 1 from apps where tenant_id = $1 and node_id = $2 for update")
+                .bind(tenant)
+                .bind(app)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            tx.commit().await?;
+            return Ok(0);
+        }
         let room = MAX_ROWS_PER_APP.saturating_sub(row_count(&mut tx, tenant, app).await?);
         let names = &names[..names.len().min(room)];
         if names.is_empty() {
@@ -1645,6 +1658,65 @@ mod tests {
             .unwrap();
         let s: Arc<dyn TelemetryFieldStore> = Arc::new(PgFieldStore::new(pool.clone()));
         confirming_existing_fields_works_at_the_bound(s, &ctx(a, ua), ua, na).await;
+    }
+
+    /// Kimi run 14 re-check (O-2): `record_seen` takes the app-row lock, so a write that holds
+    /// it (a confirmation or a suggestion) and fills the app cannot be overtaken by seen rows
+    /// counted before that write commits.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_seen_rows_wait_for_the_app_lock(pool: sqlx::PgPool) {
+        use crate::apps::store::AppStore;
+        use crate::apps::store::conformance::tests::{pg_app_node, pg_tenant};
+        use crate::apps::store::conformance::{app, ctx};
+        let (a, ua) = pg_tenant(&pool).await;
+        let na = pg_app_node(&pool, a, ua).await;
+        let apps = crate::apps::store::postgres::PgAppStore::new(pool.clone());
+        apps.insert_app(&ctx(a, ua), app(na, "planner"))
+            .await
+            .unwrap()
+            .unwrap();
+        // A writer holds the app-row lock and fills the app to the seen-row bound.
+        let mut held = crate::journal::postgres::begin_tenant(&pool, a).await.unwrap();
+        sqlx::query("select 1 from apps where tenant_id = $1 and node_id = $2 for update")
+            .bind(a)
+            .bind(na)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+        sqlx::query(
+            "insert into telemetry_fields (tenant_id, app_node_id, field, kind) \
+             select $1, $2, 'g' || i, 'log_field' from generate_series(1, $3) as i",
+        )
+        .bind(a)
+        .bind(na)
+        .bind(MAX_ROWS_PER_APP as i32)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        let store = PgFieldStore::new(pool.clone());
+        let seen = tokio::spawn(async move {
+            store
+                .record_seen(
+                    a,
+                    na,
+                    &[(FieldKind::LogField, "late".to_owned())],
+                    crate::now(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        held.commit().await.unwrap();
+        let n = seen.await.unwrap().unwrap();
+        assert_eq!(n, 0, "a seen row was written past the bound");
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from telemetry_fields where tenant_id = $1 and app_node_id = $2",
+        )
+        .bind(a)
+        .bind(na)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, MAX_ROWS_PER_APP as i64);
     }
 
     #[tokio::test]
