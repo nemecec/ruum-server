@@ -1092,13 +1092,15 @@ pub(crate) async fn bindings_stay_in_their_tenant(h: &dyn Harness) {
     assert_eq!(s.list_bindings(a, &all).await.unwrap().len(), 1);
 }
 
-/// Card I-6: the edge's question before a certificate. Only a tenant slug that a tenant has now
-/// together with an app slug of that tenant is known; another tenant's app slug, an unknown
-/// slug and a swapped pair are not.
+/// Card I-6: the edge's question before a certificate. A live host is known only while its app
+/// has a live deployment; a preview host only with the short ID of a pending, running or ready
+/// preview of that app that has not expired (review of I-6 1). Another tenant's app slug or short
+/// ID, another app's short ID, an unknown slug, a swapped pair and a made-up short ID are not.
 pub(crate) async fn app_hosts_are_known_only_for_real_apps(h: &dyn Harness) {
     let s = h.store();
     let (a, ua) = h.tenant().await;
-    let (b, _) = h.tenant().await;
+    let (b, ub) = h.tenant().await;
+    let (ca, cb) = (ctx(a, ua), ctx(b, ub));
     let ta = unique("hosta");
     let tb = unique("hostb");
     s.ensure_tenant_settings(a, std::slice::from_ref(&ta))
@@ -1108,20 +1110,142 @@ pub(crate) async fn app_hosts_are_known_only_for_real_apps(h: &dyn Harness) {
         .await
         .unwrap();
     let slug = unique("site");
+    let other_slug = unique("other");
+    let b_slug = unique("bsite");
     let n = h.app_node(a, ua).await;
-    assert!(
-        s.insert_app(&ctx(a, ua), app(n, &slug))
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(s.app_host_known(&ta, &slug).await.unwrap());
+    let n2 = h.app_node(a, ua).await;
+    let nb = h.app_node(b, ub).await;
+    for (c, node, sl) in [(&ca, n, &slug), (&ca, n2, &other_slug), (&cb, nb, &b_slug)] {
+        assert!(s.insert_app(c, app(node, sl)).await.unwrap().is_some());
+    }
+    // Never published: the live host serves nothing yet.
+    assert!(!s.app_host_known(&ta, &slug, None).await.unwrap());
+    let publish = Release {
+        kind: ReleaseKind::Publish,
+        expected_live: None,
+        restored_from: None,
+        rollback_of: None,
+        approval_id: None,
+    };
+    let live = s
+        .release(
+            &ca,
+            deployment(n, Environment::Live, DeploymentState::Live),
+            publish,
+        )
+        .await
+        .unwrap()
+        .deployment;
+    assert!(s.app_host_known(&ta, &slug, None).await.unwrap());
     // The same app slug under another tenant's slug, an unknown app, an unknown tenant, the
     // slugs swapped: not known.
-    assert!(!s.app_host_known(&tb, &slug).await.unwrap());
-    assert!(!s.app_host_known(&ta, &unique("none")).await.unwrap());
-    assert!(!s.app_host_known(&unique("nobody"), &slug).await.unwrap());
-    assert!(!s.app_host_known(&slug, &ta).await.unwrap());
+    assert!(!s.app_host_known(&tb, &slug, None).await.unwrap());
+    assert!(!s.app_host_known(&ta, &unique("none"), None).await.unwrap());
+    assert!(
+        !s.app_host_known(&unique("nobody"), &slug, None)
+            .await
+            .unwrap()
+    );
+    assert!(!s.app_host_known(&slug, &ta, None).await.unwrap());
+    // The live deployment's short ID is not a preview host.
+    assert!(
+        !s.app_host_known(&ta, &slug, Some(&live.short_id))
+            .await
+            .unwrap()
+    );
+
+    // A fresh preview is known from `pending` on, and while it is `ready`.
+    let p = s
+        .insert_deployment(
+            &ca,
+            deployment(n, Environment::Preview, DeploymentState::Pending),
+        )
+        .await
+        .unwrap();
+    assert!(
+        s.app_host_known(&ta, &slug, Some(&p.short_id))
+            .await
+            .unwrap()
+    );
+    assert!(
+        s.set_deployment_state(a, p.id, DeploymentState::Ready)
+            .await
+            .unwrap()
+    );
+    assert!(
+        s.app_host_known(&ta, &slug, Some(&p.short_id))
+            .await
+            .unwrap()
+    );
+    // A made-up short ID in front of a known app: not known.
+    let made_up = super::super::slugs::short_id();
+    assert!(!s.app_host_known(&ta, &slug, Some(&made_up)).await.unwrap());
+    // The short ID under another tenant's slug: not known.
+    assert!(
+        !s.app_host_known(&tb, &slug, Some(&p.short_id))
+            .await
+            .unwrap()
+    );
+    // Another app's preview (same tenant): known for that app only.
+    let p2 = s
+        .insert_deployment(
+            &ca,
+            deployment(n2, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    assert!(
+        s.app_host_known(&ta, &other_slug, Some(&p2.short_id))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s.app_host_known(&ta, &slug, Some(&p2.short_id))
+            .await
+            .unwrap()
+    );
+    // Another tenant's preview: known for that tenant's host only.
+    let pb = s
+        .insert_deployment(
+            &cb,
+            deployment(nb, Environment::Preview, DeploymentState::Ready),
+        )
+        .await
+        .unwrap();
+    assert!(
+        s.app_host_known(&tb, &b_slug, Some(&pb.short_id))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s.app_host_known(&ta, &slug, Some(&pb.short_id))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s.app_host_known(&ta, &b_slug, Some(&pb.short_id))
+            .await
+            .unwrap()
+    );
+    // A failed preview and an expired one: not known.
+    assert!(
+        s.set_deployment_state(a, p.id, DeploymentState::Failed)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s.app_host_known(&ta, &slug, Some(&p.short_id))
+            .await
+            .unwrap()
+    );
+    let mut old = deployment(n, Environment::Preview, DeploymentState::Ready);
+    old.expires_at = Some(crate::now() - time::Duration::minutes(1));
+    let old = s.insert_deployment(&ca, old).await.unwrap();
+    assert!(
+        !s.app_host_known(&ta, &slug, Some(&old.short_id))
+            .await
+            .unwrap()
+    );
 }
 
 /// Runs every case.
@@ -1297,6 +1421,52 @@ mod tests {
             pool,
         };
         run_all(&h).await;
+    }
+
+    /// Card I-6 (review of I-6 1): an app in the trash serves nothing, so its live host gets no
+    /// certificate. Only the Postgres store sees the trash (`nodes.trashed_at`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn postgres_app_hosts_of_trashed_apps_are_not_known(pool: sqlx::PgPool) {
+        let s = PgAppStore::new(pool.clone());
+        let (t, u) = pg_tenant(&pool).await;
+        let tenant_slug = unique("trash");
+        s.ensure_tenant_settings(t, std::slice::from_ref(&tenant_slug))
+            .await
+            .unwrap();
+        let n = pg_app_node(&pool, t, u).await;
+        let slug = unique("bin");
+        let c = ctx(t, u);
+        assert!(s.insert_app(&c, app(n, &slug)).await.unwrap().is_some());
+        let publish = Release {
+            kind: ReleaseKind::Publish,
+            expected_live: None,
+            restored_from: None,
+            rollback_of: None,
+            approval_id: None,
+        };
+        s.release(
+            &c,
+            deployment(n, Environment::Live, DeploymentState::Live),
+            publish,
+        )
+        .await
+        .unwrap();
+        assert!(s.app_host_known(&tenant_slug, &slug, None).await.unwrap());
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("set local ruum.system = 'on'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "update nodes set trashed_at = now(), trash_root = id where tenant_id = $1 and id = $2",
+        )
+        .bind(t)
+        .bind(n)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(!s.app_host_known(&tenant_slug, &slug, None).await.unwrap());
     }
 
     /// The plan of one page of a prepared statement in its generic form, which Postgres may

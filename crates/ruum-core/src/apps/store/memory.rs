@@ -251,7 +251,12 @@ impl AppStore for MemoryAppStore {
         })
     }
 
-    async fn app_host_known(&self, tenant_slug: &str, app_slug: &str) -> Result<bool> {
+    async fn app_host_known(
+        &self,
+        tenant_slug: &str,
+        app_slug: &str,
+        short_id: Option<&str>,
+    ) -> Result<bool> {
         let st = self.st();
         let Some(tenant) = st
             .tenants
@@ -261,10 +266,28 @@ impl AppStore for MemoryAppStore {
         else {
             return Ok(false);
         };
-        Ok(st
+        let Some(app) = st
             .apps
             .values()
-            .any(|a| a.tenant_id == tenant && a.slug == app_slug))
+            .find(|a| a.tenant_id == tenant && a.slug == app_slug)
+        else {
+            return Ok(false);
+        };
+        let Some(short) = short_id else {
+            return Ok(app.live_deployment_id.is_some());
+        };
+        let now = crate::now();
+        Ok(st.deployments.values().any(|d| {
+            d.tenant_id == tenant
+                && d.app_node_id == app.node_id
+                && d.short_id == short
+                && d.environment == Environment::Preview
+                && matches!(
+                    d.state,
+                    DeploymentState::Pending | DeploymentState::Running | DeploymentState::Ready
+                )
+                && d.expires_at.is_none_or(|e| e > now)
+        }))
     }
 
     async fn insert_app(&self, ctx: &Context, app: NewApp) -> Result<Option<AppRow>> {

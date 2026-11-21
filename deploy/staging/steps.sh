@@ -140,19 +140,37 @@ tunnel_targets() {
 # staging and of the build server (nodes, load balancer, the build server's IPv4 and its IPv6
 # /64), from the Hetzner API. The proxy refuses private ranges by itself; the public addresses are
 # what only this list denies (a name such as <node IP>.nip.io resolves to one). Comma-separated.
+# Each API answer is read on its own and checked (review of I-6, Kimi 4): a failed request, a
+# node count other than NODE_COUNT, a node or the build server without its public IPv4 (nodes
+# have no IPv6: tofu ipv6_enabled = false; an IPv6 network is added when there is one), a load
+# balancer without its IPv4 and IPv6 address, or a build server that is not exactly one stops the
+# step, so the list is never silently short.
 egress_deny() {
-  local list
+  local nodes lbs bb
+  nodes="$(hapi "servers?label_selector=env%3Dstaging%2Crole%3Dnode")" || die "EGRESS_DENY: the Hetzner API did not list the nodes"
+  lbs="$(hapi "load_balancers?label_selector=env%3Dstaging")" || die "EGRESS_DENY: the Hetzner API did not list the load balancers"
+  bb="$(hapi "servers?name=ruum-buildbox")" || die "EGRESS_DENY: the Hetzner API did not find the build server"
+  egress_deny_from "$nodes" "$lbs" "$bb" "$NODE_COUNT"
+}
+
+# egress_deny_from NODES_JSON LBS_JSON BUILDBOX_JSON NODE_COUNT: the list from the three API
+# answers (tests/run.sh calls it with fixtures).
+egress_deny_from() {
+  local nodes="$1" lbs="$2" bb="$3" count="$4" list
+  jq -e --argjson n "$count" '(.servers | length) == $n and all(.servers[]; .public_net.ipv4.ip)' <<<"$nodes" >/dev/null 2>&1 ||
+    die "EGRESS_DENY: the Hetzner API does not list $count staging nodes, each with a public IPv4 address"
+  jq -e '(.load_balancers | length) >= 1 and all(.load_balancers[]; .public_net.ipv4.ip and .public_net.ipv6.ip)' <<<"$lbs" >/dev/null 2>&1 ||
+    die "EGRESS_DENY: the Hetzner API lists no staging load balancer with a public IPv4 and IPv6 address"
+  jq -e '(.servers | length) == 1 and (.servers[0].public_net.ipv4.ip)' <<<"$bb" >/dev/null 2>&1 ||
+    die "EGRESS_DENY: the Hetzner API does not list exactly one build server (ruum-buildbox) with a public IPv4 address"
   list="$( {
     printf '%s\n' 10.20.0.0/16 10.244.0.0/16 10.96.0.0/12
-    hapi "servers?label_selector=env%3Dstaging%2Crole%3Dnode" |
-      jq -r '.servers[].public_net | (.ipv4.ip // empty), (.ipv6.network // empty)'
-    hapi "load_balancers?label_selector=env%3Dstaging" |
-      jq -r '.load_balancers[].public_net | (.ipv4.ip // empty), (.ipv6.ip // empty)'
-    hapi "servers?name=ruum-buildbox" |
-      jq -r '.servers[].public_net | (.ipv4.ip // empty), (.ipv6.network // empty)'
-  } | grep -E '^[0-9a-fA-F.:/]+$' | sort -u | paste -sd, -)"
-  [[ "$list" == *,* ]] || die "EGRESS_DENY: no public address of staging from the Hetzner API"
-  printf '%s' "$list"
+    jq -r '.servers[].public_net | .ipv4.ip, (.ipv6.network // empty)' <<<"$nodes"
+    jq -r '.load_balancers[].public_net | .ipv4.ip, .ipv6.ip' <<<"$lbs"
+    jq -r '.servers[].public_net | .ipv4.ip, (.ipv6.network // empty)' <<<"$bb"
+  } | LC_ALL=C sort -u)"
+  grep -qvE '^[0-9a-fA-F.:/]+$' <<<"$list" && die "EGRESS_DENY: an entry is not an address or a prefix"
+  paste -sd, - <<<"$list"
 }
 
 # The build server's Hetzner ID: check-plan.sh refuses any attachment or target that names it.

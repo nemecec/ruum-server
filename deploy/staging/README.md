@@ -530,32 +530,51 @@ Milestone M2 on staging: apps are served at `<app>.<tenant slug>.apps.staging.ru
 - **The gateway and the egress proxy** (`charts/ruum` `gateway.yaml`, `egress.yaml`) run from
   `ghcr.io/nemecec/ruum-gateway` and `ruum-egress`, built, scanned and attested by `images.yml`
   with the other images. `ops/deploy-chart.sh` takes them from the tag `<commit>` and checks
-  their provenance like the server's; a commit without them (older than I-6) deploys without the
-  app runtime, and one image without the other stops the deploy. The gateway: two replicas,
+  their provenance and their revision label like the server's. One image without the other
+  stops the deploy, and so does a registry or network error of either lookup. A commit without
+  both images (older than I-6, or the packages are private) deploys without the app runtime only
+  when the live release has none, or on `deploy.sh --rollback`: otherwise helm would delete the
+  running gateway and egress proxy (review of I-6, 2). The gateway: two replicas,
   `RUUM_GATEWAY_*` settings from the chart, its database role `ruum_gateway` (it may only execute
   `ruum_app_host_lookup`; `k8s/sql/ruum-gateway-grants.sql` fails the platform step when it can
   do more), the user-token key as a file (`STG_GATEWAY_TOKEN_KEY`), and an optional read
   credential of the static sites' bucket (`STG_GATEWAY_S3_*`; without it the gateway serves no
   static file). The egress proxy: one replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
   (the cluster ranges and every public address of staging and of the build server, ConfigMap
-  `ruum/ruum-egress-deny`), its control socket inside the pod.
+  `ruum/ruum-egress-deny`; the platform step stops when an API answer fails or misses a node, the
+  load balancer or the build server, and restarts the proxy when the list changed), its control
+  socket inside the pod.
 - **Network policy** (`charts/platform` `networkpolicies.yaml`): nothing reaches the gateway but
   the edge (8494); the gateway reaches only ruum-server's internal listener (8493), Postgres,
   the sandboxes, DNS and public addresses on 443 (the bucket); sandboxes in `ruum-apps` get
   ingress only from the gateway and egress only to the egress proxy (3128: no DNS, no other
   pod, no metadata address); only `ruum-apps` reaches the egress proxy, which reaches DNS and
-  public addresses on 443. `status.sh --netpol` probes each path, a sandbox of the runtime class
-  gvisor included.
+  public addresses on 443. "Public" excludes the private and special-use ranges that
+  `crates/ruum-egress/src/addr.rs` refuses (IPv6: global unicast `2000::/3` only).
+  `status.sh --netpol` probes each path, a sandbox of the runtime class gvisor included.
 - **The edge and DNS.** The site `*.*.apps.staging.ruumapps.net` goes to the gateway with
-  on-demand TLS and no HSTS; ruum-server's `ask` endpoint answers 200 only for a host whose
-  tenant slug and app slug name an existing app (`ruum_api::internal`), within the same hourly
-  limit as the content hosts. `tofu/cluster/dns.tf`: `*.apps.staging` A, AAAA and CAA.
+  on-demand TLS and no HSTS; ruum-server's `ask` endpoint answers 200 only for a host that can
+  serve (`ruum_api::internal`): the live host of an app with a live deployment that is not in
+  the trash, or the preview host whose short ID is a pending, running or ready preview of that
+  app. It shares the hourly limit with the content hosts, checks an allowed name again after
+  10 minutes, remembers a refused name for a minute and runs at most 8 lookups at a time. `tofu/cluster/dns.tf`: `*.apps.staging` A, AAAA and CAA.
   `RUUM_APPS_DOMAIN` is the same in ruum-server and the gateway (the app addresses, the sign-in
   redirect to an app origin).
 - **Smoke checks** (`ops/smoke-apps.sh`, in `status.sh --checks`): DNS, no certificate for an
   unknown app host, and for the hosts in `STG_SMOKE_STATIC_HOST` (and, later,
   `STG_SMOKE_NODE22_HOST`) a certificate, no HSTS, and the gateway's sign-in chain to the
   platform. The page behind the sign-in is the person's browser check.
+
+**Staging apps of different tenants are not separate sites yet** (backlog I6-11). Browsers
+group origins into sites by the Public Suffix List. `ruumapps.net` is not on it, so every app
+origin under `apps.staging.ruumapps.net` (and the content hosts under
+`content.staging.ruumapps.net`) is one site, `ruumapps.net`. One tenant's app can set a cookie
+for `.apps.staging.ruumapps.net` or `.ruumapps.net` that other tenants' apps and the content
+hosts receive, and per-site reputation (Safe Browsing) crosses tenants. The gateway's
+`__Host-` cookies and the platform sign-in are not affected; tenant apps' own cookies are. The
+PSL entry of decision 0006 E-1 (`*.ruumapps.net`) is not enough for staging: it makes
+`apps.staging.ruumapps.net` one site. Do not put anything on staging apps that needs the
+separation.
 
 **Not on staging yet** (backlog I6-1 to I6-6): a runtime driver that starts sandboxes on
 Kubernetes (the Docker driver needs a Docker engine; Talos has none), so node22 apps answer the
@@ -574,11 +593,17 @@ of user tokens for apps (P-97); scale to zero (Knative or KEDA, STEP3 "Infrastru
 2. Optional, for static apps: Hetzner Console, project of staging, Object Storage, "S3
    credentials", "Generate credentials", description `ruum-staging-gateway`. Put the two values
    into `secrets.env` as `STG_GATEWAY_S3_ACCESS_KEY` and `STG_GATEWAY_S3_SECRET_KEY`. Hetzner
-   credentials are not scoped: this key can write every bucket of the project, like the server's.
-   A separate key only makes it separately revocable (backlog I6-3).
-3. After the deploy: sign in at `https://staging.ruum.space`, deploy one static app over MCP or
-   the web UI and publish it, put its host into `secrets.env` as `STG_SMOKE_STATIC_HOST`, and open
-   it in the browser (a certificate of the configured CA, the page after the app sign-in).
+   credentials are not scoped: this key can read, write and delete every bucket of the project,
+   every tenant's blobs included. Then the gateway, the
+   Internet-facing part of the app runtime, holds a key as strong as the server's, and a flaw
+   in the gateway reaches every tenant's files. A separate key only makes it separately
+   revocable. Make this key only after the decision of backlog I6-3 (a key limited to the
+   static sites, or static files served through the core); until then staging serves no static
+   file, which fails closed.
+3. After the deploy, and only with the key of step 2: sign in at `https://staging.ruum.space`,
+   deploy one static app over MCP or the web UI and publish it, put its host into `secrets.env`
+   as `STG_SMOKE_STATIC_HOST`, and open it in the browser (a certificate of the configured CA,
+   the page after the app sign-in).
 
 ### The orchestrator: from main to the app runtime
 

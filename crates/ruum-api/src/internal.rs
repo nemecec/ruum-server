@@ -6,13 +6,17 @@
 //!
 //! - `GET /internal/tls-ask?domain=<host>`: the `ask` endpoint of Caddy's on-demand TLS. It
 //!   answers `200` only for `<tenant>.<content host>` where the tenant exists, and for an app
-//!   host `<app>.<tenant slug>.<apps domain>` or `<short id>--<app>.<tenant slug>.<apps domain>`
-//!   where that tenant has an app with that slug (card I-6; the gateway decides later whether
-//!   the host serves), and `404` for every other name, so Caddy gets no certificate for a name
-//!   that nobody uses. Caddy fails closed: an
+//!   host that can serve (card I-6): `<app>.<tenant slug>.<apps domain>` of an app with a live
+//!   deployment, or `<short id>--<app>.<tenant slug>.<apps domain>` of a pending, running or
+//!   ready preview of that app with that short ID (`AppStore::app_host_known`). Every other name
+//!   gets `404`, so Caddy gets no certificate for a name that nobody uses. Caddy fails closed: an
 //!   error or a timeout also means no certificate. New names are rate limited
 //!   ([`TlsAskConfig::new_hosts_per_hour`]), so even many real tenants cannot use up the CA's
-//!   limits in a burst; a name that was allowed once stays allowed without counting again.
+//!   limits in a burst; a name that was allowed once stays allowed without counting again, but
+//!   is checked again after [`ALLOWED_RECHECK`] (a trashed app or an expired preview loses it).
+//!   The store lookups are bounded (review of I-6, Kimi 3): at most [`ASK_LOOKUPS`] at a time
+//!   (else `503` after a wait of a second), each within [`ASK_LOOKUP_TIMEOUT`], and a refused name is remembered
+//!   for [`DENIED_FOR`], so a stream of made-up names costs the database a bounded amount of work.
 //! - `POST /internal/gateway/v1/...`: the small internal API of the app gateway (card G-1a;
 //!   `ruum_core::identity::app_sign_in::wire`). The gateway holds no tenant keys and no general
 //!   system access (decision 0006-1), so it asks the core: what a deployment is (`deployment`),
@@ -32,7 +36,7 @@ use axum::routing::get;
 use ruum_core::TenantId;
 use ruum_core::blobs::signed::tenant_of_host;
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,6 +52,11 @@ pub struct TlsAskConfig {
     /// The apps domain (`RUUM_APPS_DOMAIN`, for example `apps.staging.ruumapps.net`), lower case
     /// without dots at the ends. `None`: no app host gets a certificate (card I-6).
     pub apps_domain: Option<String>,
+    /// How long an allowed name stays allowed before the store is asked again
+    /// ([`ALLOWED_RECHECK`]; tests set it shorter).
+    pub allowed_recheck: Duration,
+    /// How long a refused name is answered without the store ([`DENIED_FOR`]).
+    pub denied_for: Duration,
 }
 
 impl TlsAskConfig {
@@ -61,6 +70,8 @@ impl TlsAskConfig {
             content_host: host,
             new_hosts_per_hour,
             apps_domain: None,
+            allowed_recheck: ALLOWED_RECHECK,
+            denied_for: DENIED_FOR,
         }
     }
 
@@ -72,18 +83,19 @@ impl TlsAskConfig {
     }
 }
 
-/// The tenant and app slugs of an app host `<app>.<tenant>.<apps domain>` or
-/// `<short id>--<app>.<tenant>.<apps domain>` (the rules of `ruum-gateway`'s host parser:
-/// exactly two labels in front of the domain, slug rules, a short ID of 8 characters of
-/// `[a-z0-9]`). `None` for anything else.
-fn app_host_slugs<'a>(domain: &'a str, apps_domain: &str) -> Option<(&'a str, &'a str)> {
+/// The tenant slug, the app slug and the short ID (a preview host) of an app host
+/// `<app>.<tenant>.<apps domain>` or `<short id>--<app>.<tenant>.<apps domain>` (the rules of
+/// `ruum-gateway`'s host parser: exactly two labels in front of the domain, slug rules, a short
+/// ID of 8 characters of `[a-z0-9]`). `None` for anything else.
+type AppHost<'a> = (&'a str, &'a str, Option<&'a str>);
+fn app_host_slugs<'a>(domain: &'a str, apps_domain: &str) -> Option<AppHost<'a>> {
     use ruum_core::apps::slugs::{SlugKind, is_valid};
     let front = domain.strip_suffix(apps_domain)?.strip_suffix('.')?;
     let (first, tenant) = front.split_once('.')?;
     if tenant.contains('.') || !is_valid(tenant, SlugKind::Tenant) {
         return None;
     }
-    let app = match first.split_once("--") {
+    let (short_id, app) = match first.split_once("--") {
         Some((short, app)) => {
             let short_ok = short.len() == 8
                 && short
@@ -92,19 +104,38 @@ fn app_host_slugs<'a>(domain: &'a str, apps_domain: &str) -> Option<(&'a str, &'
             if !short_ok {
                 return None;
             }
-            app
+            (Some(short), app)
         }
-        None => first,
+        None => (None, first),
     };
-    is_valid(app, SlugKind::App).then_some((tenant, app))
+    is_valid(app, SlugKind::App).then_some((tenant, app, short_id))
 }
 
 #[derive(Default)]
 struct Window {
-    /// Names that got `200`.
-    allowed: HashSet<String>,
+    /// Names that got `200`, and when the store last confirmed each one.
+    allowed: HashMap<String, Instant>,
     /// When each new name got `200`, in the last hour.
     recent: VecDeque<Instant>,
+    /// Names that the store refused, and when (at most [`DENIED_MAX`]).
+    denied: HashMap<String, Instant>,
+}
+
+impl Window {
+    /// Remembers a refused name for `denied_for` ([`DENIED_FOR`]). When the map is full, the
+    /// expired entries go; when it is still full, all of them go (a flood of made-up names),
+    /// which only means more lookups, never a wrong answer.
+    fn deny(&mut self, domain: String, now: Instant, denied_for: Duration) {
+        self.allowed.remove(&domain);
+        if self.denied.len() >= DENIED_MAX {
+            self.denied
+                .retain(|_, at| now.duration_since(*at) < denied_for);
+            if self.denied.len() >= DENIED_MAX {
+                self.denied.clear();
+            }
+        }
+        self.denied.insert(domain, now);
+    }
 }
 
 #[derive(Clone)]
@@ -112,6 +143,8 @@ struct AskState {
     app: AppState,
     config: TlsAskConfig,
     window: Arc<Mutex<Window>>,
+    /// Bounds the store lookups of the ask endpoint (see the module docs).
+    lookups: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +153,17 @@ struct AskQuery {
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
+/// How long an allowed name stays allowed before the store is asked again (it does not count
+/// against the hourly limit again while it still exists).
+pub const ALLOWED_RECHECK: Duration = Duration::from_secs(600);
+/// How long a refused name is answered `404` without asking the store.
+pub const DENIED_FOR: Duration = Duration::from_secs(60);
+/// At most this many refused names are remembered.
+const DENIED_MAX: usize = 4096;
+/// At most this many store lookups of the ask endpoint run at a time (per process).
+pub const ASK_LOOKUPS: usize = 8;
+/// A store lookup of the ask endpoint that takes longer fails closed (`404`, not remembered).
+pub const ASK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The internal router (see the module docs).
 pub fn router(app: AppState, config: TlsAskConfig) -> Router {
@@ -129,6 +173,7 @@ pub fn router(app: AppState, config: TlsAskConfig) -> Router {
             app: app.clone(),
             config,
             window: Arc::default(),
+            lookups: Arc::new(tokio::sync::Semaphore::new(ASK_LOOKUPS)),
         })
         .merge(gateway::router(app))
 }
@@ -433,7 +478,11 @@ async fn tls_ask(State(s): State<AskState>, Query(q): Query<AskQuery>) -> Status
     // existing app (card I-6).
     enum Wanted<'a> {
         Content(TenantId),
-        App { tenant: &'a str, app: &'a str },
+        App {
+            tenant: &'a str,
+            app: &'a str,
+            short_id: Option<&'a str>,
+        },
     }
     let content = domain
         .strip_suffix(&s.config.content_host)
@@ -447,42 +496,85 @@ async fn tls_ask(State(s): State<AskState>, Query(q): Query<AskQuery>) -> Status
             return StatusCode::NOT_FOUND;
         };
         Wanted::Content(tenant)
-    } else if let Some((tenant, app)) = s
+    } else if let Some((tenant, app, short_id)) = s
         .config
         .apps_domain
         .as_deref()
         .and_then(|apps| app_host_slugs(&domain, apps))
     {
-        Wanted::App { tenant, app }
+        Wanted::App {
+            tenant,
+            app,
+            short_id,
+        }
     } else {
         return StatusCode::NOT_FOUND;
     };
     {
         let w = s.window.lock().expect("ask window lock");
-        if w.allowed.contains(&domain) {
+        let now = Instant::now();
+        if w.allowed
+            .get(&domain)
+            .is_some_and(|at| now.duration_since(*at) < s.config.allowed_recheck)
+        {
             return StatusCode::OK;
         }
+        if w.denied
+            .get(&domain)
+            .is_some_and(|at| now.duration_since(*at) < s.config.denied_for)
+        {
+            return StatusCode::NOT_FOUND;
+        }
     }
-    let exists = match wanted {
-        Wanted::Content(tenant) => s.app.services.tenants.find(tenant).await.is_ok(),
-        // An error fails closed: no certificate.
-        Wanted::App { tenant, app } => s
-            .app
-            .services
-            .apps
-            .store()
-            .app_host_known(tenant, app)
-            .await
-            .unwrap_or(false),
+    // A bounded lookup: no free slot in a short wait means `503` (Caddy asks again at the next
+    // handshake); a slow store means `404` without remembering it.
+    let Ok(Ok(_permit)) = tokio::time::timeout(Duration::from_secs(1), s.lookups.acquire()).await
+    else {
+        tracing::warn!(
+            target: "ruum::security",
+            event = "tls.ask_busy",
+            "too many certificate lookups at once; no certificate now"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE;
     };
+    let lookup = async {
+        match wanted {
+            // Only "no such tenant" is a refusal that is remembered; another error fails closed.
+            Wanted::Content(tenant) => match s.app.services.tenants.find(tenant).await {
+                Ok(_) => Ok(true),
+                Err(e) if e.http_status() == 404 => Ok(false),
+                Err(e) => Err(e),
+            },
+            Wanted::App {
+                tenant,
+                app,
+                short_id,
+            } => {
+                s.app
+                    .services
+                    .apps
+                    .store()
+                    .app_host_known(tenant, app, short_id)
+                    .await
+            }
+        }
+    };
+    let exists = match tokio::time::timeout(ASK_LOOKUP_TIMEOUT, lookup).await {
+        Ok(Ok(exists)) => exists,
+        // An error or a timeout fails closed: no certificate, and nothing remembered.
+        Ok(Err(_)) | Err(_) => return StatusCode::NOT_FOUND,
+    };
+    let mut w = s.window.lock().expect("ask window lock");
+    let now = Instant::now();
     if !exists {
+        w.deny(domain, now, s.config.denied_for);
         return StatusCode::NOT_FOUND;
     }
-    let mut w = s.window.lock().expect("ask window lock");
-    if w.allowed.contains(&domain) {
+    // Allowed before (and still there): confirmed again, without counting again.
+    if let Some(at) = w.allowed.get_mut(&domain) {
+        *at = now;
         return StatusCode::OK;
     }
-    let now = Instant::now();
     while w
         .recent
         .front()
@@ -494,12 +586,13 @@ async fn tls_ask(State(s): State<AskState>, Query(q): Query<AskQuery>) -> Status
         tracing::warn!(
             target: "ruum::security",
             event = "tls.ask_rate_limited",
-            "too many new content hosts in the last hour; no certificate"
+            "too many new hosts in the last hour; no certificate"
         );
         return StatusCode::TOO_MANY_REQUESTS;
     }
     w.recent.push_back(now);
-    w.allowed.insert(domain);
+    w.denied.remove(&domain);
+    w.allowed.insert(domain, now);
     StatusCode::OK
 }
 
@@ -576,12 +669,55 @@ mod tests {
         );
     }
 
-    /// Card I-6: an app host gets a certificate only when its tenant slug and app slug name an
-    /// app; the labels follow the gateway's host rules. Without an apps domain no app host does.
-    #[tokio::test]
-    async fn only_hosts_of_existing_apps_get_a_certificate() {
+    /// A deployment row of `app` for the tests of app hosts.
+    fn app_deployment(
+        app: ruum_core::NodeId,
+        environment: ruum_core::apps::store::Environment,
+        state: ruum_core::apps::store::DeploymentState,
+        short_id: &str,
+    ) -> ruum_core::apps::store::NewDeployment {
+        use ruum_core::apps::store::{Archive, DeploymentSource, NewDeployment};
+        NewDeployment {
+            id: uuid::Uuid::now_v7(),
+            app_node_id: app,
+            environment,
+            state,
+            short_id: short_id.into(),
+            label: None,
+            draft: None,
+            new_chunks: Vec::new(),
+            source: DeploymentSource {
+                kind: "file".into(),
+                node_id: Some(ruum_core::NodeId::new()),
+                version_id: Some(ruum_core::VersionId::new()),
+                files: None,
+            },
+            archive: Archive {
+                content_hash: [7; 32],
+                size: 10,
+                chunks: vec![1, 2, 3],
+            },
+            manifest: Some(serde_json::json!({ "runtime": "static" })),
+            stages: serde_json::json!([]),
+            published_from: None,
+            expires_at: None,
+        }
+    }
+
+    struct AppHosts {
+        state: AppState,
+        ctx: ruum_core::Context,
+        /// The live app `plants` of tenant slug `garden`.
+        plants: ruum_core::NodeId,
+        /// The ready preview `ab12cd34` of `plants`.
+        preview: uuid::Uuid,
+    }
+
+    /// Tenant `garden` with the published app `plants` (preview `ab12cd34--plants`), the app
+    /// `seeds` that was never published (its preview `cd34ef56--seeds`), and tenant `orchard`.
+    async fn app_hosts() -> AppHosts {
         use ruum_core::apps::settings::AppSettings;
-        use ruum_core::apps::store::NewApp;
+        use ruum_core::apps::store::{DeploymentState, Environment, NewApp, Release, ReleaseKind};
         let (_, _, state) = crate::routes::auth::tests::app();
         let t = tenant(&state, "apps@example.test").await;
         let other = tenant(&state, "other@example.test").await;
@@ -600,18 +736,75 @@ mod tests {
             scope: None,
             idempotency_key: None,
         };
+        let (plants, seeds) = (ruum_core::NodeId::new(), ruum_core::NodeId::new());
+        for (node, slug) in [(plants, "plants"), (seeds, "seeds")] {
+            store
+                .insert_app(
+                    &ctx,
+                    NewApp {
+                        node_id: node,
+                        slug: slug.into(),
+                        settings: AppSettings::default(),
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
         store
-            .insert_app(
+            .release(
                 &ctx,
-                NewApp {
-                    node_id: ruum_core::NodeId::new(),
-                    slug: "plants".into(),
-                    settings: AppSettings::default(),
+                app_deployment(plants, Environment::Live, DeploymentState::Live, "live0001"),
+                Release {
+                    kind: ReleaseKind::Publish,
+                    expected_live: None,
+                    restored_from: None,
+                    rollback_of: None,
+                    approval_id: None,
                 },
             )
             .await
-            .unwrap()
             .unwrap();
+        let preview = store
+            .insert_deployment(
+                &ctx,
+                app_deployment(
+                    plants,
+                    Environment::Preview,
+                    DeploymentState::Ready,
+                    "ab12cd34",
+                ),
+            )
+            .await
+            .unwrap()
+            .id;
+        store
+            .insert_deployment(
+                &ctx,
+                app_deployment(
+                    seeds,
+                    Environment::Preview,
+                    DeploymentState::Ready,
+                    "cd34ef56",
+                ),
+            )
+            .await
+            .unwrap();
+        AppHosts {
+            state,
+            ctx,
+            plants,
+            preview,
+        }
+    }
+
+    /// Card I-6: an app host gets a certificate only when it can serve: the live host of an app
+    /// with a live deployment, or the preview host of that app's preview with that short ID
+    /// (review of I-6 1: any short ID in front of a known app got one before). The labels follow
+    /// the gateway's host rules. Without an apps domain no app host does.
+    #[tokio::test]
+    async fn only_hosts_of_existing_apps_get_a_certificate() {
+        let AppHosts { state, .. } = app_hosts().await;
         let config = TlsAskConfig::for_content_url("https://content.staging.ruumapps.net", 20);
         let without = router(state.clone(), config.clone());
         assert_eq!(
@@ -627,12 +820,20 @@ mod tests {
             "plants.garden.apps.staging.ruumapps.net",
             "PLANTS.Garden.apps.staging.ruumapps.net.",
             "ab12cd34--plants.garden.apps.staging.ruumapps.net",
+            "cd34ef56--seeds.garden.apps.staging.ruumapps.net",
         ] {
             assert_eq!(ask(&app, good).await, StatusCode::OK, "{good}");
         }
         for bad in [
+            // A made-up short ID, another app's short ID, the live deployment's short ID.
+            "zz99zz99--plants.garden.apps.staging.ruumapps.net",
+            "cd34ef56--plants.garden.apps.staging.ruumapps.net",
+            "live0001--plants.garden.apps.staging.ruumapps.net",
+            // An app that was never published (its live host serves nothing).
+            "seeds.garden.apps.staging.ruumapps.net",
             // Another tenant's slug, an unknown app, an unknown tenant.
             "plants.orchard.apps.staging.ruumapps.net",
+            "ab12cd34--plants.orchard.apps.staging.ruumapps.net",
             "weeds.garden.apps.staging.ruumapps.net",
             "plants.nobody.apps.staging.ruumapps.net",
             // Label count, the domain itself, a bad short ID, reserved and malformed slugs.
@@ -647,6 +848,74 @@ mod tests {
         ] {
             assert_eq!(ask(&app, bad).await, StatusCode::NOT_FOUND, "{bad}");
         }
+    }
+
+    /// Review of I-6 (Kimi 2 and 3): an allowed name is checked again after the recheck time,
+    /// so an ended preview loses it; a refused name is answered from memory for a while, so a
+    /// repeated made-up name does not reach the store again.
+    #[tokio::test]
+    async fn allowed_names_are_checked_again_and_refused_names_are_remembered() {
+        use ruum_core::apps::store::DeploymentState;
+        let AppHosts {
+            state,
+            ctx,
+            plants,
+            preview,
+        } = app_hosts().await;
+        let store = state.services.apps.store().clone();
+        let mut config = TlsAskConfig::for_content_url("https://content.staging.ruumapps.net", 20)
+            .with_apps_domain("apps.staging.ruumapps.net");
+        config.allowed_recheck = Duration::ZERO;
+        let app = router(state.clone(), config.clone());
+        let host = "ab12cd34--plants.garden.apps.staging.ruumapps.net";
+        assert_eq!(ask(&app, host).await, StatusCode::OK);
+        assert_eq!(
+            ask(&app, host).await,
+            StatusCode::OK,
+            "still there: allowed"
+        );
+        assert!(
+            store
+                .set_deployment_state(ctx.tenant, preview, DeploymentState::Expired)
+                .await
+                .unwrap()
+        );
+        assert_eq!(ask(&app, host).await, StatusCode::NOT_FOUND, "expired");
+        // The default recheck time keeps the answer for a while.
+        let cached = router(
+            state.clone(),
+            TlsAskConfig::for_content_url("https://content.staging.ruumapps.net", 20)
+                .with_apps_domain("apps.staging.ruumapps.net"),
+        );
+        let live = "plants.garden.apps.staging.ruumapps.net";
+        assert_eq!(ask(&cached, live).await, StatusCode::OK);
+        // A refused name: remembered for `denied_for`, then asked again.
+        let fresh = "fe12dc34--plants.garden.apps.staging.ruumapps.net";
+        assert_eq!(ask(&cached, fresh).await, StatusCode::NOT_FOUND);
+        store
+            .insert_deployment(
+                &ctx,
+                app_deployment(
+                    plants,
+                    ruum_core::apps::store::Environment::Preview,
+                    DeploymentState::Pending,
+                    "fe12dc34",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ask(&cached, fresh).await,
+            StatusCode::NOT_FOUND,
+            "refused a moment ago: not asked again"
+        );
+        config.denied_for = Duration::ZERO;
+        let uncached = router(state, config);
+        assert_eq!(
+            ask(&uncached, fresh).await,
+            StatusCode::OK,
+            "a fresh preview"
+        );
     }
 
     #[tokio::test]

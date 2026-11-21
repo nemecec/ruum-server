@@ -1085,11 +1085,13 @@ YAML
     grep -qF 'kubernetes.io/metadata.name: ruum-apps' "$TMP/np-gw-out.yaml" && ok "the gateway reaches the core's internal listener, Postgres and the sandboxes" || bad "the gateway's egress misses the core, Postgres or the sandboxes"
   doc_of "$P" NetworkPolicy egress-proxy-out >"$TMP/np-eg-out.yaml"
   for f in "$TMP/np-gw-out.yaml" "$TMP/np-eg-out.yaml"; do
-    for c in 10.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10; do
+    for c in 0.0.0.0/8 10.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 192.0.0.0/24 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4 2001::/23 2002::/16; do
       grep -qF "\"$c\"" "$f" || bad "an egress policy of the app runtime does not except $c"
     done
+    # IPv6: global unicast only (review of I-6, Kimi 7), never ::/0 (IPv4-mapped, NAT64, fc00::/7).
+    grep -qF 'cidr: 2000::/3' "$f" && ! grep -qF 'cidr: ::/0' "$f" || bad "an egress policy of the app runtime allows IPv6 outside 2000::/3"
   done
-  ok "the gateway and the egress proxy reach no private range by address block"
+  ok "the gateway and the egress proxy reach no private or special range by address block"
   doc_of "$P" NetworkPolicy egress-from-sandboxes | grep -F 'kubernetes.io/metadata.name: ruum-apps' >/dev/null && ok "only ruum-apps reaches the egress proxy" || bad "the egress proxy's ingress is not ruum-apps"
   doc_of "$P" NetworkPolicy pg-clients | grep -F 'matchLabels: { app: ruum-gateway }' >/dev/null && ok "the gateway reaches Postgres (pg-clients)" || bad "pg-clients does not let the gateway in"
   doc_of "$P" NetworkPolicy ruum-server-internal-from-gateway | grep -F '{ protocol: TCP, port: 8493 }' >/dev/null && ok "the gateway reaches ruum-server's internal listener only (8493)" || bad "no policy lets the gateway reach the internal listener"
@@ -1891,15 +1893,116 @@ grep -qF 'cargo build --release --locked -p ruum-gateway' "$ROOT/deploy/images/r
   [[ "ghcr.io/nemecec/ruum-gateway@sha256:$(printf '%064d' 3)" =~ $RUUM_IMAGE_RE ]] && exit 1
   exit 0 ) && ok "RUUM_APP_IMAGE_RE takes the gateway and egress images by digest, nothing else (and the server pattern never takes them)" || bad "RUUM_APP_IMAGE_RE"
 dc="$STG/ops/deploy-chart.sh"
-grep -qF 'ghcr_digest "nemecec/ruum-$kind" "$commit"' "$dc" && grep -qF 'cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"' "$dc" &&
+grep -qF 'ghcr_tag_lookup "nemecec/ruum-$kind" "$commit"' "$dc" && grep -qF 'cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"' "$dc" &&
   grep -qF 'images: { server: $server, edge: $edge, gateway: $gateway, egress: $egress }' "$dc" &&
   ok "deploy-chart.sh takes the gateway and egress images from the tag <commit>, checks their provenance and passes them to helm" || bad "deploy-chart.sh does not resolve or check the app runtime images"
 grep -qF 'only one of ruum-gateway and ruum-egress has the tag' "$dc" && ok "deploy-chart.sh stops when only one of the two images exists" || bad "deploy-chart.sh deploys half the app runtime"
+# Review of I-6, 2 and Kimi 5: a lookup error stops the deploy, a release without the app runtime
+# over one with it needs a rollback, and the revision label must be the commit.
+grep -qF 'not deploying, so a failed lookup never removes the app runtime' "$dc" && ! grep -qF 'ghcr_digest "nemecec/ruum-$kind" "$commit" 2>/dev/null || true' "$dc" &&
+  ok "deploy-chart.sh stops on a registry error of the app runtime images (never treats it as 'no image')" || bad "deploy-chart.sh treats a registry error as a commit without the app runtime"
+la="$(grep -nF 'live="$(kubectl -n ruum get configmap ruum-release' "$dc" | head -1 | cut -d: -f1)"
+lg="$(grep -nF 'live_gateway="$(kubectl -n ruum get configmap ruum-release -o jsonpath='"'"'{.data.gateway}'"'"'' "$dc" | head -1 | cut -d: -f1)"
+lh="$(grep -n '^helm upgrade --install' "$dc" | head -1 | cut -d: -f1)"
+[[ -n "$la" && -n "$lg" && -n "$lh" && "$lg" -gt "$la" && "$lg" -lt "$lh" ]] && grep -qF 'this deploy would delete the gateway and the egress proxy' "$dc" && grep -qF '[[ $rollback != 0 ]] ||' "$dc" &&
+  ok "deploy-chart.sh refuses to drop a live app runtime unless it is a rollback (under the lock, before helm)" || bad "deploy-chart.sh can drop the live app runtime ($la $lg $lh)"
+grep -qF 'rev="$(ghcr_revision "$ref")"' "$dc" && grep -qF '[[ "$rev" == "$commit" ]] || die' "$dc" &&
+  ok "deploy-chart.sh requires the revision label of the gateway and egress images to be the commit" || bad "deploy-chart.sh does not check the revision of the app runtime images"
+# The GHCR helpers against a fake curl: a missing package or tag is status 3, an error is 1, the
+# digest is the manifest's SHA-256, and the revision is read through verified digests only.
+FG2="$TMP/fake-ghcr"
+mkdir -p "$FG2/bin" "$FG2/srv"
+cat >"$FG2/bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+# Serves $FAKE_GHCR/<URL path with / as _>; <file>.code gives another status; $FAKE_GHCR/down
+# is a network error.
+out="" fmt="" url="" cfg=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) fmt="$2"; shift 2 ;;
+    -K) cfg=1; shift 2 ;;
+    -H) shift 2 ;;
+    https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[[ $cfg == 0 ]] || cat >/dev/null
+[[ -f "$FAKE_GHCR/down" ]] && { echo "curl: (6) Could not resolve host" >&2; printf '%s' "${fmt//%\{http_code\}/000}"; exit 6; }
+case "$url" in
+  https://ghcr.io/token*) img="${url#*repository:}"; img="${img%%:pull*}"; f="$FAKE_GHCR/token_${img//\//_}" ;;
+  *) p="${url#https://ghcr.io/}"; f="$FAKE_GHCR/${p//\//_}" ;;
+esac
+if [[ -f "$f.code" ]]; then code="$(cat "$f.code")"; body=/dev/null
+elif [[ -f "$f" ]]; then code=200; body="$f"
+else code=404; body=/dev/null; fi
+if [[ -n "$out" ]]; then cat "$body" >"$out"; else cat "$body"; fi
+fmt="${fmt//%\{http_code\}/$code}"
+printf "$fmt"
+FAKE
+chmod +x "$FG2/bin/curl"
+sha() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+srv="$FG2/srv"
+gimg="nemecec/ruum-gateway"
+gc="$(printf '%040d' 7)"
+echo '{"token":"fake-token"}' >"$srv/token_${gimg//\//_}"
+printf '{"config":{"Labels":{"org.opencontainers.image.revision":"%s"}}}' "$gc" >"$TMP/cfg.json"
+cfgd="sha256:$(sha "$TMP/cfg.json")"
+cp "$TMP/cfg.json" "$srv/v2_${gimg//\//_}_blobs_$cfgd"
+printf '{"schemaVersion":2,"config":{"digest":"%s"}}' "$cfgd" >"$TMP/man.json"
+mand="sha256:$(sha "$TMP/man.json")"
+cp "$TMP/man.json" "$srv/v2_${gimg//\//_}_manifests_$mand"
+printf '{"schemaVersion":2,"manifests":[{"digest":"sha256:%064d","platform":{"os":"unknown","architecture":"unknown"}},{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}}]}' 0 "$mand" >"$TMP/idx.json"
+idxd="sha256:$(sha "$TMP/idx.json")"
+cp "$TMP/idx.json" "$srv/v2_${gimg//\//_}_manifests_$idxd"
+cp "$TMP/idx.json" "$srv/v2_${gimg//\//_}_manifests_$gc"
+ghcr_try() { ( PATH="$FG2/bin:$PATH" FAKE_GHCR="$srv"; export FAKE_GHCR; . "$STG/ops/image-check.sh"; "$@" ); }
+got="$(ghcr_try ghcr_tag_lookup "$gimg" "$gc")" && [[ "$got" == "$idxd" ]] &&
+  ok "ghcr_tag_lookup prints the digest of the tag's manifest" || bad "ghcr_tag_lookup: got '$got', want $idxd"
+expect 3 "ghcr_tag_lookup: a missing tag is 'no image' (status 3)" ghcr_try ghcr_tag_lookup "$gimg" "$(printf '%040d' 8)"
+echo 403 >"$srv/token_nemecec_ruum-egress.code"
+expect 3 "ghcr_tag_lookup: a denied token (missing or private package) is 'no image' (status 3)" ghcr_try ghcr_tag_lookup nemecec/ruum-egress "$gc"
+echo 500 >"$srv/token_nemecec_ruum-egress.code"
+expect 1 "ghcr_tag_lookup: a server error of the token endpoint is an error (status 1)" ghcr_try ghcr_tag_lookup nemecec/ruum-egress "$gc"
+echo 429 >"$srv/v2_${gimg//\//_}_manifests_$gc.code"
+expect 1 "ghcr_tag_lookup: a rate-limited manifest is an error (status 1)" ghcr_try ghcr_tag_lookup "$gimg" "$gc"
+rm -f "$srv/v2_${gimg//\//_}_manifests_$gc.code"
+touch "$srv/down"
+expect 1 "ghcr_tag_lookup: a network error is an error (status 1)" ghcr_try ghcr_tag_lookup "$gimg" "$gc"
+rm -f "$srv/down"
+got="$(ghcr_try ghcr_revision "ghcr.io/$gimg@$idxd")" && [[ "$got" == "$gc" ]] &&
+  ok "ghcr_revision reads the revision label through the index, the linux/amd64 manifest and the config" || bad "ghcr_revision: got '$got', want $gc"
+got="$(ghcr_try ghcr_revision "ghcr.io/$gimg@$mand")" && [[ "$got" == "$gc" ]] &&
+  ok "ghcr_revision also reads a plain image manifest" || bad "ghcr_revision of a manifest: got '$got'"
+printf '{"config":{"Labels":{"org.opencontainers.image.revision":"%040d"}}}' 9 >"$srv/v2_${gimg//\//_}_blobs_$cfgd"
+expect 1 "ghcr_revision refuses a config that does not match its digest" ghcr_try ghcr_revision "ghcr.io/$gimg@$idxd"
+cp "$TMP/cfg.json" "$srv/v2_${gimg//\//_}_blobs_$cfgd"
+cp "$TMP/man.json" "$srv/v2_${gimg//\//_}_manifests_$idxd"
+expect 1 "ghcr_revision refuses a manifest that does not match its digest" ghcr_try ghcr_revision "ghcr.io/$gimg@$idxd"
 for n in STG_PG_RUUM_GATEWAY_PASSWORD STG_GATEWAY_TOKEN_KEY STG_EGRESS_CONTROL_TOKEN; do
   grep -qF "add $n " "$STG/secrets-init.sh" && grep -qx "$n" <<<"$(bash "$STG/secrets-push.sh" --list)" || bad "$n is not generated by secrets-init.sh and sent by secrets-push.sh"
 done
 grep -qF 'add STG_GATEWAY_S3' "$STG/secrets-init.sh" && bad "secrets-init.sh generates the gateway's S3 credential (the person makes it)" || ok "the gateway's secrets are generated and sent; its S3 credential comes from the person"
 grep -qF 'STG_EGRESS_DENY="$(egress_deny)"' "$STG/steps.sh" && ok "steps.sh platform computes EGRESS_DENY from the Hetzner API" || bad "EGRESS_DENY is not computed"
+# Review of I-6, Kimi 4: each API answer is checked; a short list stops the step.
+awk '/^egress_deny_from\(\) \{$/,/^\}$/' "$STG/steps.sh" >"$TMP/egress-deny.sh"
+ed_nodes='{"servers":[{"public_net":{"ipv4":{"ip":"198.51.100.1"},"ipv6":null}},{"public_net":{"ipv4":{"ip":"198.51.100.2"},"ipv6":null}},{"public_net":{"ipv4":{"ip":"198.51.100.3"},"ipv6":null}}]}'
+ed_lbs='{"load_balancers":[{"public_net":{"ipv4":{"ip":"198.51.100.9"},"ipv6":{"ip":"2001:db8::9"}}}]}'
+ed_bb='{"servers":[{"public_net":{"ipv4":{"ip":"203.0.113.10"},"ipv6":{"network":"2001:db8:1::/64"}}}]}'
+edf() { ( die() { echo "die: $*" >&2; exit 1; }; . "$TMP/egress-deny.sh"; egress_deny_from "$@" ); }
+got="$(edf "$ed_nodes" "$ed_lbs" "$ed_bb" 3)" &&
+  [[ "$got" == "10.20.0.0/16,10.244.0.0/16,10.96.0.0/12,198.51.100.1,198.51.100.2,198.51.100.3,198.51.100.9,2001:db8:1::/64,2001:db8::9,203.0.113.10" ]] &&
+  ok "EGRESS_DENY: the cluster ranges, every node, the load balancer and the build server" || bad "EGRESS_DENY from fixtures: '$got'"
+expect 1 "EGRESS_DENY stops when the API lists fewer nodes than NODE_COUNT" edf "$(jq -c '.servers |= .[:2]' <<<"$ed_nodes")" "$ed_lbs" "$ed_bb" 3
+expect 1 "EGRESS_DENY stops when a node has no public IPv4 address" edf "$(jq -c '.servers[1].public_net.ipv4 = null' <<<"$ed_nodes")" "$ed_lbs" "$ed_bb" 3
+expect 1 "EGRESS_DENY stops without a load balancer" edf "$ed_nodes" '{"load_balancers":[]}' "$ed_bb" 3
+expect 1 "EGRESS_DENY stops when the load balancer has no IPv6 address" edf "$ed_nodes" "$(jq -c '.load_balancers[0].public_net.ipv6 = null' <<<"$ed_lbs")" "$ed_bb" 3
+expect 1 "EGRESS_DENY stops without the build server" edf "$ed_nodes" "$ed_lbs" '{"servers":[]}' 3
+expect 1 "EGRESS_DENY stops on an answer that is not JSON (a failed request)" edf "$ed_nodes" "$ed_lbs" 'curl: (22) 503' 3
+grep -qF 'nodes="$(hapi "servers?label_selector=env%3Dstaging%2Crole%3Dnode")" || die' "$STG/steps.sh" &&
+  ok "EGRESS_DENY reads each Hetzner API answer on its own and stops when one fails" || bad "EGRESS_DENY masks a failed API request"
+grep -qF 'k -n ruum rollout restart deployment/ruum-egress' "$STG/k8s/apply.sh" && grep -qF '"$deny_before" != "$STG_EGRESS_DENY"' "$STG/k8s/apply.sh" &&
+  ok "apply.sh restarts the egress proxy when EGRESS_DENY changed (it reads the list at start)" || bad "a changed EGRESS_DENY does not reach the running egress proxy"
 ap="$STG/k8s/apply.sh"
 grl="$(grep -nF 'sql/ruum-gateway-grants.sql" >/dev/null' "$ap" | cut -d: -f1)" gsl="$(grep -nF 'secret ruum ruum-gateway$' "$ap" | cut -d: -f1)"
 [[ -z "$gsl" ]] && gsl="$(grep -nE '\| secret ruum ruum-gateway$' "$ap" | cut -d: -f1)"
