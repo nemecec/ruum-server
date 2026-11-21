@@ -1676,7 +1676,9 @@ mod tests {
             .unwrap()
             .unwrap();
         // A writer holds the app-row lock and fills the app to the seen-row bound.
-        let mut held = crate::journal::postgres::begin_tenant(&pool, a).await.unwrap();
+        let mut held = crate::journal::postgres::begin_tenant(&pool, a)
+            .await
+            .unwrap();
         sqlx::query("select 1 from apps where tenant_id = $1 and node_id = $2 for update")
             .bind(a)
             .bind(na)
@@ -1708,15 +1710,11 @@ mod tests {
         held.commit().await.unwrap();
         let n = seen.await.unwrap().unwrap();
         assert_eq!(n, 0, "a seen row was written past the bound");
-        let count: i64 = sqlx::query_scalar(
-            "select count(*) from telemetry_fields where tenant_id = $1 and app_node_id = $2",
-        )
-        .bind(a)
-        .bind(na)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count, MAX_ROWS_PER_APP as i64);
+        let mut tx = crate::journal::postgres::begin_tenant(&pool, a)
+            .await
+            .unwrap();
+        assert_eq!(row_count(&mut tx, a, na).await.unwrap(), MAX_ROWS_PER_APP);
+        tx.commit().await.unwrap();
     }
 
     #[tokio::test]
