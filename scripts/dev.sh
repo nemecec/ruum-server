@@ -32,6 +32,8 @@ COLLECTOR_TOKEN_FILE="$STATE/otel/collector-token"
 # tenant, one file per database. The litestream service replicates them to SQLITE_BUCKET.
 SQLITE_DIR="$DEV/data/sqlite"
 SQLITE_BUCKET=ruum-sqlite
+# The bucket of static app files (decision 0008-4): never the blob bucket S3_BUCKET.
+STATIC_BUCKET=ruum-dev-static
 ZITADEL_URL="http://localhost:8180"
 
 # No provenance attestation: it carries a build time, so every `up --build` would give the postgres
@@ -196,6 +198,10 @@ init_garage() {
     garage bucket create "$SQLITE_BUCKET" >/dev/null
   fi
   garage bucket allow --read --write "$SQLITE_BUCKET" --key "$S3_ACCESS_KEY_ID" >/dev/null
+  if ! garage bucket info "$STATIC_BUCKET" >/dev/null 2>&1; then
+    garage bucket create "$STATIC_BUCKET" >/dev/null
+  fi
+  garage bucket allow --read --write "$STATIC_BUCKET" --key "$S3_ACCESS_KEY_ID" >/dev/null
 }
 
 # Delete the local SQLite files. The litestream container writes as root, so on Linux a file can
@@ -388,6 +394,7 @@ export RUUM_OIDC_ISSUER=$ZITADEL_URL
 export RUUM_OIDC_CLIENT_ID=${ZITADEL_WEB_CLIENT_ID:-}
 export RUUM_S3_ENDPOINT=http://127.0.0.1:3900
 export RUUM_S3_BUCKET=$S3_BUCKET
+export RUUM_STATIC_S3_BUCKET=$STATIC_BUCKET
 export RUUM_SPICEDB_ENDPOINT=http://127.0.0.1:50051
 export RUUM_OTLP_ENDPOINT=http://127.0.0.1:$OTLP_HTTP_PORT
 export RUUM_OTLP_GRPC_ENDPOINT=http://127.0.0.1:$OTLP_GRPC_PORT

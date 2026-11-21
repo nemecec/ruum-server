@@ -110,6 +110,10 @@ spec:
             - { name: RUUM_S3_REGION, value: hel1 }
             - { name: RUUM_S3_BUCKET, value: ruum-staging-blobs-768usm }
             - { name: RUUM_S3_FORCE_PATH_STYLE, value: "false" }
+            # Static app files: a bucket of their own (decision 0008-4, card I6-3D; tofu/cluster
+            # minio_s3_bucket.static). The rest of the settings come from RUUM_S3_*. The server
+            # moves sites of older releases out of the blob bucket into it.
+            - { name: RUUM_STATIC_S3_BUCKET, value: ruum-staging-static-768usm }
             - { name: SMTP_URL, value: "smtp://mailpit.ops.svc.cluster.local:1025" }
             - { name: RUUM_MAIL_FROM, value: "no-reply@notify.staging.ruum.space" }
             # PUT bodies of the WebDAV host (ruum_webdav::SPOOL_DIR_ENV).

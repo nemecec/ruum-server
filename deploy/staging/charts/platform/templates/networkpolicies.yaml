@@ -201,7 +201,8 @@ spec:
         - { protocol: TCP, port: 8494 }
 ---
 # The app gateway reaches the core's internal listener, Postgres, the sandboxes, DNS and the
-# static sites' bucket (a public address on 443), nothing else.
+# static bucket's endpoint (a public address on 443: it fetches the links that ruum-server signs,
+# decision 0008-4), nothing else.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

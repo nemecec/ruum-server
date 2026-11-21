@@ -16,10 +16,10 @@
 //! - `RUUM_GATEWAY_TOKEN_KEY_FILE` (required): the user-token key, a file with the Ed25519 seed as
 //!   base64url (never an environment value). `RUUM_GATEWAY_JWKS_FILE` (optional): where to write
 //!   the public key set at start, for the runtime and the SDK.
-//! - `RUUM_GATEWAY_S3_ENDPOINT`, `RUUM_GATEWAY_S3_BUCKET`, `RUUM_GATEWAY_S3_REGION` (default
-//!   `garage`), `RUUM_GATEWAY_S3_ACCESS_KEY_ID`, `RUUM_GATEWAY_S3_SECRET_ACCESS_KEY_FILE`: the
-//!   read-only object store credential of the static sites. Without `RUUM_GATEWAY_S3_BUCKET` the
-//!   gateway serves no static file (an empty in-process store) and says so at start.
+//! - No bucket settings (decision 0008-4; backlog I6-3D): static files come through links that
+//!   the core signs, one file for a minute. The gateway refuses to start when a bucket
+//!   credential is in its environment (`RUUM_GATEWAY_S3_*`, `RUUM_S3_*`, `RUUM_STATIC_S3_*`,
+//!   `S3_*`, `AWS_*`; [`ruum_gateway::bucket_settings_refused`]).
 //! - Sandboxes (card G-1b; whole seconds or counts, each above zero): `RUUM_GATEWAY_WAKE_HOLD`
 //!   (default 10): how long a request is held while its app starts; `RUUM_GATEWAY_HOLD_PER_APP`
 //!   (64), `RUUM_GATEWAY_HOLD_PER_TENANT` (256) and `RUUM_GATEWAY_HOLD_GLOBAL` (1024): held
@@ -29,7 +29,6 @@
 //!   answer; `RUUM_GATEWAY_WS_IDLE` (600): an idle WebSocket closes. Where an instance runs comes
 //!   from the core's internal listener (`RUUM_GATEWAY_INTERNAL_URL`), never from a setting.
 
-use ruum_core::apps::static_site::StaticSites;
 use ruum_gateway::core_api::HttpCore;
 use ruum_gateway::host::PgHostLookup;
 use ruum_gateway::proxy::ProxyConfig;
@@ -93,32 +92,8 @@ fn proxy_config() -> Result<ProxyConfig, String> {
     })
 }
 
-fn static_sites() -> Result<StaticSites, String> {
-    let Some(bucket) = var("RUUM_GATEWAY_S3_BUCKET") else {
-        tracing::warn!("RUUM_GATEWAY_S3_BUCKET is not set: the gateway serves no static file");
-        return Ok(StaticSites::in_memory());
-    };
-    let secret_file = required("RUUM_GATEWAY_S3_SECRET_ACCESS_KEY_FILE")?;
-    let secret = std::fs::read_to_string(&secret_file).map_err(|e| {
-        format!(
-            "cannot read RUUM_GATEWAY_S3_SECRET_ACCESS_KEY_FILE: {}",
-            e.kind()
-        )
-    })?;
-    let mut b = object_store::aws::AmazonS3Builder::new()
-        .with_region(var("RUUM_GATEWAY_S3_REGION").unwrap_or_else(|| "garage".into()))
-        .with_bucket_name(bucket)
-        .with_access_key_id(required("RUUM_GATEWAY_S3_ACCESS_KEY_ID")?)
-        .with_secret_access_key(secret.trim())
-        .with_virtual_hosted_style_request(false);
-    if let Some(e) = var("RUUM_GATEWAY_S3_ENDPOINT") {
-        b = b.with_allow_http(e.starts_with("http://")).with_endpoint(e);
-    }
-    let store = b.build().map_err(|e| format!("S3 settings: {e}"))?;
-    Ok(StaticSites::new(Arc::new(store)))
-}
-
 async fn run() -> Result<(), String> {
+    ruum_gateway::bucket_settings_refused(std::env::vars_os().map(|(k, _)| k))?;
     let bind = required("RUUM_GATEWAY_BIND")?;
     let issuer = required("RUUM_GATEWAY_ISSUER")?;
     let platform_url = var("RUUM_GATEWAY_PLATFORM_URL").unwrap_or_else(|| issuer.clone());
@@ -146,7 +121,6 @@ async fn run() -> Result<(), String> {
             Arc::new(PgHostLookup::new(pool)),
             Arc::new(core),
             tokens,
-            static_sites()?,
         )
         .with_sandboxes(Arc::new(sandboxes), hold_config()?)
         .with_proxy(proxy_config()?),

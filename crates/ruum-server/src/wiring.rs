@@ -246,13 +246,38 @@ pub fn install_apps(
             p
         }
     };
-    // Static sites go to the bucket of the blob store when there is one (card W-2s); the
-    // runtime driver stays the in-memory one until the runtime cards (R-2a, I-4).
-    if let Some(s3) = ruum_core::blobs::object::S3Settings::from_env() {
-        let store = s3
-            .build()
-            .context("set up the object store of static sites")?;
-        parts.sites = ruum_core::apps::static_site::StaticSites::new(Arc::new(store));
+    // Static sites go to a bucket of their own, never to the tenant blob bucket (decision
+    // 0008-4; `ruum_core::apps::static_links`); the gateway reads them through links that the
+    // core signs. Sites that releases before I6-3D wrote to the blob bucket move over at start
+    // and then every few minutes. The runtime driver stays the in-memory one until the runtime
+    // cards (R-2a, I-4).
+    let blob = ruum_core::blobs::object::S3Settings::from_env();
+    let var = |name: &str| std::env::var(name).ok();
+    match ruum_core::apps::static_links::bucket_settings(blob.as_ref(), &var)
+        .map_err(anyhow::Error::msg)?
+    {
+        Some(s3) => {
+            let store = s3
+                .build()
+                .context("set up the bucket of static sites (RUUM_STATIC_S3_*)")?;
+            parts.sites = ruum_core::apps::static_site::StaticSites::s3(store);
+            tracing::info!(bucket = %s3.bucket, "static sites: the static bucket");
+            if let Some(b) = &blob {
+                let from = b
+                    .build()
+                    .context("set up the blob bucket to move static sites from")?;
+                tokio::spawn(ruum_core::apps::static_links::run_moves(
+                    Arc::new(from),
+                    parts.sites.clone(),
+                    ruum_core::apps::static_links::MOVE_EVERY,
+                ));
+            }
+        }
+        None if blob.is_some() => tracing::warn!(
+            "RUUM_STATIC_S3_BUCKET is not set: static sites stay in memory and are lost at a \
+             restart (they never go to the tenant blob bucket, decision 0008-4)"
+        ),
+        None => {}
     }
     ruum_core::apps::install(services, parts).context("set up the apps area")?;
     tokio::spawn(services.apps.clone().run_sweeper(PREVIEW_SWEEP_EVERY));

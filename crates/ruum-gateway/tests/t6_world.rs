@@ -251,6 +251,64 @@ async fn a_request_path_never_chooses_the_object() {
     }
 }
 
+/// The gateway holds no bucket key (decision 0008-4; backlog I6-3D): a static file comes
+/// through a link that the core signed for exactly that file object; `HEAD` and a matching
+/// `If-None-Match` fetch nothing, and a refused path asks for no link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_files_come_through_the_cores_links() {
+    let w = World::new().await.unwrap();
+    let (_, a, u, host) = app_scene(&w).await;
+    let (target, nonce) = code_for(&w, &u, &host).await;
+    let cb = w
+        .gateway_get(&host, &target, Some(&format!("__Host-ruum_auth={nonce}")))
+        .await
+        .unwrap();
+    let session = format!(
+        "__Host-ruum_app={}",
+        cookie_value(&cb, "__Host-ruum_app").unwrap()
+    );
+    let ok = w.gateway_get(&host, "/", Some(&session)).await.unwrap();
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.text(), "hi");
+    let hash = blake3::hash(b"hi").to_hex().to_string();
+    assert_eq!(
+        *w.link_hits.lock().unwrap(),
+        vec![format!("apps/static/{}/files/{hash}", a.tenant.id)],
+        "the file did not come through one link of its own object"
+    );
+    let etag = ok.header("etag").unwrap().to_string();
+    assert_eq!(etag, format!("\"{hash}\""));
+    let addr = w.gateway;
+    let head = gateway::http::send(
+        addr,
+        &Req::new("HEAD", &host, "/").header("Cookie", &session),
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    assert_eq!(head.status, 200);
+    let cached = gateway::http::send(
+        addr,
+        &Req::get(&host, "/")
+            .header("Cookie", &session)
+            .header("If-None-Match", &etag),
+        Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached.status, 304);
+    let bad = w
+        .gateway_get(&host, "/%2e%2e/index.html", Some(&session))
+        .await
+        .unwrap();
+    assert_eq!(bad.status, 400);
+    assert_eq!(
+        w.link_hits.lock().unwrap().len(),
+        1,
+        "HEAD, a matching If-None-Match or a refused path fetched a file"
+    );
+}
+
 /// Two `Authorization` headers get `400` and reach nothing: an app's own `Basic` value in front
 /// cannot carry a platform token past the check to the app (review-g1a 2; decision 0006-10,
 /// `gateway.openapi.yaml` "The check of every request" 3). One header of the app's own scheme

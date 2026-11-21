@@ -27,7 +27,6 @@ http.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util.workspace = true
 jsonwebtoken.workspace = true
-object_store.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

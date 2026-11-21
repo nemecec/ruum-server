@@ -537,16 +537,23 @@ Milestone M2 on staging: apps are served at `<app>.<tenant slug>.apps.staging.ru
   running gateway and egress proxy (review of I-6, 2). The gateway: two replicas,
   `RUUM_GATEWAY_*` settings from the chart, its database role `ruum_gateway` (it may only execute
   `ruum_app_host_lookup`; `k8s/sql/ruum-gateway-grants.sql` fails the platform step when it can
-  do more), the user-token key as a file (`STG_GATEWAY_TOKEN_KEY`), and an optional read
-  credential of the static sites' bucket (`STG_GATEWAY_S3_*`; without it the gateway serves no
-  static file). The egress proxy: one replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
+  do more) and the user-token key as a file (`STG_GATEWAY_TOKEN_KEY`). It holds **no key of any
+  bucket** (decision 0008-4, card I6-3D) and refuses to start when a bucket setting is in its
+  environment. Static app files live in a bucket of their own, `ruum-staging-static-768usm`
+  (`tofu/cluster` `minio_s3_bucket.static`; ruum-server's `RUUM_STATIC_S3_BUCKET`, with the
+  other settings and the key of `RUUM_S3_*`). Only ruum-server writes to it. For each static
+  file the gateway asks ruum-server's internal listener, which checks that the deployment serves,
+  looks the path up in the site index and answers a presigned link for that one file object,
+  `GET` only, valid for 60 seconds (`ruum_core::apps::static_links`). ruum-server moves the sites
+  of older releases out of the blob bucket at start and every 10 minutes. The egress proxy: one
+  replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
   (the cluster ranges and every public address of staging and of the build server, ConfigMap
   `ruum/ruum-egress-deny`; the platform step stops when an API answer fails or misses a node, the
   load balancer or the build server, and restarts the proxy when the list changed), its control
   socket inside the pod.
 - **Network policy** (`charts/platform` `networkpolicies.yaml`): nothing reaches the gateway but
   the edge (8494); the gateway reaches only ruum-server's internal listener (8493), Postgres,
-  the sandboxes, DNS and public addresses on 443 (the bucket); sandboxes in `ruum-apps` get
+  the sandboxes, DNS and public addresses on 443 (the links to the static bucket); sandboxes in `ruum-apps` get
   ingress only from the gateway and egress only to the egress proxy (3128: no DNS, no other
   pod, no metadata address); only `ruum-apps` reaches the egress proxy, which reaches DNS and
   public addresses on 443. "Public" excludes the private and special-use ranges that
@@ -590,17 +597,11 @@ of user tokens for apps (P-97); scale to zero (Knative or KEDA, STEP3 "Infrastru
    `ruum-gateway` and `ruum-egress` (Your profile, Packages, the package, Package settings,
    "Change visibility", Public), like `ruum-server`. Until then `deploy-chart.sh` finds no
    image and deploys without the app runtime.
-2. Optional, for static apps: Hetzner Console, project of staging, Object Storage, "S3
-   credentials", "Generate credentials", description `ruum-staging-gateway`. Put the two values
-   into `secrets.env` as `STG_GATEWAY_S3_ACCESS_KEY` and `STG_GATEWAY_S3_SECRET_KEY`. Hetzner
-   credentials are not scoped: this key can read, write and delete every bucket of the project,
-   every tenant's blobs included. Then the gateway, the
-   Internet-facing part of the app runtime, holds a key as strong as the server's, and a flaw
-   in the gateway reaches every tenant's files. A separate key only makes it separately
-   revocable. Make this key only after the decision of backlog I6-3 (a key limited to the
-   static sites, or static files served through the core); until then staging serves no static
-   file, which fails closed.
-3. After the deploy, and only with the key of step 2: sign in at `https://staging.ruum.space`,
+2. Nothing for the static bucket: tofu makes it, and the gateway gets no key (decision 0008-4).
+   If you made the key `ruum-staging-gateway` for card I-6 (Hetzner Console, project of staging,
+   Object Storage, "S3 credentials"), delete it there and delete `STG_GATEWAY_S3_ACCESS_KEY` and
+   `STG_GATEWAY_S3_SECRET_KEY` from `secrets.env`; no script reads them any more.
+3. After the deploy: sign in at `https://staging.ruum.space`,
    deploy one static app over MCP or the web UI and publish it, put its host into `secrets.env`
    as `STG_SMOKE_STATIC_HOST`, and open it in the browser (a certificate of the configured CA,
    the page after the app sign-in).
@@ -611,7 +612,8 @@ Each step stops on the first error; the live release keeps serving through all o
 
 1. `deploy/staging/up.sh` (read-only plan). Expected: the persistent root unchanged; the cluster
    root creates `hcloud_zone_rrset.apps_a["*.apps.staging"]`, `apps_aaaa["*.apps.staging"]` and
-   `app_origins_caa`, and changes `talos_machine_configuration_apply.node["stg-1"]` to `["stg-3"]`
+   `app_origins_caa` and the bucket `minio_s3_bucket.static` (`ruum-staging-static-768usm`, card
+   I6-3D), and changes `talos_machine_configuration_apply.node["stg-1"]` to `["stg-3"]`
    in place (the installer image); Talos access `tunnel`; nothing else; price unchanged.
 2. `deploy/staging/tool.sh bash deploy/staging/ops/upgrade-talos.sh --check` shows each node's
    version, schematic and extensions (read-only). Then
@@ -620,15 +622,16 @@ Each step stops on the first error; the live release keeps serving through all o
    installer image, wait, the schematic and gvisor checked before the next node). About 10
    minutes per node. `--check` again: all current.
 3. `RUUM_STAGING_APPLY=yes deploy/staging/up.sh --apply --infra-only`: uploads the snapshot of the
-   new schematic (a temporary server for about 10 minutes), applies the three DNS records and
+   new schematic (a temporary server for about 10 minutes), applies the three DNS records, the
+   static bucket (before the deploy: ruum-server writes static files only there) and
    the machine configs through the admin tunnel (the nodes already run that installer image, so
    nothing reboots).
 4. `deploy/staging/secrets-init.sh` (adds `STG_PG_RUUM_GATEWAY_PASSWORD`, `STG_GATEWAY_TOKEN_KEY`,
    `STG_EGRESS_CONTROL_TOKEN`; prints names only), then
    `RUUM_STAGING_APPLY=yes deploy/staging/secrets-push.sh platform`: the extension check, the
    runtime class, `ruum-apps`, the network policies, the role `ruum_gateway` and its grants, the
-   Secrets `ruum/ruum-gateway`, `ruum/ruum-egress` (and `ruum/ruum-gateway-s3` when the person
-   made the key), `ruum/ruum-egress-deny`, the new deploy controller (whose chart has the
+   Secrets `ruum/ruum-gateway`, `ruum/ruum-egress` and `ruum/ruum-egress-deny` (the old
+   `ruum/ruum-gateway-s3` of card I-6 is deleted), the new deploy controller (whose chart has the
    gateway), and the gVisor pod check.
 5. `deploy/staging/deploy.sh <sha of main>`: the controller resolves the gateway and egress
    images of that commit and rolls out the chart; ruum-server gets `RUUM_APPS_DOMAIN`.
@@ -639,7 +642,10 @@ Going back: `deploy.sh --rollback` to the previous release removes the gateway a
 proxy with the chart (the controller's chart renders them only with both images; the previous
 commit has none); the older ruum-server ignores `RUUM_APPS_DOMAIN` and gives no certificate to
 app hosts. The runtime class, `ruum-apps`, the policies and the Secrets stay (the platform step of an
-older checkout removes the policies; the rest is harmless). The nodes keep gVisor.
+older checkout removes the policies; the rest is harmless). The nodes keep gVisor. A
+ruum-server older than I6-3D reads and writes static sites in the blob bucket and does not see
+the ones in the static bucket: sites deployed after the move then answer `404` until the newer
+release is back (it moves the older release's sites over again, `ruum_core::apps::static_links`).
 
 ## Recreate
 

@@ -87,7 +87,11 @@ pub struct Seeds {
 pub struct World {
     pub state: AppState,
     pub hosts: Arc<MemoryHostLookup>,
+    /// The core's static sites (in memory); the gateway reads them only through the links that
+    /// the core signs, answered by the world's link server ([`LinkServer`]).
     pub sites: StaticSites,
+    /// The keys of the objects that the link server sent, in order.
+    pub link_hits: Arc<Mutex<Vec<String>>>,
     pub gw: Arc<Gateway>,
     pub platform: SocketAddr,
     pub gateway: SocketAddr,
@@ -360,6 +364,51 @@ impl Drop for World {
     }
 }
 
+/// The world's link server: it answers the links of the core's in-memory sites
+/// (`ruum_core::apps::static_links::MemoryLinks`) as S3 answers presigned URLs: `403` for a
+/// forged or expired link, `404` for a missing object, the object otherwise. It records the key
+/// of each object it sends.
+pub fn link_server(
+    links: Arc<ruum_core::apps::static_links::MemoryLinks>,
+    hits: Arc<Mutex<Vec<String>>>,
+) -> axum::Router {
+    use axum::extract::Query;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    use futures::StreamExt;
+    use ruum_core::apps::static_links::MemoryOpen;
+    axum::Router::new().route(
+        "/o",
+        axum::routing::get(move |Query(q): Query<HashMap<String, String>>| {
+            let links = links.clone();
+            let hits = hits.clone();
+            async move {
+                let (Some(key), Some(exp), Some(sig)) = (
+                    q.get("key"),
+                    q.get("exp").and_then(|e| e.parse::<i64>().ok()),
+                    q.get("sig"),
+                ) else {
+                    return StatusCode::FORBIDDEN.into_response();
+                };
+                match links.open(key, exp, sig).await {
+                    Ok(MemoryOpen::Found(r)) => {
+                        hits.lock().expect("hits").push(key.clone());
+                        let size = r.meta.size;
+                        let body = axum::body::Body::from_stream(
+                            r.into_stream()
+                                .map(|c| c.map_err(|e| std::io::Error::other(e.to_string()))),
+                        );
+                        ([(header::CONTENT_LENGTH, size.to_string())], body).into_response()
+                    }
+                    Ok(MemoryOpen::Missing) => StatusCode::NOT_FOUND.into_response(),
+                    Ok(MemoryOpen::Refused) => StatusCode::FORBIDDEN.into_response(),
+                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+        }),
+    )
+}
+
 pub async fn listen() -> tokio::net::TcpListener {
     tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -398,7 +447,21 @@ impl World {
             ruum_api::internal::TlsAskConfig::for_content_url("https://content.ruumapps.net", 20),
         );
         let hosts = Arc::new(MemoryHostLookup::default());
-        let sites = StaticSites::in_memory();
+        // The gateway holds no bucket key (decision 0008-4): it gets links from the core, and
+        // the world's link server answers them from the core's in-memory sites.
+        let sites = state.services.apps.sites().clone();
+        let links = sites
+            .memory_links()
+            .ok_or_else(|| WorldError::Failed("the core's sites are not in memory".into()))?;
+        let links_l = listen().await;
+        let links_addr = links_l.local_addr().expect("addr");
+        links.set_base(
+            format!("http://{links_addr}/o")
+                .parse()
+                .map_err(|e| failed("the link base", e))?,
+        );
+        let link_hits = Arc::new(Mutex::new(Vec::new()));
+        let link_router = link_server(links, link_hits.clone());
         let core = ruum_gateway::core_api::HttpCore::new(&format!("http://{internal}"))
             .map_err(|e| failed("the core client", e))?;
         let sandboxes = HttpSandboxes::new(&format!("http://{internal}"))
@@ -413,7 +476,6 @@ impl World {
                 hosts.clone(),
                 Arc::new(core),
                 UserTokenSigner::generate(ISSUER),
-                sites.clone(),
             )
             .with_sandboxes(Arc::new(sandboxes), opts.hold)
             .with_proxy(opts.proxy),
@@ -429,6 +491,9 @@ impl World {
         tasks.push(tokio::spawn(async move {
             let _ = axum::serve(internal_l, internal_router.into_make_service()).await;
         }));
+        tasks.push(tokio::spawn(async move {
+            let _ = axum::serve(links_l, link_router.into_make_service()).await;
+        }));
         let g = gw.clone();
         tasks.push(tokio::spawn(async move {
             let _ = ruum_gateway::serve(gateway_l, g).await;
@@ -437,6 +502,7 @@ impl World {
             state,
             hosts,
             sites,
+            link_hits,
             gw,
             platform,
             gateway,

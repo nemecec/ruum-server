@@ -12,7 +12,7 @@ use ruum_core::TenantId;
 use ruum_core::identity::app_sign_in::AppBinding;
 use ruum_core::identity::app_sign_in::wire::{
     AgentAnswer, AgentRequest, DeploymentInfo, DeploymentQuery, EndSessionRequest, PREFIX,
-    RedeemRequest, RedeemResponse, SessionInfo, SessionRequest,
+    RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, StaticFileLink, StaticQuery,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -45,6 +45,9 @@ pub trait CoreApi: Send + Sync {
     async fn session(&self, r: &SessionRequest) -> CoreResult<Option<SessionInfo>>;
     async fn end_session(&self, r: &EndSessionRequest) -> CoreResult<()>;
     async fn agent(&self, r: &AgentRequest) -> CoreResult<AgentAnswer>;
+    /// The link to one static file (decision 0008-4: the gateway holds no bucket key). `None`
+    /// when nothing serves the path.
+    async fn static_file(&self, q: &StaticQuery) -> CoreResult<Option<StaticFileLink>>;
 }
 
 /// The core's internal listener over HTTP.
@@ -130,6 +133,15 @@ impl CoreApi for HttpCore {
         Self::json_or_none("/agent", r, reqwest::StatusCode::NOT_FOUND)
             .await?
             .ok_or_else(|| CoreError("/agent: no answer".into()))
+    }
+
+    async fn static_file(&self, q: &StaticQuery) -> CoreResult<Option<StaticFileLink>> {
+        let r = self.post("/static", q).await?;
+        // `400` (a path the core refuses) is a miss too: the gateway checked the path first.
+        if r.status() == reqwest::StatusCode::BAD_REQUEST {
+            return Ok(None);
+        }
+        Self::json_or_none("/static", r, reqwest::StatusCode::NOT_FOUND).await
     }
 }
 
@@ -260,6 +272,11 @@ impl CoreCache {
         self.inner.redeem(r).await
     }
 
+    /// The link to a static file (not cached: a link expires after a minute).
+    pub async fn static_file(&self, q: &StaticQuery) -> CoreResult<Option<StaticFileLink>> {
+        self.inner.static_file(q).await
+    }
+
     /// Ends a session in the core and forgets its cached answers.
     pub async fn end_session(&self, tenant: TenantId, secret: &str) -> CoreResult<()> {
         let key = credential_key(secret);
@@ -315,6 +332,9 @@ mod tests {
         }
         async fn agent(&self, _: &AgentRequest) -> CoreResult<AgentAnswer> {
             Ok(AgentAnswer::Foreign)
+        }
+        async fn static_file(&self, _: &StaticQuery) -> CoreResult<Option<StaticFileLink>> {
+            Ok(None)
         }
     }
 

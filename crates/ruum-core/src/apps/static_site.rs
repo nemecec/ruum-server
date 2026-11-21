@@ -18,8 +18,10 @@
 //!   ([`request_path`]; decision 0006 G point 4).
 //!
 //! Everything goes through the `object_store` abstraction: `InMemory` in tests and on a server
-//! without S3, Garage or S3 for real (the bucket of the blob store; the `apps/` prefix never
-//! clashes with chunk paths, which start with a tenant ID).
+//! without S3, Garage or S3 for real: the bucket of static sites, `RUUM_STATIC_S3_BUCKET`, never
+//! the tenant blob bucket (decision 0008-4; [`super::static_links`]). Only the core writes to
+//! it. The gateway holds no key: it serves a file through a short-lived link that the core
+//! signs for one object ([`StaticSites::file_link`]).
 //!
 //! Objects stay when a preview expires (they may be shared with another deployment); the
 //! sweeper deletes only the index of an expired preview. The garbage collection of static sites
@@ -32,6 +34,7 @@
 //! The objects of a tenant count against its storage quota ([`StaticSites::stored_bytes`]); a
 //! site is written only when its new objects fit ([`StaticSites::write_site_within`]).
 
+use super::static_links::{FileLink, LINK_TTL, MemoryLinks, S3Links, SiteLinks};
 use crate::blobs::Hash;
 use crate::error::{Error, Result};
 use crate::ids::TenantId;
@@ -77,7 +80,7 @@ fn index_id(path: &Path) -> Result<Uuid> {
 }
 
 /// The prefix of every static object of all tenants.
-const ROOT_PREFIX: &str = "apps/static";
+pub(crate) const ROOT_PREFIX: &str = "apps/static";
 
 /// The prefix of every static object of a tenant.
 fn tenant_prefix(tenant: TenantId) -> Path {
@@ -415,6 +418,10 @@ pub struct WrittenSite {
 #[derive(Clone)]
 pub struct StaticSites {
     store: Arc<dyn ObjectStore>,
+    /// Signs the links that the gateway reads files through; `None`: no file is served.
+    links: Option<Arc<dyn SiteLinks>>,
+    /// The links of the in-memory store (tests start a server that answers them).
+    memory: Option<Arc<MemoryLinks>>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -424,13 +431,89 @@ impl std::fmt::Debug for StaticSites {
 }
 
 impl StaticSites {
+    /// Sites over `store`, without links (no file can be served through the gateway).
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            links: None,
+            memory: None,
+        }
     }
 
-    /// Sites in an in-process object store, for tests and a server without S3.
+    /// Sites in an S3 bucket (the static bucket), with presigned links of the same client.
+    pub fn s3(store: object_store::aws::AmazonS3) -> Self {
+        let s3 = Arc::new(store);
+        Self {
+            store: s3.clone(),
+            links: Some(Arc::new(S3Links::new(s3))),
+            memory: None,
+        }
+    }
+
+    /// Sites in an in-process object store, for tests and a server without S3. Its links
+    /// ([`MemoryLinks`]) work once a server that answers them has set their base address
+    /// ([`StaticSites::memory_links`]).
     pub fn in_memory() -> Self {
-        Self::new(Arc::new(object_store::memory::InMemory::new()))
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let memory = Arc::new(MemoryLinks::new(store.clone()));
+        Self {
+            store,
+            links: Some(memory.clone()),
+            memory: Some(memory),
+        }
+    }
+
+    /// The same sites with other links.
+    pub fn with_links(mut self, links: Arc<dyn SiteLinks>) -> Self {
+        self.links = Some(links);
+        self.memory = None;
+        self
+    }
+
+    /// The links of the in-memory store ([`StaticSites::in_memory`]); `None` otherwise.
+    pub fn memory_links(&self) -> Option<Arc<MemoryLinks>> {
+        self.memory.clone()
+    }
+
+    /// The object store under the sites.
+    pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
+    /// The link to the file that a request path of a deployment's site names, for the gateway
+    /// (`POST /internal/gateway/v1/static`): the path is checked ([`request_path`]) and looked
+    /// up in the deployment's index ([`SiteIndex::resolve`]), never used as an object key. The
+    /// link allows one `GET` of that one file object for [`LINK_TTL`]. `None` when the path is
+    /// refused, the deployment has no index or the index has no entry for the path. An error
+    /// when these sites have no links.
+    pub async fn file_link(
+        &self,
+        tenant: TenantId,
+        deployment: Uuid,
+        path: &str,
+        navigation: bool,
+    ) -> Result<Option<FileLink>> {
+        let Some(path) = request_path(path) else {
+            return Ok(None);
+        };
+        let links = self.links.as_ref().ok_or_else(|| {
+            Error::Internal("no bucket of static sites: static files are not served".into())
+        })?;
+        let Some(index) = self.read_index(tenant, deployment).await? else {
+            return Ok(None);
+        };
+        let Some((_, entry)) = index.resolve(path, navigation) else {
+            return Ok(None);
+        };
+        let url = links
+            .get_link(&file_key(tenant, &entry.content_hash()?), LINK_TTL)
+            .await?;
+        Ok(Some(FileLink {
+            hash: entry.hash.clone(),
+            size: entry.size,
+            media_type: entry.media_type.clone(),
+            url: url.to_string(),
+        }))
     }
 
     /// Stores each file as a content-addressed object (skipping objects that exist), then the

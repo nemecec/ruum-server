@@ -231,6 +231,25 @@ pub mod wire {
         Crashed,
     }
 
+    /// `POST /static`: the link to one static file of a deployment (decision 0008-4; backlog
+    /// I6-3D). The gateway holds no bucket key; the core checks that the deployment serves and
+    /// is static, checks the path, resolves it in the deployment's site index, and answers a
+    /// [`StaticFileLink`] (`404` when nothing serves the path, `400` for a refused path).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StaticQuery {
+        pub tenant_id: TenantId,
+        pub app_id: NodeId,
+        pub deployment_id: Uuid,
+        /// The request path (after the host, before `?`), as the gateway got it.
+        pub path: String,
+        /// The request is a browser navigation (`spa_fallback` answers only those).
+        pub navigation: bool,
+    }
+
+    /// The answer of `POST /static`: the file's hash, size and media type and a link that
+    /// allows one `GET` of that file for a minute.
+    pub type StaticFileLink = crate::apps::static_links::FileLink;
+
     /// `POST /redeem`: redeem a sign-in code for an app session.
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct RedeemRequest {

@@ -3136,7 +3136,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
- "object_store",
  "rand 0.10.3",
  "reqwest",
  "ruum-api",

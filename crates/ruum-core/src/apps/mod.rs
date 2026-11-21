@@ -37,6 +37,7 @@ pub mod provider;
 pub mod settings;
 pub mod slugs;
 pub mod static_gc;
+pub mod static_links;
 pub mod static_site;
 pub mod store;
 
@@ -285,7 +286,7 @@ pub struct AppDeps {
     pub transfers: Arc<dyn crate::blobs::Transfers>,
     /// Stores the chunks of deployment archives.
     pub blobs: Arc<dyn crate::blobs::BlobStore>,
-    /// The static sites (card W-2s; G-1a reads them).
+    /// The static sites (card W-2s; the gateway reads them through links, I6-3D).
     pub sites: static_site::StaticSites,
     /// Runs the images of deployments (R-1's trait).
     pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,
@@ -299,7 +300,7 @@ pub struct AppParts {
     pub usage: Arc<dyn UsageSink>,
     pub config: AppConfig,
     /// The object store of static sites: in memory by default; the server gives the S3 store
-    /// of the blob store when it has one.
+    /// of the static bucket (`RUUM_STATIC_S3_BUCKET`, never the blob bucket) when it has one.
     pub sites: static_site::StaticSites,
     /// The runtime driver: the in-memory driver until card R-2a/I-4 give the real ones.
     pub runtime: Arc<dyn crate::runtime::RuntimeDriver>,

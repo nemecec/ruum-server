@@ -24,8 +24,9 @@
 //! The gateway holds **no tenant keys and no general system access**: the host lookup (its
 //! database role may only execute `ruum_app_host_lookup`), the core's small internal API
 //! ([`core_api`]; the core runs the SpiceDB checks and holds the pseudonym keys of the pairwise
-//! subjects), the user-token signing key, and a read-only object store credential for the static
-//! sites.
+//! subjects), and the user-token signing key. It holds **no key of any bucket** (decision 0008-4;
+//! backlog I6-3D): a static file comes through a link that the core signs for that one file
+//! object, `GET` only, for a minute ([`static_files`], `ruum_core::apps::static_links`).
 //!
 //! The module tree of `docs/STEP3.md` "Shared files": `host`, `session`, `check`, `token`,
 //! `static_files`, `proxy`, `sandbox` (G-1b), `telemetry` (G-2), `reports` (G-4), `domains`
@@ -51,7 +52,6 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use host::{AppHost, HostCache, Resolved};
 use proxy::{Frame, Outgoing, Sent};
-use ruum_core::apps::static_site::StaticSites;
 use ruum_core::identity::app_sign_in::wire::{DeploymentInfo, DeploymentQuery, UpstreamQuery};
 use ruum_core::identity::app_sign_in::{AppBinding, AppEnv};
 use sandbox::{HoldConfig, Route, SandboxHold, Sandboxes};
@@ -113,7 +113,6 @@ pub struct Gateway {
     pub hosts: HostCache,
     pub core: core_api::CoreCache,
     pub tokens: UserTokenSigner,
-    pub sites: StaticSites,
     pub upstreams: proxy::TestUpstreams,
     pub visits: session::Visits,
     /// The core's answers where sandboxes run, and the hold of cold starts (card G-1b).
@@ -121,6 +120,8 @@ pub struct Gateway {
     /// The settings of the proxy to an upstream.
     pub proxy: proxy::ProxyConfig,
     upstream_http: reqwest::Client,
+    /// Fetches static files through the core's links ([`static_files`]).
+    files_http: reqwest::Client,
 }
 
 impl Gateway {
@@ -129,7 +130,6 @@ impl Gateway {
         hosts: Arc<dyn host::HostLookup>,
         core: Arc<dyn core_api::CoreApi>,
         tokens: UserTokenSigner,
-        sites: StaticSites,
     ) -> Self {
         let proxy = proxy::ProxyConfig::default();
         Self {
@@ -137,11 +137,11 @@ impl Gateway {
             hosts: HostCache::new(hosts),
             core: core_api::CoreCache::new(core),
             tokens,
-            sites,
             upstreams: proxy::TestUpstreams::default(),
             visits: session::Visits::default(),
             sandboxes: SandboxHold::new(Arc::new(sandbox::NoSandboxes), HoldConfig::default()),
             upstream_http: proxy::client(&proxy),
+            files_http: static_files::client(),
             proxy,
         }
     }
@@ -159,6 +159,33 @@ impl Gateway {
         self.proxy = proxy;
         self
     }
+}
+
+/// Refuses bucket credentials in the gateway's environment (decision 0008-4; backlog I6-3D):
+/// the gateway holds no key of any bucket, so a setting that would give it one is a mistake of
+/// the deployment, and the gateway does not start (`Err` names the setting, never its value).
+/// Refused: `RUUM_GATEWAY_S3_*` (the settings of releases before I6-3D), `RUUM_S3_*` and
+/// `S3_*` (the blob bucket), `RUUM_STATIC_S3_*` (the static bucket) and `AWS_*`.
+pub fn bucket_settings_refused(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<(), String> {
+    const REFUSED: [&str; 5] = [
+        "RUUM_GATEWAY_S3_",
+        "RUUM_S3_",
+        "RUUM_STATIC_S3_",
+        "S3_",
+        "AWS_",
+    ];
+    for name in names {
+        let name = name.to_string_lossy();
+        if REFUSED.iter().any(|p| name.starts_with(p)) {
+            return Err(format!(
+                "{name} is set: the gateway holds no bucket key (decision 0008-4); static files \
+                 come through links of the core"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The router of a gateway: every request goes to [`handle`].
@@ -490,5 +517,42 @@ mod tests {
         assert!(!same_visitor(&agent("a1", "p1"), &agent("a2", "p1")));
         assert!(!same_visitor(&agent("a1", "p1"), &agent("a1", "p2")));
         assert!(!same_visitor(&agent("a1", "p1"), &user("a1", &[])));
+    }
+}
+
+#[cfg(test)]
+mod bucket_settings_tests {
+    use super::bucket_settings_refused;
+    use std::ffi::OsString;
+
+    fn names(n: &[&str]) -> Vec<OsString> {
+        n.iter().map(OsString::from).collect()
+    }
+
+    /// The gateway holds no bucket key (decision 0008-4): a bucket credential in its
+    /// environment stops the start, and the error names the setting, never a value.
+    #[test]
+    fn a_bucket_credential_stops_the_gateway() {
+        let fine = names(&[
+            "RUUM_GATEWAY_BIND",
+            "RUUM_GATEWAY_TOKEN_KEY_FILE",
+            "RUUM_GATEWAY_INTERNAL_URL",
+            "PATH",
+        ]);
+        assert!(bucket_settings_refused(fine.clone()).is_ok());
+        for bad in [
+            "RUUM_GATEWAY_S3_BUCKET",
+            "RUUM_GATEWAY_S3_ACCESS_KEY_ID",
+            "RUUM_GATEWAY_S3_SECRET_ACCESS_KEY_FILE",
+            "RUUM_S3_SECRET_ACCESS_KEY",
+            "RUUM_STATIC_S3_BUCKET",
+            "S3_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            let mut all = fine.clone();
+            all.push(OsString::from(bad));
+            let err = bucket_settings_refused(all).unwrap_err();
+            assert!(err.starts_with(bad), "{err}");
+        }
     }
 }

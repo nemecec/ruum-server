@@ -24,7 +24,10 @@
 //!   (`session`), end a session (`session/end`), what a bearer token is (`agent`), and where the
 //!   instance of a sandbox deployment runs (`upstream`, card G-1b: the core's
 //!   `SandboxDirectory` answers from its own deployment record; without a directory the answer
-//!   is `not_running`). The answers name only what the gateway needs: IDs, flags, the pairwise
+//!   is `not_running`), and the link to one static file (`static`, decision 0008-4: the gateway
+//!   holds no bucket key; the core answers only for a static deployment that serves, resolves
+//!   the path in the deployment's site index and signs a link that allows one `GET` of that
+//!   one file object for a minute, `ruum_core::apps::static_links`). The answers name only what the gateway needs: IDs, flags, the pairwise
 //!   subjects of design 9.4 and an instance's `http://<host>:<port>`, never a platform user ID or
 //!   an email.
 //! - `POST /internal/runtime/v1/...`: the small internal API of the runtime API (card R-3;
@@ -206,7 +209,8 @@ pub mod gateway {
     use ruum_core::authz::{ObjectRef, Role, SubjectRef};
     use ruum_core::identity::app_sign_in::wire::{
         AgentAnswer, AgentRequest, DeploymentInfo, DeploymentQuery, EndSessionRequest, PREFIX,
-        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, UpstreamAnswer, UpstreamQuery,
+        RedeemRequest, RedeemResponse, SessionInfo, SessionRequest, StaticQuery, UpstreamAnswer,
+        UpstreamQuery,
     };
     use ruum_core::identity::app_sign_in::{AppBinding, AppEnv, pairwise};
     use ruum_core::{NodeId, TenantId, UserId};
@@ -221,6 +225,7 @@ pub mod gateway {
             .route(&format!("{PREFIX}/session/end"), post(end_session))
             .route(&format!("{PREFIX}/agent"), post(agent))
             .route(&format!("{PREFIX}/upstream"), post(upstream))
+            .route(&format!("{PREFIX}/static"), post(static_file))
             // Each request gets its own authz freshness floor, as on the public router (decision
             // 0002-4). Without it the floor helpers do nothing here, and a check falls back to
             // this process's own last token: a revoke made on another replica could still pass.
@@ -294,6 +299,34 @@ pub mod gateway {
         match dir.upstream(&q).await {
             Ok(a) => Json(a).into_response(),
             Err(e) => failed("upstream", e),
+        }
+    }
+
+    /// The link to one static file (decision 0008-4; backlog I6-3D). The core trusts nothing of
+    /// the query but its IDs: the deployment must belong to the app and the tenant, serve (the
+    /// live deployment, or a ready preview that has not expired) and be static; the path is
+    /// checked again and only looked up in that deployment's own index. Anything else is `404`
+    /// (`400` for a refused path), so a gateway can get links only to files that the internet
+    /// can already reach through it.
+    async fn static_file(State(s): State<AppState>, Json(q): Json<StaticQuery>) -> Response {
+        match deployment_info(&s, q.tenant_id, q.app_id, q.deployment_id).await {
+            Ok(Some(info)) if info.serving && !info.sandbox => {}
+            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return failed("static", e),
+        }
+        if ruum_core::apps::static_site::request_path(&q.path).is_none() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        match s
+            .services
+            .apps
+            .sites()
+            .file_link(q.tenant_id, q.deployment_id, &q.path, q.navigation)
+            .await
+        {
+            Ok(Some(link)) => Json(link).into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => failed("static", e),
         }
     }
 
@@ -1396,6 +1429,119 @@ mod tests {
                     ask(&app, &bad).await,
                     (StatusCode::OK, Some(UpstreamAnswer::NotRunning)),
                     "{bad:?}"
+                );
+            }
+        }
+
+        async fn ask_static(
+            app: &Router,
+            q: &ruum_core::identity::app_sign_in::wire::StaticQuery,
+        ) -> (
+            StatusCode,
+            Option<ruum_core::identity::app_sign_in::wire::StaticFileLink>,
+        ) {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("{PREFIX}/static"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(q).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            (status, serde_json::from_slice(&body).ok())
+        }
+
+        /// The `static` route (decision 0008-4, I6-3D): a link only for a path of a static
+        /// deployment that serves, in its own tenant and app; the link opens that one file.
+        #[tokio::test]
+        async fn the_static_route_links_only_files_of_a_serving_static_deployment() {
+            use ruum_core::apps::static_links::MemoryOpen;
+            use ruum_core::identity::app_sign_in::wire::StaticQuery;
+            let state = AppState::in_memory();
+            let sites = state.services.apps.sites().clone();
+            let links = sites.memory_links().unwrap();
+            links.set_base("http://127.0.0.1:1/o".parse().unwrap());
+            let stat = seed(&state, "static").await;
+            let node = seed(&state, "node22").await.query;
+            let files = vec![(
+                "index.html".to_string(),
+                bytes::Bytes::from_static(b"I6-3D page"),
+            )];
+            for q in [&stat.query, &node] {
+                sites
+                    .write_site(q.tenant_id, q.deployment_id, &files, None)
+                    .await
+                    .unwrap();
+            }
+            let q = StaticQuery {
+                tenant_id: stat.query.tenant_id,
+                app_id: stat.query.app_id,
+                deployment_id: stat.query.deployment_id,
+                path: "/".into(),
+                navigation: true,
+            };
+            let app = routes(state);
+            let (status, link) = ask_static(&app, &q).await;
+            assert_eq!(status, StatusCode::OK);
+            let link = link.unwrap();
+            assert_eq!(link.size, 10);
+            let url: url::Url = link.url.parse().unwrap();
+            let p: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            let MemoryOpen::Found(r) = links
+                .open(&p["key"], p["exp"].parse().unwrap(), &p["sig"])
+                .await
+                .unwrap()
+            else {
+                panic!("the link does not open the file");
+            };
+            assert_eq!(&r.bytes().await.unwrap()[..], b"I6-3D page");
+            // A sandbox deployment, another tenant, another app, an unknown deployment, a path
+            // that the index does not have: no link.
+            for bad in [
+                StaticQuery {
+                    tenant_id: node.tenant_id,
+                    app_id: node.app_id,
+                    deployment_id: node.deployment_id,
+                    ..q.clone()
+                },
+                StaticQuery {
+                    tenant_id: stat.other_tenant,
+                    ..q.clone()
+                },
+                StaticQuery {
+                    app_id: node.app_id,
+                    ..q.clone()
+                },
+                StaticQuery {
+                    deployment_id: uuid::Uuid::now_v7(),
+                    ..q.clone()
+                },
+                StaticQuery {
+                    path: "/nope.js".into(),
+                    navigation: false,
+                    ..q.clone()
+                },
+            ] {
+                assert_eq!(
+                    ask_static(&app, &bad).await,
+                    (StatusCode::NOT_FOUND, None),
+                    "{bad:?}"
+                );
+            }
+            // A refused path is refused by the core too.
+            for path in ["/../index.html", "/%2e%2e/x", "index.html"] {
+                let bad = StaticQuery {
+                    path: path.into(),
+                    ..q.clone()
+                };
+                assert_eq!(
+                    ask_static(&app, &bad).await,
+                    (StatusCode::BAD_REQUEST, None),
+                    "{path}"
                 );
             }
         }

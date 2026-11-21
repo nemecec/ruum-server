@@ -80,3 +80,9 @@ variable "bucket_blobs" {
   type        = string
   default     = "ruum-staging-blobs-768usm"
 }
+
+variable "bucket_static" {
+  description = "Hetzner bucket of the static app files, never the blob bucket (decision 0008-4; destroyed with staging)."
+  type        = string
+  default     = "ruum-staging-static-768usm"
+}
