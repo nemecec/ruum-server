@@ -132,13 +132,62 @@ async fn the_core_gives_files_only_of_a_serving_deployment_of_the_named_tenant()
         404,
         "no bytes of a deployment that does not serve"
     );
+    // A sandbox deployment that serves, with a site index under its ID: never static files.
+    let sandbox = w
+        .seed_node_deployment(&app, Env::Preview, "http://127.0.0.1:9")
+        .await
+        .unwrap();
+    let list: Vec<(String, bytes::Bytes)> = files
+        .iter()
+        .map(|(p, b)| (p.clone(), bytes::Bytes::from(b.clone())))
+        .collect();
+    let tid = TenantId(acme.id.parse().unwrap());
+    w.sites
+        .write_site(tid, sandbox.id.parse().unwrap(), &list, None)
+        .await
+        .unwrap();
+    q["deployment_id"] = json!(sandbox.id);
+    let a: StaticFileAnswer = core_post(&w, "/static/file", &q)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(a, StaticFileAnswer::NotServing, "a sandbox deployment");
+    c["deployment_id"] = json!(sandbox.id);
+    assert_eq!(core_post(&w, "/static/content", &c).await.status(), 404);
 }
 
-/// A fake bucket: `/ok` holds `hello`, `/long` a longer object, `/gone` nothing.
+/// A body of `parts`, sent without `Content-Length`.
+fn streamed(parts: &[&'static str]) -> axum::body::Body {
+    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = parts
+        .iter()
+        .map(|p| Ok(bytes::Bytes::from_static(p.as_bytes())))
+        .collect();
+    axum::body::Body::from_stream(futures::stream::iter(chunks))
+}
+
+/// All bytes of a file stream, or its error.
+async fn read_all(mut s: ruum_gateway::static_files::FileStream) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(c) = s.next().await {
+        out.extend_from_slice(&c?);
+    }
+    Ok(out)
+}
+
+/// A fake bucket: `/ok` holds `hello`, `/long` a longer object, `/gone` nothing; `/streamed*`
+/// send no `Content-Length`.
 async fn bucket() -> String {
     let app = Router::new()
         .route("/ok", get(|| async { "hello" }))
         .route("/long", get(|| async { "hello, and more" }))
+        // Bodies without Content-Length (chunked).
+        .route("/streamed", get(|| async { streamed(&["he", "llo"]) }))
+        .route("/streamed-short", get(|| async { streamed(&["hel"]) }))
+        .route(
+            "/streamed-long",
+            get(|| async { streamed(&["hello", " more"]) }),
+        )
         .route(
             "/gone",
             get(|| async { (axum::http::StatusCode::NOT_FOUND, "") }),
@@ -191,6 +240,22 @@ async fn a_link_is_fetched_and_checked_against_the_index_entry() {
             .is_none(),
         "a missing object is the gateway's 404"
     );
+    // Kimi review of k14r3, finding 5: without Content-Length the length is checked at the end.
+    for (path, whole) in [
+        ("/streamed", true),
+        ("/streamed-short", false),
+        ("/streamed-long", false),
+    ] {
+        let body = s
+            .open(&q, &entry, Some(&format!("{base}{path}")))
+            .await
+            .unwrap()
+            .expect("the object");
+        match read_all(body).await {
+            Ok(b) => assert!(whole && b == b"hello", "{path}: {b:?}"),
+            Err(_) => assert!(!whole, "{path}"),
+        }
+    }
     assert!(
         s.open(&q, &entry, Some("file:///etc/passwd"))
             .await

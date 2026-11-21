@@ -545,7 +545,10 @@ Milestone M2 on staging: apps are served at `<app>.<tenant slug>.apps.staging.ru
   link of that one object signed for 30 seconds, and the gateway fetches the file through it. A
   compromised gateway can read only the files of serving apps and change nothing. At its start
   the server moves the static files that card W-2s put into the blob bucket over to the new
-  bucket (each object copied, checked, then deleted from the blob bucket). The egress proxy: one replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
+  bucket: files first, then site indexes, each copy checked; new static deploys wait (`503`)
+  until that first pass ends; an object leaves the blob bucket only an hour after its copy, so
+  the previous release loses nothing during the rolling deploy; the pass repeats every 10
+  minutes until the blob bucket holds no static object. The egress proxy: one replica, CONNECT on 443, `EGRESS_DENY` from the Hetzner API
   (the cluster ranges and every public address of staging and of the build server, ConfigMap
   `ruum/ruum-egress-deny`; the platform step stops when an API answer fails or misses a node, the
   load balancer or the build server, and restarts the proxy when the list changed), its control
@@ -630,8 +633,9 @@ Each step stops on the first error; the live release keeps serving through all o
    gateway), and the gVisor pod check.
 5. `deploy/staging/deploy.sh <sha of main>`: the controller resolves the gateway and egress
    images of that commit and rolls out the chart; ruum-server gets `RUUM_APPS_DOMAIN` and
-   `RUUM_STATIC_S3_BUCKET`, and moves the static files of the blob bucket over at its start (log
-   line "static sites moved out of the blob bucket").
+   `RUUM_STATIC_S3_BUCKET`, and moves the static files of the blob bucket over (log lines
+   "static sites: a pass of the move out of the blob bucket", then after about an hour "the
+   move is done").
 6. `deploy/staging/status.sh --checks` (smoke and smoke-apps) and `deploy/staging/status.sh
    --netpol`.
 
@@ -639,8 +643,8 @@ Going back: `deploy.sh --rollback` to the previous release removes the gateway a
 proxy with the chart (the controller's chart renders them only with both images; the previous
 commit has none); the older ruum-server ignores `RUUM_APPS_DOMAIN` and gives no certificate to
 app hosts. A ruum-server older than decision 0008-4 reads static files from the blob bucket,
-which no longer holds them after the move: its static apps answer `404` (deploy them again, or
-copy `apps/static/` back). The runtime class, `ruum-apps`, the policies and the Secrets stay (the platform step of an
+which no longer holds them an hour after the move: its static apps answer `404` (deploy them
+again, or copy `apps/static/` back). The runtime class, `ruum-apps`, the policies and the Secrets stay (the platform step of an
 older checkout removes the policies; the rest is harmless). The nodes keep gVisor.
 
 ## Recreate

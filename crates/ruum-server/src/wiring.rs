@@ -254,9 +254,12 @@ pub fn install_apps(
     Ok(())
 }
 
+/// How often the move of static sites out of the blob bucket runs again until it is done.
+const STATIC_MOVE_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The store of static sites (decision 0008-4): the bucket of `RUUM_STATIC_S3_BUCKET`, with
 /// signed read links for the gateway. When the blob store is S3 too, the sites that card W-2s
-/// wrote into the blob bucket move over in the background. With S3 blobs but no
+/// wrote into the blob bucket move over in the background (`StaticSites::migrate_from`). With S3 blobs but no
 /// `RUUM_STATIC_S3_BUCKET`, sites stay in this process's memory and the server says so on every
 /// start: they never go into the blob bucket again.
 fn static_sites(parts: &mut ruum_core::apps::AppParts) -> anyhow::Result<()> {
@@ -275,18 +278,35 @@ fn static_sites(parts: &mut ruum_core::apps::AppParts) -> anyhow::Result<()> {
     };
     let sites = StaticSites::s3(&settings).context("set up the bucket of static sites")?;
     if let Some(blob) = blob {
+        // Writes of new sites wait for the first pass (the quota cannot see sites that are
+        // still only in the blob bucket); passes repeat until the blob bucket holds no static
+        // object, so sites that a previous-release server writes during the rollout move too.
+        sites.begin_move();
         let target = sites.clone();
         tokio::spawn(async move {
-            match target.migrate_from_blob_bucket(&blob).await {
-                Ok(r) => tracing::info!(
-                    copied = r.copied,
-                    present = r.present,
-                    "static sites moved out of the blob bucket"
-                ),
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "static sites could not move out of the blob bucket; the next start tries again"
-                ),
+            loop {
+                match target.migrate_from_blob_bucket(&blob).await {
+                    Ok(r) if r.listed == 0 => {
+                        tracing::info!(
+                            "static sites: the blob bucket holds none (the move is done)"
+                        );
+                        break;
+                    }
+                    Ok(r) => tracing::info!(
+                        listed = r.listed,
+                        copied = r.copied,
+                        present = r.present,
+                        deleted = r.deleted,
+                        gone = r.gone,
+                        broken = r.broken,
+                        "static sites: a pass of the move out of the blob bucket"
+                    ),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "static sites: a pass of the move out of the blob bucket failed"
+                    ),
+                }
+                tokio::time::sleep(STATIC_MOVE_EVERY).await;
             }
         });
     }

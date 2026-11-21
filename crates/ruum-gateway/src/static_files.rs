@@ -117,23 +117,37 @@ impl CoreStatic {
                 "{what}: the object does not have the size of its index entry"
             )));
         }
-        let limit = entry.size;
-        let mut seen = 0u64;
-        Ok(Some(
-            r.bytes_stream()
-                .map(move |chunk| {
-                    let chunk = chunk.map_err(|e| std::io::Error::other(e.without_url()))?;
-                    seen += chunk.len() as u64;
-                    if seen > limit {
-                        return Err(std::io::Error::other(
-                            "a static file object is longer than its index entry",
-                        ));
-                    }
-                    Ok(chunk)
-                })
-                .boxed(),
-        ))
+        Ok(Some(exact_length(r.bytes_stream().boxed(), entry.size)))
     }
+}
+
+/// The bytes of `body`, which must be exactly `size` bytes long: a longer body fails at the
+/// first byte too many, a shorter one at its end (Kimi review of k14r3, finding 5: a body
+/// without `Content-Length` that ends early is not a whole file).
+fn exact_length(body: BoxStream<'static, reqwest::Result<Bytes>>, size: u64) -> FileStream {
+    futures::stream::unfold(Some((body, 0u64)), move |state| async move {
+        let (mut body, seen) = state?;
+        match body.next().await {
+            Some(Ok(chunk)) => {
+                let seen = seen + chunk.len() as u64;
+                if seen > size {
+                    let e = std::io::Error::other(
+                        "a static file object is longer than its index entry",
+                    );
+                    return Some((Err(e), None));
+                }
+                Some((Ok(chunk), Some((body, seen))))
+            }
+            Some(Err(e)) => Some((Err(std::io::Error::other(e.without_url())), None)),
+            None if seen != size => {
+                let e =
+                    std::io::Error::other("a static file object is shorter than its index entry");
+                Some((Err(e), None))
+            }
+            None => None,
+        }
+    })
+    .boxed()
 }
 
 #[async_trait]

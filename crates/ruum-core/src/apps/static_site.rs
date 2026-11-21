@@ -534,57 +534,60 @@ pub struct WrittenSite {
     pub new_bytes: u64,
 }
 
-/// What one run of [`StaticSites::migrate_from`] did.
+/// How long a moved object stays in the old bucket after its copy (decision 0008-4): longer
+/// than a rolling deploy, so servers and gateways of the previous release, which still read and
+/// collect the old bucket, never lose an object under them.
+pub const MOVE_DELETE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// What one pass of [`StaticSites::migrate_from`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SiteMigration {
-    /// Objects copied into the bucket of static sites (and deleted from the old bucket).
+    /// Static objects in the old bucket at the start of the pass. `0`: the move is complete.
+    pub listed: u64,
+    /// Objects copied into the bucket of static sites.
     pub copied: u64,
-    /// Objects the bucket of static sites held already (deleted from the old bucket), or that
-    /// went from the old bucket while the run looked at them.
+    /// Objects the bucket of static sites held already.
     pub present: u64,
+    /// Objects deleted from the old bucket (their copy is older than the delete delay).
+    pub deleted: u64,
+    /// File objects that went from the old bucket before they were copied (the old garbage
+    /// collection deleted them: no index named them).
+    pub gone: u64,
+    /// Files that a moved index names but that neither bucket holds (logged; such a site was
+    /// broken in the old bucket too).
+    pub broken: u64,
 }
 
-/// Moves one object of [`StaticSites::migrate_from`]: `true` when it was copied.
-async fn migrate_one(
+/// Copies one object into `store` unless it holds it with the same size. `Some(true)`: copied,
+/// `Some(false)`: present, `None`: the old bucket no longer holds it.
+async fn copy_one(
     legacy: &dyn ObjectStore,
     store: &dyn ObjectStore,
-    meta: &object_store::ObjectMeta,
-) -> Result<bool> {
-    let present = match store.head(&meta.location).await {
-        Ok(m) => m.size == meta.size,
-        Err(object_store::Error::NotFound { .. }) => false,
+    location: &Path,
+    size: u64,
+) -> Result<Option<bool>> {
+    match store.head(location).await {
+        Ok(m) if m.size == size => return Ok(Some(false)),
+        Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let bytes = match legacy.get(location).await {
+        Ok(r) => r.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut copied = false;
-    if !present {
-        let bytes = match legacy.get(&meta.location).await {
-            Ok(r) => r.bytes().await?,
-            // Another server moved it first.
-            Err(object_store::Error::NotFound { .. }) => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        if bytes.len() as u64 != meta.size {
-            return Err(Error::Internal(format!(
-                "a static object changed while it was moved: {}",
-                meta.location
-            )));
-        }
-        store
-            .put(&meta.location, PutPayload::from_bytes(bytes))
-            .await?;
-        let m = store.head(&meta.location).await?;
-        if m.size != meta.size {
-            return Err(Error::Internal(format!(
-                "a moved static object has another size: {}",
-                meta.location
-            )));
-        }
-        copied = true;
+    if bytes.len() as u64 != size {
+        return Err(Error::Internal(format!(
+            "a static object changed while it was moved: {location}"
+        )));
     }
-    match legacy.delete(&meta.location).await {
-        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(copied),
-        Err(e) => Err(e.into()),
+    store.put(location, PutPayload::from_bytes(bytes)).await?;
+    if store.head(location).await?.size != size {
+        return Err(Error::Internal(format!(
+            "a moved static object has another size: {location}"
+        )));
     }
+    Ok(Some(true))
 }
 
 /// The static sites over an object store.
@@ -594,6 +597,9 @@ pub struct StaticSites {
     /// Signs the short-lived read links of file objects ([`StaticSites::file_link`]); `None`
     /// for a store that cannot sign (the in-process store).
     signer: Option<Arc<dyn Signer>>,
+    /// Writes of new sites wait while the first pass of the move runs
+    /// ([`StaticSites::begin_move`]).
+    moving: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for StaticSites {
@@ -608,6 +614,7 @@ impl StaticSites {
         Self {
             store,
             signer: None,
+            moving: Arc::default(),
         }
     }
 
@@ -618,6 +625,7 @@ impl StaticSites {
         Ok(Self {
             store: s3.clone(),
             signer: Some(s3),
+            moving: Arc::default(),
         })
     }
 
@@ -654,42 +662,159 @@ impl StaticSites {
         Ok(Some(url.to_string()))
     }
 
-    /// Moves every static object out of the tenant blob bucket of `blob` (where card W-2s put
-    /// them before decision 0008-4) into this store: each object under `apps/static/` is copied
-    /// when this store does not hold it with the same size, then deleted from `legacy`. It is
-    /// safe to run on several servers at once and again after a stop: objects are
-    /// content-addressed or never change, a copy is checked before its source is deleted, and an
-    /// object that went in the meantime is skipped. A file is copied in one piece (static files
-    /// are smaller than the plan's file limit).
+    /// One pass of the move of static objects out of the tenant blob bucket of `blob` (where
+    /// card W-2s put them before decision 0008-4) into this store. See
+    /// [`StaticSites::migrate_from`].
     pub async fn migrate_from_blob_bucket(&self, blob: &S3Settings) -> Result<SiteMigration> {
-        self.migrate_from(Arc::new(blob.build()?)).await
+        self.migrate_from(Arc::new(blob.build()?), MOVE_DELETE_AFTER)
+            .await
     }
 
-    /// [`StaticSites::migrate_from_blob_bucket`] from any object store.
-    pub async fn migrate_from(&self, legacy: Arc<dyn ObjectStore>) -> Result<SiteMigration> {
+    /// One pass of the move out of `legacy` (Kimi review of k14r3, findings 1 to 3):
+    ///
+    /// 1. Every file object under `apps/static/` is copied, unless this store holds it with the
+    ///    same size; then every index, so a moved index never names a file that is not here.
+    ///    Each index is checked: a file it names that is still missing here is copied from the
+    ///    old bucket, or counted as `broken` when neither bucket holds it.
+    /// 2. An object of the old bucket is deleted only when its copy here is older than
+    ///    `delete_after` (longer than a rolling deploy), so servers and gateways of the previous
+    ///    release, which still read and collect the old bucket, lose nothing under them.
+    ///
+    /// The server runs a pass at its start and again until the old bucket holds no static
+    /// object (`listed == 0`), so sites that a previous-release server writes during the
+    /// rollout move too. Passes are safe on several servers at once: objects are
+    /// content-addressed or never change, and every copy is checked before anything is deleted.
+    /// When step 1 succeeds, the writes of new sites open again ([`StaticSites::begin_move`]).
+    /// Objects are copied whole (static files are smaller than the plan's file limit).
+    pub async fn migrate_from(
+        &self,
+        legacy: Arc<dyn ObjectStore>,
+        delete_after: std::time::Duration,
+    ) -> Result<SiteMigration> {
         let mut report = SiteMigration::default();
         let mut list = legacy.list(Some(&Path::from(ROOT_PREFIX)));
-        let mut metas = Vec::new();
+        let (mut files, mut indexes) = (Vec::new(), Vec::new());
         while let Some(meta) = list.next().await {
-            metas.push(meta?);
+            let meta = meta?;
+            report.listed += 1;
+            if meta.location.as_ref().contains("/sites/") {
+                indexes.push(meta);
+            } else {
+                files.push(meta);
+            }
         }
-        let results: Vec<Result<bool>> = futures::stream::iter(metas)
-            .map(|meta| {
-                let legacy = legacy.clone();
-                let store = self.store.clone();
-                async move { migrate_one(legacy.as_ref(), store.as_ref(), &meta).await }
+        // 1. Files first, then indexes.
+        let jobs: Vec<(Path, u64)> = files.iter().map(|m| (m.location.clone(), m.size)).collect();
+        let results: Vec<Result<Option<bool>>> = futures::stream::iter(jobs)
+            .map(|(location, size)| {
+                let (legacy, store) = (legacy.clone(), self.store.clone());
+                async move { copy_one(legacy.as_ref(), store.as_ref(), &location, size).await }
             })
             .buffer_unordered(OBJECT_CONCURRENCY)
             .collect()
             .await;
         for r in results {
-            if r? {
-                report.copied += 1;
-            } else {
-                report.present += 1;
+            match r? {
+                Some(true) => report.copied += 1,
+                Some(false) => report.present += 1,
+                None => report.gone += 1,
+            }
+        }
+        for meta in &indexes {
+            match copy_one(
+                legacy.as_ref(),
+                self.store.as_ref(),
+                &meta.location,
+                meta.size,
+            )
+            .await?
+            {
+                Some(true) => report.copied += 1,
+                Some(false) => report.present += 1,
+                None => {
+                    report.gone += 1;
+                    continue;
+                }
+            }
+            report.broken += self.check_moved_index(legacy.as_ref(), meta).await?;
+        }
+        self.moving
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // 2. Deletes, only of objects whose copy here is old enough.
+        let cutoff = (crate::now().unix_timestamp_nanos() / 1_000_000)
+            .saturating_sub(i128::try_from(delete_after.as_millis()).unwrap_or(i128::MAX));
+        for meta in indexes.iter().chain(files.iter()) {
+            let copy = match self.store.head(&meta.location).await {
+                Ok(m) => m,
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if copy.size != meta.size || !older(&copy, cutoff) {
+                continue;
+            }
+            match legacy.delete(&meta.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => report.deleted += 1,
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(report)
+    }
+
+    /// Checks that every file a moved index names is here; copies a missing one from `legacy`.
+    /// The count of files that neither bucket holds.
+    async fn check_moved_index(
+        &self,
+        legacy: &dyn ObjectStore,
+        meta: &object_store::ObjectMeta,
+    ) -> Result<u64> {
+        let bytes = self.store.get(&meta.location).await?.bytes().await?;
+        let index: SiteIndex = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Internal(format!("the moved index {}: {e}", meta.location)))?;
+        let tenant = meta
+            .location
+            .parts()
+            .nth(2)
+            .and_then(|p| p.as_ref().parse::<Uuid>().ok())
+            .map(TenantId)
+            .ok_or_else(|| Error::Internal(format!("not a site index: {}", meta.location)))?;
+        let mut broken = 0;
+        for entry in index.files.values() {
+            let key = file_key(tenant, &entry.content_hash()?);
+            if copy_one(legacy, self.store.as_ref(), &key, entry.size)
+                .await?
+                .is_none()
+            {
+                tracing::error!(
+                    target: "ruum::apps",
+                    index = %meta.location,
+                    file = %key,
+                    "a moved site index names a file that no bucket holds"
+                );
+                broken += 1;
+            }
+        }
+        Ok(broken)
+    }
+
+    /// Closes the writes of new sites until the first pass of the move has copied every object
+    /// of the old bucket (Kimi review of k14r3, finding 3): until then the storage quota cannot
+    /// see the sites that are still only in the old bucket. A write answers `503 unavailable`.
+    pub fn begin_move(&self) {
+        self.moving.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `503 unavailable` while the move closes the writes ([`StaticSites::begin_move`]).
+    fn writes_open(&self) -> Result<()> {
+        if self.moving.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Api(
+                crate::error::ApiError::new(
+                    crate::error::ErrorCode::Unavailable,
+                    "static sites are moving to their own bucket",
+                )
+                .with_hint("try again in a minute"),
+            ));
+        }
+        Ok(())
     }
 
     /// Stores each file as a content-addressed object (skipping objects that exist), then the
@@ -719,6 +844,7 @@ impl StaticSites {
         spa_fallback: Option<String>,
         budget: Option<u64>,
     ) -> Result<WrittenSite> {
+        self.writes_open()?;
         let list = static_files(files);
         let data: std::collections::HashMap<Hash, &Bytes> = list
             .iter()
@@ -946,6 +1072,7 @@ impl StaticSites {
         to: Uuid,
         budget: Option<u64>,
     ) -> Result<SiteIndex> {
+        self.writes_open()?;
         let index = self
             .read_index(tenant, from)
             .await?
@@ -1232,8 +1359,67 @@ mod tests {
         );
     }
 
-    /// The move out of the blob bucket (decision 0008-4): static objects only, each one copied
-    /// and then deleted from the blob bucket; chunks stay; a second run does nothing.
+    /// A link against a real S3 (Garage of `scripts/dev.sh env`; skipped without it): it reads
+    /// its one object, writes and deletes nothing, and stops working when it ends (Kimi review
+    /// of k14r3, finding 4: the signing test alone cannot see the method).
+    #[tokio::test]
+    async fn a_file_link_on_garage_reads_only_and_ends() {
+        let Some(settings) = S3Settings::from_env() else {
+            eprintln!("skipped: no S3 settings (eval \"$(scripts/dev.sh env)\")");
+            return;
+        };
+        let sites = StaticSites::s3(&settings).unwrap();
+        let t = TenantId(Uuid::now_v7());
+        let d = Uuid::now_v7();
+        sites.write_site(t, d, &files(), None).await.unwrap();
+        let index = sites.read_index(t, d).await.unwrap().unwrap();
+        let (_, e) = index.resolve("", true).unwrap();
+        let link = sites.file_link(t, e, LINK_TTL).await.unwrap().unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let r = http.get(&link).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), b"<h1>Hi</h1>");
+        for m in [
+            reqwest::Method::PUT,
+            reqwest::Method::DELETE,
+            reqwest::Method::POST,
+        ] {
+            let r = http
+                .request(m.clone(), &link)
+                .body("changed")
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_client_error(), "{m}: {}", r.status());
+        }
+        assert_eq!(
+            sites.read_file(t, e, 1024).await.unwrap(),
+            Bytes::from_static(b"<h1>Hi</h1>"),
+            "the object is unchanged"
+        );
+        let short = sites
+            .file_link(t, e, std::time::Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let r = http.get(&short).send().await.unwrap();
+        assert!(
+            r.status().is_client_error(),
+            "an ended link: {}",
+            r.status()
+        );
+        let store = sites.object_store();
+        store.delete(&index_key(t, d)).await.unwrap();
+        for e in index.files.values() {
+            let _ = store.delete(&file_key(t, &e.content_hash().unwrap())).await;
+        }
+    }
+
+    /// The move out of the blob bucket (decision 0008-4): static objects only; nothing leaves
+    /// the old bucket until its copy is older than the delete delay (Kimi review of k14r3,
+    /// findings 1 and 2: previous-release servers and gateways still read and collect it);
+    /// chunks stay; a pass on an empty old bucket does nothing.
     #[tokio::test]
     async fn the_migration_moves_static_objects_out_of_the_blob_bucket() {
         let legacy: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -1254,12 +1440,15 @@ mod tests {
             .put(&index_html, PutPayload::from_static(b"<h1>Hi</h1>"))
             .await
             .unwrap();
-        let r = sites.migrate_from(legacy.clone()).await.unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+        let r = sites.migrate_from(legacy.clone(), hour).await.unwrap();
         assert_eq!(
             r,
             SiteMigration {
+                listed: 4,
                 copied: 3,
-                present: 1
+                present: 1,
+                ..SiteMigration::default()
             }
         );
         let index = sites.read_index(t, d).await.unwrap().unwrap();
@@ -1268,6 +1457,16 @@ mod tests {
             sites.read_file(t, e, 1024).await.unwrap(),
             Bytes::from_static(b"<h1>Docs</h1>")
         );
+        // The previous release still finds its site in the old bucket.
+        assert!(old.read_index(t, d).await.unwrap().is_some());
+        let all: Vec<_> = legacy.list(None).collect().await;
+        assert_eq!(all.len(), 5, "nothing deleted before the delay");
+        // Once the copies are older than the delay, the old objects go; the chunk stays.
+        let r = sites
+            .migrate_from(legacy.clone(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!((r.listed, r.present, r.deleted, r.copied), (4, 4, 4, 0));
         let left: Vec<_> = legacy
             .list(None)
             .map(|m| m.unwrap().location)
@@ -1275,9 +1474,70 @@ mod tests {
             .await;
         assert_eq!(left, vec![chunk], "only the chunk stays in the blob bucket");
         assert_eq!(
-            sites.migrate_from(legacy).await.unwrap(),
+            sites.migrate_from(legacy, hour).await.unwrap(),
             SiteMigration::default()
         );
+    }
+
+    /// A moved index never names a file that the new bucket lacks: files go first, and each
+    /// index is checked. A file that the previous release's collection deleted from the old
+    /// bucket is `gone`; a file that a moved index names and no bucket holds is `broken`, and
+    /// the pass deletes nothing of that site before the delay (Kimi review of k14r3, finding 1).
+    #[tokio::test]
+    async fn a_moved_index_finds_its_files_or_is_reported_broken() {
+        let legacy: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let old = StaticSites::new(legacy.clone());
+        let t = TenantId(Uuid::now_v7());
+        let d = Uuid::now_v7();
+        old.write_site(t, d, &files(), None).await.unwrap();
+        // The old collection deleted one file of the site (the site is broken there too).
+        let js = file_key(t, &Hash::of(b"console.log(1)"));
+        legacy.delete(&js).await.unwrap();
+        let sites = StaticSites::in_memory();
+        let r = sites
+            .migrate_from(legacy.clone(), std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!((r.listed, r.copied, r.broken, r.deleted), (3, 3, 1, 0));
+        let index = sites.read_index(t, d).await.unwrap().unwrap();
+        for e in index.files.values() {
+            let key = file_key(t, &e.content_hash().unwrap());
+            let here = sites.object_store().head(&key).await.is_ok();
+            assert_eq!(here, key != js, "{key}");
+        }
+    }
+
+    /// Kimi review of k14r3, finding 3: while the first pass of the move runs, new sites are
+    /// not written (the quota cannot see sites that are still only in the old bucket); after
+    /// it, they are.
+    #[tokio::test]
+    async fn writes_wait_for_the_first_pass_of_the_move() {
+        let legacy: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let sites = StaticSites::in_memory();
+        let t = TenantId(Uuid::now_v7());
+        sites.begin_move();
+        let e = sites
+            .write_site_within(t, Uuid::now_v7(), &files(), None, Some(1 << 20))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Api(a) if a.code == crate::error::ErrorCode::Unavailable),
+            "{e:?}"
+        );
+        assert!(
+            sites
+                .copy_site_within(t, Uuid::now_v7(), Uuid::now_v7(), None)
+                .await
+                .is_err()
+        );
+        sites
+            .migrate_from(legacy, std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        sites
+            .write_site_within(t, Uuid::now_v7(), &files(), None, Some(1 << 20))
+            .await
+            .unwrap();
     }
 
     #[test]
