@@ -19,7 +19,7 @@ the operations policy and the product direction), the integration of run 8 (2026
 (2026-11-11: the privacy filter of Postgres queries for agents), the integration of run 9 (2026-11-12 to
 11-13: decision 0004-40, cards A-2 and D-3a, step 3 wave 1 with T-4a, W-1, R-1 and spike S-2, and
 updates without downtime O-25), the Kimi re-review fixes of O-25, T-4a and S-2 (2026-11-13), the integration of run 10 (2026-11-13 to
-11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
+11-14: card S-35 of decision 0008-1, step 3 wave 2 with T-6, W-2s, B-2 and G-1a), the Kimi review fixes of run 10 (2026-11-14: T-6, G-1a, backlog S-43 and the deploy controller O-34), the integration of run 11 (2026-11-17: step 3 wave 3 with the egress proxy R-2e, the Docker runtime driver R-2a and the laptop telemetry stack I-5), the integration of run 12 (2026-11-18: step 3 wave 4 with the gateway in front of sandboxes G-1b and the node22 builder R-2b, and the follow-ups K11, FU-1, P-57, W2S-1 and O-1a), the Kimi review fixes of run 12 (2026-11-19: P-57, K11, G-1b, O-1a and R-2b), the integration of run 13 (2026-11-20: step 3 wave 5 with the telemetry processor O-1b, bindings B-1 and the Node SDK O-5, the site purge at scale W2S-4 and the staging admin tunnel for Talos O-21), the Kimi review fixes of run 13 (2026-11-21: B-1, O-5, W2S-4 and O-21), the integration of run 14 (2026-11-21: step 3 wave 6 with the runtime API R-3 and the telemetry reads O-2, and the app runtime on staging I-6), how to run it, the test counts and the known gaps. The work areas are in `docs/STEP1.md`. The foundation and wave A are in
 `docs/FOUNDATION.md`.
 
 ## What is merged
@@ -252,6 +252,22 @@ Fixes made during the night integration:
 - The rebased branches were pushed as `integ/f-followups-4`, `integ/w-voice`, `integ/s2-k-1`,
   `integ/s2-a-1` and `integ/s2-a-1-r` (no force push) and deleted from GitHub after the
   fast-forward.
+
+Integration of run 14 (2026-11-21; three branches rebased onto `main` `3f57d95` in one stack,
+each tip checked on the build server, pushed as `integ14/<name>`, green in GitHub CI, then
+fast-forwarded in this order, `3f57d95..7114115`, then the test-tool fix `798ca89`; linear history, no merge commit, no co-author
+line). `main` `3f57d95` already held the O-1b Kimi fixes of run 13 (`c048082`, `3f57d95`). The
+digest is `docs/digests/2026-11-21-run14.md`, the new backlog rows are in
+`docs/backlog/2026-11-21-run14.md` (and the cards' own files `2026-11-21-r3.md`, `-o2.md`,
+`-i6.md`). Kimi K3.1 Pro finished a review of all three (CHANGES REQUESTED each); every finding
+was fixed, rightly rejected or recorded, and a second Claude review accepted each fix; Kimi has
+not seen the fix commits (S-78).
+
+| Branch (pushed as) | What it adds | Reviews |
+|---|---|---|
+| `s3/r-3` (`integ14/r-3`) | The runtime API binary `ruum-runtime-api` (the six operations of `contracts/apps/runtime.openapi.yaml` on the host `ruum.internal`; holds no tenant keys and no database credential), the workload token issuer in the core (`WorkloadTokenIssuer`, EdDSA, 15 minutes, renewal; `RUUM_WORKLOAD_TOKEN_KEY_FILE`, `RUUM_WORKLOAD_JWKS_FILE`), and the core's internal runtime routes `/internal/runtime/v1/*`, which take the caller only from a verified workload or delegated token. Delegated tokens are signed by the core with the workload key; tokens carry the deployment (`dep`), so a replaced live deployment's tokens stop within 5 s; a trashed app stops at once; caps per app, tenant and listener, a body deadline, a per-tenant connection share with a caller network lookup. The T-6 runtime API cases run with its world (`crates/ruum-runtime-api/tests/t6_world.rs`). Integration fix `d1ce40f`: the gateway meta test still required every runtime API case to be pending (T-72). | Claude: 4 required, all closed; Kimi **CHANGES REQUESTED** on `84fd35f` (1 High, 4 Medium, 1 Low; fixed in `1a5d2a0` except the idle keep-alive part, rightly rejected; not re-checked by Kimi); Claude accept |
+| `s3/o-2` (`integ14/o-2-r2`) | Telemetry classes and reads: the seven telemetry operations (search logs, metrics, a trace, the comparison of deployments, the field listing and confirmation, a pseudonym for a user), field classes in Postgres with privacy file suggestions that can only make a class stricter (a person's confirmation relaxes), a read budget and pseudonym limits, bound cursors; the MCP server offers five telemetry read tools (82 tools); the telemetry acceptance cases (15, both backends; CI suite lines). The journal writes `app.telemetry_fields_confirmed`. No migration. | Claude: 6 required, all closed; Kimi **CHANGES REQUESTED** on `01301c3` (2 High, 2 Medium, 1 Low; fixed in `b99ad7b`, the cursor one rightly rejected, the per-process limits accepted as P-108; not re-checked by Kimi); Claude accept |
+| `ops/i-6` (`integ14/i-6-r2`) | The app runtime on staging (code and plan only, nothing applied): the Talos schematic with gVisor and `ops/upgrade-talos.sh`, the runtime class `gvisor`, the namespace `ruum-apps`, the gateway and the egress proxy in the `ruum` chart (images built by `images.yml`), network policies, the edge site `*.*.apps.staging.ruumapps.net` with on-demand TLS, the `ask` endpoint that allows only hosts that can serve (`AppStore::app_host_known`), DNS, smoke and netpol checks; `deploy-chart.sh` stops on a registry error instead of dropping the app runtime. | Claude: 3 required, all closed; Kimi **CHANGES REQUESTED** on `06b6d28` (1 High, 5 Medium, 1 Low; fixed in `5d67a28`, the gateway key High as a decision I6-3, the Talos artifacts deferred to I6-12; not re-checked by Kimi); Claude accept |
 
 Kimi review fixes of run 13 (2026-11-21; four fix branches rebased onto `main` `106080e` in one
 stack, each tip checked, pushed as `integ13k/<name>`, green in GitHub CI, then fast-forwarded in
@@ -667,10 +683,11 @@ operations, 19 are built (cards D-1, K-1, A-1, Q-1, A-2 and D-3a); the other 5 a
 `x-ruum-status: planned` (decision 0004-21). Of the 45 step 3 app operations, 11 are built (card
 W-1: `createApp`, `getApp`, `updateAppSettings`, `listAppDeployments`, `getAppDeployment`; card
 W-2s: `createAppDeployment`, `publishAppDeployment`; card B-2: `listAppRoles`,
-`listAppRoleGrants`, `addAppRoleGrant`, `removeAppRoleGrant`); 42 operations are still `planned`
-in all. Bindings (B-1) run in the deployment stages, without database bindings (B-1d). The app gateway (`ruum-gateway`, card G-1a) serves static apps; it is not deployed yet. The telemetry processor role (O-1b) is in `ruum-server`, off unless `RUUM_TELEMETRY=on`; the Node SDK (O-5) is in `sdk/node`. The egress proxy
-(`ruum-egress`, R-2e) and the Docker runtime driver (`ruum-runtime`, R-2a) are built and tested but not
-wired into `ruum-server` and not deployed (I-4, I-6); the laptop telemetry stack (I-5) runs with
+`listAppRoleGrants`, `addAppRoleGrant`, `removeAppRoleGrant`) and 7 more by card O-2 (the
+telemetry reads: `searchAppLogs`, `getAppMetrics`, `getAppTrace`, `compareAppDeployment`,
+`listAppTelemetryFields`, `confirmAppTelemetryFields`, `computeAppPseudonym`), 18 in all; 35
+operations are still `planned` in all. Bindings (B-1) run in the deployment stages, without database bindings (B-1d). The telemetry processor role (O-1b) is in `ruum-server`, off unless `RUUM_TELEMETRY=on`; the Node SDK (O-5) is in `sdk/node`. The runtime API (`ruum-runtime-api`, card R-3) is a binary of its own with the core's internal runtime routes and the workload token issuer (`RUUM_WORKLOAD_TOKEN_KEY_FILE`; off without it); no chart deploys it yet (I-4). The staging charts and scripts of card I-6 run the app gateway (`ruum-gateway`, G-1a) and the egress proxy (`ruum-egress`, R-2e) on staging with gVisor nodes and the apps domain once the orchestrator applies them (`deploy/staging/README.md` "The app runtime"); no runtime driver starts sandboxes on Kubernetes yet (backlog I6-1), so node22 apps answer the gateway's 502. The Docker runtime driver (`ruum-runtime`, R-2a) is built and tested but not
+wired into `ruum-server` (I-4); the laptop telemetry stack (I-5) runs with
 `scripts/dev.sh up --apps`.
 
 | Area | What works |
@@ -829,6 +846,38 @@ npm run dev:server                # proxies the API to the server on 8490 (see w
 
 For Zitadel sign-in through Vite, start the server with
 `RUUM_OIDC_REDIRECT_URI=http://localhost:5173/auth/callback`.
+
+## Checks (2026-11-21, `main` after the integration of run 14, on the build server)
+
+`main` is `798ca89` before this documentation commit. Each tip was checked with its own key, one
+full check at a time (`panel/integ14-check.sh`: fmt, clippy, the workspace without
+`ruum-dbengine`, `ruum-dbengine` with 4 threads, the test kit on both backends with
+`RUUM_REQUIRE_IMPLEMENTED=1`, the browser tests; the final tip also the smoke test).
+
+| Tip | `cargo test --workspace` (passed / failed / ignored) | Isolation (memory = Postgres) | Permission matrix (memory = Postgres) | Privacy (memory / Postgres) | Trashed | Browser |
+|---|---|---|---|---|---|---|
+| R-3 (`d1ce40f`) | 1426 / 0 / 5 | 375 passed, 128 planned | 2032 passed, 624 planned | 99 planned / 38 passed, 61 planned | 112 | 172 passed, 1 skipped |
+| O-2 (`a89b2d9`) | 1446 / 0 / 5 | 396, 107 | 2144, 512 | same | 112 | 172, 1 |
+| I-6 before the integration fix (`b0031d5`) | 1449 / 1 / 5 (the stale meta test `every_pending_entry_names_a_case_and_a_card`, fixed in `d1ce40f`; T-72) | 396, 107 | 2144, 512 | same | 112 | 172, 1 |
+| I-6 (`7114115`, final) | **1450 / 0 / 5** | **396 passed, 107 planned** | **2144 passed, 512 planned** | **99 planned / 38 passed, 61 planned** | **112** | **172 passed, 1 skipped** |
+
+On the final tree: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+--locked -- -D warnings` clean; the test kit with `RUUM_REQUIRE_IMPLEMENTED=1` passes on memory
+and Postgres (95 tests each, 0 operations without a case; the telemetry cases 15 of 15 on both);
+`scripts/e2e_smoke.sh`: `PASSED: 59 checks`. Also:
+
+- `MUTATION_STRICT=1 crates/ruum-testkit/scripts/mutation_check.sh`: **379 mutations, all KILLED** in the end (342 on `main` before; R-3 adds 14, O-2 17, I-6 six).
+  Two shards of 179 and 178 (no Docker) ran beside the tip checks: 356 killed, 1 SKIP
+  (`telemetry-processor-shipper-no-rotation`: its pattern no longer matched the O-1b Kimi fix
+  code of run 13; updated in `798ca89`, then KILLED alone; T-73). The 22 Docker mutations
+  (`runtime-docker-*`, `runtime-build-*`) ran in a shard of their own: 22 KILLED. The first start
+  of shard 1 stopped in its baseline on a database provisioning wait under load (T-70) and passed
+  when started again.
+- `deploy/staging/tests/run.sh` on the Mac: 685 checks passed on the R-3 and O-2 tips, 775 on
+  the I-6 tip.
+- GitHub CI: green at the first attempt on `integ14/r-3` (`ci` 44887042746), `integ14/o-2-r2`
+  (44887044999) and `integ14/i-6-r2` (44887046948); `images` green on `integ14/i-6-r2`
+  (44887046947).
 
 ## Checks (2026-11-21, `main` after the Kimi review fixes of run 13, on the build server)
 
