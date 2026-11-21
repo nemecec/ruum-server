@@ -34,6 +34,7 @@ pub mod apps_deploy;
 pub mod apps_publish;
 pub mod apps_roles;
 pub mod apps_settings;
+pub mod apps_telemetry;
 pub mod d1;
 pub mod guests;
 pub mod nodes;
