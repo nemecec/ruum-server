@@ -31,7 +31,8 @@
 //! 2. the deny-list ([`denylist`]),
 //! 3. the classes ([`classify::effective_class`]),
 //! 4. the free-text patterns ([`scrub`]),
-//! 5. pseudonyms with the per-app key ([`app_telemetry_key`]),
+//! 5. pseudonyms with the per-app key ([`app_telemetry_key`]; a preview has its own key,
+//!    [`source_telemetry_key`]),
 //! 6. no raw copy here (card O-3; the hook point is marked `RAW COPY HOOK` in `classify.rs`).
 //!
 //! No code of the pipeline keeps a raw value: the input types have no `Debug`, error texts name
@@ -896,6 +897,34 @@ pub fn app_telemetry_key(tenant_key: &PseudonymKey, app: NodeId) -> PseudonymKey
     PseudonymKey::from_bytes(hmac_sha256(tenant_key.as_bytes(), msg.as_bytes()))
 }
 
+/// The domain of a preview deployment's key, below the app key.
+pub const PREVIEW_KEY_DOMAIN: &str = "ruum/telemetry/v1/preview/";
+
+/// The pseudonym key that the pipeline uses for the records of `source` (Kimi run 14, O-2
+/// finding 1; backlog P-107):
+///
+/// ```text
+/// live:    app_key
+/// preview: HMAC-SHA-256(app_key, "ruum/telemetry/v1/preview/" || deployment_id)
+/// ```
+///
+/// An agent with `edit` can deploy a preview without a person. If a preview used the app key,
+/// its code could log guessed values in a `personal` field, and the stored pseudonyms would
+/// then find live records through `searchAppLogs?q=p_...`: the guess-testing oracle that
+/// decision 0006-8 closes by making `computeAppPseudonym` users only. With a key per preview
+/// deployment, a pseudonym that a preview stored matches no live record and no record of
+/// another preview. `computeAppPseudonym` answers with the live key.
+pub fn source_telemetry_key(tenant_key: &PseudonymKey, source: &SourceIdentity) -> PseudonymKey {
+    let app_key = app_telemetry_key(tenant_key, source.app);
+    match source.environment {
+        Environment::Live => app_key,
+        Environment::Preview => {
+            let msg = format!("{PREVIEW_KEY_DOMAIN}{}", source.deployment.hyphenated());
+            PseudonymKey::from_bytes(hmac_sha256(app_key.as_bytes(), msg.as_bytes()))
+        }
+    }
+}
+
 /// HMAC-SHA-256 (RFC 2104) on `sha2`, for a key of at most one block (64 bytes). The same
 /// construction as the private one of `privacy` (which this card may not change); the tests
 /// check it against RFC 4231 and against `PseudonymKey::derive_for_database`.
@@ -967,7 +996,7 @@ impl TelemetryIngest for PipelineIngest {
         let target = *identity;
         let classes = self.classes.classes(identity.tenant, identity.app).await?;
         let tenant_key = self.keys.tenant_key(identity.tenant).await?;
-        let pseudonymizer = HmacPseudonymizer::new(app_telemetry_key(&tenant_key, identity.app));
+        let pseudonymizer = HmacPseudonymizer::new(source_telemetry_key(&tenant_key, identity));
         let secret_values = self.secrets.secrets(identity).await?;
         let matcher = secrets::SecretMatcher::new(secret_values.iter().map(|s| s.expose()));
         let (out, mut report) = classify::process(
