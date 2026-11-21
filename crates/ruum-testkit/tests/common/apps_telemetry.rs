@@ -495,14 +495,18 @@ pub fn cases() -> Vec<Case> {
                     fail!("stripe_token is not listed: {rows:?}");
                 };
                 check!(r["class"] == "secret", "stripe_token is secret: {r}");
+                // q matches the template and normal values (order_id is personal here).
                 let recs = found(
                     &cx,
                     &cx.p(Who::Member).clone(),
-                    search(cx.a(), &w, &format!("?q={}", enc("dl-1"))),
+                    search(cx.a(), &w, "?q=deny"),
                 )
                 .await?;
-                let Some(rec) = recs.iter().find(|r| r["fields"]["order_id"] == "dl-1") else {
-                    fail!("the record is not found by its order_id (positive control): {recs:?}");
+                let Some(rec) = recs
+                    .iter()
+                    .find(|r| r["template"] == "deny check {order_id}")
+                else {
+                    fail!("the record is not found by its template (positive control): {recs:?}");
                 };
                 check!(
                     is_hidden(&rec["fields"]["stripe_token"]),
@@ -1654,6 +1658,17 @@ pub fn cases() -> Vec<Case> {
                 );
                 let app = new_app(&cx, Who::Member, a.projects, "cursor other").await?;
                 let x = app_id(&app)?;
+                // X has older records of its own, so a cursor that is not bound to its app
+                // would page through them.
+                ingest(
+                    &cx,
+                    &source_of(&a, &x, Uuid::now_v7())?,
+                    logs(vec![
+                        log(Severity::Info, "page {order_id}", &[("order_id", "px-1")], 300),
+                        log(Severity::Info, "page {order_id}", &[("order_id", "px-2")], 200),
+                    ]),
+                )
+                .await?;
                 for req in [
                     search(&a, &x, &format!("?q=page&limit=1&cursor={}", enc(&cursor))),
                     search(&a, &w, &format!("?q=other&limit=1&cursor={}", enc(&cursor))),
