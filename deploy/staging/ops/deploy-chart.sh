@@ -12,8 +12,11 @@
 #   - each digest has a provenance attestation of images.yml on refs/heads/main (cosign);
 #   - the app runtime (card I-6): the gateway and egress images come from the tag <commit> of
 #     ghcr.io/nemecec/ruum-{gateway,egress} (the same images.yml run), each with the same
-#     provenance check. A commit without them (before I-6) deploys without the app runtime;
-#     one image without the other stops the deploy;
+#     provenance check and its revision label equal to <commit> (review of I-6, Kimi 5). One
+#     image without the other stops the deploy; so does a lookup error (network, rate limit:
+#     review of I-6, 2). A commit without both images (before I-6) deploys without the app
+#     runtime only when the live release has none, or on a stated rollback (--rollback,
+#     --rollback-older); otherwise helm would delete the running gateway and egress proxy;
 #   - the values go to helm in a values file (JSON), never through --set, so no value can add
 #     another key (helm splits --set on commas).
 # Then (design 12.7, backlog O-25), holding the deploy lock (Lease ruum/ruum-deploy,
@@ -96,22 +99,30 @@ for ref in "$server" "$edge"; do
 done
 
 # The app runtime (card I-6): the gateway and the egress proxy of the same commit, by digest.
+# A missing image (status 3 of ghcr_tag_lookup) and a lookup error are told apart: an error
+# stops the deploy, so a registry outage never removes the running app runtime (review of I-6, 2).
 gateway="" egress=""
 for kind in gateway egress; do
-  digest="$(ghcr_digest "nemecec/ruum-$kind" "$commit" 2>/dev/null || true)"
-  [[ -n "$digest" ]] || continue
+  rc=0
+  digest="$(ghcr_tag_lookup "nemecec/ruum-$kind" "$commit")" || rc=$?
+  [[ $rc == 3 ]] && continue
+  [[ $rc == 0 ]] || die "cannot read the tag ghcr.io/nemecec/ruum-$kind:$commit (a registry or network error); not deploying, so a failed lookup never removes the app runtime. Run deploy.sh again later"
   [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || die "ghcr.io/nemecec/ruum-$kind:$commit resolves to an odd digest"
   ref="ghcr.io/nemecec/ruum-$kind@$digest"
   [[ "$ref" =~ $RUUM_APP_IMAGE_RE ]] || die "unexpected $kind image $ref"
   cosign_verify_provenance "$ref" || die "no valid provenance attestation for $ref"
+  # The signed image says which commit it was built from, as the controller checks for the
+  # server and the edge (a tag moved to an older signed image fails here).
+  rev="$(ghcr_revision "$ref")" || die "cannot read the revision label of $ref"
+  [[ "$rev" == "$commit" ]] || die "$ref was built from ${rev:-an unknown commit}, not from $commit"
   printf -v "$kind" '%s' "$ref"
 done
 if [[ -n "$gateway" && -n "$egress" ]]; then
-  echo "==> app runtime: $gateway, $egress (provenance checked)" >&2
+  echo "==> app runtime: $gateway, $egress (provenance and revision checked)" >&2
 elif [[ -n "$gateway$egress" ]]; then
   die "only one of ruum-gateway and ruum-egress has the tag $commit; images.yml publishes both (card I-6)"
 else
-  echo "==> no ruum-gateway or ruum-egress image of $commit: deploying without the app runtime (a commit from before card I-6, or the packages are not public yet)" >&2
+  echo "==> no ruum-gateway or ruum-egress image of $commit (a commit from before card I-6, or the packages are not public): allowed only when the live release has no app runtime, or on a rollback (checked under the deploy lock)" >&2
 fi
 
 tmp="$(mktemp -d "$WORK/deploy.XXXXXX")"
@@ -135,6 +146,14 @@ live="$(kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.commit}' 
 previous="$(kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.previous}' 2>/dev/null || true)"
 [[ "${live:-none}" == "$expect_deployed" ]] ||
   die "the live release is ${live:-none}, not $expect_deployed as deploy.sh checked: another deploy ran in between; run deploy.sh again"
+# A release without the app runtime over one with it would delete the gateway and the egress
+# proxy (every app offline): only a stated rollback may do that (review of I-6, 2).
+live_gateway="$(kubectl -n ruum get configmap ruum-release -o jsonpath='{.data.gateway}' 2>/dev/null || true)"
+if [[ -z "$gateway" && -n "$live_gateway" ]]; then
+  [[ $rollback != 0 ]] ||
+    die "the live release runs the app runtime ($live_gateway), but $commit has no ruum-gateway and ruum-egress images (the tags are missing, or the packages are private again): this deploy would delete the gateway and the egress proxy. Make the packages public, or deploy a commit with both images; only a rollback (--rollback) to a commit from before card I-6 removes the app runtime"
+  echo "deploy-chart: rollback to $commit, a release without the app runtime: the gateway and the egress proxy will be removed" >&2
+fi
 if [[ $rollback != 0 ]]; then
   ruum_rollback_target_ok "$commit" "$previous" "$([[ $rollback == 2 ]] && echo 1 || echo 0)" ||
     die "$commit is not the previous release (${previous:-none recorded}); a plain --rollback goes back one release only (design 12.7). Use --rollback-older on purpose"

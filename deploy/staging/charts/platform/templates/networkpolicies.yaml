@@ -7,9 +7,14 @@
 # egress policy is added for Zitadel, allow auth/zitadel to TCP 587 out (and DNS).
 {{- $ns := list "data" "authz" "auth" "ops" "nats" "ruum" "edge" "ruum-deploy" "ruum-apps" }}
 {{- /* The private and special ranges that the gateway and the egress proxy never reach outside
-       the cluster rules below (the egress proxy checks them again after resolution). */}}
-{{- $private4 := list "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.168.0.0/16" }}
-{{- $private6 := list "fc00::/7" "fe80::/10" "::1/128" }}
+       the cluster rules below (the egress proxy checks them again after resolution). They mirror
+       the refused ranges of crates/ruum-egress/src/addr.rs (review of I-6, Kimi 7). IPv6: only
+       global unicast 2000::/3, without Teredo, ORCHID and benchmarking (2001::/23), documentation
+       (2001:db8::/32, 3fff::/20) and 6to4 (2002::/16); so IPv4-mapped, NAT64, unique local,
+       link-local and multicast addresses are outside it. */}}
+{{- $private4 := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.88.99.0/24" "192.168.0.0/16" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4" }}
+{{- $public6 := "2000::/3" }}
+{{- $private6 := list "2001::/23" "2001:db8::/32" "2002::/16" "3fff::/20" }}
 {{- range $ns }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -236,7 +241,7 @@ spec:
             cidr: 0.0.0.0/0
             except: {{ toJson $private4 }}
         - ipBlock:
-            cidr: ::/0
+            cidr: {{ $public6 }}
             except: {{ toJson $private6 }}
       ports:
         - { protocol: TCP, port: 443 }
@@ -283,7 +288,7 @@ spec:
             cidr: 0.0.0.0/0
             except: {{ toJson $private4 }}
         - ipBlock:
-            cidr: ::/0
+            cidr: {{ $public6 }}
             except: {{ toJson $private6 }}
       ports:
         - { protocol: TCP, port: 443 }

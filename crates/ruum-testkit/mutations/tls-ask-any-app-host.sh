@@ -3,6 +3,6 @@
 # (review 1 B-6): a random name must not spend the CA's rate limits of ruumapps.net.
 DESCRIPTION="tls-ask answers 200 for an app host without asking the app store"
 FILE="crates/ruum-api/src/internal.rs"
-PERL='s/\.app_host_known\(tenant, app\)\s*\.await\s*\.unwrap_or\(false\)/.app_host_known(tenant, app).await.map(|_| true).unwrap_or(true)/'
+PERL='s/\.app_host_known\(tenant, app, short_id\)\s*\.await/.app_host_known(tenant, app, short_id).await.map(|_| true)/'
 TESTS="-p ruum-api --lib internal::"
 PLACEHOLDER=0
