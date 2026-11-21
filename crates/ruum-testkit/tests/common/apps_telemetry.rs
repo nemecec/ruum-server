@@ -1664,8 +1664,18 @@ pub fn cases() -> Vec<Case> {
                     &cx,
                     &source_of(&a, &x, Uuid::now_v7())?,
                     logs(vec![
-                        log(Severity::Info, "page {order_id}", &[("order_id", "px-1")], 300),
-                        log(Severity::Info, "page {order_id}", &[("order_id", "px-2")], 200),
+                        log(
+                            Severity::Info,
+                            "page {order_id}",
+                            &[("order_id", "px-1")],
+                            300,
+                        ),
+                        log(
+                            Severity::Info,
+                            "page {order_id}",
+                            &[("order_id", "px-2")],
+                            200,
+                        ),
                     ]),
                 )
                 .await?;
