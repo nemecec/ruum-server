@@ -1,5 +1,5 @@
 {
- "openapi_sha256": "f6354a58c152b0dc1f406d4e0d10a0423e2785af4e6e062e278e94e68efad3a4",
+ "openapi_sha256": "a6d29f0e93bb396c286c6470644bfa8ccb3dc342ebc9e3b31330c8012cd42ff2",
  "operations": [
   {
    "method": "GET",
